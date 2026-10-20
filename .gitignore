@@ -1,0 +1,7 @@
+build/
+*.user
+.vs/
+*.yuv
+*.h264
+*.h265
+*.bmp
