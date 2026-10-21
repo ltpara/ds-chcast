@@ -147,6 +147,7 @@ target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll user32
 # the other.
 add_library(chast.host STATIC
     src/host/bitrate_controller.cc
+    src/host/clipboard.cc
     src/host/host_settings.cc
     src/host/host_server.cc)
 

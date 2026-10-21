@@ -63,6 +63,10 @@ struct HostServerStats {
     InputStats input_stats;
     uint64_t input_events = 0;
     uint64_t input_releases = 0;
+    // Clipboard updates applied locally (received from the viewer) and sent
+    // out (local changes). Both stay zero when clipboard sync is disabled.
+    uint64_t clipboard_sent = 0;
+    uint64_t clipboard_received = 0;
 };
 
 struct HostStatus {
@@ -126,6 +130,11 @@ struct HostServerConfig {
     std::function<void(const FrameHeader&, const uint8_t* data, size_t size)> packet;
     // Called for every InputEvent the session drained, in order.
     std::function<void(const InputEvent&)> input_event;
+    // Text clipboard access. Empty means the real Win32 CF_UNICODETEXT
+    // backend; the loopback check substitutes an in-memory pair so it never
+    // touches the operator's clipboard.
+    std::function<bool(std::string&)> clipboard_read;
+    std::function<bool(const std::string&)> clipboard_write;
 };
 
 class HostServer {

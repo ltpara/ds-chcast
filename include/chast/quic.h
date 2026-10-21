@@ -64,6 +64,10 @@ struct QuicServerConfig {
     // connects to a port bound to loopback is still a client, and the gate
     // belongs to the server, not to the binding.
     bool allow_input = false;
+    // Accept ClipboardUpdates from the viewer and allow the server to send its
+    // own. Off by default for the same reason as allow_input; HostServer turns
+    // it on from the host settings.
+    bool allow_clipboard = false;
     // Walk the injection path without calling SendInput. Only for the
     // loopback check, which must not move the real pointer.
     bool dry_run_input = false;
@@ -261,6 +265,18 @@ public:
     // Reports the closing statistics, says Bye, and waits for the server to
     // shut the connection down.
     Error finish_client(const ClientStats& stats, std::chrono::milliseconds timeout);
+
+    // ----- clipboard (both roles) -----
+
+    // Sends one text change. `seq` is the sender's running counter. Returns
+    // InvalidCall for text that fails valid_clipboard_text() and, on a server
+    // whose config forbids clipboard, for every call.
+    Error send_clipboard(uint64_t seq, const std::string& text);
+    // Pops the oldest clipboard update received since the last call. On the
+    // server the peer is the viewer; on the client, the host.
+    bool take_clipboard_update(ClipboardUpdate& update);
+    // Total ClipboardUpdates received since the connection started.
+    uint64_t clipboard_updates_received() const;
 
     // True after the server shut down its send direction of the video stream.
     bool video_finished() const;

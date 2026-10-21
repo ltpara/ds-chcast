@@ -1,7 +1,7 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--input-dry-run]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
@@ -38,14 +38,23 @@
 // generates and prints one. --approve asks on stdin before letting a viewer
 // in. connect --token sends the token, and a refusal prints the server's
 // reason. verify exercises all three refusal paths on throwaway servers.
+//
+// With --clipboard the serve end mirrors text through the real clipboard and
+// connect prints what the host sends. verify always covers this path with an
+// in-memory clipboard shared by both ends: the viewer uploads one text, the
+// host writes it, and only then does the emulated host clipboard change so the
+// viewer must receive exactly one update. Exact counts prove neither side
+// echoes the other's text back.
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -63,6 +72,52 @@
 #include "crash_handler.h"
 
 namespace {
+
+// In-memory clipboard shared by verify's server and its test driver. The
+// baseline is only there to be primed; the changed text is released after the
+// viewer's upload was written, so both directions have a deterministic order.
+struct FakeClipboard {
+    bool read(std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++reads;
+        if (update_enabled && !update_sent) {
+            update_sent = true;
+            current = updated_text;
+        }
+        text = current;
+        return true;
+    }
+
+    bool write(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++writes;
+        last_write = text;
+        current = text;
+        cv.notify_all();
+        return true;
+    }
+
+    bool wait_for_write(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout, [this] { return writes > 0; });
+    }
+
+    void enable_update() {
+        std::lock_guard<std::mutex> lock(mutex);
+        update_enabled = true;
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::string baseline_text = "chast clipboard: host baseline";
+    std::string updated_text = "chast clipboard: host update \xE2\x9C\x93";
+    std::string current = baseline_text;
+    std::string last_write;
+    uint64_t reads = 0;
+    uint64_t writes = 0;
+    bool update_enabled = false;
+    bool update_sent = false;
+};
 
 struct Options {
     std::string mode;
@@ -85,6 +140,16 @@ struct Options {
     // sequence once the handshake reports input enabled. verify: the same,
     // and check that the server observed exactly the events the client sent.
     bool input = false;
+    // serve: mirror clipboard text through the real clipboard. connect: print
+    // the texts the host sends. verify: the same as serve with a fake backend
+    // and checks in both directions.
+    bool clipboard = false;
+    // connect only: upload this text once after the handshake, for checking a
+    // host's real clipboard write path. Implies --clipboard.
+    std::string send_clipboard;
+    // verify only: the server's clipboard backend and the test driver's view.
+    // When set, the real clipboard is never touched.
+    std::shared_ptr<FakeClipboard> fake_clipboard;
     // serve only: accept input but stop at the OS boundary. Lets the Flutter
     // viewer exercise its full send path against a server on the same machine
     // without the injected events looping back into the viewer's own window.
@@ -185,6 +250,11 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.save = argv[++i];
             } else if (arg == "--input") {
                 options.input = true;
+            } else if (arg == "--clipboard") {
+                options.clipboard = true;
+            } else if (arg == "--send-clipboard" && i + 1 < argc) {
+                options.send_clipboard = argv[++i];
+                options.clipboard = true;
             } else if (arg == "--input-dry-run") {
                 options.input = true;
                 options.input_dry_run = true;
@@ -241,6 +311,16 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "--token-reuse and --approve only apply to serve\n");
         return false;
     }
+    if (!options.send_clipboard.empty()) {
+        if (options.mode != "connect") {
+            std::fprintf(stderr, "--send-clipboard only applies to connect\n");
+            return false;
+        }
+        if (!chast::valid_clipboard_text(options.send_clipboard)) {
+            std::fprintf(stderr, "--send-clipboard wants 1..256 KiB of valid UTF-8\n");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -295,6 +375,11 @@ struct SenderStats {
     chast::InputStats input_stats;
     uint64_t input_releases = 0;
     bool input_enabled = false;
+    // Clipboard texts the server sent and received, plus the gate it
+    // announced. The counts are assigned from HostServerStats.
+    uint64_t clipboard_sent = 0;
+    uint64_t clipboard_received = 0;
+    bool clipboard_enabled = false;
     std::vector<chast::DisplayDescription> displays;
     // What Hello asked for (kDisplayAuto when the client left it to the
     // server) and the index the capturer actually used.
@@ -336,6 +421,12 @@ struct ReceiverStats {
     std::vector<chast::InputEvent> input_sent;
     bool input_enabled = false;
     uint64_t input_errors = 0;
+    // Clipboard texts this receiver sent and every text it received.
+    uint64_t clipboard_sent = 0;
+    uint64_t clipboard_received = 0;
+    uint64_t clipboard_errors = 0;
+    bool clipboard_enabled = false;
+    std::vector<std::string> clipboard_texts;
     std::vector<chast::DisplayDescription> displays;
     // StreamInfo messages received, and the description from the last one.
     uint64_t stream_updates = 0;
@@ -453,6 +544,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.bind_address = options.bind;
     config.settings.port = options.port;
     config.settings.allow_input = options.input;
+    config.settings.allow_clipboard = options.clipboard;
     config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
                                                      : chast::HostTokenMode::OneTime;
     config.settings.access_token = options.token;
@@ -516,6 +608,15 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         event.modifiers);
         }
     };
+    if (options.fake_clipboard) {
+        std::shared_ptr<FakeClipboard> clipboard = options.fake_clipboard;
+        config.clipboard_read = [clipboard](std::string& text) {
+            return clipboard->read(text);
+        };
+        config.clipboard_write = [clipboard](const std::string& text) {
+            return clipboard->write(text);
+        };
+    }
 
     std::string error;
     std::unique_ptr<chast::HostServer> server =
@@ -555,6 +656,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.input_enabled = options.input;
     stats.input_stats = status.stats.input_stats;
     stats.input_releases = status.stats.input_releases;
+    stats.clipboard_enabled = options.clipboard;
+    stats.clipboard_sent = status.stats.clipboard_sent;
+    stats.clipboard_received = status.stats.clipboard_received;
     stats.stats_received = status.stats.stats_received;
     stats.peer = status.stats.peer;
     stats.peer_left = status.stats.peer_left;
@@ -603,6 +707,11 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         static_cast<unsigned long long>(stats.input_stats.failed),
                         static_cast<unsigned long long>(stats.input_stats.dropped),
                         static_cast<unsigned long long>(stats.input_releases));
+        }
+        if (options.clipboard) {
+            std::printf("sender: clipboard sent=%llu received=%llu\n",
+                        static_cast<unsigned long long>(stats.clipboard_sent),
+                        static_cast<unsigned long long>(stats.clipboard_received));
         }
     }
     stats.ok = stats.error.empty();
@@ -679,6 +788,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.origin_x = info.origin_x;
     stats.origin_y = info.origin_y;
     stats.input_enabled = info.input_enabled;
+    stats.clipboard_enabled = info.clipboard_enabled;
     stats.displays = info.displays;
     stats.target_bitrate = info.bitrate;
     if (!options.quiet) {
@@ -709,6 +819,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         info.input_enabled ? "enabled" : "disabled", info.origin_x,
                         info.origin_y);
         }
+        if (options.clipboard) {
+            std::printf("quic: server clipboard %s\n",
+                        info.clipboard_enabled ? "enabled" : "disabled");
+        }
     }
     if (options.input) {
         if (!info.input_enabled) {
@@ -731,6 +845,28 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (chast::Error released = session->release_input(); !released.ok()) {
             ++stats.input_errors;
             std::fprintf(stderr, "release_input: %s\n", released.to_string().c_str());
+        }
+    }
+
+    if (options.clipboard) {
+        if (!info.clipboard_enabled) {
+            return fail("the server refused clipboard (it was not started with --clipboard)");
+        }
+        // verify uploads a fixed text so the fake backend can prove the exact
+        // traffic; connect may upload one given on the command line.
+        std::string upload;
+        if (options.mode == "verify") {
+            upload = "chast clipboard: viewer upload \xE2\x9C\x93";
+        } else {
+            upload = options.send_clipboard;
+        }
+        if (!upload.empty()) {
+            if (chast::Error sent = session->send_clipboard(1, upload); !sent.ok()) {
+                ++stats.clipboard_errors;
+                std::fprintf(stderr, "send_clipboard: %s\n", sent.to_string().c_str());
+            } else {
+                ++stats.clipboard_sent;
+            }
         }
     }
 
@@ -769,7 +905,20 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     bool clock_synced = false;
     int64_t clock_offset_us = 0;
 
+    auto drain_clipboard = [&] {
+        chast::ClipboardUpdate update;
+        while (session->take_clipboard_update(update)) {
+            ++stats.clipboard_received;
+            stats.clipboard_texts.push_back(update.text);
+            if (!options.quiet) {
+                std::printf("clipboard: seq=%llu text=%s\n",
+                            static_cast<unsigned long long>(update.seq), update.text.c_str());
+            }
+        }
+    };
+
     while (std::chrono::steady_clock::now() < deadline) {
+        drain_clipboard();
         {
             const auto probe_now = std::chrono::steady_clock::now();
             if (probe_now - last_probe >= std::chrono::seconds(1)) {
@@ -853,6 +1002,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.origin_y = info.origin_y;
             stats.displays = info.displays;
             stats.input_enabled = info.input_enabled;
+            stats.clipboard_enabled = info.clipboard_enabled;
             stats.target_bitrate = info.bitrate;
             if (reconfigure) {
                 // The next access unit may belong to a new stream (new SPS,
@@ -954,6 +1104,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
 
     std::vector<chast::DecodedFrame> tail;
+    drain_clipboard();
     chast::Error flushed = decoder->flush(tail);
     if (flushed.ok()) {
         for (const chast::DecodedFrame& frame : tail) {
@@ -1017,11 +1168,18 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         stats.last_frame_age_ms, stats.max_frame_age_ms,
                         stats.target_bitrate / 1000u,
                         static_cast<unsigned long long>(stats.frames_without_capture));
+            if (options.clipboard) {
+                std::printf("receiver: clipboard sent=%llu received=%llu errors=%llu\n",
+                            static_cast<unsigned long long>(stats.clipboard_sent),
+                            static_cast<unsigned long long>(stats.clipboard_received),
+                            static_cast<unsigned long long>(stats.clipboard_errors));
+            }
         }
     }
     stats.ok = stats.error.empty() && stats.received > 0 && stats.decoded > 0 &&
                stats.crc_errors == 0 && stats.decode_errors == 0 && stats.gaps == 0 &&
-               stats.protocol_errors == 0 && stats.input_errors == 0 && saw_video_end;
+               stats.protocol_errors == 0 && stats.input_errors == 0 &&
+               stats.clipboard_errors == 0 && saw_video_end;
     return stats;
 }
 
@@ -1314,6 +1472,87 @@ bool access_control_works(uint16_t port, std::string* detail) {
     return true;
 }
 
+// A server whose clipboard gate is closed must not send text and must drop a
+// viewer's updates instead of failing the session.
+bool clipboard_gate_works(uint16_t port, std::string* detail) {
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = port;
+    server_config.idle_timeout_ms = 3000;
+    server_config.allow_clipboard = false;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "server: " + error;
+        return false;
+    }
+    const std::string pin = server->server_fingerprint();
+    std::thread serving([&] {
+        if (!server->wait_for_client(std::chrono::seconds(5)).ok()) {
+            return;
+        }
+        chast::ServerInfo info;
+        info.width = 64;
+        info.height = 64;
+        info.framerate = 30;
+        info.bitrate = 100000;
+        info.encoder = "clipboard probe";
+        server->announce(info);
+    });
+
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 3000;
+    client_config.pinned_fingerprint = pin;
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        serving.join();
+        return false;
+    }
+    if (chast::Error connected = client->connect(std::chrono::seconds(5)); !connected.ok()) {
+        *detail = "connect: " + connected.to_string();
+        serving.join();
+        return false;
+    }
+    chast::ServerInfo info;
+    if (chast::Error handshaken =
+            client->handshake(info, std::chrono::seconds(5), chast::kDisplayAuto);
+        !handshaken.ok()) {
+        *detail = "handshake: " + handshaken.to_string();
+        serving.join();
+        return false;
+    }
+    if (info.clipboard_enabled) {
+        *detail = "HelloAck announced clipboard despite the closed gate";
+        serving.join();
+        return false;
+    }
+    if (server->send_clipboard(1, "server must not send").status() != chast::Status::InvalidCall) {
+        *detail = "the closed server accepted its own clipboard send";
+        serving.join();
+        return false;
+    }
+    if (chast::Error sent = client->send_clipboard(1, "viewer update is dropped"); !sent.ok()) {
+        *detail = "the viewer could not send: " + sent.to_string();
+        serving.join();
+        return false;
+    }
+    // The control stream and the server's handler run on transport threads;
+    // give them a moment to deliver and drop the message.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    if (server->clipboard_updates_received() != 0) {
+        *detail = "the closed server queued a viewer update";
+        serving.join();
+        return false;
+    }
+    serving.join();
+    return true;
+}
+
 int run_verify(const Options& options) {
     Options local = options;
     if (local.seconds <= 0.0) {
@@ -1332,6 +1571,10 @@ int run_verify(const Options& options) {
     // in dry-run mode, so the events travel the whole path without touching
     // the real pointer.
     local.input = true;
+    // Clipboard text is covered both ways too. The server gets an in-memory
+    // backend, so the real clipboard is never read or written.
+    local.clipboard = true;
+    local.fake_clipboard = std::make_shared<FakeClipboard>();
     // Cover the mid-session description path: the sender re-announces the
     // current stream two seconds in.
     local.reannounce = true;
@@ -1355,7 +1598,16 @@ int run_verify(const Options& options) {
     std::shared_future<ServerReady> server_ready = listening.get_future().share();
     ReceiverStats received;
     std::thread receiver([&] { received = run_receiver(receiver_options, server_ready); });
-    const SenderStats sent = run_sender(local, path, &listening);
+    SenderStats sent;
+    std::thread sender([&] { sent = run_sender(local, path, &listening); });
+    // Wait until the viewer's upload arrived, then let the host clipboard
+    // change. That ordering is what proves the host's poll sends its own
+    // change rather than echoing the upload.
+    if (!local.fake_clipboard->wait_for_write(std::chrono::seconds(15))) {
+        std::printf("     clipboard: the viewer's text never reached the host\n");
+    }
+    local.fake_clipboard->enable_update();
+    sender.join();
     receiver.join();
 
     std::printf("---- loopback check ----\n");
@@ -1397,6 +1649,14 @@ int run_verify(const Options& options) {
         check(passed, "wrong, spent and declined viewers are refused and told why");
         if (!passed) {
             std::printf("     access control probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
+        const bool passed = clipboard_gate_works(static_cast<uint16_t>(probe_base + 3), &detail);
+        check(passed, "a clipboard-disabled server refuses to send and drops viewer updates");
+        if (!passed) {
+            std::printf("     clipboard gate probe: %s\n", detail.c_str());
         }
     }
     check(sent.encoded > 0, "the sender produced frames");
@@ -1497,6 +1757,23 @@ int run_verify(const Options& options) {
                   sent.input_stats.dropped == 0,
               "no input event was rejected, failed or dropped");
         check(sent.input_releases == 1, "the viewer's release request reached the server");
+    }
+
+    if (local.clipboard) {
+        check(sent.clipboard_enabled, "the server announced clipboard as enabled");
+        check(received.clipboard_enabled, "the client saw clipboard enabled in HelloAck");
+        check(received.clipboard_sent == 1, "the viewer uploaded exactly one clipboard text");
+        check(sent.clipboard_received == 1, "the host received exactly one clipboard text");
+        check(local.fake_clipboard->writes == 1 &&
+                  local.fake_clipboard->last_write ==
+                      "chast clipboard: viewer upload \xE2\x9C\x93",
+              "the host wrote the viewer's text into its clipboard");
+        check(sent.clipboard_sent == 1, "the host sent exactly one clipboard change");
+        check(received.clipboard_received == 1,
+              "the viewer received exactly one clipboard text");
+        check(received.clipboard_texts.size() == 1 &&
+                  received.clipboard_texts.front() == local.fake_clipboard->updated_text,
+              "the received clipboard text matched the host's change");
     }
 
     const StreamDigest replay = digest_saved_stream(path, sent.codec);

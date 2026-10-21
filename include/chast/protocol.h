@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 8.
+// The chast wire protocol, version 9.
 //
 // One QUIC connection carries two things:
 //
@@ -30,7 +30,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 8;
+inline constexpr uint16_t kProtocolVersion = 9;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -75,6 +75,12 @@ enum class ControlType : uint16_t {
     // clock's epoch; the viewer subtracts its own receive time to get RTT and
     // the clock offset without trusting either wall clock.
     LatencyReply = 11,
+    // A change of the sender's text clipboard. Payload: seq (u64) followed by
+    // the UTF-8 text. Both roles may send; QUIC's ordered stream already
+    // guarantees delivery order, so seq is diagnostic rather than a dedup key.
+    // Peers only send text that differs from the baseline they last saw, which
+    // keeps the update from echoing back to its origin.
+    ClipboardUpdate = 12,
 };
 
 // ----- input -----
@@ -177,6 +183,22 @@ struct InputEvent {
     uint16_t modifiers = 0;
 };
 
+// ----- clipboard -----
+//
+// Only plain text travels, as UTF-8. The limit keeps one update from tying up
+// the control stream; larger texts are simply not synced in this version.
+inline constexpr size_t kMaxClipboardBytes = 256u * 1024u;
+
+// True when `text` is a non-empty, well-formed UTF-8 string of at most
+// kMaxClipboardBytes with no NUL. NUL is rejected because Windows'
+// CF_UNICODETEXT is NUL-terminated and would silently truncate.
+bool valid_clipboard_text(const std::string& text);
+
+struct ClipboardUpdate {
+    uint64_t seq = 0;
+    std::string text;
+};
+
 struct FrameHeader {
     uint64_t seq = 0;
     // Presentation time relative to the host session's first stream. Ordering
@@ -196,8 +218,12 @@ struct FrameHeader {
     uint64_t capture_ms = 0;
 };
 
-// HelloAck flags. Bit 0 tells the viewer it may send InputEvents.
+// HelloAck flags. Bit 0 tells the viewer it may send InputEvents; bit 1 tells
+// it that both sides may exchange ClipboardUpdate messages.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
+inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
+inline constexpr uint16_t kServerInfoKnownFlags =
+    kServerInfoInputEnabled | kServerInfoClipboardEnabled;
 
 // One attached output, as the server sees it. `rect` is the output's
 // virtual-desktop rect (the orientation the user sees, so a rotated panel
@@ -230,6 +256,8 @@ inline constexpr uint16_t kMaxDisplayCount = 64;
 // when false the viewer must not send InputEvents (they would be dropped).
 // `displays` lists every attached output; the one being streamed is the entry
 // whose rect starts at the origin and is `width` x `height` pixels.
+// `clipboard_enabled` mirrors the server's clipboard gate: when false the
+// viewer must not send ClipboardUpdates and will not receive any.
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
     uint16_t width = 0;
@@ -239,6 +267,7 @@ struct ServerInfo {
     int32_t origin_x = 0;
     int32_t origin_y = 0;
     bool input_enabled = false;
+    bool clipboard_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
 };
@@ -318,6 +347,11 @@ bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_u
                          uint64_t& host_recv_us, uint64_t& host_send_us, std::string* error);
 std::vector<uint8_t> make_input_event(const InputEvent& event);
 bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error);
+// Returns an empty vector when `text` fails valid_clipboard_text(); callers
+// then skip the update instead of sending an invalid message.
+std::vector<uint8_t> make_clipboard_update(uint64_t seq, const std::string& text);
+bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate& update,
+                            std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.

@@ -131,6 +131,7 @@ void test_hello_ack() {
     sent.origin_x = -1920;
     sent.origin_y = -120;
     sent.input_enabled = true;
+    sent.clipboard_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -159,6 +160,7 @@ void test_hello_ack() {
     check(got.origin_x == sent.origin_x && got.origin_y == sent.origin_y,
           "HelloAck keeps negative virtual-desktop origins");
     check(got.input_enabled, "HelloAck keeps the input flag");
+    check(got.clipboard_enabled, "HelloAck keeps the clipboard flag");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
     if (got.displays.size() == 2) {
@@ -191,12 +193,19 @@ void test_hello_ack() {
     empty_rect[right_at + 2] = 0;
     empty_rect[right_at + 3] = 0;
     rejects_ack(empty_rect, "a display with an empty rect is rejected");
+    std::vector<uint8_t> unknown_flags = ack_payload();
+    // codec, reserved, size, rate, bitrate, origin, then the flags word.
+    constexpr size_t kFlagsAt = 20;
+    unknown_flags[kFlagsAt] = 0x04;
+    unknown_flags[kFlagsAt + 1] = 0;
+    rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
     sent.input_enabled = false;
+    sent.clipboard_enabled = false;
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
-              !disabled.input_enabled,
-          "HelloAck reports input disabled");
+              !disabled.input_enabled && !disabled.clipboard_enabled,
+          "HelloAck reports input and clipboard disabled");
 }
 
 void test_frame_header() {
@@ -278,6 +287,52 @@ void test_latency_probe() {
     check(!chast::parse_latency_reply(payload_of(chast::make_latency_reply(10, 25, 20)),
                                       client_us, host_recv_us, host_send_us, &error),
           "LatencyReply that sends before receiving is rejected");
+}
+
+void test_clipboard() {
+    std::string error;
+    const std::string text = "hello 剪贴板 😀";
+    const std::vector<uint8_t> message = chast::make_clipboard_update(0x1122334455667788ull, text);
+    check(message.size() == chast::kControlHeaderSize + 8 + text.size(),
+          "ClipboardUpdate carries the sequence and the text");
+    check(message.size() > 7 &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::ClipboardUpdate),
+          "ClipboardUpdate names its control type");
+    chast::ClipboardUpdate got;
+    check(chast::parse_clipboard_update(payload_of(message), got, &error) &&
+              got.seq == 0x1122334455667788ull && got.text == text,
+          "ClipboardUpdate round-trips UTF-8 text");
+
+    const std::string largest(chast::kMaxClipboardBytes, 'a');
+    check(chast::valid_clipboard_text(largest), "the clipboard length limit is accepted");
+    check(chast::parse_clipboard_update(
+              payload_of(chast::make_clipboard_update(7, largest)), got, &error) &&
+              got.seq == 7 && got.text == largest,
+          "a clipboard text at the length limit round-trips");
+    check(chast::make_clipboard_update(1, largest + "a").empty(),
+          "a text past the length limit is not encoded");
+
+    check(!chast::valid_clipboard_text(""), "an empty clipboard text is rejected");
+    check(!chast::valid_clipboard_text(std::string("a\0b", 3)),
+          "a clipboard text with NUL is rejected");
+    check(!chast::valid_clipboard_text("\x80"), "a lone continuation byte is rejected");
+    check(!chast::valid_clipboard_text("\xC0\x80"), "an overlong NUL is rejected");
+    check(!chast::valid_clipboard_text("\xE0\x80\x80"), "an overlong three-byte form is rejected");
+    check(!chast::valid_clipboard_text("\xED\xA0\x80"), "a UTF-16 surrogate is rejected");
+    check(!chast::valid_clipboard_text("\xF4\x90\x80\x80"), "a code point past U+10FFFF is rejected");
+    check(!chast::valid_clipboard_text("\xE4\xB8"), "a truncated sequence is rejected");
+
+    check(!chast::parse_clipboard_update(std::vector<uint8_t>(8), got, &error),
+          "a ClipboardUpdate without text is rejected");
+    std::vector<uint8_t> too_long(8 + chast::kMaxClipboardBytes + 1, 'a');
+    check(!chast::parse_clipboard_update(too_long, got, &error),
+          "an oversized ClipboardUpdate is rejected");
+    std::vector<uint8_t> invalid_utf8{0, 0, 0, 0, 0, 0, 0, 0, 0xED, 0xA0, 0x80};
+    check(!chast::parse_clipboard_update(invalid_utf8, got, &error),
+          "a ClipboardUpdate with invalid UTF-8 is rejected");
+    std::vector<uint8_t> short_message(7, 0);
+    check(!chast::parse_clipboard_update(short_message, got, &error),
+          "a truncated ClipboardUpdate is rejected");
 }
 
 void test_stream_info() {
@@ -675,6 +730,7 @@ int main(int argc, char** argv) {
     test_hello_ack();
     test_frame_header();
     test_latency_probe();
+    test_clipboard();
     test_stream_info();
     test_input_events();
     test_identity();

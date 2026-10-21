@@ -16,6 +16,54 @@ constexpr size_t kMaxFrameBuffer = 64u * 1024u * 1024u;
 constexpr size_t kMaxControlBuffer = 4u * 1024u * 1024u;
 constexpr size_t kMaxDisplays = kMaxDisplayCount;
 
+bool valid_utf8(const std::string& text) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(text.data());
+    size_t i = 0;
+    while (i < text.size()) {
+        const unsigned char lead = bytes[i];
+        if (lead < 0x80) {
+            if (lead == 0) {
+                return false;
+            }
+            ++i;
+            continue;
+        }
+        size_t tail = 0;
+        uint32_t code_point = 0;
+        if ((lead & 0xE0) == 0xC0) {
+            tail = 1;
+            code_point = lead & 0x1Fu;
+        } else if ((lead & 0xF0) == 0xE0) {
+            tail = 2;
+            code_point = lead & 0x0Fu;
+        } else if ((lead & 0xF8) == 0xF0) {
+            tail = 3;
+            code_point = lead & 0x07u;
+        } else {
+            return false;
+        }
+        if (i + tail >= text.size()) {
+            return false;
+        }
+        for (size_t j = 1; j <= tail; ++j) {
+            const unsigned char next = bytes[i + j];
+            if ((next & 0xC0) != 0x80) {
+                return false;
+            }
+            code_point = (code_point << 6) | (next & 0x3Fu);
+        }
+        if ((tail == 1 && code_point < 0x80) || (tail == 2 && code_point < 0x800) ||
+            (tail == 3 && code_point < 0x10000)) {
+            return false;  // overlong encoding
+        }
+        if ((code_point >= 0xD800 && code_point <= 0xDFFF) || code_point > 0x10FFFF) {
+            return false;
+        }
+        i += tail + 1;
+    }
+    return true;
+}
+
 // HelloAck display entry: name_size u16, name, left/top/right/bottom i32,
 // rotation u16, flags u16 (bit 0: primary).
 constexpr size_t kDisplayFixedSize = 2 + 16 + 2 + 2;
@@ -334,7 +382,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     put_u32(cursor, info.bitrate);
     put_u32(cursor, static_cast<uint32_t>(info.origin_x));
     put_u32(cursor, static_cast<uint32_t>(info.origin_y));
-    put_u16(cursor, info.input_enabled ? kServerInfoInputEnabled : 0);
+    put_u16(cursor, static_cast<uint16_t>((info.input_enabled ? kServerInfoInputEnabled : 0) |
+                                          (info.clipboard_enabled ? kServerInfoClipboardEnabled
+                                                                  : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -381,7 +431,12 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     info.origin_x = static_cast<int32_t>(origin_x);
     info.origin_y = static_cast<int32_t>(origin_y);
+    if ((flags & ~kServerInfoKnownFlags) != 0) {
+        set_error(error, "HelloAck carries unknown flags");
+        return false;
+    }
     info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
+    info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
@@ -588,6 +643,44 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
             set_error(error, "InputEvent names unknown kind " + std::to_string(kind));
             return false;
     }
+}
+
+bool valid_clipboard_text(const std::string& text) {
+    return !text.empty() && text.size() <= kMaxClipboardBytes && valid_utf8(text);
+}
+
+std::vector<uint8_t> make_clipboard_update(uint64_t seq, const std::string& text) {
+    if (!valid_clipboard_text(text)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(8 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, seq);
+    std::memcpy(cursor, text.data(), text.size());
+    return make_control(ControlType::ClipboardUpdate, payload);
+}
+
+bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate& update,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u64(update.seq)) {
+        set_error(error, "truncated ClipboardUpdate");
+        return false;
+    }
+    if (reader.remaining() == 0) {
+        set_error(error, "ClipboardUpdate carries no text");
+        return false;
+    }
+    if (reader.remaining() > kMaxClipboardBytes) {
+        set_error(error, "ClipboardUpdate text is too long");
+        return false;
+    }
+    reader.string(update.text, reader.remaining());
+    if (!valid_clipboard_text(update.text)) {
+        set_error(error, "ClipboardUpdate carries invalid clipboard text");
+        return false;
+    }
+    return true;
 }
 
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload) {

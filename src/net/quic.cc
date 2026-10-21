@@ -462,6 +462,8 @@ struct QuicSession::Impl {
     std::unique_ptr<InputInjector> injector;
     std::deque<InputEvent> input_events;
     size_t input_releases = 0;
+    std::deque<ClipboardUpdate> clipboard_updates;
+    uint64_t clipboard_received = 0;
     // Client: last clock-sync result. `last_reply_probe_us` rejects a reply
     // that overtook a newer one on the control stream.
     LatencySample latency;
@@ -980,6 +982,28 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::ClipboardUpdate: {
+                if (role == Role::Server && !server_config.allow_clipboard) {
+                    // The HelloAck already reported clipboard off; a client
+                    // that sends it anyway is dropped, not fatal.
+                    break;
+                }
+                ClipboardUpdate update;
+                if (!parse_clipboard_update(payload, update, &error)) {
+                    note_transport_failure("ClipboardUpdate: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (clipboard_updates.size() >= 64) {
+                        clipboard_updates.pop_front();
+                    }
+                    clipboard_updates.push_back(std::move(update));
+                    ++clipboard_received;
+                }
+                cv.notify_all();
+                break;
+            }
             default:
                 break;
         }
@@ -1150,6 +1174,8 @@ struct QuicSession::Impl {
             bye_ready = false;
             input_events.clear();
             input_releases = 0;
+            clipboard_updates.clear();
+            clipboard_received = 0;
             latency = LatencySample{};
             last_reply_probe_us = 0;
             received.clear();
@@ -1880,6 +1906,33 @@ Error QuicSession::release_input() {
     }
     return impl.send_bytes(impl.control.load(), make_control(ControlType::InputRelease, {}),
                            QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::send_clipboard(uint64_t seq, const std::string& text) {
+    Impl& impl = *impl_;
+    if (impl.role == Impl::Role::Server && !impl.server_config.allow_clipboard) {
+        return Error(Status::InvalidCall, "clipboard is disabled on this server");
+    }
+    std::vector<uint8_t> message = make_clipboard_update(seq, text);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid clipboard text");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_clipboard_update(ClipboardUpdate& update) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->clipboard_updates.empty()) {
+        return false;
+    }
+    update = std::move(impl_->clipboard_updates.front());
+    impl_->clipboard_updates.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::clipboard_updates_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->clipboard_received;
 }
 
 Error QuicSession::finish_client(const ClientStats& stats, std::chrono::milliseconds timeout) {

@@ -54,7 +54,8 @@ std::wstring widen_utf8(const std::string& text) {
 
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port &&
-           a.allow_input == b.allow_input && a.require_approval == b.require_approval &&
+           a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
+           a.require_approval == b.require_approval &&
            a.token_mode == b.token_mode && a.access_token == b.access_token &&
            a.codec == b.codec && a.bitrate_kbps == b.bitrate_kbps &&
            a.framerate == b.framerate && a.quality == b.quality && a.autostart == b.autostart &&
@@ -69,6 +70,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.bind_address = "192.168.1.5";
     settings.port = 6100;
     settings.allow_input = false;
+    settings.allow_clipboard = false;
     settings.require_approval = false;
     settings.token_mode = chast::HostTokenMode::Reusable;
     settings.access_token = "ABC234XY";
@@ -104,6 +106,7 @@ void test_missing_file(const std::filesystem::path& dir) {
           "missing file yields the documented defaults");
     check(loaded.settings.allow_input && loaded.settings.require_approval,
           "a fresh host accepts input behind an approval");
+    check(loaded.settings.allow_clipboard, "a fresh host syncs the clipboard");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
     check(loaded.settings.tunnel, "a fresh host enables the connection service");
@@ -121,6 +124,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "bind=\n"
                "port=70000\n"
                "input=maybe\n"
+               "clipboard=perhaps\n"
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
@@ -143,6 +147,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.bind_address == "0.0.0.0", "an empty bind falls back");
     check(settings.port == 4433, "an out-of-range port falls back");
     check(settings.allow_input, "an unparsable boolean keeps the default");
+    check(settings.allow_clipboard, "an unparsable clipboard toggle keeps the default");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -158,9 +163,10 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_key.empty(), "a short device key is dropped");
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
 
-    for (const char* key : {"port", "input", "token_mode", "token", "codec", "bitrate_kbps",
-                            "framerate", "quality", "display", "tunnel", "server_url",
-                            "server_key", "tunnel_id", "tunnel_key", "tunnel_listen"}) {
+    for (const char* key : {"port", "input", "clipboard", "token_mode", "token", "codec",
+                            "bitrate_kbps", "framerate", "quality", "display", "tunnel",
+                            "server_url", "server_key", "tunnel_id", "tunnel_key",
+                            "tunnel_listen"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
     }

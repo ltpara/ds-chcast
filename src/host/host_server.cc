@@ -13,6 +13,7 @@
 
 #include "chast/bitrate_controller.h"
 #include "chast/capture.h"
+#include "chast/clipboard.h"
 
 namespace chast {
 
@@ -76,7 +77,7 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
 // capturer is reading, `attached` the full list from the moment of the call.
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
                            const DisplayInfo& display, const IVideoEncoder& encoder,
-                           uint16_t framerate) {
+                           uint16_t framerate, bool clipboard_enabled) {
     ServerInfo info;
     info.codec = encoder.codec();
     info.width = static_cast<uint16_t>(encoder.width());
@@ -85,6 +86,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.bitrate = encoder.bitrate();
     info.origin_x = display.rect.left;
     info.origin_y = display.rect.top;
+    info.clipboard_enabled = clipboard_enabled;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
     for (const DisplayInfo& listed : attached) {
         DisplayDescription described;
@@ -116,6 +118,12 @@ const char* codec_name(VideoCodec codec) {
 }  // namespace
 
 std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::string* error) {
+    if (!config.clipboard_read) {
+        config.clipboard_read = [](std::string& text) { return read_clipboard_text(text); };
+    }
+    if (!config.clipboard_write) {
+        config.clipboard_write = [](const std::string& text) { return write_clipboard_text(text); };
+    }
     std::unique_ptr<HostServer> server(new HostServer(std::move(config)));
     if (server->settings_.access_token.empty()) {
         server->settings_.access_token = generate_access_token();
@@ -176,6 +184,7 @@ bool HostServer::open_session(std::string* error) {
     quic.port = settings_.port;
     quic.identity_scope = config_.identity_scope;
     quic.allow_input = settings_.allow_input;
+    quic.allow_clipboard = settings_.allow_clipboard;
     quic.dry_run_input = config_.dry_run_input;
     quic.access_token = settings_.access_token;
     quic.reuse_access_token = settings_.token_mode == HostTokenMode::Reusable;
@@ -445,7 +454,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     stats.target_bitrate = encoder->bitrate();
 
     ServerInfo stream_info =
-        describe_stream(attached, capturer->display(), *encoder, settings_.framerate);
+        describe_stream(attached, capturer->display(), *encoder, settings_.framerate,
+                        settings_.allow_clipboard);
     publish_stream(stream_info, find_display(attached, capturer->display()),
                    display_name_utf8(capturer->display()));
     if (config_.stream_announced) {
@@ -475,7 +485,20 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     bool have_input = false;
     std::vector<EncodedPacket> packets;
 
-    auto drain_input = [&] {
+    // Clipboard baseline: remember what the host clipboard held when the
+    // session started and upload only changes after that, never its history.
+    const bool clipboard_enabled = settings_.allow_clipboard;
+    std::string last_clipboard;
+    if (clipboard_enabled) {
+        std::string current;
+        if (config_.clipboard_read(current)) {
+            last_clipboard = std::move(current);
+        }
+    }
+    uint64_t clipboard_seq = 1;
+    auto next_clipboard_poll = Clock::now() + std::chrono::milliseconds(500);
+
+    auto drain_peer = [&] {
         for (const InputEvent& event : session_->take_input_events()) {
             ++stats.input_events;
             if (config_.input_event) {
@@ -484,6 +507,47 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         stats.input_stats = session_->input_stats();
         stats.input_releases = session_->input_release_requests();
+        if (!clipboard_enabled) {
+            return;
+        }
+        ClipboardUpdate update;
+        while (session_->take_clipboard_update(update)) {
+            if (update.text == last_clipboard) {
+                continue;
+            }
+            if (config_.clipboard_write(update.text)) {
+                // Remembering the applied text is what stops the next poll
+                // from sending it straight back to the viewer.
+                last_clipboard = std::move(update.text);
+                ++stats.clipboard_received;
+            }
+        }
+    };
+
+    auto poll_clipboard = [&](Clock::time_point now) {
+        if (!clipboard_enabled || now < next_clipboard_poll) {
+            return;
+        }
+        next_clipboard_poll = now + std::chrono::milliseconds(500);
+        std::string current;
+        if (!config_.clipboard_read(current) || current == last_clipboard) {
+            return;
+        }
+        // Remember text we cannot put on the wire (too large, embedded NUL)
+        // so every later tick does not retry the same value.
+        const bool sendable = valid_clipboard_text(current);
+        last_clipboard = std::move(current);
+        if (!sendable) {
+            return;
+        }
+        Error sent = session_->send_clipboard(clipboard_seq, last_clipboard);
+        if (!sent.ok()) {
+            ++stats.send_errors;
+            log("clipboard send failed: " + sent.to_string());
+            return;
+        }
+        ++clipboard_seq;
+        ++stats.clipboard_sent;
     };
 
     auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
@@ -640,7 +704,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     if (!process_frame(0, capture_clock_ms(Clock::now()))) {
         // A vanished viewer is a normal end, not a failure.
         const bool clean = error->empty();
-        drain_input();
+        drain_peer();
         return clean;
     }
 
@@ -650,11 +714,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
         }
-        drain_input();
+        drain_peer();
+        poll_clipboard(now);
         if (now - last_link_sample >= std::chrono::seconds(1)) {
             if (!sample_link(now)) {
                 const bool clean = error->empty();
-                drain_input();
+                drain_peer();
                 return clean;
             }
         }
@@ -678,7 +743,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     *error = "refresh_stream: " + refreshed.to_string();
                 }
                 const bool clean = error->empty();
-                drain_input();
+                drain_peer();
                 return clean;
             }
             ++stats.stream_updates;
@@ -712,7 +777,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 Error err = capturer->reinitialize();
                 if (!err.ok()) {
                     *error = "reinit failed: " + err.to_string();
-                    drain_input();
+                    drain_peer();
                     return false;
                 }
                 encoder.reset();
@@ -722,7 +787,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             }
             case CaptureResult::FatalError:
                 *error = "capture failed: " + capturer->last_error().to_string();
-                drain_input();
+                drain_peer();
                 return false;
             case CaptureResult::Frame:
                 break;
@@ -742,7 +807,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             encoder = create_encoder(rebuilt_adapter.device, encoder_config, error);
             if (!encoder) {
                 *error = "encoder recreation failed: " + *error;
-                drain_input();
+                drain_peer();
                 return false;
             }
             // A rebuilt encoder starts from the configured bitrate again, so
@@ -751,7 +816,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stats.target_bitrate = encoder->bitrate();
             const std::vector<DisplayInfo> refreshed = enumerate_displays();
             stream_info =
-                describe_stream(refreshed, capturer->display(), *encoder, settings_.framerate);
+                describe_stream(refreshed, capturer->display(), *encoder, settings_.framerate,
+                                settings_.allow_clipboard);
             publish_stream(stream_info, find_display(refreshed, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {
@@ -766,7 +832,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     *error = "refresh_stream: " + refreshed_err.to_string();
                 }
                 const bool clean = error->empty();
-                drain_input();
+                drain_peer();
                 return clean;
             }
             ++stats.stream_updates;
@@ -780,12 +846,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
         if (!process_frame(pts_ms, capture_clock_ms(captured_at))) {
             const bool clean = error->empty();
-            drain_input();
+            drain_peer();
             return clean;
         }
     }
 
-    drain_input();
+    drain_peer();
     return true;
 }
 

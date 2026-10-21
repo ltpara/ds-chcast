@@ -27,6 +27,8 @@ constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 constexpr auto kProbeInterval = std::chrono::seconds(1);
 constexpr size_t kMaxPendingInput = 256;
+constexpr size_t kMaxPendingClipboard = 16;
+constexpr size_t kMaxReceivedClipboard = 16;
 
 std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
@@ -65,6 +67,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(input_mutex_);
         pending_input_.clear();
         input_enabled_ = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(clipboard_mutex_);
+        pending_clipboard_.clear();
+        received_clipboard_.clear();
+        clipboard_enabled_ = false;
     }
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
@@ -110,6 +118,31 @@ bool ViewerEngine::ReleaseInput() {
     return true;
 }
 
+bool ViewerEngine::SendClipboard(const std::string& text) {
+    if (!running_.load(std::memory_order_acquire) || !chast::valid_clipboard_text(text)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(clipboard_mutex_);
+    if (!clipboard_enabled_) {
+        return false;
+    }
+    if (pending_clipboard_.size() >= kMaxPendingClipboard) {
+        pending_clipboard_.pop_front();
+    }
+    pending_clipboard_.push_back(text);
+    return true;
+}
+
+bool ViewerEngine::TakeClipboard(std::string& text) {
+    std::lock_guard<std::mutex> lock(clipboard_mutex_);
+    if (received_clipboard_.empty()) {
+        return false;
+    }
+    text = std::move(received_clipboard_.front());
+    received_clipboard_.pop_front();
+    return true;
+}
+
 ViewerStatus ViewerEngine::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     ViewerStatus status = status_;
@@ -148,6 +181,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t bytes = 0;
     uint64_t input_sent = 0;
     uint64_t input_failed = 0;
+    bool clipboard_enabled = false;
+    uint64_t clipboard_sent = 0;
+    uint64_t clipboard_received = 0;
+    uint64_t clipboard_failed = 0;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
     bool clock_synced = false;
@@ -195,6 +232,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.height = display_height;
             status_.input_sent = input_sent;
             status_.input_failed = input_failed;
+            status_.clipboard_enabled = clipboard_enabled;
+            status_.clipboard_sent = clipboard_sent;
+            status_.clipboard_received = clipboard_received;
+            status_.clipboard_failed = clipboard_failed;
             status_.elapsed_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
             if (final) {
@@ -274,6 +315,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 status_.server_bitrate = info.bitrate;
                 status_.server_encoder = info.encoder;
                 status_.input_enabled = info.input_enabled;
+                status_.clipboard_enabled = info.clipboard_enabled;
                 status_.origin_x = info.origin_x;
                 status_.origin_y = info.origin_y;
                 status_.displays = info.displays;
@@ -281,6 +323,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             {
                 std::lock_guard<std::mutex> lock(input_mutex_);
                 input_enabled_ = info.input_enabled;
+            }
+            clipboard_enabled = info.clipboard_enabled;
+            {
+                std::lock_guard<std::mutex> lock(clipboard_mutex_);
+                clipboard_enabled_ = clipboard_enabled;
+                if (!clipboard_enabled) {
+                    pending_clipboard_.clear();
+                }
             }
             std::fprintf(stderr,
                          "viewer: display request %s; %zu announced, stream origin %d,%d\n",
@@ -386,7 +436,50 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 };
 
                 uint64_t expected_seq = 0;
+                uint64_t clipboard_seq = 1;
                 std::vector<chast::DecodedFrame> frames;
+
+                // Sends the texts the UI queued since the last poll and moves
+                // every received host text into the UI queue. Runs on the
+                // session thread, like drain_input().
+                auto drain_clipboard = [&] {
+                    std::deque<std::string> texts;
+                    {
+                        std::lock_guard<std::mutex> lock(clipboard_mutex_);
+                        if (!clipboard_enabled) {
+                            pending_clipboard_.clear();
+                            return;
+                        }
+                        texts.swap(pending_clipboard_);
+                    }
+                    for (const std::string& text : texts) {
+                        chast::Error sent = session->send_clipboard(clipboard_seq, text);
+                        if (sent.ok()) {
+                            ++clipboard_seq;
+                            ++clipboard_sent;
+                            continue;
+                        }
+                        ++clipboard_failed;
+                        if (clipboard_failed <= 3) {
+                            std::fprintf(stderr, "viewer: send_clipboard: %s\n",
+                                         sent.to_string().c_str());
+                        }
+                    }
+                };
+
+                auto receive_clipboard = [&] {
+                    chast::ClipboardUpdate update;
+                    while (clipboard_enabled && session->take_clipboard_update(update)) {
+                        {
+                            std::lock_guard<std::mutex> lock(clipboard_mutex_);
+                            if (received_clipboard_.size() >= kMaxReceivedClipboard) {
+                                received_clipboard_.pop_front();
+                            }
+                            received_clipboard_.push_back(std::move(update.text));
+                        }
+                        ++clipboard_received;
+                    }
+                };
 
                 // Applies StreamInfo messages: the captured output changed
                 // size, rotation or origin after the server rebuilt its
@@ -410,6 +503,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.server_bitrate = info.bitrate;
                             status_.server_encoder = info.encoder;
                             status_.input_enabled = info.input_enabled;
+                            status_.clipboard_enabled = info.clipboard_enabled;
                             status_.origin_x = info.origin_x;
                             status_.origin_y = info.origin_y;
                             status_.displays = info.displays;
@@ -417,6 +511,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         {
                             std::lock_guard<std::mutex> lock(input_mutex_);
                             input_enabled_ = info.input_enabled;
+                        }
+                        clipboard_enabled = info.clipboard_enabled;
+                        {
+                            std::lock_guard<std::mutex> lock(clipboard_mutex_);
+                            clipboard_enabled_ = clipboard_enabled;
+                            if (!clipboard_enabled) {
+                                pending_clipboard_.clear();
+                            }
                         }
                         std::fprintf(stderr,
                                      "viewer: stream is now %s %ux%u at %d,%d\n",
@@ -467,11 +569,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                     }
                     drain_input();
+                    drain_clipboard();
+                    receive_clipboard();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
                     chast::Error received_frame = session->receive_frame(
                         header, payload,
-                        info.input_enabled ? kInputPoll : kReceiveTimeout);
+                        (info.input_enabled || info.clipboard_enabled) ? kInputPoll
+                                                                       : kReceiveTimeout);
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {
@@ -606,6 +711,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         std::lock_guard<std::mutex> lock(input_mutex_);
         input_enabled_ = false;
         pending_input_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(clipboard_mutex_);
+        pending_clipboard_.clear();
+        received_clipboard_.clear();
+        clipboard_enabled_ = false;
     }
 
     if (handshaken) {

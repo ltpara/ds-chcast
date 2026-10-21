@@ -117,6 +117,13 @@ class StatsOverlay extends StatelessWidget {
                 : '${status.inputSent} 事件'
                     '${status.inputFailed > 0 ? ' · ${status.inputFailed} 失败' : ''}',
           ),
+          _row(
+            '剪贴板',
+            !status.clipboardEnabled
+                ? '服务端未启用'
+                : '收 ${status.clipboardReceived} · 发 ${status.clipboardSent}'
+                    '${status.clipboardFailed > 0 ? ' · ${status.clipboardFailed} 失败' : ''}',
+          ),
           if (anomalies > 0)
             _row(
               '异常',

@@ -235,6 +235,13 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.input_sent));
         map[key("inputFailed")] =
             flutter::EncodableValue(static_cast<int64_t>(status.input_failed));
+        map[key("clipboardEnabled")] = flutter::EncodableValue(status.clipboard_enabled);
+        map[key("clipboardSent")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.clipboard_sent));
+        map[key("clipboardReceived")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.clipboard_received));
+        map[key("clipboardFailed")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.clipboard_failed));
         flutter::EncodableList displays;
         for (const chast::DisplayDescription& display : status.displays) {
             flutter::EncodableMap entry;
@@ -277,6 +284,27 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         SendInput(*args, std::move(result));
+        return;
+    }
+
+    if (method == "sendClipboard") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        if (text == nullptr || !chast::valid_clipboard_text(*text)) {
+            result->Error("bad_args", "sendClipboard wants 1..262144 bytes of valid UTF-8");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->SendClipboard(*text);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "takeClipboard") {
+        std::string text;
+        if (viewer_ != nullptr && viewer_->TakeClipboard(text)) {
+            result->Success(flutter::EncodableValue(std::move(text)));
+        } else {
+            result->Success();
+        }
         return;
     }
 

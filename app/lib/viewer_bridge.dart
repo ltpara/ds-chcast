@@ -91,6 +91,10 @@ class ViewerStatus {
     this.originY = 0,
     this.inputSent = 0,
     this.inputFailed = 0,
+    this.clipboardEnabled = false,
+    this.clipboardSent = 0,
+    this.clipboardReceived = 0,
+    this.clipboardFailed = 0,
     this.displays = const <ViewerDisplay>[],
   });
 
@@ -142,6 +146,14 @@ class ViewerStatus {
   final int originY;
   final int inputSent;
   final int inputFailed;
+
+  /// True when the server announced that it mirrors clipboard text for this
+  /// session. Only then does the page read the local clipboard, and the
+  /// native side accepts [ViewerBridge.sendClipboard].
+  final bool clipboardEnabled;
+  final int clipboardSent;
+  final int clipboardReceived;
+  final int clipboardFailed;
   final List<ViewerDisplay> displays;
 
   bool get hasFrame => published > 0 && width > 0 && height > 0;
@@ -151,6 +163,7 @@ class ViewerStatus {
   // Pointer and keyboard events can only reach the host while the stream is
   // live and the server announced its input gate as open.
   bool get acceptsInput => inputEnabled && isLive;
+  bool get acceptsClipboard => clipboardEnabled && isLive;
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
 
   /// The announced display whose rect is the stream's origin and size, or
@@ -219,6 +232,10 @@ class ViewerStatus {
       originY: asInt(map['originY']),
       inputSent: asInt(map['inputSent']),
       inputFailed: asInt(map['inputFailed']),
+      clipboardEnabled: map['clipboardEnabled'] == true,
+      clipboardSent: asInt(map['clipboardSent']),
+      clipboardReceived: asInt(map['clipboardReceived']),
+      clipboardFailed: asInt(map['clipboardFailed']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
     );
   }
@@ -345,6 +362,20 @@ class ViewerBridge {
   static Future<bool> releaseInput() async {
     final bool? queued = await _channel.invokeMethod<bool>('releaseInput');
     return queued ?? false;
+  }
+
+  /// Queues one clipboard text for the host. Invalid UTF-8, text over 256 KiB
+  /// and sessions without the server's clipboard gate are refused; the caller
+  /// should keep the local copy as the source of truth either way.
+  static Future<bool> sendClipboard(String text) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendClipboard', text);
+    return queued ?? false;
+  }
+
+  /// Takes the next clipboard text the host sent, or null when none is
+  /// waiting. Updates are only queued while the server's gate is open.
+  static Future<String?> takeClipboard() {
+    return _channel.invokeMethod<String>('takeClipboard');
   }
 }
 

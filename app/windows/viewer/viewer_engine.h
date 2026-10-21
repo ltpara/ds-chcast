@@ -99,6 +99,13 @@ struct ViewerStatus {
     int32_t origin_y = 0;
     uint64_t input_sent = 0;
     uint64_t input_failed = 0;
+    // Clipboard gate from HelloAck, and updates exchanged this session. A
+    // received text stays queued until the UI takes it; counting happens when
+    // it is queued, so a UI that stops polling does not lose the count.
+    bool clipboard_enabled = false;
+    uint64_t clipboard_sent = 0;
+    uint64_t clipboard_received = 0;
+    uint64_t clipboard_failed = 0;
     // What the server announced in HelloAck. `displays` is the list the UI's
     // picker shows; the streamed entry is the one whose rect starts at
     // origin_x/origin_y and matches width x height.
@@ -135,6 +142,13 @@ public:
     // Queues a request to lift everything the host still holds. Ordered with
     // the events above, so releases the UI already sent land first.
     bool ReleaseInput();
+    // Queues one text for the host. Returns false when the server did not
+    // offer clipboard sync, no session is running, the text is invalid, or
+    // the queue already holds the newest text. Only changes should be sent;
+    // echo suppression belongs to the UI.
+    bool SendClipboard(const std::string& text);
+    // Pops the oldest text the host sent. Returns false when none is pending.
+    bool TakeClipboard(std::string& text);
 
     ViewerStatus Snapshot() const;
 
@@ -163,6 +177,14 @@ private:
     };
     std::deque<PendingInput> pending_input_;
     bool input_enabled_ = false;
+
+    // Clipboard crosses between the UI and the session thread the same way:
+    // bounded queues, newest wins for outgoing text because the UI only sends
+    // changes.
+    mutable std::mutex clipboard_mutex_;
+    std::deque<std::string> pending_clipboard_;
+    std::deque<std::string> received_clipboard_;
+    bool clipboard_enabled_ = false;
 };
 
 }  // namespace chast_viewer

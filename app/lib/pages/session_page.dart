@@ -26,6 +26,7 @@ class SessionPage extends StatefulWidget {
 
 class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   static const Duration _pollInterval = Duration(milliseconds: 200);
+  static const Duration _clipboardInterval = Duration(milliseconds: 500);
   static const Duration _hideDelay = Duration(seconds: 5);
 
   final FocusNode _focus = FocusNode(debugLabel: 'session');
@@ -34,7 +35,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Timer? _pollTimer;
   Timer? _hideTimer;
+  Timer? _clipboardTimer;
   ViewerStatus _status = const ViewerStatus();
+  // The text most recently exchanged with the host, either direction. Null
+  // until the first local read after the gate opened, which is what keeps the
+  // clipboard from before the connection from being uploaded.
+  String? _lastClipboardText;
+  bool _clipboardBusy = false;
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -83,6 +90,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _clipboardTimer?.cancel();
     _focus.dispose();
     unawaited(_shutdown());
     super.dispose();
@@ -288,10 +296,89 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (nowOver || !status.inputEnabled) {
       _controlEnabled = false;
     }
+    _syncClipboardPolling(status.acceptsClipboard && !nowOver);
     setState(() {
       _status = status;
       _fullscreen = status.fullscreen;
     });
+  }
+
+  void _syncClipboardPolling(bool enabled) {
+    if (enabled == (_clipboardTimer != null)) {
+      return;
+    }
+    if (!enabled) {
+      _clipboardTimer?.cancel();
+      _clipboardTimer = null;
+      return;
+    }
+    _clipboardTimer =
+        Timer.periodic(_clipboardInterval, (_) => unawaited(_pollClipboard()));
+    unawaited(_pollClipboard());
+  }
+
+  /// Applies text the host sent, then uploads a local text only when it is new.
+  /// Both directions remember the exchanged value, so neither copies the other
+  /// side's own text back and forth.
+  Future<void> _pollClipboard() async {
+    if (_clipboardBusy || !mounted || _over) {
+      return;
+    }
+    _clipboardBusy = true;
+    try {
+      String? remote;
+      try {
+        remote = await ViewerBridge.takeClipboard();
+      } on MissingPluginException {
+        return;
+      } on PlatformException {
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      if (remote != null && remote.isNotEmpty) {
+        // Remember it before writing; the read below would otherwise see the
+        // host's text as a fresh local copy and echo it straight back.
+        _lastClipboardText = remote;
+        try {
+          await Clipboard.setData(ClipboardData(text: remote));
+        } on PlatformException {
+          // The text is still remembered, so it is not uploaded again.
+        } on MissingPluginException {
+          return;
+        }
+      }
+      String? local;
+      try {
+        final ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
+        local = data?.text;
+      } on PlatformException {
+        return;
+      } on MissingPluginException {
+        return;
+      }
+      if (!mounted || local == null || local.isEmpty) {
+        return;
+      }
+      if (_lastClipboardText == null) {
+        _lastClipboardText = local;
+        return;
+      }
+      if (local == _lastClipboardText) {
+        return;
+      }
+      _lastClipboardText = local;
+      try {
+        await ViewerBridge.sendClipboard(local);
+      } on MissingPluginException {
+        // The session is going away.
+      } on PlatformException {
+        // Oversized or malformed text; wait for the next local change.
+      }
+    } finally {
+      _clipboardBusy = false;
+    }
   }
 
   void _scheduleHide() {
@@ -421,6 +508,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     });
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _clipboardTimer?.cancel();
+    _clipboardTimer = null;
     if (_controlEnabled) {
       // The session is about to be torn down; lift what this page still holds
       // so the short window before Stop() does not leave a key down.
@@ -455,6 +544,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _shutdownOnce() async {
     _closing = true;
+    _clipboardTimer?.cancel();
+    _clipboardTimer = null;
     await _starting;
     _teardown = null;
     await _stopSession();
@@ -470,6 +561,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _closing = true;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _clipboardTimer?.cancel();
+    _clipboardTimer = null;
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
@@ -483,6 +576,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _cleanupAfterPop() {
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _clipboardTimer?.cancel();
+    _clipboardTimer = null;
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }

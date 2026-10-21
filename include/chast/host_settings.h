@@ -31,6 +31,9 @@ struct HostSettings {
     // The gate belongs to the host, and a remote-desktop host is not useful
     // without it; access control is the token and the approval, not this.
     bool allow_input = true;
+    // Sync plain-text clipboard changes in both directions. Off means the
+    // HelloAck reports clipboard unavailable and the viewer stays silent.
+    bool allow_clipboard = true;
     bool require_approval = true;
     HostTokenMode token_mode = HostTokenMode::OneTime;
     // Empty means "generate one on first start".

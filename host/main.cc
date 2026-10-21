@@ -67,6 +67,7 @@ enum ControlId {
     kCopyButton,
     kRegenerateButton,
     kInputCheck,
+    kClipboardCheck,
     kApproveCheck,
     kOneTimeCheck,
     kAutostartCheck,
@@ -92,6 +93,7 @@ struct HostApp {
     HWND token_edit = nullptr;
     HWND fingerprint_edit = nullptr;
     HWND input_check = nullptr;
+    HWND clipboard_check = nullptr;
     HWND approve_check = nullptr;
     HWND onetime_check = nullptr;
     HWND autostart_check = nullptr;
@@ -455,6 +457,7 @@ void refresh_ui() {
     set_text(g_app->fingerprint_edit, widen(format_fingerprint(status.fingerprint)));
 
     set_check(g_app->input_check, g_app->settings.allow_input);
+    set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
     set_check(g_app->approve_check, g_app->settings.require_approval);
     set_check(g_app->onetime_check, g_app->settings.token_mode == HostTokenMode::OneTime);
     set_check(g_app->autostart_check, g_app->settings.autostart);
@@ -598,11 +601,11 @@ void create_controls() {
                                        150, 24, kOneTimeCheck, nullptr);
     g_app->autostart_check = add_control(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 0, 24, 368,
                                          160, 24, kAutostartCheck, nullptr);
+    g_app->clipboard_check = add_control(L"BUTTON", L"同步剪贴板", BS_AUTOCHECKBOX, 0, 386, 368,
+                                         150, 24, kClipboardCheck, nullptr);
 
     add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 200, 364, 170, 30,
                 kFirewallButton, nullptr);
-    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 386, 364, 150, 30,
-                kOpenConfigButton, nullptr);
 
     g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 406, 120,
                                        32, kToggleButton, nullptr);
@@ -615,6 +618,8 @@ void create_controls() {
     add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 24, 444, 120, 32, kHideButton,
                 nullptr);
     add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 156, 444, 100, 32, kQuitButton, nullptr);
+    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 376, 444, 120, 32,
+                kOpenConfigButton, nullptr);
 
     add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 492, 200, 20, 0, nullptr);
     g_app->log_edit =
@@ -622,6 +627,7 @@ void create_controls() {
                     WS_EX_CLIENTEDGE, 24, 514, 572, 150, kLogEdit, nullptr);
 
     set_check(g_app->input_check, g_app->settings.allow_input);
+    set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
     set_check(g_app->approve_check, g_app->settings.require_approval);
     set_check(g_app->onetime_check, g_app->settings.token_mode == HostTokenMode::OneTime);
     set_check(g_app->autostart_check, g_app->settings.autostart);
@@ -949,6 +955,8 @@ void show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kRegenerateButton, L"更换访问令牌");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_input ? MF_CHECKED : 0), kInputCheck,
                 L"接受远程输入");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_clipboard ? MF_CHECKED : 0),
+                kClipboardCheck, L"同步剪贴板");
     AppendMenuW(menu, MF_STRING | (g_app->settings.require_approval ? MF_CHECKED : 0),
                 kApproveCheck, L"连接前需要确认");
     AppendMenuW(menu,
@@ -1013,6 +1021,13 @@ void handle_command(int id) {
             restart_server();
             append_log_line(g_app->settings.allow_input ? L"远程输入已开启"
                                                         : L"远程输入已关闭");
+            break;
+        case kClipboardCheck:
+            g_app->settings.allow_clipboard = !g_app->settings.allow_clipboard;
+            save_settings();
+            restart_server();
+            append_log_line(g_app->settings.allow_clipboard ? L"剪贴板同步已开启"
+                                                            : L"剪贴板同步已关闭");
             break;
         case kApproveCheck:
             g_app->settings.require_approval = !g_app->settings.require_approval;

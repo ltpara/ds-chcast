@@ -348,6 +348,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_input)) {
                 warn(result.warning, "input '" + value + "' is not a boolean");
             }
+        } else if (key == "clipboard") {
+            if (!parse_bool(value, settings.allow_clipboard)) {
+                warn(result.warning, "clipboard '" + value + "' is not a boolean");
+            }
         } else if (key == "approve") {
             if (!parse_bool(value, settings.require_approval)) {
                 warn(result.warning, "approve '" + value + "' is not a boolean");
@@ -477,6 +481,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "bind=" << settings.bind_address << "\n"
          << "port=" << settings.port << "\n"
          << "input=" << (settings.allow_input ? 1 : 0) << "\n"
+         << "clipboard=" << (settings.allow_clipboard ? 1 : 0) << "\n"
          << "approve=" << (settings.require_approval ? 1 : 0) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"
