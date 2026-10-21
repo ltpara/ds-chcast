@@ -5,7 +5,7 @@
 // One QUIC connection carries two things:
 //
 //   * a client-initiated bidirectional control stream (Hello / HelloAck,
-//     key-frame requests, closing statistics), and
+//     key-frame requests, input events, closing statistics), and
 //   * a server-initiated unidirectional video stream: a sequence of access
 //     units, each prefixed by a fixed FrameHeader.
 //
@@ -30,8 +30,10 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 1;
-// Complies with the ALPN private-use range.
+inline constexpr uint16_t kProtocolVersion = 2;
+// Complies with the ALPN private-use range. The ALPN names the protocol
+// family, not its version: a mismatch is reported by the Hello exchange with
+// the peer's number instead of as an opaque handshake failure.
 inline constexpr char kAlpn[] = "chast/1";
 
 inline constexpr size_t kFrameHeaderSize = 48;
@@ -45,6 +47,70 @@ enum class ControlType : uint16_t {
     KeyframeRequest = 3,
     Stats = 4,
     Bye = 5,
+    InputEvent = 6,
+};
+
+// ----- input -----
+//
+// The client sends one InputEvent message per pointer or keyboard event on the
+// control stream, in the order they happened. Coordinates are in the host's
+// virtual-desktop space (pixels), so the server never needs to know which
+// output the viewer is looking at and a later multi-display UI needs no wire
+// change. Keys travel as USB HID usage ids: layout independent, and mapped to
+// scan codes on the injecting side.
+
+enum class InputKind : uint8_t {
+    Mouse = 1,
+    Key = 2,
+};
+
+enum class MouseAction : uint8_t {
+    Move = 0,             // absolute, virtual-desktop pixels
+    MoveRelative = 1,
+    ButtonDown = 2,
+    ButtonUp = 3,
+    Wheel = 4,            // y, in WHEEL_DELTA (120) units
+    WheelHorizontal = 5,  // x, in WHEEL_DELTA units
+};
+
+// Bit positions in MouseEvent::buttons. Matches the order Windows uses for
+// its X buttons so the injector can pass the value straight through.
+enum MouseButtonBit : uint16_t {
+    kMouseLeft = 1u << 0,
+    kMouseRight = 1u << 1,
+    kMouseMiddle = 1u << 2,
+    kMouseBack = 1u << 3,
+    kMouseForward = 1u << 4,
+};
+
+struct MouseEvent {
+    MouseAction action = MouseAction::Move;
+    // For ButtonDown/ButtonUp: exactly the button the action applies to, one
+    // of MouseButtonBit. For Move: the buttons held at that moment, which the
+    // injector does not need but a recording tool does. Zero for wheel events.
+    uint16_t buttons = 0;
+    // Absolute actions carry virtual-desktop pixels; relative moves carry the
+    // delta; Wheel reads y and WheelHorizontal reads x, both in WHEEL_DELTA
+    // (120) units with the desktop's sign convention.
+    int32_t x = 0;
+    int32_t y = 0;
+};
+
+enum class KeyAction : uint8_t {
+    Down = 0,
+    Up = 1,
+};
+
+struct KeyEvent {
+    KeyAction action = KeyAction::Down;
+    // USB HID usage id from usage page 0x07 (keyboard), e.g. 0x04 for A.
+    uint16_t hid_usage = 0;
+};
+
+struct InputEvent {
+    InputKind kind = InputKind::Mouse;
+    MouseEvent mouse;
+    KeyEvent key;
 };
 
 struct FrameHeader {
@@ -59,15 +125,24 @@ struct FrameHeader {
     bool idr = false;
 };
 
+// HelloAck flags. Bit 0 tells the viewer it may send InputEvents.
+inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
+
 // What the server announces in HelloAck. `encoder` is informational (the VPL
 // implementation that won the tier ladder); `codec` is what the video stream
-// actually contains.
+// actually contains. `origin_x`/`origin_y` are the captured output's top-left
+// in virtual-desktop pixels, which the viewer adds to the frame-space pointer
+// position before sending it back. `input_enabled` mirrors the server's gate:
+// when false the viewer must not send InputEvents (they would be dropped).
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
     uint16_t width = 0;
     uint16_t height = 0;
     uint16_t framerate = 30;
     uint32_t bitrate = 0;
+    int32_t origin_x = 0;
+    int32_t origin_y = 0;
+    bool input_enabled = false;
     std::string encoder;
 };
 
@@ -106,6 +181,8 @@ std::vector<uint8_t> make_hello_ack(const ServerInfo& info);
 bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std::string* error);
 std::vector<uint8_t> make_stats(const ClientStats& stats);
 bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::string* error);
+std::vector<uint8_t> make_input_event(const InputEvent& event);
+bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.

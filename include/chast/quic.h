@@ -8,6 +8,10 @@
 // Hello handshake, and reads frames. Control messages share a client-initiated
 // bidirectional stream. See chast/protocol.h for the wire format.
 //
+// A server created with QuicServerConfig::allow_input also injects the
+// viewer's pointer and keyboard events locally (chast/input.h) and says so in
+// the HelloAck; a client checks ServerInfo::input_enabled before sending.
+//
 // The class is deliberately blocking and single-owner: MsQuic callbacks run on
 // its worker threads, but every public method is called from one application
 // thread. The methods that touch the peer wait on condition variables and
@@ -25,6 +29,7 @@
 #include <vector>
 
 #include "chast/error.h"
+#include "chast/input.h"
 #include "chast/protocol.h"
 
 namespace chast {
@@ -34,6 +39,13 @@ struct QuicServerConfig {
     uint16_t port = 4433;
     // How long the connection may sit idle before the transport closes it.
     uint32_t idle_timeout_ms = 30000;
+    // Accept InputEvents from the viewer. Off by default: a client that
+    // connects to a port bound to loopback is still a client, and the gate
+    // belongs to the server, not to the binding.
+    bool allow_input = false;
+    // Walk the injection path without calling SendInput. Only for the
+    // loopback check, which must not move the real pointer.
+    bool dry_run_input = false;
 };
 
 struct QuicClientConfig {
@@ -76,6 +88,13 @@ public:
     Error send_frame(FrameHeader header, const uint8_t* payload, size_t size);
     // True when the client asked for a key frame since the last call.
     bool take_keyframe_request();
+    // Drains the input events received since the last call, in order. They
+    // were already injected by the session's own InputInjector when
+    // QuicServerConfig::allow_input is set; this is the observation hook for
+    // tests and for callers that want their own policy.
+    std::vector<InputEvent> take_input_events();
+    // Injection counters (events applied, rejected, failed, dropped).
+    InputStats input_stats() const;
     // Ends the video stream, waits for the client's closing Stats/Bye, and
     // shuts the connection down. `stats_received` is false when the client
     // disappeared first; that alone is not an error.
@@ -94,6 +113,10 @@ public:
                         std::chrono::milliseconds timeout);
     // Asks the server for an IDR (sent on the control stream).
     Error request_keyframe();
+    // Sends one pointer or keyboard event to the server. The caller is
+    // responsible for the coordinate space (virtual-desktop pixels) and for
+    // not sending when the HelloAck reported input disabled.
+    Error send_input(const InputEvent& event);
     // Reports the closing statistics, says Bye, and waits for the server to
     // shut the connection down.
     Error finish_client(const ClientStats& stats, std::chrono::milliseconds timeout);

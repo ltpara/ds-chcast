@@ -1,8 +1,8 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--save sent.h264]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--save received.h264]
-//   chast-quic verify  --port 45433 --seconds 5
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--save sent.h264] [--input]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--save received.h264] [--input]
+//   chast-quic verify  --port 45433 --seconds 5 [--input-real]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -16,6 +16,15 @@
 // and a fresh decoder, and requires the receiver's frame count and content
 // digest to match. That is the repeatable proof that the bytes crossing QUIC
 // decoded into the same pictures the sender encoded. No display is involved.
+//
+// With --input the serve end accepts InputEvents and injects them, connect
+// replays a scripted pointer/key sequence (for real: the pointer moves and a
+// Shift+A is typed), and verify also closes that loop: the events the server
+// received must equal the ones the client sent, in order, and every one must
+// have been injected. verify injects in dry-run mode unless --input-real is
+// given, so a normal test run never touches the real pointer; keys are left
+// out of the script in that mode, because a test must not type into whatever
+// window happens to be focused.
 
 #include <chrono>
 #include <cstdio>
@@ -52,6 +61,15 @@ struct Options {
     // Receiver-side: ask for an IDR this often, exercising the control stream
     // and the sender's key-frame-on-request path.
     UINT keyframe_request_ms = 0;
+    // serve: accept and inject InputEvents. connect: send the scripted input
+    // sequence once the handshake reports input enabled. verify: the same,
+    // and check that the server observed exactly the events the client sent.
+    bool input = false;
+    // verify only: really call SendInput instead of stopping at the OS
+    // boundary. Keys are left out of the script in that mode, because a test
+    // run must not type into whatever window happens to be focused; the key
+    // path is covered by the dry run and the injector's own checks.
+    bool input_real = false;
     double seconds = 0.0;
     bool seconds_set = false;
     double wait_seconds = 30.0;
@@ -109,6 +127,11 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.wait_seconds = std::stod(argv[++i]);
             } else if (arg == "--save" && i + 1 < argc) {
                 options.save = argv[++i];
+            } else if (arg == "--input") {
+                options.input = true;
+            } else if (arg == "--input-real") {
+                options.input = true;
+                options.input_real = true;
             } else if (arg == "--no-hdr") {
                 options.config.want_hdr = false;
             } else if (arg == "--no-cursor") {
@@ -152,6 +175,11 @@ struct SenderStats {
     bool peer_left = false;
     bool stats_received = false;
     chast::ClientStats peer;
+    // Input events the server observed, in order, plus the injector's
+    // counters. Empty unless --input was given.
+    std::vector<chast::InputEvent> input_events;
+    chast::InputStats input_stats;
+    bool input_enabled = false;
     bool ok = false;
 };
 
@@ -171,6 +199,10 @@ struct ReceiverStats {
     std::string decoder;
     std::string error;
     bool ok = false;
+    // Events this receiver sent, and whether the HelloAck allowed them.
+    std::vector<chast::InputEvent> input_sent;
+    bool input_enabled = false;
+    uint64_t input_errors = 0;
 };
 
 // Captures until a frame with an NV12 texture is available. The reference
@@ -213,6 +245,54 @@ bool wait_for_usable_frame(chast::IDxgiCapturer& capturer, bool quiet, std::stri
     return false;
 }
 
+// The input script connect and verify replay. It exercises every action the
+// protocol carries: an absolute move, a click, both wheel axes, a relative
+// move, and a chord that leaves a modifier down across other events.
+std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, bool keys) {
+    std::vector<chast::InputEvent> events;
+    auto mouse = [&](chast::MouseAction action, uint16_t buttons, int32_t x, int32_t y) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Mouse;
+        event.mouse.action = action;
+        event.mouse.buttons = buttons;
+        event.mouse.x = x;
+        event.mouse.y = y;
+        events.push_back(event);
+    };
+    auto key = [&](uint16_t usage, chast::KeyAction action) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Key;
+        event.key.hid_usage = usage;
+        event.key.action = action;
+        events.push_back(event);
+    };
+
+    mouse(chast::MouseAction::Move, 0, origin_x + 10, origin_y + 10);
+    mouse(chast::MouseAction::ButtonDown, chast::kMouseLeft, 0, 0);
+    mouse(chast::MouseAction::ButtonUp, chast::kMouseLeft, 0, 0);
+    mouse(chast::MouseAction::Wheel, 0, 0, -WHEEL_DELTA);
+    mouse(chast::MouseAction::WheelHorizontal, 0, WHEEL_DELTA, 0);
+    mouse(chast::MouseAction::MoveRelative, 0, 5, -3);
+    if (keys) {
+        key(0xE1, chast::KeyAction::Down);  // Left Shift
+        key(0x04, chast::KeyAction::Down);  // A
+        key(0x04, chast::KeyAction::Up);
+        key(0xE1, chast::KeyAction::Up);
+    }
+    return events;
+}
+
+bool same_event(const chast::InputEvent& a, const chast::InputEvent& b) {
+    if (a.kind != b.kind) {
+        return false;
+    }
+    if (a.kind == chast::InputKind::Mouse) {
+        return a.mouse.action == b.mouse.action && a.mouse.buttons == b.mouse.buttons &&
+               a.mouse.x == b.mouse.x && a.mouse.y == b.mouse.y;
+    }
+    return a.key.action == b.key.action && a.key.hid_usage == b.key.hid_usage;
+}
+
 SenderStats run_sender(const Options& options, const std::string& save_path,
                        std::promise<bool>* listening) {
     SenderStats stats;
@@ -241,6 +321,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     chast::QuicServerConfig server_config;
     server_config.bind_address = options.bind;
     server_config.port = options.port;
+    server_config.allow_input = options.input;
+    server_config.dry_run_input = options.input && options.mode == "verify" && !options.input_real;
     std::unique_ptr<chast::QuicSession> server =
         chast::QuicSession::create_server(server_config, &error);
     if (!server) {
@@ -309,6 +391,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     if (!announced.ok()) {
         return fail("announce: " + announced.to_string());
     }
+    stats.input_enabled = options.input;
 
     FILE* sink = nullptr;
     if (!save_path.empty() &&
@@ -508,6 +591,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         fclose(sink);
     }
 
+    stats.input_events = server->take_input_events();
+    stats.input_stats = server->input_stats();
+
     chast::ClientStats peer;
     bool received = false;
     chast::Error finished = server->finish_server(std::chrono::milliseconds(15000), peer,
@@ -535,6 +621,15 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         static_cast<unsigned long long>(peer.received),
                         static_cast<unsigned long long>(peer.decoded),
                         static_cast<unsigned long long>(peer.digest));
+        }
+        if (options.input) {
+            std::printf("sender: input received=%llu applied=%llu rejected=%llu "
+                        "failed=%llu dropped=%llu\n",
+                        static_cast<unsigned long long>(stats.input_events.size()),
+                        static_cast<unsigned long long>(stats.input_stats.applied),
+                        static_cast<unsigned long long>(stats.input_stats.rejected),
+                        static_cast<unsigned long long>(stats.input_stats.failed),
+                        static_cast<unsigned long long>(stats.input_stats.dropped));
         }
     }
     stats.ok = stats.error.empty();
@@ -578,10 +673,33 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
     stats.codec = info.codec;
     stats.width = info.width;
     stats.height = info.height;
+    stats.input_enabled = info.input_enabled;
     if (!options.quiet) {
         std::printf("quic: connected, server streams %s %ux%u at %u kbps (%s)\n",
                     chast_tools::codec_name(info.codec), info.width, info.height,
                     info.bitrate / 1000u, info.encoder.c_str());
+        if (options.input) {
+            std::printf("quic: server input %s (origin %d,%d)\n",
+                        info.input_enabled ? "enabled" : "disabled", info.origin_x,
+                        info.origin_y);
+        }
+    }
+    if (options.input) {
+        if (!info.input_enabled) {
+            return fail("the server refused input (it was not started with --input)");
+        }
+        // Sent before the frame loop: the server injects on its own thread, so
+        // these land while the stream is already running and the check does
+        // not depend on frame timing.
+        stats.input_sent = input_script(info.origin_x, info.origin_y, !options.input_real);
+        for (const chast::InputEvent& event : stats.input_sent) {
+            if (chast::Error sent = session->send_input(event); !sent.ok()) {
+                ++stats.input_errors;
+                if (stats.input_errors == 1) {
+                    std::fprintf(stderr, "send_input: %s\n", sent.to_string().c_str());
+                }
+            }
+        }
     }
 
     chast::DecoderConfig decoder_config;
@@ -776,7 +894,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
     }
     stats.ok = stats.error.empty() && stats.received > 0 && stats.decoded > 0 &&
                stats.crc_errors == 0 && stats.decode_errors == 0 && stats.gaps == 0 &&
-               stats.protocol_errors == 0 && saw_video_end;
+               stats.protocol_errors == 0 && stats.input_errors == 0 && saw_video_end;
     return stats;
 }
 
@@ -861,6 +979,10 @@ int run_verify(const Options& options) {
     if (local.seconds <= 0.0) {
         local.seconds = 5.0;
     }
+    // The loopback check always covers the input channel: the server injects
+    // in dry-run mode, so the events travel the whole path without touching
+    // the real pointer.
+    local.input = true;
     const bool keep_file = !options.save.empty();
     const std::string path = keep_file ? options.save : ".chast-quic-verify.bin";
 
@@ -914,6 +1036,23 @@ int run_verify(const Options& options) {
     }
     check(received.width == sent.width && received.height == sent.height,
           "decoded picture size matches the encoded size");
+
+    if (local.input) {
+        check(sent.input_enabled, "the server announced input as enabled");
+        check(received.input_enabled, "the client saw input enabled in HelloAck");
+        check(sent.input_events.size() == received.input_sent.size(),
+              "every input event reached the server");
+        bool same = sent.input_events.size() == received.input_sent.size();
+        for (size_t i = 0; same && i < received.input_sent.size(); ++i) {
+            same = same_event(sent.input_events[i], received.input_sent[i]);
+        }
+        check(same, "input events arrived intact and in order");
+        check(sent.input_stats.applied == received.input_sent.size(),
+              "every input event was injected");
+        check(sent.input_stats.rejected == 0 && sent.input_stats.failed == 0 &&
+                  sent.input_stats.dropped == 0,
+              "no input event was rejected, failed or dropped");
+    }
 
     const StreamDigest replay = digest_saved_stream(path, sent.codec);
     if (!replay.error.empty()) {

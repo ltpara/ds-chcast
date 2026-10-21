@@ -238,7 +238,7 @@ bool parse_hello(const std::vector<uint8_t>& payload, std::string* error) {
 }
 
 std::vector<uint8_t> make_hello_ack(const ServerInfo& info) {
-    std::vector<uint8_t> payload(14 + info.encoder.size());
+    std::vector<uint8_t> payload(24 + info.encoder.size());
     uint8_t* cursor = payload.data();
     put_u8(cursor, codec_wire(info.codec));
     put_u8(cursor, 0);
@@ -246,6 +246,9 @@ std::vector<uint8_t> make_hello_ack(const ServerInfo& info) {
     put_u16(cursor, info.height);
     put_u16(cursor, info.framerate);
     put_u32(cursor, info.bitrate);
+    put_u32(cursor, static_cast<uint32_t>(info.origin_x));
+    put_u32(cursor, static_cast<uint32_t>(info.origin_y));
+    put_u16(cursor, info.input_enabled ? kServerInfoInputEnabled : 0);
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     return make_control(ControlType::HelloAck, payload);
@@ -255,13 +258,20 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     Reader reader(payload.data(), payload.size());
     uint8_t codec = 0;
     uint8_t reserved = 0;
+    uint32_t origin_x = 0;
+    uint32_t origin_y = 0;
+    uint16_t flags = 0;
     uint16_t name_size = 0;
     if (!reader.u8(codec) || !reader.u8(reserved) || !reader.u16(info.width) ||
         !reader.u16(info.height) || !reader.u16(info.framerate) || !reader.u32(info.bitrate) ||
+        !reader.u32(origin_x) || !reader.u32(origin_y) || !reader.u16(flags) ||
         !reader.u16(name_size)) {
         set_error(error, "truncated HelloAck");
         return false;
     }
+    info.origin_x = static_cast<int32_t>(origin_x);
+    info.origin_y = static_cast<int32_t>(origin_y);
+    info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
@@ -298,6 +308,71 @@ bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::s
         return false;
     }
     return true;
+}
+
+std::vector<uint8_t> make_input_event(const InputEvent& event) {
+    std::vector<uint8_t> payload(16);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(event.kind));
+    const bool mouse = event.kind == InputKind::Mouse;
+    put_u8(cursor, mouse ? static_cast<uint8_t>(event.mouse.action)
+                         : static_cast<uint8_t>(event.key.action));
+    put_u16(cursor, mouse ? event.mouse.buttons : 0);
+    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.x : 0));
+    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.y : 0));
+    put_u16(cursor, mouse ? 0 : event.key.hid_usage);
+    put_u16(cursor, 0);
+    return make_control(ControlType::InputEvent, payload);
+}
+
+bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t kind = 0;
+    uint8_t action = 0;
+    uint16_t buttons = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint16_t hid_usage = 0;
+    uint16_t reserved = 0;
+    if (!reader.u8(kind) || !reader.u8(action) || !reader.u16(buttons) || !reader.u32(x) ||
+        !reader.u32(y) || !reader.u16(hid_usage) || !reader.u16(reserved)) {
+        set_error(error, "truncated InputEvent");
+        return false;
+    }
+    switch (kind) {
+        case static_cast<uint8_t>(InputKind::Mouse):
+            if (action > static_cast<uint8_t>(MouseAction::WheelHorizontal)) {
+                set_error(error, "InputEvent names unknown mouse action " +
+                                     std::to_string(action));
+                return false;
+            }
+            if (buttons & ~0x1Fu) {
+                set_error(error, "InputEvent carries unknown mouse buttons");
+                return false;
+            }
+            event.kind = InputKind::Mouse;
+            event.mouse.action = static_cast<MouseAction>(action);
+            event.mouse.buttons = buttons;
+            event.mouse.x = static_cast<int32_t>(x);
+            event.mouse.y = static_cast<int32_t>(y);
+            return true;
+        case static_cast<uint8_t>(InputKind::Key):
+            if (action > static_cast<uint8_t>(KeyAction::Up)) {
+                set_error(error, "InputEvent names unknown key action " + std::to_string(action));
+                return false;
+            }
+            if (hid_usage == 0) {
+                set_error(error, "InputEvent carries no HID usage");
+                return false;
+            }
+            event.kind = InputKind::Key;
+            event.key.action = static_cast<KeyAction>(action);
+            event.key.hid_usage = hid_usage;
+            return true;
+        default:
+            set_error(error, "InputEvent names unknown kind " + std::to_string(kind));
+            return false;
+    }
 }
 
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload) {

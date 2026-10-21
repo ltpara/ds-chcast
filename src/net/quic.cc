@@ -270,6 +270,9 @@ struct QuicSession::Impl {
     std::deque<std::vector<uint8_t>> received;
     ControlParser control_parser;
     FrameParser frame_parser;
+    // Server only, when QuicServerConfig::allow_input is set.
+    std::unique_ptr<InputInjector> injector;
+    std::deque<InputEvent> input_events;
 
     std::atomic<uint64_t> next_seq{0};
     std::atomic<bool> transport_down{false};
@@ -573,6 +576,34 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::InputEvent: {
+                if (role != Role::Server || !server_config.allow_input) {
+                    // The HelloAck already told the viewer input is off; a
+                    // client that sends it anyway is dropped, not fatal.
+                    break;
+                }
+                InputEvent event;
+                if (!parse_input_event(payload, event, &error)) {
+                    // Same policy as a malformed Stats or Hello: the peer is
+                    // not speaking the protocol, so the session ends rather
+                    // than dropping events silently.
+                    note_transport_failure("InputEvent: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // The observation queue is a convenience for the tools;
+                    // it must not grow without bound when nobody drains it.
+                    if (input_events.size() >= 4096) {
+                        input_events.pop_front();
+                    }
+                    input_events.push_back(event);
+                }
+                if (injector) {
+                    injector->submit(event);
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -653,6 +684,11 @@ struct QuicSession::Impl {
     void close() {
         if (!api) {
             return;
+        }
+        // Stops the injection thread and lifts anything it was holding, so a
+        // disconnect never leaves a key or button down on this machine.
+        if (injector) {
+            injector->stop();
         }
         HQUIC connection_handle = connection.load();
         if (connection_handle) {
@@ -788,6 +824,12 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
                  std::to_string(config.port) + ": " + status_hex(status);
         return nullptr;
     }
+    if (config.allow_input) {
+        impl.injector = InputInjector::create(config.dry_run_input, error);
+        if (!impl.injector) {
+            return nullptr;
+        }
+    }
     return session;
 }
 
@@ -880,7 +922,11 @@ Error QuicSession::announce(const ServerInfo& info) {
     if (impl.announced) {
         return Error(Status::InvalidCall, "the stream was already announced");
     }
-    Error sent = impl.send_bytes(impl.control.load(), make_hello_ack(info),
+    ServerInfo ack = info;
+    // The gate belongs to the server; never let a caller announce input the
+    // session will not inject.
+    ack.input_enabled = impl.server_config.allow_input;
+    Error sent = impl.send_bytes(impl.control.load(), make_hello_ack(ack),
                                  QUIC_SEND_FLAG_NONE);
     if (!sent.ok()) {
         return sent;
@@ -933,6 +979,17 @@ bool QuicSession::take_keyframe_request() {
     const bool requested = impl_->keyframe_requested;
     impl_->keyframe_requested = false;
     return requested;
+}
+
+std::vector<InputEvent> QuicSession::take_input_events() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::vector<InputEvent> events(impl_->input_events.begin(), impl_->input_events.end());
+    impl_->input_events.clear();
+    return events;
+}
+
+InputStats QuicSession::input_stats() const {
+    return impl_->injector ? impl_->injector->stats() : InputStats{};
 }
 
 Error QuicSession::finish_server(std::chrono::milliseconds timeout, ClientStats& stats,
@@ -1091,6 +1148,14 @@ Error QuicSession::request_keyframe() {
     }
     return impl.send_bytes(impl.control.load(), make_control(ControlType::KeyframeRequest, {}),
                            QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::send_input(const InputEvent& event) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_input is a client operation");
+    }
+    return impl.send_bytes(impl.control.load(), make_input_event(event), QUIC_SEND_FLAG_NONE);
 }
 
 Error QuicSession::finish_client(const ClientStats& stats, std::chrono::milliseconds timeout) {

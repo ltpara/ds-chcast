@@ -126,16 +126,19 @@ if("Profile" IN_LIST CMAKE_CONFIGURATION_TYPES)
     endforeach()
 endif()
 
-# chast wire protocol and MsQuic session. No DXGI or VPL dependency, so the
-# receiver side links this without the capture stack.
+# chast wire protocol, the MsQuic session and server-side input injection. No
+# DXGI or VPL dependency, so the receiver side links this without the capture
+# stack.
 add_library(chast.net STATIC
     src/net/protocol.cc
-    src/net/quic.cc)
+    src/net/quic.cc
+    src/win/input.cc)
 
 target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
-target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll)
+# user32 supplies SendInput/GetSystemMetrics for the injector.
+target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll user32)
 
 if(CHAST_BUILD_TESTS)
     add_executable(chast-capture tools/capture.cc tools/crash_handler.cc)
@@ -174,8 +177,13 @@ if(CHAST_BUILD_TESTS)
     target_include_directories(chast-cursor-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(chast-cursor-test PRIVATE chast.dxgi)
 
+    # Pure-logic checks for the wire format and the HID -> scan-code table.
+    add_executable(chast-protocol-test tests/protocol_test.cc)
+    target_link_libraries(chast-protocol-test PRIVATE chast.net)
+
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
+    add_test(NAME protocol COMMAND chast-protocol-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.
