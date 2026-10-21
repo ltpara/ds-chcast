@@ -46,6 +46,14 @@ struct ClientRequest {
     std::string peer_address;
 };
 
+// Where the server keeps its key and certificate. The tray is per-user; the
+// Windows service needs an identity that survives logins and belongs to the
+// machine.
+enum class IdentityScope {
+    CurrentUser,
+    LocalMachine,
+};
+
 struct QuicServerConfig {
     std::string bind_address = "127.0.0.1";
     uint16_t port = 4433;
@@ -72,6 +80,9 @@ struct QuicServerConfig {
     // calling thread, not on a MsQuic thread, so it may prompt an operator;
     // it should still return promptly, because the peer is waiting.
     std::function<bool(const ClientRequest&)> approve_client;
+    // LocalMachine requires the caller to be able to create machine keys and
+    // write to the machine certificate store (a service running as SYSTEM).
+    IdentityScope identity_scope = IdentityScope::CurrentUser;
 };
 
 struct QuicClientConfig {

@@ -315,34 +315,98 @@ bool TunnelProcess::start(const HostSettings& settings, uint16_t local_port,
     SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_HIDE;
-    startup.hStdOutput = stdout_write;
-    startup.hStdError = stderr_write;
-    startup.hStdInput = nullptr;
-    PROCESS_INFORMATION process{};
-    std::vector<wchar_t> command_buffer(command.begin(), command.end());
-    command_buffer.push_back(L'\0');
-    if (!CreateProcessW(nullptr, command_buffer.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
-                        nullptr, nullptr, &startup, &process)) {
-        const DWORD code = GetLastError();
+    // Only the two pipe handles may cross the process boundary. Inheriting
+    // every inheritable handle would also hand the agent the host's QUIC
+    // socket, which then keeps port 4433 bound after the host process dies.
+    SIZE_T attribute_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+    std::vector<BYTE> attribute_storage(attribute_size);
+    auto* attribute_list =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+    HANDLE inherited[] = {stdout_write, stderr_write};
+    const auto close_pipes = [&] {
         CloseHandle(stdout_read);
         CloseHandle(stdout_write);
         CloseHandle(stderr_read);
         CloseHandle(stderr_write);
+    };
+    if (!InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_size)) {
+        const DWORD code = GetLastError();
+        close_pipes();
         if (error != nullptr) {
-            *error = "无法启动隧道代理（Windows 错误 " + std::to_string(code) + "）：" +
+            *error = "无法准备隧道代理的启动属性（Windows 错误 " + std::to_string(code) + "）";
+        }
+        return false;
+    }
+    if (!UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherited, sizeof(inherited), nullptr, nullptr)) {
+        const DWORD code = GetLastError();
+        DeleteProcThreadAttributeList(attribute_list);
+        close_pipes();
+        if (error != nullptr) {
+            *error = "无法准备隧道代理的启动属性（Windows 错误 " + std::to_string(code) + "）";
+        }
+        return false;
+    }
+
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.StartupInfo.wShowWindow = SW_HIDE;
+    startup.StartupInfo.hStdOutput = stdout_write;
+    startup.StartupInfo.hStdError = stderr_write;
+    startup.StartupInfo.hStdInput = nullptr;
+    startup.lpAttributeList = attribute_list;
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> command_buffer(command.begin(), command.end());
+    command_buffer.push_back(L'\0');
+    // Suspended until the agent is inside its own job, so a crash of this
+    // process can never leave an unowned agent behind.
+    const BOOL started = CreateProcessW(
+        nullptr, command_buffer.data(), nullptr, nullptr, TRUE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr,
+        &startup.StartupInfo, &process);
+    const DWORD start_error = GetLastError();
+    DeleteProcThreadAttributeList(attribute_list);
+    if (!started) {
+        close_pipes();
+        if (error != nullptr) {
+            *error = "无法启动隧道代理（Windows 错误 " + std::to_string(start_error) + "）：" +
                      narrow(executable);
         }
         return false;
     }
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    bool bound = false;
+    if (job != nullptr) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        bound = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                        sizeof(limits)) != FALSE &&
+                AssignProcessToJobObject(job, process.hProcess) != FALSE;
+    }
+    if (!bound) {
+        const DWORD code = GetLastError();
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 5000);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        if (job != nullptr) {
+            CloseHandle(job);
+        }
+        close_pipes();
+        if (error != nullptr) {
+            *error = "无法约束隧道代理的生命周期（Windows 错误 " + std::to_string(code) + "）";
+        }
+        return false;
+    }
+    ResumeThread(process.hThread);
     CloseHandle(stdout_write);
     CloseHandle(stderr_write);
     CloseHandle(process.hThread);
 
     process_ = process.hProcess;
+    job_ = job;
     stdout_read_ = stdout_read;
     stderr_read_ = stderr_read;
     on_event_ = std::move(on_event);
@@ -394,6 +458,11 @@ void TunnelProcess::stop() {
     }
     CloseHandle(process_);
     process_ = nullptr;
+    if (job_ != nullptr) {
+        // Kills anything the agent itself may have left running.
+        CloseHandle(job_);
+        job_ = nullptr;
+    }
     running_ = false;
 }
 

@@ -3,11 +3,14 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <string>
 
+#include "chast/host_server.h"
 #include "chast/host_settings.h"
+#include "chast/quic.h"
 
 namespace {
 
@@ -33,6 +36,20 @@ std::filesystem::path temp_dir() {
 void write_text(const std::filesystem::path& path, const std::string& text) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+std::wstring widen_utf8(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                         static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) {
+        return {};
+    }
+    std::wstring out(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size);
+    return out;
 }
 
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
@@ -241,6 +258,40 @@ void test_generated_tunnel_id() {
     check(chast::generate_tunnel_id() == id, "the generated device id is stable");
 }
 
+void test_machine_paths() {
+    const std::string machine_dir = chast::machine_settings_directory();
+    const std::string machine_path = chast::machine_settings_path();
+    check(!machine_dir.empty(), "ProgramData resolves");
+    check(machine_dir != chast::host_settings_directory(),
+          "machine and per-user settings are separate");
+    check(machine_dir.size() > 6 &&
+              machine_dir.compare(machine_dir.size() - 6, 6, "\\chast") == 0,
+          "machine settings live in a chast folder");
+    check(machine_path == machine_dir + "\\host.ini", "the machine settings file is host.ini");
+
+    wchar_t program_data[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) {
+        const std::wstring expected =
+            (std::filesystem::path(std::wstring(program_data, length)) / L"chast").wstring();
+        check(_wcsicmp(widen_utf8(machine_dir).c_str(), expected.c_str()) == 0,
+              "machine settings follow %ProgramData%");
+    } else {
+        check(false, "ProgramData is available in the environment");
+    }
+}
+
+void test_identity_defaults() {
+    chast::QuicServerConfig quic;
+    check(quic.identity_scope == chast::IdentityScope::CurrentUser,
+          "QUIC keeps the per-user identity by default");
+    chast::HostServerConfig host;
+    check(host.identity_scope == chast::IdentityScope::CurrentUser,
+          "the host keeps the per-user identity by default");
+    check(host.max_consecutive_failures == 5,
+          "the interactive host stops after five consecutive failures");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -270,6 +321,8 @@ int main() {
     test_codec_names();
     test_service_parsers();
     test_generated_tunnel_id();
+    test_machine_paths();
+    test_identity_defaults();
     test_unicode_path(dir);
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

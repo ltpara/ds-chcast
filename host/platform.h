@@ -25,6 +25,10 @@ bool set_autostart(bool enabled, std::string* error);
 // Returns the netsh exit code (0 on success).
 int apply_firewall_rule(uint16_t port, uint16_t tunnel_port);
 
+// Deletes both program-scoped rules (host and tunnel). Used by the service
+// uninstaller, which cannot leave a stale allowance behind.
+void remove_firewall_rules();
+
 // Relaunches this executable with --firewall <port> [<tunnel_port>] through
 // the UAC prompt and waits for it. False when the user cancels or netsh fails.
 bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error);

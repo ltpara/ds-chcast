@@ -160,6 +160,7 @@ bool HostServer::open_session(std::string* error) {
     QuicServerConfig quic;
     quic.bind_address = settings_.bind_address;
     quic.port = settings_.port;
+    quic.identity_scope = config_.identity_scope;
     quic.allow_input = settings_.allow_input;
     quic.dry_run_input = config_.dry_run_input;
     quic.access_token = settings_.access_token;
@@ -178,7 +179,7 @@ bool HostServer::open_session(std::string* error) {
 
 void HostServer::run() {
     HostServerStats stats;
-    int failures = 0;
+    uint32_t failures = 0;
     while (!stopping_.load()) {
         if (!session_) {
             std::string error;
@@ -188,7 +189,8 @@ void HostServer::run() {
                 if (config_.serve_once) {
                     break;
                 }
-                if (++failures >= 5) {
+                if (config_.max_consecutive_failures != 0 &&
+                    ++failures >= config_.max_consecutive_failures) {
                     break;
                 }
                 sleep_unless_stopping(std::chrono::seconds(2));
@@ -237,7 +239,8 @@ void HostServer::run() {
             if (config_.serve_once) {
                 break;
             }
-            if (++failures >= 5) {
+            if (config_.max_consecutive_failures != 0 &&
+                ++failures >= config_.max_consecutive_failures) {
                 break;
             }
             sleep_unless_stopping(std::chrono::seconds(2));
@@ -300,7 +303,8 @@ void HostServer::run() {
             if (config_.serve_once) {
                 break;
             }
-            if (++failures >= 5) {
+            if (config_.max_consecutive_failures != 0 &&
+                ++failures >= config_.max_consecutive_failures) {
                 break;
             }
             sleep_unless_stopping(std::chrono::seconds(2));

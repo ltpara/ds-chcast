@@ -191,10 +191,13 @@ PCCERT_CONTEXT find_stored_identity(HCERTSTORE store) {
     return best;
 }
 
-// Creates the server credential. The RSA key lives in the user's CNG key store
-// under a fixed container name so restarts reuse it; the certificate itself is
-// stored by open_or_create_identity().
-PCCERT_CONTEXT create_identity_certificate(std::string* error) {
+// Creates the server credential. The RSA key lives in the selected CNG key
+// store under a fixed container name so restarts reuse it; the certificate
+// itself is stored by open_or_create_identity().
+PCCERT_CONTEXT create_identity_certificate(IdentityScope scope, std::string* error) {
+    const DWORD key_flags =
+        NCRYPT_SILENT_FLAG |
+        (scope == IdentityScope::LocalMachine ? NCRYPT_MACHINE_KEY_FLAG : 0);
     NCRYPT_PROV_HANDLE provider = 0;
     SECURITY_STATUS sec = NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0);
     if (FAILED(sec)) {
@@ -202,9 +205,10 @@ PCCERT_CONTEXT create_identity_certificate(std::string* error) {
         return nullptr;
     }
     NCRYPT_KEY_HANDLE key = 0;
-    sec = NCryptOpenKey(provider, &key, kKeyContainer, 0, NCRYPT_SILENT_FLAG);
+    sec = NCryptOpenKey(provider, &key, kKeyContainer, 0, key_flags);
     if (sec == NTE_BAD_KEYSET) {
-        sec = NCryptCreatePersistedKey(provider, &key, NCRYPT_RSA_ALGORITHM, kKeyContainer, 0, 0);
+        sec = NCryptCreatePersistedKey(provider, &key, NCRYPT_RSA_ALGORITHM, kKeyContainer, 0,
+                                       key_flags);
         if (!FAILED(sec)) {
             DWORD key_size = 2048;
             DWORD usage = NCRYPT_ALLOW_SIGNING_FLAG;
@@ -297,7 +301,12 @@ PCCERT_CONTEXT create_identity_certificate(std::string* error) {
     key_info.pwszContainerName = const_cast<LPWSTR>(kKeyContainer);
     key_info.pwszProvName = const_cast<LPWSTR>(MS_KEY_STORAGE_PROVIDER);
     key_info.dwProvType = 0;
-    key_info.dwFlags = NCRYPT_SILENT_FLAG;
+    // The certificate is read back from LocalMachine\My by a different
+    // process than the one that created it, so the stored provider info has to
+    // name the machine key store explicitly.
+    key_info.dwFlags =
+        NCRYPT_SILENT_FLAG |
+        (scope == IdentityScope::LocalMachine ? static_cast<DWORD>(CRYPT_MACHINE_KEYSET) : 0);
     key_info.dwKeySpec = AT_KEYEXCHANGE;
 
     CRYPT_ALGORITHM_IDENTIFIER signature{};
@@ -336,12 +345,15 @@ PCCERT_CONTEXT create_identity_certificate(std::string* error) {
 // The identity must survive restarts, otherwise a pinned client would refuse
 // the server after a reboot. Reuse the stored certificate when it is still
 // valid; create and store one otherwise.
-PCCERT_CONTEXT open_or_create_identity(std::string* error) {
-    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
-                                     CERT_SYSTEM_STORE_CURRENT_USER, L"MY");
+PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, std::string* error) {
+    const DWORD store_location = scope == IdentityScope::LocalMachine
+                                     ? CERT_SYSTEM_STORE_LOCAL_MACHINE
+                                     : CERT_SYSTEM_STORE_CURRENT_USER;
+    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, store_location, L"MY");
     if (!store) {
-        *error = "cannot open the current user's certificate store, GetLastError=" +
-                 std::to_string(GetLastError());
+        *error = std::string("cannot open the ") +
+                 (scope == IdentityScope::LocalMachine ? "machine" : "current user's") +
+                 " certificate store, GetLastError=" + std::to_string(GetLastError());
         return nullptr;
     }
     PCCERT_CONTEXT existing = find_stored_identity(store);
@@ -349,7 +361,7 @@ PCCERT_CONTEXT open_or_create_identity(std::string* error) {
         CertCloseStore(store, 0);
         return existing;
     }
-    PCCERT_CONTEXT created = create_identity_certificate(error);
+    PCCERT_CONTEXT created = create_identity_certificate(scope, error);
     if (!created) {
         CertCloseStore(store, 0);
         return nullptr;
@@ -1204,7 +1216,7 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
         return nullptr;
     }
 
-    impl.certificate = open_or_create_identity(error);
+    impl.certificate = open_or_create_identity(config.identity_scope, error);
     if (!impl.certificate) {
         return nullptr;
     }

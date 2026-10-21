@@ -33,6 +33,7 @@
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "platform.h"
+#include "service.h"
 #include "tunnel.h"
 
 namespace {
@@ -287,6 +288,10 @@ void stop_server() {
 
 void start_server() {
     if (g_app->server) {
+        return;
+    }
+    if (g_app->config_path == host_settings_path() && chast::host::service_running()) {
+        append_log_line(L"chast 主机服务正在运行，托盘不能同时共享");
         return;
     }
     HostServerConfig config;
@@ -1260,6 +1265,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (config_path.empty()) {
         MessageBoxW(nullptr, L"无法确定设置文件的位置。", kWindowTitle, MB_ICONERROR | MB_OK);
         return 1;
+    }
+    if (config_path == host_settings_path() && chast::host::service_running()) {
+        MessageBoxW(nullptr,
+                    L"chast 主机服务正在运行，托盘主机已让位。\n"
+                    L"请使用 chast-service.exe --token 查看访问令牌。",
+                    kWindowTitle, MB_ICONINFORMATION | MB_OK);
+        return 0;
     }
     app.config_path = config_path;
 

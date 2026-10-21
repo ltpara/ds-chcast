@@ -131,6 +131,16 @@ int apply_firewall_rule(uint16_t port, uint16_t tunnel_port) {
     return add_firewall_rule(kTunnelRuleName, tunnel_executable(), tunnel_port);
 }
 
+void remove_firewall_rules() {
+    DWORD ignored = 0;
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kHostRuleName) + L"\"",
+               &ignored);
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kTunnelRuleName) + L"\"",
+               &ignored);
+}
+
 bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error) {
     const std::wstring exe = executable_path();
     std::wstring arguments = L"--firewall " + std::to_wstring(port);

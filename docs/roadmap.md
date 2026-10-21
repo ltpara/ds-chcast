@@ -86,7 +86,7 @@
   - 客户端：`QuicClientConfig` 以 `pinned_fingerprint` 指定期望身份；MsQuic 使用 `INDICATE_CERTIFICATE_RECEIVED | DEFER_CERTIFICATE_VALIDATION`，回调里比对指纹后才 `ConnectionCertificateValidationComplete` 放行或拒绝。没有 pin 又不是显式 `allow_any_certificate` 时连接直接失败——旧的“默认不校验证书”已删除。`allow_any_certificate` 只服务于首次接触（此时 UI 从状态里读出指纹并落盘），工具里对应 `--insecure`。
   - Flutter：`TrustStore` 把每个 `host:port` 的指纹存到 `%APPDATA%\chast\trust.json`；首次成功握手写入（TOFU），之后每次连接都 pin。身份不匹配时原生层拒绝连接、状态里仍带对端实际指纹，断线卡片显示新旧指纹并要求“信任并重新连接”；统计浮层显示 `SHA256` 短指纹。
   - 设计取舍：自签名证书 + 指纹 pin 而不是搭一套 CA —— 对直连的两台机器，指纹就是最短的信任锚，也避免客户端依赖系统信任链。身份持久化放在用户证书库而不是每次新建，换来跨重启稳定的指纹，否则 pin 无从谈起。pin 按端点保存而不是全局，同一台服务器换地址需要重新确认一次。
-  - 已知限制：身份属于当前 Windows 用户，服务账户（M3.2 的 Windows 服务）需要自己的密钥与证书；指纹校验不做证书链或有效期检查（自签名场景下无意义）。
+  - 已知限制：身份属于当前 Windows 用户；服务账户的机器级身份已由 M3.2b 补齐（`LocalMachine` 密钥与证书）。指纹校验不做证书链或有效期检查（自签名场景下无意义）。
 - 已完成：连接审批与一次性令牌 M3.1（协议 v7）。
   - 协议：`Hello` 增加访问令牌（`u16` 长度 + 字节，上限 128）；新增 `ControlType::AccessDenied = 9`，载荷为 `u8` 拒绝代码（1 令牌无效、2 令牌已用、3 主机拒绝）+ `u16` 长度的原因。令牌只在 TLS 已认证的 QUIC 连接内传输，服务端做常量时间比较。
   - 服务端：`QuicServerConfig::access_token` 与 `reuse_access_token`；第一个被接受的 Hello 花掉令牌（`reuse` 时保留），之后再出现同一令牌即判 `TokenUsed`。`approve_client` 在令牌通过后由 `wait_for_client()` 在应用线程调用，返回 false 时发送 `Declined`。所有拒绝走同一条路：先发 `AccessDenied` 并等待发送完成，再等对端自行断开（最多 750 ms），才关闭连接并复位会话状态（含 `transport_down`/`transport_failed`、握手字段与令牌外的所有会话状态），监听器随即接受下一位查看者。`wait_for_client()` 在“已连接但未握手就离开”时同样复位后继续等待，而不是结束整个等待。
@@ -101,8 +101,14 @@
   - 系统集成：开机启动写 `HKCU\...\CurrentVersion\Run` 的 `chast-host` = `"<exe>" --tray`；防火墙用 `netsh advfirewall` 添加一条按程序 + UDP 端口限定的入站规则，先删同名旧规则再加，避免换端口后留下多条。托盘通过 `ShellExecuteExW` 的 `runas` 重新拉起自己执行 `--firewall`，UAC 取消时只记一条日志。
   - 设计取舍：设置不放注册表而放文本文件——可直接编辑、可复制排障、跨进程（托盘/服务）共享同一套解析与校验代码；托盘与服务共用 `HostServer` 而不是各写一份循环，保证“命令行验证过的行为就是产品行为”。默认监听 `0.0.0.0` 且默认开启远程输入，因为输入闸门已有令牌 + 审批两层准入；不想暴露时把 `bind` 改成 `127.0.0.1`。
   - 修复：MsQuic 在连接收尾时 `StreamSend` 可能返回 `E_ABORT`/`E_NOT_VALID_STATE`，此前被映射成 `CaptureFailed` 并在托盘日志里显示成 `send_frame: capture failed:`；现在按“对端已离开”处理，日志只报查看器离开或消失，不计入失败。关闭共享导致的收尾错误也不再被当成会话失败。
-  - 已知限制：托盘只服务当前登录用户，锁屏/未登录时不工作（Windows 服务属于 M3.2b）；身份证书在用户证书库，服务账户需要自己的证书；托盘没有单实例跨会话（不同用户各一份）；界面为固定布局，只按 DPI 缩放，未做自适应重排。
-- 待做：Windows 服务（M3.2b）：`%ProgramData%` 机器级设置、服务账户身份、服务模式防火墙与安装/卸载。
+  - 已知限制：托盘只服务当前登录用户，锁屏/未登录时不工作（无人值守场景由 M3.2b 的 Windows 服务覆盖）；身份证书在用户证书库，服务账户的机器证书由 M3.2b 提供；托盘没有单实例跨会话（不同用户各一份）；界面为固定布局，只按 DPI 缩放，未做自适应重排。
+- 已完成：Windows 服务主机 M3.2b（`docs/m3.2b-plan.md`）。
+  - 安装与控制：`chast-service.exe --install/--uninstall/--token/--run/--worker`，服务名 `chast-host`，LocalSystem、延迟自动启动、失败后 5/10/30 s 重启；安装时初始化 `%ProgramData%\chast\host.ini`、移除当前用户 HKCU 自启动、写入分别指向 `chast-service.exe`/`chast-tunnel.exe` 的两条 UDP 入站规则；卸载删除服务与规则、保留设置和日志。
+  - 会话工作进程：服务发现 `WTSGetActiveConsoleSessionId` 对应的已登录会话，复制该会话 `winlogon.exe` 令牌并以 `winsta0\default` 启动 `--worker`（SYSTEM，用户会话），由它运行 `HostServer` 与 `chast-tunnel host`。停止事件在 `Global\` 命名空间，服务级 job 管住工作进程，隧道另有 `KILL_ON_JOB_CLOSE` 子作业；工作进程被强杀后服务 3 s 重启，`max_consecutive_failures=0` 让锁屏等采集失败无限重试。
+  - 机器身份与设置：CNG 机器密钥容器 + `LocalMachine\My` 自签证书，指纹跨重启、跨用户稳定；服务模式取消审批对话框，仅访问令牌准入，一次性令牌轮换后写回机器设置，`--token` 供操作者读取。托盘检测到服务运行后提示并退出。
+  - 验证（2026-10-22，单机回环）：`ctest` 5/5、`go test ./...`、Release 全目标通过；服务托管下直连 653 帧、中继 691 帧，CRC/解码错误为 0；强杀工作进程测试暴露“隧道继承 QUIC 套接字导致 4433 被残留隧道占用”的缺陷，修复句柄白名单与隧道子作业后，3 s 恢复、新隧道上线、指纹不变，经中继回放 703 帧、0 错误；托盘让位、停止后注册 55 s 过期、重启自动上线、卸载清理均实测通过。
+  - 设计取舍：服务只做生命周期，采集/编码/输入留在交互会话；身份放机器证书库而不是服务账户的用户库，保证卸载重装与不同登录用户看到同一设备；隧道生命周期绑定工作进程，宁可被一起杀掉也不留下占端口的孤儿。
+  - 已知限制：锁屏/登录/UAC 安全桌面本身仍无法采集与注入，本阶段只保证服务与工作进程在锁屏期间存活、解锁后恢复；注销/切换用户与锁屏恢复需人工复核；同一时刻只服务活动控制台会话。
 - 若要在不可信网络使用，M3.1 必须排在 M4 之前。
 
 ## M4 — 连接与地址簿
@@ -129,8 +135,8 @@
   - 构建与防火墙：CMake 调 `go build` 产出与 `chast-host.exe` 同目录的 `chast-tunnel.exe`；防火墙按程序各建一条 UDP 入站规则（主机 QUIC 端口 + 隧道端口），禁用服务时删除隧道规则。
   - 验证（2026-10-22，单机回环）：托盘自动注册后 `/v1/hosts/m42-host` 返回在线、候选 `127.0.0.1:16434`、中继 `127.0.0.1:41100` 与指纹；直连 `received=603 decoded=603 gaps=0 digest=610B8EF3346AD47C`，中继 `received=603 decoded=603 digest=659B01211DD715C6` 且中继统计 `to_host_bytes:35677,to_viewer_bytes:10594896`；托盘分别显示“最近路径：直连/经中继”。`ctest -C Release` 5/5、`go test ./...` 全过；退出托盘后子进程消失、注册过期下线；两条防火墙规则实测生效后删除。
   - 设计取舍：继续复用 Go 代理与 stdout 事件，托盘不引入 JSON 库；代理只报告主机侧观察到的路径事实，由托盘按串流状态决定是否展示。
-  - 已知限制：单机无真实 NAT，跨网打洞/对称 NAT 仍待两台异网机器；锁屏/未登录场景留给 M3.2b；设置对话框的鼠标点击路径未自动化。
-- 下一阶段：M3.2b Windows 服务主机（`%ProgramData%` 机器级设置、服务账户身份、锁屏/未登录场景）。
+  - 已知限制：单机无真实 NAT，跨网打洞/对称 NAT 仍待两台异网机器；锁屏/未登录的安全桌面采集仍不在范围内（M3.2b 只保证服务存活与解锁后恢复）；设置对话框的鼠标点击路径未自动化。
+- 下一阶段：M5 体验扩展（自适应码率、剪贴板、音频、文件传输等）。
 
 ## M5 — 体验扩展
 

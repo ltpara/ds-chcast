@@ -72,6 +72,9 @@ struct HostStatus {
 
 struct HostServerConfig {
     HostSettings settings;
+    // The tray keeps its identity in the user's store; the Windows service
+    // worker uses the machine store so the fingerprint survives logins.
+    IdentityScope identity_scope = IdentityScope::CurrentUser;
     // Walk the injection path without calling SendInput. Only for tests.
     bool dry_run_input = false;
     bool want_hdr = true;
@@ -91,6 +94,10 @@ struct HostServerConfig {
     // waits are unlimited.
     uint32_t first_client_timeout_ms = 0;
     uint32_t finish_timeout_ms = 15000;
+    // Consecutive open/session failures before the run gives up. 0 retries
+    // forever: the service worker must survive a locked desktop, where
+    // capture fails until the user unlocks.
+    uint32_t max_consecutive_failures = 5;
 
     // Human-readable progress, one line per event. May be empty.
     std::function<void(const std::string&)> log;

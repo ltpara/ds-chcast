@@ -86,6 +86,10 @@ private:
     void finish();
 
     HANDLE process_ = nullptr;
+    // KILL_ON_JOB_CLOSE. The handle lives in this process, so a crashed host
+    // takes the agent down with it instead of leaving it bound to the QUIC
+    // port it inherited.
+    HANDLE job_ = nullptr;
     HANDLE stdout_read_ = nullptr;
     HANDLE stderr_read_ = nullptr;
     HANDLE stdout_thread_ = nullptr;

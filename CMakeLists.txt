@@ -153,16 +153,19 @@ target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(chast.host PUBLIC chast.codec chast.net shell32 ole32)
 
-# Tray-only Windows integration: firewall/autostart helpers and the Go tunnel
-# child process. Kept apart from chast.host so the command-line tools do not
-# pull in Win32 process management just for the settings.
+# Windows integration shared by the tray and the service: firewall/autostart
+# helpers, the Go tunnel child process and SCM control. Kept apart from
+# chast.host so the command-line tools do not pull in Win32 process management
+# just for the settings.
 add_library(chast.host.tray STATIC
     host/platform.cc
-    host/tunnel.cc)
+    host/tunnel.cc
+    host/service.cc
+    host/service_log.cc)
 target_include_directories(chast.host.tray PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/host)
-target_link_libraries(chast.host.tray PUBLIC chast.host shell32)
+target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi32)
 
 # Notification-area host application. It is product code, so it is built even
 # when the test tools are switched off.
@@ -192,6 +195,19 @@ else()
     message(WARNING
         "Go was not found; the tray cannot register with a rendezvous service "
         "until chast-tunnel.exe is placed next to chast-host.exe.")
+endif()
+
+# Windows service host. The SCM entry point and the session worker share one
+# executable: the service launches itself with --worker, so an upgrade only has
+# to replace one file.
+add_executable(chast-service host/service_main.cc host/worker.cc)
+target_link_libraries(chast-service PRIVATE chast.host.tray)
+add_custom_command(TARGET chast-service POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-service>
+    VERBATIM)
+if(GO_EXECUTABLE)
+    add_dependencies(chast-service chast_tunnel_binary)
 endif()
 
 if(CHAST_BUILD_TESTS)
