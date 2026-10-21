@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/bitrate_controller.h"
 #include "chast/capture.h"
 
 namespace chast {
@@ -18,6 +19,19 @@ namespace chast {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// FrameHeader::capture_ms is 48 bits: milliseconds since the steady clock's
+// epoch, which is the same clock the latency probe reports.
+uint64_t capture_clock_ms(Clock::time_point time) {
+    return static_cast<uint64_t>(
+               std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch())
+                   .count()) &
+           0xFFFFFFFFFFFFull;
+}
+
+uint32_t bitrate_floor(uint32_t ceiling) {
+    return std::min(ceiling, std::max<uint32_t>(500000u, ceiling / 10u));
+}
 
 bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomic<bool>& stopping,
                            std::string* error) {
@@ -424,6 +438,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         ", " + std::to_string(encoder->width()) + "x" + std::to_string(encoder->height()) +
         ", target " + std::to_string(encoder->bitrate() / 1000u) + " kbps");
 
+    // The encoder's starting bitrate is the ceiling: the operator's configured
+    // rate, or the hardware default when the settings leave it at zero. The
+    // controller only ever lowers it and later climbs back to this value.
+    BitrateController abr(encoder->bitrate(), bitrate_floor(encoder->bitrate()));
+    stats.target_bitrate = encoder->bitrate();
+
     ServerInfo stream_info =
         describe_stream(attached, capturer->display(), *encoder, settings_.framerate);
     publish_stream(stream_info, find_display(attached, capturer->display()),
@@ -466,7 +486,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         stats.input_releases = session_->input_release_requests();
     };
 
-    auto process_frame = [&](uint64_t pts_ms) -> bool {
+    auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
         const FrameInfo& frame = capturer->frame();
         if (!frame.nv12_texture) {
             return true;
@@ -509,6 +529,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             header.codec = encoder->codec();
             header.keyframe = packet.keyframe;
             header.idr = packet.idr;
+            header.capture_ms = capture_ms;
             Error sent = session_->send_frame(header, packet.data.data(), packet.data.size());
             if (!sent.ok()) {
                 if (sent.status() == Status::Unavailable ||
@@ -535,12 +556,88 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
+    // Once a second: link telemetry for the tray, and the bitrate decision
+    // that follows from it. Runs on the host thread between frames so the
+    // encoder reset set_bitrate performs cannot overlap an encode call.
+    auto last_link_sample = Clock::now();
+    uint64_t last_sample_bytes = stats.bytes;
+    auto sample_link = [&](Clock::time_point now) -> bool {
+        const uint32_t elapsed_ms = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_link_sample)
+                .count());
+        if (elapsed_ms == 0) {
+            return true;
+        }
+        const uint64_t byte_delta =
+            stats.bytes >= last_sample_bytes ? stats.bytes - last_sample_bytes : 0;
+        // bytes * 8 / milliseconds is exactly kilobits per second.
+        stats.send_kbps =
+            static_cast<double>(byte_delta) * 8.0 / static_cast<double>(elapsed_ms);
+        last_sample_bytes = stats.bytes;
+        last_link_sample = now;
+
+        const TransportStats transport = session_->transport_stats();
+        if (!transport.available) {
+            return true;
+        }
+        stats.rtt_ms = static_cast<double>(transport.rtt_us) / 1000.0;
+        stats.min_rtt_ms = static_cast<double>(transport.min_rtt_us) / 1000.0;
+        if (!config_.adaptive_bitrate) {
+            return true;
+        }
+
+        BitrateSample sample;
+        sample.rtt_us = transport.rtt_us;
+        sample.min_rtt_us = transport.min_rtt_us;
+        sample.queued_bytes = transport.queued_bytes;
+        sample.congestion_window = transport.congestion_window;
+        sample.sent_bytes = transport.send_bytes;
+        sample.lost_packets = transport.lost_packets;
+        sample.sent_packets = transport.sent_packets;
+        const BitrateDecision decision = abr.update(sample, elapsed_ms);
+        if (!decision.changed) {
+            return true;
+        }
+
+        Error applied = encoder->set_bitrate(decision.target_bps);
+        if (!applied.ok()) {
+            log("adaptive bitrate: cannot apply " +
+                std::to_string(decision.target_bps / 1000u) + " kbps after " + decision.reason +
+                ": " + applied.to_string());
+            return true;
+        }
+        stats.target_bitrate = decision.target_bps;
+        ++stats.abr_changes;
+        // The encoder reset invalidates its reference state.
+        force_keyframe = true;
+        stream_info.bitrate = decision.target_bps;
+        publish_stream(stream_info, find_display(attached, capturer->display()),
+                       display_name_utf8(capturer->display()));
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "refresh_stream: " + refreshed.to_string();
+            }
+            return false;
+        }
+        ++stats.stream_updates;
+        log("adaptive bitrate: " + std::string(decision.reason) + "; target " +
+            std::to_string(decision.target_bps / 1000u) + " kbps, RTT " +
+            std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms");
+        publish_stats(stats);
+        return true;
+    };
+
     // The frame captured before the handshake is the first one on the wire.
     ++stats.frames;
     if (!first.desktop_updated) {
         ++stats.pointer_only;
     }
-    if (!process_frame(0)) {
+    if (!process_frame(0, capture_clock_ms(Clock::now()))) {
         // A vanished viewer is a normal end, not a failure.
         const bool clean = error->empty();
         drain_input();
@@ -554,6 +651,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             break;
         }
         drain_input();
+        if (now - last_link_sample >= std::chrono::seconds(1)) {
+            if (!sample_link(now)) {
+                const bool clean = error->empty();
+                drain_input();
+                return clean;
+            }
+        }
         if (session_->take_keyframe_request()) {
             force_keyframe = true;
         }
@@ -599,6 +703,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
 
         const CaptureResult result = capturer->capture(std::chrono::milliseconds(100));
+        const auto captured_at = Clock::now();
         switch (result) {
             case CaptureResult::NoNewFrame:
                 continue;
@@ -640,6 +745,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 drain_input();
                 return false;
             }
+            // A rebuilt encoder starts from the configured bitrate again, so
+            // the controller starts over with that value as its ceiling.
+            abr = BitrateController(encoder->bitrate(), bitrate_floor(encoder->bitrate()));
+            stats.target_bitrate = encoder->bitrate();
             const std::vector<DisplayInfo> refreshed = enumerate_displays();
             stream_info =
                 describe_stream(refreshed, capturer->display(), *encoder, settings_.framerate);
@@ -669,7 +778,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         const uint64_t pts_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
-        if (!process_frame(pts_ms)) {
+        if (!process_frame(pts_ms, capture_clock_ms(captured_at))) {
             const bool clean = error->empty();
             drain_input();
             return clean;

@@ -39,6 +39,7 @@
 // in. connect --token sends the token, and a refusal prints the server's
 // reason. verify exercises all three refusal paths on throwaway servers.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -262,6 +263,12 @@ struct ServerReady {
     std::string fingerprint;
 };
 
+int64_t steady_clock_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 struct SenderStats {
     uint64_t frames = 0;
     uint64_t encoded = 0;
@@ -295,6 +302,13 @@ struct SenderStats {
     size_t display_index = 0;
     // StreamInfo messages this server sent.
     uint64_t stream_updates_sent = 0;
+    // Adaptive bitrate telemetry: the encoder's current target (the setting is
+    // the ceiling), how often the controller changed it, and the transport RTT
+    // the controller sampled.
+    uint32_t target_bitrate = 0;
+    uint64_t abr_changes = 0;
+    double rtt_ms = 0.0;
+    double send_kbps = 0.0;
     // SHA-256 identity the server presents (uppercase hex).
     std::string fingerprint;
     bool ok = false;
@@ -326,6 +340,16 @@ struct ReceiverStats {
     // StreamInfo messages received, and the description from the last one.
     uint64_t stream_updates = 0;
     chast::ServerInfo last_update;
+    // Latency probes: the last clock-sync sample plus counters, and the frame
+    // age (host capture -> local receipt) of the newest and worst frame seen.
+    chast::LatencySample latency;
+    uint64_t probes_sent = 0;
+    uint64_t probe_errors = 0;
+    uint64_t frames_without_capture = 0;
+    double last_frame_age_ms = -1.0;
+    double max_frame_age_ms = -1.0;
+    // Bitrate the last StreamInfo announced (the encoder's target after ABR).
+    uint32_t target_bitrate = 0;
     // Fingerprint of the certificate the server presented.
     std::string peer_fingerprint;
 };
@@ -542,6 +566,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.pointer_only = status.stats.pointer_only;
     stats.repeats = status.stats.repeats;
     stats.send_errors = status.stats.send_errors;
+    stats.target_bitrate = status.stats.target_bitrate;
+    stats.abr_changes = status.stats.abr_changes;
+    stats.rtt_ms = status.stats.rtt_ms;
+    stats.send_kbps = status.stats.send_kbps;
     stats.error = status.error;
 
     if (!options.quiet || !stats.error.empty()) {
@@ -555,6 +583,11 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                     static_cast<unsigned long long>(stats.bytes),
                     static_cast<unsigned long long>(stats.send_errors),
                     static_cast<unsigned long long>(stats.stream_updates_sent));
+        std::printf("sender: target-bitrate=%u kbps abr-changes=%llu rtt=%.1f ms "
+                    "send-rate=%.1f kbps\n",
+                    stats.target_bitrate / 1000u,
+                    static_cast<unsigned long long>(stats.abr_changes), stats.rtt_ms,
+                    stats.send_kbps);
         if (stats.stats_received) {
             std::printf("sender: peer received=%llu decoded=%llu digest=%016llX\n",
                         static_cast<unsigned long long>(stats.peer.received),
@@ -647,6 +680,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.origin_y = info.origin_y;
     stats.input_enabled = info.input_enabled;
     stats.displays = info.displays;
+    stats.target_bitrate = info.bitrate;
     if (!options.quiet) {
         std::printf("quic: connected, server streams %s %ux%u at %u kbps (%s)\n",
                     chast_tools::codec_name(info.codec), info.width, info.height,
@@ -731,8 +765,31 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     uint64_t expected_seq = 0;
     std::vector<chast::DecodedFrame> frames;
     bool saw_video_end = false;
+    auto last_probe = start - std::chrono::seconds(1);
+    bool clock_synced = false;
+    int64_t clock_offset_us = 0;
 
     while (std::chrono::steady_clock::now() < deadline) {
+        {
+            const auto probe_now = std::chrono::steady_clock::now();
+            if (probe_now - last_probe >= std::chrono::seconds(1)) {
+                last_probe = probe_now;
+                ++stats.probes_sent;
+                if (chast::Error probed = session->send_latency_probe(); !probed.ok()) {
+                    ++stats.probe_errors;
+                    if (stats.probe_errors == 1) {
+                        std::fprintf(stderr, "latency probe: %s\n",
+                                     probed.to_string().c_str());
+                    }
+                } else {
+                    stats.latency = session->latency();
+                    if (stats.latency.valid) {
+                        clock_synced = true;
+                        clock_offset_us = stats.latency.offset_us;
+                    }
+                }
+            }
+        }
         chast::FrameHeader header;
         std::vector<uint8_t> payload;
         chast::Error received =
@@ -766,6 +823,21 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         ++stats.received;
         last_frame = std::chrono::steady_clock::now();
 
+        if (header.capture_ms == 0) {
+            ++stats.frames_without_capture;
+        } else if (clock_synced) {
+            const int64_t age_us = steady_clock_us() + clock_offset_us -
+                                   static_cast<int64_t>(header.capture_ms) * 1000;
+            // A wild value means the offset does not belong to this clock pair
+            // (or the frame is a replay); do not fold it into the reported age.
+            if (age_us > -100000 && age_us < 10000000) {
+                stats.last_frame_age_ms =
+                    static_cast<double>(std::max<int64_t>(age_us, 0)) / 1000.0;
+                stats.max_frame_age_ms =
+                    (std::max)(stats.max_frame_age_ms, stats.last_frame_age_ms);
+            }
+        }
+
         chast::ServerInfo update;
         while (session->take_stream_update(update)) {
             ++stats.stream_updates;
@@ -781,6 +853,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.origin_y = info.origin_y;
             stats.displays = info.displays;
             stats.input_enabled = info.input_enabled;
+            stats.target_bitrate = info.bitrate;
             if (reconfigure) {
                 // The next access unit may belong to a new stream (new SPS,
                 // possibly a new codec). Start over and let the decoder wait
@@ -898,6 +971,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start)
             .count());
+    // Drain the last reply that may have arrived with the final frames.
+    stats.latency = session->latency();
     chast::ClientStats closing;
     closing.received = stats.received;
     closing.decoded = stats.decoded;
@@ -928,6 +1003,21 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                     static_cast<unsigned long long>(stats.digest),
                     static_cast<unsigned long long>(elapsed_ms),
                     saw_video_end ? "" : " (stream did not end cleanly)");
+        if (!options.quiet) {
+            std::printf("receiver: rtt=%.1f ms offset=%.1f ms probes=%llu replies=%llu "
+                        "frame-age=%.1f ms max-frame-age=%.1f ms target-bitrate=%u kbps "
+                        "uncaptured=%llu\n",
+                        stats.latency.valid ? static_cast<double>(stats.latency.rtt_us) / 1000.0
+                                            : 0.0,
+                        stats.latency.valid
+                            ? static_cast<double>(stats.latency.offset_us) / 1000.0
+                            : 0.0,
+                        static_cast<unsigned long long>(stats.probes_sent),
+                        static_cast<unsigned long long>(stats.latency.replies),
+                        stats.last_frame_age_ms, stats.max_frame_age_ms,
+                        stats.target_bitrate / 1000u,
+                        static_cast<unsigned long long>(stats.frames_without_capture));
+        }
     }
     stats.ok = stats.error.empty() && stats.received > 0 && stats.decoded > 0 &&
                stats.crc_errors == 0 && stats.decode_errors == 0 && stats.gaps == 0 &&
@@ -1322,6 +1412,19 @@ int run_verify(const Options& options) {
     check(received.decode_errors == 0, "no decode errors");
     check(received.gaps == 0, "no sequence gaps");
     check(received.protocol_errors == 0, "no protocol violations");
+    check(received.latency.valid && received.latency.replies > 0,
+          "the client received a latency reply");
+    check(received.latency.valid && received.latency.rtt_us > 0 &&
+              received.latency.rtt_us < 1000000,
+          "the measured round trip is plausible");
+    check(received.frames_without_capture == 0,
+          "every received frame carried its capture timestamp");
+    check(received.last_frame_age_ms >= -100.0 && received.last_frame_age_ms <= 1000.0,
+          "the measured frame age is plausible");
+    check(received.target_bitrate > 0, "the viewer saw the server's target bitrate");
+    check(sent.target_bitrate > 0, "the server exposed adaptive-bitrate telemetry");
+    check(sent.rtt_ms > 0.0, "the host sampled transport RTT");
+    check(sent.abr_changes == 0, "the clean loopback stayed at the configured bitrate");
     check(sent.stats_received, "the client's closing statistics reached the server");
     if (sent.stats_received) {
         check(sent.peer.received == received.received, "server-side receive count agrees");

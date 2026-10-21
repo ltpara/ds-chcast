@@ -146,6 +146,7 @@ target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll user32
 # top of both chast.codec and chast.net so neither of those has to know about
 # the other.
 add_library(chast.host STATIC
+    src/host/bitrate_controller.cc
     src/host/host_settings.cc
     src/host/host_server.cc)
 
@@ -255,6 +256,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host)
 
+    # Adaptive bitrate policy: pure logic, driven by synthetic transport
+    # samples.
+    add_executable(chast-bitrate-test tests/bitrate_test.cc)
+    target_link_libraries(chast-bitrate-test PRIVATE chast.host)
+
     # Tunnel event parsing, argument construction and child lifecycle. The
     # lifecycle case relaunches this executable as a fake agent.
     add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
@@ -265,6 +271,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME protocol COMMAND chast-protocol-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
+    add_test(NAME bitrate COMMAND chast-bitrate-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.

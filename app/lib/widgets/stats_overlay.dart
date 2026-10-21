@@ -96,6 +96,19 @@ class StatsOverlay extends StatelessWidget {
           ),
           _row('解码', status.decoder.isEmpty ? '—' : status.decoder),
           _row('编码', status.serverEncoder.isEmpty ? '—' : status.serverEncoder),
+          _row(
+            '目标',
+            status.serverBitrate > 0
+                ? '${(status.serverBitrate / 1000).round()} kbps'
+                : '—',
+          ),
+          _row(
+            '延迟',
+            status.rttMs > 0
+                ? 'RTT ${status.rttMs.toStringAsFixed(1)} ms'
+                    '${status.latencyMs > 0 ? ' · 帧龄 ${status.latencyMs.toStringAsFixed(0)} ms' : ''}'
+                : '—',
+          ),
           _row('帧', '${status.decoded} 解码 / ${status.received} 接收'),
           _row(
             '输入',

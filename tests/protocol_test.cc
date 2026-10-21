@@ -199,6 +199,87 @@ void test_hello_ack() {
           "HelloAck reports input disabled");
 }
 
+void test_frame_header() {
+    chast::FrameHeader sent;
+    sent.seq = 42;
+    sent.pts_ms = 1234;
+    sent.payload_size = 1000;
+    sent.payload_crc32 = 0xA5A5F00D;
+    sent.width = 1920;
+    sent.height = 1080;
+    sent.codec = chast::VideoCodec::Hevc;
+    sent.keyframe = true;
+    sent.idr = true;
+    sent.capture_ms = 0x0000ABCDEF123456ull;
+
+    uint8_t bytes[chast::kFrameHeaderSize]{};
+    chast::encode_frame_header(sent, bytes);
+    chast::FrameHeader got;
+    std::string error;
+    const bool decoded =
+        chast::decode_frame_header(bytes, sizeof(bytes), got, &error);
+    check(decoded, "FrameHeader round-trips");
+    if (decoded) {
+        check(got.seq == sent.seq && got.pts_ms == sent.pts_ms &&
+                  got.payload_size == sent.payload_size &&
+                  got.payload_crc32 == sent.payload_crc32,
+              "FrameHeader keeps its counters");
+        check(got.width == sent.width && got.height == sent.height &&
+                  got.codec == sent.codec && got.keyframe && got.idr,
+              "FrameHeader keeps the picture description");
+        check(got.capture_ms == sent.capture_ms,
+              "FrameHeader round-trips the 48-bit capture time");
+    }
+    check(sizeof(bytes) == 48, "FrameHeader is still 48 bytes");
+
+    sent.capture_ms = 0xFFFFFFFFFFFFull;
+    chast::encode_frame_header(sent, bytes);
+    check(chast::decode_frame_header(bytes, sizeof(bytes), got, &error) &&
+              got.capture_ms == 0xFFFFFFFFFFFFull,
+          "FrameHeader carries the largest 48-bit capture time");
+
+    std::vector<uint8_t> old_version(bytes, bytes + sizeof(bytes));
+    old_version[4] = static_cast<uint8_t>(chast::kProtocolVersion - 1);
+    old_version[5] = 0;
+    check(!chast::decode_frame_header(old_version.data(), old_version.size(), got, &error),
+          "FrameHeader from another protocol version is rejected");
+    check(!chast::decode_frame_header(bytes, chast::kFrameHeaderSize - 1, got, &error),
+          "a short FrameHeader is rejected");
+}
+
+void test_latency_probe() {
+    std::string error;
+    uint64_t client_us = 0;
+    check(chast::parse_latency_probe(
+              payload_of(chast::make_latency_probe(0x1122334455667788ull)), client_us,
+              &error) &&
+              client_us == 0x1122334455667788ull,
+          "LatencyProbe round-trips its client timestamp");
+
+    check(!chast::parse_latency_probe(std::vector<uint8_t>(7), client_us, &error),
+          "a short LatencyProbe is rejected");
+    std::vector<uint8_t> trailing =
+        payload_of(chast::make_latency_probe(1));
+    trailing.push_back(0);
+    check(!chast::parse_latency_probe(trailing, client_us, &error),
+          "LatencyProbe with trailing bytes is rejected");
+
+    uint64_t host_recv_us = 0;
+    uint64_t host_send_us = 0;
+    const std::vector<uint8_t> reply =
+        chast::make_latency_reply(10, 20, 25);
+    check(chast::parse_latency_reply(payload_of(reply), client_us, host_recv_us,
+                                     host_send_us, &error) &&
+              client_us == 10 && host_recv_us == 20 && host_send_us == 25,
+          "LatencyReply round-trips all three timestamps");
+    check(reply.size() == chast::kControlHeaderSize + 24 &&
+              reply[6] == static_cast<uint8_t>(chast::ControlType::LatencyReply),
+          "LatencyReply names its control type and size");
+    check(!chast::parse_latency_reply(payload_of(chast::make_latency_reply(10, 25, 20)),
+                                      client_us, host_recv_us, host_send_us, &error),
+          "LatencyReply that sends before receiving is rejected");
+}
+
 void test_stream_info() {
     chast::ServerInfo sent;
     sent.codec = chast::VideoCodec::H264;
@@ -592,6 +673,8 @@ int main(int argc, char** argv) {
     test_hello();
     test_access_denied();
     test_hello_ack();
+    test_frame_header();
+    test_latency_probe();
     test_stream_info();
     test_input_events();
     test_identity();

@@ -1,5 +1,6 @@
 #include "viewer_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -24,10 +25,15 @@ constexpr auto kReceiveTimeout = std::chrono::milliseconds(250);
 constexpr auto kInputPoll = std::chrono::milliseconds(10);
 constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
+constexpr auto kProbeInterval = std::chrono::seconds(1);
 constexpr size_t kMaxPendingInput = 256;
 
 std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
+}
+
+int64_t steady_us(std::chrono::steady_clock::time_point time) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count();
 }
 
 }  // namespace
@@ -128,6 +134,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
+    auto last_probe = started - kProbeInterval;
     auto window_start = started;
 
     uint64_t received = 0;
@@ -141,6 +148,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t bytes = 0;
     uint64_t input_sent = 0;
     uint64_t input_failed = 0;
+    double rtt_ms = 0.0;
+    double latency_ms = 0.0;
+    bool clock_synced = false;
+    int64_t clock_offset_us = 0;
     uint64_t digest = chast::kFrameDigestSeed;
     uint64_t window_frames = 0;
     uint64_t window_bytes = 0;
@@ -178,6 +189,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.protocol_errors = protocol_errors;
             status_.gaps = gaps;
             status_.bytes = bytes;
+            status_.rtt_ms = rtt_ms;
+            status_.latency_ms = latency_ms;
             status_.width = display_width;
             status_.height = display_height;
             status_.input_sent = input_sent;
@@ -440,6 +453,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     if (!apply_stream_updates()) {
                         break;
                     }
+                    {
+                        const auto probe_now = Clock::now();
+                        if (probe_now - last_probe >= kProbeInterval) {
+                            last_probe = probe_now;
+                            session->send_latency_probe();
+                            const chast::LatencySample sample = session->latency();
+                            if (sample.valid) {
+                                rtt_ms = static_cast<double>(sample.rtt_us) / 1000.0;
+                                clock_offset_us = sample.offset_us;
+                                clock_synced = true;
+                            }
+                        }
+                    }
                     drain_input();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
@@ -487,6 +513,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     last_frame = now;
                     bytes += payload.size();
                     window_bytes += payload.size();
+                    if (clock_synced && header.capture_ms != 0) {
+                        const int64_t host_now_us = steady_us(now) + clock_offset_us;
+                        const int64_t age_us =
+                            host_now_us - static_cast<int64_t>(header.capture_ms) * 1000;
+                        // A wild value means the offset is stale (for example
+                        // after a long receive stall); keep the last good one
+                        // instead of showing a bogus age.
+                        if (age_us > -100000 && age_us < 10000000) {
+                            latency_ms = static_cast<double>(std::max<int64_t>(age_us, 0)) / 1000.0;
+                        }
+                    }
                     if (header.keyframe) {
                         ++keyframes;
                     }

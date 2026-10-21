@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 7.
+// The chast wire protocol, version 8.
 //
 // One QUIC connection carries two things:
 //
@@ -30,7 +30,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 7;
+inline constexpr uint16_t kProtocolVersion = 8;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -64,6 +64,17 @@ enum class ControlType : uint16_t {
     // length, reason. Sent before the server closes the connection, so the
     // viewer can show why instead of a generic transport error.
     AccessDenied = 9,
+    // Clock-sync probe. The viewer sends its steady-clock timestamp; the host
+    // answers on the same control stream with LatencyReply. The four
+    // timestamps give the viewer the round-trip time and the offset between
+    // the two monotonic clocks, which is what turns FrameHeader::capture_ms
+    // into an end-to-end frame age. Sent about once a second.
+    LatencyProbe = 10,
+    // Answer to LatencyProbe. Payload: client_us, host_recv_us, host_send_us
+    // (u64 each). All are steady_clock readings in microseconds since that
+    // clock's epoch; the viewer subtracts its own receive time to get RTT and
+    // the clock offset without trusting either wall clock.
+    LatencyReply = 11,
 };
 
 // ----- input -----
@@ -168,6 +179,8 @@ struct InputEvent {
 
 struct FrameHeader {
     uint64_t seq = 0;
+    // Presentation time relative to the host session's first stream. Ordering
+    // and pacing only; it is not comparable across sessions or machines.
     uint64_t pts_ms = 0;
     uint32_t payload_size = 0;
     uint32_t payload_crc32 = 0;
@@ -176,6 +189,11 @@ struct FrameHeader {
     VideoCodec codec = VideoCodec::H264;
     bool keyframe = false;
     bool idr = false;
+    // Host steady_clock milliseconds at capture, low 48 bits. Together with
+    // the offset learned from LatencyReply it gives the viewer the age of the
+    // picture without assuming the two clocks share an epoch. Zero when the
+    // sender does not know (a synthetic frame).
+    uint64_t capture_ms = 0;
 };
 
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents.
@@ -288,6 +306,16 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
 std::vector<uint8_t> make_stream_info(const ServerInfo& info);
 std::vector<uint8_t> make_stats(const ClientStats& stats);
 bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::string* error);
+// Clock-sync exchange for RTT and the host-minus-client clock offset. All
+// values are steady_clock microseconds; the host echoes the client's stamp so
+// an out-of-order reply can still be paired with its probe.
+std::vector<uint8_t> make_latency_probe(uint64_t client_us);
+bool parse_latency_probe(const std::vector<uint8_t>& payload, uint64_t& client_us,
+                         std::string* error);
+std::vector<uint8_t> make_latency_reply(uint64_t client_us, uint64_t host_recv_us,
+                                        uint64_t host_send_us);
+bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_us,
+                         uint64_t& host_recv_us, uint64_t& host_send_us, std::string* error);
 std::vector<uint8_t> make_input_event(const InputEvent& event);
 bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);

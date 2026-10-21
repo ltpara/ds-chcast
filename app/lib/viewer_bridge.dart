@@ -81,6 +81,8 @@ class ViewerStatus {
     this.bytes = 0,
     this.fps = 0,
     this.kbps = 0,
+    this.rttMs = 0,
+    this.latencyMs = 0,
     this.elapsedMs = 0,
     this.videoFinished = false,
     this.fullscreen = false,
@@ -124,6 +126,14 @@ class ViewerStatus {
   final int bytes;
   final double fps;
   final double kbps;
+
+  /// Probe round trip to the host, in milliseconds; 0 until the first
+  /// LatencyReply.
+  final double rttMs;
+
+  /// Age of the most recent frame from host capture to local receipt, in
+  /// milliseconds; 0 until a reply and a timestamped frame arrived.
+  final double latencyMs;
   final int elapsedMs;
   final bool videoFinished;
   final bool fullscreen;
@@ -199,6 +209,8 @@ class ViewerStatus {
       bytes: asInt(map['bytes']),
       fps: asDouble(map['fps']),
       kbps: asDouble(map['kbps']),
+      rttMs: asDouble(map['rttMs']),
+      latencyMs: asDouble(map['latencyMs']),
       elapsedMs: asInt(map['elapsedMs']),
       videoFinished: map['videoFinished'] == true,
       fullscreen: map['fullscreen'] == true,

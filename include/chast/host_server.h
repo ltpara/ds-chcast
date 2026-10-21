@@ -48,6 +48,14 @@ struct HostServerStats {
     uint64_t repeats = 0;
     uint64_t send_errors = 0;
     uint64_t stream_updates = 0;
+    // Adaptive bitrate and link telemetry. target_bitrate starts at the
+    // configured (or hardware auto) bitrate and only moves when the
+    // controller sees loss, RTT inflation or a filling send queue.
+    uint32_t target_bitrate = 0;  // bits per second
+    uint64_t abr_changes = 0;
+    double rtt_ms = 0.0;
+    double min_rtt_ms = 0.0;
+    double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
     bool client_connected = false;  // at least one viewer got through
     bool peer_left = false;         // the last session ended with the peer gone
     bool stats_received = false;
@@ -90,6 +98,10 @@ struct HostServerConfig {
     bool reannounce = false;
     // Force an IDR this often; 0 leaves key frames to viewer requests.
     uint32_t keyframe_interval_ms = 0;
+    // Let the host lower the encoder bitrate when the transport reports loss,
+    // RTT inflation or a full send queue. The configured bitrate is the
+    // ceiling; the target recovers when the path is clean again.
+    bool adaptive_bitrate = true;
     // How long the first wait_for_client() may take; 0 = wait forever. Later
     // waits are unlimited.
     uint32_t first_client_timeout_ms = 0;

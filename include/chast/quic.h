@@ -24,6 +24,7 @@
 // a development escape hatch, not a default.
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -83,6 +84,35 @@ struct QuicServerConfig {
     // LocalMachine requires the caller to be able to create machine keys and
     // write to the machine certificate store (a service running as SYSTEM).
     IdentityScope identity_scope = IdentityScope::CurrentUser;
+};
+
+// What the QUIC stack says about the connection. RTT and loss come from the
+// transport's own packet accounting; queued_* are this session's application
+// sends that MsQuic has not completed yet, which is what tells an adaptive
+// controller that the host is outrunning the path rather than the desktop.
+struct TransportStats {
+    bool available = false;  // false when no connection existed or the query failed
+    uint32_t rtt_us = 0;
+    uint32_t min_rtt_us = 0;
+    uint32_t max_rtt_us = 0;
+    uint64_t send_bytes = 0;   // UDP payload bytes
+    uint64_t recv_bytes = 0;
+    uint64_t sent_packets = 0;
+    uint64_t lost_packets = 0;  // suspected minus spurious, cumulative
+    uint32_t congestion_window = 0;
+    size_t queued_bytes = 0;
+    size_t queued_sends = 0;
+};
+
+// The client's clock-sync result. offset_us maps a client steady-clock reading
+// to the host's: host_us = client_us + offset_us. `valid` stays false until
+// the first LatencyReply; values are raw samples, not smoothed.
+struct LatencySample {
+    bool valid = false;
+    uint64_t rtt_us = 0;
+    int64_t offset_us = 0;
+    uint64_t probes_sent = 0;
+    uint64_t replies = 0;
 };
 
 struct QuicClientConfig {
@@ -200,6 +230,15 @@ public:
                         std::chrono::milliseconds timeout);
     // Asks the server for an IDR (sent on the control stream).
     Error request_keyframe();
+    // Sends one LatencyProbe carrying this process's steady clock. The server
+    // answers automatically; the result appears in latency(). Call about once
+    // a second while streaming.
+    Error send_latency_probe();
+    // Last clock-sync result and probe/reply counters.
+    LatencySample latency() const;
+    // Transport-level RTT, loss and queue state. Safe on both ends; on the
+    // server it is what the adaptive bitrate controller samples.
+    TransportStats transport_stats() const;
     // Copies the description from the last StreamInfo the server sent, if one
     // arrived since the previous call. The same struct as the HelloAck: the
     // viewer replaces its mapping and decoder parameters with it.

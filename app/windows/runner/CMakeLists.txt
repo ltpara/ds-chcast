@@ -72,7 +72,7 @@ find_program(GO_EXECUTABLE go)
 if(GO_EXECUTABLE)
   # The runner's runtime directory next to this CMakeLists, per configuration.
   set(CHAST_TUNNEL_OUT "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/chast-tunnel.exe")
-  add_custom_target(chast_tunnel_binary ALL
+  add_custom_target(chast_viewer_tunnel_binary ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>"
     COMMAND ${GO_EXECUTABLE} build -trimpath
             -o "${CHAST_TUNNEL_OUT}"
@@ -81,7 +81,7 @@ if(GO_EXECUTABLE)
     BYPRODUCTS "${CHAST_TUNNEL_OUT}"
     COMMENT "Building chast-tunnel.exe"
     VERBATIM)
-  add_dependencies(chast_tunnel_binary ${BINARY_NAME})
+  add_dependencies(chast_viewer_tunnel_binary ${BINARY_NAME})
 else()
   message(WARNING
     "Go was not found; server-assisted connections will fail until "

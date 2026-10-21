@@ -83,6 +83,12 @@ struct ViewerStatus {
     uint64_t bytes = 0;
     double fps = 0.0;
     double kbps = 0.0;
+    // Link quality from LatencyProbe/Reply. Both stay 0 until the first reply
+    // (and, for latency_ms, the first frame after it); latency_ms is the age
+    // of the most recent frame from host capture to local receipt, after
+    // correcting for the measured clock offset.
+    double rtt_ms = 0.0;
+    double latency_ms = 0.0;
     uint64_t elapsed_ms = 0;
     bool video_finished = false;
     // Input gate and coordinate origin from HelloAck. `origin_x`/`origin_y`

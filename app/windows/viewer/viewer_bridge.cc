@@ -222,6 +222,8 @@ void ViewerBridge::HandleMethodCall(
         map[key("bytes")] = flutter::EncodableValue(static_cast<int64_t>(status.bytes));
         map[key("fps")] = flutter::EncodableValue(status.fps);
         map[key("kbps")] = flutter::EncodableValue(status.kbps);
+        map[key("rttMs")] = flutter::EncodableValue(status.rtt_ms);
+        map[key("latencyMs")] = flutter::EncodableValue(status.latency_ms);
         map[key("elapsedMs")] =
             flutter::EncodableValue(static_cast<int64_t>(status.elapsed_ms));
         map[key("videoFinished")] = flutter::EncodableValue(status.video_finished);

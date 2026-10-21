@@ -425,6 +425,14 @@ void refresh_ui() {
                               codec_label(status.stream.codec) + L" · " +
                               std::to_wstring(status.stream.framerate) + L" fps · " +
                               std::to_wstring(status.stats.encoded) + L" 帧";
+        if (status.stats.target_bitrate > 0) {
+            stream += L" · " +
+                      std::to_wstring((status.stats.target_bitrate + 500) / 1000) + L" kbps";
+        }
+        if (status.stats.rtt_ms > 0.0) {
+            stream += L" · RTT " +
+                      std::to_wstring(static_cast<int>(status.stats.rtt_ms + 0.5)) + L" ms";
+        }
         if (status.stats.input_events > 0) {
             stream += L" · 输入 " + std::to_wstring(status.stats.input_events);
         }

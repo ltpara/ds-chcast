@@ -174,7 +174,11 @@ void encode_frame_header(const FrameHeader& header, uint8_t out[kFrameHeaderSize
     put_u32(cursor, header.width);
     put_u32(cursor, header.height);
     put_u8(cursor, codec_wire(header.codec));
-    std::memset(cursor, 0, 7);
+    const uint64_t capture_ms = header.capture_ms & 0xFFFFFFFFFFFFull;
+    for (int i = 0; i < 6; ++i) {
+        put_u8(cursor, static_cast<uint8_t>(capture_ms >> (8 * i)));
+    }
+    put_u8(cursor, 0);
 }
 
 bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
@@ -217,6 +221,15 @@ bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
     }
     header.keyframe = (flags & 0x1) != 0;
     header.idr = (flags & 0x2) != 0;
+    header.capture_ms = 0;
+    for (int i = 0; i < 6; ++i) {
+        uint8_t byte = 0;
+        if (!reader.u8(byte)) {
+            set_error(error, "truncated frame capture time");
+            return false;
+        }
+        header.capture_ms |= static_cast<uint64_t>(byte) << (8 * i);
+    }
     return true;
 }
 
@@ -460,6 +473,48 @@ bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::s
         !reader.u64(stats.crc_errors) || !reader.u64(stats.decode_errors) ||
         !reader.u64(stats.digest) || !reader.u64(stats.elapsed_ms)) {
         set_error(error, "truncated Stats");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_latency_probe(uint64_t client_us) {
+    std::vector<uint8_t> payload(8);
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, client_us);
+    return make_control(ControlType::LatencyProbe, payload);
+}
+
+bool parse_latency_probe(const std::vector<uint8_t>& payload, uint64_t& client_us,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u64(client_us) || !reader.at_end()) {
+        set_error(error, "malformed LatencyProbe");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_latency_reply(uint64_t client_us, uint64_t host_recv_us,
+                                        uint64_t host_send_us) {
+    std::vector<uint8_t> payload(24);
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, client_us);
+    put_u64(cursor, host_recv_us);
+    put_u64(cursor, host_send_us);
+    return make_control(ControlType::LatencyReply, payload);
+}
+
+bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_us,
+                         uint64_t& host_recv_us, uint64_t& host_send_us, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u64(client_us) || !reader.u64(host_recv_us) || !reader.u64(host_send_us) ||
+        !reader.at_end()) {
+        set_error(error, "malformed LatencyReply");
+        return false;
+    }
+    if (host_send_us < host_recv_us) {
+        set_error(error, "LatencyReply sends before it receives");
         return false;
     }
     return true;

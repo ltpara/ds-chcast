@@ -44,6 +44,12 @@ namespace {
 constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
 constexpr uint64_t kKeepAliveMs = 5000;
+
+uint64_t steady_us() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
 constexpr wchar_t kKeyContainer[] = L"chast-quic-key";
 // Unique enough that the lookup in the user's store cannot confuse the
 // identity with a certificate another application placed there.
@@ -456,6 +462,10 @@ struct QuicSession::Impl {
     std::unique_ptr<InputInjector> injector;
     std::deque<InputEvent> input_events;
     size_t input_releases = 0;
+    // Client: last clock-sync result. `last_reply_probe_us` rejects a reply
+    // that overtook a newer one on the control stream.
+    LatencySample latency;
+    uint64_t last_reply_probe_us = 0;
 
     std::atomic<uint64_t> next_seq{0};
     std::atomic<bool> transport_down{false};
@@ -912,6 +922,64 @@ struct QuicSession::Impl {
                 }
                 break;
             }
+            case ControlType::LatencyProbe: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint64_t client_us = 0;
+                if (!parse_latency_probe(payload, client_us, &error)) {
+                    note_transport_failure("LatencyProbe: " + error);
+                    break;
+                }
+                const uint64_t recv_us = steady_us();
+                const std::vector<uint8_t> reply =
+                    make_latency_reply(client_us, recv_us, steady_us());
+                // A full send queue drops this sample; the viewer probes again
+                // in a second. Blocking a MsQuic worker here would be worse.
+                try_send_bytes(control.load(), reply, QUIC_SEND_FLAG_NONE);
+                break;
+            }
+            case ControlType::LatencyReply: {
+                if (role != Role::Client) {
+                    break;
+                }
+                uint64_t client_us = 0;
+                uint64_t host_recv_us = 0;
+                uint64_t host_send_us = 0;
+                if (!parse_latency_reply(payload, client_us, host_recv_us, host_send_us,
+                                         &error)) {
+                    note_transport_failure("LatencyReply: " + error);
+                    break;
+                }
+                const uint64_t received_us = steady_us();
+                if (received_us < client_us) {
+                    // The host echoed a stamp from the viewer's future. Only a
+                    // broken clock or a forged message does that.
+                    break;
+                }
+                const uint64_t processing_us = host_send_us - host_recv_us;
+                const uint64_t round_trip_us = received_us - client_us;
+                if (processing_us > round_trip_us) {
+                    break;
+                }
+                const uint64_t rtt_us = round_trip_us - processing_us;
+                const int64_t offset_us =
+                    (static_cast<int64_t>(host_recv_us) - static_cast<int64_t>(client_us) +
+                     static_cast<int64_t>(host_send_us) - static_cast<int64_t>(received_us)) /
+                    2;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!latency.valid || client_us >= last_reply_probe_us) {
+                        last_reply_probe_us = client_us;
+                        latency.valid = true;
+                        latency.rtt_us = rtt_us;
+                        latency.offset_us = offset_us;
+                    }
+                    ++latency.replies;
+                }
+                cv.notify_all();
+                break;
+            }
             default:
                 break;
         }
@@ -928,7 +996,11 @@ struct QuicSession::Impl {
         send_cv.notify_all();
     }
 
-    Error send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
+    // `wait_for_capacity` is false only for messages sent from a MsQuic
+    // callback (a latency reply). Blocking there could stall the transport's
+    // own worker, so such a send is dropped when the queue is full instead.
+    Error send_bytes_impl(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags,
+                          bool wait_for_capacity) {
         if (!stream) {
             return Error(Status::Unavailable, "no stream is open");
         }
@@ -937,11 +1009,16 @@ struct QuicSession::Impl {
         }
         {
             std::unique_lock<std::mutex> lock(send_mutex);
-            send_cv.wait(lock, [this] {
-                return (in_flight_sends < kMaxInFlightSends &&
-                        in_flight_bytes < kMaxInFlightBytes) ||
-                       transport_down.load();
-            });
+            if (wait_for_capacity) {
+                send_cv.wait(lock, [this] {
+                    return (in_flight_sends < kMaxInFlightSends &&
+                            in_flight_bytes < kMaxInFlightBytes) ||
+                           transport_down.load();
+                });
+            } else if (in_flight_sends >= kMaxInFlightSends ||
+                       in_flight_bytes >= kMaxInFlightBytes) {
+                return Error(Status::WaitTimeout, "send queue is full");
+            }
             if (transport_down.load()) {
                 return Error(Status::Unavailable, "connection closed before send");
             }
@@ -966,6 +1043,14 @@ struct QuicSession::Impl {
             return quic_error(status, "QUIC StreamSend");
         }
         return Error::success();
+    }
+
+    Error send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
+        return send_bytes_impl(stream, std::move(bytes), flags, true);
+    }
+
+    bool try_send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
+        return send_bytes_impl(stream, std::move(bytes), flags, false).ok();
     }
 
     bool wait_sends(std::chrono::milliseconds timeout) {
@@ -1065,6 +1150,8 @@ struct QuicSession::Impl {
             bye_ready = false;
             input_events.clear();
             input_releases = 0;
+            latency = LatencySample{};
+            last_reply_probe_us = 0;
             received.clear();
             control_parser.reset();
             transport_failed = false;
@@ -1709,6 +1796,73 @@ Error QuicSession::request_keyframe() {
     }
     return impl.send_bytes(impl.control.load(), make_control(ControlType::KeyframeRequest, {}),
                            QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::send_latency_probe() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_latency_probe is a client operation");
+    }
+    Error sent = impl.send_bytes(impl.control.load(), make_latency_probe(steady_us()),
+                                 QUIC_SEND_FLAG_NONE);
+    if (sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        ++impl.latency.probes_sent;
+    }
+    return sent;
+}
+
+LatencySample QuicSession::latency() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->latency;
+}
+
+TransportStats QuicSession::transport_stats() const {
+    Impl& impl = *impl_;
+    TransportStats stats;
+    {
+        std::lock_guard<std::mutex> lock(impl.send_mutex);
+        stats.queued_bytes = impl.in_flight_bytes;
+        stats.queued_sends = impl.in_flight_sends;
+    }
+    HQUIC handle = impl.connection.load();
+    if (!handle) {
+        return stats;
+    }
+    QUIC_STATISTICS_V2 v2{};
+    uint32_t size = sizeof(v2);
+    if (QUIC_SUCCEEDED(
+            impl.api->GetParam(handle, QUIC_PARAM_CONN_STATISTICS_V2, &size, &v2))) {
+        stats.available = true;
+        stats.rtt_us = v2.Rtt;
+        stats.min_rtt_us = v2.MinRtt;
+        stats.max_rtt_us = v2.MaxRtt;
+        stats.send_bytes = v2.SendTotalBytes;
+        stats.recv_bytes = v2.RecvTotalBytes;
+        stats.sent_packets = v2.SendTotalPackets;
+        stats.lost_packets = v2.SendSuspectedLostPackets >= v2.SendSpuriousLostPackets
+                                 ? v2.SendSuspectedLostPackets - v2.SendSpuriousLostPackets
+                                 : 0;
+        stats.congestion_window = v2.SendCongestionWindow;
+        return stats;
+    }
+    // Older MsQuic builds expose only the v1 layout; RTT and bytes are still
+    // useful, the congestion window is not part of it.
+    QUIC_STATISTICS v1{};
+    size = sizeof(v1);
+    if (QUIC_SUCCEEDED(impl.api->GetParam(handle, QUIC_PARAM_CONN_STATISTICS, &size, &v1))) {
+        stats.available = true;
+        stats.rtt_us = v1.Rtt;
+        stats.min_rtt_us = v1.MinRtt;
+        stats.max_rtt_us = v1.MaxRtt;
+        stats.send_bytes = v1.Send.TotalBytes;
+        stats.recv_bytes = v1.Recv.TotalBytes;
+        stats.sent_packets = v1.Send.TotalPackets;
+        stats.lost_packets = v1.Send.SuspectedLostPackets >= v1.Send.SpuriousLostPackets
+                                 ? v1.Send.SuspectedLostPackets - v1.Send.SpuriousLostPackets
+                                 : 0;
+    }
+    return stats;
 }
 
 Error QuicSession::send_input(const InputEvent& event) {
