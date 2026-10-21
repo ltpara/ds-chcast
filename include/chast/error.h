@@ -24,6 +24,7 @@ enum class Status {
     Unsupported,       // API not available on this stack (e.g. no HDR pass)
     Unavailable,       // the target no longer exists (display unplugged, adapter gone)
     InvalidCall,
+    PermissionDenied,  // the peer refused the handshake (token or approval)
     NoFrame,           // nothing captured yet
     CaptureFailed,     // generic failure with a message
 };

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../target.dart';
+import '../trust_store.dart';
 import '../viewer_bridge.dart';
 
 class StatsOverlay extends StatelessWidget {
@@ -81,9 +82,22 @@ class StatsOverlay extends StatelessWidget {
           Container(height: 1, color: Colors.white12),
           const SizedBox(height: 7),
           _row('链路', target.label),
+          _row(
+            '身份',
+            status.serverFingerprint.isEmpty
+                ? '—'
+                : 'SHA256 ${shortenFingerprint(status.serverFingerprint)}',
+          ),
           _row('解码', status.decoder.isEmpty ? '—' : status.decoder),
           _row('编码', status.serverEncoder.isEmpty ? '—' : status.serverEncoder),
           _row('帧', '${status.decoded} 解码 / ${status.received} 接收'),
+          _row(
+            '输入',
+            !status.inputEnabled
+                ? '服务端未启用'
+                : '${status.inputSent} 事件'
+                    '${status.inputFailed > 0 ? ' · ${status.inputFailed} 失败' : ''}',
+          ),
           if (anomalies > 0)
             _row(
               '异常',

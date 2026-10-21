@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
+import '../viewer_bridge.dart';
 import 'remote_view.dart';
 
 class RemoteToolbar extends StatelessWidget {
@@ -11,6 +12,12 @@ class RemoteToolbar extends StatelessWidget {
     required this.fullscreen,
     required this.statsVisible,
     required this.fit,
+    required this.controlEnabled,
+    required this.inputAvailable,
+    required this.displays,
+    required this.activeDisplay,
+    required this.onSelectDisplay,
+    required this.onToggleControl,
     required this.onTogglePin,
     required this.onToggleStats,
     required this.onToggleFullscreen,
@@ -25,6 +32,12 @@ class RemoteToolbar extends StatelessWidget {
   final bool fullscreen;
   final bool statsVisible;
   final ViewFit fit;
+  final bool controlEnabled;
+  final bool inputAvailable;
+  final List<ViewerDisplay> displays;
+  final int activeDisplay;
+  final ValueChanged<int> onSelectDisplay;
+  final VoidCallback onToggleControl;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
   final VoidCallback onToggleFullscreen;
@@ -64,15 +77,21 @@ class RemoteToolbar extends StatelessWidget {
             ),
             _FitButton(fit: fit, onChanged: onFitChanged),
             const _BarSeparator(),
-            const _BarButton(
-              icon: Icons.monitor_rounded,
-              tooltip: '多显示器切换：下一阶段',
-              disabled: true,
+            _DisplayButton(
+              displays: displays,
+              active: activeDisplay,
+              onSelected: onSelectDisplay,
             ),
-            const _BarButton(
+            _BarButton(
               icon: Icons.keyboard_alt_outlined,
-              tooltip: '远程键鼠：下一阶段',
-              disabled: true,
+              tooltip: !inputAvailable
+                  ? '服务端未开放输入'
+                  : controlEnabled
+                      ? '关闭远程键鼠'
+                      : '开启远程键鼠',
+              disabled: !inputAvailable,
+              active: controlEnabled,
+              onTap: onToggleControl,
             ),
             _BarButton(
               icon: Icons.speed_rounded,
@@ -263,6 +282,109 @@ class _FitButton extends StatelessWidget {
             ),
           ),
           const Spacer(),
+          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+        ],
+      ),
+    );
+  }
+}
+
+class _DisplayButton extends StatelessWidget {
+  const _DisplayButton({
+    required this.displays,
+    required this.active,
+    required this.onSelected,
+  });
+
+  final List<ViewerDisplay> displays;
+  final int active;
+  final ValueChanged<int> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool available = displays.isNotEmpty;
+    return Tooltip(
+      message: available
+          ? '切换显示器（重新连接）'
+          : '服务端尚未公布显示器列表',
+      waitDuration: const Duration(milliseconds: 450),
+      child: PopupMenuButton<int>(
+        enabled: available,
+        tooltip: '',
+        color: const Color(0xFF24252B),
+        elevation: 8,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(minWidth: 210, maxWidth: 300),
+        onSelected: onSelected,
+        itemBuilder: (BuildContext context) {
+          return <PopupMenuEntry<int>>[
+            _displayItem(kViewerDisplayAuto, '服务端默认', '由服务端选择输出',
+                Icons.auto_mode_rounded),
+            for (final ViewerDisplay display in displays)
+              _displayItem(
+                display.index,
+                display.label.isEmpty ? '显示器 ${display.index}' : display.label,
+                _detail(display),
+                Icons.monitor_rounded,
+              ),
+          ];
+        },
+        child: SizedBox(
+          width: 32,
+          height: 32,
+          child: Icon(
+            Icons.monitor_rounded,
+            size: 18,
+            color: available ? Colors.grey.shade300 : Colors.white24,
+          ),
+        ),
+      ),
+    );
+  }
+
+  static String _detail(ViewerDisplay display) {
+    final StringBuffer text = StringBuffer('${display.width}×${display.height}');
+    if (display.primary) {
+      text.write(' · 主屏');
+    }
+    if (display.rotation != 0) {
+      text.write(' · ${display.rotation}°');
+    }
+    return text.toString();
+  }
+
+  PopupMenuItem<int> _displayItem(int value, String title, String detail, IconData icon) {
+    final bool selected = value == active;
+    return PopupMenuItem<int>(
+      value: value,
+      height: 46,
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: selected ? kAccentBright : Colors.white70,
+                  ),
+                ),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
           if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),

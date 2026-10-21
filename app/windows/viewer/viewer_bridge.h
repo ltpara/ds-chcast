@@ -40,6 +40,8 @@ private:
     void HandleMethodCall(
         const flutter::MethodCall<flutter::EncodableValue>& call,
         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+    void SendInput(const flutter::EncodableMap& args,
+                   std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
     void SetFullscreen(bool enable);
 
     flutter::FlutterEngine* engine_ = nullptr;

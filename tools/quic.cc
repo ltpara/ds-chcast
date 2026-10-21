@@ -1,8 +1,8 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--save sent.h264] [--input]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--save received.h264] [--input]
-//   chast-quic verify  --port 45433 --seconds 5 [--input-real]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--input-dry-run]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input]
+//   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -25,6 +25,19 @@
 // given, so a normal test run never touches the real pointer; keys are left
 // out of the script in that mode, because a test must not type into whatever
 // window happens to be focused.
+//
+// Hello carries a display index: connect --display N asks serve to capture the
+// Nth output of the announced list, and serve creates its capturer only after
+// Hello arrives so the choice can be honoured. Without --display the client
+// leaves the choice to the server, whose own --display is the fallback
+// (primary when unset). verify always asks for display 0 and checks that the
+// announced origin and picture size are that display's rect.
+//
+// Access control: serve --token T requires Hello to carry T and spends it on
+// the first accepted viewer unless --token-reuse is given; --token auto
+// generates and prints one. --approve asks on stdin before letting a viewer
+// in. connect --token sends the token, and a refusal prints the server's
+// reason. verify exercises all three refusal paths on throwaway servers.
 
 #include <chrono>
 #include <cstdio>
@@ -32,6 +45,7 @@
 #include <exception>
 #include <future>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -41,6 +55,8 @@
 #include "chast/capture.h"
 #include "chast/decoder.h"
 #include "chast/encoder.h"
+#include "chast/host_server.h"
+#include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
 #include "crash_handler.h"
@@ -52,7 +68,10 @@ struct Options {
     std::string bind = "127.0.0.1";
     std::string host = "127.0.0.1";
     uint16_t port = 4433;
+    // serve: fallback output when the client does not ask for one.
+    // connect: the output to ask the server for.
     size_t display = 0;
+    bool display_set = false;
     chast::VideoCodec codec = chast::VideoCodec::H264;
     UINT bitrate_kbps = 0;
     UINT framerate = 30;
@@ -65,11 +84,40 @@ struct Options {
     // sequence once the handshake reports input enabled. verify: the same,
     // and check that the server observed exactly the events the client sent.
     bool input = false;
+    // serve only: accept input but stop at the OS boundary. Lets the Flutter
+    // viewer exercise its full send path against a server on the same machine
+    // without the injected events looping back into the viewer's own window.
+    bool input_dry_run = false;
+    // serve: print every InputEvent the server observes, for diagnosing
+    // the viewer's mapping.
+    bool dump_input = false;
+    // serve and verify: send a StreamInfo with the current description once,
+    // two seconds in. serve uses it to exercise a viewer's update path without
+    // changing the host's display mode; verify turns it on to cover the wire
+    // and session layers.
+    bool reannounce = false;
     // verify only: really call SendInput instead of stopping at the OS
     // boundary. Keys are left out of the script in that mode, because a test
     // run must not type into whatever window happens to be focused; the key
     // path is covered by the dry run and the injector's own checks.
     bool input_real = false;
+    // connect/verify: SHA-256 fingerprint to pin. verify fills it from the
+    // server it starts when the option is absent.
+    std::string fingerprint;
+    // connect: accept any certificate. Development only, and never combined
+    // with a pin.
+    bool insecure = false;
+    // serve: Hello must carry this token. connect: the token to send. verify:
+    // shared by the local server and the receiver.
+    std::string token;
+    // serve --token auto: generate a token and print it. Cleared once the
+    // token is resolved, so later code only sees the value.
+    bool token_auto = false;
+    // serve: let the same token serve later sessions instead of spending it
+    // on the first accepted viewer.
+    bool token_reuse = false;
+    // serve: ask on stdin before letting a viewer in.
+    bool approve = false;
     double seconds = 0.0;
     bool seconds_set = false;
     double wait_seconds = 30.0;
@@ -99,7 +147,14 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--host" && i + 1 < argc) {
                 options.host = argv[++i];
             } else if (arg == "--display" && i + 1 < argc) {
-                options.display = static_cast<size_t>(std::stoul(argv[++i]));
+                const unsigned long value = std::stoul(argv[++i]);
+                if (value >= chast::kMaxDisplayCount) {
+                    std::fprintf(stderr, "display index %lu is past the %u-display limit\n",
+                                 value, static_cast<unsigned>(chast::kMaxDisplayCount));
+                    return false;
+                }
+                options.display = static_cast<size_t>(value);
+                options.display_set = true;
             } else if (arg == "--codec" && i + 1 < argc) {
                 const std::string value = argv[++i];
                 if (value == "h264" || value == "avc") {
@@ -129,9 +184,31 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.save = argv[++i];
             } else if (arg == "--input") {
                 options.input = true;
+            } else if (arg == "--input-dry-run") {
+                options.input = true;
+                options.input_dry_run = true;
+            } else if (arg == "--dump-input") {
+                options.dump_input = true;
+            } else if (arg == "--reannounce") {
+                options.reannounce = true;
             } else if (arg == "--input-real") {
                 options.input = true;
                 options.input_real = true;
+            } else if (arg == "--fingerprint" && i + 1 < argc) {
+                options.fingerprint = argv[++i];
+            } else if (arg == "--insecure") {
+                options.insecure = true;
+            } else if (arg == "--token" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                if (value == "auto") {
+                    options.token_auto = true;
+                } else {
+                    options.token = value;
+                }
+            } else if (arg == "--token-reuse") {
+                options.token_reuse = true;
+            } else if (arg == "--approve") {
+                options.approve = true;
             } else if (arg == "--no-hdr") {
                 options.config.want_hdr = false;
             } else if (arg == "--no-cursor") {
@@ -154,8 +231,36 @@ bool parse_args(int argc, char** argv, Options& options) {
         // serve and verify need an end; connect follows the server's FIN.
         options.seconds = options.mode == "connect" ? 0.0 : 5.0;
     }
+    if (options.token.size() > chast::kMaxAccessTokenLength) {
+        std::fprintf(stderr, "--token is longer than %u bytes\n",
+                     static_cast<unsigned>(chast::kMaxAccessTokenLength));
+        return false;
+    }
+    if ((options.token_reuse || options.approve) && options.mode != "serve") {
+        std::fprintf(stderr, "--token-reuse and --approve only apply to serve\n");
+        return false;
+    }
     return true;
 }
+
+// Eight characters from a 32-symbol alphabet: about 40 bits, which is far
+// beyond online guessing for a single one-time token, and short enough to read
+// aloud or type on a phone.
+std::string generate_token() {
+    static constexpr char kAlphabet[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    std::random_device random;
+    std::string token;
+    token.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        token.push_back(kAlphabet[random() % (sizeof(kAlphabet) - 1)]);
+    }
+    return token;
+}
+
+struct ServerReady {
+    bool ok = false;
+    std::string fingerprint;
+};
 
 struct SenderStats {
     uint64_t frames = 0;
@@ -167,6 +272,8 @@ struct SenderStats {
     uint64_t send_errors = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    int32_t origin_x = 0;
+    int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
     std::string encoder;
     std::string save_path;
@@ -179,7 +286,17 @@ struct SenderStats {
     // counters. Empty unless --input was given.
     std::vector<chast::InputEvent> input_events;
     chast::InputStats input_stats;
+    uint64_t input_releases = 0;
     bool input_enabled = false;
+    std::vector<chast::DisplayDescription> displays;
+    // What Hello asked for (kDisplayAuto when the client left it to the
+    // server) and the index the capturer actually used.
+    uint16_t requested_display = chast::kDisplayAuto;
+    size_t display_index = 0;
+    // StreamInfo messages this server sent.
+    uint64_t stream_updates_sent = 0;
+    // SHA-256 identity the server presents (uppercase hex).
+    std::string fingerprint;
     bool ok = false;
 };
 
@@ -195,6 +312,8 @@ struct ReceiverStats {
     uint64_t digest = chast::kFrameDigestSeed;
     uint32_t width = 0;
     uint32_t height = 0;
+    int32_t origin_x = 0;
+    int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
     std::string decoder;
     std::string error;
@@ -203,47 +322,13 @@ struct ReceiverStats {
     std::vector<chast::InputEvent> input_sent;
     bool input_enabled = false;
     uint64_t input_errors = 0;
+    std::vector<chast::DisplayDescription> displays;
+    // StreamInfo messages received, and the description from the last one.
+    uint64_t stream_updates = 0;
+    chast::ServerInfo last_update;
+    // Fingerprint of the certificate the server presented.
+    std::string peer_fingerprint;
 };
-
-// Captures until a frame with an NV12 texture is available. The reference
-// returned by capturer.frame() stays valid until the next capture() call.
-bool wait_for_usable_frame(chast::IDxgiCapturer& capturer, bool quiet, std::string* error) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (std::chrono::steady_clock::now() < deadline) {
-        const chast::CaptureResult result = capturer.capture(std::chrono::milliseconds(100));
-        switch (result) {
-            case chast::CaptureResult::NoNewFrame:
-                continue;
-            case chast::CaptureResult::ReinitNeeded:
-                if (!quiet) {
-                    std::printf("reinitializing: %s\n",
-                                capturer.last_error().to_string().c_str());
-                }
-                if (chast::Error err = capturer.reinitialize(); !err.ok()) {
-                    *error = "reinit failed: " + err.to_string();
-                    return false;
-                }
-                continue;
-            case chast::CaptureResult::FatalError:
-                *error = "capture failed: " + capturer.last_error().to_string();
-                return false;
-            case chast::CaptureResult::Frame:
-                break;
-        }
-        const chast::FrameInfo& frame = capturer.frame();
-        if (!frame.nv12_texture) {
-            continue;
-        }
-        if (frame.rotation_degrees != 0) {
-            *error = "the encoder cannot carry " + std::to_string(frame.rotation_degrees) +
-                     "-degree output and capture could not rotate the desktop";
-            return false;
-        }
-        return true;
-    }
-    *error = "no frame with an NV12 texture arrived in 30 s";
-    return false;
-}
 
 // The input script connect and verify replay. It exercises every action the
 // protocol carries: an absolute move, a click, both wheel axes, a relative
@@ -259,11 +344,12 @@ std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, 
         event.mouse.y = y;
         events.push_back(event);
     };
-    auto key = [&](uint16_t usage, chast::KeyAction action) {
+    auto key = [&](uint16_t usage, chast::KeyAction action, uint16_t modifiers) {
         chast::InputEvent event;
         event.kind = chast::InputKind::Key;
         event.key.hid_usage = usage;
         event.key.action = action;
+        event.modifiers = modifiers;
         events.push_back(event);
     };
 
@@ -274,16 +360,16 @@ std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, 
     mouse(chast::MouseAction::WheelHorizontal, 0, WHEEL_DELTA, 0);
     mouse(chast::MouseAction::MoveRelative, 0, 5, -3);
     if (keys) {
-        key(0xE1, chast::KeyAction::Down);  // Left Shift
-        key(0x04, chast::KeyAction::Down);  // A
-        key(0x04, chast::KeyAction::Up);
-        key(0xE1, chast::KeyAction::Up);
+        key(0xE1, chast::KeyAction::Down, chast::kModifierLeftShift);  // Left Shift
+        key(0x04, chast::KeyAction::Down, chast::kModifierLeftShift);  // A
+        key(0x04, chast::KeyAction::Up, chast::kModifierLeftShift);
+        key(0xE1, chast::KeyAction::Up, 0);
     }
     return events;
 }
 
 bool same_event(const chast::InputEvent& a, const chast::InputEvent& b) {
-    if (a.kind != b.kind) {
+    if (a.kind != b.kind || a.modifiers != b.modifiers) {
         return false;
     }
     if (a.kind == chast::InputKind::Mouse) {
@@ -293,15 +379,27 @@ bool same_event(const chast::InputEvent& a, const chast::InputEvent& b) {
     return a.key.action == b.key.action && a.key.hid_usage == b.key.hid_usage;
 }
 
+bool same_display(const chast::DisplayDescription& a, const chast::DisplayDescription& b) {
+    return a.name == b.name && a.left == b.left && a.top == b.top && a.right == b.right &&
+           a.bottom == b.bottom && a.rotation_degrees == b.rotation_degrees &&
+           a.primary == b.primary;
+}
+
+// One host run over HostServer: the tool supplies the policy (display
+// fallback, save sink, approval prompt, run length) and keeps its own stats
+// view for the checks.
 SenderStats run_sender(const Options& options, const std::string& save_path,
-                       std::promise<bool>* listening) {
+                       std::promise<ServerReady>* listening) {
     SenderStats stats;
     stats.save_path = save_path;
     bool ready_published = false;
     auto publish_ready = [&](bool value) {
         if (listening && !ready_published) {
             ready_published = true;
-            listening->set_value(value);
+            ServerReady ready;
+            ready.ok = value;
+            ready.fingerprint = value ? stats.fingerprint : std::string();
+            listening->set_value(std::move(ready));
         }
     };
     auto fail = [&](std::string message) {
@@ -311,332 +409,174 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         return stats;
     };
 
-    std::string error;
-    std::unique_ptr<chast::IDxgiCapturer> capturer =
-        chast::create_capturer(options.display, options.config, &error);
-    if (!capturer) {
-        return fail("capturer creation failed: " + error);
+    struct FileCloser {
+        void operator()(FILE* file) const {
+            if (file) {
+                std::fclose(file);
+            }
+        }
+    };
+    std::unique_ptr<FILE, FileCloser> sink;
+    if (!save_path.empty()) {
+        FILE* raw = nullptr;
+        if (fopen_s(&raw, save_path.c_str(), "wb") != 0 || !raw) {
+            return fail("could not open " + save_path);
+        }
+        sink.reset(raw);
     }
 
-    chast::QuicServerConfig server_config;
-    server_config.bind_address = options.bind;
-    server_config.port = options.port;
-    server_config.allow_input = options.input;
-    server_config.dry_run_input = options.input && options.mode == "verify" && !options.input_real;
-    std::unique_ptr<chast::QuicSession> server =
-        chast::QuicSession::create_server(server_config, &error);
+    chast::HostServerConfig config;
+    config.settings.bind_address = options.bind;
+    config.settings.port = options.port;
+    config.settings.allow_input = options.input;
+    config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
+                                                     : chast::HostTokenMode::OneTime;
+    config.settings.access_token = options.token;
+    config.settings.codec = options.codec;
+    config.settings.bitrate_kbps = options.bitrate_kbps;
+    config.settings.framerate = static_cast<uint16_t>(options.framerate);
+    config.settings.quality = options.quality;
+    if (options.display_set) {
+        config.settings.display = static_cast<uint16_t>(options.display);
+    }
+    config.dry_run_input =
+        options.input_dry_run || (options.input && options.mode == "verify" && !options.input_real);
+    config.want_hdr = options.config.want_hdr;
+    config.capture_cursor = options.config.capture_cursor;
+    config.serve_once = true;
+    config.run_seconds = options.seconds;
+    config.reannounce = options.reannounce;
+    config.keyframe_interval_ms = options.keyframe_ms;
+    config.first_client_timeout_ms = static_cast<uint32_t>(options.wait_seconds * 1000.0);
+    if (!options.quiet) {
+        config.log = [](const std::string& message) {
+            std::printf("quic: %s\n", message.c_str());
+        };
+    }
+    if (options.approve) {
+        // Runs on the host thread while wait_for_client() is blocked, so
+        // reading stdin here cannot stall the transport's own workers.
+        config.approve_client = [](const chast::ClientRequest& request) {
+            const std::string display =
+                request.display == chast::kDisplayAuto ? "auto"
+                                                       : std::to_string(request.display);
+            std::printf("quic: %s asks to connect (display %s); allow? [y/N] ",
+                        request.peer_address.empty() ? "a client" : request.peer_address.c_str(),
+                        display.c_str());
+            std::fflush(stdout);
+            char line[16]{};
+            if (!std::fgets(line, sizeof(line), stdin)) {
+                std::printf("\n");
+                return false;
+            }
+            return line[0] == 'y' || line[0] == 'Y';
+        };
+    }
+    if (sink) {
+        config.packet = [&sink](const chast::FrameHeader&, const uint8_t* data, size_t size) {
+            std::fwrite(data, 1, size, sink.get());
+        };
+    }
+    config.input_event = [&stats, &options](const chast::InputEvent& event) {
+        stats.input_events.push_back(event);
+        if (!options.dump_input) {
+            return;
+        }
+        if (event.kind == chast::InputKind::Mouse) {
+            std::printf("input: mouse action=%u buttons=%u x=%d y=%d state=0x%03X\n",
+                        static_cast<unsigned>(event.mouse.action), event.mouse.buttons,
+                        event.mouse.x, event.mouse.y, event.modifiers);
+        } else {
+            std::printf("input: key action=%u usage=0x%02X state=0x%03X\n",
+                        static_cast<unsigned>(event.key.action), event.key.hid_usage,
+                        event.modifiers);
+        }
+    };
+
+    std::string error;
+    std::unique_ptr<chast::HostServer> server =
+        chast::HostServer::create(std::move(config), &error);
     if (!server) {
         return fail("QUIC server: " + error);
     }
+    const chast::HostStatus initial = server->status();
+    stats.fingerprint = initial.fingerprint;
     publish_ready(true);
     if (!options.quiet) {
-        std::printf("quic: listening on %s:%u\n", options.bind.c_str(), options.port);
-    }
-
-    chast::Error waited =
-        server->wait_for_client(std::chrono::milliseconds(
-            static_cast<long long>(options.wait_seconds * 1000.0)));
-    if (!waited.ok()) {
-        return fail("waiting for a client: " + waited.to_string());
-    }
-    stats.client_connected = true;
-    if (!options.quiet) {
-        std::printf("quic: client connected; starting the capture\n");
-    }
-
-    if (!wait_for_usable_frame(*capturer, options.quiet, &error)) {
-        return fail(error);
-    }
-    const chast::FrameInfo& first = capturer->frame();
-
-    chast::EncoderConfig encoder_config;
-    encoder_config.codec = options.codec;
-    encoder_config.bitrate = options.bitrate_kbps * 1000u;
-    encoder_config.framerate = options.framerate;
-    encoder_config.quality_ratio = options.quality;
-    encoder_config.gop_size = 0;
-    encoder_config.width = first.width;
-    encoder_config.height = first.height;
-    const chast::AdapterDevice adapter = capturer->adapter_device();
-    std::unique_ptr<chast::IVideoEncoder> encoder =
-        chast::create_encoder(adapter.device, encoder_config, &error);
-    if (!encoder) {
-        return fail("encoder creation failed: " + error);
-    }
-    stats.codec = encoder->codec();
-    stats.width = encoder->width();
-    stats.height = encoder->height();
-    stats.encoder = encoder->implementation();
-
-    if (!options.quiet) {
-        std::printf("encoder: %s via %s, %ux%u, target %u kbps\n",
-                    chast_tools::codec_name(stats.codec),
-                    stats.encoder.empty() ? "oneVPL" : stats.encoder.c_str(), stats.width,
-                    stats.height, encoder->bitrate() / 1000u);
-        if (stats.codec != options.codec) {
-            std::printf("encoder fell back: requested %s, producing %s\n",
-                        chast_tools::codec_name(options.codec),
-                        chast_tools::codec_name(stats.codec));
+        std::printf("quic: identity SHA256 %s\n",
+                    chast::format_fingerprint(stats.fingerprint).c_str());
+        if (!initial.token.empty()) {
+            std::printf("quic: access token %s (%s)\n", initial.token.c_str(),
+                        options.token_reuse ? "reusable" : "one-time");
+        }
+        if (options.approve) {
+            std::printf("quic: every viewer will need operator approval\n");
         }
     }
 
-    chast::ServerInfo info;
-    info.codec = encoder->codec();
-    info.width = static_cast<uint16_t>(encoder->width());
-    info.height = static_cast<uint16_t>(encoder->height());
-    info.framerate = static_cast<uint16_t>(options.framerate);
-    info.bitrate = encoder->bitrate();
-    info.encoder = encoder->implementation().empty() ? "oneVPL" : encoder->implementation();
-    chast::Error announced = server->announce(info);
-    if (!announced.ok()) {
-        return fail("announce: " + announced.to_string());
-    }
+    server->start();
+    server->wait();
+    const chast::HostStatus status = server->status();
+
+    stats.client_connected = status.stats.client_connected;
+    stats.requested_display = status.requested_display;
+    stats.display_index = status.display_index;
+    stats.codec = status.stream.codec;
+    stats.width = status.stream.width;
+    stats.height = status.stream.height;
+    stats.origin_x = status.stream.origin_x;
+    stats.origin_y = status.stream.origin_y;
+    stats.encoder = status.stream.encoder;
+    stats.displays = status.stream.displays;
     stats.input_enabled = options.input;
+    stats.input_stats = status.stats.input_stats;
+    stats.input_releases = status.stats.input_releases;
+    stats.stats_received = status.stats.stats_received;
+    stats.peer = status.stats.peer;
+    stats.peer_left = status.stats.peer_left;
+    stats.stream_updates_sent = status.stats.stream_updates;
+    stats.frames = status.stats.frames;
+    stats.encoded = status.stats.encoded;
+    stats.keyframes = status.stats.keyframes;
+    stats.bytes = status.stats.bytes;
+    stats.pointer_only = status.stats.pointer_only;
+    stats.repeats = status.stats.repeats;
+    stats.send_errors = status.stats.send_errors;
+    stats.error = status.error;
 
-    FILE* sink = nullptr;
-    if (!save_path.empty() &&
-        (fopen_s(&sink, save_path.c_str(), "wb") != 0 || !sink)) {
-        return fail("could not open " + save_path);
-    }
-
-    const auto start = std::chrono::steady_clock::now();
-    // DXGI delivers frames at the desktop refresh rate. Pace the capture so
-    // the stream matches the framerate the encoder and HelloAck declare,
-    // instead of sending 60 fps into a 30 fps rate-control configuration.
-    const std::chrono::steady_clock::duration frame_interval =
-        options.framerate > 0
-            ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                  std::chrono::duration<double>(1.0 / static_cast<double>(options.framerate)))
-            : std::chrono::steady_clock::duration::zero();
-    auto next_frame_due = start + frame_interval;
-    auto last_keyframe = start;
-    bool force_keyframe = true;  // the first access unit is always an IDR
-    bool have_input = false;
-    bool keep_running = true;
-    std::vector<chast::EncodedPacket> packets;
-
-    auto process_frame = [&](uint64_t pts_ms) -> bool {
-        const chast::FrameInfo& frame = capturer->frame();
-        if (!frame.nv12_texture) {
-            return true;
-        }
-        if (frame.rotation_degrees != 0) {
-            stats.error = "capture lost rotation while streaming";
-            return false;
-        }
-        packets.clear();
-        chast::Error err = chast::Error::success();
-        if (!frame.nv12_updated && have_input) {
-            err = encoder->encode_repeat(pts_ms, force_keyframe, packets);
-            if (err.ok()) {
-                ++stats.repeats;
-            } else if (err.status() == chast::Status::DeviceRemoved ||
-                       err.status() == chast::Status::DeviceReset) {
-                stats.error = "encode_repeat: " + err.to_string();
-                return false;
-            } else {
-                packets.clear();
-                err = encoder->encode(frame.nv12_texture, pts_ms, force_keyframe, packets);
-            }
-        } else {
-            err = encoder->encode(frame.nv12_texture, pts_ms, force_keyframe, packets);
-        }
-        if (!err.ok()) {
-            stats.error = "encode: " + err.to_string();
-            return false;
-        }
-        have_input = true;
-
-        for (const chast::EncodedPacket& packet : packets) {
-            if (packet.data.empty()) {
-                continue;
-            }
-            chast::FrameHeader header;
-            header.pts_ms = packet.pts_ms;
-            header.width = encoder->width();
-            header.height = encoder->height();
-            header.codec = encoder->codec();
-            header.keyframe = packet.keyframe;
-            header.idr = packet.idr;
-            chast::Error sent =
-                server->send_frame(header, packet.data.data(), packet.data.size());
-            if (!sent.ok()) {
-                if (sent.status() == chast::Status::Unavailable ||
-                    sent.status() == chast::Status::WaitTimeout) {
-                    stats.peer_left = true;
-                } else {
-                    ++stats.send_errors;
-                    stats.error = "send_frame: " + sent.to_string();
-                }
-                return false;
-            }
-            if (sink) {
-                fwrite(packet.data.data(), 1, packet.data.size(), sink);
-            }
-            ++stats.encoded;
-            stats.bytes += packet.data.size();
-            if (packet.keyframe) {
-                ++stats.keyframes;
-                last_keyframe = std::chrono::steady_clock::now();
-                force_keyframe = false;
-            }
-        }
-        return true;
-    };
-
-    // The frame captured before the handshake is the first one on the wire.
-    ++stats.frames;
-    if (!first.desktop_updated) {
-        ++stats.pointer_only;
-    }
-    keep_running = process_frame(0);
-
-    uint64_t timeouts = 0;
-    while (keep_running) {
-        const auto now = std::chrono::steady_clock::now();
-        const double elapsed = std::chrono::duration<double>(now - start).count();
-        if (options.seconds > 0.0 && elapsed >= options.seconds) {
-            break;
-        }
-        if (server->take_keyframe_request()) {
-            force_keyframe = true;
-        }
-        if (options.keyframe_ms > 0 &&
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keyframe).count() >=
-                static_cast<long long>(options.keyframe_ms)) {
-            force_keyframe = true;
-        }
-
-        if (frame_interval != std::chrono::steady_clock::duration::zero()) {
-            const auto wait_now = std::chrono::steady_clock::now();
-            if (next_frame_due > wait_now) {
-                std::this_thread::sleep_for(next_frame_due - wait_now);
-            }
-            // Advance on an absolute timeline; capture() itself waits for the
-            // next present, so a relative sleep would halve the frame rate.
-            next_frame_due += frame_interval;
-            const auto late = std::chrono::steady_clock::now() - next_frame_due;
-            if (late > std::chrono::seconds(1)) {
-                next_frame_due = std::chrono::steady_clock::now();
-            }
-        }
-
-        const chast::CaptureResult result = capturer->capture(std::chrono::milliseconds(100));
-        switch (result) {
-            case chast::CaptureResult::NoNewFrame:
-                ++timeouts;
-                continue;
-            case chast::CaptureResult::ReinitNeeded: {
-                if (!options.quiet) {
-                    std::printf("reinitializing: %s\n",
-                                capturer->last_error().to_string().c_str());
-                }
-                chast::Error err = capturer->reinitialize();
-                if (!err.ok()) {
-                    stats.error = "reinit failed: " + err.to_string();
-                    keep_running = false;
-                    break;
-                }
-                encoder.reset();
-                have_input = false;
-                force_keyframe = true;
-                continue;
-            }
-            case chast::CaptureResult::FatalError:
-                stats.error = "capture failed: " + capturer->last_error().to_string();
-                keep_running = false;
-                break;
-            case chast::CaptureResult::Frame:
-                break;
-        }
-        if (!keep_running) {
-            break;
-        }
-
-        ++stats.frames;
-        const chast::FrameInfo& frame = capturer->frame();
-        if (!frame.desktop_updated) {
-            ++stats.pointer_only;
-        }
-        if (!encoder) {
-            // The reinitialized duplication may be a different size; the
-            // announced stream description would be a lie, so stop instead.
-            if (frame.width != stats.width || frame.height != stats.height) {
-                stats.error = "the desktop changed size mid-stream";
-                break;
-            }
-            encoder_config.width = frame.width;
-            encoder_config.height = frame.height;
-            encoder = chast::create_encoder(adapter.device, encoder_config, &error);
-            if (!encoder) {
-                stats.error = "encoder recreation failed: " + error;
-                break;
-            }
-            if (encoder->codec() != stats.codec) {
-                stats.error = "the encoder changed codec mid-stream; restart the session";
-                break;
-            }
-            force_keyframe = true;
-        }
-        const uint64_t pts_ms = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start)
-                .count());
-        if (!process_frame(pts_ms)) {
-            break;
-        }
-    }
-
-    if (sink) {
-        fclose(sink);
-    }
-
-    stats.input_events = server->take_input_events();
-    stats.input_stats = server->input_stats();
-
-    chast::ClientStats peer;
-    bool received = false;
-    chast::Error finished = server->finish_server(std::chrono::milliseconds(15000), peer,
-                                                  received);
-    stats.stats_received = received;
-    stats.peer = peer;
-    if (!finished.ok() && stats.error.empty()) {
-        // A client that vanished is normal for serve; anything else is not.
-        if (!stats.peer_left) {
-            stats.error = "finish: " + finished.to_string();
-        }
-    }
     if (!options.quiet || !stats.error.empty()) {
         std::printf("sender: frames=%llu encoded=%llu keyframes=%llu pointer-only=%llu "
-                    "repeats=%llu bytes=%llu send-errors=%llu\n",
+                    "repeats=%llu bytes=%llu send-errors=%llu stream-updates=%llu\n",
                     static_cast<unsigned long long>(stats.frames),
                     static_cast<unsigned long long>(stats.encoded),
                     static_cast<unsigned long long>(stats.keyframes),
                     static_cast<unsigned long long>(stats.pointer_only),
                     static_cast<unsigned long long>(stats.repeats),
                     static_cast<unsigned long long>(stats.bytes),
-                    static_cast<unsigned long long>(stats.send_errors));
-        if (received) {
+                    static_cast<unsigned long long>(stats.send_errors),
+                    static_cast<unsigned long long>(stats.stream_updates_sent));
+        if (stats.stats_received) {
             std::printf("sender: peer received=%llu decoded=%llu digest=%016llX\n",
-                        static_cast<unsigned long long>(peer.received),
-                        static_cast<unsigned long long>(peer.decoded),
-                        static_cast<unsigned long long>(peer.digest));
+                        static_cast<unsigned long long>(stats.peer.received),
+                        static_cast<unsigned long long>(stats.peer.decoded),
+                        static_cast<unsigned long long>(stats.peer.digest));
         }
         if (options.input) {
             std::printf("sender: input received=%llu applied=%llu rejected=%llu "
-                        "failed=%llu dropped=%llu\n",
+                        "failed=%llu dropped=%llu releases=%llu\n",
                         static_cast<unsigned long long>(stats.input_events.size()),
                         static_cast<unsigned long long>(stats.input_stats.applied),
                         static_cast<unsigned long long>(stats.input_stats.rejected),
                         static_cast<unsigned long long>(stats.input_stats.failed),
-                        static_cast<unsigned long long>(stats.input_stats.dropped));
+                        static_cast<unsigned long long>(stats.input_stats.dropped),
+                        static_cast<unsigned long long>(stats.input_releases));
         }
     }
     stats.ok = stats.error.empty();
     return stats;
 }
 
-ReceiverStats run_receiver(const Options& options, std::shared_future<bool> server_ready) {
+ReceiverStats run_receiver(const Options& options, std::shared_future<ServerReady> server_ready) {
     ReceiverStats stats;
     auto fail = [&](std::string message) {
         stats.error = std::move(message);
@@ -644,16 +584,37 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
         return stats;
     };
 
+    ServerReady ready;
     if (server_ready.valid()) {
-        if (server_ready.wait_for(std::chrono::seconds(10)) != std::future_status::ready ||
-            !server_ready.get()) {
+        if (server_ready.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
             return fail("the local server did not start");
         }
+        ready = server_ready.get();
+        if (!ready.ok) {
+            return fail("the local server did not start");
+        }
+    }
+
+    std::string pinned = chast::normalize_fingerprint(options.fingerprint);
+    if (!options.fingerprint.empty() && pinned.empty()) {
+        return fail("--fingerprint is not a SHA-256 fingerprint");
+    }
+    if (pinned.empty()) {
+        // verify starts the server itself, so it can take the identity from
+        // there instead of asking the caller to copy it.
+        pinned = ready.fingerprint;
+    }
+    if (pinned.empty() && !options.insecure) {
+        return fail("no pinned server identity: pass --fingerprint <SHA256> "
+                    "(printed by serve), or --insecure for local development");
     }
 
     chast::QuicClientConfig client_config;
     client_config.host = options.host;
     client_config.port = options.port;
+    client_config.pinned_fingerprint = pinned;
+    client_config.allow_any_certificate = pinned.empty() && options.insecure;
+    client_config.access_token = options.token;
     std::string error;
     std::unique_ptr<chast::QuicSession> session =
         chast::QuicSession::create_client(client_config, &error);
@@ -664,20 +625,51 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
     if (!connected.ok()) {
         return fail("connect: " + connected.to_string());
     }
+    stats.peer_fingerprint = session->peer_fingerprint();
+    if (!options.quiet) {
+        std::printf("quic: server identity SHA256 %s%s\n",
+                    chast::format_fingerprint(stats.peer_fingerprint).c_str(),
+                    pinned.empty() ? " (unverified)" : " (pinned)");
+    }
 
     chast::ServerInfo info;
-    chast::Error handshaken = session->handshake(info, std::chrono::seconds(15));
+    const uint16_t requested_display =
+        options.display_set ? static_cast<uint16_t>(options.display) : chast::kDisplayAuto;
+    chast::Error handshaken =
+        session->handshake(info, std::chrono::seconds(15), requested_display);
     if (!handshaken.ok()) {
         return fail("handshake: " + handshaken.to_string());
     }
     stats.codec = info.codec;
     stats.width = info.width;
     stats.height = info.height;
+    stats.origin_x = info.origin_x;
+    stats.origin_y = info.origin_y;
     stats.input_enabled = info.input_enabled;
+    stats.displays = info.displays;
     if (!options.quiet) {
         std::printf("quic: connected, server streams %s %ux%u at %u kbps (%s)\n",
                     chast_tools::codec_name(info.codec), info.width, info.height,
                     info.bitrate / 1000u, info.encoder.c_str());
+        if (!options.token.empty()) {
+            std::printf("quic: access token accepted\n");
+        }
+        std::printf("quic: server has %zu display%s\n", info.displays.size(),
+                    info.displays.size() == 1 ? "" : "s");
+        for (size_t i = 0; i < info.displays.size(); ++i) {
+            const chast::DisplayDescription& display = info.displays[i];
+            std::printf("quic:   [%zu] %s %dx%d at %d,%d rotation %u%s\n", i,
+                        display.name.empty() ? "(unnamed)" : display.name.c_str(),
+                        display.right - display.left, display.bottom - display.top,
+                        display.left, display.top,
+                        static_cast<unsigned>(display.rotation_degrees),
+                        display.primary ? " primary" : "");
+        }
+        if (options.display_set) {
+            std::printf("quic: asked the server for display %zu\n", options.display);
+        } else {
+            std::printf("quic: let the server choose the display\n");
+        }
         if (options.input) {
             std::printf("quic: server input %s (origin %d,%d)\n",
                         info.input_enabled ? "enabled" : "disabled", info.origin_x,
@@ -699,6 +691,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
                     std::fprintf(stderr, "send_input: %s\n", sent.to_string().c_str());
                 }
             }
+        }
+        // The viewer does this whenever it gives up control; here it also
+        // proves the release message travels and reaches the injector.
+        if (chast::Error released = session->release_input(); !released.ok()) {
+            ++stats.input_errors;
+            std::fprintf(stderr, "release_input: %s\n", released.to_string().c_str());
         }
     }
 
@@ -767,6 +765,43 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
 
         ++stats.received;
         last_frame = std::chrono::steady_clock::now();
+
+        chast::ServerInfo update;
+        while (session->take_stream_update(update)) {
+            ++stats.stream_updates;
+            const bool reconfigure = update.codec != info.codec ||
+                                     update.width != info.width ||
+                                     update.height != info.height;
+            info = update;
+            stats.last_update = update;
+            stats.codec = info.codec;
+            stats.width = info.width;
+            stats.height = info.height;
+            stats.origin_x = info.origin_x;
+            stats.origin_y = info.origin_y;
+            stats.displays = info.displays;
+            stats.input_enabled = info.input_enabled;
+            if (reconfigure) {
+                // The next access unit may belong to a new stream (new SPS,
+                // possibly a new codec). Start over and let the decoder wait
+                // for that stream's first key frame.
+                decoder.reset();
+                chast::DecoderConfig updated_decoder;
+                updated_decoder.codec = info.codec;
+                decoder = chast::create_decoder(updated_decoder, &error);
+                if (!decoder) {
+                    return fail("decoder recreation failed: " + error);
+                }
+                stats.decoder = decoder->implementation();
+                last_keyframe_request = start - std::chrono::seconds(10);
+            }
+            if (!options.quiet) {
+                std::printf("quic: stream description updated: %s %ux%u at %d,%d\n",
+                            chast_tools::codec_name(info.codec), info.width, info.height,
+                            info.origin_x, info.origin_y);
+            }
+        }
+
         if (options.keyframe_request_ms > 0 &&
             last_frame >= next_keyframe_request) {
             session->request_keyframe();
@@ -878,7 +913,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
     if (!options.quiet || !stats.error.empty()) {
         std::printf("receiver: decoder=%s codec=%s size=%ux%u received=%llu decoded=%llu "
                     "keyframes=%llu crc-errors=%llu decode-errors=%llu gaps=%llu "
-                    "protocol-errors=%llu bytes=%llu digest=%016llX elapsed=%llu ms%s\n",
+                    "protocol-errors=%llu stream-updates=%llu bytes=%llu digest=%016llX "
+                    "elapsed=%llu ms%s\n",
                     stats.decoder.c_str(), chast_tools::codec_name(stats.codec), stats.width,
                     stats.height, static_cast<unsigned long long>(stats.received),
                     static_cast<unsigned long long>(stats.decoded),
@@ -887,6 +923,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<bool> serv
                     static_cast<unsigned long long>(stats.decode_errors),
                     static_cast<unsigned long long>(stats.gaps),
                     static_cast<unsigned long long>(stats.protocol_errors),
+                    static_cast<unsigned long long>(stats.stream_updates),
                     static_cast<unsigned long long>(stats.bytes),
                     static_cast<unsigned long long>(stats.digest),
                     static_cast<unsigned long long>(elapsed_ms),
@@ -974,15 +1011,243 @@ StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec code
     return result;
 }
 
+// Starts a second server and connects to it with a deliberately wrong pin.
+// The TLS callback must refuse the certificate before any Hello is exchanged.
+bool pinned_client_rejects_other_identity(uint16_t port, std::string* detail) {
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = port;
+    server_config.idle_timeout_ms = 3000;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "server: " + error;
+        return false;
+    }
+    std::thread waiting([&] { server->wait_for_client(std::chrono::seconds(3)); });
+
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 3000;
+    client_config.pinned_fingerprint.assign(64, '0');
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    bool rejected = false;
+    if (!client) {
+        *detail = "client: " + error;
+    } else {
+        const chast::Error connected = client->connect(std::chrono::seconds(5));
+        rejected = !connected.ok();
+        *detail = connected.to_string();
+    }
+    waiting.join();
+    return rejected;
+}
+
+struct ProbeClient {
+    bool ok = false;
+    chast::Status status = chast::Status::Ok;
+    std::string error;
+};
+
+// Runs one full connect + Hello against `port`.
+ProbeClient probe_handshake(uint16_t port, const std::string& pin, const std::string& token,
+                            std::chrono::milliseconds timeout) {
+    ProbeClient result;
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 3000;
+    client_config.pinned_fingerprint = pin;
+    client_config.access_token = token;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        result.error = "client: " + error;
+        return result;
+    }
+    const chast::Error connected = client->connect(std::chrono::seconds(5));
+    if (!connected.ok()) {
+        result.status = connected.status();
+        result.error = connected.to_string();
+        return result;
+    }
+    chast::ServerInfo info;
+    const chast::Error handshaken = client->handshake(info, timeout, chast::kDisplayAuto);
+    result.ok = handshaken.ok();
+    result.status = handshaken.status();
+    result.error = handshaken.to_string();
+    return result;
+}
+
+// Token and approval, on their own server so the main loopback stays a plain
+// accepted session: a wrong token is refused with a reason, then an operator
+// who declines the first viewer and accepts the second gets exactly that.
+bool access_control_works(uint16_t port, std::string* detail) {
+    {
+        chast::QuicServerConfig server_config;
+        server_config.bind_address = "127.0.0.1";
+        server_config.port = port;
+        server_config.idle_timeout_ms = 3000;
+        server_config.access_token = "the-right-token";
+        std::string error;
+        std::unique_ptr<chast::QuicSession> server =
+            chast::QuicSession::create_server(server_config, &error);
+        if (!server) {
+            *detail = "server: " + error;
+            return false;
+        }
+        const std::string pin = server->server_fingerprint();
+        std::thread waiting([&] { server->wait_for_client(std::chrono::seconds(2)); });
+        const ProbeClient client =
+            probe_handshake(port, pin, "the-wrong-token", std::chrono::seconds(3));
+        waiting.join();
+        if (client.status != chast::Status::PermissionDenied ||
+            client.error.find("token") == std::string::npos) {
+            *detail = "wrong token was not refused by name: " + client.error;
+            return false;
+        }
+    }
+
+    const uint16_t approval_port = static_cast<uint16_t>(port + 1);
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = approval_port;
+    server_config.idle_timeout_ms = 3000;
+    server_config.access_token = "approval-token";
+    int decisions = 0;
+    server_config.approve_client = [&decisions](const chast::ClientRequest&) {
+        return ++decisions > 1;
+    };
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "approval server: " + error;
+        return false;
+    }
+    const std::string pin = server->server_fingerprint();
+    std::thread serving([&] {
+        if (!server->wait_for_client(std::chrono::seconds(15)).ok()) {
+            return;
+        }
+        chast::ServerInfo info;
+        info.width = 64;
+        info.height = 64;
+        info.framerate = 30;
+        info.bitrate = 100000;
+        info.encoder = "approval probe";
+        server->announce(info);
+    });
+    const ProbeClient declined =
+        probe_handshake(approval_port, pin, "approval-token", std::chrono::seconds(3));
+    ProbeClient approved;
+    // The refusal closes the old connection and frees the slot on the
+    // server's thread; retrying absorbs that hand-off.
+    const auto approval_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!approved.ok && std::chrono::steady_clock::now() < approval_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        approved = probe_handshake(approval_port, pin, "approval-token",
+                                   std::chrono::seconds(3));
+    }
+    serving.join();
+    if (declined.status != chast::Status::PermissionDenied ||
+        declined.error.find("declined") == std::string::npos) {
+        *detail = "the declined viewer was not told why: " + declined.error;
+        return false;
+    }
+    if (!approved.ok) {
+        *detail = "the approved viewer did not connect: " + approved.error;
+        return false;
+    }
+    if (decisions != 2) {
+        *detail = "the approval callback ran " + std::to_string(decisions) + " times";
+        return false;
+    }
+
+    // A one-time token is spent by the first accepted Hello: the next viewer
+    // presenting it is refused by name rather than silently failing.
+    const uint16_t spent_port = static_cast<uint16_t>(port + 2);
+    {
+        chast::QuicServerConfig spent_config;
+        spent_config.bind_address = "127.0.0.1";
+        spent_config.port = spent_port;
+        spent_config.idle_timeout_ms = 3000;
+        spent_config.access_token = "one-shot";
+        std::string spent_error;
+        std::unique_ptr<chast::QuicSession> spent =
+            chast::QuicSession::create_server(spent_config, &spent_error);
+        if (!spent) {
+            *detail = "one-time server: " + spent_error;
+            return false;
+        }
+        const std::string spent_pin = spent->server_fingerprint();
+        std::thread spending([&] {
+            if (!spent->wait_for_client(std::chrono::seconds(10)).ok()) {
+                return;
+            }
+            chast::ServerInfo info;
+            info.width = 64;
+            info.height = 64;
+            info.framerate = 30;
+            info.bitrate = 100000;
+            info.encoder = "one-time probe";
+            spent->announce(info);
+            // The first viewer leaves on its own; waiting again re-arms the
+            // session so the second Hello reaches the token check.
+            spent->wait_for_client(std::chrono::seconds(5));
+        });
+        const ProbeClient first =
+            probe_handshake(spent_port, spent_pin, "one-shot", std::chrono::seconds(3));
+        ProbeClient second;
+        const auto spent_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (second.status != chast::Status::PermissionDenied &&
+               std::chrono::steady_clock::now() < spent_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            second = probe_handshake(spent_port, spent_pin, "one-shot",
+                                     std::chrono::seconds(3));
+        }
+        spending.join();
+        if (!first.ok) {
+            *detail = "the first one-time viewer did not connect: " + first.error;
+            return false;
+        }
+        if (second.status != chast::Status::PermissionDenied ||
+            second.error.find("already used") == std::string::npos) {
+            *detail = "the spent token was not refused by name: " + second.error;
+            return false;
+        }
+    }
+    return true;
+}
+
 int run_verify(const Options& options) {
     Options local = options;
     if (local.seconds <= 0.0) {
         local.seconds = 5.0;
     }
+    // A fingerprint the caller passed by hand is the one to check against; the
+    // normal loopback run pins whatever identity the local server presents.
+    local.insecure = false;
+    // The loopback always covers the token path. A caller-supplied token is
+    // reused so a manual `serve --token`/`connect --token` pair matches.
+    if (local.token.empty()) {
+        local.token = generate_token();
+    }
+    local.token_reuse = false;
     // The loopback check always covers the input channel: the server injects
     // in dry-run mode, so the events travel the whole path without touching
     // the real pointer.
     local.input = true;
+    // Cover the mid-session description path: the sender re-announces the
+    // current stream two seconds in.
+    local.reannounce = true;
+    if (local.seconds < 3.0) {
+        local.seconds = 3.0;
+    }
     const bool keep_file = !options.save.empty();
     const std::string path = keep_file ? options.save : ".chast-quic-verify.bin";
 
@@ -990,9 +1255,14 @@ int run_verify(const Options& options) {
     // offline replay checks.
     Options receiver_options = local;
     receiver_options.save.clear();
+    // Exercise the wire request instead of leaving the choice to the server.
+    if (!receiver_options.display_set) {
+        receiver_options.display_set = true;
+        receiver_options.display = 0;
+    }
 
-    std::promise<bool> listening;
-    std::shared_future<bool> server_ready = listening.get_future().share();
+    std::promise<ServerReady> listening;
+    std::shared_future<ServerReady> server_ready = listening.get_future().share();
     ReceiverStats received;
     std::thread receiver([&] { received = run_receiver(receiver_options, server_ready); });
     const SenderStats sent = run_sender(local, path, &listening);
@@ -1015,6 +1285,30 @@ int run_verify(const Options& options) {
     if (!received.error.empty()) {
         std::printf("     receiver: %s\n", received.error.c_str());
     }
+    check(!sent.fingerprint.empty() && received.peer_fingerprint == sent.fingerprint,
+          "the viewer connected to the pinned server identity");
+    check(!local.token.empty(), "the loopback ran with an access token");
+    // Probes run on neighbouring ports so they cannot disturb the session
+    // above.
+    const uint16_t probe_base =
+        options.port > 65530 ? static_cast<uint16_t>(options.port - 10) : options.port;
+    {
+        std::string detail;
+        const bool rejected =
+            pinned_client_rejects_other_identity(static_cast<uint16_t>(probe_base + 1), &detail);
+        check(rejected, "a client pinned to another fingerprint rejects the server");
+        if (!rejected) {
+            std::printf("     mismatch probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
+        const bool passed = access_control_works(static_cast<uint16_t>(probe_base + 2), &detail);
+        check(passed, "wrong, spent and declined viewers are refused and told why");
+        if (!passed) {
+            std::printf("     access control probe: %s\n", detail.c_str());
+        }
+    }
     check(sent.encoded > 0, "the sender produced frames");
     check(sent.encoded == received.received, "every sent access unit was received");
     check(received.decoded == received.received,
@@ -1036,10 +1330,57 @@ int run_verify(const Options& options) {
     }
     check(received.width == sent.width && received.height == sent.height,
           "decoded picture size matches the encoded size");
+    check(sent.stream_updates_sent == 1, "the server re-announced the stream mid-session");
+    check(received.stream_updates == sent.stream_updates_sent,
+          "the viewer received every stream update");
+    if (received.stream_updates > 0) {
+        const chast::ServerInfo& update = received.last_update;
+        check(update.codec == sent.codec && update.width == sent.width &&
+                  update.height == sent.height && update.origin_x == sent.origin_x &&
+                  update.origin_y == sent.origin_y && update.displays.size() == sent.displays.size(),
+              "the stream update described the running stream");
+    }
 
     if (local.input) {
         check(sent.input_enabled, "the server announced input as enabled");
         check(received.input_enabled, "the client saw input enabled in HelloAck");
+        check(received.origin_x == sent.origin_x && received.origin_y == sent.origin_y,
+              "the viewer saw the captured output's virtual-desktop origin");
+        bool displays_same =
+            !sent.displays.empty() && sent.displays.size() == received.displays.size();
+        for (size_t i = 0; displays_same && i < sent.displays.size(); ++i) {
+            displays_same = same_display(sent.displays[i], received.displays[i]);
+        }
+        check(displays_same, "the display list arrived intact and in order");
+        size_t primary_count = 0;
+        bool captured_listed = false;
+        for (const chast::DisplayDescription& display : received.displays) {
+            if (display.primary) {
+                ++primary_count;
+            }
+            if (display.left == sent.origin_x && display.top == sent.origin_y &&
+                static_cast<uint32_t>(display.right - display.left) == sent.width &&
+                static_cast<uint32_t>(display.bottom - display.top) == sent.height) {
+                captured_listed = true;
+            }
+        }
+        check(primary_count == 1, "exactly one display is marked primary");
+        check(captured_listed, "the captured output is listed among the displays");
+        check(sent.requested_display == static_cast<uint16_t>(receiver_options.display),
+              "the server saw the viewer's display choice");
+        check(sent.display_index == receiver_options.display,
+              "the server captured the display the viewer asked for");
+        bool requested_matches = receiver_options.display < received.displays.size();
+        if (requested_matches) {
+            const chast::DisplayDescription& chosen =
+                received.displays[receiver_options.display];
+            requested_matches =
+                chosen.left == sent.origin_x && chosen.top == sent.origin_y &&
+                static_cast<uint32_t>(chosen.right - chosen.left) == sent.width &&
+                static_cast<uint32_t>(chosen.bottom - chosen.top) == sent.height;
+        }
+        check(requested_matches,
+              "the stream's origin and size are the requested display's rect");
         check(sent.input_events.size() == received.input_sent.size(),
               "every input event reached the server");
         bool same = sent.input_events.size() == received.input_sent.size();
@@ -1052,6 +1393,7 @@ int run_verify(const Options& options) {
         check(sent.input_stats.rejected == 0 && sent.input_stats.failed == 0 &&
                   sent.input_stats.dropped == 0,
               "no input event was rejected, failed or dropped");
+        check(sent.input_releases == 1, "the viewer's release request reached the server");
     }
 
     const StreamDigest replay = digest_saved_stream(path, sent.codec);
@@ -1088,6 +1430,10 @@ int main(int argc, char** argv) {
     Options options;
     if (!parse_args(argc, argv, options)) {
         return 2;
+    }
+    if (options.token_auto) {
+        options.token = generate_token();
+        options.token_auto = false;
     }
 
     if (options.mode == "serve") {

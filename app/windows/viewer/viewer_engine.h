@@ -13,11 +13,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "chast/encoder.h"
+#include "chast/protocol.h"
 
 struct ID3D11Device;
 struct ID3D11Texture2D;
@@ -60,6 +63,15 @@ struct ViewerStatus {
     uint32_t server_bitrate = 0;
     std::string decoder;
     std::string server_encoder;
+    // SHA-256 of the certificate the server presented, uppercase hex without
+    // separators. Empty until a certificate arrived; also set when the
+    // connection was rejected for not matching the pinned one, so the UI can
+    // offer the new identity.
+    std::string server_fingerprint;
+    // The server's AccessDenied code when it refused the Hello: one of
+    // chast::AccessDenial, or 0 when it never did. The UI turns this into its
+    // own wording; `error` carries the server's reason.
+    int denial = 0;
     uint64_t received = 0;
     uint64_t decoded = 0;
     uint64_t keyframes = 0;
@@ -73,6 +85,18 @@ struct ViewerStatus {
     double kbps = 0.0;
     uint64_t elapsed_ms = 0;
     bool video_finished = false;
+    // Input gate and coordinate origin from HelloAck. `origin_x`/`origin_y`
+    // are the captured output's top-left in virtual-desktop pixels; the UI
+    // adds them to the frame-space pointer position.
+    bool input_enabled = false;
+    int32_t origin_x = 0;
+    int32_t origin_y = 0;
+    uint64_t input_sent = 0;
+    uint64_t input_failed = 0;
+    // What the server announced in HelloAck. `displays` is the list the UI's
+    // picker shows; the streamed entry is the one whose rect starts at
+    // origin_x/origin_y and matches width x height.
+    std::vector<chast::DisplayDescription> displays;
 };
 
 class ViewerEngine {
@@ -83,17 +107,35 @@ public:
     ViewerEngine(const ViewerEngine&) = delete;
     ViewerEngine& operator=(const ViewerEngine&) = delete;
 
-    // Starts a session thread. Fails when one is already running; call Stop()
-    // first to switch targets.
-    bool Start(const std::string& host, uint16_t port);
+    // Starts a session thread, asking the server for `display` (an index into
+    // its announced list, or kDisplayAuto). The server must present the
+    // certificate whose SHA-256 is `pinned_fingerprint`; `allow_unverified`
+    // skips that check and is only for the first contact, whose fingerprint
+    // the caller then stores. `access_token` is sent in Hello and is empty for
+    // servers that do not gate access. Fails when one is already running; call
+    // Stop() first to switch targets or displays.
+    bool Start(const std::string& host, uint16_t port, uint16_t display,
+               std::string pinned_fingerprint = {},
+               bool allow_unverified = false,
+               std::string access_token = {});
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
 
+    // Queues one input event for the session thread, which owns the QUIC
+    // session and sends events in order. Returns false when input is not
+    // enabled by the server yet, no session is running, or the queue is full.
+    bool SendInput(const chast::InputEvent& event);
+    // Queues a request to lift everything the host still holds. Ordered with
+    // the events above, so releases the UI already sent land first.
+    bool ReleaseInput();
+
     ViewerStatus Snapshot() const;
 
 private:
-    void Run(std::string host, uint16_t port);
+    void Run(std::string host, uint16_t port, uint16_t display,
+             std::string pinned_fingerprint, bool allow_unverified,
+             std::string access_token);
     void SetState(ViewerState state, std::string error = {});
 
     FrameSink* sink_;
@@ -103,6 +145,18 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+
+    // Input crosses from the UI thread to the session thread here. The queue
+    // is bounded: a stalled transport drops the newest events instead of
+    // growing, which is the right trade for a pointer stream that is already
+    // stale.
+    mutable std::mutex input_mutex_;
+    struct PendingInput {
+        bool release = false;
+        chast::InputEvent event;
+    };
+    std::deque<PendingInput> pending_input_;
+    bool input_enabled_ = false;
 };
 
 }  // namespace chast_viewer

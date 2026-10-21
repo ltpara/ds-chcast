@@ -130,6 +130,7 @@ endif()
 # DXGI or VPL dependency, so the receiver side links this without the capture
 # stack.
 add_library(chast.net STATIC
+    src/net/identity.cc
     src/net/protocol.cc
     src/net/quic.cc
     src/win/input.cc)
@@ -139,6 +140,29 @@ target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
 # user32 supplies SendInput/GetSystemMetrics for the injector.
 target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll user32)
+
+# Host product code shared by the tray application and the command-line
+# server: settings persistence and the capture/encode/serve loop. It sits on
+# top of both chast.codec and chast.net so neither of those has to know about
+# the other.
+add_library(chast.host STATIC
+    src/host/host_settings.cc
+    src/host/host_server.cc)
+
+target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(chast.host PUBLIC chast.codec chast.net shell32 ole32)
+
+# Notification-area host application. It is product code, so it is built even
+# when the test tools are switched off.
+add_executable(chast-host WIN32
+    host/main.cc
+    host/platform.cc)
+target_link_libraries(chast-host PRIVATE chast.host)
+add_custom_command(TARGET chast-host POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-host>
+    VERBATIM)
 
 if(CHAST_BUILD_TESTS)
     add_executable(chast-capture tools/capture.cc tools/crash_handler.cc)
@@ -161,7 +185,7 @@ if(CHAST_BUILD_TESTS)
     # separate processes; verify closes the loop in one process and checks the
     # decoded content against an offline replay of the sent stream.
     add_executable(chast-quic tools/quic.cc tools/crash_handler.cc)
-    target_link_libraries(chast-quic PRIVATE chast.codec chast.net dbghelp)
+    target_link_libraries(chast-quic PRIVATE chast.codec chast.net chast.host dbghelp)
     add_custom_command(TARGET chast-quic POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-quic>
@@ -181,9 +205,14 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
+    # Settings file round-trip: no GPU, no network, no certificate store.
+    add_executable(chast-host-settings-test tests/host_settings_test.cc)
+    target_link_libraries(chast-host-settings-test PRIVATE chast.host)
+
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME host_settings COMMAND chast-host-settings-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.

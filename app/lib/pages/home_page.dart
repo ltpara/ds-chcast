@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -18,6 +19,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final TextEditingController _address = TextEditingController();
+  final TextEditingController _token = TextEditingController();
   final RecentStore _recentStore = RecentStore();
   List<RecentEntry> _recent = <RecentEntry>[];
   String? _error;
@@ -46,6 +48,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _address.dispose();
+    _token.dispose();
     super.dispose();
   }
 
@@ -61,7 +64,12 @@ class _HomePageState extends State<HomePage> {
     if (_opening) {
       return;
     }
-    final ConnectTarget? target = parseConnectTarget(input);
+    final String token = _token.text.trim();
+    if (utf8.encode(token).length > 128) {
+      setState(() => _error = '访问令牌过长，最多 128 字节');
+      return;
+    }
+    final ConnectTarget? target = parseConnectTarget(input, token: token);
     if (target == null) {
       setState(() => _error = '请输入有效地址，例如 192.168.1.10:4433');
       return;
@@ -107,8 +115,9 @@ class _HomePageState extends State<HomePage> {
           title: const Text('关于 Chast'),
           content: const Text(
             'Chast 0.1.0\n\n'
-            'Windows 桌面采集、Intel 硬件编码与 MsQuic 直连显示。'
-            '当前阶段只接收画布，键鼠控制与多显示器切换将在后续接入。',
+            'Windows 桌面采集、Intel 硬件编码、MsQuic 直连显示与键鼠控制。'
+            '远端需以 chast-quic serve --input 启动才会接受输入；'
+            '会话中可用工具栏的显示器菜单切换被采集的输出。',
           ),
           actions: <Widget>[
             TextButton(
@@ -204,6 +213,44 @@ class _HomePageState extends State<HomePage> {
                                 borderSide: const BorderSide(color: kAccent, width: 1.5),
                               ),
                             ),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _token,
+                            onSubmitted: _connect,
+                            style: TextStyle(
+                              fontSize: 14,
+                              letterSpacing: 0.6,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            decoration: InputDecoration(
+                              hintText: '访问令牌（主机启用时填写）',
+                              hintStyle: TextStyle(
+                                fontSize: 13,
+                                color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
+                              ),
+                              prefixIcon: Icon(
+                                Icons.key_rounded,
+                                size: 18,
+                                color: dark ? Colors.white54 : const Color(0xFF7C8390),
+                              ),
+                              filled: true,
+                              fillColor: fieldFill,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                borderSide: BorderSide(color: subtle),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                                borderSide: const BorderSide(color: kAccent, width: 1.5),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '令牌由远端 chast-quic serve --token 生成，只用于这次连接。',
+                            style: mutedStyle(context, size: 10.5),
                           ),
                           if (_error != null) ...<Widget>[
                             const SizedBox(height: 10),
@@ -445,7 +492,7 @@ class _Sidebar extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             Text(
-              '身份、中继与地址簿将在下一阶段接入。',
+              '身份与中继将在后续接入。',
               style: mutedStyle(context, size: 11),
             ),
             const Spacer(),

@@ -1,5 +1,6 @@
 #include "chast/protocol.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 
@@ -13,6 +14,11 @@ constexpr char kControlMagic[4] = {'C', 'C', 'T', 'L'};
 // means the peer is not speaking the protocol.
 constexpr size_t kMaxFrameBuffer = 64u * 1024u * 1024u;
 constexpr size_t kMaxControlBuffer = 4u * 1024u * 1024u;
+constexpr size_t kMaxDisplays = kMaxDisplayCount;
+
+// HelloAck display entry: name_size u16, name, left/top/right/bottom i32,
+// rotation u16, flags u16 (bit 0: primary).
+constexpr size_t kDisplayFixedSize = 2 + 16 + 2 + 2;
 
 void put_u8(uint8_t*& out, uint8_t value) {
     *out++ = value;
@@ -214,19 +220,25 @@ bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
     return true;
 }
 
-std::vector<uint8_t> make_hello() {
-    std::vector<uint8_t> payload(4);
+std::vector<uint8_t> make_hello(uint16_t display, const std::string& access_token) {
+    const size_t token_size =
+        access_token.size() > kMaxAccessTokenLength ? kMaxAccessTokenLength
+                                                    : access_token.size();
+    std::vector<uint8_t> payload(6 + token_size);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
-    put_u16(cursor, 0);
+    put_u16(cursor, display);
+    put_u16(cursor, static_cast<uint16_t>(token_size));
+    std::memcpy(cursor, access_token.data(), token_size);
     return make_control(ControlType::Hello, payload);
 }
 
-bool parse_hello(const std::vector<uint8_t>& payload, std::string* error) {
+bool parse_hello(const std::vector<uint8_t>& payload, uint16_t& display,
+                 std::string& access_token, std::string* error) {
     Reader reader(payload.data(), payload.size());
     uint16_t version = 0;
-    uint16_t reserved = 0;
-    if (!reader.u16(version) || !reader.u16(reserved)) {
+    uint16_t token_size = 0;
+    if (!reader.u16(version) || !reader.u16(display) || !reader.u16(token_size)) {
         set_error(error, "truncated Hello");
         return false;
     }
@@ -234,11 +246,72 @@ bool parse_hello(const std::vector<uint8_t>& payload, std::string* error) {
         set_error(error, "client speaks protocol version " + std::to_string(version));
         return false;
     }
+    if (display != kDisplayAuto && display >= kMaxDisplayCount) {
+        set_error(error, "Hello asks for display " + std::to_string(display) +
+                             " outside the protocol limit");
+        return false;
+    }
+    if (token_size > kMaxAccessTokenLength || reader.remaining() != token_size) {
+        set_error(error, "Hello carries a malformed access token");
+        return false;
+    }
+    if (!reader.string(access_token, token_size)) {
+        set_error(error, "truncated Hello access token");
+        return false;
+    }
     return true;
 }
 
-std::vector<uint8_t> make_hello_ack(const ServerInfo& info) {
-    std::vector<uint8_t> payload(24 + info.encoder.size());
+std::vector<uint8_t> make_access_denied(AccessDenial code, const std::string& reason) {
+    const size_t reason_size =
+        reason.size() > kMaxAccessDenialReason ? kMaxAccessDenialReason : reason.size();
+    std::vector<uint8_t> payload(3 + reason_size);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(reason_size));
+    std::memcpy(cursor, reason.data(), reason_size);
+    return make_control(ControlType::AccessDenied, payload);
+}
+
+bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code,
+                         std::string& reason, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u16(reason_size)) {
+        set_error(error, "truncated AccessDenied");
+        return false;
+    }
+    if (raw_code < static_cast<uint8_t>(AccessDenial::InvalidToken) ||
+        raw_code > static_cast<uint8_t>(AccessDenial::Declined)) {
+        set_error(error, "unknown access denial code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason_size > kMaxAccessDenialReason || reader.remaining() != reason_size) {
+        set_error(error, "AccessDenied carries a malformed reason");
+        return false;
+    }
+    if (!reader.string(reason, reason_size)) {
+        set_error(error, "truncated AccessDenied reason");
+        return false;
+    }
+    code = static_cast<AccessDenial>(raw_code);
+    return true;
+}
+
+namespace {
+
+// HelloAck and StreamInfo share their payload byte for byte.
+std::vector<uint8_t> build_server_info(const ServerInfo& info) {
+    size_t display_count = info.displays.size();
+    if (display_count > kMaxDisplays) {
+        display_count = kMaxDisplays;
+    }
+    size_t size = 24 + info.encoder.size() + 2;
+    for (size_t i = 0; i < display_count; ++i) {
+        size += kDisplayFixedSize + info.displays[i].name.size();
+    }
+    std::vector<uint8_t> payload(size);
     uint8_t* cursor = payload.data();
     put_u8(cursor, codec_wire(info.codec));
     put_u8(cursor, 0);
@@ -251,7 +324,31 @@ std::vector<uint8_t> make_hello_ack(const ServerInfo& info) {
     put_u16(cursor, info.input_enabled ? kServerInfoInputEnabled : 0);
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
-    return make_control(ControlType::HelloAck, payload);
+    cursor += info.encoder.size();
+    put_u16(cursor, static_cast<uint16_t>(display_count));
+    for (size_t i = 0; i < display_count; ++i) {
+        const DisplayDescription& display = info.displays[i];
+        put_u16(cursor, static_cast<uint16_t>(display.name.size()));
+        std::memcpy(cursor, display.name.data(), display.name.size());
+        cursor += display.name.size();
+        put_u32(cursor, static_cast<uint32_t>(display.left));
+        put_u32(cursor, static_cast<uint32_t>(display.top));
+        put_u32(cursor, static_cast<uint32_t>(display.right));
+        put_u32(cursor, static_cast<uint32_t>(display.bottom));
+        put_u16(cursor, display.rotation_degrees);
+        put_u16(cursor, display.primary ? 1 : 0);
+    }
+    return payload;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_hello_ack(const ServerInfo& info) {
+    return make_control(ControlType::HelloAck, build_server_info(info));
+}
+
+std::vector<uint8_t> make_stream_info(const ServerInfo& info) {
+    return make_control(ControlType::StreamInfo, build_server_info(info));
 }
 
 bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std::string* error) {
@@ -284,7 +381,65 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck encoder name overruns the message");
         return false;
     }
-    return reader.string(info.encoder, name_size);
+    if (!reader.string(info.encoder, name_size)) {
+        set_error(error, "HelloAck encoder name is truncated");
+        return false;
+    }
+    uint16_t display_count = 0;
+    if (!reader.u16(display_count)) {
+        set_error(error, "HelloAck carries no display list");
+        return false;
+    }
+    if (display_count > kMaxDisplays) {
+        set_error(error, "HelloAck lists " + std::to_string(display_count) + " displays");
+        return false;
+    }
+    info.displays.clear();
+    info.displays.reserve(display_count);
+    for (uint16_t i = 0; i < display_count; ++i) {
+        DisplayDescription display;
+        uint16_t display_name_size = 0;
+        uint32_t left = 0;
+        uint32_t top = 0;
+        uint32_t right = 0;
+        uint32_t bottom = 0;
+        uint16_t display_flags = 0;
+        if (!reader.u16(display_name_size)) {
+            set_error(error, "truncated HelloAck display " + std::to_string(i));
+            return false;
+        }
+        // After the name come four i32, the rotation and the flags.
+        constexpr size_t kAfterName = 20;
+        if (reader.remaining() < kAfterName ||
+            display_name_size > reader.remaining() - kAfterName ||
+            !reader.string(display.name, display_name_size) || !reader.u32(left) ||
+            !reader.u32(top) || !reader.u32(right) || !reader.u32(bottom) ||
+            !reader.u16(display.rotation_degrees) || !reader.u16(display_flags)) {
+            set_error(error, "truncated HelloAck display " + std::to_string(i));
+            return false;
+        }
+        display.left = static_cast<int32_t>(left);
+        display.top = static_cast<int32_t>(top);
+        display.right = static_cast<int32_t>(right);
+        display.bottom = static_cast<int32_t>(bottom);
+        display.primary = (display_flags & 0x1u) != 0;
+        if ((display_flags & ~0x1u) != 0) {
+            set_error(error, "HelloAck display " + std::to_string(i) + " has unknown flags");
+            return false;
+        }
+        if (display.rotation_degrees != 0 && display.rotation_degrees != 90 &&
+            display.rotation_degrees != 180 && display.rotation_degrees != 270) {
+            set_error(error, "HelloAck display " + std::to_string(i) +
+                                 " has an unknown rotation");
+            return false;
+        }
+        if (display.right <= display.left || display.bottom <= display.top) {
+            set_error(error, "HelloAck display " + std::to_string(i) + " has an empty rect");
+            return false;
+        }
+        info.displays.push_back(std::move(display));
+    }
+    return true;
 }
 
 std::vector<uint8_t> make_stats(const ClientStats& stats) {
@@ -321,7 +476,7 @@ std::vector<uint8_t> make_input_event(const InputEvent& event) {
     put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.x : 0));
     put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.y : 0));
     put_u16(cursor, mouse ? 0 : event.key.hid_usage);
-    put_u16(cursor, 0);
+    put_u16(cursor, static_cast<uint16_t>(event.modifiers & kInputStateMask));
     return make_control(ControlType::InputEvent, payload);
 }
 
@@ -333,12 +488,17 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
     uint32_t x = 0;
     uint32_t y = 0;
     uint16_t hid_usage = 0;
-    uint16_t reserved = 0;
+    uint16_t modifiers = 0;
     if (!reader.u8(kind) || !reader.u8(action) || !reader.u16(buttons) || !reader.u32(x) ||
-        !reader.u32(y) || !reader.u16(hid_usage) || !reader.u16(reserved)) {
+        !reader.u32(y) || !reader.u16(hid_usage) || !reader.u16(modifiers)) {
         set_error(error, "truncated InputEvent");
         return false;
     }
+    if ((modifiers & ~kInputStateMask) != 0) {
+        set_error(error, "InputEvent carries unknown input state bits");
+        return false;
+    }
+    event.modifiers = modifiers;
     switch (kind) {
         case static_cast<uint8_t>(InputKind::Mouse):
             if (action > static_cast<uint8_t>(MouseAction::WheelHorizontal)) {

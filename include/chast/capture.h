@@ -79,6 +79,11 @@ struct DisplayInfo {
 // only on 1" still enumerates the other outputs as attached but zero-sized.
 std::vector<DisplayInfo> enumerate_displays();
 
+// DisplayInfo::device_name as UTF-8, for the protocol's display list. Device
+// names are normally ASCII, but the conversion is explicit so a localized
+// name cannot reach the wire in UTF-16 bytes.
+std::string display_name_utf8(const DisplayInfo& display);
+
 // How the NV12 stage turns RGB into YCbCr. RustDesk's VRAM encoder converts
 // with a fixed matrix and range for every frame (hwcodec's ffmpeg_vram sets
 // bt709_ = false, full_range_ = false), so the stream is always BT.601 limited

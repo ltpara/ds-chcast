@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace chast {
 
@@ -189,10 +190,61 @@ DWORD x_button(uint16_t buttons) {
     return (buttons & kMouseBack) ? XBUTTON1 : XBUTTON2;
 }
 
+uint16_t modifier_usage(uint16_t bit) {
+    switch (bit) {
+        case kModifierLeftCtrl: return 0xE0;
+        case kModifierLeftShift: return 0xE1;
+        case kModifierLeftAlt: return 0xE2;
+        case kModifierLeftGui: return 0xE3;
+        case kModifierRightCtrl: return 0xE4;
+        case kModifierRightShift: return 0xE5;
+        case kModifierRightAlt: return 0xE6;
+        case kModifierRightGui: return 0xE7;
+        default: return 0;
+    }
+}
+
+uint16_t lock_usage(uint16_t bit) {
+    switch (bit) {
+        case kLockCaps: return 0x39;
+        case kLockNum: return 0x53;
+        case kLockScroll: return 0x47;
+        default: return 0;
+    }
+}
+
+uint16_t lock_bit_for_usage(uint16_t usage) {
+    switch (usage) {
+        case 0x39: return kLockCaps;
+        case 0x53: return kLockNum;
+        case 0x47: return kLockScroll;
+        default: return 0;
+    }
+}
+
+bool system_lock_state(uint16_t bit) {
+    // GetAsyncKeyState, not GetKeyState: the injection thread has no message
+    // loop, and the thread-local state GetKeyState reports only advances when
+    // messages are dispatched. The low bit is the lock's toggle state here.
+    switch (bit) {
+        case kLockCaps: return (GetAsyncKeyState(VK_CAPITAL) & 0x0001) != 0;
+        case kLockNum: return (GetAsyncKeyState(VK_NUMLOCK) & 0x0001) != 0;
+        case kLockScroll: return (GetAsyncKeyState(VK_SCROLL) & 0x0001) != 0;
+        default: return false;
+    }
+}
+
 }  // namespace
 
 bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended) {
     return lookup(hid_usage, scan_code, extended);
+}
+
+uint16_t modifier_bit_for_usage(uint16_t hid_usage) {
+    if (hid_usage >= 0xE0 && hid_usage <= 0xE7) {
+        return static_cast<uint16_t>(1u << (hid_usage - 0xE0));
+    }
+    return 0;
 }
 
 std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* error) {
@@ -230,7 +282,22 @@ void InputInjector::submit(const InputEvent& event) {
             ++stats_.dropped;
             return;
         }
-        queue_.push_back(event);
+        Pending pending;
+        pending.event = event;
+        queue_.push_back(pending);
+    }
+    cv_.notify_one();
+}
+
+void InputInjector::release_held() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_ || queue_.size() >= 1024) {
+            return;
+        }
+        Pending pending;
+        pending.release = true;
+        queue_.push_back(pending);
     }
     cv_.notify_one();
 }
@@ -261,14 +328,18 @@ void InputInjector::run() {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
         cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-        std::deque<InputEvent> batch;
+        std::deque<Pending> batch;
         batch.swap(queue_);
         if (!batch.empty()) {
             // Apply outside the lock: SendInput can take milliseconds when
             // the desktop is busy, and submit() must stay non-blocking.
             lock.unlock();
-            for (const InputEvent& event : batch) {
-                apply(event);
+            for (const Pending& pending : batch) {
+                if (pending.release) {
+                    release_all();
+                } else {
+                    apply(pending.event);
+                }
             }
             lock.lock();
         }
@@ -281,10 +352,125 @@ void InputInjector::run() {
 }
 
 void InputInjector::apply(const InputEvent& event) {
+    uint16_t locks = static_cast<uint16_t>(event.modifiers & kLockStateMask);
+    if (event.kind == InputKind::Key) {
+        // A lock key toggles the host by itself; reconciling that same bit
+        // first would tap it twice.
+        locks = static_cast<uint16_t>(locks & ~lock_bit_for_usage(event.key.hid_usage));
+    }
+    sync_locks(locks);
+
+    const uint16_t reported = normalize_modifiers(event.modifiers);
+    if (event.kind == InputKind::Key) {
+        const uint16_t own = modifier_bit_for_usage(event.key.hid_usage);
+        if (own != 0) {
+            // A modifier transition is applied by the reconciliation itself,
+            // so it is injected once and cannot be pressed twice.
+            const uint16_t target = event.key.action == KeyAction::Down
+                                        ? static_cast<uint16_t>(reported | own)
+                                        : static_cast<uint16_t>(reported & ~own);
+            sync_modifiers(target);
+            return;
+        }
+    }
+    sync_modifiers(reported);
     if (event.kind == InputKind::Mouse) {
         apply_mouse(event.mouse);
     } else {
         apply_key(event.key);
+    }
+}
+
+uint16_t InputInjector::normalize_modifiers(uint16_t reported) {
+    reported &= kModifierMask;
+    if ((reported & kModifierRightAlt) != 0) {
+        if ((reported & kModifierLeftCtrl) != 0) {
+            // Windows turns AltGr into a synthetic left Ctrl plus Right Alt.
+            // Right Alt already means AltGr on the host, so fold the pair and
+            // remember the Ctrl was synthetic until the peer stops reporting
+            // it; otherwise releasing AltGr would press a stray Ctrl.
+            altgr_synthetic_ctrl_ = true;
+            reported &= static_cast<uint16_t>(~kModifierLeftCtrl);
+        }
+    } else if (altgr_synthetic_ctrl_) {
+        if ((reported & kModifierLeftCtrl) != 0) {
+            reported &= static_cast<uint16_t>(~kModifierLeftCtrl);
+        } else {
+            altgr_synthetic_ctrl_ = false;
+        }
+    }
+    return reported;
+}
+
+bool InputInjector::lock_state(uint16_t bit) {
+    if (!locks_seeded_) {
+        locks_seeded_ = true;
+        if (!dry_run_) {
+            // A dry run must not read the real desktop either: SendInput never
+            // flips it, so a model seeded at zero stays deterministic.
+            host_locks_ = 0;
+            if (system_lock_state(kLockCaps)) host_locks_ |= kLockCaps;
+            if (system_lock_state(kLockNum)) host_locks_ |= kLockNum;
+            if (system_lock_state(kLockScroll)) host_locks_ |= kLockScroll;
+        }
+    }
+    return (host_locks_ & bit) != 0;
+}
+
+void InputInjector::sync_locks(uint16_t reported) {
+    reported &= kLockStateMask;
+    const uint16_t bits[] = {kLockCaps, kLockNum, kLockScroll};
+    for (uint16_t bit : bits) {
+        if (((reported & bit) != 0) == lock_state(bit)) {
+            continue;
+        }
+        // A lock key is a toggle: one tap, with the release immediately after.
+        // apply_key() flips host_locks_ on the press, so the loop's next event
+        // sees the new state and does not tap again.
+        KeyEvent tap;
+        tap.hid_usage = lock_usage(bit);
+        tap.action = KeyAction::Down;
+        apply_key(tap);
+        tap.action = KeyAction::Up;
+        apply_key(tap);
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.lock_toggles;
+    }
+}
+
+void InputInjector::sync_modifiers(uint16_t reported) {
+    uint16_t held = 0;
+    for (const HeldKey& key : held_keys_) {
+        held |= modifier_bit_for_usage(key.usage);
+    }
+
+    const uint16_t lift = held & ~reported;
+    if (lift != 0) {
+        // Reverse press order, like release_all: lifting a chord in the order
+        // it went down keeps intermediate states sensible.
+        std::vector<uint16_t> usages;
+        for (auto it = held_keys_.rbegin(); it != held_keys_.rend(); ++it) {
+            if (lift & modifier_bit_for_usage(it->usage)) {
+                usages.push_back(it->usage);
+            }
+        }
+        for (uint16_t usage : usages) {
+            KeyEvent up;
+            up.action = KeyAction::Up;
+            up.hid_usage = usage;
+            apply_key(up);
+        }
+    }
+
+    const uint16_t press = reported & ~held;
+    for (uint16_t bit = kModifierLeftCtrl; bit <= kModifierRightGui;
+         bit = static_cast<uint16_t>(bit << 1)) {
+        if (press & bit) {
+            KeyEvent down;
+            down.action = KeyAction::Down;
+            down.hid_usage = modifier_usage(bit);
+            apply_key(down);
+        }
     }
 }
 
@@ -388,7 +574,12 @@ void InputInjector::apply_key(const KeyEvent& event) {
         // Auto-repeat arrives as repeated Downs. Only the first press belongs
         // in the held set; otherwise a single Up would leave the key stuck.
         if (found == held_keys_.end()) {
-            held_keys_.push_back(HeldKey{scan, extended});
+            held_keys_.push_back(HeldKey{scan, extended, event.hid_usage});
+            // Whether the tap came from the peer or from sync_locks(), the
+            // host's lock state just changed under us.
+            if (const uint16_t lock = lock_bit_for_usage(event.hid_usage); lock != 0) {
+                host_locks_ ^= lock;
+            }
         }
     } else if (found != held_keys_.end()) {
         held_keys_.erase(found);

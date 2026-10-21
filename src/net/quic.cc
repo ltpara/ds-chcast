@@ -7,10 +7,10 @@
 // queue (protected) and PendingSend contexts (owned by MsQuic until
 // SEND_COMPLETE, then deleted).
 //
-// The server certificate is a CNG RSA key in the user's key store plus a
-// self-signed certificate created at startup. The client turns validation off
-// for localhost development; the rendezvous phase will replace this with a
-// pinned peer identity.
+// The server certificate is a CNG RSA key plus a self-signed certificate in
+// the current user's certificate store, created once and reused on later
+// runs. Its SHA-256 fingerprint is the server's identity: clients pin it and
+// MsQuic's certificate validation callback refuses anything else.
 
 // Winsock 2 must precede windows.h, which chast/quic.h pulls in through
 // chast/error.h; otherwise the SDK sees winsock 1 first and ws2tcpip.h fails.
@@ -35,6 +35,8 @@
 #include <utility>
 #include <vector>
 
+#include "chast/identity.h"
+
 namespace chast {
 
 namespace {
@@ -43,6 +45,39 @@ constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
 constexpr uint64_t kKeepAliveMs = 5000;
 constexpr wchar_t kKeyContainer[] = L"chast-quic-key";
+// Unique enough that the lookup in the user's store cannot confuse the
+// identity with a certificate another application placed there.
+constexpr wchar_t kIdentitySubject[] = L"CN=chast-device";
+constexpr wchar_t kIdentityCommonName[] = L"chast-device";
+
+// Length-independent comparison for the access token. The lengths are not
+// secret (they travel in the Hello payload); the bytes are.
+bool tokens_match(const std::string& presented, const std::string& expected) {
+    size_t diff = presented.size() ^ expected.size();
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const unsigned char actual =
+            i < presented.size() ? static_cast<unsigned char>(presented[i]) : 0;
+        diff |= static_cast<size_t>(actual ^ static_cast<unsigned char>(expected[i]));
+    }
+    return diff == 0;
+}
+
+std::string format_address(const QUIC_ADDR& address) {
+    char text[64]{};
+    if (address.si_family == AF_INET) {
+        if (!inet_ntop(AF_INET, &address.Ipv4.sin_addr, text, sizeof(text))) {
+            return {};
+        }
+        return std::string(text) + ":" + std::to_string(ntohs(address.Ipv4.sin_port));
+    }
+    if (address.si_family == AF_INET6) {
+        if (!inet_ntop(AF_INET6, &address.Ipv6.sin6_addr, text, sizeof(text))) {
+            return {};
+        }
+        return "[" + std::string(text) + "]:" + std::to_string(ntohs(address.Ipv6.sin6_port));
+    }
+    return {};
+}
 
 std::string status_hex(uint32_t status) {
     char text[16]{};
@@ -82,10 +117,84 @@ bool encode_object(LPCSTR type, const void* info, DataBlob& out) {
                              out.blob.pbData, &out.blob.cbData) != FALSE;
 }
 
+std::string certificate_fingerprint(PCCERT_CONTEXT certificate) {
+    if (!certificate || !certificate->pbCertEncoded || certificate->cbCertEncoded == 0) {
+        return {};
+    }
+    BYTE hash[64]{};
+    DWORD hash_size = sizeof(hash);
+    if (!CryptHashCertificate(0, CALG_SHA_256, 0, certificate->pbCertEncoded,
+                              certificate->cbCertEncoded, hash, &hash_size) ||
+        hash_size != 32) {
+        return {};
+    }
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string text;
+    text.reserve(hash_size * 2);
+    for (DWORD i = 0; i < hash_size; ++i) {
+        text.push_back(kHex[hash[i] >> 4]);
+        text.push_back(kHex[hash[i] & 0x0F]);
+    }
+    return text;
+}
+
+// True when the certificate's private key is the fixed chast container. Any
+// certificate in the user's store could share the subject, so the key is what
+// identifies ours.
+bool certificate_uses_our_key(PCCERT_CONTEXT certificate) {
+    DWORD size = 0;
+    if (!CertGetCertificateContextProperty(certificate, CERT_KEY_PROV_INFO_PROP_ID, nullptr,
+                                           &size) ||
+        size == 0) {
+        return false;
+    }
+    std::vector<BYTE> buffer(size);
+    if (!CertGetCertificateContextProperty(certificate, CERT_KEY_PROV_INFO_PROP_ID,
+                                           buffer.data(), &size)) {
+        return false;
+    }
+    const auto* info = reinterpret_cast<const CRYPT_KEY_PROV_INFO*>(buffer.data());
+    return info->pwszContainerName != nullptr &&
+           wcscmp(info->pwszContainerName, kKeyContainer) == 0;
+}
+
+bool certificate_is_current(PCCERT_CONTEXT certificate) {
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    return CompareFileTime(&certificate->pCertInfo->NotBefore, &now) <= 0 &&
+           CompareFileTime(&now, &certificate->pCertInfo->NotAfter) < 0;
+}
+
+// Newest valid certificate in `store` that belongs to this installation.
+PCCERT_CONTEXT find_stored_identity(HCERTSTORE store) {
+    PCCERT_CONTEXT best = nullptr;
+    FILETIME best_time{};
+    for (PCCERT_CONTEXT current = CertEnumCertificatesInStore(store, nullptr); current;
+         current = CertEnumCertificatesInStore(store, current)) {
+        wchar_t name[256]{};
+        if (!CertGetNameStringW(current, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name,
+                                256) ||
+            wcscmp(name, kIdentityCommonName) != 0) {
+            continue;
+        }
+        if (!certificate_uses_our_key(current) || !certificate_is_current(current)) {
+            continue;
+        }
+        if (!best || CompareFileTime(&current->pCertInfo->NotBefore, &best_time) > 0) {
+            if (best) {
+                CertFreeCertificateContext(best);
+            }
+            best = CertDuplicateCertificateContext(current);
+            best_time = current->pCertInfo->NotBefore;
+        }
+    }
+    return best;
+}
+
 // Creates the server credential. The RSA key lives in the user's CNG key store
 // under a fixed container name so restarts reuse it; the certificate itself is
-// rebuilt each run (it is only trusted because the client skips validation).
-PCCERT_CONTEXT create_self_signed_certificate(std::string* error) {
+// stored by open_or_create_identity().
+PCCERT_CONTEXT create_identity_certificate(std::string* error) {
     NCRYPT_PROV_HANDLE provider = 0;
     SECURITY_STATUS sec = NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0);
     if (FAILED(sec)) {
@@ -126,7 +235,7 @@ PCCERT_CONTEXT create_self_signed_certificate(std::string* error) {
     }
 
     DWORD subject_size = 0;
-    if (!CertStrToNameW(X509_ASN_ENCODING, L"CN=localhost", CERT_X500_NAME_STR, nullptr,
+    if (!CertStrToNameW(X509_ASN_ENCODING, kIdentitySubject, CERT_X500_NAME_STR, nullptr,
                         nullptr, &subject_size, nullptr)) {
         *error = "CertStrToNameW failed";
         NCryptFreeObject(key);
@@ -134,7 +243,7 @@ PCCERT_CONTEXT create_self_signed_certificate(std::string* error) {
         return nullptr;
     }
     std::vector<BYTE> subject(subject_size);
-    if (!CertStrToNameW(X509_ASN_ENCODING, L"CN=localhost", CERT_X500_NAME_STR, nullptr,
+    if (!CertStrToNameW(X509_ASN_ENCODING, kIdentitySubject, CERT_X500_NAME_STR, nullptr,
                         subject.data(), &subject_size, nullptr)) {
         *error = "CertStrToNameW failed";
         NCryptFreeObject(key);
@@ -224,6 +333,42 @@ PCCERT_CONTEXT create_self_signed_certificate(std::string* error) {
     return certificate;
 }
 
+// The identity must survive restarts, otherwise a pinned client would refuse
+// the server after a reboot. Reuse the stored certificate when it is still
+// valid; create and store one otherwise.
+PCCERT_CONTEXT open_or_create_identity(std::string* error) {
+    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+                                     CERT_SYSTEM_STORE_CURRENT_USER, L"MY");
+    if (!store) {
+        *error = "cannot open the current user's certificate store, GetLastError=" +
+                 std::to_string(GetLastError());
+        return nullptr;
+    }
+    PCCERT_CONTEXT existing = find_stored_identity(store);
+    if (existing) {
+        CertCloseStore(store, 0);
+        return existing;
+    }
+    PCCERT_CONTEXT created = create_identity_certificate(error);
+    if (!created) {
+        CertCloseStore(store, 0);
+        return nullptr;
+    }
+    if (!CertAddCertificateContextToStore(store, created, CERT_STORE_ADD_REPLACE_EXISTING,
+                                          nullptr)) {
+        // Without the stored certificate the fingerprint changes on the next
+        // run, which silently breaks every pin. Refuse rather than pretend the
+        // identity is stable.
+        *error = "cannot store the server identity, GetLastError=" +
+                 std::to_string(GetLastError());
+        CertFreeCertificateContext(created);
+        CertCloseStore(store, 0);
+        return nullptr;
+    }
+    CertCloseStore(store, 0);
+    return created;
+}
+
 }  // namespace
 
 struct QuicSession::Impl {
@@ -237,6 +382,13 @@ struct QuicSession::Impl {
     Role role = Role::Server;
     QuicServerConfig server_config;
     QuicClientConfig client_config;
+    // Server: fingerprint of the certificate it presents. Client: fingerprint
+    // of the certificate the peer presented, and the pin it was checked
+    // against. Both canonical uppercase hex.
+    std::string identity_fingerprint;
+    std::string peer_fingerprint;
+    std::string pinned_fingerprint;
+    bool allow_any_certificate = false;
 
     const QUIC_API_TABLE* api = nullptr;
     HQUIC registration = nullptr;
@@ -267,12 +419,31 @@ struct QuicSession::Impl {
     std::string transport_message;
     ServerInfo peer_info;
     ClientStats peer_stats;
+    // Client side: a StreamInfo arrived since take_stream_update().
+    bool stream_update_ready = false;
+    uint64_t stream_updates = 0;
+    // Server side: what Hello asked to have captured.
+    uint16_t requested_display = kDisplayAuto;
+    std::string requested_peer;
+    // Server: a Hello the token check refused, waiting for the application
+    // thread to answer it. Delivery happens there because closing a
+    // connection from inside its own callback is not allowed.
+    bool pending_denial = false;
+    AccessDenial pending_code = AccessDenial::InvalidToken;
+    std::string pending_reason;
+    // Server: the one-time token has been spent.
+    bool token_consumed = false;
+    // Client: the server refused the Hello, with its reason.
+    bool access_denied_ready = false;
+    std::string denial_reason;
+    std::optional<AccessDenial> denial_code;
     std::deque<std::vector<uint8_t>> received;
     ControlParser control_parser;
     FrameParser frame_parser;
     // Server only, when QuicServerConfig::allow_input is set.
     std::unique_ptr<InputInjector> injector;
     std::deque<InputEvent> input_events;
+    size_t input_releases = 0;
 
     std::atomic<uint64_t> next_seq{0};
     std::atomic<bool> transport_down{false};
@@ -342,7 +513,10 @@ struct QuicSession::Impl {
         HQUIC expected = nullptr;
         if (!connection.compare_exchange_strong(expected, event.NEW_CONNECTION.Connection)) {
             // The tool serves one viewer at a time; a second connection is
-            // refused before the handshake continues.
+            // refused before the handshake continues. Shutting it down first
+            // tells that client right away instead of leaving it retransmit.
+            api->ConnectionShutdown(event.NEW_CONNECTION.Connection,
+                                    QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
             api->ConnectionClose(event.NEW_CONNECTION.Connection);
             return QUIC_STATUS_SUCCESS;
         }
@@ -388,6 +562,43 @@ struct QuicSession::Impl {
                     api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
                 }
                 cv.notify_all();
+                break;
+            }
+            case QUIC_CONNECTION_EVENT_PEER_CERTIFICATE_RECEIVED: {
+                if (role != Role::Client) {
+                    break;
+                }
+                // Schannel hands over a PCCERT_CONTEXT. Validation was
+                // deferred so the fingerprint comparison below, not the OS
+                // chain, decides whether the peer is the pinned server.
+                const auto* presented = reinterpret_cast<const CERT_CONTEXT*>(
+                    event.PEER_CERTIFICATE_RECEIVED.Certificate);
+                const std::string actual = certificate_fingerprint(presented);
+                bool accepted = false;
+                std::string reason;
+                if (actual.empty()) {
+                    reason = "the server presented no readable certificate";
+                } else if (!pinned_fingerprint.empty()) {
+                    accepted = fingerprint_matches(pinned_fingerprint, actual);
+                    if (!accepted) {
+                        reason = "the server's certificate " + format_fingerprint(actual) +
+                                 " does not match the pinned fingerprint";
+                    }
+                } else if (allow_any_certificate) {
+                    accepted = true;
+                } else {
+                    reason = "no pinned server fingerprint";
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    peer_fingerprint = actual;
+                }
+                api->ConnectionCertificateValidationComplete(
+                    connection.load(), accepted ? TRUE : FALSE,
+                    accepted ? QUIC_TLS_ALERT_CODE_SUCCESS : QUIC_TLS_ALERT_CODE_USER_CANCELED);
+                if (!accepted) {
+                    note_transport_failure("server certificate: " + reason);
+                }
                 break;
             }
             case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT: {
@@ -518,13 +729,65 @@ struct QuicSession::Impl {
                 if (role != Role::Server) {
                     break;
                 }
-                if (!parse_hello(payload, &error)) {
+                uint16_t display = kDisplayAuto;
+                std::string token;
+                if (!parse_hello(payload, display, token, &error)) {
                     note_transport_failure("Hello: " + error);
+                    break;
+                }
+                // Copied under the lock because set_access_token() may replace
+                // the token between sessions.
+                std::string expected;
+                bool used = false;
+                bool reusable = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    expected = server_config.access_token;
+                    used = token_consumed;
+                    reusable = server_config.reuse_access_token;
+                }
+                if (!expected.empty()) {
+                    if (!tokens_match(token, expected)) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        pending_denial = true;
+                        pending_code = AccessDenial::InvalidToken;
+                        pending_reason = "the access token was not accepted";
+                        cv.notify_all();
+                        break;
+                    }
+                    if (used && !reusable) {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        pending_denial = true;
+                        pending_code = AccessDenial::TokenUsed;
+                        pending_reason = "the one-time access token was already used";
+                        cv.notify_all();
+                        break;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    requested_display = display;
+                    requested_peer = remote_address();
+                    hello_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::AccessDenied: {
+                if (role != Role::Client) {
+                    break;
+                }
+                AccessDenial code = AccessDenial::InvalidToken;
+                std::string reason;
+                if (!parse_access_denied(payload, code, reason, &error)) {
+                    note_transport_failure("AccessDenied: " + error);
                     break;
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    hello_ready = true;
+                    denial_reason = std::move(reason);
+                    denial_code = code;
+                    access_denied_ready = true;
                 }
                 cv.notify_all();
                 break;
@@ -542,6 +805,26 @@ struct QuicSession::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     peer_info = std::move(info);
                     hello_ack_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::StreamInfo: {
+                if (role != Role::Client) {
+                    break;
+                }
+                // Same payload as HelloAck. Frames keep flowing on the video
+                // stream; this only replaces the description.
+                ServerInfo info;
+                if (!parse_hello_ack(payload, info, &error)) {
+                    note_transport_failure("StreamInfo: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    peer_info = std::move(info);
+                    stream_update_ready = true;
+                    ++stream_updates;
                 }
                 cv.notify_all();
                 break;
@@ -604,6 +887,19 @@ struct QuicSession::Impl {
                 }
                 break;
             }
+            case ControlType::InputRelease: {
+                if (role != Role::Server || !server_config.allow_input) {
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++input_releases;
+                }
+                if (injector) {
+                    injector->release_held();
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -650,6 +946,11 @@ struct QuicSession::Impl {
         if (QUIC_FAILED(status)) {
             release_send(pending->bytes.size());
             delete pending;
+            // A send that aborts is the stream or connection already closing,
+            // which for the host means the viewer is gone. Not a failure.
+            if (status == QUIC_STATUS_ABORTED || status == QUIC_STATUS_INVALID_STATE) {
+                return Error(Status::Unavailable, "the connection closed before the send");
+            }
             return quic_error(status, "QUIC StreamSend");
         }
         return Error::success();
@@ -660,6 +961,118 @@ struct QuicSession::Impl {
         return send_cv.wait_for(lock, timeout, [this] {
             return in_flight_sends == 0 || transport_down.load();
         });
+    }
+
+    std::string remote_address() const {
+        HQUIC handle = connection.load();
+        if (!handle) {
+            return {};
+        }
+        QUIC_ADDR address{};
+        uint32_t size = sizeof(address);
+        if (QUIC_FAILED(api->GetParam(handle, QUIC_PARAM_CONN_REMOTE_ADDRESS, &size, &address))) {
+            return {};
+        }
+        return format_address(address);
+    }
+
+    // Answers a refused Hello and frees the connection slot so the listener
+    // can accept the next client. Application thread only: the denial is sent
+    // and the connection closed outside any MsQuic callback.
+    void refuse_client(AccessDenial code, const std::string& reason) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            hello_ready = false;
+        }
+        if (HQUIC control_handle = control.load()) {
+            send_bytes(control_handle, make_access_denied(code, reason), QUIC_SEND_FLAG_NONE);
+            wait_sends(std::chrono::milliseconds(500));
+        }
+        // Hold the connection open until the refused client has read the
+        // denial and gone away: closing it here races the message, and the
+        // client then only sees the transport drop instead of the reason.
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait_for(lock, std::chrono::milliseconds(750), [this] {
+                return peer_closed || shutdown_complete || transport_failed;
+            });
+        }
+        reset_connection();
+    }
+
+    // Closes the current connection and clears everything a handshake set, so
+    // the session is ready for another client.
+    void reset_connection() {
+        HQUIC connection_handle = connection.load();
+        if (connection_handle) {
+            bool complete = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                complete = shutdown_complete;
+            }
+            if (!complete) {
+                api->ConnectionShutdown(connection_handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait_for(lock, std::chrono::milliseconds(1500),
+                            [this] { return shutdown_complete; });
+            }
+        }
+        wait_sends(std::chrono::milliseconds(500));
+        if (HQUIC handle = video.exchange(nullptr)) {
+            api->StreamClose(handle);
+        }
+        if (HQUIC handle = control.exchange(nullptr)) {
+            api->StreamClose(handle);
+        }
+        if (connection_handle) {
+            // No callback runs for this handle after ConnectionClose returns,
+            // so the state can be cleared without a late event overwriting it.
+            api->ConnectionClose(connection_handle);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            connected = false;
+            shutdown_complete = false;
+            peer_closed = false;
+            video_finished = false;
+            control_finished = false;
+            video_shutdown_complete = false;
+            control_shutdown_complete = false;
+            hello_ready = false;
+            hello_ack_ready = false;
+            pending_denial = false;
+            requested_display = kDisplayAuto;
+            requested_peer.clear();
+            peer_info = ServerInfo{};
+            peer_stats = ClientStats{};
+            stream_update_ready = false;
+            stream_updates = 0;
+            keyframe_requested = false;
+            announced = false;
+            stats_ready = false;
+            bye_ready = false;
+            input_events.clear();
+            input_releases = 0;
+            received.clear();
+            control_parser.reset();
+            transport_failed = false;
+            transport_status = Status::Ok;
+            transport_message.clear();
+        }
+        transport_down = false;
+        // Only now can the listener claim the slot for the next client.
+        connection = nullptr;
+        cv.notify_all();
+        send_cv.notify_all();
+    }
+
+    // Spends a one-time token once a client was accepted.
+    void consume_token() {
+        if (server_config.access_token.empty() || server_config.reuse_access_token) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        token_consumed = true;
     }
 
     Error shutdown_connection(std::chrono::milliseconds timeout) {
@@ -698,7 +1111,7 @@ struct QuicSession::Impl {
                 complete = shutdown_complete;
             }
             if (!complete) {
-                api->ConnectionShutdown(connection_handle, QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0);
+                api->ConnectionShutdown(connection_handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
                 std::unique_lock<std::mutex> lock(mutex);
                 cv.wait_for(lock, std::chrono::milliseconds(2000),
                             [this] { return shutdown_complete; });
@@ -791,8 +1204,13 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
         return nullptr;
     }
 
-    impl.certificate = create_self_signed_certificate(error);
+    impl.certificate = open_or_create_identity(error);
     if (!impl.certificate) {
+        return nullptr;
+    }
+    impl.identity_fingerprint = certificate_fingerprint(impl.certificate);
+    if (impl.identity_fingerprint.empty()) {
+        *error = "cannot fingerprint the server identity certificate";
         return nullptr;
     }
     QUIC_CREDENTIAL_CONFIG credential{};
@@ -872,11 +1290,27 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
         return nullptr;
     }
 
+    const std::string pin = normalize_fingerprint(config.pinned_fingerprint);
+    if (!config.pinned_fingerprint.empty() && pin.empty()) {
+        *error = "the pinned server fingerprint is not a SHA-256 value";
+        return nullptr;
+    }
+    if (pin.empty() && !config.allow_any_certificate) {
+        *error = "no pinned server identity: set pinned_fingerprint, or "
+                 "allow_any_certificate for local development";
+        return nullptr;
+    }
+    impl.pinned_fingerprint = pin;
+    impl.allow_any_certificate = config.allow_any_certificate;
+
     QUIC_CREDENTIAL_CONFIG credential{};
     credential.Type = QUIC_CREDENTIAL_TYPE_NONE;
-    credential.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
-    if (config.skip_certificate_validation) {
-        credential.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
+    credential.Flags = QUIC_CREDENTIAL_FLAG_CLIENT |
+                       QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED |
+                       QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION;
+    if (impl.api->ConnectionCertificateValidationComplete == nullptr) {
+        *error = "MsQuic does not support the certificate validation callback";
+        return nullptr;
     }
     status = impl.api->ConfigurationLoadCredential(impl.configuration, &credential);
     if (QUIC_FAILED(status)) {
@@ -897,21 +1331,95 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
 
 Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
-    std::unique_lock<std::mutex> lock(impl.mutex);
-    impl.cv.wait_for(lock, timeout, [&impl] {
-        return impl.hello_ready || impl.transport_failed || impl.shutdown_complete ||
-               impl.peer_closed;
-    });
-    if (impl.transport_failed) {
-        return Error(impl.transport_status, impl.transport_message);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        std::unique_lock<std::mutex> lock(impl.mutex);
+        const bool woken = impl.cv.wait_until(lock, deadline, [&impl] {
+            return impl.hello_ready || impl.pending_denial || impl.transport_failed ||
+                   impl.shutdown_complete || impl.peer_closed;
+        });
+        if (impl.transport_failed) {
+            return Error(impl.transport_status, impl.transport_message);
+        }
+        if (impl.pending_denial) {
+            const AccessDenial code = impl.pending_code;
+            const std::string reason = impl.pending_reason;
+            impl.pending_denial = false;
+            lock.unlock();
+            impl.refuse_client(code, reason);
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Error(Status::WaitTimeout, "no client connected in time");
+            }
+            continue;
+        }        if (impl.hello_ready) {
+            // Consumed here: the next wait must be triggered by a new Hello,
+            // not by the one this call already answered.
+            impl.hello_ready = false;
+            if (!impl.server_config.approve_client) {
+                lock.unlock();
+                impl.consume_token();
+                return Error::success();
+            }
+            const ClientRequest request{impl.requested_display, impl.requested_peer};
+            lock.unlock();
+            if (impl.server_config.approve_client(request)) {
+                impl.consume_token();
+                return Error::success();
+            }
+            impl.refuse_client(AccessDenial::Declined, "the host declined the connection");
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Error(Status::WaitTimeout, "no client connected in time");
+            }
+            continue;
+        }
+        if (woken) {
+            // A connection that came and went without a usable Hello (aborted
+            // TLS, no Hello, wrong protocol version) frees the slot; the
+            // listener stays available for the next client.
+            lock.unlock();
+            impl.reset_connection();
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Error(Status::WaitTimeout, "no client connected in time");
+            }
+            continue;
+        }
+        return Error(Status::WaitTimeout, "no client connected in time");
     }
-    if (impl.hello_ready) {
-        return Error::success();
-    }
-    if (impl.shutdown_complete || impl.peer_closed) {
-        return Error(Status::Unavailable, "client left before the handshake");
-    }
-    return Error(Status::WaitTimeout, "no client connected in time");
+}
+
+std::optional<AccessDenial> QuicSession::denial() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->denial_code;
+}
+
+uint16_t QuicSession::requested_display() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->requested_display;
+}
+
+std::string QuicSession::server_fingerprint() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->identity_fingerprint;
+}
+
+std::string QuicSession::client_address() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->requested_peer;
+}
+
+void QuicSession::set_access_token(std::string token) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->server_config.access_token = std::move(token);
+    impl_->token_consumed = false;
+}
+
+void QuicSession::reset_for_next_client() {
+    impl_->reset_connection();
+}
+
+std::string QuicSession::peer_fingerprint() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->peer_fingerprint;
 }
 
 Error QuicSession::announce(const ServerInfo& info) {
@@ -948,6 +1456,35 @@ Error QuicSession::announce(const ServerInfo& info) {
     }
     impl.announced = true;
     return Error::success();
+}
+
+Error QuicSession::refresh_stream(const ServerInfo& info) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "refresh_stream is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream was not announced yet");
+    }
+    ServerInfo update = info;
+    update.input_enabled = impl.server_config.allow_input;
+    return impl.send_bytes(impl.control.load(), make_stream_info(update),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_stream_update(ServerInfo& info) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->stream_update_ready) {
+        return false;
+    }
+    info = impl_->peer_info;
+    impl_->stream_update_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::stream_updates() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->stream_updates;
 }
 
 Error QuicSession::send_frame(FrameHeader header, const uint8_t* payload, size_t size) {
@@ -990,6 +1527,11 @@ std::vector<InputEvent> QuicSession::take_input_events() {
 
 InputStats QuicSession::input_stats() const {
     return impl_->injector ? impl_->injector->stats() : InputStats{};
+}
+
+uint64_t QuicSession::input_release_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->input_releases;
 }
 
 Error QuicSession::finish_server(std::chrono::milliseconds timeout, ClientStats& stats,
@@ -1048,7 +1590,8 @@ Error QuicSession::connect(std::chrono::milliseconds timeout) {
     return Error::success();
 }
 
-Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout) {
+Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout,
+                             uint16_t display) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "handshake is a client operation");
@@ -1068,15 +1611,21 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
         return quic_error(status, "QUIC StreamStart(control)");
     }
 
-    Error sent = impl.send_bytes(control, make_hello(), QUIC_SEND_FLAG_NONE);
+    Error sent = impl.send_bytes(
+        control, make_hello(display, impl.client_config.access_token), QUIC_SEND_FLAG_NONE);
     if (!sent.ok()) {
         return sent;
     }
     std::unique_lock<std::mutex> lock(impl.mutex);
     impl.cv.wait_for(lock, timeout, [&impl] {
-        return impl.hello_ack_ready || impl.transport_failed || impl.shutdown_complete ||
-               impl.peer_closed;
+        return impl.hello_ack_ready || impl.access_denied_ready || impl.transport_failed ||
+               impl.shutdown_complete || impl.peer_closed;
     });
+    // A refusal arrives just before the server closes the connection, so it
+    // is checked first: the transport error that follows is only a symptom.
+    if (impl.access_denied_ready) {
+        return Error(Status::PermissionDenied, impl.denial_reason);
+    }
     if (impl.transport_failed) {
         return Error(impl.transport_status, impl.transport_message);
     }
@@ -1156,6 +1705,15 @@ Error QuicSession::send_input(const InputEvent& event) {
         return Error(Status::InvalidCall, "send_input is a client operation");
     }
     return impl.send_bytes(impl.control.load(), make_input_event(event), QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::release_input() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "release_input is a client operation");
+    }
+    return impl.send_bytes(impl.control.load(), make_control(ControlType::InputRelease, {}),
+                           QUIC_SEND_FLAG_NONE);
 }
 
 Error QuicSession::finish_client(const ClientStats& stats, std::chrono::milliseconds timeout) {

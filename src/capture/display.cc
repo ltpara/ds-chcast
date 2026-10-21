@@ -388,4 +388,21 @@ std::vector<DisplayInfo> enumerate_displays() {
     return displays;
 }
 
+std::string display_name_utf8(const DisplayInfo& display) {
+    if (display.device_name.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, display.device_name.data(),
+                                         static_cast<int>(display.device_name.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string name(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, display.device_name.data(),
+                        static_cast<int>(display.device_name.size()), name.data(), size,
+                        nullptr, nullptr);
+    return name;
+}
+
 }  // namespace chast

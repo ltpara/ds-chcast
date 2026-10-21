@@ -37,11 +37,16 @@ namespace chast {
 // code).
 bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended);
 
+// Modifier bit (see chast/protocol.h) for a HID usage, or 0 when the usage is
+// not one of the eight modifier keys.
+uint16_t modifier_bit_for_usage(uint16_t hid_usage);
+
 struct InputStats {
     uint64_t applied = 0;
     uint64_t rejected = 0;  // unknown key or malformed event
     uint64_t failed = 0;    // SendInput reported zero inserted events
     uint64_t dropped = 0;   // queue was full
+    uint64_t lock_toggles = 0;  // Caps/Num/Scroll taps that matched the client
 };
 
 class InputInjector {
@@ -62,6 +67,11 @@ public:
     // is already stale at that point.
     void submit(const InputEvent& event);
 
+    // Queues a release of everything held so far. It lands behind the events
+    // already submitted and ahead of anything later, so a burst of pointer
+    // moves cannot be applied after the viewer has given up control.
+    void release_held();
+
     // Releases every key and button this injector is holding down, then stops
     // the thread. Called on teardown so a disconnect cannot leave a modifier
     // stuck on the host.
@@ -74,6 +84,14 @@ private:
 
     void run();
     void apply(const InputEvent& event);
+    // Brings held modifiers in line with the bitmap the peer reported.
+    void sync_modifiers(uint16_t reported);
+    // Taps Caps/Num/Scroll once when the peer's lock state differs from this
+    // machine's. `reported` only carries kLockStateMask bits.
+    void sync_locks(uint16_t reported);
+    bool lock_state(uint16_t bit);
+    // Folds Windows' synthetic Ctrl+Right Alt (AltGr) into Right Alt alone.
+    uint16_t normalize_modifiers(uint16_t reported);
     void apply_mouse(const MouseEvent& event);
     void apply_key(const KeyEvent& event);
     void release_all();
@@ -82,7 +100,11 @@ private:
     bool dry_run_ = false;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<InputEvent> queue_;
+    struct Pending {
+        bool release = false;
+        InputEvent event;
+    };
+    std::deque<Pending> queue_;
     bool stopping_ = false;
     std::thread thread_;
 
@@ -91,11 +113,22 @@ private:
     struct HeldKey {
         uint16_t scan = 0;
         bool extended = false;
+        uint16_t usage = 0;
     };
     // Keys currently down, in press order, so release_all lifts them in
     // reverse. Scan code alone is ambiguous (0x1D is both Ctrl keys), so the
     // extended flag is kept with it.
     std::deque<HeldKey> held_keys_;
+    // Set while a reported left Ctrl is the synthetic one Windows emits for
+    // AltGr; kept until the peer stops reporting it.
+    bool altgr_synthetic_ctrl_ = false;
+    // This injector's view of the host lock keys. Seeded from the OS on first
+    // use and toggled whenever a lock key is injected (including the taps
+    // sync_locks() makes and a lock key the peer presses itself), so a tap
+    // is never applied twice. A dry run seeds it at zero, since no tap ever
+    // changes the real desktop.
+    bool locks_seeded_ = false;
+    uint16_t host_locks_ = 0;
 
     mutable std::mutex stats_mutex_;
     InputStats stats_;

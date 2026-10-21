@@ -2,12 +2,15 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "chast/identity.h"
 #include "chast/input.h"
 #include "chast/protocol.h"
 
@@ -27,6 +30,97 @@ std::vector<uint8_t> payload_of(const std::vector<uint8_t>& message) {
     return std::vector<uint8_t>(message.begin() + chast::kControlHeaderSize, message.end());
 }
 
+void test_hello() {
+    std::string error;
+    auto parses_hello = [&](const std::vector<uint8_t>& payload, uint16_t& display,
+                            std::string& token) {
+        return chast::parse_hello(payload, display, token, &error);
+    };
+    auto rejects_hello = [&](std::vector<uint8_t> payload, const char* what) {
+        uint16_t display = chast::kDisplayAuto;
+        std::string token;
+        check(!parses_hello(payload, display, token), what);
+    };
+
+    uint16_t display = 0;
+    std::string token;
+    check(parses_hello(payload_of(chast::make_hello()), display, token), "Hello round-trips");
+    check(display == chast::kDisplayAuto, "Hello defaults to the server's display");
+    check(token.empty(), "Hello without a token carries an empty one");
+    check(parses_hello(payload_of(chast::make_hello(3)), display, token) && display == 3,
+          "Hello keeps an explicit display index");
+
+    const std::string secret = "correct horse battery staple";
+    check(parses_hello(payload_of(chast::make_hello(chast::kDisplayAuto, secret)), display,
+                       token) &&
+              token == secret,
+          "Hello round-trips an access token");
+    check(parses_hello(payload_of(chast::make_hello(1, std::string(128, 'x'))), display,
+                       token) &&
+              token.size() == 128,
+          "Hello accepts a token at the length limit");
+
+    rejects_hello(std::vector<uint8_t>(4), "short Hello is rejected");
+    std::vector<uint8_t> bad_display = payload_of(chast::make_hello());
+    bad_display[2] = static_cast<uint8_t>(chast::kMaxDisplayCount);
+    bad_display[3] = 0;
+    rejects_hello(bad_display, "Hello with a display index past the limit is rejected");
+
+    std::vector<uint8_t> old_version = payload_of(chast::make_hello());
+    old_version[0] = static_cast<uint8_t>(chast::kProtocolVersion - 1);
+    old_version[1] = 0;
+    rejects_hello(old_version, "Hello from another protocol version is rejected");
+
+    std::vector<uint8_t> long_token = payload_of(chast::make_hello());
+    long_token[4] = static_cast<uint8_t>(chast::kMaxAccessTokenLength + 1);
+    long_token[5] = 0;
+    rejects_hello(long_token, "Hello with an oversized token length is rejected");
+
+    std::vector<uint8_t> truncated_token = payload_of(chast::make_hello());
+    truncated_token[4] = 3;  // claims three bytes that are not there
+    truncated_token[5] = 0;
+    rejects_hello(truncated_token, "Hello whose token length disagrees with the payload is rejected");
+
+    std::vector<uint8_t> trailing = payload_of(chast::make_hello());
+    trailing.push_back(0xFF);
+    rejects_hello(trailing, "Hello with trailing bytes is rejected");
+}
+
+void test_access_denied() {
+    chast::AccessDenial code = chast::AccessDenial::InvalidToken;
+    std::string reason;
+    std::string error;
+    check(chast::parse_access_denied(
+              payload_of(chast::make_access_denied(chast::AccessDenial::TokenUsed,
+                                                   "the token was already used")),
+              code, reason, &error) &&
+              code == chast::AccessDenial::TokenUsed &&
+              reason == "the token was already used",
+          "AccessDenied round-trips its code and reason");
+
+    check(chast::parse_access_denied(
+              payload_of(chast::make_access_denied(chast::AccessDenial::Declined, "")), code,
+              reason, &error) &&
+              code == chast::AccessDenial::Declined && reason.empty(),
+          "AccessDenied may carry an empty reason");
+
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_access_denied(chast::AccessDenial::Declined, "no"));
+    unknown_code[0] = 0;
+    check(!chast::parse_access_denied(unknown_code, code, reason, &error),
+          "AccessDenied with an unknown code is rejected");
+
+    std::vector<uint8_t> long_reason = payload_of(
+        chast::make_access_denied(chast::AccessDenial::Declined, "short"));
+    long_reason[1] = static_cast<uint8_t>(chast::kMaxAccessDenialReason + 1);
+    long_reason[2] = static_cast<uint8_t>((chast::kMaxAccessDenialReason + 1) >> 8);
+    check(!chast::parse_access_denied(long_reason, code, reason, &error),
+          "AccessDenied whose reason length disagrees with the payload is rejected");
+
+    check(!chast::parse_access_denied(std::vector<uint8_t>(2), code, reason, &error),
+          "short AccessDenied is rejected");
+}
+
 void test_hello_ack() {
     chast::ServerInfo sent;
     sent.codec = chast::VideoCodec::Hevc;
@@ -38,6 +132,17 @@ void test_hello_ack() {
     sent.origin_y = -120;
     sent.input_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
+    chast::DisplayDescription primary;
+    primary.name = "\\\\.\\DISPLAY1";
+    primary.right = 2560;
+    primary.bottom = 1440;
+    primary.primary = true;
+    chast::DisplayDescription portrait;
+    portrait.name = "\\\\.\\DISPLAY2";
+    portrait.left = -1080;
+    portrait.bottom = 1920;
+    portrait.rotation_degrees = 90;
+    sent.displays = {primary, portrait};
 
     chast::ServerInfo got;
     std::string error;
@@ -55,12 +160,115 @@ void test_hello_ack() {
           "HelloAck keeps negative virtual-desktop origins");
     check(got.input_enabled, "HelloAck keeps the input flag");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
+    check(got.displays.size() == 2, "HelloAck keeps the display count");
+    if (got.displays.size() == 2) {
+        check(got.displays[0].name == primary.name && got.displays[0].primary &&
+                  got.displays[0].right == 2560 && got.displays[0].rotation_degrees == 0,
+              "HelloAck keeps the primary display");
+        check(got.displays[1].left == -1080 && got.displays[1].top == 0 &&
+                  got.displays[1].rotation_degrees == 90 && !got.displays[1].primary,
+              "HelloAck keeps a rotated display with a negative origin");
+    }
+
+    auto ack_payload = [&] { return payload_of(chast::make_hello_ack(sent)); };
+    const size_t display_count_at = 24 + sent.encoder.size();
+    const size_t first_display_at = display_count_at + 2;
+    auto rejects_ack = [&](std::vector<uint8_t> payload, const char* what) {
+        chast::ServerInfo dropped;
+        check(!chast::parse_hello_ack(payload, dropped, &error), what);
+    };
+    std::vector<uint8_t> too_many = ack_payload();
+    too_many[display_count_at] = 65;
+    too_many[display_count_at + 1] = 0;
+    rejects_ack(too_many, "a HelloAck with too many displays is rejected");
+    std::vector<uint8_t> bad_rotation = ack_payload();
+    bad_rotation[first_display_at + 2 + primary.name.size() + 16] = 45;
+    rejects_ack(bad_rotation, "a display with an unknown rotation is rejected");
+    std::vector<uint8_t> empty_rect = ack_payload();
+    const size_t right_at = first_display_at + 2 + primary.name.size() + 8;
+    empty_rect[right_at] = 0;
+    empty_rect[right_at + 1] = 0;
+    empty_rect[right_at + 2] = 0;
+    empty_rect[right_at + 3] = 0;
+    rejects_ack(empty_rect, "a display with an empty rect is rejected");
 
     sent.input_enabled = false;
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
               !disabled.input_enabled,
           "HelloAck reports input disabled");
+}
+
+void test_stream_info() {
+    chast::ServerInfo sent;
+    sent.codec = chast::VideoCodec::H264;
+    sent.width = 1280;
+    sent.height = 720;
+    sent.framerate = 30;
+    sent.bitrate = 4000000;
+    sent.origin_x = 1920;
+    sent.encoder = "mfxhw64 (VDENC AVC)";
+    chast::DisplayDescription display;
+    display.name = "\\\\.\\DISPLAY2";
+    display.left = 1920;
+    display.right = 3200;
+    display.bottom = 720;
+    sent.displays = {display};
+
+    const std::vector<uint8_t> hello_ack = chast::make_hello_ack(sent);
+    const std::vector<uint8_t> stream_info = chast::make_stream_info(sent);
+    check(payload_of(hello_ack) == payload_of(stream_info),
+          "StreamInfo carries the HelloAck payload");
+    check(stream_info.size() >= chast::kControlHeaderSize &&
+              stream_info[6] == static_cast<uint8_t>(chast::ControlType::StreamInfo),
+          "StreamInfo names its control type");
+
+    chast::ServerInfo got;
+    std::string error;
+    const bool parsed = chast::parse_hello_ack(payload_of(stream_info), got, &error);
+    check(parsed, "StreamInfo parses with the HelloAck parser");
+    if (parsed) {
+        check(got.width == sent.width && got.height == sent.height && got.codec == sent.codec,
+              "StreamInfo carries the new stream parameters");
+        check(got.origin_x == sent.origin_x && got.displays.size() == 1 &&
+                  got.displays[0].left == 1920,
+              "StreamInfo carries the new origin and display list");
+    }
+}
+
+void test_identity() {
+    const std::string hex = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+    check(chast::normalize_fingerprint(hex) == hex, "a canonical fingerprint is unchanged");
+    check(chast::normalize_fingerprint("01:23:45:67:89:ab:cd:ef"
+                                        "01:23:45:67:89:ab:cd:ef"
+                                        "01:23:45:67:89:ab:cd:ef"
+                                        "01:23:45:67:89:ab:cd:ef") == hex,
+          "colons, lower case and spacing normalize to upper hex");
+    check(chast::normalize_fingerprint(" 0123 4567 89ab cdef 0123 4567 89ab cdef"
+                                       " 0123 4567 89ab cdef 0123 4567 89ab cdef ") == hex,
+          "spaces between byte groups are accepted");
+    check(chast::normalize_fingerprint(std::string(63, 'A')).empty(),
+          "a 63-digit fingerprint is rejected");
+    check(chast::normalize_fingerprint(std::string(65, 'A')).empty(),
+          "a 65-digit fingerprint is rejected");
+    check(chast::normalize_fingerprint(std::string(64, 'G')).empty(),
+          "a non-hex fingerprint is rejected");
+    check(chast::normalize_fingerprint("").empty(), "an empty fingerprint is rejected");
+
+    check(chast::format_fingerprint(hex) ==
+              "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:"
+              "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF",
+          "formatting inserts a colon between bytes");
+    check(chast::format_fingerprint("").empty(), "an empty fingerprint formats to nothing");
+
+    check(chast::fingerprint_matches(hex, hex), "an identical fingerprint matches");
+    check(chast::fingerprint_matches(chast::format_fingerprint(hex), hex),
+          "a formatted pin matches the bare fingerprint");
+    std::string other = hex;
+    other.back() = '0';
+    check(!chast::fingerprint_matches(other, hex), "a 1-bit difference is not a match");
+    check(!chast::fingerprint_matches("not-a-fingerprint", hex),
+          "an invalid pin never matches");
 }
 
 void test_input_events() {
@@ -72,6 +280,8 @@ void test_input_events() {
     mouse.mouse.buttons = chast::kMouseBack;
     mouse.mouse.x = -32768;
     mouse.mouse.y = 65535;
+    mouse.modifiers = chast::kModifierLeftCtrl | chast::kModifierRightShift | chast::kLockCaps |
+                      chast::kLockScroll;
     chast::InputEvent got;
     check(chast::parse_input_event(payload_of(chast::make_input_event(mouse)), got, &error),
           "mouse event round-trips");
@@ -80,16 +290,19 @@ void test_input_events() {
     check(got.mouse.buttons == chast::kMouseBack, "mouse event keeps the button");
     check(got.mouse.x == mouse.mouse.x && got.mouse.y == mouse.mouse.y,
           "mouse event keeps signed coordinates");
+    check(got.modifiers == mouse.modifiers, "mouse event keeps the modifier and lock state");
 
     chast::InputEvent key;
     key.kind = chast::InputKind::Key;
     key.key.action = chast::KeyAction::Up;
     key.key.hid_usage = 0xE6;
+    key.modifiers = chast::kModifierRightAlt;
     check(chast::parse_input_event(payload_of(chast::make_input_event(key)), got, &error),
           "key event round-trips");
     check(got.kind == chast::InputKind::Key && got.key.action == chast::KeyAction::Up,
           "key event keeps kind and action");
     check(got.key.hid_usage == 0xE6, "key event keeps the HID usage");
+    check(got.modifiers == chast::kModifierRightAlt, "key event keeps the modifier bitmap");
 
     auto rejects = [&](std::vector<uint8_t> payload, const char* what) {
         chast::InputEvent dropped;
@@ -110,6 +323,9 @@ void test_input_events() {
     std::vector<uint8_t> no_usage = body;
     no_usage[0] = static_cast<uint8_t>(chast::InputKind::Key);
     rejects(no_usage, "key event without a HID usage is rejected");
+    std::vector<uint8_t> unknown_modifiers = body;
+    unknown_modifiers[15] = 0x80;
+    rejects(unknown_modifiers, "unknown input state bits are rejected");
 }
 
 // The injector's whole path except SendInput itself, which is what the dry
@@ -120,6 +336,16 @@ void test_injector_dry_run() {
         std::unique_ptr<chast::InputInjector> injector;
     };
 
+    auto key = [](uint16_t usage, chast::KeyAction action, uint16_t modifiers) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Key;
+        event.key.hid_usage = usage;
+        event.key.action = action;
+        event.modifiers = modifiers;
+        return event;
+    };
+
+    // A coherent chord needs exactly one injection per event.
     {
         InjectorFixture fixture{chast::InputInjector::create(true, &error)};
         check(fixture.injector != nullptr, "the dry-run injector starts");
@@ -129,32 +355,130 @@ void test_injector_dry_run() {
             move.mouse.action = chast::MouseAction::Move;
             move.mouse.x = 40;
             move.mouse.y = 20;
+            move.modifiers = chast::kModifierLeftShift;
+            fixture.injector->submit(key(0xE1, chast::KeyAction::Down,
+                                         chast::kModifierLeftShift));
             fixture.injector->submit(move);
-
-            chast::InputEvent wheel;
-            wheel.kind = chast::InputKind::Mouse;
-            wheel.mouse.action = chast::MouseAction::Wheel;
-            wheel.mouse.y = -120;
-            fixture.injector->submit(wheel);
-
-            chast::InputEvent shift;
-            shift.kind = chast::InputKind::Key;
-            shift.key.hid_usage = 0xE1;
-            fixture.injector->submit(shift);
-            chast::InputEvent a;
-            a.kind = chast::InputKind::Key;
-            a.key.hid_usage = 0x04;
-            fixture.injector->submit(a);
-            a.key.action = chast::KeyAction::Up;
-            fixture.injector->submit(a);
-            shift.key.action = chast::KeyAction::Up;
-            fixture.injector->submit(shift);
+            fixture.injector->submit(key(0x04, chast::KeyAction::Down,
+                                         chast::kModifierLeftShift));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Up,
+                                         chast::kModifierLeftShift));
+            fixture.injector->submit(key(0xE1, chast::KeyAction::Up, 0));
 
             fixture.injector->stop();
             const chast::InputStats stats = fixture.injector->stats();
-            check(stats.applied == 6, "a balanced event batch is injected once each");
+            check(stats.applied == 5, "a coherent chord is injected once per event");
             check(stats.rejected == 0 && stats.failed == 0 && stats.dropped == 0,
-                  "a balanced event batch has no rejects, failures or drops");
+                  "a coherent chord has no rejects, failures or drops");
+        }
+    }
+
+    // A Shift Down that never arrived is synthesized from the next bitmap.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            fixture.injector->submit(key(0x04, chast::KeyAction::Down,
+                                         chast::kModifierLeftShift));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Up,
+                                         chast::kModifierLeftShift));
+            fixture.injector->stop();  // lifts the synthesized Shift
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 4, "a missing modifier press is synthesized once");
+        }
+    }
+
+    // A Shift Up that never arrived is lifted by the next empty bitmap.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            fixture.injector->submit(key(0xE1, chast::KeyAction::Down,
+                                         chast::kModifierLeftShift));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Down, 0));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Up, 0));
+            fixture.injector->stop();  // nothing is left held
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 4, "a missing modifier release is repaired once");
+        }
+    }
+
+    // AltGr arrives as Windows' synthetic left Ctrl plus Right Alt; the pair is
+    // folded into Right Alt, including the Ctrl release at the end.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            const uint16_t altgr = chast::kModifierLeftCtrl | chast::kModifierRightAlt;
+            fixture.injector->submit(key(0xE0, chast::KeyAction::Down,
+                                         chast::kModifierLeftCtrl));
+            fixture.injector->submit(key(0xE6, chast::KeyAction::Down, altgr));
+            fixture.injector->submit(key(0xE6, chast::KeyAction::Up,
+                                         chast::kModifierLeftCtrl));
+            fixture.injector->submit(key(0xE0, chast::KeyAction::Up, 0));
+            fixture.injector->stop();
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 4, "AltGr's synthetic Ctrl is folded away");
+            check(stats.rejected == 0 && stats.failed == 0 && stats.dropped == 0,
+                  "AltGr has no rejects, failures or drops");
+        }
+    }
+
+    // Lock keys are states, not held keys: the first event reports Caps on
+    // and the injector taps Caps once; later events carrying the same state
+    // do nothing, and switching back taps it again.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            fixture.injector->submit(key(0x04, chast::KeyAction::Down, chast::kLockCaps));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Up, chast::kLockCaps));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Down, 0));
+            fixture.injector->submit(key(0x04, chast::KeyAction::Up, 0));
+            fixture.injector->stop();
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.lock_toggles == 2, "a lock-state change taps the lock key once");
+            check(stats.applied == 8, "each lock tap is a press and a release");
+            check(stats.rejected == 0 && stats.failed == 0,
+                  "lock synchronization injects cleanly");
+        }
+    }
+
+    // A host already in the reported lock state is left alone.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            fixture.injector->submit(key(0xE0, chast::KeyAction::Down, 0));
+            fixture.injector->stop();
+            check(fixture.injector->stats().lock_toggles == 0,
+                  "an already matching lock state is left alone");
+        }
+    }
+
+    // InputRelease lifts what is held, in order, without stopping the thread.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            fixture.injector->submit(key(0xE0, chast::KeyAction::Down,
+                                         chast::kModifierLeftCtrl));
+            fixture.injector->release_held();
+            auto applied = [&] { return fixture.injector->stats().applied; };
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (applied() < 2 && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            check(applied() == 2, "a release request lifts the held modifier");
+        }
+    }
+
+    // Fast toggling of a held modifier stays balanced.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            for (int i = 0; i < 10; ++i) {
+                fixture.injector->submit(key(0xE1, chast::KeyAction::Down,
+                                             chast::kModifierLeftShift));
+                fixture.injector->submit(key(0xE1, chast::KeyAction::Up, 0));
+            }
+            fixture.injector->stop();
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 20, "rapid modifier toggling injects every transition once");
         }
     }
 
@@ -265,8 +589,12 @@ bool test_live_pointer() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    test_hello();
+    test_access_denied();
     test_hello_ack();
+    test_stream_info();
     test_input_events();
+    test_identity();
     test_scancodes();
     test_injector_dry_run();
     bool live = false;

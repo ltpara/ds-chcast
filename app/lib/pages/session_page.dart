@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +7,7 @@ import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
 
 import '../target.dart';
 import '../theme.dart';
+import '../trust_store.dart';
 import '../viewer_bridge.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/remote_view.dart';
@@ -20,12 +22,13 @@ class SessionPage extends StatefulWidget {
   State<SessionPage> createState() => _SessionPageState();
 }
 
-class _SessionPageState extends State<SessionPage> {
+class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   static const Duration _pollInterval = Duration(milliseconds: 200);
   static const Duration _hideDelay = Duration(seconds: 5);
 
   final FocusNode _focus = FocusNode(debugLabel: 'session');
   final FlutterGpuTextureRenderer _gpuTexture = FlutterGpuTextureRenderer();
+  final TrustStore _trustStore = TrustStore();
 
   Timer? _pollTimer;
   Timer? _hideTimer;
@@ -44,11 +47,26 @@ class _SessionPageState extends State<SessionPage> {
   bool _fullscreen = false;
   bool _reconnecting = false;
   bool _closing = false;
+  bool _controlEnabled = false;
+  double _wheelY = 0;
+  double _wheelX = 0;
+  int _heldButtons = 0;
+  final LinkedHashSet<int> _heldKeys = LinkedHashSet<int>();
   ViewFit _fit = ViewFit.adaptive;
+  // What the next connection asks the server for. Kept across reconnects so
+  // "重新连接" returns to the same output; kViewerDisplayAuto leaves the
+  // choice to the server.
+  int _display = kViewerDisplayAuto;
+  // The identity this page pins for the current connection. Empty only until
+  // the first contact, whose certificate is then remembered by the store.
+  String _pinnedFingerprint = '';
+
+  bool get _inputActive => _controlEnabled && _status.acceptsInput && _startError == null;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _startPolling();
     _starting = _start();
     unawaited(_starting);
@@ -56,11 +74,23 @@ class _SessionPageState extends State<SessionPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     _focus.dispose();
     unawaited(_shutdown());
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed || !_controlEnabled) {
+      return;
+    }
+    // Switching away means the key-ups for anything still held will never
+    // reach the page; lift them here and tell the host to drop whatever it
+    // still holds. Control stays on for when the window comes back.
+    _releaseRemoteInput();
   }
 
   Future<void> _start() async {
@@ -110,11 +140,21 @@ class _SessionPageState extends State<SessionPage> {
       return;
     }
     _textureId = id;
+    final String pin = await _trustStore.fingerprintFor(widget.target.label);
+    if (!mounted) {
+      await _stopSession();
+      return;
+    }
+    _pinnedFingerprint = pin;
     try {
       await ViewerBridge.start(
         host: widget.target.host,
         port: widget.target.port,
         gpuOutput: output,
+        display: _display,
+        fingerprint: pin,
+        allowUnverified: pin.isEmpty,
+        accessToken: widget.target.token,
       );
     } catch (_) {
       await _stopSession();
@@ -176,6 +216,12 @@ class _SessionPageState extends State<SessionPage> {
   }
 
   void _applyStatus(ViewerStatus status) {
+    // First contact: remember the identity the server just proved it holds,
+    // so every later connection to this endpoint is pinned to it.
+    if (_pinnedFingerprint.isEmpty && status.serverFingerprint.isNotEmpty) {
+      _pinnedFingerprint = status.serverFingerprint;
+      unawaited(_trustStore.trust(widget.target.label, status.serverFingerprint));
+    }
     final bool nowOver = status.isOver;
     if (status.hasFrame && !_sawFrame) {
       _sawFrame = true;
@@ -187,6 +233,9 @@ class _SessionPageState extends State<SessionPage> {
       _hideTimer?.cancel();
       _pollTimer?.cancel();
       _collapsed = false;
+    }
+    if (nowOver || !status.inputEnabled) {
+      _controlEnabled = false;
     }
     setState(() {
       _status = status;
@@ -272,6 +321,45 @@ class _SessionPageState extends State<SessionPage> {
 
   Future<void> _toggleFullscreen() => _setFullscreen(!_fullscreen);
 
+  /// The output the toolbar should mark. An explicit request is authoritative;
+  /// after "server chooses" the list is matched against the stream's origin
+  /// and size, which is how HelloAck identifies the captured output.
+  int get _activeDisplay {
+    if (_display != kViewerDisplayAuto) {
+      return _display;
+    }
+    return _status.streamedDisplayIndex ?? kViewerDisplayAuto;
+  }
+
+  Future<void> _switchDisplay(int display) async {
+    if (_reconnecting || display == _display) {
+      return;
+    }
+    _display = display;
+    await _reconnect();
+  }
+
+  /// True when the server proved a different identity than the one stored for
+  /// this endpoint. The native side refuses that connection; the card then
+  /// offers to replace the pin explicitly.
+  bool get _identityChanged =>
+      _pinnedFingerprint.isNotEmpty &&
+      _status.serverFingerprint.isNotEmpty &&
+      _status.serverFingerprint != _pinnedFingerprint;
+
+  Future<void> _trustNewIdentity() async {
+    final String fresh = _status.serverFingerprint;
+    if (fresh.isEmpty || _reconnecting) {
+      return;
+    }
+    await _trustStore.trust(widget.target.label, fresh);
+    if (!mounted) {
+      return;
+    }
+    _pinnedFingerprint = fresh;
+    await _reconnect();
+  }
+
   Future<void> _reconnect() async {
     if (_reconnecting) {
       return;
@@ -282,6 +370,11 @@ class _SessionPageState extends State<SessionPage> {
     });
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    if (_controlEnabled) {
+      // The session is about to be torn down; lift what this page still holds
+      // so the short window before Stop() does not leave a key down.
+      _releaseRemoteInput();
+    }
     await _starting;
     _teardown = null;
     await _stopSession();
@@ -294,6 +387,11 @@ class _SessionPageState extends State<SessionPage> {
       _over = false;
       _collapsed = false;
       _reconnecting = false;
+      _controlEnabled = false;
+      _wheelX = 0;
+      _wheelY = 0;
+      _heldButtons = 0;
+      _heldKeys.clear();
     });
     _startPolling();
     _starting = _start();
@@ -338,6 +436,29 @@ class _SessionPageState extends State<SessionPage> {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (_inputActive) {
+      if (event is KeyRepeatEvent) {
+        // The host generates its own auto-repeat; forwarding these would
+        // double the rate.
+        return KeyEventResult.handled;
+      }
+      if (event is KeyDownEvent || event is KeyUpEvent) {
+        // Flutter's usbHidUsage carries the usage page in the upper half
+        // (0x00070004 for A); the protocol wants the page-0x07 id alone.
+        final int raw = event.physicalKey.usbHidUsage;
+        final int usage = raw & 0xFFFF;
+        if ((raw >> 16) == 0x07 && usage > 0) {
+          if (event is KeyDownEvent) {
+            _heldKeys.add(usage);
+          } else {
+            _heldKeys.remove(usage);
+          }
+          unawaited(_sendKey(usage, event is KeyDownEvent));
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    }
     if (event is! KeyDownEvent) {
       return KeyEventResult.ignored;
     }
@@ -356,6 +477,144 @@ class _SessionPageState extends State<SessionPage> {
     return KeyEventResult.ignored;
   }
 
+  /// Remote-control shortcuts: while control is on every key goes to the
+  /// host, including Esc and F11. Local exit and fullscreen stay on the
+  /// toolbar, which the pointer reveals at the top edge.
+  void _toggleControl() {
+    if (!_status.acceptsInput) {
+      return;
+    }
+    if (_controlEnabled) {
+      // The host's injector only releases on teardown, so lifting a chord
+      // before dropping the gate keeps a toggle-off from leaving keys or a
+      // button down on the far side.
+      _releaseRemoteInput();
+    }
+    setState(() {
+      _controlEnabled = !_controlEnabled;
+      _wheelX = 0;
+      _wheelY = 0;
+    });
+    if (_controlEnabled) {
+      // The toolbar button may claim focus while it handles the tap; take it
+      // back once the frame settles so keys go to the host immediately.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _inputActive) {
+          _focus.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _releaseRemoteInput() {
+    for (final int usage in _heldKeys.toList().reversed) {
+      unawaited(_sendKey(usage, false));
+    }
+    _heldKeys.clear();
+    for (final int bit in <int>[
+      ViewerMouse.left,
+      ViewerMouse.right,
+      ViewerMouse.middle,
+      ViewerMouse.back,
+      ViewerMouse.forward,
+    ]) {
+      if (_heldButtons & bit != 0) {
+        _sendMouse(ViewerMouse.buttonUp, buttons: bit);
+      }
+    }
+    _heldButtons = 0;
+    // Even if an Up above was lost, or the host saw a press this page never
+    // recorded, this lifts whatever it still holds.
+    unawaited(_guardSend(ViewerBridge.releaseInput()));
+  }
+
+  Future<void> _guardSend(Future<bool> send) async {
+    try {
+      await send;
+    } on PlatformException {
+      // A closing session rejects events; the status poll reports why.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  /// Modifier keys held and locks on right now, in the bit layout
+  /// [ViewerModifier] and [ViewerLock] share with the host.
+  int _inputState() {
+    final HardwareKeyboard keyboard = HardwareKeyboard.instance;
+    return modifierBitsFor(keyboard.physicalKeysPressed) |
+        lockBitsFor(keyboard.lockModesEnabled);
+  }
+
+  void _sendMouse(int action, {int buttons = 0, int x = 0, int y = 0}) {
+    unawaited(_guardSend(ViewerBridge.sendMouse(
+      action: action,
+      buttons: buttons,
+      x: x,
+      y: y,
+      modifiers: _inputState(),
+    )));
+  }
+
+  Future<void> _sendKey(int usage, bool down) {
+    return _guardSend(ViewerBridge.sendKey(
+      usage: usage,
+      down: down,
+      modifiers: _inputState(),
+    ));
+  }
+
+  int _desktopX(Offset frame) {
+    final int left = _status.originX;
+    final int width = _status.width > 0 ? _status.width : 1;
+    return (left + frame.dx).round().clamp(left, left + width - 1).toInt();
+  }
+
+  int _desktopY(Offset frame) {
+    final int top = _status.originY;
+    final int height = _status.height > 0 ? _status.height : 1;
+    return (top + frame.dy).round().clamp(top, top + height - 1).toInt();
+  }
+
+  void _onPointerHover(Offset frame, int buttons) {
+    _sendMouse(ViewerMouse.move, buttons: buttons, x: _desktopX(frame), y: _desktopY(frame));
+  }
+
+  void _onPointerMove(Offset frame, int buttons) {
+    _sendMouse(ViewerMouse.move, buttons: buttons, x: _desktopX(frame), y: _desktopY(frame));
+  }
+
+  void _onPointerButton(Offset frame, int button, bool down) {
+    if (down) {
+      _heldButtons |= button;
+    } else {
+      _heldButtons &= ~button;
+    }
+    _sendMouse(
+      down ? ViewerMouse.buttonDown : ViewerMouse.buttonUp,
+      buttons: button,
+    );
+  }
+
+  void _onPointerScroll(Offset frame, Offset delta) {
+    _wheelY += delta.dy;
+    _wheelX += delta.dx;
+    final int stepsY =
+        (_wheelY / kViewerScrollPixelsPerNotch).truncate().clamp(-10, 10).toInt();
+    if (stepsY != 0) {
+      _wheelY -= stepsY * kViewerScrollPixelsPerNotch;
+      // Flutter's positive dy scrolls down; Windows WHEEL_DELTA is positive
+      // when the wheel turns up (away from the user).
+      _sendMouse(ViewerMouse.wheel, y: -stepsY * kViewerWheelDelta);
+    }
+    final int stepsX =
+        (_wheelX / kViewerScrollPixelsPerNotch).truncate().clamp(-10, 10).toInt();
+    if (stepsX != 0) {
+      _wheelX -= stepsX * kViewerScrollPixelsPerNotch;
+      _sendMouse(ViewerMouse.wheelHorizontal, x: stepsX * kViewerWheelDelta);
+    }
+  }
+
   String get _stateText {
     switch (_status.state) {
       case ViewerState.idle:
@@ -372,9 +631,17 @@ class _SessionPageState extends State<SessionPage> {
     }
   }
 
+  /// True when the connection was refused by the host's access control. The
+  /// token lives on the home page, so the card sends the user back to edit it
+  /// instead of offering another attempt with the same one.
+  bool get _denied => _startError == null && _status.denial != 0;
+
   String get _overTitle {
     if (_startError != null) {
       return '无法发起连接';
+    }
+    if (_denied) {
+      return '服务端拒绝了连接';
     }
     if (_status.state == ViewerState.failed) {
       return '连接中断';
@@ -385,6 +652,15 @@ class _SessionPageState extends State<SessionPage> {
   String get _overDetail {
     if (_startError != null) {
       return _startError!;
+    }
+    final String denial = accessDenialText(_status.denial);
+    if (denial.isNotEmpty) {
+      // The server's own reason follows the viewer's wording; it is what a
+      // host operator sees in their log, so it helps to compare.
+      const String prefix = 'handshake: permission denied: ';
+      final String reason =
+          _status.error.startsWith(prefix) ? _status.error.substring(prefix.length) : '';
+      return reason.isEmpty ? denial : '$denial\n\n服务端说明：$reason';
     }
     if (_status.error.isNotEmpty) {
       return _status.error;
@@ -419,12 +695,18 @@ class _SessionPageState extends State<SessionPage> {
                 if (hasFrame && _textureId >= 0)
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onDoubleTap: _toggleFullscreen,
+                    onDoubleTap: _inputActive ? null : _toggleFullscreen,
                     child: RemoteView(
                       textureId: _textureId,
                       videoWidth: _status.width,
                       videoHeight: _status.height,
                       fit: _fit,
+                      captureInput: _inputActive,
+                      onHover: _inputActive ? _onPointerHover : null,
+                      onMove: _inputActive ? _onPointerMove : null,
+                      onButton: _inputActive ? _onPointerButton : null,
+                      onScroll: _inputActive ? _onPointerScroll : null,
+                      onFocusRequested: _focus.requestFocus,
                     ),
                   )
                 else
@@ -445,6 +727,12 @@ class _SessionPageState extends State<SessionPage> {
                         fullscreen: _fullscreen,
                         statsVisible: _statsVisible,
                         fit: _fit,
+                        controlEnabled: _controlEnabled,
+                        inputAvailable: _status.acceptsInput,
+                        displays: _status.displays,
+                        activeDisplay: _activeDisplay,
+                        onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
+                        onToggleControl: _toggleControl,
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
                         onToggleFullscreen: _toggleFullscreen,
@@ -460,6 +748,25 @@ class _SessionPageState extends State<SessionPage> {
                     top: 10,
                     right: 10,
                     child: StatsOverlay(status: _status, target: widget.target),
+                  ),
+                if (hasFrame && !showOverlay && _inputActive)
+                  Positioned(
+                    left: 10,
+                    bottom: 10,
+                    child: IgnorePointer(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: const Text(
+                          '远程键鼠已开启 · Esc 与 F11 已转发，工具栏可退出',
+                          style: TextStyle(color: Colors.white54, fontSize: 10.5),
+                        ),
+                      ),
+                    ),
                   ),
               ],
             ),
@@ -552,7 +859,9 @@ class _SessionPageState extends State<SessionPage> {
                   shape: BoxShape.circle,
                 ),
                 child: Icon(
-                  failed ? Icons.link_off_rounded : Icons.videocam_off_rounded,
+                  _denied
+                      ? Icons.lock_outline_rounded
+                      : (failed ? Icons.link_off_rounded : Icons.videocam_off_rounded),
                   size: 23,
                   color: failed ? Colors.redAccent : kAccentBright,
                 ),
@@ -572,6 +881,48 @@ class _SessionPageState extends State<SessionPage> {
                 textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.white54, fontSize: 12.5, height: 1.5),
               ),
+              if (_identityChanged) ...<Widget>[
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFB74D).withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFFFB74D).withValues(alpha: 0.32)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      const Row(
+                        children: <Widget>[
+                          Icon(Icons.shield_outlined, size: 14, color: Color(0xFFFFB74D)),
+                          SizedBox(width: 6),
+                          Text(
+                            '服务器证书指纹已变化',
+                            style: TextStyle(
+                              color: Color(0xFFFFCC80),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '已固定 ${shortenFingerprint(_pinnedFingerprint)} · '
+                        '当前 ${shortenFingerprint(_status.serverFingerprint)}',
+                        style: const TextStyle(color: Colors.white54, fontSize: 11, height: 1.4),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        '对端可能重装或换了证书。确认这是同一台机器后再信任；'
+                        '否则请不要继续，避免连到冒充的主机。',
+                        style: TextStyle(color: Colors.white38, fontSize: 11, height: 1.4),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (_status.received > 0) ...<Widget>[
                 const SizedBox(height: 12),
                 Container(height: 1, color: Colors.white12),
@@ -583,56 +934,79 @@ class _SessionPageState extends State<SessionPage> {
                 ),
               ],
               const SizedBox(height: 20),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: SizedBox(
-                      height: 38,
-                      child: OutlinedButton(
-                        onPressed: _leave,
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white70,
-                          side: const BorderSide(color: Colors.white24),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
+              if (_denied)
+                SizedBox(
+                  width: double.infinity,
+                  height: 38,
+                  child: FilledButton(
+                    onPressed: _leave,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: kAccent,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                    child: const Text('返回并修改令牌'),
+                  ),
+                )
+              else
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: SizedBox(
+                        height: 38,
+                        child: OutlinedButton(
+                          onPressed: _leave,
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white70,
+                            side: const BorderSide(color: Colors.white24),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            textStyle: const TextStyle(fontSize: 13),
                           ),
-                          textStyle: const TextStyle(fontSize: 13),
+                          child: const Text('返回'),
                         ),
-                        child: const Text('返回'),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: SizedBox(
-                      height: 38,
-                      child: FilledButton(
-                        onPressed: _reconnecting ? null : _reconnect,
-                        style: FilledButton.styleFrom(
-                          backgroundColor: kAccent,
-                          foregroundColor: Colors.white,
-                          disabledBackgroundColor: kAccent.withValues(alpha: 0.5),
-                          elevation: 0,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: SizedBox(
+                        height: 38,
+                        child: FilledButton(
+                          onPressed: _reconnecting
+                              ? null
+                              : (_identityChanged
+                                  ? () => unawaited(_trustNewIdentity())
+                                  : _reconnect),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: kAccent,
+                            foregroundColor: Colors.white,
+                            disabledBackgroundColor: kAccent.withValues(alpha: 0.5),
+                            elevation: 0,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
                           ),
-                          textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                          child: _reconnecting
+                              ? const SizedBox(
+                                  width: 15,
+                                  height: 15,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                  ),
+                                )
+                              : Text(_identityChanged ? '信任并重新连接' : '重新连接'),
                         ),
-                        child: _reconnecting
-                            ? const SizedBox(
-                                width: 15,
-                                height: 15,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                                ),
-                              )
-                            : const Text('重新连接'),
                       ),
                     ),
-                  ),
-                ],
-              ),
+                  ],
+                ),
             ],
           ),
         ),

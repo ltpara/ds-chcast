@@ -1,15 +1,20 @@
 class ConnectTarget {
-  const ConnectTarget(this.host, this.port);
+  const ConnectTarget(this.host, this.port, {this.token = ''});
 
   final String host;
   final int port;
+
+  /// The server's access token for this connection; empty when the host runs
+  /// without one. Not part of [label]: a one-time token is not an address and
+  /// does not belong in the recent list or the trust store.
+  final String token;
 
   String get label => host.contains(':') ? '[$host]:$port' : '$host:$port';
 }
 
 /// Parses "host", "host:port" or "[ipv6]:port". A missing port uses the chast
 /// default, 4433.
-ConnectTarget? parseConnectTarget(String input) {
+ConnectTarget? parseConnectTarget(String input, {String token = ''}) {
   final text = input.trim();
   if (text.isEmpty) {
     return null;
@@ -40,5 +45,5 @@ ConnectTarget? parseConnectTarget(String input) {
   if (host.isEmpty || port <= 0 || port > 65535) {
     return null;
   }
-  return ConnectTarget(host, port);
+  return ConnectTarget(host, port, token: token.trim());
 }

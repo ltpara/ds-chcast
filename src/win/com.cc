@@ -18,6 +18,7 @@ std::string to_string(Status status) {
         case Status::Unsupported: return "unsupported";
         case Status::Unavailable: return "unavailable";
         case Status::InvalidCall: return "invalid call";
+        case Status::PermissionDenied: return "permission denied";
         case Status::NoFrame: return "no frame captured yet";
         case Status::CaptureFailed: return "capture failed";
     }

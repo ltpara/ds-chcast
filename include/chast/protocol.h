@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 1.
+// The chast wire protocol, version 7.
 //
 // One QUIC connection carries two things:
 //
@@ -30,7 +30,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 2;
+inline constexpr uint16_t kProtocolVersion = 7;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -48,6 +48,22 @@ enum class ControlType : uint16_t {
     Stats = 4,
     Bye = 5,
     InputEvent = 6,
+    // The viewer is giving up the keyboard and pointer (control toggled off,
+    // the window lost focus, the app is closing). The server lifts everything
+    // the injector still holds; no payload.
+    InputRelease = 7,
+    // The captured output's parameters changed mid-session (resolution,
+    // rotation, origin, codec or rate control) after a duplication rebuild.
+    // The payload is exactly the HelloAck payload, so the viewer can replace
+    // everything it learned in the handshake. The video stream continues on
+    // the same QUIC stream with the same sequence numbers; the sender forces
+    // an IDR so a viewer that has to recreate its decoder can start there.
+    StreamInfo = 8,
+    // The server refused the Hello (bad or already used access token, or the
+    // host declined the connection). Payload: AccessDenial code, reason
+    // length, reason. Sent before the server closes the connection, so the
+    // viewer can show why instead of a generic transport error.
+    AccessDenied = 9,
 };
 
 // ----- input -----
@@ -57,7 +73,9 @@ enum class ControlType : uint16_t {
 // virtual-desktop space (pixels), so the server never needs to know which
 // output the viewer is looking at and a later multi-display UI needs no wire
 // change. Keys travel as USB HID usage ids: layout independent, and mapped to
-// scan codes on the injecting side.
+// scan codes on the injecting side. Every event also carries the modifier
+// keys held at that moment, which lets the injecting side repair a lost key
+// transition instead of trusting that every Down has a matching Up.
 
 enum class InputKind : uint8_t {
     Mouse = 1,
@@ -107,10 +125,45 @@ struct KeyEvent {
     uint16_t hid_usage = 0;
 };
 
+// Bit positions in InputEvent::modifiers. Bits 0..7 are the modifier keys on
+// HID usage page 0x07 (0xE0..0xE7) in that order; every event, pointer or
+// keyboard, carries the set the client saw held at that moment. The injector
+// reconciles its own held set to this bitmap, so a lost press or release (a
+// key-up that never arrives because the viewer lost focus, say) cannot leave
+// the host keyboard out of sync.
+//
+// Bits 8..10 carry the client's lock-key state. Locks are toggles rather than
+// held keys, so the injector compares them with the host's state and taps the
+// lock key once when they disagree; that is what makes typed text match the
+// viewer's expectations even when the two sides started with different Caps,
+// Num or Scroll state.
+enum ModifierBit : uint16_t {
+    kModifierLeftCtrl = 1u << 0,
+    kModifierLeftShift = 1u << 1,
+    kModifierLeftAlt = 1u << 2,
+    kModifierLeftGui = 1u << 3,
+    kModifierRightCtrl = 1u << 4,
+    kModifierRightShift = 1u << 5,
+    kModifierRightAlt = 1u << 6,  // AltGr on layouts that have it
+    kModifierRightGui = 1u << 7,
+    kModifierMask = 0x00FFu,
+
+    kLockCaps = 1u << 8,
+    kLockNum = 1u << 9,
+    kLockScroll = 1u << 10,
+    kLockStateMask = 0x0700u,
+};
+
+// Everything InputEvent::modifiers may carry.
+inline constexpr uint16_t kInputStateMask = 0x07FFu;
+
 struct InputEvent {
     InputKind kind = InputKind::Mouse;
     MouseEvent mouse;
     KeyEvent key;
+    // Modifier keys held and lock keys on, when the event happened; see
+    // ModifierBit and LockStateBit.
+    uint16_t modifiers = 0;
 };
 
 struct FrameHeader {
@@ -128,12 +181,37 @@ struct FrameHeader {
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 
+// One attached output, as the server sees it. `rect` is the output's
+// virtual-desktop rect (the orientation the user sees, so a rotated panel
+// reports its rotated width and height). The list order is the server's
+// display index, which is what Hello asks for when the viewer picks an output.
+struct DisplayDescription {
+    std::string name;  // "\\.\DISPLAY1", UTF-8
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t right = 0;
+    int32_t bottom = 0;
+    uint16_t rotation_degrees = 0;  // 0/90/180/270
+    bool primary = false;
+};
+
+// Hello display index meaning "whatever the server captures by default". The
+// server's fallback is its own configuration (primary when unset).
+inline constexpr uint16_t kDisplayAuto = 0xFFFF;
+// Upper bound on a HelloAck display list; also the valid range of a Hello
+// display index. A machine with more outputs than this is not something the
+// viewer UI could present anyway, and the cap bounds the work a malformed
+// HelloAck can cause.
+inline constexpr uint16_t kMaxDisplayCount = 64;
+
 // What the server announces in HelloAck. `encoder` is informational (the VPL
 // implementation that won the tier ladder); `codec` is what the video stream
 // actually contains. `origin_x`/`origin_y` are the captured output's top-left
 // in virtual-desktop pixels, which the viewer adds to the frame-space pointer
 // position before sending it back. `input_enabled` mirrors the server's gate:
 // when false the viewer must not send InputEvents (they would be dropped).
+// `displays` lists every attached output; the one being streamed is the entry
+// whose rect starts at the origin and is `width` x `height` pixels.
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
     uint16_t width = 0;
@@ -144,6 +222,7 @@ struct ServerInfo {
     int32_t origin_y = 0;
     bool input_enabled = false;
     std::string encoder;
+    std::vector<DisplayDescription> displays;
 };
 
 // What the receiver reports before it closes the connection.
@@ -175,10 +254,38 @@ void encode_frame_header(const FrameHeader& header, uint8_t out[kFrameHeaderSize
 bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
                          std::string* error);
 
-std::vector<uint8_t> make_hello();
-bool parse_hello(const std::vector<uint8_t>& payload, std::string* error);
+// Hello asks the server to stream one display: `display` is an index into the
+// HelloAck display list from a previous session, or kDisplayAuto. The server
+// answers with the display it actually captured, which also fixes origin_x /
+// origin_y for the viewer's pointer mapping.
+//
+// `access_token` is the passphrase the server was started with, empty when it
+// accepts connections without one. It travels inside the TLS-authenticated
+// QUIC connection, never as plaintext, and the server compares it in constant
+// time. A one-time token is consumed by the first accepted handshake.
+inline constexpr size_t kMaxAccessTokenLength = 128;
+inline constexpr size_t kMaxAccessDenialReason = 512;
+
+// Why the server refused a Hello.
+enum class AccessDenial : uint8_t {
+    InvalidToken = 1,  // no token, or one that does not match
+    TokenUsed = 2,     // the one-time token was already spent
+    Declined = 3,      // the host operator said no
+};
+
+std::vector<uint8_t> make_hello(uint16_t display = kDisplayAuto,
+                                const std::string& access_token = {});
+bool parse_hello(const std::vector<uint8_t>& payload, uint16_t& display,
+                 std::string& access_token, std::string* error);
+// The server's refusal of a Hello. The viewer shows `reason` to the user.
+std::vector<uint8_t> make_access_denied(AccessDenial code, const std::string& reason);
+bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code,
+                         std::string& reason, std::string* error);
 std::vector<uint8_t> make_hello_ack(const ServerInfo& info);
 bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std::string* error);
+// A mid-session replacement for the HelloAck parameters. Same payload; the
+// parser above reads it.
+std::vector<uint8_t> make_stream_info(const ServerInfo& info);
 std::vector<uint8_t> make_stats(const ClientStats& stats);
 bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::string* error);
 std::vector<uint8_t> make_input_event(const InputEvent& event);
