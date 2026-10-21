@@ -161,3 +161,32 @@ func TestAutoFallbackDoesNotFlap(t *testing.T) {
 		t.Fatalf("a late direct packet switched back to direct")
 	}
 }
+
+func TestPathInfoReportsInitialPathAndFallback(t *testing.T) {
+	direct := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001}
+	relay := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002}
+	var got []PathInfo
+	v := &ViewerAgent{
+		cfg: ViewerConfig{
+			Mode:   ModeAuto,
+			OnPath: func(info PathInfo) { got = append(got, info) },
+		},
+		ctx:    context.Background(),
+		direct: direct,
+		remote: direct,
+		relay:  relay,
+		log:    quietLogger(),
+	}
+	v.reportPath()
+	if len(got) != 1 || got[0].Path != "direct" || got[0].Remote != direct.String() {
+		t.Fatalf("initial path = %+v", got)
+	}
+	v.onDirectTimeout()
+	if len(got) != 2 || got[1].Path != "relay" || got[1].Remote != relay.String() {
+		t.Fatalf("paths after fallback = %+v", got)
+	}
+	v.onDirectPacket(direct)
+	if len(got) != 2 {
+		t.Fatalf("a late direct packet reported another path change: %+v", got)
+	}
+}

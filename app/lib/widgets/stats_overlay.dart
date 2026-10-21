@@ -9,10 +9,15 @@ class StatsOverlay extends StatelessWidget {
     super.key,
     required this.status,
     required this.target,
+    this.path = '',
   });
 
   final ViewerStatus status;
   final ConnectTarget target;
+
+  /// "直连"/"中继" when a tunnel agent is in front of the QUIC connection;
+  /// empty for a plain host:port connection.
+  final String path;
 
   @override
   Widget build(BuildContext context) {
@@ -82,6 +87,7 @@ class StatsOverlay extends StatelessWidget {
           Container(height: 1, color: Colors.white12),
           const SizedBox(height: 7),
           _row('链路', target.label),
+          if (path.isNotEmpty) _row('路径', path),
           _row(
             '身份',
             status.serverFingerprint.isEmpty

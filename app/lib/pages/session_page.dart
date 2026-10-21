@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
 
+import '../server_settings.dart';
 import '../target.dart';
 import '../theme.dart';
 import '../trust_store.dart';
+import '../tunnel_agent.dart';
 import '../viewer_bridge.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/remote_view.dart';
@@ -60,6 +62,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // The identity this page pins for the current connection. Empty only until
   // the first contact, whose certificate is then remembered by the store.
   String _pinnedFingerprint = '';
+  // One viewer tunnel for the lifetime of this page; reconnects reuse it so
+  // the host sees a stable NAT mapping and the selected path survives.
+  TunnelAgent? _tunnel;
+  Future<TunnelAgent>? _tunnelStarting;
 
   bool get _inputActive => _controlEnabled && _status.acceptsInput && _startError == null;
 
@@ -115,11 +121,56 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           setState(() => _startError = error.message ?? error.code);
         }
         return;
+      } on TunnelException catch (error) {
+        if (mounted) {
+          setState(() => _startError = '无法通过连接服务打开设备：${error.message}');
+        }
+        return;
       }
     }
   }
 
+  /// Starts the viewer agent on first use. A reconnect keeps the same agent,
+  /// so its direct/relay decision and the host's NAT mapping do not reset.
+  Future<TunnelAgent?> _ensureTunnel() async {
+    if (!widget.target.viaServer) {
+      return null;
+    }
+    final TunnelAgent? existing = _tunnel;
+    if (existing != null) {
+      if (existing.running) {
+        return existing;
+      }
+      // The agent died while the session was up; a reconnect needs a fresh
+      // process and a fresh loopback port.
+      _tunnel = null;
+      _tunnelStarting = null;
+      unawaited(existing.stop());
+    }
+    _tunnelStarting ??= TunnelAgent.start(
+      server: ServerSettings(
+        url: widget.target.server,
+        mode: widget.target.mode,
+      ),
+      hostId: widget.target.hostId,
+    );
+    try {
+      final TunnelAgent agent = await _tunnelStarting!;
+      _tunnel = agent;
+      _tunnelStarting = null;
+      return agent;
+    } catch (_) {
+      _tunnelStarting = null;
+      rethrow;
+    }
+  }
+
   Future<void> _startOnce() async {
+    final TunnelAgent? tunnel = await _ensureTunnel();
+    if (!mounted) {
+      await _stopSession();
+      return;
+    }
     final int id = await _gpuTexture.registerTexture() ?? -1;
     int output = 0;
     if (id >= 0) {
@@ -140,7 +191,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return;
     }
     _textureId = id;
-    final String pin = await _trustStore.fingerprintFor(widget.target.label);
+    final String pin = await _trustStore.fingerprintFor(widget.target.trustKey);
     if (!mounted) {
       await _stopSession();
       return;
@@ -148,8 +199,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _pinnedFingerprint = pin;
     try {
       await ViewerBridge.start(
-        host: widget.target.host,
-        port: widget.target.port,
+        host: tunnel?.host ?? widget.target.host,
+        port: tunnel?.port ?? widget.target.port,
         gpuOutput: output,
         display: _display,
         fingerprint: pin,
@@ -220,7 +271,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // so every later connection to this endpoint is pinned to it.
     if (_pinnedFingerprint.isEmpty && status.serverFingerprint.isNotEmpty) {
       _pinnedFingerprint = status.serverFingerprint;
-      unawaited(_trustStore.trust(widget.target.label, status.serverFingerprint));
+      unawaited(_trustStore.trust(widget.target.trustKey, status.serverFingerprint));
     }
     final bool nowOver = status.isOver;
     if (status.hasFrame && !_sawFrame) {
@@ -352,7 +403,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (fresh.isEmpty || _reconnecting) {
       return;
     }
-    await _trustStore.trust(widget.target.label, fresh);
+    await _trustStore.trust(widget.target.trustKey, fresh);
     if (!mounted) {
       return;
     }
@@ -407,6 +458,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _starting;
     _teardown = null;
     await _stopSession();
+    await _tunnel?.stop();
+    _tunnel = null;
+    _tunnelStarting = null;
   }
 
   Future<void> _leave() async {
@@ -615,6 +669,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Path selected by the embedded agent, empty for a direct connection that
+  /// does not use the connection service.
+  String get _tunnelPath {
+    if (!widget.target.viaServer) {
+      return '';
+    }
+    return _tunnel?.pathLabel ?? '连接中';
+  }
+
   String get _stateText {
     switch (_status.state) {
       case ViewerState.idle:
@@ -747,7 +810,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   Positioned(
                     top: 10,
                     right: 10,
-                    child: StatsOverlay(status: _status, target: widget.target),
+                    child: StatsOverlay(
+                      status: _status,
+                      target: widget.target,
+                      path: _tunnelPath,
+                    ),
                   ),
                 if (hasFrame && !showOverlay && _inputActive)
                   Positioned(
@@ -807,6 +874,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 letterSpacing: 0.3,
               ),
             ),
+            if (_tunnelPath.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 4),
+              Text(
+                '隧道 · $_tunnelPath',
+                style: const TextStyle(
+                  color: Colors.white30,
+                  fontSize: 11,
+                  letterSpacing: 0.3,
+                ),
+              ),
+            ],
             if (streaming && _status.width > 0) ...<Widget>[
               const SizedBox(height: 10),
               Text(

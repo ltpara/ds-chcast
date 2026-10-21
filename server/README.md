@@ -184,6 +184,24 @@ chast-quic connect 127.0.0.1:24434 --token <token>
 `--mode relay` 强制中继，`--mode direct` 只走打洞直连，用于分别验证两条路径。
 `chast-tunnel host --help` / `viewer --help` 列出全部参数。
 
+## 查看者集成（Flutter）
+
+M4.1 起 Flutter 查看者不再要求手工启动查看者代理：会话页启动随包的
+`chast-tunnel.exe viewer`，代理监听 `127.0.0.1:0`，把系统分配的 UDP 端口经
+stdout 事件交回，`ViewerEngine` 再连接该端口。代理默认从查看者可执行文件
+同目录查找，可用 `CHAST_TUNNEL` 环境变量指定其他路径。
+
+stdout 是面向嵌入方的 JSON Lines 事件流（诊断仍在 stderr）：
+
+```json
+{"event":"ready","listen":"127.0.0.1:52144","host":"devbox","path":"connecting","direct":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
+{"event":"path","path":"direct","remote":"198.51.100.7:51234","direct":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
+{"event":"path","path":"relay","remote":"203.0.113.5:41007","direct":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
+```
+
+`ready` 表示本地监听已就绪，`path` 在首次选定路径或 `auto` 回退到中继时输出。
+证书指纹 pin 使用逻辑身份 `server:<url>/<id>`，不是代理的 loopback 端口。
+
 ## 验证记录
 
 2026-10-21，在单机回环上跑通完整链路：`chast-server` + `chast-tunnel host` +
@@ -205,6 +223,13 @@ chast-quic connect 127.0.0.1:24434 --token <token>
   `internal/agent` 的三种模式；其中 agent 测试用真实 UDP 回显和进程内服务器，
   分别断言直连路径不经过中继、强制中继路径双向转发、`auto` 在直连失败后回退，
   以及未知主机、错误密钥、第二查看者 `busy` 等失败路径。
+
+2026-10-22，M4.1 的 Flutter 集成在同样的单机回环上复测：Dart `TunnelAgent`
+启动 `chast-tunnel viewer --listen 127.0.0.1:0`，`chast-quic connect` 连接
+`ready` 事件给出的本地端口。直连模式 `received=201 decoded=201 digest=A188ABD0B85F082B`，
+中继计数全 0；强制中继 `received=202 decoded=202 digest=E092051892076F56`，
+中继统计 `to_host_bytes:18054, to_viewer_bytes:2575942`。两次均无 CRC、解码、
+序号或协议错误，代理报告的最终路径分别为 `direct` 与 `relay`。
 
 环境边界：本机只有一张网卡、无法制造真实 NAT，因此上述直连走的是回环地址，
 **没有验证跨网锥形 NAT 的打洞**；对称 NAT 下直连失败后切中继的行为由单元测试

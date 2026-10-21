@@ -26,6 +26,19 @@ type ViewerConfig struct {
 	Mode          string
 	DirectTimeout time.Duration
 	Logger        *slog.Logger
+	// OnPath receives every direct/relay change, starting with the initial
+	// path once StartViewer has resolved the host. It is called from the read
+	// or timer goroutine, so it must not block.
+	OnPath func(PathInfo)
+}
+
+// PathInfo is the viewer agent's current forwarding path. Path is "direct",
+// "relay" or "connecting" while the first direct probe is still unanswered.
+type PathInfo struct {
+	Path   string `json:"path"`
+	Remote string `json:"remote,omitempty"`
+	Direct string `json:"direct,omitempty"`
+	Relay  string `json:"relay,omitempty"`
 }
 
 type ViewerAgent struct {
@@ -41,16 +54,17 @@ type ViewerAgent struct {
 	direct *net.UDPAddr
 	relay  *net.UDPAddr
 
-	mu         sync.Mutex
-	remote     *net.UDPAddr
-	local      *net.UDPAddr
-	latched    bool
-	timer      *time.Timer
-	timerArmed bool
-	directOK   atomic.Bool
-	punched    atomic.Bool
-	fellBack   bool
-	nonce      string
+	mu          sync.Mutex
+	remote      *net.UDPAddr
+	local       *net.UDPAddr
+	latched     bool
+	timer       *time.Timer
+	timerArmed  bool
+	directOK    atomic.Bool
+	punched     atomic.Bool
+	fellBack    bool
+	nonce       string
+	lastPathKey string
 }
 
 func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error) {
@@ -161,10 +175,55 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		path = "direct " + addrText(v.direct)
 	}
 	v.log.Info("viewer agent listening", "on", conn.LocalAddr().String(), "path", path)
+	v.reportPath()
 	return v, nil
 }
 
 func (v *ViewerAgent) LocalAddr() net.Addr { return v.conn.LocalAddr() }
+
+// PathInfo returns a snapshot of the forwarding path. It is safe to call from
+// the embedding application while the agent keeps running.
+func (v *ViewerAgent) PathInfo() PathInfo {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.pathLocked()
+}
+
+func (v *ViewerAgent) pathLocked() PathInfo {
+	path := "connecting"
+	if v.remote != nil {
+		if v.relay != nil && sameAddr(v.remote, v.relay) {
+			path = "relay"
+		} else {
+			path = "direct"
+		}
+	}
+	return PathInfo{
+		Path:   path,
+		Remote: addrValue(v.remote),
+		Direct: addrValue(v.direct),
+		Relay:  addrValue(v.relay),
+	}
+}
+
+func (v *ViewerAgent) reportPath() {
+	v.mu.Lock()
+	info := v.pathLocked()
+	key := info.Path + "|" + info.Remote
+	changed := key != v.lastPathKey
+	v.lastPathKey = key
+	v.mu.Unlock()
+	if changed && v.cfg.OnPath != nil {
+		v.cfg.OnPath(info)
+	}
+}
+
+func addrValue(a *net.UDPAddr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
 
 func (v *ViewerAgent) Close() {
 	v.mu.Lock()
@@ -276,17 +335,17 @@ func (v *ViewerAgent) readLoop() {
 			continue
 		}
 		// Everything else on a loopback-only listener is the local QUIC client.
+		// A reconnect creates a new local source port, so the newest loopback
+		// sender always becomes the client instead of being ignored forever.
 		v.mu.Lock()
-		if v.local == nil {
+		if v.local == nil || !sameAddr(v.local, src) {
 			v.local = cloneAddr(src)
 			if firstLocal {
 				firstLocal = false
 				v.log.Info("local QUIC client attached", "from", src.String())
+			} else {
+				v.log.Info("local QUIC client switched", "from", src.String())
 			}
-		} else if !sameAddr(v.local, src) {
-			v.mu.Unlock()
-			v.log.Warn("ignoring a second local client", "from", src.String())
-			continue
 		}
 		remote := cloneAddr(v.remote)
 		if v.cfg.Mode == ModeAuto && !v.timerArmed && remote != nil && !sameAddr(remote, v.relay) {
@@ -304,36 +363,36 @@ func (v *ViewerAgent) readLoop() {
 func (v *ViewerAgent) onDirectPacket(src *net.UDPAddr) {
 	v.directOK.Store(true)
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	if !sameAddr(v.direct, src) {
 		v.direct = cloneAddr(src)
 	}
-	if v.cfg.Mode == ModeRelay || v.fellBack {
-		return
+	if v.cfg.Mode != ModeRelay && !v.fellBack {
+		if !v.latched || !sameAddr(v.remote, v.direct) {
+			v.log.Info("direct path answered", "host", src.String())
+		}
+		v.latched = true
+		v.remote = cloneAddr(src)
+		if v.timer != nil {
+			v.timer.Stop()
+		}
 	}
-	if !v.latched || !sameAddr(v.remote, v.direct) {
-		v.log.Info("direct path answered", "host", src.String())
-	}
-	v.latched = true
-	v.remote = cloneAddr(src)
-	if v.timer != nil {
-		v.timer.Stop()
-	}
+	v.mu.Unlock()
+	v.reportPath()
 }
 
 func (v *ViewerAgent) onDirectTimeout() {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.latched || v.ctx.Err() != nil || v.relay == nil {
-		return
-	}
-	if v.remote == nil || sameAddr(v.remote, v.relay) {
+	if v.latched || v.ctx.Err() != nil || v.relay == nil ||
+		v.remote == nil || sameAddr(v.remote, v.relay) {
+		v.mu.Unlock()
 		return
 	}
 	v.latched = true
 	v.fellBack = true
 	v.remote = cloneAddr(v.relay)
 	v.log.Warn("direct path did not answer; using relay", "relay", v.relay.String())
+	v.mu.Unlock()
+	v.reportPath()
 }
 
 func (v *ViewerAgent) handleControl(data []byte) {
@@ -369,6 +428,7 @@ func (v *ViewerAgent) handleControl(data []byte) {
 	case wire.TypeBusy:
 		v.log.Warn("relay is busy", "error", msg.Error)
 	}
+	v.reportPath()
 }
 
 func addrText(a *net.UDPAddr) string {

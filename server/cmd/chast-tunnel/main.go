@@ -5,11 +5,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -95,6 +97,16 @@ func runViewer(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Stdout is a machine-readable event stream for an embedding client;
+	// diagnostics stay on stderr. The first ready event tells the client which
+	// local UDP port to point its QUIC connection at.
+	var emitMu sync.Mutex
+	emit := func(event agentEvent) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		_ = json.NewEncoder(os.Stdout).Encode(event)
+	}
+
 	v, err := agent.StartViewer(ctx, agent.ViewerConfig{
 		ServerURL:     *server,
 		ServerKey:     *serverKey,
@@ -103,14 +115,43 @@ func runViewer(args []string) error {
 		Mode:          *mode,
 		DirectTimeout: *directTimeout,
 		Logger:        log,
+		OnPath: func(info agent.PathInfo) {
+			emit(agentEvent{
+				Event:  "path",
+				Path:   info.Path,
+				Remote: info.Remote,
+				Direct: info.Direct,
+				Relay:  info.Relay,
+			})
+		},
 	})
 	if err != nil {
 		return err
 	}
 	defer v.Close()
+	info := v.PathInfo()
+	emit(agentEvent{
+		Event:  "ready",
+		Listen: v.LocalAddr().String(),
+		Host:   *id,
+		Path:   info.Path,
+		Remote: info.Remote,
+		Direct: info.Direct,
+		Relay:  info.Relay,
+	})
 	log.Info("viewer agent online", "host", *id)
 	<-ctx.Done()
 	return nil
+}
+
+type agentEvent struct {
+	Event  string `json:"event"`
+	Listen string `json:"listen,omitempty"`
+	Host   string `json:"host,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Remote string `json:"remote,omitempty"`
+	Direct string `json:"direct,omitempty"`
+	Relay  string `json:"relay,omitempty"`
 }
 
 func newLogger(verbose bool) *slog.Logger {

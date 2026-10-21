@@ -65,5 +65,28 @@ if(DEFINED MSQUIC_ROOT AND EXISTS "${MSQUIC_ROOT}/bin/msquic.dll")
     VERBATIM)
 endif()
 
+# Server-assisted sessions spawn the Go tunnel agent from the app directory.
+# go build is incremental, so running the target on every build stays cheap and
+# picks up agent changes without a CMake reconfigure.
+find_program(GO_EXECUTABLE go)
+if(GO_EXECUTABLE)
+  # The runner's runtime directory next to this CMakeLists, per configuration.
+  set(CHAST_TUNNEL_OUT "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/chast-tunnel.exe")
+  add_custom_target(chast_tunnel_binary ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>"
+    COMMAND ${GO_EXECUTABLE} build -trimpath
+            -o "${CHAST_TUNNEL_OUT}"
+            ./cmd/chast-tunnel
+    WORKING_DIRECTORY "${CHAST_ROOT}/server"
+    BYPRODUCTS "${CHAST_TUNNEL_OUT}"
+    COMMENT "Building chast-tunnel.exe"
+    VERBATIM)
+  add_dependencies(chast_tunnel_binary ${BINARY_NAME})
+else()
+  message(WARNING
+    "Go was not found; server-assisted connections will fail until "
+    "chast-tunnel.exe is placed next to the viewer.")
+endif()
+
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)

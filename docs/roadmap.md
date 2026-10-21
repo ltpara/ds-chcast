@@ -1,6 +1,6 @@
 # chast 开发路线图
 
-更新时间：2026-10-21。按依赖顺序排列，已完成项保留在这里作为基线。
+更新时间：2026-10-22。按依赖顺序排列，已完成项保留在这里作为基线。
 
 ## 已完成
 
@@ -114,8 +114,16 @@
   - 代理协议是 `CHASTC1\n` + JSON 的 UDP 控制报文，与不透明数据靠魔数区分；注册只上传主机密钥的 SHA-256 摘要，`--server-key` 保护注册、统计和下线，重复注册 ID 但摘要不符会被拒绝。
   - 验证（2026-10-21，单机回环）：真实 chast 端到端在直连模式下 `frames=201 ... received=201 decoded=201 digest=E198527DF2B2B548`，同期中继字节为 0；强制中继模式下 `frames=202 ... received=202 decoded=202 digest=90C686753B88E5A2`，中继端口统计 `to_host_bytes:16402, to_viewer_bytes:2501405`。`go test ./...` 覆盖控制报文、注册表、HTTP API、会合/中继及代理三种模式（真实 UDP 回显 + 进程内服务器），并验证未知主机、错误密钥、第二查看者 `busy` 等失败路径。命令与数据见 `server/README.md` 的“验证记录”。
   - 设计取舍：不做账号体系，主机 ID + 密钥摘要就是最小注册凭据；中继不合并多个主机到一个端口，换取“服务器重启后按主机重新分配”的简单性与不混淆数据报的隔离性；直连失败是显式回退而不是伪装成功。
-  - 已知限制：单机无真实 NAT，跨网锥形 NAT 打洞与对称 NAT→中继仍需两台异网机器手动复核（回退决策本身有单元测试）；Go 代理尚未嵌入 Flutter 查看者与托盘主机，当前需手动启动 `chast-tunnel`；中继是 UDP，无拥塞控制，弱网表现取决于 QUIC 自身；HTTP 默认明文，公网部署需在前置 TLS 反向代理后。
-- 待做：M4.1 地址簿：设备列表与首页“最近连接”打通，客户端内置代理（或直接实现打洞），与首页身份/中继占位文案对应。
+  - 已知限制：单机无真实 NAT，跨网锥形 NAT 打洞与对称 NAT→中继仍需两台异网机器手动复核（回退决策本身有单元测试）；Go 代理尚未嵌入托盘主机（查看者侧已在 M4.1 内嵌）；中继是 UDP，无拥塞控制，弱网表现取决于 QUIC 自身；HTTP 默认明文，公网部署需在前置 TLS 反向代理后。
+- 已完成：设备地址簿与内置查看者代理 M4.1（`docs/m4.1-plan.md`）。
+  - 查看者：Flutter 会话页通过 `TunnelAgent` 托管 `chast-tunnel viewer` 子进程，代理监听 `127.0.0.1:0` 并把实际端口经 stdout `ready` JSON 事件交回；`path` 事件在直连/中继切换时更新会话浮层。代理随 Flutter Windows 构建一起生成，Release 目录中 `chast_viewer.exe` 与 `chast-tunnel.exe` 并存。
+  - 地址簿：`DeviceStore` 用一份 `%APPDATA%\chast\devices.json` 同时保存“我的设备”（`saved=true`）和最近连接（未保存、上限 8 条）；首页支持添加/改名/删除、从最近连接保存、清空最近不影响地址簿。服务器 URL 与 `auto/direct/relay` 策略保存在 `server.json`，`GET /v1/hosts/{id}` 用于在线状态、候选/中继地址与指纹。
+  - 信任：经服务连接时按逻辑身份 `server:<url>/<id>` 做指纹 pin，而不是代理的随机 loopback 端口；直连设备仍按 `host:port`。首页侧栏显示连接服务、路径策略、在线设备数和已固定身份数，替换原“身份与中继将在后续接入”占位。
+  - 代理协议：`ViewerConfig.OnPath` 与 `PathInfo` 在 Go 侧报告初始路径和回退；stdout 只输出机器可读 JSON，诊断留在 stderr。查看者重连时新 loopback 源端口可接管旧客户端，代理可被同一会话页复用。
+  - 验证（2026-10-22，单机回环）：真实 chast 经 Dart `TunnelAgent` 直连 `received=201 decoded=201 keyframes=1 crc-errors=0 decode-errors=0 gaps=0 digest=A188ABD0B85F082B`，中继计数全 0；强制中继 `received=202 decoded=202 digest=E092051892076F56`，中继统计 `to_host_bytes:18054,to_viewer_bytes:2575942`。`go vet ./...`、`go test ./...`、`flutter analyze`、50 项 `flutter test` 与 Release 构建全部通过。
+  - 设计取舍：继续复用 Go 代理而不是在 Dart/C++ 重写打洞，避免两套 NAT 逻辑分叉；代理用 stdout 事件而不是解析日志，嵌入方只依赖稳定字段；地址簿与最近连接共用一个文件，保存只是改 `saved` 标记。
+  - 已知限制：主机端仍需手动启动 `chast-tunnel host`，自动注册留给 M4.2；服务器设置对话框的桌面截图因应用被视频窗口遮挡未补，行为由 widget 测试覆盖；跨网 NAT 与物理鼠标路径仍属环境限制。
+- 待做：M4.2 主机端集成：托盘主机自动注册、内置/随包 `chast-tunnel host`、主机侧路径与中继状态展示。
 
 ## M5 — 体验扩展
 
