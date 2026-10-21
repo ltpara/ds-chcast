@@ -1,21 +1,36 @@
-// Intel oneVPL hardware encoder.
+// Intel hardware encoder: oneVPL on newer runtimes, Media SDK ABI 1.x on the
+// legacy mfxhw64 runtime that ships for older iGPUs (6th-10th gen).
+//
+// Implementation selection is pinned to the capture adapter: the capturer's
+// D3D11 device is the one that produced the NV12 texture, so only a VPL
+// implementation reporting the same DXGI LUID is eligible. Inside that, tiers
+// are tried in order until one initialises:
+//
+//   VDENC + HEVC  ->  VDENC + AVC  ->  VME + AVC
+//
+// A tier is only accepted after a test frame completes, so a runtime that can
+// open a session but not encode does not become the stream's encoder. An HEVC
+// request may end on AVC when HEVC encoding is unavailable; an AVC
+// request never upgrades. VDENC is mfx.LowPower=ON on runtimes that have both
+// encoders; oneVPL 2.10+ implementations are VDENC-only, so VME fails Init and
+// the ladder stops there.
 //
 // One frame, end to end:
 //
 //   FrameInfo::nv12_texture (GPU, in the capture device)
-//     -> mfxMemoryInterface::ImportFrameSurface (D3D11 texture)
+//     -> either ImportFrameSurface (oneVPL 2.10+)
+//        or a surface wrapping the texture (mfxhw64)
 //     -> MFXVideoENCODE_EncodeFrameAsync       (input: video memory)
 //     -> MFXVideoCORE_SyncOperation
 //     -> mfxBitstream bytes
 //
-// The import is what keeps the frame off the CPU: the runtime takes the NV12
-// texture in VRAM and either maps it (IMPORT_SHARED) or GPU-copies it into its
-// internal surface pool (IMPORT_COPY). Never a system-memory upload, never a
-// readback -- there is no code path here that stages the image through RAM.
-// This machine's driver answers MFX_ERR_MEMORY_ALLOC to IMPORT_SHARED on NV12
-// textures (Intel's own hello-sharing-dx11-import fails the same way), so
-// IMPORT_COPY is what actually runs; import_surface() records which one the
-// runtime negotiated.
+// Neither path stages the frame through CPU memory. The 2.10 path either maps
+// the texture (IMPORT_SHARED) or GPU-copies it into the runtime's surface pool
+// (IMPORT_COPY); shared import is requested first, and import_surface()
+// records which one actually ran. The legacy path has no memory interface:
+// EncodeFrameAsync is handed the NV12 texture itself, and a pass-through
+// mfxFrameAllocator::GetHDL resolves it, so the encoder reads the texture in
+// place with no copy at all.
 //
 // Settings follow RustDesk's VRAM encoder (hwcodec's util_encode::set_av_codec_ctx
 // and set_rate_control): CBR, no B-frames, no periodic key frames, one slice,
@@ -28,6 +43,7 @@
 #include "chast/encoder.h"
 
 #include <d3d10.h>
+#include <dxgi1_6.h>
 
 #include <vpl/mfxdefs.h>
 #include <vpl/mfxdispatcher.h>
@@ -36,8 +52,11 @@
 #include <vpl/mfxvideo.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
+#include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "chast/com_ptr.h"
@@ -47,10 +66,15 @@ namespace chast {
 namespace {
 
 constexpr UINT kAsyncDepth = 1;
-constexpr mfxU32 kBitstreamBufferSize = 4u * 1024u * 1024u;
+constexpr size_t kBitstreamBufferSize = 4u * 1024u * 1024u;
+// Upper bound for growing a bitstream that cannot hold one access unit.
+constexpr size_t kMaxBitstreamBufferSize = 64u * 1024u * 1024u;
 // MFXVideoCORE_SyncOperation polling step; the encode itself is a few ms.
 constexpr mfxU32 kSyncWaitMs = 100;
 constexpr int kMaxSyncPolls = 100;  // 10 s before giving up on a frame
+// A tier's test frame must come back quickly; a broken encoder should cost the
+// ladder a second, not the full stream timeout.
+constexpr int kProbeSyncPolls = 10;  // 1 s
 
 const char* mfx_status_name(mfxStatus sts) {
     switch (sts) {
@@ -64,17 +88,23 @@ const char* mfx_status_name(mfxStatus sts) {
         case MFX_ERR_DEVICE_LOST: return "MFX_ERR_DEVICE_LOST";
         case MFX_ERR_NOT_INITIALIZED: return "MFX_ERR_NOT_INITIALIZED";
         case MFX_ERR_MORE_DATA: return "MFX_ERR_MORE_DATA";
+        case MFX_ERR_MORE_SURFACE: return "MFX_ERR_MORE_SURFACE";
+        case MFX_ERR_ABORTED: return "MFX_ERR_ABORTED";
         case MFX_ERR_INCOMPATIBLE_VIDEO_PARAM: return "MFX_ERR_INCOMPATIBLE_VIDEO_PARAM";
+        case MFX_ERR_INVALID_VIDEO_PARAM: return "MFX_ERR_INVALID_VIDEO_PARAM";
+        case MFX_ERR_NOT_FOUND: return "MFX_ERR_NOT_FOUND";
         case MFX_ERR_DEVICE_FAILED: return "MFX_ERR_DEVICE_FAILED";
+        case MFX_ERR_MORE_BITSTREAM: return "MFX_ERR_MORE_BITSTREAM";
         case MFX_ERR_GPU_HANG: return "MFX_ERR_GPU_HANG";
         case MFX_ERR_UNDEFINED_BEHAVIOR: return "MFX_ERR_UNDEFINED_BEHAVIOR";
         case MFX_WRN_IN_EXECUTION: return "MFX_WRN_IN_EXECUTION";
         case MFX_WRN_DEVICE_BUSY: return "MFX_WRN_DEVICE_BUSY";
+        case MFX_WRN_INCOMPATIBLE_VIDEO_PARAM: return "MFX_WRN_INCOMPATIBLE_VIDEO_PARAM";
         default: return "MFX status";
     }
 }
 
-Error mfx_error(mfxStatus sts, const char* what) {
+Error mfx_error(mfxStatus sts, std::string_view what) {
     // Device loss and GPU hangs are the ones capture has to hear about: the
     // caller treats DeviceRemoved as a reason to rebuild the whole pipeline.
     Status status = Status::CaptureFailed;
@@ -94,34 +124,143 @@ mfxU16 align16(UINT value) {
     return static_cast<mfxU16>((value + 15u) & ~15u);
 }
 
-// True when the LUID identifies this adapter. VPL's mfxImplDescription does
-// not carry a LUID, so the adapter is matched by walking DXGI in the same
-// order the dispatcher chose the device: the implementation selected with
-// MFXCreateSession is tied to the adapter VPL picks, which is adapter 0 of the
-// Intel device. If the capture device is not on that adapter,
-// D3D11 device sharing fails and the import is refused, which is reported at
-// creation.
-struct ImplementationInfo {
-    std::string name;
+// Identity of the adapter the capture device lives on. VPL may only use an
+// implementation on this adapter: the NV12 texture belongs to that device, so
+// an encoder on another GPU would have to cross devices, which neither import
+// nor surface wrapping can do.
+struct AdapterIdentity {
+    bool valid = false;
+    LUID luid{};
+    UINT vendor_id = 0;
+    UINT device_id = 0;
 };
 
-ImplementationInfo describe_implementation(mfxLoader loader, mfxU32 index) {
-    ImplementationInfo info;
+AdapterIdentity identify_adapter(ID3D11Device* device) {
+    AdapterIdentity identity;
+    ComPtr<IDXGIDevice> dxgi_device = com_query<IDXGIDevice>(device);
+    ComPtr<IDXGIAdapter> adapter;
+    if (!dxgi_device || FAILED(dxgi_device->GetAdapter(adapter.put()))) {
+        return identity;
+    }
+    ComPtr<IDXGIAdapter1> adapter1 = com_query<IDXGIAdapter1>(adapter);
+    DXGI_ADAPTER_DESC1 desc{};
+    if (!adapter1 || FAILED(adapter1->GetDesc1(&desc))) {
+        return identity;
+    }
+    identity.valid = true;
+    identity.luid = desc.AdapterLuid;
+    identity.vendor_id = desc.VendorId;
+    identity.device_id = desc.DeviceId;
+    return identity;
+}
+
+std::string luid_string(const LUID& luid) {
+    char text[32]{};
+    std::snprintf(text, sizeof(text), "%08lX:%08lX",
+                  static_cast<unsigned long>(luid.HighPart),
+                  static_cast<unsigned long>(luid.LowPart));
+    return text;
+}
+
+// One enumerated implementation that runs on the capture adapter.
+struct ImplCandidate {
+    mfxU32 index = 0;
+    std::string name;
+    mfxU16 api_major = 0;
+    mfxU16 api_minor = 0;
+};
+
+// True when the implementation's device is the capture adapter. The extended
+// device ID carries the DXGI LUID, verified against the actual device; runtimes
+// that do not populate it fall back to PCI vendor/device IDs, and anything that
+// cannot prove it is on this adapter is rejected rather than risk crossing.
+bool implementation_on_adapter(mfxLoader loader, mfxU32 index, const mfxImplDescription& desc,
+                               const AdapterIdentity& adapter) {
     mfxHDL raw = nullptr;
-    if (MFXEnumImplementations(loader, index, MFX_IMPLCAPS_IMPLDESCSTRUCTURE, &raw) != MFX_ERR_NONE ||
-        !raw) {
-        return info;
-    }
-    const auto* desc = reinterpret_cast<const mfxImplDescription*>(raw);
-    info.name = desc->ImplName;
-    if (desc->Dev.DeviceID[0] != '\0') {
-        if (!info.name.empty()) {
-            info.name += " on ";
+    if (MFXEnumImplementations(loader, index, MFX_IMPLCAPS_DEVICE_ID_EXTENDED, &raw) ==
+            MFX_ERR_NONE &&
+        raw != nullptr) {
+        const auto* extended = reinterpret_cast<const mfxExtendedDeviceId*>(raw);
+        bool match = false;
+        if (extended->LUIDValid) {
+            match = std::memcmp(extended->DeviceLUID, &adapter.luid, sizeof(adapter.luid)) == 0;
+        } else {
+            match = extended->VendorID == adapter.vendor_id &&
+                    extended->DeviceID == adapter.device_id;
         }
-        info.name += desc->Dev.DeviceID;
+        MFXDispReleaseImplDescription(loader, raw);
+        return match;
     }
-    MFXDispReleaseImplDescription(loader, raw);
-    return info;
+
+    if (desc.VendorID != adapter.vendor_id) {
+        return false;
+    }
+    unsigned device_id = 0;
+    const auto parsed = std::from_chars(desc.Dev.DeviceID,
+                                        desc.Dev.DeviceID + sizeof(desc.Dev.DeviceID), device_id);
+    return parsed.ec == std::errc() && device_id == adapter.device_id;
+}
+
+// Restricts the dispatcher to a hardware implementation with D3D11
+// acceleration. A non-zero `codec_id` additionally requires that encoder;
+// session creation passes 0 so one loader can serve every fallback tier.
+// Surface-sharing capabilities are deliberately not a filter: several runtimes
+// (including this machine's mfxhw64) do not populate mfxSurfaceTypesSupported,
+// and filtering on it removes an implementation that can still encode. The API
+// version decides how frames get in: 2.10+ imports through the memory
+// interface, older runtimes wrap the texture directly.
+Error filter_d3d11_encoder(mfxLoader loader, mfxU32 codec_id) {
+    struct Filter {
+        const char* name;
+        mfxU32 value;
+    };
+    const Filter filters[] = {
+        {"mfxImplDescription.Impl", MFX_IMPL_TYPE_HARDWARE},
+        {"mfxImplDescription.mfxEncoderDescription.encoder.CodecID", codec_id},
+        {"mfxImplDescription.AccelerationMode", MFX_ACCEL_MODE_VIA_D3D11},
+    };
+    for (const Filter& filter : filters) {
+        if (filter.value == 0) {
+            continue;
+        }
+        mfxConfig cfg = MFXCreateConfig(loader);
+        if (!cfg) {
+            return Error(Status::Unsupported, "MFXCreateConfig failed");
+        }
+        mfxVariant value{};
+        value.Type = MFX_VARIANT_TYPE_U32;
+        value.Data.U32 = filter.value;
+        const mfxStatus sts = MFXSetConfigFilterProperty(
+            cfg, reinterpret_cast<const mfxU8*>(filter.name), value);
+        if (sts != MFX_ERR_NONE) {
+            return mfx_error(sts,
+                             std::string("MFXSetConfigFilterProperty(") + filter.name + ")");
+        }
+    }
+    return Error::success();
+}
+
+// One encoder configuration to try. `low_power` selects VDENC on runtimes that
+// have both fixed-function and VME encoders (Media SDK 1.x); oneVPL 2.10+
+// implementations only exist in the low-power form, where VME attempts simply
+// fail Init and the ladder stops there.
+struct EncodeTier {
+    VideoCodec codec;
+    bool low_power;
+    const char* label;
+};
+
+// Requested codec first. An HEVC request may fall back to H.264 when HEVC
+// hardware encoding is unavailable; an H.264 request never upgrades, so a
+// client that cannot decode HEVC is never sent it.
+std::vector<EncodeTier> encode_tiers(VideoCodec requested) {
+    std::vector<EncodeTier> tiers;
+    if (requested == VideoCodec::Hevc) {
+        tiers.push_back({VideoCodec::Hevc, true, "VDENC HEVC"});
+    }
+    tiers.push_back({VideoCodec::H264, true, "VDENC AVC"});
+    tiers.push_back({VideoCodec::H264, false, "VME AVC"});
+    return tiers;
 }
 
 // Common D3D11 device lifetime for VPL. MFXVideoCORE_SetHandle does not take a
@@ -135,24 +274,48 @@ public:
     Error initialize(ID3D11Device* device, const EncoderConfig& config);
     Error encode(ID3D11Texture2D* nv12, uint64_t pts_ms, bool force_keyframe,
                  std::vector<EncodedPacket>& out) override;
+    Error encode_repeat(uint64_t pts_ms, bool force_keyframe,
+                        std::vector<EncodedPacket>& out) override;
     Error set_bitrate(UINT bits_per_second) override;
     UINT bitrate() const noexcept override { return bitrate_; }
     VideoCodec codec() const noexcept override { return codec_; }
     UINT width() const noexcept override { return width_; }
     UINT height() const noexcept override { return height_; }
     const std::string& implementation() const noexcept override { return implementation_; }
-    bool shared_import() const noexcept override { return import_shared_; }
+    bool shared_import() const noexcept override { return legacy_memory_ || import_shared_; }
 
 private:
     void close();
+    void discard_session();
+    Error start_tier(const ImplCandidate& implementation, const EncodeTier& tier);
+    Error probe_encode();
     Error import_surface(ID3D11Texture2D* texture, mfxFrameSurface1** surface);
     Error submit(mfxFrameSurface1* surface, bool force_keyframe,
-                 std::vector<EncodedPacket>& out, uint64_t pts_ms);
+                 std::vector<EncodedPacket>& out, uint64_t pts_ms,
+                 mfxU32 wait_ms = kSyncWaitMs, int max_polls = kMaxSyncPolls);
 
+    // mfxFrameAllocator used only on legacy runtimes, whose video-memory Init
+    // requires one. Frames are D3D11 NV12 textures; the MemId is the texture
+    // pointer itself.
+    static mfxStatus MFX_CDECL alloc_frames(mfxHDL pthis, mfxFrameAllocRequest* request,
+                                           mfxFrameAllocResponse* response);
+    static mfxStatus MFX_CDECL free_frames(mfxHDL pthis, mfxFrameAllocResponse* response);
+    static mfxStatus MFX_CDECL lock_frames(mfxHDL pthis, mfxMemId mid, mfxFrameData* data);
+    static mfxStatus MFX_CDECL unlock_frames(mfxHDL pthis, mfxMemId mid, mfxFrameData* data);
+    static mfxStatus MFX_CDECL get_handle(mfxHDL pthis, mfxMemId mid, mfxHDL* handle);
+
+    AdapterIdentity adapter_;
     mfxLoader loader_ = nullptr;
     mfxSession session_ = nullptr;
     bool encode_open_ = false;
     mfxMemoryInterface* memory_interface_ = nullptr;
+    // The legacy runtime exposes no memory interface, so the texture is wrapped
+    // in a surface directly; frame_allocator_ must outlive the session. The
+    // surface is reused across frames and kept alive even past a sync timeout,
+    // because the runtime may still reference it.
+    bool legacy_memory_ = false;
+    mfxFrameAllocator frame_allocator_{};
+    mfxFrameSurface1 legacy_surface_{};
     ComPtr<ID3D11Device> device_;
     // The NV12 texture imported on the previous call, and the surface the
     // runtime handed back for it. Re-importing is skipped only when the runtime
@@ -160,9 +323,16 @@ private:
     // see import_surface.
     ID3D11Texture2D* imported_texture_ = nullptr;
     mfxFrameSurface1* imported_surface_ = nullptr;
+    // True once a frame has been submitted successfully, so encode_repeat()
+    // has a surface to hand back to the runtime.
+    bool has_input_ = false;
     // True when the runtime mapped the texture (IMPORT_SHARED) instead of
-    // GPU-copying it (IMPORT_COPY); see import_surface.
+    // GPU-copying it (IMPORT_COPY); see import_surface. On the legacy path the
+    // texture is wrapped in place, which is also a no-copy handover.
     bool import_shared_ = false;
+    // Set after the runtime refuses a shared import once, so the fallback is
+    // used directly on later frames instead of retrying a known failure.
+    bool shared_import_refused_ = false;
     mfxBitstream bitstream_{};
     std::vector<mfxU8> bitstream_data_;
     // The parameters the encoder was initialised with (as corrected by
@@ -171,16 +341,102 @@ private:
     // signal buffer lives beside them because the extension list points into
     // it.
     mfxExtVideoSignalInfo signal_{};
+    // Owns the extension pointer list carried by params_ so it stays valid for
+    // the whole session (a local array would dangle after initialize()).
+    mfxExtBuffer* extensions_[1] = {nullptr};
     mfxVideoParam params_{};
 
     VideoCodec codec_ = VideoCodec::H264;
     UINT width_ = 0;
     UINT height_ = 0;
     UINT bitrate_ = 0;
+    UINT requested_bitrate_ = 0;
     UINT framerate_ = 30;
     UINT gop_size_ = 0;
+    float quality_ratio_ = 0.67f;
     std::string implementation_;
 };
+
+mfxStatus MFX_CDECL MfxEncoder::alloc_frames(mfxHDL pthis, mfxFrameAllocRequest* request,
+                                             mfxFrameAllocResponse* response) {
+    if (!pthis || !request || !response) {
+        return MFX_ERR_NULL_PTR;
+    }
+    response->mids = nullptr;
+    response->NumFrameActual = 0;
+    if ((request->Type & MFX_MEMTYPE_VIDEO_MEMORY_DECODER_TARGET) == 0 ||
+        request->Info.FourCC != MFX_FOURCC_NV12 || request->Info.Width == 0 ||
+        request->Info.Height == 0) {
+        return MFX_ERR_UNSUPPORTED;
+    }
+    auto* self = static_cast<MfxEncoder*>(pthis);
+    const mfxU16 count =
+        (std::max)(static_cast<mfxU16>(1), request->NumFrameSuggested);
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = request->Info.Width;
+    desc.Height = request->Info.Height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags =
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    auto** mids = new mfxMemId[count]{};
+    for (mfxU32 i = 0; i < count; ++i) {
+        ID3D11Texture2D* texture = nullptr;
+        if (FAILED(self->device_->CreateTexture2D(&desc, nullptr, &texture)) || !texture) {
+            for (mfxU32 j = 0; j < i; ++j) {
+                static_cast<ID3D11Texture2D*>(mids[j])->Release();
+            }
+            delete[] mids;
+            return MFX_ERR_MEMORY_ALLOC;
+        }
+        mids[i] = texture;
+    }
+    response->mids = mids;
+    response->NumFrameActual = count;
+    return MFX_ERR_NONE;
+}
+
+mfxStatus MFX_CDECL MfxEncoder::free_frames(mfxHDL, mfxFrameAllocResponse* response) {
+    if (!response) {
+        return MFX_ERR_NULL_PTR;
+    }
+    if (response->mids) {
+        for (mfxU32 i = 0; i < response->NumFrameActual; ++i) {
+            auto* texture = static_cast<ID3D11Texture2D*>(response->mids[i]);
+            if (texture) {
+                texture->Release();
+            }
+        }
+        delete[] response->mids;
+    }
+    response->mids = nullptr;
+    response->NumFrameActual = 0;
+    return MFX_ERR_NONE;
+}
+
+mfxStatus MFX_CDECL MfxEncoder::lock_frames(mfxHDL, mfxMemId, mfxFrameData*) {
+    return MFX_ERR_UNSUPPORTED;
+}
+
+mfxStatus MFX_CDECL MfxEncoder::unlock_frames(mfxHDL, mfxMemId, mfxFrameData*) {
+    return MFX_ERR_UNSUPPORTED;
+}
+
+mfxStatus MFX_CDECL MfxEncoder::get_handle(mfxHDL, mfxMemId mid, mfxHDL* handle) {
+    if (!mid || !handle) {
+        return MFX_ERR_INVALID_HANDLE;
+    }
+    // mfxhw64 expects the texture pointer itself in *handle; mfxHDLPair is only
+    // needed for texture arrays, which this encoder never allocates.
+    *handle = mid;
+    return MFX_ERR_NONE;
+}
 
 Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) {
     if (!device) {
@@ -192,101 +448,71 @@ Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) 
     device_ = ComPtr<ID3D11Device>(device);
     device_.add_ref();
 
-    codec_ = config.codec;
     width_ = config.width;
     height_ = config.height;
     framerate_ = config.framerate ? config.framerate : 30;
     gop_size_ = config.gop_size;
-    bitrate_ = config.bitrate;
-    if (bitrate_ == 0) {
-        bitrate_ = hardware_bitrate(width_, height_, config.quality_ratio,
-                                    codec_ == VideoCodec::H264);
+    requested_bitrate_ = config.bitrate;
+    quality_ratio_ = config.quality_ratio;
+
+    // The texture comes from this device, so the encoder must be on the same
+    // adapter. Never let the dispatcher pick an implementation that lives on
+    // another GPU: the frame cannot cross devices.
+    adapter_ = identify_adapter(device_.get());
+    if (!adapter_.valid) {
+        return Error(Status::InvalidCall,
+                     "cannot identify the adapter the capture device lives on");
     }
 
-    const mfxU32 codec_id = codec_ == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
-
-    // Dispatcher: pick hardware implementations that expose exactly the
-    // surface-sharing configuration the import needs. Intel's hello-sharing
-    // example does the same, and a runtime without the D3D11 sharing extension
-    // is filtered out here instead of failing mid-frame.
     loader_ = MFXLoad();
     if (!loader_) {
         return Error(Status::Unsupported, "MFXLoad failed: no oneVPL runtime is installed");
     }
-
-    mfxConfig cfg[4];
-    mfxVariant value[4];
-
-    cfg[0] = MFXCreateConfig(loader_);
-    value[0].Type = MFX_VARIANT_TYPE_U32;
-    value[0].Data.U32 = MFX_IMPL_TYPE_HARDWARE;
-    mfxStatus sts = MFXSetConfigFilterProperty(
-        cfg[0], reinterpret_cast<const mfxU8*>("mfxImplDescription.Impl"), value[0]);
-    if (sts != MFX_ERR_NONE) {
-        return mfx_error(sts, "MFXSetConfigFilterProperty(Impl)");
+    // No codec filter here: the fallback ladder may switch codec, so the loader
+    // lists every hardware D3D11 implementation and each tier is tried against
+    // those that sit on the capture adapter.
+    Error filtered = filter_d3d11_encoder(loader_, 0);
+    if (!filtered.ok()) {
+        return filtered;
     }
 
-    cfg[1] = MFXCreateConfig(loader_);
-    value[1].Type = MFX_VARIANT_TYPE_U32;
-    value[1].Data.U32 = codec_id;
-    sts = MFXSetConfigFilterProperty(
-        cfg[1],
-        reinterpret_cast<const mfxU8*>(
-            "mfxImplDescription.mfxEncoderDescription.encoder.CodecID"),
-        value[1]);
-    if (sts != MFX_ERR_NONE) {
-        return mfx_error(sts, "MFXSetConfigFilterProperty(CodecID)");
+    std::vector<ImplCandidate> candidates;
+    std::vector<std::string> elsewhere;
+    for (mfxU32 index = 0;; ++index) {
+        mfxHDL raw = nullptr;
+        if (MFXEnumImplementations(loader_, index, MFX_IMPLCAPS_IMPLDESCSTRUCTURE, &raw) !=
+                MFX_ERR_NONE ||
+            !raw) {
+            break;
+        }
+        const auto* desc = reinterpret_cast<const mfxImplDescription*>(raw);
+        if (implementation_on_adapter(loader_, index, *desc, adapter_)) {
+            ImplCandidate candidate;
+            candidate.index = index;
+            candidate.name = desc->ImplName;
+            candidate.api_major = desc->ApiVersion.Major;
+            candidate.api_minor = desc->ApiVersion.Minor;
+            candidates.push_back(std::move(candidate));
+        } else if (desc->ImplName[0] != '\0') {
+            elsewhere.emplace_back(desc->ImplName);
+        }
+        MFXDispReleaseImplDescription(loader_, raw);
     }
-
-    cfg[2] = MFXCreateConfig(loader_);
-    value[2].Type = MFX_VARIANT_TYPE_U32;
-    value[2].Data.U32 = MFX_ACCEL_MODE_VIA_D3D11;
-    sts = MFXSetConfigFilterProperty(
-        cfg[2], reinterpret_cast<const mfxU8*>("mfxImplDescription.AccelerationMode"), value[2]);
-    if (sts != MFX_ERR_NONE) {
-        return mfx_error(sts, "MFXSetConfigFilterProperty(AccelerationMode)");
+    if (candidates.empty()) {
+        std::string message =
+            "no oneVPL D3D11 implementation on the capture adapter (LUID " +
+            luid_string(adapter_.luid) + ")";
+        if (!elsewhere.empty()) {
+            message += "; implementations on other adapters: ";
+            for (size_t i = 0; i < elsewhere.size(); ++i) {
+                if (i != 0) {
+                    message += ", ";
+                }
+                message += elsewhere[i];
+            }
+        }
+        return Error(Status::Unsupported, message);
     }
-
-    // The import path is experimental API that must be advertised by the
-    // runtime: D3D11 text2D surfaces used as encode input. The sharing flag is
-    // deliberately not part of the filter -- this machine's runtime only
-    // accepts a copy import on a render-target NV12 texture (see
-    // import_surface), and the filter must not hide it.
-    cfg[3] = MFXCreateConfig(loader_);
-    value[3].Type = MFX_VARIANT_TYPE_U32;
-    value[3].Data.U32 = MFX_SURFACE_TYPE_D3D11_TEX2D;
-    sts = MFXSetConfigFilterProperty(
-        cfg[3], reinterpret_cast<const mfxU8*>("mfxSurfaceTypesSupported.surftype.SurfaceType"),
-        value[3]);
-    if (sts != MFX_ERR_NONE) {
-        return mfx_error(sts, "MFXSetConfigFilterProperty(SurfaceType)");
-    }
-    value[3].Data.U32 = MFX_SURFACE_COMPONENT_ENCODE;
-    sts = MFXSetConfigFilterProperty(
-        cfg[3],
-        reinterpret_cast<const mfxU8*>("mfxSurfaceTypesSupported.surftype.surfcomp.SurfaceComponent"),
-        value[3]);
-    if (sts != MFX_ERR_NONE) {
-        return mfx_error(sts, "MFXSetConfigFilterProperty(SurfaceComponent)");
-    }
-
-    // The dispatcher has already filtered the implementations down to the one
-    // that encodes this codec on this adapter with D3D11 acceleration and
-    // admits a shared D3D11 texture on the encode input, so index 0 is the
-    // session we want. Building the session any other way (MFXInitEx, or
-    // MFXInitialize directly) bypasses that selection.
-    sts = MFXCreateSession(loader_, 0, &session_);
-    if (sts != MFX_ERR_NONE) {
-        // No driver on this adapter. OneVPL's software (or another vendor's)
-        // runtime cannot take a D3D11 texture, so there is nothing to fall
-        // back to -- and copy-based import is exactly what this project rules
-        // out.
-        return Error(Status::Unsupported,
-                     std::string("oneVPL has no D3D11 hardware session for ") +
-                         (codec_ == VideoCodec::H264 ? "H.264" : "HEVC") + ": " +
-                         mfx_status_name(sts));
-    }
-    implementation_ = describe_implementation(loader_, 0).name;
 
     // The runtime encodes on its own internal thread and drives the D3D11
     // immediate context from there. Without multithread protection on the
@@ -294,14 +520,68 @@ Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) 
     // MFX_ERR_UNDEFINED_BEHAVIOR). hwcodec and Intel's examples both set it
     // before handing the device over.
     ComPtr<ID3D10Multithread> multithread;
-    if (SUCCEEDED(device_.get()->QueryInterface(IID_PPV_ARGS(multithread.put())))) {
+    if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(multithread.put())))) {
         multithread->SetMultithreadProtected(TRUE);
     }
+
+    std::string attempts;
+    for (const EncodeTier& tier : encode_tiers(config.codec)) {
+        for (const ImplCandidate& candidate : candidates) {
+            Error err = start_tier(candidate, tier);
+            if (err.ok()) {
+                return Error::success();
+            }
+            if (!attempts.empty()) {
+                attempts += "; ";
+            }
+            attempts += candidate.name + " " + tier.label + ": " + err.to_string();
+            discard_session();
+        }
+    }
+    return Error(Status::Unsupported,
+                 "no VPL encoder tier could be initialised: " + attempts);
+}
+
+Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& tier) {
+    discard_session();
+
+    codec_ = tier.codec;
+    bitrate_ = requested_bitrate_ ? requested_bitrate_
+                                  : hardware_bitrate(width_, height_, quality_ratio_,
+                                                     codec_ == VideoCodec::H264);
+
+    mfxStatus sts = MFXCreateSession(loader_, candidate.index, &session_);
+    if (sts != MFX_ERR_NONE) {
+        return mfx_error(sts, "MFXCreateSession");
+    }
+    // ImportFrameSurface and the memory interface arrived in oneVPL 2.10. The
+    // legacy mfxhw64 runtime (API 1.x) can still encode D3D11 textures, but
+    // only through an application frame allocator, so it wraps them instead.
+    legacy_memory_ = candidate.api_major < 2 ||
+                     (candidate.api_major == 2 && candidate.api_minor < 10);
 
     sts = MFXVideoCORE_SetHandle(session_, MFX_HANDLE_D3D11_DEVICE,
                                  reinterpret_cast<mfxHDL>(device_.get()));
     if (sts != MFX_ERR_NONE) {
         return mfx_error(sts, "MFXVideoCORE_SetHandle(D3D11)");
+    }
+
+    if (legacy_memory_) {
+        // mfxhw64 refuses MFX_IOPATTERN_IN_VIDEO_MEMORY without an allocator
+        // (Init answers MFX_ERR_INVALID_VIDEO_PARAM). The allocator produces
+        // D3D11 NV12 textures for the runtime's internal requests; external
+        // frames are the capture textures themselves.
+        frame_allocator_ = {};
+        frame_allocator_.pthis = this;
+        frame_allocator_.Alloc = &MfxEncoder::alloc_frames;
+        frame_allocator_.Free = &MfxEncoder::free_frames;
+        frame_allocator_.Lock = &MfxEncoder::lock_frames;
+        frame_allocator_.Unlock = &MfxEncoder::unlock_frames;
+        frame_allocator_.GetHDL = &MfxEncoder::get_handle;
+        sts = MFXVideoCORE_SetFrameAllocator(session_, &frame_allocator_);
+        if (sts != MFX_ERR_NONE) {
+            return mfx_error(sts, "MFXVideoCORE_SetFrameAllocator");
+        }
     }
 
     // Query and Init with the same description so the runtime can allocate its
@@ -311,11 +591,16 @@ Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) 
     params.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
     params.AsyncDepth = kAsyncDepth;
     mfxInfoMFX& mfx = params.mfx;
-    mfx.CodecId = codec_id;
-    mfx.LowPower = MFX_CODINGOPTION_OFF;
+    mfx.CodecId = tier.codec == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
+    // ON selects the fixed-function VDENC encoder where the runtime has both;
+    // OFF asks for the VME encoder. oneVPL 2.10+ implementations are VDENC-only,
+    // so their VME tier fails Init and the ladder ends there.
+    mfx.LowPower =
+        static_cast<mfxU16>(tier.low_power ? MFX_CODINGOPTION_ON : MFX_CODINGOPTION_OFF);
     mfx.TargetUsage = MFX_TARGETUSAGE_BALANCED;
     mfx.RateControlMethod = MFX_RATECONTROL_CBR;
-    mfx.TargetKbps = static_cast<mfxU16>((std::max)(1u, bitrate_ / 1000u));
+    mfx.TargetKbps =
+        static_cast<mfxU16>((std::clamp)(bitrate_ / 1000u, 1u, 0xFFFFu));
     // A stream with no periodic key frames; RustDesk's gop is MAX_GOP unless
     // the caller configured an interval, and this encoder asks per frame.
     mfx.GopPicSize =
@@ -323,7 +608,7 @@ Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) 
     mfx.GopRefDist = 1;  // no B-frames
     mfx.IdrInterval = 0;  // every I-frame an IDR (H.264)
     mfx.CodecProfile = static_cast<mfxU16>(
-        codec_ == VideoCodec::H264 ? MFX_PROFILE_AVC_HIGH : MFX_PROFILE_HEVC_MAIN);
+        tier.codec == VideoCodec::H264 ? MFX_PROFILE_AVC_HIGH : MFX_PROFILE_HEVC_MAIN);
 
     mfxFrameInfo& info = mfx.FrameInfo;
     info.FourCC = MFX_FOURCC_NV12;
@@ -354,8 +639,8 @@ Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) 
     signal.ColourPrimaries = 6;               // SMPTE 170M
     signal.TransferCharacteristics = 6;       // SMPTE 170M
     signal.MatrixCoefficients = 6;            // SMPTE 170M (BT.601)
-    mfxExtBuffer* extensions[] = {&signal.Header};
-    params.ExtParam = extensions;
+    extensions_[0] = &signal.Header;
+    params.ExtParam = extensions_;
     params.NumExtParam = 1;
 
     sts = MFXVideoENCODE_Query(session_, &params, &params);
@@ -368,17 +653,130 @@ Error MfxEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) 
         return mfx_error(sts, "MFXVideoENCODE_Init");
     }
     encode_open_ = true;
+    // Query may have corrected the rate; report the value actually in use.
+    bitrate_ = static_cast<UINT>(params.mfx.TargetKbps) * 1000u;
 
     bitstream_data_.resize(kBitstreamBufferSize);
     bitstream_ = {};
-    bitstream_.MaxLength = kBitstreamBufferSize;
+    bitstream_.MaxLength = static_cast<mfxU32>(kBitstreamBufferSize);
     bitstream_.Data = bitstream_data_.data();
 
-    sts = MFXGetMemoryInterface(session_, &memory_interface_);
-    if (sts != MFX_ERR_NONE || !memory_interface_) {
-        return mfx_error(sts, "MFXGetMemoryInterface");
+    if (!legacy_memory_) {
+        sts = MFXGetMemoryInterface(session_, &memory_interface_);
+        if (sts != MFX_ERR_NONE) {
+            return mfx_error(sts, "MFXGetMemoryInterface");
+        }
+        if (!memory_interface_) {
+            return Error(Status::Unsupported,
+                         "oneVPL runtime " + candidate.name + " exposed no memory interface");
+        }
     }
+
+    // Init accepting the parameters is not proof the runtime can encode: a
+    // driver can open a VDENC session and then fail every EncodeFrameAsync.
+    // The tier is only accepted after a frame goes through the same path real
+    // frames take.
+    Error probe = probe_encode();
+    if (!probe.ok()) {
+        return probe;
+    }
+
+    implementation_ = candidate.name;
+    if (!implementation_.empty()) {
+        implementation_ += " ";
+    }
+    implementation_ += "(";
+    implementation_ += tier.label;
+    implementation_ += ")";
     return Error::success();
+}
+
+Error MfxEncoder::probe_encode() {
+    // Same NV12 description the capture pass publishes, so the test exercises
+    // the texture flags real frames carry.
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = align16(width_);
+    desc.Height = align16(height_);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags =
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    ComPtr<ID3D11Texture2D> texture;
+    const HRESULT hr = device_->CreateTexture2D(&desc, nullptr, texture.put());
+    if (FAILED(hr) || !texture) {
+        return Error(Status::CaptureFailed,
+                     "CreateTexture2D(NV12 probe) failed: " +
+                         std::to_string(static_cast<unsigned long>(hr)));
+    }
+
+    mfxFrameSurface1* surface = nullptr;
+    if (legacy_memory_) {
+        legacy_surface_ = {};
+        legacy_surface_.Info = params_.mfx.FrameInfo;
+        legacy_surface_.Data.MemId = texture.get();
+        surface = &legacy_surface_;
+    } else {
+        Error err = import_surface(texture.get(), &surface);
+        if (!err.ok()) {
+            return err;
+        }
+    }
+
+    std::vector<EncodedPacket> packets;
+    Error err = submit(surface, /*force_keyframe=*/true, packets, /*pts_ms=*/0, kSyncWaitMs,
+                       kProbeSyncPolls);
+    // A frame that comes back must be the IDR the probe asked for; a runtime
+    // that silently ignores the request is not usable for a live stream.
+    if (err.ok() && !packets.empty() && !packets.front().keyframe) {
+        err = Error(Status::Unsupported, "probe encode returned no key frame");
+    }
+
+    // The probe image is garbage, so it must not become the repeat input. The
+    // imported surface holds its own reference; drop it before the texture dies.
+    if (imported_surface_) {
+        if (imported_surface_->FrameInterface) {
+            imported_surface_->FrameInterface->Release(imported_surface_);
+        }
+        imported_surface_ = nullptr;
+    }
+    imported_texture_ = nullptr;
+    import_shared_ = false;
+    legacy_surface_ = {};
+    bitstream_.DataOffset = 0;
+    bitstream_.DataLength = 0;
+    return err;
+}
+
+void MfxEncoder::discard_session() {
+    if (imported_surface_) {
+        if (imported_surface_->FrameInterface) {
+            imported_surface_->FrameInterface->Release(imported_surface_);
+        }
+        imported_surface_ = nullptr;
+    }
+    imported_texture_ = nullptr;
+    import_shared_ = false;
+    shared_import_refused_ = false;
+    if (session_) {
+        if (encode_open_) {
+            MFXVideoENCODE_Close(session_);
+            encode_open_ = false;
+        }
+        MFXClose(session_);
+        session_ = nullptr;
+    }
+    memory_interface_ = nullptr;
+    legacy_memory_ = false;
+    frame_allocator_ = {};
+    legacy_surface_ = {};
+    has_input_ = false;
+    bitstream_ = {};
+    bitstream_data_.clear();
 }
 
 Error MfxEncoder::import_surface(ID3D11Texture2D* texture, mfxFrameSurface1** surface) {
@@ -406,30 +804,47 @@ Error MfxEncoder::import_surface(ID3D11Texture2D* texture, mfxFrameSurface1** su
         return Error(Status::InvalidCall, "encoder input texture is smaller than the frame");
     }
 
-    // MFX_SURFACE_FLAG_IMPORT_SHARED asks the runtime to map the texture, and
-    // this machine's driver refuses it (MFX_ERR_MEMORY_ALLOC) for NV12
-    // textures bound as decoder, render target, or both, even though it
-    // advertises the flag in its capabilities; Intel's own
-    // hello-sharing-dx11-import fails the same way here. The copy import is
-    // the one that works: the texture never leaves the GPU, and the runtime
-    // GPU-copies it into its internal surface pool (device-to-device, not the
-    // CPU upload a system-memory import would do). The flag the runtime
-    // actually negotiated is recorded, so a driver that starts honouring
-    // shared import shows up in the log instead of being used silently.
-    mfxSurfaceD3D11Tex2D external{};
-    external.SurfaceInterface.Header.SurfaceType = MFX_SURFACE_TYPE_D3D11_TEX2D;
-    external.SurfaceInterface.Header.SurfaceFlags = MFX_SURFACE_FLAG_IMPORT_COPY;
-    external.SurfaceInterface.Header.StructSize = sizeof(external);
-    external.texture2D = reinterpret_cast<mfxHDL>(texture);
+    auto import_with = [&](mfxU32 flags, mfxU32* negotiated, mfxFrameSurface1** imported) {
+        mfxSurfaceD3D11Tex2D external{};
+        external.SurfaceInterface.Header.SurfaceType = MFX_SURFACE_TYPE_D3D11_TEX2D;
+        external.SurfaceInterface.Header.SurfaceFlags = flags;
+        external.SurfaceInterface.Header.StructSize = sizeof(external);
+        external.texture2D = reinterpret_cast<mfxHDL>(texture);
+        *imported = nullptr;
+        const mfxStatus result = memory_interface_->ImportFrameSurface(
+            memory_interface_, MFX_SURFACE_COMPONENT_ENCODE, &external.SurfaceInterface.Header,
+            imported);
+        *negotiated = external.SurfaceInterface.Header.SurfaceFlags;
+        return result;
+    };
 
-    mfxStatus sts = memory_interface_->ImportFrameSurface(
-        memory_interface_, MFX_SURFACE_COMPONENT_ENCODE, &external.SurfaceInterface.Header,
-        surface);
+    // Mapping the texture is the cheapest path. Some runtimes advertise the
+    // flag but refuse it at import time (this machine's driver answers
+    // MFX_ERR_MEMORY_ALLOC for an NV12 render target; Intel's own
+    // hello-sharing-dx11-import fails the same way). Once that happens, copy
+    // import is used directly for the rest of the session: the texture still
+    // never leaves the GPU, it is device-copied into the runtime's pool.
+    mfxU32 negotiated = MFX_SURFACE_FLAG_IMPORT_COPY;
+    mfxStatus sts = MFX_ERR_UNSUPPORTED;
+    if (!shared_import_refused_) {
+        sts = import_with(MFX_SURFACE_FLAG_IMPORT_SHARED, &negotiated, surface);
+        if (sts != MFX_ERR_NONE) {
+            shared_import_refused_ = true;
+            // A refused import should not hand back a surface, but releasing a
+            // partial result here is cheaper than leaking it if one does.
+            if (*surface && (*surface)->FrameInterface) {
+                (*surface)->FrameInterface->Release(*surface);
+            }
+            *surface = nullptr;
+        }
+    }
+    if (sts != MFX_ERR_NONE) {
+        sts = import_with(MFX_SURFACE_FLAG_IMPORT_COPY, &negotiated, surface);
+    }
     if (sts != MFX_ERR_NONE) {
         return mfx_error(sts, "ImportFrameSurface(NV12)");
     }
-    import_shared_ =
-        (external.SurfaceInterface.Header.SurfaceFlags & MFX_SURFACE_FLAG_IMPORT_SHARED) != 0;
+    import_shared_ = (negotiated & MFX_SURFACE_FLAG_IMPORT_SHARED) != 0;
 
     imported_texture_ = texture;
     imported_surface_ = *surface;
@@ -444,16 +859,65 @@ Error MfxEncoder::encode(ID3D11Texture2D* nv12, uint64_t pts_ms, bool force_keyf
     if (!nv12) {
         return Error(Status::InvalidCall, "encoder got a null NV12 texture");
     }
+    if (legacy_memory_) {
+        D3D11_TEXTURE2D_DESC desc{};
+        nv12->GetDesc(&desc);
+        if (desc.Format != DXGI_FORMAT_NV12) {
+            return Error(Status::InvalidCall, "encoder input is not NV12");
+        }
+        if (desc.Width < align16(width_) || desc.Height < align16(height_)) {
+            return Error(Status::InvalidCall, "encoder input texture is smaller than the frame");
+        }
+        // The legacy runtime resolves MemId through get_handle() and reads the
+        // capture texture in place. The persistent surface is refilled here;
+        // submit() waits for the sync point before returning.
+        legacy_surface_ = {};
+        legacy_surface_.Info = params_.mfx.FrameInfo;
+        legacy_surface_.Data.MemId = nv12;
+        legacy_surface_.Data.Pitch = 0;
+        Error err = submit(&legacy_surface_, force_keyframe, out, pts_ms);
+        if (err.ok()) {
+            has_input_ = true;
+        }
+        return err;
+    }
     mfxFrameSurface1* surface = nullptr;
     Error err = import_surface(nv12, &surface);
     if (!err.ok()) {
         return err;
     }
+    err = submit(surface, force_keyframe, out, pts_ms);
+    if (err.ok()) {
+        has_input_ = true;
+    }
+    return err;
+}
+
+Error MfxEncoder::encode_repeat(uint64_t pts_ms, bool force_keyframe,
+                                std::vector<EncodedPacket>& out) {
+    if (!session_ || !encode_open_) {
+        return Error(Status::NotCurrentlyAvailable, "encoder is not initialized");
+    }
+    if (!has_input_) {
+        return Error(Status::NotCurrentlyAvailable, "no encoded input to repeat");
+    }
+    // A repeat frame never touches the texture, so no import failure reports a
+    // removed device first; without this check the runtime would sit in the
+    // sync wait for the full timeout before the loss surfaces.
+    const HRESULT device_status = device_->GetDeviceRemovedReason();
+    if (FAILED(device_status)) {
+        return check(device_status, "D3D11 device check before repeat");
+    }
+    mfxFrameSurface1* surface = legacy_memory_ ? &legacy_surface_ : imported_surface_;
+    if (!surface) {
+        return Error(Status::NotCurrentlyAvailable, "no encoded input to repeat");
+    }
     return submit(surface, force_keyframe, out, pts_ms);
 }
 
 Error MfxEncoder::submit(mfxFrameSurface1* surface, bool force_keyframe,
-                         std::vector<EncodedPacket>& out, uint64_t pts_ms) {
+                         std::vector<EncodedPacket>& out, uint64_t pts_ms,
+                         mfxU32 wait_ms, int max_polls) {
     mfxEncodeCtrl control{};
     mfxEncodeCtrl* control_ptr = nullptr;
     if (force_keyframe) {
@@ -462,33 +926,56 @@ Error MfxEncoder::submit(mfxFrameSurface1* surface, bool force_keyframe,
     }
 
     surface->Data.TimeStamp = pts_ms;
-    bitstream_.DataOffset = 0;
-    bitstream_.DataLength = 0;
-
     mfxSyncPoint sync = nullptr;
-    mfxStatus sts = MFXVideoENCODE_EncodeFrameAsync(session_, control_ptr, surface, &bitstream_,
-                                                   &sync);
     // The surface stays referenced by the runtime until the operation
     // completes; nothing to release here (the import keeps it alive).
+    auto encode_once = [&]() {
+        bitstream_.DataOffset = 0;
+        bitstream_.DataLength = 0;
+        sync = nullptr;
+        return MFXVideoENCODE_EncodeFrameAsync(session_, control_ptr, surface, &bitstream_,
+                                               &sync);
+    };
+    mfxStatus sts = encode_once();
     if (sts == MFX_WRN_DEVICE_BUSY) {
         // Transient back-pressure from the GPU; wait for outstanding work, as
         // Intel's examples do, then retry once.
-        MFXVideoCORE_SyncOperation(session_, nullptr, kSyncWaitMs);
-        sts = MFXVideoENCODE_EncodeFrameAsync(session_, control_ptr, surface, &bitstream_, &sync);
+        MFXVideoCORE_SyncOperation(session_, nullptr, wait_ms);
+        sts = encode_once();
+    }
+    // One access unit can exceed the initial buffer (large IDR at a high
+    // target rate). Grow it as Intel's samples do instead of failing the
+    // stream permanently on the same undersized buffer.
+    for (unsigned growth = 0; sts == MFX_ERR_NOT_ENOUGH_BUFFER; ++growth) {
+        if (growth >= 4 || bitstream_data_.size() >= kMaxBitstreamBufferSize) {
+            break;
+        }
+        const size_t capacity =
+            (std::min)(bitstream_data_.size() * 2, kMaxBitstreamBufferSize);
+        bitstream_data_.resize(capacity);
+        bitstream_.MaxLength = static_cast<mfxU32>(capacity);
+        bitstream_.Data = bitstream_data_.data();
+        sts = encode_once();
+    }
+    // The encoder accepted the frame but produced nothing yet. This is normal
+    // for the low-delay path and is not an error; the sync point (when one is
+    // returned) is still waited on below.
+    if (sts == MFX_ERR_MORE_DATA && sync == nullptr) {
+        return Error::success();
     }
     if (sts < MFX_ERR_NONE) {
         return mfx_error(sts, "MFXVideoENCODE_EncodeFrameAsync");
     }
-    // MFX_ERR_MORE_DATA with a valid sync point is the normal low-delay case:
-    // the encoder accepted the frame but has no output yet.
     if (sync) {
         int polls = 0;
         do {
-            sts = MFXVideoCORE_SyncOperation(session_, sync, kSyncWaitMs);
+            sts = MFXVideoCORE_SyncOperation(session_, sync, wait_ms);
             ++polls;
-        } while (sts == MFX_WRN_IN_EXECUTION && polls < kMaxSyncPolls);
+        } while (sts == MFX_WRN_IN_EXECUTION && polls < max_polls);
         if (sts == MFX_WRN_IN_EXECUTION) {
-            return Error(Status::CaptureFailed, "encode did not complete within 10 s");
+            return Error(Status::CaptureFailed,
+                         "encode did not complete within " +
+                             std::to_string(static_cast<long long>(wait_ms) * max_polls) + " ms");
         }
         if (sts != MFX_ERR_NONE) {
             return mfx_error(sts, "MFXVideoCORE_SyncOperation");
@@ -515,15 +1002,14 @@ Error MfxEncoder::set_bitrate(UINT bits_per_second) {
     if (!session_ || !encode_open_) {
         return Error(Status::NotCurrentlyAvailable, "encoder is not initialized");
     }
-    const UINT kbps = (std::max)(1u, bits_per_second / 1000u);
+    const UINT kbps = (std::clamp)(bits_per_second / 1000u, 1u, 0xFFFFu);
     // The reset needs a full description, not just the fields that change: the
     // runtime compares it against what is running. Everything else is carried
     // over from initialisation.
     mfxVideoParam reset = params_;
     reset.mfx.RateControlMethod = MFX_RATECONTROL_CBR;
-    reset.mfx.TargetKbps = static_cast<mfxU16>((std::min)(kbps, 0xFFFFu));
-    mfxExtBuffer* extensions[] = {&signal_.Header};
-    reset.ExtParam = extensions;
+    reset.mfx.TargetKbps = static_cast<mfxU16>(kbps);
+    reset.ExtParam = extensions_;
     reset.NumExtParam = 1;
     const mfxStatus sts = MFXVideoENCODE_Reset(session_, &reset);
     // A positive status is a warning the runtime already resolved (mfx-gen
@@ -533,31 +1019,16 @@ Error MfxEncoder::set_bitrate(UINT bits_per_second) {
         return mfx_error(sts, "MFXVideoENCODE_Reset(bitrate)");
     }
     params_.mfx.TargetKbps = reset.mfx.TargetKbps;
-    bitrate_ = bits_per_second;
+    bitrate_ = static_cast<UINT>(reset.mfx.TargetKbps) * 1000u;
     return Error::success();
 }
 
 void MfxEncoder::close() {
-    if (imported_surface_) {
-        if (imported_surface_->FrameInterface) {
-            imported_surface_->FrameInterface->Release(imported_surface_);
-        }
-        imported_surface_ = nullptr;
-    }
-    imported_texture_ = nullptr;
-    if (session_) {
-        if (encode_open_) {
-            MFXVideoENCODE_Close(session_);
-            encode_open_ = false;
-        }
-        MFXClose(session_);
-        session_ = nullptr;
-    }
+    discard_session();
     if (loader_) {
         MFXUnload(loader_);
         loader_ = nullptr;
     }
-    memory_interface_ = nullptr;
     device_.reset();
 }
 
@@ -613,48 +1084,54 @@ UINT hardware_bitrate(UINT width, UINT height, float quality_ratio, bool h264) {
     return (std::max)(1u, kbps) * 1000u;
 }
 
-bool hardware_encoder_available(VideoCodec codec) {
-    mfxLoader loader = MFXLoad();
-    if (!loader) {
-        return false;
-    }
-    const mfxU32 codec_id = codec == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
-    mfxConfig cfg = MFXCreateConfig(loader);
-    mfxVariant value{};
-    value.Type = MFX_VARIANT_TYPE_U32;
-    value.Data.U32 = codec_id;
-    MFXSetConfigFilterProperty(
-        cfg,
-        reinterpret_cast<const mfxU8*>(
-            "mfxImplDescription.mfxEncoderDescription.encoder.CodecID"),
-        value);
-    bool found = false;
-    for (mfxU32 i = 0;; ++i) {
-        mfxHDL raw = nullptr;
-        if (MFXEnumImplementations(loader, i, MFX_IMPLCAPS_IMPLDESCSTRUCTURE, &raw) != MFX_ERR_NONE ||
-            !raw) {
-            break;
+bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device) {
+    AdapterIdentity adapter;
+    if (device) {
+        adapter = identify_adapter(device);
+        if (!adapter.valid) {
+            return false;
         }
-        const auto* desc = reinterpret_cast<const mfxImplDescription*>(raw);
-        if (desc->Impl == MFX_IMPL_TYPE_HARDWARE) {
-            for (mfxU16 e = 0; e < desc->Enc.NumCodecs; ++e) {
-                if (desc->Enc.Codecs[e].CodecID == codec_id) {
-                    found = true;
+    }
+
+    auto has_implementation = [&](VideoCodec wanted) {
+        mfxLoader loader = MFXLoad();
+        if (!loader) {
+            return false;
+        }
+        const mfxU32 codec_id = wanted == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
+        bool found = false;
+        // Any enumerated implementation already satisfies the filters. The
+        // description's encoder table is not consulted: mfxhw64 leaves
+        // Enc.NumCodecs at zero even though session creation and encoding work,
+        // and its API version (1.x) predates ImportFrameSurface, which is fine
+        // -- create_encoder() uses an application frame allocator there.
+        if (filter_d3d11_encoder(loader, codec_id).ok()) {
+            for (mfxU32 index = 0; !found; ++index) {
+                mfxHDL raw = nullptr;
+                if (MFXEnumImplementations(loader, index, MFX_IMPLCAPS_IMPLDESCSTRUCTURE, &raw) !=
+                        MFX_ERR_NONE ||
+                    !raw) {
+                    break;
                 }
+                const auto* desc = reinterpret_cast<const mfxImplDescription*>(raw);
+                found = !device || implementation_on_adapter(loader, index, *desc, adapter);
+                MFXDispReleaseImplDescription(loader, raw);
             }
         }
-        MFXDispReleaseImplDescription(loader, raw);
-        if (found) {
-            break;
-        }
+        MFXUnload(loader);
+        return found;
+    };
+
+    if (has_implementation(codec)) {
+        return true;
     }
-    MFXUnload(loader);
-    return found;
+    // An HEVC request falls back to the AVC tiers when HEVC hardware encoding
+    // is absent, so an AVC encoder on the capture adapter still qualifies.
+    return codec == VideoCodec::Hevc && has_implementation(VideoCodec::H264);
 }
 
-std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device, const LUID& adapter_luid,
-                                              const EncoderConfig& config, std::string* error) {
-    (void)adapter_luid;  // see MfxEncoder::initialize: the device decides the adapter
+std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device, const EncoderConfig& config,
+                                              std::string* error) {
     auto encoder = std::make_unique<MfxEncoder>();
     const Error err = encoder->initialize(device, config);
     if (!err.ok()) {

@@ -1,0 +1,23 @@
+name: chast_viewer
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_gpu_texture_renderer:
+    git:
+      url: https://github.com/rustdesk-org/flutter_gpu_texture_renderer
+      ref: 08a471bb8ceccdd50483c81cdfa8b81b07b14b87
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

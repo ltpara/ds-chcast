@@ -10,9 +10,10 @@
 //                 [--colorimetry bt601-limited|bt601-full|bt709-limited|bt709-full]
 //                 [--cursor cur.bmp] [--no-hdr] [--no-cursor] [--quiet]
 //
-// The NV12 dump is a planar YUV4:2:0 file (full Y plane, then interleaved UV),
-// which ffmpeg reads as rawvideo yuv420p when told the matrix and range:
-//   ffmpeg -f rawvideo -pix_fmt yuv420p -s WxH -i out.yuv -vf scale=out_color_matrix=bt601 \
+// The NV12 dump is a planar NV12 file (full Y plane, then interleaved UV),
+// which ffmpeg reads as rawvideo nv12. yuv420p is the wrong pixel format: its
+// chroma planes are separate.
+//   ffmpeg -f rawvideo -pix_fmt nv12 -s WxH -i out.yuv -vf scale=out_color_matrix=bt601 \
 //          out.png
 
 #include <d3d11.h>
@@ -41,43 +42,48 @@ struct Options {
 };
 
 bool parse_args(int argc, char** argv, Options& options) {
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "--display" && i + 1 < argc) {
-            options.display = static_cast<size_t>(std::stoul(argv[++i]));
-        } else if (arg == "--seconds" && i + 1 < argc) {
-            options.seconds = std::stod(argv[++i]);
-        } else if (arg == "--dump" && i + 1 < argc) {
-            options.frame_path = argv[++i];
-        } else if (arg == "--nv12" && i + 1 < argc) {
-            options.nv12_path = argv[++i];
-            options.config.nv12.enabled = true;
-        } else if (arg == "--colorimetry" && i + 1 < argc) {
-            const std::string value = argv[++i];
-            if (value == "bt601-limited") {
-                options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt601Limited;
-            } else if (value == "bt601-full") {
-                options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt601Full;
-            } else if (value == "bt709-limited") {
-                options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt709Limited;
-            } else if (value == "bt709-full") {
-                options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt709Full;
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--display" && i + 1 < argc) {
+                options.display = static_cast<size_t>(std::stoul(argv[++i]));
+            } else if (arg == "--seconds" && i + 1 < argc) {
+                options.seconds = std::stod(argv[++i]);
+            } else if (arg == "--dump" && i + 1 < argc) {
+                options.frame_path = argv[++i];
+            } else if (arg == "--nv12" && i + 1 < argc) {
+                options.nv12_path = argv[++i];
+                options.config.nv12.enabled = true;
+            } else if (arg == "--colorimetry" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                if (value == "bt601-limited") {
+                    options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt601Limited;
+                } else if (value == "bt601-full") {
+                    options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt601Full;
+                } else if (value == "bt709-limited") {
+                    options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt709Limited;
+                } else if (value == "bt709-full") {
+                    options.config.nv12.colorimetry = chast::Nv12Colorimetry::Bt709Full;
+                } else {
+                    std::fprintf(stderr, "unknown colorimetry: %s\n", value.c_str());
+                    return false;
+                }
+            } else if (arg == "--cursor" && i + 1 < argc) {
+                options.cursor_path = argv[++i];
+            } else if (arg == "--no-hdr") {
+                options.config.want_hdr = false;
+            } else if (arg == "--no-cursor") {
+                options.config.capture_cursor = false;
+            } else if (arg == "--quiet") {
+                options.quiet = true;
             } else {
-                std::fprintf(stderr, "unknown colorimetry: %s\n", value.c_str());
+                std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
                 return false;
             }
-        } else if (arg == "--cursor" && i + 1 < argc) {
-            options.cursor_path = argv[++i];
-        } else if (arg == "--no-hdr") {
-            options.config.want_hdr = false;
-        } else if (arg == "--no-cursor") {
-            options.config.capture_cursor = false;
-        } else if (arg == "--quiet") {
-            options.quiet = true;
-        } else {
-            std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
-            return false;
         }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "invalid argument value: %s\n", e.what());
+        return false;
     }
     return true;
 }
@@ -321,9 +327,15 @@ int main(int argc, char** argv) {
     uint64_t pointer_only = 0;
     uint64_t timeouts = 0;
     uint64_t reinit_needed = 0;
+    // Whether each dump was asked for has to be remembered separately: a path
+    // is cleared when its dump fails so the loop stops retrying it.
+    const bool want_frame = !options.frame_path.empty();
+    const bool want_nv12 = !options.nv12_path.empty();
+    const bool want_cursor = !options.cursor_path.empty();
     bool dumped = false;
     bool dumped_nv12 = false;
     bool dumped_cursor = false;
+    bool nv12_missing_reported = false;
 
     while (true) {
         if (options.seconds > 0.0) {
@@ -382,6 +394,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (want_nv12 && !frame.nv12_texture && !nv12_missing_reported) {
+            nv12_missing_reported = true;
+            std::fprintf(stderr, "frame has no NV12 texture: %s\n",
+                         capturer->last_error().to_string().c_str());
+        }
+
         if (!options.nv12_path.empty() && !dumped_nv12 && frame.nv12_updated &&
             frame.nv12_texture != nullptr) {
             std::string dump_error;
@@ -413,6 +431,9 @@ int main(int argc, char** argv) {
                                 cursor.hotspot.x, cursor.hotspot.y, cursor.origin_offset.x,
                                 cursor.origin_offset.y, cursor.outlined ? ", outlined" : "");
                 }
+            } else {
+                std::fprintf(stderr, "cursor dump failed: %s\n", dump_error.c_str());
+                options.cursor_path.clear();
             }
         }
 
@@ -435,5 +456,19 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(timeouts),
                 static_cast<unsigned long long>(reinit_needed),
                 elapsed > 0.0 ? static_cast<double>(events) / elapsed : 0.0);
-    return 0;
+    bool missing = false;
+    if (want_frame && !dumped) {
+        std::fprintf(stderr, "requested frame dump was not produced\n");
+        missing = true;
+    }
+    if (want_nv12 && !dumped_nv12) {
+        std::fprintf(stderr, "requested NV12 dump was not produced: %s\n",
+                     capturer->last_error().to_string().c_str());
+        missing = true;
+    }
+    if (want_cursor && !dumped_cursor) {
+        std::fprintf(stderr, "requested cursor dump was not produced (no cursor shape seen)\n");
+        missing = true;
+    }
+    return missing ? 1 : 0;
 }

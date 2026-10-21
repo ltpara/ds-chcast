@@ -86,8 +86,8 @@ Error Nv12Pass::initialize(ID3D11Device* device, ID3D11DeviceContext* context, U
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputFrameRate = DXGI_RATIONAL{30, 1};
     content.OutputFrameRate = DXGI_RATIONAL{30, 1};
-    content.InputWidth = surface_width_;
-    content.InputHeight = surface_height_;
+    content.InputWidth = width_;
+    content.InputHeight = height_;
     content.OutputWidth = surface_width_;
     content.OutputHeight = surface_height_;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
@@ -144,7 +144,10 @@ Error Nv12Pass::convert(ID3D11Texture2D* source, ID3D11Texture2D** out) {
 
     D3D11_TEXTURE2D_DESC source_desc{};
     source->GetDesc(&source_desc);
-    if (source_desc.Width < surface_width_ || source_desc.Height < surface_height_) {
+    // The source is the unpadded frame the stages publish; only the output
+    // target is 16-aligned, so the source has to cover the real frame, not the
+    // padded surface.
+    if (source_desc.Width < width_ || source_desc.Height < height_) {
         return Error(Status::InvalidCall, "NV12 source is smaller than the pass frame");
     }
     Error err = ensure_target();

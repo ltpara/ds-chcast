@@ -45,7 +45,11 @@ void HdrPass::mark_unavailable() {
 }
 
 HdrPass::HdrPass(ID3D11Device* device, ID3D11DeviceContext* context)
-    : device_(device), context_(context) {}
+    : device_(device), context_(context) {
+    // Both belong to the capturer: take a reference instead of adopting one.
+    device_.add_ref();
+    context_.add_ref();
+}
 
 Error HdrPass::convert(ID3D11Texture2D* source, const Params& params, ID3D11Texture2D** out) {
     *out = nullptr;

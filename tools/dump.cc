@@ -12,6 +12,45 @@ namespace {
 
 const char* yes_no(bool value) { return value ? "yes" : "no"; }
 
+// UTF-8 bytes of `text` with JSON string escaping. Device and adapter names
+// are user-visible monitor names, so a quote or non-ASCII character in them
+// must not break the document.
+std::string json_string(const std::wstring& text) {
+    std::string utf8;
+    if (!text.empty()) {
+        const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+                                             static_cast<int>(text.size()), nullptr, 0, nullptr,
+                                             nullptr);
+        if (size > 0) {
+            utf8.resize(static_cast<size_t>(size));
+            WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                utf8.data(), size, nullptr, nullptr);
+        }
+    }
+    std::string escaped;
+    escaped.reserve(utf8.size());
+    for (const unsigned char c : utf8) {
+        switch (c) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char code[7];
+                    std::snprintf(code, sizeof(code), "\\u%04x", c);
+                    escaped += code;
+                } else {
+                    escaped += static_cast<char>(c);
+                }
+        }
+    }
+    return escaped;
+}
+
 void print_text(const std::vector<chast::DisplayInfo>& displays) {
     std::printf("duplication supported: %s\n", chast::duplication_supported() ? "yes" : "no");
     std::printf("displays: %zu\n\n", displays.size());
@@ -42,14 +81,15 @@ void print_json(const std::vector<chast::DisplayInfo>& displays) {
                 chast::duplication_supported() ? "true" : "false");
     for (size_t i = 0; i < displays.size(); ++i) {
         const chast::DisplayInfo& d = displays[i];
+        const std::string device = json_string(d.device_name);
+        const std::string adapter = json_string(d.adapter_name);
         std::printf(
-            "%s{\"index\":%zu,\"device\":\"%ls\",\"adapter\":\"%ls\",\"left\":%ld,\"top\":%ld,"
+            "%s{\"index\":%zu,\"device\":\"%s\",\"adapter\":\"%s\",\"left\":%ld,\"top\":%ld,"
             "\"width\":%u,\"height\":%u,\"rotation\":%u,\"primary\":%s,\"hdr\":%s,"
             "\"advanced_color_sdr\":%s,\"sdr_white_level\":%u,\"max_luminance_nits\":%.1f}",
-            i ? "," : "", i, d.device_name.c_str(), d.adapter_name.c_str(), d.rect.left,
-            d.rect.top, d.width, d.height, d.rotation_degrees, d.primary ? "true" : "false",
-            d.hdr ? "true" : "false", d.advanced_color_sdr ? "true" : "false",
-            d.sdr_white_level, d.max_luminance_nits);
+            i ? "," : "", i, device.c_str(), adapter.c_str(), d.rect.left, d.rect.top, d.width,
+            d.height, d.rotation_degrees, d.primary ? "true" : "false", d.hdr ? "true" : "false",
+            d.advanced_color_sdr ? "true" : "false", d.sdr_white_level, d.max_luminance_nits);
     }
     std::printf("]}\n");
 }

@@ -50,10 +50,14 @@ std::string hresult_message(HRESULT hr) {
     const wchar_t* text = err.Description();
     std::string out;
     if (text && *text) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+        // -1 includes the terminator in the byte count, so the buffer has to
+        // hold `len` bytes even though the result excludes the NUL.
+        const int len = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
         if (len > 1) {
-            out.resize(static_cast<size_t>(len - 1));
-            WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), len, nullptr, nullptr);
+            std::string converted(static_cast<size_t>(len), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, text, -1, converted.data(), len, nullptr, nullptr);
+            converted.resize(static_cast<size_t>(len - 1));
+            out = std::move(converted);
         }
     }
     char code[16];

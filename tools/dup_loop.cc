@@ -62,33 +62,66 @@ int main(int argc, char** argv) {
     }
 
     IDXGIFactory1* factory = nullptr;
-    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
-        return 1;
-    }
     IDXGIAdapter1* adapter = nullptr;
-    factory->EnumAdapters1(0, &adapter);
     IDXGIOutput* output = nullptr;
-    adapter->EnumOutputs(0, &output);
-
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
-                                   &device, &level, &context);
-    std::printf("device hr=%08lX level=%d\n", static_cast<unsigned long>(hr), level);
-
     IDXGIOutput1* output1 = nullptr;
-    output->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
     IDXGIOutputDuplication* duplication = nullptr;
+    ID3D11Texture2D* staging = nullptr;
+    auto shutdown = [&]() {
+        release(staging);
+        release(duplication);
+        release(output1);
+        release(context);
+        release(device);
+        release(output);
+        release(adapter);
+        release(factory);
+    };
+
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+    if (FAILED(hr) || !factory) {
+        std::fprintf(stderr, "CreateDXGIFactory1 hr=%08lX\n", static_cast<unsigned long>(hr));
+        return 1;
+    }
+    hr = factory->EnumAdapters1(0, &adapter);
+    if (FAILED(hr) || !adapter) {
+        std::fprintf(stderr, "EnumAdapters1 hr=%08lX\n", static_cast<unsigned long>(hr));
+        shutdown();
+        return 1;
+    }
+    hr = adapter->EnumOutputs(0, &output);
+    if (FAILED(hr) || !output) {
+        std::fprintf(stderr, "EnumOutputs hr=%08lX\n", static_cast<unsigned long>(hr));
+        shutdown();
+        return 1;
+    }
+
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                           D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+                           &device, &level, &context);
+    std::printf("device hr=%08lX level=%d\n", static_cast<unsigned long>(hr), level);
+    if (FAILED(hr) || !device || !context) {
+        shutdown();
+        return 1;
+    }
+
+    hr = output->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&output1));
+    if (FAILED(hr) || !output1) {
+        std::fprintf(stderr, "IDXGIOutput1 hr=%08lX\n", static_cast<unsigned long>(hr));
+        shutdown();
+        return 1;
+    }
     hr = output1->DuplicateOutput(device, &duplication);
     std::printf("duplicate hr=%08lX dup=%p\n", static_cast<unsigned long>(hr),
                 static_cast<void*>(duplication));
-    if (FAILED(hr)) {
+    if (FAILED(hr) || !duplication) {
+        shutdown();
         return 1;
     }
 
-    ID3D11Texture2D* staging = nullptr;
     std::vector<uint8_t> cursor_buffer;
 
     IDXGIResource* held = nullptr;
@@ -112,11 +145,17 @@ int main(int argc, char** argv) {
 
         ID3D11Texture2D* texture = nullptr;
         if (options.desc || options.staging) {
-            resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture));
-            D3D11_TEXTURE2D_DESC desc{};
-            texture->GetDesc(&desc);
-            std::printf("[%d] tex %ux%u fmt=%u bind=%08X misc=%08X usage=%u\n", i, desc.Width,
-                        desc.Height, desc.Format, desc.BindFlags, desc.MiscFlags, desc.Usage);
+            const HRESULT qhr =
+                resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture));
+            if (FAILED(qhr) || !texture) {
+                std::fprintf(stderr, "[%d] ID3D11Texture2D hr=%08lX\n", i,
+                             static_cast<unsigned long>(qhr));
+            } else {
+                D3D11_TEXTURE2D_DESC desc{};
+                texture->GetDesc(&desc);
+                std::printf("[%d] tex %ux%u fmt=%u bind=%08X misc=%08X usage=%u\n", i, desc.Width,
+                            desc.Height, desc.Format, desc.BindFlags, desc.MiscFlags, desc.Usage);
+            }
         }
 
         if (options.cursor) {
@@ -174,14 +213,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    release(staging);
-    duplication->Release();
-    output1->Release();
-    context->Release();
-    device->Release();
-    output->Release();
-    adapter->Release();
-    factory->Release();
+    release(held_texture);
+    release(held);
+    shutdown();
     std::printf("done\n");
     return 0;
 }

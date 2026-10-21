@@ -1,8 +1,8 @@
 // Shader compilation for the GPU stages.
 //
 // d3dcompiler_47.dll is delay-loaded (see CMakeLists) so the capture library
-// loads on systems where it is absent; availability() is the runtime gate the
-// capturer checks before asking DXGI for FP16 frames.
+// loads on systems where it is absent; shader_support_available() is the
+// runtime gate the capturer checks before asking DXGI for FP16 frames.
 
 #include "capture/shader.h"
 
@@ -18,6 +18,17 @@ namespace {
 std::atomic<bool> g_checked{false};
 std::atomic<bool> g_available{false};
 
+// D3DCompile is delay-loaded, so a missing d3dcompiler_47.dll would otherwise
+// fail inside the delay-load helper as a structured exception. Loading the
+// module up front turns that into a plain "unsupported" result. The reference
+// is held for the process lifetime: another thread may be compiling when the
+// first check finishes, and FreeLibrary would make the delay-load target
+// disappear again.
+bool compiler_loaded() {
+    static const bool loaded = [] { return LoadLibraryW(L"d3dcompiler_47.dll") != nullptr; }();
+    return loaded;
+}
+
 struct CompiledBlob {
     ComPtr<ID3DBlob> code;
     std::string diagnostics;
@@ -25,6 +36,10 @@ struct CompiledBlob {
 
 Error compile(const char* source, const char* entry, const char* target,
               std::string_view debug_name, CompiledBlob& out) {
+    if (!compiler_loaded()) {
+        return Error(Status::Unsupported,
+                     "d3dcompiler_47.dll is not available; shader stages are disabled");
+    }
     ComPtr<ID3DBlob> errors;
     UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #if defined(_DEBUG)

@@ -56,9 +56,14 @@ private:
     // Records a non-fatal setup problem for last_error() without dropping an
     // earlier one (a degraded rotation and a missing NV12 pass can both happen).
     void note(const Error& err);
-    Error run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out, HANDLE* shared_out);
+    Error run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out, HANDLE* shared_out,
+                     bool* rotation_failed, bool* hdr_failed, bool* fp16_without_hdr);
     Error run_nv12(ID3D11Texture2D* source);
     void release_nv12();
+    // Builds the rotation pass for the current rotation and sizes. Rebuilding
+    // drops a previous pass so a topology change cannot leave stale geometry
+    // behind. A no-op rotation leaves the pass not-ready.
+    void create_rotation_pass();
     // Builds (or, on a topology change, rebuilds) the NV12 pass for the size
     // the stages currently publish. A no-op when NV12 is not configured.
     void create_nv12_pass();
@@ -145,23 +150,7 @@ Error DxgiCapturer::initialize() {
     detail::surface_size(screen_width_, screen_height_, rotation_, surface_width_, surface_height_);
     color_ = desc.color;
 
-    if (desc.desc.ModeDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        // Only DuplicateOutput1 asks for FP16, and only when a shader exists to
-        // normalize it; a duplication that came back FP16 always has a pass.
-        hdr_pass_ = std::make_unique<detail::HdrPass>(device_.get(), context_.get());
-    }
-
-    if (rotation_ != DXGI_MODE_ROTATION_IDENTITY &&
-        rotation_ != DXGI_MODE_ROTATION_UNSPECIFIED) {
-        Error rot = rotation_pass_.initialize(device_.get(), context_.get(), rotation_,
-                                              surface_width_, surface_height_, screen_width_,
-                                              screen_height_);
-        if (!rot.ok()) {
-            // The encoder can still rotate itself; report the pending rotation
-            // on every frame instead of failing capture.
-            note(rot);
-        }
-    }
+    create_rotation_pass();
 
     color_monitor_ = std::make_unique<detail::ColorStateMonitor>(display_.device_name);
 
@@ -204,6 +193,21 @@ void DxgiCapturer::published_size(UINT& width, UINT& height) const {
     } else {
         width = surface_width_;
         height = surface_height_;
+    }
+}
+
+void DxgiCapturer::create_rotation_pass() {
+    rotation_pass_ = detail::RotationPass{};
+    if (rotation_ == DXGI_MODE_ROTATION_IDENTITY ||
+        rotation_ == DXGI_MODE_ROTATION_UNSPECIFIED) {
+        return;
+    }
+    Error rot = rotation_pass_.initialize(device_.get(), context_.get(), rotation_, surface_width_,
+                                          surface_height_, screen_width_, screen_height_);
+    if (!rot.ok()) {
+        // The encoder can still carry the rotation itself; report the pending
+        // rotation on every frame instead of failing capture.
+        note(rot);
     }
 }
 
@@ -343,18 +347,15 @@ Error DxgiCapturer::create_duplication() {
     }
     output_ = output;
     // DuplicateOutput1 (the FP16 path) lives on IDXGIOutput5, DuplicateOutput
-    // on IDXGIOutput1.
+    // on IDXGIOutput1. Legacy DuplicateOutput works without IDXGIOutput5, so
+    // its absence only costs the FP16 path.
     output1_ = com_query<IDXGIOutput5>(output);
-    if (!output1_) {
-        return Error(Status::Unsupported,
-                     "IDXGIOutput5 unavailable (Windows 7 without the platform update)");
-    }
 
     // DuplicateOutput1 hands over FP16 scRGB on HDR desktops; the legacy call
     // converts to BGRA8 by clipping, which washes out HDR hosts. FP16 is only
     // requested where a shader exists to normalize it, since there is no CPU
     // fallback that could convert it later.
-    if (config_.want_hdr && detail::HdrPass::available()) {
+    if (output1_ && config_.want_hdr && detail::HdrPass::available()) {
         const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT,
                                        DXGI_FORMAT_B8G8R8A8_UNORM};
         HRESULT hr = output1_->DuplicateOutput1(device_.get(), 0, ARRAYSIZE(formats), formats,
@@ -366,8 +367,11 @@ Error DxgiCapturer::create_duplication() {
         // that still support the legacy call (e.g. third-party display
         // drivers), and an SDR-quality capture beats none.
     }
-    return check(com_query<IDXGIOutput1>(output_)->DuplicateOutput(device_.get(),
-                                                                 duplication_.put()),
+    ComPtr<IDXGIOutput1> legacy = com_query<IDXGIOutput1>(output_);
+    if (!legacy) {
+        return Error(Status::Unsupported, "output does not expose IDXGIOutput1");
+    }
+    return check(legacy->DuplicateOutput(device_.get(), duplication_.put()),
                  "DuplicateOutput");
 }
 
@@ -386,8 +390,11 @@ Error DxgiCapturer::re_duplicate_without_hdr() {
     // HDR desktops. That is the same trade-off RustDesk's abandon_tonemap
     // makes; it falls back to GDI there, which is the one thing this capturer
     // never does.
-    Error err = check(com_query<IDXGIOutput1>(output_)->DuplicateOutput(device_.get(),
-                                                                       duplication_.put()),
+    ComPtr<IDXGIOutput1> legacy = com_query<IDXGIOutput1>(output_);
+    if (!legacy) {
+        return Error(Status::Unsupported, "output does not expose IDXGIOutput1");
+    }
+    Error err = check(legacy->DuplicateOutput(device_.get(), duplication_.put()),
                       "DuplicateOutput(legacy)");
     if (!err.ok()) {
         return err;
@@ -407,13 +414,16 @@ Error DxgiCapturer::re_duplicate_without_hdr() {
     display_.rotation_degrees = detail::rotation_degrees(rotation_);
     detail::surface_size(screen_width_, screen_height_, rotation_, surface_width_,
                          surface_height_);
+    display_.width = screen_width_;
+    display_.height = screen_height_;
+    display_.rotation_degrees = detail::rotation_degrees(rotation_);
+
+    // The new duplication can describe different geometry; rebuild both passes
+    // for it instead of letting the old rotation output and the new NV12 target
+    // disagree.
+    create_rotation_pass();
     frame_.rotation_degrees =
         rotation_pass_.ready() ? 0 : detail::rotation_degrees(rotation_);
-
-    // The NV12 target is sized for the frame the stages publish, which can
-    // differ after a mode or rotation change (and whether the video processor
-    // rotates can change with the new caps), so it is rebuilt here alongside
-    // the rotation pass. The next desktop frame converts again.
     frame_.nv12_texture = nullptr;
     frame_.nv12_shared_handle = nullptr;
     frame_.nv12_surface_width = 0;
@@ -485,11 +495,16 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
     // as E_INVALIDARG.
     ID3D11Texture2D* staged = nullptr;
     HANDLE staged_handle = nullptr;
-    Error err = run_stages(desktop.get(), &staged, &staged_handle);
+    bool rotation_failed = false;
+    bool hdr_failed = false;
+    bool fp16_without_hdr = false;
+    Error err = run_stages(desktop.get(), &staged, &staged_handle, &rotation_failed, &hdr_failed,
+                           &fp16_without_hdr);
     if (!err.ok()) {
         last_error_ = err;
-        if (hdr_pass_ && detail::stage_failure_is_permanent(err.status())) {
-            // The FP16 conversion is what failed. Stop asking for FP16 in this
+        const bool permanent = detail::stage_failure_is_permanent(err.status());
+        if (permanent && (hdr_failed || fp16_without_hdr)) {
+            // The FP16 path is what failed. Stop asking for FP16 in this
             // process, then re-duplicate so DXGI does the conversion itself;
             // the alternative is failing every frame from now on. Like
             // RustDesk's abandon_tonemap, the caller sees a no-new-frame and
@@ -504,6 +519,22 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
             }
             return CaptureResult::NoNewFrame;
         }
+        if (permanent && rotation_failed) {
+            // The video processor can no longer rotate this surface (the mode
+            // or format changed under it). Fall back to publishing the
+            // unrotated image with rotation_degrees set, the same contract the
+            // capturer uses when the device has no rotation caps, instead of
+            // failing every frame.
+            rotation_pass_ = detail::RotationPass{};
+            frame_.rotation_degrees = detail::rotation_degrees(rotation_);
+            release_frame();
+            frame_.texture = nullptr;
+            frame_.shared_handle = nullptr;
+            release_nv12();
+            create_nv12_pass();
+            frame_dirty_ = true;
+            return CaptureResult::NoNewFrame;
+        }
         release_frame();
         // The publishable texture may have been the duplication surface, which
         // ReleaseFrame just invalidated; the NV12 copy was made from it in an
@@ -512,8 +543,8 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
         frame_.shared_handle = nullptr;
         frame_.nv12_texture = nullptr;
         frame_.nv12_shared_handle = nullptr;
-    frame_.nv12_surface_width = 0;
-    frame_.nv12_surface_height = 0;
+        frame_.nv12_surface_width = 0;
+        frame_.nv12_surface_height = 0;
         frame_.nv12_updated = false;
         frame_dirty_ = true;
         return needs_reinit(err.status()) ? CaptureResult::ReinitNeeded
@@ -540,8 +571,8 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
                 nv12_pass_.reset();
                 frame_.nv12_texture = nullptr;
                 frame_.nv12_shared_handle = nullptr;
-    frame_.nv12_surface_width = 0;
-    frame_.nv12_surface_height = 0;
+                frame_.nv12_surface_width = 0;
+                frame_.nv12_surface_height = 0;
             }
         } else {
             frame_.nv12_updated = true;
@@ -639,9 +670,13 @@ void DxgiCapturer::release_frame() {
 }
 
 Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
-                               HANDLE* shared_out) {
+                               HANDLE* shared_out, bool* rotation_failed, bool* hdr_failed,
+                               bool* fp16_without_hdr) {
     *out = nullptr;
     *shared_out = nullptr;
+    *rotation_failed = false;
+    *hdr_failed = false;
+    *fp16_without_hdr = false;
     D3D11_TEXTURE2D_DESC desc{};
     desktop->GetDesc(&desc);
     ID3D11Texture2D* current = desktop;
@@ -649,6 +684,7 @@ Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
     if (rotation_pass_.ready()) {
         Error err = rotation_pass_.rotate(current, &current);
         if (!err.ok()) {
+            *rotation_failed = true;
             return err;
         }
         // When the HDR pass follows, its target replaces this one and its
@@ -658,7 +694,15 @@ Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
 
     if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
         if (!hdr_pass_) {
-            return Error(Status::Unsupported, "FP16 desktop without an HDR pass");
+            // DuplicateOutput1 only asks for FP16 where a pass can be built,
+            // but another capturer in this process can latch the shader off
+            // between duplication creation and the first frame. Recover by
+            // re-duplicating with the legacy call rather than failing forever.
+            if (detail::HdrPass::unavailable() || !detail::HdrPass::available()) {
+                *fp16_without_hdr = true;
+                return Error(Status::Unsupported, "FP16 desktop without an HDR pass");
+            }
+            hdr_pass_ = std::make_unique<detail::HdrPass>(device_.get(), context_.get());
         }
         detail::HdrPass::Params params;
         params.hdr = color_.hdr;
@@ -666,6 +710,7 @@ Error DxgiCapturer::run_stages(ID3D11Texture2D* desktop, ID3D11Texture2D** out,
         params.max_luminance = color_.max_luminance;
         Error err = hdr_pass_->convert(current, params, &current);
         if (!err.ok()) {
+            *hdr_failed = true;
             return err;
         }
         *shared_out = hdr_pass_->shared_handle();

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -351,6 +352,10 @@ private:
 // asks again (a late-joining viewer, one whose decoder cache was evicted) gets
 // the bytes without the host decoding them again. Bounded by entry count and
 // total bytes, oldest entries evicted first.
+//
+// The cache is process-wide, so several capturers (or a capturer and a
+// consumer thread) can reach it at once. find() returns a shared_ptr: the
+// entry stays alive for the caller even if another thread evicts it.
 class CursorShapeCache {
 public:
     static constexpr size_t kMaxEntries = 4096;
@@ -358,15 +363,16 @@ public:
 
     // Stores a shape under its content id (no-op for a shape still cached).
     void put(const CursorInfo& info);
-    const CursorInfo* find(uint64_t content_id) const;
-    size_t size() const noexcept { return entries_.size(); }
-    size_t bytes() const noexcept { return bytes_; }
+    std::shared_ptr<const CursorInfo> find(uint64_t content_id) const;
+    size_t size() const;
+    size_t bytes() const;
     void clear();
 
 private:
     void evict_oldest();
 
-    std::unordered_map<uint64_t, CursorInfo> entries_;
+    mutable std::mutex mutex_;
+    std::unordered_map<uint64_t, std::shared_ptr<const CursorInfo>> entries_;
     std::deque<uint64_t> order_;  // insertion order, for eviction
     size_t bytes_ = 0;
 };

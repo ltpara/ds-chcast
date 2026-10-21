@@ -365,11 +365,12 @@ void CursorShapeCache::put(const CursorInfo& info) {
     if (!info.shape_valid || info.content_id == 0) {
         return;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     if (entries_.contains(info.content_id)) {
         return;
     }
     const size_t entry_bytes = info.bitmap.size() + info.invert.size();
-    entries_.emplace(info.content_id, info);
+    entries_.emplace(info.content_id, std::make_shared<const CursorInfo>(info));
     order_.push_back(info.content_id);
     bytes_ += entry_bytes;
 
@@ -390,18 +391,30 @@ void CursorShapeCache::evict_oldest() {
         if (it == entries_.end()) {
             continue;
         }
-        bytes_ -= it->second.bitmap.size() + it->second.invert.size();
+        bytes_ -= it->second->bitmap.size() + it->second->invert.size();
         entries_.erase(it);
         return;
     }
 }
 
-const CursorInfo* CursorShapeCache::find(uint64_t content_id) const {
-    auto it = entries_.find(content_id);
-    return it == entries_.end() ? nullptr : &it->second;
+std::shared_ptr<const CursorInfo> CursorShapeCache::find(uint64_t content_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = entries_.find(content_id);
+    return it == entries_.end() ? nullptr : it->second;
+}
+
+size_t CursorShapeCache::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return entries_.size();
+}
+
+size_t CursorShapeCache::bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return bytes_;
 }
 
 void CursorShapeCache::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
     order_.clear();
     bytes_ = 0;

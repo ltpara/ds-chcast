@@ -8,11 +8,11 @@
 //   * FrameInfo::texture lives on FrameInfo::device. An encoder on another
 //     device imports it through the shared handle; one on the same device uses
 //     it directly.
-//   * The desktop image is never mapped. MapDesktopSurface() is called only
-//     with DXGI_MAP_READ to make the pointer shape readable, and pointer shapes
-//     are the only pixels that ever cross into system memory.
-//   * Dirty and move regions are reported in output (rotated) pixels, so an
-//     encoder can restrict its work without touching the texture either.
+//   * The desktop image is never mapped on the CPU. Pointer sprites are the
+//     only pixels that cross into system memory, and DXGI hands them over as
+//     small shapes.
+//   * Frames are delivered whole. There is no dirty/move-region tracking, so a
+//     consumer that needs regions has to compute them from the textures.
 //
 // Hardware encoders consume NV12. The optional NV12 stage converts the BGRA8
 // frame with the D3D11 video processor (one GPU blit, the same conversion
@@ -119,9 +119,11 @@ struct FrameInfo {
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     LUID adapter_luid{};
     uint64_t frame_number = 0;           // monotonic count of captured frames
-    // Rotation already applied to `texture`. Non-zero only when the GPU can
-    // not rotate (no video processor rotation caps); the encoder must then
-    // carry the rotation.
+    // Rotation the consumer still has to apply: 0 when the GPU rotated the
+    // image into screen orientation, non-zero when it could not (no video
+    // processor rotation caps). In that case `texture` is panel-native and
+    // `width`/`height` describe the unrotated surface; an encoder must carry
+    // the rotation itself or reject the frame.
     UINT rotation_degrees = 0;
     // False when DXGI left the pixel contents untouched this frame (pointer
     // only); the texture still holds the last desktop image.

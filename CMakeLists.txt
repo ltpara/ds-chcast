@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Honour MSQUIC_ROOT when locating the MsQuic config package.
+if(POLICY CMP0144)
+    cmake_policy(SET CMP0144 NEW)
+endif()
+
 project(chast
     VERSION 0.1.0
     DESCRIPTION "Screen streaming stack modelled on RustDesk"
@@ -60,15 +65,77 @@ target_link_libraries(chast.dxgi PUBLIC
 
 target_link_options(chast.dxgi PUBLIC "/DELAYLOAD:d3dcompiler_47.dll")
 
+# FFmpeg static build for hardware decoding. D3D11VA lives in libavutil and
+# libavcodec supplies the H.264/HEVC decoders; vcpkg's x64-windows-static
+# triplet ships both, so the receiver needs no FFmpeg DLLs at run time.
+if(NOT DEFINED FFMPEG_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static/lib/avcodec.lib")
+    set(FFMPEG_ROOT "D:/vcpkg/installed/x64-windows-static" CACHE PATH "FFmpeg static install prefix")
+endif()
+if(NOT DEFINED FFMPEG_ROOT OR NOT EXISTS "${FFMPEG_ROOT}/lib/avcodec.lib")
+    message(FATAL_ERROR "FFmpeg static libraries not found; set FFMPEG_ROOT to an install prefix with lib/avcodec.lib")
+endif()
+add_library(chast.ffmpeg INTERFACE)
+target_include_directories(chast.ffmpeg INTERFACE "${FFMPEG_ROOT}/include")
+target_link_libraries(chast.ffmpeg INTERFACE
+    "${FFMPEG_ROOT}/lib/avcodec.lib"
+    "${FFMPEG_ROOT}/lib/avutil.lib"
+    "${FFMPEG_ROOT}/lib/swresample.lib"
+    mfuuid
+    strmiids
+    bcrypt)
+
 # Hardware encoder. Kept out of chast.dxgi so the capture library has no
 # dependency on the vendor runtime; it consumes what the capturer publishes.
+# The decoder is FFmpeg D3D11VA; the oneVPL decoder is shelved in favour of it.
 add_library(chast.codec STATIC
-    src/codec/vpl_encoder.cc)
+    src/codec/vpl_encoder.cc
+    src/codec/ffmpeg_decoder.cc)
 
 target_include_directories(chast.codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(chast.codec PRIVATE ONEVPL_EXPERIMENTAL)
-target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher)
+target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg)
+
+# MsQuic. The vcpkg install ships a config package under share/msquic; point
+# MSQUIC_ROOT at the install prefix when find_package cannot see it.
+if(NOT DEFINED MSQUIC_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows/share/msquic")
+    set(MSQUIC_ROOT "D:/vcpkg/installed/x64-windows" CACHE PATH "MsQuic install prefix")
+endif()
+if(DEFINED MSQUIC_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH "${MSQUIC_ROOT}")
+endif()
+find_package(msquic CONFIG REQUIRED)
+
+# The Flutter Visual Studio generator adds a Profile configuration that
+# neither the VPL package nor vcpkg's MsQuic exports. Map Profile onto the
+# release binaries instead of modifying the installed packages.
+if("Profile" IN_LIST CMAKE_CONFIGURATION_TYPES)
+    foreach(_imported_target IN ITEMS VPL::dispatcher msquic)
+        if(TARGET ${_imported_target})
+            get_target_property(_release_location ${_imported_target} IMPORTED_LOCATION_RELEASE)
+            if(_release_location)
+                set_target_properties(${_imported_target} PROPERTIES
+                    IMPORTED_LOCATION_PROFILE "${_release_location}")
+            endif()
+            get_target_property(_release_implib ${_imported_target} IMPORTED_IMPLIB_RELEASE)
+            if(_release_implib)
+                set_target_properties(${_imported_target} PROPERTIES
+                    IMPORTED_IMPLIB_PROFILE "${_release_implib}")
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# chast wire protocol and MsQuic session. No DXGI or VPL dependency, so the
+# receiver side links this without the capture stack.
+add_library(chast.net STATIC
+    src/net/protocol.cc
+    src/net/quic.cc)
+
+target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
+# RtlIpv*StringToAddressEx, which the imported target does not declare.
+target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll)
 
 if(CHAST_BUILD_TESTS)
     add_executable(chast-capture tools/capture.cc tools/crash_handler.cc)
@@ -82,6 +149,21 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-dump tools/dump.cc tools/crash_handler.cc)
     target_link_libraries(chast-dump PRIVATE chast.dxgi dbghelp)
 
+    # Elementary-stream decoder harness: proves the receiver's VPL path
+    # without a network or a capture device.
+    add_executable(chast-decode tools/decode.cc tools/crash_handler.cc)
+    target_link_libraries(chast-decode PRIVATE chast.codec dbghelp)
+
+    # Capture -> encode -> QUIC -> decode. serve/connect run the two ends as
+    # separate processes; verify closes the loop in one process and checks the
+    # decoded content against an offline replay of the sent stream.
+    add_executable(chast-quic tools/quic.cc tools/crash_handler.cc)
+    target_link_libraries(chast-quic PRIVATE chast.codec chast.net dbghelp)
+    add_custom_command(TARGET chast-quic POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-quic>
+        VERBATIM)
+
     # Raw duplicate/acquire loop: isolates a driver or platform fault from the
     # capturer's own code when debugging.
     add_executable(chast-dup-loop tools/dup_loop.cc tools/crash_handler.cc)
@@ -94,4 +176,10 @@ if(CHAST_BUILD_TESTS)
 
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
+
+    # Localhost loopback: needs an interactive desktop like the other capture
+    # tools, so it is not part of the pure-logic set.
+    add_test(NAME quic_loopback
+        COMMAND chast-quic verify --port 45433 --seconds 4 --request-keyframe-ms 1200 --quiet)
+    set_tests_properties(quic_loopback PROPERTIES TIMEOUT 120)
 endif()
