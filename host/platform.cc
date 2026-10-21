@@ -5,13 +5,16 @@
 #include <cstring>
 #include <vector>
 
+#include "tunnel.h"
+
 namespace chast::host {
 
 namespace {
 
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"chast-host";
-constexpr wchar_t kRuleName[] = L"chast host";
+constexpr wchar_t kHostRuleName[] = L"chast host";
+constexpr wchar_t kTunnelRuleName[] = L"chast tunnel";
 
 bool run_hidden(const std::wstring& command, DWORD* exit_code) {
     std::vector<wchar_t> buffer(command.begin(), command.end());
@@ -93,15 +96,15 @@ bool set_autostart(bool enabled, std::string* error) {
     return true;
 }
 
-int apply_firewall_rule(uint16_t port) {
+int add_firewall_rule(const wchar_t* name, const std::wstring& executable, uint16_t port) {
     const std::wstring netsh = L"netsh.exe";
     // A rule with the same name is replaced rather than duplicated, and the
     // program scope keeps every other binary out.
     DWORD ignored = 0;
-    run_hidden(netsh + L" advfirewall firewall delete rule name=\"" + kRuleName + L"\"", &ignored);
+    run_hidden(netsh + L" advfirewall firewall delete rule name=\"" + name + L"\"", &ignored);
     const std::wstring add =
-        netsh + L" advfirewall firewall add rule name=\"" + kRuleName +
-        L"\" dir=in action=allow program=\"" + executable_path() +
+        netsh + L" advfirewall firewall add rule name=\"" + name +
+        L"\" dir=in action=allow program=\"" + executable +
         L"\" protocol=UDP localport=" + std::to_wstring(port) +
         L" profile=any enable=yes";
     DWORD code = 1;
@@ -111,9 +114,29 @@ int apply_firewall_rule(uint16_t port) {
     return static_cast<int>(code);
 }
 
-bool request_firewall_rule(uint16_t port, std::string* error) {
+int apply_firewall_rule(uint16_t port, uint16_t tunnel_port) {
+    // Drop the tunnel rule first so disabling the service does not leave a
+    // stale allowance behind.
+    DWORD ignored = 0;
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kTunnelRuleName) + L"\"",
+               &ignored);
+    const int host_code = add_firewall_rule(kHostRuleName, executable_path(), port);
+    if (host_code != 0) {
+        return host_code;
+    }
+    if (tunnel_port == 0) {
+        return 0;
+    }
+    return add_firewall_rule(kTunnelRuleName, tunnel_executable(), tunnel_port);
+}
+
+bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error) {
     const std::wstring exe = executable_path();
-    const std::wstring arguments = L"--firewall " + std::to_wstring(port);
+    std::wstring arguments = L"--firewall " + std::to_wstring(port);
+    if (tunnel_port != 0) {
+        arguments += L" " + std::to_wstring(tunnel_port);
+    }
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;

@@ -28,6 +28,23 @@ type HostConfig struct {
 	ListenAddr string
 	Keepalive  time.Duration
 	Logger     *slog.Logger
+	// OnInfo receives registration and viewer-path changes, starting with the
+	// relay assigned by the server. It is called from the read or refresh
+	// goroutine, so it must not block.
+	OnInfo func(HostInfo)
+}
+
+// HostInfo is a snapshot of the host agent for an embedding application.
+// Path is "direct" or "relay" once a viewer has sent data; Viewer is the
+// public address that data came from (the relay endpoint for a relayed
+// viewer).
+type HostInfo struct {
+	ID     string `json:"id,omitempty"`
+	Listen string `json:"listen,omitempty"`
+	Punch  string `json:"punch,omitempty"`
+	Relay  string `json:"relay,omitempty"`
+	Viewer string `json:"viewer,omitempty"`
+	Path   string `json:"path,omitempty"`
 }
 
 type HostAgent struct {
@@ -44,6 +61,12 @@ type HostAgent struct {
 	punch   *net.UDPAddr
 	relay   *net.UDPAddr
 	refresh time.Duration
+	// viewer and viewerPath describe the last path that delivered data. They
+	// are reported to the embedding UI; unlike remote they are not used for
+	// forwarding.
+	viewer     *net.UDPAddr
+	viewerPath string
+	lastInfo   string
 
 	// remote is only touched by the read loop: it is the source of the last
 	// datagram that came from a viewer path (direct or via the relay).
@@ -107,10 +130,42 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	go h.refreshLoop()
 
 	h.log.Info("host agent listening", "on", conn.LocalAddr().String(), "forwarding_to", local.String(), "relay", reg.Relay)
+	h.reportInfo()
 	return h, nil
 }
 
 func (h *HostAgent) LocalAddr() net.Addr { return h.conn.LocalAddr() }
+
+// Info returns a snapshot of the registration and the last viewer path. Safe
+// to call while the agent is running.
+func (h *HostAgent) Info() HostInfo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.infoLocked()
+}
+
+func (h *HostAgent) infoLocked() HostInfo {
+	return HostInfo{
+		ID:     h.cfg.ID,
+		Listen: h.conn.LocalAddr().String(),
+		Punch:  addrValue(h.punch),
+		Relay:  addrValue(h.relay),
+		Viewer: addrValue(h.viewer),
+		Path:   h.viewerPath,
+	}
+}
+
+func (h *HostAgent) reportInfo() {
+	h.mu.Lock()
+	info := h.infoLocked()
+	key := info.Relay + "|" + info.Viewer + "|" + info.Path
+	changed := key != h.lastInfo
+	h.lastInfo = key
+	h.mu.Unlock()
+	if changed && h.cfg.OnInfo != nil {
+		h.cfg.OnInfo(info)
+	}
+}
 
 func (h *HostAgent) Close() {
 	h.cancel()
@@ -162,6 +217,7 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.refresh = refresh
 	}
 	h.mu.Unlock()
+	h.reportInfo()
 }
 
 func (h *HostAgent) getPunch() *net.UDPAddr {
@@ -178,7 +234,6 @@ func (h *HostAgent) getRelay() *net.UDPAddr {
 
 func (h *HostAgent) readLoop() {
 	buf := make([]byte, 65535)
-	firstViewer := true
 	for {
 		n, src, err := h.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -210,13 +265,38 @@ func (h *HostAgent) readLoop() {
 			h.conn.WriteToUDP(data, h.remote)
 			continue
 		}
-		if firstViewer {
-			firstViewer = false
-			h.log.Info("viewer path established", "from", src.String())
-		}
+		h.noteViewer(src)
 		h.remote = cloneAddr(src)
 		h.conn.WriteToUDP(data, h.local)
 	}
+}
+
+// noteViewer records a new viewer path and reports a change. A relayed viewer
+// is seen by this agent as the relay endpoint, while a direct viewer keeps its
+// own public address.
+func (h *HostAgent) noteViewer(src *net.UDPAddr) {
+	relay := h.getRelay()
+	path := "direct"
+	if relay != nil && sameAddr(src, relay) {
+		path = "relay"
+	}
+	h.mu.Lock()
+	first := h.viewer == nil
+	changed := !sameAddr(h.viewer, src) || h.viewerPath != path
+	if changed {
+		h.viewer = cloneAddr(src)
+		h.viewerPath = path
+	}
+	h.mu.Unlock()
+	if !changed {
+		return
+	}
+	if first {
+		h.log.Info("viewer path established", "from", src.String(), "path", path)
+	} else {
+		h.log.Info("viewer path switched", "from", src.String(), "path", path)
+	}
+	h.reportInfo()
 }
 
 func (h *HostAgent) handleControl(data []byte) {

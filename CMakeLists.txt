@@ -153,16 +153,46 @@ target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(chast.host PUBLIC chast.codec chast.net shell32 ole32)
 
+# Tray-only Windows integration: firewall/autostart helpers and the Go tunnel
+# child process. Kept apart from chast.host so the command-line tools do not
+# pull in Win32 process management just for the settings.
+add_library(chast.host.tray STATIC
+    host/platform.cc
+    host/tunnel.cc)
+target_include_directories(chast.host.tray PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/host)
+target_link_libraries(chast.host.tray PUBLIC chast.host shell32)
+
 # Notification-area host application. It is product code, so it is built even
 # when the test tools are switched off.
-add_executable(chast-host WIN32
-    host/main.cc
-    host/platform.cc)
-target_link_libraries(chast-host PRIVATE chast.host)
+add_executable(chast-host WIN32 host/main.cc)
+target_link_libraries(chast-host PRIVATE chast.host.tray)
 add_custom_command(TARGET chast-host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-host>
     VERBATIM)
+
+# The tray spawns the same Go agent the viewer uses. go build is incremental,
+# so keeping the target on every build picks up agent changes without a
+# reconfigure; the executable lands next to chast-host.exe.
+find_program(GO_EXECUTABLE go)
+if(GO_EXECUTABLE)
+    set(CHAST_TUNNEL_OUT "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/chast-tunnel.exe")
+    add_custom_target(chast_tunnel_binary ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>"
+        COMMAND ${GO_EXECUTABLE} build -trimpath -o "${CHAST_TUNNEL_OUT}"
+                ./cmd/chast-tunnel
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/server"
+        BYPRODUCTS "${CHAST_TUNNEL_OUT}"
+        COMMENT "Building chast-tunnel.exe"
+        VERBATIM)
+    add_dependencies(chast-host chast_tunnel_binary)
+else()
+    message(WARNING
+        "Go was not found; the tray cannot register with a rendezvous service "
+        "until chast-tunnel.exe is placed next to chast-host.exe.")
+endif()
 
 if(CHAST_BUILD_TESTS)
     add_executable(chast-capture tools/capture.cc tools/crash_handler.cc)
@@ -209,10 +239,16 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host)
 
+    # Tunnel event parsing, argument construction and child lifecycle. The
+    # lifecycle case relaunches this executable as a fake agent.
+    add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
+    target_link_libraries(chast-host-tunnel-test PRIVATE chast.host.tray)
+
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
+    add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.

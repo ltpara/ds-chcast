@@ -6,8 +6,8 @@
 //
 // Commands: --config <path> to use another settings file, --tray to start
 // hidden (what the autostart entry passes), --autostart on|off to change the
-// login entry and exit, --firewall <port> to apply the rule (the elevated
-// child the tray starts through the UAC prompt).
+// login entry and exit, --firewall <port> [<tunnel_port>] to apply the rules
+// (the elevated child the tray starts through the UAC prompt).
 
 #define NOMINMAX
 #define UNICODE
@@ -23,6 +23,7 @@
 #include <deque>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,11 +33,15 @@
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "platform.h"
+#include "tunnel.h"
 
 namespace {
 
 using namespace chast;
 using chast::host::narrow;
+using chast::host::TunnelEvent;
+using chast::host::TunnelProcess;
+using chast::host::validate_tunnel_settings;
 using chast::host::widen;
 
 constexpr wchar_t kWindowClass[] = L"ChastHostTrayWindow";
@@ -45,6 +50,8 @@ constexpr wchar_t kWindowTitle[] = L"chast 主机";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kLogMessage = WM_APP + 2;
 constexpr UINT kTokenMessage = WM_APP + 3;
+constexpr UINT kTunnelMessage = WM_APP + 4;
+constexpr UINT kTunnelExitMessage = WM_APP + 5;
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -52,6 +59,8 @@ enum ControlId {
     kStateLabel = 1000,
     kPeerLabel,
     kStreamLabel,
+    kTunnelLabel,
+    kPathLabel,
     kTokenEdit,
     kFingerprintEdit,
     kCopyButton,
@@ -63,6 +72,8 @@ enum ControlId {
     kFirewallButton,
     kOpenConfigButton,
     kToggleButton,
+    kTunnelSettingsButton,
+    kTunnelRegisterButton,
     kReloadButton,
     kHideButton,
     kQuitButton,
@@ -75,6 +86,8 @@ struct HostApp {
     HWND state_label = nullptr;
     HWND peer_label = nullptr;
     HWND stream_label = nullptr;
+    HWND tunnel_label = nullptr;
+    HWND path_label = nullptr;
     HWND token_edit = nullptr;
     HWND fingerprint_edit = nullptr;
     HWND input_check = nullptr;
@@ -96,6 +109,13 @@ struct HostApp {
     bool startup_created = false;
     std::string startup_save_error;
     std::unique_ptr<HostServer> server;
+    TunnelProcess tunnel;
+    std::mutex tunnel_mutex;
+    std::deque<TunnelEvent> tunnel_events;
+    std::string tunnel_relay;
+    std::string tunnel_viewer_path;
+    std::string tunnel_viewer_remote;
+    std::string tunnel_error;
     std::deque<std::wstring> log_lines;
 };
 
@@ -171,6 +191,22 @@ void server_token_changed(const std::string& token) {
     }
 }
 
+void tunnel_event(const TunnelEvent& event) {
+    {
+        std::lock_guard<std::mutex> lock(g_app->tunnel_mutex);
+        g_app->tunnel_events.push_back(event);
+    }
+    PostMessageW(g_app->window, kTunnelMessage, 0, 0);
+}
+
+void tunnel_log(const std::string& message) {
+    post_log(widen(message));
+}
+
+void tunnel_exited(uint32_t code) {
+    PostMessageW(g_app->window, kTunnelExitMessage, static_cast<WPARAM>(code), 0);
+}
+
 bool server_approve(const ClientRequest& request) {
     const std::wstring peer =
         request.peer_address.empty() ? std::wstring(L"未知地址") : widen(request.peer_address);
@@ -196,7 +232,51 @@ bool save_settings() {
     return true;
 }
 
+void stop_tunnel() {
+    g_app->tunnel.stop();
+    {
+        std::lock_guard<std::mutex> lock(g_app->tunnel_mutex);
+        g_app->tunnel_events.clear();
+    }
+    g_app->tunnel_relay.clear();
+    g_app->tunnel_viewer_path.clear();
+    g_app->tunnel_viewer_remote.clear();
+}
+
+void start_tunnel() {
+    if (!g_app->settings.tunnel || g_app->tunnel.running()) {
+        return;
+    }
+    if (g_app->settings.server_url.empty()) {
+        g_app->tunnel_error = "尚未配置服务器地址";
+        append_log_line(L"连接服务：尚未配置服务器地址");
+        return;
+    }
+    std::string error;
+    if (!validate_tunnel_settings(g_app->settings, &error)) {
+        g_app->tunnel_error = error;
+        append_log_line(L"连接服务：" + widen(error));
+        return;
+    }
+    std::string fingerprint;
+    if (g_app->server) {
+        fingerprint = g_app->server->status().fingerprint;
+    }
+    g_app->tunnel_relay.clear();
+    g_app->tunnel_viewer_path.clear();
+    g_app->tunnel_viewer_remote.clear();
+    g_app->tunnel_error.clear();
+    if (!g_app->tunnel.start(g_app->settings, g_app->settings.port, fingerprint, tunnel_event,
+                             tunnel_log, tunnel_exited, &error)) {
+        g_app->tunnel_error = error;
+        append_log_line(L"连接服务启动失败：" + widen(error));
+        return;
+    }
+    append_log_line(L"正在注册设备 " + widen(g_app->settings.tunnel_id) + L"…");
+}
+
 void stop_server() {
+    stop_tunnel();
     if (!g_app->server) {
         return;
     }
@@ -226,11 +306,21 @@ void start_server() {
     }
     g_app->server->start();
     append_log_line(L"正在等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）");
+    start_tunnel();
 }
 
 void restart_server() {
     stop_server();
     start_server();
+}
+
+void restart_tunnel() {
+    stop_tunnel();
+    if (!g_app->server) {
+        start_server();
+        return;
+    }
+    start_tunnel();
 }
 
 void update_tray_tip(const std::wstring& tip) {
@@ -271,6 +361,43 @@ std::wstring state_text(HostState state, const HostStatus& status) {
     return L"—";
 }
 
+std::wstring tunnel_text() {
+    const HostSettings& settings = g_app->settings;
+    if (!settings.tunnel) {
+        return L"连接服务：已关闭";
+    }
+    if (settings.server_url.empty()) {
+        return L"连接服务：未配置服务器（打开“连接服务设置…”）";
+    }
+    std::wstring text = L"连接服务：";
+    if (g_app->tunnel.running()) {
+        text += g_app->tunnel_relay.empty() ? L"注册中…"
+                                            : L"已在线 · 中继 " + widen(g_app->tunnel_relay);
+    } else if (!g_app->server) {
+        text += L"已停止";
+    } else if (!g_app->tunnel_error.empty()) {
+        text += L"离线 · " + widen(g_app->tunnel_error);
+    } else {
+        text += L"未连接";
+    }
+    if (!settings.tunnel_id.empty()) {
+        text += L" · 设备 ID " + widen(settings.tunnel_id);
+    }
+    return text;
+}
+
+std::wstring path_text(const HostStatus& status) {
+    if (status.state != HostState::Streaming || g_app->tunnel_viewer_path.empty()) {
+        return L"最近路径：—";
+    }
+    const bool relay = g_app->tunnel_viewer_path == "relay";
+    std::wstring text = relay ? L"最近路径：经中继" : L"最近路径：直连";
+    if (!g_app->tunnel_viewer_remote.empty()) {
+        text += L" · " + widen(g_app->tunnel_viewer_remote);
+    }
+    return text;
+}
+
 // Reads the live state and updates every label. Called on a timer, so it only
 // writes text that changed: rewriting the token edit would clear a selection
 // the operator is about to copy.
@@ -300,6 +427,8 @@ void refresh_ui() {
     } else {
         set_text(g_app->stream_label, L"画面：—");
     }
+    set_text(g_app->tunnel_label, tunnel_text());
+    set_text(g_app->path_label, path_text(status));
 
     std::string token = g_app->settings.access_token;
     if (!status.token.empty()) {
@@ -320,16 +449,68 @@ void refresh_ui() {
 
     std::wstring tip = std::wstring(L"chast 主机 · ") +
                        (g_app->server ? state_text(status.state, status) : std::wstring(L"已停止"));
+    if (g_app->settings.tunnel && g_app->tunnel.running()) {
+        tip += g_app->tunnel_relay.empty() ? L" · 连接服务注册中" : L" · 连接服务在线";
+    }
     update_tray_tip(tip);
+}
+
+void apply_tunnel_event(const TunnelEvent& event) {
+    if (event.event == "ready") {
+        g_app->tunnel_relay = event.relay;
+        g_app->tunnel_error.clear();
+        const std::string device =
+            event.host.empty() ? g_app->settings.tunnel_id : event.host;
+        std::wstring line = L"连接服务已上线 · 设备 ID " + widen(device);
+        if (!event.listen.empty()) {
+            line += L" · 隧道 " + widen(event.listen);
+        }
+        if (!event.relay.empty()) {
+            line += L" · 中继 " + widen(event.relay);
+        }
+        append_log_line(line);
+    } else if (event.event == "relay") {
+        g_app->tunnel_relay = event.relay;
+        append_log_line(L"连接服务中继地址：" + widen(event.relay));
+    } else if (event.event == "viewer") {
+        g_app->tunnel_viewer_path = event.path;
+        g_app->tunnel_viewer_remote = event.remote;
+        std::wstring line =
+            event.path == "relay" ? L"查看者经中继连接" : L"查看者经直连";
+        if (!event.remote.empty()) {
+            line += L"：" + widen(event.remote);
+        }
+        append_log_line(line);
+    }
+}
+
+void process_tunnel_events() {
+    std::deque<TunnelEvent> events;
+    {
+        std::lock_guard<std::mutex> lock(g_app->tunnel_mutex);
+        events.swap(g_app->tunnel_events);
+    }
+    for (const TunnelEvent& event : events) {
+        apply_tunnel_event(event);
+    }
+    refresh_ui();
 }
 
 void load_settings() {
     const HostSettingsLoad loaded = load_host_settings(g_app->config_path);
     g_app->settings = loaded.settings;
     g_app->startup_warning = loaded.warning;
-    g_app->startup_created = !loaded.existed || g_app->settings.access_token.empty();
+    g_app->startup_created = !loaded.existed || g_app->settings.access_token.empty() ||
+                             g_app->settings.tunnel_id.empty() ||
+                             g_app->settings.tunnel_key.empty();
     if (g_app->settings.access_token.empty()) {
         g_app->settings.access_token = generate_access_token();
+    }
+    if (g_app->settings.tunnel_id.empty()) {
+        g_app->settings.tunnel_id = generate_tunnel_id();
+    }
+    if (g_app->settings.tunnel_key.empty()) {
+        g_app->settings.tunnel_key = generate_access_token(16);
     }
     if (g_app->startup_created) {
         std::string error;
@@ -378,51 +559,326 @@ void create_controls() {
                                     kPeerLabel, nullptr);
     g_app->stream_label = add_control(L"STATIC", L"画面：—", SS_LEFT, 0, 24, 132, 572, 22,
                                       kStreamLabel, nullptr);
+    g_app->tunnel_label = add_control(L"STATIC", L"连接服务：—", SS_LEFT, 0, 24, 156, 572, 22,
+                                      kTunnelLabel, nullptr);
+    g_app->path_label = add_control(L"STATIC", L"最近路径：—", SS_LEFT, 0, 24, 180, 572, 22,
+                                    kPathLabel, nullptr);
 
-    add_control(L"STATIC", L"访问令牌", SS_LEFT, 0, 24, 170, 200, 20, 0, nullptr);
+    add_control(L"STATIC", L"访问令牌", SS_LEFT, 0, 24, 214, 200, 20, 0, nullptr);
     g_app->token_edit = add_control(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL,
-                                    WS_EX_CLIENTEDGE, 24, 192, 340, 26, kTokenEdit, nullptr);
-    add_control(L"BUTTON", L"复制令牌", BS_PUSHBUTTON, 0, 376, 191, 88, 28, kCopyButton,
+                                    WS_EX_CLIENTEDGE, 24, 236, 340, 26, kTokenEdit, nullptr);
+    add_control(L"BUTTON", L"复制令牌", BS_PUSHBUTTON, 0, 376, 235, 88, 28, kCopyButton,
                 nullptr);
-    add_control(L"BUTTON", L"更换令牌", BS_PUSHBUTTON, 0, 476, 191, 120, 28,
+    add_control(L"BUTTON", L"更换令牌", BS_PUSHBUTTON, 0, 476, 235, 120, 28,
                 kRegenerateButton, nullptr);
 
-    add_control(L"STATIC", L"身份指纹（SHA-256）", SS_LEFT, 0, 24, 228, 300, 20, 0, nullptr);
+    add_control(L"STATIC", L"身份指纹（SHA-256）", SS_LEFT, 0, 24, 272, 300, 20, 0, nullptr);
     g_app->fingerprint_edit =
-        add_control(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 24, 250, 572,
+        add_control(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 24, 294, 572,
                     26, kFingerprintEdit, nullptr);
 
-    g_app->input_check = add_control(L"BUTTON", L"接受远程输入", BS_AUTOCHECKBOX, 0, 24, 290,
+    g_app->input_check = add_control(L"BUTTON", L"接受远程输入", BS_AUTOCHECKBOX, 0, 24, 334,
                                      160, 24, kInputCheck, nullptr);
-    g_app->approve_check = add_control(L"BUTTON", L"连接前需要确认", BS_AUTOCHECKBOX, 0, 200, 290,
+    g_app->approve_check = add_control(L"BUTTON", L"连接前需要确认", BS_AUTOCHECKBOX, 0, 200, 334,
                                        170, 24, kApproveCheck, nullptr);
-    g_app->onetime_check = add_control(L"BUTTON", L"一次性令牌", BS_AUTOCHECKBOX, 0, 386, 290,
+    g_app->onetime_check = add_control(L"BUTTON", L"一次性令牌", BS_AUTOCHECKBOX, 0, 386, 334,
                                        150, 24, kOneTimeCheck, nullptr);
-    g_app->autostart_check = add_control(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 0, 24, 324,
+    g_app->autostart_check = add_control(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 0, 24, 368,
                                          160, 24, kAutostartCheck, nullptr);
 
-    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 200, 320, 170, 30,
+    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 200, 364, 170, 30,
                 kFirewallButton, nullptr);
-    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 386, 320, 150, 30,
+    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 386, 364, 150, 30,
                 kOpenConfigButton, nullptr);
 
-    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 362, 120,
+    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 406, 120,
                                        32, kToggleButton, nullptr);
-    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 156, 362, 140, 32, kReloadButton,
+    add_control(L"BUTTON", L"连接服务设置…", BS_PUSHBUTTON, 0, 156, 406, 160, 32,
+                kTunnelSettingsButton, nullptr);
+    add_control(L"BUTTON", L"重新注册", BS_PUSHBUTTON, 0, 328, 406, 120, 32,
+                kTunnelRegisterButton, nullptr);
+    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 460, 406, 112, 32, kReloadButton,
                 nullptr);
-    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 308, 362, 120, 32, kHideButton,
+    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 24, 444, 120, 32, kHideButton,
                 nullptr);
-    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 440, 362, 100, 32, kQuitButton, nullptr);
+    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 156, 444, 100, 32, kQuitButton, nullptr);
 
-    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 410, 200, 20, 0, nullptr);
+    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 492, 200, 20, 0, nullptr);
     g_app->log_edit =
         add_control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-                    WS_EX_CLIENTEDGE, 24, 432, 572, 150, kLogEdit, nullptr);
+                    WS_EX_CLIENTEDGE, 24, 514, 572, 150, kLogEdit, nullptr);
 
     set_check(g_app->input_check, g_app->settings.allow_input);
     set_check(g_app->approve_check, g_app->settings.require_approval);
     set_check(g_app->onetime_check, g_app->settings.token_mode == HostTokenMode::OneTime);
     set_check(g_app->autostart_check, g_app->settings.autostart);
+}
+
+constexpr wchar_t kTunnelDialogClass[] = L"ChastTunnelSettingsWindow";
+
+enum TunnelDialogId {
+    kDialogUrl = 2000,
+    kDialogServerKey,
+    kDialogId,
+    kDialogKey,
+    kDialogListen,
+    kDialogEnabled,
+};
+
+struct TunnelDialogState {
+    HWND window = nullptr;
+    HWND url = nullptr;
+    HWND server_key = nullptr;
+    HWND id = nullptr;
+    HWND key = nullptr;
+    HWND listen = nullptr;
+    HWND enabled = nullptr;
+    bool done = false;
+    bool accepted = false;
+    HostSettings result;
+};
+
+std::wstring control_text(HWND control) {
+    const int length = GetWindowTextLengthW(control);
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(control, text.data(), length + 1);
+    text.resize(static_cast<size_t>(length));
+    return text;
+}
+
+std::string trim_ascii(std::string text) {
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, std::string& error) {
+    std::string normalized;
+    const std::string url = trim_ascii(narrow(control_text(dialog.url)));
+    if (!url.empty()) {
+        if (!parse_server_url(url, normalized)) {
+            error = "服务器地址无效，需要 http:// 或 https:// 地址";
+            return false;
+        }
+        updated.server_url = normalized;
+    } else {
+        updated.server_url.clear();
+    }
+
+    const std::string server_key = trim_ascii(narrow(control_text(dialog.server_key)));
+    if (!valid_server_key(server_key)) {
+        error = "服务器密钥需要最多 256 个可打印字符，且不能包含引号或反斜杠";
+        return false;
+    }
+    updated.server_key = server_key;
+
+    const std::string id = trim_ascii(narrow(control_text(dialog.id)));
+    if (id.empty()) {
+        updated.tunnel_id = updated.tunnel ? generate_tunnel_id() : std::string();
+    } else {
+        if (!parse_tunnel_id(id, normalized)) {
+            error = "设备 ID 需要 1..64 个字母、数字、'.'、'_' 或 '-'，且以字母或数字开头结尾";
+            return false;
+        }
+        updated.tunnel_id = normalized;
+    }
+
+    const std::string key = trim_ascii(narrow(control_text(dialog.key)));
+    if (key.empty()) {
+        updated.tunnel_key = updated.tunnel ? generate_access_token(16) : std::string();
+    } else {
+        if (!valid_tunnel_key(key)) {
+            error = "设备密钥需要 8..128 个可打印字符，且不能包含引号或反斜杠";
+            return false;
+        }
+        updated.tunnel_key = key;
+    }
+
+    const std::string listen = trim_ascii(narrow(control_text(dialog.listen)));
+    if (listen.empty()) {
+        updated.tunnel_listen = "0.0.0.0:14434";
+    } else {
+        if (!parse_tunnel_listen(listen, normalized)) {
+            error = "隧道监听地址无效，需要 host:port";
+            return false;
+        }
+        updated.tunnel_listen = normalized;
+    }
+    return validate_tunnel_settings(updated, &error);
+}
+
+void accept_tunnel_dialog(TunnelDialogState& dialog) {
+    HostSettings updated = g_app->settings;
+    updated.tunnel = SendMessageW(dialog.enabled, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    std::string error;
+    if (!collect_tunnel_settings(dialog, updated, error)) {
+        MessageBoxW(dialog.window, widen(error).c_str(), L"连接服务设置",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    dialog.result = std::move(updated);
+    dialog.accepted = true;
+    DestroyWindow(dialog.window);
+}
+
+LRESULT CALLBACK tunnel_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    auto* dialog =
+        reinterpret_cast<TunnelDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        dialog = static_cast<TunnelDialogState*>(create->lpCreateParams);
+        dialog->window = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(dialog));
+        return TRUE;
+    }
+    if (dialog == nullptr) {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    switch (message) {
+        case WM_COMMAND:
+            if (LOWORD(wparam) == IDOK) {
+                accept_tunnel_dialog(*dialog);
+                return 0;
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            dialog->done = true;
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+bool edit_tunnel_settings(HostSettings& result) {
+    static bool class_ready = false;
+    if (!class_ready) {
+        WNDCLASSEXW window_class{};
+        window_class.cbSize = sizeof(window_class);
+        window_class.style = CS_HREDRAW | CS_VREDRAW;
+        window_class.lpfnWndProc = tunnel_dialog_proc;
+        window_class.hInstance = g_app->instance;
+        window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        window_class.lpszClassName = kTunnelDialogClass;
+        if (RegisterClassExW(&window_class) == 0) {
+            return false;
+        }
+        class_ready = true;
+    }
+
+    TunnelDialogState dialog;
+    RECT owner_rect{};
+    GetWindowRect(g_app->window, &owner_rect);
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT frame{0, 0, px(540), px(470)};
+    AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
+    const int width = frame.right - frame.left;
+    const int height = frame.bottom - frame.top;
+    const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
+    const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kTunnelDialogClass, L"连接服务设置",
+                                  style, x, y, width, height, g_app->window, nullptr,
+                                  g_app->instance, &dialog);
+    if (window == nullptr) {
+        return false;
+    }
+
+    const auto add = [&dialog](const wchar_t* cls, const wchar_t* text, DWORD control_style,
+                               DWORD ex_style, int left, int top, int w, int h, int id,
+                               HFONT font) {
+        HWND control = CreateWindowExW(
+            ex_style, cls, text, WS_CHILD | WS_VISIBLE | control_style, px(left), px(top),
+            px(w), px(h), dialog.window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app->instance, nullptr);
+        if (control != nullptr) {
+            SendMessageW(control, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(font != nullptr ? font : g_app->font), TRUE);
+        }
+        return control;
+    };
+
+    add(L"STATIC",
+        L"服务器地址留空表示不注册，只在本机或局域网共享。设备密钥不会上传，"
+        L"服务端只保存它的摘要。",
+        SS_LEFT, 0, 20, 14, 500, 40, 0, nullptr);
+    add(L"STATIC", L"服务器地址（http:// 或 https://）", SS_LEFT, 0, 20, 64, 400, 20, 0,
+        nullptr);
+    dialog.url = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 86, 500,
+                     26, kDialogUrl, nullptr);
+    add(L"STATIC", L"服务器密钥（可选）", SS_LEFT, 0, 20, 122, 400, 20, 0, nullptr);
+    dialog.server_key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20,
+                            144, 500, 26, kDialogServerKey, nullptr);
+    add(L"STATIC", L"设备 ID（会合服务中的名称）", SS_LEFT, 0, 20, 180, 400, 20, 0, nullptr);
+    dialog.id = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 202, 500,
+                    26, kDialogId, nullptr);
+    add(L"STATIC", L"设备密钥（8 个字符以上，不会被上传）", SS_LEFT, 0, 20, 238, 400, 20, 0,
+        nullptr);
+    dialog.key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 260, 500,
+                     26, kDialogKey, nullptr);
+    add(L"STATIC", L"隧道监听地址（UDP）", SS_LEFT, 0, 20, 296, 240, 20, 0, nullptr);
+    dialog.listen = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 318,
+                        240, 26, kDialogListen, nullptr);
+    const std::wstring port_hint =
+        L"主机 QUIC 端口：" + std::to_wstring(g_app->settings.port) +
+        L"\n隧道端口必须不同，例如 0.0.0.0:14434";
+    add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 316, 250, 40, 0, nullptr);
+    dialog.enabled =
+        add(L"BUTTON", L"启用连接服务（注册到会合服务器）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20,
+            366, 400, 24, kDialogEnabled, nullptr);
+    add(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 300, 408, 100, 32, IDOK,
+        nullptr);
+    add(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 410, 408, 100, 32, IDCANCEL,
+        nullptr);
+
+    set_text(dialog.url, widen(g_app->settings.server_url));
+    set_text(dialog.server_key, widen(g_app->settings.server_key));
+    set_text(dialog.id, widen(g_app->settings.tunnel_id));
+    set_text(dialog.key, widen(g_app->settings.tunnel_key));
+    set_text(dialog.listen, widen(g_app->settings.tunnel_listen));
+    set_check(dialog.enabled, g_app->settings.tunnel);
+
+    EnableWindow(g_app->window, FALSE);
+    ShowWindow(window, SW_SHOW);
+    SetForegroundWindow(window);
+    SetFocus(dialog.url);
+
+    MSG message{};
+    bool quit = false;
+    while (!dialog.done) {
+        const BOOL got = GetMessageW(&message, nullptr, 0, 0);
+        if (got <= 0) {
+            quit = got == 0;
+            break;
+        }
+        if (!IsDialogMessageW(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    EnableWindow(g_app->window, TRUE);
+    if (IsWindow(window)) {
+        DestroyWindow(window);
+    }
+    SetForegroundWindow(g_app->window);
+    if (quit) {
+        PostQuitMessage(static_cast<int>(message.wParam));
+    }
+    if (dialog.accepted) {
+        result = dialog.result;
+    }
+    return dialog.accepted;
 }
 
 void add_tray_icon() {
@@ -488,6 +944,10 @@ void show_tray_menu() {
                 kOneTimeCheck, L"一次性令牌");
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
                 L"开机自动启动");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, tunnel_text().c_str());
+    AppendMenuW(menu, MF_STRING, kTunnelSettingsButton, L"连接服务设置…");
+    AppendMenuW(menu, MF_STRING, kTunnelRegisterButton, L"重新注册连接服务");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kToggleButton, running ? L"停止共享" : L"开始共享");
     AppendMenuW(menu, MF_STRING, kOpenConfigButton, L"打开设置文件");
@@ -573,19 +1033,43 @@ void handle_command(int id) {
             append_log_line(enabled ? L"已加入开机启动" : L"已从开机启动移除");
             break;
         }
-        case kFirewallButton:
+        case kFirewallButton: {
             append_log_line(L"正在请求管理员权限以添加防火墙规则…");
             SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-            {
-                std::string error;
-                if (chast::host::request_firewall_rule(g_app->settings.port, &error)) {
-                    append_log_line(L"已允许 chast 在 UDP 端口 " +
-                                    std::to_wstring(g_app->settings.port) + L" 上通过防火墙");
-                } else {
-                    append_log_line(L"防火墙：" + widen(error));
+            uint16_t tunnel_port = 0;
+            if (g_app->settings.tunnel) {
+                (void)tunnel_listen_port(g_app->settings.tunnel_listen, tunnel_port);
+            }
+            std::string error;
+            if (chast::host::request_firewall_rule(g_app->settings.port, tunnel_port, &error)) {
+                std::wstring ports = std::to_wstring(g_app->settings.port);
+                if (tunnel_port != 0) {
+                    ports += L" 和 " + std::to_wstring(tunnel_port);
                 }
+                append_log_line(L"已允许 chast 在 UDP 端口 " + ports + L" 上通过防火墙");
+            } else {
+                append_log_line(L"防火墙：" + widen(error));
             }
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            break;
+        }
+        case kTunnelSettingsButton: {
+            HostSettings updated;
+            if (edit_tunnel_settings(updated)) {
+                g_app->settings = updated;
+                save_settings();
+                restart_server();
+                append_log_line(L"连接服务设置已保存");
+            }
+            break;
+        }
+        case kTunnelRegisterButton:
+            if (!g_app->settings.tunnel) {
+                append_log_line(L"连接服务已关闭，请先在“连接服务设置…”中启用");
+            } else {
+                append_log_line(L"正在重新注册连接服务…");
+                restart_tunnel();
+            }
             break;
         case kOpenConfigButton:
             save_settings();
@@ -654,6 +1138,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             refresh_ui();
             return 0;
         }
+        case kTunnelMessage:
+            process_tunnel_events();
+            return 0;
+        case kTunnelExitMessage: {
+            const uint32_t code = static_cast<uint32_t>(wparam);
+            g_app->tunnel.stop();
+            g_app->tunnel_error = "代理已退出（代码 " + std::to_string(code) + "）";
+            g_app->tunnel_relay.clear();
+            g_app->tunnel_viewer_path.clear();
+            g_app->tunnel_viewer_remote.clear();
+            append_log_line(L"连接服务已断开：" + widen(g_app->tunnel_error));
+            refresh_ui();
+            return 0;
+        }
         case kTrayMessage:
             switch (LOWORD(lparam)) {
                 case WM_LBUTTONUP:
@@ -676,6 +1174,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kStatusTimer);
+            g_app->tunnel.stop();
             if (g_app->server) {
                 g_app->server->stop();
                 g_app->server.reset();
@@ -727,11 +1226,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             start_hidden = true;
         } else if (arg == L"--firewall" && i + 1 < argc) {
             const unsigned long port = wcstoul(argv[++i], nullptr, 10);
+            unsigned long tunnel_port = 0;
+            if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                tunnel_port = wcstoul(argv[++i], nullptr, 10);
+            }
             LocalFree(argv);
-            if (port == 0 || port > 65535) {
+            if (port == 0 || port > 65535 || tunnel_port > 65535) {
                 return 2;
             }
-            return chast::host::apply_firewall_rule(static_cast<uint16_t>(port)) == 0 ? 0 : 1;
+            return chast::host::apply_firewall_rule(static_cast<uint16_t>(port),
+                                                    static_cast<uint16_t>(tunnel_port)) == 0
+                       ? 0
+                       : 1;
         } else if (arg == L"--autostart" && i + 1 < argc) {
             const bool enabled = _wcsicmp(argv[++i], L"on") == 0;
             std::string error;
@@ -744,7 +1250,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                         L"--config <路径>     使用其他设置文件\n"
                         L"--tray              启动后隐藏窗口\n"
                         L"--autostart on|off  设置开机启动\n"
-                        L"--firewall <端口>   添加防火墙规则（需要管理员）",
+                        L"--firewall <端口> [隧道端口]  添加防火墙规则（需要管理员）",
                         kWindowTitle, MB_OK | MB_ICONINFORMATION);
             LocalFree(argv);
             return 0;
@@ -798,7 +1304,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rect{0, 0, px(620), px(610)};
+    RECT rect{0, 0, px(620), px(690)};
     AdjustWindowRectEx(&rect, style, FALSE, 0);
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;

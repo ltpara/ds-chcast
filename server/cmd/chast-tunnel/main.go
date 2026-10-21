@@ -56,6 +56,21 @@ func runHost(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Stdout carries machine events for the tray. Registration and path
+	// changes are dropped until the ready snapshot is written, so an embedding
+	// UI never sees a partial state.
+	var emitMu sync.Mutex
+	ready := false
+	writeEvent := func(event agentEvent) {
+		_ = json.NewEncoder(os.Stdout).Encode(event)
+	}
+	emit := func(event agentEvent) {
+		if event.Event != "ready" && !ready {
+			return
+		}
+		writeEvent(event)
+	}
+
 	h, err := agent.StartHost(ctx, agent.HostConfig{
 		ServerURL:   *server,
 		ServerKey:   *serverKey,
@@ -66,6 +81,23 @@ func runHost(args []string) error {
 		ListenAddr:  *listen,
 		Keepalive:   *keepalive,
 		Logger:      log,
+		OnInfo: func(info agent.HostInfo) {
+			emitMu.Lock()
+			defer emitMu.Unlock()
+			event := agentEvent{
+				Event:  "relay",
+				Listen: info.Listen,
+				Host:   info.ID,
+				Path:   info.Path,
+				Remote: info.Viewer,
+				Punch:  info.Punch,
+				Relay:  info.Relay,
+			}
+			if info.Viewer != "" {
+				event.Event = "viewer"
+			}
+			emit(event)
+		},
 	})
 	if err != nil {
 		return err
@@ -77,6 +109,19 @@ func runHost(args []string) error {
 	if err != nil {
 		return fmt.Errorf("become reachable: %w", err)
 	}
+	info := h.Info()
+	emitMu.Lock()
+	ready = true
+	writeEvent(agentEvent{
+		Event:  "ready",
+		Listen: info.Listen,
+		Host:   info.ID,
+		Path:   info.Path,
+		Remote: info.Viewer,
+		Punch:  info.Punch,
+		Relay:  info.Relay,
+	})
+	emitMu.Unlock()
 	log.Info("host agent online", "id", *id)
 	<-ctx.Done()
 	return nil
@@ -150,6 +195,7 @@ type agentEvent struct {
 	Host   string `json:"host,omitempty"`
 	Path   string `json:"path,omitempty"`
 	Remote string `json:"remote,omitempty"`
+	Punch  string `json:"punch,omitempty"`
 	Direct string `json:"direct,omitempty"`
 	Relay  string `json:"relay,omitempty"`
 }

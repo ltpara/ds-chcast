@@ -41,7 +41,9 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.token_mode == b.token_mode && a.access_token == b.access_token &&
            a.codec == b.codec && a.bitrate_kbps == b.bitrate_kbps &&
            a.framerate == b.framerate && a.quality == b.quality && a.autostart == b.autostart &&
-           a.display == b.display;
+           a.display == b.display && a.tunnel == b.tunnel && a.server_url == b.server_url &&
+           a.server_key == b.server_key && a.tunnel_id == b.tunnel_id &&
+           a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen;
 }
 
 void test_round_trip(const std::filesystem::path& dir) {
@@ -59,6 +61,12 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.quality = 0.5f;
     settings.autostart = true;
     settings.display = 1;
+    settings.tunnel = false;
+    settings.server_url = "https://rendezvous.example.com/chast";
+    settings.server_key = "server secret";
+    settings.tunnel_id = "devbox.office";
+    settings.tunnel_key = "host secret 123";
+    settings.tunnel_listen = "127.0.0.1:46000";
 
     std::string error;
     check(chast::save_host_settings(path, settings, &error), "settings save");
@@ -81,6 +89,12 @@ void test_missing_file(const std::filesystem::path& dir) {
           "a fresh host accepts input behind an approval");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
+    check(loaded.settings.tunnel, "a fresh host enables the connection service");
+    check(loaded.settings.server_url.empty(), "a fresh host has no service URL");
+    check(loaded.settings.tunnel_id.empty() && loaded.settings.tunnel_key.empty(),
+          "a fresh host has no service identity yet");
+    check(loaded.settings.tunnel_listen == "0.0.0.0:14434",
+          "the tunnel listens on the documented UDP port");
 }
 
 void test_invalid_values(const std::filesystem::path& dir) {
@@ -98,6 +112,12 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "framerate=0\n"
                "quality=2\n"
                "display=99\n"
+               "tunnel=perhaps\n"
+               "server_url=ftp://example.com\n"
+               "server_key=" + std::string(300, 's') + "\n"
+               "tunnel_id=bad id\n"
+               "tunnel_key=short\n"
+               "tunnel_listen=127.0.0.1:0\n"
                "unknown_key=whatever\n"
                "this line has no equals\n");
     const chast::HostSettingsLoad loaded = chast::load_host_settings(path.string());
@@ -114,9 +134,16 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.framerate == 30, "a zero framerate falls back");
     check(settings.quality == 0.67f, "an out-of-range quality falls back");
     check(settings.display == chast::kDisplayAuto, "an out-of-range display falls back");
+    check(settings.tunnel, "an unparsable tunnel toggle keeps the default");
+    check(settings.server_url.empty(), "a non-http service URL is dropped");
+    check(settings.server_key.empty(), "an oversized server key is dropped");
+    check(settings.tunnel_id.empty(), "an invalid device id is dropped");
+    check(settings.tunnel_key.empty(), "a short device key is dropped");
+    check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
 
     for (const char* key : {"port", "input", "token_mode", "token", "codec", "bitrate_kbps",
-                            "framerate", "quality", "display"}) {
+                            "framerate", "quality", "display", "tunnel", "server_url",
+                            "server_key", "tunnel_id", "tunnel_key", "tunnel_listen"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
     }
@@ -157,6 +184,63 @@ void test_codec_names() {
           "HEVC is written as hevc");
 }
 
+void test_service_parsers() {
+    std::string out;
+    check(chast::parse_server_url("", out) && out.empty(), "an empty service URL is allowed");
+    check(chast::parse_server_url(" 127.0.0.1:8443/ ", out) &&
+              out == "http://127.0.0.1:8443",
+          "a bare address gains http:// and loses its trailing slash");
+    check(chast::parse_server_url("HTTPS://Example.COM/chast///", out) &&
+              out == "https://Example.COM/chast",
+          "the scheme is normalized and nested slashes survive");
+    check(!chast::parse_server_url("ftp://example.com", out), "a non-http scheme is rejected");
+    check(!chast::parse_server_url("http://example.com?x=1", out), "a query is rejected");
+    check(!chast::parse_server_url("http://", out), "a URL without a host is rejected");
+    check(!chast::parse_server_url("http://example.com/a b", out), "a space is rejected");
+
+    check(chast::valid_server_key("") && chast::valid_server_key("dev secret"),
+          "optional server keys accept printable text");
+    check(!chast::valid_server_key(std::string(300, 's')), "an oversized server key is rejected");
+    check(!chast::valid_server_key("bad\nkey"), "a server key cannot span lines");
+
+    check(chast::parse_tunnel_id("devbox-1", out) && out == "devbox-1",
+          "a device id accepts letters, digits and separators");
+    check(!chast::parse_tunnel_id("bad id", out), "a device id rejects spaces");
+    check(!chast::parse_tunnel_id("-leading", out), "a device id starts alphanumeric");
+    check(!chast::parse_tunnel_id("dot.", out), "a device id ends alphanumeric");
+    check(!chast::parse_tunnel_id(std::string(65, 'a'), out), "a device id is at most 64 bytes");
+
+    check(chast::valid_tunnel_key("host-secret") && chast::valid_tunnel_key("two words"),
+          "device keys accept printable text");
+    check(!chast::valid_tunnel_key("short"), "a device key needs eight characters");
+    check(!chast::valid_tunnel_key("bad\"key"), "a device key cannot contain a quote");
+
+    check(chast::parse_tunnel_listen("0.0.0.0:14434", out) && out == "0.0.0.0:14434",
+          "an IPv4 tunnel listener parses");
+    check(chast::parse_tunnel_listen("localhost:014434", out) && out == "localhost:14434",
+          "the port is normalized");
+    check(chast::parse_tunnel_listen("[::]:14434", out) && out == "[::]:14434",
+          "an IPv6 tunnel listener keeps its brackets");
+    check(!chast::parse_tunnel_listen("127.0.0.1", out), "a listener needs a port");
+    check(!chast::parse_tunnel_listen("127.0.0.1:0", out), "the port cannot be zero");
+    check(!chast::parse_tunnel_listen("::1:14434", out),
+          "an unbracketed IPv6 listener is rejected");
+
+    uint16_t port = 0;
+    check(chast::tunnel_listen_port("0.0.0.0:14434", port) && port == 14434,
+          "the firewall port is read back from the listener");
+    check(!chast::tunnel_listen_port("broken", port), "a broken listener has no port");
+}
+
+void test_generated_tunnel_id() {
+    const std::string id = chast::generate_tunnel_id();
+    std::string normalized;
+    check(!id.empty() && id.size() <= 40, "a generated device id fits the limit");
+    check(chast::parse_tunnel_id(id, normalized) && normalized == id,
+          "a generated device id passes the parser");
+    check(chast::generate_tunnel_id() == id, "the generated device id is stable");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -184,6 +268,8 @@ int main() {
     test_invalid_values(dir);
     test_tokens();
     test_codec_names();
+    test_service_parsers();
+    test_generated_tunnel_id();
     test_unicode_path(dir);
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

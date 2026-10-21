@@ -43,6 +43,19 @@ struct HostSettings {
     // Fallback output when the viewer leaves the choice to the host.
     // kDisplayAuto means the primary display.
     uint16_t display = kDisplayAuto;
+
+    // Rendezvous service. An empty server_url means standalone operation: the
+    // host serves the LAN directly and does not register anywhere.
+    bool tunnel = true;
+    std::string server_url;
+    std::string server_key;
+    // Device identity registered with the service. The key is never uploaded;
+    // the server stores only its SHA-256 digest.
+    std::string tunnel_id;
+    std::string tunnel_key;
+    // Public-facing UDP socket of chast-tunnel host. It must differ from the
+    // QUIC port above because both are UDP listeners.
+    std::string tunnel_listen = "0.0.0.0:14434";
 };
 
 struct HostSettingsLoad {
@@ -71,5 +84,17 @@ std::string generate_access_token(size_t length = 8);
 // "h264"/"hevc", the spelling used in the settings file.
 const char* codec_setting_name(VideoCodec codec);
 bool parse_codec_setting(const std::string& text, VideoCodec& codec);
+
+// Service settings. All parsers trim their input and return false when the
+// value is unusable; the caller decides whether to keep a default. An empty
+// server URL is valid and means "not configured".
+bool parse_server_url(const std::string& input, std::string& normalized);
+bool valid_server_key(const std::string& key);
+bool parse_tunnel_id(const std::string& input, std::string& normalized);
+bool valid_tunnel_key(const std::string& key);
+bool parse_tunnel_listen(const std::string& input, std::string& normalized);
+bool tunnel_listen_port(const std::string& listen, uint16_t& port);
+// Machine name normalized to the device-id alphabet, for a fresh host.
+std::string generate_tunnel_id();
 
 }  // namespace chast

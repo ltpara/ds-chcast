@@ -19,13 +19,15 @@ std::string narrow(const std::wstring& text);
 // host with --tray, so autostart does not open a window at login.
 bool set_autostart(bool enabled, std::string* error);
 
-// Applies the inbound UDP rule for this executable. Runs netsh; the caller
-// must already be elevated. Returns the netsh exit code (0 on success).
-int apply_firewall_rule(uint16_t port);
+// Applies the inbound UDP rules for the host and, when tunnel_port is
+// non-zero, for its sibling chast-tunnel.exe (a separate executable needs its
+// own program-scoped rule). Runs netsh; the caller must already be elevated.
+// Returns the netsh exit code (0 on success).
+int apply_firewall_rule(uint16_t port, uint16_t tunnel_port);
 
-// Relaunches this executable with --firewall <port> through the UAC prompt and
-// waits for it. False when the user cancels or netsh fails.
-bool request_firewall_rule(uint16_t port, std::string* error);
+// Relaunches this executable with --firewall <port> [<tunnel_port>] through
+// the UAC prompt and waits for it. False when the user cancels or netsh fails.
+bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error);
 
 void copy_text(HWND owner, const std::wstring& text);
 std::wstring executable_path();

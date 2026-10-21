@@ -202,6 +202,44 @@ stdout 是面向嵌入方的 JSON Lines 事件流（诊断仍在 stderr）：
 `ready` 表示本地监听已就绪，`path` 在首次选定路径或 `auto` 回退到中继时输出。
 证书指纹 pin 使用逻辑身份 `server:<url>/<id>`，不是代理的 loopback 端口。
 
+## 主机集成（托盘）
+
+M4.2 起 `chast-host.exe`（Win32 托盘）自己托管主机代理：HostServer 成功监听后
+启动随包的 `chast-tunnel.exe host`，停止共享、重载设置或退出托盘时先停代理，
+因此服务端不会在主机停服后仍显示在线。代理默认从 `chast-host.exe` 同目录查找，
+可用 `CHAST_TUNNEL` 覆盖。
+
+连接服务配置保存在 `host.ini`：
+
+```ini
+tunnel=1
+server_url=https://rendezvous.example.com
+server_key=...
+tunnel_id=devbox
+tunnel_key=...
+tunnel_listen=0.0.0.0:14434
+```
+
+- `server_url` 为空表示不注册（仅局域网直连）；`tunnel=0` 时不启动代理。
+- `tunnel_id`/`tunnel_key` 首次启动按机器名自动生成（密钥 16 字符，可修改）；
+  密钥不上传，服务端只保存 SHA-256 摘要。
+- `tunnel_listen` 必须与主机 QUIC 的 `port` 不同（两者都是 UDP 监听），默认
+  `0.0.0.0:14434`。托盘“允许防火墙”为主机端口与隧道端口各建一条按程序限定的
+  UDP 入站规则；禁用隧道服务时会删除隧道规则。
+
+主机代理的 stdout 同样只输出 JSON Lines 机器事件（字段随事件可选）：
+
+```json
+{"event":"ready","listen":"127.0.0.1:14434","host":"devbox","punch":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
+{"event":"relay","listen":"127.0.0.1:14434","host":"devbox","punch":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
+{"event":"viewer","listen":"127.0.0.1:14434","host":"devbox","path":"direct","remote":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
+```
+
+`ready` 在注册与中继绑定完成后输出；`relay` 在重新注册后中继端点变化时输出；
+`viewer` 在查看者首次出现或路径变化时输出。HostServer 看到的对端永远是代理的
+loopback 地址，所以路径由代理按数据报来源判定（来源等于分配到的中继端点即
+`relay`），托盘只在 HostServer 正在串流时展示“最近路径”。
+
 ## 验证记录
 
 2026-10-21，在单机回环上跑通完整链路：`chast-server` + `chast-tunnel host` +
@@ -230,6 +268,29 @@ stdout 是面向嵌入方的 JSON Lines 事件流（诊断仍在 stderr）：
 中继计数全 0；强制中继 `received=202 decoded=202 digest=E092051892076F56`，
 中继统计 `to_host_bytes:18054, to_viewer_bytes:2575942`。两次均无 CRC、解码、
 序号或协议错误，代理报告的最终路径分别为 `direct` 与 `relay`。
+
+2026-10-22，M4.2 的托盘主机集成在单机回环上验证：`chast-host --tray` 读取
+`host.ini` 后自动启动同目录 `chast-tunnel host`，`GET /v1/hosts/m42-host` 返回
+`online=true`、候选 `127.0.0.1:16434`、中继 `127.0.0.1:41100`、会合观察地址
+`127.0.0.1:18444` 与指纹 `C2F256…6421`；托盘显示“连接服务：已在线 · 中继
+127.0.0.1:41100 · 设备 ID m42-host”。
+
+- 直连：`chast-tunnel viewer --mode direct` 输出 `path=direct`，
+  `chast-quic connect` 得到 `received=603 decoded=603 keyframes=1 crc-errors=0
+  decode-errors=0 gaps=0 digest=610B8EF3346AD47C`；托盘显示“最近路径：直连 ·
+  127.0.0.1:24434”，同期中继计数为 0。
+- 中继：`--mode relay` 输出 `path=relay, remote=127.0.0.1:41100`，
+  `received=603 decoded=603 keyframes=1 crc-errors=0 decode-errors=0 gaps=1
+  digest=659B01211DD715C6`；首帧序号 1708 是中途加入已在运行的编码流，不是丢帧。
+  托盘显示“最近路径：经中继 · 127.0.0.1:41100”；`/v1/stats` 的 41100 端口为
+  `to_host_bytes:35677, to_viewer_bytes:10594896, dropped:0`。
+- 清理：`WM_COMMAND` 退出托盘后 `chast-host`/`chast-tunnel` 进程均消失；注册在
+  TTL（约 50 s）后从 API 消失（`host is not registered`）。
+- 防火墙：`chast-host.exe --firewall 46333 16434` 实测生成两条按程序限定的 UDP
+  入站规则（`chast host`/`chast tunnel`），验证后删除。
+- 自动化：`go test ./...` 覆盖主机代理的 `ready`、直连/中继分类与切换去重；
+  `ctest -C Release` 5/5 通过，其中 `host_tunnel` 覆盖事件解析、参数引用与子进程
+  生命周期。
 
 环境边界：本机只有一张网卡、无法制造真实 NAT，因此上述直连走的是回环地址，
 **没有验证跨网锥形 NAT 的打洞**；对称 NAT 下直连失败后切中继的行为由单元测试

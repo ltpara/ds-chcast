@@ -37,6 +37,12 @@ func startEcho(t *testing.T) *net.UDPConn {
 
 func startHostAgent(t *testing.T, ctx context.Context, serverURL, echoAddr string) *HostAgent {
 	t.Helper()
+	return startHostAgentInfo(t, ctx, serverURL, echoAddr, nil)
+}
+
+func startHostAgentInfo(t *testing.T, ctx context.Context, serverURL, echoAddr string,
+	onInfo func(HostInfo)) *HostAgent {
+	t.Helper()
 	host, err := StartHost(ctx, HostConfig{
 		ServerURL:  serverURL,
 		ServerKey:  testutil.ServerKey,
@@ -46,6 +52,7 @@ func startHostAgent(t *testing.T, ctx context.Context, serverURL, echoAddr strin
 		ListenAddr: "127.0.0.1:0",
 		Keepalive:  300 * time.Millisecond,
 		Logger:     quietLogger(),
+		OnInfo:     onInfo,
 	})
 	if err != nil {
 		t.Fatalf("start host agent: %v", err)
@@ -188,5 +195,71 @@ func TestPathInfoReportsInitialPathAndFallback(t *testing.T) {
 	v.onDirectPacket(direct)
 	if len(got) != 2 {
 		t.Fatalf("a late direct packet reported another path change: %+v", got)
+	}
+}
+
+func TestHostInfoReportsViewerPath(t *testing.T) {
+	for _, mode := range []string{ModeDirect, ModeRelay} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s := testutil.Start(t)
+			echo := startEcho(t)
+			events := make(chan HostInfo, 16)
+			host := startHostAgentInfo(t, ctx, s.URL, echo.LocalAddr().String(),
+				func(info HostInfo) { events <- info })
+			initial := host.Info()
+			if initial.ID != "devbox" || initial.Listen == "" || initial.Relay == "" {
+				t.Fatalf("initial info = %+v", initial)
+			}
+			if initial.Viewer != "" || initial.Path != "" {
+				t.Fatalf("a fresh host already reports a viewer: %+v", initial)
+			}
+
+			viewer, err := StartViewer(ctx, ViewerConfig{
+				ServerURL:     s.URL,
+				ServerKey:     testutil.ServerKey,
+				HostID:        "devbox",
+				ListenAddr:    "127.0.0.1:0",
+				Mode:          mode,
+				DirectTimeout: 1 * time.Second,
+				Logger:        quietLogger(),
+			})
+			if err != nil {
+				t.Fatalf("start viewer agent: %v", err)
+			}
+			t.Cleanup(viewer.Close)
+
+			client, err := net.DialUDP("udp", nil, viewer.LocalAddr().(*net.UDPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			payload := []byte("host-path-" + mode)
+			deadline := time.Now().Add(4 * time.Second)
+			buf := make([]byte, 2048)
+			for {
+				client.Write(payload)
+				client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+				if n, err := client.Read(buf); err == nil && string(buf[:n]) == string(payload) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%s path did not echo", mode)
+				}
+			}
+
+			wait := time.After(2 * time.Second)
+			for {
+				select {
+				case info := <-events:
+					if info.Path == mode && info.Viewer != "" {
+						return
+					}
+				case <-wait:
+					t.Fatalf("host never reported the %s viewer path", mode)
+				}
+			}
+		})
 	}
 }
