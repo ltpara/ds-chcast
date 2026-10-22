@@ -74,7 +74,7 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--keyframe-interval" && i + 1 < argc) {
                 options.keyframe_ms = static_cast<UINT>(std::stoul(argv[++i]));
             } else if (arg == "--bitrate-switch" && i + 1 < argc) {
-                // "after-ms:kbps": exercises set_bitrate() mid-stream, the way
+                // "after-ms:kbps": exercises set_rate() mid-stream, the way
                 // the quality setting moves during a session.
                 const std::string value = argv[++i];
                 const size_t colon = value.find(':');
@@ -304,9 +304,10 @@ int main(int argc, char** argv) {
             std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >=
                 static_cast<long long>(options.change_bitrate_ms)) {
             bitrate_changed = true;
-            const chast::Error change = encoder->set_bitrate(options.change_bitrate_kbps * 1000u);
+            const chast::Error change =
+                encoder->set_rate(options.change_bitrate_kbps * 1000u, options.framerate);
             if (!change.ok()) {
-                std::fprintf(stderr, "set_bitrate failed: %s\n", change.to_string().c_str());
+                std::fprintf(stderr, "set_rate failed: %s\n", change.to_string().c_str());
                 ++errors;
             } else if (!options.quiet) {
                 std::printf("bitrate switched to %u kbps at %u ms\n", encoder->bitrate() / 1000u,

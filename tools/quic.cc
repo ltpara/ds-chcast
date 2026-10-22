@@ -592,10 +592,12 @@ struct SenderStats {
     size_t display_index = 0;
     // StreamInfo messages this server sent.
     uint64_t stream_updates_sent = 0;
-    // Adaptive bitrate telemetry: the encoder's current target (the setting is
-    // the ceiling), how often the controller changed it, and the transport RTT
-    // the controller sampled.
+    // Adaptive bitrate telemetry: the encoder's current target (the video
+    // budget after the audio reserve, or the setting when audio is off), the
+    // frame rate the ladder picked, how often the controller changed it, and
+    // the transport RTT the controller sampled.
     uint32_t target_bitrate = 0;
+    uint32_t framerate = 0;
     uint64_t abr_changes = 0;
     double rtt_ms = 0.0;
     double send_kbps = 0.0;
@@ -669,8 +671,10 @@ struct ReceiverStats {
     uint64_t frames_without_capture = 0;
     double last_frame_age_ms = -1.0;
     double max_frame_age_ms = -1.0;
-    // Bitrate the last StreamInfo announced (the encoder's target after ABR).
+    // Bitrate and frame rate the last StreamInfo announced (the encoder's
+    // target and ladder pick after ABR).
     uint32_t target_bitrate = 0;
+    uint32_t framerate = 0;
     // Pointer updates received, and how many of them carried a sprite. The
     // last state is reported so a verification run can show the pointer moved.
     uint64_t cursor_updates = 0;
@@ -925,6 +929,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.cursor_sent = status.stats.cursor_sent;
     stats.send_errors = status.stats.send_errors;
     stats.target_bitrate = status.stats.target_bitrate;
+    stats.framerate = status.stats.framerate;
     stats.abr_changes = status.stats.abr_changes;
     stats.rtt_ms = status.stats.rtt_ms;
     stats.send_kbps = status.stats.send_kbps;
@@ -947,9 +952,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                     static_cast<unsigned long long>(status.stats.cursor_bytes),
                     static_cast<unsigned long long>(status.stats.cursor_dropped),
                     static_cast<unsigned long long>(status.stats.cursor_errors));
-        std::printf("sender: target-bitrate=%u kbps abr-changes=%llu rtt=%.1f ms "
+        std::printf("sender: target-bitrate=%u kbps framerate=%u abr-changes=%llu rtt=%.1f ms "
                     "send-rate=%.1f kbps\n",
-                    stats.target_bitrate / 1000u,
+                    stats.target_bitrate / 1000u, stats.framerate,
                     static_cast<unsigned long long>(stats.abr_changes), stats.rtt_ms,
                     stats.send_kbps);
         if (stats.stats_received) {
@@ -1067,6 +1072,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.clipboard_enabled = info.clipboard_enabled;
     stats.displays = info.displays;
     stats.target_bitrate = info.bitrate;
+    stats.framerate = info.framerate;
     stats.audio_info = info.audio;
     stats.audio_announced = info.audio.enabled;
     if (!options.quiet) {
@@ -1431,6 +1437,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.input_enabled = info.input_enabled;
             stats.clipboard_enabled = info.clipboard_enabled;
             stats.target_bitrate = info.bitrate;
+            stats.framerate = info.framerate;
             stats.audio_info = info.audio;
             stats.audio_announced = info.audio.enabled;
             if (!ensure_audio_decoder(info.audio)) {
@@ -2302,6 +2309,10 @@ int run_verify(const Options& options) {
     check(sent.target_bitrate > 0, "the server exposed adaptive-bitrate telemetry");
     check(sent.rtt_ms > 0.0, "the host sampled transport RTT");
     check(sent.abr_changes == 0, "the clean loopback stayed at the configured bitrate");
+    check(sent.framerate > 0 && received.framerate == sent.framerate,
+          "the viewer saw the frame rate the host captured at");
+    check(sent.framerate == options.framerate,
+          "a clean path keeps the configured frame rate");
     check(sent.stats_received, "the client's closing statistics reached the server");
     if (sent.stats_received) {
         check(sent.peer.received == received.received, "server-side receive count agrees");

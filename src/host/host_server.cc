@@ -31,8 +31,9 @@ uint64_t capture_clock_ms(Clock::time_point time) {
            0xFFFFFFFFFFFFull;
 }
 
-uint32_t bitrate_floor(uint32_t ceiling) {
-    return std::min(ceiling, std::max<uint32_t>(500000u, ceiling / 10u));
+uint32_t bitrate_reserve(const AudioInfo& audio) {
+    return audio.enabled ? static_cast<uint32_t>(static_cast<uint64_t>(audio.bitrate) * 11u / 10u)
+                         : 0u;
 }
 
 bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomic<bool>& stopping,
@@ -452,12 +453,6 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         ", " + std::to_string(encoder->width()) + "x" + std::to_string(encoder->height()) +
         ", target " + std::to_string(encoder->bitrate() / 1000u) + " kbps");
 
-    // The encoder's starting bitrate is the ceiling: the operator's configured
-    // rate, or the hardware default when the settings leave it at zero. The
-    // controller only ever lowers it and later climbs back to this value.
-    BitrateController abr(encoder->bitrate(), bitrate_floor(encoder->bitrate()));
-    stats.target_bitrate = encoder->bitrate();
-
     // System sound is optional: the endpoint and the AAC encoder are opened
     // before the announcement so AudioInfo describes what will actually be
     // encoded, and a machine without a usable endpoint simply streams video.
@@ -483,8 +478,28 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     }
     stats.audio_active = audio_info.enabled;
 
+    // The configured bitrate is the whole session's budget, audio included;
+    // the video encoder starts at what is left after reserving it. The
+    // controller only ever lowers that and later climbs back to it.
+    uint32_t framerate = encoder->framerate();
+    BitrateController abr(video_budget(encoder->bitrate(), bitrate_reserve(audio_info)),
+                          video_floor(encoder->bitrate()), static_cast<uint16_t>(framerate));
+    if (abr.ceiling_bps() != encoder->bitrate()) {
+        log("video budget " + std::to_string(abr.ceiling_bps() / 1000u) +
+            " kbps after reserving audio out of " + std::to_string(encoder->bitrate() / 1000u) +
+            " kbps");
+        // The announcement below reads the encoder, and it must describe the
+        // rate that is actually running.
+        Error trimmed = encoder->set_rate(abr.ceiling_bps(), framerate);
+        if (!trimmed.ok()) {
+            log("cannot apply the video budget: " + trimmed.to_string());
+        }
+    }
+    stats.target_bitrate = encoder->bitrate();
+    stats.framerate = static_cast<uint16_t>(framerate);
+
     ServerInfo stream_info =
-        describe_stream(attached, capturer->display(), *encoder, settings_.framerate,
+        describe_stream(attached, capturer->display(), *encoder, static_cast<uint16_t>(framerate),
                         settings_.allow_clipboard, audio_info);
     publish_stream(stream_info, find_display(attached, capturer->display()),
                    display_name_utf8(capturer->display()));
@@ -505,11 +520,15 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     }
 
     const auto start = run_start_;
-    const auto frame_interval =
-        settings_.framerate > 0
-            ? std::chrono::duration_cast<Clock::duration>(
-                  std::chrono::duration<double>(1.0 / static_cast<double>(settings_.framerate)))
-            : Clock::duration::zero();
+    // The capture cadence follows the controller's frame rate; 0 disables
+    // pacing entirely (capture() then waits on the desktop itself).
+    auto frame_duration = [&](uint32_t fps) {
+        return settings_.framerate == 0 || fps == 0
+                   ? Clock::duration::zero()
+                   : std::chrono::duration_cast<Clock::duration>(
+                         std::chrono::duration<double>(1.0 / static_cast<double>(fps)));
+    };
+    auto frame_interval = frame_duration(framerate);
     auto next_frame_due = Clock::now() + frame_interval;
     auto last_keyframe = Clock::now();
     const auto next_reannounce = start + std::chrono::seconds(2);
@@ -801,7 +820,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     // Once a second: link telemetry for the tray, and the bitrate decision
     // that follows from it. Runs on the host thread between frames so the
-    // encoder reset set_bitrate performs cannot overlap an encode call.
+    // encoder reset set_rate performs cannot overlap an encode call.
     auto last_link_sample = Clock::now();
     uint64_t last_sample_bytes = stats.bytes;
     auto sample_link = [&](Clock::time_point now) -> bool {
@@ -842,18 +861,26 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return true;
         }
 
-        Error applied = encoder->set_bitrate(decision.target_bps);
+        Error applied = encoder->set_rate(decision.target_bps, decision.framerate);
         if (!applied.ok()) {
             log("adaptive bitrate: cannot apply " +
-                std::to_string(decision.target_bps / 1000u) + " kbps after " + decision.reason +
-                ": " + applied.to_string());
+                std::to_string(decision.target_bps / 1000u) + " kbps at " +
+                std::to_string(decision.framerate) + " fps after " + decision.reason + ": " +
+                applied.to_string());
             return true;
         }
         stats.target_bitrate = decision.target_bps;
+        stats.framerate = decision.framerate;
         ++stats.abr_changes;
-        // The encoder reset invalidates its reference state.
+        // The encoder reset invalidates its reference state, and the capture
+        // cadence has to follow the rate the encoder now divides its budget
+        // over, or every frame keeps a budget for a frame nobody sends.
         force_keyframe = true;
+        framerate = decision.framerate;
+        frame_interval = frame_duration(framerate);
+        next_frame_due = now + frame_interval;
         stream_info.bitrate = decision.target_bps;
+        stream_info.framerate = static_cast<uint16_t>(framerate);
         publish_stream(stream_info, find_display(attached, capturer->display()),
                        display_name_utf8(capturer->display()));
         Error refreshed = session_->refresh_stream(stream_info);
@@ -869,7 +896,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         ++stats.stream_updates;
         log("adaptive bitrate: " + std::string(decision.reason) + "; target " +
-            std::to_string(decision.target_bps / 1000u) + " kbps, RTT " +
+            std::to_string(decision.target_bps / 1000u) + " kbps at " +
+            std::to_string(framerate) + " fps, RTT " +
             std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms");
         publish_stats(stats);
         return true;
@@ -995,13 +1023,29 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 return false;
             }
             // A rebuilt encoder starts from the configured bitrate again, so
-            // the controller starts over with that value as its ceiling.
-            abr = BitrateController(encoder->bitrate(), bitrate_floor(encoder->bitrate()));
+            // the controller starts over with the budget as its ceiling and
+            // the configured frame rate at the top of the ladder.
+            abr = BitrateController(video_budget(encoder->bitrate(), bitrate_reserve(audio_info)),
+                                    video_floor(encoder->bitrate()),
+                                    static_cast<uint16_t>(encoder->framerate()));
+            framerate = encoder->framerate();
+            frame_interval = frame_duration(framerate);
+            next_frame_due = Clock::now() + frame_interval;
+            if (abr.ceiling_bps() != encoder->bitrate()) {
+                // Same reservation as at session start: the rebuilt encoder
+                // came back at the configured rate, audio included.
+                Error trimmed = encoder->set_rate(abr.ceiling_bps(), framerate);
+                if (!trimmed.ok()) {
+                    log("cannot apply the video budget: " + trimmed.to_string());
+                }
+            }
             stats.target_bitrate = encoder->bitrate();
+            stats.framerate = static_cast<uint16_t>(framerate);
             const std::vector<DisplayInfo> refreshed = enumerate_displays();
             stream_info =
-                describe_stream(refreshed, capturer->display(), *encoder, settings_.framerate,
-                                settings_.allow_clipboard, audio_info);
+                describe_stream(refreshed, capturer->display(), *encoder,
+                                static_cast<uint16_t>(framerate), settings_.allow_clipboard,
+                                audio_info);
             publish_stream(stream_info, find_display(refreshed, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {

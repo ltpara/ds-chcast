@@ -276,8 +276,9 @@ public:
                  std::vector<EncodedPacket>& out) override;
     Error encode_repeat(uint64_t pts_ms, bool force_keyframe,
                         std::vector<EncodedPacket>& out) override;
-    Error set_bitrate(UINT bits_per_second) override;
+    Error set_rate(UINT bits_per_second, UINT framerate) override;
     UINT bitrate() const noexcept override { return bitrate_; }
+    UINT framerate() const noexcept override { return framerate_; }
     VideoCodec codec() const noexcept override { return codec_; }
     UINT width() const noexcept override { return width_; }
     UINT height() const noexcept override { return height_; }
@@ -337,7 +338,7 @@ private:
     std::vector<mfxU8> bitstream_data_;
     // The parameters the encoder was initialised with (as corrected by
     // MFXVideoENCODE_Query). MFXVideoENCODE_Reset takes a complete description,
-    // not a patch, so set_bitrate() edits these and resets with them; the
+    // not a patch, so set_rate() edits these and resets with them; the
     // signal buffer lives beside them because the extension list points into
     // it.
     mfxExtVideoSignalInfo signal_{};
@@ -998,17 +999,20 @@ Error MfxEncoder::submit(mfxFrameSurface1* surface, bool force_keyframe,
     return Error::success();
 }
 
-Error MfxEncoder::set_bitrate(UINT bits_per_second) {
+Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate) {
     if (!session_ || !encode_open_) {
         return Error(Status::NotCurrentlyAvailable, "encoder is not initialized");
     }
     const UINT kbps = (std::clamp)(bits_per_second / 1000u, 1u, 0xFFFFu);
+    const UINT fps = (std::clamp)(framerate == 0 ? framerate_ : framerate, 1u, 0xFFFFu);
     // The reset needs a full description, not just the fields that change: the
     // runtime compares it against what is running. Everything else is carried
     // over from initialisation.
     mfxVideoParam reset = params_;
     reset.mfx.RateControlMethod = MFX_RATECONTROL_CBR;
     reset.mfx.TargetKbps = static_cast<mfxU16>(kbps);
+    reset.mfx.FrameInfo.FrameRateExtN = static_cast<mfxU16>(fps);
+    reset.mfx.FrameInfo.FrameRateExtD = 1;
     reset.ExtParam = extensions_;
     reset.NumExtParam = 1;
     const mfxStatus sts = MFXVideoENCODE_Reset(session_, &reset);
@@ -1016,10 +1020,12 @@ Error MfxEncoder::set_bitrate(UINT bits_per_second) {
     // answers MFX_WRN_INCOMPATIBLE_VIDEO_PARAM while applying the new rate) and
     // the reset has taken effect.
     if (sts < MFX_ERR_NONE) {
-        return mfx_error(sts, "MFXVideoENCODE_Reset(bitrate)");
+        return mfx_error(sts, "MFXVideoENCODE_Reset(rate)");
     }
     params_.mfx.TargetKbps = reset.mfx.TargetKbps;
+    params_.mfx.FrameInfo.FrameRateExtN = reset.mfx.FrameInfo.FrameRateExtN;
     bitrate_ = static_cast<UINT>(reset.mfx.TargetKbps) * 1000u;
+    framerate_ = static_cast<UINT>(reset.mfx.FrameInfo.FrameRateExtN);
     return Error::success();
 }
 

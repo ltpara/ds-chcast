@@ -24,20 +24,70 @@ constexpr double kQueueSevereRatio = 1.00;
 constexpr double kQueueModerateRatio = 0.65;
 constexpr double kQueueHealthyRatio = 0.50;
 
+// Frame-rate ladder, as a share of the ceiling. A 1080p screen at 500 kbps
+// needs about 10 fps to spend 0.02 bits per pixel; below that the desktop
+// turns into colour blocks, so the ladder bottoms out there.
+constexpr double kFullFramerateRatio = 0.70;
+constexpr double kTwoThirdsRatio = 0.45;
+constexpr double kHalfRatio = 0.25;
+constexpr uint16_t kMinimumFramerate = 10;
+
 }  // namespace
 
-BitrateController::BitrateController(uint32_t ceiling_bps, uint32_t floor_bps)
+uint32_t video_floor(uint32_t configured_bps) {
+    return std::min(configured_bps, std::max<uint32_t>(500000u, configured_bps / 10u));
+}
+
+uint32_t video_budget(uint32_t configured_bps, uint32_t reserved_bps) {
+    const uint32_t reserve = std::min(reserved_bps, configured_bps / 2u);
+    return std::max(video_floor(configured_bps), configured_bps - reserve);
+}
+
+BitrateController::BitrateController(uint32_t ceiling_bps, uint32_t floor_bps, uint16_t framerate)
     : ceiling_bps_(std::max<uint32_t>(ceiling_bps, 1)),
       floor_bps_(std::min(std::max<uint32_t>(floor_bps, 1), std::max<uint32_t>(ceiling_bps, 1))),
-      target_bps_(std::max<uint32_t>(ceiling_bps, 1)) {}
+      target_bps_(std::max<uint32_t>(ceiling_bps, 1)),
+      ceiling_fps_(framerate == 0 ? 30 : framerate),
+      framerate_(ceiling_fps_) {}
+
+uint16_t BitrateController::framerate_for(uint32_t target_bps, uint32_t ceiling_bps,
+                                          uint16_t ceiling_fps) {
+    const uint32_t ceiling = std::max<uint32_t>(ceiling_bps, 1);
+    const double ratio = static_cast<double>(target_bps) / static_cast<double>(ceiling);
+    const uint16_t top = ceiling_fps == 0 ? 30 : ceiling_fps;
+    uint32_t fps = top;
+    if (ratio < kHalfRatio) {
+        fps = top / 3;
+    } else if (ratio < kTwoThirdsRatio) {
+        fps = top / 2;
+    } else if (ratio < kFullFramerateRatio) {
+        fps = top * 2 / 3;
+    }
+    fps = std::clamp<uint32_t>(fps, std::min<uint32_t>(kMinimumFramerate, top), top);
+    return static_cast<uint16_t>(fps);
+}
+
+// Fills in the fields a decision carries when the target did not move. The
+// frame rate always follows the target, so it is recomputed every call and a
+// ceiling change (audio toggled) shows up without waiting on the transport.
+BitrateDecision BitrateController::settle() {
+    BitrateDecision decision;
+    decision.target_bps = target_bps_;
+    decision.framerate = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
+    if (decision.framerate != framerate_) {
+        framerate_ = decision.framerate;
+        decision.changed = true;
+        decision.reason = "framerate";
+    }
+    return decision;
+}
 
 BitrateDecision BitrateController::lower(uint32_t percent, const char* reason) {
     BitrateDecision decision;
     const uint32_t next =
         std::max(floor_bps_, static_cast<uint32_t>(target_bps_ * percent / 100u));
     if (next >= target_bps_) {
-        decision.target_bps = target_bps_;
-        return decision;
+        return settle();
     }
     target_bps_ = next;
     down_cooldown_ms_ = kDownCooldownMs;
@@ -45,13 +95,14 @@ BitrateDecision BitrateController::lower(uint32_t percent, const char* reason) {
     healthy_ms_ = 0;
     decision.changed = true;
     decision.target_bps = target_bps_;
+    decision.framerate = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
+    framerate_ = decision.framerate;
     decision.reason = reason;
     return decision;
 }
 
 BitrateDecision BitrateController::update(const BitrateSample& sample, uint32_t elapsed_ms) {
-    BitrateDecision decision;
-    decision.target_bps = target_bps_;
+    BitrateDecision decision = settle();
 
     uint64_t sent_delta = 0;
     uint64_t lost_delta = 0;
@@ -129,6 +180,8 @@ BitrateDecision BitrateController::update(const BitrateSample& sample, uint32_t 
     up_cooldown_ms_ = kUpCooldownMs;
     decision.changed = true;
     decision.target_bps = target_bps_;
+    decision.framerate = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
+    framerate_ = decision.framerate;
     decision.reason = "recover";
     return decision;
 }

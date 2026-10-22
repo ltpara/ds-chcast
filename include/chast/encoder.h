@@ -90,12 +90,15 @@ public:
     virtual Error encode_repeat(uint64_t pts_ms, bool force_keyframe,
                                 std::vector<EncodedPacket>& out) = 0;
 
-    // Changes the target bitrate without recreating the session, like RustDesk's
-    // set_bitrate when the quality setting moves. The new rate takes effect
-    // from the next frame.
-    virtual Error set_bitrate(UINT bits_per_second) = 0;
+    // Changes the target bitrate and capture frame rate without recreating the
+    // session, like RustDesk's set_bitrate when the quality setting moves. The
+    // rate control divides the bitrate over the frame rate, so a caller that
+    // captures slower must move both or every frame gets a budget for a frame
+    // it is not sending. The new rates take effect from the next frame.
+    virtual Error set_rate(UINT bits_per_second, UINT framerate) = 0;
 
     virtual UINT bitrate() const noexcept = 0;
+    virtual UINT framerate() const noexcept = 0;
     // The codec the encoder is actually producing. Anything that tells a peer
     // what format the stream uses (session negotiation, file naming) must use
     // this, not EncoderConfig::codec: an HEVC request can be fulfilled by an

@@ -27,7 +27,7 @@ chast::BitrateSample healthy_sample(uint64_t packets) {
 }
 
 void test_severe_loss_and_cooldown() {
-    chast::BitrateController controller(10000000, 1000000);
+    chast::BitrateController controller(10000000, 1000000, 30);
     chast::BitrateDecision decision = controller.update(healthy_sample(1000), 1000);
     check(!decision.changed && controller.target_bps() == 10000000,
           "a clean baseline leaves the target at the ceiling");
@@ -53,7 +53,7 @@ void test_severe_loss_and_cooldown() {
 }
 
 void test_rtt_inflation() {
-    chast::BitrateController controller(10000000, 1000000);
+    chast::BitrateController controller(10000000, 1000000, 30);
     controller.update(healthy_sample(1000), 1000);
 
     chast::BitrateSample inflated = healthy_sample(1100);
@@ -65,7 +65,7 @@ void test_rtt_inflation() {
 }
 
 void test_queue_pressure() {
-    chast::BitrateController controller(10000000, 1000000);
+    chast::BitrateController controller(10000000, 1000000, 30);
     controller.update(healthy_sample(1000), 1000);
 
     chast::BitrateSample backed_up = healthy_sample(1100);
@@ -75,7 +75,7 @@ void test_queue_pressure() {
               std::string(decision.reason) == "queue",
           "a filling send queue drops the target");
 
-    chast::BitrateController severe(10000000, 1000000);
+    chast::BitrateController severe(10000000, 1000000, 30);
     severe.update(healthy_sample(1000), 1000);
     backed_up.queued_bytes = 1200000;
     decision = severe.update(backed_up, 1000);
@@ -84,7 +84,7 @@ void test_queue_pressure() {
 }
 
 void test_recovery_and_ceiling() {
-    chast::BitrateController controller(10000000, 1000000);
+    chast::BitrateController controller(10000000, 1000000, 30);
     controller.update(healthy_sample(1000), 1000);
     chast::BitrateSample inflated = healthy_sample(1100);
     inflated.rtt_us = 50000;
@@ -111,7 +111,7 @@ void test_recovery_and_ceiling() {
 }
 
 void test_floor_and_bounds() {
-    chast::BitrateController controller(2000000, 1500000);
+    chast::BitrateController controller(2000000, 1500000, 30);
     check(controller.floor_bps() == 1500000, "floor below the ceiling is kept");
 
     controller.update(healthy_sample(1000), 1000);
@@ -127,18 +127,18 @@ void test_floor_and_bounds() {
     check(!decision.changed && controller.target_bps() == 1500000,
           "the target stays at the floor under continuing loss");
 
-    chast::BitrateController inverted(1000000, 5000000);
+    chast::BitrateController inverted(1000000, 5000000, 30);
     check(inverted.ceiling_bps() == 1000000 && inverted.floor_bps() == 1000000 &&
               inverted.target_bps() == 1000000,
           "an inverted floor/ceiling pair collapses to the ceiling");
 
-    chast::BitrateController empty(0, 0);
+    chast::BitrateController empty(0, 0, 30);
     check(empty.target_bps() == 1 && empty.floor_bps() == 1,
           "a zero-bitrate configuration is clamped to a usable value");
 }
 
 void test_no_congestion_window() {
-    chast::BitrateController controller(10000000, 1000000);
+    chast::BitrateController controller(10000000, 1000000, 30);
     chast::BitrateSample sample;
     sample.min_rtt_us = 1000;
     sample.rtt_us = 1000;
@@ -150,6 +150,95 @@ void test_no_congestion_window() {
     }
 }
 
+void test_framerate_ladder() {
+    using chast::BitrateController;
+    check(BitrateController::framerate_for(10000000, 10000000, 30) == 30,
+          "a full-rate target keeps the configured frame rate");
+    check(BitrateController::framerate_for(7000000, 10000000, 30) == 30,
+          "70% of the ceiling still counts as full rate");
+    check(BitrateController::framerate_for(6999999, 10000000, 30) == 20,
+          "just under 70% drops to two thirds");
+    check(BitrateController::framerate_for(4500000, 10000000, 30) == 20,
+          "45% is the bottom of the two-thirds step");
+    check(BitrateController::framerate_for(4400000, 10000000, 30) == 15,
+          "under 45% drops to half");
+    check(BitrateController::framerate_for(2500000, 10000000, 30) == 15,
+          "25% is the bottom of the half step");
+    check(BitrateController::framerate_for(2400000, 10000000, 30) == 10,
+          "under 25% drops to a third");
+    check(BitrateController::framerate_for(1, 10000000, 30) == 10,
+          "the ladder never goes below 10 fps");
+    check(BitrateController::framerate_for(1000000, 1000000, 12) == 12,
+          "a 12 fps configuration stays at 12");
+    check(BitrateController::framerate_for(1, 1000000, 12) == 10,
+          "a slow configuration still bottoms out at 10, not a third of 12");
+
+    // The ladder is a function of target/ceiling, so a decision that lowers
+    // the rate moves the frame rate with it, and recovery restores both.
+    chast::BitrateController controller(10000000, 1000000, 30);
+    chast::BitrateDecision decision = controller.update(healthy_sample(1000), 1000);
+    check(!decision.changed && decision.framerate == 30,
+          "a clean sample reports the configured frame rate");
+
+    chast::BitrateSample lossy = healthy_sample(1100);
+    lossy.lost_packets = 20;
+    decision = controller.update(lossy, 1000);
+    check(decision.changed && decision.target_bps == 7000000 && decision.framerate == 30,
+          "a 30% cut stays at full frame rate");
+
+    for (int i = 0; i < 3; ++i) {
+        lossy.sent_packets += 100;
+        lossy.lost_packets += 20;
+        decision = controller.update(lossy, 1600);
+    }
+    const uint16_t lowest = decision.framerate;
+    check(decision.target_bps < 5000000 && lowest < 30,
+          "repeated cuts bring the frame rate down with the rate");
+
+    uint64_t packets = lossy.sent_packets;
+    bool saw_ladder_up = false;
+    for (int i = 0; i < 300; ++i) {
+        packets += 100;
+        const chast::BitrateDecision up = controller.update(healthy_sample(packets), 1000);
+        if (up.changed && up.framerate > lowest) {
+            saw_ladder_up = true;
+        }
+    }
+    check(saw_ladder_up, "recovery climbs the frame rate ladder back up");
+    check(controller.target_bps() == 10000000 && controller.framerate() == 30,
+          "a recovered path is back at full rate and full frame rate");
+}
+
+void test_audio_budget() {
+    using chast::BitrateController;
+    check(chast::video_floor(10000000) == 1000000, "the video floor is a tenth of the budget");
+    check(chast::video_floor(2000000) == 500000, "the video floor never drops below 500 kbps");
+    check(chast::video_floor(300000) == 300000, "the floor never exceeds a small budget");
+
+    check(chast::video_budget(10000000, 0) == 10000000,
+          "no companion stream leaves the whole budget to video");
+    check(chast::video_budget(10000000, 193600) == 9806400,
+          "audio plus 10% overhead is reserved out of the budget");
+    check(chast::video_budget(2000000, 193600) == 1806400,
+          "the reserve scales with a smaller budget");
+    check(chast::video_budget(1000000, 10000000) == 500000,
+          "a reserve larger than the budget is capped at half of it");
+    check(chast::video_budget(2000000, 1900000) == 1000000,
+          "the floor wins when the reserve would starve video");
+
+    // The ceiling the controller is built with is the budget, so recovery
+    // stops at video + audio rather than at the configured number.
+    chast::BitrateController controller(chast::video_budget(10000000, 193600),
+                                        chast::video_floor(10000000), 30);
+    check(controller.ceiling_bps() == 9806400, "the controller works against the video budget");
+    controller.update(healthy_sample(1000), 1000);
+    chast::BitrateSample lossy = healthy_sample(1100);
+    lossy.lost_packets = 20;
+    controller.update(lossy, 1000);
+    check(controller.target_bps() == 6864480,
+          "the first cut is a share of the budget, not of the configured rate");
+}
+
 }  // namespace
 
 int main() {
@@ -159,6 +248,8 @@ int main() {
     test_recovery_and_ceiling();
     test_floor_and_bounds();
     test_no_congestion_window();
+    test_framerate_ladder();
+    test_audio_budget();
     if (failures != 0) {
         std::printf("bitrate checks FAILED (%d)\n", failures);
         return 1;

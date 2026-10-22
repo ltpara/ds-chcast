@@ -176,11 +176,23 @@
   - 设计取舍：安装系统光标而非在视频上叠画精灵（远程控制时位置由本地手决定，只有系统光标能做到同频）；掩码取自 alpha 而非黑色像素（Flutter 引擎自带的 `createCustomCursor/windows` 会把描边指针的黑边当透明抠掉，`flutter_custom_cursor` 0.0.4 的 Windows 实现是硬编码示例图的桩，均不可用）。
   - 已知限制：本机默认没有可见硬件指针（`GetCursorInfo` 为 `flags=0, hCursor=0`），用 `ShowCursor(TRUE)` 强制显示后回环得到 `sender: cursor sent=257 shapes=15 bytes=64080 dropped=0` 与 `receiver: cursor updates=229 shapes=11 visible=1`，`chast-capture --cursor` 导出 `32x32 color` 精灵；但**查看者窗口内肉眼可见的指针仍需一台有物理鼠标的机器人工确认**（安装器已由 `GetIconInfo` 验证到 64×64 与热点 (6,10)）；仅实现 Windows 查看者路径。
 
-## M5 后续（未开始）
+## M6 — 弱网 QoS 深化
 
-- 分辨率/帧率自适应与弱网 QoS 扩展。
+- 已完成：帧率阶梯与音频预算 M6.0（`docs/m6.0-plan.md`）。
+  - 问题：M5.0 的码率控制器只有一个杠杆。码率降到 500 kbps 时 1080p 每帧只有约 0.008 bpp，画面碎成色块；而系统声音是恒定 160 kbps，视频却仍按整个配置码率发送，两者相加会超出运营者配的预算。
+  - 帧率阶梯：`BitrateController::framerate_for()` 按“目标 / 上限”的比例分四档——≥70% 满帧率、45–70% 2/3、25–45% 1/2、<25% 1/3，下限 10 fps；它是目标码率的纯函数，恢复时自动跟随，不会出现“码率回来了帧率还卡在 10 fps”。`BitrateDecision` 每次都携带帧率，漏掉某次变化的调用方仍能拿到与当前目标一致的速率。
+  - 音频预算：新增 `video_floor()`/`video_budget()`，上限 = 配置码率 −（音频码率 × 1.1），预留夹在半额以内，下限仍按 1/10 兜底；音频未启用时全额留给视频。控制器从构造起就以预算为天花板，所以“恢复”也停在“视频 + 音频 = 配置预算”。
+  - 编码器：`set_bitrate()` 升级为 `set_rate(bitrate, framerate)`，一次 `MFXVideoENCODE_Reset` 同时改 `TargetKbps` 与 `FrameRateExtN`——CBR 用帧率折算每帧预算，只改采集节奏不改编码器会让目标失真；新增 `framerate()` 访问器。
+  - 主机：采集节奏由 `frame_duration(fps)` 计算，决策变化时同步重算 `next_frame_due`、置 `force_keyframe`、把 `stream_info.framerate` 一起写进 `refresh_stream`；重建编码器时控制器与阶梯一并重置。`HostServerStats::framerate` 进遥测，托盘与 `chast-quic` 输出同时报告。
+  - 验证（2026-10-22，单机）：`chast-bitrate-test` 共 82 项断言全过（新增帧率阶梯的四档边界、12 fps 配置的下限、恢复时爬梯、预算扣除与夹取）；`chast-quic verify` 74 项断言全过（新增“查看者看到的帧率等于主机采集帧率”“干净链路保持配置帧率”），151 个访问单元；真实 `serve --audio` + `connect` 打印 `video budget 2601 kbps after reserving audio out of 2777 kbps` 与 `target-bitrate=2601 kbps framerate=30 abr-changes=0`；`ctest -C Release` 8/8。
+  - 设计取舍：帧率是码率的函数而不是第二套状态机（不引入第二组冷却/恢复计时，避免两个调速器打架）；降帧率的目的不是省带宽而是省“每帧比特”（CBR 下总量不变），所以档位按比例分而不是按绝对帧率分；预算扣在上限侧而非目标侧，恢复逻辑因此天然收敛。
+  - 已知限制：决策到下一帧之间最多有一个已排定的帧按旧节奏发出；音频预算按 `AudioInfo::bitrate` 固定扣除，不跟踪瞬时码率；真实弱网（丢包/抖动/带宽突变）仍需双机验收，本轮是合成样本 + 回环。
+
+## M6 后续（未开始）
+
 - 文件传输。
-- 音频质量调优：唇音同步校准、设备热切换、音频计入拥塞预算、麦克风/双向语音。
+- 音频质量调优：唇音同步校准、设备热切换、麦克风/双向语音。
+- 分辨率自适应（重建代价大，暂缓）。
 - 更多采集/编码后端与其他平台。
 
 ## 推进原则
