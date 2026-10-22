@@ -550,6 +550,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // for the rest of the session instead of retrying on every sample.
     bool resolution_fixed = false;
     bool probe_pending = config_.resolution_probe_percent != 0;
+    // The scale the running encoder was built for. A requested scale only
+    // becomes applied once an encoder at that size exists; stats follow it.
+    UINT applied_resolution_percent = stats.resolution_percent;
+    UINT pending_resolution_percent = applied_resolution_percent;
+    uint32_t frames_without_nv12 = 0;
     std::vector<EncodedPacket> packets;
 
     // Clipboard baseline: remember what the host clipboard held when the
@@ -766,8 +771,20 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
         const FrameInfo& frame = capturer->frame();
         if (!frame.nv12_texture) {
-            return true;
+            // A conversion can fail for one frame and recover; a pass that was
+            // torn down cannot. Give it a few frames, then end the session
+            // instead of stalling silently.
+            if (++frames_without_nv12 < 3) {
+                return true;
+            }
+            *error = "capture produced no NV12 image for 3 frames";
+            const Error& capture_error = capturer->last_error();
+            if (!capture_error.ok()) {
+                *error += ": " + capture_error.to_string();
+            }
+            return false;
         }
+        frames_without_nv12 = 0;
         if (frame.rotation_degrees != 0) {
             *error = "capture lost rotation while streaming";
             return false;
@@ -915,13 +932,22 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             Error scaled = capturer->set_nv12_scale(decision.resolution_percent);
             if (!scaled.ok()) {
                 resolution_fixed = true;
+                pending_resolution_percent = applied_resolution_percent;
+                Error reverted = capturer->set_nv12_scale(applied_resolution_percent);
+                if (!reverted.ok()) {
+                    *error = "adaptive resolution: cannot return to " +
+                             std::to_string(applied_resolution_percent) +
+                             "% after refusing " +
+                             std::to_string(decision.resolution_percent) + "%: " +
+                             reverted.to_string();
+                    return false;
+                }
                 log("adaptive resolution: cannot scale to " +
                     std::to_string(decision.resolution_percent) +
-                    "%; staying at " + std::to_string(stats.resolution_percent) +
+                    "%; staying at " + std::to_string(applied_resolution_percent) +
                     "% for this session: " + scaled.to_string());
             } else {
-                stats.resolution_percent = decision.resolution_percent;
-                ++stats.resolution_changes;
+                pending_resolution_percent = decision.resolution_percent;
                 force_keyframe = true;
                 extra_idrs = 1;
                 // The frame loop rebuilds the encoder at the new captured size
@@ -1019,19 +1045,30 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (probe_pending && now - start >= std::chrono::milliseconds(2500)) {
             probe_pending = false;
             if (!resolution_fixed &&
-                config_.resolution_probe_percent != stats.resolution_percent) {
+                config_.resolution_probe_percent != pending_resolution_percent) {
                 Error scaled = capturer->set_nv12_scale(config_.resolution_probe_percent);
                 if (!scaled.ok()) {
                     resolution_fixed = true;
+                    pending_resolution_percent = applied_resolution_percent;
+                    Error reverted = capturer->set_nv12_scale(applied_resolution_percent);
+                    if (!reverted.ok()) {
+                        *error = "resolution probe: cannot return to " +
+                                 std::to_string(applied_resolution_percent) +
+                                 "% after refusing " +
+                                 std::to_string(config_.resolution_probe_percent) + "%: " +
+                                 reverted.to_string();
+                        drain_peer();
+                        return false;
+                    }
                     log("resolution probe: cannot scale to " +
-                        std::to_string(config_.resolution_probe_percent) + "%: " +
-                        scaled.to_string());
+                        std::to_string(config_.resolution_probe_percent) +
+                        "%; staying at " + std::to_string(applied_resolution_percent) +
+                        "% for this session: " + scaled.to_string());
                 } else {
-                    stats.resolution_percent = config_.resolution_probe_percent;
-                    ++stats.resolution_changes;
+                    pending_resolution_percent = config_.resolution_probe_percent;
                     force_keyframe = true;
                     extra_idrs = 1;
-                    log("resolution probe: " + std::to_string(stats.resolution_percent) + "%");
+                    log("resolution probe: " + std::to_string(pending_resolution_percent) + "%");
                 }
             }
         }
@@ -1060,6 +1097,17 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         drain_audio();
         switch (result) {
             case CaptureResult::NoNewFrame:
+                // A failed conversion leaves no NV12 behind. If the desktop
+                // stays quiet, no Frame event will advance the counter.
+                if (frames_without_nv12 > 0 && ++frames_without_nv12 >= 3) {
+                    *error = "capture produced no NV12 image for 3 frames";
+                    const Error& capture_error = capturer->last_error();
+                    if (!capture_error.ok()) {
+                        *error += ": " + capture_error.to_string();
+                    }
+                    drain_peer();
+                    return false;
+                }
                 continue;
             case CaptureResult::ReinitNeeded: {
                 log("reinitializing: " + capturer->last_error().to_string());
@@ -1072,6 +1120,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 encoder.reset();
                 have_input = false;
                 force_keyframe = true;
+                // The rebuilt duplication has no frame yet; a quiet desktop is
+                // not the same as a broken NV12 conversion.
+                frames_without_nv12 = 0;
                 continue;
             }
             case CaptureResult::FatalError:
@@ -1099,6 +1150,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 drain_peer();
                 return false;
             }
+            // A capture reinit keeps the last requested scale, so the encoder
+            // just built at that size is the one the stats must describe.
+            if (pending_resolution_percent != stats.resolution_percent) {
+                stats.resolution_percent = static_cast<uint16_t>(pending_resolution_percent);
+                ++stats.resolution_changes;
+            }
+            applied_resolution_percent = pending_resolution_percent;
             // A rebuilt encoder starts from the configured bitrate again, so
             // the controller starts over with the budget as its ceiling and
             // the configured frame rate at the top of the ladder.
@@ -1155,6 +1213,18 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         // and frame rate the controller currently holds -- not a reset.
         if (frame.nv12_texture &&
             (frame.nv12_width != encoder->width() || frame.nv12_height != encoder->height())) {
+            if (resolution_fixed) {
+                // The refused scale was reverted, so a mismatch here cannot be
+                // a pending resize. Retrying would rebuild the encoder once per
+                // frame; the stream cannot continue safely.
+                *error = "adaptive resolution: capture is " +
+                         std::to_string(frame.nv12_width) + "x" +
+                         std::to_string(frame.nv12_height) + " but the fixed encoder is " +
+                         std::to_string(encoder->width()) + "x" +
+                         std::to_string(encoder->height());
+                drain_peer();
+                return false;
+            }
             EncoderConfig resized = encoder_config;
             resized.width = frame.nv12_width;
             resized.height = frame.nv12_height;
@@ -1168,14 +1238,19 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 // Keep the stream that is running: put the capture back on the
                 // size the current encoder was built for and stop resizing.
                 resolution_fixed = true;
-                Error reverted = capturer->set_nv12_scale(stats.resolution_percent);
+                pending_resolution_percent = applied_resolution_percent;
+                Error reverted = capturer->set_nv12_scale(applied_resolution_percent);
                 if (!reverted.ok()) {
-                    log("adaptive resolution: revert failed: " + reverted.to_string());
+                    *error = "adaptive resolution: cannot restore " +
+                             std::to_string(applied_resolution_percent) +
+                             "% after encoder recreation failed: " + reverted.to_string();
+                    drain_peer();
+                    return false;
                 }
                 log("adaptive resolution: encoder recreation at " +
-                    std::to_string(frame.nv12_width) + "x" +
-                    std::to_string(frame.nv12_height) + " failed; staying at " +
-                    std::to_string(stats.resolution_percent) + "%: " + resize_error);
+                    std::to_string(resized.width) + "x" +
+                    std::to_string(resized.height) + " failed; staying at " +
+                    std::to_string(applied_resolution_percent) + "%: " + resize_error);
                 stream_info.bitrate = stats.target_bitrate;
                 stream_info.framerate = static_cast<uint16_t>(framerate);
                 publish_stream(stream_info, find_display(attached, capturer->display()),
@@ -1203,6 +1278,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             have_input = false;
             force_keyframe = true;
             extra_idrs = 1;
+            if (pending_resolution_percent != stats.resolution_percent) {
+                stats.resolution_percent = static_cast<uint16_t>(pending_resolution_percent);
+                ++stats.resolution_changes;
+            }
+            applied_resolution_percent = pending_resolution_percent;
             stats.target_bitrate = encoder->bitrate();
             stats.framerate = static_cast<uint16_t>(framerate);
             stream_info =

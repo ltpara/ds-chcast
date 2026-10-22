@@ -262,7 +262,11 @@ Error DxgiCapturer::set_nv12_scale(UINT percent) {
     if (percent == 0 || percent > 100) {
         return Error(Status::InvalidCall, "NV12 scale is a percentage from 1 to 100");
     }
-    if (percent == nv12_percent_) {
+    // A scale with no working pass is not a no-op: the pass may have been torn
+    // down by a permanent conversion failure, and the caller is asking for a
+    // usable image at this size.
+    const bool pass_ready = !config_.nv12.enabled || (nv12_pass_ && nv12_pass_->ready());
+    if (percent == nv12_percent_ && pass_ready) {
         return Error::success();
     }
     if (!config_.nv12.enabled) {
