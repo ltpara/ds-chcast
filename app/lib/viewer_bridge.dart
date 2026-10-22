@@ -89,6 +89,8 @@ class ViewerStatus {
     this.videoFinished = false,
     this.fullscreen = false,
     this.inputEnabled = false,
+    this.permissions = 0,
+    this.permissionUpdates = 0,
     this.originX = 0,
     this.originY = 0,
     this.inputSent = 0,
@@ -170,6 +172,13 @@ class ViewerStatus {
   final bool videoFinished;
   final bool fullscreen;
   final bool inputEnabled;
+
+  /// The permission mask the host currently grants this session
+  /// (chast::Permission in chast/protocol.h), and how many times the host
+  /// announced a change to it. The first announcement counts too, so a
+  /// non-zero value after a drop means a live update arrived.
+  final int permissions;
+  final int permissionUpdates;
   final int originX;
   final int originY;
   final int inputSent;
@@ -309,6 +318,8 @@ class ViewerStatus {
       videoFinished: map['videoFinished'] == true,
       fullscreen: map['fullscreen'] == true,
       inputEnabled: map['inputEnabled'] == true,
+      permissions: asInt(map['permissions']),
+      permissionUpdates: asInt(map['permissionUpdates']),
       originX: asInt(map['originX']),
       originY: asInt(map['originY']),
       inputSent: asInt(map['inputSent']),
@@ -369,6 +380,11 @@ class ViewerBridge {
   ///
   /// [accessToken] is the server's access token, sent in Hello over the
   /// encrypted connection. Empty for servers started without one.
+  ///
+  /// [password] is the session password the host asked for. [totp] is the
+  /// six-digit code for hosts that also require two-factor. [trustDevice]
+  /// asks the host to remember this viewer's identity after a successful
+  /// sign-in, so later connections skip the password.
   static Future<void> start({
     required String host,
     required int port,
@@ -377,6 +393,9 @@ class ViewerBridge {
     String fingerprint = '',
     bool allowUnverified = false,
     String accessToken = '',
+    String password = '',
+    String totp = '',
+    bool trustDevice = false,
   }) async {
     await _channel.invokeMethod<void>(
       'start',
@@ -388,8 +407,26 @@ class ViewerBridge {
         'fingerprint': fingerprint,
         'allowUnverified': allowUnverified,
         'accessToken': accessToken,
+        'password': password,
+        'totp': totp,
+        'trustDevice': trustDevice,
       },
     );
+  }
+
+  /// Reads the password saved for [trustKey] from this Windows account's
+  /// DPAPI-protected store, or null when none is saved.
+  static Future<String?> loadPassword(String trustKey) {
+    return _channel.invokeMethod<String>('loadPassword', trustKey);
+  }
+
+  /// Saves [password] for [trustKey]. The native side encrypts it with DPAPI
+  /// under the current user; an empty password removes the entry.
+  static Future<void> savePassword(String trustKey, String password) async {
+    await _channel.invokeMethod<void>('savePassword', <String, Object>{
+      'key': trustKey,
+      'password': password,
+    });
   }
 
   static Future<void> stop() => _channel.invokeMethod<void>('stop');
@@ -603,12 +640,30 @@ const int kViewerWheelDelta = 120;
 /// (chast::kDisplayAuto in chast/protocol.h).
 const int kViewerDisplayAuto = 0xFFFF;
 
+/// The permission mask a host announces (chast::Permission in
+/// chast/protocol.h). Input covers pointer and keyboard injection; clipboard
+/// covers both directions; audio is granted only while an audio stream is open.
+abstract final class ViewerPermission {
+  static const int input = 0x0001;
+  static const int clipboard = 0x0002;
+  static const int audio = 0x0004;
+}
+
 /// The AccessDenied codes a server answers a refused Hello with
 /// (chast::AccessDenial in chast/protocol.h).
 abstract final class ViewerDenial {
   static const int invalidToken = 1;
   static const int tokenUsed = 2;
   static const int declined = 3;
+  static const int wrongPassword = 4;
+
+  /// The host wants a session password that this connection did not send.
+  static const int passwordRequired = 5;
+  static const int twoFactorRequired = 6;
+  static const int wrongTwoFactor = 7;
+  static const int lockedOut = 8;
+  static const int notWhitelisted = 9;
+  static const int authTimeout = 10;
 }
 
 /// What to tell the user about a refusal; empty when the server did not
@@ -621,6 +676,20 @@ String accessDenialText(int denial) {
       return '该一次性令牌已被使用，请让主机重新生成一个。';
     case ViewerDenial.declined:
       return '主机拒绝了本次连接请求，请让主机确认后重试。';
+    case ViewerDenial.wrongPassword:
+      return '密码不正确，请重试。';
+    case ViewerDenial.passwordRequired:
+      return '主机要求输入连接密码。';
+    case ViewerDenial.twoFactorRequired:
+      return '主机要求两步验证码。';
+    case ViewerDenial.wrongTwoFactor:
+      return '两步验证码不正确或已过期，请重新输入。';
+    case ViewerDenial.lockedOut:
+      return '尝试次数过多，主机已暂时拒绝此地址。请稍后再试。';
+    case ViewerDenial.notWhitelisted:
+      return '本机地址不在主机的允许列表中。';
+    case ViewerDenial.authTimeout:
+      return '主机未在限定时间内完成验证，请重试。';
     default:
       return '';
   }

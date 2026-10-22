@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -25,6 +26,10 @@
 
 struct ID3D11Device;
 struct ID3D11Texture2D;
+
+namespace chast {
+class DeviceIdentity;
+}
 
 namespace chast_viewer {
 
@@ -98,6 +103,11 @@ struct ViewerStatus {
     double latency_ms = 0.0;
     uint64_t elapsed_ms = 0;
     bool video_finished = false;
+    // The permission mask the host last announced (chast::PermissionBit) and
+    // how many masks have been applied, including the one from HelloAck. The
+    // UI compares the mask to explain a live revocation.
+    uint16_t permissions = 0;
+    uint64_t permission_updates = 0;
     // Input gate and coordinate origin from HelloAck. `origin_x`/`origin_y`
     // are the captured output's top-left in virtual-desktop pixels; the UI
     // adds them to the source-space pointer position.
@@ -159,12 +169,18 @@ public:
     // certificate whose SHA-256 is `pinned_fingerprint`; `allow_unverified`
     // skips that check and is only for the first contact, whose fingerprint
     // the caller then stores. `access_token` is sent in Hello and is empty for
-    // servers that do not gate access. Fails when one is already running; call
-    // Stop() first to switch targets or displays.
+    // servers that do not gate access. `password` and `totp` answer an
+    // interactive host's challenges; `device_identity` lets the host recognize
+    // this viewer and skip two-factor, and `trust_device` asks it to remember
+    // the key after a successful sign-in. Fails when one is already running;
+    // call Stop() first to switch targets or displays.
     bool Start(const std::string& host, uint16_t port, uint16_t display,
                std::string pinned_fingerprint = {},
                bool allow_unverified = false,
-               std::string access_token = {});
+               std::string access_token = {}, std::string password = {},
+               std::string totp = {},
+               std::shared_ptr<chast::DeviceIdentity> device_identity = {},
+               bool trust_device = false);
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
@@ -199,10 +215,13 @@ public:
 private:
     void Run(std::string host, uint16_t port, uint16_t display,
              std::string pinned_fingerprint, bool allow_unverified,
-             std::string access_token);
+             std::string access_token, std::string password, std::string totp,
+             bool trust_device);
     void SetState(ViewerState state, std::string error = {});
 
     FrameSink* sink_;
+    // Kept alive for the whole session because QuicClientConfig borrows it.
+    std::shared_ptr<chast::DeviceIdentity> device_identity_;
     mutable std::mutex mutex_;
     ViewerStatus status_;
     std::chrono::steady_clock::time_point started_at_;

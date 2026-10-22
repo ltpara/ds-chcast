@@ -56,6 +56,9 @@ private:
     // the poll timer, so it runs on the platform thread.
     void ApplyCursor(const flutter::EncodableMap& args);
     void ClearCursor();
+    // Loads the device key once from %APPDATA%\chast, so hosts that trust this
+    // viewer can skip the interactive challenges on later connections.
+    void EnsureIdentity();
 
     // Swaps the physical key back in for the VK_PROCESSKEY an IME reports when
     // the context could not be detached. Installed on the Flutter view window,
@@ -80,6 +83,8 @@ private:
     std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
     std::unique_ptr<GpuFrameSink> texture_sink_;
     std::unique_ptr<ViewerEngine> viewer_;
+    std::shared_ptr<chast::DeviceIdentity> identity_;
+    bool identity_loaded_ = false;
     bool fullscreen_ = false;
     LONG_PTR saved_style_ = 0;
     WINDOWPLACEMENT saved_placement_{};

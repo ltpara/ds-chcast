@@ -12,6 +12,7 @@
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
+#include "chast/security.h"
 
 namespace chast_viewer {
 
@@ -49,13 +50,17 @@ ViewerEngine::~ViewerEngine() {
 
 bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t display,
                          std::string pinned_fingerprint, bool allow_unverified,
-                         std::string access_token) {
+                         std::string access_token, std::string password,
+                         std::string totp,
+                         std::shared_ptr<chast::DeviceIdentity> device_identity,
+                         bool trust_device) {
     if (running_.load(std::memory_order_acquire)) {
         return false;
     }
     if (thread_.joinable()) {
         thread_.join();
     }
+    device_identity_ = std::move(device_identity);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = ViewerStatus{};
@@ -84,7 +89,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
                           std::move(pinned_fingerprint), allow_unverified,
-                          std::move(access_token));
+                          std::move(access_token), std::move(password),
+                          std::move(totp), trust_device);
     return true;
 }
 
@@ -192,7 +198,8 @@ void ViewerEngine::SetState(ViewerState state, std::string error) {
 
 void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string pinned_fingerprint, bool allow_unverified,
-                       std::string access_token) {
+                       std::string access_token, std::string password,
+                       std::string totp, bool trust_device) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -220,6 +227,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool audio_broken = false;
     bool audio_enabled = false;
     bool audio_muted_applied = false;
+    uint16_t permissions = 0;
+    uint64_t permission_updates = 0;
     uint32_t audio_sample_rate = 0;
     uint32_t audio_channels = 0;
     uint32_t audio_bitrate = 0;
@@ -336,6 +345,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     client_config.pinned_fingerprint = std::move(pinned_fingerprint);
     client_config.allow_any_certificate = allow_unverified;
     client_config.access_token = std::move(access_token);
+    client_config.password = std::move(password);
+    client_config.totp = std::move(totp);
+    client_config.device_identity = device_identity_.get();
+    client_config.trust_device = trust_device;
     std::string error;
     std::unique_ptr<chast::QuicSession> session =
         chast::QuicSession::create_client(client_config, &error);
@@ -476,6 +489,43 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             };
             start_audio(info.audio);
 
+            // Applies a permission mask to every gate the session exposes:
+            // the UI's queue gates, the flags it polls, and the counters it
+            // watches for a live change. Queued events that the host no
+            // longer accepts are dropped here rather than sent and refused.
+            auto apply_permissions = [&](uint16_t mask) {
+                if (permission_updates != 0 && mask == permissions) {
+                    return;
+                }
+                permissions = mask;
+                ++permission_updates;
+                const bool input = (mask & chast::kPermissionInput) != 0;
+                const bool clipboard = (mask & chast::kPermissionClipboard) != 0;
+                {
+                    std::lock_guard<std::mutex> lock(input_mutex_);
+                    input_enabled_ = input;
+                    if (!input) {
+                        pending_input_.clear();
+                    }
+                }
+                clipboard_enabled = clipboard;
+                {
+                    std::lock_guard<std::mutex> lock(clipboard_mutex_);
+                    clipboard_enabled_ = clipboard;
+                    if (!clipboard) {
+                        pending_clipboard_.clear();
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.permissions = mask;
+                    status_.permission_updates = permission_updates;
+                    status_.input_enabled = input;
+                    status_.clipboard_enabled = clipboard;
+                }
+            };
+            apply_permissions(session->permissions());
+
             std::fprintf(stderr,
                          "viewer: display request %s; %zu announced, stream origin %d,%d\n",
                          display == chast::kDisplayAuto ? "auto"
@@ -554,7 +604,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // order. Runs on this thread, which owns the session, so
                 // send_input() never races receive_frame().
                 auto drain_input = [&] {
-                    if (!info.input_enabled) {
+                    if ((permissions & chast::kPermissionInput) == 0) {
+                        std::lock_guard<std::mutex> lock(input_mutex_);
+                        pending_input_.clear();
                         return;
                     }
                     std::deque<PendingInput> events;
@@ -735,6 +787,18 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Adopts every PermissionUpdate the host sent. The transport
+                // enforces the same mask on its side; this keeps the UI's
+                // gates and the queues consistent with it immediately.
+                auto receive_permissions = [&] {
+                    uint16_t updated = 0;
+                    while (session->take_permission_update(updated)) {
+                        apply_permissions(updated);
+                        std::fprintf(stderr, "viewer: permissions are now 0x%04x\n",
+                                     updated);
+                    }
+                };
+
                 // Applies StreamInfo messages: the captured output changed
                 // size, rotation or origin after the server rebuilt its
                 // duplication. Frames keep flowing on the same stream, so only
@@ -786,6 +850,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 pending_clipboard_.clear();
                             }
                         }
+                        // StreamInfo carries the permission mask too (for
+                        // example after the host rebuilt its capture under a
+                        // reduced grant), so adopt it before announcing.
+                        apply_permissions(session->permissions());
                         std::fprintf(stderr,
                                      "viewer: stream is now %s %ux%u at %d,%d\n",
                                      codec_name(info.codec).c_str(), info.width, info.height,
@@ -821,6 +889,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     if (!apply_stream_updates()) {
                         break;
                     }
+                    receive_permissions();
                     {
                         const auto probe_now = Clock::now();
                         if (probe_now - last_probe >= kProbeInterval) {
@@ -845,12 +914,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
                     const bool fast_media_poll =
-                        info.input_enabled || info.clipboard_enabled || audio_announced;
+                        (permissions & (chast::kPermissionInput |
+                                        chast::kPermissionClipboard)) != 0 ||
+                        audio_announced;
                     chast::Error received_frame = session->receive_frame(
                         header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
                     // Audio packets arrive on their own stream and never wake
                     // receive_frame(), so drain them as soon as the wait ends.
                     drain_audio();
+                    receive_permissions();
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {

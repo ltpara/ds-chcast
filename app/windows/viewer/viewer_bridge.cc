@@ -2,16 +2,23 @@
 
 #include <commctrl.h>
 #include <imm.h>
+#include <shlobj.h>
 
 #include <flutter/flutter_engine.h>
 #include <flutter/standard_method_codec.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include "chast/identity.h"
+#include "chast/protocol.h"
+#include "chast/security.h"
 #include "gpu_frame_sink.h"
 
 namespace chast_viewer {
@@ -19,6 +26,8 @@ namespace chast_viewer {
 namespace {
 
 constexpr UINT_PTR kViewSubclassId = 1;
+// The Dart side uses a server URL or host:port as the password-store key.
+constexpr size_t kMaxTrustKeyLength = 512;
 
 const char* state_name(ViewerState state) {
     switch (state) {
@@ -84,6 +93,67 @@ bool map_bool(const flutter::EncodableMap& map, const char* name, bool* out) {
     return true;
 }
 
+// %APPDATA%\chast, where the viewer's device key and saved passwords live.
+// Empty when the shell cannot name the roaming profile.
+std::filesystem::path app_data_chast_dir() {
+    PWSTR raw = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_CREATE, nullptr, &raw))) {
+        return {};
+    }
+    const std::filesystem::path path(raw);
+    CoTaskMemFree(raw);
+    return path / L"chast";
+}
+
+// The password store is keyed by the same trust key Dart uses for the pin, so
+// a file cannot be moved to another target by editing plain text. FNV-1a is
+// enough here: the key is not a secret, only a lookup name.
+std::string password_file_name(const std::string& trust_key) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const char raw : trust_key) {
+        hash ^= static_cast<unsigned char>(raw);
+        hash *= 1099511628211ull;
+    }
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx.bin",
+                  static_cast<unsigned long long>(hash));
+    return name;
+}
+
+std::string password_entropy(const std::string& trust_key) {
+    return "chast-viewer-password:" + trust_key;
+}
+
+bool read_text_file(const std::filesystem::path& path, std::string* out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return true;
+}
+
+bool write_text_file(const std::filesystem::path& path, const std::string& text,
+                     std::string* error) {
+    std::error_code code;
+    std::filesystem::create_directories(path.parent_path(), code);
+    if (code) {
+        *error = "create " + path.parent_path().string() + ": " + code.message();
+        return false;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        *error = "open " + path.string() + " for writing";
+        return false;
+    }
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!out) {
+        *error = "write " + path.string();
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
@@ -139,6 +209,31 @@ void ViewerBridge::Shutdown() {
     channel_.reset();
 }
 
+void ViewerBridge::EnsureIdentity() {
+    if (identity_loaded_) {
+        return;
+    }
+    identity_loaded_ = true;
+    const std::filesystem::path dir = app_data_chast_dir();
+    if (dir.empty()) {
+        std::fprintf(stderr, "chast_viewer: cannot locate the roaming profile for the device key\n");
+        return;
+    }
+    std::error_code code;
+    std::filesystem::create_directories(dir, code);
+    if (code) {
+        std::fprintf(stderr, "chast_viewer: create %s: %s\n", dir.string().c_str(),
+                     code.message().c_str());
+        return;
+    }
+    std::string error;
+    identity_ = chast::DeviceIdentity::load_or_create(
+        (dir / L"viewer-identity.bin").string(), &error);
+    if (!identity_) {
+        std::fprintf(stderr, "chast_viewer: device identity: %s\n", error.c_str());
+    }
+}
+
 void ViewerBridge::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
@@ -158,7 +253,10 @@ void ViewerBridge::HandleMethodCall(
         int64_t display = chast::kDisplayAuto;
         std::string fingerprint;
         std::string access_token;
+        std::string password;
+        std::string totp;
         bool allow_unverified = false;
+        bool trust_device = false;
         if (args == nullptr || !map_string(*args, "host", &host) ||
             !map_int(*args, "port", &port) || !map_int(*args, "gpuOutput", &output) ||
             host.empty() || port <= 0 || port > 65535 || output <= 0) {
@@ -172,6 +270,7 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         map_bool(*args, "allowUnverified", &allow_unverified);
+        map_bool(*args, "trustDevice", &trust_device);
         if (map_string(*args, "fingerprint", &fingerprint) && !fingerprint.empty()) {
             fingerprint = chast::normalize_fingerprint(fingerprint);
             if (fingerprint.empty()) {
@@ -184,10 +283,23 @@ void ViewerBridge::HandleMethodCall(
             result->Error("bad_args", "accessToken must be at most 128 bytes");
             return;
         }
+        map_string(*args, "password", &password);
+        if (password.size() > chast::kMaxPasswordLength) {
+            result->Error("bad_args", "password must be at most 128 bytes");
+            return;
+        }
+        map_string(*args, "totp", &totp);
+        if (totp.size() > chast::kMaxTotpLength) {
+            result->Error("bad_args", "totp must be at most 16 characters");
+            return;
+        }
+        EnsureIdentity();
         texture_sink_->SetOutput(reinterpret_cast<void*>(static_cast<intptr_t>(output)));
         if (!viewer_->Start(host, static_cast<uint16_t>(port),
                             static_cast<uint16_t>(display), std::move(fingerprint),
-                            allow_unverified, std::move(access_token))) {
+                            allow_unverified, std::move(access_token),
+                            std::move(password), std::move(totp), identity_,
+                            trust_device)) {
             texture_sink_->SetOutput(nullptr);
             result->Error("busy", "a session is already running");
             return;
@@ -251,6 +363,10 @@ void ViewerBridge::HandleMethodCall(
         map[key("videoFinished")] = flutter::EncodableValue(status.video_finished);
         map[key("fullscreen")] = flutter::EncodableValue(fullscreen_);
         map[key("inputEnabled")] = flutter::EncodableValue(status.input_enabled);
+        map[key("permissions")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.permissions));
+        map[key("permissionUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.permission_updates));
         map[key("originX")] = flutter::EncodableValue(static_cast<int32_t>(status.origin_x));
         map[key("originY")] = flutter::EncodableValue(static_cast<int32_t>(status.origin_y));
         map[key("inputSent")] =
@@ -392,6 +508,75 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "clearRemoteCursor") {
         ClearCursor();
+        result->Success();
+        return;
+    }
+
+    if (method == "loadPassword") {
+        const auto* trust_key = std::get_if<std::string>(call.arguments());
+        if (trust_key == nullptr || trust_key->empty() ||
+            trust_key->size() > kMaxTrustKeyLength) {
+            result->Error("bad_args", "loadPassword wants a non-empty trust key");
+            return;
+        }
+        const std::filesystem::path dir = app_data_chast_dir();
+        if (dir.empty()) {
+            result->Success();
+            return;
+        }
+        std::string stored;
+        if (!read_text_file(dir / L"passwords" / password_file_name(*trust_key), &stored)) {
+            result->Success();
+            return;
+        }
+        std::string password;
+        std::string error;
+        if (!chast::unprotect_secret(stored, chast::SecretScope::CurrentUser,
+                                     password_entropy(*trust_key), password, &error)) {
+            std::fprintf(stderr, "chast_viewer: saved password: %s\n", error.c_str());
+            result->Success();
+            return;
+        }
+        result->Success(flutter::EncodableValue(std::move(password)));
+        return;
+    }
+
+    if (method == "savePassword") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        std::string trust_key;
+        std::string password;
+        if (args == nullptr || !map_string(*args, "key", &trust_key) ||
+            !map_string(*args, "password", &password) || trust_key.empty() ||
+            trust_key.size() > kMaxTrustKeyLength ||
+            password.size() > chast::kMaxPasswordLength) {
+            result->Error("bad_args",
+                          "savePassword wants a trust key and at most 128 bytes of password");
+            return;
+        }
+        const std::filesystem::path dir = app_data_chast_dir();
+        if (dir.empty()) {
+            result->Error("no_profile", "the roaming profile is not available");
+            return;
+        }
+        const std::filesystem::path file =
+            dir / L"passwords" / password_file_name(trust_key);
+        if (password.empty()) {
+            std::error_code code;
+            std::filesystem::remove(file, code);
+            result->Success();
+            return;
+        }
+        std::string protected_text;
+        std::string error;
+        if (!chast::protect_secret(password, chast::SecretScope::CurrentUser,
+                                   password_entropy(trust_key), protected_text, &error)) {
+            result->Error("dpapi", error);
+            return;
+        }
+        if (!write_text_file(file, protected_text, &error)) {
+            result->Error("io", error);
+            return;
+        }
         result->Success();
         return;
     }

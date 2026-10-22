@@ -14,12 +14,15 @@ class RemoteToolbar extends StatelessWidget {
     required this.fit,
     required this.controlEnabled,
     required this.inputAvailable,
+    required this.clipboardEnabled,
+    required this.clipboardAvailable,
     required this.audioAvailable,
     required this.audioMuted,
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
     required this.onToggleControl,
+    required this.onToggleClipboard,
     required this.onToggleAudio,
     required this.onTogglePin,
     required this.onToggleStats,
@@ -37,12 +40,15 @@ class RemoteToolbar extends StatelessWidget {
   final ViewFit fit;
   final bool controlEnabled;
   final bool inputAvailable;
+  final bool clipboardEnabled;
+  final bool clipboardAvailable;
   final bool audioAvailable;
   final bool audioMuted;
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
   final VoidCallback onToggleControl;
+  final VoidCallback onToggleClipboard;
   final VoidCallback onToggleAudio;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
@@ -98,6 +104,19 @@ class RemoteToolbar extends StatelessWidget {
               disabled: !inputAvailable,
               active: controlEnabled,
               onTap: onToggleControl,
+            ),
+            _BarButton(
+              icon: clipboardEnabled
+                  ? Icons.content_paste_go_rounded
+                  : Icons.content_paste_off_rounded,
+              tooltip: !clipboardAvailable
+                  ? '服务端未开放剪贴板'
+                  : clipboardEnabled
+                      ? '暂停剪贴板同步'
+                      : '恢复剪贴板同步',
+              disabled: !clipboardAvailable,
+              active: clipboardAvailable && clipboardEnabled,
+              onTap: onToggleClipboard,
             ),
             _BarButton(
               icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,

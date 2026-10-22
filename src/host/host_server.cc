@@ -376,8 +376,19 @@ ClientApproval HostServer::approve_client(const ClientRequest& request) {
     const std::string from =
         request.peer_address.empty() ? std::string("an unknown address") : request.peer_address;
     if (!approval.allow) {
-        log("the operator declined the viewer from " + from);
+        if (annotated.peer_alive && !annotated.peer_alive()) {
+            log("the viewer from " + from + " left while waiting for approval");
+        } else {
+            log("the operator declined the viewer from " + from);
+        }
         return approval;
+    }
+    if (annotated.peer_alive && !annotated.peer_alive()) {
+        // The viewer stopped waiting while the prompt was open. Do not record
+        // a trusted device or spend a password for a session that the
+        // transport is about to refuse.
+        log("the viewer from " + from + " left while waiting for approval");
+        return ClientApproval{};
     }
     // The trust list and a spent temporary password are committed only now:
     // a refused approval is a denial, not a login.

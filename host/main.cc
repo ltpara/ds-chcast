@@ -245,10 +245,22 @@ struct ApprovalDialogState {
     HWND input = nullptr;
     HWND clipboard = nullptr;
     HWND audio = nullptr;
+    // Valid for the duration of server_approve(): the transport keeps the
+    // request alive across the callback and re-checks liveness before it
+    // admits the viewer.
+    const ClientRequest* request = nullptr;
     uint16_t result = 0;
     bool allowed = false;
+    bool peer_gone = false;
     bool done = false;
 };
+
+bool approval_peer_alive(const ApprovalDialogState& dialog) {
+    // A caller that does not provide the predicate cannot be watched; keep
+    // the dialog open rather than closing it for the wrong reason.
+    return dialog.request == nullptr || !dialog.request->peer_alive ||
+           dialog.request->peer_alive();
+}
 
 void finish_approval(ApprovalDialogState& dialog, bool allowed) {
     dialog.allowed = allowed;
@@ -286,7 +298,15 @@ LRESULT CALLBACK approval_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
     switch (message) {
         case WM_COMMAND:
             if (LOWORD(wparam) == kApprovalAllow) {
-                finish_approval(*dialog, true);
+                // The viewer may have given up between two timer ticks. Count
+                // that as a cancelled request, not an approval, so the log
+                // says why nothing was admitted.
+                if (!approval_peer_alive(*dialog)) {
+                    dialog->peer_gone = true;
+                    finish_approval(*dialog, false);
+                } else {
+                    finish_approval(*dialog, true);
+                }
                 return 0;
             }
             if (LOWORD(wparam) == kApprovalDeny || LOWORD(wparam) == IDCANCEL) {
@@ -302,6 +322,14 @@ LRESULT CALLBACK approval_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             // the host thread must not keep the viewer hanging on a window
             // nobody is going to answer.
             if (g_app->quitting.load() || g_app->server_stopping.load()) {
+                finish_approval(*dialog, false);
+                return 0;
+            }
+            // A viewer whose handshake timed out has already disconnected.
+            // Close the prompt instead of letting the operator approve a
+            // session that no longer exists.
+            if (!approval_peer_alive(*dialog)) {
+                dialog->peer_gone = true;
                 finish_approval(*dialog, false);
             }
             return 0;
@@ -352,6 +380,7 @@ ClientApproval server_approve(const ClientRequest& request) {
     }
 
     ApprovalDialogState dialog;
+    dialog.request = &request;
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     RECT frame{0, 0, px(470), px(320)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_TOPMOST);
@@ -437,12 +466,17 @@ ClientApproval server_approve(const ClientRequest& request) {
         }
     }
     const bool allowed = dialog.allowed;
+    const bool peer_gone = dialog.peer_gone;
     const uint16_t mask = dialog.result;
     if (IsWindow(window)) {
         DestroyWindow(window);
     }
-    post_log(allowed ? L"已允许来自 " + peer + L" 的连接"
-                     : L"已拒绝来自 " + peer + L" 的连接");
+    if (peer_gone) {
+        post_log(L"查看者在审批期间离开，已取消来自 " + peer + L" 的请求");
+    } else {
+        post_log(allowed ? L"已允许来自 " + peer + L" 的连接"
+                         : L"已拒绝来自 " + peer + L" 的连接");
+    }
     if (!allowed) {
         return ClientApproval{};
     }

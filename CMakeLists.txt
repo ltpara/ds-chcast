@@ -96,6 +96,9 @@ target_link_libraries(chast.ffmpeg PUBLIC
     "${FFMPEG_ROOT}/lib/avcodec.lib"
     "${FFMPEG_ROOT}/lib/avutil.lib"
     "${FFMPEG_ROOT}/lib/swresample.lib"
+    # avcodec's codec registry pulls the Opus objects, which are the only
+    # external codec in this static build.
+    "${FFMPEG_ROOT}/lib/opus.lib"
     VPL::dispatcher
     mfuuid
     strmiids

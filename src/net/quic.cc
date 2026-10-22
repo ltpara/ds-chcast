@@ -567,6 +567,17 @@ struct QuicSession::Impl {
         return transport_failed;
     }
 
+    // Whether the connection that carried the pending Hello is still usable.
+    // The approval callback may poll this from the application thread while
+    // the MsQuic workers update the flags under `mutex`.
+    bool peer_alive() const {
+        if (transport_down.load()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        return !peer_closed && !shutdown_complete && !transport_failed;
+    }
+
     // ----- callbacks -----
 
     static QUIC_STATUS QUIC_API listener_callback(HQUIC listener_handle, void* context,
@@ -1687,6 +1698,7 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             request.peer_address = impl.requested_peer;
             request.hello = std::move(impl.pending_hello);
             impl.pending_hello = ClientHello{};
+            request.peer_alive = [&impl] { return impl.peer_alive(); };
             lock.unlock();
 
             ClientAuthResult auth;
@@ -1739,6 +1751,15 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
                         auth.permissions = request.permissions & approval.permissions;
                     }
                 }
+            }
+
+            if (refusal.empty() && !impl.peer_alive()) {
+                // The viewer can give up while an operator prompt is open (the
+                // command-line handshake timeout is 15 s). Admitting it then
+                // would announce into a connection that is already gone and
+                // fail with E_ABORT; treat it as an expired handshake instead.
+                refuse(AccessDenial::AuthTimeout,
+                       "the viewer stopped waiting for approval");
             }
 
             if (refusal.empty()) {

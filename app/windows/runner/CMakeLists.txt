@@ -52,6 +52,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "imm32.lib" "comctl32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib" "ole32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE chast_viewer_core)
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(${BINARY_NAME} PRIVATE "${VIEWER_DIR}")

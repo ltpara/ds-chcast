@@ -36,8 +36,11 @@
 // Access control: serve --token T requires Hello to carry T and spends it on
 // the first accepted viewer unless --token-reuse is given; --token auto
 // generates and prints one. --approve asks on stdin before letting a viewer
-// in. connect --token sends the token, and a refusal prints the server's
-// reason. verify exercises all three refusal paths on throwaway servers.
+// in. serve --password P installs a permanent password and
+// --auth-mode password|click|both picks the policy; --totp-secret B enables
+// 2FA. connect --token/--password/--totp (or --totp-secret to compute the
+// code) send those credentials, and a refusal prints the server's reason.
+// verify exercises the refusal paths on throwaway servers.
 //
 // With --clipboard the serve end mirrors text through the real clipboard and
 // connect prints what the host sends. verify always covers this path with an
@@ -62,8 +65,10 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -79,9 +84,11 @@
 #include "chast/decoder.h"
 #include "chast/encoder.h"
 #include "chast/host_server.h"
+#include "chast/host_settings.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
+#include "chast/security.h"
 #include "crash_handler.h"
 
 namespace {
@@ -374,6 +381,17 @@ struct Options {
     bool token_reuse = false;
     // serve: ask on stdin before letting a viewer in.
     bool approve = false;
+    // serve: the permanent password Hello must carry. connect: the password to
+    // send. An empty password with click/both mode asks for approval instead.
+    std::string password;
+    // serve: require this base32 TOTP secret in addition to the password.
+    // connect: compute the current six-digit code from it, or send `totp`.
+    std::string totp_secret;
+    std::string totp;
+    // serve: access mode. Empty keeps the flag-derived default (click with
+    // --approve, password with --password, token otherwise).
+    chast::HostAuthMode auth_mode = chast::HostAuthMode::Both;
+    bool auth_mode_set = false;
     double seconds = 0.0;
     bool seconds_set = false;
     double wait_seconds = 30.0;
@@ -475,6 +493,19 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.token_reuse = true;
             } else if (arg == "--approve") {
                 options.approve = true;
+            } else if (arg == "--password" && i + 1 < argc) {
+                options.password = argv[++i];
+            } else if (arg == "--totp" && i + 1 < argc) {
+                options.totp = argv[++i];
+            } else if (arg == "--totp-secret" && i + 1 < argc) {
+                options.totp_secret = argv[++i];
+            } else if (arg == "--auth-mode" && i + 1 < argc) {
+                const std::string value = argv[++i];
+                if (!chast::parse_auth_mode(value, options.auth_mode)) {
+                    std::fprintf(stderr, "--auth-mode wants password, click or both\n");
+                    return false;
+                }
+                options.auth_mode_set = true;
             } else if (arg == "--no-hdr") {
                 options.config.want_hdr = false;
             } else if (arg == "--resolution" && i + 1 < argc) {
@@ -526,6 +557,46 @@ bool parse_args(int argc, char** argv, Options& options) {
             std::fprintf(stderr, "--send-clipboard wants 1..256 KiB of valid UTF-8\n");
             return false;
         }
+    }
+    if (!options.password.empty() && options.mode == "verify") {
+        std::fprintf(stderr, "--password only applies to serve and connect\n");
+        return false;
+    }
+    if (!options.totp.empty() && options.mode != "connect") {
+        std::fprintf(stderr, "--totp only applies to connect\n");
+        return false;
+    }
+    if (!options.totp.empty() && !options.totp_secret.empty()) {
+        std::fprintf(stderr, "pass either --totp or --totp-secret, not both\n");
+        return false;
+    }
+    if (!options.totp_secret.empty() && options.mode == "verify") {
+        std::fprintf(stderr, "--totp-secret only applies to serve and connect\n");
+        return false;
+    }
+    if (!options.totp_secret.empty()) {
+        std::vector<uint8_t> key;
+        if (!chast::parse_totp_secret(options.totp_secret, key)) {
+            std::fprintf(stderr, "--totp-secret is not base32\n");
+            return false;
+        }
+    }
+    if (!options.totp.empty() &&
+        (options.totp.size() != 6 ||
+         !std::all_of(options.totp.begin(), options.totp.end(),
+                      [](char c) { return c >= '0' && c <= '9'; }))) {
+        std::fprintf(stderr, "--totp wants the six-digit code\n");
+        return false;
+    }
+    if (options.auth_mode_set && options.mode != "serve") {
+        std::fprintf(stderr, "--auth-mode only applies to serve\n");
+        return false;
+    }
+    if (options.auth_mode_set && options.auth_mode != chast::HostAuthMode::Password &&
+        !options.approve) {
+        std::fprintf(stderr, "--auth-mode %s needs --approve to answer the prompt\n",
+                     chast::auth_mode_name(options.auth_mode));
+        return false;
     }
     return true;
 }
@@ -824,12 +895,25 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
                                                      : chast::HostTokenMode::OneTime;
     config.settings.access_token = options.token;
+    if (!options.password.empty()) {
+        config.settings.password_hash = chast::hash_password(options.password);
+    }
+    config.settings.totp_secret = options.totp_secret;
     // This tool is CLI/automation, so the access token is its credential. With
     // --approve an operator is present and the click flow replaces it.
-    if (options.approve) {
+    if (options.auth_mode_set) {
+        config.settings.auth_mode = options.auth_mode;
+        config.settings.require_approval =
+            options.auth_mode != chast::HostAuthMode::Password;
+        config.settings.token_auth = !options.approve;
+    } else if (options.approve) {
         config.settings.auth_mode = chast::HostAuthMode::Click;
         config.settings.require_approval = true;
         config.settings.token_auth = false;
+    } else if (!options.password.empty()) {
+        config.settings.auth_mode = chast::HostAuthMode::Password;
+        config.settings.require_approval = false;
+        config.settings.token_auth = true;
     } else {
         config.settings.token_auth = true;
     }
@@ -1090,6 +1174,19 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     client_config.pinned_fingerprint = pinned;
     client_config.allow_any_certificate = pinned.empty() && options.insecure;
     client_config.access_token = options.token;
+    client_config.password = options.password;
+    client_config.totp = options.totp;
+    if (client_config.totp.empty() && !options.totp_secret.empty()) {
+        // Computed right before the Hello so the 30 s window is fresh.
+        std::vector<uint8_t> key;
+        if (!chast::parse_totp_secret(options.totp_secret, key)) {
+            return fail("--totp-secret is not base32");
+        }
+        char code[8]{};
+        std::snprintf(code, sizeof(code), "%06u",
+                      chast::totp_code(key, static_cast<uint64_t>(std::time(nullptr))));
+        client_config.totp = code;
+    }
     std::string error;
     std::unique_ptr<chast::QuicSession> session =
         chast::QuicSession::create_client(client_config, &error);
@@ -2418,6 +2515,140 @@ bool auth_and_permissions_work(uint16_t port, std::string* detail) {
     return true;
 }
 
+// The operator prompt blocks wait_for_client() on the host thread. A viewer
+// whose handshake times out disconnects while that prompt is still open; the
+// transport must expose that through ClientRequest::peer_alive, refuse the
+// dead session even if the prompt answers "allow", and keep the listener ready
+// for the next client.
+bool approval_liveness_works(uint16_t port, std::string* detail) {
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = port;
+    server_config.idle_timeout_ms = 3000;
+    server_config.allow_input = true;
+    server_config.dry_run_input = true;
+    server_config.authenticate = [](const chast::ClientRequest&) {
+        chast::ClientAuthResult result;
+        result.action = chast::ClientAuthAction::RequireApproval;
+        result.permissions = chast::kPermissionInput;
+        return result;
+    };
+    std::atomic<int> approvals{0};
+    std::atomic<bool> saw_peer_gone{false};
+    server_config.approve_client = [&](const chast::ClientRequest& request) {
+        if (approvals.fetch_add(1) == 0) {
+            // Stand in for an operator who takes longer than the viewer's
+            // handshake timeout: wait until the transport reports the peer
+            // gone, then approve anyway. The transport owns the final check.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+            while (request.peer_alive && request.peer_alive() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            saw_peer_gone = !request.peer_alive || !request.peer_alive();
+        }
+        return chast::ClientApproval{true, request.permissions};
+    };
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "approval-liveness server: " + error;
+        return false;
+    }
+    const std::string pin = server->server_fingerprint();
+    auto make_client = [&] {
+        chast::QuicClientConfig config;
+        config.host = "127.0.0.1";
+        config.port = port;
+        config.idle_timeout_ms = 3000;
+        config.pinned_fingerprint = pin;
+        return config;
+    };
+
+    chast::Error first_wait = chast::Error::success();
+    chast::Error second_wait = chast::Error::success();
+    std::atomic<bool> second_wait_started{false};
+    bool second_announced = false;
+    std::thread serving([&] {
+        first_wait = server->wait_for_client(std::chrono::seconds(3));
+        second_wait_started = true;
+        second_wait = server->wait_for_client(std::chrono::seconds(5));
+        if (second_wait.ok()) {
+            chast::ServerInfo info;
+            info.width = 64;
+            info.height = 64;
+            info.source_width = 64;
+            info.source_height = 64;
+            info.framerate = 30;
+            info.bitrate = 100000;
+            info.encoder = "approval liveness probe";
+            second_announced = server->announce(info).ok();
+        }
+    });
+
+    // The first viewer gives up on the handshake and disconnects while the
+    // approval callback is still waiting.
+    std::unique_ptr<chast::QuicSession> first =
+        chast::QuicSession::create_client(make_client(), &error);
+    chast::ServerInfo info;
+    chast::Error handshaken =
+        first ? first->connect(std::chrono::seconds(5))
+              : chast::Error(chast::Status::InvalidCall, "client: " + error);
+    if (handshaken.ok()) {
+        handshaken = first->handshake(info, std::chrono::milliseconds(800));
+    }
+    first.reset();
+
+    const auto started_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!second_wait_started && std::chrono::steady_clock::now() < started_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!second_wait_started) {
+        serving.join();
+        *detail = "the listener did not return to waiting after a dead approval";
+        return false;
+    }
+
+    // A second viewer must still be served: the dead session released its
+    // connection slot instead of leaving the listener stuck.
+    std::unique_ptr<chast::QuicSession> second =
+        chast::QuicSession::create_client(make_client(), &error);
+    chast::ServerInfo second_info;
+    bool second_ok = second && second->connect(std::chrono::seconds(5)).ok() &&
+                     second->handshake(second_info, std::chrono::seconds(5)).ok();
+    second.reset();
+    serving.join();
+
+    if (handshaken.ok()) {
+        *detail = "the first viewer's handshake succeeded while approval was pending";
+        return false;
+    }
+    if (!saw_peer_gone) {
+        *detail = "the approval request never saw the viewer leave";
+        return false;
+    }
+    if (approvals.load() != 2) {
+        *detail = "the approval callback ran " + std::to_string(approvals.load()) +
+                  " times, expected 2";
+        return false;
+    }
+    if (first_wait.status() != chast::Status::WaitTimeout) {
+        *detail = "a viewer that left during approval was admitted: " +
+                  chast::to_string(first_wait.status()) + " " + first_wait.message();
+        return false;
+    }
+    if (!second_wait.ok() || !second_announced || !second_ok) {
+        *detail = "the listener did not serve the next viewer: second wait " +
+                  second_wait.to_string() +
+                  (second_ok ? "" : ", client handshake failed") +
+                  (second_announced ? "" : ", announce failed");
+        return false;
+    }
+    return true;
+}
+
 // A server whose clipboard gate is closed must not send text and must drop a
 // viewer's updates instead of failing the session.
 bool clipboard_gate_works(uint16_t port, std::string* detail) {
@@ -2602,7 +2833,10 @@ struct ProbePasswordHandshake {
 
 ProbePasswordHandshake probe_password(uint16_t port, const std::string& pin,
                                       const std::string& password,
-                                      std::chrono::milliseconds timeout) {
+                                      std::chrono::milliseconds timeout,
+                                      const std::string& totp = {},
+                                      const chast::DeviceIdentity* identity = nullptr,
+                                      bool trust_device = false) {
     ProbePasswordHandshake result;
     chast::QuicClientConfig client_config;
     client_config.host = "127.0.0.1";
@@ -2610,6 +2844,9 @@ ProbePasswordHandshake probe_password(uint16_t port, const std::string& pin,
     client_config.idle_timeout_ms = 3000;
     client_config.pinned_fingerprint = pin;
     client_config.password = password;
+    client_config.totp = totp;
+    client_config.device_identity = identity;
+    client_config.trust_device = trust_device;
     std::string error;
     std::unique_ptr<chast::QuicSession> client =
         chast::QuicSession::create_client(client_config, &error);
@@ -2629,6 +2866,348 @@ ProbePasswordHandshake probe_password(uint16_t port, const std::string& pin,
     result.denial = client->denial();
     result.error = handshaken.to_string();
     return result;
+}
+
+// A transport listener whose Hello gate runs the real HostSecurity policy, so
+// the probes below exercise signatures, TOTP and lockout across the wire.
+struct PolicyServer {
+    std::shared_ptr<chast::HostSecurity> security;
+    std::unique_ptr<chast::QuicSession> session;
+};
+
+std::unique_ptr<PolicyServer> create_policy_server(uint16_t port,
+                                                   chast::HostSecurity::Config policy,
+                                                   std::atomic<bool>* trusted_device_used,
+                                                   std::string* error) {
+    auto server = std::make_unique<PolicyServer>();
+    server->security = std::make_shared<chast::HostSecurity>(std::move(policy));
+    chast::QuicServerConfig quic;
+    quic.bind_address = "127.0.0.1";
+    quic.port = port;
+    quic.idle_timeout_ms = 3000;
+    quic.authenticate = [state = server->security,
+                         trusted_device_used](const chast::ClientRequest& request) {
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        const chast::HostSecurity::Result result =
+            state->evaluate(request.hello, request.peer_address, now);
+        chast::ClientAuthResult auth;
+        auth.permissions = result.permissions;
+        if (result.decision == chast::HostSecurity::Decision::Allow) {
+            state->note_connected(result, now);
+            if (trusted_device_used && result.via_trusted_device) {
+                trusted_device_used->store(true);
+            }
+            auth.action = chast::ClientAuthAction::Allow;
+        } else {
+            auth.action = chast::ClientAuthAction::Deny;
+            auth.denial = result.denial;
+            auth.reason = result.reason;
+        }
+        return auth;
+    };
+    server->session = chast::QuicSession::create_server(quic, error);
+    if (!server->session) {
+        return nullptr;
+    }
+    // Signed Hellos bind to the certificate this listener presents.
+    chast::HostSecurity::Config bound = server->security->config();
+    bound.host_fingerprint = server->session->server_fingerprint();
+    server->security->set_config(std::move(bound));
+    return server;
+}
+
+void announce_probe_stream(chast::QuicSession& session, const char* encoder) {
+    chast::ServerInfo info;
+    info.width = 64;
+    info.height = 64;
+    info.source_width = 64;
+    info.source_height = 64;
+    info.framerate = 30;
+    info.bitrate = 100000;
+    info.encoder = encoder;
+    session.announce(info);
+}
+
+std::thread serve_policy_client(PolicyServer& server, const char* encoder,
+                                std::chrono::milliseconds timeout,
+                                std::atomic<bool>* admitted = nullptr) {
+    return std::thread([&server, encoder, timeout, admitted] {
+        if (!server.session->wait_for_client(timeout).ok()) {
+            return;
+        }
+        if (admitted) {
+            admitted->store(true);
+        }
+        announce_probe_stream(*server.session, encoder);
+    });
+}
+
+bool wait_host_listening(chast::HostServer& server, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (server.status().state == chast::HostState::Listening) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+std::unique_ptr<chast::HostServer> start_probe_host(
+    uint16_t port, const std::function<void(chast::HostSettings&)>& setup, std::string* error) {
+    chast::HostServerConfig host;
+    host.settings.bind_address = "127.0.0.1";
+    host.settings.port = port;
+    host.settings.auth_mode = chast::HostAuthMode::Password;
+    host.settings.password_hash = chast::hash_password("open-sesame");
+    host.serve_once = true;
+    setup(host.settings);
+    std::unique_ptr<chast::HostServer> server =
+        chast::HostServer::create(std::move(host), error);
+    if (!server) {
+        return nullptr;
+    }
+    server->start();
+    if (!wait_host_listening(*server, std::chrono::seconds(5))) {
+        *error = "the host did not start listening";
+        server->stop();
+        return nullptr;
+    }
+    return server;
+}
+
+// Two-factor and trusted devices through the host settings and policy, then
+// lockout and the allow-list. The trusted device is remembered by a real
+// connection and skips only the second factor: the password is still checked.
+bool secure_auth_wiring_works(uint16_t port, std::string* detail) {
+    const std::string password = "open-sesame";
+    const char* const kTotpSecret = "JBSWY3DPEHPK3PXP";
+    std::vector<uint8_t> totp_key;
+    if (!chast::parse_totp_secret(kTotpSecret, totp_key)) {
+        *detail = "the probe's TOTP secret is not base32";
+        return false;
+    }
+    auto totp_now = [&totp_key] {
+        char code[8]{};
+        std::snprintf(code, sizeof(code), "%06u",
+                      chast::totp_code(totp_key, static_cast<uint64_t>(std::time(nullptr))));
+        return std::string(code);
+    };
+    auto wrong_totp = [&totp_key] {
+        char code[8]{};
+        std::snprintf(code, sizeof(code), "%06u",
+                      chast::totp_code(totp_key, static_cast<uint64_t>(std::time(nullptr))));
+        std::string wrong = code;
+        wrong.back() = wrong.back() == '0' ? '1' : '0';
+        return wrong;
+    };
+
+    std::string identity_error;
+    std::unique_ptr<chast::DeviceIdentity> identity =
+        chast::DeviceIdentity::generate(&identity_error);
+    std::unique_ptr<chast::DeviceIdentity> unknown =
+        chast::DeviceIdentity::generate(&identity_error);
+    if (!identity || !unknown) {
+        *detail = "device identity: " + identity_error;
+        return false;
+    }
+
+    const uint16_t totp_port = static_cast<uint16_t>(port + 1);
+    const uint16_t trust_port = static_cast<uint16_t>(port + 2);
+    const uint16_t trusted_port = static_cast<uint16_t>(port + 3);
+    const uint16_t lockout_port = static_cast<uint16_t>(port + 4);
+    const uint16_t allow_port = static_cast<uint16_t>(port + 5);
+
+    // The host's settings -> policy -> Hello path asks for the code.
+    {
+        std::string error;
+        std::unique_ptr<chast::HostServer> server = start_probe_host(
+            port, [&](chast::HostSettings& settings) { settings.totp_secret = kTotpSecret; },
+            &error);
+        if (!server) {
+            *detail = "two-factor host: " + error;
+            return false;
+        }
+        const ProbePasswordHandshake refused = probe_password(
+            port, server->status().fingerprint, password, std::chrono::seconds(5));
+        server->stop();
+        if (refused.status != chast::Status::PermissionDenied ||
+            refused.denial != chast::AccessDenial::TwoFactorRequired ||
+            refused.error.find("two-factor") == std::string::npos) {
+            *detail = "the host did not ask for a two-factor code: " + refused.error;
+            return false;
+        }
+    }
+
+    {
+        std::string error;
+        std::unique_ptr<chast::HostServer> server = start_probe_host(
+            totp_port, [&](chast::HostSettings& settings) { settings.totp_secret = kTotpSecret; },
+            &error);
+        if (!server) {
+            *detail = "two-factor host: " + error;
+            return false;
+        }
+        const ProbePasswordHandshake refused =
+            probe_password(totp_port, server->status().fingerprint, password,
+                           std::chrono::seconds(5), wrong_totp());
+        server->stop();
+        if (refused.status != chast::Status::PermissionDenied ||
+            refused.denial != chast::AccessDenial::WrongTwoFactor) {
+            *detail = "a wrong two-factor code was not refused by name: " + refused.error;
+            return false;
+        }
+    }
+
+    // A device proves itself with a signed Hello and asks to be remembered.
+    std::vector<chast::TrustedDevice> trusted;
+    {
+        chast::HostSecurity::Config policy;
+        policy.mode = chast::HostAuthMode::Password;
+        policy.password_hash = chast::hash_password(password);
+        policy.totp_secret = kTotpSecret;
+        std::string error;
+        std::unique_ptr<PolicyServer> server =
+            create_policy_server(trust_port, policy, nullptr, &error);
+        if (!server) {
+            *detail = "trust server: " + error;
+            return false;
+        }
+        const std::string pin = server->session->server_fingerprint();
+        std::atomic<bool> admitted{false};
+        std::thread serving =
+            serve_policy_client(*server, "trust enrollment", std::chrono::seconds(10), &admitted);
+        const ProbePasswordHandshake challenged =
+            probe_password(trust_port, pin, password, std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const ProbePasswordHandshake enrolled =
+            probe_password(trust_port, pin, password, std::chrono::seconds(8), totp_now(),
+                           identity.get(), true);
+        serving.join();
+        if (challenged.denial != chast::AccessDenial::TwoFactorRequired) {
+            *detail = "the code was not demanded before enrollment: " + challenged.error;
+            return false;
+        }
+        if (!enrolled.ok || !admitted.load()) {
+            *detail = "the enrolled device did not connect: " + enrolled.error;
+            return false;
+        }
+        trusted = server->security->config().trusted_devices;
+        if (trusted.size() != 1 || trusted.front().public_key != identity->public_key()) {
+            *detail = "the host did not remember the enrolled device";
+            return false;
+        }
+    }
+
+    // The remembered device signs with the same key and skips the code. A new
+    // device is still challenged, and a bad password is never skipped.
+    {
+        chast::HostSecurity::Config policy;
+        policy.mode = chast::HostAuthMode::Password;
+        policy.password_hash = chast::hash_password(password);
+        policy.totp_secret = kTotpSecret;
+        policy.trusted_devices = trusted;
+        std::string error;
+        std::atomic<bool> trusted_used{false};
+        std::unique_ptr<PolicyServer> server =
+            create_policy_server(trusted_port, policy, &trusted_used, &error);
+        if (!server) {
+            *detail = "trusted server: " + error;
+            return false;
+        }
+        const std::string pin = server->session->server_fingerprint();
+        std::atomic<bool> admitted{false};
+        std::thread serving = serve_policy_client(
+            *server, "trusted device", std::chrono::seconds(12), &admitted);
+        const ProbePasswordHandshake wrong_password =
+            probe_password(trusted_port, pin, "not-the-password", std::chrono::seconds(5), "",
+                           identity.get());
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const ProbePasswordHandshake unknown_device =
+            probe_password(trusted_port, pin, password, std::chrono::seconds(5), "",
+                           unknown.get());
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const ProbePasswordHandshake skipped =
+            probe_password(trusted_port, pin, password, std::chrono::seconds(8), "",
+                           identity.get());
+        serving.join();
+        if (wrong_password.denial != chast::AccessDenial::WrongPassword) {
+            *detail = "a trusted device skipped the password: " + wrong_password.error;
+            return false;
+        }
+        if (unknown_device.denial != chast::AccessDenial::TwoFactorRequired) {
+            *detail = "an unknown device was not challenged for a code: " + unknown_device.error;
+            return false;
+        }
+        if (!skipped.ok || !admitted.load() || !trusted_used.load()) {
+            *detail = "the trusted device did not skip the code: " + skipped.error;
+            return false;
+        }
+    }
+
+    // Repeated failures lock the address, including a later correct password.
+    {
+        chast::HostSecurity::Config policy;
+        policy.mode = chast::HostAuthMode::Password;
+        policy.password_hash = chast::hash_password(password);
+        std::string error;
+        std::unique_ptr<PolicyServer> server =
+            create_policy_server(lockout_port, policy, nullptr, &error);
+        if (!server) {
+            *detail = "lockout server: " + error;
+            return false;
+        }
+        const std::string pin = server->session->server_fingerprint();
+        std::thread serving =
+            serve_policy_client(*server, "lockout", std::chrono::seconds(5));
+        bool every_failure_named = true;
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            const ProbePasswordHandshake refused =
+                probe_password(lockout_port, pin, "wrong-" + std::to_string(attempt),
+                               std::chrono::seconds(3));
+            if (refused.denial != chast::AccessDenial::WrongPassword) {
+                *detail = "failure " + std::to_string(attempt + 1) +
+                          " was not named as a wrong password: " + refused.error;
+                every_failure_named = false;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        const ProbePasswordHandshake locked =
+            probe_password(lockout_port, pin, password, std::chrono::seconds(3));
+        serving.join();
+        if (!every_failure_named) {
+            return false;
+        }
+        if (locked.denial != chast::AccessDenial::LockedOut ||
+            locked.error.find("too many failed attempts") == std::string::npos) {
+            *detail = "the locked address was not refused by name: " + locked.error;
+            return false;
+        }
+    }
+
+    // The allow-list is checked before any credential.
+    {
+        std::string error;
+        std::unique_ptr<chast::HostServer> server = start_probe_host(
+            allow_port,
+            [](chast::HostSettings& settings) { settings.ip_whitelist = "10.0.0.0/8"; },
+            &error);
+        if (!server) {
+            *detail = "allow-list host: " + error;
+            return false;
+        }
+        const ProbePasswordHandshake refused =
+            probe_password(allow_port, server->status().fingerprint, password,
+                           std::chrono::seconds(5));
+        server->stop();
+        if (refused.status != chast::Status::PermissionDenied ||
+            refused.denial != chast::AccessDenial::NotWhitelisted) {
+            *detail = "an address outside the allow-list was not refused: " + refused.error;
+            return false;
+        }
+    }
+    return true;
 }
 
 // The HostServer wiring, not just the transport callbacks: a service with no
@@ -2843,6 +3422,15 @@ int run_verify(const Options& options) {
     }
     {
         std::string detail;
+        const bool passed =
+            approval_liveness_works(static_cast<uint16_t>(probe_base + 9), &detail);
+        check(passed, "a viewer that leaves during approval is not admitted");
+        if (!passed) {
+            std::printf("     approval liveness probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
         const bool passed = clipboard_gate_works(static_cast<uint16_t>(probe_base + 3), &detail);
         check(passed, "a clipboard-disabled server refuses to send and drops viewer updates");
         if (!passed) {
@@ -2864,6 +3452,15 @@ int run_verify(const Options& options) {
         check(passed, "service mode demands a password and the temporary password rotates");
         if (!passed) {
             std::printf("     host security probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
+        const bool passed =
+            secure_auth_wiring_works(static_cast<uint16_t>(probe_base + 12), &detail);
+        check(passed, "two-factor, trusted devices, lockout and the allow-list work");
+        if (!passed) {
+            std::printf("     secure auth probe: %s\n", detail.c_str());
         }
     }
     check(sent.encoded > 0, "the sender produced frames");

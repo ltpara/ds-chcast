@@ -71,6 +71,13 @@ struct ClientRequest {
     ClientApprovalMethod method = ClientApprovalMethod::Unknown;
     // The viewer proved its device key and asked to be remembered.
     bool device_proof = false;
+    // True while the connection that sent this Hello is still usable. Set by
+    // the transport and valid only for the duration of authenticate /
+    // approve_client: those run on the application thread while the viewer
+    // waits, and an operator prompt can poll it to close itself when the
+    // viewer gives up. Admission is re-checked after the callback returns, so
+    // approving a connection that died in the meantime cannot start a session.
+    std::function<bool()> peer_alive;
 };
 
 enum class ClientAuthAction {

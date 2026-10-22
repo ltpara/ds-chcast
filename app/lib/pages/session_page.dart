@@ -42,6 +42,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // clipboard from before the connection from being uploaded.
   String? _lastClipboardText;
   bool _clipboardBusy = false;
+  // Local clipboard switch, independent of the host's gate: turning it off
+  // stops both directions without asking the host to change permissions.
+  bool _clipboardSync = true;
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -82,6 +85,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // The identity this page pins for the current connection. Empty only until
   // the first contact, whose certificate is then remembered by the store.
   String _pinnedFingerprint = '';
+  // Interactive authentication. The password is loaded from this account's
+  // DPAPI store once, then kept for reconnects; the code is cleared whenever
+  // the password changes because the host checks them in that order.
+  bool _credentialsLoaded = false;
+  bool _rememberPassword = false;
+  bool _trustDevice = false;
+  String _password = '';
+  String _totp = '';
+  bool _authPromptOpen = false;
+  int _challengeDenial = 0;
   // One viewer tunnel for the lifetime of this page; reconnects reuse it so
   // the host sees a stable NAT mapping and the selected path survives.
   TunnelAgent? _tunnel;
@@ -227,6 +240,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return;
     }
     _pinnedFingerprint = pin;
+    if (!_credentialsLoaded) {
+      _credentialsLoaded = true;
+      try {
+        final String? saved = await ViewerBridge.loadPassword(widget.target.trustKey);
+        if (saved != null && saved.isNotEmpty) {
+          _password = saved;
+          _rememberPassword = true;
+        }
+      } on PlatformException {
+        // A store that cannot be read just means the host asks for a password.
+      } on MissingPluginException {
+        // The native side is not up yet; the first start reports it.
+      }
+      if (!mounted) {
+        await _stopSession();
+        return;
+      }
+    }
     try {
       await ViewerBridge.start(
         host: tunnel?.host ?? widget.target.host,
@@ -236,6 +267,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         fingerprint: pin,
         allowUnverified: pin.isEmpty,
         accessToken: widget.target.token,
+        password: _password,
+        totp: _totp,
+        trustDevice: _trustDevice,
       );
     } catch (_) {
       await _stopSession();
@@ -303,7 +337,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _pinnedFingerprint = status.serverFingerprint;
       unawaited(_trustStore.trust(widget.target.trustKey, status.serverFingerprint));
     }
-    final bool nowOver = status.isOver;
+    final int previousPermissions = _status.permissions;
+    final int previousPermissionUpdates = _status.permissionUpdates;
+    // A refused password or one-time code is a step, not an end: the session
+    // is dead, but the card stays away while the dialog collects fresh
+    // credentials and reconnects.
+    final bool challenge = _startError == null &&
+        status.isOver &&
+        !_over &&
+        _isCredentialChallenge(status.denial);
+    final bool nowOver = status.isOver && !challenge;
     if (status.hasFrame && !_sawFrame) {
       _sawFrame = true;
       _collapsed = false;
@@ -319,13 +362,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (droppedControl) {
       _controlEnabled = false;
     }
-    _syncClipboardPolling(status.acceptsClipboard && !nowOver);
+    _syncClipboardPolling(status.acceptsClipboard && !nowOver && _clipboardSync);
     setState(() {
       _status = status;
       _fullscreen = status.fullscreen;
     });
     if (droppedControl) {
       _setKeyCapture(false);
+    }
+    if (!nowOver &&
+        status.state == ViewerState.streaming &&
+        previousPermissionUpdates > 0 &&
+        status.permissionUpdates > previousPermissionUpdates) {
+      _notifyPermissionChange(previousPermissions, status);
+    }
+    if (challenge && !_authPromptOpen && _challengeDenial != status.denial) {
+      _challengeDenial = status.denial;
+      unawaited(_handleCredentialChallenge(status.denial));
     }
     if (nowOver) {
       _clearCursor();
@@ -435,11 +488,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     unawaited(_pollClipboard());
   }
 
+  void _toggleClipboardSync() {
+    setState(() => _clipboardSync = !_clipboardSync);
+    _syncClipboardPolling(
+        _status.acceptsClipboard && !_status.isOver && !_over && _clipboardSync);
+  }
+
   /// Applies text the host sent, then uploads a local text only when it is new.
   /// Both directions remember the exchanged value, so neither copies the other
   /// side's own text back and forth.
   Future<void> _pollClipboard() async {
-    if (_clipboardBusy || !mounted || _over) {
+    if (_clipboardBusy || !mounted || _over || !_clipboardSync) {
       return;
     }
     _clipboardBusy = true;
@@ -629,6 +688,105 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _reconnect();
   }
 
+  /// Explains a live grant change. Input loss has already dropped control and
+  /// the host lifts the keys it still holds, so this only tells the user why.
+  void _notifyPermissionChange(int before, ViewerStatus status) {
+    final int lost = before & ~status.permissions;
+    final int gained = status.permissions & ~before;
+    String names(int mask) {
+      final List<String> parts = <String>[];
+      if ((mask & ViewerPermission.input) != 0) {
+        parts.add('输入控制');
+      }
+      if ((mask & ViewerPermission.clipboard) != 0) {
+        parts.add('剪贴板');
+      }
+      if ((mask & ViewerPermission.audio) != 0) {
+        parts.add('音频');
+      }
+      return parts.join('、');
+    }
+
+    final String lostNames = names(lost);
+    final String gainedNames = names(gained);
+    final String text;
+    if (lostNames.isNotEmpty && gainedNames.isNotEmpty) {
+      text = '主机已收回 $lostNames，并授予 $gainedNames。';
+    } else if (lostNames.isNotEmpty) {
+      text = '主机已收回 $lostNames。';
+    } else if (gainedNames.isNotEmpty) {
+      text = '主机已授予 $gainedNames。';
+    } else {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(text),
+      duration: const Duration(seconds: 4),
+    ));
+  }
+
+  /// Collects the credential the host asked for and reconnects with it. A
+  /// password challenge also offers to keep the password in this Windows
+  /// account's DPAPI store; a two-factor challenge offers to trust the device.
+  Future<void> _handleCredentialChallenge(int denial) async {
+    if (_authPromptOpen || !mounted) {
+      return;
+    }
+    _authPromptOpen = true;
+    final bool passwordStep = denial == ViewerDenial.passwordRequired ||
+        denial == ViewerDenial.wrongPassword;
+    final _CredentialResult? entered = await showDialog<_CredentialResult>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) => _CredentialDialog(
+        passwordStep: passwordStep,
+        initialPassword: _password,
+        initialRemember: passwordStep ? _rememberPassword : _trustDevice,
+        detail: accessDenialText(denial),
+      ),
+    );
+    _authPromptOpen = false;
+    if (!mounted) {
+      return;
+    }
+    if (entered == null) {
+      // Backing out is an ordinary end: the card explains the refusal and
+      // offers a retry, which asks again.
+      final String detail = accessDenialText(denial);
+      setState(() {
+        _over = true;
+        _startError = detail.isEmpty ? '身份验证未完成' : detail;
+      });
+      _pollTimer?.cancel();
+      _clearCursor();
+      return;
+    }
+    if (passwordStep) {
+      _password = entered.text;
+      // The host checks the password before the code; a new password needs a
+      // new code.
+      _totp = '';
+      _rememberPassword = entered.remember;
+      try {
+        await ViewerBridge.savePassword(
+          widget.target.trustKey,
+          entered.remember ? entered.text : '',
+        );
+      } on PlatformException {
+        // The connection still works with the password held in memory.
+      } on MissingPluginException {
+        // Same.
+      }
+    } else {
+      _totp = entered.text;
+      _trustDevice = entered.remember;
+    }
+    if (!mounted) {
+      return;
+    }
+    await _reconnect();
+  }
+
   Future<void> _reconnect() async {
     if (_reconnecting) {
       return;
@@ -636,6 +794,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     setState(() {
       _reconnecting = true;
       _startError = null;
+      _challengeDenial = 0;
     });
     _pollTimer?.cancel();
     _hideTimer?.cancel();
@@ -1042,12 +1201,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fit: _fit,
                         controlEnabled: _controlEnabled,
                         inputAvailable: _status.acceptsInput,
+                        clipboardEnabled: _clipboardSync,
+                        clipboardAvailable: _status.acceptsClipboard,
                         audioAvailable: _status.acceptsAudio,
                         audioMuted: _status.audioMuted,
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
                         onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
                         onToggleControl: _toggleControl,
+                        onToggleClipboard: _toggleClipboardSync,
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
@@ -1368,6 +1530,115 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// True when the host refused the Hello only because it wants credentials,
+/// i.e. the viewer can solve it without the operator changing the token.
+bool _isCredentialChallenge(int denial) {
+  return denial == ViewerDenial.passwordRequired ||
+      denial == ViewerDenial.wrongPassword ||
+      denial == ViewerDenial.twoFactorRequired ||
+      denial == ViewerDenial.wrongTwoFactor;
+}
+
+class _CredentialResult {
+  const _CredentialResult(this.text, this.remember);
+
+  final String text;
+  final bool remember;
+}
+
+class _CredentialDialog extends StatefulWidget {
+  const _CredentialDialog({
+    required this.passwordStep,
+    required this.initialPassword,
+    required this.initialRemember,
+    required this.detail,
+  });
+
+  final bool passwordStep;
+  final String initialPassword;
+  final bool initialRemember;
+  final String detail;
+
+  @override
+  State<_CredentialDialog> createState() => _CredentialDialogState();
+}
+
+class _CredentialDialogState extends State<_CredentialDialog> {
+  late final TextEditingController _text =
+      TextEditingController(text: widget.passwordStep ? widget.initialPassword : '');
+  late bool _remember = widget.initialRemember;
+  String? _error;
+
+  @override
+  void dispose() {
+    _text.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final String value = _text.text.trim();
+    if (value.isEmpty) {
+      setState(() => _error = widget.passwordStep ? '请输入密码' : '请输入两步验证码');
+      return;
+    }
+    Navigator.of(context).pop(_CredentialResult(value, _remember));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool passwordStep = widget.passwordStep;
+    return AlertDialog(
+      title: Text(passwordStep ? '输入连接密码' : '输入两步验证码'),
+      content: SizedBox(
+        width: 320,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            if (widget.detail.isNotEmpty) ...<Widget>[
+              Text(
+                widget.detail,
+                style: const TextStyle(color: Colors.white54, fontSize: 12, height: 1.4),
+              ),
+              const SizedBox(height: 14),
+            ],
+            TextField(
+              controller: _text,
+              autofocus: true,
+              obscureText: passwordStep,
+              keyboardType:
+                  passwordStep ? TextInputType.visiblePassword : TextInputType.number,
+              maxLength: passwordStep ? 128 : 16,
+              onSubmitted: (_) => _submit(),
+              decoration: InputDecoration(
+                labelText: passwordStep ? '密码' : '6 位验证码',
+                errorText: _error,
+                counterText: '',
+              ),
+            ),
+            const SizedBox(height: 8),
+            CheckboxListTile(
+              value: _remember,
+              onChanged: (bool? value) => setState(() => _remember = value ?? false),
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              dense: true,
+              title: Text(
+                passwordStep ? '在本机加密保存密码' : '信任此设备，下次跳过两步验证',
+                style: const TextStyle(fontSize: 12.5),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('取消')),
+        FilledButton(onPressed: _submit, child: const Text('连接')),
+      ],
     );
   }
 }
