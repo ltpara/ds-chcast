@@ -37,6 +37,13 @@ find_package(VPL REQUIRED COMPONENTS dispatcher)
 # Keep PDBs out of the source tree and give every target the same warning set.
 add_compile_options(/W4 /permissive- /EHsc /utf-8 /Zc:preprocessor)
 
+# Status text and the retry policy, shared by every layer. The COM helpers stay
+# in chast.dxgi so the audio codec can format an Error without the capture
+# stack.
+add_library(chast.base STATIC
+    src/win/error.cc)
+target_include_directories(chast.base PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 add_library(chast.dxgi STATIC
     src/win/com.cc
     src/capture/display.cc
@@ -55,6 +62,7 @@ target_include_directories(chast.dxgi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # it, and the HDR pass is gated on D3DCompile being present at runtime, so a
 # system without the DLL falls back instead of failing to load.
 target_link_libraries(chast.dxgi PUBLIC
+    chast.base
     d3d11
     dxgi
     user32
@@ -74,12 +82,13 @@ endif()
 if(NOT DEFINED FFMPEG_ROOT OR NOT EXISTS "${FFMPEG_ROOT}/lib/avcodec.lib")
     message(FATAL_ERROR "FFmpeg static libraries not found; set FFMPEG_ROOT to an install prefix with lib/avcodec.lib")
 endif()
-add_library(chast.ffmpeg INTERFACE)
-target_include_directories(chast.ffmpeg INTERFACE "${FFMPEG_ROOT}/include")
-target_link_libraries(chast.ffmpeg INTERFACE
+add_library(chast.ffmpeg STATIC src/codec/ffmpeg_compat.cc)
+target_include_directories(chast.ffmpeg PUBLIC "${FFMPEG_ROOT}/include")
+target_link_libraries(chast.ffmpeg PUBLIC
     "${FFMPEG_ROOT}/lib/avcodec.lib"
     "${FFMPEG_ROOT}/lib/avutil.lib"
     "${FFMPEG_ROOT}/lib/swresample.lib"
+    VPL::dispatcher
     mfuuid
     strmiids
     bcrypt)
@@ -95,6 +104,19 @@ target_include_directories(chast.codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_include_directories(chast.codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(chast.codec PRIVATE ONEVPL_EXPERIMENTAL)
 target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg)
+
+# System audio: AAC-LC through the same static FFmpeg build, plus WASAPI
+# loopback capture (host) and render (viewer). Kept out of chast.codec so a
+# build that only needs video does not link the audio endpoints; it has no
+# capture-stack dependency beyond the headers protocol.h pulls in.
+add_library(chast.audio STATIC
+    src/audio/aac_codec.cc
+    src/audio/wasapi_capture.cc
+    src/audio/wasapi_player.cc)
+
+target_include_directories(chast.audio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(chast.audio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(chast.audio PUBLIC chast.base chast.ffmpeg ole32)
 
 # MsQuic. The vcpkg install ships a config package under share/msquic; point
 # MSQUIC_ROOT at the install prefix when find_package cannot see it.
@@ -139,7 +161,7 @@ target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
 # user32 supplies SendInput/GetSystemMetrics for the injector.
-target_link_libraries(chast.net PUBLIC msquic crypt32 ncrypt ws2_32 ntdll user32)
+target_link_libraries(chast.net PUBLIC chast.base msquic crypt32 ncrypt ws2_32 ntdll user32)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -153,7 +175,7 @@ add_library(chast.host STATIC
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(chast.host PUBLIC chast.codec chast.net shell32 ole32)
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio shell32 ole32)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from
@@ -249,6 +271,14 @@ if(CHAST_BUILD_TESTS)
     target_include_directories(chast-cursor-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(chast-cursor-test PRIVATE chast.dxgi)
 
+    # The viewer's sprite installer: validation, the scaled-handle cache and
+    # release. Builds handles from a screen DC only, so it needs no desktop.
+    add_executable(chast-remote-cursor-test tests/remote_cursor_test.cc
+                   app/windows/viewer/remote_cursor.cc)
+    target_include_directories(chast-remote-cursor-test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer)
+    target_link_libraries(chast-remote-cursor-test PRIVATE chast.dxgi)
+
     # Pure-logic checks for the wire format and the HID -> scan-code table.
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
@@ -262,6 +292,10 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-bitrate-test tests/bitrate_test.cc)
     target_link_libraries(chast-bitrate-test PRIVATE chast.host)
 
+    # AAC encode/decode round trip: no device, no network.
+    add_executable(chast-audio-codec-test tests/audio_codec_test.cc)
+    target_link_libraries(chast-audio-codec-test PRIVATE chast.audio)
+
     # Tunnel event parsing, argument construction and child lifecycle. The
     # lifecycle case relaunches this executable as a fake agent.
     add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
@@ -269,10 +303,12 @@ if(CHAST_BUILD_TESTS)
 
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
+    add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
+    add_test(NAME audio COMMAND chast-audio-codec-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.

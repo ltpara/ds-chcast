@@ -66,6 +66,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // "重新连接" returns to the same output; kViewerDisplayAuto leaves the
   // choice to the server.
   int _display = kViewerDisplayAuto;
+  // Logical pixels per captured pixel, as the frame is currently drawn. The
+  // host's pointer is scaled by this times the window's device pixel ratio.
+  double _viewScale = 1.0;
+  // Remote-cursor state as last handed to the native side. The sprite never
+  // comes back here; only "is one installed" does, and that is what decides
+  // whether the local pointer is hidden.
+  bool _cursorSynced = false;
+  bool _cursorWanted = false;
+  bool _cursorInstalled = false;
+  int _cursorSeen = -1;
+  double _cursorScale = 0;
+  bool _cursorBusy = false;
+  bool _cursorDirty = false;
   // The identity this page pins for the current connection. Empty only until
   // the first contact, whose certificate is then remembered by the store.
   String _pinnedFingerprint = '';
@@ -75,6 +88,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Future<TunnelAgent>? _tunnelStarting;
 
   bool get _inputActive => _controlEnabled && _status.acceptsInput && _startError == null;
+
+  /// Physical cursor pixels per captured pixel. The native side needs this to
+  /// size the host's sprite the way the frame is being drawn, so a stream
+  /// shown at half size gets a half-size pointer.
+  double get _cursorTargetScale =>
+      _viewScale * (MediaQuery.maybeDevicePixelRatioOf(context) ?? 1.0);
 
   @override
   void initState() {
@@ -88,11 +107,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _closing = true;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     _clipboardTimer?.cancel();
     _focus.dispose();
     _setKeyCapture(false);
+    _clearCursor();
     unawaited(_shutdown());
     super.dispose();
   }
@@ -306,6 +327,98 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (droppedControl) {
       _setKeyCapture(false);
     }
+    if (nowOver) {
+      _clearCursor();
+      return;
+    }
+    _syncCursor();
+  }
+
+  /// Hands the newest host pointer state to the native side while control is
+  /// on. Cheap to call every poll: nothing happens unless the host's counter,
+  /// the control gate or the drawn scale changed since the last call.
+  void _syncCursor() {
+    final bool enabled = _inputActive;
+    final double scale = _cursorTargetScale;
+    if (_cursorSynced && enabled == _cursorWanted && _status.cursorUpdates == _cursorSeen &&
+        (_cursorScale - scale).abs() < 0.001) {
+      return;
+    }
+    _cursorSynced = true;
+    _cursorWanted = enabled;
+    _cursorSeen = _status.cursorUpdates;
+    _cursorScale = scale;
+    unawaited(_refreshCursor());
+  }
+
+  Future<void> _refreshCursor() async {
+    if (_cursorBusy) {
+      // A call is in flight; the last state it saw may already be stale, so
+      // run once more when it lands rather than dropping the change.
+      _cursorDirty = true;
+      return;
+    }
+    _cursorBusy = true;
+    bool installed = _cursorInstalled;
+    try {
+      installed = await ViewerBridge.refreshRemoteCursor(
+        enabled: _cursorWanted,
+        scale: _cursorScale,
+      );
+    } on PlatformException {
+      installed = _cursorInstalled;
+    } on MissingPluginException {
+      installed = _cursorInstalled;
+    } finally {
+      _cursorBusy = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (installed != _cursorInstalled) {
+      setState(() => _cursorInstalled = installed);
+    }
+    if (_cursorDirty) {
+      _cursorDirty = false;
+      await _refreshCursor();
+    }
+  }
+
+  void _clearCursor() {
+    final bool touched = _cursorSynced || _cursorInstalled;
+    _cursorSynced = false;
+    _cursorWanted = false;
+    _cursorSeen = -1;
+    _cursorScale = 0;
+    if (_cursorInstalled) {
+      _cursorInstalled = false;
+      if (mounted) {
+        setState(() {});
+      }
+    }
+    // Also clear when only a refresh was ever sent: the host may have
+    // installed a cursor without this page having seen the reply yet.
+    if (touched) {
+      unawaited(_guardCursorClear());
+    }
+  }
+
+  Future<void> _guardCursorClear() async {
+    try {
+      await ViewerBridge.clearRemoteCursor();
+    } on PlatformException {
+      // The session is already going away.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  void _onViewScale(double scale) {
+    if ((_viewScale - scale).abs() < 0.0005) {
+      return;
+    }
+    _viewScale = scale;
+    _syncCursor();
   }
 
   void _syncClipboardPolling(bool enabled) {
@@ -464,6 +577,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _toggleFullscreen() => _setFullscreen(!_fullscreen);
 
+  Future<void> _toggleAudioMute() async {
+    if (!_status.acceptsAudio) {
+      return;
+    }
+    try {
+      await ViewerBridge.setAudioMuted(!_status.audioMuted);
+    } on PlatformException {
+      // The session is closing; the next poll reports the final state.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
   /// The output the toolbar should mark. An explicit request is authoritative;
   /// after "server chooses" the list is matched against the stream's origin
   /// and size, which is how HelloAck identifies the captured output.
@@ -523,6 +649,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _starting;
     _teardown = null;
     await _stopSession();
+    _clearCursor();
     if (!mounted) {
       return;
     }
@@ -573,6 +700,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(ViewerBridge.setFullscreen(false));
     }
     _setKeyCapture(false);
+    _clearCursor();
     await _shutdown();
     if (!mounted) {
       return;
@@ -589,6 +717,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(ViewerBridge.setFullscreen(false));
     }
     _setKeyCapture(false);
+    _clearCursor();
     unawaited(_shutdown());
   }
 
@@ -653,6 +782,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelY = 0;
     });
     _setKeyCapture(_inputActive);
+    _syncCursor();
     if (_controlEnabled) {
       // The toolbar button may claim focus while it handles the tap; take it
       // back once the frame settles so keys go to the host immediately.
@@ -873,6 +1003,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       videoHeight: _status.height,
                       fit: _fit,
                       captureInput: _inputActive,
+                      hideCursor: _inputActive && _cursorInstalled,
+                      onScaleChanged: _onViewScale,
                       onHover: _inputActive ? _onPointerHover : null,
                       onMove: _inputActive ? _onPointerMove : null,
                       onButton: _inputActive ? _onPointerButton : null,
@@ -900,10 +1032,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fit: _fit,
                         controlEnabled: _controlEnabled,
                         inputAvailable: _status.acceptsInput,
+                        audioAvailable: _status.acceptsAudio,
+                        audioMuted: _status.audioMuted,
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
                         onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
                         onToggleControl: _toggleControl,
+                        onToggleAudio: () => unawaited(_toggleAudioMute()),
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
                         onToggleFullscreen: _toggleFullscreen,
@@ -939,6 +1074,32 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         child: const Text(
                           '远程键鼠已开启 · Esc 与 F11 已转发，工具栏可退出',
                           style: TextStyle(color: Colors.white54, fontSize: 10.5),
+                        ),
+                      ),
+                    ),
+                  ),
+                if (hasFrame && !showOverlay && _status.acceptsAudio && _status.audioMuted)
+                  Positioned(
+                    right: 10,
+                    bottom: 10,
+                    child: IgnorePointer(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            Icon(Icons.volume_off_rounded, size: 13, color: Colors.white54),
+                            SizedBox(width: 5),
+                            Text(
+                              '已静音',
+                              style: TextStyle(color: Colors.white54, fontSize: 10.5),
+                            ),
+                          ],
                         ),
                       ),
                     ),

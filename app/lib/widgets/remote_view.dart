@@ -35,6 +35,8 @@ class RemoteView extends StatefulWidget {
     required this.videoHeight,
     required this.fit,
     this.captureInput = false,
+    this.hideCursor = false,
+    this.onScaleChanged,
     this.onHover,
     this.onMove,
     this.onButton,
@@ -47,9 +49,18 @@ class RemoteView extends StatefulWidget {
   final int videoHeight;
   final ViewFit fit;
 
-  /// When true the view hides the local pointer and forwards raw pointer
-  /// events. The session page only enables this while remote control is on.
+  /// When true the view forwards raw pointer events. The session page only
+  /// enables this while remote control is on.
   final bool captureInput;
+
+  /// True while the native side has installed the host's own pointer. The
+  /// local one is hidden only then, so a host that sends no sprite (a machine
+  /// with no pointing device) still leaves the user an arrow to aim with.
+  final bool hideCursor;
+
+  /// Reports the drawn size in logical pixels per video pixel, which is what
+  /// the remote pointer is scaled by. Called after layout, only on change.
+  final ValueChanged<double>? onScaleChanged;
   final FramePointerHandler? onHover;
   final FramePointerHandler? onMove;
   final FrameButtonHandler? onButton;
@@ -69,6 +80,7 @@ class _RemoteViewState extends State<RemoteView> {
   /// derived from the difference against this.
   int _buttons = 0;
   Offset _lastFrame = Offset.zero;
+  double? _reportedScale;
 
   @override
   void dispose() {
@@ -76,6 +88,25 @@ class _RemoteViewState extends State<RemoteView> {
     _vertical.dispose();
     _horizontal.dispose();
     super.dispose();
+  }
+
+  /// Tells the page how large the frame is drawn, once per change. Deferred to
+  /// after the frame because the page answers with a native call, and
+  /// [build] must not have a side effect on the engine.
+  void _reportScale(Size drawn) {
+    if (widget.videoWidth <= 0 || drawn.width <= 0) {
+      return;
+    }
+    final double scale = drawn.width / widget.videoWidth;
+    if (_reportedScale != null && (_reportedScale! - scale).abs() < 0.0005) {
+      return;
+    }
+    _reportedScale = scale;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        widget.onScaleChanged?.call(scale);
+      }
+    });
   }
 
   @override
@@ -130,6 +161,7 @@ class _RemoteViewState extends State<RemoteView> {
   }
 
   Widget _layer(Size box) {
+    _reportScale(box);
     final Widget texture = Texture(
       textureId: widget.textureId,
       filterQuality: widget.fit == ViewFit.original ? FilterQuality.none : FilterQuality.low,
@@ -138,7 +170,7 @@ class _RemoteViewState extends State<RemoteView> {
       return texture;
     }
     return MouseRegion(
-      cursor: SystemMouseCursors.none,
+      cursor: widget.hideCursor ? SystemMouseCursors.none : MouseCursor.defer,
       onExit: (_) => _releaseButtons(),
       child: Listener(
         behavior: HitTestBehavior.opaque,

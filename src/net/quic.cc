@@ -26,11 +26,13 @@
 #include <msquic.h>
 
 #include <atomic>
+#include <algorithm>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -416,6 +418,7 @@ struct QuicSession::Impl {
     std::atomic<HQUIC> connection{nullptr};
     std::atomic<HQUIC> control{nullptr};
     std::atomic<HQUIC> video{nullptr};
+    std::atomic<HQUIC> audio{nullptr};
 
     mutable std::mutex mutex;
     std::condition_variable cv;
@@ -426,8 +429,11 @@ struct QuicSession::Impl {
     bool hello_ack_ready = false;
     bool video_finished = false;
     bool control_finished = false;
+    bool audio_finished = false;
     bool video_shutdown_complete = false;
     bool control_shutdown_complete = false;
+    bool audio_shutdown_complete = false;
+    bool audio_stopped = false;
     bool stats_ready = false;
     bool bye_ready = false;
     bool keyframe_requested = false;
@@ -456,20 +462,31 @@ struct QuicSession::Impl {
     std::string denial_reason;
     std::optional<AccessDenial> denial_code;
     std::deque<std::vector<uint8_t>> received;
+    std::deque<std::vector<uint8_t>> audio_received;
     ControlParser control_parser;
     FrameParser frame_parser;
+    AudioParser audio_parser;
+    // Client: server-initiated streams whose first bytes have not arrived yet.
+    // The packet magic, not the stream order, says which one is which.
+    std::vector<std::pair<HQUIC, std::vector<uint8_t>>> unclassified;
     // Server only, when QuicServerConfig::allow_input is set.
     std::unique_ptr<InputInjector> injector;
     std::deque<InputEvent> input_events;
     size_t input_releases = 0;
     std::deque<ClipboardUpdate> clipboard_updates;
     uint64_t clipboard_received = 0;
+    // Client: the newest pointer state. A viewer that falls behind wants the
+    // current pointer, not a replay, so a newer update replaces an older one
+    // that was never taken.
+    std::optional<CursorUpdate> cursor_update;
+    uint64_t cursor_received = 0;
     // Client: last clock-sync result. `last_reply_probe_us` rejects a reply
     // that overtook a newer one on the control stream.
     LatencySample latency;
     uint64_t last_reply_probe_us = 0;
 
     std::atomic<uint64_t> next_seq{0};
+    std::atomic<uint64_t> next_audio_seq{0};
     std::atomic<bool> transport_down{false};
 
     std::mutex send_mutex;
@@ -579,8 +596,18 @@ struct QuicSession::Impl {
                     HQUIC expected = nullptr;
                     accepted = control.compare_exchange_strong(expected, stream);
                 } else if (role == Role::Client && unidirectional) {
-                    HQUIC expected = nullptr;
-                    accepted = video.compare_exchange_strong(expected, stream);
+                    // Which media stream this is cannot be told from the start
+                    // event: QUIC does not order two server-initiated streams'
+                    // first bytes. Park it until a RECEIVE names its magic.
+                    std::lock_guard<std::mutex> lock(mutex);
+                    bool known = false;
+                    for (const auto& entry : unclassified) {
+                        known = known || entry.first == stream;
+                    }
+                    if (!known) {
+                        unclassified.emplace_back(stream, std::vector<uint8_t>{});
+                    }
+                    accepted = !known;
                 }
                 if (!accepted) {
                     api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
@@ -657,6 +684,72 @@ struct QuicSession::Impl {
         return QUIC_STATUS_SUCCESS;
     }
 
+    static void copy_chunks(std::deque<std::vector<uint8_t>>& queue,
+                            const QUIC_STREAM_EVENT& event) {
+        for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+            const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+            queue.emplace_back(buffer.Buffer, buffer.Buffer + buffer.Length);
+        }
+    }
+
+    // Buffers a server-initiated stream until its packet magic identifies it
+    // as video or audio, then moves those bytes into the matching queue.
+    void classify_media_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
+        bool unknown = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            std::vector<uint8_t>* pending = nullptr;
+            for (auto& entry : unclassified) {
+                if (entry.first == stream) {
+                    pending = &entry.second;
+                    break;
+                }
+            }
+            if (!pending) {
+                unclassified.emplace_back(stream, std::vector<uint8_t>{});
+                pending = &unclassified.back().second;
+            }
+            for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+                const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+                pending->insert(pending->end(), buffer.Buffer, buffer.Buffer + buffer.Length);
+            }
+            if (pending->size() < 4) {
+                // Not even the magic is complete; keep waiting.
+                return;
+            }
+            std::deque<std::vector<uint8_t>>* queue = nullptr;
+            if (std::memcmp(pending->data(), "CFRM", 4) == 0) {
+                HQUIC expected = nullptr;
+                if (video.compare_exchange_strong(expected, stream)) {
+                    queue = &received;
+                }
+            } else if (std::memcmp(pending->data(), "CAUD", 4) == 0) {
+                HQUIC expected = nullptr;
+                if (audio.compare_exchange_strong(expected, stream)) {
+                    queue = &audio_received;
+                }
+            } else {
+                unknown = true;
+            }
+            if (queue) {
+                queue->push_back(std::move(*pending));
+            } else if (!unknown) {
+                // A second stream of a kind that already has its slot.
+                unknown = true;
+            }
+            unclassified.erase(
+                std::remove_if(unclassified.begin(), unclassified.end(),
+                               [stream](const std::pair<HQUIC, std::vector<uint8_t>>& entry) {
+                                   return entry.first == stream;
+                               }),
+                unclassified.end());
+        }
+        if (unknown) {
+            note_transport_failure("the server opened an unusable media stream");
+        }
+        cv.notify_all();
+    }
+
     QUIC_STATUS on_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
         switch (event.Type) {
             case QUIC_STREAM_EVENT_START_COMPLETE:
@@ -667,17 +760,12 @@ struct QuicSession::Impl {
                 break;
             case QUIC_STREAM_EVENT_RECEIVE: {
                 if (stream == video.load()) {
-                    std::deque<std::vector<uint8_t>> chunks;
-                    for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
-                        const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
-                        chunks.emplace_back(buffer.Buffer, buffer.Buffer + buffer.Length);
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        for (std::vector<uint8_t>& chunk : chunks) {
-                            received.push_back(std::move(chunk));
-                        }
-                    }
+                    std::lock_guard<std::mutex> lock(mutex);
+                    copy_chunks(received, event);
+                    cv.notify_all();
+                } else if (stream == audio.load()) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    copy_chunks(audio_received, event);
                     cv.notify_all();
                 } else if (stream == control.load()) {
                     std::vector<std::pair<ControlType, std::vector<uint8_t>>> messages;
@@ -697,6 +785,8 @@ struct QuicSession::Impl {
                     for (const auto& message : messages) {
                         handle_control(message.first, message.second);
                     }
+                } else {
+                    classify_media_stream(stream, event);
                 }
                 break;
             }
@@ -713,6 +803,8 @@ struct QuicSession::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (stream == video.load()) {
                         video_finished = true;
+                    } else if (stream == audio.load()) {
+                        audio_finished = true;
                     } else if (stream == control.load()) {
                         control_finished = true;
                     }
@@ -721,6 +813,16 @@ struct QuicSession::Impl {
                 break;
             }
             case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+                if (stream == audio.load()) {
+                    // Audio is optional: a broken audio stream ends audio, not
+                    // the video session.
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        audio_finished = true;
+                    }
+                    cv.notify_all();
+                    break;
+                }
                 note_transport_failure("QUIC peer aborted a stream");
                 if (stream == video.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
@@ -733,6 +835,8 @@ struct QuicSession::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (stream == video.load()) {
                         video_shutdown_complete = true;
+                    } else if (stream == audio.load()) {
+                        audio_shutdown_complete = true;
                     } else if (stream == control.load()) {
                         control_shutdown_complete = true;
                     }
@@ -1004,6 +1108,23 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::CursorUpdate: {
+                if (role != Role::Client) {
+                    break;
+                }
+                CursorUpdate update;
+                if (!parse_cursor_update(payload, update, &error)) {
+                    // The pointer is cosmetic: a malformed update is skipped
+                    // rather than ending a session whose video is fine.
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    cursor_update = std::move(update);
+                    ++cursor_received;
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -1139,6 +1260,9 @@ struct QuicSession::Impl {
             }
         }
         wait_sends(std::chrono::milliseconds(500));
+        if (HQUIC handle = audio.exchange(nullptr)) {
+            api->StreamClose(handle);
+        }
         if (HQUIC handle = video.exchange(nullptr)) {
             api->StreamClose(handle);
         }
@@ -1157,8 +1281,11 @@ struct QuicSession::Impl {
             peer_closed = false;
             video_finished = false;
             control_finished = false;
+            audio_finished = false;
             video_shutdown_complete = false;
             control_shutdown_complete = false;
+            audio_shutdown_complete = false;
+            audio_stopped = false;
             hello_ready = false;
             hello_ack_ready = false;
             pending_denial = false;
@@ -1176,15 +1303,22 @@ struct QuicSession::Impl {
             input_releases = 0;
             clipboard_updates.clear();
             clipboard_received = 0;
+            cursor_update.reset();
+            cursor_received = 0;
             latency = LatencySample{};
             last_reply_probe_us = 0;
             received.clear();
+            audio_received.clear();
             control_parser.reset();
+            frame_parser.reset();
+            audio_parser.reset();
+            unclassified.clear();
             transport_failed = false;
             transport_status = Status::Ok;
             transport_message.clear();
         }
         transport_down = false;
+        next_audio_seq = 0;
         // Only now can the listener claim the slot for the next client.
         connection = nullptr;
         cv.notify_all();
@@ -1244,9 +1378,27 @@ struct QuicSession::Impl {
         }
         wait_sends(std::chrono::milliseconds(1000));
 
+        // A server-initiated stream parked for classification still holds an
+        // application reference; left open it would keep the connection alive
+        // and RegistrationClose would wait forever.
+        std::vector<HQUIC> parked;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto& entry : unclassified) {
+                parked.push_back(entry.first);
+            }
+            unclassified.clear();
+        }
+        for (HQUIC handle : parked) {
+            api->StreamClose(handle);
+        }
+
         // StreamClose is the only release for a stream handle, whether or not
         // its SHUTDOWN_COMPLETE was observed; closing before that implicitly
         // aborts, which is what teardown wants.
+        if (HQUIC handle = audio.exchange(nullptr)) {
+            api->StreamClose(handle);
+        }
         if (HQUIC handle = video.exchange(nullptr)) {
             api->StreamClose(handle);
         }
@@ -1401,8 +1553,9 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
     settings.IsSet.IdleTimeoutMs = TRUE;
     settings.KeepAliveIntervalMs = kKeepAliveMs;
     settings.IsSet.KeepAliveIntervalMs = TRUE;
-    // The server opens one unidirectional video stream.
-    settings.PeerUnidiStreamCount = 1;
+    // The server opens one unidirectional video stream and, when it shares
+    // system audio, a second for audio. Either may send first.
+    settings.PeerUnidiStreamCount = 2;
     settings.IsSet.PeerUnidiStreamCount = TRUE;
 
     QUIC_BUFFER alpn{};
@@ -1556,15 +1709,17 @@ Error QuicSession::announce(const ServerInfo& info) {
         return Error(Status::InvalidCall, "the stream was already announced");
     }
     ServerInfo ack = info;
-    // The gate belongs to the server; never let a caller announce input the
-    // session will not inject.
+    // The gates belong to the server; never let a caller announce input the
+    // session will not inject or audio the host disabled.
     ack.input_enabled = impl.server_config.allow_input;
-    Error sent = impl.send_bytes(impl.control.load(), make_hello_ack(ack),
-                                 QUIC_SEND_FLAG_NONE);
-    if (!sent.ok()) {
-        return sent;
+    ack.audio.enabled = ack.audio.enabled && impl.server_config.allow_audio;
+    if (!ack.audio.enabled) {
+        ack.audio.extradata.clear();
     }
 
+    // Open both media streams before the HelloAck so the announcement never
+    // describes a stream that failed to open. The client classifies them by
+    // packet magic, so their order here does not matter.
     HQUIC video = nullptr;
     QUIC_STATUS status = impl.api->StreamOpen(
         impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
@@ -1572,14 +1727,51 @@ Error QuicSession::announce(const ServerInfo& info) {
     if (QUIC_FAILED(status)) {
         return quic_error(status, "QUIC StreamOpen(video)");
     }
-    impl.video = video;
     status = impl.api->StreamStart(video, QUIC_STREAM_START_FLAG_NONE);
     if (QUIC_FAILED(status)) {
-        impl.video = nullptr;
         impl.api->StreamClose(video);
         return quic_error(status, "QUIC StreamStart(video)");
     }
+    impl.video = video;
+
+    if (ack.audio.enabled) {
+        HQUIC audio = nullptr;
+        QUIC_STATUS audio_status = impl.api->StreamOpen(
+            impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+            &Impl::stream_callback, &impl, &audio);
+        if (QUIC_SUCCEEDED(audio_status)) {
+            audio_status =
+                impl.api->StreamStart(audio, QUIC_STREAM_START_FLAG_NONE);
+        }
+        if (QUIC_FAILED(audio_status)) {
+            if (audio) {
+                impl.api->StreamClose(audio);
+            }
+            // Audio is optional: announce video only instead of failing a
+            // session that could still stream the desktop.
+            ack.audio.enabled = false;
+            ack.audio.extradata.clear();
+        } else {
+            impl.audio = audio;
+            impl.next_audio_seq = 0;
+        }
+    }
+
     impl.announced = true;
+    Error sent = impl.send_bytes(impl.control.load(), make_hello_ack(ack),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        if (HQUIC handle = impl.audio.exchange(nullptr)) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            impl.api->StreamClose(handle);
+        }
+        if (HQUIC handle = impl.video.exchange(nullptr)) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            impl.api->StreamClose(handle);
+        }
+        impl.announced = false;
+        return sent;
+    }
     return Error::success();
 }
 
@@ -1593,6 +1785,16 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     }
     ServerInfo update = info;
     update.input_enabled = impl.server_config.allow_input;
+    bool audio_stream_open = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        audio_stream_open = impl.audio.load() != nullptr && !impl.audio_stopped;
+    }
+    update.audio.enabled =
+        update.audio.enabled && impl.server_config.allow_audio && audio_stream_open;
+    if (!update.audio.enabled) {
+        update.audio.extradata.clear();
+    }
     return impl.send_bytes(impl.control.load(), make_stream_info(update),
                            QUIC_SEND_FLAG_NONE);
 }
@@ -1643,6 +1845,57 @@ bool QuicSession::take_keyframe_request() {
     return requested;
 }
 
+Error QuicSession::send_audio(AudioHeader header, const uint8_t* payload, size_t size) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_audio is a server operation");
+    }
+    // A closed gate is a caller mistake, not a lost stream; keep the two
+    // cases distinguishable for the host and the loopback check.
+    if (!impl.server_config.allow_audio) {
+        return Error(Status::InvalidCall, "audio is disabled on this server");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the audio stream is not open");
+    }
+    if (!payload || size == 0 || size > kMaxAudioPayload) {
+        return Error(Status::InvalidCall, "invalid audio payload size");
+    }
+    HQUIC audio = impl.audio.load();
+    if (!audio) {
+        return Error(Status::Unavailable, "the audio stream is gone");
+    }
+    header.seq = impl.next_audio_seq.fetch_add(1);
+    header.payload_size = static_cast<uint32_t>(size);
+    header.payload_crc32 = crc32(payload, size);
+    std::vector<uint8_t> bytes(kAudioHeaderSize + size);
+    encode_audio_header(header, bytes.data());
+    std::memcpy(bytes.data() + kAudioHeaderSize, payload, size);
+    // Never waits: a full queue would otherwise stall the capture loop and,
+    // with it, video. Dropping a packet is a short gap in the AAC stream.
+    return impl.send_bytes_impl(audio, std::move(bytes), QUIC_SEND_FLAG_NONE, false);
+}
+
+Error QuicSession::stop_audio() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "stop_audio is a server operation");
+    }
+    HQUIC audio = impl.audio.load();
+    if (!audio) {
+        return Error(Status::InvalidCall, "the audio stream is not open");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.audio_stopped) {
+            return Error::success();
+        }
+        impl.audio_stopped = true;
+    }
+    impl.api->StreamShutdown(audio, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+    return Error::success();
+}
+
 std::vector<InputEvent> QuicSession::take_input_events() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     std::vector<InputEvent> events(impl_->input_events.begin(), impl_->input_events.end());
@@ -1667,6 +1920,9 @@ Error QuicSession::finish_server(std::chrono::milliseconds timeout, ClientStats&
     }
     if (HQUIC video = impl.video.load()) {
         impl.api->StreamShutdown(video, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+    }
+    if (HQUIC audio = impl.audio.load()) {
+        impl.api->StreamShutdown(audio, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     }
     impl.wait_sends(timeout / 2);
 
@@ -1815,6 +2071,60 @@ Error QuicSession::receive_frame(FrameHeader& header, std::vector<uint8_t>& payl
     }
 }
 
+Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payload,
+                                 std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "receive_audio is a client operation");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(impl.mutex);
+    for (;;) {
+        while (!impl.audio_received.empty()) {
+            std::vector<uint8_t> chunk = std::move(impl.audio_received.front());
+            impl.audio_received.pop_front();
+            lock.unlock();
+            std::string error;
+            const bool ok = impl.audio_parser.push(chunk.data(), chunk.size(), &error);
+            lock.lock();
+            if (!ok) {
+                return Error(Status::CaptureFailed, "audio stream: " + error);
+            }
+        }
+
+        const uint8_t* audio_payload = nullptr;
+        std::string parse_error;
+        switch (impl.audio_parser.next(header, &audio_payload, &parse_error)) {
+            case AudioParser::Status::Packet: {
+                payload.assign(audio_payload, audio_payload + header.payload_size);
+                impl.audio_parser.consume();
+                return Error::success();
+            }
+            case AudioParser::Status::Error:
+                return Error(Status::CaptureFailed, "audio stream: " + parse_error);
+            case AudioParser::Status::Incomplete:
+                break;
+        }
+
+        if (impl.audio_finished) {
+            if (impl.audio_parser.buffered() > 0) {
+                return Error(Status::CaptureFailed, "audio stream ended mid-packet");
+            }
+            return Error(Status::Unavailable, "the server finished the audio stream");
+        }
+        if (impl.transport_failed) {
+            return Error(impl.transport_status, impl.transport_message);
+        }
+        if (impl.shutdown_complete) {
+            return Error(Status::Unavailable, "the connection closed");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Error(Status::WaitTimeout, "no audio arrived in time");
+        }
+        impl.cv.wait_until(lock, deadline);
+    }
+}
+
 Error QuicSession::request_keyframe() {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
@@ -1935,6 +2245,37 @@ uint64_t QuicSession::clipboard_updates_received() const {
     return impl_->clipboard_received;
 }
 
+Error QuicSession::send_cursor(const CursorUpdate& update) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_cursor is a server operation");
+    }
+    std::vector<uint8_t> message = make_cursor_update(update);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid cursor update");
+    }
+    // Never waits: a pointer that is already stale is worth dropping, and the
+    // capture loop must not stall behind it. The next frame sends the current
+    // position again.
+    return impl.send_bytes_impl(impl.control.load(), std::move(message),
+                                QUIC_SEND_FLAG_NONE, false);
+}
+
+bool QuicSession::take_cursor_update(CursorUpdate& update) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->cursor_update) {
+        return false;
+    }
+    update = std::move(*impl_->cursor_update);
+    impl_->cursor_update.reset();
+    return true;
+}
+
+uint64_t QuicSession::cursor_updates_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->cursor_received;
+}
+
 Error QuicSession::finish_client(const ClientStats& stats, std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
@@ -1974,6 +2315,11 @@ Error QuicSession::finish_client(const ClientStats& stats, std::chrono::millisec
 bool QuicSession::video_finished() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->video_finished;
+}
+
+bool QuicSession::audio_finished() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->audio_finished;
 }
 
 Error QuicSession::async_error() const {

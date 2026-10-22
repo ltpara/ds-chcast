@@ -1,7 +1,7 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
@@ -45,12 +45,24 @@
 // host writes it, and only then does the emulated host clipboard change so the
 // viewer must receive exactly one update. Exact counts prove neither side
 // echoes the other's text back.
+//
+// With --audio the serve end captures the system sound through WASAPI and
+// connect decodes the second uni-stream, printing packet/sample/energy
+// counters. With --play connect also renders the decoded blocks through WASAPI
+// and prints the player's buffer depth and underrun count, which is the only
+// way the tool exercises the viewer's real render path. verify substitutes a
+// generated 440 Hz tone (encoded by the real AAC codec) so it can assert packet
+// counts, CRCs, decoded duration and energy without a sound card, and probes a
+// server whose audio gate is closed.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <future>
 #include <memory>
@@ -62,6 +74,7 @@
 #include <vector>
 
 #include "annexb.h"
+#include "chast/audio.h"
 #include "chast/capture.h"
 #include "chast/decoder.h"
 #include "chast/encoder.h"
@@ -119,6 +132,169 @@ struct FakeClipboard {
     bool update_sent = false;
 };
 
+// verify's stand-in for the WASAPI loopback endpoint: a 440 Hz stereo tone at
+// the encoder's rate, paced against the steady clock and encoded with the real
+// AAC codec. It makes the loopback check cover encode -> wire -> decode
+// without depending on a sound card.
+class SyntheticCapture final : public chast::ILoopbackCapture {
+public:
+    explicit SyntheticCapture(std::unique_ptr<chast::IAudioEncoder> encoder)
+        : encoder_(std::move(encoder)) {
+        info_.enabled = true;
+        info_.codec = chast::AudioCodec::AAC;
+        info_.sample_rate = encoder_->sample_rate();
+        info_.channels = encoder_->channels();
+        info_.bitrate = encoder_->bitrate();
+        info_.frame_samples = encoder_->frame_samples();
+        info_.extradata = encoder_->extradata();
+    }
+
+    ~SyntheticCapture() override { stop(); }
+
+    void start() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (thread_.joinable() || stopping_.load()) {
+            return;
+        }
+        thread_ = std::thread(&SyntheticCapture::run, this);
+    }
+
+    void stop() override {
+        stopping_.store(true);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    bool take_packet(chast::EncodedAudio& packet) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return false;
+        }
+        packet = std::move(queue_.front());
+        queue_.pop_front();
+        return true;
+    }
+
+    bool failed() const override { return failed_.load(); }
+
+    std::string error() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return error_;
+    }
+
+    chast::AudioInfo info() const override { return info_; }
+
+    chast::AudioCaptureStats stats() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stats_;
+    }
+
+private:
+    static constexpr size_t kQueuePackets = 32;
+    static constexpr double kToneHz = 440.0;
+    static constexpr double kAmplitude = 0.30;
+    static constexpr double kTwoPi = 6.28318530717958647692;
+
+    void run() {
+        using Clock = std::chrono::steady_clock;
+        const uint32_t rate = encoder_->sample_rate();
+        const uint16_t channels = encoder_->channels();
+        const size_t frame_samples = encoder_->frame_samples();
+        if (rate == 0 || channels == 0 || frame_samples == 0) {
+            fail("the encoder reported an empty format");
+            return;
+        }
+        auto steady_ms = [](Clock::time_point time) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch())
+                    .count());
+        };
+        const auto start = Clock::now();
+        const uint64_t start_ms = steady_ms(start);
+        const double step = kTwoPi * kToneHz / static_cast<double>(rate);
+        std::vector<int16_t> samples(frame_samples * channels);
+        double phase = 0.0;
+        uint64_t produced = 0;
+        // The frame count follows the wall clock, not the sleep cadence: a
+        // late wake-up emits the frames it missed so the tone's duration
+        // always matches the session instead of drifting slow on coarse
+        // Windows timers.
+        while (!stopping_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (stopping_.load()) {
+                break;
+            }
+            const uint64_t due = (steady_ms(Clock::now()) - start_ms) * rate / 1000;
+            while (!stopping_.load() && produced + frame_samples <= due) {
+                for (size_t i = 0; i < frame_samples; ++i) {
+                    const int16_t value = static_cast<int16_t>(
+                        std::lround(std::sin(phase) * kAmplitude * 32767.0));
+                    for (uint16_t ch = 0; ch < channels; ++ch) {
+                        samples[i * channels + ch] = value;
+                    }
+                    phase += step;
+                }
+                phase = std::fmod(phase, kTwoPi);
+                const uint64_t capture_ms = start_ms + produced * 1000 / rate;
+                std::vector<chast::EncodedAudio> encoded;
+                const chast::Error result =
+                    encoder_->encode(samples.data(), frame_samples, capture_ms, encoded);
+                if (!result.ok()) {
+                    fail(result.to_string());
+                    return;
+                }
+                produced += frame_samples;
+                for (chast::EncodedAudio& packet : encoded) {
+                    enqueue(std::move(packet));
+                }
+            }
+        }
+    }
+
+    void enqueue(chast::EncodedAudio packet) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failed_.load()) {
+            return;
+        }
+        while (queue_.size() >= kQueuePackets) {
+            queue_.pop_front();
+            ++stats_.dropped;
+        }
+        queue_.push_back(std::move(packet));
+        ++stats_.packets;
+    }
+
+    void fail(std::string message) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!failed_.exchange(true)) {
+                error_ = std::move(message);
+            }
+        }
+        stopping_.store(true);
+    }
+
+    std::unique_ptr<chast::IAudioEncoder> encoder_;
+    chast::AudioInfo info_;
+    std::thread thread_;
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> failed_{false};
+    mutable std::mutex mutex_;
+    std::deque<chast::EncodedAudio> queue_;
+    chast::AudioCaptureStats stats_;
+    std::string error_;
+};
+
+std::unique_ptr<chast::ILoopbackCapture> make_synthetic_capture(std::string* error) {
+    chast::AudioEncoderConfig config;
+    std::unique_ptr<chast::IAudioEncoder> encoder = chast::create_aac_encoder(config, error);
+    if (!encoder) {
+        return nullptr;
+    }
+    return std::make_unique<SyntheticCapture>(std::move(encoder));
+}
+
 struct Options {
     std::string mode;
     std::string bind = "127.0.0.1";
@@ -144,6 +320,16 @@ struct Options {
     // the texts the host sends. verify: the same as serve with a fake backend
     // and checks in both directions.
     bool clipboard = false;
+    // serve: capture the system sound through WASAPI. connect: require and
+    // decode the audio stream, printing its counters. verify always turns
+    // this on with a synthetic source.
+    bool audio = false;
+    // connect only: render the decoded audio through WASAPI as well, so the
+    // real playback path reports its buffer and underruns. Implies --audio.
+    bool play = false;
+    // verify only: the host encodes a generated 440 Hz tone instead of opening
+    // the real loopback endpoint, so the check needs no sound card.
+    bool synthetic_audio = false;
     // connect only: upload this text once after the handshake, for checking a
     // host's real clipboard write path. Implies --clipboard.
     std::string send_clipboard;
@@ -252,6 +438,11 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.input = true;
             } else if (arg == "--clipboard") {
                 options.clipboard = true;
+            } else if (arg == "--audio") {
+                options.audio = true;
+            } else if (arg == "--play") {
+                options.audio = true;
+                options.play = true;
             } else if (arg == "--send-clipboard" && i + 1 < argc) {
                 options.send_clipboard = argv[++i];
                 options.clipboard = true;
@@ -380,6 +571,20 @@ struct SenderStats {
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     bool clipboard_enabled = false;
+    // Audio format the host announced, whether it stayed active, and the
+    // HostServer counters for packets it handed to the transport.
+    chast::AudioInfo audio_info;
+    bool audio_announced = false;
+    bool audio_active = false;
+    uint64_t audio_packets = 0;
+    uint64_t audio_bytes = 0;
+    uint64_t audio_dropped = 0;
+    uint64_t audio_errors = 0;
+    uint64_t audio_capture_recoveries = 0;
+    uint64_t audio_gate_transitions = 0;
+    bool audio_recovering = false;
+    // CursorUpdates the server sent (shapes carrying a sprite included).
+    uint64_t cursor_sent = 0;
     std::vector<chast::DisplayDescription> displays;
     // What Hello asked for (kDisplayAuto when the client left it to the
     // server) and the index the capturer actually used.
@@ -427,6 +632,31 @@ struct ReceiverStats {
     uint64_t clipboard_errors = 0;
     bool clipboard_enabled = false;
     std::vector<std::string> clipboard_texts;
+    // Audio the viewer received and decoded: announced format, packet and
+    // byte counts, sequence/CRC/decode errors, decoded sample count and the
+    // RMS of the decoded PCM (the tone-energy check).
+    chast::AudioInfo audio_info;
+    bool audio_announced = false;
+    bool audio_finished = false;
+    uint64_t audio_received = 0;
+    uint64_t audio_bytes = 0;
+    uint64_t audio_gaps = 0;
+    uint64_t audio_crc_errors = 0;
+    uint64_t audio_decode_errors = 0;
+    uint64_t audio_protocol_errors = 0;
+    uint64_t audio_samples = 0;
+    double audio_energy = 0.0;
+    uint64_t audio_energy_values = 0;
+    double audio_rms = 0.0;
+    double audio_seconds = 0.0;
+    double elapsed_seconds = 0.0;
+    // Only with --play: what the WASAPI renderer actually did.
+    uint64_t audio_played = 0;
+    uint64_t audio_underruns = 0;
+    uint64_t audio_player_drops = 0;
+    uint64_t audio_player_recoveries = 0;
+    uint32_t audio_buffer_ms = 0;
+    std::string audio_player_error;
     std::vector<chast::DisplayDescription> displays;
     // StreamInfo messages received, and the description from the last one.
     uint64_t stream_updates = 0;
@@ -441,6 +671,13 @@ struct ReceiverStats {
     double max_frame_age_ms = -1.0;
     // Bitrate the last StreamInfo announced (the encoder's target after ABR).
     uint32_t target_bitrate = 0;
+    // Pointer updates received, and how many of them carried a sprite. The
+    // last state is reported so a verification run can show the pointer moved.
+    uint64_t cursor_updates = 0;
+    uint64_t cursor_shapes = 0;
+    bool cursor_visible = false;
+    int32_t cursor_x = 0;
+    int32_t cursor_y = 0;
     // Fingerprint of the certificate the server presented.
     std::string peer_fingerprint;
 };
@@ -545,6 +782,12 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.port = options.port;
     config.settings.allow_input = options.input;
     config.settings.allow_clipboard = options.clipboard;
+    config.settings.allow_audio = options.audio;
+    if (options.synthetic_audio) {
+        config.audio_capture = [](std::string* capture_error) {
+            return make_synthetic_capture(capture_error);
+        };
+    }
     config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
                                                      : chast::HostTokenMode::OneTime;
     config.settings.access_token = options.token;
@@ -659,6 +902,16 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.clipboard_enabled = options.clipboard;
     stats.clipboard_sent = status.stats.clipboard_sent;
     stats.clipboard_received = status.stats.clipboard_received;
+    stats.audio_info = status.stream.audio;
+    stats.audio_announced = status.stream.audio.enabled;
+    stats.audio_active = status.stats.audio_active;
+    stats.audio_packets = status.stats.audio_packets;
+    stats.audio_bytes = status.stats.audio_bytes;
+    stats.audio_dropped = status.stats.audio_dropped;
+    stats.audio_errors = status.stats.audio_errors;
+    stats.audio_capture_recoveries = status.stats.audio_capture_recoveries;
+    stats.audio_gate_transitions = status.stats.audio_gate_transitions;
+    stats.audio_recovering = status.stats.audio_recovering;
     stats.stats_received = status.stats.stats_received;
     stats.peer = status.stats.peer;
     stats.peer_left = status.stats.peer_left;
@@ -669,6 +922,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.bytes = status.stats.bytes;
     stats.pointer_only = status.stats.pointer_only;
     stats.repeats = status.stats.repeats;
+    stats.cursor_sent = status.stats.cursor_sent;
     stats.send_errors = status.stats.send_errors;
     stats.target_bitrate = status.stats.target_bitrate;
     stats.abr_changes = status.stats.abr_changes;
@@ -687,6 +941,12 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                     static_cast<unsigned long long>(stats.bytes),
                     static_cast<unsigned long long>(stats.send_errors),
                     static_cast<unsigned long long>(stats.stream_updates_sent));
+        std::printf("sender: cursor sent=%llu shapes=%llu bytes=%llu dropped=%llu errors=%llu\n",
+                    static_cast<unsigned long long>(stats.cursor_sent),
+                    static_cast<unsigned long long>(status.stats.cursor_shapes),
+                    static_cast<unsigned long long>(status.stats.cursor_bytes),
+                    static_cast<unsigned long long>(status.stats.cursor_dropped),
+                    static_cast<unsigned long long>(status.stats.cursor_errors));
         std::printf("sender: target-bitrate=%u kbps abr-changes=%llu rtt=%.1f ms "
                     "send-rate=%.1f kbps\n",
                     stats.target_bitrate / 1000u,
@@ -712,6 +972,22 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
             std::printf("sender: clipboard sent=%llu received=%llu\n",
                         static_cast<unsigned long long>(stats.clipboard_sent),
                         static_cast<unsigned long long>(stats.clipboard_received));
+        }
+        if (options.audio) {
+            std::printf("sender: audio announced=%d active=%d %s %u Hz %u ch %u kbps "
+                        "packets=%llu bytes=%llu dropped=%llu errors=%llu "
+                        "recoveries=%llu gates=%llu recovering=%d\n",
+                        stats.audio_announced ? 1 : 0, stats.audio_active ? 1 : 0,
+                        stats.audio_info.codec == chast::AudioCodec::AAC ? "AAC-LC" : "?",
+                        stats.audio_info.sample_rate, stats.audio_info.channels,
+                        stats.audio_info.bitrate / 1000u,
+                        static_cast<unsigned long long>(stats.audio_packets),
+                        static_cast<unsigned long long>(stats.audio_bytes),
+                        static_cast<unsigned long long>(stats.audio_dropped),
+                        static_cast<unsigned long long>(stats.audio_errors),
+                        static_cast<unsigned long long>(stats.audio_capture_recoveries),
+                        static_cast<unsigned long long>(stats.audio_gate_transitions),
+                        stats.audio_recovering ? 1 : 0);
         }
     }
     stats.ok = stats.error.empty();
@@ -791,6 +1067,8 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.clipboard_enabled = info.clipboard_enabled;
     stats.displays = info.displays;
     stats.target_bitrate = info.bitrate;
+    stats.audio_info = info.audio;
+    stats.audio_announced = info.audio.enabled;
     if (!options.quiet) {
         std::printf("quic: connected, server streams %s %ux%u at %u kbps (%s)\n",
                     chast_tools::codec_name(info.codec), info.width, info.height,
@@ -822,6 +1100,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (options.clipboard) {
             std::printf("quic: server clipboard %s\n",
                         info.clipboard_enabled ? "enabled" : "disabled");
+        }
+        if (options.audio) {
+            std::printf("quic: server audio %s (%s %u Hz %u ch %u kbps)\n",
+                        info.audio.enabled ? "enabled" : "disabled",
+                        info.audio.codec == chast::AudioCodec::AAC ? "AAC-LC" : "?",
+                        info.audio.sample_rate, info.audio.channels,
+                        info.audio.bitrate / 1000u);
         }
     }
     if (options.input) {
@@ -867,6 +1152,45 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             } else {
                 ++stats.clipboard_sent;
             }
+        }
+    }
+
+    std::unique_ptr<chast::IAudioDecoder> audio_decoder;
+    auto ensure_audio_decoder = [&](const chast::AudioInfo& audio) -> bool {
+        if (!options.audio || !audio.enabled) {
+            return true;
+        }
+        if (audio_decoder && audio_decoder->sample_rate() == audio.sample_rate &&
+            audio_decoder->channels() == audio.channels) {
+            return true;
+        }
+        audio_decoder.reset();
+        std::string audio_error;
+        audio_decoder = chast::create_aac_decoder(audio, &audio_error);
+        if (!audio_decoder) {
+            stats.error = "audio decoder creation failed: " + audio_error;
+            return false;
+        }
+        return true;
+    };
+    if (options.audio) {
+        if (!info.audio.enabled) {
+            return fail("the server did not announce audio (serve with --audio)");
+        }
+        if (!ensure_audio_decoder(info.audio)) {
+            return fail(stats.error);
+        }
+    }
+    std::unique_ptr<chast::IAudioPlayer> audio_player;
+    if (options.play) {
+        chast::AudioPlayerConfig player_config;
+        std::string player_error;
+        audio_player = chast::create_audio_player(player_config, &player_error);
+        if (!audio_player) {
+            return fail("audio player creation failed: " + player_error);
+        }
+        if (chast::Error started = audio_player->start(); !started.ok()) {
+            return fail("audio player start failed: " + started.to_string());
         }
     }
 
@@ -917,8 +1241,105 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
     };
 
+    // Only the newest pointer state matters, so take_cursor_update() replaces
+    // anything not yet read instead of queueing it.
+    auto drain_cursor = [&] {
+        chast::CursorUpdate update;
+        while (session->take_cursor_update(update)) {
+            ++stats.cursor_updates;
+            if (!update.sprite.empty()) {
+                ++stats.cursor_shapes;
+            }
+            stats.cursor_visible = update.visible;
+            stats.cursor_x = update.x;
+            stats.cursor_y = update.y;
+        }
+    };
+
+    // The first call may wait for the audio FIN that follows the video's; all
+    // later calls take whatever is already queued.
+    chast::AudioHeader audio_header;
+    std::vector<uint8_t> audio_payload;
+    uint64_t expected_audio_seq = 0;
+    auto count_audio = [&](const std::vector<chast::DecodedAudio>& blocks) {
+        for (const chast::DecodedAudio& block : blocks) {
+            const size_t channels = block.channels == 0 ? 1 : block.channels;
+            stats.audio_samples += block.samples.size() / channels;
+            for (int16_t sample : block.samples) {
+                stats.audio_energy += static_cast<double>(sample) * sample;
+            }
+            stats.audio_energy_values += block.samples.size();
+        }
+    };
+    auto play_audio = [&](const std::vector<chast::DecodedAudio>& blocks) {
+        if (!audio_player) {
+            return;
+        }
+        for (const chast::DecodedAudio& block : blocks) {
+            if (chast::Error pushed = audio_player->push(block); !pushed.ok()) {
+                if (stats.audio_player_error.empty()) {
+                    stats.audio_player_error = pushed.to_string();
+                }
+                return;
+            }
+        }
+    };
+    auto drain_audio = [&](std::chrono::milliseconds wait) {
+        if (!options.audio) {
+            return;
+        }
+        for (;;) {
+            chast::Error next = session->receive_audio(audio_header, audio_payload, wait);
+            wait = std::chrono::milliseconds(0);
+            if (next.status() == chast::Status::WaitTimeout) {
+                break;
+            }
+            if (next.status() == chast::Status::Unavailable) {
+                stats.audio_finished = session->audio_finished();
+                break;
+            }
+            if (!next.ok()) {
+                ++stats.audio_protocol_errors;
+                if (stats.audio_protocol_errors == 1) {
+                    std::fprintf(stderr, "audio receive: %s\n", next.to_string().c_str());
+                }
+                break;
+            }
+            ++stats.audio_received;
+            stats.audio_bytes += audio_payload.size();
+            if (audio_header.seq != expected_audio_seq) {
+                ++stats.audio_gaps;
+            }
+            expected_audio_seq = audio_header.seq + 1;
+            if (!audio_decoder) {
+                continue;
+            }
+            if (audio_header.payload_size != audio_payload.size() ||
+                chast::crc32(audio_payload.data(), audio_payload.size()) !=
+                    audio_header.payload_crc32) {
+                ++stats.audio_crc_errors;
+                continue;
+            }
+            std::vector<chast::DecodedAudio> blocks;
+            chast::Error decoded_audio = audio_decoder->decode(
+                audio_header, audio_payload.data(), audio_payload.size(), blocks);
+            if (!decoded_audio.ok()) {
+                ++stats.audio_decode_errors;
+                if (stats.audio_decode_errors == 1) {
+                    std::fprintf(stderr, "audio decode: %s\n",
+                                 decoded_audio.to_string().c_str());
+                }
+                continue;
+            }
+            count_audio(blocks);
+            play_audio(blocks);
+        }
+    };
+
     while (std::chrono::steady_clock::now() < deadline) {
         drain_clipboard();
+        drain_cursor();
+        drain_audio(std::chrono::milliseconds(0));
         {
             const auto probe_now = std::chrono::steady_clock::now();
             if (probe_now - last_probe >= std::chrono::seconds(1)) {
@@ -935,6 +1356,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                     if (stats.latency.valid) {
                         clock_synced = true;
                         clock_offset_us = stats.latency.offset_us;
+                        if (audio_player) {
+                            audio_player->set_clock_offset(stats.latency.offset_us / 1000);
+                        }
                     }
                 }
             }
@@ -943,6 +1367,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         std::vector<uint8_t> payload;
         chast::Error received =
             session->receive_frame(header, payload, std::chrono::milliseconds(2000));
+        // Audio is on its own stream and does not wake this call; drain it
+        // right after every video wait so it never queues behind a stall.
+        drain_audio(std::chrono::milliseconds(0));
         if (received.status() == chast::Status::WaitTimeout) {
             if (session->async_error().ok() && !session->video_finished() &&
                 std::chrono::steady_clock::now() - last_frame < std::chrono::seconds(30)) {
@@ -1004,6 +1431,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.input_enabled = info.input_enabled;
             stats.clipboard_enabled = info.clipboard_enabled;
             stats.target_bitrate = info.bitrate;
+            stats.audio_info = info.audio;
+            stats.audio_announced = info.audio.enabled;
+            if (!ensure_audio_decoder(info.audio)) {
+                return fail(stats.error);
+            }
             if (reconfigure) {
                 // The next access unit may belong to a new stream (new SPS,
                 // possibly a new codec). Start over and let the decoder wait
@@ -1105,6 +1537,41 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
 
     std::vector<chast::DecodedFrame> tail;
     drain_clipboard();
+    drain_cursor();
+    if (options.audio) {
+        // The server FINs the audio stream right after the video's; wait
+        // briefly for the tail and its closing packet before finishing.
+        const auto audio_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!stats.audio_finished && std::chrono::steady_clock::now() < audio_deadline) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                audio_deadline - std::chrono::steady_clock::now());
+            if (left <= std::chrono::milliseconds(0)) {
+                break;
+            }
+            drain_audio((std::min)(left, std::chrono::milliseconds(200)));
+        }
+        if (audio_decoder) {
+            std::vector<chast::DecodedAudio> tail_audio;
+            if (audio_decoder->flush(tail_audio).ok()) {
+                count_audio(tail_audio);
+                play_audio(tail_audio);
+            } else {
+                ++stats.audio_decode_errors;
+            }
+        }
+    }
+    if (audio_player) {
+        const chast::AudioPlayerStats played = audio_player->stats();
+        stats.audio_played = played.played_frames;
+        stats.audio_underruns = played.underruns;
+        stats.audio_player_drops = played.dropped;
+        stats.audio_player_recoveries = played.recoveries;
+        stats.audio_buffer_ms = played.buffer_ms;
+        if (stats.audio_player_error.empty() && !audio_player->error().empty()) {
+            stats.audio_player_error = audio_player->error();
+        }
+        audio_player->stop();
+    }
     chast::Error flushed = decoder->flush(tail);
     if (flushed.ok()) {
         for (const chast::DecodedFrame& frame : tail) {
@@ -1122,6 +1589,15 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start)
             .count());
+    const uint32_t audio_rate =
+        stats.audio_info.sample_rate != 0 ? stats.audio_info.sample_rate : 48000;
+    stats.elapsed_seconds = static_cast<double>(elapsed_ms) / 1000.0;
+    stats.audio_seconds =
+        static_cast<double>(stats.audio_samples) / static_cast<double>(audio_rate);
+    if (stats.audio_energy_values != 0) {
+        stats.audio_rms = std::sqrt(stats.audio_energy /
+                                    static_cast<double>(stats.audio_energy_values));
+    }
     // Drain the last reply that may have arrived with the final frames.
     stats.latency = session->latency();
     chast::ClientStats closing;
@@ -1174,12 +1650,53 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             static_cast<unsigned long long>(stats.clipboard_received),
                             static_cast<unsigned long long>(stats.clipboard_errors));
             }
+            std::printf("receiver: cursor updates=%llu shapes=%llu visible=%d at=%d,%d\n",
+                        static_cast<unsigned long long>(stats.cursor_updates),
+                        static_cast<unsigned long long>(stats.cursor_shapes),
+                        stats.cursor_visible ? 1 : 0, stats.cursor_x, stats.cursor_y);
+            if (options.audio) {
+                std::printf("receiver: audio announced=%d finished=%d packets=%llu bytes=%llu "
+                            "gaps=%llu crc-errors=%llu decode-errors=%llu samples=%llu "
+                            "(%.2f s) rms=%.0f\n",
+                            stats.audio_announced ? 1 : 0, stats.audio_finished ? 1 : 0,
+                            static_cast<unsigned long long>(stats.audio_received),
+                            static_cast<unsigned long long>(stats.audio_bytes),
+                            static_cast<unsigned long long>(stats.audio_gaps),
+                            static_cast<unsigned long long>(stats.audio_crc_errors),
+                            static_cast<unsigned long long>(stats.audio_decode_errors),
+                            static_cast<unsigned long long>(stats.audio_samples),
+                            stats.audio_seconds, stats.audio_rms);
+                if (options.play) {
+                    std::printf("receiver: playback played=%llu frames underruns=%llu "
+                                "dropped=%llu recoveries=%llu buffer=%u ms%s%s\n",
+                                static_cast<unsigned long long>(stats.audio_played),
+                                static_cast<unsigned long long>(stats.audio_underruns),
+                                static_cast<unsigned long long>(stats.audio_player_drops),
+                                static_cast<unsigned long long>(stats.audio_player_recoveries),
+                                stats.audio_buffer_ms,
+                                stats.audio_player_error.empty() ? "" : " error=",
+                                stats.audio_player_error.c_str());
+                }
+            }
         }
     }
     stats.ok = stats.error.empty() && stats.received > 0 && stats.decoded > 0 &&
                stats.crc_errors == 0 && stats.decode_errors == 0 && stats.gaps == 0 &&
                stats.protocol_errors == 0 && stats.input_errors == 0 &&
                stats.clipboard_errors == 0 && saw_video_end;
+    if (options.audio) {
+        const double video_seconds = static_cast<double>(elapsed_ms) / 1000.0;
+        stats.ok = stats.ok && stats.audio_announced && stats.audio_finished &&
+                   stats.audio_received > 0 && stats.audio_crc_errors == 0 &&
+                   stats.audio_decode_errors == 0 && stats.audio_gaps == 0 &&
+                   stats.audio_protocol_errors == 0 &&
+                   stats.audio_seconds > video_seconds - 1.0 &&
+                   stats.audio_seconds < video_seconds + 1.0 && stats.audio_rms > 1000.0 &&
+                   stats.audio_rms < 15000.0;
+    }
+    if (options.play) {
+        stats.ok = stats.ok && stats.audio_player_error.empty() && stats.audio_played > 0;
+    }
     return stats;
 }
 
@@ -1553,6 +2070,94 @@ bool clipboard_gate_works(uint16_t port, std::string* detail) {
     return true;
 }
 
+// A server with the audio gate closed must announce it closed, refuse to send
+// audio and never open the stream.
+bool audio_gate_works(uint16_t port, std::string* detail) {
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = port;
+    server_config.idle_timeout_ms = 3000;
+    server_config.allow_audio = false;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "server: " + error;
+        return false;
+    }
+    const std::string pin = server->server_fingerprint();
+    std::thread serving([&] {
+        if (!server->wait_for_client(std::chrono::seconds(5)).ok()) {
+            return;
+        }
+        chast::ServerInfo info;
+        info.width = 64;
+        info.height = 64;
+        info.framerate = 30;
+        info.bitrate = 100000;
+        info.encoder = "audio probe";
+        // The caller asks for audio; the session's gate must still turn it off.
+        info.audio.enabled = true;
+        info.audio.bitrate = 160000;
+        server->announce(info);
+    });
+
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 3000;
+    client_config.pinned_fingerprint = pin;
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        serving.join();
+        return false;
+    }
+    if (chast::Error connected = client->connect(std::chrono::seconds(5)); !connected.ok()) {
+        *detail = "connect: " + connected.to_string();
+        serving.join();
+        return false;
+    }
+    chast::ServerInfo info;
+    if (chast::Error handshaken =
+            client->handshake(info, std::chrono::seconds(5), chast::kDisplayAuto);
+        !handshaken.ok()) {
+        *detail = "handshake: " + handshaken.to_string();
+        serving.join();
+        return false;
+    }
+    if (info.audio.enabled) {
+        *detail = "HelloAck announced audio despite the closed gate";
+        serving.join();
+        return false;
+    }
+    const uint8_t silence[16] = {};
+    chast::AudioHeader header;
+    header.sample_rate = 48000;
+    header.channels = 2;
+    header.frame_samples = 1024;
+    if (server->send_audio(header, silence, sizeof(silence)).status() !=
+        chast::Status::InvalidCall) {
+        *detail = "the closed server accepted its own audio send";
+        serving.join();
+        return false;
+    }
+    // No audio stream was opened, so the client must time out rather than see
+    // data or a FIN.
+    chast::AudioHeader received_header;
+    std::vector<uint8_t> received_payload;
+    if (client->receive_audio(received_header, received_payload,
+                              std::chrono::milliseconds(150))
+            .status() != chast::Status::WaitTimeout) {
+        *detail = "the client saw audio data or a FIN from a closed gate";
+        serving.join();
+        return false;
+    }
+    serving.join();
+    return true;
+}
+
 int run_verify(const Options& options) {
     Options local = options;
     if (local.seconds <= 0.0) {
@@ -1575,6 +2180,10 @@ int run_verify(const Options& options) {
     // backend, so the real clipboard is never read or written.
     local.clipboard = true;
     local.fake_clipboard = std::make_shared<FakeClipboard>();
+    // Audio is covered with a generated tone and the real AAC codec, so the
+    // check runs the same path without touching the machine's sound devices.
+    local.audio = true;
+    local.synthetic_audio = true;
     // Cover the mid-session description path: the sender re-announces the
     // current stream two seconds in.
     local.reannounce = true;
@@ -1659,6 +2268,14 @@ int run_verify(const Options& options) {
             std::printf("     clipboard gate probe: %s\n", detail.c_str());
         }
     }
+    {
+        std::string detail;
+        const bool passed = audio_gate_works(static_cast<uint16_t>(probe_base + 5), &detail);
+        check(passed, "an audio-disabled server announces it off and refuses to send");
+        if (!passed) {
+            std::printf("     audio gate probe: %s\n", detail.c_str());
+        }
+    }
     check(sent.encoded > 0, "the sender produced frames");
     check(sent.encoded == received.received, "every sent access unit was received");
     check(received.decoded == received.received,
@@ -1700,7 +2317,11 @@ int run_verify(const Options& options) {
         const chast::ServerInfo& update = received.last_update;
         check(update.codec == sent.codec && update.width == sent.width &&
                   update.height == sent.height && update.origin_x == sent.origin_x &&
-                  update.origin_y == sent.origin_y && update.displays.size() == sent.displays.size(),
+                  update.origin_y == sent.origin_y &&
+                  update.displays.size() == sent.displays.size() &&
+                  update.audio.enabled == sent.audio_info.enabled &&
+                  update.audio.sample_rate == sent.audio_info.sample_rate &&
+                  update.audio.channels == sent.audio_info.channels,
               "the stream update described the running stream");
     }
 
@@ -1774,6 +2395,31 @@ int run_verify(const Options& options) {
         check(received.clipboard_texts.size() == 1 &&
                   received.clipboard_texts.front() == local.fake_clipboard->updated_text,
               "the received clipboard text matched the host's change");
+    }
+
+    if (local.audio) {
+        check(sent.audio_announced, "the server announced the synthetic audio stream");
+        check(received.audio_announced, "the client saw audio enabled in HelloAck");
+        check(sent.audio_info.codec == chast::AudioCodec::AAC &&
+                  sent.audio_info.sample_rate == 48000 && sent.audio_info.channels == 2 &&
+                  sent.audio_info.frame_samples == 1024,
+              "the announced audio format is AAC-LC 48 kHz stereo, 1024-sample frames");
+        check(!sent.audio_info.extradata.empty(), "the server announced the AAC decoder config");
+        check(sent.audio_packets > 0 && sent.audio_bytes > 0, "the server sent audio packets");
+        check(sent.audio_errors == 0 && sent.audio_dropped == 0,
+              "the host's audio path reported no errors or drops");
+        check(received.audio_received == sent.audio_packets,
+              "every sent audio packet was received");
+        check(received.audio_crc_errors == 0, "no audio payload CRC errors");
+        check(received.audio_decode_errors == 0, "no audio decode errors");
+        check(received.audio_gaps == 0, "no audio sequence gaps");
+        check(received.audio_protocol_errors == 0, "no audio protocol violations");
+        check(received.audio_finished, "the audio stream ended with a FIN");
+        check(received.audio_samples > 0 &&
+                  std::fabs(received.audio_seconds - received.elapsed_seconds) < 1.0,
+              "the decoded audio duration matches the session");
+        check(received.audio_rms > 1000.0 && received.audio_rms < 15000.0,
+              "the decoded tone carried the expected energy");
     }
 
     const StreamDigest replay = digest_saved_stream(path, sent.codec);

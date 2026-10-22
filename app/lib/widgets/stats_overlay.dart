@@ -124,10 +124,31 @@ class StatsOverlay extends StatelessWidget {
                 : '收 ${status.clipboardReceived} · 发 ${status.clipboardSent}'
                     '${status.clipboardFailed > 0 ? ' · ${status.clipboardFailed} 失败' : ''}',
           ),
-          if (anomalies > 0)
+          if (status.acceptsAudio) ...<Widget>[
+            _row(
+              '音频',
+              '${status.audioMuted ? '已静音 · ' : ''}'
+                  '${status.audioRecovering ? '设备恢复中 · ' : ''}'
+                  'AAC-LC ${status.audioSampleRateLabel} ${status.audioChannelLabel}',
+            ),
+            _row(
+              '缓冲',
+              '${status.audioBufferMs} ms · 收 ${status.audioReceived}'
+                  '${status.audioUnderruns > 0 ? ' · 欠载 ${status.audioUnderruns}' : ''}'
+                  '${status.audioRecoveries > 0 ? ' · 恢复 ${status.audioRecoveries}' : ''}',
+            ),
+          ] else
+            _row(
+              '音频',
+              status.audioAnnounced
+                  ? (status.audioError.isEmpty ? '本机无法播放' : status.audioError)
+                  : '服务端未启用',
+            ),
+          if (anomalies > 0 || status.audioErrors > 0)
             _row(
               '异常',
-              'CRC ${status.crcErrors} · 解码 ${status.decodeErrors} · 缺口 ${status.gaps}',
+              'CRC ${status.crcErrors} · 解码 ${status.decodeErrors} · 缺口 ${status.gaps}'
+                  '${status.audioErrors > 0 ? ' · 音频 ${status.audioErrors}' : ''}',
               color: const Color(0xFFFFB74D),
             ),
         ],

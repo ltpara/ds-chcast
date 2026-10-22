@@ -95,6 +95,22 @@ class ViewerStatus {
     this.clipboardSent = 0,
     this.clipboardReceived = 0,
     this.clipboardFailed = 0,
+    this.cursorUpdates = 0,
+    this.cursorPending = false,
+    this.audioAnnounced = false,
+    this.audioEnabled = false,
+    this.audioMuted = false,
+    this.audioSampleRate = 0,
+    this.audioChannels = 0,
+    this.audioBitrate = 0,
+    this.audioReceived = 0,
+    this.audioDecoded = 0,
+    this.audioErrors = 0,
+    this.audioUnderruns = 0,
+    this.audioRecoveries = 0,
+    this.audioRecovering = false,
+    this.audioBufferMs = 0,
+    this.audioError = '',
     this.displays = const <ViewerDisplay>[],
   });
 
@@ -154,6 +170,37 @@ class ViewerStatus {
   final int clipboardSent;
   final int clipboardReceived;
   final int clipboardFailed;
+
+  /// Pointer updates the host sent. The sprite itself never reaches Dart: the
+  /// native side installs it as the Windows cursor, which is where it has to
+  /// live to be composited by the OS at the pointer's own rate.
+  final int cursorUpdates;
+
+  /// True while a pointer update is waiting for the native side to pick up.
+  final bool cursorPending;
+
+  /// True when the host announced system sound in HelloAck/StreamInfo.
+  /// [audioEnabled] additionally requires the local decoder and renderer to be
+  /// running; [audioError] explains a local pipeline that failed while video
+  /// kept going.
+  final bool audioAnnounced;
+  final bool audioEnabled;
+  final bool audioMuted;
+  final int audioSampleRate;
+  final int audioChannels;
+  final int audioBitrate;
+  final int audioReceived;
+  final int audioDecoded;
+  final int audioErrors;
+  final int audioUnderruns;
+
+  /// Render-endpoint rebuilds caused by a lost or changed default output.
+  /// [audioRecovering] is true while the renderer sits between attempts; the
+  /// audio stream stays up, so this is not an error.
+  final int audioRecoveries;
+  final bool audioRecovering;
+  final int audioBufferMs;
+  final String audioError;
   final List<ViewerDisplay> displays;
 
   bool get hasFrame => published > 0 && width > 0 && height > 0;
@@ -164,7 +211,20 @@ class ViewerStatus {
   // live and the server announced its input gate as open.
   bool get acceptsInput => inputEnabled && isLive;
   bool get acceptsClipboard => clipboardEnabled && isLive;
+  // The speaker button and the overlay's audio row need a live local pipeline.
+  bool get acceptsAudio => audioEnabled && isLive;
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
+
+  /// The sample rate as "48 kHz", the way the overlay shows it.
+  String get audioSampleRateLabel {
+    if (audioSampleRate <= 0) {
+      return '';
+    }
+    final double khz = audioSampleRate / 1000.0;
+    return '${khz == khz.roundToDouble() ? khz.toStringAsFixed(0) : khz.toStringAsFixed(1)} kHz';
+  }
+
+  String get audioChannelLabel => audioChannels >= 2 ? '立体声' : '单声道';
 
   /// The announced display whose rect is the stream's origin and size, or
   /// null while no list has arrived.
@@ -236,6 +296,22 @@ class ViewerStatus {
       clipboardSent: asInt(map['clipboardSent']),
       clipboardReceived: asInt(map['clipboardReceived']),
       clipboardFailed: asInt(map['clipboardFailed']),
+      cursorUpdates: asInt(map['cursorUpdates']),
+      cursorPending: map['cursorPending'] == true,
+      audioAnnounced: map['audioAnnounced'] == true,
+      audioEnabled: map['audioEnabled'] == true,
+      audioMuted: map['audioMuted'] == true,
+      audioSampleRate: asInt(map['audioSampleRate']),
+      audioChannels: asInt(map['audioChannels']),
+      audioBitrate: asInt(map['audioBitrate']),
+      audioReceived: asInt(map['audioReceived']),
+      audioDecoded: asInt(map['audioDecoded']),
+      audioErrors: asInt(map['audioErrors']),
+      audioUnderruns: asInt(map['audioUnderruns']),
+      audioRecoveries: asInt(map['audioRecoveries']),
+      audioRecovering: map['audioRecovering'] == true,
+      audioBufferMs: asInt(map['audioBufferMs']),
+      audioError: asString(map['audioError']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
     );
   }
@@ -384,6 +460,43 @@ class ViewerBridge {
   /// waiting. Updates are only queued while the server's gate is open.
   static Future<String?> takeClipboard() {
     return _channel.invokeMethod<String>('takeClipboard');
+  }
+
+  /// Picks up whatever pointer state the host sent and installs it as this
+  /// window's cursor while [enabled]. [scale] is the size the video is drawn
+  /// at on this screen (logical video pixels to physical cursor pixels), so a
+  /// scaled-down stream gets a proportionally smaller pointer.
+  ///
+  /// The sprite never crosses this boundary: the native side registers it
+  /// straight from the session and only the two numbers come back from Dart.
+  /// Returns true while a remote cursor is installed, i.e. while the local one
+  /// should stay hidden.
+  static Future<bool> refreshRemoteCursor({
+    required bool enabled,
+    required double scale,
+  }) async {
+    final bool? installed = await _channel.invokeMethod<bool>(
+      'refreshRemoteCursor',
+      <String, Object>{
+        'enabled': enabled,
+        'scaleMilli': (scale * 1000).round(),
+      },
+    );
+    return installed ?? false;
+  }
+
+  /// Drops every cached pointer shape and hands the window back to the system
+  /// arrow. Called when control ends, so the page's own cursor returns.
+  static Future<void> clearRemoteCursor() async {
+    await _channel.invokeMethod<void>('clearRemoteCursor');
+  }
+
+  /// Mutes or unmutes system sound on this viewer. Decoding and buffering keep
+  /// running while muted. Returns false when no audio pipeline is running, so
+  /// the caller knows the tap had no effect.
+  static Future<bool> setAudioMuted(bool mute) async {
+    final bool? muted = await _channel.invokeMethod<bool>('setAudioMuted', mute);
+    return muted ?? false;
   }
 }
 

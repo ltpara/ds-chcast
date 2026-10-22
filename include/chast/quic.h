@@ -4,8 +4,9 @@
 //
 // One QuicSession is one connection: the server side accepts a single client,
 // announces the stream in a HelloAck, and writes access units on a server-
-// initiated unidirectional stream; the client side connects, performs the
-// Hello handshake, and reads frames. Control messages share a client-initiated
+// initiated unidirectional stream (plus a second audio stream when the host
+// shares system sound); the client side connects, performs the Hello
+// handshake, and reads both. Control messages share a client-initiated
 // bidirectional stream. See chast/protocol.h for the wire format.
 //
 // A server created with QuicServerConfig::allow_input also injects the
@@ -68,6 +69,11 @@ struct QuicServerConfig {
     // own. Off by default for the same reason as allow_input; HostServer turns
     // it on from the host settings.
     bool allow_clipboard = false;
+    // Open an audio stream when the announced ServerInfo carries an enabled
+    // AudioInfo. Off by default; HostServer turns it on from the host
+    // settings. When false, announce() clears audio.enabled so the viewer is
+    // never told about a stream that will not exist.
+    bool allow_audio = false;
     // Walk the injection path without calling SendInput. Only for the
     // loopback check, which must not move the real pointer.
     bool dry_run_input = false;
@@ -181,8 +187,11 @@ public:
     // the listener up. Call after finish_server() so wait_for_client() can
     // accept the next client.
     void reset_for_next_client();
-    // Answers the Hello with the stream description and opens the video stream.
-    // Must be called once, after wait_for_client() succeeded.
+    // Answers the Hello with the stream description and opens the media
+    // streams. Must be called once, after wait_for_client() succeeded. The
+    // audio stream is opened too when `info.audio.enabled` is set and the
+    // server allows audio; if the stream cannot be opened the announcement
+    // falls back to video only instead of failing the session.
     Error announce(const ServerInfo& info);
     // Replaces the stream description mid-session: the captured output's size,
     // origin, rotation or codec changed after a capture rebuild. Sent on the
@@ -195,6 +204,16 @@ public:
     // when too much unacknowledged data is queued (backpressure), so the
     // caller can keep capturing without unbounded memory growth.
     Error send_frame(FrameHeader header, const uint8_t* payload, size_t size);
+    // Sends one audio access unit on the audio stream. Like send_frame it
+    // fills in the sequence number, size and CRC. Unlike it, the send never
+    // waits: when the shared video/audio queue is full the packet is dropped
+    // and WaitTimeout is returned, so audio can never stall video. A dropped
+    // packet is a gap in the AAC stream and shows up as a short glitch.
+    Error send_audio(AudioHeader header, const uint8_t* payload, size_t size);
+    // Ends the audio stream gracefully (host setting turned audio off). The
+    // stream cannot be reopened on this connection; a StreamInfo announcing
+    // audio disabled tells the viewer why it ended.
+    Error stop_audio();
     // True when the client asked for a key frame since the last call.
     bool take_keyframe_request();
     // Drains the input events received since the last call, in order. They
@@ -231,6 +250,13 @@ public:
     // Waits for one complete access unit. Returns WaitTimeout when nothing
     // arrived in time, or Unavailable once the peer finished the video stream.
     Error receive_frame(FrameHeader& header, std::vector<uint8_t>& payload,
+                        std::chrono::milliseconds timeout);
+    // Waits for one complete audio access unit. Returns WaitTimeout when
+    // nothing arrived in time, or Unavailable once the server finished the
+    // audio stream; either is normal when audio is optional. A malformed
+    // packet returns CaptureFailed, which the caller may treat as "audio
+    // broken" without ending the video session.
+    Error receive_audio(AudioHeader& header, std::vector<uint8_t>& payload,
                         std::chrono::milliseconds timeout);
     // Asks the server for an IDR (sent on the control stream).
     Error request_keyframe();
@@ -278,8 +304,23 @@ public:
     // Total ClipboardUpdates received since the connection started.
     uint64_t clipboard_updates_received() const;
 
+    // ----- pointer (server to client) -----
+
+    // Sends the host's pointer state. Only the newest update matters to a
+    // viewer, so a send never blocks: when the queue is full the update is
+    // dropped and WaitTimeout returned, like audio.
+    Error send_cursor(const CursorUpdate& update);
+    // Pops the newest CursorUpdate received since the last call, discarding
+    // any older ones that were never taken. Returns false when nothing new
+    // arrived.
+    bool take_cursor_update(CursorUpdate& update);
+    // Total CursorUpdates received since the connection started.
+    uint64_t cursor_updates_received() const;
+
     // True after the server shut down its send direction of the video stream.
     bool video_finished() const;
+    // True after the server shut down its send direction of the audio stream.
+    bool audio_finished() const;
     // Asynchronous transport/protocol error, if one was recorded.
     Error async_error() const;
 

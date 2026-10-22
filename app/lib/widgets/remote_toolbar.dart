@@ -14,10 +14,13 @@ class RemoteToolbar extends StatelessWidget {
     required this.fit,
     required this.controlEnabled,
     required this.inputAvailable,
+    required this.audioAvailable,
+    required this.audioMuted,
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
     required this.onToggleControl,
+    required this.onToggleAudio,
     required this.onTogglePin,
     required this.onToggleStats,
     required this.onToggleFullscreen,
@@ -34,10 +37,13 @@ class RemoteToolbar extends StatelessWidget {
   final ViewFit fit;
   final bool controlEnabled;
   final bool inputAvailable;
+  final bool audioAvailable;
+  final bool audioMuted;
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
   final VoidCallback onToggleControl;
+  final VoidCallback onToggleAudio;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
   final VoidCallback onToggleFullscreen;
@@ -92,6 +98,17 @@ class RemoteToolbar extends StatelessWidget {
               disabled: !inputAvailable,
               active: controlEnabled,
               onTap: onToggleControl,
+            ),
+            _BarButton(
+              icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+              tooltip: !audioAvailable
+                  ? '服务端未启用声音'
+                  : audioMuted
+                      ? '取消静音'
+                      : '静音',
+              disabled: !audioAvailable,
+              active: audioAvailable && !audioMuted,
+              onTap: onToggleAudio,
             ),
             _BarButton(
               icon: Icons.speed_rounded,

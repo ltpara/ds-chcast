@@ -9,12 +9,13 @@ set(VIEWER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../viewer")
 add_library(chast_viewer_core STATIC
   "${VIEWER_DIR}/gpu_frame_sink.cc"
   "${VIEWER_DIR}/viewer_engine.cc"
+  "${VIEWER_DIR}/remote_cursor.cc"
 )
 target_include_directories(chast_viewer_core PUBLIC "${VIEWER_DIR}")
 target_compile_features(chast_viewer_core PUBLIC cxx_std_20)
 target_compile_definitions(chast_viewer_core PRIVATE NOMINMAX)
 target_compile_options(chast_viewer_core PRIVATE /W4 /permissive- /EHsc /utf-8)
-target_link_libraries(chast_viewer_core PUBLIC chast.codec chast.net)
+target_link_libraries(chast_viewer_core PUBLIC chast.codec chast.net chast.audio)
 target_link_libraries(chast_viewer_core PRIVATE flutter)
 
 # Define the application target. To change its name, change BINARY_NAME in the

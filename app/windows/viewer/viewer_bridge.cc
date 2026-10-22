@@ -118,6 +118,7 @@ void ViewerBridge::Shutdown() {
     }
     shutting_down_ = true;
     SetKeyCapture(false);
+    ClearCursor();
     if (view_ != nullptr) {
         if (IsWindow(view_)) {
             RemoveWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId);
@@ -259,6 +260,32 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.clipboard_received));
         map[key("clipboardFailed")] =
             flutter::EncodableValue(static_cast<int64_t>(status.clipboard_failed));
+        map[key("cursorUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.cursor_updates));
+        map[key("cursorPending")] = flutter::EncodableValue(status.cursor_pending);
+        map[key("audioAnnounced")] = flutter::EncodableValue(status.audio_announced);
+        map[key("audioEnabled")] = flutter::EncodableValue(status.audio_enabled);
+        map[key("audioMuted")] = flutter::EncodableValue(status.audio_muted);
+        map[key("audioSampleRate")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.audio_sample_rate));
+        map[key("audioChannels")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.audio_channels));
+        map[key("audioBitrate")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_bitrate));
+        map[key("audioReceived")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_received));
+        map[key("audioDecoded")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_decoded));
+        map[key("audioErrors")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_errors));
+        map[key("audioUnderruns")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_underruns));
+        map[key("audioRecoveries")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_recoveries));
+        map[key("audioRecovering")] = flutter::EncodableValue(status.audio_recovering);
+        map[key("audioBufferMs")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_buffer_ms));
+        map[key("audioError")] = flutter::EncodableValue(status.audio_error);
         flutter::EncodableList displays;
         for (const chast::DisplayDescription& display : status.displays) {
             flutter::EncodableMap entry;
@@ -327,6 +354,17 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setAudioMuted") {
+        const auto* mute = std::get_if<bool>(call.arguments());
+        if (mute == nullptr) {
+            result->Error("bad_args", "setAudioMuted wants a bool");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SetAudioMuted(*mute);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
     if (method == "takeClipboard") {
         std::string text;
         if (viewer_ != nullptr && viewer_->TakeClipboard(text)) {
@@ -334,6 +372,23 @@ void ViewerBridge::HandleMethodCall(
         } else {
             result->Success();
         }
+        return;
+    }
+
+    if (method == "refreshRemoteCursor") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "refreshRemoteCursor wants an argument map");
+            return;
+        }
+        ApplyCursor(*args);
+        result->Success(flutter::EncodableValue(cursor_override_));
+        return;
+    }
+
+    if (method == "clearRemoteCursor") {
+        ClearCursor();
+        result->Success();
         return;
     }
 
@@ -454,6 +509,19 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                     }
                 }
                 break;
+            case WM_SETCURSOR:
+                // The host's pointer shape over the video area. Answering here
+                // keeps Flutter from installing its own cursor on top: the
+                // page hides the system cursor while control is on, and this
+                // is what puts the host's arrow/I-beam/resize grip back.
+                if (LOWORD(lparam) == HTCLIENT && self->cursor_override_) {
+                    HCURSOR cursor = self->remote_cursor_.cursor();
+                    if (cursor != nullptr) {
+                        ::SetCursor(cursor);
+                        return TRUE;
+                    }
+                }
+                break;
             case WM_NCDESTROY:
                 RemoveWindowSubclass(window, &ViewerBridge::ViewSubclassProc, id);
                 self->view_ = nullptr;
@@ -463,6 +531,78 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
         }
     }
     return DefSubclassProc(window, message, wparam, lparam);
+}
+
+void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
+    if (viewer_ == nullptr) {
+        return;
+    }
+    // Every update the session received since the last poll: register the
+    // sprite of each new shape, then remember only the newest state. The
+    // sprite crosses no boundary here, which is why this stays in native code.
+    chast::CursorUpdate update;
+    while (viewer_->TakeCursor(update)) {
+        if (!update.sprite.empty() && update.shape_id != 0) {
+            std::string error;
+            if (!remote_cursor_.Register(update.shape_id, update.width, update.height,
+                                         update.hotspot_x, update.hotspot_y, update.sprite,
+                                         &error)) {
+                std::fprintf(stderr, "chast_viewer: remote cursor: %s\n", error.c_str());
+            }
+        }
+        last_cursor_ = std::move(update);
+        have_cursor_ = true;
+    }
+
+    bool enabled = false;
+    int64_t scale_milli = 1000;
+    map_bool(args, "enabled", &enabled);
+    map_int(args, "scaleMilli", &scale_milli);
+    if (!enabled || !have_cursor_ || !last_cursor_.visible || last_cursor_.shape_id == 0) {
+        // View-only, or the host says its pointer is hidden: Flutter's own
+        // cursor is the right one again.
+        if (cursor_override_) {
+            cursor_override_ = false;
+            remote_cursor_.Deactivate();
+            if (view_ != nullptr && IsWindow(view_)) {
+                ::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
+            }
+        }
+        return;
+    }
+
+    const double scale =
+        scale_milli > 0 ? static_cast<double>(scale_milli) / 1000.0 : 1.0;
+    if (cursor_override_ && cursor_shape_ == last_cursor_.shape_id &&
+        RemoteCursor::QuantiseScale(cursor_scale_) == RemoteCursor::QuantiseScale(scale)) {
+        return;
+    }
+    std::string error;
+    if (!remote_cursor_.Activate(last_cursor_.shape_id, scale, &error)) {
+        // The sprite for the shape the host is showing has not arrived yet (a
+        // shape id can precede its image after a cache eviction). Keep the
+        // previous cursor and try again on the next poll.
+        if (error != "the cursor shape was never registered") {
+            std::fprintf(stderr, "chast_viewer: remote cursor: %s\n", error.c_str());
+        }
+        return;
+    }
+    cursor_shape_ = last_cursor_.shape_id;
+    cursor_scale_ = scale;
+    cursor_override_ = true;
+    if (view_ != nullptr && IsWindow(view_)) {
+        ::SetCursor(remote_cursor_.cursor());
+    }
+}
+
+void ViewerBridge::ClearCursor() {
+    cursor_override_ = false;
+    have_cursor_ = false;
+    cursor_shape_ = 0;
+    remote_cursor_.Clear();
+    if (view_ != nullptr && IsWindow(view_)) {
+        ::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
+    }
 }
 
 void ViewerBridge::SetFullscreen(bool enable) {

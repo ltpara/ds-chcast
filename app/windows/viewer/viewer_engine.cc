@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/audio.h"
 #include "chast/decoder.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
@@ -19,10 +20,10 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr auto kReceiveTimeout = std::chrono::milliseconds(250);
-// Input is drained once per receive poll, so an idle desktop (where the
-// receive timeout is the only thing pacing the loop) still carries pointer
-// motion within this bound.
-constexpr auto kInputPoll = std::chrono::milliseconds(10);
+// Input and audio are drained once per receive poll, so an idle desktop (where
+// the receive timeout is the only thing pacing the loop) still carries pointer
+// motion and audio frames within this bound.
+constexpr auto kMediaPoll = std::chrono::milliseconds(10);
 constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 constexpr auto kProbeInterval = std::chrono::seconds(1);
@@ -73,6 +74,11 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_clipboard_.clear();
         received_clipboard_.clear();
         clipboard_enabled_ = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        pending_cursor_.reset();
+        cursor_updates_ = 0;
     }
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
@@ -143,6 +149,29 @@ bool ViewerEngine::TakeClipboard(std::string& text) {
     return true;
 }
 
+bool ViewerEngine::TakeCursor(chast::CursorUpdate& update) {
+    std::lock_guard<std::mutex> lock(cursor_mutex_);
+    if (!pending_cursor_) {
+        return false;
+    }
+    update = std::move(*pending_cursor_);
+    pending_cursor_.reset();
+    std::lock_guard<std::mutex> status_lock(mutex_);
+    status_.cursor_pending = false;
+    return true;
+}
+
+bool ViewerEngine::SetAudioMuted(bool mute) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_.audio_enabled) {
+            return false;
+        }
+    }
+    audio_muted_.store(mute, std::memory_order_relaxed);
+    return true;
+}
+
 ViewerStatus ViewerEngine::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     ViewerStatus status = status_;
@@ -185,6 +214,23 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
+    uint64_t cursor_updates = 0;
+    bool audio_announced = false;
+    bool audio_finished = false;
+    bool audio_broken = false;
+    bool audio_enabled = false;
+    bool audio_muted_applied = false;
+    uint32_t audio_sample_rate = 0;
+    uint32_t audio_channels = 0;
+    uint32_t audio_bitrate = 0;
+    uint64_t audio_received = 0;
+    uint64_t audio_decoded = 0;
+    uint64_t audio_errors = 0;
+    uint64_t audio_underruns = 0;
+    uint64_t audio_recoveries = 0;
+    bool audio_recovering = false;
+    uint32_t audio_buffer_ms = 0;
+    std::string audio_error;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
     bool clock_synced = false;
@@ -200,6 +246,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool logged_drop = false;
     uint64_t init_errors = 0;
     std::string failure;
+    std::unique_ptr<chast::IAudioDecoder> audio_decoder;
+    std::unique_ptr<chast::IAudioPlayer> audio_player;
 
     // Folds the worker's counters into the status the UI polls. Called from
     // this thread only; the window counters are reset once per second.
@@ -209,6 +257,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             std::chrono::duration<double>(now - window_start).count();
         double fps = 0.0;
         double kbps = 0.0;
+        if (audio_player) {
+            const chast::AudioPlayerStats audio_stats = audio_player->stats();
+            audio_buffer_ms = audio_stats.buffer_ms;
+            audio_underruns = audio_stats.underruns;
+            audio_recoveries = audio_stats.recoveries;
+            audio_recovering = audio_stats.recovering;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (window_seconds >= 1.0) {
@@ -236,6 +291,21 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.clipboard_sent = clipboard_sent;
             status_.clipboard_received = clipboard_received;
             status_.clipboard_failed = clipboard_failed;
+            status_.cursor_updates = cursor_updates;
+            status_.audio_announced = audio_announced;
+            status_.audio_enabled = audio_enabled;
+            status_.audio_muted = audio_muted_.load(std::memory_order_relaxed);
+            status_.audio_sample_rate = audio_sample_rate;
+            status_.audio_channels = audio_channels;
+            status_.audio_bitrate = audio_bitrate;
+            status_.audio_received = audio_received;
+            status_.audio_decoded = audio_decoded;
+            status_.audio_errors = audio_errors;
+            status_.audio_underruns = audio_underruns;
+            status_.audio_recoveries = audio_recoveries;
+            status_.audio_recovering = audio_recovering;
+            status_.audio_buffer_ms = audio_buffer_ms;
+            status_.audio_error = audio_error;
             status_.elapsed_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
             if (final) {
@@ -332,6 +402,69 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     pending_clipboard_.clear();
                 }
             }
+
+            // Audio is optional end to end: a missing render endpoint or a
+            // decoder that cannot start leaves video untouched and reports
+            // why through audio_error.
+            auto stop_audio_pipeline = [&] {
+                if (audio_player) {
+                    const chast::AudioPlayerStats stats = audio_player->stats();
+                    audio_buffer_ms = stats.buffer_ms;
+                    audio_underruns = stats.underruns;
+                    audio_recoveries = stats.recoveries;
+                    audio_recovering = stats.recovering;
+                    audio_player->stop();
+                    audio_player.reset();
+                }
+                audio_decoder.reset();
+                audio_enabled = false;
+            };
+            auto start_audio = [&](const chast::AudioInfo& audio) {
+                audio_announced = audio.enabled;
+                audio_finished = false;
+                audio_broken = false;
+                audio_sample_rate = audio.sample_rate;
+                audio_channels = audio.channels;
+                audio_bitrate = audio.bitrate;
+                if (!audio.enabled) {
+                    return;
+                }
+                std::string audio_setup_error;
+                audio_decoder = chast::create_aac_decoder(audio, &audio_setup_error);
+                if (!audio_decoder) {
+                    audio_error = "decoder: " + audio_setup_error;
+                    std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
+                    return;
+                }
+                chast::AudioPlayerConfig player_config;
+                audio_player =
+                    chast::create_audio_player(player_config, &audio_setup_error);
+                if (!audio_player) {
+                    audio_decoder.reset();
+                    audio_error = "playback: " + audio_setup_error;
+                    std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
+                    return;
+                }
+                const bool muted = audio_muted_.load(std::memory_order_relaxed);
+                audio_player->set_mute(muted);
+                audio_muted_applied = muted;
+                chast::Error audio_started = audio_player->start();
+                if (!audio_started.ok()) {
+                    audio_error = "playback: " + audio_started.to_string();
+                    std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
+                    audio_player.reset();
+                    audio_decoder.reset();
+                    return;
+                }
+                audio_enabled = true;
+                audio_error.clear();
+                std::fprintf(stderr,
+                             "viewer: audio AAC-LC %u Hz %u ch %u kbps, decoder and "
+                             "renderer running\n",
+                             audio.sample_rate, audio.channels, audio.bitrate / 1000u);
+            };
+            start_audio(info.audio);
+
             std::fprintf(stderr,
                          "viewer: display request %s; %zu announced, stream origin %d,%d\n",
                          display == chast::kDisplayAuto ? "auto"
@@ -481,6 +614,116 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Moves the newest pointer state the host sent into the slot
+                // the UI takes from. A newer update replaces an older one that
+                // was never taken, so the UI always sees the current position.
+                auto receive_cursor = [&] {
+                    chast::CursorUpdate update;
+                    bool any = false;
+                    while (session->take_cursor_update(update)) {
+                        any = true;
+                        ++cursor_updates;
+                        std::lock_guard<std::mutex> lock(cursor_mutex_);
+                        pending_cursor_ = std::move(update);
+                        ++cursor_updates_;
+                    }
+                    if (any) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.cursor_updates = cursor_updates;
+                        status_.cursor_pending = true;
+                    }
+                };
+
+                // Drains every complete audio packet that arrived since the
+                // last poll. Audio never fails the session: a malformed packet
+                // or a dead render endpoint stops local playback and video
+                // keeps running.
+                auto drain_audio = [&] {
+                    if (!audio_announced || audio_finished || audio_broken) {
+                        return;
+                    }
+                    chast::AudioHeader audio_header;
+                    std::vector<uint8_t> audio_payload;
+                    for (;;) {
+                        chast::Error next = session->receive_audio(
+                            audio_header, audio_payload, std::chrono::milliseconds(0));
+                        if (next.status() == chast::Status::WaitTimeout) {
+                            break;
+                        }
+                        if (next.status() == chast::Status::Unavailable) {
+                            audio_finished = true;
+                            audio_announced = false;
+                            break;
+                        }
+                        if (!next.ok()) {
+                            // The parser cannot resynchronise after a bad
+                            // header, so stop consuming rather than spin on
+                            // the same error.
+                            ++audio_errors;
+                            audio_broken = true;
+                            audio_error = "protocol: " + next.to_string();
+                            std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
+                            break;
+                        }
+                        ++audio_received;
+                        if (!audio_player || !audio_decoder) {
+                            // Local playback is unavailable; keep consuming so
+                            // the transport queue cannot grow.
+                            continue;
+                        }
+                        if (audio_header.payload_size != audio_payload.size() ||
+                            chast::crc32(audio_payload.data(), audio_payload.size()) !=
+                                audio_header.payload_crc32) {
+                            ++audio_errors;
+                            continue;
+                        }
+                        std::vector<chast::DecodedAudio> audio_blocks;
+                        chast::Error audio_decode = audio_decoder->decode(
+                            audio_header, audio_payload.data(), audio_payload.size(),
+                            audio_blocks);
+                        if (!audio_decode.ok()) {
+                            ++audio_errors;
+                            if (audio_errors <= 3) {
+                                std::fprintf(stderr, "viewer: audio decode: %s\n",
+                                             audio_decode.to_string().c_str());
+                            }
+                            continue;
+                        }
+                        ++audio_decoded;
+                        for (const chast::DecodedAudio& block : audio_blocks) {
+                            chast::Error pushed = audio_player->push(block);
+                            if (!pushed.ok()) {
+                                ++audio_errors;
+                                if (audio_errors <= 3) {
+                                    std::fprintf(stderr, "viewer: audio push: %s\n",
+                                                 pushed.to_string().c_str());
+                                }
+                                break;
+                            }
+                        }
+                        if (!audio_player->error().empty()) {
+                            break;
+                        }
+                    }
+                    if (audio_player) {
+                        const bool muted = audio_muted_.load(std::memory_order_relaxed);
+                        if (muted != audio_muted_applied) {
+                            audio_player->set_mute(muted);
+                            audio_muted_applied = muted;
+                        }
+                        const std::string player_error = audio_player->error();
+                        if (!player_error.empty()) {
+                            audio_error = "playback: " + player_error;
+                            std::fprintf(stderr, "viewer: audio stopped: %s\n",
+                                         player_error.c_str());
+                            stop_audio_pipeline();
+                        }
+                    }
+                    if ((audio_finished || audio_broken) && (audio_player || audio_decoder)) {
+                        stop_audio_pipeline();
+                    }
+                };
+
                 // Applies StreamInfo messages: the captured output changed
                 // size, rotation or origin after the server rebuilt its
                 // duplication. Frames keep flowing on the same stream, so only
@@ -496,6 +739,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                    update.width != info.width ||
                                                    update.height != info.height;
                         info = update;
+                        if (!info.audio.enabled) {
+                            if (audio_announced || audio_player || audio_decoder) {
+                                audio_announced = false;
+                                audio_finished = true;
+                                stop_audio_pipeline();
+                                std::fprintf(stderr, "viewer: the host stopped audio\n");
+                            }
+                        } else if (!audio_announced) {
+                            start_audio(info.audio);
+                        }
                         {
                             std::lock_guard<std::mutex> lock(mutex_);
                             status_.codec = info.codec;
@@ -565,18 +818,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 rtt_ms = static_cast<double>(sample.rtt_us) / 1000.0;
                                 clock_offset_us = sample.offset_us;
                                 clock_synced = true;
+                                if (audio_player) {
+                                    audio_player->set_clock_offset(clock_offset_us / 1000);
+                                }
                             }
                         }
                     }
                     drain_input();
                     drain_clipboard();
                     receive_clipboard();
+                    receive_cursor();
+                    drain_audio();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
+                    const bool fast_media_poll =
+                        info.input_enabled || info.clipboard_enabled || audio_announced;
                     chast::Error received_frame = session->receive_frame(
-                        header, payload,
-                        (info.input_enabled || info.clipboard_enabled) ? kInputPoll
-                                                                       : kReceiveTimeout);
+                        header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
+                    // Audio packets arrive on their own stream and never wake
+                    // receive_frame(), so drain them as soon as the wait ends.
+                    drain_audio();
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {

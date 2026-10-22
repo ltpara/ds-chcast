@@ -68,6 +68,7 @@ enum ControlId {
     kRegenerateButton,
     kInputCheck,
     kClipboardCheck,
+    kAudioCheck,
     kApproveCheck,
     kOneTimeCheck,
     kAutostartCheck,
@@ -94,6 +95,7 @@ struct HostApp {
     HWND fingerprint_edit = nullptr;
     HWND input_check = nullptr;
     HWND clipboard_check = nullptr;
+    HWND audio_check = nullptr;
     HWND approve_check = nullptr;
     HWND onetime_check = nullptr;
     HWND autostart_check = nullptr;
@@ -458,6 +460,7 @@ void refresh_ui() {
 
     set_check(g_app->input_check, g_app->settings.allow_input);
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
+    set_check(g_app->audio_check, g_app->settings.allow_audio);
     set_check(g_app->approve_check, g_app->settings.require_approval);
     set_check(g_app->onetime_check, g_app->settings.token_mode == HostTokenMode::OneTime);
     set_check(g_app->autostart_check, g_app->settings.autostart);
@@ -601,33 +604,36 @@ void create_controls() {
                                        150, 24, kOneTimeCheck, nullptr);
     g_app->autostart_check = add_control(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 0, 24, 368,
                                          160, 24, kAutostartCheck, nullptr);
-    g_app->clipboard_check = add_control(L"BUTTON", L"同步剪贴板", BS_AUTOCHECKBOX, 0, 386, 368,
+    g_app->clipboard_check = add_control(L"BUTTON", L"同步剪贴板", BS_AUTOCHECKBOX, 0, 200, 368,
                                          150, 24, kClipboardCheck, nullptr);
+    g_app->audio_check = add_control(L"BUTTON", L"共享系统声音", BS_AUTOCHECKBOX, 0, 386, 368,
+                                     150, 24, kAudioCheck, nullptr);
 
-    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 200, 364, 170, 30,
+    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 24, 402, 170, 30,
                 kFirewallButton, nullptr);
 
-    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 406, 120,
+    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 440, 120,
                                        32, kToggleButton, nullptr);
-    add_control(L"BUTTON", L"连接服务设置…", BS_PUSHBUTTON, 0, 156, 406, 160, 32,
+    add_control(L"BUTTON", L"连接服务设置…", BS_PUSHBUTTON, 0, 156, 440, 160, 32,
                 kTunnelSettingsButton, nullptr);
-    add_control(L"BUTTON", L"重新注册", BS_PUSHBUTTON, 0, 328, 406, 120, 32,
+    add_control(L"BUTTON", L"重新注册", BS_PUSHBUTTON, 0, 328, 440, 120, 32,
                 kTunnelRegisterButton, nullptr);
-    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 460, 406, 112, 32, kReloadButton,
+    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 460, 440, 112, 32, kReloadButton,
                 nullptr);
-    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 24, 444, 120, 32, kHideButton,
+    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 24, 478, 120, 32, kHideButton,
                 nullptr);
-    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 156, 444, 100, 32, kQuitButton, nullptr);
-    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 376, 444, 120, 32,
+    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 156, 478, 100, 32, kQuitButton, nullptr);
+    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 376, 478, 120, 32,
                 kOpenConfigButton, nullptr);
 
-    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 492, 200, 20, 0, nullptr);
+    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 526, 200, 20, 0, nullptr);
     g_app->log_edit =
         add_control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-                    WS_EX_CLIENTEDGE, 24, 514, 572, 150, kLogEdit, nullptr);
+                    WS_EX_CLIENTEDGE, 24, 548, 572, 150, kLogEdit, nullptr);
 
     set_check(g_app->input_check, g_app->settings.allow_input);
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
+    set_check(g_app->audio_check, g_app->settings.allow_audio);
     set_check(g_app->approve_check, g_app->settings.require_approval);
     set_check(g_app->onetime_check, g_app->settings.token_mode == HostTokenMode::OneTime);
     set_check(g_app->autostart_check, g_app->settings.autostart);
@@ -957,6 +963,8 @@ void show_tray_menu() {
                 L"接受远程输入");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_clipboard ? MF_CHECKED : 0),
                 kClipboardCheck, L"同步剪贴板");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
+                L"共享系统声音");
     AppendMenuW(menu, MF_STRING | (g_app->settings.require_approval ? MF_CHECKED : 0),
                 kApproveCheck, L"连接前需要确认");
     AppendMenuW(menu,
@@ -1028,6 +1036,13 @@ void handle_command(int id) {
             restart_server();
             append_log_line(g_app->settings.allow_clipboard ? L"剪贴板同步已开启"
                                                             : L"剪贴板同步已关闭");
+            break;
+        case kAudioCheck:
+            g_app->settings.allow_audio = !g_app->settings.allow_audio;
+            save_settings();
+            restart_server();
+            append_log_line(g_app->settings.allow_audio ? L"系统声音共享已开启"
+                                                        : L"系统声音共享已关闭");
             break;
         case kApproveCheck:
             g_app->settings.require_approval = !g_app->settings.require_approval;
@@ -1339,7 +1354,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rect{0, 0, px(620), px(690)};
+    RECT rect{0, 0, px(620), px(724)};
     AdjustWindowRectEx(&rect, style, FALSE, 0);
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;

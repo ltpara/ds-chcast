@@ -31,6 +31,8 @@
 
 namespace chast {
 
+class ILoopbackCapture;
+
 enum class HostState {
     Stopped,    // not started, or the run ended
     Listening,  // bound and waiting for a viewer
@@ -67,6 +69,27 @@ struct HostServerStats {
     // out (local changes). Both stay zero when clipboard sync is disabled.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
+    // System sound. audio_active says whether the current session announced
+    // and is still sending audio; the counters cover packets handed to the
+    // transport, encoded bytes, packets dropped by the capture or send queues,
+    // and failures that turned audio off.
+    bool audio_active = false;
+    uint64_t audio_packets = 0;
+    uint64_t audio_bytes = 0;
+    uint64_t audio_dropped = 0;
+    uint64_t audio_errors = 0;
+    uint64_t audio_capture_recoveries = 0;
+    uint64_t audio_gate_transitions = 0;
+    bool audio_recovering = false;
+    // Pointer traffic. cursor_sent counts the CursorUpdates handed to the
+    // transport; cursor_shapes is how many of them carried a sprite and
+    // cursor_bytes their total sprite size. cursor_dropped counts updates the
+    // full control queue refused (the next frame sends the same state again).
+    uint64_t cursor_sent = 0;
+    uint64_t cursor_shapes = 0;
+    uint64_t cursor_bytes = 0;
+    uint64_t cursor_dropped = 0;
+    uint64_t cursor_errors = 0;
 };
 
 struct HostStatus {
@@ -135,6 +158,12 @@ struct HostServerConfig {
     // touches the operator's clipboard.
     std::function<bool(std::string&)> clipboard_read;
     std::function<bool(const std::string&)> clipboard_write;
+    // Creates the system-audio source. Empty opens the default render
+    // endpoint's loopback; the loopback check substitutes a synthetic tone so
+    // it covers encode -> wire -> decode without a sound card. Called only
+    // when settings.allow_audio is set; returning nullptr (with `error`) means
+    // this session streams video only.
+    std::function<std::unique_ptr<ILoopbackCapture>(std::string*)> audio_capture;
 };
 
 class HostServer {

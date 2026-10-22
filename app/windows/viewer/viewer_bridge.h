@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 
+#include "remote_cursor.h"
 #include "viewer_engine.h"
 
 namespace flutter {
@@ -50,6 +51,11 @@ private:
     // VK_PROCESSKEY. Restored when control is dropped, which keeps the home
     // page's text fields working in Chinese.
     void SetKeyCapture(bool enable);
+    // Picks the host's newest pointer up and installs it as the local system
+    // cursor while the page shows remote control on this window. Called from
+    // the poll timer, so it runs on the platform thread.
+    void ApplyCursor(const flutter::EncodableMap& args);
+    void ClearCursor();
 
     // Swaps the physical key back in for the VK_PROCESSKEY an IME reports when
     // the context could not be detached. Installed on the Flutter view window,
@@ -62,6 +68,15 @@ private:
     HWND view_ = nullptr;
     std::atomic<bool> key_capture_{false};
     HIMC saved_himc_ = nullptr;
+    // The host pointer, installed as the local cursor while this window is
+    // the one under it. Windows asks WM_SETCURSOR for HTCLIENT, so answering
+    // that message is all it takes; Flutter's own cursor is left alone.
+    RemoteCursor remote_cursor_;
+    chast::CursorUpdate last_cursor_;
+    bool have_cursor_ = false;
+    bool cursor_override_ = false;
+    uint64_t cursor_shape_ = 0;
+    double cursor_scale_ = 1.0;
     std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
     std::unique_ptr<GpuFrameSink> texture_sink_;
     std::unique_ptr<ViewerEngine> viewer_;

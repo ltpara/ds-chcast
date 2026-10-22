@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/audio.h"
 #include "chast/bitrate_controller.h"
 #include "chast/capture.h"
 #include "chast/clipboard.h"
@@ -77,7 +78,8 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
 // capturer is reading, `attached` the full list from the moment of the call.
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
                            const DisplayInfo& display, const IVideoEncoder& encoder,
-                           uint16_t framerate, bool clipboard_enabled) {
+                           uint16_t framerate, bool clipboard_enabled,
+                           const AudioInfo& audio) {
     ServerInfo info;
     info.codec = encoder.codec();
     info.width = static_cast<uint16_t>(encoder.width());
@@ -87,6 +89,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.origin_x = display.rect.left;
     info.origin_y = display.rect.top;
     info.clipboard_enabled = clipboard_enabled;
+    info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
     for (const DisplayInfo& listed : attached) {
         DisplayDescription described;
@@ -185,6 +188,7 @@ bool HostServer::open_session(std::string* error) {
     quic.identity_scope = config_.identity_scope;
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
+    quic.allow_audio = settings_.allow_audio;
     quic.dry_run_input = config_.dry_run_input;
     quic.access_token = settings_.access_token;
     quic.reuse_access_token = settings_.token_mode == HostTokenMode::Reusable;
@@ -366,6 +370,7 @@ void HostServer::run() {
 
 bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
+    stats.audio_active = false;
     const std::vector<DisplayInfo> attached = enumerate_displays();
     if (attached.empty()) {
         *error = "no displays are attached";
@@ -453,9 +458,34 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     BitrateController abr(encoder->bitrate(), bitrate_floor(encoder->bitrate()));
     stats.target_bitrate = encoder->bitrate();
 
+    // System sound is optional: the endpoint and the AAC encoder are opened
+    // before the announcement so AudioInfo describes what will actually be
+    // encoded, and a machine without a usable endpoint simply streams video.
+    std::unique_ptr<ILoopbackCapture> audio_capture;
+    AudioInfo audio_info;
+    if (settings_.allow_audio) {
+        std::string audio_error;
+        if (config_.audio_capture) {
+            audio_capture = config_.audio_capture(&audio_error);
+        } else {
+            LoopbackCaptureConfig audio_config;
+            audio_capture = create_loopback_capture(audio_config, &audio_error);
+        }
+        if (audio_capture) {
+            audio_info = audio_capture->info();
+            log("audio: AAC-LC " + std::to_string(audio_info.sample_rate / 1000u) + " kHz, " +
+                std::to_string(audio_info.channels) + " ch, " +
+                std::to_string(audio_info.bitrate / 1000u) + " kbps");
+        } else {
+            ++stats.audio_errors;
+            log("audio unavailable: " + audio_error);
+        }
+    }
+    stats.audio_active = audio_info.enabled;
+
     ServerInfo stream_info =
         describe_stream(attached, capturer->display(), *encoder, settings_.framerate,
-                        settings_.allow_clipboard);
+                        settings_.allow_clipboard, audio_info);
     publish_stream(stream_info, find_display(attached, capturer->display()),
                    display_name_utf8(capturer->display()));
     if (config_.stream_announced) {
@@ -465,6 +495,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     if (!announced.ok()) {
         *error = "announce: " + announced.to_string();
         return false;
+    }
+    if (audio_capture) {
+        audio_capture->start();
     }
     if (!run_clock_started_) {
         run_clock_started_ = true;
@@ -548,6 +581,152 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         ++clipboard_seq;
         ++stats.clipboard_sent;
+    };
+
+    // Audio degrades on its own: a failed endpoint, encoder or send turns the
+    // stream off with a StreamInfo and leaves video running.
+    auto disable_audio = [&](const std::string& reason) {
+        audio_capture->stop();
+        audio_capture.reset();
+        audio_info = AudioInfo{};
+        stats.audio_active = false;
+        stream_info.audio = audio_info;
+        publish_stream(stream_info, find_display(attached, capturer->display()),
+                       display_name_utf8(capturer->display()));
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            log("audio off: could not announce it: " + refreshed.to_string());
+        }
+        Error stopped = session_->stop_audio();
+        if (!stopped.ok() && stopped.status() != Status::Unavailable &&
+            stopped.status() != Status::InvalidCall) {
+            log("audio off: " + stopped.to_string());
+        }
+        log("audio stopped: " + reason);
+    };
+
+    uint64_t audio_send_drops = 0;
+    uint64_t audio_recoveries_logged = 0;
+    bool audio_recovering_logged = false;
+    const uint64_t audio_base_ms = capture_clock_ms(start);
+    auto drain_audio = [&] {
+        if (!audio_capture) {
+            return;
+        }
+        EncodedAudio packet;
+        while (audio_capture->take_packet(packet)) {
+            const uint64_t host_ms = packet.capture_ms & 0xFFFFFFFFFFFFull;
+            AudioHeader header;
+            header.pts_ms = host_ms >= audio_base_ms ? host_ms - audio_base_ms : 0;
+            header.capture_ms = host_ms;
+            header.sample_rate = audio_info.sample_rate;
+            header.frame_samples = audio_info.frame_samples;
+            header.channels = audio_info.channels;
+            header.codec = audio_info.codec;
+            Error sent = session_->send_audio(header, packet.data.data(), packet.data.size());
+            if (!sent.ok()) {
+                if (sent.status() == Status::WaitTimeout) {
+                    // The shared send queue is full; video owns the path and
+                    // this packet is a short gap, not a reason to stop audio.
+                    ++audio_send_drops;
+                    continue;
+                }
+                ++stats.audio_errors;
+                log("audio send failed: " + sent.to_string());
+                disable_audio("send failed");
+                return;
+            }
+            ++stats.audio_packets;
+            stats.audio_bytes += packet.data.size();
+        }
+        const AudioCaptureStats captured = audio_capture->stats();
+        stats.audio_dropped = audio_send_drops + captured.dropped;
+        stats.audio_capture_recoveries = captured.recoveries;
+        stats.audio_gate_transitions = captured.gate_transitions;
+        stats.audio_recovering = captured.recovering;
+        if (captured.recoveries != audio_recoveries_logged) {
+            audio_recoveries_logged = captured.recoveries;
+            log("audio capture switched to the default output endpoint");
+        }
+        if (captured.recovering != audio_recovering_logged) {
+            audio_recovering_logged = captured.recovering;
+            log(captured.recovering ? "audio capture endpoint lost; retrying"
+                                    : "audio capture endpoint recovered");
+        }
+        if (audio_capture->failed()) {
+            ++stats.audio_errors;
+            const std::string reason = audio_capture->error();
+            disable_audio(reason.empty() ? "capture failed" : reason);
+        }
+    };
+
+    // Pointer state. Desktop Duplication keeps the pointer out of the desktop
+    // image, so the viewer is told the sprite and where it is; the sprite
+    // travels once per shape id and later updates carry only the position.
+    // The cadence comes from capture(): DXGI produces a frame for every
+    // pointer move, so no timer is needed and an idle pointer costs nothing.
+    bool cursor_sent_once = false;
+    CursorUpdate cursor_sent;
+    auto publish_cursor = [&]() {
+        if (!config_.capture_cursor) {
+            return;
+        }
+        const CursorInfo& info = capturer->cursor();
+        if (!info.position_valid) {
+            return;
+        }
+        const bool shape_known = info.shape_valid && info.content_id != 0;
+        CursorUpdate update;
+        update.visible = info.visible;
+        update.x = info.position.x;
+        update.y = info.position.y;
+        // A pointer whose shape the decoder has not seen yet (the first frames
+        // of a session) still moves; reuse the geometry already sent so the
+        // viewer can keep placing the sprite it holds.
+        if (shape_known) {
+            update.shape_id = info.content_id;
+            update.width = static_cast<uint16_t>(info.width);
+            update.height = static_cast<uint16_t>(info.height);
+            update.hotspot_x = static_cast<uint16_t>(info.hotspot.x);
+            update.hotspot_y = static_cast<uint16_t>(info.hotspot.y);
+        } else if (cursor_sent_once) {
+            update.shape_id = cursor_sent.shape_id;
+            update.width = cursor_sent.width;
+            update.height = cursor_sent.height;
+            update.hotspot_x = cursor_sent.hotspot_x;
+            update.hotspot_y = cursor_sent.hotspot_y;
+        } else {
+            return;
+        }
+        const bool new_shape = shape_known && update.shape_id != cursor_sent.shape_id;
+        if (new_shape) {
+            update.sprite = info.bitmap;
+        }
+        if (cursor_sent_once && !new_shape && update.visible == cursor_sent.visible &&
+            update.x == cursor_sent.x && update.y == cursor_sent.y) {
+            return;
+        }
+        Error sent = session_->send_cursor(update);
+        if (!sent.ok()) {
+            if (sent.status() == Status::WaitTimeout) {
+                // The control queue is full; the next frame carries the same
+                // state again, so nothing is lost by skipping this one.
+                ++stats.cursor_dropped;
+                return;
+            }
+            ++stats.cursor_errors;
+            if (stats.cursor_errors <= 3) {
+                log("cursor send failed: " + sent.to_string());
+            }
+            return;
+        }
+        ++stats.cursor_sent;
+        if (new_shape) {
+            ++stats.cursor_shapes;
+            stats.cursor_bytes += update.sprite.size();
+        }
+        cursor_sent = std::move(update);
+        cursor_sent_once = true;
     };
 
     auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
@@ -707,6 +886,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         drain_peer();
         return clean;
     }
+    publish_cursor();
 
     while (!stopping_.load()) {
         const auto now = Clock::now();
@@ -714,6 +894,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
         }
+        drain_audio();
         drain_peer();
         poll_clipboard(now);
         if (now - last_link_sample >= std::chrono::seconds(1)) {
@@ -769,6 +950,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
         const CaptureResult result = capturer->capture(std::chrono::milliseconds(100));
         const auto captured_at = Clock::now();
+        // The endpoint keeps producing while capture waits for the next
+        // present; drain here so audio does not wait behind a slow frame.
+        drain_audio();
         switch (result) {
             case CaptureResult::NoNewFrame:
                 continue;
@@ -817,7 +1001,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             const std::vector<DisplayInfo> refreshed = enumerate_displays();
             stream_info =
                 describe_stream(refreshed, capturer->display(), *encoder, settings_.framerate,
-                                settings_.allow_clipboard);
+                                settings_.allow_clipboard, audio_info);
             publish_stream(stream_info, find_display(refreshed, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {
@@ -849,6 +1033,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             drain_peer();
             return clean;
         }
+        publish_cursor();
     }
 
     drain_peer();

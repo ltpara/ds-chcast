@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -144,6 +145,14 @@ void test_hello_ack() {
     portrait.bottom = 1920;
     portrait.rotation_degrees = 90;
     sent.displays = {primary, portrait};
+    sent.audio.enabled = true;
+    sent.audio.codec = chast::AudioCodec::AAC;
+    sent.audio.sample_rate = 48000;
+    sent.audio.channels = 2;
+    sent.audio.bitrate = 160000;
+    sent.audio.frame_samples = chast::kAudioFrameSamples;
+    // AudioSpecificConfig for AAC-LC 48 kHz stereo.
+    sent.audio.extradata = {0x11, 0x90};
 
     chast::ServerInfo got;
     std::string error;
@@ -171,10 +180,22 @@ void test_hello_ack() {
                   got.displays[1].rotation_degrees == 90 && !got.displays[1].primary,
               "HelloAck keeps a rotated display with a negative origin");
     }
+    check(got.audio.enabled && got.audio.codec == chast::AudioCodec::AAC &&
+              got.audio.sample_rate == sent.audio.sample_rate &&
+              got.audio.channels == sent.audio.channels &&
+              got.audio.bitrate == sent.audio.bitrate &&
+              got.audio.frame_samples == sent.audio.frame_samples &&
+              got.audio.extradata == sent.audio.extradata,
+          "HelloAck keeps the audio description and decoder config");
 
     auto ack_payload = [&] { return payload_of(chast::make_hello_ack(sent)); };
     const size_t display_count_at = 24 + sent.encoder.size();
     const size_t first_display_at = display_count_at + 2;
+    size_t display_bytes = 0;
+    for (const chast::DisplayDescription& display : sent.displays) {
+        display_bytes += 22 + display.name.size();
+    }
+    const size_t audio_at = first_display_at + display_bytes;
     auto rejects_ack = [&](std::vector<uint8_t> payload, const char* what) {
         chast::ServerInfo dropped;
         check(!chast::parse_hello_ack(payload, dropped, &error), what);
@@ -196,16 +217,56 @@ void test_hello_ack() {
     std::vector<uint8_t> unknown_flags = ack_payload();
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
-    unknown_flags[kFlagsAt] = 0x04;
+    unknown_flags[kFlagsAt] = 0x08;
     unknown_flags[kFlagsAt + 1] = 0;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
+    std::vector<uint8_t> no_audio = ack_payload();
+    no_audio.resize(audio_at);
+    rejects_ack(std::move(no_audio), "a HelloAck without the audio description is rejected");
+    std::vector<uint8_t> audio_flag_only = ack_payload();
+    audio_flag_only[kFlagsAt] = 0x03;  // input and clipboard, no audio
+    rejects_ack(std::move(audio_flag_only),
+                "a HelloAck whose audio flag disagrees with its block is rejected");
+    std::vector<uint8_t> audio_block_only = ack_payload();
+    audio_block_only[audio_at] = 0;
+    rejects_ack(std::move(audio_block_only),
+                "a HelloAck that announces audio without the flag is rejected");
+    std::vector<uint8_t> unknown_audio_codec = ack_payload();
+    unknown_audio_codec[audio_at + 1] = 2;
+    rejects_ack(std::move(unknown_audio_codec),
+                "a HelloAck with an unknown audio codec is rejected");
+    std::vector<uint8_t> no_extradata = ack_payload();
+    no_extradata[audio_at + 14] = 0;
+    no_extradata[audio_at + 15] = 0;
+    rejects_ack(std::move(no_extradata),
+                "a HelloAck that announces audio without its config is rejected");
+    std::vector<uint8_t> long_extradata = ack_payload();
+    long_extradata[audio_at + 14] = static_cast<uint8_t>(chast::kMaxAudioExtradata + 1);
+    long_extradata[audio_at + 15] = 0;
+    rejects_ack(std::move(long_extradata),
+                "a HelloAck with an oversized audio config is rejected");
+    std::vector<uint8_t> bad_audio_frame = ack_payload();
+    bad_audio_frame[audio_at + 4] = 0;
+    bad_audio_frame[audio_at + 5] = 0;
+    rejects_ack(std::move(bad_audio_frame),
+                "a HelloAck with an unsupported audio frame length is rejected");
+    std::vector<uint8_t> bad_audio_rate = ack_payload();
+    bad_audio_rate[audio_at + 6] = 0;
+    bad_audio_rate[audio_at + 7] = 0;
+    bad_audio_rate[audio_at + 8] = 0;
+    bad_audio_rate[audio_at + 9] = 0;
+    rejects_ack(std::move(bad_audio_rate), "a HelloAck with a bad audio rate is rejected");
+
     sent.input_enabled = false;
     sent.clipboard_enabled = false;
+    sent.audio.enabled = false;
+    sent.audio.extradata.clear();
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
-              !disabled.input_enabled && !disabled.clipboard_enabled,
-          "HelloAck reports input and clipboard disabled");
+              !disabled.input_enabled && !disabled.clipboard_enabled &&
+              !disabled.audio.enabled,
+          "HelloAck reports input, clipboard and audio disabled");
 }
 
 void test_frame_header() {
@@ -254,6 +315,153 @@ void test_frame_header() {
           "FrameHeader from another protocol version is rejected");
     check(!chast::decode_frame_header(bytes, chast::kFrameHeaderSize - 1, got, &error),
           "a short FrameHeader is rejected");
+}
+
+void test_audio_header() {
+    chast::AudioHeader sent;
+    sent.seq = 0x1122334455667788ull;
+    sent.pts_ms = 987654;
+    sent.capture_ms = 0x0000123456789ABCull;
+    sent.payload_size = 411;
+    sent.payload_crc32 = 0xBEEF1234;
+    sent.sample_rate = 48000;
+    sent.frame_samples = chast::kAudioFrameSamples;
+    sent.channels = 2;
+    sent.codec = chast::AudioCodec::AAC;
+
+    uint8_t bytes[chast::kAudioHeaderSize]{};
+    chast::encode_audio_header(sent, bytes);
+    check(sizeof(bytes) == 48, "AudioHeader is 48 bytes");
+    check(std::memcmp(bytes, "CAUD", 4) == 0, "AudioHeader starts with the audio magic");
+    chast::AudioHeader got;
+    std::string error;
+    const bool decoded = chast::decode_audio_header(bytes, sizeof(bytes), got, &error);
+    check(decoded, "AudioHeader round-trips");
+    if (decoded) {
+        check(got.seq == sent.seq && got.pts_ms == sent.pts_ms &&
+                  got.capture_ms == sent.capture_ms,
+              "AudioHeader keeps its timestamps");
+        check(got.payload_size == sent.payload_size &&
+                  got.payload_crc32 == sent.payload_crc32,
+              "AudioHeader keeps its payload description");
+        check(got.sample_rate == sent.sample_rate && got.frame_samples == sent.frame_samples &&
+                  got.channels == sent.channels && got.codec == sent.codec,
+              "AudioHeader keeps the audio format");
+    }
+
+    sent.capture_ms = 0xFFFFFFFFFFFFFFFFull;
+    chast::encode_audio_header(sent, bytes);
+    check(chast::decode_audio_header(bytes, sizeof(bytes), got, &error) &&
+              got.capture_ms == 0xFFFFFFFFFFFFull,
+          "AudioHeader masks the capture time to 48 bits");
+    sent.capture_ms = 0x0000123456789ABCull;
+    chast::encode_audio_header(sent, bytes);
+
+    auto set_u32 = [](std::vector<uint8_t>& header, size_t at, uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+            header[at + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    auto rejects_header = [&](std::vector<uint8_t> header, const char* what) {
+        chast::AudioHeader dropped;
+        check(!chast::decode_audio_header(header.data(), header.size(), dropped, &error), what);
+    };
+    const std::vector<uint8_t> wire(bytes, bytes + sizeof(bytes));
+    std::vector<uint8_t> bad_magic = wire;
+    bad_magic[0] = 'X';
+    rejects_header(std::move(bad_magic), "an AudioHeader with bad magic is rejected");
+    std::vector<uint8_t> old_version = wire;
+    old_version[4] = static_cast<uint8_t>(chast::kProtocolVersion - 1);
+    old_version[5] = 0;
+    rejects_header(std::move(old_version),
+                   "an AudioHeader from another protocol version is rejected");
+    std::vector<uint8_t> bad_flags = wire;
+    bad_flags[6] = 1;
+    rejects_header(std::move(bad_flags), "an AudioHeader with unknown flags is rejected");
+    std::vector<uint8_t> no_payload = wire;
+    set_u32(no_payload, 32, 0);
+    rejects_header(std::move(no_payload), "an AudioHeader without a payload is rejected");
+    std::vector<uint8_t> huge_payload = wire;
+    set_u32(huge_payload, 32, chast::kMaxAudioPayload + 1);
+    rejects_header(std::move(huge_payload), "an oversized audio payload is rejected");
+    std::vector<uint8_t> bad_rate = wire;
+    set_u32(bad_rate, 40, 4000);
+    rejects_header(std::move(bad_rate), "an AudioHeader with an unsupported rate is rejected");
+    std::vector<uint8_t> bad_frame = wire;
+    bad_frame[44] = 0;
+    bad_frame[45] = 0;
+    rejects_header(std::move(bad_frame), "an AudioHeader with an empty frame is rejected");
+    std::vector<uint8_t> bad_channels = wire;
+    bad_channels[46] = 3;
+    rejects_header(std::move(bad_channels),
+                   "an AudioHeader with an unsupported channel count is rejected");
+    check(!chast::decode_audio_header(bytes, chast::kAudioHeaderSize - 1, got, &error),
+          "a short AudioHeader is rejected");
+}
+
+void test_audio_parser() {
+    chast::AudioHeader sent;
+    sent.seq = 9;
+    sent.pts_ms = 160;
+    sent.capture_ms = 0x1234;
+    sent.sample_rate = 48000;
+    sent.frame_samples = chast::kAudioFrameSamples;
+    sent.channels = 2;
+    const std::vector<uint8_t> body = {0xDE, 0xAD, 0xBE, 0xEF};
+    sent.payload_size = static_cast<uint32_t>(body.size());
+    sent.payload_crc32 = chast::crc32(body.data(), body.size());
+    std::vector<uint8_t> packet(chast::kAudioHeaderSize + body.size());
+    chast::encode_audio_header(sent, packet.data());
+    std::memcpy(packet.data() + chast::kAudioHeaderSize, body.data(), body.size());
+
+    chast::AudioParser parser;
+    std::string error;
+    chast::AudioHeader got;
+    const uint8_t* payload = nullptr;
+    bool split_ok = true;
+    // Feed all but the last header byte one at a time.
+    for (size_t i = 0; i + 1 < chast::kAudioHeaderSize && split_ok; ++i) {
+        split_ok = parser.push(packet.data() + i, 1, &error) &&
+                   parser.next(got, &payload, &error) ==
+                       chast::AudioParser::Status::Incomplete;
+    }
+    check(split_ok, "a byte-at-a-time audio header waits for the rest");
+    check(parser.push(packet.data() + chast::kAudioHeaderSize - 1,
+                      packet.size() - (chast::kAudioHeaderSize - 1), &error),
+          "the rest of a split audio packet is accepted");
+    check(parser.next(got, &payload, &error) == chast::AudioParser::Status::Packet &&
+              got.seq == sent.seq && got.payload_size == body.size() &&
+              std::memcmp(payload, body.data(), body.size()) == 0,
+          "a split audio packet is reassembled intact");
+    parser.consume();
+    check(parser.buffered() == 0, "consuming a packet empties the audio parser");
+
+    chast::AudioParser pair;
+    std::vector<uint8_t> two = packet;
+    two.insert(two.end(), packet.begin(), packet.end());
+    check(pair.push(two.data(), two.size(), &error), "two audio packets in one chunk are accepted");
+    int packets = 0;
+    bool payloads_match = true;
+    while (pair.next(got, &payload, &error) == chast::AudioParser::Status::Packet) {
+        ++packets;
+        payloads_match = payloads_match &&
+                         std::memcmp(payload, body.data(), body.size()) == 0;
+        pair.consume();
+    }
+    check(packets == 2 && payloads_match, "both audio packets are yielded in order");
+
+    chast::AudioParser corrupt;
+    std::vector<uint8_t> damaged = packet;
+    damaged[0] = 'X';
+    check(corrupt.push(damaged.data(), damaged.size(), &error),
+          "a damaged audio packet reaches the parser");
+    check(corrupt.next(got, &payload, &error) == chast::AudioParser::Status::Error,
+          "a damaged audio packet is reported as an error");
+
+    chast::AudioParser flooded;
+    std::vector<uint8_t> junk(4u * 1024u * 1024u + 1, 0);
+    check(!flooded.push(junk.data(), junk.size(), &error),
+          "an audio stream buffer past the limit is rejected");
 }
 
 void test_latency_probe() {
@@ -335,6 +543,76 @@ void test_clipboard() {
           "a truncated ClipboardUpdate is rejected");
 }
 
+void test_cursor_update() {
+    std::string error;
+    chast::CursorUpdate update;
+    update.visible = true;
+    update.x = 1280;
+    update.y = -40;
+    update.hotspot_x = 3;
+    update.hotspot_y = 5;
+    update.width = 8;
+    update.height = 6;
+    update.shape_id = 0x1F2E3D4C5B6A7980ull & ((1ull << 53) - 1);
+    update.sprite.assign(static_cast<size_t>(update.width) * update.height * 4u, 0x40);
+    const std::vector<uint8_t> message = chast::make_cursor_update(update);
+    check(message.size() == chast::kControlHeaderSize + 26 + update.sprite.size(),
+          "CursorUpdate carries a fixed header and the sprite");
+    check(message.size() > 7 &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::CursorUpdate),
+          "CursorUpdate names its control type");
+    chast::CursorUpdate got;
+    check(chast::parse_cursor_update(payload_of(message), got, &error) &&
+              got.visible && got.x == 1280 && got.y == -40 && got.hotspot_x == 3 &&
+              got.hotspot_y == 5 && got.shape_id == update.shape_id &&
+              got.width == 8 && got.height == 6 && got.sprite == update.sprite,
+          "CursorUpdate round-trips the sprite and the position");
+
+    chast::CursorUpdate moved = update;
+    moved.sprite.clear();
+    moved.x = 4;
+    const std::vector<uint8_t> move_message = chast::make_cursor_update(moved);
+    check(move_message.size() == chast::kControlHeaderSize + 26,
+          "a position-only CursorUpdate carries no image");
+    check(chast::parse_cursor_update(payload_of(move_message), got, &error) && got.sprite.empty() &&
+              got.x == 4 && got.width == 8,
+          "a position-only CursorUpdate round-trips the shape id and size");
+
+    chast::CursorUpdate hidden;
+    check(chast::parse_cursor_update(
+              payload_of(chast::make_cursor_update(hidden)), got, &error) &&
+              !got.visible && got.shape_id == 0 && got.width == 0,
+          "a hidden CursorUpdate round-trips");
+
+    chast::CursorUpdate bad = update;
+    bad.sprite.pop_back();
+    check(chast::make_cursor_update(bad).empty(),
+          "a sprite that does not match its size is not encoded");
+    bad = update;
+    bad.shape_id = 0;
+    check(chast::make_cursor_update(bad).empty(), "a sprite without an id is not encoded");
+    bad = update;
+    bad.width = chast::kMaxCursorSize + 1;
+    check(chast::make_cursor_update(bad).empty(), "an oversized sprite is not encoded");
+
+    std::vector<uint8_t> payload;
+    payload.resize(12);
+    check(!chast::parse_cursor_update(payload, got, &error),
+          "a truncated CursorUpdate is rejected");
+    payload = payload_of(chast::make_cursor_update(update));
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    check(!chast::parse_cursor_update(trailing, got, &error),
+          "a CursorUpdate with trailing bytes is rejected");
+    payload[1] = 2;
+    check(!chast::parse_cursor_update(payload, got, &error),
+          "a CursorUpdate with unknown flags is rejected");
+    payload[1] = 0;
+    payload[10] = 9;  // hotspot_x past an 8-pixel-wide sprite
+    check(!chast::parse_cursor_update(payload, got, &error),
+          "a hotspot outside the sprite is rejected");
+}
+
 void test_stream_info() {
     chast::ServerInfo sent;
     sent.codec = chast::VideoCodec::H264;
@@ -350,6 +628,9 @@ void test_stream_info() {
     display.right = 3200;
     display.bottom = 720;
     sent.displays = {display};
+    sent.audio.enabled = true;
+    sent.audio.bitrate = 160000;
+    sent.audio.extradata = {0x11, 0x90};
 
     const std::vector<uint8_t> hello_ack = chast::make_hello_ack(sent);
     const std::vector<uint8_t> stream_info = chast::make_stream_info(sent);
@@ -369,7 +650,16 @@ void test_stream_info() {
         check(got.origin_x == sent.origin_x && got.displays.size() == 1 &&
                   got.displays[0].left == 1920,
               "StreamInfo carries the new origin and display list");
+        check(got.audio.enabled && got.audio.extradata == sent.audio.extradata,
+              "StreamInfo carries the audio description");
     }
+
+    sent.audio.enabled = false;
+    sent.audio.extradata.clear();
+    chast::ServerInfo muted;
+    check(chast::parse_hello_ack(payload_of(chast::make_stream_info(sent)), muted, &error) &&
+              !muted.audio.enabled,
+          "StreamInfo can turn audio off mid-session");
 }
 
 void test_identity() {
@@ -729,8 +1019,11 @@ int main(int argc, char** argv) {
     test_access_denied();
     test_hello_ack();
     test_frame_header();
+    test_audio_header();
+    test_audio_parser();
     test_latency_probe();
     test_clipboard();
+    test_cursor_update();
     test_stream_info();
     test_input_events();
     test_identity();

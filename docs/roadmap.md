@@ -154,11 +154,33 @@
   - 验证（2026-10-22，单机回环）：`chast-quic verify` 57 项断言全过（含 8 项剪贴板断言与关闭闸门探针：主机/查看者各收 1 条、各发 1 条、内容逐字相等、计数为 1 证明无回声），145 个访问单元；真实 Win32 剪贴板双向实测（主机→查看者、`connect --send-clipboard`→主机各一次）；`ctest -C Release` 6/6、`flutter analyze`、53 项 `flutter test`、`flutter build windows --release`、`go vet`/`go test` 全部通过。
   - 设计取舍：复用可靠有序的控制流而不新开流；两端都以“变化”为准并轮询而非剪贴板监听链，换取两端一致与简单，代价最多 500 ms 延迟；畸形消息计入传输错误但不关闭会话，避免剪贴板拖垮视频。
   - 已知限制：只同步纯文本，图片/文件/HTML 与历史记录不在范围；超过 256 KiB 的文本静默不同步（待分片）；快速连续复制只保留最后一次稳定文本；Windows 以外的剪贴板后端未实现；未做真实鼠标操作的复制粘贴人工验收，Win32 路径由真实回环与 PowerShell 读写覆盖。
+- 已完成：系统声音单向传输 M5.2（`docs/m5.2-plan.md`）。
+  - 协议 v10：新增 48 字节 `AudioHeader`（`CAUD` magic、独立序号、`pts_ms`/`capture_ms`、载荷 CRC32、采样率/帧长/声道/codec）与 `AudioParser`；`ServerInfo` 在显示器列表后追加音频参数块，flags bit2 公告可用，extradata 上限 64 字节；HelloAck 与 StreamInfo 逐字节相同。
+  - 传输：主机在 `announce()` 时按闸门打开第二条单向流，查看者按首 4 字节 magic 分类，不依赖开流顺序；音频发送使用非阻塞路径，队列满只丢音频包并计数，不阻塞视频；闸门关闭时 `send_audio` 返回 `InvalidCall`。
+  - 采集与编码：WASAPI loopback 共享模式 + 事件回调，设备混音格式统一重采样/下混到 48 kHz 立体声 s16；FFmpeg 原生 AAC-LC（48 kHz、160 kbps、1024 样本/帧，静态链接）；采集/编码在独立线程按设备节奏运行，主机循环只负责 drain 与发送。
+  - 播放：查看者 AAC 解码后按“主机 capture_ms − 时钟偏移 + 80 ms lead”排程，WASAPI 共享渲染；端点缓冲深度计入提前量，启动时以静音铺垫 lead、并允许提前一个端点缓冲提交；欠载补静音，陈旧块丢弃，缓冲/欠载/丢块进遥测与浮层。
+  - 降级：启动时打不开设备或采集/编码终端失败只关闭音频并通过 `StreamInfo(audio.enabled=false)` 重公告，视频继续；运行中端点失效或默认输出变化原地跟随新默认端点恢复，不中断音频流；查看者协议错误的音频包只计数并丢弃。
+  - 设置与 UI：`host.ini` 新增 `audio=0/1`（默认开），托盘“共享系统声音”复选与菜单随设置持久化；查看者工具栏扬声器按钮切换静音，浮层显示音频格式、缓冲、收包与欠载（恢复期间显示“设备恢复中”，恢复次数随遥测显示），静音时显示“已静音”。
+  - 验证（2026-10-22，单机回环）：`chast-quic verify` 72 项断言全过（含 14 项音频断言 + 关闭闸门探针），151 个访问单元；真实 WASAPI 采集 25 s 为 1170 包/24.94 s、零丢包零错误、RMS 574；真实 WASAPI 渲染 20 s 为 `played=948224 frames underruns=1 dropped=9`、收包 936/19.95 s、零 CRC/解码/序号错误；`ctest -C Release` 7/7、`flutter analyze`、57 项 `flutter test`、`flutter build windows --release`、`go vet`/`go test` 全部通过。
+  - 设计取舍：独立单向流避免音频被大视频帧队头阻塞；固定 48 kHz 立体声上行让线上格式与设备解耦，端点切换无需重新协商；AAC-LC 复用静态 FFmpeg，零新增运行时依赖；采集线程与视频循环解耦；时间线统一用主机 steady_clock，与视频帧龄、LatencyReply 同一时钟域。
+  - Windows 健壮性补强（2026-10-22）：连续数字静音超过 2 s 停止编码（`gates` 遥测）；采集/播放起播、欠载与门控恢复后 5 ms 线性淡入；采集与播放每秒检查默认端点，失效或变化时原地重开并重试，`recoveries`/`recovering` 进遥测与 `chast-quic` 输出；修复 `push()` 与端点重建的格式竞争及静音的跨线程 COM 调用。
+  - 补强验证：`ctest` 7/7；`verify` 72 项断言全过；数字静音 6 s 回环 `gates=2`、静音期间只编码约 2 s、收包 654/13.93 s 且零 CRC/解码/序号错误；真实播放 12 s 为 `played=668672 frames underruns=1 dropped=1 recoveries=0`。
+  - 已知限制：单机回环无真实网络抖动；AAC + 80 ms 抖动缓冲相对视频晚约 50–100 ms，未做精细唇音校准；>2 声道下混为立体声；端点切换需改系统默认设备，单机无法触发，恢复路径仅代码审查；静音门控在“无声即不产包”的驱动上不会被触发（但本就没有流量）；托盘与浮层未做人工鼠标验收。
+- 已完成：远端指针（原生光标）M5.3（`docs/m5.3-plan.md`）。
+  - 问题：Desktop Duplication 不把指针画进桌面纹理，捕获侧虽然早已解码并缓存指针形状（`CursorDecoder` + `cursor_content_id`），却没有任何通路把它送到查看者；查看者远程控制时又设了 `SystemMouseCursors.none`，于是远程指针完全不可见。
+  - 协议 v11：新增 `CursorUpdate = 13`（服务端→客户端），26 字节定长头（visible / x / y / 热点 / 53 位 shape_id / 宽高）+ 可选预乘 BGRA 精灵；解析拒绝截断、>256 px、未知 flags、尺寸不符、尾随字节与热点越界。
+  - 传输：`QuicSession::send_cursor` 走控制流且非阻塞（队列满即丢并计数，绝不拖慢视频），`take_cursor_update` 采用“最新覆盖”而不是排队；主机按 `content_id` 去重，只有新形状才带精灵，位置/可见性不变则完全不发。
+  - 查看者：新增 `RemoteCursor`（`CreateDIBSection` + 按 **alpha** 生成 AND 掩码 + `CreateIconIndirect`，`DestroyCursor` 释放），通过 `WM_SETCURSOR(HTCLIENT)` 安装为系统光标——由 OS 在硬件光标频率合成，不落后、不漂移；精灵按“绘制比例 × 设备像素比”缩放，1/4 步进量化并缓存 (形状, 比例) 句柄，形状表上界 64、每形状句柄上界 12。
+  - 分层：精灵不经过 Dart。`ViewerStatus` 只增加 `cursorUpdates`/`cursorPending`；`ViewerEngine::TakeCursor` 由原生桥接每 200 ms 直接取走，Dart 只提供 `enabled` 与 `scaleMilli`。
+  - 验证（2026-10-22，单机）：`chast-protocol-test` 新增约 10 项 CursorUpdate 断言、新增 `chast-remote-cursor-test`（缩放量化、注册校验、句柄复用、越界缩放、容量淘汰）均通过；`ctest --test-dir build -C Release` 8/8、`flutter analyze` 无问题、`flutter test` 59 项全过、`flutter build windows` 成功。
+  - 设计取舍：安装系统光标而非在视频上叠画精灵（远程控制时位置由本地手决定，只有系统光标能做到同频）；掩码取自 alpha 而非黑色像素（Flutter 引擎自带的 `createCustomCursor/windows` 会把描边指针的黑边当透明抠掉，`flutter_custom_cursor` 0.0.4 的 Windows 实现是硬编码示例图的桩，均不可用）。
+  - 已知限制：本机默认没有可见硬件指针（`GetCursorInfo` 为 `flags=0, hCursor=0`），用 `ShowCursor(TRUE)` 强制显示后回环得到 `sender: cursor sent=257 shapes=15 bytes=64080 dropped=0` 与 `receiver: cursor updates=229 shapes=11 visible=1`，`chast-capture --cursor` 导出 `32x32 color` 精灵；但**查看者窗口内肉眼可见的指针仍需一台有物理鼠标的机器人工确认**（安装器已由 `GetIconInfo` 验证到 64×64 与热点 (6,10)）；仅实现 Windows 查看者路径。
 
 ## M5 后续（未开始）
 
 - 分辨率/帧率自适应与弱网 QoS 扩展。
-- 音频、文件传输。
+- 文件传输。
+- 音频质量调优：唇音同步校准、设备热切换、音频计入拥塞预算、麦克风/双向语音。
 - 更多采集/编码后端与其他平台。
 
 ## 推进原则

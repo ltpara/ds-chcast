@@ -9,10 +9,12 @@ namespace chast {
 namespace {
 
 constexpr char kFrameMagic[4] = {'C', 'F', 'R', 'M'};
+constexpr char kAudioMagic[4] = {'C', 'A', 'U', 'D'};
 constexpr char kControlMagic[4] = {'C', 'C', 'T', 'L'};
 // A single receive buffer holding more than this without yielding a frame
 // means the peer is not speaking the protocol.
 constexpr size_t kMaxFrameBuffer = 64u * 1024u * 1024u;
+constexpr size_t kMaxAudioBuffer = 4u * 1024u * 1024u;
 constexpr size_t kMaxControlBuffer = 4u * 1024u * 1024u;
 constexpr size_t kMaxDisplays = kMaxDisplayCount;
 
@@ -146,6 +148,15 @@ public:
         return true;
     }
 
+    bool bytes(std::vector<uint8_t>& value, size_t size) {
+        if (remaining() < size) {
+            return false;
+        }
+        value.assign(cursor_, cursor_ + size);
+        cursor_ += size;
+        return true;
+    }
+
     bool at_end() const { return cursor_ == end_; }
     size_t remaining() const { return static_cast<size_t>(end_ - cursor_); }
 
@@ -183,6 +194,22 @@ bool codec_from_wire(uint8_t value, VideoCodec& codec) {
         return true;
     }
     return false;
+}
+
+uint8_t audio_codec_wire(AudioCodec codec) {
+    return codec == AudioCodec::AAC ? 1 : 0;
+}
+
+bool audio_codec_from_wire(uint8_t value, AudioCodec& codec) {
+    if (value == 1) {
+        codec = AudioCodec::AAC;
+        return true;
+    }
+    return false;
+}
+
+bool valid_audio_rate(uint32_t rate) {
+    return rate >= 8000 && rate <= 96000;
 }
 
 void set_error(std::string* error, const std::string& message) {
@@ -281,6 +308,84 @@ bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
     return true;
 }
 
+void encode_audio_header(const AudioHeader& header, uint8_t out[kAudioHeaderSize]) {
+    uint8_t* cursor = out;
+    std::memcpy(cursor, kAudioMagic, sizeof(kAudioMagic));
+    cursor += sizeof(kAudioMagic);
+    put_u16(cursor, kProtocolVersion);
+    put_u16(cursor, 0);
+    put_u64(cursor, header.seq);
+    put_u64(cursor, header.pts_ms);
+    const uint64_t capture_ms = header.capture_ms & 0xFFFFFFFFFFFFull;
+    put_u64(cursor, capture_ms);
+    put_u32(cursor, header.payload_size);
+    put_u32(cursor, header.payload_crc32);
+    put_u32(cursor, header.sample_rate);
+    put_u16(cursor, header.frame_samples);
+    put_u8(cursor, static_cast<uint8_t>(header.channels));
+    put_u8(cursor, audio_codec_wire(header.codec));
+}
+
+bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
+                         std::string* error) {
+    if (size < kAudioHeaderSize) {
+        set_error(error, "short audio header");
+        return false;
+    }
+    if (std::memcmp(data, kAudioMagic, sizeof(kAudioMagic)) != 0) {
+        set_error(error, "bad audio magic");
+        return false;
+    }
+    Reader reader(data + sizeof(kAudioMagic), size - sizeof(kAudioMagic));
+    uint16_t version = 0;
+    uint16_t flags = 0;
+    uint8_t channels = 0;
+    uint8_t codec = 0;
+    if (!reader.u16(version) || !reader.u16(flags) || !reader.u64(header.seq) ||
+        !reader.u64(header.pts_ms) || !reader.u64(header.capture_ms) ||
+        !reader.u32(header.payload_size) || !reader.u32(header.payload_crc32) ||
+        !reader.u32(header.sample_rate) || !reader.u16(header.frame_samples) ||
+        !reader.u8(channels) || !reader.u8(codec)) {
+        set_error(error, "truncated audio header");
+        return false;
+    }
+    header.channels = channels;
+    if (version != kProtocolVersion) {
+        set_error(error, "unsupported audio protocol version " + std::to_string(version));
+        return false;
+    }
+    if (flags != 0) {
+        set_error(error, "audio header carries unknown flags");
+        return false;
+    }
+    if (!audio_codec_from_wire(codec, header.codec)) {
+        set_error(error, "unknown audio codec " + std::to_string(codec));
+        return false;
+    }
+    header.capture_ms &= 0xFFFFFFFFFFFFull;
+    if (header.payload_size == 0 || header.payload_size > kMaxAudioPayload) {
+        set_error(error, "audio payload size " + std::to_string(header.payload_size) +
+                             " outside the protocol limit");
+        return false;
+    }
+    if (!valid_audio_rate(header.sample_rate)) {
+        set_error(error, "audio sample rate " + std::to_string(header.sample_rate) +
+                             " is not supported");
+        return false;
+    }
+    if (header.channels != 1 && header.channels != 2) {
+        set_error(error, "audio header has " + std::to_string(header.channels) +
+                             " channels");
+        return false;
+    }
+    if (header.frame_samples == 0 || header.frame_samples > 8192) {
+        set_error(error, "audio frame length " + std::to_string(header.frame_samples) +
+                             " is outside the protocol limit");
+        return false;
+    }
+    return true;
+}
+
 std::vector<uint8_t> make_hello(uint16_t display, const std::string& access_token) {
     const size_t token_size =
         access_token.size() > kMaxAccessTokenLength ? kMaxAccessTokenLength
@@ -368,7 +473,13 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (display_count > kMaxDisplays) {
         display_count = kMaxDisplays;
     }
-    size_t size = 24 + info.encoder.size() + 2;
+    size_t extradata_size = info.audio.extradata.size();
+    if (extradata_size > kMaxAudioExtradata) {
+        extradata_size = kMaxAudioExtradata;
+    }
+    // 24 fixed bytes, the encoder name, the display count, the displays, then
+    // the 16-byte audio description and its AudioSpecificConfig.
+    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size;
     for (size_t i = 0; i < display_count; ++i) {
         size += kDisplayFixedSize + info.displays[i].name.size();
     }
@@ -382,9 +493,10 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     put_u32(cursor, info.bitrate);
     put_u32(cursor, static_cast<uint32_t>(info.origin_x));
     put_u32(cursor, static_cast<uint32_t>(info.origin_y));
-    put_u16(cursor, static_cast<uint16_t>((info.input_enabled ? kServerInfoInputEnabled : 0) |
-                                          (info.clipboard_enabled ? kServerInfoClipboardEnabled
-                                                                  : 0)));
+    put_u16(cursor, static_cast<uint16_t>(
+                        (info.input_enabled ? kServerInfoInputEnabled : 0) |
+                        (info.clipboard_enabled ? kServerInfoClipboardEnabled : 0) |
+                        (info.audio.enabled ? kServerInfoAudioEnabled : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -400,6 +512,17 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
         put_u32(cursor, static_cast<uint32_t>(display.bottom));
         put_u16(cursor, display.rotation_degrees);
         put_u16(cursor, display.primary ? 1 : 0);
+    }
+    put_u8(cursor, info.audio.enabled ? 1 : 0);
+    put_u8(cursor, audio_codec_wire(info.audio.codec));
+    put_u16(cursor, info.audio.channels);
+    put_u16(cursor, info.audio.frame_samples);
+    put_u32(cursor, info.audio.sample_rate);
+    put_u32(cursor, info.audio.bitrate);
+    put_u16(cursor, static_cast<uint16_t>(extradata_size));
+    if (extradata_size > 0) {
+        std::memcpy(cursor, info.audio.extradata.data(), extradata_size);
+        cursor += extradata_size;
     }
     return payload;
 }
@@ -437,6 +560,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
     info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
+    const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
@@ -506,6 +630,57 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
             return false;
         }
         info.displays.push_back(std::move(display));
+    }
+    uint8_t audio_enabled = 0;
+    uint8_t audio_codec = 0;
+    uint16_t extradata_size = 0;
+    info.audio = AudioInfo{};
+    if (!reader.u8(audio_enabled) || !reader.u8(audio_codec) ||
+        !reader.u16(info.audio.channels) || !reader.u16(info.audio.frame_samples) ||
+        !reader.u32(info.audio.sample_rate) || !reader.u32(info.audio.bitrate) ||
+        !reader.u16(extradata_size)) {
+        set_error(error, "HelloAck carries no audio description");
+        return false;
+    }
+    if ((audio_enabled != 0) != audio_flag) {
+        set_error(error, "HelloAck audio flag disagrees with its audio block");
+        return false;
+    }
+    info.audio.enabled = audio_flag;
+    if (!audio_codec_from_wire(audio_codec, info.audio.codec)) {
+        set_error(error, "HelloAck names unknown audio codec " + std::to_string(audio_codec));
+        return false;
+    }
+    if (info.audio.channels != 1 && info.audio.channels != 2) {
+        set_error(error, "HelloAck audio has " +
+                             std::to_string(info.audio.channels) + " channels");
+        return false;
+    }
+    if (!valid_audio_rate(info.audio.sample_rate)) {
+        set_error(error, "HelloAck audio sample rate " +
+                             std::to_string(info.audio.sample_rate) + " is not supported");
+        return false;
+    }
+    if (info.audio.frame_samples != kAudioFrameSamples) {
+        set_error(error, "HelloAck audio frame length " +
+                             std::to_string(info.audio.frame_samples) + " is not supported");
+        return false;
+    }
+    if (extradata_size > kMaxAudioExtradata || extradata_size > reader.remaining()) {
+        set_error(error, "HelloAck audio config overruns the message");
+        return false;
+    }
+    if (info.audio.bitrate > 2000000u) {
+        set_error(error, "HelloAck audio bitrate is outside the protocol limit");
+        return false;
+    }
+    if (extradata_size > 0 && !reader.bytes(info.audio.extradata, extradata_size)) {
+        set_error(error, "HelloAck audio config is truncated");
+        return false;
+    }
+    if (info.audio.enabled && info.audio.extradata.empty()) {
+        set_error(error, "HelloAck announced audio without its decoder config");
+        return false;
     }
     return true;
 }
@@ -683,6 +858,102 @@ bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate
     return true;
 }
 
+// CursorUpdate: flags u8, reserved u8, x/y u32, hotspot u16 x2, shape id u64,
+// width/height u16 x2, then width*height*4 premultiplied BGRA bytes or none.
+constexpr size_t kCursorFixedSize = 1 + 1 + 4 + 4 + 2 + 2 + 8 + 2 + 2;
+
+std::vector<uint8_t> make_cursor_update(const CursorUpdate& update) {
+    if (update.width > kMaxCursorSize || update.height > kMaxCursorSize) {
+        return {};
+    }
+    const size_t pixels = static_cast<size_t>(update.width) * update.height;
+    // A sprite that does not fill the declared size is dropped rather than
+    // truncated: half an image is worse than none, and the viewer keeps the
+    // previous shape either way.
+    const bool has_sprite = !update.sprite.empty();
+    if (has_sprite && update.sprite.size() != pixels * 4u) {
+        return {};
+    }
+    if (has_sprite && update.shape_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(kCursorFixedSize + (has_sprite ? pixels * 4u : 0u));
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, update.visible ? 1 : 0);
+    put_u8(cursor, has_sprite ? 1 : 0);
+    put_u32(cursor, static_cast<uint32_t>(update.x));
+    put_u32(cursor, static_cast<uint32_t>(update.y));
+    put_u16(cursor, update.hotspot_x);
+    put_u16(cursor, update.hotspot_y);
+    put_u64(cursor, update.shape_id);
+    put_u16(cursor, update.width);
+    put_u16(cursor, update.height);
+    if (has_sprite) {
+        std::memcpy(cursor, update.sprite.data(), pixels * 4u);
+    }
+    return make_control(ControlType::CursorUpdate, payload);
+}
+
+bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& update,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t flags = 0;
+    uint8_t shape_flags = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint16_t hotspot_x = 0;
+    uint16_t hotspot_y = 0;
+    uint64_t shape_id = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    update = CursorUpdate{};
+    if (!reader.u8(flags) || !reader.u8(shape_flags) || !reader.u32(x) || !reader.u32(y) ||
+        !reader.u16(hotspot_x) || !reader.u16(hotspot_y) || !reader.u64(shape_id) ||
+        !reader.u16(width) || !reader.u16(height)) {
+        set_error(error, "truncated CursorUpdate");
+        return false;
+    }
+    if (width > kMaxCursorSize || height > kMaxCursorSize) {
+        set_error(error, "CursorUpdate sprite is " + std::to_string(width) + "x" +
+                             std::to_string(height));
+        return false;
+    }
+    if ((flags & ~1u) != 0 || (shape_flags & ~1u) != 0) {
+        set_error(error, "CursorUpdate has unknown flags");
+        return false;
+    }
+    update.visible = (flags & 1u) != 0;
+    update.x = static_cast<int32_t>(x);
+    update.y = static_cast<int32_t>(y);
+    update.hotspot_x = hotspot_x;
+    update.hotspot_y = hotspot_y;
+    update.shape_id = shape_id;
+    update.width = width;
+    update.height = height;
+    const size_t pixels = static_cast<size_t>(width) * height;
+    if ((shape_flags & 1u) != 0) {
+        if (pixels == 0 || !reader.bytes(update.sprite, pixels * 4u)) {
+            set_error(error, "CursorUpdate sprite is truncated");
+            return false;
+        }
+    } else if (update.shape_id != 0 && pixels == 0) {
+        set_error(error, "CursorUpdate names a shape without a size");
+        return false;
+    }
+    if (!reader.at_end()) {
+        set_error(error, "CursorUpdate carries trailing bytes");
+        return false;
+    }
+    // A hotspot outside the sprite means the two sides disagree on the
+    // geometry; refuse instead of drawing off-target.
+    if (width != 0 && height != 0 &&
+        (hotspot_x >= width || hotspot_y >= height)) {
+        set_error(error, "CursorUpdate hotspot lies outside the sprite");
+        return false;
+    }
+    return true;
+}
+
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> message(kControlHeaderSize + payload.size());
     uint8_t* cursor = message.data();
@@ -802,6 +1073,65 @@ void FrameParser::consume() {
         buffer_.clear();
         offset_ = 0;
     }
+}
+
+void FrameParser::reset() {
+    buffer_.clear();
+    offset_ = 0;
+    current_payload_ = 0;
+}
+
+bool AudioParser::push(const uint8_t* data, size_t size, std::string* error) {
+    if (!data || size == 0) {
+        return true;
+    }
+    if (offset_ == buffer_.size()) {
+        buffer_.clear();
+        offset_ = 0;
+    } else if (offset_ > 0 && offset_ >= 64u * 1024u) {
+        buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(offset_));
+        offset_ = 0;
+    }
+    buffer_.insert(buffer_.end(), data, data + size);
+    if (buffered() > kMaxAudioBuffer) {
+        set_error(error, "audio stream buffer overflow");
+        return false;
+    }
+    return true;
+}
+
+AudioParser::Status AudioParser::next(AudioHeader& header, const uint8_t** payload,
+                                      std::string* error) {
+    const size_t available = buffered();
+    if (available < kAudioHeaderSize) {
+        return Status::Incomplete;
+    }
+    const uint8_t* front = buffer_.data() + offset_;
+    if (!decode_audio_header(front, available, header, error)) {
+        return Status::Error;
+    }
+    const size_t total = kAudioHeaderSize + header.payload_size;
+    if (available < total) {
+        return Status::Incomplete;
+    }
+    *payload = front + kAudioHeaderSize;
+    current_payload_ = header.payload_size;
+    return Status::Packet;
+}
+
+void AudioParser::consume() {
+    offset_ += kAudioHeaderSize + current_payload_;
+    current_payload_ = 0;
+    if (offset_ == buffer_.size()) {
+        buffer_.clear();
+        offset_ = 0;
+    }
+}
+
+void AudioParser::reset() {
+    buffer_.clear();
+    offset_ = 0;
+    current_payload_ = 0;
 }
 
 }  // namespace chast

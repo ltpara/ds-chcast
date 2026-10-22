@@ -412,11 +412,3 @@ std::unique_ptr<IVideoDecoder> create_decoder(const DecoderConfig& config,
 }
 
 }  // namespace chast
-
-// FFmpeg's codec registry pulls in the QSV decoder object, which references
-// the QSV user-plugin loader even though this project never selects QSV. The
-// oneVPL dispatcher we link has no user-plugin support, so resolve the dead
-// reference with an unsupported stub.
-extern "C" int __cdecl MFXVideoUSER_Load(void*, const void*, unsigned int) {
-    return -3;  // MFX_ERR_UNSUPPORTED
-}

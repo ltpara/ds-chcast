@@ -34,6 +34,9 @@ struct HostSettings {
     // Sync plain-text clipboard changes in both directions. Off means the
     // HelloAck reports clipboard unavailable and the viewer stays silent.
     bool allow_clipboard = true;
+    // Send the system sound to the viewer. Off means no audio stream is
+    // opened and the HelloAck reports audio unavailable.
+    bool allow_audio = true;
     bool require_approval = true;
     HostTokenMode token_mode = HostTokenMode::OneTime;
     // Empty means "generate one on first start".

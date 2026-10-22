@@ -1,17 +1,24 @@
 #pragma once
 
-// The chast wire protocol, version 9.
+// The chast wire protocol, version 10.
 //
-// One QUIC connection carries two things:
+// One QUIC connection carries:
 //
 //   * a client-initiated bidirectional control stream (Hello / HelloAck,
-//     key-frame requests, input events, closing statistics), and
+//     key-frame requests, input events, clipboard text, closing statistics),
 //   * a server-initiated unidirectional video stream: a sequence of access
-//     units, each prefixed by a fixed FrameHeader.
+//     units, each prefixed by a fixed FrameHeader, and
+//   * when the host shares system audio, a second server-initiated
+//     unidirectional stream of AAC-LC access units, each prefixed by an
+//     AudioHeader.
 //
-// QUIC streams give the video reliable, ordered delivery; the sequence number
+// The two media streams are told apart by their packet magic, not by the order
+// the streams were opened: QUIC does not promise that the first bytes of a
+// later stream arrive after an earlier one. Video is `CFRM`, audio is `CAUD`.
+//
+// QUIC streams give the media reliable, ordered delivery; the sequence number
 // is still carried so the receiver can report gaps and so a future version can
-// move frames to independent streams or datagrams without changing the header.
+// move packets to independent streams or datagrams without changing the header.
 // Every payload carries a CRC32 because the transport is only part of the
 // pipeline: it catches assembly or ordering mistakes in this protocol, not
 // corruption on the wire.
@@ -30,15 +37,17 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 9;
+inline constexpr uint16_t kProtocolVersion = 11;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
 inline constexpr char kAlpn[] = "chast/1";
 
 inline constexpr size_t kFrameHeaderSize = 48;
+inline constexpr size_t kAudioHeaderSize = 48;
 inline constexpr size_t kControlHeaderSize = 12;
 inline constexpr uint32_t kMaxFramePayload = 32u * 1024u * 1024u;
+inline constexpr uint32_t kMaxAudioPayload = 64u * 1024u;
 inline constexpr uint32_t kMaxControlPayload = 1024u * 1024u;
 
 enum class ControlType : uint16_t {
@@ -81,6 +90,11 @@ enum class ControlType : uint16_t {
     // Peers only send text that differs from the baseline they last saw, which
     // keeps the update from echoing back to its origin.
     ClipboardUpdate = 12,
+    // The host's pointer as the viewer should draw it. The sprite travels once
+    // per shape; positions that reuse the same shape are 24 bytes. Sent only
+    // when the shape, the position or the visibility actually changed, so an
+    // idle pointer costs nothing. See CursorUpdate for the payload.
+    CursorUpdate = 13,
 };
 
 // ----- input -----
@@ -199,6 +213,63 @@ struct ClipboardUpdate {
     std::string text;
 };
 
+// ----- pointer -----
+//
+// The host draws its pointer itself (Desktop Duplication leaves it out of the
+// desktop image), so the viewer has to be told both the sprite and where it
+// is. The sprite only rides along when its id changes; a position-only update
+// is 26 bytes.
+
+inline constexpr uint16_t kMaxCursorSize = 256;
+
+struct CursorUpdate {
+    // The host's pointer is on the captured output and should be drawn. False
+    // while the host hides it (a full-screen video, an idle timer) or when it
+    // is over another output.
+    bool visible = false;
+    // `x`/`y` are in frame pixels, the same space the viewer's own pointer
+    // occupies: the sprite's top-left lands on them.
+    int32_t x = 0;
+    int32_t y = 0;
+    // The pixel inside the sprite that sits on (x, y).
+    uint16_t hotspot_x = 0;
+    uint16_t hotspot_y = 0;
+    // Identity of `sprite`; stable across revisits, so an id the viewer
+    // already has needs no image. Zero when no sprite is attached.
+    uint64_t shape_id = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    // Premultiplied BGRA, width*height*4 bytes. Empty when the update only
+    // moves a sprite the viewer already holds; `width`/`height` still
+    // describe it so the viewer can place a shape it does not have yet.
+    std::vector<uint8_t> sprite;
+};
+
+// ----- audio -----
+//
+// The host's system sound travels one way, on its own server-initiated stream.
+// Packet payloads are raw AAC-LC access units; the AudioSpecificConfig needed
+// to decode them rides in AudioInfo (HelloAck / StreamInfo) so the stream
+// itself needs no side channel.
+enum class AudioCodec : uint8_t {
+    AAC = 1,  // AAC-LC, raw access units
+};
+
+inline constexpr size_t kMaxAudioExtradata = 64;
+inline constexpr uint32_t kAudioFrameSamples = 1024;
+
+struct AudioInfo {
+    bool enabled = false;
+    AudioCodec codec = AudioCodec::AAC;
+    uint32_t sample_rate = 48000;
+    uint16_t channels = 2;
+    uint32_t bitrate = 0;  // bits per second, informational
+    uint16_t frame_samples = kAudioFrameSamples;
+    // AudioSpecificConfig. Empty when audio is disabled; the decoder needs it
+    // before the first packet.
+    std::vector<uint8_t> extradata;
+};
+
 struct FrameHeader {
     uint64_t seq = 0;
     // Presentation time relative to the host session's first stream. Ordering
@@ -218,12 +289,34 @@ struct FrameHeader {
     uint64_t capture_ms = 0;
 };
 
+// One compressed audio access unit. A media stream never mixes audio and
+// video packets: this header starts with its own magic so the receiver can
+// classify a server-initiated stream from its first bytes.
+struct AudioHeader {
+    uint64_t seq = 0;
+    // Presentation timestamp on the host session's timeline, same origin as
+    // FrameHeader::pts_ms. The viewer schedules PCM against it after
+    // correcting with the clock offset from LatencyReply.
+    uint64_t pts_ms = 0;
+    // Host steady_clock milliseconds at capture, low 48 bits, same clock as
+    // FrameHeader::capture_ms.
+    uint64_t capture_ms = 0;
+    uint32_t payload_size = 0;
+    uint32_t payload_crc32 = 0;
+    uint32_t sample_rate = 0;
+    uint16_t frame_samples = 0;  // decoded samples per channel
+    uint16_t channels = 0;
+    AudioCodec codec = AudioCodec::AAC;
+};
+
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents; bit 1 tells
-// it that both sides may exchange ClipboardUpdate messages.
+// it that both sides may exchange ClipboardUpdate messages; bit 2 tells it the
+// host opened an audio stream and described the format in the audio block.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
+inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
 inline constexpr uint16_t kServerInfoKnownFlags =
-    kServerInfoInputEnabled | kServerInfoClipboardEnabled;
+    kServerInfoInputEnabled | kServerInfoClipboardEnabled | kServerInfoAudioEnabled;
 
 // One attached output, as the server sees it. `rect` is the output's
 // virtual-desktop rect (the orientation the user sees, so a rotated panel
@@ -258,6 +351,9 @@ inline constexpr uint16_t kMaxDisplayCount = 64;
 // whose rect starts at the origin and is `width` x `height` pixels.
 // `clipboard_enabled` mirrors the server's clipboard gate: when false the
 // viewer must not send ClipboardUpdates and will not receive any.
+// `audio.enabled` says whether an audio stream follows; when true, `audio`
+// carries the codec, rate, channel count and AudioSpecificConfig needed to
+// decode it. Audio that fails mid-session is turned off with a StreamInfo.
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
     uint16_t width = 0;
@@ -270,6 +366,7 @@ struct ServerInfo {
     bool clipboard_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
+    AudioInfo audio;
 };
 
 // What the receiver reports before it closes the connection.
@@ -299,6 +396,9 @@ uint32_t crc32(const uint8_t* data, size_t size);
 
 void encode_frame_header(const FrameHeader& header, uint8_t out[kFrameHeaderSize]);
 bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
+                         std::string* error);
+void encode_audio_header(const AudioHeader& header, uint8_t out[kAudioHeaderSize]);
+bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
                          std::string* error);
 
 // Hello asks the server to stream one display: `display` is an index into the
@@ -352,6 +452,12 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
 std::vector<uint8_t> make_clipboard_update(uint64_t seq, const std::string& text);
 bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate& update,
                             std::string* error);
+// CursorUpdate payloads. The maker drops an attached sprite that does not
+// match width*height*4 and clamps the size to kMaxCursorSize; callers that
+// keep the sprite can send the same update again with an empty one.
+std::vector<uint8_t> make_cursor_update(const CursorUpdate& update);
+bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& update,
+                         std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.
@@ -388,6 +494,29 @@ public:
     // Error: the header is malformed or the payload is oversized.
     Status next(FrameHeader& header, const uint8_t** payload, std::string* error);
     void consume();
+    void reset();
+    size_t buffered() const { return buffer_.size() - offset_; }
+
+private:
+    std::vector<uint8_t> buffer_;
+    size_t offset_ = 0;
+    size_t current_payload_ = 0;
+};
+
+// Same reassembly rules as FrameParser, for the audio stream. Kept separate so
+// a malformed audio packet can be dropped without disturbing video framing.
+class AudioParser {
+public:
+    enum class Status {
+        Incomplete,
+        Packet,
+        Error,
+    };
+
+    bool push(const uint8_t* data, size_t size, std::string* error);
+    Status next(AudioHeader& header, const uint8_t** payload, std::string* error);
+    void consume();
+    void reset();
     size_t buffered() const { return buffer_.size() - offset_; }
 
 private:

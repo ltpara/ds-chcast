@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -106,6 +107,33 @@ struct ViewerStatus {
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
+    // Pointer: updates received, and whether one is waiting for the UI. The
+    // sprite is deliberately not part of ViewerStatus: it can be a quarter of
+    // a megabyte and the UI polls the status four times a second, so it is
+    // taken separately through TakeCursor().
+    uint64_t cursor_updates = 0;
+    bool cursor_pending = false;
+    // System sound from the host. `audio_announced` mirrors the server's gate;
+    // `audio_enabled` means the local decoder and renderer are also running.
+    // A local pipeline that failed while video kept going explains itself in
+    // `audio_error`. All counters cover the current session.
+    bool audio_announced = false;
+    bool audio_enabled = false;
+    bool audio_muted = false;
+    uint32_t audio_sample_rate = 0;
+    uint32_t audio_channels = 0;
+    uint32_t audio_bitrate = 0;
+    uint64_t audio_received = 0;
+    uint64_t audio_decoded = 0;
+    uint64_t audio_errors = 0;
+    uint64_t audio_underruns = 0;
+    // Endpoint rebuilds the renderer performed after a loss or a default
+    // output change. `audio_recovering` means it is between rebuilds now;
+    // the audio stream itself stays up, so this is not an error.
+    uint64_t audio_recoveries = 0;
+    bool audio_recovering = false;
+    uint32_t audio_buffer_ms = 0;
+    std::string audio_error;
     // What the server announced in HelloAck. `displays` is the list the UI's
     // picker shows; the streamed entry is the one whose rect starts at
     // origin_x/origin_y and matches width x height.
@@ -150,6 +178,16 @@ public:
     // Pops the oldest text the host sent. Returns false when none is pending.
     bool TakeClipboard(std::string& text);
 
+    // Copies the newest pointer state the host sent, once per received update.
+    // The sprite is only attached to the update that introduced a shape, so a
+    // caller caches it by `shape_id`. Returns false when nothing new arrived.
+    bool TakeCursor(chast::CursorUpdate& update);
+
+    // Mutes or unmutes system sound. Safe from the UI thread; the session
+    // thread applies it to the render session. Returns false when no audio
+    // pipeline is running, so the caller knows the tap had no effect.
+    bool SetAudioMuted(bool mute);
+
     ViewerStatus Snapshot() const;
 
 private:
@@ -165,6 +203,8 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+    // Survives reconnects: the speaker stays off until the user turns it on.
+    std::atomic<bool> audio_muted_{false};
 
     // Input crosses from the UI thread to the session thread here. The queue
     // is bounded: a stalled transport drops the newest events instead of
@@ -185,6 +225,12 @@ private:
     std::deque<std::string> pending_clipboard_;
     std::deque<std::string> received_clipboard_;
     bool clipboard_enabled_ = false;
+
+    // Pointer state crosses the same way, but only the newest update is kept:
+    // a viewer that falls behind wants where the pointer is now, not a replay.
+    mutable std::mutex cursor_mutex_;
+    std::optional<chast::CursorUpdate> pending_cursor_;
+    uint64_t cursor_updates_ = 0;
 };
 
 }  // namespace chast_viewer
