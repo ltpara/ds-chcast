@@ -70,6 +70,13 @@ struct Options {
     // run must not type into whatever window happens to be focused; the key
     // path is covered by the dry run and the injector's own checks.
     bool input_real = false;
+    // serve: accept input and count it, but stop at the OS boundary. A viewer
+    // and its host on one machine cannot inject for real: the injected keys
+    // land in the viewer, which forwards them again.
+    bool input_dry = false;
+    // serve: print every InputEvent as it arrives, for low-level checks of
+    // what a viewer actually sends.
+    bool input_log = false;
     double seconds = 0.0;
     bool seconds_set = false;
     double wait_seconds = 30.0;
@@ -132,6 +139,12 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--input-real") {
                 options.input = true;
                 options.input_real = true;
+            } else if (arg == "--input-dry") {
+                options.input = true;
+                options.input_dry = true;
+            } else if (arg == "--input-log") {
+                options.input = true;
+                options.input_log = true;
             } else if (arg == "--no-hdr") {
                 options.config.want_hdr = false;
             } else if (arg == "--no-cursor") {
@@ -322,7 +335,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     server_config.bind_address = options.bind;
     server_config.port = options.port;
     server_config.allow_input = options.input;
-    server_config.dry_run_input = options.input && options.mode == "verify" && !options.input_real;
+    server_config.dry_run_input =
+        options.input_dry || (options.input && options.mode == "verify" && !options.input_real);
     std::unique_ptr<chast::QuicSession> server =
         chast::QuicSession::create_server(server_config, &error);
     if (!server) {
@@ -387,6 +401,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     info.framerate = static_cast<uint16_t>(options.framerate);
     info.bitrate = encoder->bitrate();
     info.encoder = encoder->implementation().empty() ? "oneVPL" : encoder->implementation();
+    // Input positions are virtual-desktop pixels, so the client needs the
+    // captured output's top-left to place a point it measured in the video.
+    info.origin_x = capturer->display().rect.left;
+    info.origin_y = capturer->display().rect.top;
     chast::Error announced = server->announce(info);
     if (!announced.ok()) {
         return fail("announce: " + announced.to_string());
@@ -500,6 +518,19 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         }
         if (server->take_keyframe_request()) {
             force_keyframe = true;
+        }
+        if (options.input_log) {
+            for (const chast::InputEvent& event : server->take_input_events()) {
+                if (event.kind == chast::InputKind::Mouse) {
+                    std::printf("input mouse action=%u buttons=%u x=%d y=%d\n",
+                                static_cast<unsigned>(event.mouse.action), event.mouse.buttons,
+                                event.mouse.x, event.mouse.y);
+                } else {
+                    std::printf("input key action=%u usage=0x%04X\n",
+                                static_cast<unsigned>(event.key.action), event.key.hid_usage);
+                }
+                std::fflush(stdout);
+            }
         }
         if (options.keyframe_ms > 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keyframe).count() >=

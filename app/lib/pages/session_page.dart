@@ -45,6 +45,11 @@ class _SessionPageState extends State<SessionPage> {
   bool _reconnecting = false;
   bool _closing = false;
   ViewFit _fit = ViewFit.adaptive;
+  // Remote control: only when the server announced input. `_interactive` is
+  // the user's switch on top of that; turning it off releases everything this
+  // side is holding.
+  bool _interactive = true;
+  final Set<int> _heldKeys = <int>{};
 
   @override
   void initState() {
@@ -187,6 +192,7 @@ class _SessionPageState extends State<SessionPage> {
       _hideTimer?.cancel();
       _pollTimer?.cancel();
       _collapsed = false;
+      _releaseKeys();
     }
     setState(() {
       _status = status;
@@ -318,6 +324,7 @@ class _SessionPageState extends State<SessionPage> {
     _closing = true;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _releaseKeys();
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
@@ -331,6 +338,7 @@ class _SessionPageState extends State<SessionPage> {
   void _cleanupAfterPop() {
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _releaseKeys();
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
@@ -338,10 +346,7 @@ class _SessionPageState extends State<SessionPage> {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) {
-      return KeyEventResult.ignored;
-    }
-    if (event.logicalKey == LogicalKeyboardKey.escape) {
+    if (event.logicalKey == LogicalKeyboardKey.escape && event is KeyDownEvent) {
       if (_fullscreen) {
         unawaited(_setFullscreen(false));
       } else {
@@ -349,11 +354,109 @@ class _SessionPageState extends State<SessionPage> {
       }
       return KeyEventResult.handled;
     }
-    if (event.logicalKey == LogicalKeyboardKey.f11) {
+    if (event.logicalKey == LogicalKeyboardKey.f11 && event is KeyDownEvent) {
       unawaited(_toggleFullscreen());
       return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+
+    if (!_canControl) {
+      return KeyEventResult.ignored;
+    }
+    // Everything else goes to the host as a HID usage, so the host's layout,
+    // IME and dead keys behave as they would locally. Auto-repeat arrives as
+    // repeated down events; the host's own repeat rate is what matters, so a
+    // usage already down is not sent again.
+    final int usage = event.physicalKey.usbHidUsage & 0xFFFF;
+    if (usage == 0) {
+      return KeyEventResult.ignored;
+    }
+    final bool down = event is KeyDownEvent;
+    if (down) {
+      if (!_heldKeys.add(usage)) {
+        return KeyEventResult.handled;
+      }
+    } else if (event is KeyUpEvent) {
+      if (!_heldKeys.remove(usage)) {
+        return KeyEventResult.handled;
+      }
+    } else {
+      return KeyEventResult.ignored;
+    }
+    unawaited(ViewerBridge.sendKey(RemoteKeyEvent(down, usage)));
+    return KeyEventResult.handled;
+  }
+
+  bool get _canControl =>
+      _interactive && _status.inputEnabled && _status.isLive && !_over;
+
+  /// Releases every key this side pressed, so switching control off or
+  /// leaving the session cannot leave a modifier down on the host.
+  void _releaseKeys() {
+    for (final int usage in _heldKeys) {
+      unawaited(ViewerBridge.sendKey(RemoteKeyEvent(false, usage)));
+    }
+    _heldKeys.clear();
+  }
+
+  void _toggleInteractive() {
+    setState(() => _interactive = !_interactive);
+    if (!_interactive) {
+      _releaseKeys();
+    }
+    _focus.requestFocus();
+  }
+
+  void _onRemoteMove(Offset pixel) {
+    if (!_canControl) {
+      return;
+    }
+    unawaited(
+      ViewerBridge.sendMouse(
+        RemoteMouseEvent(
+          RemoteMouseAction.move,
+          x: _status.originX + pixel.dx.round(),
+          y: _status.originY + pixel.dy.round(),
+        ),
+      ),
+    );
+  }
+
+  void _onRemoteButton(int buttonBit, bool down, Offset pixel) {
+    if (!_canControl) {
+      return;
+    }
+    // The host moves the pointer itself; the position on the button event is
+    // for the case where it has not caught up yet.
+    _onRemoteMove(pixel);
+    unawaited(
+      ViewerBridge.sendMouse(
+        RemoteMouseEvent(
+          down ? RemoteMouseAction.buttonDown : RemoteMouseAction.buttonUp,
+          buttons: buttonBit,
+        ),
+      ),
+    );
+  }
+
+  void _onRemoteWheel(int deltaX, int deltaY, Offset pixel) {
+    if (!_canControl || (deltaX == 0 && deltaY == 0)) {
+      return;
+    }
+    _onRemoteMove(pixel);
+    if (deltaY != 0) {
+      unawaited(
+        ViewerBridge.sendMouse(
+          RemoteMouseEvent(RemoteMouseAction.wheel, y: -deltaY),
+        ),
+      );
+    }
+    if (deltaX != 0) {
+      unawaited(
+        ViewerBridge.sendMouse(
+          RemoteMouseEvent(RemoteMouseAction.wheelHorizontal, x: deltaX),
+        ),
+      );
+    }
   }
 
   String get _stateText {
@@ -425,6 +528,10 @@ class _SessionPageState extends State<SessionPage> {
                       videoWidth: _status.width,
                       videoHeight: _status.height,
                       fit: _fit,
+                      interactive: _canControl,
+                      onPointerMove: _onRemoteMove,
+                      onPointerButton: _onRemoteButton,
+                      onPointerWheel: _onRemoteWheel,
                     ),
                   )
                 else
@@ -445,6 +552,9 @@ class _SessionPageState extends State<SessionPage> {
                         fullscreen: _fullscreen,
                         statsVisible: _statsVisible,
                         fit: _fit,
+                        inputEnabled: _status.inputEnabled,
+                        interactive: _canControl,
+                        onToggleInput: _toggleInteractive,
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
                         onToggleFullscreen: _toggleFullscreen,

@@ -11,6 +11,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.fullscreen,
     required this.statsVisible,
     required this.fit,
+    required this.inputEnabled,
+    required this.interactive,
     required this.onTogglePin,
     required this.onToggleStats,
     required this.onToggleFullscreen,
@@ -18,6 +20,7 @@ class RemoteToolbar extends StatelessWidget {
     required this.onExpand,
     required this.onClose,
     required this.onFitChanged,
+    required this.onToggleInput,
   });
 
   final bool collapsed;
@@ -25,6 +28,11 @@ class RemoteToolbar extends StatelessWidget {
   final bool fullscreen;
   final bool statsVisible;
   final ViewFit fit;
+  /// The server accepts input (HelloAck). When false the control toggle is
+  /// disabled: there is nobody to inject the events.
+  final bool inputEnabled;
+  /// The user's switch on top of inputEnabled.
+  final bool interactive;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
   final VoidCallback onToggleFullscreen;
@@ -32,6 +40,7 @@ class RemoteToolbar extends StatelessWidget {
   final VoidCallback onExpand;
   final VoidCallback onClose;
   final ValueChanged<ViewFit> onFitChanged;
+  final VoidCallback onToggleInput;
 
   @override
   Widget build(BuildContext context) {
@@ -69,10 +78,16 @@ class RemoteToolbar extends StatelessWidget {
               tooltip: '多显示器切换：下一阶段',
               disabled: true,
             ),
-            const _BarButton(
-              icon: Icons.keyboard_alt_outlined,
-              tooltip: '远程键鼠：下一阶段',
-              disabled: true,
+            _BarButton(
+              icon: interactive
+                  ? Icons.keyboard_alt_rounded
+                  : Icons.keyboard_alt_outlined,
+              tooltip: inputEnabled
+                  ? (interactive ? '关闭远程键鼠' : '开启远程键鼠')
+                  : '远端未开启键鼠注入',
+              active: interactive && inputEnabled,
+              disabled: !inputEnabled,
+              onTap: onToggleInput,
             ),
             _BarButton(
               icon: Icons.speed_rounded,

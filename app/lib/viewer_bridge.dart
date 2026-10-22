@@ -2,6 +2,36 @@ import 'package:flutter/services.dart';
 
 enum ViewerState { idle, connecting, handshaking, streaming, ended, failed }
 
+/// Pointer actions, mirroring chast::MouseAction on the wire.
+enum RemoteMouseAction { move, moveRelative, buttonDown, buttonUp, wheel, wheelHorizontal }
+
+/// Mouse button bits, mirroring chast::MouseButtonBit.
+class RemoteMouseButton {
+  static const int left = 1;
+  static const int right = 2;
+  static const int middle = 4;
+  static const int back = 8;
+  static const int forward = 16;
+}
+
+/// One pointer event in remote virtual-desktop pixels.
+class RemoteMouseEvent {
+  const RemoteMouseEvent(this.action, {this.buttons = 0, this.x = 0, this.y = 0});
+
+  final RemoteMouseAction action;
+  final int buttons;
+  final int x;
+  final int y;
+}
+
+/// One keyboard event carrying a USB HID usage id (usage page 0x07).
+class RemoteKeyEvent {
+  const RemoteKeyEvent(this.down, this.hidUsage);
+
+  final bool down;
+  final int hidUsage;
+}
+
 class ViewerStatus {
   const ViewerStatus({
     this.state = ViewerState.idle,
@@ -29,6 +59,11 @@ class ViewerStatus {
     this.elapsedMs = 0,
     this.videoFinished = false,
     this.fullscreen = false,
+    this.inputEnabled = false,
+    this.originX = 0,
+    this.originY = 0,
+    this.inputSent = 0,
+    this.inputDropped = 0,
   });
 
   final ViewerState state;
@@ -56,6 +91,19 @@ class ViewerStatus {
   final int elapsedMs;
   final bool videoFinished;
   final bool fullscreen;
+
+  /// The server accepts input events (it was started with input enabled).
+  final bool inputEnabled;
+
+  /// The captured output's top-left in the host's virtual-desktop pixels.
+  /// Pointers are sent in that space, so the viewer adds these to positions
+  /// measured inside the video picture.
+  final int originX;
+  final int originY;
+
+  /// Events this viewer handed to the transport, and how many it dropped.
+  final int inputSent;
+  final int inputDropped;
 
   bool get hasFrame => published > 0 && width > 0 && height > 0;
   bool get isLive => state == ViewerState.streaming;
@@ -93,6 +141,11 @@ class ViewerStatus {
       elapsedMs: asInt(map['elapsedMs']),
       videoFinished: map['videoFinished'] == true,
       fullscreen: map['fullscreen'] == true,
+      inputEnabled: map['inputEnabled'] == true,
+      originX: asInt(map['originX']),
+      originY: asInt(map['originY']),
+      inputSent: asInt(map['inputSent']),
+      inputDropped: asInt(map['inputDropped']),
     );
   }
 
@@ -144,5 +197,27 @@ class ViewerBridge {
   static Future<bool> setFullscreen(bool enable) async {
     final bool? actual = await _channel.invokeMethod<bool>('setFullscreen', enable);
     return actual ?? false;
+  }
+
+  /// Queues one pointer event. Returns false when the session has ended or the
+  /// queue is full, which is not an error: the event is simply stale.
+  static Future<bool> sendMouse(RemoteMouseEvent event) async {
+    final bool? accepted = await _channel.invokeMethod<bool>('input', <String, Object>{
+      'kind': 'mouse',
+      'action': event.action.index,
+      'buttons': event.buttons,
+      'x': event.x,
+      'y': event.y,
+    });
+    return accepted ?? false;
+  }
+
+  static Future<bool> sendKey(RemoteKeyEvent event) async {
+    final bool? accepted = await _channel.invokeMethod<bool>('input', <String, Object>{
+      'kind': 'key',
+      'action': event.down ? 0 : 1,
+      'hidUsage': event.hidUsage,
+    });
+    return accepted ?? false;
   }
 }

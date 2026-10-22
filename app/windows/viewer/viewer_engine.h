@@ -13,10 +13,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
 
+#include "chast/input.h"
 #include "chast/encoder.h"
 
 struct ID3D11Device;
@@ -73,6 +75,12 @@ struct ViewerStatus {
     double kbps = 0.0;
     uint64_t elapsed_ms = 0;
     bool video_finished = false;
+    // Input: what the server announced, plus what this client sent.
+    bool input_enabled = false;
+    int32_t origin_x = 0;
+    int32_t origin_y = 0;
+    uint64_t input_sent = 0;
+    uint64_t input_dropped = 0;  // queue full or session gone
 };
 
 class ViewerEngine {
@@ -90,6 +98,13 @@ public:
     // QUIC connection. Safe to call when no session is running.
     void Stop();
 
+    // Queues one pointer/keyboard event for the session thread, which owns
+    // the QuicSession and is the only thread allowed to send on it. Returns
+    // false when no session is running or the queue is full; the event is
+    // then dropped, which is the right trade for a pointer stream that is
+    // already stale by the time the queue backs up.
+    bool SendInput(const chast::InputEvent& event);
+
     ViewerStatus Snapshot() const;
 
 private:
@@ -103,6 +118,11 @@ private:
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+
+    mutable std::mutex input_mutex_;
+    std::deque<chast::InputEvent> input_queue_;
+    uint64_t input_sent_ = 0;
+    uint64_t input_dropped_ = 0;
 };
 
 }  // namespace chast_viewer

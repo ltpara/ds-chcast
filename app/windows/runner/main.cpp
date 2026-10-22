@@ -1,5 +1,6 @@
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
+#include <imm.h>
 #include <windows.h>
 
 #include "flutter_window.h"
@@ -12,6 +13,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {
     CreateAndAttachConsole();
   }
+
+  // Keys belong to the host: the viewer forwards HID usages and the host's own
+  // IME composes the text there. With a local IME active, Windows swallows the
+  // keystroke and reports WM_KEYDOWN with VK_PROCESSKEY instead, which the
+  // engine treats as an IME press and drops.
+  ::ImmDisableIME(static_cast<DWORD>(-1));
 
   // Initialize COM, so that it is available for use in the library and/or
   // plugins.

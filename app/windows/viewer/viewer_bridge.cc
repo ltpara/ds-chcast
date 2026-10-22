@@ -63,6 +63,58 @@ bool map_int(const flutter::EncodableMap& map, const char* name, int64_t* out) {
     return false;
 }
 
+// The Dart side sends one flat map per event; the fields it does not need for
+// a given kind are simply absent.
+bool parse_input(const flutter::EncodableMap& args, chast::InputEvent& event,
+                 std::string* problem) {
+    std::string kind;
+    if (!map_string(args, "kind", &kind)) {
+        *problem = "input event has no kind";
+        return false;
+    }
+    int64_t action = 0;
+    if (!map_int(args, "action", &action)) {
+        *problem = "input event has no action";
+        return false;
+    }
+
+    if (kind == "mouse") {
+        if (action < 0 || action > static_cast<int64_t>(chast::MouseAction::WheelHorizontal)) {
+            *problem = "unknown mouse action " + std::to_string(action);
+            return false;
+        }
+        int64_t buttons = 0;
+        int64_t x = 0;
+        int64_t y = 0;
+        map_int(args, "buttons", &buttons);
+        map_int(args, "x", &x);
+        map_int(args, "y", &y);
+        event.kind = chast::InputKind::Mouse;
+        event.mouse.action = static_cast<chast::MouseAction>(action);
+        event.mouse.buttons = static_cast<uint16_t>(buttons & 0xFFFF);
+        event.mouse.x = static_cast<int32_t>(x);
+        event.mouse.y = static_cast<int32_t>(y);
+        return true;
+    }
+    if (kind == "key") {
+        if (action < 0 || action > static_cast<int64_t>(chast::KeyAction::Up)) {
+            *problem = "unknown key action " + std::to_string(action);
+            return false;
+        }
+        int64_t usage = 0;
+        if (!map_int(args, "hidUsage", &usage) || usage <= 0 || usage > 0xFFFF) {
+            *problem = "key event has no HID usage";
+            return false;
+        }
+        event.kind = chast::InputKind::Key;
+        event.key.action = static_cast<chast::KeyAction>(action);
+        event.key.hid_usage = static_cast<uint16_t>(usage);
+        return true;
+    }
+    *problem = "unknown input kind " + kind;
+    return false;
+}
+
 }  // namespace
 
 ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
@@ -184,7 +236,35 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.elapsed_ms));
         map[key("videoFinished")] = flutter::EncodableValue(status.video_finished);
         map[key("fullscreen")] = flutter::EncodableValue(fullscreen_);
+        map[key("inputEnabled")] = flutter::EncodableValue(status.input_enabled);
+        map[key("originX")] = flutter::EncodableValue(status.origin_x);
+        map[key("originY")] = flutter::EncodableValue(status.origin_y);
+        map[key("inputSent")] = flutter::EncodableValue(static_cast<int64_t>(status.input_sent));
+        map[key("inputDropped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.input_dropped));
         result->Success(flutter::EncodableValue(std::move(map)));
+        return;
+    }
+
+    if (method == "input") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        chast::InputEvent event;
+        std::string problem;
+        if (args == nullptr || !parse_input(*args, event, &problem)) {
+            std::fprintf(stderr, "viewer: input rejected: %s\n",
+                         problem.empty() ? "no map" : problem.c_str());
+            result->Error("bad_args", problem.empty() ? "input wants an event map" : problem);
+            return;
+        }
+        const bool queued = viewer_->SendInput(event);
+        if (!queued) {
+            // Not an error: the session may have ended while the pointer was
+            // still moving, and the queue drops bursts rather than blocking
+            // the UI thread.
+            result->Success(flutter::EncodableValue(false));
+            return;
+        }
+        result->Success(flutter::EncodableValue(true));
         return;
     }
 

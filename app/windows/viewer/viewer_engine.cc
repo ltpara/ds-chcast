@@ -17,6 +17,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr auto kReceiveTimeout = std::chrono::milliseconds(250);
+// With input enabled the receive wait is the upper bound on how long a
+// pointer event can sit in the queue before it goes out, so it shrinks to
+// something below one frame. MsQuic queues received data either way, so a
+// short wait costs nothing but wake-ups.
+constexpr auto kReceiveTimeoutInput = std::chrono::milliseconds(8);
 constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 
@@ -59,6 +64,23 @@ void ViewerEngine::Stop() {
         thread_.join();
     }
     running_.store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(input_mutex_);
+    input_queue_.clear();
+}
+
+bool ViewerEngine::SendInput(const chast::InputEvent& event) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(input_mutex_);
+        if (input_queue_.size() >= 512) {
+            ++input_dropped_;
+            return false;
+        }
+        input_queue_.push_back(event);
+    }
+    return true;
 }
 
 ViewerStatus ViewerEngine::Snapshot() const {
@@ -69,6 +91,11 @@ ViewerStatus ViewerEngine::Snapshot() const {
         status.elapsed_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at_)
                 .count());
+    }
+    {
+        std::lock_guard<std::mutex> input_lock(input_mutex_);
+        status.input_sent = input_sent_;
+        status.input_dropped = input_dropped_;
     }
     return status;
 }
@@ -185,6 +212,9 @@ void ViewerEngine::Run(std::string host, uint16_t port) {
                 status_.framerate = info.framerate;
                 status_.server_bitrate = info.bitrate;
                 status_.server_encoder = info.encoder;
+                status_.input_enabled = info.input_enabled;
+                status_.origin_x = info.origin_x;
+                status_.origin_y = info.origin_y;
             }
 
             chast::DecoderConfig decoder_config;
@@ -255,14 +285,45 @@ void ViewerEngine::Run(std::string host, uint16_t port) {
                     }
                 };
 
+                // The UI thread queues events; only this thread may send on
+                // the session, so they leave here, in order, between receives.
+                auto drain_input = [&] {
+                    std::deque<chast::InputEvent> batch;
+                    {
+                        std::lock_guard<std::mutex> lock(input_mutex_);
+                        if (input_queue_.empty()) {
+                            return;
+                        }
+                        batch.swap(input_queue_);
+                    }
+                    uint64_t sent = 0;
+                    uint64_t dropped = 0;
+                    for (const chast::InputEvent& event : batch) {
+                        if (session->send_input(event).ok()) {
+                            ++sent;
+                        } else {
+                            ++dropped;
+                        }
+                    }
+                    std::lock_guard<std::mutex> lock(input_mutex_);
+                    input_sent_ += sent;
+                    input_dropped_ += dropped;
+                };
+
+                const auto receive_timeout =
+                    info.input_enabled ? kReceiveTimeoutInput : kReceiveTimeout;
+
                 uint64_t expected_seq = 0;
                 std::vector<chast::DecodedFrame> frames;
 
                 while (!stop_requested_.load(std::memory_order_acquire)) {
+                    if (info.input_enabled) {
+                        drain_input();
+                    }
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
                     chast::Error received_frame = session->receive_frame(
-                        header, payload, kReceiveTimeout);
+                        header, payload, receive_timeout);
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {
