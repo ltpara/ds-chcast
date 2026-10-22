@@ -1,5 +1,8 @@
 #include "viewer_bridge.h"
 
+#include <commctrl.h>
+#include <imm.h>
+
 #include <flutter/flutter_engine.h>
 #include <flutter/standard_method_codec.h>
 
@@ -14,6 +17,8 @@
 namespace chast_viewer {
 
 namespace {
+
+constexpr UINT_PTR kViewSubclassId = 1;
 
 const char* state_name(ViewerState state) {
     switch (state) {
@@ -96,6 +101,11 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
         std::fprintf(stderr, "chast_viewer: GPU display is not available: %s\n",
                      texture_sink_->error().c_str());
     }
+    view_ = FindWindowExW(window_, nullptr, L"FLUTTERVIEW", nullptr);
+    if (view_ != nullptr) {
+        SetWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId,
+                          reinterpret_cast<DWORD_PTR>(this));
+    }
 }
 
 ViewerBridge::~ViewerBridge() {
@@ -107,6 +117,13 @@ void ViewerBridge::Shutdown() {
         return;
     }
     shutting_down_ = true;
+    SetKeyCapture(false);
+    if (view_ != nullptr) {
+        if (IsWindow(view_)) {
+            RemoveWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId);
+        }
+        view_ = nullptr;
+    }
     if (channel_) {
         channel_->SetMethodCallHandler(nullptr);
     }
@@ -271,6 +288,18 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setKeyCapture") {
+        const auto* enable = std::get_if<bool>(call.arguments());
+        if (enable == nullptr) {
+            result->Error("bad_args", "setKeyCapture wants a bool");
+            return;
+        }
+        SetKeyCapture(*enable);
+        result->Success(
+            flutter::EncodableValue(key_capture_.load(std::memory_order_relaxed)));
+        return;
+    }
+
     if (method == "releaseInput") {
         const bool queued = viewer_ != nullptr && viewer_->ReleaseInput();
         result->Success(flutter::EncodableValue(queued));
@@ -379,6 +408,61 @@ void ViewerBridge::SendInput(
 
     const bool queued = viewer_ != nullptr && viewer_->SendInput(event);
     result->Success(flutter::EncodableValue(queued));
+}
+
+void ViewerBridge::SetKeyCapture(bool enable) {
+    const bool was = key_capture_.exchange(enable, std::memory_order_relaxed);
+    if (was == enable || view_ == nullptr || !IsWindow(view_)) {
+        return;
+    }
+    if (enable) {
+        saved_himc_ = ImmAssociateContext(view_, nullptr);
+    } else if (saved_himc_ != nullptr) {
+        ImmAssociateContext(view_, saved_himc_);
+        saved_himc_ = nullptr;
+    }
+}
+
+LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARAM wparam,
+                                                LPARAM lparam, UINT_PTR id, DWORD_PTR ref_data) {
+    auto* self = reinterpret_cast<ViewerBridge*>(ref_data);
+    if (self != nullptr) {
+        switch (message) {
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYUP:
+                // An active local IME replaces the virtual key with
+                // VK_PROCESSKEY and the engine drops such events; while the
+                // remote host owns composition, hand it the physical key.
+                // ImmGetVirtualKey knows the original for real key presses,
+                // but not for synthesized ones, so fall back to the scan code
+                // in lParam (the remote side injects by HID usage anyway).
+                if (wparam == VK_PROCESSKEY &&
+                    self->key_capture_.load(std::memory_order_relaxed)) {
+                    UINT original = ImmGetVirtualKey(window);
+                    if (original == 0 || original == VK_PROCESSKEY) {
+                        const UINT scan = static_cast<UINT>((lparam >> 16) & 0xff);
+                        if (scan != 0) {
+                            const UINT extended =
+                                scan | ((lparam & (1 << 24)) != 0 ? 0xE000u : 0u);
+                            original = MapVirtualKeyW(extended, MAPVK_VSC_TO_VK_EX);
+                        }
+                    }
+                    if (original != 0 && original != VK_PROCESSKEY) {
+                        wparam = original;
+                    }
+                }
+                break;
+            case WM_NCDESTROY:
+                RemoveWindowSubclass(window, &ViewerBridge::ViewSubclassProc, id);
+                self->view_ = nullptr;
+                break;
+            default:
+                break;
+        }
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
 }
 
 void ViewerBridge::SetFullscreen(bool enable) {

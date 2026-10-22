@@ -1,10 +1,12 @@
 #pragma once
 
 #include <windows.h>
+#include <imm.h>
 
 #include <flutter/encodable_value.h>
 #include <flutter/method_channel.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -43,9 +45,23 @@ private:
     void SendInput(const flutter::EncodableMap& args,
                    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
     void SetFullscreen(bool enable);
+    // Detaches the view's IME context while remote control owns the keyboard,
+    // so a local IME neither composes locally nor turns keys into
+    // VK_PROCESSKEY. Restored when control is dropped, which keeps the home
+    // page's text fields working in Chinese.
+    void SetKeyCapture(bool enable);
+
+    // Swaps the physical key back in for the VK_PROCESSKEY an IME reports when
+    // the context could not be detached. Installed on the Flutter view window,
+    // and only active while the page has remote control.
+    static LRESULT CALLBACK ViewSubclassProc(HWND window, UINT message, WPARAM wparam,
+                                             LPARAM lparam, UINT_PTR id, DWORD_PTR ref_data);
 
     flutter::FlutterEngine* engine_ = nullptr;
     HWND window_ = nullptr;
+    HWND view_ = nullptr;
+    std::atomic<bool> key_capture_{false};
+    HIMC saved_himc_ = nullptr;
     std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
     std::unique_ptr<GpuFrameSink> texture_sink_;
     std::unique_ptr<ViewerEngine> viewer_;

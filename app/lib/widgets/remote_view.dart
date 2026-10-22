@@ -14,6 +14,19 @@ typedef FramePointerHandler = void Function(Offset position, int buttons);
 typedef FrameButtonHandler = void Function(Offset position, int button, bool down);
 typedef FrameScrollHandler = void Function(Offset position, Offset delta);
 
+const int _mouseButtonMask = ViewerMouse.left |
+    ViewerMouse.right |
+    ViewerMouse.middle |
+    ViewerMouse.back |
+    ViewerMouse.forward;
+const List<int> _mouseButtons = <int>[
+  ViewerMouse.left,
+  ViewerMouse.right,
+  ViewerMouse.middle,
+  ViewerMouse.back,
+  ViewerMouse.forward,
+];
+
 class RemoteView extends StatefulWidget {
   const RemoteView({
     super.key,
@@ -55,12 +68,22 @@ class _RemoteViewState extends State<RemoteView> {
   /// state, while the protocol wants one button per message, so down/up are
   /// derived from the difference against this.
   int _buttons = 0;
+  Offset _lastFrame = Offset.zero;
 
   @override
   void dispose() {
+    _releaseButtons();
     _vertical.dispose();
     _horizontal.dispose();
     super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant RemoteView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.captureInput && !widget.captureInput) {
+      _releaseButtons();
+    }
   }
 
   Offset _toFrame(Offset local, Size box) {
@@ -74,23 +97,34 @@ class _RemoteViewState extends State<RemoteView> {
     return Offset(x, y);
   }
 
-  void _pointerButton(PointerEvent event, bool down, Size box) {
-    final int changed = down ? event.buttons & ~_buttons : _buttons & ~event.buttons;
-    _buttons = event.buttons;
-    widget.onFocusRequested?.call();
+  void _releaseButtons() {
+    if (_buttons == 0) {
+      return;
+    }
+    final int held = _buttons;
+    _buttons = 0;
+    for (final int bit in _mouseButtons) {
+      if (held & bit != 0) {
+        widget.onButton?.call(_lastFrame, bit, false);
+      }
+    }
+  }
+
+  /// Reconciles the buttons this view believes are down with the bitmask the
+  /// embedder reports. Flutter delivers a second button pressed while another
+  /// is held as a move, and a PointerUpEvent whose buttons field already omits
+  /// the released bit, so neither down nor up alone names the changed button.
+  void _syncButtons(int buttons, Offset position) {
+    _lastFrame = position;
+    final int target = buttons & _mouseButtonMask;
+    final int changed = _buttons ^ target;
     if (changed == 0) {
       return;
     }
-    final Offset position = _toFrame(event.localPosition, box);
-    for (final int bit in <int>[
-      ViewerMouse.left,
-      ViewerMouse.right,
-      ViewerMouse.middle,
-      ViewerMouse.back,
-      ViewerMouse.forward,
-    ]) {
+    _buttons = target;
+    for (final int bit in _mouseButtons) {
       if (changed & bit != 0) {
-        widget.onButton?.call(position, bit, down);
+        widget.onButton?.call(position, bit, target & bit != 0);
       }
     }
   }
@@ -105,18 +139,27 @@ class _RemoteViewState extends State<RemoteView> {
     }
     return MouseRegion(
       cursor: SystemMouseCursors.none,
+      onExit: (_) => _releaseButtons(),
       child: Listener(
         behavior: HitTestBehavior.opaque,
-        onPointerDown: (PointerDownEvent event) => _pointerButton(event, true, box),
-        onPointerUp: (PointerUpEvent event) => _pointerButton(event, false, box),
+        onPointerDown: (PointerDownEvent event) {
+          widget.onFocusRequested?.call();
+          _syncButtons(event.buttons, _toFrame(event.localPosition, box));
+        },
+        onPointerUp: (PointerUpEvent event) =>
+            _syncButtons(event.buttons, _toFrame(event.localPosition, box)),
         onPointerMove: (PointerMoveEvent event) {
-          _buttons = event.buttons;
-          widget.onMove?.call(_toFrame(event.localPosition, box), event.buttons);
+          final Offset position = _toFrame(event.localPosition, box);
+          _syncButtons(event.buttons, position);
+          widget.onMove?.call(position, event.buttons);
         },
         onPointerHover: (PointerHoverEvent event) {
-          _buttons = event.buttons;
-          widget.onHover?.call(_toFrame(event.localPosition, box), event.buttons);
+          final Offset position = _toFrame(event.localPosition, box);
+          _syncButtons(event.buttons, position);
+          widget.onHover?.call(position, event.buttons);
         },
+        onPointerCancel: (PointerCancelEvent event) =>
+            _syncButtons(0, _toFrame(event.localPosition, box)),
         onPointerSignal: (PointerSignalEvent event) {
           if (event is PointerScrollEvent) {
             widget.onScroll?.call(_toFrame(event.localPosition, box), event.scrollDelta);

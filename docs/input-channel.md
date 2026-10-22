@@ -110,7 +110,7 @@ ok   no input event was rejected, failed or dropped
 ### Flutter 端
 
 - 工具栏键盘按钮成为控制开关：只在服务端开放输入且流已进入 streaming 时可用；断线、结束、重连自动关闭。开启后本地指针在画面区域隐藏，点击画面会重新获取键盘焦点。
-- 指针在 `RemoteView` 内换算成**帧像素**（自适应/原始大小两种布局各自处理），会话页再加 origin 并夹取到该输出范围；鼠标按键位直接使用 Flutter 的 `PointerEvent.buttons`（位布局与协议一致）。
+- 指针在 `RemoteView` 内换算成**帧像素**（自适应/原始大小两种布局各自处理），会话页再加 origin 并夹取到该输出范围；鼠标按键位用 `PointerEvent.buttons` 与本地按键位图异或对账后逐位发送（见 m4 修复一节）。
 - 按键取 `physicalKey.usbHidUsage`，只转发 Down/Up，忽略 `KeyRepeatEvent`（自动重复由被控端生成）。
 - 滚轮按 Flutter Windows 的 53 逻辑像素/格累积，换算成 `WHEEL_DELTA`（120）单位；纵向取反以匹配 Windows 的“向上为正”。
 - 控制开启时 Esc/F11 也转发给远端，本地退出/全屏改走工具栏；原始大小模式下控制开启时不再本地滚动，滚轮完全归远端。
@@ -154,7 +154,7 @@ sender: input received=14 applied=14 rejected=0 failed=0 dropped=0
 
 未能自动验证的部分：
 
-- 本机自动化环境会拦截合成的键盘事件（独立 WinForms 文本框同样收不到），因此 Flutter 的按键转发没有做端到端回放；HID→扫描码与注入路径由 `protocol` 测试和 CLI 回环的 Shift+A 覆盖，`physicalKey.usbHidUsage` 分支需用真实键盘再确认一次。
+- 早前记录的“合成键盘事件被拦截”实为中文输入法把按键改写成 `VK_PROCESSKEY` 后被引擎丢弃；m4 在控制期间摘除本地 IME 上下文后，`SendInput` 的扫描码按键已能端到端回放（见 m4 修复一节）。`physicalKey.usbHidUsage` 分支仍建议用物理键盘再确认一次。
 - 自动化注入 `WM_MOUSEHWHEEL` 时客户端没有产生横向滚动事件，`WheelHorizontal` 目前只有协议/CLI 回环覆盖。
 
 ## P3 — 修饰键、锁定键与卡键保护
@@ -175,7 +175,7 @@ sender: input received=14 applied=14 rejected=0 failed=0 dropped=0
 - `chast-quic verify`：脚本携带状态位图的 Shift+A，逐条比较状态位后全部 ok；随后发送 `InputRelease`，新增断言 `the viewer's release request reached the server`。
 - Flutter `test/modifier_bits_test.dart`：八个修饰键 usage 的位映射、三种锁键状态位、非修饰键忽略、`tester.sendKeyDownEvent` 后 `physicalKeysPressed` 生成的位图。
 - Release 构建同机演练（`serve --input-dry-run --dump-input`，脚本开启控制、移动、点击、关闭控制）：收到 4 个事件，dump 为 `state=0x000`，`input received=4 applied=4 rejected=0 failed=0 dropped=0 releases=1`。
-- 本机自动化仍无法合成真实键盘事件（见 P2 记录），位图与锁键随真实按键的端到端回放需用物理键盘再确认一次。
+- 本机自动化的键盘回放限制已解除（见 m4 修复一节），位图与锁键随真实按键的端到端回放仍建议用物理键盘再确认一次。
 
 ### 已完成范围
 
@@ -188,4 +188,26 @@ sender: input received=14 applied=14 rejected=0 failed=0 dropped=0
 
 - 不做按键级“按下超时”：长时间按住（游戏、拖拽）是合法操作，按时间强行释放会打断它。真正卡住的情况是客户端消失或网络中断，这时 QUIC idle timeout（30 s）结束会话，`stop()` 的 held 释放兜底；短暂失焦由客户端主动释放。
 - 锁键只在状态变化时点按，且注入器用 `host_locks_` 记录自己造成的切换，避免每个事件都重复点按。
+
+## m4 修复 — 本地输入法与多键指针
+
+### 本地输入法吞键
+
+- 现象：控制开启且系统输入法为中文（微软拼音）时，`WM_KEYDOWN` 到达 Flutter 视图时虚拟键已被改写成 `VK_PROCESSKEY`，引擎的键盘处理直接丢弃；本地同时弹出候选窗，挡住工具栏。
+- `ImmGetVirtualKey()` 实测对真实按键也只返回 `VK_PROCESSKEY`，不能还原原键；兜底改为从 `lParam` 取扫描码、扩展键补 `0xE000`，再用 `MapVirtualKeyW(..., MAPVK_VSC_TO_VK_EX)` 还原。
+- 主路径：控制开启时在平台线程对 Flutter 视图调用 `ImmAssociateContext(view_, nullptr)` 摘掉 IME 上下文，本地不再组词、不再产生 `VK_PROCESSKEY`；关闭控制、重连、退出时恢复保存的 `HIMC`，主页文本框的中文输入不受影响。子类过程保留扫描码还原，作为 IME 被重新关联时的兜底。
+- 该 API 是线程亲和的：跨进程从注入线程调用无效（实测 `contextWas=0`），必须在 `ViewerBridge` 所在的平台线程执行。
+
+### 指针多键
+
+- Flutter 在按住一个键时按下第二个键只派发 `PointerMove`（`buttons` 从 1 变 3），不派发第二个 `PointerDown`；`PointerUp` 的 `buttons` 又已去掉释放位。按“本次变化”推断会漏掉第二个键的 Down/Up。
+- 现在维护本地按键位图，用 `event.buttons ^ 本地位图` 对账出变化位并逐个发送；控制关闭、指针移出画面、指针取消时按最后位置补发全部 Up。服务端 `Move` 不读取 `buttons`，所以按下/抬起只能由客户端显式补发。
+
+### 验证（m4 + 中文输入法）
+
+- 控制开：发送扫描码 A（`KEYEVENTF_SCANCODE`，scan 0x1E），本地无候选窗，服务端 dump 收到 `key action=0/1 usage=0x04`。
+- 控制关：同样的合成按键弹出微软拼音候选窗，服务端日志零新增事件；再开控制后按键继续到达，证明 `HIMC` 的摘除/恢复成对生效。
+- 多键：按住左键再按右键，服务端依次收到左 Down、右 Down、右 Up、左 Up，中间的 Move 携带 `buttons=1/3/2/1`；指针移出画面收到剩余按键的 Up。
+- 工具栏固定（pin）后可稳定切换控制；探针脚本在 `D:\ds-chcast-probes`（`ime_probe.ps1` 等），服务端以 `--input-dry-run --dump-input` 运行。
+
 

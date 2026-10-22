@@ -364,6 +364,14 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// While remote control is on, an active local IME must not turn physical
+  /// keys into VK_PROCESSKEY (the engine drops those before Dart sees them).
+  /// Turning this off restores the IME for local text fields.
+  static Future<bool> setKeyCapture(bool enable) async {
+    final bool? active = await _channel.invokeMethod<bool>('setKeyCapture', enable);
+    return active ?? false;
+  }
+
   /// Queues one clipboard text for the host. Invalid UTF-8, text over 256 KiB
   /// and sessions without the server's clipboard gate are refused; the caller
   /// should keep the local copy as the source of truth either way.

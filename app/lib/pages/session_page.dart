@@ -92,6 +92,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _hideTimer?.cancel();
     _clipboardTimer?.cancel();
     _focus.dispose();
+    _setKeyCapture(false);
     unawaited(_shutdown());
     super.dispose();
   }
@@ -293,7 +294,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _pollTimer?.cancel();
       _collapsed = false;
     }
-    if (nowOver || !status.inputEnabled) {
+    final bool droppedControl = (nowOver || !status.inputEnabled) && _controlEnabled;
+    if (droppedControl) {
       _controlEnabled = false;
     }
     _syncClipboardPolling(status.acceptsClipboard && !nowOver);
@@ -301,6 +303,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    if (droppedControl) {
+      _setKeyCapture(false);
+    }
   }
 
   void _syncClipboardPolling(bool enabled) {
@@ -533,6 +538,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _heldButtons = 0;
       _heldKeys.clear();
     });
+    _setKeyCapture(false);
     _startPolling();
     _starting = _start();
     await _starting;
@@ -566,6 +572,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
+    _setKeyCapture(false);
     await _shutdown();
     if (!mounted) {
       return;
@@ -581,6 +588,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
+    _setKeyCapture(false);
     unawaited(_shutdown());
   }
 
@@ -644,6 +652,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelX = 0;
       _wheelY = 0;
     });
+    _setKeyCapture(_inputActive);
     if (_controlEnabled) {
       // The toolbar button may claim focus while it handles the tap; take it
       // back once the frame settles so keys go to the host immediately.
@@ -675,6 +684,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Even if an Up above was lost, or the host saw a press this page never
     // recorded, this lifts whatever it still holds.
     unawaited(_guardSend(ViewerBridge.releaseInput()));
+  }
+
+  void _setKeyCapture(bool enable) {
+    unawaited(_guardSend(ViewerBridge.setKeyCapture(enable)));
   }
 
   Future<void> _guardSend(Future<bool> send) async {
