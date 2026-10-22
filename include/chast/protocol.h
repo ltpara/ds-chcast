@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 10.
+// The chast wire protocol, version 13.
 //
 // One QUIC connection carries:
 //
@@ -27,6 +27,7 @@
 // stream's actual codec in the handshake; a requested HEVC stream that fell
 // back to AVC is announced as AVC.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -37,7 +38,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 12;
+inline constexpr uint16_t kProtocolVersion = 13;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -95,6 +96,12 @@ enum class ControlType : uint16_t {
     // when the shape, the position or the visibility actually changed, so an
     // idle pointer costs nothing. See CursorUpdate for the payload.
     CursorUpdate = 13,
+    // The host's grants changed mid-session (the operator ticked a checkbox
+    // in the session window, or a policy revoked a permission). Payload: the
+    // u16 permission mask. The viewer applies it immediately and stops
+    // sending input or clipboard it no longer holds; audio teardown follows
+    // the stream state in the next StreamInfo.
+    PermissionUpdate = 14,
 };
 
 // ----- input -----
@@ -321,6 +328,25 @@ inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
 inline constexpr uint16_t kServerInfoKnownFlags =
     kServerInfoInputEnabled | kServerInfoClipboardEnabled | kServerInfoAudioEnabled;
 
+// The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
+// after the source size, PermissionUpdate replaces it mid-session, and the
+// three ServerInfo booleans are its decoded form. Input covers pointer and
+// keyboard injection; clipboard governs ClipboardUpdate in both directions;
+// audio is present only while an audio stream is open.
+enum PermissionBit : uint16_t {
+    kPermissionInput = 0x0001,
+    kPermissionClipboard = 0x0002,
+    kPermissionAudio = 0x0004,
+};
+inline constexpr uint16_t kPermissionAll =
+    kPermissionInput | kPermissionClipboard | kPermissionAudio;
+
+// Informational platform tag in the trust list.
+enum class DevicePlatform : uint8_t {
+    Unknown = 0,
+    Windows = 1,
+};
+
 // One attached output, as the server sees it. `rect` is the output's
 // virtual-desktop rect (the orientation the user sees, so a rotated panel
 // reports its rotated width and height). The list order is the server's
@@ -416,24 +442,80 @@ bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
 // answers with the display it actually captured, which also fixes origin_x /
 // origin_y for the viewer's pointer mapping.
 //
-// `access_token` is the passphrase the server was started with, empty when it
-// accepts connections without one. It travels inside the TLS-authenticated
-// QUIC connection, never as plaintext, and the server compares it in constant
-// time. A one-time token is consumed by the first accepted handshake.
+// Authentication travels in the same message. `access_token` is the legacy
+// passphrase for CLI and automation (empty unless the host enabled it);
+// `password` is what the interactive viewer collects from the user. A signed
+// Hello proves the device key belongs to this request: the signature covers
+// the host fingerprint, `nonce` and `unix_seconds`, so a replayed Hello fails
+// once the nonce cache expires or the clock window closes.
 inline constexpr size_t kMaxAccessTokenLength = 128;
 inline constexpr size_t kMaxAccessDenialReason = 512;
+inline constexpr size_t kMaxPasswordLength = 128;
+inline constexpr size_t kMaxDeviceKeyLength = 128;
+inline constexpr size_t kMaxDeviceNameLength = 64;
+inline constexpr size_t kMaxTotpLength = 16;
+inline constexpr size_t kMaxSignatureLength = 128;
+inline constexpr size_t kHelloNonceBytes = 16;
+
+// auth_flags bits.
+inline constexpr uint8_t kAuthFlagTrustDevice = 0x01;  // add this key to the trust list
+inline constexpr uint8_t kAuthFlagSigned = 0x02;       // signature is present
+inline constexpr uint8_t kAuthFlagsKnown = kAuthFlagTrustDevice | kAuthFlagSigned;
+
+struct ClientHello {
+    uint16_t display = kDisplayAuto;
+    std::string access_token;
+    std::string password;
+    // Bits from PermissionBit. The host intersects this with its defaults and
+    // with what the operator approves.
+    uint16_t requested_permissions = kPermissionAll;
+    // ECDSA P-256 public key blob. Empty when the client has no identity (the
+    // CLI tools); a signed flag requires it.
+    std::vector<uint8_t> device_key;
+    uint8_t device_platform = static_cast<uint8_t>(DevicePlatform::Unknown);
+    std::string device_name;
+    std::array<uint8_t, kHelloNonceBytes> nonce{};
+    uint64_t unix_seconds = 0;
+    uint8_t auth_flags = 0;
+    // ECDSA-SHA256 over host_fingerprint || nonce || unix_seconds (little
+    // endian). Empty when unsigned.
+    std::vector<uint8_t> signature;
+    // Six ASCII digits, empty when the client has nothing to prove.
+    std::string totp;
+};
+
+// The bytes a trusted device signs: the host's canonical (64 uppercase hex
+// digit) certificate fingerprint, the nonce, and unix_seconds as a
+// little-endian u64. Binding the fingerprint keeps a captured proof from
+// working against another host; the nonce and timestamp keep it from working
+// again later.
+inline std::vector<uint8_t> hello_signature_message(const std::string& host_fingerprint,
+                                                    const ClientHello& hello) {
+    std::vector<uint8_t> message(host_fingerprint.begin(), host_fingerprint.end());
+    message.insert(message.end(), hello.nonce.begin(), hello.nonce.end());
+    for (int i = 0; i < 8; ++i) {
+        message.push_back(static_cast<uint8_t>(hello.unix_seconds >> (8 * i)));
+    }
+    return message;
+}
 
 // Why the server refused a Hello.
 enum class AccessDenial : uint8_t {
-    InvalidToken = 1,  // no token, or one that does not match
-    TokenUsed = 2,     // the one-time token was already spent
-    Declined = 3,      // the host operator said no
+    InvalidToken = 1,      // no token, or one that does not match
+    TokenUsed = 2,         // the one-time token was already spent
+    Declined = 3,          // the host operator said no
+    WrongPassword = 4,     // password auth failed; the viewer may retry
+    PasswordRequired = 5,  // the mode requires a password and none was given
+    TwoFactorRequired = 6, // the password was right; reconnect with a TOTP code
+    WrongTwoFactor = 7,    // the TOTP code was wrong or expired
+    LockedOut = 8,         // too many failures from this address
+    NotWhitelisted = 9,    // the source address is outside the IP whitelist
+    AuthTimeout = 10,      // a challenge was not answered in time
 };
 
-std::vector<uint8_t> make_hello(uint16_t display = kDisplayAuto,
-                                const std::string& access_token = {});
-bool parse_hello(const std::vector<uint8_t>& payload, uint16_t& display,
-                 std::string& access_token, std::string* error);
+std::vector<uint8_t> make_hello(const ClientHello& hello);
+bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
+                 std::string* error);
 // The server's refusal of a Hello. The viewer shows `reason` to the user.
 std::vector<uint8_t> make_access_denied(AccessDenial code, const std::string& reason);
 bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code,
@@ -468,6 +550,11 @@ bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate
 std::vector<uint8_t> make_cursor_update(const CursorUpdate& update);
 bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& update,
                          std::string* error);
+// Host -> viewer permission change. Unknown bits are rejected so a newer
+// sender cannot silently grant something this build does not understand.
+std::vector<uint8_t> make_permission_update(uint16_t permissions);
+bool parse_permission_update(const std::vector<uint8_t>& payload,
+                             uint16_t& permissions, std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.

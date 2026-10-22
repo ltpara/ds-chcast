@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -34,6 +35,29 @@ uint64_t capture_clock_ms(Clock::time_point time) {
 uint32_t bitrate_reserve(const AudioInfo& audio) {
     return audio.enabled ? static_cast<uint32_t>(static_cast<uint64_t>(audio.bitrate) * 11u / 10u)
                          : 0u;
+}
+
+int64_t unix_now() {
+    return static_cast<int64_t>(std::time(nullptr));
+}
+
+SecretScope secret_scope(IdentityScope scope) {
+    return scope == IdentityScope::LocalMachine ? SecretScope::LocalMachine
+                                                : SecretScope::CurrentUser;
+}
+
+uint16_t settings_permissions(const HostSettings& settings) {
+    uint16_t mask = 0;
+    if (settings.allow_input) {
+        mask |= kPermissionInput;
+    }
+    if (settings.allow_clipboard) {
+        mask |= kPermissionClipboard;
+    }
+    if (settings.allow_audio) {
+        mask |= kPermissionAudio;
+    }
+    return mask;
 }
 
 bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomic<bool>& stopping,
@@ -123,6 +147,39 @@ const char* codec_name(VideoCodec codec) {
     return codec == VideoCodec::Hevc ? "hevc" : "h264";
 }
 
+std::string auth_method_suffix(const HostSecurity::Result& result) {
+    if (result.via_token) {
+        return " with the access token";
+    }
+    if (result.used_temporary_password) {
+        return " with the temporary password";
+    }
+    if (result.via_trusted_device) {
+        return " with a trusted device";
+    }
+    return " with a password";
+}
+
+std::string permission_names(uint16_t mask) {
+    std::string text;
+    auto add = [&text](const char* name) {
+        if (!text.empty()) {
+            text += ", ";
+        }
+        text += name;
+    };
+    if ((mask & kPermissionInput) != 0) {
+        add("keyboard and pointer");
+    }
+    if ((mask & kPermissionClipboard) != 0) {
+        add("clipboard");
+    }
+    if ((mask & kPermissionAudio) != 0) {
+        add("audio");
+    }
+    return text.empty() ? "view only" : text;
+}
+
 }  // namespace
 
 std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::string* error) {
@@ -141,6 +198,15 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
     }
     if (!server->open_session(error)) {
         return nullptr;
+    }
+    // The policy binds signed Hellos to the certificate just loaded, so it
+    // exists only once the session knows its fingerprint.
+    server->security_ = std::make_unique<HostSecurity>(
+        server->security_config(server->session_->server_fingerprint()));
+    server->publish_security_status();
+    if (server->config_.service_mode && server->settings_.password_hash.empty()) {
+        server->log("service mode has no permanent password; every viewer will be refused "
+                    "until one is set");
     }
     return server;
 }
@@ -194,19 +260,217 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
     quic.allow_audio = settings_.allow_audio;
+    quic.allow_permission_change = settings_.allow_permission_change;
     quic.dry_run_input = config_.dry_run_input;
-    quic.access_token = settings_.access_token;
-    quic.reuse_access_token = settings_.token_mode == HostTokenMode::Reusable;
-    quic.approve_client = config_.approve_client;
+    // The one-shot tool reports a refused password instead of waiting for the
+    // next viewer; the interactive host keeps listening.
+    quic.stop_after_denial = config_.serve_once;
+    // The policy owns every credential, including the legacy token; the
+    // transport's own token gate stays off.
+    quic.authenticate = [this](const ClientRequest& request) {
+        return authenticate_client(request);
+    };
+    quic.approve_client = [this](const ClientRequest& request) {
+        return approve_client(request);
+    };
     session_ = QuicSession::create_server(quic, error);
     if (!session_) {
         return false;
     }
     const std::string fingerprint = session_->server_fingerprint();
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    status_.fingerprint = fingerprint;
-    status_.token = settings_.access_token;
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.fingerprint = fingerprint;
+        status_.token = settings_.access_token;
+    }
+    if (security_) {
+        // A reopened listener may see a new certificate; signed Hellos must
+        // bind to the one now on the wire.
+        refresh_security_config();
+    }
     return true;
+}
+
+HostSecurity::Config HostServer::security_config(const std::string& fingerprint) {
+    HostSecurity::Config config;
+    config.mode = settings_.auth_mode;
+    config.password_hash = settings_.password_hash;
+    config.totp_secret = settings_.totp_secret;
+    if (!config.totp_secret.empty()) {
+        // host.ini stores the secret DPAPI-protected; an early/hand-written
+        // value may still be plain base32.
+        std::string plain;
+        std::string error;
+        if (unprotect_totp_secret(config.totp_secret, secret_scope(config_.identity_scope),
+                                  plain, &error)) {
+            config.totp_secret = std::move(plain);
+        } else {
+            std::vector<uint8_t> key;
+            if (!parse_totp_secret(config.totp_secret, key)) {
+                // Leave the unusable string in place: HostSecurity marks 2FA
+                // invalid and refuses password logins instead of silently
+                // dropping the second factor.
+                log("two-factor secret cannot be read (" + error +
+                    "); password logins will be refused");
+            }
+        }
+    }
+    config.default_permissions = settings_permissions(settings_);
+    config.allow_permission_change = settings_.allow_permission_change;
+    config.ip_whitelist = settings_.ip_whitelist;
+    config.service_mode = config_.service_mode;
+    config.token_auth = settings_.token_auth;
+    config.access_token = settings_.access_token;
+    config.host_fingerprint = fingerprint;
+    // Once the policy exists it is the authority: the operator may have
+    // revoked a device since the settings were loaded.
+    config.trusted_devices = security_ ? security_->config().trusted_devices
+                                       : settings_.trusted_devices;
+    return config;
+}
+
+ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
+    ClientAuthResult auth;
+    if (!security_) {
+        auth.action = ClientAuthAction::Deny;
+        auth.denial = AccessDenial::Declined;
+        auth.reason = "the host security policy is not ready";
+        return auth;
+    }
+    pending_security_ = security_->evaluate(request.hello, request.peer_address, unix_now());
+    const std::string from =
+        request.peer_address.empty() ? std::string("an unknown address") : request.peer_address;
+    auth.permissions = pending_security_.permissions;
+    switch (pending_security_.decision) {
+        case HostSecurity::Decision::Allow:
+            auth.action = ClientAuthAction::Allow;
+            log("admitted " + from + auth_method_suffix(pending_security_));
+            commit_security();
+            break;
+        case HostSecurity::Decision::RequireApproval:
+            auth.action = ClientAuthAction::RequireApproval;
+            log("a viewer from " + from + " is waiting for approval");
+            break;
+        case HostSecurity::Decision::Deny:
+            auth.action = ClientAuthAction::Deny;
+            auth.denial = pending_security_.denial;
+            auth.reason = pending_security_.reason;
+            log("refused " + from + ": " + pending_security_.reason);
+            break;
+    }
+    return auth;
+}
+
+ClientApproval HostServer::approve_client(const ClientRequest& request) {
+    if (!config_.approve_client) {
+        return ClientApproval{};
+    }
+    // The approval window explains why it is up; the transport request has no
+    // opinion on that, so annotate a copy before handing it over.
+    ClientRequest annotated = request;
+    annotated.method = settings_.auth_mode == HostAuthMode::Click
+                           ? ClientApprovalMethod::Click
+                           : ClientApprovalMethod::NoPassword;
+    annotated.device_proof = pending_security_.request_trust;
+    const ClientApproval approval = config_.approve_client(annotated);
+    const std::string from =
+        request.peer_address.empty() ? std::string("an unknown address") : request.peer_address;
+    if (!approval.allow) {
+        log("the operator declined the viewer from " + from);
+        return approval;
+    }
+    // The trust list and a spent temporary password are committed only now:
+    // a refused approval is a denial, not a login.
+    commit_security();
+    log("the operator approved the viewer from " + from + "; granting " +
+        permission_names(request.permissions & approval.permissions));
+    return approval;
+}
+
+void HostServer::commit_security() {
+    if (!security_) {
+        return;
+    }
+    security_->note_connected(pending_security_, unix_now());
+    publish_trusted_devices();
+    publish_security_status();
+}
+
+void HostServer::refresh_security_config() {
+    if (!security_) {
+        return;
+    }
+    std::string fingerprint;
+    if (session_) {
+        fingerprint = session_->server_fingerprint();
+    } else {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        fingerprint = status_.fingerprint;
+    }
+    security_->set_config(security_config(fingerprint));
+    publish_security_status();
+}
+
+void HostServer::publish_trusted_devices() {
+    if (!security_ || !config_.trusted_devices_changed) {
+        return;
+    }
+    const std::vector<TrustedDevice> devices = security_->config().trusted_devices;
+    // Sessions that never carry a device key must not rewrite the file.
+    if (devices.empty() && settings_.trusted_devices.empty()) {
+        return;
+    }
+    config_.trusted_devices_changed(devices);
+}
+
+void HostServer::publish_security_status() {
+    if (!security_) {
+        return;
+    }
+    const HostSecurity::Config config = security_->config();
+    const std::string temporary = security_->temporary_password();
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    status_.auth_mode = config.mode;
+    status_.password_configured = !config.password_hash.empty();
+    status_.two_factor_enabled = !config.totp_secret.empty();
+    status_.temporary_password = temporary;
+}
+
+std::string HostServer::refresh_temporary_password() {
+    if (!security_) {
+        return {};
+    }
+    const std::string password = security_->refresh_temporary_password();
+    publish_security_status();
+    return password;
+}
+
+std::vector<TrustedDevice> HostServer::trusted_devices() const {
+    if (!security_) {
+        return {};
+    }
+    return security_->trusted_devices(unix_now());
+}
+
+bool HostServer::revoke_trusted_device(const std::vector<uint8_t>& public_key) {
+    if (!security_ || !security_->revoke_trusted_device(public_key)) {
+        return false;
+    }
+    publish_trusted_devices();
+    return true;
+}
+
+void HostServer::clear_trusted_devices() {
+    if (!security_) {
+        return;
+    }
+    security_->clear_trusted_devices();
+    publish_trusted_devices();
+}
+
+void HostServer::set_permissions(uint16_t permissions) {
+    pending_permissions_.store(permissions & kPermissionAll);
+    permission_update_pending_.store(true);
 }
 
 void HostServer::run() {
@@ -287,6 +551,7 @@ void HostServer::run() {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.peer_address = peer;
             status_.requested_display = session_->requested_display();
+            status_.session_permissions = session_->permissions();
             status_.display_index = 0;
             status_.display_name.clear();
             status_.stream = ServerInfo{};
@@ -355,6 +620,9 @@ void HostServer::run() {
             if (config_.token_changed) {
                 config_.token_changed(settings_.access_token);
             }
+            // The policy holds its own copy of the token, so automation sees
+            // the same rotation the legacy caller does.
+            refresh_security_config();
             log("the one-time token was spent; a new token is ready");
         }
 
@@ -464,6 +732,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // encoded, and a machine without a usable endpoint simply streams video.
     std::unique_ptr<ILoopbackCapture> audio_capture;
     AudioInfo audio_info;
+    const uint16_t granted_permissions = session_->permissions();
+    // The endpoint stays open for the whole session even if audio was denied
+    // at approval: the operator can grant it back live, and rebuilding WASAPI
+    // mid-session would cost a fresh announcement for no benefit.
     if (settings_.allow_audio) {
         std::string audio_error;
         if (config_.audio_capture) {
@@ -482,7 +754,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             log("audio unavailable: " + audio_error);
         }
     }
-    stats.audio_active = audio_info.enabled;
+    stats.audio_active =
+        audio_info.enabled && (granted_permissions & kPermissionAudio) != 0;
 
     // The configured bitrate is the whole session's budget, audio included;
     // the video encoder starts at what is left after reserving it. The
@@ -506,7 +779,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     ServerInfo stream_info =
         describe_stream(attached, capturer->display(), *encoder, first.width, first.height,
-                        static_cast<uint16_t>(framerate), settings_.allow_clipboard, audio_info);
+                        static_cast<uint16_t>(framerate),
+                        (granted_permissions & kPermissionClipboard) != 0, audio_info);
     publish_stream(stream_info, find_display(attached, capturer->display()),
                    display_name_utf8(capturer->display()));
     if (config_.stream_announced) {
@@ -516,6 +790,54 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     if (!announced.ok()) {
         *error = "announce: " + announced.to_string();
         return false;
+    }
+    // A UI request made between sessions is applied once the stream exists:
+    // set_permissions() is only valid after the announcement.
+    uint16_t announced_permissions = granted_permissions;
+    auto apply_pending_permissions = [&]() -> bool {
+        if (!permission_update_pending_.exchange(false)) {
+            return true;
+        }
+        Error applied = session_->set_permissions(pending_permissions_.load());
+        if (!applied.ok()) {
+            if (applied.status() != Status::InvalidCall) {
+                log("permission update failed: " + applied.to_string());
+            }
+            return true;
+        }
+        const uint16_t now_mask = session_->permissions();
+        if (now_mask == announced_permissions) {
+            return true;
+        }
+        announced_permissions = now_mask;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.session_permissions = now_mask;
+        }
+        // Audio and clipboard availability travel in the stream description.
+        // A viewer that was denied audio at approval has no AAC config yet,
+        // so a fresh description is what makes a restore usable.
+        stream_info.audio.enabled = audio_info.enabled;
+        publish_stream(stream_info, find_display(attached, capturer->display()),
+                       display_name_utf8(capturer->display()));
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "refresh_stream: " + refreshed.to_string();
+            }
+            return false;
+        }
+        ++stats.stream_updates;
+        stats.audio_active = audio_info.enabled && (now_mask & kPermissionAudio) != 0;
+        log("the session permissions are now " + permission_names(now_mask));
+        return true;
+    };
+    if (!apply_pending_permissions()) {
+        return error->empty();
     }
     if (audio_capture) {
         audio_capture->start();
@@ -554,9 +876,16 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     // Clipboard baseline: remember what the host clipboard held when the
     // session started and upload only changes after that, never its history.
-    const bool clipboard_enabled = settings_.allow_clipboard;
+    // The operator can revoke the permission mid-session, so the same check
+    // runs on every poll; re-enabling starts from a fresh baseline instead of
+    // flushing whatever changed while the viewer could not see it.
+    auto clipboard_allowed = [&] {
+        return settings_.allow_clipboard &&
+               (session_->permissions() & kPermissionClipboard) != 0;
+    };
+    bool clipboard_was_allowed = clipboard_allowed();
     std::string last_clipboard;
-    if (clipboard_enabled) {
+    if (clipboard_was_allowed) {
         std::string current;
         if (config_.clipboard_read(current)) {
             last_clipboard = std::move(current);
@@ -574,7 +903,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         stats.input_stats = session_->input_stats();
         stats.input_releases = session_->input_release_requests();
-        if (!clipboard_enabled) {
+        if (!clipboard_allowed()) {
             return;
         }
         ClipboardUpdate update;
@@ -592,7 +921,21 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     };
 
     auto poll_clipboard = [&](Clock::time_point now) {
-        if (!clipboard_enabled || now < next_clipboard_poll) {
+        const bool allowed = clipboard_allowed();
+        if (!allowed) {
+            clipboard_was_allowed = false;
+            return;
+        }
+        if (!clipboard_was_allowed) {
+            clipboard_was_allowed = true;
+            std::string current;
+            if (config_.clipboard_read(current)) {
+                last_clipboard = std::move(current);
+            }
+            next_clipboard_poll = now + std::chrono::milliseconds(500);
+            return;
+        }
+        if (now < next_clipboard_poll) {
             return;
         }
         next_clipboard_poll = now + std::chrono::milliseconds(500);
@@ -647,6 +990,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (!audio_capture) {
             return;
         }
+        if ((session_->permissions() & kPermissionAudio) == 0) {
+            // Keep the endpoint warm so a restore resumes immediately, but
+            // encode nothing the viewer may not receive.
+            EncodedAudio dropped;
+            while (audio_capture->take_packet(dropped)) {
+            }
+            return;
+        }
         EncodedAudio packet;
         while (audio_capture->take_packet(packet)) {
             const uint64_t host_ms = packet.capture_ms & 0xFFFFFFFFFFFFull;
@@ -659,6 +1010,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             header.codec = audio_info.codec;
             Error sent = session_->send_audio(header, packet.data.data(), packet.data.size());
             if (!sent.ok()) {
+                if (sent.status() == Status::PermissionDenied) {
+                    // The operator revoked audio between the check above and
+                    // the send; the next tick sees the new mask.
+                    continue;
+                }
                 if (sent.status() == Status::WaitTimeout) {
                     // The shared send queue is full; video owns the path and
                     // this packet is a short gap, not a reason to stop audio.
@@ -843,6 +1199,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // encoder reset set_rate performs cannot overlap an encode call.
     auto last_link_sample = Clock::now();
     uint64_t last_sample_bytes = stats.bytes;
+    uint64_t last_sent_packets = 0;
+    uint64_t last_lost_packets = 0;
     auto sample_link = [&](Clock::time_point now) -> bool {
         const uint32_t elapsed_ms = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_link_sample)
@@ -864,6 +1222,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         stats.rtt_ms = static_cast<double>(transport.rtt_us) / 1000.0;
         stats.min_rtt_ms = static_cast<double>(transport.min_rtt_us) / 1000.0;
+        const uint64_t sent_delta = transport.sent_packets >= last_sent_packets
+                                        ? transport.sent_packets - last_sent_packets
+                                        : 0;
+        const uint64_t lost_delta = transport.lost_packets >= last_lost_packets
+                                        ? transport.lost_packets - last_lost_packets
+                                        : 0;
+        last_sent_packets = transport.sent_packets;
+        last_lost_packets = transport.lost_packets;
         if (!config_.adaptive_bitrate) {
             return true;
         }
@@ -955,7 +1321,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             log("adaptive bitrate: " + std::string(decision.reason) + "; target " +
                 std::to_string(decision.target_bps / 1000u) + " kbps at " +
                 std::to_string(framerate) + " fps, RTT " +
-                std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms");
+                std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms, loss " +
+                std::to_string(lost_delta) + "/" + std::to_string(sent_delta) +
+                " pkts, queued " + std::to_string(transport.queued_bytes) + " of cwnd " +
+                std::to_string(transport.congestion_window));
         }
         publish_stats(stats);
         return true;
@@ -979,6 +1348,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (config_.run_seconds > 0.0 &&
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
+        }
+        if (!apply_pending_permissions()) {
+            const bool clean = error->empty();
+            drain_peer();
+            return clean;
         }
         drain_audio();
         drain_peer();
@@ -1123,7 +1497,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stream_info =
                 describe_stream(refreshed, capturer->display(), *encoder, frame.width,
                                 frame.height, static_cast<uint16_t>(framerate),
-                                settings_.allow_clipboard, audio_info);
+                                (session_->permissions() & kPermissionClipboard) != 0,
+                                audio_info);
             publish_stream(stream_info, find_display(refreshed, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {
@@ -1208,7 +1583,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stream_info =
                 describe_stream(attached, capturer->display(), *encoder, frame.width,
                                 frame.height, static_cast<uint16_t>(framerate),
-                                settings_.allow_clipboard, audio_info);
+                                (session_->permissions() & kPermissionClipboard) != 0,
+                                audio_info);
             publish_stream(stream_info, find_display(attached, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {

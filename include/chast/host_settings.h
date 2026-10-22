@@ -11,9 +11,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "chast/encoder.h"
 #include "chast/protocol.h"
+#include "chast/security.h"
 
 namespace chast {
 
@@ -23,6 +25,30 @@ enum class HostTokenMode {
     OneTime,
     Reusable,
 };
+
+// How a viewer may get in. Password: a permanent or temporary password is
+// required. Click: the operator approves every connection; passwords are not
+// consulted. Both: a supplied password is checked and a wrong one is refused,
+// while an empty one asks the operator (this is the default and the RustDesk
+// "both" flow).
+enum class HostAuthMode {
+    Password,
+    Click,
+    Both,
+};
+
+// A viewer device that proved a 2FA login and asked to be remembered. The
+// public key is not a secret; the private half stays on the viewer. Entries
+// live for 90 days after their last use and can be revoked by the operator.
+struct TrustedDevice {
+    std::vector<uint8_t> public_key;
+    std::string name;
+    uint8_t platform = 0;
+    int64_t added_unix_seconds = 0;
+    int64_t last_seen_unix_seconds = 0;
+};
+
+inline constexpr size_t kMaxTrustedDevices = 32;
 
 struct HostSettings {
     // 0.0.0.0 serves the LAN; 127.0.0.1 keeps everything local.
@@ -37,7 +63,26 @@ struct HostSettings {
     // Send the system sound to the viewer. Off means no audio stream is
     // opened and the HelloAck reports audio unavailable.
     bool allow_audio = true;
+    HostAuthMode auth_mode = HostAuthMode::Both;
+    // Legacy mirror of auth_mode: true unless the mode is Password. The mode
+    // is authoritative; this stays so older builds and callers keep working.
     bool require_approval = true;
+    // PBKDF2-encoded permanent password. Empty means none; click mode and the
+    // temporary password do not need one.
+    std::string password_hash;
+    // Accept the legacy access token from CLI tools. Off by default: the
+    // interactive viewer authenticates with a password.
+    bool token_auth = false;
+    // The operator may narrow permissions in the approval window and toggle
+    // them during a session.
+    bool allow_permission_change = true;
+    // DPAPI-protected TOTP secret (base64); empty means 2FA is off. Use
+    // protect_totp_secret()/unprotect_totp_secret() for the clear text.
+    std::string totp_secret;
+    std::vector<TrustedDevice> trusted_devices;
+    // Comma-separated IPv4 CIDR list; empty means no restriction. Entries that
+    // do not parse make the list fail closed rather than disappear.
+    std::string ip_whitelist;
     HostTokenMode token_mode = HostTokenMode::OneTime;
     // Empty means "generate one on first start".
     std::string access_token;
@@ -86,6 +131,26 @@ std::string machine_settings_path();
 // 8 characters from an alphabet without look-alikes (no 0/O/1/I), so a token
 // read out loud or typed from a screen cannot be mistyped as another one.
 std::string generate_access_token(size_t length = 8);
+
+// "password"/"click"/"both", the spelling used in the settings file.
+const char* auth_mode_name(HostAuthMode mode);
+bool parse_auth_mode(const std::string& text, HostAuthMode& mode);
+
+// trusted_devices= uses
+// <base64(pubkey)>:<base64(name)>:<base64(platform)>:<added>:<last_seen>
+// entries separated by commas. The decoder returns false on any malformed
+// entry; callers drop the whole line so a corrupt list cannot silently trust
+// the wrong key.
+std::string encode_trusted_devices(const std::vector<TrustedDevice>& devices);
+bool decode_trusted_devices(const std::string& text, std::vector<TrustedDevice>& devices,
+                            std::string* error);
+
+// The TOTP secret is DPAPI-protected with a fixed entropy string before it is
+// written to host.ini. The tray uses CurrentUser, the service LocalMachine.
+bool protect_totp_secret(const std::string& plaintext, SecretScope scope,
+                         std::string& stored_base64, std::string* error);
+bool unprotect_totp_secret(const std::string& stored_base64, SecretScope scope,
+                           std::string& plaintext, std::string* error);
 
 // "h264"/"hevc", the spelling used in the settings file.
 const char* codec_setting_name(VideoCodec codec);

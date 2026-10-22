@@ -30,6 +30,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -46,6 +47,34 @@ namespace {
 constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
 constexpr uint64_t kKeepAliveMs = 5000;
+
+// Device names come from the local computer and the protocol caps them at
+// kMaxDeviceNameLength bytes. Cut on a whole UTF-8 sequence so a long name
+// never produces a Hello the host rejects as malformed.
+std::string truncate_utf8(const std::string& text, size_t limit) {
+    if (text.size() <= limit) {
+        return text;
+    }
+    size_t cut = limit;
+    while (cut > 0 && (static_cast<uint8_t>(text[cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    return text.substr(0, cut);
+}
+
+uint16_t permission_mask_from_info(const ServerInfo& info) {
+    uint16_t mask = 0;
+    if (info.input_enabled) {
+        mask |= kPermissionInput;
+    }
+    if (info.clipboard_enabled) {
+        mask |= kPermissionClipboard;
+    }
+    if (info.audio.enabled) {
+        mask |= kPermissionAudio;
+    }
+    return mask;
+}
 
 uint64_t steady_us() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -446,15 +475,25 @@ struct QuicSession::Impl {
     // Client side: a StreamInfo arrived since take_stream_update().
     bool stream_update_ready = false;
     uint64_t stream_updates = 0;
-    // Server side: what Hello asked to have captured.
+    // Server side: what Hello asked to have captured, and the full Hello for
+    // the application thread to authenticate. The decision is made there
+    // because hashing a password or prompting an operator must not run on a
+    // MsQuic worker, and closing the connection from its own callback is not
+    // allowed.
     uint16_t requested_display = kDisplayAuto;
     std::string requested_peer;
-    // Server: a Hello the token check refused, waiting for the application
-    // thread to answer it. Delivery happens there because closing a
-    // connection from inside its own callback is not allowed.
-    bool pending_denial = false;
-    AccessDenial pending_code = AccessDenial::InvalidToken;
-    std::string pending_reason;
+    ClientHello pending_hello;
+    // Server: the mask the viewer was granted, and the ceiling that grant
+    // established. Mid-session changes may only stay inside the ceiling.
+    // Client: the mask the host last announced. Atomic because the transport
+    // callbacks read it while the application thread updates it.
+    std::atomic<uint16_t> session_permissions{0};
+    uint16_t permission_ceiling = 0;
+    // Client: a PermissionUpdate arrived since take_permission_update().
+    bool permission_update_ready = false;
+    uint64_t permission_updates = 0;
+    // Client: HelloAck was accepted, so the permission mask is meaningful.
+    bool hello_complete = false;
     // Server: the one-time token has been spent.
     bool token_consumed = false;
     // Client: the server refused the Hello, with its reason.
@@ -857,45 +896,16 @@ struct QuicSession::Impl {
                 if (role != Role::Server) {
                     break;
                 }
-                uint16_t display = kDisplayAuto;
-                std::string token;
-                if (!parse_hello(payload, display, token, &error)) {
+                ClientHello hello;
+                if (!parse_hello(payload, hello, &error)) {
                     note_transport_failure("Hello: " + error);
                     break;
                 }
-                // Copied under the lock because set_access_token() may replace
-                // the token between sessions.
-                std::string expected;
-                bool used = false;
-                bool reusable = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    expected = server_config.access_token;
-                    used = token_consumed;
-                    reusable = server_config.reuse_access_token;
-                }
-                if (!expected.empty()) {
-                    if (!tokens_match(token, expected)) {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        pending_denial = true;
-                        pending_code = AccessDenial::InvalidToken;
-                        pending_reason = "the access token was not accepted";
-                        cv.notify_all();
-                        break;
-                    }
-                    if (used && !reusable) {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        pending_denial = true;
-                        pending_code = AccessDenial::TokenUsed;
-                        pending_reason = "the one-time access token was already used";
-                        cv.notify_all();
-                        break;
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(mutex);
-                    requested_display = display;
+                    requested_display = hello.display;
                     requested_peer = remote_address();
+                    pending_hello = std::move(hello);
                     hello_ready = true;
                 }
                 cv.notify_all();
@@ -931,6 +941,7 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    session_permissions = permission_mask_from_info(info);
                     peer_info = std::move(info);
                     hello_ack_ready = true;
                 }
@@ -950,6 +961,7 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
+                    session_permissions = permission_mask_from_info(info);
                     peer_info = std::move(info);
                     stream_update_ready = true;
                     ++stream_updates;
@@ -988,9 +1000,12 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::InputEvent: {
-                if (role != Role::Server || !server_config.allow_input) {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionInput) == 0) {
                     // The HelloAck already told the viewer input is off; a
-                    // client that sends it anyway is dropped, not fatal.
+                    // client that sends it anyway is dropped, not fatal. This
+                    // also covers a mid-session revocation: the operator does
+                    // not have to trust the viewer to stop by itself.
                     break;
                 }
                 InputEvent event;
@@ -1016,7 +1031,10 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::InputRelease: {
-                if (role != Role::Server || !server_config.allow_input) {
+                // Processed even when input is revoked: this message only
+                // lifts what is held, and a viewer that lost input before its
+                // key-up still has to be able to release it.
+                if (role != Role::Server) {
                     break;
                 }
                 {
@@ -1086,8 +1104,27 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::PermissionUpdate: {
+                if (role != Role::Client) {
+                    break;
+                }
+                uint16_t permissions = 0;
+                if (!parse_permission_update(payload, permissions, &error)) {
+                    note_transport_failure("PermissionUpdate: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_permissions = permissions;
+                    permission_update_ready = true;
+                    ++permission_updates;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::ClipboardUpdate: {
-                if (role == Role::Server && !server_config.allow_clipboard) {
+                if (role == Role::Server &&
+                    (session_permissions.load() & kPermissionClipboard) == 0) {
                     // The HelloAck already reported clipboard off; a client
                     // that sends it anyway is dropped, not fatal.
                     break;
@@ -1288,9 +1325,14 @@ struct QuicSession::Impl {
             audio_stopped = false;
             hello_ready = false;
             hello_ack_ready = false;
-            pending_denial = false;
+            pending_hello = ClientHello{};
             requested_display = kDisplayAuto;
             requested_peer.clear();
+            session_permissions = 0;
+            permission_ceiling = 0;
+            permission_update_ready = false;
+            permission_updates = 0;
+            hello_complete = false;
             peer_info = ServerInfo{};
             peer_stats = ClientStats{};
             stream_update_ready = false;
@@ -1323,6 +1365,22 @@ struct QuicSession::Impl {
         connection = nullptr;
         cv.notify_all();
         send_cv.notify_all();
+    }
+
+    // The hard gates from QuicServerConfig. Authentication and approval may
+    // only reduce this; the transport never grants beyond it.
+    uint16_t config_permissions() const {
+        uint16_t mask = 0;
+        if (server_config.allow_input) {
+            mask |= kPermissionInput;
+        }
+        if (server_config.allow_clipboard) {
+            mask |= kPermissionClipboard;
+        }
+        if (server_config.allow_audio) {
+            mask |= kPermissionAudio;
+        }
+        return mask;
     }
 
     // Spends a one-time token once a client was accepted.
@@ -1610,41 +1668,91 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
 Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const uint16_t ceiling = impl.config_permissions();
     for (;;) {
         std::unique_lock<std::mutex> lock(impl.mutex);
         const bool woken = impl.cv.wait_until(lock, deadline, [&impl] {
-            return impl.hello_ready || impl.pending_denial || impl.transport_failed ||
+            return impl.hello_ready || impl.transport_failed ||
                    impl.shutdown_complete || impl.peer_closed;
         });
         if (impl.transport_failed) {
             return Error(impl.transport_status, impl.transport_message);
         }
-        if (impl.pending_denial) {
-            const AccessDenial code = impl.pending_code;
-            const std::string reason = impl.pending_reason;
-            impl.pending_denial = false;
-            lock.unlock();
-            impl.refuse_client(code, reason);
-            if (std::chrono::steady_clock::now() >= deadline) {
-                return Error(Status::WaitTimeout, "no client connected in time");
-            }
-            continue;
-        }        if (impl.hello_ready) {
+        if (impl.hello_ready) {
             // Consumed here: the next wait must be triggered by a new Hello,
             // not by the one this call already answered.
             impl.hello_ready = false;
-            if (!impl.server_config.approve_client) {
-                lock.unlock();
-                impl.consume_token();
-                return Error::success();
-            }
-            const ClientRequest request{impl.requested_display, impl.requested_peer};
+            ClientRequest request;
+            request.display = impl.requested_display;
+            request.peer_address = impl.requested_peer;
+            request.hello = std::move(impl.pending_hello);
+            impl.pending_hello = ClientHello{};
             lock.unlock();
-            if (impl.server_config.approve_client(request)) {
-                impl.consume_token();
+
+            ClientAuthResult auth;
+            std::string refusal;
+            auto refuse = [&](AccessDenial code, const std::string& reason) {
+                refusal = reason;
+                impl.refuse_client(code, reason);
+            };
+            if (impl.server_config.authenticate) {
+                auth = impl.server_config.authenticate(request);
+                if (auth.action == ClientAuthAction::Deny) {
+                    refuse(auth.denial, auth.reason.empty() ? "the host refused the connection"
+                                                            : auth.reason);
+                }
+                request.permissions = auth.permissions & ceiling;
+            } else {
+                // Legacy gate: the shared token, then the boolean approval.
+                std::string expected;
+                bool used = false;
+                bool reusable = false;
+                {
+                    std::lock_guard<std::mutex> guard(impl.mutex);
+                    expected = impl.server_config.access_token;
+                    used = impl.token_consumed;
+                    reusable = impl.server_config.reuse_access_token;
+                }
+                if (!expected.empty() && !tokens_match(request.hello.access_token, expected)) {
+                    refuse(AccessDenial::InvalidToken, "the access token was not accepted");
+                } else if (!expected.empty() && used && !reusable) {
+                    refuse(AccessDenial::TokenUsed, "the one-time access token was already used");
+                } else {
+                    request.permissions = ceiling;
+                    auth.action = impl.server_config.approve_client
+                                      ? ClientAuthAction::RequireApproval
+                                      : ClientAuthAction::Allow;
+                    auth.permissions = ceiling;
+                }
+            }
+
+            if (refusal.empty() && auth.action == ClientAuthAction::RequireApproval) {
+                if (!impl.server_config.approve_client) {
+                    refuse(AccessDenial::Declined,
+                           "the host requires approval but cannot ask for it");
+                } else {
+                    const ClientApproval approval = impl.server_config.approve_client(request);
+                    if (!approval.allow) {
+                        refuse(AccessDenial::Declined, "the host declined the connection");
+                    } else {
+                        auth.action = ClientAuthAction::Allow;
+                        auth.permissions = request.permissions & approval.permissions;
+                    }
+                }
+            }
+
+            if (refusal.empty()) {
+                const uint16_t granted = auth.permissions & ceiling;
+                impl.session_permissions = granted;
+                impl.permission_ceiling = granted;
+                if (!impl.server_config.authenticate) {
+                    impl.consume_token();
+                }
                 return Error::success();
             }
-            impl.refuse_client(AccessDenial::Declined, "the host declined the connection");
+            if (impl.server_config.stop_after_denial) {
+                return Error(Status::PermissionDenied, refusal);
+            }
             if (std::chrono::steady_clock::now() >= deadline) {
                 return Error(Status::WaitTimeout, "no client connected in time");
             }
@@ -1685,6 +1793,54 @@ std::string QuicSession::client_address() const {
     return impl_->requested_peer;
 }
 
+uint16_t QuicSession::permissions() const {
+    return impl_->session_permissions.load();
+}
+
+Error QuicSession::set_permissions(uint16_t permissions) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "set_permissions is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream was not announced yet");
+    }
+    if (!impl.server_config.allow_permission_change) {
+        return Error(Status::InvalidCall, "permission changes are disabled on this host");
+    }
+    uint16_t next = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        next = permissions & impl.permission_ceiling & impl.config_permissions();
+        if (next == impl.session_permissions.load()) {
+            return Error::success();
+        }
+        // The local gate changes before the message goes out: if telling the
+        // viewer fails, the host is still the one enforcing the reduction.
+        impl.session_permissions = next;
+    }
+    if ((next & kPermissionInput) == 0 && impl.injector) {
+        impl.injector->release_held();
+    }
+    return impl.send_bytes(impl.control.load(), make_permission_update(next),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_permission_update(uint16_t& permissions) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->permission_update_ready) {
+        return false;
+    }
+    permissions = impl_->session_permissions.load();
+    impl_->permission_update_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::permission_updates() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->permission_updates;
+}
+
 void QuicSession::set_access_token(std::string token) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->server_config.access_token = std::move(token);
@@ -1710,9 +1866,13 @@ Error QuicSession::announce(const ServerInfo& info) {
     }
     ServerInfo ack = info;
     // The gates belong to the server; never let a caller announce input the
-    // session will not inject or audio the host disabled.
-    ack.input_enabled = impl.server_config.allow_input;
-    ack.audio.enabled = ack.audio.enabled && impl.server_config.allow_audio;
+    // session will not inject or audio the host disabled. The accepted mask
+    // is already clamped to these gates, so it is the single source of truth
+    // and includes any reduction the operator made at approval time.
+    const uint16_t granted = impl.session_permissions.load();
+    ack.input_enabled = (granted & kPermissionInput) != 0;
+    ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
+    ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
     }
@@ -1784,14 +1944,16 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
         return Error(Status::InvalidCall, "the stream was not announced yet");
     }
     ServerInfo update = info;
-    update.input_enabled = impl.server_config.allow_input;
+    const uint16_t granted = impl.session_permissions.load();
+    update.input_enabled = (granted & kPermissionInput) != 0;
+    update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         audio_stream_open = impl.audio.load() != nullptr && !impl.audio_stopped;
     }
     update.audio.enabled =
-        update.audio.enabled && impl.server_config.allow_audio && audio_stream_open;
+        update.audio.enabled && (granted & kPermissionAudio) != 0 && audio_stream_open;
     if (!update.audio.enabled) {
         update.audio.extradata.clear();
     }
@@ -1854,6 +2016,11 @@ Error QuicSession::send_audio(AudioHeader header, const uint8_t* payload, size_t
     // cases distinguishable for the host and the loopback check.
     if (!impl.server_config.allow_audio) {
         return Error(Status::InvalidCall, "audio is disabled on this server");
+    }
+    // The operator may revoke audio mid-session. The stream stays open so a
+    // restore resumes immediately, but nothing leaves the host in between.
+    if ((impl.session_permissions.load() & kPermissionAudio) == 0) {
+        return Error(Status::PermissionDenied, "audio is disabled for this session");
     }
     if (!impl.announced) {
         return Error(Status::InvalidCall, "the audio stream is not open");
@@ -1992,8 +2159,39 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
         return quic_error(status, "QUIC StreamStart(control)");
     }
 
-    Error sent = impl.send_bytes(
-        control, make_hello(display, impl.client_config.access_token), QUIC_SEND_FLAG_NONE);
+    ClientHello hello;
+    hello.display = display;
+    hello.access_token = impl.client_config.access_token;
+    hello.password = impl.client_config.password;
+    hello.totp = impl.client_config.totp;
+    hello.requested_permissions = impl.client_config.requested_permissions & kPermissionAll;
+    if (impl.client_config.device_identity) {
+        const DeviceIdentity& identity = *impl.client_config.device_identity;
+        hello.device_key = identity.public_key();
+        hello.device_name = truncate_utf8(identity.name(), kMaxDeviceNameLength);
+        hello.device_platform = static_cast<uint8_t>(impl.client_config.device_platform);
+        if (!secure_random(hello.nonce.data(), hello.nonce.size())) {
+            return Error(Status::CaptureFailed, "cannot generate the Hello nonce");
+        }
+        hello.unix_seconds = static_cast<uint64_t>(std::time(nullptr));
+        hello.auth_flags = kAuthFlagSigned;
+        if (impl.client_config.trust_device) {
+            hello.auth_flags |= kAuthFlagTrustDevice;
+        }
+        std::string fingerprint;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            fingerprint = impl.peer_fingerprint;
+        }
+        std::string sign_error;
+        if (!identity.sign(hello_signature_message(fingerprint, hello), hello.signature,
+                           &sign_error)) {
+            return Error(Status::CaptureFailed, "cannot sign the Hello: " + sign_error);
+        }
+    } else if (impl.client_config.trust_device) {
+        return Error(Status::InvalidCall, "trust_device needs a device identity");
+    }
+    Error sent = impl.send_bytes(control, make_hello(hello), QUIC_SEND_FLAG_NONE);
     if (!sent.ok()) {
         return sent;
     }
@@ -2013,7 +2211,9 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     if (!impl.hello_ack_ready) {
         return Error(Status::Unavailable, "the server did not answer Hello");
     }
+    // `lock` from the wait above is still held here.
     info = impl.peer_info;
+    impl.hello_complete = true;
     return Error::success();
 }
 
@@ -2206,6 +2406,15 @@ Error QuicSession::send_input(const InputEvent& event) {
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "send_input is a client operation");
     }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+        return Error(Status::PermissionDenied, "input is disabled by the host");
+    }
     return impl.send_bytes(impl.control.load(), make_input_event(event), QUIC_SEND_FLAG_NONE);
 }
 
@@ -2220,8 +2429,18 @@ Error QuicSession::release_input() {
 
 Error QuicSession::send_clipboard(uint64_t seq, const std::string& text) {
     Impl& impl = *impl_;
-    if (impl.role == Impl::Role::Server && !impl.server_config.allow_clipboard) {
-        return Error(Status::InvalidCall, "clipboard is disabled on this server");
+    if (impl.role == Impl::Role::Server) {
+        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+            return Error(Status::PermissionDenied, "clipboard is disabled for this session");
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+            return Error(Status::PermissionDenied, "clipboard is disabled by the host");
+        }
     }
     std::vector<uint8_t> message = make_clipboard_update(seq, text);
     if (message.empty()) {

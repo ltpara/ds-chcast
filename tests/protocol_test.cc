@@ -33,58 +33,112 @@ std::vector<uint8_t> payload_of(const std::vector<uint8_t>& message) {
 
 void test_hello() {
     std::string error;
-    auto parses_hello = [&](const std::vector<uint8_t>& payload, uint16_t& display,
-                            std::string& token) {
-        return chast::parse_hello(payload, display, token, &error);
+    auto parses_hello = [&](const std::vector<uint8_t>& payload,
+                            chast::ClientHello& hello) {
+        return chast::parse_hello(payload, hello, &error);
     };
-    auto rejects_hello = [&](std::vector<uint8_t> payload, const char* what) {
-        uint16_t display = chast::kDisplayAuto;
-        std::string token;
-        check(!parses_hello(payload, display, token), what);
+    auto rejects_hello = [&](const std::vector<uint8_t>& payload, const char* what) {
+        chast::ClientHello hello;
+        check(!parses_hello(payload, hello), what);
     };
 
-    uint16_t display = 0;
-    std::string token;
-    check(parses_hello(payload_of(chast::make_hello()), display, token), "Hello round-trips");
-    check(display == chast::kDisplayAuto, "Hello defaults to the server's display");
-    check(token.empty(), "Hello without a token carries an empty one");
-    check(parses_hello(payload_of(chast::make_hello(3)), display, token) && display == 3,
+    chast::ClientHello sent;
+    chast::ClientHello got;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got), "Hello round-trips");
+    check(got.display == chast::kDisplayAuto, "Hello defaults to the server's display");
+    check(got.access_token.empty(), "Hello without a token carries an empty one");
+    check(got.password.empty(), "Hello without a password carries an empty one");
+    check(got.requested_permissions == chast::kPermissionAll,
+          "Hello requests every permission by default");
+
+    sent.display = 3;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) && got.display == 3,
           "Hello keeps an explicit display index");
 
-    const std::string secret = "correct horse battery staple";
-    check(parses_hello(payload_of(chast::make_hello(chast::kDisplayAuto, secret)), display,
-                       token) &&
-              token == secret,
-          "Hello round-trips an access token");
-    check(parses_hello(payload_of(chast::make_hello(1, std::string(128, 'x'))), display,
-                       token) &&
-              token.size() == 128,
-          "Hello accepts a token at the length limit");
+    sent.access_token = "correct horse battery staple";
+    sent.password = "hunter2";
+    sent.requested_permissions = chast::kPermissionInput | chast::kPermissionAudio;
+    sent.device_key.assign(72, 0x11);
+    sent.device_platform = static_cast<uint8_t>(chast::DevicePlatform::Windows);
+    sent.device_name = "viewer-pc";
+    for (size_t i = 0; i < sent.nonce.size(); ++i) {
+        sent.nonce[i] = static_cast<uint8_t>(i * 7);
+    }
+    sent.unix_seconds = 1700000000;
+    sent.auth_flags = chast::kAuthFlagSigned;
+    sent.signature.assign(64, 0x22);
+    sent.totp = "123456";
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+              got.access_token == sent.access_token &&
+              got.password == sent.password &&
+              got.requested_permissions == sent.requested_permissions &&
+              got.device_key == sent.device_key &&
+              got.device_platform == sent.device_platform &&
+              got.device_name == sent.device_name &&
+              got.nonce == sent.nonce &&
+              got.unix_seconds == sent.unix_seconds &&
+              got.auth_flags == sent.auth_flags &&
+              got.signature == sent.signature && got.totp == sent.totp,
+          "Hello round-trips the v13 authentication fields");
+
+    sent.access_token.clear();
+    sent.password.clear();
+    sent.device_key.clear();
+    sent.signature.clear();
+    sent.auth_flags = 0;
+    sent.totp.clear();
+    sent.device_name.clear();
+    sent.unix_seconds = 0;
 
     rejects_hello(std::vector<uint8_t>(4), "short Hello is rejected");
-    std::vector<uint8_t> bad_display = payload_of(chast::make_hello());
+    std::vector<uint8_t> bad_display = payload_of(chast::make_hello(sent));
     bad_display[2] = static_cast<uint8_t>(chast::kMaxDisplayCount);
     bad_display[3] = 0;
     rejects_hello(bad_display, "Hello with a display index past the limit is rejected");
 
-    std::vector<uint8_t> old_version = payload_of(chast::make_hello());
+    std::vector<uint8_t> old_version = payload_of(chast::make_hello(sent));
     old_version[0] = static_cast<uint8_t>(chast::kProtocolVersion - 1);
     old_version[1] = 0;
     rejects_hello(old_version, "Hello from another protocol version is rejected");
 
-    std::vector<uint8_t> long_token = payload_of(chast::make_hello());
+    std::vector<uint8_t> long_token = payload_of(chast::make_hello(sent));
     long_token[4] = static_cast<uint8_t>(chast::kMaxAccessTokenLength + 1);
     long_token[5] = 0;
     rejects_hello(long_token, "Hello with an oversized token length is rejected");
 
-    std::vector<uint8_t> truncated_token = payload_of(chast::make_hello());
-    truncated_token[4] = 3;  // claims three bytes that are not there
+    std::vector<uint8_t> truncated_token = payload_of(chast::make_hello(sent));
+    truncated_token[4] = 3;  // claims three bytes that belong to later fields
     truncated_token[5] = 0;
-    rejects_hello(truncated_token, "Hello whose token length disagrees with the payload is rejected");
+    rejects_hello(truncated_token,
+                  "Hello whose token length disagrees with the payload is rejected");
 
-    std::vector<uint8_t> trailing = payload_of(chast::make_hello());
+    std::vector<uint8_t> long_password = payload_of(chast::make_hello(sent));
+    long_password[6] = static_cast<uint8_t>(chast::kMaxPasswordLength + 1);
+    long_password[7] = 0;
+    rejects_hello(long_password, "Hello with an oversized password is rejected");
+
+    std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
+    unknown_permissions[8] = 0x08;  // version, display, token length, password length
+    unknown_permissions[9] = 0;
+    rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
+
+    std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
     trailing.push_back(0xFF);
     rejects_hello(trailing, "Hello with trailing bytes is rejected");
+
+    chast::ClientHello unsigned_claim = sent;
+    unsigned_claim.auth_flags = chast::kAuthFlagSigned;
+    rejects_hello(payload_of(chast::make_hello(unsigned_claim)),
+                  "Hello that claims a signature but carries none is rejected");
+    chast::ClientHello trust_claim = sent;
+    trust_claim.auth_flags = chast::kAuthFlagTrustDevice;
+    trust_claim.device_key.assign(72, 0x11);
+    rejects_hello(payload_of(chast::make_hello(trust_claim)),
+                  "Hello that asks for trust without a signature is rejected");
+    chast::ClientHello bad_totp = sent;
+    bad_totp.totp = "12ab56";
+    rejects_hello(payload_of(chast::make_hello(bad_totp)),
+                  "Hello with a non-numeric TOTP code is rejected");
 }
 
 void test_access_denied() {
@@ -174,6 +228,8 @@ void test_hello_ack() {
           "HelloAck keeps negative virtual-desktop origins");
     check(got.input_enabled, "HelloAck keeps the input flag");
     check(got.clipboard_enabled, "HelloAck keeps the clipboard flag");
+    check(got.input_enabled && got.clipboard_enabled && got.audio.enabled,
+          "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
     if (got.displays.size() == 2) {
@@ -272,6 +328,17 @@ void test_hello_ack() {
     empty_source[empty_source.size() - 1] = 0;
     rejects_ack(std::move(empty_source), "a HelloAck with an empty source picture is rejected");
 
+    std::vector<uint8_t> mask_mismatch = ack_payload();
+    mask_mismatch[mask_mismatch.size() - 2] = 0x03;  // flags still say audio too
+    mask_mismatch[mask_mismatch.size() - 1] = 0;
+    rejects_ack(std::move(mask_mismatch),
+                "a HelloAck whose permission mask disagrees with its flags is rejected");
+    std::vector<uint8_t> unknown_permissions = ack_payload();
+    unknown_permissions[unknown_permissions.size() - 2] = 0x08;
+    unknown_permissions[unknown_permissions.size() - 1] = 0;
+    rejects_ack(std::move(unknown_permissions),
+                "a HelloAck granting unknown permissions is rejected");
+
     sent.input_enabled = false;
     sent.clipboard_enabled = false;
     sent.audio.enabled = false;
@@ -281,6 +348,32 @@ void test_hello_ack() {
               !disabled.input_enabled && !disabled.clipboard_enabled &&
               !disabled.audio.enabled,
           "HelloAck reports input, clipboard and audio disabled");
+}
+
+void test_permission_update() {
+    uint16_t permissions = chast::kPermissionAll;
+    std::string error;
+    check(chast::parse_permission_update(
+              payload_of(chast::make_permission_update(chast::kPermissionInput)),
+              permissions, &error) &&
+              permissions == chast::kPermissionInput,
+          "PermissionUpdate round-trips a reduced mask");
+    check(chast::parse_permission_update(
+              payload_of(chast::make_permission_update(chast::kPermissionAll)),
+              permissions, &error) &&
+              permissions == chast::kPermissionAll,
+          "PermissionUpdate round-trips every permission");
+
+    std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
+    unknown[0] = 0x08;
+    check(!chast::parse_permission_update(unknown, permissions, &error),
+          "PermissionUpdate with unknown bits is rejected");
+    std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
+    trailing.push_back(0);
+    check(!chast::parse_permission_update(trailing, permissions, &error),
+          "PermissionUpdate with trailing bytes is rejected");
+    check(!chast::parse_permission_update(std::vector<uint8_t>(1), permissions, &error),
+          "short PermissionUpdate is rejected");
 }
 
 void test_frame_header() {
@@ -1036,6 +1129,7 @@ int main(int argc, char** argv) {
     test_hello();
     test_access_denied();
     test_hello_ack();
+    test_permission_update();
     test_frame_header();
     test_audio_header();
     test_audio_parser();

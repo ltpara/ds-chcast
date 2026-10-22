@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "chast/host_server.h"
 #include "chast/identity.h"
@@ -49,6 +50,18 @@ void save_rotated_token(const std::string& token) {
     std::string error;
     if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
         worker_log("cannot save the new access token: " + error);
+    }
+}
+
+void save_trusted_devices(const std::vector<TrustedDevice>& devices) {
+    std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
+    g_worker->settings.trusted_devices = devices;
+    if (g_worker->settings_path.empty()) {
+        return;
+    }
+    std::string error;
+    if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
+        worker_log("cannot save the trusted-device list: " + error);
     }
 }
 
@@ -121,8 +134,16 @@ int run_worker(std::string* error) {
     }
     context.settings = settings;
 
-    if (settings.require_approval) {
-        worker_log("approval is unavailable in service mode; the access token is the gate");
+    if (settings.password_hash.empty()) {
+        worker_log("service mode has no permanent password; every viewer will be refused "
+                   "until one is set");
+    }
+    if (settings.auth_mode != HostAuthMode::Password) {
+        worker_log("service mode ignores click approval and the temporary password; "
+                   "a permanent password is required");
+    }
+    if (settings.token_auth) {
+        worker_log("access-token authentication is enabled for automation");
     }
 
     HANDLE stop = OpenEventW(SYNCHRONIZE, FALSE, kWorkerStopEvent);
@@ -142,12 +163,16 @@ int run_worker(std::string* error) {
     HostServerConfig config;
     config.settings = settings;
     config.identity_scope = IdentityScope::LocalMachine;
+    // No interactive operator: the policy forces password-only mode, keeps no
+    // temporary password and never asks for click approval.
+    config.service_mode = true;
     // A locked desktop makes capture fail; the worker has to keep retrying
     // until the user unlocks instead of ending the service.
     config.max_consecutive_failures = 0;
     config.approve_client = nullptr;
     config.log = worker_log;
     config.token_changed = save_rotated_token;
+    config.trusted_devices_changed = save_trusted_devices;
 
     std::string create_error;
     std::unique_ptr<HostServer> server = HostServer::create(std::move(config), &create_error);

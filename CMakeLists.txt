@@ -44,6 +44,14 @@ add_library(chast.base STATIC
     src/win/error.cc)
 target_include_directories(chast.base PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# Password hashing, TOTP, DPAPI protection and the viewer's device key. CNG
+# supplies PBKDF2/HMAC/ECDSA, crypt32 the data-protection API; neither has a
+# dependency on the capture or network stacks.
+add_library(chast.security STATIC
+    src/security/security.cc)
+target_include_directories(chast.security PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chast.security PUBLIC chast.base bcrypt crypt32)
+
 add_library(chast.dxgi STATIC
     src/win/com.cc
     src/capture/display.cc
@@ -161,7 +169,7 @@ target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
 # user32 supplies SendInput/GetSystemMetrics for the injector.
-target_link_libraries(chast.net PUBLIC chast.base msquic crypt32 ncrypt ws2_32 ntdll user32)
+target_link_libraries(chast.net PUBLIC chast.base chast.security msquic crypt32 ncrypt ws2_32 ntdll user32)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -170,6 +178,7 @@ target_link_libraries(chast.net PUBLIC chast.base msquic crypt32 ncrypt ws2_32 n
 add_library(chast.host STATIC
     src/host/bitrate_controller.cc
     src/host/clipboard.cc
+    src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc)
 
@@ -194,7 +203,7 @@ target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi3
 # Notification-area host application. It is product code, so it is built even
 # when the test tools are switched off.
 add_executable(chast-host WIN32 host/main.cc)
-target_link_libraries(chast-host PRIVATE chast.host.tray)
+target_link_libraries(chast-host PRIVATE chast.host.tray comctl32)
 add_custom_command(TARGET chast-host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-host>
@@ -251,6 +260,12 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-decode tools/decode.cc tools/crash_handler.cc)
     target_link_libraries(chast-decode PRIVATE chast.codec dbghelp)
 
+    # Userspace weak-link relay for the QoS acceptance runs: a UDP hop with
+    # delay, jitter, loss and a bandwidth bottleneck that the transport sees
+    # as a real bad path. Independent of the chast libraries on purpose.
+    add_executable(chast-netem tools/netem.cc)
+    target_link_libraries(chast-netem PRIVATE ws2_32 winmm)
+
     # Capture -> encode -> QUIC -> decode. serve/connect run the two ends as
     # separate processes; verify closes the loop in one process and checks the
     # decoded content against an offline replay of the sent stream.
@@ -283,9 +298,19 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
+    # Cryptographic primitives against published vectors, plus a DPAPI and
+    # device-key round trip in the user's own profile.
+    add_executable(chast-security-test tests/security_test.cc)
+    target_link_libraries(chast-security-test PRIVATE chast.security)
+
     # Settings file round-trip: no GPU, no network, no certificate store.
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host)
+
+    # Authentication policy: modes, lockout, temporary password, 2FA,
+    # trusted devices, allow list and permission intersection.
+    add_executable(chast-host-security-test tests/host_security_test.cc)
+    target_link_libraries(chast-host-security-test PRIVATE chast.host)
 
     # Adaptive bitrate policy: pure logic, driven by synthetic transport
     # samples.
@@ -305,7 +330,9 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
+    add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)

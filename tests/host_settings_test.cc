@@ -52,14 +52,35 @@ std::wstring widen_utf8(const std::string& text) {
     return out;
 }
 
+bool same_devices(const std::vector<chast::TrustedDevice>& a,
+                  const std::vector<chast::TrustedDevice>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].public_key != b[i].public_key || a[i].name != b[i].name ||
+            a[i].platform != b[i].platform ||
+            a[i].added_unix_seconds != b[i].added_unix_seconds ||
+            a[i].last_seen_unix_seconds != b[i].last_seen_unix_seconds) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
-           a.allow_audio == b.allow_audio && a.require_approval == b.require_approval &&
-           a.token_mode == b.token_mode && a.access_token == b.access_token &&
-           a.codec == b.codec && a.bitrate_kbps == b.bitrate_kbps &&
-           a.framerate == b.framerate && a.quality == b.quality && a.autostart == b.autostart &&
-           a.display == b.display && a.tunnel == b.tunnel && a.server_url == b.server_url &&
+           a.allow_audio == b.allow_audio && a.auth_mode == b.auth_mode &&
+           a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
+           a.token_auth == b.token_auth &&
+           a.allow_permission_change == b.allow_permission_change &&
+           a.totp_secret == b.totp_secret && same_devices(a.trusted_devices, b.trusted_devices) &&
+           a.ip_whitelist == b.ip_whitelist && a.token_mode == b.token_mode &&
+           a.access_token == b.access_token && a.codec == b.codec &&
+           a.bitrate_kbps == b.bitrate_kbps && a.framerate == b.framerate &&
+           a.quality == b.quality && a.autostart == b.autostart && a.display == b.display &&
+           a.tunnel == b.tunnel && a.server_url == b.server_url &&
            a.server_key == b.server_key && a.tunnel_id == b.tunnel_id &&
            a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen;
 }
@@ -72,7 +93,28 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_input = false;
     settings.allow_clipboard = false;
     settings.allow_audio = false;
+    settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
+    settings.password_hash =
+        "pbkdf2-sha256$210000$00112233445566778899aabbccddeeff$"
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    settings.token_auth = true;
+    settings.allow_permission_change = false;
+    settings.totp_secret = "MFRGGZDFMZTWQ2LKNNWG23TP";
+    chast::TrustedDevice phone;
+    phone.public_key = {1, 2, 3, 4, 5};
+    phone.name = "工作笔记本";
+    phone.platform = 1;
+    phone.added_unix_seconds = 1700000000;
+    phone.last_seen_unix_seconds = 1700001000;
+    chast::TrustedDevice tablet;
+    tablet.public_key = {9, 8, 7};
+    tablet.name = "tablet";
+    tablet.platform = 0;
+    tablet.added_unix_seconds = 1700002000;
+    tablet.last_seen_unix_seconds = 1700003000;
+    settings.trusted_devices = {phone, tablet};
+    settings.ip_whitelist = "192.168.0.0/16, 10.0.0.0/8";
     settings.token_mode = chast::HostTokenMode::Reusable;
     settings.access_token = "ABC234XY";
     settings.codec = chast::VideoCodec::Hevc;
@@ -111,6 +153,14 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.allow_audio, "a fresh host shares the system sound");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
+    check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
+          "a fresh host accepts a password or asks for approval");
+    check(!loaded.settings.token_auth, "a fresh host does not accept access tokens");
+    check(loaded.settings.allow_permission_change,
+          "a fresh host lets the operator adjust permissions");
+    check(loaded.settings.password_hash.empty() && loaded.settings.totp_secret.empty() &&
+              loaded.settings.trusted_devices.empty() && loaded.settings.ip_whitelist.empty(),
+          "a fresh host has no secrets, trusted devices or allow list");
     check(loaded.settings.tunnel, "a fresh host enables the connection service");
     check(loaded.settings.server_url.empty(), "a fresh host has no service URL");
     check(loaded.settings.tunnel_id.empty() && loaded.settings.tunnel_key.empty(),
@@ -196,6 +246,89 @@ void test_tokens() {
     }
     check(differ, "generated tokens are not constant");
     check(chast::generate_access_token(16).size() == 16, "the token length is honoured");
+}
+
+void test_security_migration(const std::filesystem::path& dir) {
+    const std::filesystem::path legacy = dir / "legacy.ini";
+    write_text(legacy,
+               "bind=0.0.0.0\n"
+               "port=4433\n"
+               "approve=0\n"
+               "token_mode=one_time\n"
+               "token=ABC234XY\n");
+    chast::HostSettingsLoad loaded = chast::load_host_settings(legacy.string());
+    check(loaded.settings.auth_mode == chast::HostAuthMode::Password,
+          "a legacy approve=0 file migrates to password mode");
+    check(!loaded.settings.require_approval, "the legacy approval mirror stays false");
+    check(loaded.settings.token_auth,
+          "a legacy token stays enabled until a password is configured");
+    check(loaded.warning.empty(), "a legacy file needs no warning");
+
+    const std::filesystem::path legacy_approval = dir / "legacy-approval.ini";
+    write_text(legacy_approval, "approve=1\ntoken=ABC234XY\n");
+    loaded = chast::load_host_settings(legacy_approval.string());
+    check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
+          "a legacy approve=1 file migrates to both");
+    check(loaded.settings.token_auth, "the migrated token authentication survives");
+
+    const std::filesystem::path modern = dir / "modern.ini";
+    write_text(modern,
+               "auth_mode=click\n"
+               "approve=0\n"
+               "token_auth=0\n"
+               "permissions=5\n"
+               "input=0\n"
+               "clipboard=1\n"
+               "audio=0\n");
+    loaded = chast::load_host_settings(modern.string());
+    check(loaded.settings.auth_mode == chast::HostAuthMode::Click,
+          "auth_mode wins over the legacy approve line");
+    check(loaded.settings.require_approval, "the approval mirror follows the mode");
+    check(!loaded.settings.token_auth, "an explicit token_auth=0 is honoured");
+    check(loaded.settings.allow_input && !loaded.settings.allow_clipboard &&
+              loaded.settings.allow_audio,
+          "the permissions mask wins over the legacy switches");
+
+    const std::filesystem::path broken = dir / "broken-security.ini";
+    write_text(broken,
+               "auth_mode=magic\n"
+               "approve=1\n"
+               "permissions=99\n"
+               "trusted_devices=not-base64:also:bad\n"
+               "ip_whitelist=10.0.0.0/8,300.1.2.3/8\n"
+               "password_hash=plain-text\n"
+               "totp_secret=two words\n");
+    loaded = chast::load_host_settings(broken.string());
+    check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
+          "an invalid auth_mode falls back through approve");
+    check(loaded.settings.trusted_devices.empty(), "a malformed trust list is dropped");
+    check(loaded.settings.ip_whitelist == "10.0.0.0/8,300.1.2.3/8",
+          "an invalid allow list is preserved so the policy can fail closed");
+    check(loaded.settings.password_hash.empty(), "a plain-text password hash is dropped");
+    check(loaded.settings.totp_secret.empty(), "a whitespace-bearing TOTP secret is dropped");
+    for (const char* key : {"auth_mode", "permissions", "trusted_devices", "ip_whitelist",
+                            "password_hash", "totp_secret"}) {
+        check(loaded.warning.find(key) != std::string::npos,
+              (std::string("the security warning names ") + key).c_str());
+    }
+}
+
+void test_totp_storage() {
+    std::string stored;
+    std::string error;
+    check(chast::protect_totp_secret("MFRGGZDFMZTWQ2LKNNWG23TP", chast::SecretScope::CurrentUser,
+                                     stored, &error),
+          "a TOTP secret is protected");
+    check(!stored.empty() && stored.find("MFRG") == std::string::npos,
+          "the protected secret does not contain the clear text");
+    std::string plain;
+    check(chast::unprotect_totp_secret(stored, chast::SecretScope::CurrentUser, plain, &error),
+          "the TOTP secret is unprotected");
+    check(plain == "MFRGGZDFMZTWQ2LKNNWG23TP", "the TOTP secret round-trips");
+    std::string ignored;
+    check(chast::protect_totp_secret("", chast::SecretScope::CurrentUser, ignored, &error),
+          "an empty TOTP secret is allowed");
+    check(ignored.empty(), "an empty TOTP secret stores nothing");
 }
 
 void test_codec_names() {
@@ -328,6 +461,8 @@ int main() {
     test_missing_file(dir);
     test_invalid_values(dir);
     test_tokens();
+    test_security_migration(dir);
+    test_totp_storage();
     test_codec_names();
     test_service_parsers();
     test_generated_tunnel_id();

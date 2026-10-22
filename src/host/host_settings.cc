@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <random>
 #include <sstream>
 #include <string_view>
+
+#include "chast/security.h"
 
 namespace chast {
 
@@ -158,6 +160,40 @@ bool id_character(unsigned char c) {
 bool alphanumeric(unsigned char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
 }
+
+bool parse_i64(const std::string& value, int64_t& out) {
+    if (value.empty()) {
+        return false;
+    }
+    int64_t parsed = 0;
+    const auto result =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+std::vector<std::string> split(const std::string& text, char separator) {
+    std::vector<std::string> parts;
+    size_t begin = 0;
+    for (;;) {
+        const size_t at = text.find(separator, begin);
+        if (at == std::string::npos) {
+            parts.push_back(text.substr(begin));
+            return parts;
+        }
+        parts.push_back(text.substr(begin, at - begin));
+        begin = at + 1;
+    }
+}
+
+std::string encode_field(const std::string& text) {
+    return base64_encode(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+}
+
+constexpr char kTotpEntropy[] = "chast-totp-v1";
 
 }  // namespace
 
@@ -317,6 +353,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         return result;
     }
     result.existed = true;
+    bool auth_mode_seen = false;
+    bool token_auth_seen = false;
+    bool permissions_seen = false;
+    uint16_t permissions_mask = kPermissionAll;
     std::string line;
     while (std::getline(in, line)) {
         const std::string text = trim(line);
@@ -355,6 +395,73 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         } else if (key == "audio") {
             if (!parse_bool(value, settings.allow_audio)) {
                 warn(result.warning, "audio '" + value + "' is not a boolean");
+            }
+        } else if (key == "auth_mode") {
+            HostAuthMode mode = HostAuthMode::Both;
+            if (!parse_auth_mode(value, mode)) {
+                warn(result.warning,
+                     "auth_mode '" + value + "' is not password, click or both");
+            } else {
+                settings.auth_mode = mode;
+                auth_mode_seen = true;
+            }
+        } else if (key == "password_hash") {
+            if (value.empty()) {
+                settings.password_hash.clear();
+            } else if (value.size() > 512 ||
+                       value.find_first_of(" \t\r\n") != std::string::npos ||
+                       value.rfind("pbkdf2-sha256$", 0) != 0) {
+                warn(result.warning,
+                     "password_hash is not a pbkdf2-sha256 hash; clearing it");
+                settings.password_hash.clear();
+            } else {
+                settings.password_hash = value;
+            }
+        } else if (key == "token_auth") {
+            if (!parse_bool(value, settings.token_auth)) {
+                warn(result.warning, "token_auth '" + value + "' is not a boolean");
+            } else {
+                token_auth_seen = true;
+            }
+        } else if (key == "permissions") {
+            uint32_t mask = 0;
+            if (!parse_u32(value, mask) || mask > kPermissionAll) {
+                warn(result.warning, "permissions '" + value + "' is not a mask below " +
+                                         std::to_string(kPermissionAll + 1));
+            } else {
+                permissions_seen = true;
+                permissions_mask = static_cast<uint16_t>(mask);
+            }
+        } else if (key == "allow_permission_change") {
+            if (!parse_bool(value, settings.allow_permission_change)) {
+                warn(result.warning,
+                     "allow_permission_change '" + value + "' is not a boolean");
+            }
+        } else if (key == "totp_secret") {
+            if (value.empty()) {
+                settings.totp_secret.clear();
+            } else if (value.size() > 2048 || value.find_first_of(" \t\r\n") != std::string::npos) {
+                warn(result.warning, "totp_secret is not a single base64 token; clearing it");
+                settings.totp_secret.clear();
+            } else {
+                settings.totp_secret = value;
+            }
+        } else if (key == "trusted_devices") {
+            std::string device_error;
+            if (!decode_trusted_devices(value, settings.trusted_devices, &device_error)) {
+                warn(result.warning, "trusted_devices: " + device_error + "; ignoring the list");
+                settings.trusted_devices.clear();
+            }
+        } else if (key == "ip_whitelist") {
+            settings.ip_whitelist = trim(value);
+            for (const std::string& entry : split(settings.ip_whitelist, ',')) {
+                const std::string item = trim(entry);
+                Ipv4Range range;
+                if (!item.empty() && !parse_ipv4_cidr(item, range)) {
+                    warn(result.warning, "ip_whitelist entry '" + item +
+                                             "' is not an IPv4 address or CIDR; the list will "
+                                             "refuse every address");
+                }
             }
         } else if (key == "approve") {
             if (!parse_bool(value, settings.require_approval)) {
@@ -466,6 +573,25 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         // Unknown keys are kept quiet: a newer build may write settings this
         // one does not know, and that is not an error the operator can fix.
     }
+
+    HostSettings& settings = result.settings;
+    if (auth_mode_seen) {
+        settings.require_approval = settings.auth_mode != HostAuthMode::Password;
+    } else {
+        // Files written before M7 only had approve=. Migrating keeps the old
+        // behaviour and, because those hosts relied on the token, leaves token
+        // authentication on until the operator sets a password or turns it off.
+        settings.auth_mode =
+            settings.require_approval ? HostAuthMode::Both : HostAuthMode::Password;
+        if (!token_auth_seen && !settings.access_token.empty()) {
+            settings.token_auth = true;
+        }
+    }
+    if (permissions_seen) {
+        settings.allow_input = (permissions_mask & kPermissionInput) != 0;
+        settings.allow_clipboard = (permissions_mask & kPermissionClipboard) != 0;
+        settings.allow_audio = (permissions_mask & kPermissionAudio) != 0;
+    }
     return result;
 }
 
@@ -480,14 +606,28 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
             return false;
         }
     }
+    const uint16_t permissions =
+        (settings.allow_input ? kPermissionInput : 0) |
+        (settings.allow_clipboard ? kPermissionClipboard : 0) |
+        (settings.allow_audio ? kPermissionAudio : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
          << "port=" << settings.port << "\n"
+         << "# security\n"
+         << "auth_mode=" << auth_mode_name(settings.auth_mode) << "\n"
+         << "password_hash=" << settings.password_hash << "\n"
+         << "token_auth=" << (settings.token_auth ? 1 : 0) << "\n"
+         << "permissions=" << permissions << "\n"
+         << "allow_permission_change=" << (settings.allow_permission_change ? 1 : 0) << "\n"
+         << "totp_secret=" << settings.totp_secret << "\n"
+         << "trusted_devices=" << encode_trusted_devices(settings.trusted_devices) << "\n"
+         << "ip_whitelist=" << settings.ip_whitelist << "\n"
+         << "# the legacy switches stay for older builds\n"
          << "input=" << (settings.allow_input ? 1 : 0) << "\n"
          << "clipboard=" << (settings.allow_clipboard ? 1 : 0) << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
-         << "approve=" << (settings.require_approval ? 1 : 0) << "\n"
+         << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"
          << "token=" << settings.access_token << "\n"
@@ -553,16 +693,147 @@ std::string machine_settings_path() {
 
 std::string generate_access_token(size_t length) {
     static constexpr char kAlphabet[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-    static constexpr size_t kAlphabetSize = sizeof(kAlphabet) - 1;
-    std::random_device device;
-    std::mt19937 engine(device());
-    std::uniform_int_distribution<size_t> pick(0, kAlphabetSize - 1);
+    constexpr uint32_t kAlphabetSize = sizeof(kAlphabet) - 1;
+    constexpr uint32_t kLimit = 256 - (256 % kAlphabetSize);
     std::string token;
     token.reserve(length);
-    for (size_t i = 0; i < length; ++i) {
-        token.push_back(kAlphabet[pick(engine)]);
+    uint8_t byte = 0;
+    while (token.size() < length) {
+        if (!secure_random(&byte, 1)) {
+            return {};
+        }
+        if (byte >= kLimit) {
+            continue;
+        }
+        token.push_back(kAlphabet[byte % kAlphabetSize]);
     }
     return token;
+}
+
+const char* auth_mode_name(HostAuthMode mode) {
+    switch (mode) {
+        case HostAuthMode::Password:
+            return "password";
+        case HostAuthMode::Click:
+            return "click";
+        case HostAuthMode::Both:
+            return "both";
+    }
+    return "both";
+}
+
+bool parse_auth_mode(const std::string& text, HostAuthMode& mode) {
+    const std::string value = lower(trim(text));
+    if (value == "password") {
+        mode = HostAuthMode::Password;
+        return true;
+    }
+    if (value == "click" || value == "approval") {
+        mode = HostAuthMode::Click;
+        return true;
+    }
+    if (value == "both") {
+        mode = HostAuthMode::Both;
+        return true;
+    }
+    return false;
+}
+
+std::string encode_trusted_devices(const std::vector<TrustedDevice>& devices) {
+    std::string out;
+    for (const TrustedDevice& device : devices) {
+        if (!out.empty()) {
+            out.push_back(',');
+        }
+        const uint8_t platform = device.platform;
+        out += base64_encode(device.public_key);
+        out.push_back(':');
+        out += encode_field(device.name);
+        out.push_back(':');
+        out += base64_encode(&platform, 1);
+        out.push_back(':');
+        out += std::to_string(device.added_unix_seconds);
+        out.push_back(':');
+        out += std::to_string(device.last_seen_unix_seconds);
+    }
+    return out;
+}
+
+bool decode_trusted_devices(const std::string& text, std::vector<TrustedDevice>& devices,
+                            std::string* error) {
+    devices.clear();
+    const std::string value = trim(text);
+    if (value.empty()) {
+        return true;
+    }
+    const std::vector<std::string> entries = split(value, ',');
+    if (entries.size() > kMaxTrustedDevices) {
+        if (error != nullptr) {
+            *error = "more than " + std::to_string(kMaxTrustedDevices) + " trusted devices";
+        }
+        return false;
+    }
+    for (const std::string& entry : entries) {
+        const std::vector<std::string> fields = split(entry, ':');
+        if (fields.size() != 5) {
+            if (error != nullptr) {
+                *error = "a trusted device needs five colon-separated fields";
+            }
+            return false;
+        }
+        TrustedDevice device;
+        if (!base64_decode(fields[0], device.public_key) || device.public_key.empty() ||
+            device.public_key.size() > kMaxDeviceKeyLength) {
+            if (error != nullptr) {
+                *error = "a trusted device key is not valid base64";
+            }
+            return false;
+        }
+        std::vector<uint8_t> name;
+        if (!base64_decode(fields[1], name) || name.size() > kMaxDeviceNameLength) {
+            if (error != nullptr) {
+                *error = "a trusted device name is not valid";
+            }
+            return false;
+        }
+        device.name.assign(name.begin(), name.end());
+        std::vector<uint8_t> platform;
+        if (!base64_decode(fields[2], platform) || platform.size() != 1) {
+            if (error != nullptr) {
+                *error = "a trusted device platform is not one byte";
+            }
+            return false;
+        }
+        device.platform = platform[0];
+        if (!parse_i64(fields[3], device.added_unix_seconds) ||
+            !parse_i64(fields[4], device.last_seen_unix_seconds) ||
+            device.added_unix_seconds < 0 || device.last_seen_unix_seconds < 0) {
+            if (error != nullptr) {
+                *error = "a trusted device timestamp is not a non-negative integer";
+            }
+            return false;
+        }
+        devices.push_back(std::move(device));
+    }
+    return true;
+}
+
+bool protect_totp_secret(const std::string& plaintext, SecretScope scope,
+                         std::string& stored_base64, std::string* error) {
+    if (plaintext.empty()) {
+        stored_base64.clear();
+        return true;
+    }
+    return protect_secret(plaintext, scope, kTotpEntropy, stored_base64, error);
+}
+
+bool unprotect_totp_secret(const std::string& stored_base64, SecretScope scope,
+                           std::string& plaintext, std::string* error) {
+    if (stored_base64.empty()) {
+        plaintext.clear();
+        return true;
+    }
+    return unprotect_secret(stored_base64, scope, kTotpEntropy, plaintext, error);
 }
 
 const char* codec_setting_name(VideoCodec codec) {

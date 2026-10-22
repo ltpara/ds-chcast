@@ -22,8 +22,10 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "chast/encoder.h"
+#include "chast/host_security.h"
 #include "chast/host_settings.h"
 #include "chast/input.h"
 #include "chast/protocol.h"
@@ -101,7 +103,17 @@ struct HostServerStats {
 struct HostStatus {
     HostState state = HostState::Stopped;
     std::string fingerprint;  // SHA-256 of the certificate this host presents
-    std::string token;        // the token the next viewer has to send
+    std::string token;        // the token CLI/automation has to send
+    // The live authentication policy. The tray shows the temporary password
+    // and the security page reads the rest; a running server reflects edits
+    // only after it is recreated, except for the temporary password.
+    HostAuthMode auth_mode = HostAuthMode::Both;
+    bool password_configured = false;
+    bool two_factor_enabled = false;
+    std::string temporary_password;  // empty in click and service modes
+    // Permissions granted to the current (or last) viewer after approval and
+    // any live reduction. 0 when no viewer was admitted yet.
+    uint16_t session_permissions = 0;
     std::string peer_address;  // "ip:port" of the current or last viewer
     uint16_t requested_display = kDisplayAuto;
     size_t display_index = 0;
@@ -116,6 +128,10 @@ struct HostServerConfig {
     // The tray keeps its identity in the user's store; the Windows service
     // worker uses the machine store so the fingerprint survives logins.
     IdentityScope identity_scope = IdentityScope::CurrentUser;
+    // No operator is present: click approval and the temporary password are
+    // unavailable and a permanent password is mandatory. A host without one
+    // still listens, but refuses every viewer and says why in the log.
+    bool service_mode = false;
     // Walk the injection path without calling SendInput. Only for tests.
     bool dry_run_input = false;
     bool want_hdr = true;
@@ -151,12 +167,18 @@ struct HostServerConfig {
 
     // Human-readable progress, one line per event. May be empty.
     std::function<void(const std::string&)> log;
-    // Asked after the token check passed; returning false refuses the viewer
-    // and keeps listening. Runs on the host thread while the viewer waits.
-    std::function<bool(const ClientRequest&)> approve_client;
+    // Asked when the security policy wants the operator to decide. Returning
+    // allow=false refuses the viewer and keeps listening. `request.permissions`
+    // is the ceiling approval starts from; the returned mask may only reduce
+    // it. Runs on the host thread while the viewer waits.
+    std::function<ClientApproval(const ClientRequest&)> approve_client;
     // Called when the initial token is generated or a spent one is replaced.
     // The tray saves it so the next connection uses the shown token.
     std::function<void(const std::string&)> token_changed;
+    // The trust list changed: a viewer asked to be remembered, a trusted
+    // device reconnected, or the operator revoked one. Called on the host
+    // thread; the receiver saves the list so it survives a restart.
+    std::function<void(const std::vector<TrustedDevice>&)> trusted_devices_changed;
     // Called after HelloAck with the description that went out.
     std::function<void(const ServerInfo&)> stream_announced;
     // Called for every encoded access unit that was handed to the transport,
@@ -198,8 +220,26 @@ public:
     bool running() const;
 
     HostStatus status() const;
-    // The token a viewer needs right now. Rotates after a one-time session.
+    // The token CLI/automation needs right now. Rotates after a one-time
+    // session.
     std::string token() const;
+
+    // Generates a new temporary password and returns it (empty in click and
+    // service modes). Safe to call from the UI thread.
+    std::string refresh_temporary_password();
+
+    // Unexpired trusted devices, most recently used first.
+    std::vector<TrustedDevice> trusted_devices() const;
+    // Revoking and clearing also publish the new list through
+    // trusted_devices_changed. Safe to call from the UI thread.
+    bool revoke_trusted_device(const std::vector<uint8_t>& public_key);
+    void clear_trusted_devices();
+
+    // Asks the host thread to reduce or restore the current session's
+    // permissions. The mask is clamped to what was granted at approval time
+    // and to the settings gates; the viewer is told through PermissionUpdate.
+    // Ignored while no session is streaming.
+    void set_permissions(uint16_t permissions);
 
 private:
     explicit HostServer(HostServerConfig config)
@@ -217,9 +257,30 @@ private:
     void publish_stats(const HostServerStats& stats);
     void publish_stream(const ServerInfo& info, size_t display_index,
                         const std::string& display_name);
+    void publish_security_status();
+
+    // Policy hooks handed to the transport. Evaluate one Hello; the transport
+    // calls the approval wrapper only when the policy asks the operator.
+    ClientAuthResult authenticate_client(const ClientRequest& request);
+    ClientApproval approve_client(const ClientRequest& request);
+    void commit_security();
+    HostSecurity::Config security_config(const std::string& fingerprint);
+    void refresh_security_config();
+    void publish_trusted_devices();
 
     HostServerConfig config_;
     HostSettings settings_;
+    // The policy outlives listener reopens so lockouts and the temporary
+    // password survive a reconnect; only a new HostServer replaces it.
+    std::unique_ptr<HostSecurity> security_;
+    // The Result of the Hello currently being admitted. authenticate_client
+    // and approve_client run on the same host thread, so committing after the
+    // operator's decision cannot race another handshake.
+    HostSecurity::Result pending_security_;
+    // A UI request is queued instead of touching the session from that
+    // thread; the frame loop applies it.
+    std::atomic<bool> permission_update_pending_{false};
+    std::atomic<uint16_t> pending_permissions_{0};
     std::thread thread_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> running_{false};

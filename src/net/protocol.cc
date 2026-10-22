@@ -386,25 +386,70 @@ bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
     return true;
 }
 
-std::vector<uint8_t> make_hello(uint16_t display, const std::string& access_token) {
+std::vector<uint8_t> make_hello(const ClientHello& hello) {
     const size_t token_size =
-        access_token.size() > kMaxAccessTokenLength ? kMaxAccessTokenLength
-                                                    : access_token.size();
-    std::vector<uint8_t> payload(6 + token_size);
+        hello.access_token.size() > kMaxAccessTokenLength ? kMaxAccessTokenLength
+                                                          : hello.access_token.size();
+    const size_t password_size =
+        hello.password.size() > kMaxPasswordLength ? kMaxPasswordLength
+                                                   : hello.password.size();
+    const size_t key_size = hello.device_key.size() > kMaxDeviceKeyLength
+                                ? kMaxDeviceKeyLength
+                                : hello.device_key.size();
+    const size_t name_size = hello.device_name.size() > kMaxDeviceNameLength
+                                 ? kMaxDeviceNameLength
+                                 : hello.device_name.size();
+    const size_t signature_size = hello.signature.size() > kMaxSignatureLength
+                                      ? kMaxSignatureLength
+                                      : hello.signature.size();
+    const size_t totp_size = hello.totp.size() > kMaxTotpLength ? kMaxTotpLength
+                                                                 : hello.totp.size();
+    std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 2 + 2 + key_size +
+                                 1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
+                                 signature_size + 2 + totp_size);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
-    put_u16(cursor, display);
+    put_u16(cursor, hello.display);
     put_u16(cursor, static_cast<uint16_t>(token_size));
-    std::memcpy(cursor, access_token.data(), token_size);
+    std::memcpy(cursor, hello.access_token.data(), token_size);
+    cursor += token_size;
+    put_u16(cursor, static_cast<uint16_t>(password_size));
+    std::memcpy(cursor, hello.password.data(), password_size);
+    cursor += password_size;
+    put_u16(cursor, hello.requested_permissions);
+    put_u16(cursor, static_cast<uint16_t>(key_size));
+    if (key_size > 0) {
+        std::memcpy(cursor, hello.device_key.data(), key_size);
+        cursor += key_size;
+    }
+    put_u8(cursor, hello.device_platform);
+    put_u16(cursor, static_cast<uint16_t>(name_size));
+    if (name_size > 0) {
+        std::memcpy(cursor, hello.device_name.data(), name_size);
+        cursor += name_size;
+    }
+    std::memcpy(cursor, hello.nonce.data(), kHelloNonceBytes);
+    cursor += kHelloNonceBytes;
+    put_u64(cursor, hello.unix_seconds);
+    put_u8(cursor, hello.auth_flags);
+    put_u16(cursor, static_cast<uint16_t>(signature_size));
+    if (signature_size > 0) {
+        std::memcpy(cursor, hello.signature.data(), signature_size);
+        cursor += signature_size;
+    }
+    put_u16(cursor, static_cast<uint16_t>(totp_size));
+    if (totp_size > 0) {
+        std::memcpy(cursor, hello.totp.data(), totp_size);
+    }
     return make_control(ControlType::Hello, payload);
 }
 
-bool parse_hello(const std::vector<uint8_t>& payload, uint16_t& display,
-                 std::string& access_token, std::string* error) {
+bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
+                 std::string* error) {
     Reader reader(payload.data(), payload.size());
     uint16_t version = 0;
     uint16_t token_size = 0;
-    if (!reader.u16(version) || !reader.u16(display) || !reader.u16(token_size)) {
+    if (!reader.u16(version) || !reader.u16(hello.display) || !reader.u16(token_size)) {
         set_error(error, "truncated Hello");
         return false;
     }
@@ -412,18 +457,98 @@ bool parse_hello(const std::vector<uint8_t>& payload, uint16_t& display,
         set_error(error, "client speaks protocol version " + std::to_string(version));
         return false;
     }
-    if (display != kDisplayAuto && display >= kMaxDisplayCount) {
-        set_error(error, "Hello asks for display " + std::to_string(display) +
+    if (hello.display != kDisplayAuto && hello.display >= kMaxDisplayCount) {
+        set_error(error, "Hello asks for display " + std::to_string(hello.display) +
                              " outside the protocol limit");
         return false;
     }
-    if (token_size > kMaxAccessTokenLength || reader.remaining() != token_size) {
+    if (token_size > kMaxAccessTokenLength ||
+        !reader.string(hello.access_token, token_size)) {
         set_error(error, "Hello carries a malformed access token");
         return false;
     }
-    if (!reader.string(access_token, token_size)) {
-        set_error(error, "truncated Hello access token");
+    uint16_t password_size = 0;
+    if (!reader.u16(password_size) || password_size > kMaxPasswordLength ||
+        !reader.string(hello.password, password_size)) {
+        set_error(error, "Hello carries a malformed password");
         return false;
+    }
+    if (!reader.u16(hello.requested_permissions)) {
+        set_error(error, "Hello carries no permission request");
+        return false;
+    }
+    if ((hello.requested_permissions & ~kPermissionAll) != 0) {
+        set_error(error, "Hello requests unknown permissions");
+        return false;
+    }
+    uint16_t key_size = 0;
+    if (!reader.u16(key_size) || key_size > kMaxDeviceKeyLength ||
+        !reader.bytes(hello.device_key, key_size)) {
+        set_error(error, "Hello carries a malformed device key");
+        return false;
+    }
+    if (!reader.u8(hello.device_platform)) {
+        set_error(error, "Hello carries no device platform");
+        return false;
+    }
+    uint16_t name_size = 0;
+    if (!reader.u16(name_size) || name_size > kMaxDeviceNameLength ||
+        !reader.string(hello.device_name, name_size)) {
+        set_error(error, "Hello carries a malformed device name");
+        return false;
+    }
+    if (!hello.device_name.empty() && !valid_utf8(hello.device_name)) {
+        set_error(error, "Hello carries an invalid device name");
+        return false;
+    }
+    std::vector<uint8_t> nonce;
+    if (!reader.bytes(nonce, kHelloNonceBytes)) {
+        set_error(error, "Hello carries no client nonce");
+        return false;
+    }
+    std::memcpy(hello.nonce.data(), nonce.data(), kHelloNonceBytes);
+    if (!reader.u64(hello.unix_seconds) || !reader.u8(hello.auth_flags)) {
+        set_error(error, "Hello carries no authentication stamp");
+        return false;
+    }
+    if ((hello.auth_flags & ~kAuthFlagsKnown) != 0) {
+        set_error(error, "Hello carries unknown authentication flags");
+        return false;
+    }
+    uint16_t signature_size = 0;
+    if (!reader.u16(signature_size) || signature_size > kMaxSignatureLength ||
+        !reader.bytes(hello.signature, signature_size)) {
+        set_error(error, "Hello carries a malformed signature");
+        return false;
+    }
+    uint16_t totp_size = 0;
+    if (!reader.u16(totp_size) || totp_size > kMaxTotpLength ||
+        !reader.string(hello.totp, totp_size)) {
+        set_error(error, "Hello carries a malformed TOTP code");
+        return false;
+    }
+    if (!reader.at_end()) {
+        set_error(error, "Hello carries trailing bytes");
+        return false;
+    }
+    if ((hello.auth_flags & kAuthFlagSigned) != 0 && hello.signature.empty()) {
+        set_error(error, "Hello claims a signature it does not carry");
+        return false;
+    }
+    if ((hello.auth_flags & kAuthFlagTrustDevice) != 0 &&
+        (hello.auth_flags & kAuthFlagSigned) == 0) {
+        set_error(error, "Hello asks for trust without a signature");
+        return false;
+    }
+    if (!hello.totp.empty()) {
+        bool digits = hello.totp.size() == 6;
+        for (char c : hello.totp) {
+            digits = digits && c >= '0' && c <= '9';
+        }
+        if (!digits) {
+            set_error(error, "Hello carries a malformed TOTP code");
+            return false;
+        }
     }
     return true;
 }
@@ -449,7 +574,7 @@ bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code
         return false;
     }
     if (raw_code < static_cast<uint8_t>(AccessDenial::InvalidToken) ||
-        raw_code > static_cast<uint8_t>(AccessDenial::Declined)) {
+        raw_code > static_cast<uint8_t>(AccessDenial::AuthTimeout)) {
         set_error(error, "unknown access denial code " + std::to_string(raw_code));
         return false;
     }
@@ -478,9 +603,10 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
         extradata_size = kMaxAudioExtradata;
     }
     // 24 fixed bytes, the encoder name, the display count, the displays, the
-    // 16-byte audio description and its AudioSpecificConfig, then the captured
-    // desktop size (the encoded size in the fixed block may be scaled down).
-    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4;
+    // 16-byte audio description and its AudioSpecificConfig, the captured
+    // desktop size (the encoded size in the fixed block may be scaled down),
+    // then the v13 permission mask.
+    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4 + 2;
     for (size_t i = 0; i < display_count; ++i) {
         size += kDisplayFixedSize + info.displays[i].name.size();
     }
@@ -527,6 +653,17 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     put_u16(cursor, info.source_width);
     put_u16(cursor, info.source_height);
+    uint16_t permissions = 0;
+    if (info.input_enabled) {
+        permissions |= kPermissionInput;
+    }
+    if (info.clipboard_enabled) {
+        permissions |= kPermissionClipboard;
+    }
+    if (info.audio.enabled) {
+        permissions |= kPermissionAudio;
+    }
+    put_u16(cursor, permissions);
     return payload;
 }
 
@@ -693,6 +830,21 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck has an empty source picture");
         return false;
     }
+    uint16_t permissions = 0;
+    if (!reader.u16(permissions)) {
+        set_error(error, "HelloAck carries no permissions");
+        return false;
+    }
+    if ((permissions & ~kPermissionAll) != 0) {
+        set_error(error, "HelloAck grants unknown permissions");
+        return false;
+    }
+    if (permissions != (flags & kServerInfoKnownFlags)) {
+        set_error(error, "HelloAck permission mask disagrees with its flags");
+        return false;
+    }
+    info.input_enabled = (permissions & kPermissionInput) != 0;
+    info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
     return true;
 }
 
@@ -960,6 +1112,27 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
     if (width != 0 && height != 0 &&
         (hotspot_x >= width || hotspot_y >= height)) {
         set_error(error, "CursorUpdate hotspot lies outside the sprite");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_permission_update(uint16_t permissions) {
+    std::vector<uint8_t> payload(2);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, permissions);
+    return make_control(ControlType::PermissionUpdate, payload);
+}
+
+bool parse_permission_update(const std::vector<uint8_t>& payload,
+                             uint16_t& permissions, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u16(permissions) || !reader.at_end()) {
+        set_error(error, "malformed PermissionUpdate");
+        return false;
+    }
+    if ((permissions & ~kPermissionAll) != 0) {
+        set_error(error, "PermissionUpdate grants unknown permissions");
         return false;
     }
     return true;

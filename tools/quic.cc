@@ -824,6 +824,15 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
                                                      : chast::HostTokenMode::OneTime;
     config.settings.access_token = options.token;
+    // This tool is CLI/automation, so the access token is its credential. With
+    // --approve an operator is present and the click flow replaces it.
+    if (options.approve) {
+        config.settings.auth_mode = chast::HostAuthMode::Click;
+        config.settings.require_approval = true;
+        config.settings.token_auth = false;
+    } else {
+        config.settings.token_auth = true;
+    }
     config.settings.codec = options.codec;
     config.settings.bitrate_kbps = options.bitrate_kbps;
     config.settings.framerate = static_cast<uint16_t>(options.framerate);
@@ -842,8 +851,12 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.resolution_probe_percent = static_cast<uint16_t>(options.resolution);
     config.first_client_timeout_ms = static_cast<uint32_t>(options.wait_seconds * 1000.0);
     if (!options.quiet) {
-        config.log = [](const std::string& message) {
-            std::printf("quic: %s\n", message.c_str());
+        const auto log_start = std::chrono::steady_clock::now();
+        config.log = [log_start](const std::string& message) {
+            const double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - log_start)
+                    .count();
+            std::printf("quic: [%7.2f] %s\n", elapsed, message.c_str());
         };
     }
     if (options.approve) {
@@ -860,9 +873,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
             char line[16]{};
             if (!std::fgets(line, sizeof(line), stdin)) {
                 std::printf("\n");
-                return false;
+                return chast::ClientApproval{};
             }
-            return line[0] == 'y' || line[0] == 'Y';
+            return chast::ClientApproval{line[0] == 'y' || line[0] == 'Y',
+                                         request.permissions};
         };
     }
     if (sink) {
@@ -1533,6 +1547,16 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                     static_cast<double>(std::max<int64_t>(age_us, 0)) / 1000.0;
                 stats.max_frame_age_ms =
                     (std::max)(stats.max_frame_age_ms, stats.last_frame_age_ms);
+                if (!options.quiet && stats.last_frame_age_ms > 1000.0) {
+                    const double elapsed = std::chrono::duration<double>(
+                                               std::chrono::steady_clock::now() - start)
+                                               .count();
+                    std::fprintf(stderr,
+                                 "frame age: %.0f ms at seq %llu (%ux%u) t=%.1f s\n",
+                                 stats.last_frame_age_ms,
+                                 static_cast<unsigned long long>(header.seq), header.width,
+                                 header.height, elapsed);
+                }
             }
         }
 
@@ -1988,8 +2012,8 @@ bool access_control_works(uint16_t port, std::string* detail) {
     server_config.idle_timeout_ms = 3000;
     server_config.access_token = "approval-token";
     int decisions = 0;
-    server_config.approve_client = [&decisions](const chast::ClientRequest&) {
-        return ++decisions > 1;
+    server_config.approve_client = [&decisions](const chast::ClientRequest& request) {
+        return chast::ClientApproval{++decisions > 1, request.permissions};
     };
     std::string error;
     std::unique_ptr<chast::QuicSession> server =
@@ -2097,6 +2121,303 @@ bool access_control_works(uint16_t port, std::string* detail) {
     return true;
 }
 
+// Authentication and permissions on their own server: a refused password is
+// named, approval can only reduce the mask, and a mid-session revocation
+// reaches the viewer and gates the transport on both ends (and can be
+// restored, but only up to the grant that was approved).
+bool auth_and_permissions_work(uint16_t port, std::string* detail) {
+    auto make_client = [](uint16_t target_port, const std::string& pin,
+                          const std::string& password) {
+        chast::QuicClientConfig config;
+        config.host = "127.0.0.1";
+        config.port = target_port;
+        config.idle_timeout_ms = 3000;
+        config.pinned_fingerprint = pin;
+        config.password = password;
+        return config;
+    };
+
+    // 1. The policy hook refuses a wrong password with its own code.
+    {
+        chast::QuicServerConfig server_config;
+        server_config.bind_address = "127.0.0.1";
+        server_config.port = port;
+        server_config.idle_timeout_ms = 3000;
+        server_config.allow_input = true;
+        server_config.dry_run_input = true;
+        server_config.stop_after_denial = true;
+        server_config.authenticate = [](const chast::ClientRequest& request) {
+            chast::ClientAuthResult result;
+            if (request.hello.password != "open-sesame") {
+                result.denial = chast::AccessDenial::WrongPassword;
+                result.reason = "the password was wrong";
+                return result;
+            }
+            result.action = chast::ClientAuthAction::Allow;
+            result.permissions = chast::kPermissionInput | chast::kPermissionClipboard;
+            return result;
+        };
+        std::string error;
+        std::unique_ptr<chast::QuicSession> server =
+            chast::QuicSession::create_server(server_config, &error);
+        if (!server) {
+            *detail = "password server: " + error;
+            return false;
+        }
+        const std::string pin = server->server_fingerprint();
+        chast::Status wait_status = chast::Status::Ok;
+        std::string wait_error;
+        std::thread waiting([&] {
+            const chast::Error waited = server->wait_for_client(std::chrono::seconds(10));
+            wait_status = waited.status();
+            wait_error = waited.message();
+        });
+        chast::QuicClientConfig client_config = make_client(port, pin, "wrong");
+        std::unique_ptr<chast::QuicSession> client =
+            chast::QuicSession::create_client(client_config, &error);
+        chast::ServerInfo info;
+        chast::Error refused =
+            client ? client->connect(std::chrono::seconds(5))
+                   : chast::Error(chast::Status::InvalidCall, "client: " + error);
+        if (refused.ok()) {
+            refused = client->handshake(info, std::chrono::seconds(5));
+        }
+        const std::optional<chast::AccessDenial> code =
+            client ? client->denial() : std::nullopt;
+        client.reset();
+        waiting.join();
+        if (refused.status() != chast::Status::PermissionDenied ||
+            code != chast::AccessDenial::WrongPassword ||
+            refused.message().find("password was wrong") == std::string::npos) {
+            *detail = "the wrong password was not named: " + refused.to_string() +
+                      (code ? " (code " + std::to_string(static_cast<int>(*code)) + ")"
+                            : " (no denial code)") +
+                      ", server wait: " + chast::to_string(wait_status) + " " + wait_error;
+            return false;
+        }
+        if (wait_status != chast::Status::PermissionDenied) {
+            *detail = "stop_after_denial did not end the wait: " + chast::to_string(wait_status) +
+                      " " + wait_error;
+            return false;
+        }
+    }
+
+    // 2. Approval returns a smaller mask than authentication allowed.
+    {
+        const uint16_t approval_port = static_cast<uint16_t>(port + 1);
+        chast::QuicServerConfig server_config;
+        server_config.bind_address = "127.0.0.1";
+        server_config.port = approval_port;
+        server_config.idle_timeout_ms = 3000;
+        server_config.allow_input = true;
+        server_config.allow_clipboard = true;
+        server_config.dry_run_input = true;
+        server_config.authenticate = [](const chast::ClientRequest& request) {
+            chast::ClientAuthResult result;
+            result.action = request.hello.password == "open-sesame"
+                                ? chast::ClientAuthAction::RequireApproval
+                                : chast::ClientAuthAction::Deny;
+            result.permissions = chast::kPermissionInput | chast::kPermissionClipboard;
+            return result;
+        };
+        server_config.approve_client = [](const chast::ClientRequest&) {
+            // The operator allows input only.
+            return chast::ClientApproval{true, chast::kPermissionInput};
+        };
+        std::string error;
+        std::unique_ptr<chast::QuicSession> server =
+            chast::QuicSession::create_server(server_config, &error);
+        if (!server) {
+            *detail = "approval server: " + error;
+            return false;
+        }
+        const std::string pin = server->server_fingerprint();
+        std::thread serving([&] {
+            if (!server->wait_for_client(std::chrono::seconds(10)).ok()) {
+                return;
+            }
+            chast::ServerInfo info;
+            info.width = 64;
+            info.height = 64;
+            info.source_width = 64;
+            info.source_height = 64;
+            info.framerate = 30;
+            info.bitrate = 100000;
+            info.encoder = "approval mask probe";
+            server->announce(info);
+        });
+        chast::QuicClientConfig client_config = make_client(approval_port, pin, "open-sesame");
+        std::unique_ptr<chast::QuicSession> client =
+            chast::QuicSession::create_client(client_config, &error);
+        chast::ServerInfo info;
+        chast::Error handshaken =
+            client ? client->connect(std::chrono::seconds(5))
+                   : chast::Error(chast::Status::InvalidCall, "client: " + error);
+        if (handshaken.ok()) {
+            handshaken = client->handshake(info, std::chrono::seconds(5));
+        }
+        serving.join();
+        if (!handshaken.ok()) {
+            *detail = "the approval viewer did not connect: " + handshaken.to_string();
+            return false;
+        }
+        if (!info.input_enabled || info.clipboard_enabled) {
+            *detail = "the approval mask was not applied to HelloAck";
+            return false;
+        }
+        if (server->permissions() != chast::kPermissionInput) {
+            *detail = "the server kept a permission the operator did not allow";
+            return false;
+        }
+        if (client->send_clipboard(1, "not allowed").status() !=
+            chast::Status::PermissionDenied) {
+            *detail = "the viewer sent clipboard without permission";
+            return false;
+        }
+    }
+
+    // 3. Live revocation and restore inside the approved ceiling.
+    {
+        const uint16_t live_port = static_cast<uint16_t>(port + 2);
+        chast::QuicServerConfig server_config;
+        server_config.bind_address = "127.0.0.1";
+        server_config.port = live_port;
+        server_config.idle_timeout_ms = 3000;
+        server_config.allow_input = true;
+        server_config.allow_clipboard = true;
+        server_config.dry_run_input = true;
+        server_config.authenticate = [](const chast::ClientRequest&) {
+            chast::ClientAuthResult result;
+            result.action = chast::ClientAuthAction::Allow;
+            result.permissions = chast::kPermissionInput | chast::kPermissionClipboard;
+            return result;
+        };
+        std::string error;
+        std::unique_ptr<chast::QuicSession> server =
+            chast::QuicSession::create_server(server_config, &error);
+        if (!server) {
+            *detail = "permission server: " + error;
+            return false;
+        }
+        const std::string pin = server->server_fingerprint();
+        bool live_ok = true;
+        std::string live_error;
+        std::thread serving([&] {
+            if (!server->wait_for_client(std::chrono::seconds(10)).ok()) {
+                live_ok = false;
+                live_error = "the viewer did not connect";
+                return;
+            }
+            chast::ServerInfo info;
+            info.width = 64;
+            info.height = 64;
+            info.source_width = 64;
+            info.source_height = 64;
+            info.framerate = 30;
+            info.bitrate = 100000;
+            info.encoder = "permission probe";
+            if (chast::Error announced = server->announce(info); !announced.ok()) {
+                live_ok = false;
+                live_error = "announce: " + announced.to_string();
+                return;
+            }
+            // Give the client time to leave handshake() before the update.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            if (chast::Error revoked =
+                    server->set_permissions(chast::kPermissionClipboard);
+                !revoked.ok()) {
+                live_ok = false;
+                live_error = "revoke input: " + revoked.to_string();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (chast::Error restored = server->set_permissions(
+                    chast::kPermissionInput | chast::kPermissionClipboard);
+                !restored.ok()) {
+                live_ok = false;
+                live_error = "restore input: " + restored.to_string();
+                return;
+            }
+            // A mask above the approved ceiling is clamped, not sent.
+            server->set_permissions(chast::kPermissionAll);
+            if (server->permissions() !=
+                (chast::kPermissionInput | chast::kPermissionClipboard)) {
+                live_ok = false;
+                live_error = "the ceiling did not clamp an oversized mask";
+            }
+        });
+
+        chast::QuicClientConfig client_config = make_client(live_port, pin, "open-sesame");
+        std::unique_ptr<chast::QuicSession> client =
+            chast::QuicSession::create_client(client_config, &error);
+        chast::ServerInfo info;
+        bool client_ok = client && client->connect(std::chrono::seconds(5)).ok() &&
+                         client->handshake(info, std::chrono::seconds(5)).ok();
+        auto wait_for_mask = [&](uint16_t expected) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                uint16_t mask = 0;
+                if (client && client->take_permission_update(mask) && mask == expected) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            return false;
+        };
+        auto mouse_move = [] {
+            chast::InputEvent event;
+            event.kind = chast::InputKind::Mouse;
+            event.mouse.action = chast::MouseAction::Move;
+            event.mouse.x = 10;
+            event.mouse.y = 10;
+            return event;
+        };
+        if (!client_ok) {
+            *detail = "the live-permission viewer did not connect";
+            client.reset();
+            serving.join();
+            return false;
+        }
+        if (!client->send_input(mouse_move()).ok()) {
+            *detail = "the initial input grant was not usable";
+            client.reset();
+            serving.join();
+            return false;
+        }
+        if (!wait_for_mask(chast::kPermissionClipboard)) {
+            *detail = "the viewer did not see the input revocation";
+            client.reset();
+            serving.join();
+            return false;
+        }
+        if (client->send_input(mouse_move()).status() != chast::Status::PermissionDenied) {
+            *detail = "the viewer sent input after the revocation";
+            client.reset();
+            serving.join();
+            return false;
+        }
+        if (!wait_for_mask(chast::kPermissionInput | chast::kPermissionClipboard)) {
+            *detail = "the viewer did not see the input restored";
+            client.reset();
+            serving.join();
+            return false;
+        }
+        if (!client->send_input(mouse_move()).ok()) {
+            *detail = "input stayed gated after the restore";
+            client.reset();
+            serving.join();
+            return false;
+        }
+        client.reset();
+        serving.join();
+        if (!live_ok) {
+            *detail = live_error;
+            return false;
+        }
+    }
+    return true;
+}
+
 // A server whose clipboard gate is closed must not send text and must drop a
 // viewer's updates instead of failing the session.
 bool clipboard_gate_works(uint16_t port, std::string* detail) {
@@ -2158,13 +2479,15 @@ bool clipboard_gate_works(uint16_t port, std::string* detail) {
         serving.join();
         return false;
     }
-    if (server->send_clipboard(1, "server must not send").status() != chast::Status::InvalidCall) {
+    if (server->send_clipboard(1, "server must not send").status() !=
+        chast::Status::PermissionDenied) {
         *detail = "the closed server accepted its own clipboard send";
         serving.join();
         return false;
     }
-    if (chast::Error sent = client->send_clipboard(1, "viewer update is dropped"); !sent.ok()) {
-        *detail = "the viewer could not send: " + sent.to_string();
+    if (client->send_clipboard(1, "viewer update is dropped").status() !=
+        chast::Status::PermissionDenied) {
+        *detail = "the viewer sent despite the closed gate";
         serving.join();
         return false;
     }
@@ -2267,6 +2590,138 @@ bool audio_gate_works(uint16_t port, std::string* detail) {
         return false;
     }
     serving.join();
+    return true;
+}
+
+struct ProbePasswordHandshake {
+    bool ok = false;
+    chast::Status status = chast::Status::Ok;
+    std::optional<chast::AccessDenial> denial;
+    std::string error;
+};
+
+ProbePasswordHandshake probe_password(uint16_t port, const std::string& pin,
+                                      const std::string& password,
+                                      std::chrono::milliseconds timeout) {
+    ProbePasswordHandshake result;
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 3000;
+    client_config.pinned_fingerprint = pin;
+    client_config.password = password;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        result.error = "client: " + error;
+        return result;
+    }
+    if (chast::Error connected = client->connect(std::chrono::seconds(5)); !connected.ok()) {
+        result.status = connected.status();
+        result.error = connected.to_string();
+        return result;
+    }
+    chast::ServerInfo info;
+    const chast::Error handshaken = client->handshake(info, timeout, chast::kDisplayAuto);
+    result.ok = handshaken.ok();
+    result.status = handshaken.status();
+    result.denial = client->denial();
+    result.error = handshaken.to_string();
+    return result;
+}
+
+// The HostServer wiring, not just the transport callbacks: a service with no
+// permanent password refuses every viewer and names the reason, the
+// interactive host exposes a rotatable temporary password, and a wrong
+// permanent password is refused through the settings -> policy path.
+bool host_security_wiring_works(uint16_t port, std::string* detail) {
+    {
+        chast::HostServerConfig config;
+        config.settings.bind_address = "127.0.0.1";
+        config.settings.port = port;
+        config.service_mode = true;
+        config.serve_once = true;
+        std::string error;
+        std::unique_ptr<chast::HostServer> server =
+            chast::HostServer::create(std::move(config), &error);
+        if (!server) {
+            *detail = "service server: " + error;
+            return false;
+        }
+        server->start();
+        const std::string pin = server->status().fingerprint;
+        const ProbePasswordHandshake refused =
+            probe_password(port, pin, "", std::chrono::seconds(5));
+        server->stop();
+        if (refused.status != chast::Status::PermissionDenied ||
+            refused.denial != chast::AccessDenial::PasswordRequired ||
+            refused.error.find("permanent password") == std::string::npos) {
+            *detail = "the service without a password did not refuse by name: " +
+                      refused.error + (refused.denial
+                                           ? " (code " +
+                                                 std::to_string(static_cast<int>(*refused.denial)) +
+                                                 ")"
+                                           : " (no denial code)");
+            return false;
+        }
+    }
+
+    {
+        chast::HostServerConfig config;
+        config.settings.bind_address = "127.0.0.1";
+        config.settings.port = static_cast<uint16_t>(port + 1);
+        config.settings.auth_mode = chast::HostAuthMode::Both;
+        std::string error;
+        std::unique_ptr<chast::HostServer> server =
+            chast::HostServer::create(std::move(config), &error);
+        if (!server) {
+            *detail = "interactive server: " + error;
+            return false;
+        }
+        const chast::HostStatus first = server->status();
+        if (first.temporary_password.size() != 6 ||
+            first.temporary_password.find_first_not_of("0123456789") != std::string::npos) {
+            *detail = "the interactive host did not publish a six-digit temporary password";
+            server->stop();
+            return false;
+        }
+        const std::string refreshed = server->refresh_temporary_password();
+        if (refreshed.size() != 6 || refreshed == first.temporary_password ||
+            server->status().temporary_password != refreshed) {
+            *detail = "refreshing the temporary password did not publish a new one";
+            server->stop();
+            return false;
+        }
+        server->stop();
+    }
+
+    {
+        const uint16_t password_port = static_cast<uint16_t>(port + 2);
+        chast::HostServerConfig config;
+        config.settings.bind_address = "127.0.0.1";
+        config.settings.port = password_port;
+        config.settings.auth_mode = chast::HostAuthMode::Password;
+        config.settings.password_hash = chast::hash_password("open-sesame");
+        config.serve_once = true;
+        std::string error;
+        std::unique_ptr<chast::HostServer> server =
+            chast::HostServer::create(std::move(config), &error);
+        if (!server) {
+            *detail = "password server: " + error;
+            return false;
+        }
+        server->start();
+        const std::string pin = server->status().fingerprint;
+        const ProbePasswordHandshake refused =
+            probe_password(password_port, pin, "wrong", std::chrono::seconds(5));
+        server->stop();
+        if (refused.status != chast::Status::PermissionDenied ||
+            refused.denial != chast::AccessDenial::WrongPassword) {
+            *detail = "the wrong permanent password was not named: " + refused.error;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2379,6 +2834,15 @@ int run_verify(const Options& options) {
     }
     {
         std::string detail;
+        const bool passed =
+            auth_and_permissions_work(static_cast<uint16_t>(probe_base + 4), &detail);
+        check(passed, "password denial, approval mask and live permissions work");
+        if (!passed) {
+            std::printf("     auth/permission probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
         const bool passed = clipboard_gate_works(static_cast<uint16_t>(probe_base + 3), &detail);
         check(passed, "a clipboard-disabled server refuses to send and drops viewer updates");
         if (!passed) {
@@ -2391,6 +2855,15 @@ int run_verify(const Options& options) {
         check(passed, "an audio-disabled server announces it off and refuses to send");
         if (!passed) {
             std::printf("     audio gate probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
+        const bool passed =
+            host_security_wiring_works(static_cast<uint16_t>(probe_base + 6), &detail);
+        check(passed, "service mode demands a password and the temporary password rotates");
+        if (!passed) {
+            std::printf("     host security probe: %s\n", detail.c_str());
         }
     }
     check(sent.encoded > 0, "the sender produced frames");

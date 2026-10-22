@@ -36,16 +36,63 @@
 #include "chast/error.h"
 #include "chast/input.h"
 #include "chast/protocol.h"
+#include "chast/security.h"
 
 namespace chast {
 
-// A Hello that passed the access-token check, handed to
-// QuicServerConfig::approve_client so the operator can decide.
+// Why the host is asking the operator. The transport itself never decides
+// this; HostServer annotates the request when it forwards a RequireApproval
+// decision, so the approval window can explain the situation.
+enum class ClientApprovalMethod {
+    Unknown,     // a custom approval callback, no host annotation
+    Click,       // the host's mode asks the operator for every viewer
+    NoPassword,  // the viewer sent no password and asked for approval
+};
+
+// One Hello, handed to QuicServerConfig::authenticate and, when the host asks
+// for a decision, to approve_client. Both run on the application thread (the
+// one calling wait_for_client), never on a MsQuic worker, so they may hash a
+// password, show a dialog or touch the settings file.
 struct ClientRequest {
     uint16_t display = kDisplayAuto;
     // "ip:port" of the connecting peer, empty when the transport would not
     // report it.
     std::string peer_address;
+    // Everything the viewer sent, including the password, TOTP code and the
+    // device proof. The signature has already been parsed but not verified:
+    // only the policy knows which keys it trusts.
+    ClientHello hello;
+    // Authentication's permission ceiling: the host's defaults intersected
+    // with what the viewer requested. The approval callback starts from this
+    // mask and may only reduce it.
+    uint16_t permissions = 0;
+    // Set by HostServer before it calls approve_client; Unknown for the raw
+    // transport request.
+    ClientApprovalMethod method = ClientApprovalMethod::Unknown;
+    // The viewer proved its device key and asked to be remembered.
+    bool device_proof = false;
+};
+
+enum class ClientAuthAction {
+    Allow,            // admitted, with `permissions`
+    RequireApproval,  // the operator has to decide (see approve_client)
+    Deny,             // refused; `denial` and `reason` go to the viewer
+};
+
+struct ClientAuthResult {
+    ClientAuthAction action = ClientAuthAction::Deny;
+    AccessDenial denial = AccessDenial::Declined;
+    std::string reason;
+    // Used for Allow and as the ceiling for RequireApproval. Bits outside the
+    // server's allow_* gates are dropped by the transport.
+    uint16_t permissions = 0;
+};
+
+struct ClientApproval {
+    bool allow = false;
+    // The operator's grant for this session. Bits outside the authentication
+    // ceiling are dropped, so approval can only reduce.
+    uint16_t permissions = 0;
 };
 
 // Where the server keeps its key and certificate. The tray is per-user; the
@@ -74,23 +121,36 @@ struct QuicServerConfig {
     // settings. When false, announce() clears audio.enabled so the viewer is
     // never told about a stream that will not exist.
     bool allow_audio = false;
+    // Accept set_permissions() during a session. Off freezes the grant made
+    // at approval time; the operator can then only end the session.
+    bool allow_permission_change = true;
     // Walk the injection path without calling SendInput. Only for the
     // loopback check, which must not move the real pointer.
     bool dry_run_input = false;
+    // Called once per Hello by wait_for_client(). This is the policy hook:
+    // password/2FA/trusted-device checks and the permission defaults live
+    // here. When empty the legacy token gate below applies instead.
+    std::function<ClientAuthResult(const ClientRequest&)> authenticate;
     // When non-empty, Hello must carry exactly this token or the server
     // answers AccessDenied. The comparison is constant time and happens
-    // inside the TLS-authenticated connection.
+    // inside the TLS-authenticated connection. Ignored when `authenticate`
+    // is set: the policy then owns token authentication.
     std::string access_token;
     // false: the first accepted Hello consumes the token, so a second viewer
     // presenting it is refused with AccessDenial::TokenUsed. true: the token
     // stays valid for later sessions (a fixed passphrase).
     bool reuse_access_token = false;
-    // Called by wait_for_client() after a Hello passed the token check.
-    // Returning false sends AccessDenied and keeps the listener waiting for
-    // another client within the same timeout. The callback runs on the
-    // calling thread, not on a MsQuic thread, so it may prompt an operator;
-    // it should still return promptly, because the peer is waiting.
-    std::function<bool(const ClientRequest&)> approve_client;
+    // Called when authenticate() returned RequireApproval. A refusal sends
+    // AccessDenied and keeps the listener waiting for another client within
+    // the same timeout, unless stop_after_denial is set. The callback runs on
+    // the calling thread, not on a MsQuic thread, so it may prompt an
+    // operator; it should still return promptly, because the peer is waiting.
+    std::function<ClientApproval(const ClientRequest&)> approve_client;
+    // End wait_for_client() with PermissionDenied after a refused Hello
+    // instead of waiting for the next client. The command-line server uses
+    // this so one wrong password is reported and the process exits; the
+    // interactive host keeps listening.
+    bool stop_after_denial = false;
     // LocalMachine requires the caller to be able to create machine keys and
     // write to the machine certificate store (a service running as SYSTEM).
     IdentityScope identity_scope = IdentityScope::CurrentUser;
@@ -131,6 +191,22 @@ struct QuicClientConfig {
     uint32_t idle_timeout_ms = 30000;
     // Sent in Hello. Empty when the server accepts connections without one.
     std::string access_token;
+    // Interactive authentication. An empty password asks the host for click
+    // approval when its mode allows that. `totp` is the six-digit code the
+    // viewer collected after a TwoFactorRequired denial.
+    std::string password;
+    std::string totp;
+    // The permissions the viewer asks for; the host intersects them with its
+    // defaults and the operator's approval.
+    uint16_t requested_permissions = kPermissionAll;
+    // Non-owning, must outlive the session. When set, Hello carries the public
+    // key and name and is signed with the host fingerprint, which lets the
+    // host recognize this device and skip 2FA. The nonce and timestamp are
+    // generated inside handshake().
+    const DeviceIdentity* device_identity = nullptr;
+    DevicePlatform device_platform = DevicePlatform::Windows;
+    // Ask the host to remember this device after 2FA succeeds.
+    bool trust_device = false;
     // SHA-256 fingerprint of the server certificate (uppercase hex; colons,
     // spaces and lowercase are accepted). The client completes the TLS
     // validation callback itself and fails the handshake when the presented
@@ -179,6 +255,15 @@ public:
     // "ip:port" of the client whose Hello this session accepted, empty when
     // the transport did not report it. Valid after wait_for_client().
     std::string client_address() const;
+    // The permission mask in force: what the accepted viewer was granted on
+    // the server, or what the host last announced on the client.
+    uint16_t permissions() const;
+    // Server: replaces the mask mid-session and tells the viewer. The new
+    // mask is clamped to the grant approved at connect time, so a permission
+    // the operator did not allow cannot be restored later. Revoking input
+    // also lifts anything the injector still holds. Requires an announced
+    // stream.
+    Error set_permissions(uint16_t permissions);
     // Replaces the token the next client has to send. Call between sessions:
     // a token spent by the previous one becomes valid again under its new
     // value, which is how a host rotates a one-time token without rebinding.
@@ -247,6 +332,11 @@ public:
     // handshake() already carries the server's reason; the code lets a caller
     // choose its own wording without matching text.
     std::optional<AccessDenial> denial() const;
+    // Pops the newest permission mask the host sent with PermissionUpdate.
+    // permissions() already reflects it, so this is the "something changed"
+    // edge for a UI that wants to explain the revocation.
+    bool take_permission_update(uint16_t& permissions);
+    uint64_t permission_updates() const;
     // Waits for one complete access unit. Returns WaitTimeout when nothing
     // arrived in time, or Unavailable once the peer finished the video stream.
     Error receive_frame(FrameHeader& header, std::vector<uint8_t>& payload,
