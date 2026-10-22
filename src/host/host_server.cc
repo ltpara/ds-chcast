@@ -77,14 +77,18 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
 
 // The description HelloAck and StreamInfo carry. `display` is the output the
 // capturer is reading, `attached` the full list from the moment of the call.
+// `source_width`/`source_height` are the captured frame; the encoder's size may
+// be smaller when adaptive resolution scaled it.
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
                            const DisplayInfo& display, const IVideoEncoder& encoder,
-                           uint16_t framerate, bool clipboard_enabled,
-                           const AudioInfo& audio) {
+                           UINT source_width, UINT source_height, uint16_t framerate,
+                           bool clipboard_enabled, const AudioInfo& audio) {
     ServerInfo info;
     info.codec = encoder.codec();
     info.width = static_cast<uint16_t>(encoder.width());
     info.height = static_cast<uint16_t>(encoder.height());
+    info.source_width = static_cast<uint16_t>(source_width);
+    info.source_height = static_cast<uint16_t>(source_height);
     info.framerate = framerate;
     info.bitrate = encoder.bitrate();
     info.origin_x = display.rect.left;
@@ -372,6 +376,8 @@ void HostServer::run() {
 bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
     stats.audio_active = false;
+    stats.resolution_percent = 100;
+    stats.resolution_changes = 0;
     const std::vector<DisplayInfo> attached = enumerate_displays();
     if (attached.empty()) {
         *error = "no displays are attached";
@@ -435,8 +441,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     encoder_config.framerate = settings_.framerate;
     encoder_config.quality_ratio = settings_.quality;
     encoder_config.gop_size = 0;
-    encoder_config.width = first.width;
-    encoder_config.height = first.height;
+    encoder_config.width = first.nv12_width;
+    encoder_config.height = first.nv12_height;
     const AdapterDevice adapter = capturer->adapter_device();
     std::unique_ptr<IVideoEncoder> encoder =
         create_encoder(adapter.device, encoder_config, error);
@@ -499,8 +505,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     stats.framerate = static_cast<uint16_t>(framerate);
 
     ServerInfo stream_info =
-        describe_stream(attached, capturer->display(), *encoder, static_cast<uint16_t>(framerate),
-                        settings_.allow_clipboard, audio_info);
+        describe_stream(attached, capturer->display(), *encoder, first.width, first.height,
+                        static_cast<uint16_t>(framerate), settings_.allow_clipboard, audio_info);
     publish_stream(stream_info, find_display(attached, capturer->display()),
                    display_name_utf8(capturer->display()));
     if (config_.stream_announced) {
@@ -534,7 +540,16 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     const auto next_reannounce = start + std::chrono::seconds(2);
     bool reannounced = false;
     bool force_keyframe = true;
+    // After a resize, one extra IDR follows the forced one: StreamInfo and the
+    // video frames travel on different QUIC streams, so the viewer can see the
+    // first new-size frame before it knows the new size and has to drop it.
+    // The second IDR is decodable once the announcement has landed.
+    uint32_t extra_idrs = 0;
     bool have_input = false;
+    // Set when the GPU refused a scale: the captured NV12 size then stays put
+    // for the rest of the session instead of retrying on every sample.
+    bool resolution_fixed = false;
+    bool probe_pending = config_.resolution_probe_percent != 0;
     std::vector<EncodedPacket> packets;
 
     // Clipboard baseline: remember what the host clipboard held when the
@@ -811,7 +826,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             if (packet.keyframe) {
                 ++stats.keyframes;
                 last_keyframe = Clock::now();
-                force_keyframe = false;
+                if (extra_idrs > 0) {
+                    --extra_idrs;
+                    force_keyframe = true;
+                } else {
+                    force_keyframe = false;
+                }
             }
         }
         publish_stats(stats);
@@ -860,45 +880,83 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (!decision.changed) {
             return true;
         }
-
-        Error applied = encoder->set_rate(decision.target_bps, decision.framerate);
-        if (!applied.ok()) {
-            log("adaptive bitrate: cannot apply " +
-                std::to_string(decision.target_bps / 1000u) + " kbps at " +
-                std::to_string(decision.framerate) + " fps after " + decision.reason + ": " +
-                applied.to_string());
+        const bool rate_changed = decision.target_bps != stats.target_bitrate ||
+                                  decision.framerate != stats.framerate;
+        const bool size_changed = !resolution_fixed &&
+                                  decision.resolution_percent != stats.resolution_percent;
+        if (!rate_changed && !size_changed) {
             return true;
         }
-        stats.target_bitrate = decision.target_bps;
-        stats.framerate = decision.framerate;
-        ++stats.abr_changes;
-        // The encoder reset invalidates its reference state, and the capture
-        // cadence has to follow the rate the encoder now divides its budget
-        // over, or every frame keeps a budget for a frame nobody sends.
-        force_keyframe = true;
-        framerate = decision.framerate;
-        frame_interval = frame_duration(framerate);
-        next_frame_due = now + frame_interval;
-        stream_info.bitrate = decision.target_bps;
-        stream_info.framerate = static_cast<uint16_t>(framerate);
-        publish_stream(stream_info, find_display(attached, capturer->display()),
-                       display_name_utf8(capturer->display()));
-        Error refreshed = session_->refresh_stream(stream_info);
-        if (!refreshed.ok()) {
-            if (refreshed.status() == Status::Unavailable ||
-                refreshed.status() == Status::WaitTimeout) {
-                *peer_left = true;
-            } else {
-                ++stats.send_errors;
-                *error = "refresh_stream: " + refreshed.to_string();
+
+        if (rate_changed) {
+            Error applied = encoder->set_rate(decision.target_bps, decision.framerate);
+            if (!applied.ok()) {
+                log("adaptive bitrate: cannot apply " +
+                    std::to_string(decision.target_bps / 1000u) + " kbps at " +
+                    std::to_string(decision.framerate) + " fps after " + decision.reason + ": " +
+                    applied.to_string());
+                return true;
             }
-            return false;
+            stats.target_bitrate = decision.target_bps;
+            stats.framerate = decision.framerate;
+            ++stats.abr_changes;
+            // The encoder reset invalidates its reference state, and the
+            // capture cadence has to follow the rate the encoder now divides
+            // its budget over, or every frame keeps a budget for a frame
+            // nobody sends.
+            force_keyframe = true;
+            framerate = decision.framerate;
+            frame_interval = frame_duration(framerate);
+            next_frame_due = now + frame_interval;
         }
-        ++stats.stream_updates;
-        log("adaptive bitrate: " + std::string(decision.reason) + "; target " +
-            std::to_string(decision.target_bps / 1000u) + " kbps at " +
-            std::to_string(framerate) + " fps, RTT " +
-            std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms");
+
+        bool announce_now = true;
+        if (size_changed) {
+            Error scaled = capturer->set_nv12_scale(decision.resolution_percent);
+            if (!scaled.ok()) {
+                resolution_fixed = true;
+                log("adaptive resolution: cannot scale to " +
+                    std::to_string(decision.resolution_percent) +
+                    "%; staying at " + std::to_string(stats.resolution_percent) +
+                    "% for this session: " + scaled.to_string());
+            } else {
+                stats.resolution_percent = decision.resolution_percent;
+                ++stats.resolution_changes;
+                force_keyframe = true;
+                extra_idrs = 1;
+                // The frame loop rebuilds the encoder at the new captured size
+                // and announces that description once the encoder accepted it;
+                // announcing the intended size here could disagree with what
+                // the encoder lands on.
+                announce_now = false;
+                log("adaptive resolution: " + std::string(decision.reason) + "; " +
+                    std::to_string(decision.resolution_percent) + "% of the captured frame");
+            }
+        }
+        if (announce_now) {
+            stream_info.bitrate = stats.target_bitrate;
+            stream_info.framerate = static_cast<uint16_t>(framerate);
+            publish_stream(stream_info, find_display(attached, capturer->display()),
+                           display_name_utf8(capturer->display()));
+            Error refreshed = session_->refresh_stream(stream_info);
+            if (!refreshed.ok()) {
+                if (refreshed.status() == Status::Unavailable ||
+                    refreshed.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                } else {
+                    ++stats.send_errors;
+                    *error = "refresh_stream: " + refreshed.to_string();
+                }
+                return false;
+            }
+            ++stats.stream_updates;
+        }
+        if (rate_changed) {
+            log("adaptive bitrate: " + std::string(decision.reason) + "; target " +
+                std::to_string(decision.target_bps / 1000u) + " kbps at " +
+                std::to_string(framerate) + " fps, RTT " +
+                std::to_string(static_cast<int>(stats.rtt_ms + 0.5)) + " ms");
+        }
         publish_stats(stats);
         return true;
     };
@@ -958,6 +1016,25 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             ++stats.stream_updates;
             log("re-announced the stream description");
         }
+        if (probe_pending && now - start >= std::chrono::milliseconds(2500)) {
+            probe_pending = false;
+            if (!resolution_fixed &&
+                config_.resolution_probe_percent != stats.resolution_percent) {
+                Error scaled = capturer->set_nv12_scale(config_.resolution_probe_percent);
+                if (!scaled.ok()) {
+                    resolution_fixed = true;
+                    log("resolution probe: cannot scale to " +
+                        std::to_string(config_.resolution_probe_percent) + "%: " +
+                        scaled.to_string());
+                } else {
+                    stats.resolution_percent = config_.resolution_probe_percent;
+                    ++stats.resolution_changes;
+                    force_keyframe = true;
+                    extra_idrs = 1;
+                    log("resolution probe: " + std::to_string(stats.resolution_percent) + "%");
+                }
+            }
+        }
 
         if (frame_interval != Clock::duration::zero()) {
             const auto wait_now = Clock::now();
@@ -1013,8 +1090,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (!encoder) {
             // The capture rebuilt: the output may have moved, rotated or
             // changed size, and the encoder may land on a different codec.
-            encoder_config.width = frame.width;
-            encoder_config.height = frame.height;
+            encoder_config.width = frame.nv12_width;
+            encoder_config.height = frame.nv12_height;
             const AdapterDevice rebuilt_adapter = capturer->adapter_device();
             encoder = create_encoder(rebuilt_adapter.device, encoder_config, error);
             if (!encoder) {
@@ -1027,7 +1104,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             // the configured frame rate at the top of the ladder.
             abr = BitrateController(video_budget(encoder->bitrate(), bitrate_reserve(audio_info)),
                                     video_floor(encoder->bitrate()),
-                                    static_cast<uint16_t>(encoder->framerate()));
+                                    static_cast<uint16_t>(encoder->framerate()),
+                                    stats.resolution_percent);
             framerate = encoder->framerate();
             frame_interval = frame_duration(framerate);
             next_frame_due = Clock::now() + frame_interval;
@@ -1043,9 +1121,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stats.framerate = static_cast<uint16_t>(framerate);
             const std::vector<DisplayInfo> refreshed = enumerate_displays();
             stream_info =
-                describe_stream(refreshed, capturer->display(), *encoder,
-                                static_cast<uint16_t>(framerate), settings_.allow_clipboard,
-                                audio_info);
+                describe_stream(refreshed, capturer->display(), *encoder, frame.width,
+                                frame.height, static_cast<uint16_t>(framerate),
+                                settings_.allow_clipboard, audio_info);
             publish_stream(stream_info, find_display(refreshed, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {
@@ -1069,6 +1147,93 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 std::to_string(stream_info.origin_x) + "," +
                 std::to_string(stream_info.origin_y) + "; re-announced");
             force_keyframe = true;
+        }
+
+        // Adaptive resolution: the capture now publishes a smaller NV12 image
+        // than the encoder was built for. VPL fixes the coded size at session
+        // creation, so a size change is a new encoder -- built with the rate
+        // and frame rate the controller currently holds -- not a reset.
+        if (frame.nv12_texture &&
+            (frame.nv12_width != encoder->width() || frame.nv12_height != encoder->height())) {
+            EncoderConfig resized = encoder_config;
+            resized.width = frame.nv12_width;
+            resized.height = frame.nv12_height;
+            resized.bitrate = stats.target_bitrate;
+            resized.framerate = framerate;
+            const AdapterDevice resize_adapter = capturer->adapter_device();
+            std::string resize_error;
+            std::unique_ptr<IVideoEncoder> next =
+                create_encoder(resize_adapter.device, resized, &resize_error);
+            if (!next) {
+                // Keep the stream that is running: put the capture back on the
+                // size the current encoder was built for and stop resizing.
+                resolution_fixed = true;
+                Error reverted = capturer->set_nv12_scale(stats.resolution_percent);
+                if (!reverted.ok()) {
+                    log("adaptive resolution: revert failed: " + reverted.to_string());
+                }
+                log("adaptive resolution: encoder recreation at " +
+                    std::to_string(frame.nv12_width) + "x" +
+                    std::to_string(frame.nv12_height) + " failed; staying at " +
+                    std::to_string(stats.resolution_percent) + "%: " + resize_error);
+                stream_info.bitrate = stats.target_bitrate;
+                stream_info.framerate = static_cast<uint16_t>(framerate);
+                publish_stream(stream_info, find_display(attached, capturer->display()),
+                               display_name_utf8(capturer->display()));
+                Error refreshed = session_->refresh_stream(stream_info);
+                if (!refreshed.ok()) {
+                    if (refreshed.status() == Status::Unavailable ||
+                        refreshed.status() == Status::WaitTimeout) {
+                        *peer_left = true;
+                    } else {
+                        ++stats.send_errors;
+                        *error = "refresh_stream: " + refreshed.to_string();
+                    }
+                    const bool clean = error->empty();
+                    drain_peer();
+                    return clean;
+                }
+                ++stats.stream_updates;
+                publish_stats(stats);
+                // This frame still holds the refused size and cannot feed the
+                // old encoder; the reverted pass produces a matching one next.
+                continue;
+            }
+            encoder = std::move(next);
+            have_input = false;
+            force_keyframe = true;
+            extra_idrs = 1;
+            stats.target_bitrate = encoder->bitrate();
+            stats.framerate = static_cast<uint16_t>(framerate);
+            stream_info =
+                describe_stream(attached, capturer->display(), *encoder, frame.width,
+                                frame.height, static_cast<uint16_t>(framerate),
+                                settings_.allow_clipboard, audio_info);
+            publish_stream(stream_info, find_display(attached, capturer->display()),
+                           display_name_utf8(capturer->display()));
+            if (config_.stream_announced) {
+                config_.stream_announced(stream_info);
+            }
+            Error resized_err = session_->refresh_stream(stream_info);
+            if (!resized_err.ok()) {
+                if (resized_err.status() == Status::Unavailable ||
+                    resized_err.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                } else {
+                    ++stats.send_errors;
+                    *error = "refresh_stream: " + resized_err.to_string();
+                }
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
+            ++stats.stream_updates;
+            log("stream resized to " + std::to_string(stream_info.width) + "x" +
+                std::to_string(stream_info.height) + " (" +
+                std::to_string(stats.resolution_percent) + "% of " +
+                std::to_string(stream_info.source_width) + "x" +
+                std::to_string(stream_info.source_height) + "); re-announced");
+            publish_stats(stats);
         }
         const uint64_t pts_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());

@@ -209,6 +209,90 @@ void test_framerate_ladder() {
           "a recovered path is back at full rate and full frame rate");
 }
 
+void test_resolution_ladder() {
+    using chast::BitrateController;
+    check(BitrateController::resolution_for(10000000, 10000000, 100) == 100,
+          "a full target keeps full resolution");
+    check(BitrateController::resolution_for(5000000, 10000000, 100) == 100,
+          "half the ceiling is still full resolution");
+    check(BitrateController::resolution_for(4999999, 10000000, 100) == 75,
+          "just under half drops to three quarters");
+    check(BitrateController::resolution_for(3000000, 10000000, 100) == 75,
+          "30% is the bottom of the three-quarter step");
+    check(BitrateController::resolution_for(2999999, 10000000, 100) == 50,
+          "under 30% drops to half");
+    check(BitrateController::resolution_for(1, 10000000, 100) == 50,
+          "the ladder bottoms out at half resolution");
+
+    // Hysteresis: recovering needs more headroom than dropping did, so a
+    // target sitting on an edge cannot toggle the encoder size.
+    check(BitrateController::resolution_for(5000000, 10000000, 75) == 75,
+          "a 75% stream holds through the full-resolution down edge");
+    check(BitrateController::resolution_for(5500000, 10000000, 75) == 100,
+          "a 75% stream restores full size at 55%");
+    check(BitrateController::resolution_for(2900000, 10000000, 75) == 50,
+          "a 75% stream drops below 30%");
+    check(BitrateController::resolution_for(3400000, 10000000, 50) == 75,
+          "a 50% stream restores three quarters at 34%");
+    check(BitrateController::resolution_for(3300000, 10000000, 50) == 50,
+          "a 50% stream holds below 34%");
+    check(BitrateController::resolution_for(5500000, 10000000, 50) == 100,
+          "a large recovery skips a rung instead of resizing twice");
+
+    // Decisions carry the size, and the frame rate and resolution move
+    // together as the target falls.
+    chast::BitrateController controller(10000000, 1000000, 30);
+    chast::BitrateDecision decision = controller.update(healthy_sample(1000), 1000);
+    check(!decision.changed && decision.resolution_percent == 100,
+          "a clean sample reports full resolution");
+
+    chast::BitrateSample lossy = healthy_sample(1100);
+    lossy.lost_packets = 20;
+    decision = controller.update(lossy, 1000);
+    check(decision.changed && decision.target_bps == 7000000 &&
+              decision.resolution_percent == 100,
+          "a 30% cut keeps full resolution");
+
+    lossy.sent_packets = 1200;
+    lossy.lost_packets = 40;
+    decision = controller.update(lossy, 1600);
+    check(decision.changed && decision.target_bps == 4900000 && decision.framerate == 20 &&
+              decision.resolution_percent == 75,
+          "under half the ceiling the frame rate and resolution drop together");
+
+    lossy.sent_packets = 1300;
+    lossy.lost_packets = 60;
+    decision = controller.update(lossy, 1600);
+    check(decision.changed && decision.target_bps == 3430000 &&
+              decision.resolution_percent == 75,
+          "the 75% rung holds until the target falls below 30%");
+
+    lossy.sent_packets = 1400;
+    lossy.lost_packets = 80;
+    decision = controller.update(lossy, 1600);
+    check(decision.changed && decision.resolution_percent == 50 && decision.framerate == 10,
+          "a deep cut reaches half resolution and a third of the frame rate");
+
+    uint64_t packets = lossy.sent_packets;
+    bool saw_size_up = false;
+    for (int i = 0; i < 300; ++i) {
+        packets += 100;
+        const chast::BitrateDecision up = controller.update(healthy_sample(packets), 1000);
+        if (up.changed && up.resolution_percent > 50) {
+            saw_size_up = true;
+        }
+    }
+    check(saw_size_up && controller.target_bps() == 10000000 &&
+              controller.resolution_percent() == 100,
+          "recovery restores full resolution with the target");
+
+    chast::BitrateController resumed(10000000, 1000000, 30, 50);
+    check(resumed.resolution_percent() == 50,
+          "a controller rebuilt on the 50% rung does not jump to full size");
+    chast::BitrateController snapped(10000000, 1000000, 30, 80);
+    check(snapped.resolution_percent() == 75, "an unknown rung snaps to a real one");
+}
+
 void test_audio_budget() {
     using chast::BitrateController;
     check(chast::video_floor(10000000) == 1000000, "the video floor is a tenth of the budget");
@@ -249,6 +333,7 @@ int main() {
     test_floor_and_bounds();
     test_no_congestion_window();
     test_framerate_ladder();
+    test_resolution_ladder();
     test_audio_budget();
     if (failures != 0) {
         std::printf("bitrate checks FAILED (%d)\n", failures);

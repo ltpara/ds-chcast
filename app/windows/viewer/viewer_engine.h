@@ -58,8 +58,14 @@ struct ViewerStatus {
     std::string host;
     uint16_t port = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    // The encoded picture size, which is what the decoder produces and the
+    // texture holds. `source_width`/`source_height` are the captured desktop
+    // size; pointer positions and input events travel in that space, so the
+    // UI maps them with these while it draws the smaller picture.
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
     uint32_t framerate = 0;
     uint32_t server_bitrate = 0;
     std::string decoder;
@@ -94,7 +100,7 @@ struct ViewerStatus {
     bool video_finished = false;
     // Input gate and coordinate origin from HelloAck. `origin_x`/`origin_y`
     // are the captured output's top-left in virtual-desktop pixels; the UI
-    // adds them to the frame-space pointer position.
+    // adds them to the source-space pointer position.
     bool input_enabled = false;
     int32_t origin_x = 0;
     int32_t origin_y = 0;

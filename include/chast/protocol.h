@@ -37,7 +37,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 11;
+inline constexpr uint16_t kProtocolVersion = 12;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -227,8 +227,11 @@ struct CursorUpdate {
     // while the host hides it (a full-screen video, an idle timer) or when it
     // is over another output.
     bool visible = false;
-    // `x`/`y` are in frame pixels, the same space the viewer's own pointer
-    // occupies: the sprite's top-left lands on them.
+    // `x`/`y` are in source pixels: the captured desktop's coordinate space,
+    // which is also the space the viewer's own pointer is mapped to and what
+    // ServerInfo::source_width/source_height describe. Independent of the
+    // encoded picture size, so adaptive downscaling does not move the pointer.
+    // The sprite's top-left lands on them.
     int32_t x = 0;
     int32_t y = 0;
     // The pixel inside the sprite that sits on (x, y).
@@ -343,21 +346,28 @@ inline constexpr uint16_t kMaxDisplayCount = 64;
 
 // What the server announces in HelloAck. `encoder` is informational (the VPL
 // implementation that won the tier ladder); `codec` is what the video stream
-// actually contains. `origin_x`/`origin_y` are the captured output's top-left
-// in virtual-desktop pixels, which the viewer adds to the frame-space pointer
-// position before sending it back. `input_enabled` mirrors the server's gate:
-// when false the viewer must not send InputEvents (they would be dropped).
-// `displays` lists every attached output; the one being streamed is the entry
-// whose rect starts at the origin and is `width` x `height` pixels.
-// `clipboard_enabled` mirrors the server's clipboard gate: when false the
-// viewer must not send ClipboardUpdates and will not receive any.
-// `audio.enabled` says whether an audio stream follows; when true, `audio`
-// carries the codec, rate, channel count and AudioSpecificConfig needed to
-// decode it. Audio that fails mid-session is turned off with a StreamInfo.
+// actually contains. `width`/`height` are the encoded picture size, which
+// adaptive resolution may scale below the captured frame; `source_width`/
+// `source_height` are the captured desktop's size in pixels, the space pointer
+// positions, cursor sprites and input coordinates use. The two are equal when
+// the stream is not scaled. `origin_x`/`origin_y` are the captured output's
+// top-left in virtual-desktop pixels, which the viewer adds to the source-space
+// pointer position before sending it back. `input_enabled` mirrors the server's
+// gate: when false the viewer must not send InputEvents (they would be
+// dropped). `displays` lists every attached output; the one being streamed is
+// the entry whose rect starts at the origin and is `source_width` x
+// `source_height` pixels. `clipboard_enabled` mirrors the server's clipboard
+// gate: when false the viewer must not send ClipboardUpdates and will not
+// receive any. `audio.enabled` says whether an audio stream follows; when true,
+// `audio` carries the codec, rate, channel count and AudioSpecificConfig
+// needed to decode it. Audio that fails mid-session is turned off with a
+// StreamInfo.
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
-    uint16_t width = 0;
+    uint16_t width = 0;         // encoded picture size
     uint16_t height = 0;
+    uint16_t source_width = 0;  // captured desktop size (pointer/input space)
+    uint16_t source_height = 0;
     uint16_t framerate = 30;
     uint32_t bitrate = 0;
     int32_t origin_x = 0;

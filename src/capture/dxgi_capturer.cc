@@ -29,6 +29,14 @@ namespace chast {
 
 namespace {
 
+// Downscaled dimension, rounded to an even pixel count: NV12 subsamples 2x2
+// and the video processor rejects odd sizes. The 16-pixel surface padding is
+// applied later by the pass.
+UINT scaled_even(UINT value, UINT percent) {
+    const UINT scaled = static_cast<UINT>((static_cast<uint64_t>(value) * percent + 50) / 100);
+    return std::max<UINT>(2, scaled) & ~1u;
+}
+
 class DxgiCapturer final : public IDxgiCapturer {
 public:
     DxgiCapturer(DisplayInfo display, CaptureConfig config)
@@ -45,6 +53,7 @@ public:
         return AdapterDevice{device_.get(), vendor_id_, display_.adapter_luid};
     }
     Error reinitialize() override;
+    Error set_nv12_scale(UINT percent) override;
     const Error& last_error() const override { return last_error_; }
 
 private:
@@ -65,8 +74,9 @@ private:
     // behind. A no-op rotation leaves the pass not-ready.
     void create_rotation_pass();
     // Builds (or, on a topology change, rebuilds) the NV12 pass for the size
-    // the stages currently publish. A no-op when NV12 is not configured.
-    void create_nv12_pass();
+    // the stages currently publish, scaled by nv12_percent_. A no-op when NV12
+    // is not configured; returns the failure that left the pass not-ready.
+    Error create_nv12_pass();
     // Size of the texture the stages publish: screen-space when the video
     // processor rotates, panel-native when the encoder has to carry the
     // rotation itself.
@@ -109,6 +119,10 @@ private:
     UINT surface_height_ = 0;
     UINT screen_width_ = 0;   // rotated size, what FrameInfo reports
     UINT screen_height_ = 0;
+    // Size of the NV12 image relative to the published frame. The scaler is the
+    // video processor in the NV12 pass, so it outlives reinitialize() and is
+    // only ever changed through set_nv12_scale().
+    UINT nv12_percent_ = 100;
 
     FrameInfo frame_;
     CursorInfo cursor_;
@@ -157,7 +171,10 @@ Error DxgiCapturer::initialize() {
     // NV12 is its own pass, not a replacement for the BGRA frame: the encoder
     // picks the one it needs, and the BGRA texture stays the reference image
     // (the dump tool and any software consumer use it).
-    create_nv12_pass();
+    const Error nv12 = create_nv12_pass();
+    if (!nv12.ok()) {
+        note(nv12);
+    }
 
     display_.width = screen_width_;
     display_.height = screen_height_;
@@ -211,10 +228,10 @@ void DxgiCapturer::create_rotation_pass() {
     }
 }
 
-void DxgiCapturer::create_nv12_pass() {
+Error DxgiCapturer::create_nv12_pass() {
     nv12_pass_.reset();
     if (!config_.nv12.enabled) {
-        return;
+        return Error::success();
     }
     UINT width = 0;
     UINT height = 0;
@@ -223,21 +240,57 @@ void DxgiCapturer::create_nv12_pass() {
     // represented; such a mode stays BGRA-only rather than rounding the image
     // up and shifting everything by a pixel.
     if (width == 0 || height == 0 || (width & 1u) != 0 || (height & 1u) != 0) {
-        note(Error(Status::Unsupported, "NV12 needs even frame dimensions; " +
-                                            std::to_string(width) + "x" +
-                                            std::to_string(height) + " stays BGRA8"));
-        return;
+        return Error(Status::Unsupported, "NV12 needs even frame dimensions; " +
+                                              std::to_string(width) + "x" +
+                                              std::to_string(height) + " stays BGRA8");
     }
+    const UINT output_width = scaled_even(width, nv12_percent_);
+    const UINT output_height = scaled_even(height, nv12_percent_);
     auto pass = std::make_unique<detail::Nv12Pass>();
-    const Error nv12 = pass->initialize(device_.get(), context_.get(), width, height,
-                                        config_.nv12.colorimetry);
-    if (nv12.ok()) {
-        nv12_pass_ = std::move(pass);
-    } else {
+    const Error nv12 = pass->initialize(device_.get(), context_.get(), width, height, output_width,
+                                        output_height, config_.nv12.colorimetry);
+    if (!nv12.ok()) {
         // RustDesk's VRAM encoder has no CPU fallback either: when the GPU
         // cannot convert, the encoder is simply not offered NV12.
-        note(nv12);
+        return nv12;
     }
+    nv12_pass_ = std::move(pass);
+    return Error::success();
+}
+
+Error DxgiCapturer::set_nv12_scale(UINT percent) {
+    if (percent == 0 || percent > 100) {
+        return Error(Status::InvalidCall, "NV12 scale is a percentage from 1 to 100");
+    }
+    if (percent == nv12_percent_) {
+        return Error::success();
+    }
+    if (!config_.nv12.enabled) {
+        // No conversion to rescale; the value still applies if NV12 is ever
+        // configured on this capturer.
+        nv12_percent_ = percent;
+        return Error::success();
+    }
+
+    // The pass owns the texture the current frame advertises, and a rebuilt
+    // pass starts with an empty target, so withdraw the old image and force the
+    // next capture through the conversion instead of republishing a stale size.
+    const UINT previous = nv12_percent_;
+    nv12_percent_ = percent;
+    release_nv12();
+    const Error err = create_nv12_pass();
+    if (!err.ok()) {
+        // Keep the scale that was working rather than leaving no NV12 at all.
+        nv12_percent_ = previous;
+        const Error reverted = create_nv12_pass();
+        if (!reverted.ok()) {
+            note(reverted);
+        }
+    }
+    // Both a working rebuild and a reverted one start with an empty target;
+    // the BGRA frame is unaffected either way.
+    frame_dirty_ = true;
+    return err;
 }
 
 void DxgiCapturer::note(const Error& err) {
@@ -424,12 +477,10 @@ Error DxgiCapturer::re_duplicate_without_hdr() {
     create_rotation_pass();
     frame_.rotation_degrees =
         rotation_pass_.ready() ? 0 : detail::rotation_degrees(rotation_);
-    frame_.nv12_texture = nullptr;
-    frame_.nv12_shared_handle = nullptr;
-    frame_.nv12_surface_width = 0;
-    frame_.nv12_surface_height = 0;
-    frame_.nv12_updated = false;
-    create_nv12_pass();
+    const Error nv12 = create_nv12_pass();
+    if (!nv12.ok()) {
+        note(nv12);
+    }
 
     // The pointer shape belongs to the old duplication; the next mouse update
     // re-fetches it.
@@ -531,7 +582,10 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
             frame_.texture = nullptr;
             frame_.shared_handle = nullptr;
             release_nv12();
-            create_nv12_pass();
+            const Error nv12 = create_nv12_pass();
+            if (!nv12.ok()) {
+                note(nv12);
+            }
             frame_dirty_ = true;
             return CaptureResult::NoNewFrame;
         }
@@ -543,6 +597,8 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
         frame_.shared_handle = nullptr;
         frame_.nv12_texture = nullptr;
         frame_.nv12_shared_handle = nullptr;
+        frame_.nv12_width = 0;
+        frame_.nv12_height = 0;
         frame_.nv12_surface_width = 0;
         frame_.nv12_surface_height = 0;
         frame_.nv12_updated = false;
@@ -571,6 +627,8 @@ CaptureResult DxgiCapturer::capture(std::chrono::milliseconds timeout) {
                 nv12_pass_.reset();
                 frame_.nv12_texture = nullptr;
                 frame_.nv12_shared_handle = nullptr;
+                frame_.nv12_width = 0;
+                frame_.nv12_height = 0;
                 frame_.nv12_surface_width = 0;
                 frame_.nv12_surface_height = 0;
             }
@@ -607,6 +665,8 @@ Error DxgiCapturer::run_nv12(ID3D11Texture2D* source) {
     }
     frame_.nv12_texture = nv12;
     frame_.nv12_shared_handle = nv12_pass_->shared_handle();
+    frame_.nv12_width = nv12_pass_->width();
+    frame_.nv12_height = nv12_pass_->height();
     frame_.nv12_surface_width = nv12_pass_->surface_width();
     frame_.nv12_surface_height = nv12_pass_->surface_height();
     return Error::success();
@@ -617,6 +677,8 @@ void DxgiCapturer::release_nv12() {
     // frame from advertising a copy that no longer matches the BGRA frame.
     frame_.nv12_texture = nullptr;
     frame_.nv12_shared_handle = nullptr;
+    frame_.nv12_width = 0;
+    frame_.nv12_height = 0;
     frame_.nv12_surface_width = 0;
     frame_.nv12_surface_height = 0;
     frame_.nv12_updated = false;
@@ -814,6 +876,8 @@ void DxgiCapturer::clear_public_state() {
     frame_.desktop_updated = true;
     frame_.nv12_texture = nullptr;
     frame_.nv12_shared_handle = nullptr;
+    frame_.nv12_width = 0;
+    frame_.nv12_height = 0;
     frame_.nv12_surface_width = 0;
     frame_.nv12_surface_height = 0;
     frame_.nv12_updated = false;

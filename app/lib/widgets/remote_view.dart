@@ -7,9 +7,10 @@ import '../viewer_bridge.dart';
 
 enum ViewFit { adaptive, original }
 
-/// Pointer callbacks report positions in captured-frame pixels: (0, 0) is the
-/// frame's top-left, before the virtual-desktop origin is added. The protocol
-/// wants virtual-desktop coordinates, so the session page does that last step.
+/// Pointer callbacks report positions in captured-desktop (source) pixels:
+/// (0, 0) is the desktop's top-left, before the virtual-desktop origin is
+/// added. The host may encode a smaller picture than the desktop, so these are
+/// source pixels, not texture pixels; the session page adds the origin last.
 typedef FramePointerHandler = void Function(Offset position, int buttons);
 typedef FrameButtonHandler = void Function(Offset position, int button, bool down);
 typedef FrameScrollHandler = void Function(Offset position, Offset delta);
@@ -33,6 +34,8 @@ class RemoteView extends StatefulWidget {
     required this.textureId,
     required this.videoWidth,
     required this.videoHeight,
+    this.sourceWidth = 0,
+    this.sourceHeight = 0,
     required this.fit,
     this.captureInput = false,
     this.hideCursor = false,
@@ -45,9 +48,20 @@ class RemoteView extends StatefulWidget {
   });
 
   final int textureId;
+
+  /// The encoded picture size, which is what the texture holds and what the
+  /// aspect ratio and drawing size follow.
   final int videoWidth;
   final int videoHeight;
+
+  /// The captured desktop size, which is the space the host sends pointer
+  /// positions in. Zero falls back to the video size.
+  final int sourceWidth;
+  final int sourceHeight;
   final ViewFit fit;
+
+  int get _pointerWidth => sourceWidth > 0 ? sourceWidth : videoWidth;
+  int get _pointerHeight => sourceHeight > 0 ? sourceHeight : videoHeight;
 
   /// When true the view forwards raw pointer events. The session page only
   /// enables this while remote control is on.
@@ -94,10 +108,12 @@ class _RemoteViewState extends State<RemoteView> {
   /// after the frame because the page answers with a native call, and
   /// [build] must not have a side effect on the engine.
   void _reportScale(Size drawn) {
-    if (widget.videoWidth <= 0 || drawn.width <= 0) {
+    if (widget._pointerWidth <= 0 || drawn.width <= 0) {
       return;
     }
-    final double scale = drawn.width / widget.videoWidth;
+    // The host's sprite is in source pixels, so a downscaled encode drawn at
+    // full window size still gets a full-size pointer.
+    final double scale = drawn.width / widget._pointerWidth;
     if (_reportedScale != null && (_reportedScale! - scale).abs() < 0.0005) {
       return;
     }
@@ -121,10 +137,12 @@ class _RemoteViewState extends State<RemoteView> {
     if (box.width <= 0 || box.height <= 0) {
       return Offset.zero;
     }
+    final int width = widget._pointerWidth;
+    final int height = widget._pointerHeight;
     final double x =
-        (local.dx * widget.videoWidth / box.width).clamp(0.0, widget.videoWidth - 1.0).toDouble();
+        (local.dx * width / box.width).clamp(0.0, width - 1.0).toDouble();
     final double y =
-        (local.dy * widget.videoHeight / box.height).clamp(0.0, widget.videoHeight - 1.0).toDouble();
+        (local.dy * height / box.height).clamp(0.0, height - 1.0).toDouble();
     return Offset(x, y);
   }
 

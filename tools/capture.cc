@@ -403,13 +403,13 @@ int main(int argc, char** argv) {
         if (!options.nv12_path.empty() && !dumped_nv12 && frame.nv12_updated &&
             frame.nv12_texture != nullptr) {
             std::string dump_error;
-            if (save_nv12(frame.device, frame.context, frame.nv12_texture, frame.width,
-                          frame.height, frame.nv12_surface_width, frame.nv12_surface_height,
+            if (save_nv12(frame.device, frame.context, frame.nv12_texture, frame.nv12_width,
+                          frame.nv12_height, frame.nv12_surface_width, frame.nv12_surface_height,
                           options.nv12_path, dump_error)) {
                 dumped_nv12 = true;
                 if (!options.quiet) {
                     std::printf("wrote %s (%ux%u, NV12, %s)\n", options.nv12_path.c_str(),
-                                frame.width, frame.height,
+                                frame.nv12_width, frame.nv12_height,
                                 colorimetry_name(options.config.nv12.colorimetry));
                 }
             } else {

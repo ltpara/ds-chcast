@@ -343,6 +343,10 @@ struct Options {
     // serve: print every InputEvent the server observes, for diagnosing
     // the viewer's mapping.
     bool dump_input = false;
+    // serve/verify: scale the published NV12 picture to this percent once,
+    // 2.5 s into the session, to exercise the live resize path without a lossy
+    // link. 0 leaves the host's own ladder alone; verify defaults to 75.
+    uint32_t resolution = 0;
     // serve and verify: send a StreamInfo with the current description once,
     // two seconds in. serve uses it to exercise a viewer's update path without
     // changing the host's display mode; verify turns it on to cover the wire
@@ -473,6 +477,13 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.approve = true;
             } else if (arg == "--no-hdr") {
                 options.config.want_hdr = false;
+            } else if (arg == "--resolution" && i + 1 < argc) {
+                const unsigned long value = std::stoul(argv[++i]);
+                if (value < 1 || value > 100) {
+                    std::fprintf(stderr, "--resolution wants 1..100 percent\n");
+                    return false;
+                }
+                options.resolution = static_cast<uint32_t>(value);
             } else if (arg == "--no-cursor") {
                 options.config.capture_cursor = false;
             } else if (arg == "--quiet") {
@@ -500,6 +511,10 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if ((options.token_reuse || options.approve) && options.mode != "serve") {
         std::fprintf(stderr, "--token-reuse and --approve only apply to serve\n");
+        return false;
+    }
+    if (options.resolution != 0 && options.mode == "connect") {
+        std::fprintf(stderr, "--resolution only applies to serve and verify\n");
         return false;
     }
     if (!options.send_clipboard.empty()) {
@@ -548,8 +563,14 @@ struct SenderStats {
     uint64_t pointer_only = 0;
     uint64_t repeats = 0;
     uint64_t send_errors = 0;
+    // Encoded picture size from the last announcement, and the captured
+    // desktop size it was scaled from.
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t resolution_percent = 100;
+    uint64_t resolution_changes = 0;
     int32_t origin_x = 0;
     int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
@@ -616,8 +637,16 @@ struct ReceiverStats {
     uint64_t gaps = 0;
     uint64_t protocol_errors = 0;
     uint64_t digest = chast::kFrameDigestSeed;
+    // Decoded picture size, plus the source size the last announcement
+    // described (the captured desktop, which pointer input uses). The HelloAck
+    // picture size is kept separately: a session starts at full resolution,
+    // so it must equal the source size.
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t hello_width = 0;
+    uint32_t hello_height = 0;
     int32_t origin_x = 0;
     int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
@@ -810,6 +839,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.run_seconds = options.seconds;
     config.reannounce = options.reannounce;
     config.keyframe_interval_ms = options.keyframe_ms;
+    config.resolution_probe_percent = static_cast<uint16_t>(options.resolution);
     config.first_client_timeout_ms = static_cast<uint32_t>(options.wait_seconds * 1000.0);
     if (!options.quiet) {
         config.log = [](const std::string& message) {
@@ -896,6 +926,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.codec = status.stream.codec;
     stats.width = status.stream.width;
     stats.height = status.stream.height;
+    stats.source_width = status.stream.source_width;
+    stats.source_height = status.stream.source_height;
+    stats.resolution_percent = status.stats.resolution_percent;
+    stats.resolution_changes = status.stats.resolution_changes;
     stats.origin_x = status.stream.origin_x;
     stats.origin_y = status.stream.origin_y;
     stats.encoder = status.stream.encoder;
@@ -957,6 +991,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                     stats.target_bitrate / 1000u, stats.framerate,
                     static_cast<unsigned long long>(stats.abr_changes), stats.rtt_ms,
                     stats.send_kbps);
+        std::printf("sender: picture=%ux%u source=%ux%u resolution=%u%% changes=%llu\n",
+                    stats.width, stats.height, stats.source_width, stats.source_height,
+                    stats.resolution_percent,
+                    static_cast<unsigned long long>(stats.resolution_changes));
         if (stats.stats_received) {
             std::printf("sender: peer received=%llu decoded=%llu digest=%016llX\n",
                         static_cast<unsigned long long>(stats.peer.received),
@@ -1066,6 +1104,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.codec = info.codec;
     stats.width = info.width;
     stats.height = info.height;
+    stats.source_width = info.source_width;
+    stats.source_height = info.source_height;
+    stats.hello_width = info.width;
+    stats.hello_height = info.height;
     stats.origin_x = info.origin_x;
     stats.origin_y = info.origin_y;
     stats.input_enabled = info.input_enabled;
@@ -1076,9 +1118,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.audio_info = info.audio;
     stats.audio_announced = info.audio.enabled;
     if (!options.quiet) {
-        std::printf("quic: connected, server streams %s %ux%u at %u kbps (%s)\n",
+        std::printf("quic: connected, server streams %s %ux%u from %ux%u at %u kbps (%s)\n",
                     chast_tools::codec_name(info.codec), info.width, info.height,
-                    info.bitrate / 1000u, info.encoder.c_str());
+                    info.source_width, info.source_height, info.bitrate / 1000u,
+                    info.encoder.c_str());
         if (!options.token.empty()) {
             std::printf("quic: access token accepted\n");
         }
@@ -1235,6 +1278,76 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     bool clock_synced = false;
     int64_t clock_offset_us = 0;
 
+    // StreamInfo and the pictures travel on different QUIC streams, so the
+    // first picture at a new size can arrive before its announcement. Track
+    // what the decoder was built for instead of what was last announced: a
+    // frame header that got here first can rebuild it, and the announcement
+    // that follows then finds it already current.
+    chast::VideoCodec decoder_codec = info.codec;
+    uint32_t decoder_width = info.width;
+    uint32_t decoder_height = info.height;
+    auto rebuild_decoder = [&](chast::VideoCodec codec, uint32_t width,
+                               uint32_t height) -> bool {
+        if (decoder_codec == codec && decoder_width == width && decoder_height == height) {
+            return true;
+        }
+        decoder.reset();
+        chast::DecoderConfig updated_decoder;
+        updated_decoder.codec = codec;
+        decoder = chast::create_decoder(updated_decoder, &error);
+        if (!decoder) {
+            stats.error = "decoder recreation failed: " + error;
+            return false;
+        }
+        stats.decoder = decoder->implementation();
+        decoder_codec = codec;
+        decoder_width = width;
+        decoder_height = height;
+        last_keyframe_request = start - std::chrono::seconds(10);
+        return true;
+    };
+
+    // Applies every queued StreamInfo. Returns false with stats.error set when
+    // a replacement decoder cannot be created.
+    auto drain_stream_updates = [&]() -> bool {
+        chast::ServerInfo update;
+        while (session->take_stream_update(update)) {
+            ++stats.stream_updates;
+            const bool reconfigure = update.codec != decoder_codec ||
+                                     update.width != decoder_width ||
+                                     update.height != decoder_height;
+            info = update;
+            stats.last_update = update;
+            stats.codec = info.codec;
+            stats.width = info.width;
+            stats.height = info.height;
+            stats.source_width = info.source_width;
+            stats.source_height = info.source_height;
+            stats.origin_x = info.origin_x;
+            stats.origin_y = info.origin_y;
+            stats.displays = info.displays;
+            stats.input_enabled = info.input_enabled;
+            stats.clipboard_enabled = info.clipboard_enabled;
+            stats.target_bitrate = info.bitrate;
+            stats.framerate = info.framerate;
+            stats.audio_info = info.audio;
+            stats.audio_announced = info.audio.enabled;
+            if (!ensure_audio_decoder(info.audio)) {
+                return false;
+            }
+            if (reconfigure && !rebuild_decoder(info.codec, info.width, info.height)) {
+                return false;
+            }
+            if (!options.quiet) {
+                std::printf("quic: stream description updated: %s %ux%u from %ux%u at %d,%d\n",
+                            chast_tools::codec_name(info.codec), info.width, info.height,
+                            info.source_width, info.source_height, info.origin_x,
+                            info.origin_y);
+            }
+        }
+        return true;
+    };
+
     auto drain_clipboard = [&] {
         chast::ClipboardUpdate update;
         while (session->take_clipboard_update(update)) {
@@ -1343,6 +1456,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     };
 
     while (std::chrono::steady_clock::now() < deadline) {
+        if (!drain_stream_updates()) {
+            return fail(stats.error);
+        }
         drain_clipboard();
         drain_cursor();
         drain_audio(std::chrono::milliseconds(0));
@@ -1420,50 +1536,6 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
         }
 
-        chast::ServerInfo update;
-        while (session->take_stream_update(update)) {
-            ++stats.stream_updates;
-            const bool reconfigure = update.codec != info.codec ||
-                                     update.width != info.width ||
-                                     update.height != info.height;
-            info = update;
-            stats.last_update = update;
-            stats.codec = info.codec;
-            stats.width = info.width;
-            stats.height = info.height;
-            stats.origin_x = info.origin_x;
-            stats.origin_y = info.origin_y;
-            stats.displays = info.displays;
-            stats.input_enabled = info.input_enabled;
-            stats.clipboard_enabled = info.clipboard_enabled;
-            stats.target_bitrate = info.bitrate;
-            stats.framerate = info.framerate;
-            stats.audio_info = info.audio;
-            stats.audio_announced = info.audio.enabled;
-            if (!ensure_audio_decoder(info.audio)) {
-                return fail(stats.error);
-            }
-            if (reconfigure) {
-                // The next access unit may belong to a new stream (new SPS,
-                // possibly a new codec). Start over and let the decoder wait
-                // for that stream's first key frame.
-                decoder.reset();
-                chast::DecoderConfig updated_decoder;
-                updated_decoder.codec = info.codec;
-                decoder = chast::create_decoder(updated_decoder, &error);
-                if (!decoder) {
-                    return fail("decoder recreation failed: " + error);
-                }
-                stats.decoder = decoder->implementation();
-                last_keyframe_request = start - std::chrono::seconds(10);
-            }
-            if (!options.quiet) {
-                std::printf("quic: stream description updated: %s %ux%u at %d,%d\n",
-                            chast_tools::codec_name(info.codec), info.width, info.height,
-                            info.origin_x, info.origin_y);
-            }
-        }
-
         if (options.keyframe_request_ms > 0 &&
             last_frame >= next_keyframe_request) {
             session->request_keyframe();
@@ -1482,15 +1554,24 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
 
         if (header.codec != info.codec || header.width != info.width ||
             header.height != info.height) {
-            ++stats.protocol_errors;
-            if (stats.protocol_errors == 1) {
-                std::fprintf(stderr,
-                             "frame %llu disagrees with HelloAck: %s %ux%u\n",
-                             static_cast<unsigned long long>(header.seq),
-                             chast_tools::codec_name(header.codec), header.width,
-                             header.height);
+            // Look for the announcement that belongs to this picture before
+            // treating the disagreement as a violation.
+            if (!drain_stream_updates()) {
+                return fail(stats.error);
             }
-            continue;
+        }
+        if (header.codec != info.codec || header.width != info.width ||
+            header.height != info.height) {
+            // The announcement still lost the race. The frame header names the
+            // new stream precisely, so rebuild for it and decode this unit; the
+            // StreamInfo that follows will find the decoder current.
+            if (!rebuild_decoder(header.codec, header.width, header.height)) {
+                return fail(stats.error);
+            }
+            if (!options.quiet) {
+                std::printf("quic: stream is %s %ux%u before its announcement\n",
+                            chast_tools::codec_name(header.codec), header.width, header.height);
+            }
         }
         if (chast::crc32(payload.data(), payload.size()) != header.payload_crc32) {
             ++stats.crc_errors;
@@ -1620,12 +1701,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
 
     if (!options.quiet || !stats.error.empty()) {
-        std::printf("receiver: decoder=%s codec=%s size=%ux%u received=%llu decoded=%llu "
-                    "keyframes=%llu crc-errors=%llu decode-errors=%llu gaps=%llu "
+        std::printf("receiver: decoder=%s codec=%s size=%ux%u source=%ux%u received=%llu "
+                    "decoded=%llu keyframes=%llu crc-errors=%llu decode-errors=%llu gaps=%llu "
                     "protocol-errors=%llu stream-updates=%llu bytes=%llu digest=%016llX "
                     "elapsed=%llu ms%s\n",
                     stats.decoder.c_str(), chast_tools::codec_name(stats.codec), stats.width,
-                    stats.height, static_cast<unsigned long long>(stats.received),
+                    stats.height, stats.source_width, stats.source_height,
+                    static_cast<unsigned long long>(stats.received),
                     static_cast<unsigned long long>(stats.decoded),
                     static_cast<unsigned long long>(stats.keyframes),
                     static_cast<unsigned long long>(stats.crc_errors),
@@ -1760,6 +1842,21 @@ StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec code
         chast::Error decoded = decoder->decode(units[i].bytes.data(), units[i].bytes.size(),
                                                static_cast<uint64_t>(i) * 33,
                                                units[i].keyframe, frames);
+        if (!decoded.ok() && units[i].keyframe && decoder->initialized()) {
+            // A resolution change arrives as a key frame carrying a new
+            // sequence header, which the live receiver applies by rebuilding
+            // its decoder. This replay has no StreamInfo, so retry the unit on
+            // a fresh decoder: the key frame is a complete re-entry point.
+            decoder = chast::create_decoder(config, &error);
+            if (!decoder) {
+                result.error = "decoder recreation failed: " + error;
+                return result;
+            }
+            frames.clear();
+            decoded = decoder->decode(units[i].bytes.data(), units[i].bytes.size(),
+                                      static_cast<uint64_t>(i) * 33, units[i].keyframe,
+                                      frames);
+        }
         if (!decoded.ok()) {
             ++result.errors;
             if (!decoder->initialized()) {
@@ -1909,6 +2006,8 @@ bool access_control_works(uint16_t port, std::string* detail) {
         chast::ServerInfo info;
         info.width = 64;
         info.height = 64;
+        info.source_width = 64;
+        info.source_height = 64;
         info.framerate = 30;
         info.bitrate = 100000;
         info.encoder = "approval probe";
@@ -1964,6 +2063,8 @@ bool access_control_works(uint16_t port, std::string* detail) {
             chast::ServerInfo info;
             info.width = 64;
             info.height = 64;
+            info.source_width = 64;
+            info.source_height = 64;
             info.framerate = 30;
             info.bitrate = 100000;
             info.encoder = "one-time probe";
@@ -2019,6 +2120,8 @@ bool clipboard_gate_works(uint16_t port, std::string* detail) {
         chast::ServerInfo info;
         info.width = 64;
         info.height = 64;
+        info.source_width = 64;
+        info.source_height = 64;
         info.framerate = 30;
         info.bitrate = 100000;
         info.encoder = "clipboard probe";
@@ -2100,6 +2203,8 @@ bool audio_gate_works(uint16_t port, std::string* detail) {
         chast::ServerInfo info;
         info.width = 64;
         info.height = 64;
+        info.source_width = 64;
+        info.source_height = 64;
         info.framerate = 30;
         info.bitrate = 100000;
         info.encoder = "audio probe";
@@ -2194,6 +2299,11 @@ int run_verify(const Options& options) {
     // Cover the mid-session description path: the sender re-announces the
     // current stream two seconds in.
     local.reannounce = true;
+    // Cover the live resize path too: the host scales the published picture to
+    // 75% once, 2.5 s in. An explicit --resolution overrides the percentage.
+    if (local.resolution == 0) {
+        local.resolution = 75;
+    }
     if (local.seconds < 3.0) {
         local.seconds = 3.0;
     }
@@ -2309,6 +2419,21 @@ int run_verify(const Options& options) {
     check(sent.target_bitrate > 0, "the server exposed adaptive-bitrate telemetry");
     check(sent.rtt_ms > 0.0, "the host sampled transport RTT");
     check(sent.abr_changes == 0, "the clean loopback stayed at the configured bitrate");
+    check(received.hello_width == received.source_width &&
+              received.hello_height == received.source_height,
+          "the first HelloAck published the source size at full resolution");
+    const bool resize_expected = local.resolution < 100;
+    if (resize_expected) {
+        check(sent.resolution_percent == local.resolution,
+              "the probe scaled the published picture");
+        check(sent.resolution_changes == 1, "the published resolution changed once");
+        check(sent.width < sent.source_width && sent.height < sent.source_height,
+              "the announced picture is smaller than the captured source");
+    } else {
+        check(sent.resolution_changes == 0, "no resolution change was requested");
+        check(sent.width == sent.source_width && sent.height == sent.source_height,
+              "the picture kept the captured source size");
+    }
     check(sent.framerate > 0 && received.framerate == sent.framerate,
           "the viewer saw the frame rate the host captured at");
     check(sent.framerate == options.framerate,
@@ -2321,14 +2446,20 @@ int run_verify(const Options& options) {
     }
     check(received.width == sent.width && received.height == sent.height,
           "decoded picture size matches the encoded size");
-    check(sent.stream_updates_sent == 1, "the server re-announced the stream mid-session");
+    const uint64_t expected_updates = resize_expected ? 2 : 1;
+    check(sent.stream_updates_sent == expected_updates,
+          "the server re-announced the stream mid-session");
     check(received.stream_updates == sent.stream_updates_sent,
           "the viewer received every stream update");
+    check(received.source_width == sent.source_width &&
+              received.source_height == sent.source_height,
+          "the announced source size stayed the captured desktop size");
     if (received.stream_updates > 0) {
         const chast::ServerInfo& update = received.last_update;
         check(update.codec == sent.codec && update.width == sent.width &&
-                  update.height == sent.height && update.origin_x == sent.origin_x &&
-                  update.origin_y == sent.origin_y &&
+                  update.height == sent.height && update.source_width == sent.source_width &&
+                  update.source_height == sent.source_height &&
+                  update.origin_x == sent.origin_x && update.origin_y == sent.origin_y &&
                   update.displays.size() == sent.displays.size() &&
                   update.audio.enabled == sent.audio_info.enabled &&
                   update.audio.sample_rate == sent.audio_info.sample_rate &&
@@ -2354,8 +2485,8 @@ int run_verify(const Options& options) {
                 ++primary_count;
             }
             if (display.left == sent.origin_x && display.top == sent.origin_y &&
-                static_cast<uint32_t>(display.right - display.left) == sent.width &&
-                static_cast<uint32_t>(display.bottom - display.top) == sent.height) {
+                static_cast<uint32_t>(display.right - display.left) == sent.source_width &&
+                static_cast<uint32_t>(display.bottom - display.top) == sent.source_height) {
                 captured_listed = true;
             }
         }
@@ -2371,8 +2502,8 @@ int run_verify(const Options& options) {
                 received.displays[receiver_options.display];
             requested_matches =
                 chosen.left == sent.origin_x && chosen.top == sent.origin_y &&
-                static_cast<uint32_t>(chosen.right - chosen.left) == sent.width &&
-                static_cast<uint32_t>(chosen.bottom - chosen.top) == sent.height;
+                static_cast<uint32_t>(chosen.right - chosen.left) == sent.source_width &&
+                static_cast<uint32_t>(chosen.bottom - chosen.top) == sent.source_height;
         }
         check(requested_matches,
               "the stream's origin and size are the requested display's rect");

@@ -53,10 +53,14 @@ struct HostServerStats {
     // Adaptive bitrate and link telemetry. target_bitrate starts at the
     // configured bitrate minus the audio reserve and only moves when the
     // controller sees loss, RTT inflation or a filling send queue.
-    // framerate is the capture rate the ladder picked for that target.
+    // framerate is the capture rate the ladder picked for that target, and
+    // resolution_percent is the encoded picture size as a percentage of the
+    // captured frame (100, 75 or 50).
     uint32_t target_bitrate = 0;  // bits per second
     uint16_t framerate = 0;
+    uint16_t resolution_percent = 100;
     uint64_t abr_changes = 0;
+    uint64_t resolution_changes = 0;
     double rtt_ms = 0.0;
     double min_rtt_ms = 0.0;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
@@ -125,6 +129,10 @@ struct HostServerConfig {
     // Re-announce the stream once, two seconds in. Exercises the viewer's
     // update path; the loopback check turns it on.
     bool reannounce = false;
+    // Scale the encoded picture once, 2.5 s in, through the adaptive-
+    // resolution path (including the encoder recreation and the second IDR).
+    // Exercises a live resize for the loopback check; 0 leaves it off.
+    uint16_t resolution_probe_percent = 0;
     // Force an IDR this often; 0 leaves key frames to viewer requests.
     uint32_t keyframe_interval_ms = 0;
     // Let the host lower the encoder bitrate and frame rate when the transport

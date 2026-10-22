@@ -139,15 +139,19 @@ struct FrameInfo {
     // on this device, or the conversion failed for this frame; `nv12_updated`
     // tells a new conversion from a pointer-only repeat of the previous one.
     //
-    // The image is the top-left width x height of the texture. The texture
-    // itself is 16-aligned (the alignment Intel oneVPL requires for frames in
-    // video memory) and carries black in the padding, so a hardware encoder
-    // imports it directly with width/height as its crop. Consumers that read
-    // the texture on the CPU must use nv12_surface_width/height as the row
-    // stride instead.
+    // The image is the top-left nv12_width x nv12_height of the texture.
+    // Those are the encoded picture size and may be smaller than width/height
+    // after set_nv12_scale(); the video processor scales during the conversion.
+    // The texture itself is 16-aligned (the alignment Intel oneVPL requires for
+    // frames in video memory) and carries black in the padding, so a hardware
+    // encoder imports it directly with nv12_width/nv12_height as its crop.
+    // Consumers that read the texture on the CPU must use nv12_surface_width
+    // and nv12_surface_height as the row stride instead.
     ID3D11Texture2D* nv12_texture = nullptr;
     HANDLE nv12_shared_handle = nullptr;
     bool nv12_updated = false;
+    UINT nv12_width = 0;
+    UINT nv12_height = 0;
     UINT nv12_surface_width = 0;
     UINT nv12_surface_height = 0;
 };
@@ -226,6 +230,17 @@ public:
     // Recreates device + duplication after ReinitNeeded. Display, cursor and
     // frame state are reset; the next capture() returns a full frame.
     virtual Error reinitialize() = 0;
+
+    // Scales the published NV12 image to `percent` of the frame size (100
+    // restores it). The video processor that converts BGRA to NV12 also does
+    // the downscale, so the image never leaves video memory and FrameInfo's
+    // BGRA texture stays full size; only the encoded picture shrinks. The next
+    // capture() is a full conversion even if the desktop did not change.
+    //
+    // The scale survives reinitialize(). On failure the previous scale stays
+    // in effect and the error says why. A capturer created without NV12
+    // remembers the value for when NV12 is configured.
+    virtual Error set_nv12_scale(UINT percent) = 0;
 
     // Last error from capture(), for logging alongside FatalError.
     virtual const Error& last_error() const = 0;

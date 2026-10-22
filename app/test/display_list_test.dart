@@ -100,6 +100,42 @@ void main() {
     expect(after.originX, 2560);
   });
 
+  test('keeps the source size for pointer space when the picture is scaled', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'width': 1280,
+      'height': 720,
+      'sourceWidth': 2560,
+      'sourceHeight': 1440,
+      'published': 3,
+      'originX': 0,
+      'originY': 0,
+      'displays': <Object?>[
+        display(name: r'\\.\DISPLAY1', rect: <int>[0, 0, 2560, 1440], primary: true),
+      ],
+    });
+
+    expect(status.width, 1280);
+    expect(status.height, 720);
+    expect(status.sourceWidth, 2560);
+    expect(status.sourceHeight, 1440);
+    expect(status.hasFrame, isTrue);
+    // The display rect is the desktop, so it matches the source size, not the
+    // smaller picture the host encodes.
+    expect(status.streamedDisplayIndex, 0);
+  });
+
+  test('falls back to the encoded size when the source size is absent', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'width': 1920,
+      'height': 1080,
+    });
+
+    expect(status.sourceWidth, 1920);
+    expect(status.sourceHeight, 1080);
+  });
+
   test('skips malformed entries and tolerates a missing list', () {
     final ViewerStatus withBadEntry = ViewerStatus.fromMap(<Object?, Object?>{
       'state': 'streaming',

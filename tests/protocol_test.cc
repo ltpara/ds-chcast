@@ -127,6 +127,8 @@ void test_hello_ack() {
     sent.codec = chast::VideoCodec::Hevc;
     sent.width = 2560;
     sent.height = 1440;
+    sent.source_width = 2560;
+    sent.source_height = 1440;
     sent.framerate = 60;
     sent.bitrate = 12000000;
     sent.origin_x = -1920;
@@ -164,6 +166,8 @@ void test_hello_ack() {
     }
     check(got.codec == sent.codec, "HelloAck keeps the codec");
     check(got.width == sent.width && got.height == sent.height, "HelloAck keeps the size");
+    check(got.source_width == 2560 && got.source_height == 1440,
+          "HelloAck keeps the captured source size");
     check(got.framerate == sent.framerate && got.bitrate == sent.bitrate,
           "HelloAck keeps the rate control");
     check(got.origin_x == sent.origin_x && got.origin_y == sent.origin_y,
@@ -257,6 +261,16 @@ void test_hello_ack() {
     bad_audio_rate[audio_at + 8] = 0;
     bad_audio_rate[audio_at + 9] = 0;
     rejects_ack(std::move(bad_audio_rate), "a HelloAck with a bad audio rate is rejected");
+
+    std::vector<uint8_t> no_source = ack_payload();
+    no_source.resize(no_source.size() - 4);
+    rejects_ack(std::move(no_source), "a HelloAck without the source size is rejected");
+    std::vector<uint8_t> empty_source = ack_payload();
+    empty_source[empty_source.size() - 4] = 0;
+    empty_source[empty_source.size() - 3] = 0;
+    empty_source[empty_source.size() - 2] = 0;
+    empty_source[empty_source.size() - 1] = 0;
+    rejects_ack(std::move(empty_source), "a HelloAck with an empty source picture is rejected");
 
     sent.input_enabled = false;
     sent.clipboard_enabled = false;
@@ -618,6 +632,8 @@ void test_stream_info() {
     sent.codec = chast::VideoCodec::H264;
     sent.width = 1280;
     sent.height = 720;
+    sent.source_width = 2560;
+    sent.source_height = 1440;
     sent.framerate = 30;
     sent.bitrate = 4000000;
     sent.origin_x = 1920;
@@ -647,6 +663,8 @@ void test_stream_info() {
     if (parsed) {
         check(got.width == sent.width && got.height == sent.height && got.codec == sent.codec,
               "StreamInfo carries the new stream parameters");
+        check(got.source_width == 2560 && got.source_height == 1440,
+              "StreamInfo keeps the source size while the encoded picture is scaled");
         check(got.origin_x == sent.origin_x && got.displays.size() == 1 &&
                   got.displays[0].left == 1920,
               "StreamInfo carries the new origin and display list");

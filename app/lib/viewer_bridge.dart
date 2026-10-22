@@ -64,6 +64,8 @@ class ViewerStatus {
     this.codec = '',
     this.width = 0,
     this.height = 0,
+    this.sourceWidth = 0,
+    this.sourceHeight = 0,
     this.framerate = 0,
     this.serverBitrate = 0,
     this.decoder = '',
@@ -119,8 +121,18 @@ class ViewerStatus {
   final String host;
   final int port;
   final String codec;
+
+  /// The encoded picture size, which is what the decoder produces and the
+  /// texture holds. The host may send a smaller picture than the desktop it
+  /// captures.
   final int width;
   final int height;
+
+  /// The captured desktop size. Pointer positions from the host and the
+  /// absolute moves sent back travel in this space, so the page maps them
+  /// through the source size, not the encoded one.
+  final int sourceWidth;
+  final int sourceHeight;
   final int framerate;
   final int serverBitrate;
   final String decoder;
@@ -226,14 +238,14 @@ class ViewerStatus {
 
   String get audioChannelLabel => audioChannels >= 2 ? '立体声' : '单声道';
 
-  /// The announced display whose rect is the stream's origin and size, or
-  /// null while no list has arrived.
+  /// The announced display whose rect is the stream's origin and source size,
+  /// or null while no list has arrived.
   int? get streamedDisplayIndex {
     for (final ViewerDisplay display in displays) {
       if (display.left == originX &&
           display.top == originY &&
-          display.width == width &&
-          display.height == height) {
+          display.width == sourceWidth &&
+          display.height == sourceHeight) {
         return display.index;
       }
     }
@@ -244,6 +256,13 @@ class ViewerStatus {
     int asInt(Object? value) => (value as num?)?.toInt() ?? 0;
     double asDouble(Object? value) => (value as num?)?.toDouble() ?? 0.0;
     String asString(Object? value) => value?.toString() ?? '';
+    final int width = asInt(map['width']);
+    final int height = asInt(map['height']);
+    // Maps from before the source size existed only carry the encoded size,
+    // which was also the desktop size then.
+    final int sourceWidth = asInt(map['sourceWidth']) > 0 ? asInt(map['sourceWidth']) : width;
+    final int sourceHeight =
+        asInt(map['sourceHeight']) > 0 ? asInt(map['sourceHeight']) : height;
     final List<ViewerDisplay> displays = <ViewerDisplay>[];
     final Object? rawDisplays = map['displays'];
     if (rawDisplays is List) {
@@ -263,8 +282,10 @@ class ViewerStatus {
       host: asString(map['host']),
       port: asInt(map['port']),
       codec: asString(map['codec']),
-      width: asInt(map['width']),
-      height: asInt(map['height']),
+      width: width,
+      height: height,
+      sourceWidth: sourceWidth,
+      sourceHeight: sourceHeight,
       framerate: asInt(map['framerate']),
       serverBitrate: asInt(map['serverBitrate']),
       decoder: asString(map['decoder']),

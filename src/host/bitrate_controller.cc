@@ -32,6 +32,17 @@ constexpr double kTwoThirdsRatio = 0.45;
 constexpr double kHalfRatio = 0.25;
 constexpr uint16_t kMinimumFramerate = 10;
 
+// Resolution ladder, as a share of the ceiling. Every rung costs an encoder
+// recreation and a keyframe, so there are only three and the up edges sit
+// above the down edges (0.50 down vs 0.55 up for full, 0.30 vs 0.34 for three
+// quarters) to keep a target hovering on an edge from toggling the size.
+constexpr double kFullResolutionRatio = 0.50;
+constexpr double kThreeQuarterResolutionRatio = 0.30;
+constexpr double kRestoreFullResolutionRatio = 0.55;
+constexpr double kRestoreThreeQuarterResolutionRatio = 0.34;
+constexpr uint16_t kMinimumResolutionPercent = 50;
+constexpr uint16_t kThreeQuarterResolutionPercent = 75;
+
 }  // namespace
 
 uint32_t video_floor(uint32_t configured_bps) {
@@ -43,12 +54,18 @@ uint32_t video_budget(uint32_t configured_bps, uint32_t reserved_bps) {
     return std::max(video_floor(configured_bps), configured_bps - reserve);
 }
 
-BitrateController::BitrateController(uint32_t ceiling_bps, uint32_t floor_bps, uint16_t framerate)
+BitrateController::BitrateController(uint32_t ceiling_bps, uint32_t floor_bps, uint16_t framerate,
+                                     uint16_t resolution_percent)
     : ceiling_bps_(std::max<uint32_t>(ceiling_bps, 1)),
       floor_bps_(std::min(std::max<uint32_t>(floor_bps, 1), std::max<uint32_t>(ceiling_bps, 1))),
       target_bps_(std::max<uint32_t>(ceiling_bps, 1)),
       ceiling_fps_(framerate == 0 ? 30 : framerate),
-      framerate_(ceiling_fps_) {}
+      framerate_(ceiling_fps_),
+      resolution_percent_(resolution_percent >= 100
+                              ? 100
+                              : (resolution_percent >= kThreeQuarterResolutionPercent
+                                     ? kThreeQuarterResolutionPercent
+                                     : kMinimumResolutionPercent)) {}
 
 uint16_t BitrateController::framerate_for(uint32_t target_bps, uint32_t ceiling_bps,
                                           uint16_t ceiling_fps) {
@@ -67,23 +84,60 @@ uint16_t BitrateController::framerate_for(uint32_t target_bps, uint32_t ceiling_
     return static_cast<uint16_t>(fps);
 }
 
+uint16_t BitrateController::resolution_for(uint32_t target_bps, uint32_t ceiling_bps,
+                                           uint16_t current_percent) {
+    const uint32_t ceiling = std::max<uint32_t>(ceiling_bps, 1);
+    // Left as a fraction so the constants above read as the ratios they are.
+    // The comparisons are per-rung: recovering or dropping goes at most two
+    // rungs in one decision, and only when the ratio skipped both edges (a
+    // large ceiling change), so the viewer never sees two resizes in a row.
+    const double ratio = static_cast<double>(target_bps) / static_cast<double>(ceiling);
+    const auto full = static_cast<uint16_t>(100);
+    if (current_percent <= kMinimumResolutionPercent) {
+        if (ratio >= kRestoreFullResolutionRatio) {
+            return full;
+        }
+        return ratio >= kRestoreThreeQuarterResolutionRatio ? kThreeQuarterResolutionPercent
+                                                            : kMinimumResolutionPercent;
+    }
+    if (current_percent <= kThreeQuarterResolutionPercent) {
+        if (ratio >= kRestoreFullResolutionRatio) {
+            return full;
+        }
+        return ratio < kThreeQuarterResolutionRatio ? kMinimumResolutionPercent
+                                                    : kThreeQuarterResolutionPercent;
+    }
+    if (ratio < kThreeQuarterResolutionRatio) {
+        return kMinimumResolutionPercent;
+    }
+    return ratio < kFullResolutionRatio ? kThreeQuarterResolutionPercent : full;
+}
+
 // Fills in the fields a decision carries when the target did not move. The
-// frame rate always follows the target, so it is recomputed every call and a
-// ceiling change (audio toggled) shows up without waiting on the transport.
+// frame rate and resolution always follow the target, so they are recomputed
+// every call and a ceiling change (audio toggled) shows up without waiting on
+// the transport.
 BitrateDecision BitrateController::settle() {
     BitrateDecision decision;
     decision.target_bps = target_bps_;
     decision.framerate = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
+    decision.resolution_percent = resolution_for(target_bps_, ceiling_bps_, resolution_percent_);
     if (decision.framerate != framerate_) {
         framerate_ = decision.framerate;
         decision.changed = true;
         decision.reason = "framerate";
     }
+    if (decision.resolution_percent != resolution_percent_) {
+        resolution_percent_ = decision.resolution_percent;
+        decision.changed = true;
+        if (decision.reason[0] == '\0') {
+            decision.reason = "resolution";
+        }
+    }
     return decision;
 }
 
 BitrateDecision BitrateController::lower(uint32_t percent, const char* reason) {
-    BitrateDecision decision;
     const uint32_t next =
         std::max(floor_bps_, static_cast<uint32_t>(target_bps_ * percent / 100u));
     if (next >= target_bps_) {
@@ -93,10 +147,10 @@ BitrateDecision BitrateController::lower(uint32_t percent, const char* reason) {
     down_cooldown_ms_ = kDownCooldownMs;
     up_cooldown_ms_ = kUpCooldownMs;
     healthy_ms_ = 0;
+    // settle() brings the frame rate and resolution along; the congestion
+    // reason wins over its "framerate"/"resolution" tokens.
+    BitrateDecision decision = settle();
     decision.changed = true;
-    decision.target_bps = target_bps_;
-    decision.framerate = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
-    framerate_ = decision.framerate;
     decision.reason = reason;
     return decision;
 }
@@ -178,12 +232,10 @@ BitrateDecision BitrateController::update(const BitrateSample& sample, uint32_t 
     target_bps_ = next;
     healthy_ms_ = 0;
     up_cooldown_ms_ = kUpCooldownMs;
-    decision.changed = true;
-    decision.target_bps = target_bps_;
-    decision.framerate = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
-    framerate_ = decision.framerate;
-    decision.reason = "recover";
-    return decision;
+    BitrateDecision moved = settle();
+    moved.changed = true;
+    moved.reason = "recover";
+    return moved;
 }
 
 }  // namespace chast

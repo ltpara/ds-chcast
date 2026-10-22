@@ -11,7 +11,8 @@
 //   * the stream color space set to RGB_FULL_G22_NONE_P709 and the output to
 //     one of the YCbCr spaces, all through ID3D11VideoContext1 (the
 //     ID3D11VideoContext color-space methods are the older DXVA2 enum set);
-//   * source and destination rects covering the whole frame;
+//   * source rect covering the whole input frame and a destination rect that
+//     is the output image (smaller than the source when scaling);
 //   * one VideoProcessorBlt into the NV12 render target.
 //
 // RustDesk hardcodes BT.601 limited output (bt709_ = false, full_range_ =
@@ -45,12 +46,13 @@ UINT align16(UINT value) {
 
 }  // namespace
 
-Error Nv12Pass::initialize(ID3D11Device* device, ID3D11DeviceContext* context, UINT width,
-                           UINT height, Nv12Colorimetry colorimetry) {
+Error Nv12Pass::initialize(ID3D11Device* device, ID3D11DeviceContext* context, UINT input_width,
+                           UINT input_height, UINT output_width, UINT output_height,
+                           Nv12Colorimetry colorimetry) {
     if (!device || !context) {
         return Error(Status::InvalidCall, "NV12 pass needs a device and context");
     }
-    if (width == 0 || height == 0) {
+    if (input_width == 0 || input_height == 0 || output_width == 0 || output_height == 0) {
         return Error(Status::InvalidCall, "NV12 pass needs a non-empty frame");
     }
 
@@ -59,10 +61,12 @@ Error Nv12Pass::initialize(ID3D11Device* device, ID3D11DeviceContext* context, U
     device_.add_ref();
     context_ = ComPtr<ID3D11DeviceContext>(context);
     context_.add_ref();
-    width_ = width;
-    height_ = height;
-    surface_width_ = align16(width);
-    surface_height_ = align16(height);
+    input_width_ = input_width;
+    input_height_ = input_height;
+    width_ = output_width;
+    height_ = output_height;
+    surface_width_ = align16(output_width);
+    surface_height_ = align16(output_height);
     input_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     output_space_ = output_space_for(colorimetry);
 
@@ -81,13 +85,14 @@ Error Nv12Pass::initialize(ID3D11Device* device, ID3D11DeviceContext* context, U
 
     // Same content description RustDesk builds for the conversion. The
     // dimensions must be even: NV12 subsamples chroma 2x2, and the video
-    // processor refuses odd sizes.
+    // processor refuses odd sizes. The output may be smaller than the input;
+    // the blit below scales between the source and destination rects.
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputFrameRate = DXGI_RATIONAL{30, 1};
     content.OutputFrameRate = DXGI_RATIONAL{30, 1};
-    content.InputWidth = width_;
-    content.InputHeight = height_;
+    content.InputWidth = input_width_;
+    content.InputHeight = input_height_;
     content.OutputWidth = surface_width_;
     content.OutputHeight = surface_height_;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
@@ -125,11 +130,14 @@ Error Nv12Pass::initialize(ID3D11Device* device, ID3D11DeviceContext* context, U
     black.YCbCr.A = 1.f;
     video_context_->VideoProcessorSetOutputBackgroundColor(processor_.get(), TRUE, &black);
 
-    // Source and dest are the real frame, not the padded surface: the extra
-    // rows and columns are never part of the image.
-    const RECT rect{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
-    video_context_->VideoProcessorSetStreamSourceRect(processor_.get(), 0, TRUE, &rect);
-    video_context1_->VideoProcessorSetStreamDestRect(processor_.get(), 0, TRUE, &rect);
+    // Source is the whole input frame, destination the real output image, not
+    // the padded surface: the extra rows and columns are never part of the
+    // picture, and a smaller destination is what turns the conversion into a
+    // downscale.
+    const RECT source{0, 0, static_cast<LONG>(input_width_), static_cast<LONG>(input_height_)};
+    const RECT dest{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    video_context_->VideoProcessorSetStreamSourceRect(processor_.get(), 0, TRUE, &source);
+    video_context1_->VideoProcessorSetStreamDestRect(processor_.get(), 0, TRUE, &dest);
     return Error::success();
 }
 
@@ -145,9 +153,9 @@ Error Nv12Pass::convert(ID3D11Texture2D* source, ID3D11Texture2D** out) {
     D3D11_TEXTURE2D_DESC source_desc{};
     source->GetDesc(&source_desc);
     // The source is the unpadded frame the stages publish; only the output
-    // target is 16-aligned, so the source has to cover the real frame, not the
-    // padded surface.
-    if (source_desc.Width < width_ || source_desc.Height < height_) {
+    // target is 16-aligned, so the source has to cover the real input frame,
+    // not the padded surface, and not the (possibly smaller) output.
+    if (source_desc.Width < input_width_ || source_desc.Height < input_height_) {
         return Error(Status::InvalidCall, "NV12 source is smaller than the pass frame");
     }
     Error err = ensure_target();

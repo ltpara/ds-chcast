@@ -856,15 +856,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     ));
   }
 
+  // Input travels in captured-desktop pixels; the encoded picture may be
+  // smaller, so the clamp follows the source size.
+  int get _sourceWidth =>
+      _status.sourceWidth > 0 ? _status.sourceWidth : _status.width;
+
+  int get _sourceHeight =>
+      _status.sourceHeight > 0 ? _status.sourceHeight : _status.height;
+
   int _desktopX(Offset frame) {
     final int left = _status.originX;
-    final int width = _status.width > 0 ? _status.width : 1;
+    final int width = _sourceWidth > 0 ? _sourceWidth : 1;
     return (left + frame.dx).round().clamp(left, left + width - 1).toInt();
   }
 
   int _desktopY(Offset frame) {
     final int top = _status.originY;
-    final int height = _status.height > 0 ? _status.height : 1;
+    final int height = _sourceHeight > 0 ? _sourceHeight : 1;
     return (top + frame.dy).round().clamp(top, top + height - 1).toInt();
   }
 
@@ -1001,6 +1009,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       textureId: _textureId,
                       videoWidth: _status.width,
                       videoHeight: _status.height,
+                      sourceWidth: _status.sourceWidth,
+                      sourceHeight: _status.sourceHeight,
                       fit: _fit,
                       captureInput: _inputActive,
                       hideCursor: _inputActive && _cursorInstalled,

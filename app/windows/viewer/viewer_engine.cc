@@ -240,6 +240,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t window_bytes = 0;
     uint32_t display_width = 0;
     uint32_t display_height = 0;
+    // Pointer and input space: the captured desktop size, unchanged by the
+    // host's resolution ladder. Display sizes above follow the decoded
+    // picture.
+    uint32_t display_source_width = 0;
+    uint32_t display_source_height = 0;
     bool video_finished = false;
     bool handshaken = false;
     bool logged_frame = false;
@@ -285,6 +290,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.latency_ms = latency_ms;
             status_.width = display_width;
             status_.height = display_height;
+            status_.source_width = display_source_width;
+            status_.source_height = display_source_height;
             status_.input_sent = input_sent;
             status_.input_failed = input_failed;
             status_.clipboard_enabled = clipboard_enabled;
@@ -376,11 +383,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             handshaken = true;
             display_width = info.width;
             display_height = info.height;
+            display_source_width = info.source_width;
+            display_source_height = info.source_height;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 status_.codec = info.codec;
                 status_.width = info.width;
                 status_.height = info.height;
+                status_.source_width = info.source_width;
+                status_.source_height = info.source_height;
                 status_.framerate = info.framerate;
                 status_.server_bitrate = info.bitrate;
                 status_.server_encoder = info.encoder;
@@ -739,6 +750,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                    update.width != info.width ||
                                                    update.height != info.height;
                         info = update;
+                        display_source_width = info.source_width;
+                        display_source_height = info.source_height;
                         if (!info.audio.enabled) {
                             if (audio_announced || audio_player || audio_decoder) {
                                 audio_announced = false;

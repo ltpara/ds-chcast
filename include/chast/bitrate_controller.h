@@ -15,6 +15,12 @@
 // desktop. The ladder is a pure function of target/ceiling, so it cannot get
 // stuck below the ceiling once the path recovers.
 //
+// Resolution follows the same ratio on a coarser, hysteretic ladder: full size
+// above half the ceiling, 75% from 30% up, 50% below that, and the way back up
+// needs more headroom than the way down. Resolution changes are far more
+// expensive than frame-rate changes -- the encoder is recreated and the
+// viewer must decode a new size -- so a boundary cannot toggle on jitter.
+//
 // No Win32, GPU or network dependency: tests drive it with synthetic samples.
 
 #include <cstdint>
@@ -44,8 +50,12 @@ struct BitrateDecision {
     // decision, not only a change: a caller that missed an earlier change
     // still gets the rate that matches the current target.
     uint16_t framerate = 0;
+    // Encoded picture size as a percentage of the captured frame (M6.1's
+    // resolution ladder): 100, 75 or 50. Carried like `framerate`, so a caller
+    // that applies a decision late still lands on the right size.
+    uint16_t resolution_percent = 100;
     // Short stable token for logs and statistics: "loss", "rtt", "queue",
-    // "recover". Empty when nothing changed.
+    // "recover", "framerate", "resolution". Empty when nothing changed.
     const char* reason = "";
 };
 
@@ -65,9 +75,12 @@ public:
     // auto choice) minus whatever the other streams already reserve; the
     // target never exceeds it. `floor_bps` is the lowest video rate worth
     // sending. `framerate` is the configured capture rate, the top of the
-    // ladder. Floor and ceiling are ordered defensively, so an inverted pair
-    // cannot open a range.
-    BitrateController(uint32_t ceiling_bps, uint32_t floor_bps, uint16_t framerate);
+    // ladder. `resolution_percent` is the rung the caller is already on (one
+    // of 50/75/100), so rebuilding the controller does not silently reset a
+    // downscaled stream. Floor and ceiling are ordered defensively, so an
+    // inverted pair cannot open a range.
+    BitrateController(uint32_t ceiling_bps, uint32_t floor_bps, uint16_t framerate,
+                      uint16_t resolution_percent = 100);
 
     // Feeds one transport sample. `elapsed_ms` is the time since the previous
     // call and drives cooldowns and the recovery window. Returns the target
@@ -78,11 +91,18 @@ public:
     uint32_t ceiling_bps() const noexcept { return ceiling_bps_; }
     uint32_t floor_bps() const noexcept { return floor_bps_; }
     uint16_t framerate() const noexcept { return framerate_; }
+    uint16_t resolution_percent() const noexcept { return resolution_percent_; }
 
     // The ladder: the capture rate for `target_bps` out of `ceiling_bps`.
     // Public because the host recomputes it after a ceiling change (audio
     // toggled) without waiting for a transport sample.
     static uint16_t framerate_for(uint32_t target_bps, uint32_t ceiling_bps, uint16_t ceiling_fps);
+
+    // The resolution ladder, including its hysteresis: `current_percent` is the
+    // rung the stream is on now, and recovering needs a higher ratio than
+    // dropping did.
+    static uint16_t resolution_for(uint32_t target_bps, uint32_t ceiling_bps,
+                                   uint16_t current_percent);
 
 private:
     BitrateDecision lower(uint32_t percent, const char* reason);
@@ -93,6 +113,7 @@ private:
     uint32_t target_bps_;
     uint16_t ceiling_fps_;
     uint16_t framerate_;
+    uint16_t resolution_percent_;
     uint32_t down_cooldown_ms_ = 0;
     uint32_t up_cooldown_ms_ = 0;
     uint32_t healthy_ms_ = 0;

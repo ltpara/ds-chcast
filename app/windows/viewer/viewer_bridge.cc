@@ -215,6 +215,10 @@ void ViewerBridge::HandleMethodCall(
             std::string(status.codec == chast::VideoCodec::H264 ? "h264" : "hevc"));
         map[key("width")] = flutter::EncodableValue(static_cast<int32_t>(status.width));
         map[key("height")] = flutter::EncodableValue(static_cast<int32_t>(status.height));
+        map[key("sourceWidth")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.source_width));
+        map[key("sourceHeight")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.source_height));
         map[key("framerate")] =
             flutter::EncodableValue(static_cast<int32_t>(status.framerate));
         map[key("serverBitrate")] =

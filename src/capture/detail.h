@@ -197,21 +197,29 @@ private:
 // the stream and the output. This is the only supported conversion -- the
 // image stays on the GPU, and a device without the video processor leaves the
 // pass not-ready so the capturer just doesn't publish NV12.
+//
+// The same blit can also downscale: the stream's source rect stays the whole
+// input frame while the destination rect covers a smaller target. That is how
+// adaptive resolution shrinks the encoded picture without a second pass and
+// without leaving the GPU.
 class Nv12Pass {
 public:
     Nv12Pass() = default;
 
     // `colorimetry` picks the output matrix/range, RustDesk's BT.601 limited
-    // unless told otherwise. Returns Unsupported when the device has no video
-    // processor for these dimensions, in which case the pass stays not-ready.
-    Error initialize(ID3D11Device* device, ID3D11DeviceContext* context, UINT width, UINT height,
+    // unless told otherwise. `output_width`/`output_height` are the image size
+    // the encoder will see; equal to the input size when not scaling. Returns
+    // Unsupported when the device has no video processor for these dimensions,
+    // in which case the pass stays not-ready.
+    Error initialize(ID3D11Device* device, ID3D11DeviceContext* context, UINT input_width,
+                     UINT input_height, UINT output_width, UINT output_height,
                      Nv12Colorimetry colorimetry);
 
     bool ready() const noexcept { return static_cast<bool>(processor_); }
 
     // Converts `source` into the owned NV12 texture; the result stays valid
-    // until the next call. Source and target are the frame size the pass was
-    // initialized with.
+    // until the next call. `source` is the input frame size the pass was
+    // initialized with; the output is output_width() x output_height().
     Error convert(ID3D11Texture2D* source, ID3D11Texture2D** out);
 
     // The display image is the top-left width() x height() of the texture;
@@ -242,7 +250,9 @@ private:
     ComPtr<ID3D11Texture2D> target_;
     DXGI_COLOR_SPACE_TYPE input_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     DXGI_COLOR_SPACE_TYPE output_space_ = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
-    UINT width_ = 0;
+    UINT input_width_ = 0;   // frame the pass reads
+    UINT input_height_ = 0;
+    UINT width_ = 0;         // image the encoder sees, may be scaled down
     UINT height_ = 0;
     UINT surface_width_ = 0;   // width_ rounded up to 16
     UINT surface_height_ = 0;  // height_ rounded up to 16

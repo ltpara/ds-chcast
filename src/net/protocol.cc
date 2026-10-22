@@ -477,9 +477,10 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (extradata_size > kMaxAudioExtradata) {
         extradata_size = kMaxAudioExtradata;
     }
-    // 24 fixed bytes, the encoder name, the display count, the displays, then
-    // the 16-byte audio description and its AudioSpecificConfig.
-    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size;
+    // 24 fixed bytes, the encoder name, the display count, the displays, the
+    // 16-byte audio description and its AudioSpecificConfig, then the captured
+    // desktop size (the encoded size in the fixed block may be scaled down).
+    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4;
     for (size_t i = 0; i < display_count; ++i) {
         size += kDisplayFixedSize + info.displays[i].name.size();
     }
@@ -524,6 +525,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
         std::memcpy(cursor, info.audio.extradata.data(), extradata_size);
         cursor += extradata_size;
     }
+    put_u16(cursor, info.source_width);
+    put_u16(cursor, info.source_height);
     return payload;
 }
 
@@ -680,6 +683,14 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     if (info.audio.enabled && info.audio.extradata.empty()) {
         set_error(error, "HelloAck announced audio without its decoder config");
+        return false;
+    }
+    if (!reader.u16(info.source_width) || !reader.u16(info.source_height)) {
+        set_error(error, "HelloAck carries no source size");
+        return false;
+    }
+    if (info.source_width == 0 || info.source_height == 0) {
+        set_error(error, "HelloAck has an empty source picture");
         return false;
     }
     return true;

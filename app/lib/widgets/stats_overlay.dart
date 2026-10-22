@@ -69,7 +69,9 @@ class StatsOverlay extends StatelessWidget {
           Row(
             children: <Widget>[
               Text(
-                '${status.width}×${status.height}',
+                status.sourceWidth > 0 && status.sourceWidth != status.width
+                    ? '${status.width}×${status.height} · 源 ${status.sourceWidth}×${status.sourceHeight}'
+                    : '${status.width}×${status.height}',
                 style: const TextStyle(
                   color: labelColor,
                   fontSize: 11,
