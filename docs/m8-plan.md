@@ -598,3 +598,12 @@ Win32 剪贴板：
 - `[x]` 收尾构建已重新链接全部目标：早先 `[!]` 记录的
   `build/Release/chast-host.exe` 被占用问题已解除，当前无残留测试
   进程。
+- `[x]` 主线同步（2026-10-23）：合入 `origin/main` 的 `1d7836c`
+  （编码器重建失败时回滚分辨率）。该提交以
+  `applied_resolution_percent`/`pending_resolution_percent` 记录真实
+  缩放，而切屏路径原先在候选采集器缩放失败时立刻改
+  `stats.resolution_percent=100`；若切换随后失败，旧流仍在运行，状态
+  已被改坏。现改为局部暂存 `next_scale_percent`，交换成功后再提交
+  stats 与 applied/pending，旧输出的回滚基准不再被新输出覆盖。
+  合并后 Release 构建通过，`ctest -C Release` 11/11（36.11 s，
+  `quic_loopback` 32.29 s）。

@@ -1605,6 +1605,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                           "cannot capture display " + std::to_string(target) + ": " +
                               switch_error);
         }
+        UINT next_scale_percent = stats.resolution_percent;
         if (stats.resolution_percent != 100) {
             Error scaled = next->set_nv12_scale(stats.resolution_percent);
             if (!scaled.ok()) {
@@ -1613,8 +1614,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 log("display switch: " + std::to_string(target) + " cannot scale to " +
                     std::to_string(stats.resolution_percent) + "%; using 100%: " +
                     scaled.to_string());
-                stats.resolution_percent = 100;
-                ++stats.resolution_changes;
+                next_scale_percent = 100;
             }
         }
         if (!wait_for_usable_frame(*next, true, stopping_, std::chrono::milliseconds(3000),
@@ -1681,6 +1681,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         have_input = false;
         force_keyframe = true;
         extra_idrs = 1;
+        if (next_scale_percent != stats.resolution_percent) {
+            stats.resolution_percent = static_cast<uint16_t>(next_scale_percent);
+            ++stats.resolution_changes;
+        }
+        // The replacement encoder runs at this capture's scale; the ABR
+        // rollback paths must revert to it, not to the abandoned output's.
+        pending_resolution_percent = next_scale_percent;
+        applied_resolution_percent = next_scale_percent;
         // The new output has its own pointer shape and position; the viewer
         // must not keep placing the old sprite.
         cursor_sent_once = false;
