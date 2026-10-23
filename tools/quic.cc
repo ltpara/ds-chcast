@@ -2,7 +2,8 @@
 //
 //   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio]
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
-//   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real]
+//   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real] [--display-mode]
+//                      [--file-upload]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -42,12 +43,19 @@
 // code) send those credentials, and a refusal prints the server's reason.
 // verify exercises the refusal paths on throwaway servers.
 //
-// With --clipboard the serve end mirrors text through the real clipboard and
-// connect prints what the host sends. verify always covers this path with an
-// in-memory clipboard shared by both ends: the viewer uploads one text, the
-// host writes it, and only then does the emulated host clipboard change so the
-// viewer must receive exactly one update. Exact counts prove neither side
-// echoes the other's text back.
+// With --clipboard the serve end mirrors the clipboard and connect prints what
+// the host sends. verify always covers this path with an in-memory clipboard
+// shared by both ends: the viewer uploads one item carrying text, HTML, RTF
+// and a DIB, the host writes all four, and only then does the emulated host
+// clipboard change so the viewer must receive exactly one update. Exact counts
+// prove neither side echoes the other's content back.
+//
+// verify also covers viewer file uploads when --file-upload is given: a fresh
+// 300 KiB file, a deliberately truncated first attempt that leaves a resumable
+// prefix, the same offer resumed from that prefix, and a file whose advertised
+// digest cannot match. The host must finalize the two complete files, keep the
+// prefix (its answer names the offset), and delete the refused upload's
+// partial file.
 //
 // With --audio the serve end captures the system sound through WASAPI and
 // connect decodes the second uni-stream, printing packet/sample/energy
@@ -68,7 +76,10 @@
 #include <ctime>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -82,6 +93,7 @@
 #include "chast/audio.h"
 #include "chast/capture.h"
 #include "chast/decoder.h"
+#include "chast/display_mode.h"
 #include "chast/encoder.h"
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
@@ -93,26 +105,72 @@
 
 namespace {
 
+// A four-format clipboard item for verify: text, HTML, RTF and a 2x2 32bpp
+// DIB. The sizes stay far below the protocol caps; the point is that every
+// format survives both the CCLB stream and the host's write-back.
+chast::ClipboardContent rich_clipboard_probe(const std::string& text) {
+    chast::ClipboardContent content;
+    chast::ClipboardFormatData plain;
+    plain.format = chast::ClipboardFormat::Text;
+    plain.data.assign(text.begin(), text.end());
+    content.formats.push_back(std::move(plain));
+    chast::ClipboardFormatData html;
+    html.format = chast::ClipboardFormat::Html;
+    const std::string html_text = "<p>" + text + "</p>";
+    html.data.assign(html_text.begin(), html_text.end());
+    content.formats.push_back(std::move(html));
+    chast::ClipboardFormatData rtf;
+    rtf.format = chast::ClipboardFormat::Rtf;
+    const std::string rtf_text = "{\\rtf1\\ansi " + text + "}";
+    rtf.data.assign(rtf_text.begin(), rtf_text.end());
+    content.formats.push_back(std::move(rtf));
+    chast::ClipboardFormatData dib;
+    dib.format = chast::ClipboardFormat::Dib;
+    // BITMAPINFOHEADER (40 bytes) + two rows of two 32bpp pixels.
+    dib.data.assign(40 + 16, 0);
+    auto put32 = [&](size_t offset, uint32_t value) {
+        dib.data[offset] = static_cast<uint8_t>(value);
+        dib.data[offset + 1] = static_cast<uint8_t>(value >> 8);
+        dib.data[offset + 2] = static_cast<uint8_t>(value >> 16);
+        dib.data[offset + 3] = static_cast<uint8_t>(value >> 24);
+    };
+    put32(0, 40);
+    put32(4, 2);
+    put32(8, 2);
+    dib.data[12] = 1;
+    dib.data[14] = 32;
+    put32(20, 16);
+    for (size_t i = 40; i < dib.data.size(); ++i) {
+        dib.data[i] = static_cast<uint8_t>(0x10 + i);
+    }
+    content.formats.push_back(std::move(dib));
+    return content;
+}
+
+inline constexpr char kClipboardAfterOverflow[] =
+    "chast clipboard: after over-limit \xE2\x9C\x93";
+
 // In-memory clipboard shared by verify's server and its test driver. The
-// baseline is only there to be primed; the changed text is released after the
+// baseline is only there to be primed; the changed item is released after the
 // viewer's upload was written, so both directions have a deterministic order.
 struct FakeClipboard {
-    bool read(std::string& text) {
+    bool read(chast::ClipboardContent& content) {
         std::lock_guard<std::mutex> lock(mutex);
         ++reads;
         if (update_enabled && !update_sent) {
             update_sent = true;
-            current = updated_text;
+            current = updated;
         }
-        text = current;
+        content = current;
         return true;
     }
 
-    bool write(const std::string& text) {
+    bool write(const chast::ClipboardContent& content) {
         std::lock_guard<std::mutex> lock(mutex);
         ++writes;
-        last_write = text;
-        current = text;
+        written.push_back(content);
+        last_write = content;
+        current = content;
         cv.notify_all();
         return true;
     }
@@ -131,13 +189,49 @@ struct FakeClipboard {
     std::condition_variable cv;
     std::string baseline_text = "chast clipboard: host baseline";
     std::string updated_text = "chast clipboard: host update \xE2\x9C\x93";
-    std::string current = baseline_text;
-    std::string last_write;
+    chast::ClipboardContent baseline = rich_clipboard_probe(baseline_text);
+    chast::ClipboardContent updated = rich_clipboard_probe(updated_text);
+    chast::ClipboardContent current = baseline;
+    chast::ClipboardContent last_write;
+    std::vector<chast::ClipboardContent> written;
     uint64_t reads = 0;
     uint64_t writes = 0;
     bool update_enabled = false;
     bool update_sent = false;
 };
+
+// Deterministic payload for verify --file-upload. Several 64 KiB CFIL chunks
+// of pseudo-random bytes, so a truncated or reordered transfer cannot match.
+std::vector<uint8_t> file_probe_content(size_t size) {
+    std::vector<uint8_t> bytes(size);
+    uint32_t state = 0x9E3779B9u;
+    for (size_t i = 0; i < size; ++i) {
+        state = state * 1664525u + 1013904223u;
+        bytes[i] = static_cast<uint8_t>(state >> 24);
+    }
+    return bytes;
+}
+
+// The upload probe's four offers: a complete fresh file, the prefix of the
+// same payload under another name, the rest of that file, and an honest
+// payload with a digest that cannot match.
+inline constexpr size_t kFileProbeBytes = 300u * 1024u;
+inline constexpr size_t kFileResumePrefix = 100u * 1024u;
+inline constexpr size_t kFileDigestBytes = 64u * 1024u;
+
+bool same_clipboard_content(const chast::ClipboardContent& left,
+                            const chast::ClipboardContent& right) {
+    if (left.formats.size() != right.formats.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < left.formats.size(); ++i) {
+        if (left.formats[i].format != right.formats[i].format ||
+            left.formats[i].data != right.formats[i].data) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // verify's stand-in for the WASAPI loopback endpoint: a 440 Hz stereo tone at
 // the encoder's rate, paced against the steady clock and encoded with the real
@@ -364,6 +458,18 @@ struct Options {
     // run must not type into whatever window happens to be focused; the key
     // path is covered by the dry run and the injector's own checks.
     bool input_real = false;
+    // verify only: also exercise the display-mode channel end to end. The
+    // probe lists the streamed output's modes, sends a no-op request, changes
+    // to another mode, restores the original and finally asks for a mode the
+    // display does not report. The session runs long enough for the whole
+    // walk because every step waits for the previous answer.
+    bool display_mode = false;
+    // verify only: upload a deterministic 300 KiB payload through CFIL and
+    // check the host wrote it, byte for byte, into the receive directory.
+    bool file_upload = false;
+    // verify only: where the local host writes uploads. Set to a temporary
+    // folder so the check never touches the operator's Downloads.
+    std::string file_receive_dir;
     // connect/verify: SHA-256 fingerprint to pin. verify fills it from the
     // server it starts when the option is absent.
     std::string fingerprint;
@@ -478,6 +584,10 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--input-real") {
                 options.input = true;
                 options.input_real = true;
+            } else if (arg == "--display-mode") {
+                options.display_mode = true;
+            } else if (arg == "--file-upload") {
+                options.file_upload = true;
             } else if (arg == "--fingerprint" && i + 1 < argc) {
                 options.fingerprint = argv[++i];
             } else if (arg == "--insecure") {
@@ -546,6 +656,10 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.resolution != 0 && options.mode == "connect") {
         std::fprintf(stderr, "--resolution only applies to serve and verify\n");
+        return false;
+    }
+    if (options.file_upload && options.mode != "verify") {
+        std::fprintf(stderr, "--file-upload only applies to verify\n");
         return false;
     }
     if (!options.send_clipboard.empty()) {
@@ -647,6 +761,11 @@ struct SenderStats {
     chast::VideoCodec codec = chast::VideoCodec::H264;
     std::string encoder;
     std::string save_path;
+    // Files the host finalized (digest verified, renamed into place), in the
+    // order it reported them, and where the last one landed.
+    uint64_t files_received = 0;
+    uint64_t file_bytes_received = 0;
+    std::vector<std::string> received_file_paths;
     std::string error;
     bool client_connected = false;
     bool peer_left = false;
@@ -685,6 +804,10 @@ struct SenderStats {
     // Display switches the host accepted and refused during the session.
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
+    // Display mode changes the host applied (accepted requests, including a
+    // no-op for the running mode) and refused.
+    uint64_t display_mode_changes = 0;
+    uint64_t display_mode_failures = 0;
     // StreamInfo messages this server sent.
     uint64_t stream_updates_sent = 0;
     // Adaptive bitrate telemetry: the encoder's current target (the video
@@ -731,12 +854,32 @@ struct ReceiverStats {
     std::vector<chast::InputEvent> input_sent;
     bool input_enabled = false;
     uint64_t input_errors = 0;
-    // Clipboard texts this receiver sent and every text it received.
+    // Clipboard items this receiver sent and every rich item it received.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_errors = 0;
     bool clipboard_enabled = false;
-    std::vector<std::string> clipboard_texts;
+    // The verify probe first injects a CCLB blob whose declared size is past
+    // the protocol limit, then sends a valid item to prove the session is
+    // still alive and old content was kept.
+    bool clipboard_over_limit_sent = false;
+    bool clipboard_followup_sent = false;
+    std::vector<chast::ClipboardContent> clipboard_contents;
+    // File upload probe (verify --file-upload): every offer, the host's answer
+    // and the final result, in order, plus the bytes streamed and any
+    // unexpected protocol state.
+    bool file_probe = false;
+    uint64_t file_offers_sent = 0;
+    uint64_t file_answers = 0;
+    std::vector<chast::FileCode> file_answer_codes;
+    std::vector<uint64_t> file_answer_offsets;
+    std::vector<std::string> file_answer_reasons;
+    uint64_t file_bytes_sent = 0;
+    uint64_t file_results = 0;
+    std::vector<chast::FileCode> file_result_codes;
+    std::vector<uint64_t> file_result_received;
+    std::vector<std::string> file_result_reasons;
+    uint64_t file_errors = 0;
     // Audio the viewer received and decoded: announced format, packet and
     // byte counts, sequence/CRC/decode errors, decoded sample count and the
     // RMS of the decoded PCM (the tone-energy check).
@@ -776,6 +919,52 @@ struct ReceiverStats {
     uint16_t last_switch_index = 0;
     chast::DisplaySwitchCode last_switch_code = chast::DisplaySwitchCode::Ok;
     std::string last_switch_reason;
+    // Display mode probe (verify --display-mode): the modes answer for the
+    // streamed output, the requests the probe picked, and every answer.
+    bool mode_probe = false;
+    uint16_t mode_display = 0;
+    uint64_t mode_lists = 0;
+    uint64_t mode_results = 0;
+    uint64_t mode_ok = 0;
+    uint64_t mode_refused = 0;
+    std::vector<chast::DisplayModeInfo> modes;
+    chast::DisplayModeCode modes_code = chast::DisplayModeCode::Ok;
+    std::string modes_error;
+    bool mode_plan_ready = false;
+    uint16_t mode_original_width = 0;
+    uint16_t mode_original_height = 0;
+    uint16_t mode_original_refresh = 0;
+    uint16_t mode_target_width = 0;
+    uint16_t mode_target_height = 0;
+    uint16_t mode_target_refresh = 0;
+    uint16_t mode_bad_width = 0;
+    uint16_t mode_bad_height = 0;
+    uint16_t mode_bad_refresh = 0;
+    // What the StreamInfo after each real change described: the source size
+    // the viewer must have seen, and whether it arrived at all.
+    bool mode_change_update_seen = false;
+    bool mode_restore_update_seen = false;
+    bool mode_leave_update_seen = false;
+    uint32_t mode_change_source_width = 0;
+    uint32_t mode_change_source_height = 0;
+    uint32_t mode_restore_source_width = 0;
+    uint32_t mode_restore_source_height = 0;
+    uint32_t mode_leave_source_width = 0;
+    uint32_t mode_leave_source_height = 0;
+    uint16_t last_mode_index = 0;
+    uint16_t last_mode_width = 0;
+    uint16_t last_mode_height = 0;
+    uint16_t last_mode_refresh = 0;
+    chast::DisplayModeCode last_mode_code = chast::DisplayModeCode::Ok;
+    std::string last_mode_reason;
+    // The refusal step's answer, kept apart from the last answer because the
+    // probe goes on to leave the display changed.
+    bool refused_mode_echoed = false;
+    uint16_t refused_mode_index = 0;
+    uint16_t refused_mode_width = 0;
+    uint16_t refused_mode_height = 0;
+    uint16_t refused_mode_refresh = 0;
+    std::string refused_mode_reason;
     // Latency probes: the last clock-sync sample plus counters, and the frame
     // age (host capture -> local receipt) of the newest and worst frame seen.
     chast::LatencySample latency;
@@ -998,13 +1187,20 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     };
     if (options.fake_clipboard) {
         std::shared_ptr<FakeClipboard> clipboard = options.fake_clipboard;
-        config.clipboard_read = [clipboard](std::string& text) {
-            return clipboard->read(text);
+        config.clipboard_read = [clipboard](chast::ClipboardContent& content) {
+            return clipboard->read(content);
         };
-        config.clipboard_write = [clipboard](const std::string& text) {
-            return clipboard->write(text);
+        config.clipboard_write = [clipboard](const chast::ClipboardContent& content) {
+            return clipboard->write(content);
         };
     }
+    config.settings.allow_file_transfer = options.file_upload;
+    config.settings.file_receive_directory = options.file_receive_dir;
+    config.file_received = [&stats](const std::string& path, uint64_t bytes) {
+        ++stats.files_received;
+        stats.file_bytes_received += bytes;
+        stats.received_file_paths.push_back(path);
+    };
 
     std::string error;
     std::unique_ptr<chast::HostServer> server =
@@ -1067,6 +1263,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.stream_updates_sent = status.stats.stream_updates;
     stats.display_switches = status.stats.display_switches;
     stats.display_switch_failures = status.stats.display_switch_failures;
+    stats.display_mode_changes = status.stats.display_mode_changes;
+    stats.display_mode_failures = status.stats.display_mode_failures;
     stats.frames = status.stats.frames;
     stats.encoded = status.stats.encoded;
     stats.keyframes = status.stats.keyframes;
@@ -1312,16 +1510,46 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!info.clipboard_enabled) {
             return fail("the server refused clipboard (it was not started with --clipboard)");
         }
-        // verify uploads a fixed text so the fake backend can prove the exact
-        // traffic; connect may upload one given on the command line.
-        std::string upload;
         if (options.mode == "verify") {
-            upload = "chast clipboard: viewer upload \xE2\x9C\x93";
-        } else {
-            upload = options.send_clipboard;
-        }
-        if (!upload.empty()) {
-            if (chast::Error sent = session->send_clipboard(1, upload); !sent.ok()) {
+            // The fake backend proves the exact four-format item, so verify
+            // uploads a fixed one; connect may still upload a text given on
+            // the command line through the legacy message.
+            chast::ClipboardContent content =
+                rich_clipboard_probe("chast clipboard: viewer upload \xE2\x9C\x93");
+            if (chast::Error sent = session->send_clipboard_content(std::move(content));
+                !sent.ok()) {
+                ++stats.clipboard_errors;
+                if (stats.clipboard_errors == 1) {
+                    std::fprintf(stderr, "send_clipboard_content: %s\n",
+                                 sent.to_string().c_str());
+                }
+            } else {
+                ++stats.clipboard_sent;
+            }
+            // Declare more than the protocol allows without carrying the
+            // bytes: the receiver must reject it from the header, drop this
+            // stream, keep the item above and stay connected.
+            std::vector<uint8_t> over_limit = chast::encode_clipboard_stream(
+                rich_clipboard_probe("chast clipboard: over-limit"));
+            if (over_limit.size() < chast::kClipboardStreamHeaderSize) {
+                return fail("could not encode the over-limit clipboard probe");
+            }
+            const uint64_t declared =
+                static_cast<uint64_t>(chast::kMaxClipboardTotalBytes) + 1;
+            for (int i = 0; i < 8; ++i) {
+                over_limit[16 + i] = static_cast<uint8_t>(declared >> (8 * i));
+            }
+            if (chast::Error sent = session->send_clipboard_blob(std::move(over_limit));
+                !sent.ok()) {
+                ++stats.clipboard_errors;
+                std::fprintf(stderr, "send_clipboard_blob: %s\n",
+                             sent.to_string().c_str());
+            } else {
+                stats.clipboard_over_limit_sent = true;
+            }
+        } else if (!options.send_clipboard.empty()) {
+            if (chast::Error sent = session->send_clipboard(1, options.send_clipboard);
+                !sent.ok()) {
                 ++stats.clipboard_errors;
                 std::fprintf(stderr, "send_clipboard: %s\n", sent.to_string().c_str());
             } else {
@@ -1329,6 +1557,194 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
         }
     }
+
+    // Give the rejected blob time to arrive first, so its handling is what
+    // the follow-up send proves survived.
+    const auto clipboard_followup_at =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+
+    // ---- file upload probe (verify --file-upload) ----
+    // Four offers in sequence: a complete file, a truncated first attempt that
+    // leaves a resumable prefix, the rest of that file resumed at the prefix,
+    // and one whose advertised digest cannot match. The host checks the digest
+    // before it renames a file into place, so the bytes on disk close the loop.
+    const uint32_t kFileProbeId = 0x0F11E001u;
+    stats.file_probe = options.file_upload;
+    struct FileProbeStage {
+        chast::FileOffer offer;
+        std::vector<uint8_t> content;
+        size_t send_from = 0;
+        size_t send_to = 0;
+        uint64_t answer_offset = 0;
+        chast::FileCode result = chast::FileCode::Ok;
+        uint64_t result_received = 0;
+        const char* label = "";
+    };
+    std::vector<FileProbeStage> file_stages;
+    size_t file_stage_index = 0;
+    enum class FileStep { Offer, WaitAnswer, SendData, WaitResult, Done };
+    FileStep file_step = FileStep::Offer;
+    size_t file_position = 0;
+    if (stats.file_probe) {
+        if (!info.file_transfer_enabled) {
+            return fail("the server did not announce file transfer");
+        }
+        const std::vector<uint8_t> payload = file_probe_content(kFileProbeBytes);
+        std::array<uint8_t, 32> digest{};
+        if (!chast::sha256(payload.data(), payload.size(), digest)) {
+            return fail("could not hash the file probe payload");
+        }
+        auto add_stage = [&](const char* label, const std::string& name, size_t send_from,
+                             size_t send_to, bool resume, chast::FileCode result,
+                             uint64_t result_received, uint64_t answer_offset) {
+            FileProbeStage stage;
+            stage.label = label;
+            stage.offer.transfer_id =
+                kFileProbeId + static_cast<uint32_t>(file_stages.size());
+            stage.offer.name = name;
+            stage.offer.size = payload.size();
+            stage.offer.sha256 = digest;
+            stage.offer.resume = resume;
+            stage.content = payload;
+            stage.send_from = send_from;
+            stage.send_to = send_to;
+            stage.result = result;
+            stage.result_received = result_received;
+            stage.answer_offset = answer_offset;
+            file_stages.push_back(std::move(stage));
+        };
+        add_stage("fresh", "chast-verify-upload.bin", 0, payload.size(), false,
+                  chast::FileCode::Ok, payload.size(), 0);
+        add_stage("truncated", "chast-verify-resume.bin", 0, kFileResumePrefix, true,
+                  chast::FileCode::IoError, kFileResumePrefix, 0);
+        add_stage("resumed", "chast-verify-resume.bin", kFileResumePrefix, payload.size(),
+                  true, chast::FileCode::Ok, payload.size(), kFileResumePrefix);
+        // The payload is honest; only the advertised digest is wrong. The host
+        // can only discover that after the stream ends, so it accepts the
+        // offer and refuses the finished file.
+        FileProbeStage digest_stage;
+        digest_stage.label = "digest";
+        digest_stage.offer.transfer_id =
+            kFileProbeId + static_cast<uint32_t>(file_stages.size());
+        digest_stage.offer.name = "chast-verify-digest.bin";
+        digest_stage.content = file_probe_content(kFileDigestBytes);
+        digest_stage.offer.size = digest_stage.content.size();
+        if (!chast::sha256(digest_stage.content.data(), digest_stage.content.size(),
+                           digest_stage.offer.sha256)) {
+            return fail("could not hash the digest probe payload");
+        }
+        digest_stage.offer.sha256[0] ^= 0xFF;
+        digest_stage.send_to = digest_stage.content.size();
+        digest_stage.result = chast::FileCode::IoError;
+        digest_stage.result_received = digest_stage.content.size();
+        file_stages.push_back(std::move(digest_stage));
+    }
+    auto advance_file_upload = [&]() -> bool {
+        if (!stats.file_probe || file_step == FileStep::Done) {
+            return true;
+        }
+        if (file_step == FileStep::Offer) {
+            const FileProbeStage& stage = file_stages[file_stage_index];
+            if (chast::Error offered = session->offer_file(stage.offer); !offered.ok()) {
+                ++stats.file_errors;
+                stats.error = std::string("offer_file: ") + offered.to_string();
+                return false;
+            }
+            ++stats.file_offers_sent;
+            file_step = FileStep::WaitAnswer;
+            if (!options.quiet) {
+                std::printf("quic: offering %s (%llu bytes%s)\n", stage.offer.name.c_str(),
+                            static_cast<unsigned long long>(stage.offer.size),
+                            stage.offer.resume ? ", resumable" : "");
+            }
+            return true;
+        }
+        const FileProbeStage& stage = file_stages[file_stage_index];
+        chast::FileAnswer answer;
+        while (session->take_file_answer(answer)) {
+            ++stats.file_answers;
+            stats.file_answer_codes.push_back(answer.code);
+            stats.file_answer_offsets.push_back(answer.resume_offset);
+            stats.file_answer_reasons.push_back(answer.reason);
+            if (answer.transfer_id != stage.offer.transfer_id) {
+                ++stats.file_errors;
+                stats.error = "the host answered a transfer the probe did not offer";
+                return false;
+            }
+            if (answer.code != chast::FileCode::Ok) {
+                ++stats.file_errors;
+                stats.error = std::string("the host refused the ") + stage.label +
+                              " file: " + answer.reason;
+                return false;
+            }
+            if (answer.resume_offset != stage.answer_offset) {
+                ++stats.file_errors;
+                stats.error = std::string("the ") + stage.label + " upload resumed at " +
+                              std::to_string(answer.resume_offset) + " instead of " +
+                              std::to_string(stage.answer_offset);
+                return false;
+            }
+            file_position = stage.send_from;
+            file_step = FileStep::SendData;
+        }
+        if (file_step == FileStep::SendData) {
+            while (file_position < stage.send_to) {
+                const size_t chunk =
+                    (std::min)(chast::kFileChunkBytes, stage.send_to - file_position);
+                chast::Error sent = session->send_file_data(
+                    stage.offer.transfer_id, stage.content.data() + file_position, chunk);
+                if (!sent.ok()) {
+                    ++stats.file_errors;
+                    stats.error = "send_file_data: " + sent.to_string();
+                    return false;
+                }
+                file_position += chunk;
+                stats.file_bytes_sent += chunk;
+            }
+            if (chast::Error finished = session->finish_file_upload(stage.offer.transfer_id);
+                !finished.ok()) {
+                ++stats.file_errors;
+                stats.error = "finish_file_upload: " + finished.to_string();
+                return false;
+            }
+            file_step = FileStep::WaitResult;
+        }
+        chast::FileResult result;
+        while (session->take_file_result(result)) {
+            ++stats.file_results;
+            stats.file_result_codes.push_back(result.code);
+            stats.file_result_received.push_back(result.received);
+            stats.file_result_reasons.push_back(result.reason);
+            if (result.transfer_id != stage.offer.transfer_id) {
+                ++stats.file_errors;
+                stats.error = "the host reported a result for another transfer";
+                return false;
+            }
+            if (result.code != stage.result || result.received != stage.result_received) {
+                ++stats.file_errors;
+                stats.error = std::string("the ") + stage.label + " upload ended as " +
+                              std::to_string(static_cast<int>(result.code)) + " after " +
+                              std::to_string(result.received) + " bytes, expected " +
+                              std::to_string(static_cast<int>(stage.result)) + " after " +
+                              std::to_string(stage.result_received);
+                return false;
+            }
+            if (!options.quiet) {
+                if (result.code == chast::FileCode::Ok) {
+                    std::printf("quic: host stored the %s file (%llu bytes)\n",
+                                stage.label,
+                                static_cast<unsigned long long>(result.received));
+                } else {
+                    std::printf("quic: host refused the %s upload as planned: %s\n",
+                                stage.label, result.reason.c_str());
+                }
+            }
+            ++file_stage_index;
+            file_step = file_stage_index < file_stages.size() ? FileStep::Offer
+                                                              : FileStep::Done;
+        }
+        return true;
+    };
 
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
     auto ensure_audio_decoder = [&](const chast::AudioInfo& audio) -> bool {
@@ -1493,10 +1909,19 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     };
 
     auto drain_clipboard = [&] {
+        chast::ClipboardContent content;
+        while (session->take_clipboard_content(content)) {
+            ++stats.clipboard_received;
+            const std::string text = content.text();
+            stats.clipboard_contents.push_back(content);
+            if (!options.quiet) {
+                std::printf("clipboard: rich formats=%zu text=%s\n", content.formats.size(),
+                            text.c_str());
+            }
+        }
         chast::ClipboardUpdate update;
         while (session->take_clipboard_update(update)) {
             ++stats.clipboard_received;
-            stats.clipboard_texts.push_back(update.text);
             if (!options.quiet) {
                 std::printf("clipboard: seq=%llu text=%s\n",
                             static_cast<unsigned long long>(update.seq), update.text.c_str());
@@ -1539,6 +1964,342 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             reason.empty() ? "" : ": ", reason.c_str());
             }
         }
+    };
+
+    // verify --display-mode drives four requests in order, spaced past the
+    // host's one-second rate limit: a no-op for the running mode (Ok without a
+    // StreamInfo), a real change, the restore of the original, and a mode the
+    // output does not report (refused). Every answer echoes the request, so
+    // the probe also proves the channel correlates them.
+    enum class ModeStep {
+        WaitList,
+        SendNoop,
+        WaitNoop,
+        SendChange,
+        WaitChange,
+        WaitChangeUpdate,
+        SendRestore,
+        WaitRestore,
+        WaitRestoreUpdate,
+        SendRefused,
+        WaitRefused,
+        SendLeave,
+        WaitLeave,
+        WaitLeaveUpdate,
+        Done,
+    };
+    stats.mode_probe = options.mode == "verify" && options.display_mode;
+    if (stats.mode_probe) {
+        stats.mode_display = static_cast<uint16_t>(options.display);
+        for (size_t i = 0; i < info.displays.size(); ++i) {
+            const chast::DisplayDescription& display = info.displays[i];
+            if (display.left == info.origin_x && display.top == info.origin_y &&
+                static_cast<uint32_t>(display.right - display.left) == info.source_width &&
+                static_cast<uint32_t>(display.bottom - display.top) == info.source_height) {
+                stats.mode_display = static_cast<uint16_t>(i);
+                break;
+            }
+        }
+    }
+    ModeStep mode_step = ModeStep::WaitList;
+    auto mode_next_send = start + std::chrono::milliseconds(3200);
+    auto mode_update_deadline = mode_next_send;
+    bool mode_list_sent = false;
+    uint16_t mode_expected_width = 0;
+    uint16_t mode_expected_height = 0;
+    uint16_t mode_expected_refresh = 0;
+    uint64_t mode_updates_before_change = 0;
+    uint64_t mode_updates_before_restore = 0;
+    uint64_t mode_updates_before_leave = 0;
+    auto mode_name = [](uint16_t width, uint16_t height, uint16_t refresh) {
+        return std::to_string(width) + "x" + std::to_string(height) + " at " +
+               std::to_string(refresh) + " Hz";
+    };
+    auto advance_mode_probe = [&]() -> bool {
+        if (!stats.mode_probe) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        chast::DisplayModeList list;
+        while (session->take_display_modes(list)) {
+            ++stats.mode_lists;
+            stats.modes = list.modes;
+            stats.modes_code = list.code;
+            stats.modes_error = list.reason;
+            if (!options.quiet) {
+                std::printf("quic: display modes for %u: %zu listed%s%s\n", list.display,
+                            list.modes.size(), list.reason.empty() ? "" : ", ",
+                            list.reason.c_str());
+            }
+            if (list.display != stats.mode_display) {
+                stats.error =
+                    "the mode list described display " + std::to_string(list.display) +
+                    ", not " + std::to_string(stats.mode_display);
+                return false;
+            }
+            if (mode_step != ModeStep::WaitList) {
+                continue;
+            }
+            if (list.code != chast::DisplayModeCode::Ok || list.modes.empty()) {
+                stats.error = "the host could not list the display modes" +
+                              (list.reason.empty() ? std::string() : ": " + list.reason);
+                return false;
+            }
+            const chast::DisplayModeInfo* original = nullptr;
+            for (const chast::DisplayModeInfo& mode : list.modes) {
+                if (mode.current) {
+                    original = &mode;
+                    break;
+                }
+            }
+            if (original == nullptr) {
+                stats.error = "the mode list did not mark the running mode";
+                return false;
+            }
+            stats.mode_original_width = original->width;
+            stats.mode_original_height = original->height;
+            stats.mode_original_refresh = original->refresh_hz;
+            // Prefer another pixel size with the same refresh; a refresh-only
+            // mode is the fallback when sizes do not vary.
+            const chast::DisplayModeInfo* target = nullptr;
+            for (const chast::DisplayModeInfo& mode : list.modes) {
+                if ((mode.width != original->width || mode.height != original->height) &&
+                    mode.refresh_hz == original->refresh_hz) {
+                    target = &mode;
+                    break;
+                }
+            }
+            if (target == nullptr) {
+                for (const chast::DisplayModeInfo& mode : list.modes) {
+                    if (mode.width != original->width || mode.height != original->height) {
+                        target = &mode;
+                        break;
+                    }
+                }
+            }
+            if (target == nullptr) {
+                for (const chast::DisplayModeInfo& mode : list.modes) {
+                    if (mode.refresh_hz != original->refresh_hz &&
+                        mode.width == original->width && mode.height == original->height) {
+                        target = &mode;
+                        break;
+                    }
+                }
+            }
+            if (target == nullptr) {
+                stats.error = "the display reports no other mode to switch to";
+                return false;
+            }
+            stats.mode_target_width = target->width;
+            stats.mode_target_height = target->height;
+            stats.mode_target_refresh = target->refresh_hz;
+            // A mode outside the enumerated list must be refused.
+            stats.mode_bad_width = 9999;
+            stats.mode_bad_height = 9999;
+            stats.mode_bad_refresh = 60;
+            stats.mode_plan_ready = true;
+            if (!options.quiet) {
+                std::printf("quic: display mode probe: %s -> %s\n",
+                            mode_name(stats.mode_original_width, stats.mode_original_height,
+                                      stats.mode_original_refresh).c_str(),
+                            mode_name(stats.mode_target_width, stats.mode_target_height,
+                                      stats.mode_target_refresh).c_str());
+            }
+            mode_step = ModeStep::SendNoop;
+            mode_next_send = now;
+        }
+
+        uint16_t answered_index = 0;
+        uint16_t answered_width = 0;
+        uint16_t answered_height = 0;
+        uint16_t answered_refresh = 0;
+        chast::DisplayModeCode code = chast::DisplayModeCode::Ok;
+        std::string reason;
+        while (session->take_display_mode_result(answered_index, answered_width,
+                                                 answered_height, answered_refresh, code,
+                                                 reason)) {
+            ++stats.mode_results;
+            stats.last_mode_index = answered_index;
+            stats.last_mode_width = answered_width;
+            stats.last_mode_height = answered_height;
+            stats.last_mode_refresh = answered_refresh;
+            stats.last_mode_code = code;
+            stats.last_mode_reason = reason;
+            if (code == chast::DisplayModeCode::Ok) {
+                ++stats.mode_ok;
+            } else {
+                ++stats.mode_refused;
+            }
+            if (!options.quiet) {
+                std::printf("quic: display mode %ux%u at %u Hz: %s%s%s\n", answered_width,
+                            answered_height, answered_refresh,
+                            code == chast::DisplayModeCode::Ok ? "accepted" : "refused",
+                            reason.empty() ? "" : ": ", reason.c_str());
+            }
+            if (answered_index != stats.mode_display ||
+                answered_width != mode_expected_width ||
+                answered_height != mode_expected_height ||
+                answered_refresh != mode_expected_refresh) {
+                stats.error = "the display mode answer did not echo the request";
+                return false;
+            }
+            switch (mode_step) {
+                case ModeStep::WaitNoop:
+                    if (code != chast::DisplayModeCode::Ok) {
+                        stats.error = "the request for the running mode was refused: " + reason;
+                        return false;
+                    }
+                    mode_step = ModeStep::SendChange;
+                    mode_next_send = now + std::chrono::milliseconds(1200);
+                    break;
+                case ModeStep::WaitChange:
+                    if (code != chast::DisplayModeCode::Ok) {
+                        stats.error = "the display mode change was refused: " + reason;
+                        return false;
+                    }
+                    mode_update_deadline = now + std::chrono::seconds(2);
+                    mode_step = ModeStep::WaitChangeUpdate;
+                    break;
+                case ModeStep::WaitRestore:
+                    if (code != chast::DisplayModeCode::Ok) {
+                        stats.error = "restoring the original display mode was refused: " + reason;
+                        return false;
+                    }
+                    mode_update_deadline = now + std::chrono::seconds(2);
+                    mode_step = ModeStep::WaitRestoreUpdate;
+                    break;
+                case ModeStep::WaitRefused:
+                    if (code == chast::DisplayModeCode::Ok) {
+                        stats.error =
+                            "the host accepted a mode the display does not report";
+                        return false;
+                    }
+                    stats.refused_mode_echoed = true;
+                    stats.refused_mode_index = answered_index;
+                    stats.refused_mode_width = answered_width;
+                    stats.refused_mode_height = answered_height;
+                    stats.refused_mode_refresh = answered_refresh;
+                    stats.refused_mode_reason = reason;
+                    // Leave the output changed so the host's end-of-session
+                    // guard is the one that puts the original back.
+                    mode_step = ModeStep::SendLeave;
+                    mode_next_send = now + std::chrono::milliseconds(1200);
+                    break;
+                case ModeStep::WaitLeave:
+                    if (code != chast::DisplayModeCode::Ok) {
+                        stats.error = "leaving the display in the new mode was refused: " +
+                                      reason;
+                        return false;
+                    }
+                    mode_update_deadline = now + std::chrono::seconds(2);
+                    mode_step = ModeStep::WaitLeaveUpdate;
+                    break;
+                default:
+                    stats.error = "an unexpected display mode answer arrived";
+                    return false;
+            }
+        }
+
+        if (mode_step == ModeStep::WaitChangeUpdate) {
+            // A StreamInfo may already have been taken while the frame that
+            // announced the new size was being decoded, so compare counters
+            // instead of waiting for another one to arrive.
+            if (stats.stream_updates > mode_updates_before_change) {
+                stats.mode_change_update_seen = true;
+                stats.mode_change_source_width = stats.source_width;
+                stats.mode_change_source_height = stats.source_height;
+                mode_step = ModeStep::SendRestore;
+                mode_next_send = now + std::chrono::milliseconds(1200);
+            } else if (now >= mode_update_deadline) {
+                stats.error = "the host never announced the changed source size";
+                return false;
+            }
+        } else if (mode_step == ModeStep::WaitRestoreUpdate) {
+            if (stats.stream_updates > mode_updates_before_restore) {
+                stats.mode_restore_update_seen = true;
+                stats.mode_restore_source_width = stats.source_width;
+                stats.mode_restore_source_height = stats.source_height;
+                mode_step = ModeStep::SendRefused;
+                mode_next_send = now + std::chrono::milliseconds(1200);
+            } else if (now >= mode_update_deadline) {
+                stats.error = "the host never announced the restored source size";
+                return false;
+            }
+        } else if (mode_step == ModeStep::WaitLeaveUpdate) {
+            if (stats.stream_updates > mode_updates_before_leave) {
+                stats.mode_leave_update_seen = true;
+                stats.mode_leave_source_width = stats.source_width;
+                stats.mode_leave_source_height = stats.source_height;
+                mode_step = ModeStep::Done;
+            } else if (now >= mode_update_deadline) {
+                stats.error = "the host never announced the source size it left behind";
+                return false;
+            }
+        }
+
+        if (mode_step == ModeStep::WaitList) {
+            if (!mode_list_sent && now >= mode_next_send) {
+                mode_list_sent = true;
+                if (chast::Error asked = session->request_display_modes(stats.mode_display);
+                    !asked.ok()) {
+                    stats.error = "request_display_modes: " + asked.to_string();
+                    return false;
+                }
+                if (!options.quiet) {
+                    std::printf("quic: asking display %u for its modes\n",
+                                stats.mode_display);
+                }
+            }
+            return true;
+        }
+        if (mode_step == ModeStep::Done || now < mode_next_send) {
+            return true;
+        }
+        switch (mode_step) {
+            case ModeStep::SendNoop:
+                mode_expected_width = stats.mode_original_width;
+                mode_expected_height = stats.mode_original_height;
+                mode_expected_refresh = stats.mode_original_refresh;
+                mode_step = ModeStep::WaitNoop;
+                break;
+            case ModeStep::SendChange:
+                mode_expected_width = stats.mode_target_width;
+                mode_expected_height = stats.mode_target_height;
+                mode_expected_refresh = stats.mode_target_refresh;
+                mode_updates_before_change = stats.stream_updates;
+                mode_step = ModeStep::WaitChange;
+                break;
+            case ModeStep::SendRestore:
+                mode_expected_width = stats.mode_original_width;
+                mode_expected_height = stats.mode_original_height;
+                mode_expected_refresh = stats.mode_original_refresh;
+                mode_updates_before_restore = stats.stream_updates;
+                mode_step = ModeStep::WaitRestore;
+                break;
+            case ModeStep::SendRefused:
+                mode_expected_width = stats.mode_bad_width;
+                mode_expected_height = stats.mode_bad_height;
+                mode_expected_refresh = stats.mode_bad_refresh;
+                mode_step = ModeStep::WaitRefused;
+                break;
+            case ModeStep::SendLeave:
+                mode_expected_width = stats.mode_target_width;
+                mode_expected_height = stats.mode_target_height;
+                mode_expected_refresh = stats.mode_target_refresh;
+                mode_updates_before_leave = stats.stream_updates;
+                mode_step = ModeStep::WaitLeave;
+                break;
+            default:
+                return true;
+        }
+        if (chast::Error sent_mode = session->request_set_display_mode(
+                stats.mode_display, mode_expected_width, mode_expected_height,
+                mode_expected_refresh);
+            !sent_mode.ok()) {
+            stats.error = "request_set_display_mode: " + sent_mode.to_string();
+            return false;
+        }
+        return true;
     };
 
     // The first call may wait for the audio FIN that follows the video's; all
@@ -1622,10 +2383,35 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     };
 
     while (std::chrono::steady_clock::now() < deadline) {
+        // The mode probe's answers arrive on the control stream, so take them
+        // before waiting on video: a host that is rebuilding capture sends no
+        // frames while a mode change is applied.
+        if (!advance_mode_probe()) {
+            return fail(stats.error);
+        }
         if (!drain_stream_updates()) {
             return fail(stats.error);
         }
+        if (stats.clipboard_over_limit_sent && !stats.clipboard_followup_sent &&
+            std::chrono::steady_clock::now() >= clipboard_followup_at) {
+            chast::ClipboardContent followup =
+                rich_clipboard_probe(kClipboardAfterOverflow);
+            if (chast::Error sent = session->send_clipboard_content(std::move(followup));
+                !sent.ok()) {
+                ++stats.clipboard_errors;
+                if (stats.clipboard_errors == 1) {
+                    std::fprintf(stderr, "send_clipboard_content: %s\n",
+                                 sent.to_string().c_str());
+                }
+            } else {
+                ++stats.clipboard_sent;
+                stats.clipboard_followup_sent = true;
+            }
+        }
         drain_clipboard();
+        if (!advance_file_upload()) {
+            return fail(stats.error);
+        }
         drain_cursor();
         drain_display_switch_results();
         drain_audio(std::chrono::milliseconds(0));
@@ -1822,6 +2608,24 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     std::vector<chast::DecodedFrame> tail;
     drain_clipboard();
     drain_cursor();
+    if (stats.file_probe && file_step != FileStep::Done) {
+        // The result normally arrives while video is still streaming; if the
+        // stream ended first, give the host time to answer the remaining
+        // offers, including the refused ones.
+        const auto file_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (file_step != FileStep::Done &&
+               std::chrono::steady_clock::now() < file_deadline) {
+            if (!advance_file_upload()) {
+                break;
+            }
+            if (file_step != FileStep::Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (file_step != FileStep::Done && stats.error.empty()) {
+            stats.error = "the file upload did not finish";
+        }
+    }
     if (options.audio) {
         // The server FINs the audio stream right after the video's; wait
         // briefly for the tail and its closing packet before finishing.
@@ -3416,6 +4220,38 @@ int run_verify(const Options& options) {
     if (local.seconds < 3.0) {
         local.seconds = 3.0;
     }
+    // The display-mode probe walks four serialized requests, each spaced past
+    // the host's one-second rate limit, and every real change waits for
+    // capture to come back at the new size. Hold the session open long enough
+    // for the whole walk even when --seconds is small.
+    if (local.display_mode && local.seconds < 20.0) {
+        local.seconds = 20.0;
+    }
+    if (local.file_upload) {
+        // Four serialized offers, two of which wait for the host to reject the
+        // finished stream, need more than the default short session.
+        if (local.seconds < 6.0) {
+            local.seconds = 6.0;
+        }
+        // Keep the probe out of the operator's Downloads folder: the host gets
+        // a fresh temporary directory it can write into without prompting.
+        std::error_code ec;
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path(ec) / "chast-quic-upload";
+        if (!ec) {
+            std::filesystem::remove_all(dir, ec);
+        }
+        if (!ec) {
+            std::filesystem::create_directories(dir, ec);
+        }
+        if (ec) {
+            std::fprintf(stderr, "could not prepare the upload directory: %s\n",
+                         ec.message().c_str());
+            return 1;
+        }
+        const std::u8string utf8 = dir.u8string();
+        local.file_receive_dir.assign(utf8.begin(), utf8.end());
+    }
     const bool keep_file = !options.save.empty();
     const std::string path = keep_file ? options.save : ".chast-quic-verify.bin";
 
@@ -3439,11 +4275,97 @@ int run_verify(const Options& options) {
     // change. That ordering is what proves the host's poll sends its own
     // change rather than echoing the upload.
     if (!local.fake_clipboard->wait_for_write(std::chrono::seconds(15))) {
-        std::printf("     clipboard: the viewer's text never reached the host\n");
+        std::printf("     clipboard: the viewer's item never reached the host\n");
     }
     local.fake_clipboard->enable_update();
     sender.join();
     receiver.join();
+
+    // The probe leaves the output in the other mode, so read the desktop only
+    // after the host thread has ended and its guard has restored the original.
+    bool session_end_mode_read = false;
+    chast::DisplayModeInfo session_end_mode;
+    if (local.display_mode) {
+        std::string mode_error;
+        const std::vector<chast::DisplayInfo> displays = chast::enumerate_displays();
+        if (received.mode_display < displays.size()) {
+            const std::vector<chast::DisplayMode> modes =
+                chast::list_display_modes(displays[received.mode_display], &mode_error);
+            for (const chast::DisplayMode& mode : modes) {
+                if (mode.current) {
+                    session_end_mode.width = mode.width;
+                    session_end_mode.height = mode.height;
+                    session_end_mode.refresh_hz = mode.refresh_hz;
+                    session_end_mode_read = true;
+                    break;
+                }
+            }
+        }
+        if (!session_end_mode_read) {
+            std::printf("     the desktop mode after the session could not be read: %s\n",
+                        mode_error.empty() ? "no current mode reported" : mode_error.c_str());
+        }
+    }
+
+    // The host verifies the offer digest before renaming each file into place,
+    // so comparing the stored bytes with the generated payload closes the
+    // upload loop without trusting the viewer's own counters.
+    bool fresh_file_on_disk_ok = false;
+    bool resumed_file_on_disk_ok = false;
+    bool digest_file_absent = false;
+    bool no_partial_left = false;
+    std::string file_check_detail;
+    if (local.file_upload) {
+        const std::vector<uint8_t> expected = file_probe_content(kFileProbeBytes);
+        auto read_all = [](const std::string& file_path, std::vector<uint8_t>& bytes) {
+            std::ifstream stored_file(file_path, std::ios::binary);
+            if (!stored_file) {
+                return false;
+            }
+            bytes.assign(std::istreambuf_iterator<char>(stored_file),
+                         std::istreambuf_iterator<char>());
+            return true;
+        };
+        std::vector<uint8_t> stored;
+        if (sent.received_file_paths.size() == 2) {
+            fresh_file_on_disk_ok =
+                read_all(sent.received_file_paths[0], stored) && stored == expected;
+            stored.clear();
+            resumed_file_on_disk_ok =
+                read_all(sent.received_file_paths[1], stored) && stored == expected;
+        }
+        file_check_detail =
+            "the host reported " + std::to_string(sent.received_file_paths.size()) +
+            " stored file(s)";
+        for (const std::string& stored_path : sent.received_file_paths) {
+            file_check_detail += "\n       " + stored_path;
+        }
+        // C++20 builds the path from the UTF-8 bytes the options carry.
+        auto from_utf8 = [](const std::string& text) {
+            return std::filesystem::path(std::u8string(text.begin(), text.end()));
+        };
+        const std::filesystem::path directory = from_utf8(local.file_receive_dir);
+        const std::filesystem::path digest_final = directory / "chast-verify-digest.bin";
+        const std::filesystem::path digest_part = directory / "chast-verify-digest.bin.part";
+        const std::filesystem::path digest_sidecar =
+            directory / "chast-verify-digest.bin.part.chast";
+        digest_file_absent = !std::filesystem::exists(digest_final) &&
+                             !std::filesystem::exists(digest_part) &&
+                             !std::filesystem::exists(digest_sidecar);
+        no_partial_left = true;
+        std::error_code ec;
+        for (const std::filesystem::directory_entry& entry :
+             std::filesystem::directory_iterator(directory, ec)) {
+            const std::filesystem::path extension = entry.path().extension();
+            if (extension == std::filesystem::path(L".part") ||
+                extension == std::filesystem::path(L".chast")) {
+                no_partial_left = false;
+            }
+        }
+        if (ec) {
+            no_partial_left = false;
+        }
+    }
 
     std::printf("---- loopback check ----\n");
     bool failed = false;
@@ -3564,9 +4486,17 @@ int run_verify(const Options& options) {
     check(sent.target_bitrate > 0, "the server exposed adaptive-bitrate telemetry");
     check(sent.rtt_ms > 0.0, "the host sampled transport RTT");
     check(sent.abr_changes == 0, "the clean loopback stayed at the configured bitrate");
-    check(received.hello_width == received.source_width &&
-              received.hello_height == received.source_height,
-          "the first HelloAck published the source size at full resolution");
+    if (local.display_mode) {
+        // The probe ends in the other mode, so the first announcement is
+        // compared with the mode the session started from.
+        check(received.hello_width == received.mode_original_width &&
+                  received.hello_height == received.mode_original_height,
+              "the first HelloAck published the original mode's source size");
+    } else {
+        check(received.hello_width == received.source_width &&
+                  received.hello_height == received.source_height,
+              "the first HelloAck published the source size at full resolution");
+    }
     const bool resize_expected = local.resolution < 100;
     if (resize_expected) {
         check(sent.resolution_percent == local.resolution,
@@ -3591,7 +4521,8 @@ int run_verify(const Options& options) {
     }
     check(received.width == sent.width && received.height == sent.height,
           "decoded picture size matches the encoded size");
-    const uint64_t expected_updates = resize_expected ? 2 : 1;
+    const uint64_t expected_updates =
+        (resize_expected ? 2 : 1) + (local.display_mode ? 3 : 0);
     check(sent.stream_updates_sent == expected_updates,
           "the server re-announced the stream mid-session");
     check(received.stream_updates == sent.stream_updates_sent,
@@ -3681,21 +4612,147 @@ int run_verify(const Options& options) {
               "the host counted one accepted and one refused switch");
     }
 
+    if (local.display_mode) {
+        check(received.mode_lists == 1, "the viewer read the streamed output's mode list");
+        check(received.modes_code == chast::DisplayModeCode::Ok && received.modes.size() >= 2,
+              "the host listed more than one mode for the output");
+        size_t running_modes = 0;
+        bool original_listed = false;
+        for (const chast::DisplayModeInfo& mode : received.modes) {
+            if (mode.current) {
+                ++running_modes;
+            }
+            if (mode.current && mode.width == received.mode_original_width &&
+                mode.height == received.mode_original_height &&
+                mode.refresh_hz == received.mode_original_refresh) {
+                original_listed = true;
+            }
+        }
+        check(running_modes == 1 && original_listed,
+              "the list marked exactly one running mode");
+        const bool target_moves =
+            received.mode_target_width != received.mode_original_width ||
+            received.mode_target_height != received.mode_original_height;
+        check(received.mode_plan_ready &&
+                  (target_moves ||
+                   received.mode_target_refresh != received.mode_original_refresh),
+              "the probe picked another mode");
+        check(received.mode_results == 5, "all five display mode requests were answered");
+        check(received.mode_ok == 4 && received.mode_refused == 1,
+              "the no-op, the change, the restore and the leave were accepted; the "
+              "unsupported mode was refused");
+        check(received.refused_mode_echoed &&
+                  received.refused_mode_index == received.mode_display &&
+                  received.refused_mode_width == received.mode_bad_width &&
+                  received.refused_mode_height == received.mode_bad_height &&
+                  received.refused_mode_refresh == received.mode_bad_refresh,
+              "the refusal echoed the unsupported mode");
+        check(!received.refused_mode_reason.empty(),
+              "the refusal carried the host's reason");
+        check(received.mode_change_update_seen &&
+                  received.mode_change_source_width ==
+                      (target_moves ? received.mode_target_width
+                                    : received.mode_original_width) &&
+                  received.mode_change_source_height ==
+                      (target_moves ? received.mode_target_height
+                                    : received.mode_original_height),
+              "the change announced the new source size");
+        check(received.mode_restore_update_seen &&
+                  received.mode_restore_source_width == received.mode_original_width &&
+                  received.mode_restore_source_height == received.mode_original_height,
+              "the restore announced the original source size");
+        check(received.mode_leave_update_seen &&
+                  received.mode_leave_source_width ==
+                      (target_moves ? received.mode_target_width
+                                    : received.mode_original_width) &&
+                  received.mode_leave_source_height ==
+                      (target_moves ? received.mode_target_height
+                                    : received.mode_original_height),
+              "the session left the display in the new mode");
+        check(received.source_width == received.mode_target_width &&
+                  received.source_height == received.mode_target_height,
+              "the last announcement described the mode the viewer left behind");
+        check(session_end_mode_read &&
+                  session_end_mode.width == received.mode_original_width &&
+                  session_end_mode.height == received.mode_original_height &&
+                  session_end_mode.refresh_hz == received.mode_original_refresh,
+              "the host restored the desktop mode when the session ended");
+        check(sent.display_mode_changes == 4 && sent.display_mode_failures == 1,
+              "the host counted four accepted and one refused mode request");
+    }
+
     if (local.clipboard) {
         check(sent.clipboard_enabled, "the server announced clipboard as enabled");
         check(received.clipboard_enabled, "the client saw clipboard enabled in HelloAck");
-        check(received.clipboard_sent == 1, "the viewer uploaded exactly one clipboard text");
-        check(sent.clipboard_received == 1, "the host received exactly one clipboard text");
-        check(local.fake_clipboard->writes == 1 &&
-                  local.fake_clipboard->last_write ==
-                      "chast clipboard: viewer upload \xE2\x9C\x93",
-              "the host wrote the viewer's text into its clipboard");
+        check(received.clipboard_over_limit_sent && received.clipboard_followup_sent,
+              "the viewer injected an over-limit CCLB blob and a follow-up item");
+        check(received.clipboard_sent == 2 && received.clipboard_errors == 0,
+              "the viewer uploaded two valid rich clipboard items");
+        check(sent.clipboard_received == 2,
+              "the host accepted both valid items and dropped the over-limit blob");
+        const chast::ClipboardContent upload =
+            rich_clipboard_probe("chast clipboard: viewer upload \xE2\x9C\x93");
+        const chast::ClipboardContent followup = rich_clipboard_probe(kClipboardAfterOverflow);
+        check(local.fake_clipboard->writes == 2 &&
+                  local.fake_clipboard->written.size() == 2 &&
+                  same_clipboard_content(local.fake_clipboard->written[0], upload) &&
+                  same_clipboard_content(local.fake_clipboard->written[1], followup),
+              "the session survived the over-limit blob and the host wrote only the "
+              "valid items");
         check(sent.clipboard_sent == 1, "the host sent exactly one clipboard change");
         check(received.clipboard_received == 1,
-              "the viewer received exactly one clipboard text");
-        check(received.clipboard_texts.size() == 1 &&
-                  received.clipboard_texts.front() == local.fake_clipboard->updated_text,
-              "the received clipboard text matched the host's change");
+              "the viewer received exactly one clipboard item");
+        check(received.clipboard_contents.size() == 1 &&
+                  same_clipboard_content(received.clipboard_contents.front(),
+                                         local.fake_clipboard->updated),
+              "the received item carried the host's text, HTML, RTF and DIB");
+    }
+
+    if (local.file_upload) {
+        check(received.file_probe, "the viewer ran the file upload probe");
+        check(received.file_offers_sent == 4 && received.file_answers == 4,
+              "the viewer made four offers and the host answered each");
+        check(received.file_answer_codes.size() == 4 &&
+                  std::all_of(received.file_answer_codes.begin(),
+                              received.file_answer_codes.end(),
+                              [](chast::FileCode code) { return code == chast::FileCode::Ok; }),
+              "the host accepted all four offers");
+        check(received.file_answer_offsets.size() == 4 &&
+                  received.file_answer_offsets[0] == 0 &&
+                  received.file_answer_offsets[1] == 0 &&
+                  received.file_answer_offsets[2] == kFileResumePrefix &&
+                  received.file_answer_offsets[3] == 0,
+              "the retry resumed at the prefix the truncated upload left");
+        check(received.file_bytes_sent == 2 * kFileProbeBytes + kFileDigestBytes,
+              "the viewer streamed 664 KiB across the four offers");
+        check(received.file_results == 4 && received.file_result_codes.size() == 4 &&
+                  received.file_result_codes[0] == chast::FileCode::Ok &&
+                  received.file_result_codes[1] == chast::FileCode::IoError &&
+                  received.file_result_codes[2] == chast::FileCode::Ok &&
+                  received.file_result_codes[3] == chast::FileCode::IoError,
+              "the truncated and mis-hashed uploads were refused, the complete ones "
+              "stored");
+        check(received.file_result_received.size() == 4 &&
+                  received.file_result_received[0] == kFileProbeBytes &&
+                  received.file_result_received[1] == kFileResumePrefix &&
+                  received.file_result_received[2] == kFileProbeBytes &&
+                  received.file_result_received[3] == kFileDigestBytes,
+              "every result reported the bytes the host actually holds");
+        check(received.file_result_reasons.size() == 4 &&
+                  !received.file_result_reasons[1].empty() &&
+                  !received.file_result_reasons[3].empty(),
+              "both refusals carried the host's reason");
+        check(received.file_errors == 0, "the uploader saw no protocol errors");
+        check(sent.files_received == 2 && sent.file_bytes_received == 2 * kFileProbeBytes,
+              "the host finalized exactly the two complete files");
+        check(fresh_file_on_disk_ok, "the fresh upload matches the offered payload");
+        check(resumed_file_on_disk_ok, "the resumed upload matches the offered payload");
+        check(digest_file_absent && no_partial_left,
+              "the digest refusal left neither the file nor a partial behind");
+        if (!fresh_file_on_disk_ok || !resumed_file_on_disk_ok || !digest_file_absent ||
+            !no_partial_left) {
+            std::printf("     %s\n", file_check_detail.c_str());
+        }
     }
 
     if (local.audio) {
@@ -3707,8 +4764,17 @@ int run_verify(const Options& options) {
               "the announced audio format is AAC-LC 48 kHz stereo, 1024-sample frames");
         check(!sent.audio_info.extradata.empty(), "the server announced the AAC decoder config");
         check(sent.audio_packets > 0 && sent.audio_bytes > 0, "the server sent audio packets");
-        check(sent.audio_errors == 0 && sent.audio_dropped == 0,
-              "the host's audio path reported no errors or drops");
+        if (local.display_mode) {
+            // Rebuilding capture and the encoder holds the host loop for a
+            // moment; the capture queue is sized for a few hundred
+            // milliseconds, so a short gap is expected. It must stay short and
+            // must not turn into errors or losses on the wire.
+            check(sent.audio_errors == 0 && sent.audio_dropped <= 8,
+                  "the mode change cost at most a fraction of a second of audio");
+        } else {
+            check(sent.audio_errors == 0 && sent.audio_dropped == 0,
+                  "the host's audio path reported no errors or drops");
+        }
         check(received.audio_received == sent.audio_packets,
               "every sent audio packet was received");
         check(received.audio_crc_errors == 0, "no audio payload CRC errors");

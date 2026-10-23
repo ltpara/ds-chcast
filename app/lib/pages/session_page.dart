@@ -26,7 +26,6 @@ class SessionPage extends StatefulWidget {
 
 class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   static const Duration _pollInterval = Duration(milliseconds: 200);
-  static const Duration _clipboardInterval = Duration(milliseconds: 500);
   static const Duration _hideDelay = Duration(seconds: 5);
 
   final FocusNode _focus = FocusNode(debugLabel: 'session');
@@ -35,16 +34,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Timer? _pollTimer;
   Timer? _hideTimer;
-  Timer? _clipboardTimer;
   ViewerStatus _status = const ViewerStatus();
-  // The text most recently exchanged with the host, either direction. Null
-  // until the first local read after the gate opened, which is what keeps the
-  // clipboard from before the connection from being uploaded.
-  String? _lastClipboardText;
-  bool _clipboardBusy = false;
   // Local clipboard switch, independent of the host's gate: turning it off
-  // stops both directions without asking the host to change permissions.
+  // stops both directions without asking the host to change permissions. The
+  // native side owns the actual read/write; this only pauses or resumes it.
   bool _clipboardSync = true;
+  // One picker at a time; the native side also refuses an upload while the
+  // previous one is active, this just keeps the dialog from stacking.
+  bool _filePickBusy = false;
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -73,6 +70,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // toolbar marks it while the host works; a refusal drops it and leaves
   // [_display] pointing at the output that is still streaming.
   int? _pendingDisplay;
+  // Resolution menu. The mode list is fetched once the stream is live for the
+  // displayed output and again after an accepted change, because the host's
+  // current-mode marker moves with it.
+  int? _modesRequestedFor;
+  int _modesRequestedLists = 0;
+  DateTime _modesRequestedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _modesRefreshPending = false;
   // Logical pixels per captured pixel, as the frame is currently drawn. The
   // host's pointer is scaled by this times the window's device pixel ratio.
   double _viewScale = 1.0;
@@ -127,7 +131,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _closing = true;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
-    _clipboardTimer?.cancel();
     _focus.dispose();
     _setKeyCapture(false);
     _clearCursor();
@@ -275,6 +278,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         totp: _totp,
         trustDevice: _trustDevice,
       );
+      // The native session starts with clipboard sync on; reapply this page's
+      // switch before the first poll can show it as enabled.
+      try {
+        await ViewerBridge.setClipboardSync(_clipboardSync);
+      } on PlatformException {
+        // The session is already gone; start would have thrown otherwise.
+      } on MissingPluginException {
+        throw StateError('the viewer is not available');
+      }
     } catch (_) {
       await _stopSession();
       _teardown = null;
@@ -376,7 +388,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final bool switchAccepted = pendingDisplay != null &&
         !switchRefused &&
         status.displaySwitches > _status.displaySwitches;
-    _syncClipboardPolling(status.acceptsClipboard && !nowOver && _clipboardSync);
+    // A mode change is answered the same way: the counters say whether this
+    // poll carries a new answer, so an old reason cannot be read twice.
+    final bool modeChangeAccepted =
+        status.displayModeChanges > _status.displayModeChanges;
+    final bool modeChangeRefused =
+        status.displayModeFailures > _status.displayModeFailures;
+    // One upload reaches an end this poll. The counters survive the phase
+    // reset, so a success and a failure can never both arrive; the name and
+    // the reason stay in the status until the next upload starts.
+    final bool fileDone = status.filesSent > _status.filesSent;
+    final bool fileFailed = status.fileFailures > _status.fileFailures;
+    if (modeChangeAccepted) {
+      _modesRefreshPending = true;
+      _modesRequestedFor = null;
+    }
     setState(() {
       if (switchAccepted) {
         _display = pendingDisplay;
@@ -394,6 +420,26 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         duration: const Duration(seconds: 4),
       ));
     }
+    if (modeChangeRefused) {
+      final String reason = status.displayModeError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '切换分辨率失败' : '切换分辨率失败：$reason'),
+        duration: const Duration(seconds: 4),
+      ));
+    }
+    if (fileDone) {
+      final String name = status.fileName;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(name.isEmpty ? '文件已发送' : '文件已发送：$name'),
+        duration: const Duration(seconds: 3),
+      ));
+    } else if (fileFailed) {
+      final String reason = status.fileError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '文件发送失败' : '文件发送失败：$reason'),
+        duration: const Duration(seconds: 5),
+      ));
+    }
     if (droppedControl) {
       _setKeyCapture(false);
     }
@@ -407,6 +453,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _challengeDenial = status.denial;
       unawaited(_handleCredentialChallenge(status.denial));
     }
+    _maybeRequestModes(status, nowOver);
     if (nowOver) {
       _clearCursor();
       return;
@@ -501,87 +548,47 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _syncCursor();
   }
 
-  void _syncClipboardPolling(bool enabled) {
-    if (enabled == (_clipboardTimer != null)) {
-      return;
-    }
-    if (!enabled) {
-      _clipboardTimer?.cancel();
-      _clipboardTimer = null;
-      return;
-    }
-    _clipboardTimer =
-        Timer.periodic(_clipboardInterval, (_) => unawaited(_pollClipboard()));
-    unawaited(_pollClipboard());
-  }
-
   void _toggleClipboardSync() {
-    setState(() => _clipboardSync = !_clipboardSync);
-    _syncClipboardPolling(
-        _status.acceptsClipboard && !_status.isOver && !_over && _clipboardSync);
+    final bool enabled = !_clipboardSync;
+    setState(() => _clipboardSync = enabled);
+    unawaited(_applyClipboardSync(enabled));
   }
 
-  /// Applies text the host sent, then uploads a local text only when it is new.
-  /// Both directions remember the exchanged value, so neither copies the other
-  /// side's own text back and forth.
-  Future<void> _pollClipboard() async {
-    if (_clipboardBusy || !mounted || _over || !_clipboardSync) {
+  Future<void> _applyClipboardSync(bool enabled) async {
+    try {
+      await ViewerBridge.setClipboardSync(enabled);
+    } on PlatformException {
+      // The session is going away; the next start reapplies the switch.
+    } on MissingPluginException {
+      // Same.
+    }
+  }
+
+  Future<void> _sendFile() async {
+    if (_filePickBusy) {
       return;
     }
-    _clipboardBusy = true;
+    _filePickBusy = true;
     try {
-      String? remote;
-      try {
-        remote = await ViewerBridge.takeClipboard();
-      } on MissingPluginException {
-        return;
-      } on PlatformException {
-        return;
+      final String? path = await ViewerBridge.sendFile();
+      if (path != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('已开始发送，进度显示在画面下方'),
+          duration: Duration(seconds: 2),
+        ));
       }
-      if (!mounted) {
-        return;
+    } on PlatformException catch (error) {
+      if (mounted) {
+        final String reason = error.message ?? '';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(reason.isEmpty ? '无法发送文件' : '无法发送文件：$reason'),
+          duration: const Duration(seconds: 4),
+        ));
       }
-      if (remote != null && remote.isNotEmpty) {
-        // Remember it before writing; the read below would otherwise see the
-        // host's text as a fresh local copy and echo it straight back.
-        _lastClipboardText = remote;
-        try {
-          await Clipboard.setData(ClipboardData(text: remote));
-        } on PlatformException {
-          // The text is still remembered, so it is not uploaded again.
-        } on MissingPluginException {
-          return;
-        }
-      }
-      String? local;
-      try {
-        final ClipboardData? data = await Clipboard.getData(Clipboard.kTextPlain);
-        local = data?.text;
-      } on PlatformException {
-        return;
-      } on MissingPluginException {
-        return;
-      }
-      if (!mounted || local == null || local.isEmpty) {
-        return;
-      }
-      if (_lastClipboardText == null) {
-        _lastClipboardText = local;
-        return;
-      }
-      if (local == _lastClipboardText) {
-        return;
-      }
-      _lastClipboardText = local;
-      try {
-        await ViewerBridge.sendClipboard(local);
-      } on MissingPluginException {
-        // The session is going away.
-      } on PlatformException {
-        // Oversized or malformed text; wait for the next local change.
-      }
+    } on MissingPluginException {
+      // The viewer is going away.
     } finally {
-      _clipboardBusy = false;
+      _filePickBusy = false;
     }
   }
 
@@ -727,6 +734,76 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _reconnect();
   }
 
+  /// Fetches the mode list for the streamed output once the session is live.
+  /// One query is in flight at a time; a list already covering the displayed
+  /// output is reused until an accepted change makes its current marker stale.
+  void _maybeRequestModes(ViewerStatus status, bool nowOver) {
+    if (nowOver || _over || !status.acceptsInput) {
+      return;
+    }
+    final int? streamed = status.streamedDisplayIndex;
+    if (streamed == null) {
+      return;
+    }
+    if (_modesRefreshPending && status.displayModeLists > _modesRequestedLists) {
+      _modesRefreshPending = false;
+    }
+    if (status.displayModesDisplay == streamed && !_modesRefreshPending) {
+      return;
+    }
+    final DateTime now = DateTime.now();
+    if (_modesRequestedFor == streamed &&
+        now.difference(_modesRequestedAt) < const Duration(seconds: 2)) {
+      return;
+    }
+    if (now.difference(_modesRequestedAt) < const Duration(seconds: 1)) {
+      return;
+    }
+    _modesRequestedFor = streamed;
+    _modesRequestedLists = status.displayModeLists;
+    _modesRequestedAt = now;
+    unawaited(_requestModes(streamed));
+  }
+
+  Future<void> _requestModes(int display) async {
+    try {
+      await ViewerBridge.requestDisplayModes(display);
+    } on PlatformException {
+      // The next poll retries while the stream stays live.
+    } on MissingPluginException {
+      // Nothing to talk to.
+    }
+  }
+
+  Future<void> _changeDisplayMode(ViewerDisplayMode mode) async {
+    final int? display = _status.streamedDisplayIndex;
+    if (display == null || !_status.acceptsInput || _over) {
+      return;
+    }
+    bool queued = false;
+    try {
+      queued = await ViewerBridge.setDisplayMode(
+        display: display,
+        width: mode.width,
+        height: mode.height,
+        refresh: mode.refresh,
+      );
+    } on PlatformException {
+      queued = false;
+    } on MissingPluginException {
+      queued = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (!queued) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('无法切换分辨率：会话未在串流，或主机未开放输入'),
+        duration: Duration(seconds: 3),
+      ));
+    }
+  }
+
   /// True when the server proved a different identity than the one stored for
   /// this endpoint. The native side refuses that connection; the card then
   /// offers to replace the pin explicitly.
@@ -858,8 +935,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     });
     _pollTimer?.cancel();
     _hideTimer?.cancel();
-    _clipboardTimer?.cancel();
-    _clipboardTimer = null;
     if (_controlEnabled) {
       // The session is about to be torn down; lift what this page still holds
       // so the short window before Stop() does not leave a key down.
@@ -897,8 +972,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _shutdownOnce() async {
     _closing = true;
-    _clipboardTimer?.cancel();
-    _clipboardTimer = null;
     await _starting;
     _teardown = null;
     await _stopSession();
@@ -914,8 +987,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _closing = true;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
-    _clipboardTimer?.cancel();
-    _clipboardTimer = null;
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
@@ -931,8 +1002,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _cleanupAfterPop() {
     _pollTimer?.cancel();
     _hideTimer?.cancel();
-    _clipboardTimer?.cancel();
-    _clipboardTimer = null;
     if (_fullscreen) {
       unawaited(ViewerBridge.setFullscreen(false));
     }
@@ -1264,13 +1333,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         inputAvailable: _status.acceptsInput,
                         clipboardEnabled: _clipboardSync,
                         clipboardAvailable: _status.acceptsClipboard,
+                        fileAvailable: _status.acceptsFiles,
+                        fileActive: _status.fileActive,
                         audioAvailable: _status.acceptsAudio,
                         audioMuted: _status.audioMuted,
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
                         onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
+                        modes: _status.displayModesDisplay ==
+                                    _status.streamedDisplayIndex &&
+                                _status.displayModesCode == 0
+                            ? _status.displayModes
+                            : const <ViewerDisplayMode>[],
+                        modeChangeAvailable: _status.acceptsInput,
+                        onSelectMode: (ViewerDisplayMode mode) =>
+                            unawaited(_changeDisplayMode(mode)),
                         onToggleControl: _toggleControl,
                         onToggleClipboard: _toggleClipboardSync,
+                        onSendFile: () => unawaited(_sendFile()),
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
@@ -1311,6 +1391,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
+                if (hasFrame && !showOverlay && _status.fileActive)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 46,
+                    child: Center(child: _buildFileProgress()),
+                  ),
                 if (hasFrame && !showOverlay && _status.acceptsAudio && _status.audioMuted)
                   Positioned(
                     right: 10,
@@ -1340,6 +1427,75 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  /// The upload sits above the bottom edge so it does not cover the keyboard
+  /// reminder or the mute badge, and it never takes pointer input.
+  Widget _buildFileProgress() {
+    final ViewerStatus status = _status;
+    final bool sending = status.filePhase == ViewerFilePhase.sending;
+    final String phase = switch (status.filePhase) {
+      ViewerFilePhase.hashing => '正在校验',
+      ViewerFilePhase.offered => '等待主机接收',
+      ViewerFilePhase.sending => '正在发送',
+      _ => '准备发送',
+    };
+    final String detail = status.fileSize > 0
+        ? '${_formatBytes(status.fileSent)} / ${_formatBytes(status.fileSize)}'
+        : '';
+    return IgnorePointer(
+      child: Container(
+        width: 340,
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 9),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.62),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                const Icon(Icons.upload_file_rounded, size: 13, color: Colors.white70),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    status.fileName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white70, fontSize: 10.5),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  phase,
+                  style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(2),
+              child: LinearProgressIndicator(
+                value: sending ? status.fileProgress : null,
+                minHeight: 3,
+                backgroundColor: Colors.white12,
+                valueColor: const AlwaysStoppedAnimation<Color>(kAccentBright),
+              ),
+            ),
+            if (detail.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 4),
+              Text(
+                detail,
+                style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -1702,4 +1858,18 @@ class _CredentialDialogState extends State<_CredentialDialog> {
       ],
     );
   }
+}
+
+String _formatBytes(int bytes) {
+  if (bytes < 1024) {
+    return '$bytes B';
+  }
+  const List<String> units = <String>['KiB', 'MiB', 'GiB', 'TiB'];
+  double value = bytes / 1024;
+  int unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    ++unit;
+  }
+  return '${value.toStringAsFixed(value >= 100 ? 0 : 1)} ${units[unit]}';
 }

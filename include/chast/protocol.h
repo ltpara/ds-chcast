@@ -1,20 +1,24 @@
 #pragma once
 
-// The chast wire protocol, version 14.
+// The chast wire protocol, version 16.
 //
 // One QUIC connection carries:
 //
 //   * a client-initiated bidirectional control stream (Hello / HelloAck,
-//     key-frame requests, input events, clipboard text, closing statistics),
+//     key-frame requests, input events, file offers, closing statistics),
 //   * a server-initiated unidirectional video stream: a sequence of access
-//     units, each prefixed by a fixed FrameHeader, and
+//     units, each prefixed by a fixed FrameHeader,
 //   * when the host shares system audio, a second server-initiated
 //     unidirectional stream of AAC-LC access units, each prefixed by an
-//     AudioHeader.
+//     AudioHeader,
+//   * one unidirectional stream per clipboard change (`CCLB`), opened by the
+//     side that copied, and
+//   * one unidirectional stream per file upload (`CFIL`), viewer to host.
 //
-// The two media streams are told apart by their packet magic, not by the order
-// the streams were opened: QUIC does not promise that the first bytes of a
-// later stream arrive after an earlier one. Video is `CFRM`, audio is `CAUD`.
+// The streams are told apart by their packet magic, not by the order the
+// streams were opened: QUIC does not promise that the first bytes of a later
+// stream arrive after an earlier one. Video is `CFRM`, audio is `CAUD`,
+// clipboard content is `CCLB` and file data is `CFIL`.
 //
 // QUIC streams give the media reliable, ordered delivery; the sequence number
 // is still carried so the receiver can report gaps and so a future version can
@@ -38,7 +42,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 14;
+inline constexpr uint16_t kProtocolVersion = 16;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -113,6 +117,44 @@ enum class ControlType : uint16_t {
     // display follows (or that nothing had to change); any other code leaves
     // the previous stream untouched. See DisplaySwitchCode.
     DisplaySwitchResult = 16,
+    // Asks for the modes the output reports. Payload: display index (u16).
+    // The host answers with DisplayModes. Listing is allowed without input
+    // permission; only SetDisplayMode is gated.
+    ListDisplayModes = 17,
+    // Answer to ListDisplayModes. Payload: display index (u16), code (u8),
+    // reason length (u16), UTF-8 reason, mode count (u16), then per mode
+    // width/height/refresh (u16 each) and flags (u16, bit 0 = current). Sizes
+    // are desktop-space: a 90/270 panel reports the swapped pair.
+    DisplayModes = 18,
+    // Changes one output's mode for this session. Payload: display index,
+    // width, height and refresh (u16 each). The display must be the one being
+    // streamed, and the mode must appear in the latest DisplayModes answer.
+    // Requires input permission. The answer is DisplayModeResult; on Ok a
+    // StreamInfo describing the new source size follows.
+    SetDisplayMode = 19,
+    // Answer to SetDisplayMode. Payload: display index, width, height,
+    // refresh (u16 each), code (u8), reason length (u16), UTF-8 reason. Ok
+    // means the mode is in effect and a StreamInfo follows; every other code
+    // leaves the previous mode and stream in place. See DisplayModeCode.
+    DisplayModeResult = 20,
+    // Viewer -> host, one file upload. Payload: transfer id (u32), size
+    // (u64), flags (u8), SHA-256 of the whole file (32 B), name length (u16)
+    // and UTF-8 name. The host answers with FileAnswer; accepted bytes follow
+    // on a client-initiated CFIL stream.
+    FileOffer = 21,
+    // Host -> viewer answer to FileOffer. Payload: transfer id (u32), code
+    // (u8), resume offset (u64), reason length (u16), UTF-8 reason. Ok means
+    // the viewer should open the CFIL stream at resume_offset.
+    FileAnswer = 22,
+    // Host -> viewer final result. Payload: transfer id (u32), code (u8),
+    // bytes written (u64), reason length (u16), UTF-8 reason. Sent once the
+    // CFIL stream ended and the digest was checked, or when the transfer was
+    // aborted.
+    FileResult = 23,
+    // Viewer -> host cancellation. Payload: transfer id (u32), code (u8),
+    // reason length (u16), UTF-8 reason. The host closes and removes the
+    // partial file.
+    FileCancel = 24,
 };
 
 // ----- input -----
@@ -217,19 +259,90 @@ struct InputEvent {
 
 // ----- clipboard -----
 //
-// Only plain text travels, as UTF-8. The limit keeps one update from tying up
-// the control stream; larger texts are simply not synced in this version.
+// Rich clipboard content (text, HTML, RTF and DIB) travels on its own
+// unidirectional CCLB stream, one stream per change. The container and its
+// limits live in chast/clipboard.h; the legacy ClipboardUpdate control message
+// below stays defined for older tools but this build only sends CCLB.
 inline constexpr size_t kMaxClipboardBytes = 256u * 1024u;
 
 // True when `text` is a non-empty, well-formed UTF-8 string of at most
 // kMaxClipboardBytes with no NUL. NUL is rejected because Windows'
 // CF_UNICODETEXT is NUL-terminated and would silently truncate.
 bool valid_clipboard_text(const std::string& text);
+// Well-formed UTF-8 without NUL, no size limit. Shared by clipboard and
+// control-message validation.
+bool valid_utf8(const std::string& text);
 
 struct ClipboardUpdate {
     uint64_t seq = 0;
     std::string text;
 };
+
+// ----- file transfer -----
+//
+// An upload starts with FileOffer on the control stream and, once the host
+// answers Ok, a client-initiated unidirectional CFIL stream carrying the
+// bytes. The control stream never carries file data.
+inline constexpr char kFileStreamMagic[4] = {'C', 'F', 'I', 'L'};
+inline constexpr uint8_t kFileStreamVersion = 1;
+// magic (4) + version (1) + reserved (3) + transfer id (4) + offset (8).
+inline constexpr size_t kFileStreamHeaderSize = 20;
+inline constexpr size_t kFileChunkBytes = 64u * 1024u;
+// Protocol ceiling; the host applies a smaller, configurable limit.
+inline constexpr uint64_t kMaxFileTransferBytes = 16ull * 1024ull * 1024ull * 1024ull;
+inline constexpr size_t kMaxFileNameBytes = 512;
+inline constexpr size_t kMaxFileReasonBytes = 256;
+inline constexpr uint8_t kFileOfferFlagResume = 0x01;
+inline constexpr uint8_t kFileOfferFlagsKnown = kFileOfferFlagResume;
+
+enum class FileCode : uint8_t {
+    Ok = 0,
+    Refused = 1,         // policy, size, disk space, or unusable name
+    Busy = 2,            // another transfer owns the receive slot
+    NotFound = 3,        // the transfer id is not the active offer
+    DigestMismatch = 4,  // the received bytes do not hash to the offer
+    IoError = 5,         // the host could not write or finalize the file
+    Cancelled = 6,       // the viewer (or a permission change) cancelled
+};
+
+struct FileOffer {
+    uint32_t transfer_id = 0;
+    uint64_t size = 0;
+    bool resume = false;
+    std::array<uint8_t, 32> sha256{};
+    std::string name;
+};
+
+struct FileAnswer {
+    uint32_t transfer_id = 0;
+    FileCode code = FileCode::Ok;
+    uint64_t resume_offset = 0;
+    std::string reason;
+};
+
+struct FileResult {
+    uint32_t transfer_id = 0;
+    FileCode code = FileCode::Ok;
+    uint64_t received = 0;
+    std::string reason;
+};
+
+struct FileCancel {
+    uint32_t transfer_id = 0;
+    FileCode code = FileCode::Cancelled;
+    std::string reason;
+};
+
+// CFIL stream prefix. The bytes after it are raw file content starting at
+// `offset`; the stream ends with a QUIC FIN.
+struct FileStreamHeader {
+    uint32_t transfer_id = 0;
+    uint64_t offset = 0;
+};
+void encode_file_stream_header(const FileStreamHeader& header,
+                               uint8_t out[kFileStreamHeaderSize]);
+bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeader& header,
+                               std::string* error);
 
 // ----- pointer -----
 //
@@ -331,26 +444,32 @@ struct AudioHeader {
 };
 
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents; bit 1 tells
-// it that both sides may exchange ClipboardUpdate messages; bit 2 tells it the
-// host opened an audio stream and described the format in the audio block.
+// it that both sides may exchange clipboard content; bit 2 tells it the host
+// opened an audio stream and described the format in the audio block; bit 3
+// tells it that file offers are accepted.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
-inline constexpr uint16_t kServerInfoKnownFlags =
-    kServerInfoInputEnabled | kServerInfoClipboardEnabled | kServerInfoAudioEnabled;
+inline constexpr uint16_t kServerInfoFileTransferEnabled = 0x0008;
+inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoInputEnabled |
+                                                 kServerInfoClipboardEnabled |
+                                                 kServerInfoAudioEnabled |
+                                                 kServerInfoFileTransferEnabled;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
-// three ServerInfo booleans are its decoded form. Input covers pointer and
-// keyboard injection; clipboard governs ClipboardUpdate in both directions;
-// audio is present only while an audio stream is open.
+// ServerInfo booleans are its decoded form. Input covers pointer and
+// keyboard injection; clipboard governs clipboard streams in both directions;
+// audio is present only while an audio stream is open; file transfer gates
+// FileOffer.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
     kPermissionAudio = 0x0004,
+    kPermissionFileTransfer = 0x0008,
 };
-inline constexpr uint16_t kPermissionAll =
-    kPermissionInput | kPermissionClipboard | kPermissionAudio;
+inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
+                                           kPermissionAudio | kPermissionFileTransfer;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -394,6 +513,36 @@ enum class DisplaySwitchCode : uint8_t {
 // message and a longer explanation belongs in the host log, not the wire.
 inline constexpr size_t kMaxDisplaySwitchReason = 256;
 
+// Why a SetDisplayMode was refused. Ok is the only code that switches the
+// output; every other code leaves the current mode (and the stream) in place.
+enum class DisplayModeCode : uint8_t {
+    Ok = 0,
+    NotFound = 1,  // the display is gone, or it does not report that mode
+    Failed = 2,    // the driver refused the mode or the stream could not rebuild
+    Busy = 3,      // a mode change is still settling; retry after a moment
+};
+inline constexpr size_t kMaxDisplayModeReason = 256;
+// Upper bound on one DisplayModes list. The host enumeration stops here too.
+inline constexpr uint16_t kMaxDisplayModes = 256;
+
+struct DisplayModeInfo {
+    // Desktop-space size (rotation already applied), matching the viewer's
+    // picture orientation.
+    uint16_t width = 0;
+    uint16_t height = 0;
+    uint16_t refresh_hz = 0;
+    bool current = false;
+};
+
+// One DisplayModes answer: the list for `display`, or a refusal with `reason`
+// and no modes.
+struct DisplayModeList {
+    uint16_t display = 0;
+    DisplayModeCode code = DisplayModeCode::Ok;
+    std::string reason;
+    std::vector<DisplayModeInfo> modes;
+};
+
 // What the server announces in HelloAck. `encoder` is informational (the VPL
 // implementation that won the tier ladder); `codec` is what the video stream
 // actually contains. `width`/`height` are the encoded picture size, which
@@ -407,11 +556,11 @@ inline constexpr size_t kMaxDisplaySwitchReason = 256;
 // dropped). `displays` lists every attached output; the one being streamed is
 // the entry whose rect starts at the origin and is `source_width` x
 // `source_height` pixels. `clipboard_enabled` mirrors the server's clipboard
-// gate: when false the viewer must not send ClipboardUpdates and will not
-// receive any. `audio.enabled` says whether an audio stream follows; when true,
-// `audio` carries the codec, rate, channel count and AudioSpecificConfig
-// needed to decode it. Audio that fails mid-session is turned off with a
-// StreamInfo.
+// gate: when false the viewer must not send clipboard content and will not
+// receive any. `file_transfer_enabled` gates FileOffer. `audio.enabled` says
+// whether an audio stream follows; when true, `audio` carries the codec, rate,
+// channel count and AudioSpecificConfig needed to decode it. Audio that fails
+// mid-session is turned off with a StreamInfo.
 struct ServerInfo {
     VideoCodec codec = VideoCodec::H264;
     uint16_t width = 0;         // encoded picture size
@@ -424,6 +573,7 @@ struct ServerInfo {
     int32_t origin_y = 0;
     bool input_enabled = false;
     bool clipboard_enabled = false;
+    bool file_transfer_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;
@@ -592,6 +742,45 @@ std::vector<uint8_t> make_display_switch_result(uint16_t display_index, DisplayS
 bool parse_display_switch_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
                                  DisplaySwitchCode& code, std::string& reason,
                                  std::string* error);
+// Viewer -> host mode list request for one announced display.
+std::vector<uint8_t> make_list_display_modes(uint16_t display_index);
+bool parse_list_display_modes(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                              std::string* error);
+// Host -> viewer mode list. The maker truncates `reason` on a UTF-8 boundary
+// and drops entries past kMaxDisplayModes; the parser rejects a list that
+// breaks the wire rules (unknown flags, more than one current mode, zero
+// sizes) instead of repairing it.
+std::vector<uint8_t> make_display_modes(const DisplayModeList& list);
+bool parse_display_modes(const std::vector<uint8_t>& payload, DisplayModeList& list,
+                         std::string* error);
+// Viewer -> host mode change for the streamed display.
+std::vector<uint8_t> make_set_display_mode(uint16_t display_index, uint16_t width,
+                                           uint16_t height, uint16_t refresh_hz);
+bool parse_set_display_mode(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                            uint16_t& width, uint16_t& height, uint16_t& refresh_hz,
+                            std::string* error);
+// Host -> viewer answer, echoing the requested mode so an out-of-order answer
+// can still be paired with its request.
+std::vector<uint8_t> make_display_mode_result(uint16_t display_index, uint16_t width,
+                                              uint16_t height, uint16_t refresh_hz,
+                                              DisplayModeCode code, const std::string& reason);
+bool parse_display_mode_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                               uint16_t& width, uint16_t& height, uint16_t& refresh_hz,
+                               DisplayModeCode& code, std::string& reason, std::string* error);
+// File transfer control messages. The makers truncate reasons/names on a
+// UTF-8 boundary; the parsers reject unknown codes, flags, empty or oversized
+// names and trailing bytes rather than repairing them.
+std::vector<uint8_t> make_file_offer(const FileOffer& offer);
+bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std::string* error);
+std::vector<uint8_t> make_file_answer(const FileAnswer& answer);
+bool parse_file_answer(const std::vector<uint8_t>& payload, FileAnswer& answer,
+                       std::string* error);
+std::vector<uint8_t> make_file_result(const FileResult& result);
+bool parse_file_result(const std::vector<uint8_t>& payload, FileResult& result,
+                       std::string* error);
+std::vector<uint8_t> make_file_cancel(const FileCancel& cancel);
+bool parse_file_cancel(const std::vector<uint8_t>& payload, FileCancel& cancel,
+                       std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.

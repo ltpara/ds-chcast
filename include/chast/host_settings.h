@@ -57,9 +57,16 @@ struct HostSettings {
     // The gate belongs to the host, and a remote-desktop host is not useful
     // without it; access control is the token and the approval, not this.
     bool allow_input = true;
-    // Sync plain-text clipboard changes in both directions. Off means the
-    // HelloAck reports clipboard unavailable and the viewer stays silent.
+    // Sync clipboard changes (text, HTML, RTF and images) in both directions.
+    // Off means the HelloAck reports clipboard unavailable and the viewer
+    // stays silent.
     bool allow_clipboard = true;
+    // Let the viewer offer files; the host answers and receives them into
+    // file_receive_directory. Off means the HelloAck reports file transfer
+    // unavailable and every FileOffer is ignored.
+    bool allow_file_transfer = true;
+    // UTF-8 directory for received files. Empty means Downloads\chast.
+    std::string file_receive_directory;
     // Send the system sound to the viewer. Off means no audio stream is
     // opened and the HelloAck reports audio unavailable.
     bool allow_audio = true;

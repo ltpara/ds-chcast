@@ -16,13 +16,19 @@ class RemoteToolbar extends StatelessWidget {
     required this.inputAvailable,
     required this.clipboardEnabled,
     required this.clipboardAvailable,
+    required this.fileAvailable,
+    required this.fileActive,
     required this.audioAvailable,
     required this.audioMuted,
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
+    required this.modes,
+    required this.modeChangeAvailable,
+    required this.onSelectMode,
     required this.onToggleControl,
     required this.onToggleClipboard,
+    required this.onSendFile,
     required this.onToggleAudio,
     required this.onTogglePin,
     required this.onToggleStats,
@@ -42,13 +48,19 @@ class RemoteToolbar extends StatelessWidget {
   final bool inputAvailable;
   final bool clipboardEnabled;
   final bool clipboardAvailable;
+  final bool fileAvailable;
+  final bool fileActive;
   final bool audioAvailable;
   final bool audioMuted;
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
+  final List<ViewerDisplayMode> modes;
+  final bool modeChangeAvailable;
+  final ValueChanged<ViewerDisplayMode> onSelectMode;
   final VoidCallback onToggleControl;
   final VoidCallback onToggleClipboard;
+  final VoidCallback onSendFile;
   final VoidCallback onToggleAudio;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
@@ -94,6 +106,11 @@ class RemoteToolbar extends StatelessWidget {
               active: activeDisplay,
               onSelected: onSelectDisplay,
             ),
+            _ResolutionButton(
+              modes: modes,
+              available: modeChangeAvailable,
+              onSelected: onSelectMode,
+            ),
             _BarButton(
               icon: Icons.keyboard_alt_outlined,
               tooltip: !inputAvailable
@@ -117,6 +134,17 @@ class RemoteToolbar extends StatelessWidget {
               disabled: !clipboardAvailable,
               active: clipboardAvailable && clipboardEnabled,
               onTap: onToggleClipboard,
+            ),
+            _BarButton(
+              icon: Icons.upload_file_rounded,
+              tooltip: !fileAvailable
+                  ? '服务端未开放文件传输'
+                  : fileActive
+                      ? '文件正在发送'
+                      : '发送文件到主机',
+              disabled: !fileAvailable || fileActive,
+              active: fileActive,
+              onTap: onSendFile,
             ),
             _BarButton(
               icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
@@ -341,7 +369,7 @@ class _DisplayButton extends StatelessWidget {
     final bool available = displays.isNotEmpty;
     return Tooltip(
       message: available
-          ? '切换显示器（重新连接）'
+          ? '切换显示器'
           : '服务端尚未公布显示器列表',
       waitDuration: const Duration(milliseconds: 450),
       child: PopupMenuButton<int>(
@@ -423,6 +451,82 @@ class _DisplayButton extends StatelessWidget {
           ),
           if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
+      ),
+    );
+  }
+}
+
+class _ResolutionButton extends StatelessWidget {
+  const _ResolutionButton({
+    required this.modes,
+    required this.available,
+    required this.onSelected,
+  });
+
+  final List<ViewerDisplayMode> modes;
+  final bool available;
+  final ValueChanged<ViewerDisplayMode> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool enabled = available && modes.isNotEmpty;
+    final String tooltip = !available
+        ? '服务端未开放输入，无法修改分辨率'
+        : modes.isEmpty
+            ? '正在读取主机的显示模式'
+            : '修改分辨率（会话内生效，断开后恢复）';
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 450),
+      child: PopupMenuButton<ViewerDisplayMode>(
+        enabled: enabled,
+        tooltip: '',
+        color: const Color(0xFF24252B),
+        elevation: 8,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(minWidth: 190, maxWidth: 280),
+        onSelected: onSelected,
+        itemBuilder: (BuildContext context) {
+          return <PopupMenuEntry<ViewerDisplayMode>>[
+            for (final ViewerDisplayMode mode in modes)
+              PopupMenuItem<ViewerDisplayMode>(
+                value: mode,
+                height: 42,
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.aspect_ratio_rounded,
+                      size: 16,
+                      color: mode.current ? kAccentBright : Colors.white54,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        mode.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: mode.current ? kAccentBright : Colors.white70,
+                        ),
+                      ),
+                    ),
+                    if (mode.current)
+                      const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+                  ],
+                ),
+              ),
+          ];
+        },
+        child: SizedBox(
+          width: 32,
+          height: 32,
+          child: Icon(
+            Icons.aspect_ratio_rounded,
+            size: 18,
+            color: enabled ? Colors.grey.shade300 : Colors.white24,
+          ),
+        ),
       ),
     );
   }

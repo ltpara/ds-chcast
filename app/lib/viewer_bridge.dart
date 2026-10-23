@@ -55,6 +55,40 @@ class ViewerDisplay {
   }
 }
 
+class ViewerDisplayMode {
+  const ViewerDisplayMode({
+    required this.width,
+    required this.height,
+    required this.refresh,
+    this.current = false,
+  });
+
+  final int width;
+  final int height;
+  final int refresh;
+
+  /// True for the mode the host's output runs right now.
+  final bool current;
+
+  /// "1920 × 1080 · 60 Hz", the way the resolution menu lists a mode.
+  String get label => '$width × $height · $refresh Hz';
+
+  static ViewerDisplayMode? fromMap(Map<Object?, Object?> map) {
+    final int width = (map['width'] as num?)?.toInt() ?? 0;
+    final int height = (map['height'] as num?)?.toInt() ?? 0;
+    final int refresh = (map['refresh'] as num?)?.toInt() ?? 0;
+    if (width <= 0 || height <= 0 || refresh <= 0) {
+      return null;
+    }
+    return ViewerDisplayMode(
+      width: width,
+      height: height,
+      refresh: refresh,
+      current: map['current'] == true,
+    );
+  }
+}
+
 class ViewerStatus {
   const ViewerStatus({
     this.state = ViewerState.idle,
@@ -99,6 +133,15 @@ class ViewerStatus {
     this.clipboardSent = 0,
     this.clipboardReceived = 0,
     this.clipboardFailed = 0,
+    this.clipboardSentFormats = 0,
+    this.clipboardReceivedFormats = 0,
+    this.filePhase = ViewerFilePhase.idle,
+    this.fileName = '',
+    this.fileSize = 0,
+    this.fileSent = 0,
+    this.fileError = '',
+    this.filesSent = 0,
+    this.fileFailures = 0,
     this.cursorUpdates = 0,
     this.cursorPending = false,
     this.audioAnnounced = false,
@@ -118,6 +161,14 @@ class ViewerStatus {
     this.displaySwitches = 0,
     this.displaySwitchFailures = 0,
     this.displaySwitchError = '',
+    this.displayModes = const <ViewerDisplayMode>[],
+    this.displayModesDisplay = 0,
+    this.displayModesCode = 0,
+    this.displayModesError = '',
+    this.displayModeLists = 0,
+    this.displayModeChanges = 0,
+    this.displayModeFailures = 0,
+    this.displayModeError = '',
     this.displays = const <ViewerDisplay>[],
   });
 
@@ -187,13 +238,31 @@ class ViewerStatus {
   final int inputSent;
   final int inputFailed;
 
-  /// True when the server announced that it mirrors clipboard text for this
-  /// session. Only then does the page read the local clipboard, and the
-  /// native side accepts [ViewerBridge.sendClipboard].
+  /// True when the server announced that it mirrors the clipboard for this
+  /// session. The native side then reads and writes the local clipboard
+  /// itself; the page only pauses or resumes it through
+  /// [ViewerBridge.setClipboardSync].
   final bool clipboardEnabled;
   final int clipboardSent;
   final int clipboardReceived;
   final int clipboardFailed;
+
+  /// Bitmask of [ViewerClipboardFormat] in the most recent item sent to the
+  /// host and received from it (0 until one crossed).
+  final int clipboardSentFormats;
+  final int clipboardReceivedFormats;
+
+  /// The most recent viewer-to-host upload. [filePhase] is a
+  /// [ViewerFilePhase] value; [fileSent] counts bytes streamed, resume offset
+  /// included. A failure leaves the local file untouched and explains itself
+  /// in [fileError]. [filesSent] and [fileFailures] cover the session.
+  final int filePhase;
+  final String fileName;
+  final int fileSize;
+  final int fileSent;
+  final String fileError;
+  final int filesSent;
+  final int fileFailures;
 
   /// Pointer updates the host sent. The sprite itself never reaches Dart: the
   /// native side installs it as the Windows cursor, which is where it has to
@@ -237,6 +306,27 @@ class ViewerStatus {
   final String displaySwitchError;
   final List<ViewerDisplay> displays;
 
+  /// The modes the host last reported for one output, the index that answer
+  /// describes, and the host's DisplayModeCode (0 = Ok) with its reason. A new
+  /// answer replaces the previous list even when it is a refusal, so the page
+  /// checks [displayModesDisplay] against [streamedDisplayIndex] before using
+  /// it. [displayModeLists] counts answers, so the page can wait for its own
+  /// request.
+  final List<ViewerDisplayMode> displayModes;
+  final int displayModesDisplay;
+  final int displayModesCode;
+  final String displayModesError;
+  final int displayModeLists;
+
+  /// Mode changes the host accepted, and the refusals the engine saw
+  /// (including requests it could not send), with the host's reason for the
+  /// most recent refusal (cleared by an accepted change). A refusal leaves the
+  /// picture as it was. The page compares both counters with the previous poll
+  /// so two identical reasons still read as two events.
+  final int displayModeChanges;
+  final int displayModeFailures;
+  final String displayModeError;
+
   bool get hasFrame => published > 0 && width > 0 && height > 0;
   bool get isLive => state == ViewerState.streaming;
   bool get isOver =>
@@ -245,6 +335,20 @@ class ViewerStatus {
   // live and the server announced its input gate as open.
   bool get acceptsInput => inputEnabled && isLive;
   bool get acceptsClipboard => clipboardEnabled && isLive;
+  // The upload button needs a live session and the host's file-transfer bit.
+  bool get acceptsFiles =>
+      isLive && (permissions & ViewerPermission.fileTransfer) != 0;
+  // True while an upload is being hashed, offered or streamed. Done and
+  // failed are terminal and leave the button usable for another file; a
+  // closed session clears the overlay even if the phase went stale.
+  bool get fileActive =>
+      isLive &&
+      (filePhase == ViewerFilePhase.hashing ||
+          filePhase == ViewerFilePhase.offered ||
+          filePhase == ViewerFilePhase.sending);
+  // Streamed fraction of [fileSize], 0 when there is nothing to show.
+  double get fileProgress =>
+      fileSize <= 0 ? 0.0 : (fileSent / fileSize).clamp(0.0, 1.0);
   // The speaker button and the overlay's audio row need a live local pipeline.
   bool get acceptsAudio => audioEnabled && isLive;
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
@@ -298,6 +402,18 @@ class ViewerStatus {
         }
       }
     }
+    final List<ViewerDisplayMode> displayModes = <ViewerDisplayMode>[];
+    final Object? rawModes = map['displayModes'];
+    if (rawModes is List) {
+      for (final Object? entry in rawModes) {
+        if (entry is Map) {
+          final ViewerDisplayMode? mode = ViewerDisplayMode.fromMap(entry);
+          if (mode != null) {
+            displayModes.add(mode);
+          }
+        }
+      }
+    }
     return ViewerStatus(
       state: _parseState(map['state']),
       error: asString(map['error']),
@@ -341,6 +457,15 @@ class ViewerStatus {
       clipboardSent: asInt(map['clipboardSent']),
       clipboardReceived: asInt(map['clipboardReceived']),
       clipboardFailed: asInt(map['clipboardFailed']),
+      clipboardSentFormats: asInt(map['clipboardSentFormats']),
+      clipboardReceivedFormats: asInt(map['clipboardReceivedFormats']),
+      filePhase: asInt(map['filePhase']),
+      fileName: asString(map['fileName']),
+      fileSize: asInt(map['fileSize']),
+      fileSent: asInt(map['fileSent']),
+      fileError: asString(map['fileError']),
+      filesSent: asInt(map['filesSent']),
+      fileFailures: asInt(map['fileFailures']),
       cursorUpdates: asInt(map['cursorUpdates']),
       cursorPending: map['cursorPending'] == true,
       audioAnnounced: map['audioAnnounced'] == true,
@@ -360,6 +485,14 @@ class ViewerStatus {
       displaySwitches: asInt(map['displaySwitches']),
       displaySwitchFailures: asInt(map['displaySwitchFailures']),
       displaySwitchError: asString(map['displaySwitchError']),
+      displayModes: List<ViewerDisplayMode>.unmodifiable(displayModes),
+      displayModesDisplay: asInt(map['displayModesDisplay']),
+      displayModesCode: asInt(map['displayModesCode']),
+      displayModesError: asString(map['displayModesError']),
+      displayModeLists: asInt(map['displayModeLists']),
+      displayModeChanges: asInt(map['displayModeChanges']),
+      displayModeFailures: asInt(map['displayModeFailures']),
+      displayModeError: asString(map['displayModeError']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
     );
   }
@@ -523,6 +656,40 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// Asks the host for [display]'s modes. False means the request was not
+  /// queued (no live session or an index outside the announced list). The
+  /// answer replaces [ViewerStatus.displayModes] and is counted by
+  /// [ViewerStatus.displayModeLists]. Listing needs no input permission.
+  static Future<bool> requestDisplayModes(int display) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('requestDisplayModes', display);
+    return queued ?? false;
+  }
+
+  /// Asks the host to change the streamed output's mode for this session. The
+  /// host puts the original mode back when the session ends. False means the
+  /// request was not queued (no live session, view-only access, or a mode
+  /// outside the announced list); the host's answer then arrives in
+  /// [ViewerStatus.displayModeChanges] / [ViewerStatus.displayModeError], and
+  /// an accepted change is followed by a StreamInfo with the new source size.
+  static Future<bool> setDisplayMode({
+    required int display,
+    required int width,
+    required int height,
+    required int refresh,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'setDisplayMode',
+      <String, Object>{
+        'display': display,
+        'width': width,
+        'height': height,
+        'refresh': refresh,
+      },
+    );
+    return queued ?? false;
+  }
+
   /// While remote control is on, an active local IME must not turn physical
   /// keys into VK_PROCESSKEY (the engine drops those before Dart sees them).
   /// Turning this off restores the IME for local text fields.
@@ -531,18 +698,20 @@ class ViewerBridge {
     return active ?? false;
   }
 
-  /// Queues one clipboard text for the host. Invalid UTF-8, text over 256 KiB
-  /// and sessions without the server's clipboard gate are refused; the caller
-  /// should keep the local copy as the source of truth either way.
-  static Future<bool> sendClipboard(String text) async {
-    final bool? queued = await _channel.invokeMethod<bool>('sendClipboard', text);
-    return queued ?? false;
+  /// Pauses or resumes the native rich-clipboard bridge. While paused neither
+  /// direction touches the local clipboard. The host's own clipboard gate is
+  /// applied on top of this switch.
+  static Future<void> setClipboardSync(bool enabled) {
+    return _channel.invokeMethod<void>('setClipboardSync', enabled);
   }
 
-  /// Takes the next clipboard text the host sent, or null when none is
-  /// waiting. Updates are only queued while the server's gate is open.
-  static Future<String?> takeClipboard() {
-    return _channel.invokeMethod<String>('takeClipboard');
+  /// Opens the system file picker and queues the chosen file for upload to
+  /// the host. Returns the picked path, or null when the dialog was
+  /// cancelled. Throws a [PlatformException] when no session is streaming or
+  /// another upload is still running. Progress arrives through
+  /// [ViewerStatus.filePhase]; the page polls it with the status timer.
+  static Future<String?> sendFile() {
+    return _channel.invokeMethod<String>('sendFile');
   }
 
   /// Picks up whatever pointer state the host sent and installs it as this
@@ -672,6 +841,38 @@ abstract final class ViewerPermission {
   static const int input = 0x0001;
   static const int clipboard = 0x0002;
   static const int audio = 0x0004;
+  static const int fileTransfer = 0x0008;
+}
+
+/// The viewer's upload state (chast_viewer::FilePhase in
+/// app/windows/viewer/viewer_engine.h).
+abstract final class ViewerFilePhase {
+  static const int idle = 0;
+  static const int hashing = 1;
+  static const int offered = 2;
+  static const int sending = 3;
+  static const int done = 4;
+  static const int failed = 5;
+}
+
+/// One bit per clipboard format in [ViewerStatus.clipboardSentFormats] and
+/// [ViewerStatus.clipboardReceivedFormats] (chast::ClipboardFormat).
+abstract final class ViewerClipboardFormat {
+  static const int text = 1 << 0;
+  static const int html = 1 << 1;
+  static const int rtf = 1 << 2;
+  static const int dib = 1 << 3;
+
+  /// "文本 + 图片" style summary; empty when [mask] is 0.
+  static String describe(int mask) {
+    final List<String> names = <String>[
+      if ((mask & text) != 0) '文本',
+      if ((mask & html) != 0) 'HTML',
+      if ((mask & rtf) != 0) 'RTF',
+      if ((mask & dib) != 0) '图片',
+    ];
+    return names.join(' + ');
+  }
 }
 
 /// The AccessDenied codes a server answers a refused Hello with

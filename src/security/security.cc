@@ -96,27 +96,6 @@ std::string trim(const std::string& text) {
     return text.substr(begin, end - begin);
 }
 
-bool sha256(const uint8_t* data, size_t size, std::array<uint8_t, 32>& digest) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    bool ok = false;
-    if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
-                                                   nullptr, 0)) &&
-        BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0))) {
-        ok = BCRYPT_SUCCESS(BCryptHashData(hash, const_cast<PUCHAR>(data),
-                                           static_cast<ULONG>(size), 0)) &&
-             BCRYPT_SUCCESS(BCryptFinishHash(hash, digest.data(),
-                                             static_cast<ULONG>(digest.size()), 0));
-    }
-    if (hash) {
-        BCryptDestroyHash(hash);
-    }
-    if (algorithm) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-    }
-    return ok;
-}
-
 bool hmac_sha1(const std::vector<uint8_t>& key, const uint8_t* data, size_t size,
                std::array<uint8_t, 20>& mac) {
     BCRYPT_ALG_HANDLE algorithm = nullptr;
@@ -350,6 +329,94 @@ std::string computer_name() {
 }
 
 }  // namespace
+
+// ----- hashing -----
+
+struct Sha256::Impl {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+
+    ~Impl() {
+        if (hash) {
+            BCryptDestroyHash(hash);
+        }
+        if (algorithm) {
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+        }
+    }
+};
+
+Sha256::Sha256() : impl_(std::make_unique<Impl>()) {
+    reset();
+}
+
+Sha256::~Sha256() = default;
+Sha256::Sha256(Sha256&&) noexcept = default;
+Sha256& Sha256::operator=(Sha256&&) noexcept = default;
+
+void Sha256::reset() {
+    if (!impl_) {
+        impl_ = std::make_unique<Impl>();
+    }
+    if (impl_->hash) {
+        BCryptDestroyHash(impl_->hash);
+        impl_->hash = nullptr;
+    }
+    if (!impl_->algorithm &&
+        !BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&impl_->algorithm,
+                                                    BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+        impl_->algorithm = nullptr;
+        return;
+    }
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(impl_->algorithm, &impl_->hash, nullptr, 0,
+                                         nullptr, 0, 0))) {
+        impl_->hash = nullptr;
+    }
+}
+
+bool Sha256::ready() const {
+    return impl_ && impl_->hash != nullptr;
+}
+
+bool Sha256::update(const void* data, size_t size) {
+    if (!ready()) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if (!data) {
+        return false;
+    }
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t offset = 0;
+    while (offset < size) {
+        const size_t chunk = std::min<size_t>(size - offset, 0xFFFFFFFFu);
+        if (!BCRYPT_SUCCESS(BCryptHashData(impl_->hash,
+                                           const_cast<PUCHAR>(bytes + offset),
+                                           static_cast<ULONG>(chunk), 0))) {
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+bool Sha256::finish(std::array<uint8_t, 32>& digest) {
+    if (!ready()) {
+        return false;
+    }
+    const bool ok = BCRYPT_SUCCESS(BCryptFinishHash(impl_->hash, digest.data(),
+                                                    static_cast<ULONG>(digest.size()), 0));
+    BCryptDestroyHash(impl_->hash);
+    impl_->hash = nullptr;
+    return ok;
+}
+
+bool sha256(const uint8_t* data, size_t size, std::array<uint8_t, 32>& digest) {
+    Sha256 hash;
+    return hash.update(data, size) && hash.finish(digest);
+}
 
 // ----- random -----
 

@@ -1,6 +1,7 @@
 #include "viewer_bridge.h"
 
 #include <commctrl.h>
+#include <commdlg.h>
 #include <imm.h>
 #include <shlobj.h>
 
@@ -78,6 +79,22 @@ bool map_int(const flutter::EncodableMap& map, const char* name, int64_t* out) {
         return true;
     }
     return false;
+}
+
+std::string utf8_from_wide(const std::wstring& wide) {
+    if (wide.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
+                                         static_cast<int>(wide.size()), nullptr, 0, nullptr,
+                                         nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(),
+                        static_cast<int>(wide.size()), out.data(), size, nullptr, nullptr);
+    return out;
 }
 
 bool map_bool(const flutter::EncodableMap& map, const char* name, bool* out) {
@@ -380,6 +397,22 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.clipboard_received));
         map[key("clipboardFailed")] =
             flutter::EncodableValue(static_cast<int64_t>(status.clipboard_failed));
+        map[key("clipboardSentFormats")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.clipboard_sent_formats));
+        map[key("clipboardReceivedFormats")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.clipboard_received_formats));
+        map[key("filePhase")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_phase));
+        map[key("fileName")] = flutter::EncodableValue(status.file_name);
+        map[key("fileSize")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_size));
+        map[key("fileSent")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_sent));
+        map[key("fileError")] = flutter::EncodableValue(status.file_error);
+        map[key("filesSent")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.files_sent));
+        map[key("fileFailures")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_failures));
         map[key("cursorUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.cursor_updates));
         map[key("cursorPending")] = flutter::EncodableValue(status.cursor_pending);
@@ -412,6 +445,29 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.display_switch_failures));
         map[key("displaySwitchError")] =
             flutter::EncodableValue(status.display_switch_error);
+        map[key("displayModeLists")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.display_mode_lists));
+        map[key("displayModeChanges")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.display_mode_changes));
+        map[key("displayModeFailures")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.display_mode_failures));
+        map[key("displayModeError")] = flutter::EncodableValue(status.display_mode_error);
+        map[key("displayModesDisplay")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.display_modes_display));
+        map[key("displayModesCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.display_modes_code));
+        map[key("displayModesError")] = flutter::EncodableValue(status.display_modes_error);
+        flutter::EncodableList modes;
+        for (const chast::DisplayModeInfo& mode : status.display_modes) {
+            flutter::EncodableMap entry;
+            entry[key("width")] = flutter::EncodableValue(static_cast<int32_t>(mode.width));
+            entry[key("height")] = flutter::EncodableValue(static_cast<int32_t>(mode.height));
+            entry[key("refresh")] =
+                flutter::EncodableValue(static_cast<int32_t>(mode.refresh_hz));
+            entry[key("current")] = flutter::EncodableValue(mode.current);
+            modes.push_back(flutter::EncodableValue(std::move(entry)));
+        }
+        map[key("displayModes")] = flutter::EncodableValue(std::move(modes));
         flutter::EncodableList displays;
         for (const chast::DisplayDescription& display : status.displays) {
             flutter::EncodableMap entry;
@@ -474,6 +530,46 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "requestDisplayModes") {
+        const auto* display = std::get_if<int32_t>(call.arguments());
+        if (display == nullptr || *display < 0 || *display >= chast::kMaxDisplayCount) {
+            result->Error("bad_args", "requestDisplayModes wants an announced display index");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->RequestDisplayModes(static_cast<uint16_t>(*display));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "setDisplayMode") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "setDisplayMode wants an argument map");
+            return;
+        }
+        int64_t display = 0;
+        int64_t width = 0;
+        int64_t height = 0;
+        int64_t refresh = 0;
+        if (!map_int(*args, "display", &display) || !map_int(*args, "width", &width) ||
+            !map_int(*args, "height", &height) || !map_int(*args, "refresh", &refresh) ||
+            display < 0 || display >= chast::kMaxDisplayCount || width <= 0 || width > 16384 ||
+            height <= 0 || height > 16384 || refresh <= 0 || refresh > 1000) {
+            result->Error("bad_args",
+                          "setDisplayMode wants display, width, height and refresh in range");
+            return;
+        }
+        const bool queued = viewer_ != nullptr &&
+                            viewer_->SetDisplayMode(static_cast<uint16_t>(display),
+                                                    static_cast<uint16_t>(width),
+                                                    static_cast<uint16_t>(height),
+                                                    static_cast<uint16_t>(refresh));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
     if (method == "sendInput") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         if (args == nullptr) {
@@ -484,14 +580,45 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
-    if (method == "sendClipboard") {
-        const auto* text = std::get_if<std::string>(call.arguments());
-        if (text == nullptr || !chast::valid_clipboard_text(*text)) {
-            result->Error("bad_args", "sendClipboard wants 1..262144 bytes of valid UTF-8");
+    if (method == "setClipboardSync") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setClipboardSync wants a bool");
             return;
         }
-        const bool queued = viewer_ != nullptr && viewer_->SendClipboard(*text);
-        result->Success(flutter::EncodableValue(queued));
+        if (viewer_ != nullptr) {
+            viewer_->SetClipboardSync(*enabled);
+        }
+        result->Success();
+        return;
+    }
+
+    if (method == "sendFile") {
+        if (viewer_ == nullptr) {
+            result->Error("unavailable", "no viewer session is running");
+            return;
+        }
+        std::vector<wchar_t> selected(32768, L'\0');
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = window_;
+        dialog.lpstrFilter = L"All files (*.*)\0*.*\0\0";
+        dialog.lpstrFile = selected.data();
+        dialog.nMaxFile = static_cast<DWORD>(selected.size());
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR |
+                       OFN_HIDEREADONLY;
+        if (!GetOpenFileNameW(&dialog)) {
+            // Cancelling is not an error; the picker simply closed.
+            result->Success();
+            return;
+        }
+        const std::string path = utf8_from_wide(selected.data());
+        if (path.empty() || !viewer_->SendFile(path)) {
+            result->Error("unavailable",
+                          "the file cannot be offered now (session busy or not permitted)");
+            return;
+        }
+        result->Success(flutter::EncodableValue(path));
         return;
     }
 
@@ -503,16 +630,6 @@ void ViewerBridge::HandleMethodCall(
         }
         const bool applied = viewer_ != nullptr && viewer_->SetAudioMuted(*mute);
         result->Success(flutter::EncodableValue(applied));
-        return;
-    }
-
-    if (method == "takeClipboard") {
-        std::string text;
-        if (viewer_ != nullptr && viewer_->TakeClipboard(text)) {
-            result->Success(flutter::EncodableValue(std::move(text)));
-        } else {
-            result->Success();
-        }
         return;
     }
 

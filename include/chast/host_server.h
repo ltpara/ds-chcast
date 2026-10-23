@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "chast/clipboard.h"
 #include "chast/encoder.h"
 #include "chast/host_security.h"
 #include "chast/host_settings.h"
@@ -68,6 +69,10 @@ struct HostServerStats {
     // refused requests (not found, busy or the rebuild failed).
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
+    // Viewer-requested display mode changes for the streamed output: answered
+    // Ok (a completed change or the mode was already running) and refused.
+    uint64_t display_mode_changes = 0;
+    uint64_t display_mode_failures = 0;
     double rtt_ms = 0.0;
     double min_rtt_ms = 0.0;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval
@@ -82,6 +87,11 @@ struct HostServerStats {
     // out (local changes). Both stay zero when clipboard sync is disabled.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
+    // Viewer uploads that were verified and renamed into place, their total
+    // size, and offers that were refused or failed before that.
+    uint64_t files_received = 0;
+    uint64_t file_bytes_received = 0;
+    uint64_t file_failures = 0;
     // System sound. audio_active says whether the current session announced
     // and is still sending audio; the counters cover packets handed to the
     // transport, encoded bytes, packets dropped by the capture or send queues,
@@ -191,11 +201,13 @@ struct HostServerConfig {
     std::function<void(const FrameHeader&, const uint8_t* data, size_t size)> packet;
     // Called for every InputEvent the session drained, in order.
     std::function<void(const InputEvent&)> input_event;
-    // Text clipboard access. Empty means the real Win32 CF_UNICODETEXT
-    // backend; the loopback check substitutes an in-memory pair so it never
-    // touches the operator's clipboard.
-    std::function<bool(std::string&)> clipboard_read;
-    std::function<bool(const std::string&)> clipboard_write;
+    // Rich clipboard access. Empty means the real Win32 backend (text, HTML,
+    // RTF and DIB); the loopback check substitutes an in-memory pair so it
+    // never touches the operator's clipboard.
+    std::function<bool(ClipboardContent&)> clipboard_read;
+    std::function<bool(const ClipboardContent&)> clipboard_write;
+    // Called after an upload passed its digest and was renamed into place.
+    std::function<void(const std::string& path, uint64_t bytes)> file_received;
     // Creates the system-audio source. Empty opens the default render
     // endpoint's loopback; the loopback check substitutes a synthetic tone so
     // it covers encode -> wire -> decode without a sound card. Called only

@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/file_transfer.h"
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
 #include "chast/identity.h"
@@ -77,6 +78,7 @@ enum ControlId {
     kSessionLabel,
     kInputCheck,
     kClipboardCheck,
+    kFileTransferCheck,
     kAudioCheck,
     kAutostartCheck,
     kSecurityButton,
@@ -236,6 +238,7 @@ constexpr wchar_t kApprovalDialogClass[] = L"ChastApprovalWindow";
 enum ApprovalDialogId {
     kApprovalInput = 4000,
     kApprovalClipboard,
+    kApprovalFile,
     kApprovalAudio,
     kApprovalAllow,
     kApprovalDeny,
@@ -245,6 +248,7 @@ struct ApprovalDialogState {
     HWND window = nullptr;
     HWND input = nullptr;
     HWND clipboard = nullptr;
+    HWND file = nullptr;
     HWND audio = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
@@ -272,6 +276,9 @@ void finish_approval(ApprovalDialogState& dialog, bool allowed) {
         }
         if (SendMessageW(dialog.clipboard, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionClipboard;
+        }
+        if (SendMessageW(dialog.file, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            mask |= kPermissionFileTransfer;
         }
         if (SendMessageW(dialog.audio, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionAudio;
@@ -383,7 +390,7 @@ ClientApproval server_approve(const ClientRequest& request) {
     ApprovalDialogState dialog;
     dialog.request = &request;
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT frame{0, 0, px(470), px(320)};
+    RECT frame{0, 0, px(470), px(348)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_TOPMOST);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -429,8 +436,9 @@ ClientApproval server_approve(const ClientRequest& request) {
     }
     add(L"STATIC", L"允许的权限（可以取消勾选）：", SS_LEFT, 20, 164, 430, 20, 0, nullptr);
 
-    const auto permission_check = [&](const wchar_t* text, uint16_t bit, int left, int id) {
-        HWND control = add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, left, 188, 130, 24,
+    const auto permission_check = [&](const wchar_t* text, uint16_t bit, int left, int top,
+                                      int id) {
+        HWND control = add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, left, top, 130, 24,
                            id, nullptr);
         if ((request.permissions & bit) == 0) {
             SendMessageW(control, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -440,14 +448,24 @@ ClientApproval server_approve(const ClientRequest& request) {
         }
         return control;
     };
-    dialog.input = permission_check(L"键盘与鼠标", kPermissionInput, 20, kApprovalInput);
+    dialog.input =
+        permission_check(L"键盘与鼠标", kPermissionInput, 20, 188, kApprovalInput);
     dialog.clipboard =
-        permission_check(L"剪贴板", kPermissionClipboard, 170, kApprovalClipboard);
-    dialog.audio = permission_check(L"系统声音", kPermissionAudio, 320, kApprovalAudio);
+        permission_check(L"剪贴板", kPermissionClipboard, 170, 188, kApprovalClipboard);
+    dialog.audio = permission_check(L"系统声音", kPermissionAudio, 320, 188, kApprovalAudio);
+    dialog.file = permission_check(L"文件传输", kPermissionFileTransfer, 20, 216, kApprovalFile);
+    const std::string receive_directory = g_app->settings.file_receive_directory.empty()
+                                              ? chast::default_receive_directory()
+                                              : g_app->settings.file_receive_directory;
+    add(L"STATIC",
+        (L"接收目录：" +
+         (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
+            .c_str(),
+        SS_LEFT | SS_ENDELLIPSIS, 170, 220, 280, 18, 0, nullptr);
 
-    add(L"BUTTON", L"允许", BS_DEFPUSHBUTTON | WS_TABSTOP, 250, 234, 90, 32, kApprovalAllow,
+    add(L"BUTTON", L"允许", BS_DEFPUSHBUTTON | WS_TABSTOP, 250, 262, 90, 32, kApprovalAllow,
         nullptr);
-    add(L"BUTTON", L"拒绝", BS_PUSHBUTTON | WS_TABSTOP, 350, 234, 90, 32, kApprovalDeny,
+    add(L"BUTTON", L"拒绝", BS_PUSHBUTTON | WS_TABSTOP, 350, 262, 90, 32, kApprovalDeny,
         nullptr);
 
     SetTimer(window, 1, 200, nullptr);
@@ -694,6 +712,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionClipboard) != 0) {
         add(L"剪贴板");
     }
+    if ((mask & kPermissionFileTransfer) != 0) {
+        add(L"文件传输");
+    }
     if ((mask & kPermissionAudio) != 0) {
         add(L"声音");
     }
@@ -703,7 +724,9 @@ std::wstring permission_label(uint16_t mask) {
 uint16_t current_gate_mask() {
     return static_cast<uint16_t>((g_app->settings.allow_input ? kPermissionInput : 0) |
                                  (g_app->settings.allow_clipboard ? kPermissionClipboard : 0) |
-                                 (g_app->settings.allow_audio ? kPermissionAudio : 0));
+                                 (g_app->settings.allow_audio ? kPermissionAudio : 0) |
+                                 (g_app->settings.allow_file_transfer ? kPermissionFileTransfer
+                                                                      : 0));
 }
 
 std::wstring security_summary_text(const HostStatus& status) {
@@ -1266,6 +1289,7 @@ enum SecurityDialogId {
     kSecWhitelist,
     kSecAllowInput,
     kSecAllowClipboard,
+    kSecAllowFile,
     kSecAllowAudio,
     kSecAllowChange,
     kSecTokenAuth,
@@ -1297,6 +1321,7 @@ struct SecurityDialogState {
     HWND whitelist = nullptr;
     HWND allow_input = nullptr;
     HWND allow_clipboard = nullptr;
+    HWND allow_file = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_change = nullptr;
     HWND token_auth = nullptr;
@@ -1455,6 +1480,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.require_approval = updated.auth_mode != HostAuthMode::Password;
     updated.allow_input = is_checked(dialog.allow_input);
     updated.allow_clipboard = is_checked(dialog.allow_clipboard);
+    updated.allow_file_transfer = is_checked(dialog.allow_file);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_permission_change = is_checked(dialog.allow_change);
 
@@ -1810,8 +1836,19 @@ bool edit_security_settings(HostSettings& result) {
     dialog.allow_audio =
         add(L"BUTTON", L"系统声音", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 276, 366, 110, 24,
             kSecAllowAudio, nullptr, &dialog.access_page);
+    dialog.allow_file =
+        add(L"BUTTON", L"文件传输", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 394, 110, 24,
+            kSecAllowFile, nullptr, &dialog.access_page);
+    const std::string receive_directory = g_app->settings.file_receive_directory.empty()
+                                              ? chast::default_receive_directory()
+                                              : g_app->settings.file_receive_directory;
+    add(L"STATIC",
+        (L"接收目录：" +
+         (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
+            .c_str(),
+        SS_LEFT | SS_ENDELLIPSIS, 0, 150, 398, 420, 20, 0, nullptr, &dialog.access_page);
     dialog.allow_change =
-        add(L"BUTTON", L"允许在会话中调整权限", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 394, 260,
+        add(L"BUTTON", L"允许在会话中调整权限", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 426, 260,
             24, kSecAllowChange, nullptr, &dialog.access_page);
 
     // ----- advanced page -----
@@ -1856,6 +1893,7 @@ bool edit_security_settings(HostSettings& result) {
     set_text(dialog.whitelist, widen(settings.ip_whitelist));
     set_check(dialog.allow_input, settings.allow_input);
     set_check(dialog.allow_clipboard, settings.allow_clipboard);
+    set_check(dialog.allow_file, settings.allow_file_transfer);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_change, settings.allow_permission_change);
     set_check(dialog.token_auth, settings.token_auth);
@@ -1973,6 +2011,8 @@ void show_tray_menu() {
                 L"接受远程输入");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_clipboard ? MF_CHECKED : 0),
                 kClipboardCheck, L"同步剪贴板");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_file_transfer ? MF_CHECKED : 0),
+                kFileTransferCheck, L"接受文件传输");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
                 L"共享系统声音");
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
@@ -2087,6 +2127,20 @@ void handle_command(int id) {
                 restart_server();
                 append_log_line(g_app->settings.allow_clipboard ? L"剪贴板同步已开启"
                                                                 : L"剪贴板同步已关闭");
+            }
+            break;
+        case kFileTransferCheck:
+            g_app->settings.allow_file_transfer = !g_app->settings.allow_file_transfer;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                append_log_line(g_app->settings.allow_file_transfer
+                                    ? L"文件传输已开启（本次会话实时生效）"
+                                    : L"文件传输已关闭（本次会话实时生效）");
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_file_transfer ? L"文件传输已开启"
+                                                                    : L"文件传输已关闭");
             }
             break;
         case kAudioCheck:

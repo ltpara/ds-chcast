@@ -15,7 +15,8 @@ target_include_directories(chast_viewer_core PUBLIC "${VIEWER_DIR}")
 target_compile_features(chast_viewer_core PUBLIC cxx_std_20)
 target_compile_definitions(chast_viewer_core PRIVATE NOMINMAX)
 target_compile_options(chast_viewer_core PRIVATE /W4 /permissive- /EHsc /utf-8)
-target_link_libraries(chast_viewer_core PUBLIC chast.codec chast.net chast.audio)
+target_link_libraries(chast_viewer_core PUBLIC chast.codec chast.net chast.audio
+                                             chast.clipboard chast.transfer)
 target_link_libraries(chast_viewer_core PRIVATE flutter)
 
 # Define the application target. To change its name, change BINARY_NAME in the
@@ -52,7 +53,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "imm32.lib" "comctl32.lib")
-target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib" "ole32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib" "ole32.lib" "comdlg32.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE chast_viewer_core)
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(${BINARY_NAME} PRIVATE "${VIEWER_DIR}")

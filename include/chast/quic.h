@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "chast/clipboard.h"
 #include "chast/error.h"
 #include "chast/input.h"
 #include "chast/protocol.h"
@@ -123,6 +124,9 @@ struct QuicServerConfig {
     // own. Off by default for the same reason as allow_input; HostServer turns
     // it on from the host settings.
     bool allow_clipboard = false;
+    // Accept CCLB streams from the viewer and let the viewer upload files.
+    // Same default and same reason as allow_clipboard.
+    bool allow_file_transfer = false;
     // Open an audio stream when the announced ServerInfo carries an enabled
     // AudioInfo. Off by default; HostServer turns it on from the host
     // settings. When false, announce() clears audio.enabled so the viewer is
@@ -190,6 +194,22 @@ struct LatencySample {
     int64_t offset_us = 0;
     uint64_t probes_sent = 0;
     uint64_t replies = 0;
+};
+
+// One piece of a CFIL upload. `offset` is the absolute file offset of the
+// first byte, so the host can check contiguity and its resume position.
+struct FileChunk {
+    uint32_t transfer_id = 0;
+    uint64_t offset = 0;
+    std::vector<uint8_t> data;
+};
+
+// What the transport knows about one incoming upload.
+struct FileUploadState {
+    uint64_t resume_offset = 0;  // where the CFIL stream started
+    uint64_t received = 0;       // content bytes, resume offset excluded
+    bool finished = false;       // stream ended and every chunk was taken
+    std::string error;           // set when the stream broke
 };
 
 struct QuicClientConfig {
@@ -320,6 +340,24 @@ public:
     // kMaxDisplaySwitchReason bytes on a character boundary.
     Error send_display_switch_result(uint16_t display_index, DisplaySwitchCode code,
                                      const std::string& reason = {});
+    // Pops the newest ListDisplayModes request. The host answers it with
+    // send_display_modes(). Only the newest request is kept, like the switch
+    // slot above.
+    bool take_list_display_modes_request(uint16_t& display_index);
+    // Sends one mode list answer. A refusal must carry no modes; the maker
+    // drops them if the caller passes some.
+    Error send_display_modes(const DisplayModeList& list);
+    // Pops the newest SetDisplayMode request. The host answers each taken
+    // request with send_display_mode_result(). Requires input permission on
+    // both ends; a request without it is dropped by the transport.
+    bool take_set_display_mode_request(uint16_t& display_index, uint16_t& width,
+                                       uint16_t& height, uint16_t& refresh_hz);
+    // Answers a SetDisplayMode. Ok tells the viewer a StreamInfo follows; every
+    // other code leaves the current mode and stream in place. The mode is
+    // echoed so the viewer can pair the answer with its request.
+    Error send_display_mode_result(uint16_t display_index, uint16_t width, uint16_t height,
+                                   uint16_t refresh_hz, DisplayModeCode code,
+                                   const std::string& reason = {});
     // Drains the input events received since the last call, in order. They
     // were already injected by the session's own InputInjector when
     // QuicServerConfig::allow_input is set; this is the observation hook for
@@ -396,6 +434,27 @@ public:
                                     std::string& reason);
     // Total DisplaySwitchResults received. Observation hook for tools.
     uint64_t display_switch_results() const;
+    // Asks the host for the modes of one announced display. The answer
+    // arrives through take_display_modes(). Listing works without input
+    // permission; only request_set_display_mode() is gated.
+    Error request_display_modes(uint16_t display_index);
+    // Pops the newest DisplayModes answer. Like the switch answer, only the
+    // newest matters; `list.display` says which output it describes.
+    bool take_display_modes(DisplayModeList& list);
+    // Total DisplayModes answers received. Observation hook for tools.
+    uint64_t display_mode_lists() const;
+    // Asks the host to change the streamed output's mode for this session.
+    // Requires the handshake and input permission. The answer arrives through
+    // take_display_mode_result(); on Ok a StreamInfo describing the new source
+    // size follows on the same control stream.
+    Error request_set_display_mode(uint16_t display_index, uint16_t width, uint16_t height,
+                                   uint16_t refresh_hz);
+    // Pops the newest DisplayModeResult, echoing the requested mode.
+    bool take_display_mode_result(uint16_t& display_index, uint16_t& width, uint16_t& height,
+                                  uint16_t& refresh_hz, DisplayModeCode& code,
+                                  std::string& reason);
+    // Total DisplayModeResults received. Observation hook for tools.
+    uint64_t display_mode_results() const;
     // SHA-256 fingerprint of the certificate the server presented (uppercase
     // hex). Empty until the TLS handshake reached the validation callback;
     // available even when the pin rejected it, which is what makes a mismatch
@@ -424,6 +483,73 @@ public:
     bool take_clipboard_update(ClipboardUpdate& update);
     // Total ClipboardUpdates received since the connection started.
     uint64_t clipboard_updates_received() const;
+
+    // ----- rich clipboard and files (protocol v16, both roles) -----
+
+    // Sends one rich clipboard change as a CCLB blob on its own
+    // unidirectional stream. Requires clipboard permission; on a server whose
+    // config forbids clipboard every call returns PermissionDenied. Returns
+    // InvalidCall for content that fails valid_clipboard_content().
+    Error send_clipboard_content(ClipboardContent content);
+    // Sends an already-encoded CCLB blob on its own unidirectional stream.
+    // Callers normally use send_clipboard_content(); this exists for content
+    // that is already encoded and for the loopback limit probe. The receiver
+    // validates the blob.
+    Error send_clipboard_blob(std::vector<uint8_t> blob);
+    // Pops the oldest rich clipboard change the peer sent. Legacy
+    // ClipboardUpdate control messages have their own taker above.
+    bool take_clipboard_content(ClipboardContent& content);
+    // Total CCLB blobs received since the connection started.
+    uint64_t clipboard_contents_received() const;
+
+    // Server: pops the oldest FileOffer the viewer sent. Nothing is accepted
+    // until send_file_answer() says so.
+    bool take_file_offer(FileOffer& offer);
+    // Server: answers an offer on the control stream. Ok tells the viewer to
+    // start the CFIL stream at `resume_offset`; every other code must pass 0
+    // and aborts a stream the viewer opened early.
+    Error send_file_answer(uint32_t transfer_id, FileCode code, uint64_t resume_offset = 0,
+                           const std::string& reason = {});
+    // Server: waits for the next piece of any incoming upload. WaitTimeout
+    // means no bytes yet, Unavailable means no upload is active any more. A
+    // broken upload returns its transport error after its bytes were drained.
+    Error receive_file_chunk(FileChunk& chunk, std::chrono::milliseconds timeout);
+    // Server: transport state of one upload; false when the id is unknown.
+    bool file_upload_state(uint32_t transfer_id, FileUploadState& state) const;
+    // Server: reports the final outcome on the control stream. A code other
+    // than Ok aborts the upload stream and discards its buffered bytes.
+    Error send_file_result(uint32_t transfer_id, FileCode code, uint64_t received,
+                           const std::string& reason = {});
+    // Server: pops the oldest FileCancel. The host owns the transfer and
+    // answers with send_file_result() when it wants to.
+    bool take_file_cancel(FileCancel& cancel);
+    // Total FileOffers received since the connection started.
+    uint64_t file_offers_received() const;
+
+    // Client: announces a file on the control stream. The transfer id has to
+    // be new for this connection and the transfer requires file-transfer
+    // permission.
+    Error offer_file(const FileOffer& offer);
+    // Client: pops the oldest FileAnswer. On Ok the caller reads the local
+    // file from the answer's resume offset.
+    bool take_file_answer(FileAnswer& answer);
+    // Client: sends one piece of an accepted upload. The first call opens the
+    // CFIL stream with the answer's resume offset; pieces then follow on
+    // exactly. Blocks on the shared send queue like video.
+    Error send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size);
+    // Client: send_file_data() without waiting for queue capacity. Returns
+    // WaitTimeout, having sent nothing, when the shared queue is full; the
+    // caller keeps the piece and retries. A bulk upload uses this so it never
+    // stalls the receive loop that feeds video, audio and input.
+    Error try_send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size);
+    // Client: half-closes the upload stream after the last byte. A zero-byte
+    // file calls this without send_file_data().
+    Error finish_file_upload(uint32_t transfer_id);
+    // Client: aborts the upload's stream and forgets it (local read failure,
+    // rejected offer or a host cancel).
+    void cancel_file_upload(uint32_t transfer_id);
+    // Client: pops the oldest FileResult. Taking it releases the upload state.
+    bool take_file_result(FileResult& result);
 
     // ----- pointer (server to client) -----
 

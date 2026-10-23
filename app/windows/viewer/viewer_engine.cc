@@ -1,14 +1,19 @@
 #include "viewer_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <utility>
 #include <vector>
 
 #include "chast/audio.h"
+#include "chast/clipboard.h"
 #include "chast/decoder.h"
+#include "chast/file_transfer.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
@@ -28,9 +33,17 @@ constexpr auto kMediaPoll = std::chrono::milliseconds(10);
 constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 constexpr auto kProbeInterval = std::chrono::seconds(1);
+constexpr auto kClipboardPollInterval = std::chrono::milliseconds(500);
+// How long one receive-loop pass may spend writing an upload, so a large file
+// cannot starve video, audio and input.
+constexpr auto kFileSendBudget = std::chrono::milliseconds(8);
+// A bulk upload is paced far below the loopback ceiling: unpaced, a 1 GiB file
+// fills the 32 MiB send queue and the viewer loop stalls on it, which costs the
+// video stream almost all of its frames. The burst lets one pass move a few
+// chunks without being reduced to a trickle by the poll cadence.
+constexpr double kFileUploadBytesPerSecond = 32.0 * 1024.0 * 1024.0;
+constexpr double kFileUploadBurst = 256.0 * 1024.0;
 constexpr size_t kMaxPendingInput = 256;
-constexpr size_t kMaxPendingClipboard = 16;
-constexpr size_t kMaxReceivedClipboard = 16;
 
 std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
@@ -50,8 +63,55 @@ const char* switch_code_name(chast::DisplaySwitchCode code) {
     return "the host refused the switch";
 }
 
+const char* mode_code_name(chast::DisplayModeCode code) {
+    switch (code) {
+        case chast::DisplayModeCode::Ok:
+            return "the change was accepted";
+        case chast::DisplayModeCode::NotFound:
+            return "the display or the mode is no longer available";
+        case chast::DisplayModeCode::Failed:
+            return "the host could not change the mode";
+        case chast::DisplayModeCode::Busy:
+            return "the host is still settling the previous change";
+    }
+    return "the host refused the change";
+}
+
+uint32_t formats_mask(const chast::ClipboardContent& content) {
+    uint32_t mask = 0;
+    for (const chast::ClipboardFormatData& format : content.formats) {
+        mask |= 1u << static_cast<uint32_t>(format.format);
+    }
+    return mask;
+}
+
+const char* file_code_name(chast::FileCode code) {
+    switch (code) {
+        case chast::FileCode::Ok:
+            return "the transfer completed";
+        case chast::FileCode::Refused:
+            return "the host refused the file";
+        case chast::FileCode::Busy:
+            return "the host is receiving another file";
+        case chast::FileCode::NotFound:
+            return "the host no longer knows this transfer";
+        case chast::FileCode::DigestMismatch:
+            return "the received bytes did not match the digest";
+        case chast::FileCode::IoError:
+            return "the host could not store the file";
+        case chast::FileCode::Cancelled:
+            return "the transfer was cancelled";
+    }
+    return "the transfer failed";
+}
+
 int64_t steady_us(std::chrono::steady_clock::time_point time) {
     return std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count();
+}
+
+std::filesystem::path path_from_utf8(const std::string& path) {
+    return std::filesystem::path(
+        std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
 }
 
 }  // namespace
@@ -74,6 +134,18 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     if (thread_.joinable()) {
         thread_.join();
     }
+    // A previous session may have ended on its own while its hash was still
+    // running; the new one starts from a clean upload slot.
+    hash_cancel_.store(true, std::memory_order_release);
+    if (hasher_.joinable()) {
+        hasher_.join();
+    }
+    hash_cancel_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        file_ = FileUpload{};
+        next_file_id_ = 1;
+    }
     device_identity_ = std::move(device_identity);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -89,12 +161,6 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         input_enabled_ = false;
     }
     {
-        std::lock_guard<std::mutex> lock(clipboard_mutex_);
-        pending_clipboard_.clear();
-        received_clipboard_.clear();
-        clipboard_enabled_ = false;
-    }
-    {
         std::lock_guard<std::mutex> lock(cursor_mutex_);
         pending_cursor_.reset();
         cursor_updates_ = 0;
@@ -102,6 +168,11 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     {
         std::lock_guard<std::mutex> lock(switch_mutex_);
         pending_switch_.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mode_mutex_);
+        pending_mode_list_.reset();
+        pending_mode_set_.reset();
     }
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
@@ -116,6 +187,12 @@ void ViewerEngine::Stop() {
     stop_requested_.store(true, std::memory_order_release);
     if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
         thread_.join();
+    }
+    // sha256_file() has no cancellation hook; the flag at least keeps a hash
+    // that has not started (or has just finished) from arming the slot again.
+    hash_cancel_.store(true, std::memory_order_release);
+    if (hasher_.joinable()) {
+        hasher_.join();
     }
     running_.store(false, std::memory_order_release);
 }
@@ -167,29 +244,136 @@ bool ViewerEngine::SwitchDisplay(uint16_t display) {
     return true;
 }
 
-bool ViewerEngine::SendClipboard(const std::string& text) {
-    if (!running_.load(std::memory_order_acquire) || !chast::valid_clipboard_text(text)) {
+bool ViewerEngine::RequestDisplayModes(uint16_t display) {
+    if (!running_.load(std::memory_order_acquire)) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(clipboard_mutex_);
-    if (!clipboard_enabled_) {
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            static_cast<size_t>(display) >= status_.displays.size()) {
+            return false;
+        }
     }
-    if (pending_clipboard_.size() >= kMaxPendingClipboard) {
-        pending_clipboard_.pop_front();
-    }
-    pending_clipboard_.push_back(text);
+    std::lock_guard<std::mutex> lock(mode_mutex_);
+    pending_mode_list_ = display;
     return true;
 }
 
-bool ViewerEngine::TakeClipboard(std::string& text) {
-    std::lock_guard<std::mutex> lock(clipboard_mutex_);
-    if (received_clipboard_.empty()) {
+bool ViewerEngine::SetDisplayMode(uint16_t display, uint16_t width, uint16_t height,
+                                  uint16_t refresh_hz) {
+    if (!running_.load(std::memory_order_acquire)) {
         return false;
     }
-    text = std::move(received_clipboard_.front());
-    received_clipboard_.pop_front();
+    if (width == 0 || height == 0 || refresh_hz == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+            return false;
+        }
+        if (static_cast<size_t>(display) >= status_.displays.size()) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(mode_mutex_);
+    PendingMode pending;
+    pending.display = display;
+    pending.width = width;
+    pending.height = height;
+    pending.refresh_hz = refresh_hz;
+    pending_mode_set_ = pending;
     return true;
+}
+
+void ViewerEngine::SetClipboardSync(bool enabled) {
+    clipboard_sync_.store(enabled, std::memory_order_release);
+}
+
+bool ViewerEngine::SendFile(const std::string& path) {
+    if (!running_.load(std::memory_order_acquire) || path.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionFileTransfer) == 0) {
+            return false;
+        }
+    }
+    const std::filesystem::path source = path_from_utf8(path);
+    std::error_code code;
+    const uintmax_t size = std::filesystem::file_size(source, code);
+    if (code || !std::filesystem::is_regular_file(source, code) || code ||
+        size > chast::kMaxFileTransferBytes) {
+        return false;
+    }
+    const std::u8string u8name = source.filename().u8string();
+    std::string name(reinterpret_cast<const char*>(u8name.data()), u8name.size());
+    if (name.empty() || name.size() > chast::kMaxFileNameBytes) {
+        return false;
+    }
+    if (hasher_.joinable()) {
+        // Only a terminal slot reaches this point, so its hash has already
+        // published its result.
+        hasher_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        if (file_.stage != FileUpload::Stage::kNone &&
+            file_.stage != FileUpload::Stage::kDone &&
+            file_.stage != FileUpload::Stage::kFailed) {
+            return false;
+        }
+        file_ = FileUpload{};
+        file_.stage = FileUpload::Stage::kHashing;
+        file_.path = path;
+        file_.name = std::move(name);
+        file_.size = size;
+        file_.transfer_id = next_file_id_++;
+    }
+    hasher_ = std::thread(&ViewerEngine::HashPendingFile, this);
+    return true;
+}
+
+void ViewerEngine::HashPendingFile() {
+    std::string path;
+    uint32_t transfer_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        path = file_.path;
+        transfer_id = file_.transfer_id;
+    }
+    uint64_t size = 0;
+    std::array<uint8_t, 32> digest{};
+    std::string error;
+    bool ok = chast::sha256_file(path, size, digest, &error);
+    if (ok && size > chast::kMaxFileTransferBytes) {
+        ok = false;
+        error = "the file exceeds the protocol's 16 GiB limit";
+    }
+    if (hash_cancel_.load(std::memory_order_acquire)) {
+        ok = false;
+        error = "the upload was cancelled";
+    }
+    std::lock_guard<std::mutex> lock(file_mutex_);
+    if (file_.transfer_id != transfer_id ||
+        file_.stage != FileUpload::Stage::kHashing) {
+        return;
+    }
+    if (!ok) {
+        file_.stage = FileUpload::Stage::kFailed;
+        file_.error = error.empty() ? "the file could not be hashed" : error;
+        std::fprintf(stderr, "viewer: file %s: %s\n", file_.name.c_str(),
+                     file_.error.c_str());
+        return;
+    }
+    file_.size = size;
+    file_.digest = digest;
+    file_.stage = FileUpload::Stage::kReady;
+    std::fprintf(stderr, "viewer: file %s is %llu bytes\n", file_.name.c_str(),
+                 static_cast<unsigned long long>(size));
 }
 
 bool ViewerEngine::TakeCursor(chast::CursorUpdate& update) {
@@ -258,6 +442,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
+    uint32_t clipboard_sent_formats = 0;
+    uint32_t clipboard_received_formats = 0;
+    uint64_t files_sent = 0;
+    uint64_t file_failures = 0;
     uint64_t cursor_updates = 0;
     bool audio_announced = false;
     bool audio_finished = false;
@@ -280,6 +468,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
+    uint64_t display_mode_lists = 0;
+    uint64_t display_mode_changes = 0;
+    uint64_t display_mode_failures = 0;
+    std::string display_mode_error;
+    std::string display_modes_error;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
     bool clock_synced = false;
@@ -347,6 +540,39 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.clipboard_sent = clipboard_sent;
             status_.clipboard_received = clipboard_received;
             status_.clipboard_failed = clipboard_failed;
+            status_.clipboard_sent_formats = clipboard_sent_formats;
+            status_.clipboard_received_formats = clipboard_received_formats;
+            status_.files_sent = files_sent;
+            status_.file_failures = file_failures;
+            {
+                std::lock_guard<std::mutex> file_lock(file_mutex_);
+                status_.file_name = file_.name;
+                status_.file_size = file_.size;
+                status_.file_sent = file_.sent;
+                status_.file_error = file_.error;
+                switch (file_.stage) {
+                    case FileUpload::Stage::kNone:
+                        status_.file_phase = FilePhase::kIdle;
+                        break;
+                    case FileUpload::Stage::kHashing:
+                        status_.file_phase = FilePhase::kHashing;
+                        break;
+                    case FileUpload::Stage::kReady:
+                    case FileUpload::Stage::kOffered:
+                        status_.file_phase = FilePhase::kOffered;
+                        break;
+                    case FileUpload::Stage::kSending:
+                    case FileUpload::Stage::kFinishing:
+                        status_.file_phase = FilePhase::kSending;
+                        break;
+                    case FileUpload::Stage::kDone:
+                        status_.file_phase = FilePhase::kDone;
+                        break;
+                    case FileUpload::Stage::kFailed:
+                        status_.file_phase = FilePhase::kFailed;
+                        break;
+                }
+            }
             status_.cursor_updates = cursor_updates;
             status_.audio_announced = audio_announced;
             status_.audio_enabled = audio_enabled;
@@ -365,6 +591,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.display_switches = display_switches;
             status_.display_switch_failures = display_switch_failures;
             status_.display_switch_error = display_switch_error;
+            status_.display_mode_lists = display_mode_lists;
+            status_.display_mode_changes = display_mode_changes;
+            status_.display_mode_failures = display_mode_failures;
+            status_.display_mode_error = display_mode_error;
+            status_.display_modes_error = display_modes_error;
             status_.elapsed_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
             if (final) {
@@ -462,13 +693,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 input_enabled_ = info.input_enabled;
             }
             clipboard_enabled = info.clipboard_enabled;
-            {
-                std::lock_guard<std::mutex> lock(clipboard_mutex_);
-                clipboard_enabled_ = clipboard_enabled;
-                if (!clipboard_enabled) {
-                    pending_clipboard_.clear();
-                }
-            }
 
             // Audio is optional end to end: a missing render endpoint or a
             // decoder that cannot start leaves video untouched and reports
@@ -552,13 +776,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 }
                 clipboard_enabled = clipboard;
-                {
-                    std::lock_guard<std::mutex> lock(clipboard_mutex_);
-                    clipboard_enabled_ = clipboard;
-                    if (!clipboard) {
-                        pending_clipboard_.clear();
-                    }
-                }
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.permissions = mask;
@@ -678,45 +895,357 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 uint64_t clipboard_seq = 1;
                 std::vector<chast::DecodedFrame> frames;
 
-                // Sends the texts the UI queued since the last poll and moves
-                // every received host text into the UI queue. Runs on the
-                // session thread, like drain_input().
-                auto drain_clipboard = [&] {
-                    std::deque<std::string> texts;
-                    {
-                        std::lock_guard<std::mutex> lock(clipboard_mutex_);
-                        if (!clipboard_enabled) {
-                            pending_clipboard_.clear();
-                            return;
-                        }
-                        texts.swap(pending_clipboard_);
+                // Rich clipboard runs natively, so a 32 MiB bitmap never
+                // crosses the Dart boundary. The baseline is what the local
+                // clipboard held when the gate opened; later changes are
+                // uploaded, and anything the host sends is written locally
+                // and remembered so the next poll cannot echo it back.
+                bool clipboard_was_allowed = false;
+                uint64_t clipboard_hash = 0;
+                auto clipboard_allowed = [&] {
+                    return clipboard_enabled &&
+                           (permissions & chast::kPermissionClipboard) != 0 &&
+                           clipboard_sync_.load(std::memory_order_relaxed);
+                };
+                auto remember_local_clipboard = [&] {
+                    chast::ClipboardContent current;
+                    std::string ignored;
+                    if (chast::read_clipboard(current, &ignored)) {
+                        clipboard_hash = chast::clipboard_content_hash(current);
                     }
-                    for (const std::string& text : texts) {
-                        chast::Error sent = session->send_clipboard(clipboard_seq, text);
-                        if (sent.ok()) {
-                            ++clipboard_seq;
-                            ++clipboard_sent;
-                            continue;
-                        }
+                };
+                auto next_clipboard_poll = Clock::now();
+
+                auto poll_clipboard = [&] {
+                    const auto now = Clock::now();
+                    if (!clipboard_allowed()) {
+                        clipboard_was_allowed = false;
+                        return;
+                    }
+                    if (!clipboard_was_allowed) {
+                        // Re-enabling starts from a fresh baseline instead of
+                        // flushing everything that changed while paused.
+                        clipboard_was_allowed = true;
+                        remember_local_clipboard();
+                        next_clipboard_poll = now + kClipboardPollInterval;
+                        return;
+                    }
+                    if (now < next_clipboard_poll) {
+                        return;
+                    }
+                    next_clipboard_poll = now + kClipboardPollInterval;
+                    chast::ClipboardContent current;
+                    std::string read_error;
+                    if (!chast::read_clipboard(current, &read_error)) {
+                        return;
+                    }
+                    const uint64_t hash = chast::clipboard_content_hash(current);
+                    if (hash == clipboard_hash) {
+                        return;
+                    }
+                    // Remember content that cannot go on the wire too, so the
+                    // same oversized item is not retried every 500 ms.
+                    clipboard_hash = hash;
+                    std::string content_error;
+                    if (!chast::valid_clipboard_content(current, &content_error)) {
+                        std::fprintf(stderr,
+                                     "viewer: clipboard: the local item is not "
+                                     "sendable: %s\n",
+                                     content_error.c_str());
+                        return;
+                    }
+                    clipboard_sent_formats = formats_mask(current);
+                    current.seq = clipboard_seq;
+                    chast::Error sent = session->send_clipboard_content(std::move(current));
+                    if (!sent.ok()) {
                         ++clipboard_failed;
                         if (clipboard_failed <= 3) {
-                            std::fprintf(stderr, "viewer: send_clipboard: %s\n",
+                            std::fprintf(stderr, "viewer: send clipboard: %s\n",
                                          sent.to_string().c_str());
                         }
+                        return;
                     }
+                    ++clipboard_seq;
+                    ++clipboard_sent;
+                    std::fprintf(stderr, "viewer: clipboard sent (formats 0x%x)\n",
+                                 clipboard_sent_formats);
+                };
+
+                auto apply_peer_clipboard = [&](chast::ClipboardContent content) {
+                    const uint64_t hash = chast::clipboard_content_hash(content);
+                    if (hash == clipboard_hash) {
+                        return;
+                    }
+                    std::string content_error;
+                    if (!chast::valid_clipboard_content(content, &content_error)) {
+                        ++clipboard_failed;
+                        std::fprintf(stderr,
+                                     "viewer: clipboard: the host sent unusable "
+                                     "content: %s\n",
+                                     content_error.c_str());
+                        return;
+                    }
+                    std::string write_error;
+                    if (!chast::write_clipboard(content, &write_error)) {
+                        ++clipboard_failed;
+                        if (clipboard_failed <= 3) {
+                            std::fprintf(stderr, "viewer: write clipboard: %s\n",
+                                         write_error.c_str());
+                        }
+                        return;
+                    }
+                    clipboard_hash = hash;
+                    clipboard_received_formats = formats_mask(content);
+                    ++clipboard_received;
+                    std::fprintf(stderr, "viewer: clipboard written (formats 0x%x)\n",
+                                 clipboard_received_formats);
                 };
 
                 auto receive_clipboard = [&] {
-                    chast::ClipboardUpdate update;
-                    while (clipboard_enabled && session->take_clipboard_update(update)) {
-                        {
-                            std::lock_guard<std::mutex> lock(clipboard_mutex_);
-                            if (received_clipboard_.size() >= kMaxReceivedClipboard) {
-                                received_clipboard_.pop_front();
-                            }
-                            received_clipboard_.push_back(std::move(update.text));
+                    chast::ClipboardContent content;
+                    while (clipboard_allowed() && session->take_clipboard_content(content)) {
+                        apply_peer_clipboard(std::move(content));
+                    }
+                    // A v15 host may still send the text message; treat it as
+                    // a text-only item rather than dropping it.
+                    chast::ClipboardUpdate legacy;
+                    while (clipboard_allowed() && session->take_clipboard_update(legacy)) {
+                        chast::ClipboardContent text_only;
+                        text_only.seq = legacy.seq;
+                        chast::ClipboardFormatData text;
+                        text.format = chast::ClipboardFormat::Text;
+                        text.data.assign(legacy.text.begin(), legacy.text.end());
+                        text_only.formats.push_back(std::move(text));
+                        apply_peer_clipboard(std::move(text_only));
+                    }
+                };
+
+                // One upload at a time. The hash was computed off this thread;
+                // here the file is offered, opened at the host's resume
+                // offset and streamed in time-budgeted chunks so video, audio
+                // and input keep flowing.
+                std::ifstream file_stream;
+                double file_tokens = kFileUploadBurst;
+                Clock::time_point file_token_time = Clock::now();
+                auto file_fail = [&](const std::string& message) {
+                    uint32_t transfer_id = 0;
+                    std::string name;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        const FileUpload::Stage stage = file_.stage;
+                        if (stage == FileUpload::Stage::kNone ||
+                            stage == FileUpload::Stage::kDone ||
+                            stage == FileUpload::Stage::kFailed) {
+                            return;
                         }
-                        ++clipboard_received;
+                        transfer_id = file_.transfer_id;
+                        name = file_.name;
+                        file_.stage = FileUpload::Stage::kFailed;
+                        file_.error = message;
+                    }
+                    file_stream.close();
+                    // Frees the host's receive slot and its .part; harmless
+                    // when the host already ended the transfer itself.
+                    session->cancel_file_upload(transfer_id);
+                    ++file_failures;
+                    std::fprintf(stderr, "viewer: file %s failed: %s\n", name.c_str(),
+                                 message.c_str());
+                };
+
+                auto drive_file_upload = [&] {
+                    FileUpload snapshot;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        snapshot = file_;
+                    }
+                    // Every result ends the attempt it belongs to, including
+                    // a host-side cancellation of a stream we still own.
+                    chast::FileResult result;
+                    while (session->take_file_result(result)) {
+                        if (result.transfer_id != snapshot.transfer_id) {
+                            continue;
+                        }
+                        const FileUpload::Stage stage = snapshot.stage;
+                        if (stage != FileUpload::Stage::kOffered &&
+                            stage != FileUpload::Stage::kSending &&
+                            stage != FileUpload::Stage::kFinishing) {
+                            continue;
+                        }
+                        file_stream.close();
+                        if (result.code == chast::FileCode::Ok) {
+                            {
+                                std::lock_guard<std::mutex> lock(file_mutex_);
+                                file_.stage = FileUpload::Stage::kDone;
+                                file_.error.clear();
+                            }
+                            ++files_sent;
+                            std::fprintf(stderr,
+                                         "viewer: file %s delivered (%llu bytes)\n",
+                                         snapshot.name.c_str(),
+                                         static_cast<unsigned long long>(result.received));
+                        } else {
+                            const std::string reason =
+                                result.reason.empty() ? file_code_name(result.code)
+                                                      : result.reason;
+                            {
+                                std::lock_guard<std::mutex> lock(file_mutex_);
+                                file_.stage = FileUpload::Stage::kFailed;
+                                file_.error = reason;
+                            }
+                            ++file_failures;
+                            std::fprintf(stderr, "viewer: file %s failed: %s\n",
+                                         snapshot.name.c_str(), reason.c_str());
+                        }
+                        return;
+                    }
+                    switch (snapshot.stage) {
+                        case FileUpload::Stage::kNone:
+                        case FileUpload::Stage::kHashing:
+                        case FileUpload::Stage::kDone:
+                        case FileUpload::Stage::kFailed:
+                            return;
+                        default:
+                            break;
+                    }
+                    if ((permissions & chast::kPermissionFileTransfer) == 0) {
+                        file_fail("the host revoked file transfer");
+                        return;
+                    }
+                    if (snapshot.stage == FileUpload::Stage::kReady) {
+                        chast::FileOffer offer;
+                        offer.transfer_id = snapshot.transfer_id;
+                        offer.size = snapshot.size;
+                        offer.resume = true;
+                        offer.sha256 = snapshot.digest;
+                        offer.name = snapshot.name;
+                        chast::Error sent = session->offer_file(offer);
+                        if (!sent.ok()) {
+                            file_fail("offer: " + sent.to_string());
+                            return;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (file_.transfer_id == snapshot.transfer_id &&
+                                file_.stage == FileUpload::Stage::kReady) {
+                                file_.stage = FileUpload::Stage::kOffered;
+                            }
+                        }
+                        std::fprintf(stderr, "viewer: file %s offered (%llu bytes)\n",
+                                     snapshot.name.c_str(),
+                                     static_cast<unsigned long long>(snapshot.size));
+                        return;
+                    }
+                    if (snapshot.stage == FileUpload::Stage::kOffered) {
+                        chast::FileAnswer answer;
+                        while (session->take_file_answer(answer)) {
+                            if (answer.transfer_id != snapshot.transfer_id) {
+                                continue;
+                            }
+                            if (answer.code != chast::FileCode::Ok) {
+                                file_fail(answer.reason.empty() ? file_code_name(answer.code)
+                                                                : answer.reason);
+                                return;
+                            }
+                            if (answer.resume_offset > snapshot.size) {
+                                file_fail("the host asked to resume past the end of the file");
+                                return;
+                            }
+                            file_stream.open(path_from_utf8(snapshot.path), std::ios::binary);
+                            if (!file_stream) {
+                                file_fail("the local file cannot be opened");
+                                return;
+                            }
+                            file_stream.seekg(static_cast<std::streamoff>(answer.resume_offset),
+                                              std::ios::beg);
+                            if (!file_stream) {
+                                file_fail("the local file cannot seek to the resume offset");
+                                return;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(file_mutex_);
+                                if (file_.transfer_id != snapshot.transfer_id ||
+                                    file_.stage != FileUpload::Stage::kOffered) {
+                                    return;
+                                }
+                                file_.stage = FileUpload::Stage::kSending;
+                                file_.resume_offset = answer.resume_offset;
+                                file_.sent = answer.resume_offset;
+                            }
+                            file_tokens = kFileUploadBurst;
+                            file_token_time = Clock::now();
+                            std::fprintf(stderr,
+                                         "viewer: file %s accepted, sending from %llu\n",
+                                         snapshot.name.c_str(),
+                                         static_cast<unsigned long long>(
+                                             answer.resume_offset));
+                            return;
+                        }
+                        return;
+                    }
+                    if (snapshot.stage != FileUpload::Stage::kSending) {
+                        return;
+                    }
+                    const auto deadline = Clock::now() + kFileSendBudget;
+                    const auto refill = Clock::now();
+                    file_tokens = std::min(
+                        kFileUploadBurst,
+                        file_tokens + std::chrono::duration<double>(refill - file_token_time)
+                                          .count() *
+                                          kFileUploadBytesPerSecond);
+                    file_token_time = refill;
+                    std::array<uint8_t, chast::kFileChunkBytes> buffer{};
+                    uint64_t sent = snapshot.sent;
+                    while (sent < snapshot.size && Clock::now() < deadline) {
+                        const size_t want = static_cast<size_t>(std::min<uint64_t>(
+                            snapshot.size - sent, buffer.size()));
+                        if (file_tokens < static_cast<double>(want)) {
+                            break;
+                        }
+                        file_stream.read(reinterpret_cast<char*>(buffer.data()),
+                                         static_cast<std::streamsize>(want));
+                        const std::streamsize got = file_stream.gcount();
+                        if (got <= 0) {
+                            file_fail("the local file ended before its announced size");
+                            return;
+                        }
+                        chast::Error wrote = session->try_send_file_data(
+                            snapshot.transfer_id, buffer.data(), static_cast<size_t>(got));
+                        if (wrote.status() == chast::Status::WaitTimeout) {
+                            // The shared queue is full: leave the piece for the
+                            // next pass rather than stall the receive loop.
+                            file_stream.clear();
+                            file_stream.seekg(static_cast<std::streamoff>(sent),
+                                              std::ios::beg);
+                            break;
+                        }
+                        if (!wrote.ok()) {
+                            file_fail("send: " + wrote.to_string());
+                            return;
+                        }
+                        sent += static_cast<uint64_t>(got);
+                        file_tokens -= static_cast<double>(got);
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (file_.transfer_id == snapshot.transfer_id &&
+                            file_.stage == FileUpload::Stage::kSending) {
+                            file_.sent = sent;
+                        }
+                    }
+                    if (sent >= snapshot.size) {
+                        chast::Error finished =
+                            session->finish_file_upload(snapshot.transfer_id);
+                        if (!finished.ok()) {
+                            file_fail("finish: " + finished.to_string());
+                            return;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (file_.transfer_id == snapshot.transfer_id &&
+                                file_.stage == FileUpload::Stage::kSending) {
+                                file_.stage = FileUpload::Stage::kFinishing;
+                            }
+                        }
+                        std::fprintf(stderr, "viewer: file %s sent, waiting for the host\n",
+                                     snapshot.name.c_str());
                     }
                 };
 
@@ -888,6 +1417,90 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the newest mode query and the newest mode change. Both
+                // slots keep only the newest request, like the switch slot.
+                auto drain_display_modes = [&] {
+                    std::optional<uint16_t> list_request;
+                    std::optional<PendingMode> set_request;
+                    {
+                        std::lock_guard<std::mutex> lock(mode_mutex_);
+                        list_request.swap(pending_mode_list_);
+                        set_request.swap(pending_mode_set_);
+                    }
+                    if (list_request) {
+                        chast::Error sent = session->request_display_modes(*list_request);
+                        if (!sent.ok()) {
+                            display_modes_error = "request: " + sent.to_string();
+                            std::fprintf(stderr, "viewer: list display modes: %s\n",
+                                         sent.to_string().c_str());
+                        }
+                    }
+                    if (set_request) {
+                        chast::Error sent = session->request_set_display_mode(
+                            set_request->display, set_request->width, set_request->height,
+                            set_request->refresh_hz);
+                        if (!sent.ok()) {
+                            ++display_mode_failures;
+                            display_mode_error = "request: " + sent.to_string();
+                            std::fprintf(stderr, "viewer: set display mode: %s\n",
+                                         sent.to_string().c_str());
+                        }
+                    }
+                };
+
+                // Adopts the newest mode list. A refusal replaces the previous
+                // list too: the UI asked about this display and must not see
+                // the answer to an earlier one.
+                auto receive_display_modes = [&] {
+                    chast::DisplayModeList list;
+                    while (session->take_display_modes(list)) {
+                        ++display_mode_lists;
+                        display_modes_error =
+                            list.code == chast::DisplayModeCode::Ok
+                                ? std::string()
+                                : (list.reason.empty() ? mode_code_name(list.code) : list.reason);
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.display_modes = list.modes;
+                            status_.display_modes_display = list.display;
+                            status_.display_modes_code = static_cast<int>(list.code);
+                            status_.display_modes_error = display_modes_error;
+                        }
+                        std::fprintf(stderr, "viewer: display %u reports %zu mode(s)%s%s\n",
+                                     list.display, list.modes.size(),
+                                     display_modes_error.empty() ? "" : ": ",
+                                     display_modes_error.c_str());
+                    }
+                };
+
+                // Adopts every mode answer. Ok is followed by a StreamInfo
+                // with the new source size; a refusal leaves the picture as it
+                // was, and the UI returns the menu to the running mode.
+                auto receive_display_mode_results = [&] {
+                    uint16_t display = 0;
+                    uint16_t width = 0;
+                    uint16_t height = 0;
+                    uint16_t refresh_hz = 0;
+                    chast::DisplayModeCode code = chast::DisplayModeCode::Failed;
+                    std::string reason;
+                    while (session->take_display_mode_result(display, width, height, refresh_hz,
+                                                             code, reason)) {
+                        if (code == chast::DisplayModeCode::Ok) {
+                            ++display_mode_changes;
+                            display_mode_error.clear();
+                            std::fprintf(stderr, "viewer: display %u now %ux%u at %u Hz\n",
+                                         display, width, height, refresh_hz);
+                            continue;
+                        }
+                        display_mode_error = reason.empty() ? mode_code_name(code) : reason;
+                        ++display_mode_failures;
+                        std::fprintf(stderr,
+                                     "viewer: display %u mode %ux%u at %u Hz refused: %s\n",
+                                     display, width, height, refresh_hz,
+                                     display_mode_error.c_str());
+                    }
+                };
+
                 // Applies StreamInfo messages: the captured output changed
                 // size, rotation or origin after the server rebuilt its
                 // duplication. Frames keep flowing on the same stream, so only
@@ -932,13 +1545,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             input_enabled_ = info.input_enabled;
                         }
                         clipboard_enabled = info.clipboard_enabled;
-                        {
-                            std::lock_guard<std::mutex> lock(clipboard_mutex_);
-                            clipboard_enabled_ = clipboard_enabled;
-                            if (!clipboard_enabled) {
-                                pending_clipboard_.clear();
-                            }
-                        }
                         // StreamInfo carries the permission mask too (for
                         // example after the host rebuilt its capture under a
                         // reduced grant), so adopt it before announcing.
@@ -980,7 +1586,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                     receive_permissions();
                     receive_display_switch();
+                    receive_display_modes();
+                    receive_display_mode_results();
                     drain_display_switch();
+                    drain_display_modes();
                     {
                         const auto probe_now = Clock::now();
                         if (probe_now - last_probe >= kProbeInterval) {
@@ -998,16 +1607,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                     }
                     drain_input();
-                    drain_clipboard();
+                    poll_clipboard();
                     receive_clipboard();
+                    drive_file_upload();
                     receive_cursor();
                     drain_audio();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
+                    FileUpload::Stage upload_stage = FileUpload::Stage::kNone;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        upload_stage = file_.stage;
+                    }
+                    const bool file_active = upload_stage == FileUpload::Stage::kOffered ||
+                                             upload_stage == FileUpload::Stage::kSending ||
+                                             upload_stage == FileUpload::Stage::kFinishing;
                     const bool fast_media_poll =
                         (permissions & (chast::kPermissionInput |
                                         chast::kPermissionClipboard)) != 0 ||
-                        audio_announced;
+                        file_active || audio_announced;
                     chast::Error received_frame = session->receive_frame(
                         header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
                     // Audio packets arrive on their own stream and never wake
@@ -1015,6 +1633,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_audio();
                     receive_permissions();
                     receive_display_switch();
+                    receive_display_modes();
+                    receive_display_mode_results();
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {
@@ -1150,11 +1770,23 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         input_enabled_ = false;
         pending_input_.clear();
     }
+    // An upload that outlived the stream cannot continue on this connection.
+    uint32_t cancelled_upload = 0;
     {
-        std::lock_guard<std::mutex> lock(clipboard_mutex_);
-        pending_clipboard_.clear();
-        received_clipboard_.clear();
-        clipboard_enabled_ = false;
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        const FileUpload::Stage stage = file_.stage;
+        if (stage == FileUpload::Stage::kHashing ||
+            stage == FileUpload::Stage::kReady || stage == FileUpload::Stage::kOffered ||
+            stage == FileUpload::Stage::kSending ||
+            stage == FileUpload::Stage::kFinishing) {
+            cancelled_upload = file_.transfer_id;
+            file_.stage = FileUpload::Stage::kFailed;
+            file_.error = "the session ended before the file finished";
+        }
+    }
+    hash_cancel_.store(true, std::memory_order_release);
+    if (cancelled_upload != 0) {
+        session->cancel_file_upload(cancelled_upload);
     }
 
     if (handshaken) {

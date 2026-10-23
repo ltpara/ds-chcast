@@ -392,6 +392,12 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_clipboard)) {
                 warn(result.warning, "clipboard '" + value + "' is not a boolean");
             }
+        } else if (key == "file_transfer") {
+            if (!parse_bool(value, settings.allow_file_transfer)) {
+                warn(result.warning, "file_transfer '" + value + "' is not a boolean");
+            }
+        } else if (key == "file_receive_dir") {
+            settings.file_receive_directory = value;
         } else if (key == "audio") {
             if (!parse_bool(value, settings.allow_audio)) {
                 warn(result.warning, "audio '" + value + "' is not a boolean");
@@ -591,6 +597,7 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_input = (permissions_mask & kPermissionInput) != 0;
         settings.allow_clipboard = (permissions_mask & kPermissionClipboard) != 0;
         settings.allow_audio = (permissions_mask & kPermissionAudio) != 0;
+        settings.allow_file_transfer = (permissions_mask & kPermissionFileTransfer) != 0;
     }
     return result;
 }
@@ -609,7 +616,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
     const uint16_t permissions =
         (settings.allow_input ? kPermissionInput : 0) |
         (settings.allow_clipboard ? kPermissionClipboard : 0) |
-        (settings.allow_audio ? kPermissionAudio : 0);
+        (settings.allow_audio ? kPermissionAudio : 0) |
+        (settings.allow_file_transfer ? kPermissionFileTransfer : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
@@ -626,6 +634,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "# the legacy switches stay for older builds\n"
          << "input=" << (settings.allow_input ? 1 : 0) << "\n"
          << "clipboard=" << (settings.allow_clipboard ? 1 : 0) << "\n"
+         << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
+         << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="

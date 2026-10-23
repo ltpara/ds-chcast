@@ -32,6 +32,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -47,6 +48,22 @@ namespace {
 constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
 constexpr uint64_t kKeepAliveMs = 5000;
+
+// Receive-side bounds for the protocol v16 streams. They are deliberately
+// larger than one legitimate item so a slow consumer is not punished, but
+// small enough that a peer cannot turn the session into an allocator.
+constexpr size_t kMaxClipboardStreams = 8;
+constexpr size_t kMaxPendingClipboardBytes = 96u * 1024u * 1024u;
+constexpr size_t kMaxClipboardStreamBytes = kMaxClipboardTotalBytes + 64u * 1024u;
+constexpr size_t kMaxIncomingUploads = 8;
+constexpr size_t kMaxBufferedFileBytes = 64u * 1024u * 1024u;
+// The host stops consuming CFIL bytes above the high-water mark (leaving the
+// rest with MsQuic, which then withholds flow-control credit) and resumes
+// below the low-water mark. A slow poll becomes backpressure on the viewer
+// instead of an overflow that drops the transfer.
+constexpr size_t kFileReceiveHighWaterBytes = 32u * 1024u * 1024u;
+constexpr size_t kFileReceiveLowWaterBytes = 8u * 1024u * 1024u;
+constexpr size_t kMaxQueuedOffers = 8;
 
 // Device names come from the local computer and the protocol caps them at
 // kMaxDeviceNameLength bytes. Cut on a whole UTF-8 sequence so a long name
@@ -72,6 +89,9 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     }
     if (info.audio.enabled) {
         mask |= kPermissionAudio;
+    }
+    if (info.file_transfer_enabled) {
+        mask |= kPermissionFileTransfer;
     }
     return mask;
 }
@@ -495,6 +515,26 @@ struct QuicSession::Impl {
     DisplaySwitchCode display_switch_code = DisplaySwitchCode::Ok;
     std::string display_switch_reason;
     uint64_t display_switch_results_seen = 0;
+    // Server: the newest mode list request and mode change request. Client:
+    // the newest answers, for the same reason as the switch pair above.
+    bool display_modes_request_ready = false;
+    uint16_t display_modes_request_display = 0;
+    bool display_modes_ready = false;
+    DisplayModeList display_modes;
+    uint64_t display_mode_lists_seen = 0;
+    bool set_display_mode_ready = false;
+    uint16_t set_display_mode_index = 0;
+    uint16_t set_display_mode_width = 0;
+    uint16_t set_display_mode_height = 0;
+    uint16_t set_display_mode_refresh = 0;
+    bool display_mode_result_ready = false;
+    uint16_t display_mode_result_index = 0;
+    uint16_t display_mode_result_width = 0;
+    uint16_t display_mode_result_height = 0;
+    uint16_t display_mode_result_refresh = 0;
+    DisplayModeCode display_mode_code = DisplayModeCode::Ok;
+    std::string display_mode_reason;
+    uint64_t display_mode_results_seen = 0;
     // Server: the mask the viewer was granted, and the ceiling that grant
     // established. Mid-session changes may only stay inside the ceiling.
     // Client: the mask the host last announced. Atomic because the transport
@@ -526,6 +566,44 @@ struct QuicSession::Impl {
     size_t input_releases = 0;
     std::deque<ClipboardUpdate> clipboard_updates;
     uint64_t clipboard_received = 0;
+    // Protocol v16 clipboard and file streams.
+    struct ClipboardStream {
+        HQUIC stream = nullptr;
+        std::vector<uint8_t> bytes;
+        bool finished = false;
+    };
+    struct ReceivedUpload {
+        HQUIC stream = nullptr;
+        uint64_t start_offset = 0;
+        uint64_t received = 0;
+        bool finished = false;
+        bool receive_paused = false;
+        std::string error;
+    };
+    struct OutgoingUpload {
+        FileOffer offer;
+        bool accepted = false;
+        bool started = false;
+        bool finished = false;
+        HQUIC stream = nullptr;
+        uint64_t next_offset = 0;
+    };
+    std::vector<ClipboardStream> clipboard_streams;
+    size_t pending_clipboard_bytes = 0;
+    std::deque<ClipboardContent> clipboard_contents;
+    uint64_t clipboard_contents_seen = 0;
+    std::deque<FileOffer> file_offers;
+    uint64_t file_offers_seen = 0;
+    std::deque<FileChunk> file_chunks;
+    size_t buffered_file_bytes = 0;
+    std::map<uint32_t, ReceivedUpload> received_uploads;
+    std::deque<FileCancel> file_cancels;
+    std::map<uint32_t, OutgoingUpload> outgoing_uploads;
+    std::deque<FileAnswer> file_answers;
+    std::deque<FileResult> file_results;
+    // Unidirectional streams this side opened for clipboard changes; their
+    // handles are closed when QUIC reports SHUTDOWN_COMPLETE.
+    std::vector<HQUIC> one_shot_streams;
     // Client: the newest pointer state. A viewer that falls behind wants the
     // current pointer, not a replay, so a newer update replaces an older one
     // that was never taken.
@@ -657,10 +735,18 @@ struct QuicSession::Impl {
                 if (role == Role::Server && !unidirectional) {
                     HQUIC expected = nullptr;
                     accepted = control.compare_exchange_strong(expected, stream);
-                } else if (role == Role::Client && unidirectional) {
-                    // Which media stream this is cannot be told from the start
-                    // event: QUIC does not order two server-initiated streams'
-                    // first bytes. Park it until a RECEIVE names its magic.
+                } else if (unidirectional) {
+                    if (role == Role::Server &&
+                        (session_permissions.load() &
+                         (kPermissionClipboard | kPermissionFileTransfer)) == 0) {
+                        // Neither clipboard nor file streams are granted for
+                        // this session; the HelloAck said so already.
+                        api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                        break;
+                    }
+                    // Which stream this is cannot be told from the start
+                    // event: QUIC does not order unidirectional streams' first
+                    // bytes. Park it until a RECEIVE names its magic.
                     std::lock_guard<std::mutex> lock(mutex);
                     bool known = false;
                     for (const auto& entry : unclassified) {
@@ -754,10 +840,12 @@ struct QuicSession::Impl {
         }
     }
 
-    // Buffers a server-initiated stream until its packet magic identifies it
-    // as video or audio, then moves those bytes into the matching queue.
+    // Buffers a stream until its packet magic identifies it: video/audio on
+    // the viewer, clipboard changes on both ends, file uploads on the host.
+    // Anything else is a peer that is not speaking this protocol version.
     void classify_media_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
-        bool unknown = false;
+        enum class Kind { Wait, Video, Audio, Clipboard, File, Bad };
+        Kind kind = Kind::Wait;
         {
             std::lock_guard<std::mutex> lock(mutex);
             std::vector<uint8_t>* pending = nullptr;
@@ -779,37 +867,230 @@ struct QuicSession::Impl {
                 // Not even the magic is complete; keep waiting.
                 return;
             }
-            std::deque<std::vector<uint8_t>>* queue = nullptr;
             if (std::memcmp(pending->data(), "CFRM", 4) == 0) {
                 HQUIC expected = nullptr;
-                if (video.compare_exchange_strong(expected, stream)) {
-                    queue = &received;
+                if (role == Role::Client && video.compare_exchange_strong(expected, stream)) {
+                    received.push_back(std::move(*pending));
+                    kind = Kind::Video;
+                } else {
+                    kind = Kind::Bad;
                 }
             } else if (std::memcmp(pending->data(), "CAUD", 4) == 0) {
                 HQUIC expected = nullptr;
-                if (audio.compare_exchange_strong(expected, stream)) {
-                    queue = &audio_received;
+                if (role == Role::Client && audio.compare_exchange_strong(expected, stream)) {
+                    audio_received.push_back(std::move(*pending));
+                    kind = Kind::Audio;
+                } else {
+                    kind = Kind::Bad;
+                }
+            } else if (std::memcmp(pending->data(), kClipboardStreamMagic, 4) == 0) {
+                const bool allowed =
+                    role != Role::Server ||
+                    (session_permissions.load() & kPermissionClipboard) != 0;
+                if (!allowed || clipboard_streams.size() >= kMaxClipboardStreams ||
+                    pending_clipboard_bytes + pending->size() > kMaxPendingClipboardBytes) {
+                    kind = Kind::Bad;
+                } else {
+                    ClipboardStream entry;
+                    entry.stream = stream;
+                    entry.bytes = std::move(*pending);
+                    pending_clipboard_bytes += entry.bytes.size();
+                    clipboard_streams.push_back(std::move(entry));
+                    kind = Kind::Clipboard;
+                }
+            } else if (std::memcmp(pending->data(), kFileStreamMagic, 4) == 0) {
+                const bool allowed =
+                    role == Role::Server &&
+                    (session_permissions.load() & kPermissionFileTransfer) != 0;
+                if (!allowed) {
+                    kind = Kind::Bad;
+                } else if (pending->size() < kFileStreamHeaderSize) {
+                    // The fixed prefix has not arrived yet.
+                    return;
+                } else {
+                    FileStreamHeader header;
+                    std::string error;
+                    // The first receive usually carries the header and the
+                    // first chunk together; decode only the fixed prefix.
+                    if (!decode_file_stream_header(pending->data(), kFileStreamHeaderSize,
+                                                   header, &error) ||
+                        received_uploads.count(header.transfer_id) != 0 ||
+                        received_uploads.size() >= kMaxIncomingUploads ||
+                        header.offset > kMaxFileTransferBytes) {
+                        kind = Kind::Bad;
+                    } else {
+                        ReceivedUpload upload;
+                        upload.stream = stream;
+                        upload.start_offset = header.offset;
+                        const auto inserted =
+                            received_uploads.emplace(header.transfer_id, std::move(upload));
+                        if (pending->size() > kFileStreamHeaderSize) {
+                            push_file_chunk_locked(
+                                inserted.first->second, inserted.first->first,
+                                pending->data() + kFileStreamHeaderSize,
+                                pending->size() - kFileStreamHeaderSize, header.offset);
+                        }
+                        kind = Kind::File;
+                    }
                 }
             } else {
-                unknown = true;
+                kind = Kind::Bad;
             }
-            if (queue) {
-                queue->push_back(std::move(*pending));
-            } else if (!unknown) {
-                // A second stream of a kind that already has its slot.
-                unknown = true;
+            if (kind != Kind::Wait) {
+                unclassified.erase(
+                    std::remove_if(unclassified.begin(), unclassified.end(),
+                                   [stream](const std::pair<HQUIC, std::vector<uint8_t>>& entry) {
+                                       return entry.first == stream;
+                                   }),
+                    unclassified.end());
             }
-            unclassified.erase(
-                std::remove_if(unclassified.begin(), unclassified.end(),
-                               [stream](const std::pair<HQUIC, std::vector<uint8_t>>& entry) {
-                                   return entry.first == stream;
-                               }),
-                unclassified.end());
         }
-        if (unknown) {
-            note_transport_failure("the server opened an unusable media stream");
+        if (kind == Kind::Bad) {
+            note_transport_failure("the peer opened an unusable stream");
         }
         cv.notify_all();
+    }
+
+    // Caller holds `mutex` and an entry in received_uploads. Drops every queued
+    // byte of the transfer when the receive window would overflow and marks
+    // the upload as broken; the host then reports IoError.
+    void push_file_chunk_locked(ReceivedUpload& upload, uint32_t id, const uint8_t* data,
+                                size_t size, uint64_t offset) {
+        if (upload.finished) {
+            return;
+        }
+        if (buffered_file_bytes + size > kMaxBufferedFileBytes) {
+            upload.finished = true;
+            upload.error = "the receive queue overflowed";
+            drop_file_chunks_locked(id);
+            if (upload.stream) {
+                api->StreamShutdown(upload.stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+            return;
+        }
+        FileChunk chunk;
+        chunk.transfer_id = id;
+        chunk.offset = offset;
+        chunk.data.assign(data, data + size);
+        upload.received += size;
+        buffered_file_bytes += size;
+        file_chunks.push_back(std::move(chunk));
+    }
+
+    void drop_file_chunks_locked(uint32_t id) {
+        for (auto it = file_chunks.begin(); it != file_chunks.end();) {
+            if (it->transfer_id == id) {
+                buffered_file_bytes -= it->data.size();
+                it = file_chunks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    bool has_active_upload_locked() const {
+        for (const auto& entry : received_uploads) {
+            if (!entry.second.finished) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Appends data of a stream that was already classified as CCLB or CFIL.
+    // Returns false when the handle belongs to neither, so the caller can
+    // classify it from its first bytes.
+    bool route_bulk_stream(HQUIC stream, QUIC_STREAM_EVENT& event, HQUIC* pause) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& entry : clipboard_streams) {
+                if (entry.stream != stream) {
+                    continue;
+                }
+                if (!entry.finished) {
+                    for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+                        const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+                        // Dropping one oversized blob must not end the session:
+                        // abort this stream only and keep the last item.
+                        if (entry.bytes.size() + buffer.Length > kMaxClipboardStreamBytes) {
+                            pending_clipboard_bytes -= entry.bytes.size();
+                            entry.bytes.clear();
+                            entry.finished = true;
+                            api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                            break;
+                        }
+                        entry.bytes.insert(entry.bytes.end(), buffer.Buffer,
+                                           buffer.Buffer + buffer.Length);
+                        pending_clipboard_bytes += buffer.Length;
+                    }
+                }
+                return true;
+            }
+            for (auto& entry : received_uploads) {
+                if (entry.second.stream != stream) {
+                    continue;
+                }
+                // Consuming zero bytes leaves them with MsQuic, which then
+                // withholds credit from the viewer until the host drains the
+                // queue and re-enables this stream.
+                if (!entry.second.finished &&
+                    (entry.second.receive_paused ||
+                     buffered_file_bytes >= kFileReceiveHighWaterBytes ||
+                     buffered_file_bytes + event.RECEIVE.TotalBufferLength >
+                         kMaxBufferedFileBytes)) {
+                    entry.second.receive_paused = true;
+                    event.RECEIVE.TotalBufferLength = 0;
+                    *pause = stream;
+                    return true;
+                }
+                for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+                    const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+                    push_file_chunk_locked(
+                        entry.second, entry.first, buffer.Buffer, buffer.Length,
+                        entry.second.start_offset + entry.second.received);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Caller holds `mutex`. Hands back every stream handle this side still owns
+    // for clipboard/file traffic and forgets all of it, so a session reset
+    // cannot leak a stream or carry a half-received item into the next one.
+    std::vector<HQUIC> detach_bulk_streams_locked() {
+        std::vector<HQUIC> handles;
+        for (auto& entry : clipboard_streams) {
+            if (entry.stream) {
+                handles.push_back(entry.stream);
+            }
+        }
+        for (auto& entry : received_uploads) {
+            if (entry.second.stream) {
+                handles.push_back(entry.second.stream);
+            }
+        }
+        for (auto& entry : outgoing_uploads) {
+            if (entry.second.stream) {
+                handles.push_back(entry.second.stream);
+            }
+        }
+        handles.insert(handles.end(), one_shot_streams.begin(), one_shot_streams.end());
+        clipboard_streams.clear();
+        pending_clipboard_bytes = 0;
+        clipboard_contents.clear();
+        clipboard_contents_seen = 0;
+        file_offers.clear();
+        file_offers_seen = 0;
+        file_chunks.clear();
+        buffered_file_bytes = 0;
+        received_uploads.clear();
+        file_cancels.clear();
+        outgoing_uploads.clear();
+        file_answers.clear();
+        file_results.clear();
+        one_shot_streams.clear();
+        return handles;
     }
 
     QUIC_STATUS on_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
@@ -821,6 +1102,7 @@ struct QuicSession::Impl {
                 }
                 break;
             case QUIC_STREAM_EVENT_RECEIVE: {
+                HQUIC pause_stream = nullptr;
                 if (stream == video.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
                     copy_chunks(received, event);
@@ -847,8 +1129,11 @@ struct QuicSession::Impl {
                     for (const auto& message : messages) {
                         handle_control(message.first, message.second);
                     }
-                } else {
+                } else if (!route_bulk_stream(stream, event, &pause_stream)) {
                     classify_media_stream(stream, event);
+                }
+                if (pause_stream) {
+                    api->StreamReceiveSetEnabled(pause_stream, FALSE);
                 }
                 break;
             }
@@ -869,30 +1154,107 @@ struct QuicSession::Impl {
                         audio_finished = true;
                     } else if (stream == control.load()) {
                         control_finished = true;
+                    } else {
+                        bool matched = false;
+                        for (auto& entry : clipboard_streams) {
+                            if (entry.stream != stream) {
+                                continue;
+                            }
+                            entry.finished = true;
+                            matched = true;
+                            const bool allowed =
+                                role != Role::Server ||
+                                (session_permissions.load() & kPermissionClipboard) != 0;
+                            if (allowed) {
+                                ClipboardContent content;
+                                std::string error;
+                                // A malformed or over-limit blob is dropped,
+                                // not fatal: the session and the last
+                                // clipboard item survive it.
+                                if (decode_clipboard_stream(entry.bytes.data(), entry.bytes.size(),
+                                                            content, &error)) {
+                                    // Clipboard means "the current item"; a
+                                    // slow consumer wants the newest, so the
+                                    // queue is short and drops the oldest.
+                                    while (clipboard_contents.size() >= 4) {
+                                        clipboard_contents.pop_front();
+                                    }
+                                    clipboard_contents.push_back(std::move(content));
+                                    ++clipboard_contents_seen;
+                                }
+                            }
+                            pending_clipboard_bytes -= entry.bytes.size();
+                            entry.bytes.clear();
+                            break;
+                        }
+                        if (!matched) {
+                            for (auto& entry : received_uploads) {
+                                if (entry.second.stream == stream) {
+                                    entry.second.finished = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 cv.notify_all();
                 break;
             }
-            case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-                if (stream == audio.load()) {
-                    // Audio is optional: a broken audio stream ends audio, not
-                    // the video session.
-                    {
-                        std::lock_guard<std::mutex> lock(mutex);
-                        audio_finished = true;
-                    }
-                    cv.notify_all();
-                    break;
-                }
-                note_transport_failure("QUIC peer aborted a stream");
-                if (stream == video.load()) {
+            case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
+                bool fatal = false;
+                {
                     std::lock_guard<std::mutex> lock(mutex);
-                    video_finished = true;
+                    bool bulk = false;
+                    for (auto& entry : clipboard_streams) {
+                        if (entry.stream == stream) {
+                            entry.finished = true;
+                            pending_clipboard_bytes -= entry.bytes.size();
+                            entry.bytes.clear();
+                            bulk = true;
+                            break;
+                        }
+                    }
+                    if (!bulk) {
+                        for (auto& entry : received_uploads) {
+                            if (entry.second.stream == stream) {
+                                entry.second.finished = true;
+                                entry.second.error = "the viewer aborted the upload";
+                                drop_file_chunks_locked(entry.first);
+                                bulk = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!bulk) {
+                        for (auto& entry : outgoing_uploads) {
+                            if (entry.second.stream == stream) {
+                                entry.second.finished = true;
+                                bulk = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (stream == video.load()) {
+                        video_finished = true;
+                        fatal = !bulk;
+                    } else if (stream == audio.load()) {
+                        // Audio is optional: a broken audio stream ends audio,
+                        // not the video session.
+                        audio_finished = true;
+                    } else if (stream == control.load()) {
+                        fatal = true;
+                    } else if (!bulk) {
+                        fatal = true;
+                    }
+                }
+                if (fatal) {
+                    note_transport_failure("QUIC peer aborted a stream");
                 }
                 cv.notify_all();
                 break;
+            }
             case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
+                std::vector<HQUIC> to_close;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     if (stream == video.load()) {
@@ -901,7 +1263,45 @@ struct QuicSession::Impl {
                         audio_shutdown_complete = true;
                     } else if (stream == control.load()) {
                         control_shutdown_complete = true;
+                    } else {
+                        for (auto it = clipboard_streams.begin(); it != clipboard_streams.end();
+                             ++it) {
+                            if (it->stream == stream) {
+                                pending_clipboard_bytes -= it->bytes.size();
+                                it->bytes.clear();
+                                clipboard_streams.erase(it);
+                                to_close.push_back(stream);
+                                break;
+                            }
+                        }
+                        for (auto& entry : received_uploads) {
+                            if (entry.second.stream == stream) {
+                                entry.second.stream = nullptr;
+                                entry.second.finished = true;
+                                to_close.push_back(stream);
+                                break;
+                            }
+                        }
+                        for (auto& entry : outgoing_uploads) {
+                            if (entry.second.stream == stream) {
+                                entry.second.stream = nullptr;
+                                entry.second.finished = true;
+                                to_close.push_back(stream);
+                                break;
+                            }
+                        }
+                        for (auto it = one_shot_streams.begin(); it != one_shot_streams.end();
+                             ++it) {
+                            if (*it == stream) {
+                                one_shot_streams.erase(it);
+                                to_close.push_back(stream);
+                                break;
+                            }
+                        }
                     }
+                }
+                for (HQUIC handle : to_close) {
+                    api->StreamClose(handle);
                 }
                 cv.notify_all();
                 break;
@@ -1141,6 +1541,20 @@ struct QuicSession::Impl {
                     session_permissions = permissions;
                     permission_update_ready = true;
                     ++permission_updates;
+                    if ((permissions & kPermissionClipboard) == 0) {
+                        clipboard_contents.clear();
+                    }
+                    if ((permissions & kPermissionFileTransfer) == 0) {
+                        for (auto& entry : outgoing_uploads) {
+                            if (!entry.second.finished) {
+                                entry.second.finished = true;
+                                if (entry.second.stream) {
+                                    api->StreamShutdown(entry.second.stream,
+                                                        QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                                }
+                            }
+                        }
+                    }
                 }
                 cv.notify_all();
                 break;
@@ -1188,6 +1602,97 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::ListDisplayModes: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint16_t index = 0;
+                if (!parse_list_display_modes(payload, index, &error)) {
+                    note_transport_failure("ListDisplayModes: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_modes_request_display = index;
+                    display_modes_request_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayModes: {
+                if (role != Role::Client) {
+                    break;
+                }
+                DisplayModeList list;
+                if (!parse_display_modes(payload, list, &error)) {
+                    note_transport_failure("DisplayModes: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_modes = std::move(list);
+                    display_modes_ready = true;
+                    ++display_mode_lists_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SetDisplayMode: {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionInput) == 0) {
+                    // Changing the host's mode affects the operator's desktop,
+                    // so it travels with input control like SwitchDisplay.
+                    break;
+                }
+                uint16_t index = 0;
+                uint16_t width = 0;
+                uint16_t height = 0;
+                uint16_t refresh_hz = 0;
+                if (!parse_set_display_mode(payload, index, width, height, refresh_hz,
+                                            &error)) {
+                    note_transport_failure("SetDisplayMode: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    set_display_mode_index = index;
+                    set_display_mode_width = width;
+                    set_display_mode_height = height;
+                    set_display_mode_refresh = refresh_hz;
+                    set_display_mode_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayModeResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                uint16_t index = 0;
+                uint16_t width = 0;
+                uint16_t height = 0;
+                uint16_t refresh_hz = 0;
+                DisplayModeCode code = DisplayModeCode::Failed;
+                std::string reason;
+                if (!parse_display_mode_result(payload, index, width, height, refresh_hz,
+                                               code, reason, &error)) {
+                    note_transport_failure("DisplayModeResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_mode_result_index = index;
+                    display_mode_result_width = width;
+                    display_mode_result_height = height;
+                    display_mode_result_refresh = refresh_hz;
+                    display_mode_code = code;
+                    display_mode_reason = std::move(reason);
+                    display_mode_result_ready = true;
+                    ++display_mode_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::ClipboardUpdate: {
                 if (role == Role::Server &&
                     (session_permissions.load() & kPermissionClipboard) == 0) {
@@ -1226,6 +1731,121 @@ struct QuicSession::Impl {
                     cursor_update = std::move(update);
                     ++cursor_received;
                 }
+                break;
+            }
+            case ControlType::FileOffer: {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionFileTransfer) == 0) {
+                    break;
+                }
+                FileOffer offer;
+                if (!parse_file_offer(payload, offer, &error)) {
+                    note_transport_failure("FileOffer: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // The viewer waits for an answer; dropping an offer past
+                    // the queue is a refusal by silence only when the queue
+                    // never drains, which the host prevents.
+                    if (file_offers.size() >= kMaxQueuedOffers) {
+                        break;
+                    }
+                    file_offers.push_back(std::move(offer));
+                    ++file_offers_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileAnswer: {
+                if (role != Role::Client) {
+                    break;
+                }
+                FileAnswer answer;
+                if (!parse_file_answer(payload, answer, &error)) {
+                    note_transport_failure("FileAnswer: " + error);
+                    break;
+                }
+                bool bad_offset = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto it = outgoing_uploads.find(answer.transfer_id);
+                    if (it != outgoing_uploads.end()) {
+                        if (answer.code == FileCode::Ok) {
+                            if (answer.resume_offset <= it->second.offer.size) {
+                                it->second.accepted = true;
+                                it->second.next_offset = answer.resume_offset;
+                                file_answers.push_back(std::move(answer));
+                            } else {
+                                bad_offset = true;
+                            }
+                        } else {
+                            file_answers.push_back(std::move(answer));
+                        }
+                    }
+                }
+                if (bad_offset) {
+                    note_transport_failure("FileAnswer: resume offset past the file size");
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                FileResult result;
+                if (!parse_file_result(payload, result, &error)) {
+                    note_transport_failure("FileResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto it = outgoing_uploads.find(result.transfer_id);
+                    if (it != outgoing_uploads.end()) {
+                        it->second.finished = true;
+                        // The stream may still be open when the host answers
+                        // early; the handle is closed when the result is taken.
+                        if (it->second.stream) {
+                            api->StreamShutdown(it->second.stream,
+                                                QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                        }
+                    }
+                    while (file_results.size() >= 8) {
+                        file_results.pop_front();
+                    }
+                    file_results.push_back(std::move(result));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileCancel: {
+                if (role != Role::Server) {
+                    break;
+                }
+                FileCancel cancel;
+                if (!parse_file_cancel(payload, cancel, &error)) {
+                    note_transport_failure("FileCancel: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto it = received_uploads.find(cancel.transfer_id);
+                    if (it != received_uploads.end()) {
+                        it->second.finished = true;
+                        it->second.error = "the viewer cancelled the upload";
+                        drop_file_chunks_locked(cancel.transfer_id);
+                        if (it->second.stream) {
+                            api->StreamShutdown(it->second.stream,
+                                                QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                        }
+                    }
+                    while (file_cancels.size() >= 8) {
+                        file_cancels.pop_front();
+                    }
+                    file_cancels.push_back(std::move(cancel));
+                }
+                cv.notify_all();
                 break;
             }
             default:
@@ -1295,6 +1915,48 @@ struct QuicSession::Impl {
 
     Error send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
         return send_bytes_impl(stream, std::move(bytes), flags, true);
+    }
+
+    // A non-blocking capacity probe. The caller checks before touching any
+    // stream state, so a full queue never leaves a half-started upload.
+    bool has_send_capacity(size_t bytes) {
+        std::lock_guard<std::mutex> lock(send_mutex);
+        return in_flight_sends < kMaxInFlightSends &&
+               in_flight_bytes + bytes <= kMaxInFlightBytes;
+    }
+
+    // A FIN with no payload; MsQuic allows a zero-length send.
+    Error send_stream_fin(HQUIC stream) {
+        if (!stream) {
+            return Error(Status::Unavailable, "no stream is open");
+        }
+        {
+            std::unique_lock<std::mutex> lock(send_mutex);
+            send_cv.wait(lock, [this] {
+                return (in_flight_sends < kMaxInFlightSends &&
+                        in_flight_bytes < kMaxInFlightBytes) ||
+                       transport_down.load();
+            });
+            if (transport_down.load()) {
+                return Error(Status::Unavailable, "connection closed before send");
+            }
+            ++in_flight_sends;
+        }
+        auto* pending = new PendingSend;
+        static uint8_t empty = 0;
+        pending->buffer.Buffer = &empty;
+        pending->buffer.Length = 0;
+        const QUIC_STATUS status =
+            api->StreamSend(stream, &pending->buffer, 1, QUIC_SEND_FLAG_FIN, pending);
+        if (QUIC_FAILED(status)) {
+            release_send(0);
+            delete pending;
+            if (status == QUIC_STATUS_ABORTED || status == QUIC_STATUS_INVALID_STATE) {
+                return Error(Status::Unavailable, "the connection closed before the send");
+            }
+            return quic_error(status, "QUIC StreamSend(FIN)");
+        }
+        return Error::success();
     }
 
     bool try_send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
@@ -1372,6 +2034,19 @@ struct QuicSession::Impl {
         if (HQUIC handle = control.exchange(nullptr)) {
             api->StreamClose(handle);
         }
+        std::vector<HQUIC> bulk;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto& entry : unclassified) {
+                bulk.push_back(entry.first);
+            }
+            unclassified.clear();
+            std::vector<HQUIC> more = detach_bulk_streams_locked();
+            bulk.insert(bulk.end(), more.begin(), more.end());
+        }
+        for (HQUIC handle : bulk) {
+            api->StreamClose(handle);
+        }
         if (connection_handle) {
             // No callback runs for this handle after ConnectionClose returns,
             // so the state can be cleared without a late event overwriting it.
@@ -1401,6 +2076,24 @@ struct QuicSession::Impl {
             display_switch_code = DisplaySwitchCode::Ok;
             display_switch_reason.clear();
             display_switch_results_seen = 0;
+            display_modes_request_ready = false;
+            display_modes_request_display = 0;
+            display_modes_ready = false;
+            display_modes = DisplayModeList{};
+            display_mode_lists_seen = 0;
+            set_display_mode_ready = false;
+            set_display_mode_index = 0;
+            set_display_mode_width = 0;
+            set_display_mode_height = 0;
+            set_display_mode_refresh = 0;
+            display_mode_result_ready = false;
+            display_mode_result_index = 0;
+            display_mode_result_width = 0;
+            display_mode_result_height = 0;
+            display_mode_result_refresh = 0;
+            display_mode_code = DisplayModeCode::Ok;
+            display_mode_reason.clear();
+            display_mode_results_seen = 0;
             session_permissions = 0;
             permission_ceiling = 0;
             permission_update_ready = false;
@@ -1449,6 +2142,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_clipboard) {
             mask |= kPermissionClipboard;
+        }
+        if (server_config.allow_file_transfer) {
+            mask |= kPermissionFileTransfer;
         }
         if (server_config.allow_audio) {
             mask |= kPermissionAudio;
@@ -1519,6 +2215,8 @@ struct QuicSession::Impl {
                 parked.push_back(entry.first);
             }
             unclassified.clear();
+            std::vector<HQUIC> more = detach_bulk_streams_locked();
+            parked.insert(parked.end(), more.begin(), more.end());
         }
         for (HQUIC handle : parked) {
             api->StreamClose(handle);
@@ -1596,9 +2294,15 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     settings.IsSet.IdleTimeoutMs = TRUE;
     settings.KeepAliveIntervalMs = kKeepAliveMs;
     settings.IsSet.KeepAliveIntervalMs = TRUE;
-    // The client may open one bidirectional stream: the control channel.
+    // The client may open one bidirectional stream: the control channel. Its
+    // unidirectional streams carry rich clipboard blobs (at most
+    // kMaxClipboardStreams at once) and one CFIL upload; the cap leaves room
+    // for both plus the streams MsQuic keeps until their FIN is acknowledged.
     settings.PeerBidiStreamCount = 1;
     settings.IsSet.PeerBidiStreamCount = TRUE;
+    settings.PeerUnidiStreamCount = static_cast<uint16_t>(
+        kMaxClipboardStreams + kMaxIncomingUploads + 2);
+    settings.IsSet.PeerUnidiStreamCount = TRUE;
     settings.ServerResumptionLevel = QUIC_SERVER_RESUME_AND_ZERORTT;
     settings.IsSet.ServerResumptionLevel = TRUE;
 
@@ -1685,8 +2389,9 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
     settings.KeepAliveIntervalMs = kKeepAliveMs;
     settings.IsSet.KeepAliveIntervalMs = TRUE;
     // The server opens one unidirectional video stream and, when it shares
-    // system audio, a second for audio. Either may send first.
-    settings.PeerUnidiStreamCount = 2;
+    // system audio, a second for audio. Its rich clipboard blobs use more, so
+    // the cap is the receive-side stream budget rather than two.
+    settings.PeerUnidiStreamCount = static_cast<uint16_t>(kMaxClipboardStreams + 2);
     settings.IsSet.PeerUnidiStreamCount = TRUE;
 
     QUIC_BUFFER alpn{};
@@ -1905,6 +2610,55 @@ Error QuicSession::set_permissions(uint16_t permissions) {
     if ((next & kPermissionInput) == 0 && impl.injector) {
         impl.injector->release_held();
     }
+    if ((next & kPermissionClipboard) == 0) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            for (const auto& entry : impl.clipboard_streams) {
+                if (entry.stream) {
+                    aborts.push_back(entry.stream);
+                }
+            }
+            impl.clipboard_streams.clear();
+            impl.pending_clipboard_bytes = 0;
+            impl.clipboard_contents.clear();
+        }
+        for (HQUIC handle : aborts) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+    }
+    if ((next & kPermissionFileTransfer) == 0) {
+        std::vector<std::pair<uint32_t, uint64_t>> cancelled;
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            for (auto& entry : impl.received_uploads) {
+                if (!entry.second.finished) {
+                    cancelled.emplace_back(entry.first, entry.second.received);
+                    entry.second.finished = true;
+                    entry.second.error = "file transfer was disabled";
+                    if (entry.second.stream) {
+                        aborts.push_back(entry.second.stream);
+                    }
+                }
+            }
+            impl.file_offers.clear();
+            impl.file_chunks.clear();
+            impl.buffered_file_bytes = 0;
+        }
+        for (HQUIC handle : aborts) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+        for (const auto& entry : cancelled) {
+            FileResult result;
+            result.transfer_id = entry.first;
+            result.code = FileCode::Cancelled;
+            result.received = entry.second;
+            result.reason = "file transfer was disabled";
+            impl.try_send_bytes(impl.control.load(), make_file_result(result),
+                                QUIC_SEND_FLAG_NONE);
+        }
+    }
     return impl.send_bytes(impl.control.load(), make_permission_update(next),
                            QUIC_SEND_FLAG_NONE);
 }
@@ -1955,6 +2709,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     const uint16_t granted = impl.session_permissions.load();
     ack.input_enabled = (granted & kPermissionInput) != 0;
     ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
+    ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -2030,6 +2785,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     const uint16_t granted = impl.session_permissions.load();
     update.input_enabled = (granted & kPermissionInput) != 0;
     update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
+    update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -2095,6 +2851,78 @@ uint64_t QuicSession::display_switch_results() const {
     return impl_->display_switch_results_seen;
 }
 
+Error QuicSession::request_display_modes(uint16_t display_index) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_display_modes is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_list_display_modes(display_index),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_modes(DisplayModeList& list) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_modes_ready) {
+        return false;
+    }
+    list = impl_->display_modes;
+    impl_->display_modes_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::display_mode_lists() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->display_mode_lists_seen;
+}
+
+Error QuicSession::request_set_display_mode(uint16_t display_index, uint16_t width,
+                                            uint16_t height, uint16_t refresh_hz) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_set_display_mode is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+            return Error(Status::PermissionDenied, "input is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(),
+                           make_set_display_mode(display_index, width, height, refresh_hz),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_mode_result(uint16_t& display_index, uint16_t& width,
+                                           uint16_t& height, uint16_t& refresh_hz,
+                                           DisplayModeCode& code, std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_mode_result_ready) {
+        return false;
+    }
+    display_index = impl_->display_mode_result_index;
+    width = impl_->display_mode_result_width;
+    height = impl_->display_mode_result_height;
+    refresh_hz = impl_->display_mode_result_refresh;
+    code = impl_->display_mode_code;
+    reason = impl_->display_mode_reason;
+    impl_->display_mode_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::display_mode_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->display_mode_results_seen;
+}
+
 Error QuicSession::send_frame(FrameHeader header, const uint8_t* payload, size_t size) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
@@ -2147,6 +2975,58 @@ Error QuicSession::send_display_switch_result(uint16_t display_index, DisplaySwi
     }
     return impl.send_bytes(impl.control.load(),
                            make_display_switch_result(display_index, code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_list_display_modes_request(uint16_t& display_index) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_modes_request_ready) {
+        return false;
+    }
+    display_index = impl_->display_modes_request_display;
+    impl_->display_modes_request_ready = false;
+    return true;
+}
+
+Error QuicSession::send_display_modes(const DisplayModeList& list) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_display_modes is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_display_modes(list),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_set_display_mode_request(uint16_t& display_index, uint16_t& width,
+                                                uint16_t& height, uint16_t& refresh_hz) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->set_display_mode_ready) {
+        return false;
+    }
+    display_index = impl_->set_display_mode_index;
+    width = impl_->set_display_mode_width;
+    height = impl_->set_display_mode_height;
+    refresh_hz = impl_->set_display_mode_refresh;
+    impl_->set_display_mode_ready = false;
+    return true;
+}
+
+Error QuicSession::send_display_mode_result(uint16_t display_index, uint16_t width,
+                                            uint16_t height, uint16_t refresh_hz,
+                                            DisplayModeCode code, const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_display_mode_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(),
+                           make_display_mode_result(display_index, width, height, refresh_hz,
+                                                    code, reason),
                            QUIC_SEND_FLAG_NONE);
 }
 
@@ -2605,6 +3485,444 @@ bool QuicSession::take_clipboard_update(ClipboardUpdate& update) {
 uint64_t QuicSession::clipboard_updates_received() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->clipboard_received;
+}
+
+Error QuicSession::send_clipboard_content(ClipboardContent content) {
+    std::vector<uint8_t> bytes = encode_clipboard_stream(content);
+    if (bytes.empty()) {
+        return Error(Status::InvalidCall, "invalid clipboard content");
+    }
+    return send_clipboard_blob(std::move(bytes));
+}
+
+Error QuicSession::send_clipboard_blob(std::vector<uint8_t> blob) {
+    Impl& impl = *impl_;
+    if (impl.role == Impl::Role::Server) {
+        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+            return Error(Status::PermissionDenied, "clipboard is disabled for this session");
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionClipboard) == 0) {
+            return Error(Status::PermissionDenied, "clipboard is disabled by the host");
+        }
+    }
+    if (blob.empty()) {
+        return Error(Status::InvalidCall, "the clipboard blob is empty");
+    }
+    HQUIC stream = nullptr;
+    const QUIC_STATUS status = impl.api->StreamOpen(
+        impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+        &Impl::stream_callback, &impl, &stream);
+    if (QUIC_FAILED(status)) {
+        return quic_error(status, "QUIC StreamOpen(clipboard)");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.one_shot_streams.push_back(stream);
+    }
+    Error sent = impl.send_bytes(
+        stream, std::move(blob),
+        static_cast<QUIC_SEND_FLAGS>(QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN));
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = std::find(impl.one_shot_streams.begin(), impl.one_shot_streams.end(),
+                                  stream);
+        if (it != impl.one_shot_streams.end()) {
+            impl.one_shot_streams.erase(it);
+        }
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+    }
+    return sent;
+}
+
+bool QuicSession::take_clipboard_content(ClipboardContent& content) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->clipboard_contents.empty()) {
+        return false;
+    }
+    content = std::move(impl_->clipboard_contents.front());
+    impl_->clipboard_contents.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::clipboard_contents_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->clipboard_contents_seen;
+}
+
+bool QuicSession::take_file_offer(FileOffer& offer) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_offers.empty()) {
+        return false;
+    }
+    offer = std::move(impl_->file_offers.front());
+    impl_->file_offers.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::file_offers_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->file_offers_seen;
+}
+
+Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_t resume_offset,
+                                    const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_file_answer is a server operation");
+    }
+    if (code != FileCode::Ok && resume_offset != 0) {
+        return Error(Status::InvalidCall, "only an accepted upload carries a resume offset");
+    }
+    if (code != FileCode::Ok) {
+        HQUIC stream = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.received_uploads.find(transfer_id);
+            if (it != impl.received_uploads.end()) {
+                stream = it->second.stream;
+                impl.drop_file_chunks_locked(transfer_id);
+                impl.received_uploads.erase(it);
+            }
+        }
+        if (stream) {
+            impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            impl.api->StreamClose(stream);
+        }
+    }
+    FileAnswer answer;
+    answer.transfer_id = transfer_id;
+    answer.code = code;
+    answer.resume_offset = resume_offset;
+    answer.reason = reason;
+    return impl.send_bytes(impl.control.load(), make_file_answer(answer), QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::receive_file_chunk(FileChunk& chunk, std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "receive_file_chunk is a server operation");
+    }
+    HQUIC resume = nullptr;
+    Error result = Error::success();
+    {
+        std::unique_lock<std::mutex> lock(impl.mutex);
+        impl.cv.wait_for(lock, timeout, [&impl] {
+            return !impl.file_chunks.empty() || impl.transport_down.load() ||
+                   !impl.has_active_upload_locked();
+        });
+        if (!impl.file_chunks.empty()) {
+            chunk = std::move(impl.file_chunks.front());
+            impl.file_chunks.pop_front();
+            impl.buffered_file_bytes -= chunk.data.size();
+            if (impl.buffered_file_bytes <= kFileReceiveLowWaterBytes) {
+                for (auto& entry : impl.received_uploads) {
+                    if (entry.second.receive_paused) {
+                        entry.second.receive_paused = false;
+                        resume = entry.second.stream;
+                        break;
+                    }
+                }
+            }
+        } else if (impl.transport_failed) {
+            result = Error(impl.transport_status, impl.transport_message);
+        } else if (!impl.has_active_upload_locked()) {
+            result = Error(Status::Unavailable, "no file upload is active");
+        } else {
+            result = Error(Status::WaitTimeout, "no file data arrived in time");
+        }
+    }
+    if (resume) {
+        impl.api->StreamReceiveSetEnabled(resume, TRUE);
+    }
+    return result;
+}
+
+bool QuicSession::file_upload_state(uint32_t transfer_id, FileUploadState& state) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->received_uploads.find(transfer_id);
+    if (it == impl_->received_uploads.end()) {
+        return false;
+    }
+    state.resume_offset = it->second.start_offset;
+    state.received = it->second.received;
+    state.error = it->second.error;
+    bool queued = false;
+    for (const FileChunk& chunk : impl_->file_chunks) {
+        if (chunk.transfer_id == transfer_id) {
+            queued = true;
+            break;
+        }
+    }
+    state.finished = it->second.finished && !queued;
+    return true;
+}
+
+Error QuicSession::send_file_result(uint32_t transfer_id, FileCode code, uint64_t received,
+                                   const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_file_result is a server operation");
+    }
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.received_uploads.find(transfer_id);
+        if (it != impl.received_uploads.end()) {
+            stream = it->second.stream;
+            impl.drop_file_chunks_locked(transfer_id);
+            impl.received_uploads.erase(it);
+        }
+    }
+    if (stream) {
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+    }
+    FileResult result;
+    result.transfer_id = transfer_id;
+    result.code = code;
+    result.received = received;
+    result.reason = reason;
+    return impl.send_bytes(impl.control.load(), make_file_result(result), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_cancel(FileCancel& cancel) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_cancels.empty()) {
+        return false;
+    }
+    cancel = std::move(impl_->file_cancels.front());
+    impl_->file_cancels.pop_front();
+    return true;
+}
+
+Error QuicSession::offer_file(const FileOffer& offer) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "offer_file is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            return Error(Status::PermissionDenied, "file transfer is disabled by the host");
+        }
+        if (impl.outgoing_uploads.count(offer.transfer_id) != 0) {
+            return Error(Status::InvalidCall, "the transfer id is already in use");
+        }
+        if (impl.outgoing_uploads.size() >= 8) {
+            return Error(Status::WaitTimeout, "too many uploads are already open");
+        }
+    }
+    std::vector<uint8_t> message = make_file_offer(offer);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the offer is not encodable");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        Impl::OutgoingUpload upload;
+        upload.offer = offer;
+        impl.outgoing_uploads.emplace(offer.transfer_id, std::move(upload));
+    }
+    Error sent = impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.outgoing_uploads.erase(offer.transfer_id);
+    }
+    return sent;
+}
+
+bool QuicSession::take_file_answer(FileAnswer& answer) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_answers.empty()) {
+        return false;
+    }
+    answer = std::move(impl_->file_answers.front());
+    impl_->file_answers.pop_front();
+    if (answer.code != FileCode::Ok) {
+        const auto it = impl_->outgoing_uploads.find(answer.transfer_id);
+        if (it != impl_->outgoing_uploads.end()) {
+            it->second.finished = true;
+        }
+    }
+    return true;
+}
+
+Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_file_data is a client operation");
+    }
+    if (!data || size == 0 || size > kFileChunkBytes) {
+        return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
+    }
+    HQUIC stream = nullptr;
+    std::vector<uint8_t> bytes;
+    bool starting = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.outgoing_uploads.find(transfer_id);
+        if (it == impl.outgoing_uploads.end() || !it->second.accepted ||
+            it->second.finished) {
+            return Error(Status::InvalidCall, "the upload was not accepted");
+        }
+        Impl::OutgoingUpload& upload = it->second;
+        if (!upload.started) {
+            QUIC_STATUS status = impl.api->StreamOpen(
+                impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+                &Impl::stream_callback, &impl, &upload.stream);
+            if (QUIC_FAILED(status)) {
+                return quic_error(status, "QUIC StreamOpen(upload)");
+            }
+            upload.started = true;
+            starting = true;
+            FileStreamHeader header;
+            header.transfer_id = transfer_id;
+            header.offset = upload.next_offset;
+            bytes.resize(kFileStreamHeaderSize + size);
+            encode_file_stream_header(header, bytes.data());
+            std::memcpy(bytes.data() + kFileStreamHeaderSize, data, size);
+        } else {
+            bytes.assign(data, data + size);
+        }
+        stream = upload.stream;
+        upload.next_offset += size;
+    }
+    Error sent = impl.send_bytes(stream, std::move(bytes),
+                                 starting ? QUIC_SEND_FLAG_START : QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        HQUIC handle = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.outgoing_uploads.find(transfer_id);
+            if (it != impl.outgoing_uploads.end()) {
+                handle = it->second.stream;
+                it->second.stream = nullptr;
+                it->second.finished = true;
+                impl.outgoing_uploads.erase(it);
+            }
+        }
+        if (handle) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            impl.api->StreamClose(handle);
+        }
+    }
+    return sent;
+}
+
+Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_file_data is a client operation");
+    }
+    if (!data || size == 0 || size > kFileChunkBytes) {
+        return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
+    }
+    if (!impl.has_send_capacity(size + kFileStreamHeaderSize)) {
+        return Error(Status::WaitTimeout, "send queue is full");
+    }
+    return send_file_data(transfer_id, data, size);
+}
+
+Error QuicSession::finish_file_upload(uint32_t transfer_id) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "finish_file_upload is a client operation");
+    }
+    HQUIC stream = nullptr;
+    bool starting = false;
+    std::vector<uint8_t> header_bytes;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.outgoing_uploads.find(transfer_id);
+        if (it == impl.outgoing_uploads.end() || !it->second.accepted ||
+            it->second.finished) {
+            return Error(Status::InvalidCall, "the upload was not accepted");
+        }
+        Impl::OutgoingUpload& upload = it->second;
+        if (!upload.started) {
+            // A zero-byte file never called send_file_data(); the stream still
+            // needs its header so the host can match it to the offer.
+            QUIC_STATUS status = impl.api->StreamOpen(
+                impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+                &Impl::stream_callback, &impl, &upload.stream);
+            if (QUIC_FAILED(status)) {
+                return quic_error(status, "QUIC StreamOpen(upload)");
+            }
+            upload.started = true;
+            starting = true;
+            FileStreamHeader header;
+            header.transfer_id = transfer_id;
+            header.offset = upload.next_offset;
+            header_bytes.resize(kFileStreamHeaderSize);
+            encode_file_stream_header(header, header_bytes.data());
+        }
+        stream = upload.stream;
+    }
+    Error sent = starting
+                     ? impl.send_bytes(
+                           stream, std::move(header_bytes),
+                           static_cast<QUIC_SEND_FLAGS>(QUIC_SEND_FLAG_START |
+                                                        QUIC_SEND_FLAG_FIN))
+                     : impl.send_stream_fin(stream);
+    if (sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.outgoing_uploads.find(transfer_id);
+        if (it != impl.outgoing_uploads.end()) {
+            it->second.finished = true;
+        }
+    }
+    return sent;
+}
+
+void QuicSession::cancel_file_upload(uint32_t transfer_id) {
+    Impl& impl = *impl_;
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.outgoing_uploads.find(transfer_id);
+        if (it == impl.outgoing_uploads.end()) {
+            return;
+        }
+        stream = it->second.stream;
+        it->second.stream = nullptr;
+        impl.outgoing_uploads.erase(it);
+    }
+    if (stream) {
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+    }
+}
+
+bool QuicSession::take_file_result(FileResult& result) {
+    Impl& impl = *impl_;
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.file_results.empty()) {
+            return false;
+        }
+        result = std::move(impl.file_results.front());
+        impl.file_results.pop_front();
+        const auto it = impl.outgoing_uploads.find(result.transfer_id);
+        if (it != impl.outgoing_uploads.end()) {
+            stream = it->second.stream;
+            it->second.stream = nullptr;
+            impl.outgoing_uploads.erase(it);
+        }
+    }
+    if (stream) {
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+    }
+    return true;
 }
 
 Error QuicSession::send_cursor(const CursorUpdate& update) {

@@ -6,6 +6,7 @@
 // deal in inert strings and byte vectors: a password hash, a TOTP secret,
 // a protected blob and an ECDSA device key.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -37,6 +38,33 @@ bool base64_decode(const std::string& text, std::vector<uint8_t>& out);
 
 // Constant-time equality for secrets. Length is allowed to leak.
 bool constant_time_equal(const void* a, const void* b, size_t size);
+
+// ----- hashing -----
+
+// Incremental SHA-256 for content hashing (clipboard echo suppression, file
+// digests). update() may be called any number of times; finish() drains the
+// object, so a second digest needs reset(). ready() is false when the OS
+// provider could not be opened.
+class Sha256 {
+public:
+    Sha256();
+    ~Sha256();
+    Sha256(const Sha256&) = delete;
+    Sha256& operator=(const Sha256&) = delete;
+    Sha256(Sha256&&) noexcept;
+    Sha256& operator=(Sha256&&) noexcept;
+
+    bool update(const void* data, size_t size);
+    bool finish(std::array<uint8_t, 32>& digest);
+    void reset();
+    bool ready() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+bool sha256(const uint8_t* data, size_t size, std::array<uint8_t, 32>& digest);
 
 // ----- password hashing -----
 

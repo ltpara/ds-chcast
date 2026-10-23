@@ -16,6 +16,8 @@
 #include "chast/bitrate_controller.h"
 #include "chast/capture.h"
 #include "chast/clipboard.h"
+#include "chast/display_mode.h"
+#include "chast/file_transfer.h"
 
 namespace chast {
 
@@ -56,6 +58,9 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_audio) {
         mask |= kPermissionAudio;
+    }
+    if (settings.allow_file_transfer) {
+        mask |= kPermissionFileTransfer;
     }
     return mask;
 }
@@ -103,11 +108,12 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
 // The description HelloAck and StreamInfo carry. `display` is the output the
 // capturer is reading, `attached` the full list from the moment of the call.
 // `source_width`/`source_height` are the captured frame; the encoder's size may
-// be smaller when adaptive resolution scaled it.
+// be smaller when adaptive resolution scaled it. `permissions` is the session
+// mask currently in force.
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
                            const DisplayInfo& display, const IVideoEncoder& encoder,
                            UINT source_width, UINT source_height, uint16_t framerate,
-                           bool clipboard_enabled, const AudioInfo& audio) {
+                           uint16_t permissions, const AudioInfo& audio) {
     ServerInfo info;
     info.codec = encoder.codec();
     info.width = static_cast<uint16_t>(encoder.width());
@@ -118,7 +124,8 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.bitrate = encoder.bitrate();
     info.origin_x = display.rect.left;
     info.origin_y = display.rect.top;
-    info.clipboard_enabled = clipboard_enabled;
+    info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
+    info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
     for (const DisplayInfo& listed : attached) {
@@ -178,17 +185,60 @@ std::string permission_names(uint16_t mask) {
     if ((mask & kPermissionAudio) != 0) {
         add("audio");
     }
+    if ((mask & kPermissionFileTransfer) != 0) {
+        add("file transfer");
+    }
     return text.empty() ? "view only" : text;
 }
+
+// Puts a session's temporary display mode back when the session ends, however
+// it ends: the viewer left, the run stopped, or an error unwound the loop.
+class ModeRestoreGuard {
+public:
+    ModeRestoreGuard(std::unique_ptr<DisplayModeChange>& change,
+                     std::function<void(const std::string&)> log)
+        : change_(change), log_(std::move(log)) {}
+    ModeRestoreGuard(const ModeRestoreGuard&) = delete;
+    ModeRestoreGuard& operator=(const ModeRestoreGuard&) = delete;
+    ~ModeRestoreGuard() {
+        if (!change_ || !change_->has_saved()) {
+            return;
+        }
+        std::string error;
+        switch (change_->restore(&error)) {
+            case ModeRestore::Restored:
+                log_("display mode restored to the one from before the session");
+                break;
+            case ModeRestore::Skipped:
+                log_("display mode left alone: it was changed outside the session");
+                break;
+            case ModeRestore::Failed:
+                log_("display mode restore failed: " + error);
+                break;
+            case ModeRestore::None:
+                break;
+        }
+    }
+
+private:
+    std::unique_ptr<DisplayModeChange>& change_;
+    std::function<void(const std::string&)> log_;
+};
 
 }  // namespace
 
 std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::string* error) {
     if (!config.clipboard_read) {
-        config.clipboard_read = [](std::string& text) { return read_clipboard_text(text); };
+        config.clipboard_read = [](ClipboardContent& content) {
+            std::string ignored;
+            return read_clipboard(content, &ignored);
+        };
     }
     if (!config.clipboard_write) {
-        config.clipboard_write = [](const std::string& text) { return write_clipboard_text(text); };
+        config.clipboard_write = [](const ClipboardContent& content) {
+            std::string ignored;
+            return write_clipboard(content, &ignored);
+        };
     }
     std::unique_ptr<HostServer> server(new HostServer(std::move(config)));
     if (server->settings_.access_token.empty()) {
@@ -260,6 +310,7 @@ bool HostServer::open_session(std::string* error) {
     quic.identity_scope = config_.identity_scope;
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
+    quic.allow_file_transfer = settings_.allow_file_transfer;
     quic.allow_audio = settings_.allow_audio;
     quic.allow_permission_change = settings_.allow_permission_change;
     quic.dry_run_input = config_.dry_run_input;
@@ -664,6 +715,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         return false;
     }
 
+    // A viewer-picked resolution is temporary: this object remembers the mode
+    // the output ran before the session, and the guard puts it back on every
+    // exit path. Declared before the capturer so the mode is restored even when
+    // an early error stops the session.
+    std::unique_ptr<DisplayModeChange> mode_change = std::make_unique<DisplayModeChange>();
+    ModeRestoreGuard mode_guard(mode_change,
+                                [this](const std::string& message) { log(message); });
+
     size_t display_index = attached.size();
     const uint16_t requested = session_->requested_display();
     if (requested != kDisplayAuto) {
@@ -794,8 +853,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     ServerInfo stream_info =
         describe_stream(attached, capturer->display(), *encoder, first.width, first.height,
-                        static_cast<uint16_t>(framerate),
-                        (granted_permissions & kPermissionClipboard) != 0, audio_info);
+                        static_cast<uint16_t>(framerate), granted_permissions, audio_info);
     publish_stream(stream_info, find_display(attached, capturer->display()),
                    display_name_utf8(capturer->display()));
     if (config_.stream_announced) {
@@ -899,15 +957,40 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                (session_->permissions() & kPermissionClipboard) != 0;
     };
     bool clipboard_was_allowed = clipboard_allowed();
-    std::string last_clipboard;
-    if (clipboard_was_allowed) {
-        std::string current;
+    ClipboardContent last_clipboard;
+    uint64_t last_clipboard_hash = 0;
+    auto remember_local_clipboard = [&] {
+        ClipboardContent current;
         if (config_.clipboard_read(current)) {
+            last_clipboard_hash = clipboard_content_hash(current);
             last_clipboard = std::move(current);
         }
+    };
+    if (clipboard_was_allowed) {
+        remember_local_clipboard();
     }
     uint64_t clipboard_seq = 1;
     auto next_clipboard_poll = Clock::now() + std::chrono::milliseconds(500);
+
+    auto apply_peer_clipboard = [&](ClipboardContent content) {
+        const uint64_t hash = clipboard_content_hash(content);
+        if (hash == last_clipboard_hash) {
+            return;
+        }
+        std::string content_error;
+        if (!valid_clipboard_content(content, &content_error)) {
+            log("clipboard: the viewer sent unusable content: " + content_error);
+            return;
+        }
+        if (!config_.clipboard_write(content)) {
+            return;
+        }
+        // Remembering what was applied is what stops the next poll from
+        // sending it straight back to the viewer.
+        last_clipboard_hash = hash;
+        last_clipboard = std::move(content);
+        ++stats.clipboard_received;
+    };
 
     auto drain_peer = [&] {
         for (const InputEvent& event : session_->take_input_events()) {
@@ -921,17 +1004,21 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (!clipboard_allowed()) {
             return;
         }
+        ClipboardContent content;
+        while (session_->take_clipboard_content(content)) {
+            apply_peer_clipboard(std::move(content));
+        }
+        // A viewer that only speaks the v15 text message still works: treat
+        // its ClipboardUpdate as a text-only item.
         ClipboardUpdate update;
         while (session_->take_clipboard_update(update)) {
-            if (update.text == last_clipboard) {
-                continue;
-            }
-            if (config_.clipboard_write(update.text)) {
-                // Remembering the applied text is what stops the next poll
-                // from sending it straight back to the viewer.
-                last_clipboard = std::move(update.text);
-                ++stats.clipboard_received;
-            }
+            ClipboardContent legacy;
+            legacy.seq = update.seq;
+            ClipboardFormatData text;
+            text.format = ClipboardFormat::Text;
+            text.data.assign(update.text.begin(), update.text.end());
+            legacy.formats.push_back(std::move(text));
+            apply_peer_clipboard(std::move(legacy));
         }
     };
 
@@ -943,10 +1030,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         if (!clipboard_was_allowed) {
             clipboard_was_allowed = true;
-            std::string current;
-            if (config_.clipboard_read(current)) {
-                last_clipboard = std::move(current);
-            }
+            remember_local_clipboard();
             next_clipboard_poll = now + std::chrono::milliseconds(500);
             return;
         }
@@ -954,18 +1038,25 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return;
         }
         next_clipboard_poll = now + std::chrono::milliseconds(500);
-        std::string current;
-        if (!config_.clipboard_read(current) || current == last_clipboard) {
+        ClipboardContent current;
+        if (!config_.clipboard_read(current)) {
             return;
         }
-        // Remember text we cannot put on the wire (too large, embedded NUL)
-        // so every later tick does not retry the same value.
-        const bool sendable = valid_clipboard_text(current);
-        last_clipboard = std::move(current);
-        if (!sendable) {
+        const uint64_t hash = clipboard_content_hash(current);
+        if (hash == last_clipboard_hash) {
             return;
         }
-        Error sent = session_->send_clipboard(clipboard_seq, last_clipboard);
+        // Remember content we cannot put on the wire (oversized or
+        // malformed) so every later tick does not retry the same value.
+        last_clipboard = current;
+        last_clipboard_hash = hash;
+        std::string content_error;
+        if (!valid_clipboard_content(current, &content_error)) {
+            log("clipboard: the local item is not sendable: " + content_error);
+            return;
+        }
+        current.seq = clipboard_seq;
+        Error sent = session_->send_clipboard_content(std::move(current));
         if (!sent.ok()) {
             ++stats.send_errors;
             log("clipboard send failed: " + sent.to_string());
@@ -973,6 +1064,220 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         ++clipboard_seq;
         ++stats.clipboard_sent;
+    };
+
+    // Viewer uploads. One transfer at a time: FileReceiver owns the .part
+    // file and the answer goes out only after the name, the free space and the
+    // resume state checked out.
+    const std::string receive_directory = settings_.file_receive_directory.empty()
+                                              ? default_receive_directory()
+                                              : settings_.file_receive_directory;
+    auto file_transfer_allowed = [&] {
+        return settings_.allow_file_transfer &&
+               (session_->permissions() & kPermissionFileTransfer) != 0;
+    };
+    struct ActiveUpload {
+        FileOffer offer;
+        std::unique_ptr<FileReceiver> receiver;
+        std::chrono::steady_clock::time_point answer_time;
+        uint64_t written = 0;
+    };
+    std::unique_ptr<ActiveUpload> upload;
+
+    // `report=false` is for a revocation the transport already announced to
+    // the viewer; sending a second FileResult would only be noise.
+    auto end_upload = [&](FileCode code, const std::string& reason, bool keep_partial,
+                          bool report = true) {
+        if (!upload) {
+            return;
+        }
+        const uint32_t transfer_id = upload->offer.transfer_id;
+        const uint64_t written = upload->written;
+        const std::string name =
+            upload->receiver ? upload->receiver->name() : upload->offer.name;
+        if (upload->receiver) {
+            upload->receiver->abort(keep_partial);
+        }
+        upload.reset();
+        if (code != FileCode::Ok) {
+            ++stats.file_failures;
+            log("file: " + name + " failed: " + reason);
+        }
+        if (!report) {
+            return;
+        }
+        Error sent = session_->send_file_result(transfer_id, code, written, reason);
+        if (!sent.ok()) {
+            log("file: cannot report the transfer result: " + sent.to_string());
+        }
+    };
+
+    auto drain_file_offers = [&] {
+        FileOffer offer;
+        while (session_->take_file_offer(offer)) {
+            if (!file_transfer_allowed()) {
+                continue;
+            }
+            if (upload) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(offer.transfer_id, FileCode::Busy, 0,
+                                                 "another transfer is running");
+                continue;
+            }
+            if (receive_directory.empty()) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(offer.transfer_id, FileCode::Refused, 0,
+                                                 "the host has no receive directory");
+                log("file: refused " + offer.name + ": no receive directory is configured");
+                continue;
+            }
+            FileReceiveOptions options;
+            options.directory = receive_directory;
+            options.name = offer.name;
+            options.size = offer.size;
+            options.sha256 = offer.sha256;
+            options.allow_resume = offer.resume;
+            uint64_t resume_offset = 0;
+            std::string receive_error;
+            std::unique_ptr<FileReceiver> receiver =
+                FileReceiver::create(options, &resume_offset, &receive_error);
+            if (!receiver) {
+                ++stats.file_failures;
+                (void)session_->send_file_answer(offer.transfer_id, FileCode::Refused, 0,
+                                                 receive_error);
+                log("file: refused " + offer.name + ": " + receive_error);
+                continue;
+            }
+            auto active = std::make_unique<ActiveUpload>();
+            active->offer = std::move(offer);
+            active->receiver = std::move(receiver);
+            active->answer_time = Clock::now();
+            active->written = resume_offset;
+            const uint32_t transfer_id = active->offer.transfer_id;
+            const std::string name = active->receiver->name();
+            upload = std::move(active);
+            Error answered = session_->send_file_answer(transfer_id, FileCode::Ok,
+                                                        resume_offset);
+            if (!answered.ok()) {
+                upload.reset();
+                ++stats.file_failures;
+                log("file: cannot accept " + name + ": " + answered.to_string());
+                continue;
+            }
+            log("file: receiving " + name + " (" + std::to_string(upload->offer.size) +
+                " bytes" +
+                (resume_offset > 0 ? ", resuming at " + std::to_string(resume_offset) : "") +
+                ")");
+        }
+    };
+
+    // Moves every queued chunk into the .part file and turns the transport's
+    // FIN into a digest check and the final rename.
+    auto drain_file_data = [&] {
+        if (!upload) {
+            return;
+        }
+        const uint32_t transfer_id = upload->offer.transfer_id;
+        for (;;) {
+            FileChunk chunk;
+            Error got = session_->receive_file_chunk(chunk, std::chrono::milliseconds(0));
+            if (got.status() == Status::WaitTimeout) {
+                break;
+            }
+            if (got.status() == Status::Unavailable) {
+                FileUploadState state;
+                if (!session_->file_upload_state(transfer_id, state)) {
+                    // The viewer has not opened its CFIL stream yet; a short
+                    // answer-to-stream window is normal.
+                    if (Clock::now() - upload->answer_time < std::chrono::seconds(10)) {
+                        return;
+                    }
+                    end_upload(FileCode::IoError, "the viewer never opened the file stream",
+                               true);
+                    return;
+                }
+                if (state.error.empty() && state.finished) {
+                    // The FIN arrived after the last chunk was taken; the state
+                    // below turns it into the digest check and the rename.
+                    break;
+                }
+                const bool revoked = state.error == "file transfer was disabled";
+                end_upload(revoked ? FileCode::Cancelled : FileCode::IoError,
+                           state.error.empty() ? "the upload stream ended early" : state.error,
+                           true, !revoked);
+                return;
+            }
+            if (!got.ok()) {
+                end_upload(FileCode::IoError, got.to_string(), true);
+                return;
+            }
+            if (chunk.transfer_id != transfer_id) {
+                end_upload(FileCode::IoError, "the upload stream carried another transfer", true);
+                return;
+            }
+            if (chunk.offset != upload->written) {
+                end_upload(FileCode::IoError, "the upload is not contiguous", false);
+                return;
+            }
+            std::string write_error;
+            if (!upload->receiver->write(chunk.data.data(), chunk.data.size(), &write_error)) {
+                end_upload(FileCode::IoError, write_error, false);
+                return;
+            }
+            upload->written += chunk.data.size();
+        }
+        FileUploadState state;
+        if (!session_->file_upload_state(transfer_id, state)) {
+            if (Clock::now() - upload->answer_time < std::chrono::seconds(10)) {
+                return;
+            }
+            end_upload(FileCode::IoError, "the viewer never opened the file stream", true);
+            return;
+        }
+        if (!state.error.empty()) {
+            const bool revoked = state.error == "file transfer was disabled";
+            end_upload(revoked ? FileCode::Cancelled : FileCode::IoError, state.error, true,
+                       !revoked);
+            return;
+        }
+        if (!state.finished) {
+            return;
+        }
+        std::string final_path;
+        std::string finish_error;
+        if (!upload->receiver->finish(final_path, &finish_error)) {
+            // Digest mismatch already removed the partial file; a rename
+            // failure kept it for a resume.
+            end_upload(FileCode::IoError, finish_error, true);
+            return;
+        }
+        const uint64_t bytes = upload->written;
+        upload->receiver.reset();
+        upload.reset();
+        ++stats.files_received;
+        stats.file_bytes_received += bytes;
+        Error sent = session_->send_file_result(transfer_id, FileCode::Ok, bytes);
+        if (!sent.ok()) {
+            log("file: cannot report the completed transfer: " + sent.to_string());
+        }
+        log("file: received " + final_path + " (" + std::to_string(bytes) + " bytes)");
+        if (config_.file_received) {
+            config_.file_received(final_path, bytes);
+        }
+        publish_stats(stats);
+    };
+
+    auto drain_file_cancel = [&] {
+        FileCancel cancel;
+        while (session_->take_file_cancel(cancel)) {
+            if (!upload || cancel.transfer_id != upload->offer.transfer_id) {
+                continue;
+            }
+            end_upload(FileCode::Cancelled,
+                       cancel.reason.empty() ? "the viewer cancelled the transfer"
+                                             : cancel.reason,
+                       false);
+        }
     };
 
     // Audio degrades on its own: a failed endpoint, encoder or send turns the
@@ -1329,6 +1634,28 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             }
         }
 
+        // The abandoned output must not keep a mode this session applied; the
+        // new output starts from its own current mode.
+        if (mode_change->active() &&
+            mode_change->device_name() != next->display().device_name) {
+            std::string restore_error;
+            switch (mode_change->restore(&restore_error)) {
+                case ModeRestore::Restored:
+                    log("display switch: restored the old output's mode");
+                    break;
+                case ModeRestore::Skipped:
+                    log("display switch: the old output's mode was changed elsewhere; "
+                        "keeping it");
+                    break;
+                case ModeRestore::Failed:
+                    log("display switch: could not restore the old output's mode: " +
+                        restore_error);
+                    break;
+                case ModeRestore::None:
+                    break;
+            }
+        }
+
         // Both sides are ready; swap and describe what now runs. `next_frame`
         // points into the capturer the move below hands to `capturer`.
         capturer = std::move(next);
@@ -1345,8 +1672,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         stream_info = describe_stream(attached, capturer->display(), *encoder,
                                       next_frame.width, next_frame.height,
                                       static_cast<uint16_t>(framerate),
-                                      (session_->permissions() & kPermissionClipboard) != 0,
-                                      audio_info);
+                                      session_->permissions(), audio_info);
         publish_stream(stream_info, new_index, display_name_utf8(capturer->display()));
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
@@ -1374,6 +1700,302 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             display_name_utf8(capturer->display()) + "), " +
             std::to_string(stream_info.source_width) + "x" +
             std::to_string(stream_info.source_height) + " source, " +
+            std::to_string(stream_info.width) + "x" + std::to_string(stream_info.height) +
+            " coded");
+        return true;
+    };
+
+    // Mode queries and changes for the streamed output. A list request is
+    // answered from a fresh enumeration; a change is a synchronous rebuild:
+    // the mode is applied, capture is recreated at the new size, a new encoder
+    // is built and announced, and only then does the viewer get Ok. Any
+    // failure puts the old mode back and leaves the old stream running.
+    auto send_mode_list = [&](uint16_t requested_index) -> bool {
+        DisplayModeList answer_list;
+        answer_list.display = requested_index;
+        std::vector<DisplayInfo> fresh = enumerate_displays();
+        std::string list_error;
+        if (fresh.empty()) {
+            answer_list.code = DisplayModeCode::NotFound;
+            answer_list.reason = "no displays are attached";
+        } else if (requested_index >= fresh.size()) {
+            answer_list.code = DisplayModeCode::NotFound;
+            answer_list.reason =
+                "display " + std::to_string(requested_index) + " is not attached";
+        } else {
+            const std::vector<DisplayMode> modes =
+                list_display_modes(fresh[requested_index], &list_error);
+            if (modes.empty()) {
+                answer_list.code = DisplayModeCode::Failed;
+                answer_list.reason =
+                    list_error.empty() ? "the display reports no usable modes" : list_error;
+            } else {
+                for (const DisplayMode& mode : modes) {
+                    DisplayModeInfo info;
+                    info.width = mode.width;
+                    info.height = mode.height;
+                    info.refresh_hz = mode.refresh_hz;
+                    info.current = mode.current;
+                    answer_list.modes.push_back(info);
+                }
+            }
+        }
+        Error sent = session_->send_display_modes(answer_list);
+        if (sent.ok()) {
+            return true;
+        }
+        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "send_display_modes: " + sent.to_string();
+        }
+        return false;
+    };
+
+    bool mode_changed_once = false;
+    Clock::time_point last_mode_change_at{};
+
+    // Recreates capture after ChangeDisplaySettingsExW invalidated the
+    // duplication and waits for a usable NV12 frame. The desktop takes a
+    // moment to settle, so with `exact_size` the output is required to report
+    // the wanted size before the frame wait starts.
+    auto rebuild_after_mode_change = [&](const DisplayMode& wanted, bool exact_size,
+                                         std::string* rebuild_error) -> bool {
+        const auto deadline = Clock::now() + std::chrono::seconds(3);
+        for (;;) {
+            Error reinit = capturer->reinitialize();
+            if (!reinit.ok()) {
+                *rebuild_error = "reinit failed: " + reinit.to_string();
+                if (Clock::now() >= deadline) {
+                    return false;
+                }
+                // A display mode change tears the desktop down and back up;
+                // DuplicateOutput answers E_ACCESSDENIED until the driver has
+                // finished, so retry instead of treating the first refusal as
+                // fatal. The lock step also covers the old duplication's
+                // asynchronous release.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            const DisplayInfo& now_display = capturer->display();
+            if (!exact_size ||
+                (now_display.width == wanted.width && now_display.height == wanted.height)) {
+                break;
+            }
+            if (Clock::now() >= deadline) {
+                *rebuild_error = "the output still reports " +
+                                 std::to_string(now_display.width) + "x" +
+                                 std::to_string(now_display.height);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        // The adaptive-resolution scale survives reinitialize(); applying the
+        // same percentage is a no-op, and a failure leaves the old pass up.
+        Error scaled = capturer->set_nv12_scale(stats.resolution_percent);
+        if (!scaled.ok()) {
+            log("mode change: cannot keep " + std::to_string(stats.resolution_percent) +
+                "% scaling: " + scaled.to_string());
+        }
+        return wait_for_usable_frame(*capturer, true, stopping_,
+                                     std::chrono::milliseconds(3000), rebuild_error);
+    };
+
+    auto change_display_mode = [&](uint16_t requested_index, uint16_t width, uint16_t height,
+                                   uint16_t refresh_hz) -> bool {
+        const auto now = Clock::now();
+        auto answer = [&](DisplayModeCode code, const std::string& reason) {
+            Error sent = session_->send_display_mode_result(requested_index, width, height,
+                                                            refresh_hz, code, reason);
+            if (sent.ok()) {
+                return true;
+            }
+            if (sent.status() == Status::Unavailable ||
+                sent.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "send_display_mode_result: " + sent.to_string();
+            }
+            return false;
+        };
+        auto refuse = [&](DisplayModeCode code, const std::string& reason) {
+            ++stats.display_mode_failures;
+            log("display mode refused: " + reason);
+            return answer(code, reason);
+        };
+
+        if ((session_->permissions() & kPermissionInput) == 0) {
+            return refuse(DisplayModeCode::Failed, "input control is disabled");
+        }
+        if (mode_changed_once && now - last_mode_change_at < std::chrono::seconds(1)) {
+            return answer(DisplayModeCode::Busy, "a display mode change just happened");
+        }
+
+        // Re-enumerate like the switch path: a hotplug can renumber outputs.
+        std::vector<DisplayInfo> fresh = enumerate_displays();
+        if (fresh.empty()) {
+            return refuse(DisplayModeCode::NotFound, "no displays are attached");
+        }
+        if (requested_index >= fresh.size()) {
+            return refuse(DisplayModeCode::NotFound,
+                          "display " + std::to_string(requested_index) + " is not attached");
+        }
+        const DisplayInfo& target_display = fresh[requested_index];
+        if (target_display.device_name != capturer->display().device_name) {
+            return refuse(DisplayModeCode::Failed,
+                          "only the streamed output can change its mode");
+        }
+        std::string mode_error;
+        const std::vector<DisplayMode> modes = list_display_modes(target_display, &mode_error);
+        if (modes.empty()) {
+            return refuse(DisplayModeCode::Failed, mode_error);
+        }
+        const auto wanted =
+            std::find_if(modes.begin(), modes.end(), [&](const DisplayMode& mode) {
+                return mode.width == width && mode.height == height &&
+                       mode.refresh_hz == refresh_hz;
+            });
+        if (wanted == modes.end()) {
+            return refuse(DisplayModeCode::Failed,
+                          "the display does not report " + std::to_string(width) + "x" +
+                              std::to_string(height) + " at " + std::to_string(refresh_hz) +
+                              " Hz");
+        }
+        if (wanted->current) {
+            mode_changed_once = true;
+            last_mode_change_at = now;
+            ++stats.display_mode_changes;
+            log("display mode: already " + std::to_string(width) + "x" +
+                std::to_string(height) + " at " + std::to_string(refresh_hz) + " Hz");
+            return answer(DisplayModeCode::Ok, std::string());
+        }
+
+        // One saved original covers one output. The host restores before it
+        // switches outputs; a request for a different output starts over.
+        if (mode_change->has_saved() &&
+            mode_change->device_name() != target_display.device_name) {
+            if (mode_change->active()) {
+                std::string restore_error;
+                if (mode_change->restore(&restore_error) == ModeRestore::Failed) {
+                    return refuse(DisplayModeCode::Failed,
+                                  "the previous output's mode cannot be restored: " +
+                                      restore_error);
+                }
+            }
+            mode_change = std::make_unique<DisplayModeChange>();
+        }
+        if (!mode_change->save(target_display, &mode_error)) {
+            return refuse(DisplayModeCode::Failed,
+                          "cannot read the current mode: " + mode_error);
+        }
+        if (!mode_change->apply(*wanted, &mode_error)) {
+            return refuse(DisplayModeCode::Failed, "cannot change the mode: " + mode_error);
+        }
+
+        // From here the output runs the new mode; every failure puts the old
+        // one back before the answer goes out and before the old stream is
+        // touched.
+        auto rollback = [&](const std::string& why) {
+            std::string restore_error;
+            switch (mode_change->restore(&restore_error)) {
+                case ModeRestore::Restored:
+                    log("display mode: the old mode is back");
+                    break;
+                case ModeRestore::Skipped:
+                    log("display mode: the mode was changed elsewhere; keeping it");
+                    break;
+                case ModeRestore::Failed:
+                    log("display mode: restoring the old mode failed: " + restore_error);
+                    break;
+                case ModeRestore::None:
+                    break;
+            }
+            std::string rebuild_error;
+            if (!rebuild_after_mode_change(DisplayMode{}, false, &rebuild_error)) {
+                log("display mode: capture did not recover at the old mode: " + rebuild_error);
+            }
+            // The old encoder cannot encode whatever size capture now
+            // publishes; the frame loop builds one and re-announces.
+            encoder.reset();
+            have_input = false;
+            force_keyframe = true;
+            attached = enumerate_displays();
+            return refuse(DisplayModeCode::Failed, why);
+        };
+
+        if (!rebuild_after_mode_change(*wanted, true, &mode_error)) {
+            return rollback("the display produced no frame in the new mode: " + mode_error);
+        }
+        const FrameInfo& mode_frame = capturer->frame();
+        EncoderConfig mode_config = encoder_config;
+        mode_config.width = mode_frame.nv12_width;
+        mode_config.height = mode_frame.nv12_height;
+        const AdapterDevice mode_adapter = capturer->adapter_device();
+        std::unique_ptr<IVideoEncoder> mode_encoder =
+            create_encoder(mode_adapter.device, mode_config, &mode_error);
+        if (!mode_encoder) {
+            return rollback("encoder creation failed: " + mode_error);
+        }
+        if (mode_encoder->codec() != settings_.codec) {
+            log(std::string("the encoder fell back: requested ") + codec_name(settings_.codec) +
+                ", producing " + codec_name(mode_encoder->codec()));
+        }
+        // The replacement starts at the configured bitrate; the audio reserve
+        // and the ABR's current step have to be applied again.
+        const uint32_t mode_fps =
+            stats.framerate != 0 ? stats.framerate : static_cast<uint32_t>(framerate);
+        if (mode_encoder->bitrate() != stats.target_bitrate ||
+            (mode_fps != 0 && mode_encoder->framerate() != mode_fps)) {
+            Error rated = mode_encoder->set_rate(stats.target_bitrate, mode_fps);
+            if (!rated.ok()) {
+                return rollback("cannot apply the current bitrate: " + rated.to_string());
+            }
+        }
+
+        // `mode_frame` points into the capturer, not the encoder, so it stays
+        // valid across the move below.
+        encoder = std::move(mode_encoder);
+        have_input = false;
+        force_keyframe = true;
+        extra_idrs = 1;
+        // The output was re-created: its pointer position and sprite are new.
+        cursor_sent_once = false;
+        cursor_sent = CursorUpdate{};
+        // `fresh` was read before ChangeDisplaySettingsExW, so its rects
+        // describe the old mode. Announce the list as it is now.
+        attached = enumerate_displays();
+        const size_t mode_index = find_display(attached, capturer->display());
+        stream_info = describe_stream(attached, capturer->display(), *encoder,
+                                      mode_frame.width, mode_frame.height,
+                                      static_cast<uint16_t>(framerate),
+                                      session_->permissions(), audio_info);
+        publish_stream(stream_info, mode_index, display_name_utf8(capturer->display()));
+        if (config_.stream_announced) {
+            config_.stream_announced(stream_info);
+        }
+        if (!answer(DisplayModeCode::Ok, std::string())) {
+            return false;
+        }
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "refresh_stream: " + refreshed.to_string();
+            }
+            return false;
+        }
+        ++stats.stream_updates;
+        ++stats.display_mode_changes;
+        mode_changed_once = true;
+        last_mode_change_at = now;
+        publish_stats(stats);
+        log("display mode changed to " + std::to_string(width) + "x" + std::to_string(height) +
+            " at " + std::to_string(refresh_hz) + " Hz, " +
             std::to_string(stream_info.width) + "x" + std::to_string(stream_info.height) +
             " coded");
         return true;
@@ -1541,6 +2163,24 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             drain_peer();
             return clean;
         }
+        uint16_t modes_index = 0;
+        if (session_->take_list_display_modes_request(modes_index) &&
+            !send_mode_list(modes_index)) {
+            const bool clean = error->empty();
+            drain_peer();
+            return clean;
+        }
+        uint16_t mode_index = 0;
+        uint16_t mode_width = 0;
+        uint16_t mode_height = 0;
+        uint16_t mode_refresh = 0;
+        if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
+                                                    mode_refresh) &&
+            !change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
+            const bool clean = error->empty();
+            drain_peer();
+            return clean;
+        }
         if (!apply_pending_permissions()) {
             const bool clean = error->empty();
             drain_peer();
@@ -1549,6 +2189,16 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         drain_audio();
         drain_peer();
         poll_clipboard(now);
+        if (upload && !file_transfer_allowed()) {
+            // The transport already told the viewer and dropped the stream;
+            // keeping the part file lets a later offer resume it.
+            log("file: stopping " + upload->receiver->name() +
+                " because file transfer was revoked");
+            end_upload(FileCode::Cancelled, "file transfer was disabled", true, false);
+        }
+        drain_file_offers();
+        drain_file_data();
+        drain_file_cancel();
         if (now - last_link_sample >= std::chrono::seconds(1)) {
             if (!sample_link(now)) {
                 const bool clean = error->empty();
@@ -1686,11 +2336,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stats.target_bitrate = encoder->bitrate();
             stats.framerate = static_cast<uint16_t>(framerate);
             const std::vector<DisplayInfo> refreshed = enumerate_displays();
+            // The output may have moved or been renumbered while capture was
+            // down; StreamInfo and the pointer origin must describe the list
+            // the viewer is about to receive.
+            attached = refreshed;
             stream_info =
                 describe_stream(refreshed, capturer->display(), *encoder, frame.width,
                                 frame.height, static_cast<uint16_t>(framerate),
-                                (session_->permissions() & kPermissionClipboard) != 0,
-                                audio_info);
+                                session_->permissions(), audio_info);
             publish_stream(stream_info, find_display(refreshed, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {
@@ -1775,8 +2428,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stream_info =
                 describe_stream(attached, capturer->display(), *encoder, frame.width,
                                 frame.height, static_cast<uint16_t>(framerate),
-                                (session_->permissions() & kPermissionClipboard) != 0,
-                                audio_info);
+                                session_->permissions(), audio_info);
             publish_stream(stream_info, find_display(attached, capturer->display()),
                            display_name_utf8(capturer->display()));
             if (config_.stream_announced) {
@@ -1813,6 +2465,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         publish_cursor();
     }
 
+    if (upload) {
+        log("file: " + upload->receiver->name() +
+            " is incomplete; its .part file is kept for a resume");
+        upload->receiver->abort(true);
+        upload.reset();
+    }
     drain_peer();
     return true;
 }

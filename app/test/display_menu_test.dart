@@ -33,6 +33,12 @@ void main() {
     required List<ViewerDisplay> announced,
     required int active,
     required ValueChanged<int> onSelect,
+    List<ViewerDisplayMode> modes = const <ViewerDisplayMode>[],
+    bool modeChangeAvailable = true,
+    ValueChanged<ViewerDisplayMode>? onSelectMode,
+    bool fileAvailable = true,
+    bool fileActive = false,
+    VoidCallback? onSendFile,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -46,13 +52,19 @@ void main() {
           inputAvailable: true,
           clipboardEnabled: true,
           clipboardAvailable: true,
+          fileAvailable: fileAvailable,
+          fileActive: fileActive,
           audioAvailable: true,
           audioMuted: false,
           displays: announced,
           activeDisplay: active,
           onSelectDisplay: onSelect,
+          modes: modes,
+          modeChangeAvailable: modeChangeAvailable,
+          onSelectMode: onSelectMode ?? (_) {},
           onToggleControl: () {},
           onToggleClipboard: () {},
+          onSendFile: onSendFile ?? () {},
           onToggleAudio: () {},
           onTogglePin: () {},
           onToggleStats: () {},
@@ -114,5 +126,83 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('服务端默认'), findsNothing);
     expect(picked, isNull);
+  });
+
+  testWidgets('lists the host modes and reports the pick', (WidgetTester tester) async {
+    ViewerDisplayMode? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      modes: const <ViewerDisplayMode>[
+        ViewerDisplayMode(width: 1920, height: 1080, refresh: 60, current: true),
+        ViewerDisplayMode(width: 2560, height: 1440, refresh: 144),
+      ],
+      onSelectMode: (ViewerDisplayMode mode) => picked = mode,
+    ));
+
+    await tester.tap(find.byIcon(Icons.aspect_ratio_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('1920 × 1080 · 60 Hz'), findsOneWidget);
+    expect(find.text('2560 × 1440 · 144 Hz'), findsOneWidget);
+
+    await tester.tap(find.text('2560 × 1440 · 144 Hz'));
+    await tester.pumpAndSettle();
+    expect(picked?.width, 2560);
+    expect(picked?.height, 1440);
+    expect(picked?.refresh, 144);
+  });
+
+  testWidgets('the resolution picker is inert without input access', (WidgetTester tester) async {
+    ViewerDisplayMode? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      modes: const <ViewerDisplayMode>[
+        ViewerDisplayMode(width: 1920, height: 1080, refresh: 60, current: true),
+      ],
+      modeChangeAvailable: false,
+      onSelectMode: (ViewerDisplayMode mode) => picked = mode,
+    ));
+
+    await tester.tap(find.byIcon(Icons.aspect_ratio_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('1920 × 1080 · 60 Hz'), findsNothing);
+    expect(picked, isNull);
+  });
+
+  testWidgets('the upload button follows the host gate and the active transfer',
+      (WidgetTester tester) async {
+    int taps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onSendFile: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.upload_file_rounded));
+    expect(taps, 1);
+
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      fileAvailable: false,
+      onSendFile: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.upload_file_rounded));
+    expect(taps, 1);
+
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      fileActive: true,
+      onSendFile: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.upload_file_rounded));
+    expect(taps, 1);
   });
 }

@@ -9,6 +9,7 @@
 // pushed to the sink from the worker thread as D3D11 textures while the
 // decoder still owns the surface.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -55,6 +56,18 @@ enum class ViewerState {
     kStreaming,
     kEnded,
     kFailed,
+};
+
+// The viewer's single file upload, as the UI shows it. kHashing covers the
+// local SHA-256 pass that precedes the offer; the last two are terminal states
+// of the most recent attempt (the local file is never modified).
+enum class FilePhase {
+    kIdle = 0,
+    kHashing = 1,
+    kOffered = 2,
+    kSending = 3,
+    kDone = 4,
+    kFailed = 5,
 };
 
 struct ViewerStatus {
@@ -116,13 +129,27 @@ struct ViewerStatus {
     int32_t origin_y = 0;
     uint64_t input_sent = 0;
     uint64_t input_failed = 0;
-    // Clipboard gate from HelloAck, and updates exchanged this session. A
-    // received text stays queued until the UI takes it; counting happens when
-    // it is queued, so a UI that stops polling does not lose the count.
+    // Clipboard gate from HelloAck. Changes are read from and written to the
+    // local Win32 clipboard by the session thread; the counters cover every
+    // rich item exchanged this session. `clipboard_*_formats` is a bitmask of
+    // chast::ClipboardFormat (1 << id) for the most recent item each way.
     bool clipboard_enabled = false;
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
+    uint32_t clipboard_sent_formats = 0;
+    uint32_t clipboard_received_formats = 0;
+    // The viewer's most recent upload. `file_phase` is a FilePhase value;
+    // `file_sent` counts bytes streamed in this attempt (resume offset
+    // included). A failure keeps the local file in place and explains itself
+    // in `file_error`. The counters cover the whole session.
+    FilePhase file_phase = FilePhase::kIdle;
+    std::string file_name;
+    uint64_t file_size = 0;
+    uint64_t file_sent = 0;
+    std::string file_error;
+    uint64_t files_sent = 0;
+    uint64_t file_failures = 0;
     // Pointer: updates received, and whether one is waiting for the UI. The
     // sprite is deliberately not part of ViewerStatus: it can be a quarter of
     // a megabyte and the UI polls the status four times a second, so it is
@@ -163,6 +190,22 @@ struct ViewerStatus {
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
+    // Resolution picker. The engine asks for the streamed output's modes on
+    // demand; display_modes_display says which announced index the newest
+    // answer describes, display_modes_code is the host's DisplayModeCode
+    // (0 = Ok) and display_modes_error its reason. display_mode_changes and
+    // display_mode_failures count SetDisplayMode answers, with the host's
+    // reason for the most recent refusal in display_mode_error (cleared by an
+    // accepted change). The UI compares the counters so two identical
+    // refusals still read as two answers.
+    std::vector<chast::DisplayModeInfo> display_modes;
+    uint16_t display_modes_display = 0;
+    int display_modes_code = 0;
+    std::string display_modes_error;
+    uint64_t display_mode_lists = 0;
+    uint64_t display_mode_changes = 0;
+    uint64_t display_mode_failures = 0;
+    std::string display_mode_error;
 };
 
 class ViewerEngine {
@@ -208,13 +251,31 @@ public:
     // on success and display_switch_error on refusal. The new geometry travels
     // in the StreamInfo the host sends after an accepted switch.
     bool SwitchDisplay(uint16_t display);
-    // Queues one text for the host. Returns false when the server did not
-    // offer clipboard sync, no session is running, the text is invalid, or
-    // the queue already holds the newest text. Only changes should be sent;
-    // echo suppression belongs to the UI.
-    bool SendClipboard(const std::string& text);
-    // Pops the oldest text the host sent. Returns false when none is pending.
-    bool TakeClipboard(std::string& text);
+    // Asks the host for the modes of one announced display. Returns false
+    // when no session is streaming or the display is not in the announced
+    // list. The answer arrives through ViewerStatus::display_modes, which
+    // pairs it with display_modes_display/display_modes_code; listing needs
+    // no input permission.
+    bool RequestDisplayModes(uint16_t display);
+    // Queues a mode change for the streamed output. Returns false when no
+    // session is streaming, the host did not grant input, or the display is
+    // not in the announced list. The answer arrives through
+    // display_mode_changes/display_mode_failures; an accepted change is
+    // followed by a StreamInfo with the new source size. One request is kept:
+    // a newer one replaces an unsent one.
+    bool SetDisplayMode(uint16_t display, uint16_t width, uint16_t height,
+                        uint16_t refresh_hz);
+    // Pauses or resumes the native rich-clipboard bridge. While paused neither
+    // direction touches the local clipboard; resuming starts from a fresh
+    // baseline, so whatever changed in between is not flushed to the host.
+    // The host's own clipboard permission is applied on top of this.
+    void SetClipboardSync(bool enabled);
+    // Queues one local file for upload (viewer -> host). Returns false when
+    // the session is not streaming, the host did not grant file transfer,
+    // another upload is still running, or the file is not a usable regular
+    // file. Hashing runs on its own thread; progress arrives through
+    // ViewerStatus::file_phase.
+    bool SendFile(const std::string& path);
 
     // Copies the newest pointer state the host sent, once per received update.
     // The sprite is only attached to the update that introduced a shape, so a
@@ -234,6 +295,9 @@ private:
              std::string access_token, std::string password, std::string totp,
              bool trust_device);
     void SetState(ViewerState state, std::string error = {});
+    // Hashes the queued file on its own thread, so a multi-gigabyte read never
+    // stalls the session's receive loop.
+    void HashPendingFile();
 
     FrameSink* sink_;
     // Kept alive for the whole session because QuicClientConfig borrows it.
@@ -259,13 +323,40 @@ private:
     std::deque<PendingInput> pending_input_;
     bool input_enabled_ = false;
 
-    // Clipboard crosses between the UI and the session thread the same way:
-    // bounded queues, newest wins for outgoing text because the UI only sends
-    // changes.
-    mutable std::mutex clipboard_mutex_;
-    std::deque<std::string> pending_clipboard_;
-    std::deque<std::string> received_clipboard_;
-    bool clipboard_enabled_ = false;
+    // Native clipboard bridge. The session thread reads the local clipboard
+    // and writes what the host sends; the toggle only crosses as a flag, and
+    // the UI never moves clipboard bytes through Dart.
+    std::atomic<bool> clipboard_sync_{true};
+
+    // The single upload and its hashing thread. `stage` is written by both the
+    // UI (SendFile resets it) and the session thread; fields are copied under
+    // the lock and the file itself is read outside it.
+    struct FileUpload {
+        enum class Stage {
+            kNone,
+            kHashing,
+            kReady,
+            kOffered,
+            kSending,
+            kFinishing,
+            kDone,
+            kFailed,
+        };
+        Stage stage = Stage::kNone;
+        std::string path;
+        std::string name;
+        uint64_t size = 0;
+        uint64_t sent = 0;
+        uint64_t resume_offset = 0;
+        std::array<uint8_t, 32> digest{};
+        uint32_t transfer_id = 0;
+        std::string error;
+    };
+    mutable std::mutex file_mutex_;
+    FileUpload file_;
+    std::thread hasher_;
+    std::atomic<bool> hash_cancel_{false};
+    uint32_t next_file_id_ = 1;
 
     // Pointer state crosses the same way, but only the newest update is kept:
     // a viewer that falls behind wants where the pointer is now, not a replay.
@@ -278,6 +369,19 @@ private:
     // through.
     mutable std::mutex switch_mutex_;
     std::optional<uint16_t> pending_switch_;
+
+    // Mode requests use the same newest-wins slots: a list answer for a
+    // display the picker left is useless, and an unsent mode change is
+    // superseded by the one the operator clicked last.
+    struct PendingMode {
+        uint16_t display = 0;
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint16_t refresh_hz = 0;
+    };
+    mutable std::mutex mode_mutex_;
+    std::optional<uint16_t> pending_mode_list_;
+    std::optional<PendingMode> pending_mode_set_;
 };
 
 }  // namespace chast_viewer

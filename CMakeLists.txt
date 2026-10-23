@@ -55,6 +55,7 @@ target_link_libraries(chast.security PUBLIC chast.base bcrypt crypt32)
 add_library(chast.dxgi STATIC
     src/win/com.cc
     src/capture/display.cc
+    src/capture/display_mode.cc
     src/capture/rotation.cc
     src/capture/shader.cc
     src/capture/hdr_pass.cc
@@ -159,6 +160,23 @@ if("Profile" IN_LIST CMAKE_CONFIGURATION_TYPES)
     endforeach()
 endif()
 
+# Multi-format clipboard content, its CCLB container codec and the Win32
+# clipboard backend. Shared by the host and the viewer; neither knows about
+# capture or network.
+add_library(chast.clipboard STATIC
+    src/clipboard/clipboard.cc
+    src/clipboard/clipboard_win.cc)
+target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32)
+
+# Receive-side file handling: name sanitizing, resumable .part files, digest
+# verification. The receiver side only; the viewer hashes what it sends through
+# the same library.
+add_library(chast.transfer STATIC
+    src/clipboard/file_transfer.cc)
+target_include_directories(chast.transfer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chast.transfer PUBLIC chast.base chast.security shell32)
+
 # chast wire protocol, the MsQuic session and server-side input injection. No
 # DXGI or VPL dependency, so the receiver side links this without the capture
 # stack.
@@ -172,7 +190,7 @@ target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
 # user32 supplies SendInput/GetSystemMetrics for the injector.
-target_link_libraries(chast.net PUBLIC chast.base chast.security msquic crypt32 ncrypt ws2_32 ntdll user32)
+target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -180,14 +198,13 @@ target_link_libraries(chast.net PUBLIC chast.base chast.security msquic crypt32 
 # the other.
 add_library(chast.host STATIC
     src/host/bitrate_controller.cc
-    src/host/clipboard.cc
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio shell32 ole32)
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from
@@ -324,6 +341,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-audio-codec-test tests/audio_codec_test.cc)
     target_link_libraries(chast-audio-codec-test PRIVATE chast.audio)
 
+    # Receive-side file handling: name sanitizing, resumable .part files and
+    # digest verification, all inside a temporary directory.
+    add_executable(chast-file-transfer-test tests/file_transfer_test.cc)
+    target_link_libraries(chast-file-transfer-test PRIVATE chast.transfer)
+
     # Tunnel event parsing, argument construction and child lifecycle. The
     # lifecycle case relaunches this executable as a fake agent.
     add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
@@ -339,10 +361,12 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
+    add_test(NAME file_transfer COMMAND chast-file-transfer-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.
     add_test(NAME quic_loopback
-        COMMAND chast-quic verify --port 45433 --seconds 4 --request-keyframe-ms 1200 --quiet)
+        COMMAND chast-quic verify --port 45433 --seconds 4 --request-keyframe-ms 1200
+                --file-upload --quiet)
     set_tests_properties(quic_loopback PROPERTIES TIMEOUT 120)
 endif()

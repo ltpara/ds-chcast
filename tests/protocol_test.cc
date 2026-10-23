@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "chast/clipboard.h"
 #include "chast/identity.h"
 #include "chast/input.h"
 #include "chast/protocol.h"
@@ -118,7 +119,7 @@ void test_hello() {
     rejects_hello(long_password, "Hello with an oversized password is rejected");
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
-    unknown_permissions[8] = 0x08;  // version, display, token length, password length
+    unknown_permissions[8] = 0x10;  // version, display, token length, password length
     unknown_permissions[9] = 0;
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
@@ -189,6 +190,7 @@ void test_hello_ack() {
     sent.origin_y = -120;
     sent.input_enabled = true;
     sent.clipboard_enabled = true;
+    sent.file_transfer_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -228,7 +230,9 @@ void test_hello_ack() {
           "HelloAck keeps negative virtual-desktop origins");
     check(got.input_enabled, "HelloAck keeps the input flag");
     check(got.clipboard_enabled, "HelloAck keeps the clipboard flag");
-    check(got.input_enabled && got.clipboard_enabled && got.audio.enabled,
+    check(got.file_transfer_enabled, "HelloAck keeps the file transfer flag");
+    check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
+              got.file_transfer_enabled,
           "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
@@ -277,7 +281,7 @@ void test_hello_ack() {
     std::vector<uint8_t> unknown_flags = ack_payload();
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
-    unknown_flags[kFlagsAt] = 0x08;
+    unknown_flags[kFlagsAt] = 0x10;
     unknown_flags[kFlagsAt + 1] = 0;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
@@ -334,25 +338,29 @@ void test_hello_ack() {
     rejects_ack(std::move(mask_mismatch),
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
-    unknown_permissions[unknown_permissions.size() - 2] = 0x08;
+    unknown_permissions[unknown_permissions.size() - 2] = 0x10;
     unknown_permissions[unknown_permissions.size() - 1] = 0;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
 
     sent.input_enabled = false;
     sent.clipboard_enabled = false;
+    sent.file_transfer_enabled = false;
     sent.audio.enabled = false;
     sent.audio.extradata.clear();
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
               !disabled.input_enabled && !disabled.clipboard_enabled &&
-              !disabled.audio.enabled,
-          "HelloAck reports input, clipboard and audio disabled");
+              !disabled.file_transfer_enabled && !disabled.audio.enabled,
+          "HelloAck reports input, clipboard, file transfer and audio disabled");
 }
 
 void test_permission_update() {
     uint16_t permissions = chast::kPermissionAll;
     std::string error;
+    check((chast::kPermissionAll & chast::kPermissionFileTransfer) != 0 &&
+              (chast::kPermissionAll & chast::kPermissionClipboard) != 0,
+          "the permission mask includes clipboard and file transfer");
     check(chast::parse_permission_update(
               payload_of(chast::make_permission_update(chast::kPermissionInput)),
               permissions, &error) &&
@@ -365,7 +373,7 @@ void test_permission_update() {
           "PermissionUpdate round-trips every permission");
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
-    unknown[0] = 0x08;
+    unknown[0] = 0x10;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -458,6 +466,190 @@ void test_display_switch() {
     check(!chast::parse_display_switch_result(trailing_result, result_index, code, reason,
                                               &error),
           "DisplaySwitchResult with trailing bytes is rejected");
+}
+
+void test_display_modes() {
+    std::string error;
+    uint16_t display = chast::kDisplayAuto;
+    check(chast::parse_list_display_modes(payload_of(chast::make_list_display_modes(2)), display,
+                                          &error) &&
+              display == 2,
+          "ListDisplayModes round-trips the display index");
+    std::vector<uint8_t> short_list = payload_of(chast::make_list_display_modes(1));
+    short_list.pop_back();
+    check(!chast::parse_list_display_modes(short_list, display, &error),
+          "short ListDisplayModes is rejected");
+    std::vector<uint8_t> trailing_list = payload_of(chast::make_list_display_modes(1));
+    trailing_list.push_back(0);
+    check(!chast::parse_list_display_modes(trailing_list, display, &error),
+          "ListDisplayModes with trailing bytes is rejected");
+
+    chast::DisplayModeList sent;
+    sent.display = 4;
+    sent.code = chast::DisplayModeCode::Ok;
+    sent.modes = {
+        chast::DisplayModeInfo{2560, 1440, 165, false},
+        chast::DisplayModeInfo{1920, 1080, 60, true},
+        chast::DisplayModeInfo{1280, 720, 60, false},
+    };
+    chast::DisplayModeList got;
+    check(chast::parse_display_modes(payload_of(chast::make_display_modes(sent)), got, &error) &&
+              got.display == 4 && got.code == chast::DisplayModeCode::Ok && got.reason.empty() &&
+              got.modes.size() == 3 && got.modes[0].width == 2560 &&
+              got.modes[0].refresh_hz == 165 && got.modes[1].current && !got.modes[2].current,
+          "DisplayModes round-trips a list and the current marker");
+
+    chast::DisplayModeList refused;
+    refused.display = 1;
+    refused.code = chast::DisplayModeCode::NotFound;
+    refused.reason = "该输出不支持此模式";
+    check(chast::parse_display_modes(payload_of(chast::make_display_modes(refused)), got,
+                                     &error) &&
+              got.code == chast::DisplayModeCode::NotFound && got.modes.empty() &&
+              got.reason == refused.reason,
+          "DisplayModes round-trips a refusal with a UTF-8 reason");
+    refused.modes = {chast::DisplayModeInfo{1920, 1080, 60, true}};
+    check(chast::parse_display_modes(payload_of(chast::make_display_modes(refused)), got,
+                                     &error) &&
+              got.modes.empty(),
+          "the DisplayModes maker drops modes from a refusal");
+
+    std::string long_reason(250, 'a');
+    for (int i = 0; i < 10; ++i) {
+        long_reason += "显示器";
+    }
+    refused.reason = long_reason;
+    check(chast::parse_display_modes(payload_of(chast::make_display_modes(refused)), got,
+                                     &error) &&
+              got.reason.size() <= chast::kMaxDisplayModeReason && !got.reason.empty(),
+          "an over-long DisplayModes reason is truncated on a character boundary");
+
+    // A maker that is handed more modes than the wire allows stops at the cap.
+    chast::DisplayModeList many;
+    many.display = 0;
+    for (uint16_t i = 0; i < chast::kMaxDisplayModes + 3; ++i) {
+        many.modes.push_back(chast::DisplayModeInfo{
+            static_cast<uint16_t>(320 + i), 240, 60, false});
+    }
+    check(chast::parse_display_modes(payload_of(chast::make_display_modes(many)), got, &error) &&
+              got.modes.size() == chast::kMaxDisplayModes,
+          "DisplayModes caps the list at kMaxDisplayModes");
+
+    std::vector<uint8_t> unknown_code = payload_of(chast::make_display_modes(sent));
+    unknown_code[2] = 9;
+    check(!chast::parse_display_modes(unknown_code, got, &error),
+          "DisplayModes with an unknown code is rejected");
+    std::vector<uint8_t> bad_flags = payload_of(chast::make_display_modes(sent));
+    bad_flags[13] |= 0x02;  // first entry's flags byte
+    check(!chast::parse_display_modes(bad_flags, got, &error),
+          "DisplayModes with unknown entry flags is rejected");
+    std::vector<uint8_t> empty_mode = payload_of(chast::make_display_modes(sent));
+    empty_mode[7] = 0;
+    empty_mode[8] = 0;
+    check(!chast::parse_display_modes(empty_mode, got, &error),
+          "DisplayModes with a zero-sized mode is rejected");
+    chast::DisplayModeList two_current = sent;
+    two_current.modes[0].current = true;
+    check(!chast::parse_display_modes(payload_of(chast::make_display_modes(two_current)), got,
+                                      &error),
+          "DisplayModes with two current modes is rejected");
+
+    const uint16_t overlong_size = static_cast<uint16_t>(chast::kMaxDisplayModeReason + 1);
+    std::vector<uint8_t> overlong(5, 0);
+    overlong[3] = static_cast<uint8_t>(overlong_size & 0xFFu);
+    overlong[4] = static_cast<uint8_t>(overlong_size >> 8);
+    overlong.resize(5 + overlong_size, 'a');
+    overlong.push_back(0);
+    overlong.push_back(0);
+    check(!chast::parse_display_modes(
+              payload_of(chast::make_control(chast::ControlType::DisplayModes, overlong)), got,
+              &error),
+          "DisplayModes with an over-long reason is rejected");
+    std::vector<uint8_t> malformed_reason(7, 0);
+    malformed_reason[3] = 1;
+    malformed_reason[5] = 0xFF;
+    check(!chast::parse_display_modes(
+              payload_of(chast::make_control(chast::ControlType::DisplayModes,
+                                             malformed_reason)),
+              got, &error),
+          "DisplayModes with a malformed reason is rejected");
+    std::vector<uint8_t> too_many(7, 0);
+    too_many[5] = static_cast<uint8_t>((chast::kMaxDisplayModes + 1) & 0xFFu);
+    too_many[6] = static_cast<uint8_t>((chast::kMaxDisplayModes + 1) >> 8);
+    check(!chast::parse_display_modes(
+              payload_of(chast::make_control(chast::ControlType::DisplayModes, too_many)), got,
+              &error),
+          "DisplayModes over the mode cap is rejected");
+    std::vector<uint8_t> refused_with_modes = payload_of(chast::make_display_modes(sent));
+    refused_with_modes[2] = 1;
+    check(!chast::parse_display_modes(refused_with_modes, got, &error),
+          "a refused DisplayModes that lists modes is rejected");
+    std::vector<uint8_t> truncated_entry = payload_of(chast::make_display_modes(sent));
+    truncated_entry.pop_back();
+    check(!chast::parse_display_modes(truncated_entry, got, &error),
+          "a truncated DisplayModes entry is rejected");
+    std::vector<uint8_t> trailing_modes = payload_of(chast::make_display_modes(sent));
+    trailing_modes.push_back(0);
+    check(!chast::parse_display_modes(trailing_modes, got, &error),
+          "DisplayModes with trailing bytes is rejected");
+
+    uint16_t set_display = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    uint16_t refresh = 0;
+    check(chast::parse_set_display_mode(
+              payload_of(chast::make_set_display_mode(1, 1920, 1080, 60)), set_display, width,
+              height, refresh, &error) &&
+              set_display == 1 && width == 1920 && height == 1080 && refresh == 60,
+          "SetDisplayMode round-trips a mode");
+    std::vector<uint8_t> short_set = payload_of(chast::make_set_display_mode(1, 1920, 1080, 60));
+    short_set.pop_back();
+    check(!chast::parse_set_display_mode(short_set, set_display, width, height, refresh, &error),
+          "short SetDisplayMode is rejected");
+    std::vector<uint8_t> empty_set = payload_of(chast::make_set_display_mode(1, 0, 1080, 60));
+    check(!chast::parse_set_display_mode(empty_set, set_display, width, height, refresh, &error),
+          "SetDisplayMode with an empty picture is rejected");
+    std::vector<uint8_t> trailing_set =
+        payload_of(chast::make_set_display_mode(1, 1920, 1080, 60));
+    trailing_set.push_back(0);
+    check(!chast::parse_set_display_mode(trailing_set, set_display, width, height, refresh,
+                                         &error),
+          "SetDisplayMode with trailing bytes is rejected");
+
+    chast::DisplayModeCode code = chast::DisplayModeCode::Busy;
+    std::string reason;
+    check(chast::parse_display_mode_result(
+              payload_of(chast::make_display_mode_result(
+                  3, 2560, 1440, 144, chast::DisplayModeCode::Ok, std::string())),
+              set_display, width, height, refresh, code, reason, &error) &&
+              set_display == 3 && width == 2560 && height == 1440 && refresh == 144 &&
+              code == chast::DisplayModeCode::Ok && reason.empty(),
+          "DisplayModeResult round-trips an accepted mode");
+    check(chast::parse_display_mode_result(
+              payload_of(chast::make_display_mode_result(
+                  0, 1920, 1080, 60, chast::DisplayModeCode::Failed, "the driver refused it")),
+              set_display, width, height, refresh, code, reason, &error) &&
+              code == chast::DisplayModeCode::Failed && reason == "the driver refused it",
+          "DisplayModeResult round-trips a failure reason");
+    long_reason = std::string(250, 'a') + "分辨率切换失败";
+    check(chast::parse_display_mode_result(
+              payload_of(chast::make_display_mode_result(
+                  0, 1920, 1080, 60, chast::DisplayModeCode::Failed, long_reason)),
+              set_display, width, height, refresh, code, reason, &error) &&
+              reason.size() <= chast::kMaxDisplayModeReason && !reason.empty(),
+          "an over-long DisplayModeResult reason is truncated on a character boundary");
+    std::vector<uint8_t> unknown_result = payload_of(chast::make_display_mode_result(
+        0, 1920, 1080, 60, chast::DisplayModeCode::Ok, std::string()));
+    unknown_result[8] = 9;
+    check(!chast::parse_display_mode_result(unknown_result, set_display, width, height, refresh,
+                                            code, reason, &error),
+          "DisplayModeResult with an unknown code is rejected");
+    std::vector<uint8_t> trailing_result = payload_of(chast::make_display_mode_result(
+        0, 1920, 1080, 60, chast::DisplayModeCode::Ok, std::string()));
+    trailing_result.push_back(0);
+    check(!chast::parse_display_mode_result(trailing_result, set_display, width, height, refresh,
+                                            code, reason, &error),
+          "DisplayModeResult with trailing bytes is rejected");
 }
 
 void test_frame_header() {
@@ -1207,6 +1399,244 @@ bool test_live_pointer() {
     return landed;
 }
 
+void test_file_transfer() {
+    std::string error;
+    chast::FileOffer offer;
+    offer.transfer_id = 7;
+    offer.size = 12;
+    offer.resume = true;
+    offer.name = "report-\xE6\x8A\xA5\xE5\x91\x8A.pdf";
+    offer.sha256.fill(0xAB);
+
+    chast::FileOffer got_offer;
+    check(chast::parse_file_offer(payload_of(chast::make_file_offer(offer)), got_offer,
+                                  &error) &&
+              got_offer.transfer_id == 7 && got_offer.size == 12 && got_offer.resume &&
+              got_offer.name == offer.name && got_offer.sha256 == offer.sha256,
+          "FileOffer round-trips id, size, resume flag, digest and UTF-8 name");
+
+    auto rejects_offer = [&](std::vector<uint8_t> payload, const char* what) {
+        chast::FileOffer dropped;
+        check(!chast::parse_file_offer(payload, dropped, &error), what);
+    };
+    std::vector<uint8_t> unknown_flags = payload_of(chast::make_file_offer(offer));
+    unknown_flags[12] = 0x02;  // id(4) + size(8), then flags
+    rejects_offer(std::move(unknown_flags), "FileOffer with unknown flags is rejected");
+
+    std::vector<uint8_t> empty_name = payload_of(chast::make_file_offer(offer));
+    // id(4) size(8) flags(1) digest(32), then the u16 name length.
+    constexpr size_t kNameLengthAt = 45;
+    empty_name[kNameLengthAt] = 0;
+    empty_name[kNameLengthAt + 1] = 0;
+    empty_name.resize(kNameLengthAt + 2);
+    rejects_offer(std::move(empty_name), "FileOffer without a name is rejected");
+
+    std::vector<uint8_t> long_name = payload_of(chast::make_file_offer(offer));
+    long_name[kNameLengthAt] = static_cast<uint8_t>(chast::kMaxFileNameBytes + 1);
+    long_name[kNameLengthAt + 1] =
+        static_cast<uint8_t>((chast::kMaxFileNameBytes + 1) >> 8);
+    rejects_offer(std::move(long_name), "FileOffer with an oversized name is rejected");
+
+    std::vector<uint8_t> trailing = payload_of(chast::make_file_offer(offer));
+    trailing.push_back(0x55);
+    rejects_offer(std::move(trailing), "FileOffer with trailing bytes is rejected");
+
+    chast::FileOffer huge;
+    huge.transfer_id = 1;
+    huge.size = chast::kMaxFileTransferBytes + 1;
+    huge.name = "huge.bin";
+    std::vector<uint8_t> huge_payload = payload_of(chast::make_file_offer(huge));
+    rejects_offer(std::move(huge_payload), "FileOffer past the protocol limit is rejected");
+
+    chast::FileAnswer answer;
+    answer.transfer_id = 7;
+    answer.code = chast::FileCode::Ok;
+    answer.resume_offset = 4096;
+    chast::FileAnswer got_answer;
+    check(chast::parse_file_answer(payload_of(chast::make_file_answer(answer)), got_answer,
+                                   &error) &&
+              got_answer.transfer_id == 7 && got_answer.code == chast::FileCode::Ok &&
+              got_answer.resume_offset == 4096,
+          "FileAnswer round-trips a resume offset");
+    answer.code = chast::FileCode::Busy;
+    answer.reason = "another transfer is active";
+    check(chast::parse_file_answer(payload_of(chast::make_file_answer(answer)), got_answer,
+                                   &error) &&
+              got_answer.code == chast::FileCode::Busy &&
+              got_answer.resume_offset == 0 &&
+              got_answer.reason == answer.reason,
+          "a refused FileAnswer carries its reason and no offset");
+
+    std::vector<uint8_t> bad_answer_code =
+        payload_of(chast::make_file_answer(answer));
+    bad_answer_code[4] = 0xFF;  // id(4), then the code
+    check(!chast::parse_file_answer(bad_answer_code, got_answer, &error),
+          "FileAnswer with an unknown code is rejected");
+
+    chast::FileResult result;
+    result.transfer_id = 7;
+    result.code = chast::FileCode::DigestMismatch;
+    result.received = 12;
+    result.reason = "sha-256 mismatch";
+    chast::FileResult got_result;
+    check(chast::parse_file_result(payload_of(chast::make_file_result(result)), got_result,
+                                   &error) &&
+              got_result.code == chast::FileCode::DigestMismatch &&
+              got_result.received == 12 && got_result.reason == result.reason,
+          "FileResult round-trips a digest mismatch");
+    result.code = chast::FileCode::Busy;
+    std::vector<uint8_t> result_busy = payload_of(chast::make_file_result(result));
+    check(!chast::parse_file_result(result_busy, got_result, &error),
+          "FileResult refuses a code it cannot report");
+
+    chast::FileCancel cancel;
+    cancel.transfer_id = 7;
+    cancel.reason = "viewer cancelled";
+    chast::FileCancel got_cancel;
+    check(chast::parse_file_cancel(payload_of(chast::make_file_cancel(cancel)), got_cancel,
+                                   &error) &&
+              got_cancel.transfer_id == 7 && got_cancel.code == chast::FileCode::Cancelled &&
+              got_cancel.reason == cancel.reason,
+          "FileCancel round-trips");
+    cancel.code = chast::FileCode::IoError;
+    std::vector<uint8_t> cancel_io = payload_of(chast::make_file_cancel(cancel));
+    check(!chast::parse_file_cancel(cancel_io, got_cancel, &error),
+          "FileCancel with a non-cancel code is rejected");
+
+    chast::FileStreamHeader header;
+    header.transfer_id = 7;
+    header.offset = 4096;
+    uint8_t stream_header[chast::kFileStreamHeaderSize]{};
+    chast::encode_file_stream_header(header, stream_header);
+    chast::FileStreamHeader got_header;
+    check(chast::decode_file_stream_header(stream_header, sizeof(stream_header), got_header,
+                                           &error) &&
+              got_header.transfer_id == 7 && got_header.offset == 4096,
+          "CFIL header round-trips");
+    uint8_t bad_magic[chast::kFileStreamHeaderSize]{};
+    std::memcpy(bad_magic, stream_header, sizeof(bad_magic));
+    bad_magic[0] = 'X';
+    check(!chast::decode_file_stream_header(bad_magic, sizeof(bad_magic), got_header, &error),
+          "CFIL header with bad magic is rejected");
+    uint8_t bad_version[chast::kFileStreamHeaderSize]{};
+    std::memcpy(bad_version, stream_header, sizeof(bad_version));
+    bad_version[4] = 2;
+    check(!chast::decode_file_stream_header(bad_version, sizeof(bad_version), got_header,
+                                            &error),
+          "CFIL header with a newer version is rejected");
+    uint8_t bad_reserved[chast::kFileStreamHeaderSize]{};
+    std::memcpy(bad_reserved, stream_header, sizeof(bad_reserved));
+    bad_reserved[5] = 1;
+    check(!chast::decode_file_stream_header(bad_reserved, sizeof(bad_reserved), got_header,
+                                            &error),
+          "CFIL header with reserved bytes is rejected");
+    check(!chast::decode_file_stream_header(stream_header,
+                                            chast::kFileStreamHeaderSize - 1, got_header,
+                                            &error),
+          "a truncated CFIL header is rejected");
+}
+
+void test_clipboard_container() {
+    std::string error;
+    chast::ClipboardContent content;
+    chast::ClipboardFormatData text;
+    text.format = chast::ClipboardFormat::Text;
+    const std::string hello = "hello \xE4\xB8\x96\xE7\x95\x8C";
+    text.data.assign(hello.begin(), hello.end());
+    content.formats.push_back(text);
+
+    chast::ClipboardFormatData html;
+    html.format = chast::ClipboardFormat::Html;
+    const std::string markup =
+        "Version:0.9\r\nStartHTML:0000000105\r\nEndHTML:0000000200\r\n"
+        "<html><body><b>hello</b></body></html>";
+    html.data.assign(markup.begin(), markup.end());
+    content.formats.push_back(html);
+
+    chast::ClipboardFormatData rtf;
+    rtf.format = chast::ClipboardFormat::Rtf;
+    const std::string rtf_text = "{\\rtf1\\ansi hello}";
+    rtf.data.assign(rtf_text.begin(), rtf_text.end());
+    content.formats.push_back(rtf);
+
+    chast::ClipboardFormatData dib;
+    dib.format = chast::ClipboardFormat::Dib;
+    dib.data.assign(44, 0);
+    // BITMAPINFOHEADER: 40-byte header, 1x1, 32 bpp, one pixel after it.
+    dib.data[0] = 40;
+    dib.data[4] = 1;
+    dib.data[8] = 1;
+    dib.data[12] = 1;  // planes
+    dib.data[14] = 32; // bit count
+    content.formats.push_back(dib);
+
+    const uint64_t hash = chast::clipboard_content_hash(content);
+    check(hash != 0, "clipboard content hashes to a non-zero value");
+    chast::ClipboardContent reordered = content;
+    std::swap(reordered.formats[0], reordered.formats[3]);
+    check(chast::clipboard_content_hash(reordered) == hash,
+          "the clipboard hash ignores entry order");
+
+    const std::vector<uint8_t> stream = chast::encode_clipboard_stream(content);
+    check(!stream.empty() &&
+              std::memcmp(stream.data(), chast::kClipboardStreamMagic, 4) == 0 &&
+              stream[4] == chast::kClipboardStreamVersion,
+          "CCLB stream starts with its magic and version");
+    chast::ClipboardContent decoded;
+    check(chast::decode_clipboard_stream(stream.data(), stream.size(), decoded, &error),
+          "CCLB stream round-trips");
+    check(decoded.hash == hash && decoded.formats.size() == 4 &&
+              decoded.formats[0].format == chast::ClipboardFormat::Text &&
+              decoded.formats[1].format == chast::ClipboardFormat::Html &&
+              decoded.formats[2].format == chast::ClipboardFormat::Rtf &&
+              decoded.formats[3].format == chast::ClipboardFormat::Dib &&
+              decoded.formats[0].data == text.data &&
+              decoded.formats[1].data == html.data &&
+              decoded.formats[3].data == dib.data,
+          "CCLB stream keeps every format and byte");
+
+    auto alters = [&](size_t at, uint8_t value, const char* what) {
+        std::vector<uint8_t> broken = stream;
+        broken[at] = value;
+        chast::ClipboardContent dropped;
+        check(!chast::decode_clipboard_stream(broken.data(), broken.size(), dropped, &error),
+              what);
+    };
+    alters(8, static_cast<uint8_t>(stream[8] ^ 0xFF), "a CCLB with a wrong hash is rejected");
+    alters(4, 2, "a CCLB with an unknown version is rejected");
+    alters(5, 9, "a CCLB with too many formats is rejected");
+    chast::ClipboardContent dropped;
+    check(!chast::decode_clipboard_stream(stream.data(), stream.size() - 1, dropped, &error),
+          "a truncated CCLB is rejected");
+
+    std::vector<uint8_t> trailing = stream;
+    trailing.push_back(0);
+    check(!chast::decode_clipboard_stream(trailing.data(), trailing.size(), dropped, &error),
+          "a CCLB with trailing bytes is rejected");
+
+    chast::ClipboardContent duplicate = content;
+    duplicate.formats.insert(duplicate.formats.begin() + 1, text);
+    check(chast::encode_clipboard_stream(duplicate).empty(),
+          "the encoder refuses duplicate clipboard formats");
+
+    chast::ClipboardContent bad_text;
+    chast::ClipboardFormatData nul_text;
+    nul_text.format = chast::ClipboardFormat::Text;
+    nul_text.data = {'a', 0, 'b'};
+    bad_text.formats.push_back(nul_text);
+    check(chast::encode_clipboard_stream(bad_text).empty(),
+          "the encoder refuses clipboard text with a NUL");
+
+    chast::ClipboardContent bad_dib;
+    chast::ClipboardFormatData short_dib;
+    short_dib.format = chast::ClipboardFormat::Dib;
+    short_dib.data.assign(40, 0);
+    short_dib.data[0] = 40;
+    bad_dib.formats.push_back(short_dib);
+    check(chast::encode_clipboard_stream(bad_dib).empty(),
+          "the encoder refuses a DIB with no picture size");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1215,6 +1645,9 @@ int main(int argc, char** argv) {
     test_hello_ack();
     test_permission_update();
     test_display_switch();
+    test_display_modes();
+    test_file_transfer();
+    test_clipboard_container();
     test_frame_header();
     test_audio_header();
     test_audio_parser();

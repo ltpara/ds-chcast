@@ -6,18 +6,6 @@
 
 namespace chast {
 
-namespace {
-
-constexpr char kFrameMagic[4] = {'C', 'F', 'R', 'M'};
-constexpr char kAudioMagic[4] = {'C', 'A', 'U', 'D'};
-constexpr char kControlMagic[4] = {'C', 'C', 'T', 'L'};
-// A single receive buffer holding more than this without yielding a frame
-// means the peer is not speaking the protocol.
-constexpr size_t kMaxFrameBuffer = 64u * 1024u * 1024u;
-constexpr size_t kMaxAudioBuffer = 4u * 1024u * 1024u;
-constexpr size_t kMaxControlBuffer = 4u * 1024u * 1024u;
-constexpr size_t kMaxDisplays = kMaxDisplayCount;
-
 bool valid_utf8(const std::string& text) {
     const auto* bytes = reinterpret_cast<const unsigned char*>(text.data());
     size_t i = 0;
@@ -65,6 +53,18 @@ bool valid_utf8(const std::string& text) {
     }
     return true;
 }
+
+namespace {
+
+constexpr char kFrameMagic[4] = {'C', 'F', 'R', 'M'};
+constexpr char kAudioMagic[4] = {'C', 'A', 'U', 'D'};
+constexpr char kControlMagic[4] = {'C', 'C', 'T', 'L'};
+// A single receive buffer holding more than this without yielding a frame
+// means the peer is not speaking the protocol.
+constexpr size_t kMaxFrameBuffer = 64u * 1024u * 1024u;
+constexpr size_t kMaxAudioBuffer = 4u * 1024u * 1024u;
+constexpr size_t kMaxControlBuffer = 4u * 1024u * 1024u;
+constexpr size_t kMaxDisplays = kMaxDisplayCount;
 
 // HelloAck display entry: name_size u16, name, left/top/right/bottom i32,
 // rotation u16, flags u16 (bit 0: primary).
@@ -153,6 +153,15 @@ public:
             return false;
         }
         value.assign(cursor_, cursor_ + size);
+        cursor_ += size;
+        return true;
+    }
+
+    bool raw(uint8_t* value, size_t size) {
+        if (remaining() < size) {
+            return false;
+        }
+        std::memcpy(value, cursor_, size);
         cursor_ += size;
         return true;
     }
@@ -623,7 +632,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     put_u16(cursor, static_cast<uint16_t>(
                         (info.input_enabled ? kServerInfoInputEnabled : 0) |
                         (info.clipboard_enabled ? kServerInfoClipboardEnabled : 0) |
-                        (info.audio.enabled ? kServerInfoAudioEnabled : 0)));
+                        (info.audio.enabled ? kServerInfoAudioEnabled : 0) |
+                        (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -662,6 +672,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     if (info.audio.enabled) {
         permissions |= kPermissionAudio;
+    }
+    if (info.file_transfer_enabled) {
+        permissions |= kPermissionFileTransfer;
     }
     put_u16(cursor, permissions);
     return payload;
@@ -845,6 +858,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     info.input_enabled = (permissions & kPermissionInput) != 0;
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
+    info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     return true;
 }
 
@@ -1208,6 +1222,460 @@ bool parse_display_switch_result(const std::vector<uint8_t>& payload, uint16_t& 
     return true;
 }
 
+namespace {
+
+std::string truncate_utf8_reason(const std::string& reason, size_t limit) {
+    if (reason.size() <= limit) {
+        return valid_utf8(reason) ? reason : std::string();
+    }
+    size_t cut = limit;
+    while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0u) == 0x80u) {
+        --cut;
+    }
+    std::string text = reason.substr(0, cut);
+    if (!valid_utf8(text)) {
+        text.clear();
+    }
+    return text;
+}
+
+bool parse_mode_code(uint8_t raw_code, DisplayModeCode& code, std::string* error) {
+    if (raw_code > static_cast<uint8_t>(DisplayModeCode::Busy)) {
+        set_error(error, "unknown display mode result code " + std::to_string(raw_code));
+        return false;
+    }
+    code = static_cast<DisplayModeCode>(raw_code);
+    return true;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_list_display_modes(uint16_t display_index) {
+    std::vector<uint8_t> payload(2);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, display_index);
+    return make_control(ControlType::ListDisplayModes, payload);
+}
+
+bool parse_list_display_modes(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u16(display_index) || !reader.at_end()) {
+        set_error(error, "malformed ListDisplayModes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_display_modes(const DisplayModeList& list) {
+    const std::string text = truncate_utf8_reason(list.reason, kMaxDisplayModeReason);
+    const size_t count = list.code == DisplayModeCode::Ok
+                             ? std::min<size_t>(list.modes.size(), kMaxDisplayModes)
+                             : 0;
+    std::vector<uint8_t> payload(5 + text.size() + 2 + count * 8);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, list.display);
+    put_u8(cursor, static_cast<uint8_t>(list.code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+        cursor += text.size();
+    }
+    put_u16(cursor, static_cast<uint16_t>(count));
+    for (size_t i = 0; i < count; ++i) {
+        const DisplayModeInfo& mode = list.modes[i];
+        put_u16(cursor, mode.width);
+        put_u16(cursor, mode.height);
+        put_u16(cursor, mode.refresh_hz);
+        put_u16(cursor, mode.current ? 1 : 0);
+    }
+    return make_control(ControlType::DisplayModes, payload);
+}
+
+bool parse_display_modes(const std::vector<uint8_t>& payload, DisplayModeList& list,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u16(list.display) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(list.reason, reason_size)) {
+        set_error(error, "truncated DisplayModes");
+        return false;
+    }
+    if (!parse_mode_code(raw_code, list.code, error)) {
+        return false;
+    }
+    if (list.reason.size() > kMaxDisplayModeReason) {
+        set_error(error, "DisplayModes reason is too long");
+        return false;
+    }
+    if (!list.reason.empty() && !valid_utf8(list.reason)) {
+        set_error(error, "DisplayModes carries a malformed reason");
+        return false;
+    }
+    uint16_t count = 0;
+    if (!reader.u16(count)) {
+        set_error(error, "DisplayModes carries no mode count");
+        return false;
+    }
+    if (count > kMaxDisplayModes) {
+        set_error(error, "DisplayModes lists " + std::to_string(count) + " modes");
+        return false;
+    }
+    if (list.code != DisplayModeCode::Ok && count != 0) {
+        set_error(error, "a refused DisplayModes lists modes");
+        return false;
+    }
+    list.modes.clear();
+    list.modes.reserve(count);
+    bool current_seen = false;
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint16_t refresh = 0;
+        uint16_t flags = 0;
+        if (!reader.u16(width) || !reader.u16(height) || !reader.u16(refresh) ||
+            !reader.u16(flags)) {
+            set_error(error, "truncated DisplayModes entry " + std::to_string(i));
+            return false;
+        }
+        if ((flags & ~1u) != 0) {
+            set_error(error, "DisplayModes entry carries unknown flags");
+            return false;
+        }
+        if (width == 0 || height == 0) {
+            set_error(error, "DisplayModes entry has an empty picture");
+            return false;
+        }
+        DisplayModeInfo mode;
+        mode.width = width;
+        mode.height = height;
+        mode.refresh_hz = refresh;
+        mode.current = (flags & 1u) != 0;
+        if (mode.current) {
+            if (current_seen) {
+                set_error(error, "DisplayModes marks more than one current mode");
+                return false;
+            }
+            current_seen = true;
+        }
+        list.modes.push_back(mode);
+    }
+    if (!reader.at_end()) {
+        set_error(error, "DisplayModes has trailing bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_set_display_mode(uint16_t display_index, uint16_t width,
+                                           uint16_t height, uint16_t refresh_hz) {
+    std::vector<uint8_t> payload(8);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, display_index);
+    put_u16(cursor, width);
+    put_u16(cursor, height);
+    put_u16(cursor, refresh_hz);
+    return make_control(ControlType::SetDisplayMode, payload);
+}
+
+bool parse_set_display_mode(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                            uint16_t& width, uint16_t& height, uint16_t& refresh_hz,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u16(display_index) || !reader.u16(width) || !reader.u16(height) ||
+        !reader.u16(refresh_hz) || !reader.at_end()) {
+        set_error(error, "malformed SetDisplayMode");
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        set_error(error, "SetDisplayMode names an empty picture");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_display_mode_result(uint16_t display_index, uint16_t width,
+                                              uint16_t height, uint16_t refresh_hz,
+                                              DisplayModeCode code, const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxDisplayModeReason);
+    std::vector<uint8_t> payload(11 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, display_index);
+    put_u16(cursor, width);
+    put_u16(cursor, height);
+    put_u16(cursor, refresh_hz);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::DisplayModeResult, payload);
+}
+
+bool parse_display_mode_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                               uint16_t& width, uint16_t& height, uint16_t& refresh_hz,
+                               DisplayModeCode& code, std::string& reason, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u16(display_index) || !reader.u16(width) || !reader.u16(height) ||
+        !reader.u16(refresh_hz) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed DisplayModeResult");
+        return false;
+    }
+    if (!parse_mode_code(raw_code, code, error)) {
+        return false;
+    }
+    if (reason.size() > kMaxDisplayModeReason) {
+        set_error(error, "DisplayModeResult reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "DisplayModeResult carries a malformed reason");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool parse_file_code(uint8_t raw, FileCode& code, std::string* error) {
+    if (raw > static_cast<uint8_t>(FileCode::Cancelled)) {
+        set_error(error, "unknown file result code " + std::to_string(raw));
+        return false;
+    }
+    code = static_cast<FileCode>(raw);
+    return true;
+}
+
+bool parse_file_reason(const std::string& reason, size_t limit, const char* what,
+                       std::string* error) {
+    if (reason.size() > limit) {
+        set_error(error, std::string(what) + " reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, std::string(what) + " carries a malformed reason");
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
+    const std::string name = truncate_utf8_reason(offer.name, kMaxFileNameBytes);
+    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, offer.transfer_id);
+    put_u64(cursor, offer.size);
+    put_u8(cursor, offer.resume ? kFileOfferFlagResume : 0);
+    std::memcpy(cursor, offer.sha256.data(), offer.sha256.size());
+    cursor += offer.sha256.size();
+    put_u16(cursor, static_cast<uint16_t>(name.size()));
+    if (!name.empty()) {
+        std::memcpy(cursor, name.data(), name.size());
+    }
+    return make_control(ControlType::FileOffer, payload);
+}
+
+bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t flags = 0;
+    uint16_t name_size = 0;
+    if (!reader.u32(offer.transfer_id) || !reader.u64(offer.size) || !reader.u8(flags) ||
+        !reader.raw(offer.sha256.data(), offer.sha256.size()) || !reader.u16(name_size)) {
+        set_error(error, "truncated FileOffer");
+        return false;
+    }
+    if ((flags & ~kFileOfferFlagsKnown) != 0) {
+        set_error(error, "FileOffer carries unknown flags");
+        return false;
+    }
+    offer.resume = (flags & kFileOfferFlagResume) != 0;
+    if (offer.size > kMaxFileTransferBytes) {
+        set_error(error, "FileOffer names a file past the protocol limit");
+        return false;
+    }
+    if (name_size > kMaxFileNameBytes) {
+        set_error(error, "FileOffer name is too long");
+        return false;
+    }
+    if (!reader.string(offer.name, name_size)) {
+        set_error(error, "FileOffer name overruns the message");
+        return false;
+    }
+    if (!reader.at_end()) {
+        set_error(error, "FileOffer has trailing bytes");
+        return false;
+    }
+    if (offer.name.empty() || !valid_utf8(offer.name)) {
+        set_error(error, "FileOffer carries an unusable name");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_answer(const FileAnswer& answer) {
+    const std::string text = truncate_utf8_reason(answer.reason, kMaxFileReasonBytes);
+    std::vector<uint8_t> payload(4 + 1 + 8 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, answer.transfer_id);
+    put_u8(cursor, static_cast<uint8_t>(answer.code));
+    put_u64(cursor, answer.code == FileCode::Ok ? answer.resume_offset : 0);
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::FileAnswer, payload);
+}
+
+bool parse_file_answer(const std::vector<uint8_t>& payload, FileAnswer& answer,
+                       std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(answer.transfer_id) || !reader.u8(raw_code) ||
+        !reader.u64(answer.resume_offset) || !reader.u16(reason_size) ||
+        !reader.string(answer.reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed FileAnswer");
+        return false;
+    }
+    if (!parse_file_code(raw_code, answer.code, error)) {
+        return false;
+    }
+    if (answer.code != FileCode::Ok) {
+        if (answer.resume_offset != 0) {
+            set_error(error, "a refused FileAnswer carries a resume offset");
+            return false;
+        }
+    } else if (answer.resume_offset > kMaxFileTransferBytes) {
+        set_error(error, "FileAnswer resume offset is past the protocol limit");
+        return false;
+    }
+    return parse_file_reason(answer.reason, kMaxFileReasonBytes, "FileAnswer", error);
+}
+
+std::vector<uint8_t> make_file_result(const FileResult& result) {
+    const std::string text = truncate_utf8_reason(result.reason, kMaxFileReasonBytes);
+    std::vector<uint8_t> payload(4 + 1 + 8 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, result.transfer_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u64(cursor, result.received);
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::FileResult, payload);
+}
+
+bool parse_file_result(const std::vector<uint8_t>& payload, FileResult& result,
+                       std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(result.transfer_id) || !reader.u8(raw_code) ||
+        !reader.u64(result.received) || !reader.u16(reason_size) ||
+        !reader.string(result.reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed FileResult");
+        return false;
+    }
+    if (!parse_file_code(raw_code, result.code, error)) {
+        return false;
+    }
+    if (result.code != FileCode::Ok && result.code != FileCode::DigestMismatch &&
+        result.code != FileCode::IoError && result.code != FileCode::Cancelled) {
+        set_error(error, "FileResult carries a code it cannot report");
+        return false;
+    }
+    if (result.received > kMaxFileTransferBytes) {
+        set_error(error, "FileResult received count is past the protocol limit");
+        return false;
+    }
+    return parse_file_reason(result.reason, kMaxFileReasonBytes, "FileResult", error);
+}
+
+std::vector<uint8_t> make_file_cancel(const FileCancel& cancel) {
+    const std::string text = truncate_utf8_reason(cancel.reason, kMaxFileReasonBytes);
+    std::vector<uint8_t> payload(4 + 1 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, cancel.transfer_id);
+    put_u8(cursor, static_cast<uint8_t>(cancel.code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::FileCancel, payload);
+}
+
+bool parse_file_cancel(const std::vector<uint8_t>& payload, FileCancel& cancel,
+                       std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(cancel.transfer_id) || !reader.u8(raw_code) ||
+        !reader.u16(reason_size) || !reader.string(cancel.reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, "malformed FileCancel");
+        return false;
+    }
+    if (!parse_file_code(raw_code, cancel.code, error)) {
+        return false;
+    }
+    if (cancel.code != FileCode::Cancelled) {
+        set_error(error, "FileCancel carries a code other than Cancelled");
+        return false;
+    }
+    return parse_file_reason(cancel.reason, kMaxFileReasonBytes, "FileCancel", error);
+}
+
+void encode_file_stream_header(const FileStreamHeader& header,
+                               uint8_t out[kFileStreamHeaderSize]) {
+    uint8_t* cursor = out;
+    std::memcpy(cursor, kFileStreamMagic, sizeof(kFileStreamMagic));
+    cursor += sizeof(kFileStreamMagic);
+    put_u8(cursor, kFileStreamVersion);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u8(cursor, 0);
+    put_u32(cursor, header.transfer_id);
+    put_u64(cursor, header.offset);
+}
+
+bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeader& header,
+                               std::string* error) {
+    if (size != kFileStreamHeaderSize) {
+        set_error(error, "truncated CFIL header");
+        return false;
+    }
+    if (std::memcmp(data, kFileStreamMagic, sizeof(kFileStreamMagic)) != 0) {
+        set_error(error, "CFIL stream has bad magic");
+        return false;
+    }
+    if (data[4] != kFileStreamVersion) {
+        set_error(error, "CFIL stream version " + std::to_string(data[4]) +
+                             " is not supported");
+        return false;
+    }
+    if (data[5] != 0 || data[6] != 0 || data[7] != 0) {
+        set_error(error, "CFIL header reserved bytes are not zero");
+        return false;
+    }
+    Reader reader(data + 8, size - 8);
+    if (!reader.u32(header.transfer_id) || !reader.u64(header.offset) || !reader.at_end()) {
+        set_error(error, "malformed CFIL header");
+        return false;
+    }
+    if (header.offset > kMaxFileTransferBytes) {
+        set_error(error, "CFIL offset is past the protocol limit");
+        return false;
+    }
+    return true;
+}
+
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> message(kControlHeaderSize + payload.size());
     uint8_t* cursor = message.data();
@@ -1221,7 +1689,6 @@ std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& 
     }
     return message;
 }
-
 bool ControlParser::push(const uint8_t* data, size_t size,
                          std::vector<std::pair<ControlType, std::vector<uint8_t>>>& messages,
                          std::string* error) {
