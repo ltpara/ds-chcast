@@ -151,4 +151,21 @@ void main() {
     expect(withoutList.displays, isEmpty);
     expect(withoutList.streamedDisplayIndex, isNull);
   });
+
+  test('separates accepted switches from refusals', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'displaySwitches': 2,
+      'displaySwitchFailures': 1,
+      'displaySwitchError': 'display 3 is not attached',
+    });
+
+    expect(status.displaySwitches, 2);
+    expect(status.displaySwitchFailures, 1);
+    expect(status.displaySwitchError, 'display 3 is not attached');
+    const ViewerStatus fresh = ViewerStatus();
+    expect(fresh.displaySwitches, 0);
+    expect(fresh.displaySwitchFailures, 0);
+    expect(fresh.displaySwitchError, isEmpty);
+  });
 }

@@ -483,6 +483,18 @@ struct QuicSession::Impl {
     uint16_t requested_display = kDisplayAuto;
     std::string requested_peer;
     ClientHello pending_hello;
+    // Server: the newest SwitchDisplay the viewer asked for. Intermediate
+    // targets are not queued; a viewer clicking through the list wants the
+    // last one, not a tour of every output in between.
+    bool display_switch_ready = false;
+    uint16_t display_switch_index = kDisplayAuto;
+    // Client: the newest DisplaySwitchResult. Like the request, only the
+    // newest answer matters; an older one describes a target already left.
+    bool display_switch_result_ready = false;
+    uint16_t display_switch_result_index = 0;
+    DisplaySwitchCode display_switch_code = DisplaySwitchCode::Ok;
+    std::string display_switch_reason;
+    uint64_t display_switch_results_seen = 0;
     // Server: the mask the viewer was granted, and the ceiling that grant
     // established. Mid-session changes may only stay inside the ceiling.
     // Client: the mask the host last announced. Atomic because the transport
@@ -1133,6 +1145,49 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::SwitchDisplay: {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionInput) == 0) {
+                    // Switching outputs changes what the viewer sees, so it
+                    // travels with input control; a viewer without it is
+                    // dropped rather than allowed to move the host's view.
+                    break;
+                }
+                uint16_t index = kDisplayAuto;
+                if (!parse_switch_display(payload, index, &error)) {
+                    note_transport_failure("SwitchDisplay: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_switch_index = index;
+                    display_switch_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplaySwitchResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                uint16_t index = 0;
+                DisplaySwitchCode code = DisplaySwitchCode::Failed;
+                std::string reason;
+                if (!parse_display_switch_result(payload, index, code, reason, &error)) {
+                    note_transport_failure("DisplaySwitchResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_switch_result_index = index;
+                    display_switch_code = code;
+                    display_switch_reason = std::move(reason);
+                    display_switch_result_ready = true;
+                    ++display_switch_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::ClipboardUpdate: {
                 if (role == Role::Server &&
                     (session_permissions.load() & kPermissionClipboard) == 0) {
@@ -1339,6 +1394,13 @@ struct QuicSession::Impl {
             pending_hello = ClientHello{};
             requested_display = kDisplayAuto;
             requested_peer.clear();
+            display_switch_ready = false;
+            display_switch_index = kDisplayAuto;
+            display_switch_result_ready = false;
+            display_switch_result_index = 0;
+            display_switch_code = DisplaySwitchCode::Ok;
+            display_switch_reason.clear();
+            display_switch_results_seen = 0;
             session_permissions = 0;
             permission_ceiling = 0;
             permission_update_ready = false;
@@ -1997,6 +2059,42 @@ uint64_t QuicSession::stream_updates() const {
     return impl_->stream_updates;
 }
 
+Error QuicSession::request_display_switch(uint16_t display_index) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_display_switch is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+            return Error(Status::PermissionDenied, "input is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_switch_display(display_index),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_switch_result(uint16_t& display_index, DisplaySwitchCode& code,
+                                             std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_switch_result_ready) {
+        return false;
+    }
+    display_index = impl_->display_switch_result_index;
+    code = impl_->display_switch_code;
+    reason = impl_->display_switch_reason;
+    impl_->display_switch_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::display_switch_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->display_switch_results_seen;
+}
+
 Error QuicSession::send_frame(FrameHeader header, const uint8_t* payload, size_t size) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
@@ -2026,6 +2124,30 @@ bool QuicSession::take_keyframe_request() {
     const bool requested = impl_->keyframe_requested;
     impl_->keyframe_requested = false;
     return requested;
+}
+
+bool QuicSession::take_display_switch_request(uint16_t& display_index) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_switch_ready) {
+        return false;
+    }
+    display_index = impl_->display_switch_index;
+    impl_->display_switch_ready = false;
+    return true;
+}
+
+Error QuicSession::send_display_switch_result(uint16_t display_index, DisplaySwitchCode code,
+                                              const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_display_switch_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(),
+                           make_display_switch_result(display_index, code, reason),
+                           QUIC_SEND_FLAG_NONE);
 }
 
 Error QuicSession::send_audio(AudioHeader header, const uint8_t* payload, size_t size) {

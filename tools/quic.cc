@@ -682,6 +682,9 @@ struct SenderStats {
     // server) and the index the capturer actually used.
     uint16_t requested_display = chast::kDisplayAuto;
     size_t display_index = 0;
+    // Display switches the host accepted and refused during the session.
+    uint64_t display_switches = 0;
+    uint64_t display_switch_failures = 0;
     // StreamInfo messages this server sent.
     uint64_t stream_updates_sent = 0;
     // Adaptive bitrate telemetry: the encoder's current target (the video
@@ -763,6 +766,16 @@ struct ReceiverStats {
     // StreamInfo messages received, and the description from the last one.
     uint64_t stream_updates = 0;
     chast::ServerInfo last_update;
+    // Mid-session display switches this receiver asked for (verify only): the
+    // two requested indexes, the answers taken, and the last answer's detail.
+    uint16_t switch_ok_index = chast::kDisplayAuto;
+    uint16_t switch_bad_index = chast::kDisplayAuto;
+    uint64_t display_switch_results = 0;
+    uint64_t display_switch_ok = 0;
+    uint64_t display_switch_refused = 0;
+    uint16_t last_switch_index = 0;
+    chast::DisplaySwitchCode last_switch_code = chast::DisplaySwitchCode::Ok;
+    std::string last_switch_reason;
     // Latency probes: the last clock-sync sample plus counters, and the frame
     // age (host capture -> local receipt) of the newest and worst frame seen.
     chast::LatencySample latency;
@@ -1052,6 +1065,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.peer = status.stats.peer;
     stats.peer_left = status.stats.peer_left;
     stats.stream_updates_sent = status.stats.stream_updates;
+    stats.display_switches = status.stats.display_switches;
+    stats.display_switch_failures = status.stats.display_switch_failures;
     stats.frames = status.stats.frames;
     stats.encoded = status.stats.encoded;
     stats.keyframes = status.stats.keyframes;
@@ -1389,6 +1404,24 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     bool clock_synced = false;
     int64_t clock_offset_us = 0;
 
+    // verify covers the mid-session switch: one request for the output that is
+    // already streaming (the host answers Ok without rebuilding), then one past
+    // the end of the announced list (NotFound). They are spaced wider than the
+    // host's 1 s switch rate limit.
+    if (options.mode == "verify" && !info.displays.empty()) {
+        size_t target = options.display_set ? options.display : 0;
+        if (target >= info.displays.size()) {
+            target = 0;
+        }
+        stats.switch_ok_index = static_cast<uint16_t>(target);
+        const size_t past = info.displays.size() + 2;
+        if (past < chast::kMaxDisplayCount) {
+            stats.switch_bad_index = static_cast<uint16_t>(past);
+        }
+    }
+    bool switch_ok_sent = false;
+    bool switch_bad_sent = false;
+
     // StreamInfo and the pictures travel on different QUIC streams, so the
     // first picture at a new size can arrive before its announcement. Track
     // what the decoder was built for instead of what was last announced: a
@@ -1486,6 +1519,28 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
     };
 
+    auto drain_display_switch_results = [&] {
+        uint16_t index = 0;
+        chast::DisplaySwitchCode code = chast::DisplaySwitchCode::Ok;
+        std::string reason;
+        while (session->take_display_switch_result(index, code, reason)) {
+            ++stats.display_switch_results;
+            stats.last_switch_index = index;
+            stats.last_switch_code = code;
+            stats.last_switch_reason = reason;
+            if (code == chast::DisplaySwitchCode::Ok) {
+                ++stats.display_switch_ok;
+            } else {
+                ++stats.display_switch_refused;
+            }
+            if (!options.quiet) {
+                std::printf("quic: display switch %u: %s%s%s\n", index,
+                            code == chast::DisplaySwitchCode::Ok ? "accepted" : "refused",
+                            reason.empty() ? "" : ": ", reason.c_str());
+            }
+        }
+    };
+
     // The first call may wait for the audio FIN that follows the video's; all
     // later calls take whatever is already queued.
     chast::AudioHeader audio_header;
@@ -1572,6 +1627,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         drain_clipboard();
         drain_cursor();
+        drain_display_switch_results();
         drain_audio(std::chrono::milliseconds(0));
         {
             const auto probe_now = std::chrono::steady_clock::now();
@@ -1603,6 +1659,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         // Audio is on its own stream and does not wake this call; drain it
         // right after every video wait so it never queues behind a stall.
         drain_audio(std::chrono::milliseconds(0));
+        drain_display_switch_results();
         if (received.status() == chast::Status::WaitTimeout) {
             if (session->async_error().ok() && !session->video_finished() &&
                 std::chrono::steady_clock::now() - last_frame < std::chrono::seconds(30)) {
@@ -1662,6 +1719,24 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             session->request_keyframe();
             next_keyframe_request = last_frame +
                 std::chrono::milliseconds(options.keyframe_request_ms);
+        }
+        if (!switch_ok_sent && stats.switch_ok_index != chast::kDisplayAuto &&
+            last_frame - start >= std::chrono::milliseconds(1200)) {
+            switch_ok_sent = true;
+            if (chast::Error sent_switch =
+                    session->request_display_switch(stats.switch_ok_index);
+                !sent_switch.ok()) {
+                return fail("request_display_switch: " + sent_switch.to_string());
+            }
+        }
+        if (!switch_bad_sent && stats.switch_bad_index != chast::kDisplayAuto &&
+            last_frame - start >= std::chrono::milliseconds(2400)) {
+            switch_bad_sent = true;
+            if (chast::Error sent_switch =
+                    session->request_display_switch(stats.switch_bad_index);
+                !sent_switch.ok()) {
+                return fail("request_display_switch: " + sent_switch.to_string());
+            }
         }
         if (header.seq != expected_seq) {
             ++stats.gaps;
@@ -3590,6 +3665,20 @@ int run_verify(const Options& options) {
                   sent.input_stats.dropped == 0,
               "no input event was rejected, failed or dropped");
         check(sent.input_releases == 1, "the viewer's release request reached the server");
+        check(received.display_switch_results == 2,
+              "both mid-session switch requests were answered");
+        check(received.display_switch_ok == 1,
+              "the host accepted a switch to the output already streaming");
+        check(received.display_switch_refused == 1 &&
+                  received.last_switch_code == chast::DisplaySwitchCode::NotFound,
+              "a switch past the announced list was refused as not found");
+        check(received.switch_bad_index != chast::kDisplayAuto &&
+                  received.last_switch_index == received.switch_bad_index,
+              "the refusal named the index the viewer asked for");
+        check(!received.last_switch_reason.empty(),
+              "the refusal carried the host's reason");
+        check(sent.display_switches == 1 && sent.display_switch_failures == 1,
+              "the host counted one accepted and one refused switch");
     }
 
     if (local.clipboard) {

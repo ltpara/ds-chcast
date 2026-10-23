@@ -58,6 +58,7 @@ constexpr UINT kTokenMessage = WM_APP + 3;
 constexpr UINT kTunnelMessage = WM_APP + 4;
 constexpr UINT kTunnelExitMessage = WM_APP + 5;
 constexpr UINT kSecurityMessage = WM_APP + 6;
+constexpr UINT kSecurityPageMessage = WM_APP + 7;
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -1361,6 +1362,9 @@ void refresh_trusted_list(SecurityDialogState& dialog) {
 }
 
 void show_security_page(SecurityDialogState& dialog, int page) {
+    if (page < 0 || page > 2) {
+        page = 0;
+    }
     const auto show = [](const std::vector<HWND>& controls, bool visible) {
         for (HWND control : controls) {
             ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
@@ -1595,14 +1599,28 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
             }
             break;
         case WM_NOTIFY: {
-            const auto* header = reinterpret_cast<const NMHDR*>(lparam);
-            if (header->idFrom == kSecTab && header->code == TCN_SELCHANGE) {
-                show_security_page(*dialog,
-                                   TabCtrl_GetCurSel(dialog->tab));
-                return 0;
+            if (lparam == 0) {
+                break;
             }
-            break;
+            const auto* header = reinterpret_cast<const NMHDR*>(lparam);
+            if (dialog->tab == nullptr || header->hwndFrom != dialog->tab ||
+                header->idFrom != kSecTab || header->code != TCN_SELCHANGE) {
+                break;
+            }
+            // Showing or hiding controls from inside the tab control's own
+            // notification re-enters COMCTL32 mid-callback; defer the page
+            // switch until the notification has fully unwound.
+            PostMessageW(hwnd, kSecurityPageMessage, 0, 0);
+            return 0;
         }
+        case kSecurityPageMessage:
+            if (dialog->tab != nullptr) {
+                const int page = TabCtrl_GetCurSel(dialog->tab);
+                if (page >= 0) {
+                    show_security_page(*dialog, page);
+                }
+            }
+            return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;

@@ -376,6 +376,90 @@ void test_permission_update() {
           "short PermissionUpdate is rejected");
 }
 
+void test_display_switch() {
+    std::string error;
+    uint16_t display = chast::kDisplayAuto;
+    check(chast::parse_switch_display(payload_of(chast::make_switch_display(3)), display,
+                                      &error) &&
+              display == 3,
+          "SwitchDisplay round-trips an explicit index");
+    check(chast::parse_switch_display(
+              payload_of(chast::make_switch_display(chast::kDisplayAuto)), display, &error) &&
+              display == chast::kDisplayAuto,
+          "SwitchDisplay round-trips the host-default index");
+    std::vector<uint8_t> short_switch = payload_of(chast::make_switch_display(1));
+    short_switch.pop_back();
+    check(!chast::parse_switch_display(short_switch, display, &error),
+          "short SwitchDisplay is rejected");
+    std::vector<uint8_t> trailing_switch = payload_of(chast::make_switch_display(1));
+    trailing_switch.push_back(0);
+    check(!chast::parse_switch_display(trailing_switch, display, &error),
+          "SwitchDisplay with trailing bytes is rejected");
+
+    uint16_t result_index = 0;
+    chast::DisplaySwitchCode code = chast::DisplaySwitchCode::Busy;
+    std::string reason;
+    check(chast::parse_display_switch_result(
+              payload_of(chast::make_display_switch_result(
+                  2, chast::DisplaySwitchCode::Ok, std::string())),
+              result_index, code, reason, &error) &&
+              result_index == 2 && code == chast::DisplaySwitchCode::Ok && reason.empty(),
+          "DisplaySwitchResult round-trips Ok without a reason");
+    const std::string chinese = "该显示器已被拔出";
+    check(chast::parse_display_switch_result(
+              payload_of(chast::make_display_switch_result(
+                  5, chast::DisplaySwitchCode::NotFound, chinese)),
+              result_index, code, reason, &error) &&
+              result_index == 5 && code == chast::DisplaySwitchCode::NotFound &&
+              reason == chinese,
+          "DisplaySwitchResult round-trips a UTF-8 reason");
+
+    // A reason longer than the cap is cut between characters, never inside
+    // one, so the result still parses.
+    std::string long_reason(250, 'a');
+    for (int i = 0; i < 10; ++i) {
+        long_reason += chinese;
+    }
+    check(chast::parse_display_switch_result(
+              payload_of(chast::make_display_switch_result(
+                  0, chast::DisplaySwitchCode::Failed, long_reason)),
+              result_index, code, reason, &error) &&
+              reason.size() <= chast::kMaxDisplaySwitchReason && !reason.empty(),
+          "an over-long result reason is truncated on a character boundary");
+
+    std::vector<uint8_t> unknown_code = payload_of(chast::make_display_switch_result(
+        0, chast::DisplaySwitchCode::Ok, std::string()));
+    unknown_code[2] = 9;
+    check(!chast::parse_display_switch_result(unknown_code, result_index, code, reason, &error),
+          "DisplaySwitchResult with an unknown code is rejected");
+
+    const uint16_t overlong_size =
+        static_cast<uint16_t>(chast::kMaxDisplaySwitchReason + 1);
+    std::vector<uint8_t> overlong(5, 0);
+    overlong[3] = static_cast<uint8_t>(overlong_size & 0xFFu);
+    overlong[4] = static_cast<uint8_t>(overlong_size >> 8);
+    overlong.resize(5 + overlong_size, 'a');
+    check(!chast::parse_display_switch_result(
+              payload_of(chast::make_control(chast::ControlType::DisplaySwitchResult, overlong)),
+              result_index, code, reason, &error),
+          "DisplaySwitchResult with an over-long reason is rejected");
+
+    std::vector<uint8_t> malformed(6, 0);
+    malformed[3] = 1;
+    malformed[5] = 0xFF;
+    check(!chast::parse_display_switch_result(
+              payload_of(chast::make_control(chast::ControlType::DisplaySwitchResult, malformed)),
+              result_index, code, reason, &error),
+          "DisplaySwitchResult with a malformed reason is rejected");
+
+    std::vector<uint8_t> trailing_result = payload_of(chast::make_display_switch_result(
+        0, chast::DisplaySwitchCode::Ok, std::string()));
+    trailing_result.push_back(0);
+    check(!chast::parse_display_switch_result(trailing_result, result_index, code, reason,
+                                              &error),
+          "DisplaySwitchResult with trailing bytes is rejected");
+}
+
 void test_frame_header() {
     chast::FrameHeader sent;
     sent.seq = 42;
@@ -1130,6 +1214,7 @@ int main(int argc, char** argv) {
     test_access_denied();
     test_hello_ack();
     test_permission_update();
+    test_display_switch();
     test_frame_header();
     test_audio_header();
     test_audio_parser();

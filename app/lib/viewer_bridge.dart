@@ -115,6 +115,9 @@ class ViewerStatus {
     this.audioRecovering = false,
     this.audioBufferMs = 0,
     this.audioError = '',
+    this.displaySwitches = 0,
+    this.displaySwitchFailures = 0,
+    this.displaySwitchError = '',
     this.displays = const <ViewerDisplay>[],
   });
 
@@ -222,6 +225,16 @@ class ViewerStatus {
   final bool audioRecovering;
   final int audioBufferMs;
   final String audioError;
+
+  /// Display switches the host accepted this session, and the refusals the
+  /// engine saw (including requests it could not send), with the host's reason
+  /// for the most recent refusal (cleared by an accepted switch). A refused
+  /// switch leaves the current stream up; the page explains it and puts the
+  /// picker back on [streamedDisplayIndex]. The page compares both counters
+  /// with the previous poll so two identical reasons still read as two events.
+  final int displaySwitches;
+  final int displaySwitchFailures;
+  final String displaySwitchError;
   final List<ViewerDisplay> displays;
 
   bool get hasFrame => published > 0 && width > 0 && height > 0;
@@ -344,6 +357,9 @@ class ViewerStatus {
       audioRecovering: map['audioRecovering'] == true,
       audioBufferMs: asInt(map['audioBufferMs']),
       audioError: asString(map['audioError']),
+      displaySwitches: asInt(map['displaySwitches']),
+      displaySwitchFailures: asInt(map['displaySwitchFailures']),
+      displaySwitchError: asString(map['displaySwitchError']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
     );
   }
@@ -495,6 +511,15 @@ class ViewerBridge {
   /// order behind the events already sent.
   static Future<bool> releaseInput() async {
     final bool? queued = await _channel.invokeMethod<bool>('releaseInput');
+    return queued ?? false;
+  }
+
+  /// Asks the running session to capture another announced display. False
+  /// means the request was not queued (no live session, view-only access, or
+  /// an index outside the announced list); the host's answer then arrives in
+  /// [ViewerStatus.displaySwitches] / [ViewerStatus.displaySwitchError].
+  static Future<bool> switchDisplay(int display) async {
+    final bool? queued = await _channel.invokeMethod<bool>('switchDisplay', display);
     return queued ?? false;
   }
 

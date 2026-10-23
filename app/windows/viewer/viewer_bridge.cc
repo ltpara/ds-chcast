@@ -406,6 +406,12 @@ void ViewerBridge::HandleMethodCall(
         map[key("audioBufferMs")] =
             flutter::EncodableValue(static_cast<int64_t>(status.audio_buffer_ms));
         map[key("audioError")] = flutter::EncodableValue(status.audio_error);
+        map[key("displaySwitches")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.display_switches));
+        map[key("displaySwitchFailures")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.display_switch_failures));
+        map[key("displaySwitchError")] =
+            flutter::EncodableValue(status.display_switch_error);
         flutter::EncodableList displays;
         for (const chast::DisplayDescription& display : status.displays) {
             flutter::EncodableMap entry;
@@ -449,6 +455,21 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "releaseInput") {
         const bool queued = viewer_ != nullptr && viewer_->ReleaseInput();
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "switchDisplay") {
+        const auto* display = std::get_if<int32_t>(call.arguments());
+        if (display == nullptr || (*display != chast::kDisplayAuto &&
+                                   (*display < 0 || *display >= chast::kMaxDisplayCount))) {
+            result->Error("bad_args",
+                          "switchDisplay wants an index in the announced list or auto");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->SwitchDisplay(static_cast<uint16_t>(*display));
         result->Success(flutter::EncodableValue(queued));
         return;
     }

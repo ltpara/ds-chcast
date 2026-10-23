@@ -1,16 +1,16 @@
 # M7 安全模型 — 当前状态
 
-更新时间：2026-10-22
-分支：`feat/m7-security`。本次提交完成 #70、#71 剩余回环与 #72 验收，
-并收尾 M7 文档。
+更新时间：2026-10-23
+分支：`feat/m7-security`。本次更新关闭 #73（安全对话框加固与压测）与
+#74（查看器认证 GUI 验收），M7 剩余工作清零。
 计划文档：`docs/m7-plan.md`。
 
 ## 一句话状态
 
-协议、策略层、主机接线、主机 UI、CLI 认证与查看器认证/权限 UI 均已完成；
-单元/回环、真实窗口、Flutter 静态检查/测试/Release 构建全部通过。仅剩
-一次未能复现的 COMCTL32 崩溃需要在发布前定位，以及查看器认证对话框的
-人工 GUI 验收。
+协议、策略层、主机接线、主机 UI、CLI 认证与查看器认证/权限 UI 均已验收；
+安全对话框的 COMCTL32 崩溃路径已加固，三页签两轮各 300 次点击压测无异常、
+无新增 dump；查看器密码/2FA/记住/信任/撤销与实时权限的 Release GUI 路径
+全部手工走通。
 
 ## 已完成
 
@@ -127,6 +127,26 @@
 - 同一来源连续 6 次错误密码后，正确的永久密码也被 `LockedOut` 拒绝，
   理由为 “too many failed attempts”。
 
+### 9. 安全对话框加固（#73）
+
+- `security_dialog_proc` 的 `WM_NOTIFY` 只接受 `hwndFrom == dialog->tab`、
+  `idFrom == kSecTab`、`code == TCN_SELCHANGE` 的通知；`lparam` 为空或
+  来源不匹配直接忽略，避免对伪造/迟到通知解引用。
+- `TCN_SELCHANGE` 不再在 COMCTL32 回调内直接 `ShowWindow` 页面控件，而是
+  `PostMessage(WM_APP+7)` 延迟到通知栈展开后再读取 `TabCtrl_GetCurSel`
+  切换；延迟期间页签再次变化时以最新选中项为准。
+- WER LocalDumps 按可执行文件配置：
+  `HKCU\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\chast-host.exe`
+  → `DumpFolder=D:\ds-chcast\build\dumps`、`DumpType=2`（完整）、
+  `DumpCount=5`。
+
+### 10. 查看器认证 GUI 验收（#74）
+
+Release 查看器 + 隔离主机（`build/tray-test.ini`，仅绑定 127.0.0.1）
+逐项走通：密码错误、密码正确、记住密码重连、2FA 错误、2FA 正确并信任
+设备、可信设备重连跳过动态码、主机撤销信任后重新要求动态码，以及会话中
+收回输入/剪贴板/音频时工具栏与 SnackBar 同步。
+
 ## 验证结果（2026-10-22）
 
 - 构建：`cmake --build build --config Release` 通过；仅剩既有的
@@ -176,8 +196,47 @@
   - 密码模式/服务模式的策略拒绝由 `chast-quic verify` 的 HostServer
     级探针覆盖（见 `tools/quic.cc`）。
 
+## 验证结果（2026-10-23）
+
+- #73 页签压测（Release，真实窗口，每次点击后 `PrintWindow` 全窗截图）：
+  - 常规：100 轮 × 3 页往返 = **300 次点击**，mismatch=0、slow=0、
+    elapsed 14.7 s，主机存活、`build/dumps` 无新增。
+  - 快速：100 轮 × 3 页，点击间隔 5 ms 并叠加 `PrintWindow`，
+    **300 次点击**，mismatch=0，final page=2 正确，elapsed 13.1 s，
+    主机存活、无新增 dump。
+  - 页面切换以每个页面代表控件的 `IsWindowVisible` 校验
+    （5004 / 5014 / 5021）。
+- #74 GUI 验收（Release `chast_viewer.exe --connect 127.0.0.1:45443`）：
+  - 密码错误：主机日志 `refused …: incorrect password`，对话框显示
+    “密码不正确，重试。”。
+  - 密码正确：`admitted 127.0.0.1:60366 with a password`（09:39:07），
+    记住密码写入 DPAPI 存储。
+  - 记住密码重启：无对话框直接 `admitted … with a password`（09:40:11）。
+  - 2FA 错误：主机 `refused …: incorrect two-factor code`（09:58:34），
+    查看器重新弹出“输入两步验证码”，提示“两步验证码不正确或已过期，
+    请重新输入。”。
+  - 2FA 正确 + 勾选“信任此设备”：`admitted … with a password`（09:59:24），
+    进入 1920×1080 / mfxhw64 / 7824 kbps 会话。
+  - 重启查看器：无 2FA 提示，`admitted … with a trusted device`（09:59:51）。
+  - 主机在“访问控制”页撤销信任后保存（页面切换走的就是新的延迟
+    `TCN_SELCHANGE` 路径）：`trusted_devices=` 清空、共享重启（10:01:25）；
+    查看器重连被 `refused …: two-factor authentication is required`
+    （10:01:34）并再次弹出验证码对话框。
+- 自动化输入说明：2FA 码必须恰好为 6 位 ASCII 数字；不足 6 位会在 Hello
+  解析阶段被 `malformed TOTP code` 拒绝（协议层兜底），属于测试脚本问题，
+  不是产品缺陷。
+
 ## 已解决的问题
 
+- **COMCTL32 页签崩溃（一次性）**：17:16 自动化连续切换页签时
+  `chast-host.exe` 崩溃，事件日志为 `COMCTL32.dll +0x5f9dc`、
+  `0xc000041d`（随后 `0xc0000005`）。现在 `WM_NOTIFY` 校验通知来源，并把
+  `TCN_SELCHANGE` 的页面切换 `PostMessage` 到通知栈外执行；两轮各 300 次
+  点击（含 5 ms 快速点击 + `PrintWindow`）均无 mismatch、无崩溃、无新增
+  dump。原崩溃 dump 保留在
+  `C:\Users\admin\AppData\Local\CrashDumps\`（`chast-host.exe.11744.dmp`
+  与 `chast-host.exe(1).11744.dmp`），可用 WER 新配置的
+  `build/dumps` 复现时留档。
 - **审批超时后的僵留对话框**：原先查看者握手超时断开后，审批窗仍可被
   点击“允许”，随后 `announce` 向已死的连接开流并以 E_ABORT 失败。
   现在 `ClientRequest::peer_alive` 由传输层注入，审批回调返回后传输层
@@ -189,32 +248,12 @@
 
 ## 仍未解决
 
-1. **COMCTL32 崩溃（一次性）**：17:16 在自动化连续切换页签时
-   `chast-host.exe` 崩溃，事件日志为
-   `COMCTL32.dll +0x5f9dc`，`0xc000041d`（随后 `0xc0000005`）。
-   重启后用相同的 PostMessage 点击连续切换 30+ 次（含三页往返）
-   未能复现；怀疑与 `PrintWindow`/自动化点击和 Tab 控件通知处理的
-   交互有关，需要抓 dump 或加入断言后再定位。发布前必须关闭。
+无。
 
 ## 剩余工作
 
-- 定位一次性 COMCTL32 崩溃（见上）。
-- 查看器手工 GUI 验收：Release 构建下由主机开启密码/2FA，依次验证
-  密码错误、2FA 错误、勾选“记住密码/信任此设备”后重连跳过动态码、
-  主机撤销信任后重新要求动态码，以及会话中主机收回权限时工具栏与
-  SnackBar 同步。桌面输入无法在自动化中可靠合成，因此保留为人工步骤。
-
-## 下次继续（2026-10-23）
-
-1. **COMCTL32 崩溃**：先做防御性收紧——在 `security_dialog_proc` 的
-   `WM_NOTIFY` 中校验 `lparam`、`hwndFrom` 与 `dialog->tab` 一致，并把
-   `TCN_SELCHANGE` 的页面切换改为 `PostMessage` 延迟到通知栈外执行，
-   避免在 COMCTL32 内部回调期间 ShowWindow 子控件；然后用自动化连续
-   切换三个页签 100+ 次并叠加 `PrintWindow` 压测。同时为 `chast-host`
-   准备 WER LocalDumps，复现时保留 dump 以定位
-   `COMCTL32.dll +0x5f9dc`。
-2. **查看器手工 GUI 验收**：按“剩余工作”第二条在 Release 构建上走完
-   密码/2FA/记住/信任/权限变化路径。
+- M7 无剩余验收项。#73 的 `host/main.cc` 改动与本文档一并提交；
+  测试脚本与 dump 目录留在本地 `build/`，不入库。
 
 ## 复现
 
@@ -243,11 +282,22 @@ flutter build windows --release
 
 # 点击批准 / 密码 / 两者可在安全设置里切换，或直接改 auth_mode=
 ./build/Release/chast-quic.exe connect --port 45443 --insecure --seconds 8
+
+# 安全对话框页签压测（先打开“安全设置”对话框）
+# 每轮依次点击 认证 / 访问控制 / 高级，点击后 PrintWindow 全窗截图，
+# 以各页代表控件的可见性核对页面切换；-Rapid 为 5 ms 间隔快速点击。
+powershell -NoProfile -ExecutionPolicy Bypass -File build/tabstress.ps1 -Rounds 100
+powershell -NoProfile -ExecutionPolicy Bypass -File build/tabstress.ps1 -Rounds 100 -Rapid
+
+# 查看器认证 GUI（Release，配合隔离主机）
+./app/build/windows/x64/runner/Release/chast_viewer.exe --connect 127.0.0.1:45443
 ```
 
 ## 注意
 
 - `b7ce199`（WIP 快照）已包含 M6 弱网验收产物
   （`tools/netem.cc`、`docs/weak-network-acceptance.md`）与路线图更新；
-  本次提交在其之上完成 M7 的查看器 UI、回环与文档收尾。
-- 临时密码、`host.ini`、测试脚本与构建产物均在 `build/` 下，未入库。
+  M7 的查看器 UI、回环与文档收尾在其之上完成。
+- #73 只改 `host/main.cc`（`WM_NOTIFY` 校验与延迟页面切换），无协议或
+  策略层变化。
+- 临时密码、`host.ini`、测试脚本、dump 与构建产物均在 `build/` 下，未入库。

@@ -308,6 +308,18 @@ public:
     Error stop_audio();
     // True when the client asked for a key frame since the last call.
     bool take_keyframe_request();
+    // Pops the newest SwitchDisplay request the viewer sent. Only the newest
+    // is kept: the host switches once, to where the viewer last pointed.
+    // Requires input permission on both ends; a request without it is
+    // dropped by the transport. The host answers each taken request with
+    // send_display_switch_result().
+    bool take_display_switch_request(uint16_t& display_index);
+    // Answers a SwitchDisplay. Ok tells the viewer a StreamInfo follows (or
+    // that the stream already shows that display); every other code leaves
+    // the current stream up. `reason` is UTF-8 and is truncated to
+    // kMaxDisplaySwitchReason bytes on a character boundary.
+    Error send_display_switch_result(uint16_t display_index, DisplaySwitchCode code,
+                                     const std::string& reason = {});
     // Drains the input events received since the last call, in order. They
     // were already injected by the session's own InputInjector when
     // QuicServerConfig::allow_input is set; this is the observation hook for
@@ -372,6 +384,18 @@ public:
     bool take_stream_update(ServerInfo& info);
     // Number of StreamInfo messages received. Observation hook for tests.
     uint64_t stream_updates() const;
+    // Asks the host to capture another display mid-session. `display_index`
+    // names an entry of the last announced display list, or kDisplayAuto.
+    // Requires the handshake and input permission; the answer arrives through
+    // take_display_switch_result(). On Ok a StreamInfo describing the new
+    // output follows on the same control stream.
+    Error request_display_switch(uint16_t display_index);
+    // Pops the newest DisplaySwitchResult. The reason is the host's UTF-8
+    // explanation, empty when it has none.
+    bool take_display_switch_result(uint16_t& display_index, DisplaySwitchCode& code,
+                                    std::string& reason);
+    // Total DisplaySwitchResults received. Observation hook for tools.
+    uint64_t display_switch_results() const;
     // SHA-256 fingerprint of the certificate the server presented (uppercase
     // hex). Empty until the TLS handshake reached the validation callback;
     // available even when the pin rejected it, which is what makes a mismatch

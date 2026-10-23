@@ -63,6 +63,11 @@ struct HostServerStats {
     uint16_t resolution_percent = 100;
     uint64_t abr_changes = 0;
     uint64_t resolution_changes = 0;
+    // Viewer-requested display switches handled this session: completed
+    // rebuilds plus no-ops (the requested output was already streaming), and
+    // refused requests (not found, busy or the rebuild failed).
+    uint64_t display_switches = 0;
+    uint64_t display_switch_failures = 0;
     double rtt_ms = 0.0;
     double min_rtt_ms = 0.0;
     double send_kbps = 0.0;  // encoded payload rate over the last ABR interval

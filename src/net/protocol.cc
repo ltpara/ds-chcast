@@ -1138,6 +1138,76 @@ bool parse_permission_update(const std::vector<uint8_t>& payload,
     return true;
 }
 
+std::vector<uint8_t> make_switch_display(uint16_t display_index) {
+    std::vector<uint8_t> payload(2);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, display_index);
+    return make_control(ControlType::SwitchDisplay, payload);
+}
+
+bool parse_switch_display(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                          std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u16(display_index) || !reader.at_end()) {
+        set_error(error, "malformed SwitchDisplay");
+        return false;
+    }
+    // The host checks the index against its display list at the moment it
+    // handles the request: the list can change while the session runs.
+    return true;
+}
+
+std::vector<uint8_t> make_display_switch_result(uint16_t display_index, DisplaySwitchCode code,
+                                                const std::string& reason) {
+    std::string text = reason;
+    if (text.size() > kMaxDisplaySwitchReason) {
+        size_t cut = kMaxDisplaySwitchReason;
+        while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0u) == 0x80u) {
+            --cut;
+        }
+        text.resize(cut);
+    }
+    if (!valid_utf8(text)) {
+        text.clear();
+    }
+    std::vector<uint8_t> payload(5 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, display_index);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::DisplaySwitchResult, payload);
+}
+
+bool parse_display_switch_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                                 DisplaySwitchCode& code, std::string& reason,
+                                 std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u16(display_index) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed DisplaySwitchResult");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(DisplaySwitchCode::Busy)) {
+        set_error(error, "unknown display switch result code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxDisplaySwitchReason) {
+        set_error(error, "DisplaySwitchResult reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "DisplaySwitchResult carries a malformed reason");
+        return false;
+    }
+    code = static_cast<DisplaySwitchCode>(raw_code);
+    return true;
+}
+
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> message(kControlHeaderSize + payload.size());
     uint8_t* cursor = message.data();

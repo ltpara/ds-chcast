@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 13.
+// The chast wire protocol, version 14.
 //
 // One QUIC connection carries:
 //
@@ -38,7 +38,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 13;
+inline constexpr uint16_t kProtocolVersion = 14;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -102,6 +102,17 @@ enum class ControlType : uint16_t {
     // sending input or clipboard it no longer holds; audio teardown follows
     // the stream state in the next StreamInfo.
     PermissionUpdate = 14,
+    // Mid-session display switch. Payload: the u16 display index (an index
+    // into the HelloAck display list, or kDisplayAuto for the host's default).
+    // The server answers with DisplaySwitchResult on the same control stream;
+    // the video stream stays up throughout. Repeating the current display is a
+    // no-op answered with Ok.
+    SwitchDisplay = 15,
+    // Answer to SwitchDisplay. Payload: requested index (u16), code (u8),
+    // reason length (u16), UTF-8 reason. Ok means a StreamInfo carrying the new
+    // display follows (or that nothing had to change); any other code leaves
+    // the previous stream untouched. See DisplaySwitchCode.
+    DisplaySwitchResult = 16,
 };
 
 // ----- input -----
@@ -370,6 +381,19 @@ inline constexpr uint16_t kDisplayAuto = 0xFFFF;
 // HelloAck can cause.
 inline constexpr uint16_t kMaxDisplayCount = 64;
 
+// Why a SwitchDisplay was refused. Ok is the only code that changes the
+// stream; the viewer keeps its current picture on every other code and shows
+// `reason` (empty when the server has nothing to add).
+enum class DisplaySwitchCode : uint8_t {
+    Ok = 0,
+    NotFound = 1,  // the index is outside the server's current display list
+    Failed = 2,    // the target output exists but could not be captured
+    Busy = 3,      // a previous switch is still settling; retry after a moment
+};
+// Bound on the UTF-8 reason; the payload stays small enough to be a control
+// message and a longer explanation belongs in the host log, not the wire.
+inline constexpr size_t kMaxDisplaySwitchReason = 256;
+
 // What the server announces in HelloAck. `encoder` is informational (the VPL
 // implementation that won the tier ladder); `codec` is what the video stream
 // actually contains. `width`/`height` are the encoded picture size, which
@@ -555,6 +579,19 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
 std::vector<uint8_t> make_permission_update(uint16_t permissions);
 bool parse_permission_update(const std::vector<uint8_t>& payload,
                              uint16_t& permissions, std::string* error);
+// Viewer -> host display switch. `display_index` is any u16; the host decides
+// whether it names one of its outputs (kDisplayAuto always means its default).
+std::vector<uint8_t> make_switch_display(uint16_t display_index);
+bool parse_switch_display(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                          std::string* error);
+// Host -> viewer result. The maker truncates `reason` to
+// kMaxDisplaySwitchReason bytes without splitting a UTF-8 sequence; the parser
+// rejects an over-long reason instead of truncating it.
+std::vector<uint8_t> make_display_switch_result(uint16_t display_index, DisplaySwitchCode code,
+                                                const std::string& reason);
+bool parse_display_switch_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
+                                 DisplaySwitchCode& code, std::string& reason,
+                                 std::string* error);
 std::vector<uint8_t> make_control(ControlType type, const std::vector<uint8_t>& payload);
 
 // Reassembles control messages from arbitrarily sized stream chunks.

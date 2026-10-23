@@ -36,6 +36,20 @@ std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
 }
 
+const char* switch_code_name(chast::DisplaySwitchCode code) {
+    switch (code) {
+        case chast::DisplaySwitchCode::Ok:
+            return "the switch was accepted";
+        case chast::DisplaySwitchCode::NotFound:
+            return "the display is no longer attached";
+        case chast::DisplaySwitchCode::Failed:
+            return "the host could not switch displays";
+        case chast::DisplaySwitchCode::Busy:
+            return "the host is still settling the previous switch";
+    }
+    return "the host refused the switch";
+}
+
 int64_t steady_us(std::chrono::steady_clock::time_point time) {
     return std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count();
 }
@@ -85,6 +99,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_cursor_.reset();
         cursor_updates_ = 0;
     }
+    {
+        std::lock_guard<std::mutex> lock(switch_mutex_);
+        pending_switch_.reset();
+    }
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
@@ -127,6 +145,25 @@ bool ViewerEngine::ReleaseInput() {
     PendingInput pending;
     pending.release = true;
     pending_input_.push_back(pending);
+    return true;
+}
+
+bool ViewerEngine::SwitchDisplay(uint16_t display) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+            return false;
+        }
+        if (display != chast::kDisplayAuto &&
+            static_cast<size_t>(display) >= status_.displays.size()) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(switch_mutex_);
+    pending_switch_ = display;
     return true;
 }
 
@@ -240,6 +277,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
     std::string audio_error;
+    uint64_t display_switches = 0;
+    uint64_t display_switch_failures = 0;
+    std::string display_switch_error;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
     bool clock_synced = false;
@@ -322,6 +362,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.audio_recovering = audio_recovering;
             status_.audio_buffer_ms = audio_buffer_ms;
             status_.audio_error = audio_error;
+            status_.display_switches = display_switches;
+            status_.display_switch_failures = display_switch_failures;
+            status_.display_switch_error = display_switch_error;
             status_.elapsed_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
             if (final) {
@@ -799,6 +842,52 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the display the picker last pointed at. One slot: a
+                // newer target replaces one the loop has not sent yet, the
+                // same policy the pointer queue uses.
+                auto drain_display_switch = [&] {
+                    std::optional<uint16_t> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(switch_mutex_);
+                        requested.swap(pending_switch_);
+                    }
+                    if (!requested) {
+                        return;
+                    }
+                    chast::Error sent = session->request_display_switch(*requested);
+                    if (!sent.ok()) {
+                        ++display_switch_failures;
+                        display_switch_error = "request: " + sent.to_string();
+                        std::fprintf(stderr, "viewer: switch display: %s\n",
+                                     sent.to_string().c_str());
+                    }
+                };
+
+                // Adopts the host's answer. Ok only says the request was
+                // accepted; the geometry that actually changed arrives in the
+                // StreamInfo following it. A refusal leaves the picture as it
+                // was, so the UI can explain it and return the picker to the
+                // output that is still streamed.
+                auto receive_display_switch = [&] {
+                    uint16_t index = 0;
+                    chast::DisplaySwitchCode code = chast::DisplaySwitchCode::Failed;
+                    std::string reason;
+                    while (session->take_display_switch_result(index, code, reason)) {
+                        if (code == chast::DisplaySwitchCode::Ok) {
+                            ++display_switches;
+                            display_switch_error.clear();
+                            std::fprintf(stderr,
+                                         "viewer: switch to display %u accepted\n", index);
+                            continue;
+                        }
+                        display_switch_error =
+                            reason.empty() ? switch_code_name(code) : reason;
+                        ++display_switch_failures;
+                        std::fprintf(stderr, "viewer: switch to display %u refused: %s\n",
+                                     index, display_switch_error.c_str());
+                    }
+                };
+
                 // Applies StreamInfo messages: the captured output changed
                 // size, rotation or origin after the server rebuilt its
                 // duplication. Frames keep flowing on the same stream, so only
@@ -890,6 +979,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         break;
                     }
                     receive_permissions();
+                    receive_display_switch();
+                    drain_display_switch();
                     {
                         const auto probe_now = Clock::now();
                         if (probe_now - last_probe >= kProbeInterval) {
@@ -923,6 +1014,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // receive_frame(), so drain them as soon as the wait ends.
                     drain_audio();
                     receive_permissions();
+                    receive_display_switch();
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {

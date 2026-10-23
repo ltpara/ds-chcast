@@ -154,6 +154,15 @@ struct ViewerStatus {
     // picker shows; the streamed entry is the one whose rect starts at
     // origin_x/origin_y and matches width x height.
     std::vector<chast::DisplayDescription> displays;
+    // Display switches the host accepted (including a request for the output
+    // already streaming) and the refusals this engine learned about, plus the
+    // host's reason for the most recent refusal. A success clears the error.
+    // The UI compares both counters with the previous poll, so it can tell a
+    // new refusal from the stale text of an old one; the error alone cannot
+    // distinguish two identical reasons.
+    uint64_t display_switches = 0;
+    uint64_t display_switch_failures = 0;
+    std::string display_switch_error;
 };
 
 class ViewerEngine {
@@ -192,6 +201,13 @@ public:
     // Queues a request to lift everything the host still holds. Ordered with
     // the events above, so releases the UI already sent land first.
     bool ReleaseInput();
+    // Queues a mid-session switch to another announced display. Returns false
+    // when no session is streaming, the host did not grant input (a view-only
+    // session cannot move the host's picture), or no such display is in the
+    // announced list. The answer arrives through ViewerStatus: display_switches
+    // on success and display_switch_error on refusal. The new geometry travels
+    // in the StreamInfo the host sends after an accepted switch.
+    bool SwitchDisplay(uint16_t display);
     // Queues one text for the host. Returns false when the server did not
     // offer clipboard sync, no session is running, the text is invalid, or
     // the queue already holds the newest text. Only changes should be sent;
@@ -256,6 +272,12 @@ private:
     mutable std::mutex cursor_mutex_;
     std::optional<chast::CursorUpdate> pending_cursor_;
     uint64_t cursor_updates_ = 0;
+
+    // A switch is a single newest target, for the same reason: the viewer
+    // wants where the picker last pointed, not a tour of the list it passed
+    // through.
+    mutable std::mutex switch_mutex_;
+    std::optional<uint16_t> pending_switch_;
 };
 
 }  // namespace chast_viewer

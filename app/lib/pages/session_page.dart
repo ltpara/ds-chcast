@@ -67,8 +67,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   ViewFit _fit = ViewFit.adaptive;
   // What the next connection asks the server for. Kept across reconnects so
   // "重新连接" returns to the same output; kViewerDisplayAuto leaves the
-  // choice to the server.
+  // choice to the server. An accepted in-session switch updates it too.
   int _display = kViewerDisplayAuto;
+  // The output an in-session switch is waiting on, or null when none is. The
+  // toolbar marks it while the host works; a refusal drops it and leaves
+  // [_display] pointing at the output that is still streaming.
+  int? _pendingDisplay;
   // Logical pixels per captured pixel, as the frame is currently drawn. The
   // host's pointer is scaled by this times the window's device pixel ratio.
   double _viewScale = 1.0;
@@ -362,11 +366,34 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (droppedControl) {
       _controlEnabled = false;
     }
+    // The host answers a switch with one result. Compare the counters with
+    // the previous poll rather than the error text: two identical refusals
+    // must still read as two answers, and a late answer for a request the
+    // picker has already replaced must not win.
+    final int? pendingDisplay = _pendingDisplay;
+    final bool switchRefused = pendingDisplay != null &&
+        status.displaySwitchFailures > _status.displaySwitchFailures;
+    final bool switchAccepted = pendingDisplay != null &&
+        !switchRefused &&
+        status.displaySwitches > _status.displaySwitches;
     _syncClipboardPolling(status.acceptsClipboard && !nowOver && _clipboardSync);
     setState(() {
+      if (switchAccepted) {
+        _display = pendingDisplay;
+      }
+      if (switchAccepted || switchRefused || nowOver) {
+        _pendingDisplay = null;
+      }
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    if (switchRefused) {
+      final String reason = status.displaySwitchError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '切换显示失败，已回到当前输出' : '切换显示失败：$reason'),
+        duration: const Duration(seconds: 4),
+      ));
+    }
     if (droppedControl) {
       _setKeyCapture(false);
     }
@@ -649,10 +676,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  /// The output the toolbar should mark. An explicit request is authoritative;
-  /// after "server chooses" the list is matched against the stream's origin
-  /// and size, which is how HelloAck identifies the captured output.
+  /// The output the toolbar should mark. A switch in flight is shown as
+  /// selected while the host works; otherwise an explicit request is
+  /// authoritative, and after "server chooses" the list is matched against
+  /// the stream's origin and size, which is how HelloAck identifies the
+  /// captured output.
   int get _activeDisplay {
+    if (_pendingDisplay != null) {
+      return _pendingDisplay!;
+    }
     if (_display != kViewerDisplayAuto) {
       return _display;
     }
@@ -660,7 +692,35 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _switchDisplay(int display) async {
-    if (_reconnecting || display == _display) {
+    if (_reconnecting) {
+      return;
+    }
+    // Tapping the output that is already shown is not a request.
+    if (display == _activeDisplay) {
+      return;
+    }
+    // A live session moves its capture without a reconnect, but only while
+    // the host grants input; otherwise the Hello-time selection is the only
+    // way to change outputs.
+    if (_status.isLive && _status.acceptsInput && !_over) {
+      setState(() => _pendingDisplay = display);
+      bool queued = false;
+      try {
+        queued = await ViewerBridge.switchDisplay(display);
+      } on PlatformException {
+        queued = false;
+      } on MissingPluginException {
+        queued = false;
+      }
+      if (!mounted) {
+        return;
+      }
+      if (queued) {
+        return;
+      }
+      setState(() => _pendingDisplay = null);
+    }
+    if (display == _display) {
       return;
     }
     _display = display;
@@ -819,6 +879,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _collapsed = false;
       _reconnecting = false;
       _controlEnabled = false;
+      _pendingDisplay = null;
       _wheelX = 0;
       _wheelY = 0;
       _heldButtons = 0;

@@ -61,8 +61,8 @@ uint16_t settings_permissions(const HostSettings& settings) {
 }
 
 bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomic<bool>& stopping,
-                           std::string* error) {
-    const auto deadline = Clock::now() + std::chrono::seconds(30);
+                           std::chrono::milliseconds timeout, std::string* error) {
+    const auto deadline = Clock::now() + timeout;
     while (Clock::now() < deadline && !stopping.load()) {
         const CaptureResult result = capturer.capture(std::chrono::milliseconds(100));
         switch (result) {
@@ -95,7 +95,8 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
         }
         return true;
     }
-    *error = "no frame with an NV12 texture arrived in 30 s";
+    *error = "no frame with an NV12 texture arrived in " +
+             std::to_string(timeout.count() / 1000) + " s";
     return false;
 }
 
@@ -657,7 +658,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     stats.audio_active = false;
     stats.resolution_percent = 100;
     stats.resolution_changes = 0;
-    const std::vector<DisplayInfo> attached = enumerate_displays();
+    std::vector<DisplayInfo> attached = enumerate_displays();
     if (attached.empty()) {
         *error = "no displays are attached";
         return false;
@@ -702,10 +703,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         *error = "capturer creation failed: " + *error;
         return false;
     }
-    if (!wait_for_usable_frame(*capturer, true, stopping_, error)) {
+    if (!wait_for_usable_frame(*capturer, true, stopping_, std::chrono::seconds(30), error)) {
         return false;
     }
     const FrameInfo& first = capturer->frame();
+    // `first` is a view into the capturer's frame and goes stale once a
+    // switch swaps the capturer; this is the only field read later.
+    const bool initial_pointer_only = !first.desktop_updated;
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_.display_index = find_display(attached, capturer->display());
@@ -1205,6 +1209,176 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
+    // A viewer can ask for another output without reconnecting. The new
+    // capturer and encoder are built beside the running pair and swapped in
+    // only after both produced a picture, so a failed switch leaves the old
+    // stream untouched. Runs on the host thread at the top of the loop.
+    bool switched_once = false;
+    Clock::time_point last_switch_at{};
+    auto switch_display = [&](uint16_t requested_index) -> bool {
+        const auto now = Clock::now();
+        auto answer = [&](DisplaySwitchCode code, const std::string& reason) {
+            Error sent = session_->send_display_switch_result(requested_index, code, reason);
+            if (sent.ok()) {
+                return true;
+            }
+            if (sent.status() == Status::Unavailable ||
+                sent.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "send_display_switch_result: " + sent.to_string();
+            }
+            return false;
+        };
+        auto refuse = [&](DisplaySwitchCode code, const std::string& reason) {
+            ++stats.display_switch_failures;
+            log("display switch refused: " + reason);
+            return answer(code, reason);
+        };
+
+        if ((session_->permissions() & kPermissionInput) == 0) {
+            return refuse(DisplaySwitchCode::Failed, "input control is disabled");
+        }
+        if (switched_once && now - last_switch_at < std::chrono::seconds(1)) {
+            return answer(DisplaySwitchCode::Busy, "a display switch just happened");
+        }
+
+        // Re-enumerate: a hotplug can renumber the outputs since HelloAck.
+        std::vector<DisplayInfo> fresh = enumerate_displays();
+        if (fresh.empty()) {
+            return refuse(DisplaySwitchCode::NotFound, "no displays are attached");
+        }
+        size_t target = fresh.size();
+        if (requested_index != kDisplayAuto) {
+            target = requested_index;
+        } else if (settings_.display != kDisplayAuto) {
+            target = settings_.display;
+        } else {
+            target = 0;
+            for (size_t i = 0; i < fresh.size(); ++i) {
+                if (fresh[i].primary) {
+                    target = i;
+                    break;
+                }
+            }
+        }
+        if (target >= fresh.size()) {
+            return refuse(DisplaySwitchCode::NotFound,
+                          "display " + std::to_string(requested_index) + " is not attached");
+        }
+        if (fresh[target].device_name == capturer->display().device_name) {
+            switched_once = true;
+            last_switch_at = now;
+            ++stats.display_switches;
+            log("display switch: already streaming " +
+                display_name_utf8(capturer->display()));
+            return answer(DisplaySwitchCode::Ok, std::string());
+        }
+
+        std::string switch_error;
+        std::unique_ptr<IDxgiCapturer> next = create_capturer(target, capture, &switch_error);
+        if (!next) {
+            return refuse(DisplaySwitchCode::Failed,
+                          "cannot capture display " + std::to_string(target) + ": " +
+                              switch_error);
+        }
+        if (stats.resolution_percent != 100) {
+            Error scaled = next->set_nv12_scale(stats.resolution_percent);
+            if (!scaled.ok()) {
+                // A screen that cannot scale still gets the switch; the ABR
+                // sees the new size as 100% from here on.
+                log("display switch: " + std::to_string(target) + " cannot scale to " +
+                    std::to_string(stats.resolution_percent) + "%; using 100%: " +
+                    scaled.to_string());
+                stats.resolution_percent = 100;
+                ++stats.resolution_changes;
+            }
+        }
+        if (!wait_for_usable_frame(*next, true, stopping_, std::chrono::milliseconds(3000),
+                                   &switch_error)) {
+            return refuse(DisplaySwitchCode::Failed,
+                          "display " + std::to_string(target) + " produced no frame: " +
+                              switch_error);
+        }
+        const FrameInfo& next_frame = next->frame();
+        EncoderConfig next_config = encoder_config;
+        next_config.width = next_frame.nv12_width;
+        next_config.height = next_frame.nv12_height;
+        const AdapterDevice next_adapter = next->adapter_device();
+        std::unique_ptr<IVideoEncoder> next_encoder =
+            create_encoder(next_adapter.device, next_config, &switch_error);
+        if (!next_encoder) {
+            return refuse(DisplaySwitchCode::Failed,
+                          "encoder creation failed: " + switch_error);
+        }
+        if (next_encoder->codec() != settings_.codec) {
+            log(std::string("the encoder fell back: requested ") + codec_name(settings_.codec) +
+                ", producing " + codec_name(next_encoder->codec()));
+        }
+        // The replacement starts at the configured bitrate, so the audio
+        // reserve and any ABR step-down have to be applied again.
+        const uint32_t next_fps =
+            stats.framerate != 0 ? stats.framerate : static_cast<uint32_t>(framerate);
+        if (next_encoder->bitrate() != stats.target_bitrate ||
+            (next_fps != 0 && next_encoder->framerate() != next_fps)) {
+            Error rated = next_encoder->set_rate(stats.target_bitrate, next_fps);
+            if (!rated.ok()) {
+                return refuse(DisplaySwitchCode::Failed,
+                              "cannot apply the current bitrate: " + rated.to_string());
+            }
+        }
+
+        // Both sides are ready; swap and describe what now runs. `next_frame`
+        // points into the capturer the move below hands to `capturer`.
+        capturer = std::move(next);
+        encoder = std::move(next_encoder);
+        attached = std::move(fresh);
+        have_input = false;
+        force_keyframe = true;
+        extra_idrs = 1;
+        // The new output has its own pointer shape and position; the viewer
+        // must not keep placing the old sprite.
+        cursor_sent_once = false;
+        cursor_sent = CursorUpdate{};
+        const size_t new_index = find_display(attached, capturer->display());
+        stream_info = describe_stream(attached, capturer->display(), *encoder,
+                                      next_frame.width, next_frame.height,
+                                      static_cast<uint16_t>(framerate),
+                                      (session_->permissions() & kPermissionClipboard) != 0,
+                                      audio_info);
+        publish_stream(stream_info, new_index, display_name_utf8(capturer->display()));
+        if (config_.stream_announced) {
+            config_.stream_announced(stream_info);
+        }
+        if (!answer(DisplaySwitchCode::Ok, std::string())) {
+            return false;
+        }
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "refresh_stream: " + refreshed.to_string();
+            }
+            return false;
+        }
+        ++stats.stream_updates;
+        ++stats.display_switches;
+        switched_once = true;
+        last_switch_at = now;
+        publish_stats(stats);
+        log("display switched to " + std::to_string(new_index) + " (" +
+            display_name_utf8(capturer->display()) + "), " +
+            std::to_string(stream_info.source_width) + "x" +
+            std::to_string(stream_info.source_height) + " source, " +
+            std::to_string(stream_info.width) + "x" + std::to_string(stream_info.height) +
+            " coded");
+        return true;
+    };
+
     // Once a second: link telemetry for the tray, and the bitrate decision
     // that follows from it. Runs on the host thread between frames so the
     // encoder reset set_rate performs cannot overlap an encode call.
@@ -1343,7 +1517,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     // The frame captured before the handshake is the first one on the wire.
     ++stats.frames;
-    if (!first.desktop_updated) {
+    if (initial_pointer_only) {
         ++stats.pointer_only;
     }
     if (!process_frame(0, capture_clock_ms(Clock::now()))) {
@@ -1359,6 +1533,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (config_.run_seconds > 0.0 &&
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
+        }
+        uint16_t switch_index = kDisplayAuto;
+        if (session_->take_display_switch_request(switch_index) &&
+            !switch_display(switch_index)) {
+            const bool clean = error->empty();
+            drain_peer();
+            return clean;
         }
         if (!apply_pending_permissions()) {
             const bool clean = error->empty();
