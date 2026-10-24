@@ -18,6 +18,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/relay"
 	"github.com/ltpara/ds-chcast/server/internal/relaynode"
+	"github.com/ltpara/ds-chcast/server/internal/servercfg"
 )
 
 func main() {
@@ -48,9 +49,33 @@ func run() error {
 		downgradeRatio  = flag.Float64("relay-downgrade-threshold", 0.66, "speed/limit ratio that triggers downgrade, 0..1")
 		blacklistFile   = flag.String("relay-blacklist-file", "", "IP list file that receives the slower relay rate")
 		blocklistFile   = flag.String("relay-blocklist-file", "", "IP list file whose viewers are disconnected")
+		configFile      = flag.String("config", "", "INI file with flag values; an explicit flag still wins")
+		envFile         = flag.String("env-file", ".env", "dotenv file with flag values; empty disables it")
 		verbose         = flag.Bool("verbose", false, "debug logging")
 	)
 	flag.Parse()
+
+	var layers []*servercfg.Layer
+	if *envFile != "" {
+		layer, err := servercfg.LoadEnvFile(*envFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("--env-file: %w", err)
+		}
+		if layer != nil {
+			layers = append(layers, layer)
+		}
+	}
+	if *configFile != "" {
+		layer, err := servercfg.LoadINI(*configFile)
+		if err != nil {
+			return fmt.Errorf("--config: %w", err)
+		}
+		layers = append([]*servercfg.Layer{layer}, layers...)
+	}
+	layers = append(layers, servercfg.FromEnv())
+	if err := servercfg.Apply(flag.CommandLine, layers...); err != nil {
+		return err
+	}
 
 	level := slog.LevelInfo
 	if *verbose {

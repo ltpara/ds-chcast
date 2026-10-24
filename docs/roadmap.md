@@ -1,6 +1,6 @@
 # chast 开发路线图
 
-更新时间：2026-10-24。按依赖顺序排列，已完成项保留在这里作为基线。
+更新时间：2026-10-25。按依赖顺序排列，已完成项保留在这里作为基线。
 
 ## 已完成
 
@@ -604,6 +604,23 @@
   - 已知限制：只按会话与全局两级限速，不支持按 ID；UDP 只能整包丢弃；名单
     不与节点共享；降级只降不升；真实跨机整形效果与时钟偏差下的降级判定仍需
     部署复核。
+
+## M10.8 — 配置来源、UDP 接收缓冲与启动自检（部分完成）
+
+- 进行中：hbbs/hbbr 式的运维入口（协议仍 v23，`docs/m10.8-plan.md`）。
+  - 已完成：`internal/servercfg` 提供「显式 flag > `--config` INI > `--env-file`
+    dotenv > 环境变量」四级来源；键名大小写不敏感，`-`/`_` 等价，接受
+    `CHAST_<KEY>` 或 `<KEY>`；INI 跳过分节与注释，dotenv 支持 `export ` 与
+    成对引号；布尔值额外接受 `Y/N`。`cmd/chast-server` 与 `cmd/chast-relay`
+    新增 `--config`、`--env-file`，在读取任何业务参数之前应用。单测 6 项，
+    `gofmt`/`vet`/`build`/`test` 全部通过。
+  - 待办：`--rmem`（会合/中继/共享载体三处 UDP 接收缓冲，失败只告警）；
+    名单文件留空时回退工作目录 `blacklist.txt`/`blocklist.txt`；
+    `--test-punch` 启动 UDP 自检（对应 `TEST_HBBS`）；`BIND`/`PORT`/
+    `RELAY-SERVERS`/`RMEM`/`TEST_HBBS`/`ALWAYS_USE_RELAY`/
+    `MAX_PUNCH_REQUESTS` 等 RustDesk 原名别名；README 与真实二进制回环验证。
+  - 已知限制：配置只在启动时读取，不支持热重载；INI 无分节层级；dotenv 不
+    展开变量；`DB_URL`/SQLite 持久化不在范围内（状态仍用 JSON 文件）。
 
 ## M6 后续（未开始）
 

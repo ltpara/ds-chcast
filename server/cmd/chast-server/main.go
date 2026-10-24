@@ -30,6 +30,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
 	"github.com/ltpara/ds-chcast/server/internal/relaypool"
 	"github.com/ltpara/ds-chcast/server/internal/rendezvous"
+	"github.com/ltpara/ds-chcast/server/internal/servercfg"
 )
 
 func main() {
@@ -71,6 +72,8 @@ func run() error {
 		relayRatio     = flag.Float64("relay-downgrade-threshold", 0.66, "speed/limit ratio that triggers downgrade, 0..1")
 		relayBlackFile = flag.String("relay-blacklist-file", "", "IP list file that receives the slower relay rate")
 		relayBlockFile = flag.String("relay-blocklist-file", "", "IP list file whose viewers are disconnected")
+		configFile     = flag.String("config", "", "INI file with flag values; an explicit flag still wins")
+		envFile        = flag.String("env-file", ".env", "dotenv file with flag values; empty disables it")
 		punchLogMax    = flag.Int("punch-log-max", 100000, "retained punch request records; 0 disables the log")
 		regMax         = flag.Int("register-max", 30, "registration attempts per IP per window; 0 disables the rate check")
 		regWindow      = flag.Duration("register-window", time.Minute, "registration rate window")
@@ -79,6 +82,28 @@ func run() error {
 		verbose        = flag.Bool("verbose", false, "debug logging")
 	)
 	flag.Parse()
+
+	var layers []*servercfg.Layer
+	if *envFile != "" {
+		layer, err := servercfg.LoadEnvFile(*envFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("--env-file: %w", err)
+		}
+		if layer != nil {
+			layers = append(layers, layer)
+		}
+	}
+	if *configFile != "" {
+		layer, err := servercfg.LoadINI(*configFile)
+		if err != nil {
+			return fmt.Errorf("--config: %w", err)
+		}
+		layers = append([]*servercfg.Layer{layer}, layers...)
+	}
+	layers = append(layers, servercfg.FromEnv())
+	if err := servercfg.Apply(flag.CommandLine, layers...); err != nil {
+		return err
+	}
 
 	level := slog.LevelInfo
 	if *verbose {

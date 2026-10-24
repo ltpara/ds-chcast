@@ -328,6 +328,14 @@ scrape_configs:
 - 指标标签不含主机 ID 与客户端地址：`endpoint` 来自路由模式、`code` 为状态
   码，基数受控。`/v1/stats` 保留为 JSON 快照，二者读取同一份注册表与中继
   统计。
+- 配置来源按 hbbs 的顺序叠加：命令行显式参数 > `--config` 指定的 INI >
+  `--env-file` 指定的 dotenv（默认 `.env`，缺失时跳过，`--env-file ""` 关闭）
+  > 环境变量。INI 只读 `key=value`，分节头与 `#`/`;` 注释被忽略；dotenv
+  额外接受 `export ` 与成对引号。键名大小写不敏感、`-` 与 `_` 等价，并且
+  优先匹配 `CHAST_<KEY>` 再匹配 `<KEY>`，例如 `CHAST_HOST_TTL=90s`、
+  `relay-single-bandwidth=64`。布尔参数也接受 `Y/N`。坏值在启动时报
+  `config <flag>=<value>: …` 并退出，不会带病运行。`chast-relay` 使用同一套
+  来源与优先级。
 
 ### 独立中继节点（chast-relay）
 
