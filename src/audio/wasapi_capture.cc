@@ -266,15 +266,16 @@ void WasapiLoopbackCapture::thread_main() {
 
 bool WasapiLoopbackCapture::open_encoder(std::string* error) {
     AudioEncoderConfig encoder_config;
+    encoder_config.codec = AudioCodec::Opus;
     encoder_config.sample_rate = kCaptureRate;
     encoder_config.channels = kCaptureChannels;
     encoder_config.bitrate = config_.bitrate;
-    encoder_ = create_aac_encoder(encoder_config, error);
+    encoder_ = create_audio_encoder(encoder_config, error);
     if (!encoder_) {
         return false;
     }
     info_.enabled = true;
-    info_.codec = AudioCodec::AAC;
+    info_.codec = encoder_config.codec;
     info_.sample_rate = encoder_->sample_rate();
     info_.channels = encoder_->channels();
     info_.bitrate = encoder_->bitrate();

@@ -70,6 +70,10 @@ struct HostSettings {
     // Send the system sound to the viewer. Off means no audio stream is
     // opened and the HelloAck reports audio unavailable.
     bool allow_audio = true;
+    // Accept the viewer's microphone into the host's speakers. Off by default:
+    // the microphone is a privacy feature, so the HelloAck reports it
+    // unavailable and CMIC streams are refused.
+    bool allow_microphone = false;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.

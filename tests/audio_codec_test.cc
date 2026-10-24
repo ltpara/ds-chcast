@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -27,39 +29,44 @@ constexpr double kToneHz = 440.0;
 constexpr double kAmplitude = 0.5;
 constexpr uint64_t kCaptureBaseMs = 123456;
 
-std::vector<int16_t> make_tone(size_t frames, double amplitude = kAmplitude) {
-    std::vector<int16_t> pcm(frames * kChannels);
+std::vector<int16_t> make_tone(size_t frames, uint16_t channels = kChannels,
+                               double amplitude = kAmplitude) {
+    std::vector<int16_t> pcm(frames * channels);
     for (size_t frame = 0; frame < frames; ++frame) {
         const double sample =
             std::sin(2.0 * kPi * kToneHz * static_cast<double>(frame) / kRate);
         const auto value =
             static_cast<int16_t>(sample * amplitude * 32767.0 + 0.5);
-        pcm[frame * kChannels] = value;
-        pcm[frame * kChannels + 1] = value;
+        for (uint16_t channel = 0; channel < channels; ++channel) {
+            pcm[frame * channels + channel] = value;
+        }
     }
     return pcm;
 }
 
 struct Decoded {
     std::vector<int16_t> samples;
-    size_t frames() const { return samples.size() / kChannels; }
+    size_t frames(uint16_t channels = kChannels) const {
+        return samples.size() / channels;
+    }
 };
 
-double rms(const std::vector<int16_t>& samples, size_t first_frame, size_t frames) {
+double rms(const std::vector<int16_t>& samples, size_t first_frame, size_t frames,
+           uint16_t channels = kChannels) {
     double sum = 0.0;
     for (size_t frame = first_frame; frame < first_frame + frames; ++frame) {
-        const double value = samples[frame * kChannels] / 32768.0;
+        const double value = samples[frame * channels] / 32768.0;
         sum += value * value;
     }
     return std::sqrt(sum / static_cast<double>(frames));
 }
 
 double zero_crossing_hz(const std::vector<int16_t>& samples, size_t first_frame,
-                        size_t frames) {
+                        size_t frames, uint16_t channels = kChannels) {
     size_t crossings = 0;
-    int16_t previous = samples[first_frame * kChannels];
+    int16_t previous = samples[first_frame * channels];
     for (size_t frame = first_frame + 1; frame < first_frame + frames; ++frame) {
-        const int16_t current = samples[frame * kChannels];
+        const int16_t current = samples[frame * channels];
         if ((previous < 0 && current >= 0) || (previous >= 0 && current < 0)) {
             ++crossings;
         }
@@ -228,6 +235,163 @@ void test_gap_reanchors() {
           "the block after the gap is stamped near its capture time");
 }
 
+void test_opus_round_trip(uint16_t channels, uint32_t bitrate, const char* label) {
+    chast::AudioEncoderConfig config;
+    config.codec = chast::AudioCodec::Opus;
+    config.sample_rate = kRate;
+    config.channels = channels;
+    config.bitrate = bitrate;
+    config.voice = channels == 1;
+    std::string error;
+    auto encoder = chast::create_audio_encoder(config, &error);
+    check(encoder != nullptr, label);
+    if (!encoder) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+    check(encoder->sample_rate() == kRate && encoder->channels() == channels &&
+              encoder->frame_samples() == chast::kOpusFrameSamples,
+          "the Opus encoder reports 20 ms frames at 48 kHz");
+    check(encoder->extradata().size() == 19 &&
+              std::memcmp(encoder->extradata().data(), "OpusHead", 8) == 0,
+          "the Opus encoder produces an OpusHead");
+
+    constexpr size_t kFrames = kRate * 2;
+    const std::vector<int16_t> pcm = make_tone(kFrames, channels);
+    std::vector<chast::EncodedAudio> packets;
+    for (size_t offset = 0, chunk = 0; offset < kFrames; offset += chunk) {
+        chunk = 317;
+        if (offset + chunk > kFrames) {
+            chunk = kFrames - offset;
+        }
+        const uint64_t capture_ms =
+            kCaptureBaseMs + static_cast<uint64_t>(offset) * 1000 / kRate;
+        chast::Error encoded =
+            encoder->encode(pcm.data() + offset * channels, chunk, capture_ms, packets);
+        if (!encoded.ok()) {
+            check(false, "Opus encode() accepts an arbitrary block size");
+            std::printf("     %s\n", encoded.to_string().c_str());
+            return;
+        }
+    }
+    check(encoder->flush(packets).ok() && !packets.empty(),
+          "the Opus encoder flushes its partial frame");
+    check(packets.front().capture_ms == kCaptureBaseMs,
+          "the first Opus packet carries the first sample's capture time");
+    bool ordered = true;
+    uint64_t previous_ms = 0;
+    for (const chast::EncodedAudio& packet : packets) {
+        if (packet.capture_ms < previous_ms) {
+            ordered = false;
+        }
+        previous_ms = packet.capture_ms;
+    }
+    check(ordered, "Opus packet timestamps are ordered");
+
+    chast::AudioInfo info;
+    info.enabled = true;
+    info.codec = chast::AudioCodec::Opus;
+    info.sample_rate = encoder->sample_rate();
+    info.channels = encoder->channels();
+    info.bitrate = encoder->bitrate();
+    info.frame_samples = encoder->frame_samples();
+    info.extradata = encoder->extradata();
+
+    auto decoder = chast::create_audio_decoder(info, &error);
+    check(decoder != nullptr, "the Opus decoder opens from the announced config");
+    if (!decoder) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+
+    Decoded decoded;
+    bool first_block_pts = false;
+    bool format_ok = true;
+    for (const chast::EncodedAudio& packet : packets) {
+        chast::AudioHeader header;
+        header.pts_ms = packet.capture_ms - kCaptureBaseMs;
+        header.capture_ms = packet.capture_ms;
+        header.sample_rate = kRate;
+        header.frame_samples = chast::kOpusFrameSamples;
+        header.channels = channels;
+        header.codec = chast::AudioCodec::Opus;
+        std::vector<chast::DecodedAudio> blocks;
+        chast::Error result =
+            decoder->decode(header, packet.data.data(), packet.data.size(), blocks);
+        if (!result.ok()) {
+            check(false, "every Opus packet decodes");
+            std::printf("     %s\n", result.to_string().c_str());
+            return;
+        }
+        for (const chast::DecodedAudio& block : blocks) {
+            if (!first_block_pts) {
+                check(block.pts_ms == 0,
+                      "the Opus pre-skip keeps the first audible sample at zero");
+                first_block_pts = true;
+            }
+            if (block.sample_rate != kRate || block.channels != channels) {
+                format_ok = false;
+            }
+            decoded.samples.insert(decoded.samples.end(), block.samples.begin(),
+                                   block.samples.end());
+        }
+    }
+    check(first_block_pts, "the Opus decoder produced audio");
+    check(format_ok, "the Opus blocks keep the announced format");
+
+    const size_t frames = decoded.frames(channels);
+    const long long expected = static_cast<long long>(kFrames);
+    check(std::llabs(static_cast<long long>(frames) - expected) <= 2048,
+          "the Opus length matches the encoded length within the pre-skip");
+    if (frames < kRate / 2) {
+        return;
+    }
+    const size_t middle_start = frames / 4;
+    const size_t middle_frames = frames / 2;
+    const double level = rms(decoded.samples, middle_start, middle_frames, channels);
+    check(level > 0.25 && level < 0.45,
+          "the decoded Opus tone keeps the expected energy");
+    const double frequency =
+        zero_crossing_hz(decoded.samples, middle_start, middle_frames, channels);
+    check(frequency > 430.0 && frequency < 450.0,
+          "the decoded Opus tone stays near 440 Hz");
+    std::printf("     %zu packets, %zu frames, RMS %.3f, %.1f Hz\n", packets.size(),
+                frames, level, frequency);
+}
+
+void test_opus() {
+    test_opus_round_trip(1, 32000, "the mono Opus encoder opens at 32 kbps");
+    test_opus_round_trip(2, 128000, "the stereo Opus encoder opens at 128 kbps");
+
+    std::string error;
+    chast::AudioEncoderConfig wrong_rate;
+    wrong_rate.codec = chast::AudioCodec::Opus;
+    wrong_rate.sample_rate = 44100;
+    check(chast::create_audio_encoder(wrong_rate, &error) == nullptr,
+          "the Opus encoder refuses a rate other than 48 kHz");
+
+    chast::AudioEncoderConfig unknown;
+    unknown.codec = static_cast<chast::AudioCodec>(9);
+    check(chast::create_audio_encoder(unknown, &error) == nullptr,
+          "an unknown encoder codec is rejected");
+
+    chast::AudioInfo bogus;
+    bogus.codec = static_cast<chast::AudioCodec>(9);
+    bogus.sample_rate = kRate;
+    bogus.channels = 1;
+    check(chast::create_audio_decoder(bogus, &error) == nullptr,
+          "an unknown decoder codec is rejected");
+
+    chast::AudioInfo missing;
+    missing.enabled = true;
+    missing.codec = chast::AudioCodec::Opus;
+    missing.sample_rate = kRate;
+    missing.channels = 1;
+    missing.frame_samples = chast::kOpusFrameSamples;
+    check(chast::create_opus_decoder(missing, &error) == nullptr,
+          "the Opus decoder refuses a missing OpusHead");
+}
+
 void test_bad_config() {
     std::string error;
     chast::AudioEncoderConfig config;
@@ -249,6 +413,7 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     test_round_trip();
     test_gap_reanchors();
+    test_opus();
     test_bad_config();
 
     if (failures == 0) {

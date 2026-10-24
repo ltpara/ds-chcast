@@ -3,7 +3,7 @@
 //   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio]
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real] [--display-mode]
-//                      [--file-upload]
+//                      [--file-upload] [--file-download]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -56,6 +56,10 @@
 // digest cannot match. The host must finalize the two complete files, keep the
 // prefix (its answer names the offset), and delete the refused upload's
 // partial file.
+//
+// --file-download runs the same channel the other way: the host offers a
+// deterministic file, the viewer accepts it, checks the bytes against the
+// offered digest and reports the result back to the host.
 //
 // With --audio the serve end captures the system sound through WASAPI and
 // connect decodes the second uni-stream, printing packet/sample/energy
@@ -470,6 +474,12 @@ struct Options {
     // verify only: where the local host writes uploads. Set to a temporary
     // folder so the check never touches the operator's Downloads.
     std::string file_receive_dir;
+    // verify only: send a deterministic file from the host to the viewer and
+    // check the bytes the viewer received against the offered digest.
+    bool file_download = false;
+    // The file the host offers when --file-download is given; verify writes
+    // it to a temporary folder before the session starts.
+    std::string download_source;
     // connect/verify: SHA-256 fingerprint to pin. verify fills it from the
     // server it starts when the option is absent.
     std::string fingerprint;
@@ -588,6 +598,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.display_mode = true;
             } else if (arg == "--file-upload") {
                 options.file_upload = true;
+            } else if (arg == "--file-download") {
+                options.file_download = true;
             } else if (arg == "--fingerprint" && i + 1 < argc) {
                 options.fingerprint = argv[++i];
             } else if (arg == "--insecure") {
@@ -660,6 +672,10 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.file_upload && options.mode != "verify") {
         std::fprintf(stderr, "--file-upload only applies to verify\n");
+        return false;
+    }
+    if (options.file_download && options.mode != "verify") {
+        std::fprintf(stderr, "--file-download only applies to verify\n");
         return false;
     }
     if (!options.send_clipboard.empty()) {
@@ -766,6 +782,12 @@ struct SenderStats {
     uint64_t files_received = 0;
     uint64_t file_bytes_received = 0;
     std::vector<std::string> received_file_paths;
+    // Host-to-viewer probe (verify --file-download): what HostServer counted
+    // for the file it offered, and whether the queue accepted it.
+    uint64_t files_sent = 0;
+    uint64_t file_bytes_sent = 0;
+    uint64_t file_send_failures = 0;
+    bool download_queued = false;
     std::string error;
     bool client_connected = false;
     bool peer_left = false;
@@ -880,6 +902,14 @@ struct ReceiverStats {
     std::vector<uint64_t> file_result_received;
     std::vector<std::string> file_result_reasons;
     uint64_t file_errors = 0;
+    // Host-to-viewer probe (verify --file-download): the offer the viewer
+    // accepted, the bytes it collected and whether they matched the digest.
+    bool download_probe = false;
+    uint64_t download_offers = 0;
+    uint64_t download_bytes = 0;
+    bool download_finished = false;
+    bool download_ok = false;
+    std::string download_error;
     // Audio the viewer received and decoded: announced format, packet and
     // byte counts, sequence/CRC/decode errors, decoded sample count and the
     // RMS of the decoded PCM (the tone-energy check).
@@ -1194,7 +1224,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
             return clipboard->write(content);
         };
     }
-    config.settings.allow_file_transfer = options.file_upload;
+    config.settings.allow_file_transfer = options.file_upload || options.file_download;
     config.settings.file_receive_directory = options.file_receive_dir;
     config.file_received = [&stats](const std::string& path, uint64_t bytes) {
         ++stats.files_received;
@@ -1203,8 +1233,25 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     };
 
     std::string error;
-    std::unique_ptr<chast::HostServer> server =
-        chast::HostServer::create(std::move(config), &error);
+    std::unique_ptr<chast::HostServer> server;
+    if (options.file_download) {
+        // Queue the download once the viewer is attached: start_file_download
+        // only accepts a live session with the file-transfer bit granted.
+        config.stream_announced = [&server, &stats,
+                                   source = options.download_source](
+                                      const chast::ServerInfo&) {
+            if (stats.download_queued) {
+                return;
+            }
+            stats.download_queued = true;
+            std::string start_error;
+            if (!server->start_file_download(source, &start_error)) {
+                stats.error = "start_file_download: " + start_error;
+                std::fprintf(stderr, "start_file_download: %s\n", start_error.c_str());
+            }
+        };
+    }
+    server = chast::HostServer::create(std::move(config), &error);
     if (!server) {
         return fail("QUIC server: " + error);
     }
@@ -1278,6 +1325,9 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.abr_changes = status.stats.abr_changes;
     stats.rtt_ms = status.stats.rtt_ms;
     stats.send_kbps = status.stats.send_kbps;
+    stats.files_sent = status.stats.files_sent;
+    stats.file_bytes_sent = status.stats.file_bytes_sent;
+    stats.file_send_failures = status.stats.file_send_failures;
     stats.error = status.error;
 
     if (!options.quiet || !stats.error.empty()) {
@@ -1744,6 +1794,118 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                                                               : FileStep::Done;
         }
         return true;
+    };
+
+    // ---- file download probe (verify --file-download) ----
+    // The host offers one file through the same channel the upload uses, with
+    // the roles reversed. The viewer accepts, collects the bytes in memory,
+    // compares them with the offered digest and reports the result.
+    stats.download_probe = options.file_download;
+    bool download_have_offer = false;
+    bool download_done = false;
+    uint32_t download_id = 0;
+    uint64_t download_size = 0;
+    std::array<uint8_t, 32> download_digest{};
+    std::vector<uint8_t> download_content;
+    auto advance_file_download = [&]() -> bool {
+        if (!stats.download_probe || download_done) {
+            return true;
+        }
+        if (!download_have_offer) {
+            chast::FileOffer offer;
+            while (session->take_file_offer(offer)) {
+                if (download_have_offer) {
+                    continue;
+                }
+                if (!info.file_transfer_enabled) {
+                    stats.download_error = "the host offered a file transfer it did not announce";
+                    return false;
+                }
+                ++stats.download_offers;
+                download_id = offer.transfer_id;
+                download_size = offer.size;
+                download_digest = offer.sha256;
+                download_content.clear();
+                download_have_offer = true;
+                if (chast::Error answered =
+                        session->send_file_answer(download_id, chast::FileCode::Ok);
+                    !answered.ok()) {
+                    stats.download_error = "send_file_answer: " + answered.to_string();
+                    return false;
+                }
+                if (!options.quiet) {
+                    std::printf("quic: accepting host download %s (%llu bytes)\n",
+                                offer.name.c_str(),
+                                static_cast<unsigned long long>(offer.size));
+                }
+            }
+        }
+        if (!download_have_offer) {
+            return true;
+        }
+        while (true) {
+            chast::FileChunk chunk;
+            chast::Error received =
+                session->receive_file_chunk(chunk, std::chrono::milliseconds(0));
+            if (received.status() == chast::Status::WaitTimeout ||
+                received.status() == chast::Status::Unavailable) {
+                break;
+            }
+            if (!received.ok()) {
+                stats.download_error = "receive_file_chunk: " + received.to_string();
+                return false;
+            }
+            if (chunk.transfer_id != download_id) {
+                continue;
+            }
+            if (chunk.offset != download_content.size()) {
+                stats.download_error = "the host's download arrived out of order";
+                return false;
+            }
+            download_content.insert(download_content.end(), chunk.data.begin(),
+                                    chunk.data.end());
+            stats.download_bytes += chunk.data.size();
+        }
+        chast::FileUploadState state;
+        if (!session->file_upload_state(download_id, state)) {
+            // The answer is on its way and the host has not opened the CFIL
+            // stream yet; the transfer becomes visible when it does.
+            return true;
+        }
+        if (!state.finished) {
+            if (!state.error.empty()) {
+                stats.download_error = "the download stream broke: " + state.error;
+                return false;
+            }
+            return true;
+        }
+        bool ok = download_content.size() == download_size;
+        std::array<uint8_t, 32> digest{};
+        if (ok && !chast::sha256(download_content.data(), download_content.size(), digest)) {
+            ok = false;
+            stats.download_error = "could not hash the received file";
+        } else if (ok && digest != download_digest) {
+            ok = false;
+            stats.download_error = "the received bytes do not match the offered digest";
+        }
+        const chast::FileCode code = ok ? chast::FileCode::Ok : chast::FileCode::DigestMismatch;
+        if (chast::Error reported =
+                session->send_file_result(download_id, code, download_content.size(),
+                                          stats.download_error);
+            !reported.ok()) {
+            stats.download_error = "send_file_result: " + reported.to_string();
+            return false;
+        }
+        stats.download_ok = ok;
+        stats.download_finished = true;
+        download_done = true;
+        if (!options.quiet) {
+            std::printf("quic: host download %s (%llu bytes)%s\n",
+                        ok ? "verified" : "rejected",
+                        static_cast<unsigned long long>(download_content.size()),
+                        ok ? "" : (" reason: " + stats.download_error).c_str());
+        }
+        return ok;
     };
 
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
@@ -2412,6 +2574,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!advance_file_upload()) {
             return fail(stats.error);
         }
+        if (!advance_file_download()) {
+            return fail(stats.download_error.empty() ? stats.error : stats.download_error);
+        }
         drain_cursor();
         drain_display_switch_results();
         drain_audio(std::chrono::milliseconds(0));
@@ -2624,6 +2789,23 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         if (file_step != FileStep::Done && stats.error.empty()) {
             stats.error = "the file upload did not finish";
+        }
+    }
+    if (stats.download_probe && !download_done) {
+        // The host hashes, offers and streams from its own frame loop; give it
+        // the same grace after video ends that the upload probe gets.
+        const auto download_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!download_done && std::chrono::steady_clock::now() < download_deadline) {
+            if (!advance_file_download()) {
+                break;
+            }
+            if (!download_done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (!download_done && stats.error.empty() && stats.download_error.empty()) {
+            stats.error = "the host download did not finish";
         }
     }
     if (options.audio) {
@@ -4252,6 +4434,41 @@ int run_verify(const Options& options) {
         const std::u8string utf8 = dir.u8string();
         local.file_receive_dir.assign(utf8.begin(), utf8.end());
     }
+    if (local.file_download) {
+        // The host hashes the file before it offers it; hashing 300 KiB takes
+        // a moment but the transfer itself needs a few frame-loop passes.
+        if (local.seconds < 6.0) {
+            local.seconds = 6.0;
+        }
+        std::error_code ec;
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path(ec) / "chast-quic-download";
+        if (!ec) {
+            std::filesystem::create_directories(dir, ec);
+        }
+        const std::filesystem::path source = dir / "chast-verify-download.bin";
+        if (!ec) {
+            const std::vector<uint8_t> payload = file_probe_content(kFileProbeBytes);
+            std::ofstream out(source, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                ec = std::make_error_code(std::errc::io_error);
+            } else {
+                out.write(reinterpret_cast<const char*>(payload.data()),
+                          static_cast<std::streamsize>(payload.size()));
+                out.close();
+                if (!out) {
+                    ec = std::make_error_code(std::errc::io_error);
+                }
+            }
+        }
+        if (ec) {
+            std::fprintf(stderr, "could not prepare the download source: %s\n",
+                         ec.message().c_str());
+            return 1;
+        }
+        const std::u8string utf8 = source.u8string();
+        local.download_source.assign(utf8.begin(), utf8.end());
+    }
     const bool keep_file = !options.save.empty();
     const std::string path = keep_file ? options.save : ".chast-quic-verify.bin";
 
@@ -4752,6 +4969,22 @@ int run_verify(const Options& options) {
         if (!fresh_file_on_disk_ok || !resumed_file_on_disk_ok || !digest_file_absent ||
             !no_partial_left) {
             std::printf("     %s\n", file_check_detail.c_str());
+        }
+    }
+
+    if (local.file_download) {
+        check(received.download_probe, "the viewer ran the file download probe");
+        check(received.download_offers == 1, "the host offered exactly one download");
+        check(received.download_bytes == kFileProbeBytes,
+              "the viewer received all 300 KiB");
+        check(received.download_finished && received.download_ok,
+              "the viewer accepted the host's file and its digest");
+        check(sent.download_queued, "the host queued the download once the viewer attached");
+        check(sent.files_sent == 1 && sent.file_bytes_sent == kFileProbeBytes,
+              "the host completed one 300 KiB download");
+        check(sent.file_send_failures == 0, "the host's download path saw no failures");
+        if (!received.download_ok) {
+            std::printf("     download: %s\n", received.download_error.c_str());
         }
     }
 

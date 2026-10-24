@@ -446,6 +446,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint32_t clipboard_received_formats = 0;
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
+    uint64_t files_received = 0;
+    uint64_t file_receive_failures = 0;
     uint64_t cursor_updates = 0;
     bool audio_announced = false;
     bool audio_finished = false;
@@ -544,6 +546,29 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.clipboard_received_formats = clipboard_received_formats;
             status_.files_sent = files_sent;
             status_.file_failures = file_failures;
+            status_.files_received = files_received;
+            status_.file_receive_failures = file_receive_failures;
+            {
+                std::lock_guard<std::mutex> file_lock(file_mutex_);
+                status_.download_name = download_.name;
+                status_.download_size = download_.size;
+                status_.download_received = download_.received;
+                status_.download_error = download_.error;
+                switch (download_.stage) {
+                    case FileDownload::Stage::kNone:
+                        status_.download_phase = FilePhase::kIdle;
+                        break;
+                    case FileDownload::Stage::kReceiving:
+                        status_.download_phase = FilePhase::kSending;
+                        break;
+                    case FileDownload::Stage::kDone:
+                        status_.download_phase = FilePhase::kDone;
+                        break;
+                    case FileDownload::Stage::kFailed:
+                        status_.download_phase = FilePhase::kFailed;
+                        break;
+                }
+            }
             {
                 std::lock_guard<std::mutex> file_lock(file_mutex_);
                 status_.file_name = file_.name;
@@ -1249,6 +1274,259 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // The host's download. Offered files are accepted into the
+                // local receive directory while file transfer is granted; the
+                // .part file is renamed only after the digest checks out.
+                const std::string download_directory = chast::default_receive_directory();
+                auto download_fail = [&](const std::string& message, bool report) {
+                    uint32_t transfer_id = 0;
+                    std::string name;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (download_.stage != FileDownload::Stage::kReceiving) {
+                            return;
+                        }
+                        transfer_id = download_.transfer_id;
+                        name = download_.name;
+                        if (download_.receiver) {
+                            download_.receiver->abort(true);
+                            download_.receiver.reset();
+                        }
+                        download_.stage = FileDownload::Stage::kFailed;
+                        download_.error = message;
+                    }
+                    if (report) {
+                        (void)session->send_file_result(transfer_id, chast::FileCode::IoError, 0,
+                                                        message);
+                    }
+                    ++file_receive_failures;
+                    std::fprintf(stderr, "viewer: download %s failed: %s\n", name.c_str(),
+                                 message.c_str());
+                };
+
+                auto drain_downloads = [&] {
+                    if ((permissions & chast::kPermissionFileTransfer) == 0) {
+                        bool active = false;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            active = download_.stage == FileDownload::Stage::kReceiving;
+                        }
+                        if (active) {
+                            download_fail("the host revoked file transfer", false);
+                        }
+                    }
+                    chast::FileOffer offer;
+                    while (session->take_file_offer(offer)) {
+                        if ((permissions & chast::kPermissionFileTransfer) == 0) {
+                            continue;
+                        }
+                        bool busy = false;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            busy = download_.stage == FileDownload::Stage::kReceiving;
+                        }
+                        if (busy || download_directory.empty()) {
+                            ++file_receive_failures;
+                            (void)session->send_file_answer(
+                                offer.transfer_id, chast::FileCode::Busy, 0,
+                                busy ? "another download is running"
+                                     : "the viewer has no download directory");
+                            continue;
+                        }
+                        chast::FileReceiveOptions options;
+                        options.directory = download_directory;
+                        options.name = offer.name;
+                        options.size = offer.size;
+                        options.sha256 = offer.sha256;
+                        options.allow_resume = offer.resume;
+                        uint64_t resume_offset = 0;
+                        std::string receive_error;
+                        std::unique_ptr<chast::FileReceiver> receiver = chast::FileReceiver::create(
+                            options, &resume_offset, &receive_error);
+                        if (!receiver) {
+                            ++file_receive_failures;
+                            (void)session->send_file_answer(offer.transfer_id, chast::FileCode::Refused,
+                                                            0, receive_error);
+                            std::fprintf(stderr, "viewer: download %s refused: %s\n",
+                                         offer.name.c_str(), receive_error.c_str());
+                            continue;
+                        }
+                        const std::string name = receiver->name();
+                        const uint64_t size = offer.size;
+                        const uint32_t transfer_id = offer.transfer_id;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            download_ = FileDownload{};
+                            download_.stage = FileDownload::Stage::kReceiving;
+                            download_.transfer_id = transfer_id;
+                            download_.name = name;
+                            download_.size = size;
+                            download_.received = resume_offset;
+                            download_.answer_time = Clock::now();
+                            download_.receiver = std::move(receiver);
+                        }
+                        chast::Error answered = session->send_file_answer(
+                            transfer_id, chast::FileCode::Ok, resume_offset);
+                        if (!answered.ok()) {
+                            download_fail("cannot accept the download: " + answered.to_string(),
+                                          false);
+                            continue;
+                        }
+                        std::fprintf(stderr, "viewer: receiving %s (%llu bytes%s)\n", name.c_str(),
+                                     static_cast<unsigned long long>(size),
+                                     resume_offset > 0 ? ", resuming" : "");
+                    }
+
+                    bool receiving = false;
+                    uint32_t transfer_id = 0;
+                    uint64_t answer_age_ms = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        receiving = download_.stage == FileDownload::Stage::kReceiving;
+                        transfer_id = download_.transfer_id;
+                        answer_age_ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                Clock::now() - download_.answer_time)
+                                .count());
+                    }
+                    if (!receiving) {
+                        return;
+                    }
+                    for (;;) {
+                        chast::FileChunk chunk;
+                        chast::Error got = session->receive_file_chunk(
+                            chunk, std::chrono::milliseconds(0));
+                        if (got.status() == chast::Status::WaitTimeout) {
+                            break;
+                        }
+                        if (got.status() == chast::Status::Unavailable) {
+                            chast::FileUploadState state;
+                            if (!session->file_upload_state(transfer_id, state)) {
+                                // The host has not opened the stream yet; a
+                                // short answer-to-stream window is normal.
+                                if (answer_age_ms < 10000) {
+                                    return;
+                                }
+                                download_fail("the host never opened the file stream", false);
+                                return;
+                            }
+                            if (state.error.empty() && state.finished) {
+                                break;
+                            }
+                            download_fail(state.error.empty()
+                                              ? "the download stream ended early"
+                                              : state.error,
+                                          true);
+                            return;
+                        }
+                        if (!got.ok()) {
+                            download_fail(got.to_string(), true);
+                            return;
+                        }
+                        if (chunk.transfer_id != transfer_id) {
+                            download_fail("the download stream carried another transfer", true);
+                            return;
+                        }
+                        chast::FileReceiver* receiver = nullptr;
+                        uint64_t received = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (download_.stage != FileDownload::Stage::kReceiving ||
+                                download_.transfer_id != transfer_id) {
+                                return;
+                            }
+                            receiver = download_.receiver.get();
+                            received = download_.received;
+                        }
+                        if (receiver == nullptr) {
+                            download_fail("the download has no partial file", false);
+                            return;
+                        }
+                        if (chunk.offset != received) {
+                            download_fail("the download is not contiguous", false);
+                            return;
+                        }
+                        std::string write_error;
+                        if (!receiver->write(chunk.data.data(), chunk.data.size(),
+                                             &write_error)) {
+                            download_fail(write_error, true);
+                            return;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (download_.stage == FileDownload::Stage::kReceiving &&
+                                download_.transfer_id == transfer_id) {
+                                download_.received = received + chunk.data.size();
+                            }
+                        }
+                    }
+                    chast::FileUploadState state;
+                    if (!session->file_upload_state(transfer_id, state)) {
+                        if (answer_age_ms < 10000) {
+                            return;
+                        }
+                        download_fail("the host never opened the file stream", false);
+                        return;
+                    }
+                    if (!state.error.empty()) {
+                        download_fail(state.error, true);
+                        return;
+                    }
+                    if (!state.finished) {
+                        return;
+                    }
+                    chast::FileReceiver* receiver = nullptr;
+                    uint64_t bytes = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        receiver = download_.receiver.get();
+                        bytes = download_.received;
+                    }
+                    if (receiver == nullptr) {
+                        download_fail("the download has no partial file", false);
+                        return;
+                    }
+                    std::string final_path;
+                    std::string finish_error;
+                    if (!receiver->finish(final_path, &finish_error)) {
+                        download_fail(finish_error, true);
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        download_.receiver.reset();
+                        download_.stage = FileDownload::Stage::kDone;
+                        download_.path = final_path;
+                        download_.error.clear();
+                    }
+                    ++files_received;
+                    chast::Error sent =
+                        session->send_file_result(transfer_id, chast::FileCode::Ok, bytes);
+                    if (!sent.ok()) {
+                        std::fprintf(stderr, "viewer: cannot report the download: %s\n",
+                                     sent.to_string().c_str());
+                    }
+                    std::fprintf(stderr, "viewer: received %s (%llu bytes)\n", final_path.c_str(),
+                                 static_cast<unsigned long long>(bytes));
+                };
+
+                auto drain_download_cancels = [&] {
+                    chast::FileCancel cancel;
+                    while (session->take_file_cancel(cancel)) {
+                        bool matches = false;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            matches = download_.stage == FileDownload::Stage::kReceiving &&
+                                      download_.transfer_id == cancel.transfer_id;
+                        }
+                        if (matches) {
+                            download_fail(cancel.reason.empty() ? "the host cancelled the download"
+                                                               : cancel.reason,
+                                          false);
+                        }
+                    }
+                };
+
                 // Moves the newest pointer state the host sent into the slot
                 // the UI takes from. A newer update replaces an older one that
                 // was never taken, so the UI always sees the current position.
@@ -1610,6 +1888,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     poll_clipboard();
                     receive_clipboard();
                     drive_file_upload();
+                    drain_downloads();
+                    drain_download_cancels();
                     receive_cursor();
                     drain_audio();
                     chast::FrameHeader header;

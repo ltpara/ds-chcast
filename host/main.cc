@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -79,7 +80,9 @@ enum ControlId {
     kInputCheck,
     kClipboardCheck,
     kFileTransferCheck,
+    kSendFileButton,
     kAudioCheck,
+    kMicrophoneCheck,
     kAutostartCheck,
     kSecurityButton,
     kFirewallButton,
@@ -109,6 +112,7 @@ struct HostApp {
     HWND input_check = nullptr;
     HWND clipboard_check = nullptr;
     HWND audio_check = nullptr;
+    HWND microphone_check = nullptr;
     HWND autostart_check = nullptr;
     HWND toggle_button = nullptr;
     HWND log_edit = nullptr;
@@ -124,6 +128,9 @@ struct HostApp {
 
     std::string config_path;
     HostSettings settings;
+    // The listener's microphone gate is fixed at creation; the UI uses this to
+    // tell an operator whether enabling it applies now or next session.
+    bool listener_microphone = false;
     std::string startup_warning;
     bool startup_created = false;
     std::string startup_save_error;
@@ -240,6 +247,7 @@ enum ApprovalDialogId {
     kApprovalClipboard,
     kApprovalFile,
     kApprovalAudio,
+    kApprovalMicrophone,
     kApprovalAllow,
     kApprovalDeny,
 };
@@ -250,6 +258,7 @@ struct ApprovalDialogState {
     HWND clipboard = nullptr;
     HWND file = nullptr;
     HWND audio = nullptr;
+    HWND microphone = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
@@ -282,6 +291,9 @@ void finish_approval(ApprovalDialogState& dialog, bool allowed) {
         }
         if (SendMessageW(dialog.audio, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionAudio;
+        }
+        if (SendMessageW(dialog.microphone, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            mask |= kPermissionMicrophone;
         }
         dialog.result = mask;
     }
@@ -462,10 +474,13 @@ ClientApproval server_approve(const ClientRequest& request) {
          (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
             .c_str(),
         SS_LEFT | SS_ENDELLIPSIS, 170, 220, 280, 18, 0, nullptr);
+    dialog.microphone =
+        permission_check(L"麦克风（上行）", kPermissionMicrophone, 20, 244,
+                         kApprovalMicrophone);
 
-    add(L"BUTTON", L"允许", BS_DEFPUSHBUTTON | WS_TABSTOP, 250, 262, 90, 32, kApprovalAllow,
+    add(L"BUTTON", L"允许", BS_DEFPUSHBUTTON | WS_TABSTOP, 250, 278, 90, 32, kApprovalAllow,
         nullptr);
-    add(L"BUTTON", L"拒绝", BS_PUSHBUTTON | WS_TABSTOP, 350, 262, 90, 32, kApprovalDeny,
+    add(L"BUTTON", L"拒绝", BS_PUSHBUTTON | WS_TABSTOP, 350, 278, 90, 32, kApprovalDeny,
         nullptr);
 
     SetTimer(window, 1, 200, nullptr);
@@ -592,6 +607,7 @@ void start_server() {
         MessageBoxW(g_app->window, message.c_str(), kWindowTitle, MB_ICONERROR | MB_OK);
         return;
     }
+    g_app->listener_microphone = g_app->settings.allow_microphone;
     g_app->server->start();
     append_log_line(L"正在等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）");
     start_tunnel();
@@ -718,6 +734,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionAudio) != 0) {
         add(L"声音");
     }
+    if ((mask & kPermissionMicrophone) != 0) {
+        add(L"麦克风");
+    }
     return text.empty() ? L"只看" : text;
 }
 
@@ -725,6 +744,7 @@ uint16_t current_gate_mask() {
     return static_cast<uint16_t>((g_app->settings.allow_input ? kPermissionInput : 0) |
                                  (g_app->settings.allow_clipboard ? kPermissionClipboard : 0) |
                                  (g_app->settings.allow_audio ? kPermissionAudio : 0) |
+                                 (g_app->settings.allow_microphone ? kPermissionMicrophone : 0) |
                                  (g_app->settings.allow_file_transfer ? kPermissionFileTransfer
                                                                       : 0));
 }
@@ -782,6 +802,13 @@ void refresh_ui() {
         if (status.stats.input_events > 0) {
             stream += L" · 输入 " + std::to_wstring(status.stats.input_events);
         }
+        if (status.download_active) {
+            stream += L" · 发送 " + widen(status.download_name) + L" " +
+                      std::to_wstring(status.download_sent) + L"/" +
+                      std::to_wstring(status.download_size);
+        } else if (!status.download_error.empty()) {
+            stream += L" · 发送失败";
+        }
         set_text(g_app->stream_label, stream);
     } else {
         set_text(g_app->stream_label, L"画面：—");
@@ -818,6 +845,7 @@ void refresh_ui() {
     set_check(g_app->input_check, g_app->settings.allow_input);
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
     set_check(g_app->audio_check, g_app->settings.allow_audio);
+    set_check(g_app->microphone_check, g_app->settings.allow_microphone);
     set_check(g_app->autostart_check, g_app->settings.autostart);
     set_text(g_app->toggle_button, running ? L"停止共享" : L"开始共享");
 
@@ -969,34 +997,37 @@ void create_controls() {
                                      130, 24, kAudioCheck, nullptr);
     g_app->autostart_check = add_control(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 0, 472, 380,
                                          120, 24, kAutostartCheck, nullptr);
+    g_app->microphone_check = add_control(L"BUTTON", L"接收查看者麦克风", BS_AUTOCHECKBOX, 0, 24,
+                                          408, 200, 24, kMicrophoneCheck, nullptr);
 
-    add_control(L"BUTTON", L"安全设置…", BS_PUSHBUTTON, 0, 24, 418, 116, 30, kSecurityButton,
+    add_control(L"BUTTON", L"安全设置…", BS_PUSHBUTTON, 0, 24, 444, 116, 30, kSecurityButton,
                 nullptr);
-    add_control(L"BUTTON", L"连接服务设置…", BS_PUSHBUTTON, 0, 146, 418, 150, 30,
+    add_control(L"BUTTON", L"连接服务设置…", BS_PUSHBUTTON, 0, 146, 444, 150, 30,
                 kTunnelSettingsButton, nullptr);
-    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 302, 418, 104, 30,
+    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 302, 444, 104, 30,
                 kOpenConfigButton, nullptr);
-    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 412, 418, 160, 30,
+    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 412, 444, 160, 30,
                 kFirewallButton, nullptr);
 
-    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 456, 110,
+    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 482, 110,
                                        32, kToggleButton, nullptr);
-    add_control(L"BUTTON", L"重新注册", BS_PUSHBUTTON, 0, 142, 456, 104, 32,
+    add_control(L"BUTTON", L"重新注册", BS_PUSHBUTTON, 0, 142, 482, 104, 32,
                 kTunnelRegisterButton, nullptr);
-    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 254, 456, 120, 32, kReloadButton,
+    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 254, 482, 120, 32, kReloadButton,
                 nullptr);
-    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 382, 456, 110, 32, kHideButton,
+    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 382, 482, 110, 32, kHideButton,
                 nullptr);
-    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 500, 456, 80, 32, kQuitButton, nullptr);
+    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 500, 482, 80, 32, kQuitButton, nullptr);
 
-    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 498, 200, 20, 0, nullptr);
+    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 524, 200, 20, 0, nullptr);
     g_app->log_edit =
         add_control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-                    WS_EX_CLIENTEDGE, 24, 520, 572, 170, kLogEdit, nullptr);
+                    WS_EX_CLIENTEDGE, 24, 544, 572, 150, kLogEdit, nullptr);
 
     set_check(g_app->input_check, g_app->settings.allow_input);
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
     set_check(g_app->audio_check, g_app->settings.allow_audio);
+    set_check(g_app->microphone_check, g_app->settings.allow_microphone);
     set_check(g_app->autostart_check, g_app->settings.autostart);
 }
 
@@ -1291,6 +1322,7 @@ enum SecurityDialogId {
     kSecAllowClipboard,
     kSecAllowFile,
     kSecAllowAudio,
+    kSecAllowMicrophone,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1323,6 +1355,7 @@ struct SecurityDialogState {
     HWND allow_clipboard = nullptr;
     HWND allow_file = nullptr;
     HWND allow_audio = nullptr;
+    HWND allow_microphone = nullptr;
     HWND allow_change = nullptr;
     HWND token_auth = nullptr;
     HWND one_time = nullptr;
@@ -1482,6 +1515,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_clipboard = is_checked(dialog.allow_clipboard);
     updated.allow_file_transfer = is_checked(dialog.allow_file);
     updated.allow_audio = is_checked(dialog.allow_audio);
+    updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_permission_change = is_checked(dialog.allow_change);
 
     std::string whitelist = narrow(control_text(dialog.whitelist));
@@ -1839,6 +1873,9 @@ bool edit_security_settings(HostSettings& result) {
     dialog.allow_file =
         add(L"BUTTON", L"文件传输", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 394, 110, 24,
             kSecAllowFile, nullptr, &dialog.access_page);
+    dialog.allow_microphone =
+        add(L"BUTTON", L"麦克风（上行）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 150, 394, 130, 24,
+            kSecAllowMicrophone, nullptr, &dialog.access_page);
     const std::string receive_directory = g_app->settings.file_receive_directory.empty()
                                               ? chast::default_receive_directory()
                                               : g_app->settings.file_receive_directory;
@@ -1846,7 +1883,7 @@ bool edit_security_settings(HostSettings& result) {
         (L"接收目录：" +
          (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
             .c_str(),
-        SS_LEFT | SS_ENDELLIPSIS, 0, 150, 398, 420, 20, 0, nullptr, &dialog.access_page);
+        SS_LEFT | SS_ENDELLIPSIS, 0, 290, 398, 290, 20, 0, nullptr, &dialog.access_page);
     dialog.allow_change =
         add(L"BUTTON", L"允许在会话中调整权限", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 426, 260,
             24, kSecAllowChange, nullptr, &dialog.access_page);
@@ -1895,6 +1932,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_clipboard, settings.allow_clipboard);
     set_check(dialog.allow_file, settings.allow_file_transfer);
     set_check(dialog.allow_audio, settings.allow_audio);
+    set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_change, settings.allow_permission_change);
     set_check(dialog.token_auth, settings.token_auth);
     set_check(dialog.one_time, settings.token_mode == HostTokenMode::OneTime);
@@ -2013,8 +2051,14 @@ void show_tray_menu() {
                 kClipboardCheck, L"同步剪贴板");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_file_transfer ? MF_CHECKED : 0),
                 kFileTransferCheck, L"接受文件传输");
+    const bool can_send = running && status.state == HostState::Streaming &&
+                          (status.session_permissions & kPermissionFileTransfer) != 0;
+    AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
+                L"发送文件到查看器…");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
                 L"共享系统声音");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_microphone ? MF_CHECKED : 0),
+                kMicrophoneCheck, L"接收查看者麦克风");
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
                 L"开机自动启动");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2129,6 +2173,30 @@ void handle_command(int id) {
                                                                 : L"剪贴板同步已关闭");
             }
             break;
+        case kSendFileButton: {
+            if (!session_is_live()) {
+                append_log_line(L"没有正在连接的查看者，无法发送文件");
+                break;
+            }
+            wchar_t path[32768]{};
+            OPENFILENAMEW dialog{};
+            dialog.lStructSize = sizeof(dialog);
+            dialog.hwndOwner = g_app->window;
+            dialog.lpstrFilter = L"所有文件\0*.*\0";
+            dialog.lpstrFile = path;
+            dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+            dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+            if (!GetOpenFileNameW(&dialog)) {
+                break;
+            }
+            std::string error;
+            if (!g_app->server->start_file_download(narrow(path), &error)) {
+                append_log_line(L"无法发送文件：" + widen(error));
+            } else {
+                append_log_line(L"已排队发送：" + std::wstring(path));
+            }
+            break;
+        }
         case kFileTransferCheck:
             g_app->settings.allow_file_transfer = !g_app->settings.allow_file_transfer;
             save_settings();
@@ -2155,6 +2223,29 @@ void handle_command(int id) {
                 restart_server();
                 append_log_line(g_app->settings.allow_audio ? L"系统声音共享已开启"
                                                             : L"系统声音共享已关闭");
+            }
+            break;
+        case kMicrophoneCheck:
+            g_app->settings.allow_microphone = !g_app->settings.allow_microphone;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                if (g_app->settings.allow_microphone && !g_app->listener_microphone) {
+                    // The transport refuses CMIC on a listener that was created
+                    // without the microphone gate; restarting would drop the
+                    // viewer, so the change waits for the next connection.
+                    append_log_line(
+                        L"已开启接收查看者麦克风；当前监听器未启用，将在下次连接时生效");
+                } else {
+                    append_log_line(g_app->settings.allow_microphone
+                                        ? L"接收查看者麦克风已开启（本次会话实时生效）"
+                                        : L"接收查看者麦克风已关闭（本次会话实时生效）");
+                }
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_microphone
+                                    ? L"接收查看者麦克风已开启"
+                                    : L"接收查看者麦克风已关闭");
             }
             break;
         case kAutostartCheck: {

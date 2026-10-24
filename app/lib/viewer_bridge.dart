@@ -142,6 +142,13 @@ class ViewerStatus {
     this.fileError = '',
     this.filesSent = 0,
     this.fileFailures = 0,
+    this.downloadPhase = ViewerFilePhase.idle,
+    this.downloadName = '',
+    this.downloadSize = 0,
+    this.downloadReceived = 0,
+    this.downloadError = '',
+    this.filesReceived = 0,
+    this.fileReceiveFailures = 0,
     this.cursorUpdates = 0,
     this.cursorPending = false,
     this.audioAnnounced = false,
@@ -264,6 +271,18 @@ class ViewerStatus {
   final int filesSent;
   final int fileFailures;
 
+  /// The most recent host-to-viewer download. [downloadPhase] is a
+  /// [ViewerFilePhase] value; [downloadReceived] counts bytes on disk, so a
+  /// resumed transfer starts above zero. [filesReceived] and
+  /// [fileReceiveFailures] cover the session.
+  final int downloadPhase;
+  final String downloadName;
+  final int downloadSize;
+  final int downloadReceived;
+  final String downloadError;
+  final int filesReceived;
+  final int fileReceiveFailures;
+
   /// Pointer updates the host sent. The sprite itself never reaches Dart: the
   /// native side installs it as the Windows cursor, which is where it has to
   /// live to be composited by the OS at the pointer's own rate.
@@ -349,6 +368,12 @@ class ViewerStatus {
   // Streamed fraction of [fileSize], 0 when there is nothing to show.
   double get fileProgress =>
       fileSize <= 0 ? 0.0 : (fileSent / fileSize).clamp(0.0, 1.0);
+  // True while the host's file is being received. The receive directory is
+  // written as the bytes arrive; a closed session clears the overlay.
+  bool get downloadActive => isLive && downloadPhase == ViewerFilePhase.sending;
+  double get downloadProgress => downloadSize <= 0
+      ? 0.0
+      : (downloadReceived / downloadSize).clamp(0.0, 1.0);
   // The speaker button and the overlay's audio row need a live local pipeline.
   bool get acceptsAudio => audioEnabled && isLive;
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
@@ -466,6 +491,13 @@ class ViewerStatus {
       fileError: asString(map['fileError']),
       filesSent: asInt(map['filesSent']),
       fileFailures: asInt(map['fileFailures']),
+      downloadPhase: asInt(map['downloadPhase']),
+      downloadName: asString(map['downloadName']),
+      downloadSize: asInt(map['downloadSize']),
+      downloadReceived: asInt(map['downloadReceived']),
+      downloadError: asString(map['downloadError']),
+      filesReceived: asInt(map['filesReceived']),
+      fileReceiveFailures: asInt(map['fileReceiveFailures']),
       cursorUpdates: asInt(map['cursorUpdates']),
       cursorPending: map['cursorPending'] == true,
       audioAnnounced: map['audioAnnounced'] == true,
@@ -713,6 +745,29 @@ class ViewerBridge {
   static Future<String?> sendFile() {
     return _channel.invokeMethod<String>('sendFile');
   }
+
+  /// Offers [path] to the host the same way [sendFile] does, but without a
+  /// picker. The native side queues it from a file dropped on the window.
+  static Future<String?> sendFileAt(String path) {
+    return _channel.invokeMethod<String>('sendFileAt', path);
+  }
+
+  /// Installs the handler for files dropped on the viewer window. Only one
+  /// page listens at a time; passing null detaches it.
+  static void setDropHandler(void Function(String path)? handler) {
+    _dropHandler = handler;
+    if (handler == null) {
+      _channel.setMethodCallHandler(null);
+      return;
+    }
+    _channel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'droppedFile' && call.arguments is String) {
+        _dropHandler?.call(call.arguments as String);
+      }
+    });
+  }
+
+  static void Function(String path)? _dropHandler;
 
   /// Picks up whatever pointer state the host sent and installs it as this
   /// window's cursor while [enabled]. [scale] is the size the video is drawn

@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -24,6 +26,16 @@ namespace chast {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// Downloads use the same budget the viewer applies to uploads: enough to move
+// a large file quickly without starving video, audio and input.
+constexpr auto kDownloadSendBudget = std::chrono::milliseconds(8);
+constexpr double kDownloadBytesPerSecond = 32.0 * 1024.0 * 1024.0;
+constexpr double kDownloadBurst = 256.0 * 1024.0;
+
+std::filesystem::path path_from_utf8(const std::string& utf8) {
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
 
 // FrameHeader::capture_ms is 48 bits: milliseconds since the steady clock's
 // epoch, which is the same clock the latency probe reports.
@@ -58,6 +70,9 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_audio) {
         mask |= kPermissionAudio;
+    }
+    if (settings.allow_microphone) {
+        mask |= kPermissionMicrophone;
     }
     if (settings.allow_file_transfer) {
         mask |= kPermissionFileTransfer;
@@ -125,6 +140,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.origin_x = display.rect.left;
     info.origin_y = display.rect.top;
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
+    info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
@@ -312,6 +328,7 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_clipboard = settings_.allow_clipboard;
     quic.allow_file_transfer = settings_.allow_file_transfer;
     quic.allow_audio = settings_.allow_audio;
+    quic.allow_microphone = settings_.allow_microphone;
     quic.allow_permission_change = settings_.allow_permission_change;
     quic.dry_run_input = config_.dry_run_input;
     // The one-shot tool reports a refused password instead of waiting for the
@@ -534,6 +551,79 @@ void HostServer::clear_trusted_devices() {
 void HostServer::set_permissions(uint16_t permissions) {
     pending_permissions_.store(permissions & kPermissionAll);
     permission_update_pending_.store(true);
+}
+
+bool HostServer::start_file_download(const std::string& utf8_path, std::string* error) {
+    const auto fail = [error](const std::string& text) {
+        if (error != nullptr) {
+            *error = text;
+        }
+        return false;
+    };
+    if (!running_.load(std::memory_order_acquire)) {
+        return fail("the host is not running");
+    }
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        if (status_.state != HostState::Streaming) {
+            return fail("no viewer is streaming");
+        }
+        if ((status_.session_permissions & kPermissionFileTransfer) == 0) {
+            return fail("file transfer is not granted to this viewer");
+        }
+    }
+    if (!settings_.allow_file_transfer) {
+        return fail("file transfer is disabled in the settings");
+    }
+    const std::filesystem::path path = path_from_utf8(utf8_path);
+    std::error_code code;
+    const uintmax_t size = std::filesystem::file_size(path, code);
+    if (code || !std::filesystem::is_regular_file(path, code) || code) {
+        return fail("the path is not a readable file");
+    }
+    if (size > kMaxFileTransferBytes) {
+        return fail("the file exceeds the protocol's 16 GiB limit");
+    }
+    {
+        std::lock_guard<std::mutex> lock(download_mutex_);
+        if (!pending_download_path_.empty()) {
+            return fail("another file is already queued");
+        }
+        switch (send_.stage) {
+            case FileSend::Stage::kHashing:
+            case FileSend::Stage::kReady:
+            case FileSend::Stage::kOffered:
+            case FileSend::Stage::kSending:
+            case FileSend::Stage::kFinishing:
+                return fail("another file is already being sent");
+            default:
+                break;
+        }
+        pending_download_path_ = utf8_path;
+    }
+    return true;
+}
+
+void HostServer::publish_download() {
+    std::lock_guard<std::mutex> lock(download_mutex_);
+    bool active = false;
+    switch (send_.stage) {
+        case FileSend::Stage::kHashing:
+        case FileSend::Stage::kReady:
+        case FileSend::Stage::kOffered:
+        case FileSend::Stage::kSending:
+        case FileSend::Stage::kFinishing:
+            active = true;
+            break;
+        default:
+            break;
+    }
+    std::lock_guard<std::mutex> status_lock(status_mutex_);
+    status_.download_active = active;
+    status_.download_name = send_.name;
+    status_.download_size = send_.size;
+    status_.download_sent = send_.sent;
+    status_.download_error = send_.error;
 }
 
 void HostServer::run() {
@@ -1280,6 +1370,374 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
     };
 
+    // Operator downloads. The tray queues a path; hashing runs on its own
+    // thread so the frame loop never waits for a large file, then the offer
+    // and the chunks use the same budget as the viewer's uploads.
+    std::ifstream download_stream;
+    double download_tokens = kDownloadBurst;
+    Clock::time_point download_token_time = Clock::now();
+
+    // Joins the hashing thread on every exit path and leaves a truthful
+    // terminal state for the tray.
+    struct DownloadCleanup {
+        HostServer* self;
+        ~DownloadCleanup() {
+            if (self->send_hasher_.joinable()) {
+                self->send_hasher_.join();
+            }
+            bool marked = false;
+            {
+                std::lock_guard<std::mutex> lock(self->download_mutex_);
+                switch (self->send_.stage) {
+                    case FileSend::Stage::kHashing:
+                    case FileSend::Stage::kReady:
+                    case FileSend::Stage::kOffered:
+                    case FileSend::Stage::kSending:
+                    case FileSend::Stage::kFinishing:
+                        self->send_.stage = FileSend::Stage::kFailed;
+                        self->send_.error = "the session ended";
+                        self->send_.counted = true;
+                        marked = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (marked) {
+                self->publish_download();
+            }
+        }
+    } download_cleanup{this};
+
+    auto send_fail = [&](const std::string& message, bool report) {
+        uint32_t transfer_id = 0;
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lock(download_mutex_);
+            switch (send_.stage) {
+                case FileSend::Stage::kHashing:
+                case FileSend::Stage::kReady:
+                case FileSend::Stage::kOffered:
+                case FileSend::Stage::kSending:
+                case FileSend::Stage::kFinishing:
+                    break;
+                default:
+                    return;
+            }
+            transfer_id = send_.transfer_id;
+            name = send_.name;
+            send_.stage = FileSend::Stage::kFailed;
+            send_.error = message;
+            send_.counted = true;
+        }
+        download_stream.close();
+        ++stats.file_send_failures;
+        if (report) {
+            // The receiver would otherwise wait for a stream that never ends.
+            (void)session_->send_file_cancel(transfer_id, FileCode::Cancelled, message);
+            session_->cancel_file_upload(transfer_id);
+        }
+        log("file: sending " + name + " failed: " + message);
+        publish_download();
+        publish_stats(stats);
+    };
+
+    auto drive_file_download = [&] {
+        FileSend snapshot;
+        {
+            std::lock_guard<std::mutex> lock(download_mutex_);
+            snapshot = send_;
+        }
+
+        if (snapshot.stage == FileSend::Stage::kNone ||
+            snapshot.stage == FileSend::Stage::kDone ||
+            snapshot.stage == FileSend::Stage::kFailed) {
+            std::string requested;
+            {
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                const bool idle = send_.stage == FileSend::Stage::kNone ||
+                                  send_.stage == FileSend::Stage::kDone ||
+                                  send_.stage == FileSend::Stage::kFailed;
+                if (idle && !pending_download_path_.empty()) {
+                    requested = std::move(pending_download_path_);
+                    pending_download_path_.clear();
+                }
+            }
+            if (requested.empty()) {
+                return;
+            }
+            if (send_hasher_.joinable()) {
+                send_hasher_.join();
+            }
+            const std::u8string u8name = path_from_utf8(requested).filename().u8string();
+            uint32_t transfer_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                send_ = FileSend{};
+                send_.stage = FileSend::Stage::kHashing;
+                send_.path = requested;
+                send_.name.assign(reinterpret_cast<const char*>(u8name.data()), u8name.size());
+                send_.transfer_id = next_send_id_++;
+                transfer_id = send_.transfer_id;
+            }
+            send_hasher_ = std::thread([this, transfer_id] {
+                std::string path;
+                {
+                    std::lock_guard<std::mutex> lock(download_mutex_);
+                    path = send_.path;
+                }
+                uint64_t size = 0;
+                std::array<uint8_t, 32> digest{};
+                std::string error;
+                bool ok = sha256_file(path, size, digest, &error);
+                if (ok && size > kMaxFileTransferBytes) {
+                    ok = false;
+                    error = "the file exceeds the protocol's 16 GiB limit";
+                }
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                if (send_.transfer_id != transfer_id ||
+                    send_.stage != FileSend::Stage::kHashing) {
+                    return;
+                }
+                if (ok) {
+                    send_.size = size;
+                    send_.digest = digest;
+                    send_.stage = FileSend::Stage::kReady;
+                } else {
+                    send_.stage = FileSend::Stage::kFailed;
+                    send_.error = error.empty() ? "the file could not be hashed" : error;
+                }
+            });
+            publish_download();
+            return;
+        }
+
+        if (snapshot.stage == FileSend::Stage::kHashing) {
+            return;
+        }
+        if (snapshot.stage == FileSend::Stage::kDone) {
+            return;
+        }
+        if (snapshot.stage == FileSend::Stage::kFailed) {
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                if (send_.stage == FileSend::Stage::kFailed && !send_.counted) {
+                    send_.counted = true;
+                    first = true;
+                }
+            }
+            if (first) {
+                ++stats.file_send_failures;
+                log("file: " + snapshot.name + " failed: " + snapshot.error);
+                publish_download();
+                publish_stats(stats);
+            }
+            return;
+        }
+
+        if (!file_transfer_allowed()) {
+            send_fail("file transfer was disabled", true);
+            return;
+        }
+
+        FileResult result;
+        while (session_->take_file_result(result)) {
+            bool current = false;
+            {
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                current = send_.transfer_id == result.transfer_id &&
+                          (send_.stage == FileSend::Stage::kOffered ||
+                           send_.stage == FileSend::Stage::kSending ||
+                           send_.stage == FileSend::Stage::kFinishing);
+            }
+            if (!current) {
+                continue;
+            }
+            download_stream.close();
+            if (result.code == FileCode::Ok) {
+                {
+                    std::lock_guard<std::mutex> lock(download_mutex_);
+                    send_.stage = FileSend::Stage::kDone;
+                    send_.error.clear();
+                    send_.sent = result.received;
+                }
+                ++stats.files_sent;
+                stats.file_bytes_sent += result.received;
+                log("file: sent " + snapshot.name + " (" +
+                    std::to_string(result.received) + " bytes)");
+            } else {
+                send_fail(result.reason.empty() ? "the viewer rejected the file"
+                                                : result.reason,
+                          false);
+            }
+            publish_download();
+            publish_stats(stats);
+            return;
+        }
+
+        FileCancel cancel;
+        while (session_->take_file_cancel(cancel)) {
+            bool current = false;
+            {
+                std::lock_guard<std::mutex> lock(download_mutex_);
+                current = send_.transfer_id == cancel.transfer_id &&
+                          (send_.stage == FileSend::Stage::kOffered ||
+                           send_.stage == FileSend::Stage::kSending ||
+                           send_.stage == FileSend::Stage::kFinishing);
+            }
+            if (current) {
+                send_fail(cancel.reason.empty() ? "the viewer cancelled the download"
+                                                : cancel.reason,
+                          false);
+                return;
+            }
+        }
+
+        switch (snapshot.stage) {
+            case FileSend::Stage::kReady: {
+                FileOffer offer;
+                offer.transfer_id = snapshot.transfer_id;
+                offer.size = snapshot.size;
+                offer.resume = true;
+                offer.sha256 = snapshot.digest;
+                offer.name = snapshot.name;
+                Error sent = session_->offer_file(offer);
+                if (!sent.ok()) {
+                    send_fail("offer: " + sent.to_string(), false);
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(download_mutex_);
+                    if (send_.transfer_id == snapshot.transfer_id &&
+                        send_.stage == FileSend::Stage::kReady) {
+                        send_.stage = FileSend::Stage::kOffered;
+                        send_.answer_time = Clock::now();
+                    }
+                }
+                log("file: offering " + snapshot.name + " (" +
+                    std::to_string(snapshot.size) + " bytes)");
+                publish_download();
+                return;
+            }
+            case FileSend::Stage::kOffered: {
+                FileAnswer answer;
+                while (session_->take_file_answer(answer)) {
+                    if (answer.transfer_id != snapshot.transfer_id) {
+                        continue;
+                    }
+                    if (answer.code != FileCode::Ok) {
+                        send_fail(answer.reason.empty() ? "the viewer refused the file"
+                                                        : answer.reason,
+                                  false);
+                        return;
+                    }
+                    if (answer.resume_offset > snapshot.size) {
+                        send_fail("the viewer asked to resume past the end of the file",
+                                  true);
+                        return;
+                    }
+                    download_stream.open(path_from_utf8(snapshot.path), std::ios::binary);
+                    if (!download_stream) {
+                        send_fail("the local file cannot be opened", false);
+                        return;
+                    }
+                    download_stream.seekg(static_cast<std::streamoff>(answer.resume_offset),
+                                          std::ios::beg);
+                    if (!download_stream) {
+                        send_fail("the local file cannot seek to the resume offset", false);
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(download_mutex_);
+                        if (send_.transfer_id == snapshot.transfer_id &&
+                            send_.stage == FileSend::Stage::kOffered) {
+                            send_.stage = FileSend::Stage::kSending;
+                            send_.resume_offset = answer.resume_offset;
+                            send_.sent = answer.resume_offset;
+                        }
+                    }
+                    download_tokens = kDownloadBurst;
+                    download_token_time = Clock::now();
+                    log("file: sending " + snapshot.name + " from " +
+                        std::to_string(answer.resume_offset));
+                    publish_download();
+                    return;
+                }
+                if (Clock::now() - snapshot.answer_time > std::chrono::seconds(30)) {
+                    send_fail("the viewer did not answer the offer", false);
+                }
+                return;
+            }
+            case FileSend::Stage::kSending: {
+                const auto deadline = Clock::now() + kDownloadSendBudget;
+                const auto refill = Clock::now();
+                download_tokens = std::min(
+                    kDownloadBurst,
+                    download_tokens +
+                        std::chrono::duration<double>(refill - download_token_time).count() *
+                            kDownloadBytesPerSecond);
+                download_token_time = refill;
+                std::array<uint8_t, kFileChunkBytes> buffer{};
+                uint64_t sent_bytes = snapshot.sent;
+                while (sent_bytes < snapshot.size && Clock::now() < deadline) {
+                    const size_t want = static_cast<size_t>(std::min<uint64_t>(
+                        snapshot.size - sent_bytes, buffer.size()));
+                    if (download_tokens < static_cast<double>(want)) {
+                        break;
+                    }
+                    download_stream.read(reinterpret_cast<char*>(buffer.data()),
+                                         static_cast<std::streamsize>(want));
+                    const std::streamsize got = download_stream.gcount();
+                    if (got <= 0) {
+                        send_fail("the local file ended before its announced size", true);
+                        return;
+                    }
+                    Error wrote = session_->try_send_file_data(
+                        snapshot.transfer_id, buffer.data(), static_cast<size_t>(got));
+                    if (wrote.status() == Status::WaitTimeout) {
+                        // The shared queue is full: leave the piece for the
+                        // next pass rather than stall the frame loop.
+                        download_stream.clear();
+                        download_stream.seekg(static_cast<std::streamoff>(sent_bytes),
+                                              std::ios::beg);
+                        break;
+                    }
+                    if (!wrote.ok()) {
+                        send_fail("send: " + wrote.to_string(), true);
+                        return;
+                    }
+                    sent_bytes += static_cast<uint64_t>(got);
+                    download_tokens -= static_cast<double>(got);
+                    std::lock_guard<std::mutex> lock(download_mutex_);
+                    if (send_.transfer_id == snapshot.transfer_id &&
+                        send_.stage == FileSend::Stage::kSending) {
+                        send_.sent = sent_bytes;
+                    }
+                }
+                if (sent_bytes >= snapshot.size) {
+                    Error finished = session_->finish_file_upload(snapshot.transfer_id);
+                    if (!finished.ok()) {
+                        send_fail("finish: " + finished.to_string(), true);
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(download_mutex_);
+                        if (send_.transfer_id == snapshot.transfer_id &&
+                            send_.stage == FileSend::Stage::kSending) {
+                            send_.stage = FileSend::Stage::kFinishing;
+                        }
+                    }
+                    log("file: " + snapshot.name + " sent, waiting for the viewer");
+                }
+                publish_download();
+                return;
+            }
+            default:
+                return;
+        }
+    };
+
     // Audio degrades on its own: a failed endpoint, encoder or send turns the
     // stream off with a StreamInfo and leaves video running.
     auto disable_audio = [&](const std::string& reason) {
@@ -1367,6 +1825,152 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             ++stats.audio_errors;
             const std::string reason = audio_capture->error();
             disable_audio(reason.empty() ? "capture failed" : reason);
+        }
+    };
+
+    // Viewer microphone: CMIC carries Opus packets the viewer captured. The
+    // decoder and player follow the stream, not the session: they are created
+    // when the viewer switches the microphone on and released when it goes
+    // off, so an idle session never holds the render endpoint. There is no
+    // echo cancellation; the host simply plays what the viewer sends.
+    std::unique_ptr<IAudioDecoder> microphone_decoder;
+    std::unique_ptr<IAudioPlayer> microphone_player;
+    AudioInfo microphone_info;
+    bool microphone_broken = false;
+    auto stop_microphone = [&](const std::string& reason) {
+        if (microphone_player) {
+            stats.microphone_underruns = microphone_player->stats().underruns;
+            microphone_player->stop();
+            microphone_player.reset();
+        }
+        microphone_decoder.reset();
+        microphone_info = AudioInfo{};
+        microphone_broken = false;
+        const bool was_active = stats.microphone_active;
+        stats.microphone_active = false;
+        if (was_active && !reason.empty()) {
+            log("microphone stopped: " + reason);
+        }
+    };
+    auto drain_microphone = [&] {
+        stats.microphone_streams = session_->microphone_streams();
+        if (!settings_.allow_microphone || stats.microphone_streams == 0) {
+            return;
+        }
+        if ((session_->permissions() & kPermissionMicrophone) == 0) {
+            if (microphone_decoder || microphone_player) {
+                stop_microphone("the microphone permission was removed");
+            }
+            return;
+        }
+        for (;;) {
+            AudioHeader header;
+            std::vector<uint8_t> payload;
+            AudioInfo info;
+            bool format_changed = false;
+            Error next = session_->receive_microphone(header, payload, info, format_changed,
+                                                      std::chrono::milliseconds(0));
+            if (next.status() == Status::WaitTimeout) {
+                break;
+            }
+            if (next.status() == Status::Unavailable) {
+                // No stream is open or the viewer closed it: the microphone
+                // was switched off, which is not a failure.
+                if (microphone_decoder || microphone_player) {
+                    stop_microphone("the viewer closed the stream");
+                }
+                break;
+            }
+            if (!next.ok()) {
+                ++stats.microphone_errors;
+                log("microphone receive failed: " + next.to_string());
+                stop_microphone("receive failed");
+                break;
+            }
+            if (format_changed) {
+                // A fresh CMIC stream always rebuilds the pipeline, even when
+                // the format happens to match the previous one.
+                if (microphone_decoder || microphone_player) {
+                    stop_microphone({});
+                }
+                microphone_info = info;
+                microphone_broken = false;
+                std::string setup_error;
+                microphone_decoder = create_audio_decoder(info, &setup_error);
+                if (!microphone_decoder) {
+                    ++stats.microphone_errors;
+                    microphone_broken = true;
+                    log("microphone decoder unavailable: " + setup_error);
+                } else {
+                    AudioPlayerConfig player_config;
+                    // The viewer's capture clock is unrelated to the host's;
+                    // anchoring blocks on arrival keeps the 80 ms jitter
+                    // buffer and recovers after a stall without LatencyReply.
+                    player_config.arrival_anchored = true;
+                    if (config_.microphone_player) {
+                        microphone_player = config_.microphone_player(&setup_error);
+                    } else {
+                        microphone_player = create_audio_player(player_config, &setup_error);
+                    }
+                    if (!microphone_player) {
+                        ++stats.microphone_errors;
+                        microphone_broken = true;
+                        microphone_decoder.reset();
+                        log("microphone playback unavailable: " + setup_error);
+                    } else if (Error started = microphone_player->start(); !started.ok()) {
+                        ++stats.microphone_errors;
+                        microphone_broken = true;
+                        microphone_player.reset();
+                        microphone_decoder.reset();
+                        log("microphone playback failed: " + started.to_string());
+                    } else {
+                        stats.microphone_active = true;
+                        log("microphone: Opus " +
+                            std::to_string(info.sample_rate / 1000u) + " kHz, " +
+                            std::to_string(info.channels) + " ch, " +
+                            std::to_string(info.bitrate / 1000u) + " kbps");
+                    }
+                }
+            }
+            ++stats.microphone_packets;
+            stats.microphone_bytes += payload.size();
+            if (payload.empty() || microphone_broken || !microphone_decoder ||
+                !microphone_player) {
+                continue;
+            }
+            std::vector<DecodedAudio> decoded;
+            Error decode_error =
+                microphone_decoder->decode(header, payload.data(), payload.size(), decoded);
+            if (!decode_error.ok()) {
+                ++stats.microphone_errors;
+                log("microphone decode failed: " + decode_error.to_string());
+                continue;
+            }
+            bool push_failed = false;
+            for (const DecodedAudio& block : decoded) {
+                if (block.channels != 0) {
+                    stats.microphone_frames += block.samples.size() / block.channels;
+                }
+                Error pushed = microphone_player->push(block);
+                if (!pushed.ok()) {
+                    ++stats.microphone_errors;
+                    log("microphone playback failed: " + pushed.to_string());
+                    stop_microphone("playback failed");
+                    push_failed = true;
+                    break;
+                }
+            }
+            if (push_failed) {
+                break;
+            }
+            stats.microphone_underruns = microphone_player->stats().underruns;
+            const std::string render_error = microphone_player->error();
+            if (!render_error.empty()) {
+                ++stats.microphone_errors;
+                log("microphone playback lost the render endpoint: " + render_error);
+                stop_microphone("the render endpoint failed");
+                break;
+            }
         }
     };
 
@@ -2187,6 +2791,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return clean;
         }
         drain_audio();
+        drain_microphone();
         drain_peer();
         poll_clipboard(now);
         if (upload && !file_transfer_allowed()) {
@@ -2199,6 +2804,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         drain_file_offers();
         drain_file_data();
         drain_file_cancel();
+        drive_file_download();
         if (now - last_link_sample >= std::chrono::seconds(1)) {
             if (!sample_link(now)) {
                 const bool clean = error->empty();
@@ -2274,6 +2880,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         // The endpoint keeps producing while capture waits for the next
         // present; drain here so audio does not wait behind a slow frame.
         drain_audio();
+        drain_microphone();
         switch (result) {
             case CaptureResult::NoNewFrame:
                 continue;

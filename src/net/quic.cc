@@ -93,6 +93,9 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.file_transfer_enabled) {
         mask |= kPermissionFileTransfer;
     }
+    if (info.microphone_enabled) {
+        mask |= kPermissionMicrophone;
+    }
     return mask;
 }
 
@@ -468,6 +471,9 @@ struct QuicSession::Impl {
     std::atomic<HQUIC> control{nullptr};
     std::atomic<HQUIC> video{nullptr};
     std::atomic<HQUIC> audio{nullptr};
+    // Server: the accepted viewer-initiated CMIC stream. Client: the stream
+    // this side opened for the microphone. Null while the microphone is off.
+    std::atomic<HQUIC> microphone{nullptr};
 
     mutable std::mutex mutex;
     std::condition_variable cv;
@@ -483,6 +489,7 @@ struct QuicSession::Impl {
     bool control_shutdown_complete = false;
     bool audio_shutdown_complete = false;
     bool audio_stopped = false;
+    bool microphone_finished = false;
     bool stats_ready = false;
     bool bye_ready = false;
     bool keyframe_requested = false;
@@ -557,6 +564,15 @@ struct QuicSession::Impl {
     ControlParser control_parser;
     FrameParser frame_parser;
     AudioParser audio_parser;
+    // Microphone uplink (CMIC). `microphone_handles` keeps every CMIC handle
+    // this side accepted, including one that was replaced by a newer stream,
+    // so late events close the old handle instead of being classified again.
+    std::deque<std::vector<uint8_t>> microphone_received;
+    AudioParser microphone_parser;
+    AudioInfo microphone_info;
+    bool microphone_format_changed = false;
+    std::vector<HQUIC> microphone_handles;
+    uint64_t microphone_streams_seen = 0;
     // Client: server-initiated streams whose first bytes have not arrived yet.
     // The packet magic, not the stream order, says which one is which.
     std::vector<std::pair<HQUIC, std::vector<uint8_t>>> unclassified;
@@ -616,6 +632,7 @@ struct QuicSession::Impl {
 
     std::atomic<uint64_t> next_seq{0};
     std::atomic<uint64_t> next_audio_seq{0};
+    std::atomic<uint64_t> next_microphone_seq{0};
     std::atomic<bool> transport_down{false};
 
     std::mutex send_mutex;
@@ -738,9 +755,11 @@ struct QuicSession::Impl {
                 } else if (unidirectional) {
                     if (role == Role::Server &&
                         (session_permissions.load() &
-                         (kPermissionClipboard | kPermissionFileTransfer)) == 0) {
-                        // Neither clipboard nor file streams are granted for
-                        // this session; the HelloAck said so already.
+                         (kPermissionClipboard | kPermissionFileTransfer |
+                          kPermissionMicrophone)) == 0) {
+                        // Neither clipboard, file nor microphone streams are
+                        // granted for this session; the HelloAck said so
+                        // already.
                         api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
                         break;
                     }
@@ -841,10 +860,11 @@ struct QuicSession::Impl {
     }
 
     // Buffers a stream until its packet magic identifies it: video/audio on
-    // the viewer, clipboard changes on both ends, file uploads on the host.
-    // Anything else is a peer that is not speaking this protocol version.
+    // the viewer, clipboard changes and file transfers on both ends, the
+    // viewer's microphone on the host. Anything else is a peer that is not
+    // speaking this protocol version.
     void classify_media_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
-        enum class Kind { Wait, Video, Audio, Clipboard, File, Bad };
+        enum class Kind { Wait, Video, Audio, Microphone, Clipboard, File, Reject, Bad };
         Kind kind = Kind::Wait;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -883,6 +903,61 @@ struct QuicSession::Impl {
                 } else {
                     kind = Kind::Bad;
                 }
+            } else if (std::memcmp(pending->data(), kMicrophoneStreamMagic, 4) == 0) {
+                // Viewer to host only, and only while the grant is live. A
+                // stream without the permission is refused quietly: the
+                // microphone is optional and never takes video down.
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionMicrophone) == 0) {
+                    // Taking the handle into the microphone list means its
+                    // abort and completion are closed here like any other
+                    // CMIC stream instead of being reported as fatal.
+                    microphone_handles.push_back(stream);
+                    kind = Kind::Reject;
+                } else if (microphone.load() != nullptr && !microphone_finished) {
+                    // One microphone stream per viewer session. A second one
+                    // is a viewer bug; abort it and keep the first.
+                    microphone_handles.push_back(stream);
+                    kind = Kind::Reject;
+                } else if (pending->size() < kMicrophoneStreamHeaderSize) {
+                    return;
+                } else {
+                    const size_t header_length =
+                        microphone_stream_header_length(pending->data(), pending->size());
+                    if (header_length == 0) {
+                        kind = Kind::Bad;
+                    } else if (pending->size() < header_length) {
+                        // The fixed part named its extradata but the rest of
+                        // the header has not arrived yet.
+                        return;
+                    } else {
+                        AudioInfo info;
+                        size_t consumed = 0;
+                        std::string error;
+                        if (!decode_microphone_stream_header(pending->data(), pending->size(),
+                                                             info, consumed, &error)) {
+                            kind = Kind::Bad;
+                        } else {
+                            // A finished stream's handle may still be waiting
+                            // for SHUTDOWN_COMPLETE; replacing the active
+                            // pointer starts a fresh decode timeline and the
+                            // old handle is closed by its own completion.
+                            microphone = stream;
+                            microphone_handles.push_back(stream);
+                            microphone_finished = false;
+                            microphone_info = std::move(info);
+                            microphone_format_changed = true;
+                            microphone_parser.reset();
+                            microphone_received.clear();
+                            if (pending->size() > consumed) {
+                                microphone_received.emplace_back(pending->begin() + consumed,
+                                                                 pending->end());
+                            }
+                            ++microphone_streams_seen;
+                            kind = Kind::Microphone;
+                        }
+                    }
+                }
             } else if (std::memcmp(pending->data(), kClipboardStreamMagic, 4) == 0) {
                 const bool allowed =
                     role != Role::Server ||
@@ -899,8 +974,9 @@ struct QuicSession::Impl {
                     kind = Kind::Clipboard;
                 }
             } else if (std::memcmp(pending->data(), kFileStreamMagic, 4) == 0) {
+                // Either side may send; the permission bit says whether the
+                // session carries file transfers at all.
                 const bool allowed =
-                    role == Role::Server &&
                     (session_permissions.load() & kPermissionFileTransfer) != 0;
                 if (!allowed) {
                     kind = Kind::Bad;
@@ -945,7 +1021,9 @@ struct QuicSession::Impl {
                     unclassified.end());
             }
         }
-        if (kind == Kind::Bad) {
+        if (kind == Kind::Reject) {
+            api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        } else if (kind == Kind::Bad) {
             note_transport_failure("the peer opened an unusable stream");
         }
         cv.notify_all();
@@ -997,12 +1075,26 @@ struct QuicSession::Impl {
         return false;
     }
 
+    // Caller holds `mutex`.
+    bool is_microphone_handle_locked(HQUIC stream) const {
+        return std::find(microphone_handles.begin(), microphone_handles.end(), stream) !=
+               microphone_handles.end();
+    }
+
     // Appends data of a stream that was already classified as CCLB or CFIL.
     // Returns false when the handle belongs to neither, so the caller can
     // classify it from its first bytes.
     bool route_bulk_stream(HQUIC stream, QUIC_STREAM_EVENT& event, HQUIC* pause) {
         {
             std::lock_guard<std::mutex> lock(mutex);
+            for (HQUIC handle : microphone_handles) {
+                if (handle == stream && stream != microphone.load()) {
+                    // A replaced CMIC stream may still deliver buffered bytes;
+                    // ownership of the receive window stays with MsQuic, so
+                    // the event is consumed and forgotten.
+                    return true;
+                }
+            }
             for (auto& entry : clipboard_streams) {
                 if (entry.stream != stream) {
                     continue;
@@ -1093,6 +1185,21 @@ struct QuicSession::Impl {
         return handles;
     }
 
+    // Caller holds `mutex`. Same for the microphone stream: the handles go
+    // back to the caller for closing and every trace of the uplink is gone,
+    // so a session reset never leaks a handle or a half-parsed packet.
+    std::vector<HQUIC> detach_microphone_locked() {
+        std::vector<HQUIC> handles = std::move(microphone_handles);
+        microphone_handles.clear();
+        microphone = nullptr;
+        microphone_finished = false;
+        microphone_info = AudioInfo{};
+        microphone_format_changed = false;
+        microphone_received.clear();
+        microphone_parser.reset();
+        return handles;
+    }
+
     QUIC_STATUS on_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
         switch (event.Type) {
             case QUIC_STREAM_EVENT_START_COMPLETE:
@@ -1110,6 +1217,10 @@ struct QuicSession::Impl {
                 } else if (stream == audio.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
                     copy_chunks(audio_received, event);
+                    cv.notify_all();
+                } else if (stream == microphone.load()) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    copy_chunks(microphone_received, event);
                     cv.notify_all();
                 } else if (stream == control.load()) {
                     std::vector<std::pair<ControlType, std::vector<uint8_t>>> messages;
@@ -1152,6 +1263,8 @@ struct QuicSession::Impl {
                         video_finished = true;
                     } else if (stream == audio.load()) {
                         audio_finished = true;
+                    } else if (stream == microphone.load()) {
+                        microphone_finished = true;
                     } else if (stream == control.load()) {
                         control_finished = true;
                     } else {
@@ -1241,6 +1354,13 @@ struct QuicSession::Impl {
                         // Audio is optional: a broken audio stream ends audio,
                         // not the video session.
                         audio_finished = true;
+                    } else if (stream == microphone.load() ||
+                               is_microphone_handle_locked(stream)) {
+                        // Same for the microphone; a retired handle only needs
+                        // its completion event, which is not an error.
+                        if (stream == microphone.load()) {
+                            microphone_finished = true;
+                        }
                     } else if (stream == control.load()) {
                         fatal = true;
                     } else if (!bulk) {
@@ -1264,38 +1384,63 @@ struct QuicSession::Impl {
                     } else if (stream == control.load()) {
                         control_shutdown_complete = true;
                     } else {
-                        for (auto it = clipboard_streams.begin(); it != clipboard_streams.end();
-                             ++it) {
-                            if (it->stream == stream) {
-                                pending_clipboard_bytes -= it->bytes.size();
-                                it->bytes.clear();
-                                clipboard_streams.erase(it);
-                                to_close.push_back(stream);
-                                break;
-                            }
-                        }
-                        for (auto& entry : received_uploads) {
-                            if (entry.second.stream == stream) {
-                                entry.second.stream = nullptr;
-                                entry.second.finished = true;
-                                to_close.push_back(stream);
-                                break;
-                            }
-                        }
-                        for (auto& entry : outgoing_uploads) {
-                            if (entry.second.stream == stream) {
-                                entry.second.stream = nullptr;
-                                entry.second.finished = true;
-                                to_close.push_back(stream);
-                                break;
-                            }
-                        }
-                        for (auto it = one_shot_streams.begin(); it != one_shot_streams.end();
-                             ++it) {
+                        bool microphone_stream = false;
+                        for (auto it = microphone_handles.begin();
+                             it != microphone_handles.end(); ++it) {
                             if (*it == stream) {
-                                one_shot_streams.erase(it);
-                                to_close.push_back(stream);
+                                microphone_handles.erase(it);
+                                microphone_stream = true;
                                 break;
+                            }
+                        }
+                        if (microphone_stream) {
+                            if (stream == microphone.load()) {
+                                microphone = nullptr;
+                                microphone_finished = true;
+                            }
+                            to_close.push_back(stream);
+                        } else {
+                            for (auto it = clipboard_streams.begin();
+                                 it != clipboard_streams.end(); ++it) {
+                                if (it->stream == stream) {
+                                    pending_clipboard_bytes -= it->bytes.size();
+                                    it->bytes.clear();
+                                    clipboard_streams.erase(it);
+                                    to_close.push_back(stream);
+                                    break;
+                                }
+                            }
+                            for (auto& entry : received_uploads) {
+                                if (entry.second.stream == stream) {
+                                    entry.second.stream = nullptr;
+                                    entry.second.finished = true;
+                                    to_close.push_back(stream);
+                                    break;
+                                }
+                            }
+                            for (auto& entry : outgoing_uploads) {
+                                if (entry.second.stream == stream) {
+                                    entry.second.stream = nullptr;
+                                    entry.second.finished = true;
+                                    to_close.push_back(stream);
+                                    break;
+                                }
+                            }
+                            for (auto it = one_shot_streams.begin();
+                                 it != one_shot_streams.end(); ++it) {
+                                if (*it == stream) {
+                                    one_shot_streams.erase(it);
+                                    to_close.push_back(stream);
+                                    break;
+                                }
+                            }
+                            // A stream rejected during classification (bad
+                            // magic, malformed microphone header) owns no
+                            // state here but still holds its handle. The
+                            // loops above already queued known streams.
+                            if (std::find(to_close.begin(), to_close.end(), stream) ==
+                                to_close.end()) {
+                                to_close.push_back(stream);
                             }
                         }
                     }
@@ -1734,8 +1879,7 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::FileOffer: {
-                if (role != Role::Server ||
-                    (session_permissions.load() & kPermissionFileTransfer) == 0) {
+                if ((session_permissions.load() & kPermissionFileTransfer) == 0) {
                     break;
                 }
                 FileOffer offer;
@@ -1745,9 +1889,9 @@ struct QuicSession::Impl {
                 }
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    // The viewer waits for an answer; dropping an offer past
+                    // The sender waits for an answer; dropping an offer past
                     // the queue is a refusal by silence only when the queue
-                    // never drains, which the host prevents.
+                    // never drains, which the receiver prevents.
                     if (file_offers.size() >= kMaxQueuedOffers) {
                         break;
                     }
@@ -1758,9 +1902,6 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::FileAnswer: {
-                if (role != Role::Client) {
-                    break;
-                }
                 FileAnswer answer;
                 if (!parse_file_answer(payload, answer, &error)) {
                     note_transport_failure("FileAnswer: " + error);
@@ -1791,9 +1932,6 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::FileResult: {
-                if (role != Role::Client) {
-                    break;
-                }
                 FileResult result;
                 if (!parse_file_result(payload, result, &error)) {
                     note_transport_failure("FileResult: " + error);
@@ -1820,9 +1958,6 @@ struct QuicSession::Impl {
                 break;
             }
             case ControlType::FileCancel: {
-                if (role != Role::Server) {
-                    break;
-                }
                 FileCancel cancel;
                 if (!parse_file_cancel(payload, cancel, &error)) {
                     note_transport_failure("FileCancel: " + error);
@@ -1833,7 +1968,7 @@ struct QuicSession::Impl {
                     const auto it = received_uploads.find(cancel.transfer_id);
                     if (it != received_uploads.end()) {
                         it->second.finished = true;
-                        it->second.error = "the viewer cancelled the upload";
+                        it->second.error = "the peer cancelled the transfer";
                         drop_file_chunks_locked(cancel.transfer_id);
                         if (it->second.stream) {
                             api->StreamShutdown(it->second.stream,
@@ -2043,6 +2178,8 @@ struct QuicSession::Impl {
             unclassified.clear();
             std::vector<HQUIC> more = detach_bulk_streams_locked();
             bulk.insert(bulk.end(), more.begin(), more.end());
+            std::vector<HQUIC> microphones = detach_microphone_locked();
+            bulk.insert(bulk.end(), microphones.begin(), microphones.end());
         }
         for (HQUIC handle : bulk) {
             api->StreamClose(handle);
@@ -2120,6 +2257,7 @@ struct QuicSession::Impl {
             control_parser.reset();
             frame_parser.reset();
             audio_parser.reset();
+            microphone_streams_seen = 0;
             unclassified.clear();
             transport_failed = false;
             transport_status = Status::Ok;
@@ -2127,6 +2265,7 @@ struct QuicSession::Impl {
         }
         transport_down = false;
         next_audio_seq = 0;
+        next_microphone_seq = 0;
         // Only now can the listener claim the slot for the next client.
         connection = nullptr;
         cv.notify_all();
@@ -2148,6 +2287,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_audio) {
             mask |= kPermissionAudio;
+        }
+        if (server_config.allow_microphone) {
+            mask |= kPermissionMicrophone;
         }
         return mask;
     }
@@ -2217,6 +2359,8 @@ struct QuicSession::Impl {
             unclassified.clear();
             std::vector<HQUIC> more = detach_bulk_streams_locked();
             parked.insert(parked.end(), more.begin(), more.end());
+            std::vector<HQUIC> microphones = detach_microphone_locked();
+            parked.insert(parked.end(), microphones.begin(), microphones.end());
         }
         for (HQUIC handle : parked) {
             api->StreamClose(handle);
@@ -2296,8 +2440,9 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     settings.IsSet.KeepAliveIntervalMs = TRUE;
     // The client may open one bidirectional stream: the control channel. Its
     // unidirectional streams carry rich clipboard blobs (at most
-    // kMaxClipboardStreams at once) and one CFIL upload; the cap leaves room
-    // for both plus the streams MsQuic keeps until their FIN is acknowledged.
+    // kMaxClipboardStreams at once), one CFIL upload and the CMIC microphone
+    // stream; the cap leaves room for all of them plus the streams MsQuic
+    // keeps until their FIN is acknowledged.
     settings.PeerBidiStreamCount = 1;
     settings.IsSet.PeerBidiStreamCount = TRUE;
     settings.PeerUnidiStreamCount = static_cast<uint16_t>(
@@ -2610,6 +2755,23 @@ Error QuicSession::set_permissions(uint16_t permissions) {
     if ((next & kPermissionInput) == 0 && impl.injector) {
         impl.injector->release_held();
     }
+    if ((next & kPermissionMicrophone) == 0) {
+        // The uplink is viewer-initiated, so revoking it means aborting the
+        // stream: the viewer sees the reset and stops capturing. A new stream
+        // after a later grant goes through classification again.
+        HQUIC handle = impl.microphone.exchange(nullptr);
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            impl.microphone_finished = true;
+            impl.microphone_received.clear();
+            impl.microphone_parser.reset();
+            impl.microphone_info = AudioInfo{};
+            impl.microphone_format_changed = false;
+        }
+        if (handle) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+    }
     if ((next & kPermissionClipboard) == 0) {
         std::vector<HQUIC> aborts;
         {
@@ -2710,6 +2872,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.input_enabled = (granted & kPermissionInput) != 0;
     ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
+    ack.microphone_enabled = (granted & kPermissionMicrophone) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -2770,6 +2933,13 @@ Error QuicSession::announce(const ServerInfo& info) {
         impl.announced = false;
         return sent;
     }
+    // The server side of the handshake is complete once HelloAck is on the
+    // wire. Later server-initiated messages (the operator's file offers) use
+    // the same guard as the client's.
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.hello_complete = true;
+    }
     return Error::success();
 }
 
@@ -2786,6 +2956,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.input_enabled = (granted & kPermissionInput) != 0;
     update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
+    update.microphone_enabled = (granted & kPermissionMicrophone) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -3348,6 +3519,178 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
     }
 }
 
+Error QuicSession::receive_microphone(AudioHeader& header, std::vector<uint8_t>& payload,
+                                      AudioInfo& format, bool& format_changed,
+                                      std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "receive_microphone is a server operation");
+    }
+    format_changed = false;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(impl.mutex);
+    for (;;) {
+        while (!impl.microphone_received.empty()) {
+            std::vector<uint8_t> chunk = std::move(impl.microphone_received.front());
+            impl.microphone_received.pop_front();
+            lock.unlock();
+            std::string error;
+            const bool ok = impl.microphone_parser.push(chunk.data(), chunk.size(), &error);
+            lock.lock();
+            if (!ok) {
+                return Error(Status::CaptureFailed, "microphone stream: " + error);
+            }
+        }
+
+        const uint8_t* microphone_payload = nullptr;
+        std::string parse_error;
+        switch (impl.microphone_parser.next(header, &microphone_payload, &parse_error)) {
+            case AudioParser::Status::Packet: {
+                payload.assign(microphone_payload, microphone_payload + header.payload_size);
+                impl.microphone_parser.consume();
+                format = impl.microphone_info;
+                format_changed = impl.microphone_format_changed;
+                impl.microphone_format_changed = false;
+                return Error::success();
+            }
+            case AudioParser::Status::Error:
+                return Error(Status::CaptureFailed, "microphone stream: " + parse_error);
+            case AudioParser::Status::Incomplete:
+                break;
+        }
+
+        if (impl.microphone_finished) {
+            if (impl.microphone_parser.buffered() > 0) {
+                return Error(Status::CaptureFailed, "microphone stream ended mid-packet");
+            }
+            return Error(Status::Unavailable, "the viewer finished the microphone stream");
+        }
+        if (impl.transport_failed) {
+            return Error(impl.transport_status, impl.transport_message);
+        }
+        if (impl.shutdown_complete) {
+            return Error(Status::Unavailable, "the connection closed");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Error(Status::WaitTimeout, "no microphone audio arrived in time");
+        }
+        impl.cv.wait_until(lock, deadline);
+    }
+}
+
+Error QuicSession::start_microphone(const AudioInfo& info) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "start_microphone is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant the microphone");
+        }
+        if (impl.microphone.load() != nullptr) {
+            return Error(Status::InvalidCall, "the microphone stream is already open");
+        }
+    }
+    std::vector<uint8_t> header = make_microphone_stream_header(info);
+    if (header.empty()) {
+        return Error(Status::InvalidCall,
+                     "the microphone format is not 48 kHz Opus with Opus config");
+    }
+    HQUIC stream = nullptr;
+    QUIC_STATUS status = impl.api->StreamOpen(
+        impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+        &Impl::stream_callback, &impl, &stream);
+    if (QUIC_FAILED(status)) {
+        return quic_error(status, "QUIC StreamOpen(microphone)");
+    }
+    impl.microphone = stream;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.microphone_handles.push_back(stream);
+        impl.next_microphone_seq = 0;
+    }
+    status = impl.api->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
+    if (QUIC_FAILED(status)) {
+        impl.microphone = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            impl.microphone_handles.erase(
+                std::remove(impl.microphone_handles.begin(), impl.microphone_handles.end(),
+                            stream),
+                impl.microphone_handles.end());
+        }
+        impl.api->StreamClose(stream);
+        return quic_error(status, "QUIC StreamStart(microphone)");
+    }
+    Error sent = impl.send_bytes(stream, std::move(header), QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        impl.microphone = nullptr;
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    }
+    return sent;
+}
+
+Error QuicSession::send_microphone(AudioHeader header, const uint8_t* payload, size_t size) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_microphone is a client operation");
+    }
+    // The host may revoke the microphone mid-session and abort the stream.
+    // Report that as a permission failure so the viewer UI can explain it.
+    if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+        return Error(Status::PermissionDenied, "the host revoked the microphone");
+    }
+    HQUIC microphone = impl.microphone.load();
+    if (!microphone) {
+        return Error(Status::InvalidCall, "the microphone stream is not open");
+    }
+    if (!payload || size == 0 || size > kMaxAudioPayload) {
+        return Error(Status::InvalidCall, "invalid microphone payload size");
+    }
+    header.seq = impl.next_microphone_seq.fetch_add(1);
+    header.payload_size = static_cast<uint32_t>(size);
+    header.payload_crc32 = crc32(payload, size);
+    std::vector<uint8_t> bytes(kAudioHeaderSize + size);
+    encode_audio_header(header, bytes.data());
+    std::memcpy(bytes.data() + kAudioHeaderSize, payload, size);
+    // Same rule as send_audio: a full queue drops this packet rather than
+    // stalling the frame loop that drives video.
+    return impl.send_bytes_impl(microphone, std::move(bytes), QUIC_SEND_FLAG_NONE, false);
+}
+
+Error QuicSession::stop_microphone() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "stop_microphone is a client operation");
+    }
+    HQUIC microphone = impl.microphone.exchange(nullptr);
+    if (!microphone) {
+        return Error::success();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.microphone_received.clear();
+        impl.microphone_parser.reset();
+        impl.microphone_format_changed = false;
+    }
+    impl.api->StreamShutdown(microphone, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+    return Error::success();
+}
+
+bool QuicSession::microphone_finished() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->microphone_finished;
+}
+
+uint64_t QuicSession::microphone_streams() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->microphone_streams_seen;
+}
+
 Error QuicSession::request_keyframe() {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
@@ -3573,9 +3916,6 @@ uint64_t QuicSession::file_offers_received() const {
 Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_t resume_offset,
                                     const std::string& reason) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Server) {
-        return Error(Status::InvalidCall, "send_file_answer is a server operation");
-    }
     if (code != FileCode::Ok && resume_offset != 0) {
         return Error(Status::InvalidCall, "only an accepted upload carries a resume offset");
     }
@@ -3605,9 +3945,6 @@ Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_
 
 Error QuicSession::receive_file_chunk(FileChunk& chunk, std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Server) {
-        return Error(Status::InvalidCall, "receive_file_chunk is a server operation");
-    }
     HQUIC resume = nullptr;
     Error result = Error::success();
     {
@@ -3666,9 +4003,6 @@ bool QuicSession::file_upload_state(uint32_t transfer_id, FileUploadState& state
 Error QuicSession::send_file_result(uint32_t transfer_id, FileCode code, uint64_t received,
                                    const std::string& reason) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Server) {
-        return Error(Status::InvalidCall, "send_file_result is a server operation");
-    }
     HQUIC stream = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -3703,9 +4037,6 @@ bool QuicSession::take_file_cancel(FileCancel& cancel) {
 
 Error QuicSession::offer_file(const FileOffer& offer) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Client) {
-        return Error(Status::InvalidCall, "offer_file is a client operation");
-    }
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         if (!impl.hello_complete) {
@@ -3757,9 +4088,6 @@ bool QuicSession::take_file_answer(FileAnswer& answer) {
 
 Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Client) {
-        return Error(Status::InvalidCall, "send_file_data is a client operation");
-    }
     if (!data || size == 0 || size > kFileChunkBytes) {
         return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
     }
@@ -3819,9 +4147,6 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
 
 Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Client) {
-        return Error(Status::InvalidCall, "send_file_data is a client operation");
-    }
     if (!data || size == 0 || size > kFileChunkBytes) {
         return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
     }
@@ -3833,9 +4158,6 @@ Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data,
 
 Error QuicSession::finish_file_upload(uint32_t transfer_id) {
     Impl& impl = *impl_;
-    if (impl.role != Impl::Role::Client) {
-        return Error(Status::InvalidCall, "finish_file_upload is a client operation");
-    }
     HQUIC stream = nullptr;
     bool starting = false;
     std::vector<uint8_t> header_bytes;
@@ -3899,6 +4221,20 @@ void QuicSession::cancel_file_upload(uint32_t transfer_id) {
         impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         impl.api->StreamClose(stream);
     }
+}
+
+Error QuicSession::send_file_cancel(uint32_t transfer_id, FileCode code,
+                                    const std::string& reason) {
+    FileCancel cancel;
+    cancel.transfer_id = transfer_id;
+    cancel.code = code;
+    cancel.reason = reason;
+    // A cancellation is advisory and tiny: never let it stall the frame loop.
+    if (!impl_->try_send_bytes(impl_->control.load(), make_file_cancel(cancel),
+                               QUIC_SEND_FLAG_NONE)) {
+        return Error(Status::Unavailable, "the control stream is closed");
+    }
+    return Error::success();
 }
 
 bool QuicSession::take_file_result(FileResult& result) {

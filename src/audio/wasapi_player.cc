@@ -763,6 +763,15 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             // waiting for the first probe.
             offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
             have_offset_.store(true);
+        } else if (config_.arrival_anchored && last_end_local_ms_ > 0 &&
+                   wasapi::now_ms() > last_end_local_ms_ + 100) {
+            // Microphone bursts carry the sender's clock and have no
+            // LatencyReply. After a stall the old offset would place every
+            // queued block in the past; re-anchor the new burst at arrival and
+            // let the renderer drop what is left of the stale one.
+            offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
+            queue_.clear();
+            queued_frames_ = 0;
         }
         Block block;
         block.pcm = std::move(pcm);
@@ -789,6 +798,9 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
 }
 
 void WasapiPlayer::set_clock_offset(int64_t host_minus_local_ms) {
+    if (config_.arrival_anchored) {
+        return;
+    }
     offset_ms_.store(host_minus_local_ms);
     have_offset_.store(true);
     if (event_) {

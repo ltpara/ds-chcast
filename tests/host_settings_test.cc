@@ -73,7 +73,8 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.allow_file_transfer == b.allow_file_transfer &&
            a.file_receive_directory == b.file_receive_directory &&
-           a.allow_audio == b.allow_audio && a.auth_mode == b.auth_mode &&
+           a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
+           a.auth_mode == b.auth_mode &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
            a.allow_permission_change == b.allow_permission_change &&
@@ -97,6 +98,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_file_transfer = false;
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
+    settings.allow_microphone = true;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
     settings.password_hash =
@@ -158,6 +160,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.file_receive_directory.empty(),
           "a fresh host uses the default receive directory");
     check(loaded.settings.allow_audio, "a fresh host shares the system sound");
+    check(!loaded.settings.allow_microphone,
+          "a fresh host does not accept the viewer microphone");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
     check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
@@ -186,6 +190,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "clipboard=perhaps\n"
                "file_transfer=perhaps\n"
                "audio=perhaps\n"
+               "microphone=perhaps\n"
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
@@ -211,6 +216,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.allow_clipboard, "an unparsable clipboard toggle keeps the default");
     check(settings.allow_file_transfer, "an unparsable file toggle keeps the default");
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
+    check(!settings.allow_microphone,
+          "an unparsable microphone toggle keeps the private default");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -227,7 +234,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
-                            "token_mode", "token", "codec", "bitrate_kbps", "framerate",
+                            "microphone", "token_mode", "token", "codec", "bitrate_kbps",
+                            "framerate",
                             "quality", "display", "tunnel", "server_url", "server_key",
                             "tunnel_id", "tunnel_key", "tunnel_listen"}) {
         check(loaded.warning.find(key) != std::string::npos,

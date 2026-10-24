@@ -206,12 +206,22 @@ bool codec_from_wire(uint8_t value, VideoCodec& codec) {
 }
 
 uint8_t audio_codec_wire(AudioCodec codec) {
-    return codec == AudioCodec::AAC ? 1 : 0;
+    switch (codec) {
+        case AudioCodec::AAC:
+            return 1;
+        case AudioCodec::Opus:
+            return 2;
+    }
+    return 0;
 }
 
 bool audio_codec_from_wire(uint8_t value, AudioCodec& codec) {
     if (value == 1) {
         codec = AudioCodec::AAC;
+        return true;
+    }
+    if (value == 2) {
+        codec = AudioCodec::Opus;
         return true;
     }
     return false;
@@ -392,6 +402,117 @@ bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
                              " is outside the protocol limit");
         return false;
     }
+    return true;
+}
+
+std::vector<uint8_t> make_microphone_stream_header(const AudioInfo& info) {
+    if (info.codec != AudioCodec::Opus || info.sample_rate != 48000 ||
+        (info.channels != 1 && info.channels != 2) ||
+        info.frame_samples != kOpusFrameSamples ||
+        info.extradata.empty() || info.extradata.size() > kMaxAudioExtradata) {
+        return {};
+    }
+    std::vector<uint8_t> header(kMicrophoneStreamHeaderSize + info.extradata.size());
+    uint8_t* cursor = header.data();
+    std::memcpy(cursor, kMicrophoneStreamMagic, sizeof(kMicrophoneStreamMagic));
+    cursor += sizeof(kMicrophoneStreamMagic);
+    put_u8(cursor, kMicrophoneStreamVersion);
+    put_u8(cursor, audio_codec_wire(info.codec));
+    put_u16(cursor, 0);
+    put_u32(cursor, info.sample_rate);
+    put_u16(cursor, info.channels);
+    put_u16(cursor, static_cast<uint16_t>(info.frame_samples));
+    put_u16(cursor, static_cast<uint16_t>(info.extradata.size()));
+    put_u16(cursor, 0);
+    std::memcpy(cursor, info.extradata.data(), info.extradata.size());
+    return header;
+}
+
+size_t microphone_stream_header_length(const uint8_t* data, size_t size) {
+    if (size < kMicrophoneStreamHeaderSize ||
+        std::memcmp(data, kMicrophoneStreamMagic, sizeof(kMicrophoneStreamMagic)) != 0) {
+        return 0;
+    }
+    const uint16_t extradata_size = static_cast<uint16_t>(
+        data[16] | (static_cast<uint16_t>(data[17]) << 8));
+    if (extradata_size == 0 || extradata_size > kMaxAudioExtradata) {
+        return 0;
+    }
+    return kMicrophoneStreamHeaderSize + extradata_size;
+}
+
+bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo& info,
+                                     size_t& consumed, std::string* error) {
+    consumed = 0;
+    if (size < kMicrophoneStreamHeaderSize) {
+        set_error(error, "short microphone stream header");
+        return false;
+    }
+    if (std::memcmp(data, kMicrophoneStreamMagic, sizeof(kMicrophoneStreamMagic)) != 0) {
+        set_error(error, "bad microphone stream magic");
+        return false;
+    }
+    Reader reader(data + sizeof(kMicrophoneStreamMagic),
+                  kMicrophoneStreamHeaderSize - sizeof(kMicrophoneStreamMagic));
+    uint8_t version = 0;
+    uint8_t codec = 0;
+    uint16_t reserved = 0;
+    uint16_t tail_reserved = 0;
+    uint16_t channels = 0;
+    uint16_t frame_samples = 0;
+    uint16_t extradata_size = 0;
+    if (!reader.u8(version) || !reader.u8(codec) || !reader.u16(reserved) ||
+        !reader.u32(info.sample_rate) || !reader.u16(channels) ||
+        !reader.u16(frame_samples) || !reader.u16(extradata_size) ||
+        !reader.u16(tail_reserved)) {
+        set_error(error, "truncated microphone stream header");
+        return false;
+    }
+    if (version != kMicrophoneStreamVersion) {
+        set_error(error, "unsupported microphone stream version " +
+                             std::to_string(version));
+        return false;
+    }
+    if (!audio_codec_from_wire(codec, info.codec) || info.codec != AudioCodec::Opus) {
+        set_error(error, "microphone stream names unsupported codec " +
+                             std::to_string(codec));
+        return false;
+    }
+    if (reserved != 0 || tail_reserved != 0) {
+        set_error(error, "microphone stream header carries non-zero reserved fields");
+        return false;
+    }
+    if (info.sample_rate != 48000) {
+        set_error(error, "microphone stream sample rate " +
+                             std::to_string(info.sample_rate) + " is not supported");
+        return false;
+    }
+    if (channels != 1 && channels != 2) {
+        set_error(error, "microphone stream has " + std::to_string(channels) +
+                             " channels");
+        return false;
+    }
+    if (frame_samples != kOpusFrameSamples) {
+        set_error(error, "microphone stream frame length " +
+                             std::to_string(frame_samples) + " is not supported");
+        return false;
+    }
+    if (extradata_size == 0 || extradata_size > kMaxAudioExtradata) {
+        set_error(error, "microphone stream config size " +
+                             std::to_string(extradata_size) + " is outside the limit");
+        return false;
+    }
+    if (size < kMicrophoneStreamHeaderSize + extradata_size) {
+        set_error(error, "microphone stream config is truncated");
+        return false;
+    }
+    info.enabled = true;
+    info.channels = channels;
+    info.frame_samples = frame_samples;
+    info.bitrate = 0;
+    info.extradata.assign(data + kMicrophoneStreamHeaderSize,
+                          data + kMicrophoneStreamHeaderSize + extradata_size);
+    consumed = kMicrophoneStreamHeaderSize + extradata_size;
     return true;
 }
 
@@ -633,7 +754,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.input_enabled ? kServerInfoInputEnabled : 0) |
                         (info.clipboard_enabled ? kServerInfoClipboardEnabled : 0) |
                         (info.audio.enabled ? kServerInfoAudioEnabled : 0) |
-                        (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0)));
+                        (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0) |
+                        (info.microphone_enabled ? kServerInfoMicrophoneEnabled : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -675,6 +797,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     if (info.file_transfer_enabled) {
         permissions |= kPermissionFileTransfer;
+    }
+    if (info.microphone_enabled) {
+        permissions |= kPermissionMicrophone;
     }
     put_u16(cursor, permissions);
     return payload;
@@ -814,9 +939,16 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
                              std::to_string(info.audio.sample_rate) + " is not supported");
         return false;
     }
-    if (info.audio.frame_samples != kAudioFrameSamples) {
+    const uint32_t expected_frame_samples =
+        info.audio.codec == AudioCodec::Opus ? kOpusFrameSamples : kAudioFrameSamples;
+    if (info.audio.frame_samples != expected_frame_samples) {
         set_error(error, "HelloAck audio frame length " +
                              std::to_string(info.audio.frame_samples) + " is not supported");
+        return false;
+    }
+    if (info.audio.enabled && info.audio.codec == AudioCodec::Opus &&
+        info.audio.sample_rate != 48000) {
+        set_error(error, "HelloAck Opus audio is not at 48 kHz");
         return false;
     }
     if (extradata_size > kMaxAudioExtradata || extradata_size > reader.remaining()) {
@@ -859,6 +991,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.input_enabled = (permissions & kPermissionInput) != 0;
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
+    info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
     return true;
 }
 

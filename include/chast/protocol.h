@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 16.
+// The chast wire protocol, version 18.
 //
 // One QUIC connection carries:
 //
@@ -9,16 +9,22 @@
 //   * a server-initiated unidirectional video stream: a sequence of access
 //     units, each prefixed by a fixed FrameHeader,
 //   * when the host shares system audio, a second server-initiated
-//     unidirectional stream of AAC-LC access units, each prefixed by an
+//     unidirectional stream of Opus access units, each prefixed by an
 //     AudioHeader,
+//   * when the viewer's microphone is granted, a viewer-initiated
+//     unidirectional microphone stream (`CMIC`): a format header followed by
+//     Opus access units,
 //   * one unidirectional stream per clipboard change (`CCLB`), opened by the
 //     side that copied, and
-//   * one unidirectional stream per file upload (`CFIL`), viewer to host.
+//   * one unidirectional stream per file transfer (`CFIL`), opened by the
+//     side that offered the file: the viewer uploads to the host and the host
+//     downloads to the viewer.
 //
 // The streams are told apart by their packet magic, not by the order the
 // streams were opened: QUIC does not promise that the first bytes of a later
-// stream arrive after an earlier one. Video is `CFRM`, audio is `CAUD`,
-// clipboard content is `CCLB` and file data is `CFIL`.
+// stream arrive after an earlier one. Video is `CFRM`, system audio is
+// `CAUD`, the microphone is `CMIC`, clipboard content is `CCLB` and file data
+// is `CFIL`.
 //
 // QUIC streams give the media reliable, ordered delivery; the sequence number
 // is still carried so the receiver can report gaps and so a future version can
@@ -42,7 +48,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 16;
+inline constexpr uint16_t kProtocolVersion = 18;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -137,22 +143,23 @@ enum class ControlType : uint16_t {
     // means the mode is in effect and a StreamInfo follows; every other code
     // leaves the previous mode and stream in place. See DisplayModeCode.
     DisplayModeResult = 20,
-    // Viewer -> host, one file upload. Payload: transfer id (u32), size
-    // (u64), flags (u8), SHA-256 of the whole file (32 B), name length (u16)
-    // and UTF-8 name. The host answers with FileAnswer; accepted bytes follow
-    // on a client-initiated CFIL stream.
+    // Sender -> receiver, one file transfer (a viewer upload or a host
+    // download). Payload: transfer id (u32), size (u64), flags (u8), SHA-256
+    // of the whole file (32 B), name length (u16) and UTF-8 name. The
+    // receiver answers with FileAnswer; accepted bytes follow on a CFIL
+    // stream opened by the sender.
     FileOffer = 21,
-    // Host -> viewer answer to FileOffer. Payload: transfer id (u32), code
-    // (u8), resume offset (u64), reason length (u16), UTF-8 reason. Ok means
-    // the viewer should open the CFIL stream at resume_offset.
+    // Receiver -> sender answer to FileOffer. Payload: transfer id (u32),
+    // code (u8), resume offset (u64), reason length (u16), UTF-8 reason. Ok
+    // means the sender should open the CFIL stream at resume_offset.
     FileAnswer = 22,
-    // Host -> viewer final result. Payload: transfer id (u32), code (u8),
+    // Receiver -> sender final result. Payload: transfer id (u32), code (u8),
     // bytes written (u64), reason length (u16), UTF-8 reason. Sent once the
     // CFIL stream ended and the digest was checked, or when the transfer was
     // aborted.
     FileResult = 23,
-    // Viewer -> host cancellation. Payload: transfer id (u32), code (u8),
-    // reason length (u16), UTF-8 reason. The host closes and removes the
+    // Either side cancels a transfer. Payload: transfer id (u32), code (u8),
+    // reason length (u16), UTF-8 reason. The receiver closes and removes the
     // partial file.
     FileCancel = 24,
 };
@@ -280,9 +287,10 @@ struct ClipboardUpdate {
 
 // ----- file transfer -----
 //
-// An upload starts with FileOffer on the control stream and, once the host
-// answers Ok, a client-initiated unidirectional CFIL stream carrying the
-// bytes. The control stream never carries file data.
+// A transfer starts with FileOffer on the control stream and, once the
+// receiver answers Ok, a unidirectional CFIL stream from the sender carrying
+// the bytes. Either side may start one: the viewer uploads to the host and the
+// host downloads to the viewer. The control stream never carries file data.
 inline constexpr char kFileStreamMagic[4] = {'C', 'F', 'I', 'L'};
 inline constexpr uint8_t kFileStreamVersion = 1;
 // magic (4) + version (1) + reserved (3) + transfer id (4) + offset (8).
@@ -381,16 +389,21 @@ struct CursorUpdate {
 
 // ----- audio -----
 //
-// The host's system sound travels one way, on its own server-initiated stream.
-// Packet payloads are raw AAC-LC access units; the AudioSpecificConfig needed
-// to decode them rides in AudioInfo (HelloAck / StreamInfo) so the stream
-// itself needs no side channel.
+// System sound travels one way on a server-initiated `CAUD` stream; the
+// viewer's microphone travels the other way on a viewer-initiated `CMIC`
+// stream. Both carry raw Opus access units in production. The decoder config
+// for `CAUD` rides in AudioInfo (HelloAck / StreamInfo); `CMIC` self-describes
+// with a header before its first packet, because the viewer chooses the
+// device and therefore the format. AAC-LC remains decodable for older
+// recordings and the codec tests, but no session creates an AAC stream.
 enum class AudioCodec : uint8_t {
-    AAC = 1,  // AAC-LC, raw access units
+    AAC = 1,   // AAC-LC, raw access units
+    Opus = 2,  // raw Opus packets, 20 ms frames
 };
 
 inline constexpr size_t kMaxAudioExtradata = 64;
 inline constexpr uint32_t kAudioFrameSamples = 1024;
+inline constexpr uint32_t kOpusFrameSamples = 960;  // 20 ms at 48 kHz
 
 struct AudioInfo {
     bool enabled = false;
@@ -399,8 +412,8 @@ struct AudioInfo {
     uint16_t channels = 2;
     uint32_t bitrate = 0;  // bits per second, informational
     uint16_t frame_samples = kAudioFrameSamples;
-    // AudioSpecificConfig. Empty when audio is disabled; the decoder needs it
-    // before the first packet.
+    // Codec config: OpusHead for Opus, AudioSpecificConfig for AAC. Empty
+    // when audio is disabled; the decoder needs it before the first packet.
     std::vector<uint8_t> extradata;
 };
 
@@ -440,8 +453,35 @@ struct AudioHeader {
     uint32_t sample_rate = 0;
     uint16_t frame_samples = 0;  // decoded samples per channel
     uint16_t channels = 0;
-    AudioCodec codec = AudioCodec::AAC;
+    AudioCodec codec = AudioCodec::Opus;
 };
+
+// ----- microphone uplink -----
+//
+// The viewer opens one client-initiated unidirectional stream per microphone
+// session. Its first bytes describe the device format; the rest are
+// AudioHeader + payload packets exactly like `CAUD`. Opening the stream turns
+// the microphone on and closing it turns it off, so no control message is
+// needed and a denied or revoked permission is simply a refused stream.
+inline constexpr char kMicrophoneStreamMagic[4] = {'C', 'M', 'I', 'C'};
+inline constexpr size_t kMicrophoneStreamHeaderSize = 20;
+inline constexpr uint8_t kMicrophoneStreamVersion = 1;
+
+// Fixed 20-byte header followed by AudioInfo::extradata. The header carries
+// the codec, rate, channel count, frame length and extradata size; trim
+// nothing, the returned vector is exactly what goes on the stream.
+std::vector<uint8_t> make_microphone_stream_header(const AudioInfo& info);
+// Full header length (20 + extradata) once the fixed part has arrived, or 0
+// while it is incomplete or names an unusable extradata size. A receiver uses
+// it to wait for a split header without rejecting a legitimately truncated
+// first packet.
+size_t microphone_stream_header_length(const uint8_t* data, size_t size);
+// Parses the fixed part and the extradata. `consumed` is 20 + extradata size,
+// which is where the first AudioHeader starts. Rejects a truncated header,
+// unknown version/codec, unsupported rate, mono/stereo-plus channels, an
+// extradata overrun, and any non-zero reserved field.
+bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo& info,
+                                     size_t& consumed, std::string* error);
 
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents; bit 1 tells
 // it that both sides may exchange clipboard content; bit 2 tells it the host
@@ -451,25 +491,29 @@ inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
 inline constexpr uint16_t kServerInfoFileTransferEnabled = 0x0008;
+inline constexpr uint16_t kServerInfoMicrophoneEnabled = 0x0010;
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoInputEnabled |
                                                  kServerInfoClipboardEnabled |
                                                  kServerInfoAudioEnabled |
-                                                 kServerInfoFileTransferEnabled;
+                                                 kServerInfoFileTransferEnabled |
+                                                 kServerInfoMicrophoneEnabled;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
 // ServerInfo booleans are its decoded form. Input covers pointer and
 // keyboard injection; clipboard governs clipboard streams in both directions;
-// audio is present only while an audio stream is open; file transfer gates
-// FileOffer.
+// audio is present only while an audio stream is open; microphone allows the
+// viewer to open a `CMIC` uplink; file transfer gates FileOffer.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
     kPermissionAudio = 0x0004,
     kPermissionFileTransfer = 0x0008,
+    kPermissionMicrophone = 0x0010,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
-                                           kPermissionAudio | kPermissionFileTransfer;
+                                           kPermissionAudio | kPermissionFileTransfer |
+                                           kPermissionMicrophone;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -574,6 +618,9 @@ struct ServerInfo {
     bool input_enabled = false;
     bool clipboard_enabled = false;
     bool file_transfer_enabled = false;
+    // The viewer may open a microphone stream. This is the permission bit's
+    // decoded form; it is not a separate wire field.
+    bool microphone_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;

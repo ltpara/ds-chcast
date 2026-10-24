@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <imm.h>
+#include <shellapi.h>
 #include <shlobj.h>
 
 #include <flutter/flutter_engine.h>
@@ -16,6 +17,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "chast/identity.h"
 #include "chast/protocol.h"
@@ -192,6 +194,7 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
     if (view_ != nullptr) {
         SetWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId,
                           reinterpret_cast<DWORD_PTR>(this));
+        DragAcceptFiles(view_, TRUE);
     }
 }
 
@@ -208,6 +211,7 @@ void ViewerBridge::Shutdown() {
     ClearCursor();
     if (view_ != nullptr) {
         if (IsWindow(view_)) {
+            DragAcceptFiles(view_, FALSE);
             RemoveWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId);
         }
         view_ = nullptr;
@@ -413,6 +417,18 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.files_sent));
         map[key("fileFailures")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_failures));
+        map[key("downloadPhase")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.download_phase));
+        map[key("downloadName")] = flutter::EncodableValue(status.download_name);
+        map[key("downloadSize")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.download_size));
+        map[key("downloadReceived")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.download_received));
+        map[key("downloadError")] = flutter::EncodableValue(status.download_error);
+        map[key("filesReceived")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.files_received));
+        map[key("fileReceiveFailures")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_receive_failures));
         map[key("cursorUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.cursor_updates));
         map[key("cursorPending")] = flutter::EncodableValue(status.cursor_pending);
@@ -593,9 +609,28 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
-    if (method == "sendFile") {
+    if (method == "sendFile" || method == "sendFileAt") {
         if (viewer_ == nullptr) {
             result->Error("unavailable", "no viewer session is running");
+            return;
+        }
+        const auto start_upload = [this, &result](const std::string& path) {
+            if (path.empty() || !viewer_->SendFile(path)) {
+                result->Error("unavailable",
+                              "the file cannot be offered now (session busy or not permitted)");
+                return;
+            }
+            result->Success(flutter::EncodableValue(path));
+        };
+        if (method == "sendFileAt") {
+            // The path comes from a drop on the window, so it is already
+            // absolute; SendFile re-checks that it is one regular file.
+            const auto* path = std::get_if<std::string>(call.arguments());
+            if (path == nullptr) {
+                result->Error("bad_args", "sendFileAt wants a path");
+                return;
+            }
+            start_upload(*path);
             return;
         }
         std::vector<wchar_t> selected(32768, L'\0');
@@ -612,13 +647,7 @@ void ViewerBridge::HandleMethodCall(
             result->Success();
             return;
         }
-        const std::string path = utf8_from_wide(selected.data());
-        if (path.empty() || !viewer_->SendFile(path)) {
-            result->Error("unavailable",
-                          "the file cannot be offered now (session busy or not permitted)");
-            return;
-        }
-        result->Success(flutter::EncodableValue(path));
+        start_upload(utf8_from_wide(selected.data()));
         return;
     }
 
@@ -849,6 +878,21 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                     }
                 }
                 break;
+            case WM_DROPFILES: {
+                // One file per transfer: extra entries in a multi-file drop
+                // are dropped here rather than silently queued.
+                HDROP drop = reinterpret_cast<HDROP>(wparam);
+                std::vector<wchar_t> path(32768, L'\0');
+                if (self->channel_ &&
+                    DragQueryFileW(drop, 0, path.data(),
+                                   static_cast<UINT>(path.size())) > 0) {
+                    self->channel_->InvokeMethod(
+                        "droppedFile",
+                        std::make_unique<flutter::EncodableValue>(utf8_from_wide(path.data())));
+                }
+                DragFinish(drop);
+                return 0;
+            }
             case WM_NCDESTROY:
                 RemoveWindowSubclass(window, &ViewerBridge::ViewSubclassProc, id);
                 self->view_ = nullptr;

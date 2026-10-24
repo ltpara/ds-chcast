@@ -119,7 +119,7 @@ void test_hello() {
     rejects_hello(long_password, "Hello with an oversized password is rejected");
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
-    unknown_permissions[8] = 0x10;  // version, display, token length, password length
+    unknown_permissions[8] = 0x20;  // version, display, token length, password length
     unknown_permissions[9] = 0;
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
@@ -191,6 +191,7 @@ void test_hello_ack() {
     sent.input_enabled = true;
     sent.clipboard_enabled = true;
     sent.file_transfer_enabled = true;
+    sent.microphone_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -231,8 +232,9 @@ void test_hello_ack() {
     check(got.input_enabled, "HelloAck keeps the input flag");
     check(got.clipboard_enabled, "HelloAck keeps the clipboard flag");
     check(got.file_transfer_enabled, "HelloAck keeps the file transfer flag");
+    check(got.microphone_enabled, "HelloAck keeps the microphone flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
-              got.file_transfer_enabled,
+              got.file_transfer_enabled && got.microphone_enabled,
           "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
@@ -251,6 +253,26 @@ void test_hello_ack() {
               got.audio.frame_samples == sent.audio.frame_samples &&
               got.audio.extradata == sent.audio.extradata,
           "HelloAck keeps the audio description and decoder config");
+
+    chast::ServerInfo opus = sent;
+    opus.audio.codec = chast::AudioCodec::Opus;
+    opus.audio.frame_samples = chast::kOpusFrameSamples;
+    opus.audio.bitrate = 128000;
+    opus.audio.extradata.assign(19, 0);
+    std::memcpy(opus.audio.extradata.data(), "OpusHead", 8);
+    opus.audio.extradata[8] = 1;
+    opus.audio.extradata[9] = 2;
+    opus.audio.extradata[10] = 0x38;
+    opus.audio.extradata[11] = 0x01;  // pre-skip 312, for a 6.5 ms lead
+    opus.audio.extradata[14] = 0x80;  // input rate 48000
+    opus.audio.extradata[15] = 0xBB;
+    chast::ServerInfo opus_got;
+    check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(opus)), opus_got, &error) &&
+              opus_got.audio.codec == chast::AudioCodec::Opus &&
+              opus_got.audio.frame_samples == chast::kOpusFrameSamples &&
+              opus_got.audio.extradata == opus.audio.extradata &&
+              opus_got.microphone_enabled,
+          "HelloAck round-trips an Opus description with the microphone permission");
 
     auto ack_payload = [&] { return payload_of(chast::make_hello_ack(sent)); };
     const size_t display_count_at = 24 + sent.encoder.size();
@@ -281,7 +303,7 @@ void test_hello_ack() {
     std::vector<uint8_t> unknown_flags = ack_payload();
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
-    unknown_flags[kFlagsAt] = 0x10;
+    unknown_flags[kFlagsAt] = 0x20;
     unknown_flags[kFlagsAt + 1] = 0;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
@@ -297,7 +319,7 @@ void test_hello_ack() {
     rejects_ack(std::move(audio_block_only),
                 "a HelloAck that announces audio without the flag is rejected");
     std::vector<uint8_t> unknown_audio_codec = ack_payload();
-    unknown_audio_codec[audio_at + 1] = 2;
+    unknown_audio_codec[audio_at + 1] = 3;
     rejects_ack(std::move(unknown_audio_codec),
                 "a HelloAck with an unknown audio codec is rejected");
     std::vector<uint8_t> no_extradata = ack_payload();
@@ -338,7 +360,7 @@ void test_hello_ack() {
     rejects_ack(std::move(mask_mismatch),
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
-    unknown_permissions[unknown_permissions.size() - 2] = 0x10;
+    unknown_permissions[unknown_permissions.size() - 2] = 0x20;
     unknown_permissions[unknown_permissions.size() - 1] = 0;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
@@ -346,13 +368,15 @@ void test_hello_ack() {
     sent.input_enabled = false;
     sent.clipboard_enabled = false;
     sent.file_transfer_enabled = false;
+    sent.microphone_enabled = false;
     sent.audio.enabled = false;
     sent.audio.extradata.clear();
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
               !disabled.input_enabled && !disabled.clipboard_enabled &&
-              !disabled.file_transfer_enabled && !disabled.audio.enabled,
-          "HelloAck reports input, clipboard, file transfer and audio disabled");
+              !disabled.file_transfer_enabled && !disabled.audio.enabled &&
+              !disabled.microphone_enabled,
+          "HelloAck reports every permission disabled");
 }
 
 void test_permission_update() {
@@ -373,7 +397,7 @@ void test_permission_update() {
           "PermissionUpdate round-trips every permission");
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
-    unknown[0] = 0x10;
+    unknown[0] = 0x20;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -780,6 +804,136 @@ void test_audio_header() {
                    "an AudioHeader with an unsupported channel count is rejected");
     check(!chast::decode_audio_header(bytes, chast::kAudioHeaderSize - 1, got, &error),
           "a short AudioHeader is rejected");
+}
+
+void test_microphone_stream_header() {
+    chast::AudioInfo sent;
+    sent.enabled = true;
+    sent.codec = chast::AudioCodec::Opus;
+    sent.sample_rate = 48000;
+    sent.channels = 1;
+    sent.frame_samples = chast::kOpusFrameSamples;
+    sent.extradata.assign(19, 0);
+    std::memcpy(sent.extradata.data(), "OpusHead", 8);
+    sent.extradata[8] = 1;
+    sent.extradata[9] = 1;
+    sent.extradata[10] = 0x38;
+    sent.extradata[11] = 0x01;
+    sent.extradata[14] = 0x80;
+    sent.extradata[15] = 0xBB;
+
+    std::string error;
+    const std::vector<uint8_t> wire = chast::make_microphone_stream_header(sent);
+    check(wire.size() == chast::kMicrophoneStreamHeaderSize + sent.extradata.size(),
+          "the microphone stream header is 20 bytes plus its config");
+    check(wire.size() >= 4 && std::memcmp(wire.data(), "CMIC", 4) == 0,
+          "the microphone stream header starts with the CMIC magic");
+    check(chast::microphone_stream_header_length(wire.data(), wire.size()) == wire.size(),
+          "the microphone stream length names the full header");
+    check(chast::microphone_stream_header_length(wire.data(),
+                                                 chast::kMicrophoneStreamHeaderSize) ==
+              wire.size(),
+          "the microphone stream length is known before the config arrives");
+    check(chast::microphone_stream_header_length(
+              wire.data(), chast::kMicrophoneStreamHeaderSize - 1) == 0,
+          "the microphone stream length waits for the fixed header");
+    std::vector<uint8_t> zero_config = wire;
+    std::fill(zero_config.begin() + 16, zero_config.begin() + 18, 0);
+    check(chast::microphone_stream_header_length(zero_config.data(), zero_config.size()) == 0,
+          "the microphone stream length rejects an empty config");
+    std::vector<uint8_t> huge_config = wire;
+    huge_config[16] = 0xFF;
+    huge_config[17] = 0x00;
+    check(chast::microphone_stream_header_length(huge_config.data(), huge_config.size()) == 0,
+          "the microphone stream length rejects an oversized config");
+    std::vector<uint8_t> no_magic = wire;
+    no_magic[0] = 'X';
+    check(chast::microphone_stream_header_length(no_magic.data(), no_magic.size()) == 0,
+          "the microphone stream length rejects another magic");
+    check(chast::make_microphone_stream_header(chast::AudioInfo{}).empty(),
+          "the encoder refuses a microphone config that is not Opus at 48 kHz");
+    chast::AudioInfo wrong_rate = sent;
+    wrong_rate.sample_rate = 44100;
+    check(chast::make_microphone_stream_header(wrong_rate).empty(),
+          "the encoder refuses a microphone config at another sample rate");
+
+    chast::AudioInfo got;
+    size_t consumed = 0;
+    const bool parsed = chast::decode_microphone_stream_header(
+        wire.data(), wire.size(), got, consumed, &error);
+    check(parsed, "the microphone stream header round-trips");
+    if (parsed) {
+        check(consumed == wire.size() && got.codec == chast::AudioCodec::Opus &&
+                  got.sample_rate == sent.sample_rate && got.channels == sent.channels &&
+                  got.frame_samples == sent.frame_samples &&
+                  got.extradata == sent.extradata,
+              "the microphone stream header keeps the encoder description");
+    }
+    std::vector<uint8_t> with_packet = wire;
+    with_packet.push_back(0xAA);
+    check(chast::decode_microphone_stream_header(with_packet.data(), with_packet.size(), got,
+                                                 consumed, &error) &&
+              consumed == wire.size(),
+          "the microphone stream header stops before the first audio packet");
+
+    auto set_u16 = [](std::vector<uint8_t>& header, size_t at, uint16_t value) {
+        header[at] = static_cast<uint8_t>(value);
+        header[at + 1] = static_cast<uint8_t>(value >> 8);
+    };
+    auto set_u32 = [](std::vector<uint8_t>& header, size_t at, uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+            header[at + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    auto rejects_header = [&](std::vector<uint8_t> header, const char* what) {
+        chast::AudioInfo dropped;
+        size_t dropped_consumed = 0;
+        check(!chast::decode_microphone_stream_header(header.data(), header.size(), dropped,
+                                                      dropped_consumed, &error),
+              what);
+    };
+    rejects_header(std::vector<uint8_t>(wire.begin(), wire.begin() + 19),
+                   "a truncated microphone stream header is rejected");
+    std::vector<uint8_t> bad_magic = wire;
+    bad_magic[0] = 'X';
+    rejects_header(std::move(bad_magic), "a microphone stream header with bad magic is rejected");
+    std::vector<uint8_t> old_version = wire;
+    old_version[4] = chast::kMicrophoneStreamVersion + 1;
+    rejects_header(std::move(old_version),
+                   "a microphone stream header from another version is rejected");
+    std::vector<uint8_t> aac_codec = wire;
+    aac_codec[5] = 1;
+    rejects_header(std::move(aac_codec), "a microphone stream using AAC is rejected");
+    std::vector<uint8_t> unknown_codec = wire;
+    unknown_codec[5] = 3;
+    rejects_header(std::move(unknown_codec), "a microphone stream with an unknown codec is rejected");
+    std::vector<uint8_t> reserved = wire;
+    reserved[6] = 1;
+    rejects_header(std::move(reserved),
+                   "a microphone stream header with a non-zero reserved field is rejected");
+    std::vector<uint8_t> tail_reserved = wire;
+    tail_reserved[18] = 1;
+    rejects_header(std::move(tail_reserved),
+                   "a microphone stream header with a non-zero trailing reserved field is rejected");
+    std::vector<uint8_t> bad_rate = wire;
+    set_u32(bad_rate, 8, 44100);
+    rejects_header(std::move(bad_rate), "a microphone stream at another sample rate is rejected");
+    std::vector<uint8_t> bad_channels = wire;
+    set_u16(bad_channels, 12, 3);
+    rejects_header(std::move(bad_channels),
+                   "a microphone stream with an unsupported channel count is rejected");
+    std::vector<uint8_t> bad_frame = wire;
+    set_u16(bad_frame, 14, chast::kAudioFrameSamples);
+    rejects_header(std::move(bad_frame),
+                   "a microphone stream with an unsupported frame length is rejected");
+    std::vector<uint8_t> no_config = wire;
+    set_u16(no_config, 16, 0);
+    rejects_header(std::move(no_config), "a microphone stream without its config is rejected");
+    std::vector<uint8_t> long_config = wire;
+    set_u16(long_config, 16, static_cast<uint16_t>(chast::kMaxAudioExtradata + 1));
+    rejects_header(std::move(long_config), "an oversized microphone config is rejected");
+    rejects_header(std::vector<uint8_t>(wire.begin(), wire.begin() + 25),
+                   "a microphone stream whose config is cut short is rejected");
 }
 
 void test_audio_parser() {
@@ -1650,6 +1804,7 @@ int main(int argc, char** argv) {
     test_clipboard_container();
     test_frame_header();
     test_audio_header();
+    test_microphone_stream_header();
     test_audio_parser();
     test_latency_probe();
     test_clipboard();

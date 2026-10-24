@@ -30,6 +30,7 @@ struct ID3D11Texture2D;
 
 namespace chast {
 class DeviceIdentity;
+class FileReceiver;
 }
 
 namespace chast_viewer {
@@ -150,6 +151,16 @@ struct ViewerStatus {
     std::string file_error;
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
+    // The host's most recent download. The bytes are written to the receive
+    // directory as they arrive, so `download_received` counts bytes on disk;
+    // a resume starts at the partial length already on disk.
+    FilePhase download_phase = FilePhase::kIdle;
+    std::string download_name;
+    uint64_t download_size = 0;
+    uint64_t download_received = 0;
+    std::string download_error;
+    uint64_t files_received = 0;
+    uint64_t file_receive_failures = 0;
     // Pointer: updates received, and whether one is waiting for the UI. The
     // sprite is deliberately not part of ViewerStatus: it can be a quarter of
     // a megabyte and the UI polls the status four times a second, so it is
@@ -352,8 +363,28 @@ private:
         uint32_t transfer_id = 0;
         std::string error;
     };
+    // The single incoming download. The session thread owns the receiver;
+    // the UI reads a snapshot under the same lock.
+    struct FileDownload {
+        enum class Stage {
+            kNone,
+            kReceiving,
+            kDone,
+            kFailed,
+        };
+        Stage stage = Stage::kNone;
+        uint32_t transfer_id = 0;
+        std::string name;
+        std::string path;
+        uint64_t size = 0;
+        uint64_t received = 0;
+        std::chrono::steady_clock::time_point answer_time;
+        std::unique_ptr<chast::FileReceiver> receiver;
+        std::string error;
+    };
     mutable std::mutex file_mutex_;
     FileUpload file_;
+    FileDownload download_;
     std::thread hasher_;
     std::atomic<bool> hash_cancel_{false};
     uint32_t next_file_id_ = 1;

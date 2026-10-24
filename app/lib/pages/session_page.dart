@@ -120,6 +120,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    ViewerBridge.setDropHandler(_sendDroppedFile);
     _startPolling();
     _starting = _start();
     unawaited(_starting);
@@ -129,6 +130,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
+    ViewerBridge.setDropHandler(null);
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     _focus.dispose();
@@ -399,6 +401,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // the reason stay in the status until the next upload starts.
     final bool fileDone = status.filesSent > _status.filesSent;
     final bool fileFailed = status.fileFailures > _status.fileFailures;
+    final bool downloadDone = status.filesReceived > _status.filesReceived;
+    final bool downloadFailed =
+        status.fileReceiveFailures > _status.fileReceiveFailures;
     if (modeChangeAccepted) {
       _modesRefreshPending = true;
       _modesRequestedFor = null;
@@ -437,6 +442,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       final String reason = status.fileError;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(reason.isEmpty ? '文件发送失败' : '文件发送失败：$reason'),
+        duration: const Duration(seconds: 5),
+      ));
+    }
+    if (downloadDone) {
+      final String name = status.downloadName;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(name.isEmpty ? '文件已接收' : '文件已接收：$name'),
+        duration: const Duration(seconds: 3),
+      ));
+    } else if (downloadFailed) {
+      final String reason = status.downloadError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '文件接收失败' : '文件接收失败：$reason'),
         duration: const Duration(seconds: 5),
       ));
     }
@@ -564,13 +582,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _sendFile() async {
+  Future<void> _sendFile() => _startUpload(ViewerBridge.sendFile);
+
+  Future<void> _sendDroppedFile(String path) =>
+      _startUpload(() => ViewerBridge.sendFileAt(path));
+
+  Future<void> _startUpload(Future<String?> Function() start) async {
     if (_filePickBusy) {
       return;
     }
     _filePickBusy = true;
     try {
-      final String? path = await ViewerBridge.sendFile();
+      final String? path = await start();
       if (path != null && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('已开始发送，进度显示在画面下方'),
@@ -1391,12 +1414,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
-                if (hasFrame && !showOverlay && _status.fileActive)
+                if (hasFrame &&
+                    !showOverlay &&
+                    (_status.fileActive || _status.downloadActive))
                   Positioned(
                     left: 0,
                     right: 0,
                     bottom: 46,
-                    child: Center(child: _buildFileProgress()),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: <Widget>[
+                          if (_status.downloadActive) _buildDownloadProgress(),
+                          if (_status.downloadActive && _status.fileActive)
+                            const SizedBox(height: 6),
+                          if (_status.fileActive) _buildFileProgress(),
+                        ],
+                      ),
+                    ),
                   ),
                 if (hasFrame && !showOverlay && _status.acceptsAudio && _status.audioMuted)
                   Positioned(
@@ -1483,6 +1518,69 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               borderRadius: BorderRadius.circular(2),
               child: LinearProgressIndicator(
                 value: sending ? status.fileProgress : null,
+                minHeight: 3,
+                backgroundColor: Colors.white12,
+                valueColor: const AlwaysStoppedAnimation<Color>(kAccentBright),
+              ),
+            ),
+            if (detail.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 4),
+              Text(
+                detail,
+                style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The host's download, drawn below the upload when both run at once. The
+  /// bytes are already in the receive directory, so this only reports them.
+  Widget _buildDownloadProgress() {
+    final ViewerStatus status = _status;
+    final String detail = status.downloadSize > 0
+        ? '${_formatBytes(status.downloadReceived)} / '
+            '${_formatBytes(status.downloadSize)}'
+        : '';
+    return IgnorePointer(
+      child: Container(
+        width: 340,
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 9),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.62),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                const Icon(Icons.download_rounded, size: 13, color: Colors.white70),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    status.downloadName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white70, fontSize: 10.5),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Text(
+                  '正在接收',
+                  style: TextStyle(color: Colors.white38, fontSize: 9.5),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(2),
+              child: LinearProgressIndicator(
+                value: status.downloadProgress,
                 minHeight: 3,
                 backgroundColor: Colors.white12,
                 valueColor: const AlwaysStoppedAnimation<Color>(kAccentBright),

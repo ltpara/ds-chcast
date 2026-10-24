@@ -7,7 +7,10 @@
 // initiated unidirectional stream (plus a second audio stream when the host
 // shares system sound); the client side connects, performs the Hello
 // handshake, and reads both. Control messages share a client-initiated
-// bidirectional stream. See chast/protocol.h for the wire format.
+// bidirectional stream. A viewer that was granted the microphone opens a
+// client-initiated `CMIC` stream in the other direction; opening and closing
+// that stream is the microphone switch. See chast/protocol.h for the wire
+// format.
 //
 // A server created with QuicServerConfig::allow_input also injects the
 // viewer's pointer and keyboard events locally (chast/input.h) and says so in
@@ -132,6 +135,11 @@ struct QuicServerConfig {
     // settings. When false, announce() clears audio.enabled so the viewer is
     // never told about a stream that will not exist.
     bool allow_audio = false;
+    // Accept a viewer-initiated CMIC microphone stream. Off by default: the
+    // microphone is a privacy feature, so a host that does not opt in never
+    // sees a stream at all. announce() clears microphone_enabled when false,
+    // and the transport aborts CMIC streams opened anyway.
+    bool allow_microphone = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -326,6 +334,20 @@ public:
     // stream cannot be reopened on this connection; a StreamInfo announcing
     // audio disabled tells the viewer why it ended.
     Error stop_audio();
+    // Pops the next microphone packet the viewer sent. `format` describes the
+    // current CMIC stream and `format_changed` is true on the first packet
+    // after one opened, so the host can rebuild its decoder and player.
+    // WaitTimeout means silence; Unavailable means the viewer ended the
+    // stream, which may later be followed by a new one. Microphone problems
+    // never end the video session: a malformed packet returns CaptureFailed.
+    Error receive_microphone(AudioHeader& header, std::vector<uint8_t>& payload,
+                             AudioInfo& format, bool& format_changed,
+                             std::chrono::milliseconds timeout);
+    // True after the viewer closed or aborted its current microphone stream.
+    // A later start on the viewer clears it again.
+    bool microphone_finished() const;
+    // Number of CMIC streams accepted since the connection started.
+    uint64_t microphone_streams() const;
     // True when the client asked for a key frame since the last call.
     bool take_keyframe_request();
     // Pops the newest SwitchDisplay request the viewer sent. Only the newest
@@ -405,6 +427,22 @@ public:
     // broken" without ending the video session.
     Error receive_audio(AudioHeader& header, std::vector<uint8_t>& payload,
                         std::chrono::milliseconds timeout);
+    // Opens the viewer-initiated CMIC stream and writes its format header.
+    // Opening the stream is the microphone switch: the host starts decoding
+    // on the header and stops when the stream ends, so there is no control
+    // message. Requires kPermissionMicrophone in the last HelloAck or
+    // PermissionUpdate, and a complete 48 kHz Opus description with OpusHead
+    // extradata. One stream at a time; stop_microphone() ends it.
+    Error start_microphone(const AudioInfo& info);
+    // Sends one Opus packet on the open CMIC stream. Like send_audio it never
+    // waits: a full queue drops the packet and returns WaitTimeout, so the
+    // microphone can never stall video. `capture_ms` stays on this viewer's
+    // steady clock; the host treats it as a relative timeline.
+    Error send_microphone(AudioHeader header, const uint8_t* payload, size_t size);
+    // Ends the microphone stream gracefully. A later start_microphone() opens
+    // a fresh stream. Revoking kPermissionMicrophone aborts it from the host
+    // side as well, so the viewer stops sending either way.
+    Error stop_microphone();
     // Asks the server for an IDR (sent on the control stream).
     Error request_keyframe();
     // Sends one LatencyProbe carrying this process's steady clock. The server
@@ -502,54 +540,67 @@ public:
     // Total CCLB blobs received since the connection started.
     uint64_t clipboard_contents_received() const;
 
-    // Server: pops the oldest FileOffer the viewer sent. Nothing is accepted
+    // ----- file transfer (both directions) -----
+    //
+    // The side that offers a file is the sender; the side that answers is the
+    // receiver and writes the bytes. A viewer upload has the host as receiver;
+    // a host download has the viewer as receiver. Every call below works on
+    // both roles, and `session_permissions` must carry
+    // kPermissionFileTransfer.
+
+    // Receiver: pops the oldest FileOffer the peer sent. Nothing is accepted
     // until send_file_answer() says so.
     bool take_file_offer(FileOffer& offer);
-    // Server: answers an offer on the control stream. Ok tells the viewer to
-    // start the CFIL stream at `resume_offset`; every other code must pass 0
-    // and aborts a stream the viewer opened early.
+    // Receiver: answers an offer on the control stream. Ok tells the sender to
+    // open the CFIL stream at `resume_offset`; every other code must pass 0
+    // and aborts a stream the sender opened early.
     Error send_file_answer(uint32_t transfer_id, FileCode code, uint64_t resume_offset = 0,
                            const std::string& reason = {});
-    // Server: waits for the next piece of any incoming upload. WaitTimeout
-    // means no bytes yet, Unavailable means no upload is active any more. A
-    // broken upload returns its transport error after its bytes were drained.
+    // Receiver: waits for the next piece of any incoming transfer. WaitTimeout
+    // means no bytes yet, Unavailable means no transfer is active any more. A
+    // broken transfer returns its transport error after its bytes were drained.
     Error receive_file_chunk(FileChunk& chunk, std::chrono::milliseconds timeout);
-    // Server: transport state of one upload; false when the id is unknown.
+    // Receiver: transport state of one incoming transfer; false when the id is
+    // unknown.
     bool file_upload_state(uint32_t transfer_id, FileUploadState& state) const;
-    // Server: reports the final outcome on the control stream. A code other
-    // than Ok aborts the upload stream and discards its buffered bytes.
+    // Receiver: reports the final outcome on the control stream. A code other
+    // than Ok aborts the data stream and discards its buffered bytes.
     Error send_file_result(uint32_t transfer_id, FileCode code, uint64_t received,
                            const std::string& reason = {});
-    // Server: pops the oldest FileCancel. The host owns the transfer and
-    // answers with send_file_result() when it wants to.
+    // Either side: pops the oldest FileCancel. The receiver owns the partial
+    // file and answers with send_file_result() when it wants to; the sender
+    // drops its stream and local read state.
     bool take_file_cancel(FileCancel& cancel);
     // Total FileOffers received since the connection started.
     uint64_t file_offers_received() const;
 
-    // Client: announces a file on the control stream. The transfer id has to
-    // be new for this connection and the transfer requires file-transfer
-    // permission.
+    // Sender: announces a file on the control stream. The transfer id has to
+    // be new for this connection.
     Error offer_file(const FileOffer& offer);
-    // Client: pops the oldest FileAnswer. On Ok the caller reads the local
+    // Sender: pops the oldest FileAnswer. On Ok the caller reads the local
     // file from the answer's resume offset.
     bool take_file_answer(FileAnswer& answer);
-    // Client: sends one piece of an accepted upload. The first call opens the
-    // CFIL stream with the answer's resume offset; pieces then follow on
+    // Sender: sends one piece of an accepted transfer. The first call opens
+    // the CFIL stream with the answer's resume offset; pieces then follow on
     // exactly. Blocks on the shared send queue like video.
     Error send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size);
-    // Client: send_file_data() without waiting for queue capacity. Returns
+    // Sender: send_file_data() without waiting for queue capacity. Returns
     // WaitTimeout, having sent nothing, when the shared queue is full; the
-    // caller keeps the piece and retries. A bulk upload uses this so it never
-    // stalls the receive loop that feeds video, audio and input.
+    // caller keeps the piece and retries. A bulk transfer uses this so it
+    // never stalls the receive loop that feeds video, audio and input.
     Error try_send_file_data(uint32_t transfer_id, const uint8_t* data, size_t size);
-    // Client: half-closes the upload stream after the last byte. A zero-byte
+    // Sender: half-closes the data stream after the last byte. A zero-byte
     // file calls this without send_file_data().
     Error finish_file_upload(uint32_t transfer_id);
-    // Client: aborts the upload's stream and forgets it (local read failure,
-    // rejected offer or a host cancel).
+    // Sender: aborts the data stream and forgets it (local read failure,
+    // rejected offer or a receiver cancel).
     void cancel_file_upload(uint32_t transfer_id);
-    // Client: pops the oldest FileResult. Taking it releases the upload state.
+    // Sender: pops the oldest FileResult. Taking it releases the transfer
+    // state.
     bool take_file_result(FileResult& result);
+    // Sender: tells the receiver to drop the transfer and its partial file.
+    // The local stream is aborted through cancel_file_upload().
+    Error send_file_cancel(uint32_t transfer_id, FileCode code, const std::string& reason);
 
     // ----- pointer (server to client) -----
 
