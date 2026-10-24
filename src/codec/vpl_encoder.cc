@@ -42,6 +42,8 @@
 
 #include "chast/encoder.h"
 
+#include "encoder_internal.h"
+
 #include <d3d10.h>
 #include <dxgi1_6.h>
 
@@ -1261,7 +1263,7 @@ UINT hardware_bitrate(UINT width, UINT height, float quality_ratio, bool h264) {
     return (std::max)(1u, kbps) * 1000u;
 }
 
-bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device) {
+bool vpl_encoder_available(VideoCodec codec, ID3D11Device* device) {
     AdapterIdentity adapter;
     if (device) {
         adapter = identify_adapter(device);
@@ -1307,8 +1309,9 @@ bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device) {
     return codec == VideoCodec::Hevc && has_implementation(VideoCodec::H264);
 }
 
-std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device, const EncoderConfig& config,
-                                              std::string* error) {
+std::unique_ptr<IVideoEncoder> create_vpl_encoder(ID3D11Device* device,
+                                                  const EncoderConfig& config,
+                                                  std::string* error) {
     auto encoder = std::make_unique<MfxEncoder>();
     const Error err = encoder->initialize(device, config);
     if (!err.ok()) {

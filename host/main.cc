@@ -85,6 +85,7 @@ enum ControlId {
     kAudioCheck,
     kMicrophoneCheck,
     kPrivacyModeCheck,
+    kCarrierCheck,
     kAutostartCheck,
     kSecurityButton,
     kFirewallButton,
@@ -116,6 +117,7 @@ struct HostApp {
     HWND audio_check = nullptr;
     HWND microphone_check = nullptr;
     HWND privacy_check = nullptr;
+    HWND carrier_check = nullptr;
     HWND autostart_check = nullptr;
     HWND toggle_button = nullptr;
     HWND log_edit = nullptr;
@@ -670,8 +672,16 @@ std::wstring state_text(HostState state, const HostStatus& status) {
     switch (state) {
         case HostState::Stopped:
             return L"已停止";
-        case HostState::Listening:
-            return L"等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）";
+        case HostState::Listening: {
+            std::wstring text =
+                L"等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）";
+            if (status.carrier_listening) {
+                text += L" · 弱网回退端口 " + std::to_wstring(status.carrier_port);
+            } else if (!status.carrier_error.empty()) {
+                text += L" · 弱网回退不可用";
+            }
+            return text;
+        }
         case HostState::Streaming:
             return L"正在共享";
         case HostState::Failed:
@@ -882,6 +892,7 @@ void refresh_ui() {
     set_check(g_app->audio_check, g_app->settings.allow_audio);
     set_check(g_app->microphone_check, g_app->settings.allow_microphone);
     set_check(g_app->privacy_check, g_app->settings.allow_privacy_mode);
+    set_check(g_app->carrier_check, g_app->settings.carrier);
     set_check(g_app->autostart_check, g_app->settings.autostart);
     set_text(g_app->toggle_button, running ? L"停止共享" : L"开始共享");
 
@@ -1037,6 +1048,8 @@ void create_controls() {
                                           408, 200, 24, kMicrophoneCheck, nullptr);
     g_app->privacy_check = add_control(L"BUTTON", L"允许隐私模式", BS_AUTOCHECKBOX, 0, 240, 408,
                                        200, 24, kPrivacyModeCheck, nullptr);
+    g_app->carrier_check = add_control(L"BUTTON", L"弱网回退（TCP）", BS_AUTOCHECKBOX, 0, 446, 408,
+                                       126, 24, kCarrierCheck, nullptr);
 
     add_control(L"BUTTON", L"安全设置…", BS_PUSHBUTTON, 0, 24, 444, 116, 30, kSecurityButton,
                 nullptr);
@@ -1067,6 +1080,7 @@ void create_controls() {
     set_check(g_app->audio_check, g_app->settings.allow_audio);
     set_check(g_app->microphone_check, g_app->settings.allow_microphone);
     set_check(g_app->privacy_check, g_app->settings.allow_privacy_mode);
+    set_check(g_app->carrier_check, g_app->settings.carrier);
     set_check(g_app->autostart_check, g_app->settings.autostart);
 }
 
@@ -2202,6 +2216,8 @@ void show_tray_menu() {
                 kMicrophoneCheck, L"接收查看者麦克风");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_privacy_mode ? MF_CHECKED : 0),
                 kPrivacyModeCheck, L"允许查看者开启隐私模式");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
+                L"弱网回退（TCP/WebSocket）");
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
                 L"开机自动启动");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2410,6 +2426,31 @@ void handle_command(int id) {
                 restart_server();
                 append_log_line(g_app->settings.allow_privacy_mode ? L"已允许隐私模式"
                                                                    : L"隐私模式已关闭");
+            }
+            break;
+        case kCarrierCheck:
+            g_app->settings.carrier = !g_app->settings.carrier;
+            save_settings();
+            if (session_is_live()) {
+                // The fallback listener is bound at start-up; changing it now
+                // would drop the viewer, so the switch waits for the next run.
+                append_log_line(g_app->settings.carrier
+                                    ? L"已开启弱网回退；将在下次开始共享时生效"
+                                    : L"已关闭弱网回退；将在下次开始共享时生效");
+            } else {
+                restart_server();
+                if (!g_app->settings.carrier) {
+                    append_log_line(L"弱网回退已关闭");
+                } else if (!g_app->server) {
+                    append_log_line(L"弱网回退已开启");
+                } else {
+                    const HostStatus status = g_app->server->status();
+                    append_log_line(status.carrier_listening
+                                        ? L"弱网回退已开启（端口 " +
+                                              std::to_wstring(status.carrier_port) + L"）"
+                                        : L"弱网回退已开启，但监听失败：" +
+                                              widen(status.carrier_error));
+                }
             }
             break;
         case kAutostartCheck: {

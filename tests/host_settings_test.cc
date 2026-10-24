@@ -69,7 +69,7 @@ bool same_devices(const std::vector<chast::TrustedDevice>& a,
 }
 
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
-    return a.bind_address == b.bind_address && a.port == b.port &&
+    return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.allow_file_transfer == b.allow_file_transfer &&
            a.file_receive_directory == b.file_receive_directory &&
@@ -94,6 +94,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     chast::HostSettings settings;
     settings.bind_address = "192.168.1.5";
     settings.port = 6100;
+    settings.carrier = false;
     settings.allow_input = false;
     settings.allow_clipboard = false;
     settings.allow_file_transfer = false;
@@ -157,6 +158,7 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.warning.empty(), "a missing file is not a warning");
     check(loaded.settings.port == 4433 && loaded.settings.bind_address == "0.0.0.0",
           "missing file yields the documented defaults");
+    check(loaded.settings.carrier, "a fresh host accepts the TCP/WebSocket fallback");
     check(loaded.settings.allow_input && loaded.settings.require_approval,
           "a fresh host accepts input behind an approval");
     check(loaded.settings.allow_clipboard, "a fresh host syncs the clipboard");

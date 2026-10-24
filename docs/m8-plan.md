@@ -42,7 +42,7 @@ M8.5（协议 v18，Opus + 麦克风上行）、M8.6（协议 v19，锁屏/UAC �
 | 会话内切换显示器 | 需断开重连（`host_server.cc` Hello 时固定输出） | `SwitchDisplay` 会话内切换 | P0（M8.0） |
 | 远程修改分辨率 | 无 | `change_resolution` + 虚拟屏 | P0（M8.1） |
 | 无头/虚拟显示器 | DXGI 无输出即建不了采集器 | IDD / usbmmidd 虚拟屏 | P0（M8.2） |
-| 编码后端覆盖 | 仅 Intel oneVPL | NVENC/QSV/AMF/VAAPI | P1（M8.3） |
+| 编码后端覆盖 | oneVPL + FFmpeg 硬件兜底（NVENC/AMF/QSV） | NVENC/QSV/AMF/VAAPI | P1（M8.3） |
 | 富剪贴板/文件传输 | 纯文本 256 KiB | 文本/HTML/RTF/图片/SVG/文件 | P1（M8.4） |
 | 麦克风/双向音频 | 仅系统声音 AAC-LC | loopback + 麦克风 + Opus | P2（M8.5） |
 | 锁屏/UAC | 注入被系统丢弃 | 检测 prelogin、切换输入桌面 | P2（M8.6） |
@@ -62,8 +62,10 @@ M8.5（协议 v18，Opus + 麦克风上行）、M8.6（协议 v19，锁屏/UAC �
   IddCx 示例同样绕不开签名，未签名驱动在强制驱动签名的系统上无法加载。
   2026-10-23 决定暂缓，等 M8.7 安装器/签名链路具备后再评估；本轮不引入
   驱动依赖，也不复制 RustDesk 驱动。
-- `[ ]` **M8.3 编码后端 NVENC/AMF**：保持采集/转换/编码同卡 LUID 绑定，
-  沿用现有三级硬件阶梯的试编与回退机制。
+- `[~]` **M8.3 编码后端 NVENC/AMF**：新增 vcpkg FFmpeg 硬件后端
+  （NVENC/AMF/QSV），Auto 先试 oneVPL、失败再试 FFmpeg；D3D11VA 帧池
+  与同卡 GPU 拷贝保持零拷贝，无软件编码。QSV 已在本机完成编码与回环
+  验证；NVENC/AMF 缺实机，仅编译与可用性检查通过（见第 9 节）。
 - `[~]` **M8.4 富剪贴板与文件传输**：协议 v17；HTML/RTF/DIB、查看器
   上传、续传/摘要、GUI 1 GiB 验收已完成（见 6.6、9）。文件传输现为
   双向：主机可经托盘把文件发到查看器，查看器支持工具栏选择与资源
@@ -809,7 +811,76 @@ HelloAck 后也发一次（即使当前是 Default），会话从锁屏开始也
 - 安全桌面路径依赖服务态进程的权限与桌面访问掩码，回环无法覆盖，
   仍以实机服务安装后的验收为准。
 
-## 9. 开发记录
+## 9. M8.3 编码后端（FFmpeg 硬件兜底）
+
+### 9.1 后端与选择
+
+- `EncoderBackend { Auto, Vpl, Ffmpeg }` 经 `EncoderConfig::backend` 与
+  `HostServerConfig::encoder_backend` 传递；`chast-encode` 与
+  `chast-quic serve/verify` 新增 `--encoder auto|vpl|ffmpeg`。
+- Auto 保持既有 Intel 路径：先 oneVPL（VDENC HEVC → VDENC AVC → VME AVC
+  三级试编），全部失败后才创建 FFmpeg 编码器；固定后端失败不回退，便于
+  定位。`has_encoder_available()` 与工具共用同一套判定。
+- FFmpeg 后端按采集适配器厂商选编码器：NVIDIA `h264_nvenc`/`hevc_nvenc`、
+  AMD `h264_amf`/`hevc_amf`、Intel `h264_qsv`/`hevc_qsv`；HEVC 不可用时
+  同一厂商退到 H.264，`codec()` 报告实际格式。工程仍不含任何软件编码器。
+
+### 9.2 零拷贝路径
+
+- NVENC/AMF：编码器自有 D3D11VA 帧池（`initial_pool_size=1`，
+  `BindFlags=D3D11_BIND_RENDER_TARGET`），采集 NV12 纹理用
+  `CopySubresourceRegion` 拷进池纹理，再以 `AV_PIX_FMT_D3D11` 送入
+  libavcodec；两端都在显存，只有压缩包回到 CPU。
+- QSV：从同一 D3D11 设备派生 QSV 设备
+  （`av_hwdevice_ctx_create_derived`），池帧映射一次得到可写 D3D11
+  纹理，之后每帧同卡 GPU 拷入。派生前必须对采集设备开启
+  `ID3D10Multithread`，否则 mfx-gen 的 `MFXVideoCORE_SetHandle`
+  返回 `MFX_ERR_DEVICE_FAILED`（-16）。
+- `shared_import()` 对 FFmpeg 后端恒为 false：这是“GPU 拷入编码器池”，
+  不是共享导入；工具输出 `import: copy (GPU to GPU, no system memory)`。
+
+### 9.3 参数与码率
+
+- 对齐 RustDesk 的 VRAM 编码：CBR、无 B 帧、GOP 无限（仅按需 IDR）、
+  单切片、低延迟、BT.601 limited、H.264 High / HEVC Main；码率缺省用
+  `hardware_bitrate()`。
+- `set_rate()`：NVENC/AMF 原地更新 `bit_rate`/`rc_max_rate`，纯码率变化
+  继续编码序列；帧率变化延迟到下一帧前重建编码器并要求 IDR。QSV 的
+  libavcodec 在码率或帧率变化时刷新并 `MFXVideoENCODE_Reset` 会话；
+  oneVPL 规定不带 `mfxExtEncoderResetOption` 的 reset 会开始新编码序列
+  （含 IDR），所以只有这条 FFmpeg 兜底路径每次速率变化补一次 IDR，主机
+  按 `keyframe_required` 决定是否强制。
+- RustDesk 对照：它的 QSV 路径同样会插入 IDR——原生 mfx 的
+  `mfx_set_bitrate()` 也是不带 reset option 的 `MFXVideoENCODE_Reset`，
+  `ffmpeg_vram` 只是写 `c->bit_rate` 后交给 libavcodec 做同一个 reset；
+  它的 NVENC `Reconfigure`/AMF `SetProperty` 不打断序列，与我们的原地
+  更新一致。RustDesk 不把自适应帧率写进编码器（mfx 的
+  `mfx_set_framerate` 返回“不支持”，Rust 侧只暴露 `set_bitrate`），
+  只改采集节奏；我们把 ABR 帧率同步给编码器，因此跨帧率档位会多一次
+  IDR（档内纯码率变化仍是连续序列）。
+- `encode_repeat()` 在内容未更新时复用池中上一帧，不重复拷贝；设备丢失
+  /复位返回 DeviceRemoved/DeviceReset，由上层重建。
+
+### 9.4 验收
+
+- 本机（Intel Iris Xe、mfx-gen 与 FFmpeg 8.1.1）：
+  `chast-encode --encoder ffmpeg --codec h264/hevc` 均输出 1920×1080、
+  52.6/48.7 fps、292/256 KB（3 s），`import: copy`。
+- 新增 CTest：`quic_loopback_ffmpeg`（端口 45463，含关键帧请求、文件
+  上传/下载、隐私）与 `quic_stream_options_ffmpeg`（端口 45473），后者
+  验证 H.264→HEVC 切换、15 fps 上限、纯码率变化（QSV 预期一次 IDR）
+  与恢复。两条均通过，原有 VPL `quic_loopback`/`quic_stream_options`
+  无回归。
+- 回放切分修正：QSV 每帧输出 SEI+slice、无 AUD，`split_access_units()`
+  改为无 AUD 时按 VCL NAL 边界成组，保存流仍与发送访问单元一一对应。
+
+### 9.5 限制
+
+- 本机没有 NVIDIA/AMD 显卡：NVENC/AMF 只验证了编译、厂商映射与负向
+  可用性，真实编码、驱动差异与零拷贝行为待实机。
+- 不改线协议（仍 v23）；编码器实现名只用于日志与 StreamInfo 展示。
+
+## 10. 开发记录
 
 ### 2026-10-23
 
@@ -1062,3 +1133,26 @@ HelloAck 后也发一次（即使当前是 Default），会话从锁屏开始也
   合成系统级键盘/锁屏事件。
 - `[!]` 虚拟显示器 M8.2 继续暂缓：没有可用的已签名开源驱动；隐私模式
   的“虚拟屏遮罩”按字面只落到真实输出的捕获排除浮层，不引入驱动。
+- `[x]` M8.3 FFmpeg 硬件兜底：`EncoderBackend`（Auto/Vpl/Ffmpeg）进入
+  `EncoderConfig`、`HostServerConfig` 与工具 `--encoder`；`create_encoder()`
+  在 Auto 下先 oneVPL、失败再 FFmpeg，固定后端不回退。新增
+  `src/codec/ffmpeg_encoder.cc`，按采集适配器厂商映射 NVENC/AMF/QSV 的
+  H.264/HEVC，HEVC 可在同厂商退 H.264，不引用软件编码器。
+- `[x]` M8.3 零拷贝：D3D11VA 帧池 + 同卡 `CopySubresourceRegion`；
+  QSV 由采集设备派生并一次映射池帧。定位并修复派生失败：mfx-gen 要求
+  采集设备开启 `ID3D10Multithread`，否则 SetHandle 返回 -16；独立工具
+  与 `verify` 复跑均通过。
+- `[x]` M8.3 速率：NVENC/AMF 原地改码率、帧率变化延迟重建；QSV 按
+  libavcodec 语义在码率/帧率变化时 reset 并要求 IDR。流参数探针按
+  实现区分：QSV 纯码率变化预期一次 IDR，oneVPL H.264 仍要求 0 次。
+  对照 RustDesk：其 QSV（原生 mfx 与 ffmpeg_vram）同样以 reset 开始新
+  序列、由硬件插入 IDR，NVENC/AMF 不插入；其自适应帧率只改采集节奏、
+  不进编码器。我们的一级 oneVPL 路径用 `StartNewSequence=OFF`，纯码率
+  变化不插 IDR，比 RustDesk 的 mfx 路径更细。
+- `[x]` M8.3 回放切分：`tools/annexb.h` 无 AUD 时按 VCL 边界成组，
+  QSV 的 SEI+slice 不再被拆成两个访问单元。
+- `[x]` M8.3 验证：`chast-encode --encoder ffmpeg` H.264/HEVC 各 3 s
+  通过（52.6/48.7 fps，292/256 KB）；新增 `quic_loopback_ffmpeg` 与
+  `quic_stream_options_ffmpeg`，连同原有两条 VPL 回环 4/4 通过。
+- `[ ]` M8.3 实机验收：NVENC/AMF 需要 NVIDIA/AMD 机器；本机只有 Intel
+  Iris Xe，QSV 已完成验证。

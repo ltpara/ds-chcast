@@ -384,6 +384,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             } else {
                 settings.port = static_cast<uint16_t>(port);
             }
+        } else if (key == "carrier") {
+            if (!parse_bool(value, settings.carrier)) {
+                warn(result.warning, "carrier '" + value + "' is not a boolean");
+            }
         } else if (key == "input") {
             if (!parse_bool(value, settings.allow_input)) {
                 warn(result.warning, "input '" + value + "' is not a boolean");
@@ -647,6 +651,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
          << "port=" << settings.port << "\n"
+         << "carrier=" << (settings.carrier ? 1 : 0) << "\n"
          << "# security\n"
          << "auth_mode=" << auth_mode_name(settings.auth_mode) << "\n"
          << "password_hash=" << settings.password_hash << "\n"

@@ -2,7 +2,8 @@
 //
 //   DXGI duplication -> Nv12Pass -> FrameInfo::nv12_texture
 //     -> oneVPL ImportFrameSurface (2.10+) or direct wrap (legacy mfxhw64)
-//     -> MFXVideoENCODE -> elementary stream file
+//        or FFmpeg's nvenc/amf/qsv pool (GPU copy)
+//     -> MFXVideoENCODE / libavcodec -> elementary stream file
 //
 // The desktop image stays in VRAM the whole way: the runtime either maps the
 // NV12 texture, GPU-copies it into its own pool, or reads it in place on the
@@ -11,7 +12,8 @@
 // network.
 //
 //   chast-encode [--display N] [--seconds S] [--codec h264|hevc] [--out file]
-//                [--bitrate kbps] [--keyframe-interval MS] [--bitrate-switch MS:KBPS]
+//                [--encoder auto|vpl|ffmpeg] [--bitrate kbps]
+//                [--keyframe-interval MS] [--bitrate-switch MS:KBPS]
 //                [--quality RATIO] [--framerate F] [--no-hdr] [--no-cursor] [--quiet]
 //
 // Verification with ffmpeg (elementary stream, so the codec must be named):
@@ -36,6 +38,7 @@ struct Options {
     size_t display = 0;
     double seconds = 5.0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    chast::EncoderBackend backend = chast::EncoderBackend::Auto;
     std::string out_path = "capture.h264";
     bool out_path_set = false;
     UINT bitrate_kbps = 0;      // 0 = RustDesk's base_bitrate for the frame size
@@ -64,6 +67,11 @@ bool parse_args(int argc, char** argv, Options& options) {
                     options.codec = chast::VideoCodec::Hevc;
                 } else {
                     std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
+                    return false;
+                }
+            } else if (arg == "--encoder" && i + 1 < argc) {
+                if (!chast::parse_encoder_backend(argv[++i], options.backend)) {
+                    std::fprintf(stderr, "--encoder wants auto, vpl or ffmpeg\n");
                     return false;
                 }
             } else if (arg == "--out" && i + 1 < argc) {
@@ -140,7 +148,8 @@ int main(int argc, char** argv) {
         std::printf("encoder: %s available on the capture adapter: %d\n",
                     codec_name(options.codec),
                     chast::hardware_encoder_available(options.codec,
-                                                      capturer->adapter_device().device)
+                                                      capturer->adapter_device().device,
+                                                      options.backend)
                         ? 1
                         : 0);
     }
@@ -154,6 +163,7 @@ int main(int argc, char** argv) {
     encoder_config.framerate = options.framerate;
     encoder_config.quality_ratio = options.quality;
     encoder_config.gop_size = 0;  // key frames on request, like RustDesk's MAX_GOP
+    encoder_config.backend = options.backend;
     std::unique_ptr<chast::IVideoEncoder> encoder;
 
     // An explicit path is opened before capture so a bad path fails fast. The

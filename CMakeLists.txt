@@ -122,6 +122,8 @@ target_link_libraries(chast.ffmpeg PUBLIC
 # dependency on the vendor runtime; it consumes what the capturer publishes.
 # The decoder is FFmpeg D3D11VA; the oneVPL decoder is shelved in favour of it.
 add_library(chast.codec STATIC
+    src/codec/encoder_factory.cc
+    src/codec/ffmpeg_encoder.cc
     src/codec/vpl_encoder.cc
     src/codec/ffmpeg_decoder.cc)
 
@@ -212,6 +214,7 @@ target_link_libraries(chast.transfer PUBLIC chast.base chast.security shell32)
 # DXGI or VPL dependency, so the receiver side links this without the capture
 # stack.
 add_library(chast.net STATIC
+    src/net/carrier.cc
     src/net/identity.cc
     src/net/protocol.cc
     src/net/quic.cc
@@ -396,6 +399,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
     target_link_libraries(chast-host-tunnel-test PRIVATE chast.host.tray)
 
+    # Raw TCP and WebSocket carrier framing against a loopback UDP echo,
+    # including the RFC 6455 handshake, bad frames and the connection limit.
+    add_executable(chast-carrier-test tests/carrier_test.cc)
+    target_link_libraries(chast-carrier-test PRIVATE chast.net)
+
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
@@ -409,6 +417,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME audio COMMAND chast-audio-codec-test)
     add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
+    add_test(NAME carrier COMMAND chast-carrier-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.
@@ -421,9 +430,27 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_stream_options
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
+    # The FFmpeg backend serves the adapters oneVPL does not cover and is the
+    # second attempt on Intel. Pin it to exercise its D3D11VA frame pool, rate
+    # programming and replay path instead of Auto's oneVPL choice.
+    add_test(NAME quic_loopback_ffmpeg
+        COMMAND chast-quic verify --port 45463 --seconds 4 --request-keyframe-ms 1200
+                --file-upload --file-download --privacy --encoder ffmpeg --quiet)
+    set_tests_properties(quic_loopback_ffmpeg PROPERTIES TIMEOUT 120)
+    add_test(NAME quic_stream_options_ffmpeg
+        COMMAND chast-quic verify --port 45473 --stream-options --encoder ffmpeg --quiet)
+    set_tests_properties(quic_stream_options_ffmpeg PROPERTIES TIMEOUT 120)
     # The merged view builds its canvas from every output, so its handshake,
     # union geometry and no-op merge switch get their own loopback.
     add_test(NAME quic_merged
         COMMAND chast-quic verify --port 45435 --merged --quiet)
     set_tests_properties(quic_merged PROPERTIES TIMEOUT 120)
+    # The same loopback over each carrier: the host still terminates QUIC and
+    # encodes video, while the viewer's datagrams travel inside TCP/WebSocket.
+    add_test(NAME quic_carrier_tcp
+        COMMAND chast-quic verify --port 45443 --transport tcp --quiet)
+    set_tests_properties(quic_carrier_tcp PROPERTIES TIMEOUT 120)
+    add_test(NAME quic_carrier_ws
+        COMMAND chast-quic verify --port 45453 --transport ws --quiet)
+    set_tests_properties(quic_carrier_ws PROPERTIES TIMEOUT 120)
 endif()

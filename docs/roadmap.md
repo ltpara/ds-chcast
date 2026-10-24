@@ -116,10 +116,10 @@
 - 已完成：Go 服务端与隧道代理 M4.0（`server/`）。
   - 服务端 `chast-server` 提供三件事：HTTP 注册表（`POST/GET/DELETE /v1/hosts`、`/healthz`、`/v1/stats`）、UDP 会合端口和按主机分配的 UDP 中继端口。参考 RustDesk `hbbs`/`hbbr` 的信号流程，但没有照搬“按 uuid 配对两条 TCP 流”：chast 的传输是 MsQuic QUIC，TCP 中继必须终止 QUIC 或改传输层，所以这里改为**透明转发 UDP 数据报**，每个主机一个中继端口，查看者把该端口当作普通 QUIC 服务端地址，TLS、令牌、审批和指纹 pin 仍然只在两端生效，服务器无法解密。
   - NAT 穿透由两侧 `chast-tunnel` 代理完成：MsQuic 不暴露内部 UDP 套接字，代理各自持有一个对外数据套接字，用它保活、打洞并转发真实数据。服务器只根据会合端口观察到的地址交换候选，不信任客户端自报；双方从同一套接字互发探针，锥形 NAT 可直连，对称 NAT 则失败。查看者 `auto` 模式在 `--direct-timeout` 后切到中继并保持，`direct`/`relay` 用于强制验证单条路径；因为切换前后代理的五元组不变，QUIC 不需要重连逻辑。直连时数据不经过服务器。
-  - 中继端口沿用 `HostServer`“同一时刻一个查看者”的语义：活跃查看者存在时其他来源收到 `busy`，空闲 60 s 或主机 90 s 无流量即回收；主机必须先用密钥摘要通过 `relay_hello` 绑定端口，未认证来源不能改绑。会合端口对 `punch_request` 按 IP 限速，中继按原样转发、不放大 QUIC 初始包。
-  - 代理协议是 `CHASTC1\n` + JSON 的 UDP 控制报文，与不透明数据靠魔数区分；注册只上传主机密钥的 SHA-256 摘要，`--server-key` 保护注册、统计和下线，重复注册 ID 但摘要不符会被拒绝。
+  - 中继端口沿用 `HostServer`“同一时刻一个查看者”的语义：活跃查看者存在时其他来源收到 `busy`，空闲 60 s 或主机 90 s 无流量即回收；主机必须先用私钥签名通过 `relay_hello` 挑战绑定端口（M10.1），未认证来源不能改绑。会合端口对 `punch_request` 按 IP 限速，中继按原样转发、不放大 QUIC 初始包。
+  - 代理协议是 `CHASTC1\n` + JSON 的 UDP 控制报文，与不透明数据靠魔数区分；注册只上传 Ed25519 公钥与签名（M10.1），`--server-key` 保护注册、统计和下线，重复注册 ID 但摘要不符会被拒绝。
   - 验证（2026-10-21，单机回环）：真实 chast 端到端在直连模式下 `frames=201 ... received=201 decoded=201 digest=E198527DF2B2B548`，同期中继字节为 0；强制中继模式下 `frames=202 ... received=202 decoded=202 digest=90C686753B88E5A2`，中继端口统计 `to_host_bytes:16402, to_viewer_bytes:2501405`。`go test ./...` 覆盖控制报文、注册表、HTTP API、会合/中继及代理三种模式（真实 UDP 回显 + 进程内服务器），并验证未知主机、错误密钥、第二查看者 `busy` 等失败路径。命令与数据见 `server/README.md` 的“验证记录”。
-  - 设计取舍：不做账号体系，主机 ID + 密钥摘要就是最小注册凭据；中继不合并多个主机到一个端口，换取“服务器重启后按主机重新分配”的简单性与不混淆数据报的隔离性；直连失败是显式回退而不是伪装成功。
+  - 设计取舍：不做账号体系，主机 ID + Ed25519 公钥就是最小注册凭据（M10.1）；中继不合并多个主机到一个端口，换取“服务器重启后按主机重新分配”的简单性与不混淆数据报的隔离性；直连失败是显式回退而不是伪装成功。
   - 已知限制：单机无真实 NAT，跨网锥形 NAT 打洞与对称 NAT→中继仍需两台异网机器手动复核（回退决策本身有单元测试）；中继是 UDP，无拥塞控制，弱网表现取决于 QUIC 自身；HTTP 默认明文，公网部署需在前置 TLS 反向代理后。
 - 已完成：设备地址簿与内置查看者代理 M4.1（`docs/m4.1-plan.md`）。
   - 查看者：Flutter 会话页通过 `TunnelAgent` 托管 `chast-tunnel viewer` 子进程，代理监听 `127.0.0.1:0` 并把实际端口经 stdout `ready` JSON 事件交回；`path` 事件在直连/中继切换时更新会话浮层。代理随 Flutter Windows 构建一起生成，Release 目录中 `chast_viewer.exe` 与 `chast-tunnel.exe` 并存。
@@ -232,6 +232,12 @@
   - 隐私模式：`kPermissionPrivacyMode`（默认关闭）控制 `SetPrivacyMode`，主机用 `WDA_EXCLUDEFROMCAPTURE` 的置顶穿透黑色遮罩遮挡本机屏幕，DXGI 采集不变；权限收回或会话结束立即撤罩。查看器提供盾牌开关、应答提示与安全桌面横幅。
   - 验证（2026-10-24，单机回环）：`chast-quic verify --privacy` 100 项断言全过，遮罩 1.32 s 开、3.54 s 关，期间视频持续且画面未变黑；关闭闸门的主机拒绝请求且不断流；181 个访问单元、摘要 `4DB1C6A97132DC4F`。`ctest -C Release` 12/12；`flutter analyze`、73 项测试、Windows Release 构建通过。
   - 已知限制：真实锁屏/UAC、服务态安全桌面采集与遮罩视觉仍需实机；虚拟显示器 M8.2 继续暂缓。
+- 进行中：编码后端 FFmpeg 硬件兜底 M8.3（协议仍 v23，`docs/m8-plan.md` 第 9 节）。
+  - 选择：`EncoderBackend::Auto` 仍先走 oneVPL 三级阶梯，全部失败后再创建 vcpkg FFmpeg 编码器（NVIDIA NVENC / AMD AMF / Intel QSV，按采集适配器厂商选，HEVC 可在同厂商退 H.264）；`Vpl`/`Ffmpeg` 固定后端失败不回退，工程不含软件编码。`HostServerConfig` 与工具新增 `--encoder auto|vpl|ffmpeg`。
+  - 零拷贝：编码器自有 D3D11VA 帧池，采集 NV12 用同卡 `CopySubresourceRegion` 拷入；QSV 从采集设备派生并一次映射池帧，mfx-gen 要求设备开启 `ID3D10Multithread`，否则 SetHandle 返回 -16。`shared_import()` 对 FFmpeg 后端为 false（GPU 拷入而非共享导入）。
+  - 速率：NVENC/AMF 纯码率变化原地更新、不打断编码序列，帧率变化延迟重建并强制 IDR；QSV 每次码率/帧率变化由 libavcodec reset 会话，要求一次 IDR，主机按 `keyframe_required` 执行。RustDesk 的 QSV（原生 mfx 与 ffmpeg_vram）同样以不带 reset option 的 reset 开始新序列，由硬件插入 IDR；其 NVENC/AMF 与我们一样不插入，其自适应帧率只改采集节奏、不写进编码器。一级 oneVPL 路径的纯码率变化用 `StartNewSequence=OFF`，不插 IDR。
+  - 验证（2026-10-24，单机 QSV）：`chast-encode --encoder ffmpeg` H.264/HEVC 各 3 s 通过（52.6/48.7 fps、292/256 KB）；新增 `quic_loopback_ffmpeg` 与 `quic_stream_options_ffmpeg`，与原有 VPL 两条回环 4/4 通过；回放切分支持无 AUD 的 QSV 流（SEI+slice 按 VCL 边界成组）。
+  - 已知限制：本机无 NVIDIA/AMD 显卡，NVENC/AMF 仅通过编译、厂商映射与可用性检查，真实编码与零拷贝待实机。
 
 ## M9 — 输入与连接补全（已完成）
 
@@ -358,12 +364,253 @@
   - 已知限制：真实扬声器-麦克风回路的 AEC 收敛与听感、设备热插拔、双机
     外放回声仍需人工验收；不做 AGC、端点自动切换与虚拟声卡。
 
+## M10 — 传输回退（已完成）
+
+- 已完成：TCP/WebSocket 弱网回退 M10.0（协议仍 v23，`docs/m10.0-plan.md`）。
+  - 载体：QUIC 数据报原样装入 TCP 帧或 WebSocket binary message；主机在 QUIC
+    端口 P 旁监听 `P+1`，同一端口按首字节区分原始 TCP 与 WS，10 s 握手、
+    64 KiB 帧上限、16 连接上限、180 s 空闲关闭；每个连接一个本地 UDP 套接字
+    与一条 QUIC 连接，TLS/指纹/令牌/审批/权限仍端到端。
+  - 查看器：`ViewerEngine` 的 `transport=auto` 依次尝试 QUIC 4 s、TCP、WS，
+    `quic`/`tcp`/`ws` 可强制；pin 失败为终态；载体桥在 127.0.0.1:0 暴露 UDP，
+    Flutter 从隧道 `path` 事件的 relay 地址或直连 `host:P+1` 取端点；状态新增
+    `transport`/`transportError`，浮层显示 UDP/TCP 回退/WebSocket 回退。
+  - 服务端：每个中继端口同时监听 TCP；主机代理建立持久认证链路，服务端配对
+    单个查看者，忙则拒绝，链路断开清理；统计新增 `tcp_to_host_bytes`、
+    `tcp_to_viewer_bytes`、`tcp_viewers`、`tcp_busy`。TCP 绑定失败只禁用该
+    端口的载体，UDP 中继继续。（M10.1 起主机链路改为 `CHASTT-HOST2` +
+    Ed25519 一次性挑战，不再使用 `key_hash`。）
+  - 主机：`host.ini` 新增 `carrier=0/1`（默认开），载体监听失败不阻止 QUIC；
+    托盘防火墙/服务安装同时放行 UDP 与载体 TCP；载体本地 UDP 缓冲 4 MiB，
+    避免关键帧突发被系统默认缓冲丢弃而误触 ABR。
+  - 工具：`chast-quic connect/verify --transport udp|tcp|ws [--carrier host:port]`
+    （`quic` 为 `udp` 别名），回环断言包含 `transport`。
+  - 验证（2026-10-24，单机回环）：`chast-carrier-test` 57 项断言；`ctest
+    -C Release` 18/18（150.38 s，含 `quic_carrier_tcp`/`quic_carrier_ws`）；
+    UDP/TCP/WS 三条基础回环各 151 个访问单元、摘要 `25CE9321F21BF8CC` /
+    `EA76FC9E972BB17C` / `A8685816B1D13F0D`；TCP/WS 再以文件上传/下载与隐私
+    的完整探针复跑，各 181 个访问单元、摘要 `CE8392D146C2570A` /
+    `D784E6732DFF6B2C`，CRC/解码/序号错误为 0；`go vet`/`go build`/`go test
+    ./...` 通过；`flutter analyze` 无问题、106 项测试、Windows Release 构建
+    通过。
+  - 已知限制：真实 UDP 封锁→自动回退、经服务中继的 C++ 主机 + Flutter 全链路、
+    WebSocket 经过真实 HTTP 代理、以及双机弱网吞吐/延迟仍需人工验收；载体不做
+    TCP 打洞、不做多查看者，不改变协议版本。
+
+## M10.1 — 服务端向 RustDesk 对齐（已完成）
+
+- 已完成：持久身份、挑战应答、候选遥测与共享载体（协议仍 v23，
+  `docs/m10.1-plan.md`）。
+  - 身份：ID 与 Ed25519 公钥永久绑定（`chast-register-v1` 签名 + 时间戳），
+    `chast-server-state.json` 持久化，离线查询仍返回身份与服务器签名的
+    `CHASTB1.<payload>.<sig>` 绑定；`/v1/server` 公布服务器公钥，
+    `DELETE /v1/identities/{id}` 是丢失密钥的人工出口。
+  - 挑战：keepalive、UDP 中继、TCP/WS 载体分别使用 30 s 单次 nonce，
+    签名覆盖 ID、端口与观察地址；服务端只保存公钥。
+  - 候选：主机上报 `local_addrs`，代理用会合/中继两处观察映射区分
+    `asymmetric`/`symmetric` NAT；查询新增 `candidates`、`nat_type`。
+  - 共享载体：`chast-server --carrier-listen`（默认 0.0.0.0:8445）一个端口
+    承载所有主机链路（`CHASTT-HOST2` + 挑战）；原始 TCP 查看者用
+    `CHASTT-V2` + `{host_id,token}`，WS 查看者 `GET /chast`（子协议
+    `chast-carrier.v1`）以 binary hello 选择主机。令牌只在主机在线时出现在
+    查询响应，租约失效后轮换；忙、坏令牌与超时都会拒绝。主机代理优先用
+    注册响应里的 `carrier`，否则回退到中继端口 TCP；Flutter/工具从隧道
+    `path` 事件取 `carrier`/`carrier_token`。
+  - 统计：`/v1/stats` 的 `relay.shared_carrier` 暴露 `hosts`、`host_links`、
+    `viewers`、`busy`、`rejected`、`to_host_bytes`、`to_viewer_bytes`。
+  - 验证（2026-10-24，单机回环）：`go vet`/`go build`/`go test ./...` 通过；
+    `chast-carrier-test` PASS（共享 hello 魔数、host id + token、缺 token 拒绝）；
+    `ctest -C Release` 20/20（212.98 s）；共享载体 TCP 回环 692 帧、摘要
+    `B2A69C6EA526D137`，WS 回环 692 帧、摘要 `EB0FC78F17BE208E`，CRC/解码/
+    序号错误均为 0；错误令牌被拒绝，`shared_carrier` 统计符合预期；
+    `flutter analyze` 无问题、`flutter test` 106 项通过。
+  - 已知限制：真实 NAT/IPv6 跨网分类、共享载体经过真实 HTTP 代理需要双机或
+    部署环境复核；共享载体仍为单查看者；服务端 HTTP 明文与限流由 M10.2 补齐。
+
+## M10.2 — 服务端运维能力（已完成）
+
+- 已完成：原生 TLS、HTTP 限流与 Prometheus 指标（协议仍 v23，
+  `docs/m10.2-plan.md`）。
+  - TLS：`--tls-cert`/`--tls-key` 同时给出即 HTTPS 监听，最低 TLS 1.2，
+    启动时加载证书；`/v1/server` 增加 `tls` 字段；不给证书保持明文以兼容
+    反向代理部署。
+  - 限流：`internal/ratelimit` 按客户端 IP 令牌桶，`--api-rate`（默认 50/s）
+    与 `--api-burst`（默认 100），`0` 关闭；覆盖全部 HTTP 路径，超限
+    `429` + `Retry-After: 1`；`--proxy-header X-Forwarded-For` 取可信代理的
+    最后一跳。
+  - 指标：`GET /metrics` 输出 Prometheus 文本，带 server-key 时需要 Bearer；
+    含主机/身份数、UDP/TCP/共享载体流量与忙拒绝、HTTP 请求数/在途/限流数/
+    延迟汇总；标签不含主机 ID 或客户端地址。
+  - 验证（2026-10-25，单机回环）：`go vet`/`go build`/`go test ./...` 通过；
+    限流突发放行后 429 并在补充后恢复；HTTPS 自签证书下 `/healthz` 200、
+    `/v1/server` 的 `tls:true`、TLS 1.2/1.3 均可协商且证书校验通过，明文
+    请求被 400 拒绝；`/metrics` 未认证 401、带 key 后内容与 `/v1/stats`
+    一致。
+  - 已知限制：证书轮换/ACME/mTLS 不在范围内；限流基于内存桶，重启后清零，
+    多实例部署需要前置网关统一限流；真实反向代理头与多客户端压力需部署
+    环境复核。
+
+## M10.3 — 载体在线、强制中继与查看者回退（已完成）
+
+- 已完成：共享载体链路计入在线、`--relay-only` 与 Go 查看者载体泵
+  （协议仍 v23，`docs/m10.3-plan.md`）。
+  - 在线：`relay.Manager.HostLinked` 暴露已认证的主机载体链路；HTTP 查询在
+    UDP keepalive 失效时仍返回 `online:true`，并隐藏过期 UDP 候选。
+  - 查询：新增 `relay_only` 与 `transport`（`direct`/`relay`/`carrier`）；
+    `--relay-only` 隐藏全部直连候选、固定 `nat_type:"symmetric"`，
+    `/v1/server`、`/v1/stats` 与 `/metrics`（`chast_server_relay_only`）同步
+    报告。
+  - 查看者：`chast-tunnel viewer --mode carrier` 使用 `CHASTT-V2` 共享载体，
+    本地 UDP 数据报 ↔ `u32le` 帧；断链 0.5 s→5 s 退避重连，30 s 空帧保活，
+    服务器以空帧应答；`auto` 按 `transport` 选路，`direct` 在强制中继下报错。
+  - 验证（2026-10-25，单机回环）：`go vet`/`go build`/`go test ./...` 通过；
+    强制中继服务器下查询无候选、`nat_type=symmetric`，`transport` 分别为
+    `carrier`/`relay`，载体与 UDP 中继均完成数据报往返，`direct` 明确失败；
+    `--offline-after 1s` + 5 s keepalive 时 `last_seen_ms` 已过期但查询仍经
+    载体返回在线，往返成功。
+  - 已知限制：载体仍为单查看者，不承载多路复用；主机关闭后要等载体读超时
+    （90 s）或 UDP 判定过期才转为离线；真实弱网重连与双机 UDP 封锁需人工
+    验收。
+
+## M10.4 — 管理通道、打洞审计与注册防滥用（已完成）
+
+- 已完成：注册阻断、打洞请求环形日志、运行时强制中继与回环管理通道
+  （协议仍 v23，`docs/m10.4-plan.md`）。
+  - 注册阻断：`internal/abuse` 在 server-key、JSON 与 ID 校验之后、公钥与
+    签名验证之前按观察 IP 计数；`--register-max`（默认 30）次 /
+    `--register-window`（默认 60 s）超过返回 `429` + `Retry-After: 1`；
+    `--register-max-ids`（默认 300）个不同 ID / `--register-id-window`
+    （默认 24 h）超过后只拒绝新 ID，已见 ID 仍可续约；条目上限 65536，
+    超出淘汰窗口最旧；两个上限都为 0 时不创建 Blocker。
+  - 打洞审计：`internal/punchlog` 环形缓冲只在目标在线、会合即将回复双方时
+    记录 `time/from_ip/to_ip/id`；同一 `from_ip + to_id` 60 s 内去重且只扫描
+    最近 30 条；`--punch-log-max`（默认 100000，`0` 关闭）写满覆盖最旧。
+  - 运行时强制中继：`api.Config.RelayOnly` 改为 `*atomic.Bool`，`lookup`、
+    `/v1/server`、`/v1/stats` 与 `/metrics` 都读取当前值；管理通道
+    `aur Y|N` 立即生效，已建立的查询与链路不受影响。
+  - 管理通道：`--admin-listen 127.0.0.1:8446`（默认，空值禁用），启动时拒绝
+    非回环绑定，连接来源不是回环直接关闭；一行文本命令（≤1 KiB），处理完
+    写回纯文本并关闭。命令 `h`、`stats`、`hosts [count]`、
+    `punch-requests|pr [start] [count]`/`pr -`、
+    `ip-blocker|ib [ip]`/`ib -`、`relay-only|aur [Y|N]`；未知命令返回单行
+    `unknown command`。
+  - 统计：`/v1/stats` 新增 `registration_blocked`（`tracked_ips`、
+    `rate_blocked`、`id_blocked`）与 `punch_requests`（`total`、`deduped`、
+    `stored`）；`/metrics` 另含 `chast_punch_requests_total`、
+    `chast_punch_requests_deduped_total`、`chast_punch_log_entries`、
+    `chast_register_blocked_total{reason}` 与 `chast_registration_tracked_ips`。
+  - 验证（2026-10-25，单机回环）：`go vet ./...`、`go build ./...`、
+    `go test ./... -count=1` 通过；管理通道 `stats`/`hosts` 显示 `devbox`
+    在线与候选 `127.0.0.1:19434`，`pr` 出现查看者打洞
+    `127.0.0.1 -> devbox@127.0.0.1`，`pr 0 1` 分页与 `pr -` 清空均正常；
+    `regflood -n 4` 得到 `200,200,200,429`，`ib 127.0.0.1` 显示
+    `count=4 ids=3`、`rate_blocked=1`，`/v1/stats` 与 `/metrics` 计数一致；
+    `aur Y` 后新查询 `relay_only:true`、`transport:"relay"` 且无候选，
+    `aur N` 恢复直连候选；`--admin-listen 0.0.0.0:18456` 以
+    `must be a loopback address` 退出。
+  - 已知限制：管理通道为回环明文，不做远程鉴权传输；计数在内存中，重启后
+    清零，多实例部署需要前置统一限流；未实现 hbbs 的 `ip-changes` 跟踪与
+    `get_relay_server` 多中继轮换，后者仍是下一阶段候选。
+
+## M10.5 — IP 变更审计与中继地址轮换（已完成）
+
+- 已完成：hbbs 风格的 IP 变更审计与多中继地址轮换（协议仍 v23，
+  `docs/m10.5-plan.md`）。
+  - `internal/ipchange`：认证后的 HTTP 注册与 UDP keepalive 共享一个
+    Tracker；首次只建基线，180 s 窗口内变化记录上一个与新 IP，360 s 后
+    剪枝；单 IP 条目只在输出层过滤，自动指标抓取不会清空审计；基线与条目
+    各上限 65536。
+  - `internal/relayaddr`：无端口的主机名/IP 列表，CSV 设置、去重、`rs -`
+    恢复；注册按轮换分配，已有租约保持地址；响应新增 `relays`（列表每个
+    地址拼接该主机的租约端口），`relay`/`carrier`/查询/keepaliveAck 使用
+    租约地址；新增 `--relay-servers`。
+  - 中继源地址：注册时把该端口的 UDP/TCP 监听重绑到租约地址
+    （`relay.Manager.BindHost`），多 IP 主机上查看者访问哪个地址，回包就
+    从哪个地址发出；地址不是本机或无法解析时回退 `--relay-listen`。
+  - 管理通道新增 `rs`/`rs a,b`/`rs -`、`ic`/`ic <id>`/`ic <start> [count]`/
+    `ic <id> -`/`ic -`、`tg <ip1> [ip2]`；`stats` 增加
+    `ip_changes`/`relay_servers`，`hosts` 增加 `relay_host`。
+  - 统计：`/v1/stats` 增加 `ip_changes`（`tracked`/`changes`）与
+    `relay_servers`；`/metrics` 增加 `chast_ip_change_events_total`、
+    `chast_ip_change_tracked` 与 `chast_relay_servers`。
+  - 验证（2026-10-25，单机回环）：devbox/devbox2 分别得到
+    `127.0.0.1:41100`/`127.0.0.2:41101`，两者的 `relays` 都含两个端点，
+    中继查看者双向回显成功；`netstat` 确认端口绑定到各自租约地址。devbox
+    从 `127.0.0.4` 重启后 `ic` 显示 `.1/.2/.4` 且中继地址不变。`rs` 改为
+    仅 `.2` 后新主机 devbox3 得到 `127.0.0.2:41102`、既有租约不变，`rs -`
+    恢复；`tg` 预览与下一次分配一致；`ic` 分页/删除/清空与指标计数一致。
+    `go vet ./...`、`go build ./...`、`go test ./... -count=1` 全部通过。
+  - 已知限制：列表条目必须指向同一个 chast-server 实例；不做
+    `check_relay_servers` 健康探测与跨服务器中继；`tg` 不读取 GeoIP；
+    地址变化时端口会短暂关闭并重绑，现有查看者依赖 QUIC 重传恢复。
+
+## M10.6 — 独立中继节点与健康探测（已完成）
+
+- 已完成：hbbr 式的独立中继进程与 hbbs 侧节点池（协议仍 v23，
+  `docs/m10.6-plan.md`）。
+  - `cmd/chast-relay`：控制面 `POST /v1/leases`、`DELETE /v1/leases/{id}`、
+    公开 `GET /healthz`、Bearer `GET /v1/stats`；UDP/TCP 中继端口集合、
+    可选共享载体、租约清理协程与 `--advertise` 重绑；节点只保存 hbbs
+    下发的公钥与载体令牌，`relay_hello` 与载体挑战在节点本地验证。
+  - `internal/relaypool`：URL 规范化（仅 http/https、无路径/凭据）、
+    周期性 `/healthz` 探测、RTT/租约/载体在线快照、健康节点轮询、
+    首选节点粘性申请、`Preview`、best-effort 异步释放。
+  - 注册流程：优先向主机上次的节点续租；失败时按轮询尝试其余健康节点；
+    全部不可用则回退本机中继并异步释放旧租约。切换节点时异步释放旧租约，
+    本机回退只在原租约属于本机时沿用原 `relay_host`。
+  - 查询与管理：`relay`/`carrier`/`transport`/`online` 按租约来源返回；
+    `stats` 增加节点计数；`hosts` 增加 `node=` 并按节点缓存判定 carrier；
+    `rs` 输出节点状态，`tg` 优先预览下一个健康节点；`/v1/stats` 增加
+    `relay_nodes`，`/metrics` 增加 `chast_relay_nodes`、
+    `chast_relay_nodes_healthy`。
+  - 验证（2026-10-25，单机回环）：远程租约 `127.0.0.1:41100`、
+    载体 `127.0.0.1:18448`，relay/carrier 两条路径的 UDP 回显均成功；
+    停止节点后 `rs` 转为 down、主机续租回退本机 `41200` 且回显成功；
+    重启节点后续租迁回 `41100` 并释放本机端口；节点 `/healthz` 的
+    `leases`/`linked`、hbbs 管理台与指标一致。`gofmt -l .`、`go vet ./...`、
+    `go build ./...`、`go test ./... -count=1` 全部通过。
+  - 已知限制：已有查看者不随节点故障迁移；健康快照最多滞后一个探测周期；
+    控制面默认明文；跨机时钟偏差会影响租约到期。
+
+## M10.7 — 中继带宽限制、黑名单与降级（已完成）
+
+- 已完成：hbbr 式的中继资源治理（协议仍 v23，`docs/m10.7-plan.md`）。
+  - `internal/relay/policy.go`：单会话/总带宽令牌桶、黑名单慢速档、阻断名单、
+    自动降级与活动会话用量；UDP 超限整包丢弃，TCP/WS 载体等待形成背压。
+  - 会话键：`udp:<port>`、`carrier:<port>`、`shared:<hostID>`；双向流量计入
+    同一会话，名单按查看者地址匹配，每 1 s 复核一次，阻断时立即释放 UDP
+    查看者槽位并关闭载体会话。
+  - 控制台与 hbbr 同名：`ba/br/b`、`Ba/Br/B`、`sb/tb/ls`、`dt/t`、`u`；
+    hbss 管理台与 `chast-relay` 回环控制台共用 `Policy.Command`。名单文件
+    可选，显式路径下启动加载、增删后原子回写。
+  - `cmd/chast-relay` 新增 `--admin-listen`（默认 `127.0.0.1:8449`）与全套
+    策略参数；`cmd/chast-server` 新增同一组策略参数。
+  - `/v1/stats` 增加 `relay.policy` 与 `relay.sessions`；`/metrics` 增加
+    `chast_relay_single_bandwidth_bps`、`chast_relay_total_bandwidth_bps`、
+    `chast_relay_blacklist_speed_bps`、`chast_relay_policy_blacklist`、
+    `chast_relay_policy_blocklist`、`chast_relay_policy_sessions`、
+    `chast_relay_limited_bytes_total`、
+    `chast_relay_rate_dropped_total{unit}`、
+    `chast_relay_blocked_sessions_total`、
+    `chast_relay_downgraded_sessions_total` 与
+    `chast_carrier_blocked_total`。
+  - 验证（2026-10-25，单机回环）：节点 `0.08/100/0.05` Mbit/s、hbss
+    `64/512/16` Mbit/s，控制台与指标一致；阻断前探针无回包、解除后 3 次往返
+    成功；burst 400 × 1400 B 只收到 4 个回包，节点计数 `limited_bytes=319200`、
+    `rate_dropped_datagrams=228`、`downgraded_sessions=1`，`u` 为
+    `downgraded=true`；运行时 `ba`/`br` 即时改变黑名单状态；名单文件启动加载；
+    节点故障回退本机中继后阻断/限速/降级计数同样生效。`gofmt -l .`、`go vet
+    ./...`、`go build ./...`、`go test ./... -count=1` 全部通过。
+  - 已知限制：只按会话与全局两级限速，不支持按 ID；UDP 只能整包丢弃；名单
+    不与节点共享；降级只降不升；真实跨机整形效果与时钟偏差下的降级判定仍需
+    部署复核。
+
 ## M6 后续（未开始）
 
 - 音频质量调优：唇音同步校准、设备热插拔自动切换（AEC/降噪/设备选择已在
   M9.4 完成）。
 - 更多采集/编码后端与其他平台。
-- M8 其余项（虚拟显示器、NVENC/AMF、安装器与 i18n）见 `docs/m8-plan.md`。
+- M8 其余项（虚拟显示器、安装器与 i18n）见 `docs/m8-plan.md`。
 
 ## 推进原则
 

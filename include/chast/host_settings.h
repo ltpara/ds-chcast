@@ -54,6 +54,10 @@ struct HostSettings {
     // 0.0.0.0 serves the LAN; 127.0.0.1 keeps everything local.
     std::string bind_address = "0.0.0.0";
     uint16_t port = 4433;
+    // Accept the TCP/WebSocket fallback on port + 1. QUIC needs UDP, which
+    // some client networks block; the fallback carries the same QUIC
+    // datagrams over a TCP stream without changing the session protocol.
+    bool carrier = true;
     // The gate belongs to the host, and a remote-desktop host is not useful
     // without it; access control is the token and the approval, not this.
     bool allow_input = true;

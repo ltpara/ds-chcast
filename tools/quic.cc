@@ -1,10 +1,10 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio] [--encoder auto|vpl|ffmpeg]
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--microphone] [--privacy]
-//                      [--sas] [--stream-options]
+//                      [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -92,6 +92,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -116,6 +117,7 @@
 #include "annexb.h"
 #include "chast/audio.h"
 #include "chast/capture.h"
+#include "chast/carrier.h"
 #include "chast/decoder.h"
 #include "chast/display_mode.h"
 #include "chast/encoder.h"
@@ -576,11 +578,28 @@ struct Options {
     std::string bind = "127.0.0.1";
     std::string host = "127.0.0.1";
     uint16_t port = 4433;
+    // connect/verify: how the QUIC datagrams reach the peer. "udp" dials the
+    // host directly; "tcp"/"ws" tunnel them through the host's carrier, which
+    // still runs the same QUIC handshake on both ends. serve always listens on
+    // both UDP and the carrier.
+    std::string transport = "udp";
+    // connect/verify: carrier endpoint override for a relay or a manually
+    // forwarded port. Empty means the host's QUIC port + 1.
+    std::string carrier;
+    // connect/verify: select this host on a shared multiplexing carrier.
+    // Empty host id means the carrier endpoint serves one host on its own
+    // port, which is what a relay port does.
+    std::string carrier_host_id;
+    std::string carrier_token;
     // serve: fallback output when the client does not ask for one.
     // connect: the output to ask the server for.
     size_t display = 0;
     bool display_set = false;
     chast::VideoCodec codec = chast::VideoCodec::H264;
+    // serve/verify: pin the hardware encoder family instead of Auto's
+    // oneVPL-then-FFmpeg order.
+    chast::EncoderBackend encoder = chast::EncoderBackend::Auto;
+    bool encoder_set = false;
     UINT bitrate_kbps = 0;
     UINT framerate = 30;
     float quality = 0.67f;
@@ -711,6 +730,28 @@ struct Options {
     bool quiet = false;
 };
 
+bool parse_host_port(const std::string& text, std::string& host, uint16_t& port) {
+    const size_t colon = text.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 == text.size()) {
+        return false;
+    }
+    host = text.substr(0, colon);
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    unsigned long value = 0;
+    try {
+        value = std::stoul(text.substr(colon + 1));
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (host.empty() || value == 0 || value > 65535) {
+        return false;
+    }
+    port = static_cast<uint16_t>(value);
+    return true;
+}
+
 bool parse_args(int argc, char** argv, Options& options) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: chast-quic serve|connect|verify [options]\n");
@@ -731,6 +772,26 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.bind = argv[++i];
             } else if (arg == "--host" && i + 1 < argc) {
                 options.host = argv[++i];
+            } else if (arg == "--transport" && i + 1 < argc) {
+                std::string value = argv[++i];
+                std::transform(value.begin(), value.end(), value.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (value == "quic") {
+                    value = "udp";
+                } else if (value == "websocket") {
+                    value = "ws";
+                }
+                if (value != "udp" && value != "tcp" && value != "ws") {
+                    std::fprintf(stderr, "--transport wants udp, tcp or ws\n");
+                    return false;
+                }
+                options.transport = value;
+            } else if (arg == "--carrier" && i + 1 < argc) {
+                options.carrier = argv[++i];
+            } else if (arg == "--carrier-id" && i + 1 < argc) {
+                options.carrier_host_id = argv[++i];
+            } else if (arg == "--carrier-token" && i + 1 < argc) {
+                options.carrier_token = argv[++i];
             } else if (arg == "--display" && i + 1 < argc) {
                 const unsigned long value = std::stoul(argv[++i]);
                 if (value >= chast::kMaxDisplayCount) {
@@ -750,6 +811,12 @@ bool parse_args(int argc, char** argv, Options& options) {
                     std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                     return false;
                 }
+            } else if (arg == "--encoder" && i + 1 < argc) {
+                if (!chast::parse_encoder_backend(argv[++i], options.encoder)) {
+                    std::fprintf(stderr, "--encoder wants auto, vpl or ffmpeg\n");
+                    return false;
+                }
+                options.encoder_set = true;
             } else if (arg == "--bitrate" && i + 1 < argc) {
                 options.bitrate_kbps = static_cast<UINT>(std::stoul(argv[++i]));
             } else if (arg == "--framerate" && i + 1 < argc) {
@@ -867,12 +934,60 @@ bool parse_args(int argc, char** argv, Options& options) {
                      static_cast<unsigned>(chast::kMaxAccessTokenLength));
         return false;
     }
+    if (options.transport != "udp" && options.mode == "serve") {
+        std::fprintf(stderr, "--transport only applies to connect and verify; "
+                             "serve always listens on UDP and the carrier\n");
+        return false;
+    }
+    if (!options.carrier.empty()) {
+        if (options.transport == "udp") {
+            std::fprintf(stderr, "--carrier needs --transport tcp or ws\n");
+            return false;
+        }
+        std::string carrier_host;
+        uint16_t carrier_port = 0;
+        if (!parse_host_port(options.carrier, carrier_host, carrier_port)) {
+            std::fprintf(stderr, "--carrier wants host:port\n");
+            return false;
+        }
+    }
+    if (options.transport != "udp" && options.carrier.empty() &&
+        (options.port == 0 || options.port == 65535)) {
+        std::fprintf(stderr, "--transport %s needs --carrier <host:port> because "
+                             "port %u has no port + 1\n",
+                     options.transport.c_str(), static_cast<unsigned>(options.port));
+        return false;
+    }
+    if (!options.carrier_host_id.empty() || !options.carrier_token.empty()) {
+        if (options.mode == "serve") {
+            std::fprintf(stderr, "--carrier-id and --carrier-token select a host on a "
+                                 "shared carrier and only apply to connect and verify\n");
+            return false;
+        }
+        if (options.carrier_host_id.empty() || options.carrier_token.empty()) {
+            std::fprintf(stderr, "--carrier-id and --carrier-token go together\n");
+            return false;
+        }
+        if (options.transport == "udp") {
+            std::fprintf(stderr, "--carrier-id needs --transport tcp or ws\n");
+            return false;
+        }
+        if (options.carrier.empty()) {
+            std::fprintf(stderr, "--carrier-id needs --carrier <host:port>: a shared "
+                                 "carrier has no fixed port + 1\n");
+            return false;
+        }
+    }
     if ((options.token_reuse || options.approve) && options.mode != "serve") {
         std::fprintf(stderr, "--token-reuse and --approve only apply to serve\n");
         return false;
     }
     if (options.resolution != 0 && options.mode == "connect") {
         std::fprintf(stderr, "--resolution only applies to serve and verify\n");
+        return false;
+    }
+    if (options.encoder_set && options.mode == "connect") {
+        std::fprintf(stderr, "--encoder only applies to serve and verify\n");
         return false;
     }
     if (options.file_upload && options.mode != "verify") {
@@ -1130,6 +1245,8 @@ struct ReceiverStats {
     int32_t origin_y = 0;
     chast::VideoCodec codec = chast::VideoCodec::H264;
     std::string decoder;
+    // "udp" for a direct QUIC session, otherwise the carrier that tunneled it.
+    std::string transport = "udp";
     std::string error;
     bool ok = false;
     // Events this receiver sent, and whether the HelloAck allowed them.
@@ -1253,11 +1370,13 @@ struct ReceiverStats {
     uint32_t stream_option_restore_update_bitrate = 0;
     // A quality-only step (Balanced with the frame-rate ceiling unchanged):
     // the StreamInfo it announced, whether the bitrate moved, and how many
-    // keyframes it cost. H.264 continues the coded sequence, so that count
-    // stays zero; HEVC reopens its session and pays one.
+    // keyframes it cost. oneVPL's H.264 tiers continue the coded sequence, so
+    // that count stays zero; libavcodec's QSV encoder resets its MFX session
+    // for the change and pays one, as does a reopened HEVC session.
     bool stream_option_rate_update_seen = false;
     uint32_t stream_option_rate_update_bitrate = 0;
     uint64_t stream_option_rate_keyframes = 0;
+    std::string stream_option_rate_encoder;
     bool stream_option_alt_seen = false;
     bool stream_option_alt_ok = false;
     bool stream_option_alt_unsupported = false;
@@ -1504,6 +1623,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         options.input_dry_run || (options.input && options.mode == "verify" && !options.input_real);
     config.want_hdr = options.config.want_hdr;
     config.capture_cursor = options.config.capture_cursor;
+    config.encoder_backend = options.encoder;
     config.serve_once = true;
     config.run_seconds = options.seconds;
     config.reannounce = options.reannounce;
@@ -1809,9 +1929,56 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                     "(printed by serve), or --insecure for local development");
     }
 
+    // The carrier is transport only: it exposes the remote QUIC endpoint as a
+    // loopback UDP socket, so pinning, tokens and every protocol message stay
+    // end to end between the same endpoints as a direct session.
+    std::unique_ptr<chast::CarrierBridge> carrier_bridge;
+    if (options.transport != "udp") {
+        std::string carrier_host;
+        uint16_t carrier_port = 0;
+        if (!options.carrier.empty()) {
+            if (!parse_host_port(options.carrier, carrier_host, carrier_port)) {
+                return fail("--carrier wants host:port");
+            }
+        } else {
+            if (options.port == 0 || options.port == 65535) {
+                return fail("--transport " + options.transport +
+                            " needs --carrier <host:port> when the QUIC port is " +
+                            std::to_string(static_cast<unsigned>(options.port)));
+            }
+            carrier_host = options.host;
+            carrier_port = static_cast<uint16_t>(options.port + 1);
+        }
+        chast::CarrierBridgeConfig carrier_config;
+        carrier_config.host = carrier_host;
+        carrier_config.port = carrier_port;
+        carrier_config.transport = options.transport == "ws"
+                                       ? chast::CarrierTransport::kWebSocket
+                                       : chast::CarrierTransport::kTcp;
+        carrier_config.host_id = options.carrier_host_id;
+        carrier_config.token = options.carrier_token;
+        std::string carrier_error;
+        carrier_bridge = chast::CarrierBridge::open(carrier_config, &carrier_error);
+        if (!carrier_bridge) {
+            return fail(options.transport + " carrier " + carrier_host + ":" +
+                        std::to_string(static_cast<unsigned>(carrier_port)) + ": " +
+                        carrier_error);
+        }
+        stats.transport = chast::carrier_transport_name(carrier_bridge->transport());
+        if (!options.quiet) {
+            const std::string shared_note = options.carrier_host_id.empty()
+                                                ? std::string()
+                                                : " for host " + options.carrier_host_id;
+            std::printf("carrier: %s to %s:%u%s, feeding the QUIC client on 127.0.0.1:%u\n",
+                        stats.transport.c_str(), carrier_host.c_str(),
+                        static_cast<unsigned>(carrier_port), shared_note.c_str(),
+                        static_cast<unsigned>(carrier_bridge->local_port()));
+        }
+    }
+
     chast::QuicClientConfig client_config;
-    client_config.host = options.host;
-    client_config.port = options.port;
+    client_config.host = carrier_bridge ? "127.0.0.1" : options.host;
+    client_config.port = carrier_bridge ? carrier_bridge->local_port() : options.port;
     client_config.pinned_fingerprint = pinned;
     client_config.allow_any_certificate = pinned.empty() && options.insecure;
     client_config.access_token = options.token;
@@ -3376,6 +3543,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             stats.stream_option_rate_update_seen = true;
             stats.stream_option_rate_update_bitrate = stats.last_update.bitrate;
+            stats.stream_option_rate_encoder = stats.last_update.encoder;
             stream_rate_frames = stats.received + 8;
             stream_rate_check_at = now + std::chrono::milliseconds(400);
             stream_step = StreamOptionStep::WaitRateOnlyCheck;
@@ -3844,12 +4012,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
 
     if (!options.quiet || !stats.error.empty()) {
-        std::printf("receiver: decoder=%s codec=%s size=%ux%u source=%ux%u received=%llu "
-                    "decoded=%llu keyframes=%llu crc-errors=%llu decode-errors=%llu gaps=%llu "
-                    "protocol-errors=%llu stream-updates=%llu bytes=%llu digest=%016llX "
-                    "elapsed=%llu ms%s\n",
-                    stats.decoder.c_str(), chast_tools::codec_name(stats.codec), stats.width,
-                    stats.height, stats.source_width, stats.source_height,
+        std::printf("receiver: decoder=%s codec=%s transport=%s size=%ux%u source=%ux%u "
+                    "received=%llu decoded=%llu keyframes=%llu crc-errors=%llu "
+                    "decode-errors=%llu gaps=%llu protocol-errors=%llu stream-updates=%llu "
+                    "bytes=%llu digest=%016llX elapsed=%llu ms%s\n",
+                    stats.decoder.c_str(), chast_tools::codec_name(stats.codec),
+                    stats.transport.c_str(), stats.width, stats.height, stats.source_width,
+                    stats.source_height,
                     static_cast<unsigned long long>(stats.received),
                     static_cast<unsigned long long>(stats.decoded),
                     static_cast<unsigned long long>(stats.keyframes),
@@ -3926,6 +4095,17 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             stats.microphone_info.channels);
             }
         }
+    }
+    if (carrier_bridge && !options.quiet) {
+        const chast::CarrierBridgeStats carrier_stats = carrier_bridge->stats();
+        std::printf("carrier: %s datagrams out=%llu in=%llu bytes out=%llu in=%llu%s%s\n",
+                    stats.transport.c_str(),
+                    static_cast<unsigned long long>(carrier_stats.to_carrier_datagrams),
+                    static_cast<unsigned long long>(carrier_stats.from_carrier_datagrams),
+                    static_cast<unsigned long long>(carrier_stats.to_carrier_bytes),
+                    static_cast<unsigned long long>(carrier_stats.from_carrier_bytes),
+                    carrier_bridge->error().empty() ? "" : " stopped: ",
+                    carrier_bridge->error().c_str());
     }
     stats.ok = stats.error.empty() && stats.received > 0 && stats.decoded > 0 &&
                stats.crc_errors == 0 && stats.decode_errors == 0 && stats.gaps == 0 &&
@@ -5916,6 +6096,12 @@ int run_verify(const Options& options) {
     }
     check(!sent.fingerprint.empty() && received.peer_fingerprint == sent.fingerprint,
           "the viewer connected to the pinned server identity");
+    check(received.transport == local.transport,
+          "the session moved over the requested transport");
+    if (received.transport != local.transport) {
+        std::printf("     transport: asked for %s, got %s\n", local.transport.c_str(),
+                    received.transport.c_str());
+    }
     check(!local.token.empty(), "the loopback ran with an access token");
     // Probes run on neighbouring ports so they cannot disturb the session
     // above.
@@ -6090,8 +6276,22 @@ int run_verify(const Options& options) {
         check(received.stream_option_rate_update_seen,
               "a quality-only change was applied and announced");
         if (received.stream_option_base_codec == chast::VideoCodec::H264) {
-            check(received.stream_option_rate_keyframes == 0,
-                  "a bitrate-only change kept the coded sequence (no IDR)");
+            // libavcodec's QSV encoder flushes and resets the MFX session for
+            // a rate change, so the host must force the one IDR the encoder
+            // reported as required. oneVPL's H.264 tiers reset continuously
+            // and NVENC/AMF update in place, so neither may cost a key frame.
+            const bool resets =
+                received.stream_option_rate_encoder.find("qsv") != std::string::npos;
+            const uint64_t expected = resets ? 1u : 0u;
+            check(received.stream_option_rate_keyframes == expected,
+                  resets ? "a bitrate-only change cost the QSV session reset (one IDR)"
+                         : "a bitrate-only change kept the coded sequence (no IDR)");
+            if (received.stream_option_rate_keyframes != expected) {
+                std::printf("     rate-only change: %llu keyframe(s) via %s\n",
+                            static_cast<unsigned long long>(
+                                received.stream_option_rate_keyframes),
+                            received.stream_option_rate_encoder.c_str());
+            }
         } else {
             // mfx-gen's HEVC encoder cannot reset its session, so the host
             // reopens it and pays the IDR. Other drivers may continue instead.

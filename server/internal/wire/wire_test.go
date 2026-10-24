@@ -1,25 +1,31 @@
 package wire
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
 
 func TestRoundTrip(t *testing.T) {
 	in := Message{
-		Type:      TypeKeepaliveAck,
-		HostID:    "devbox",
-		KeyHash:   strings.Repeat("a", 64),
-		Candidate: "192.0.2.10:5000",
-		Relay:     "192.0.2.1:41000",
-		OK:        true,
-		ExpiresMS: 30000,
+		Type:        TypeKeepaliveAck,
+		HostID:      "devbox",
+		Candidate:   "192.0.2.10:5000",
+		LocalAddrs:  []string{"192.168.1.20:5000", "2001:db8::1:5000"},
+		NATType:     "port-restricted",
+		Fingerprint: "SHA256:abc",
+		PublicKey:   "pk",
+		Binding:     "payload.sig",
+		Signature:   "sig",
+		Relay:       "192.0.2.1:41000",
+		OK:          true,
+		ExpiresMS:   30000,
 	}
 	out, err := Decode(Encode(in))
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("round trip changed the message:\n got %+v\nwant %+v", out, in)
 	}
 }

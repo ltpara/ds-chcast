@@ -2,30 +2,39 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/carrier"
+	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
 const (
-	ModeAuto   = "auto"
-	ModeDirect = "direct"
-	ModeRelay  = "relay"
+	ModeAuto    = "auto"
+	ModeDirect  = "direct"
+	ModeRelay   = "relay"
+	ModeCarrier = "carrier"
 )
 
 type ViewerConfig struct {
-	ServerURL     string
-	ServerKey     string
-	HostID        string
-	ListenAddr    string
-	Mode          string
-	DirectTimeout time.Duration
-	Logger        *slog.Logger
+	ServerURL string
+	ServerKey string
+	// ServerPublicKey pins the rendezvous server identity. When set, lookups
+	// must carry a valid server-signed binding for the host.
+	ServerPublicKey string
+	HostID          string
+	ListenAddr      string
+	Mode            string
+	DirectTimeout   time.Duration
+	Logger          *slog.Logger
 	// OnPath receives every direct/relay change, starting with the initial
 	// path once StartViewer has resolved the host. It is called from the read
 	// or timer goroutine, so it must not block.
@@ -33,12 +42,20 @@ type ViewerConfig struct {
 }
 
 // PathInfo is the viewer agent's current forwarding path. Path is "direct",
-// "relay" or "connecting" while the first direct probe is still unanswered.
+// "relay", "carrier" or "connecting" while the first direct probe is still
+// unanswered. NAT is the host's advertised NAT classification; Candidates is
+// the number of direct addresses the viewer is probing. Carrier and
+// CarrierToken are the shared-carrier endpoint and the per-lease credential
+// for it, empty when the server has no shared carrier.
 type PathInfo struct {
-	Path   string `json:"path"`
-	Remote string `json:"remote,omitempty"`
-	Direct string `json:"direct,omitempty"`
-	Relay  string `json:"relay,omitempty"`
+	Path         string `json:"path"`
+	Remote       string `json:"remote,omitempty"`
+	Direct       string `json:"direct,omitempty"`
+	Relay        string `json:"relay,omitempty"`
+	NAT          string `json:"nat,omitempty"`
+	Candidates   int    `json:"candidates,omitempty"`
+	Carrier      string `json:"carrier,omitempty"`
+	CarrierToken string `json:"carrier_token,omitempty"`
 }
 
 type ViewerAgent struct {
@@ -54,6 +71,20 @@ type ViewerAgent struct {
 	direct *net.UDPAddr
 	relay  *net.UDPAddr
 
+	// carrier and carrierToken come from the authenticated lookup. The token
+	// authorizes this viewer's slot while the host's lease is live.
+	carrier      string
+	carrierToken string
+	// relayOnly means the server hides direct candidates; transport is its
+	// hint (direct, relay or carrier). carrierMode forwards local datagrams
+	// through the shared TCP carrier instead of a UDP address.
+	relayOnly   bool
+	transport   string
+	carrierMode bool
+	carrierConn net.Conn
+	carrierMu   sync.Mutex
+	carrierSend *carrier.FrameWriter
+
 	mu          sync.Mutex
 	remote      *net.UDPAddr
 	local       *net.UDPAddr
@@ -65,6 +96,8 @@ type ViewerAgent struct {
 	fellBack    bool
 	nonce       string
 	lastPathKey string
+	candidates  []*net.UDPAddr
+	natType     string
 }
 
 func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error) {
@@ -74,14 +107,19 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	if cfg.Mode == "" {
 		cfg.Mode = ModeAuto
 	}
-	if cfg.Mode != ModeAuto && cfg.Mode != ModeDirect && cfg.Mode != ModeRelay {
-		return nil, fmt.Errorf("--mode must be auto, direct or relay")
+	if cfg.Mode != ModeAuto && cfg.Mode != ModeDirect && cfg.Mode != ModeRelay && cfg.Mode != ModeCarrier {
+		return nil, fmt.Errorf("--mode must be auto, direct, relay or carrier")
 	}
 	if cfg.DirectTimeout <= 0 {
 		cfg.DirectTimeout = 2 * time.Second
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.ServerPublicKey != "" {
+		if _, err := identity.ParsePublicKey(cfg.ServerPublicKey); err != nil {
+			return nil, fmt.Errorf("--server-pubkey: %w", err)
+		}
 	}
 	listen, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	if err != nil {
@@ -110,6 +148,11 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel()
 		return nil, fmt.Errorf("lookup: %w", err)
 	}
+	if err := checkHostBinding(cfg.ServerPublicKey, cfg.HostID, host); err != nil {
+		conn.Close()
+		cancel()
+		return nil, err
+	}
 	if !host.Online {
 		conn.Close()
 		cancel()
@@ -121,29 +164,56 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel()
 		return nil, fmt.Errorf("punch address: %w", err)
 	}
-	v.direct, err = resolveUDP(host.Candidate)
-	if err != nil {
-		conn.Close()
-		cancel()
-		return nil, fmt.Errorf("host candidate: %w", err)
+	candidateTexts := append([]string{}, host.Candidates...)
+	if host.Candidate != "" {
+		candidateTexts = append(candidateTexts, host.Candidate)
 	}
+	candidateTexts = append(candidateTexts, host.LocalAddrs...)
+	v.candidates = mergeCandidates(conn.LocalAddr().(*net.UDPAddr), candidateTexts)
+	if len(v.candidates) > 0 {
+		v.direct = v.candidates[0]
+	}
+	v.natType = host.NATType
+	v.carrier = host.Carrier
+	v.carrierToken = host.CarrierToken
+	v.relayOnly = host.RelayOnly
+	v.transport = host.Transport
 	v.relay, err = resolveUDP(host.Relay)
 	if err != nil {
 		conn.Close()
 		cancel()
 		return nil, fmt.Errorf("relay address: %w", err)
 	}
+	carrierReady := v.carrier != "" && v.carrierToken != ""
+	useCarrier := false
 
 	switch cfg.Mode {
-	case ModeRelay:
-		if v.relay == nil {
+	case ModeCarrier:
+		if !carrierReady {
 			conn.Close()
 			cancel()
-			return nil, fmt.Errorf("host has no relay address")
+			return nil, fmt.Errorf("host has no shared carrier address")
 		}
-		v.remote = v.relay
-		v.latched = true
+		useCarrier = true
+	case ModeRelay:
+		if host.Transport == "carrier" && carrierReady {
+			useCarrier = true
+		} else if v.relay != nil {
+			v.remote = v.relay
+			v.latched = true
+		} else if carrierReady {
+			useCarrier = true
+		} else {
+			conn.Close()
+			cancel()
+			return nil, fmt.Errorf("host has no relay or carrier address")
+		}
 	case ModeDirect:
+		if host.RelayOnly {
+			conn.Close()
+			cancel()
+			return nil, fmt.Errorf("server forces relay; direct mode is unavailable")
+		}
 		if v.direct == nil {
 			conn.Close()
 			cancel()
@@ -152,26 +222,36 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		v.remote = v.direct
 		v.latched = true
 	default:
-		if v.direct != nil {
+		switch {
+		case !host.RelayOnly && v.direct != nil:
 			v.remote = v.direct
-		} else if v.relay != nil {
+		case host.Transport == "carrier" && carrierReady:
+			useCarrier = true
+		case v.relay != nil:
 			v.remote = v.relay
 			v.latched = true
 			v.log.Warn("host has no direct candidate; using relay")
-		} else {
+		case carrierReady:
+			useCarrier = true
+		default:
 			conn.Close()
 			cancel()
-			return nil, fmt.Errorf("host has neither a direct nor a relay address")
+			return nil, fmt.Errorf("host has neither a direct, relay nor carrier address")
 		}
 	}
+	v.carrierMode = useCarrier
 
 	go v.readLoop()
-	if cfg.Mode != ModeRelay && v.punch != nil && v.direct != nil {
+	if v.carrierMode {
+		go v.carrierLoop()
+	} else if cfg.Mode != ModeRelay && !host.RelayOnly && v.punch != nil && v.direct != nil {
 		v.sendPunchRequest()
 		go v.punchLoop()
 	}
 	path := "relay " + addrText(v.relay)
-	if v.remote != nil && sameAddr(v.remote, v.direct) {
+	if v.carrierMode {
+		path = "carrier " + v.carrier
+	} else if v.remote != nil && sameAddr(v.remote, v.direct) {
 		path = "direct " + addrText(v.direct)
 	}
 	v.log.Info("viewer agent listening", "on", conn.LocalAddr().String(), "path", path)
@@ -191,7 +271,11 @@ func (v *ViewerAgent) PathInfo() PathInfo {
 
 func (v *ViewerAgent) pathLocked() PathInfo {
 	path := "connecting"
-	if v.remote != nil {
+	remote := addrValue(v.remote)
+	if v.carrierMode {
+		path = "carrier"
+		remote = v.carrier
+	} else if v.remote != nil {
 		if v.relay != nil && sameAddr(v.remote, v.relay) {
 			path = "relay"
 		} else {
@@ -199,17 +283,21 @@ func (v *ViewerAgent) pathLocked() PathInfo {
 		}
 	}
 	return PathInfo{
-		Path:   path,
-		Remote: addrValue(v.remote),
-		Direct: addrValue(v.direct),
-		Relay:  addrValue(v.relay),
+		Path:         path,
+		Remote:       remote,
+		Direct:       addrValue(v.direct),
+		Relay:        addrValue(v.relay),
+		NAT:          v.natType,
+		Candidates:   len(v.candidates),
+		Carrier:      v.carrier,
+		CarrierToken: v.carrierToken,
 	}
 }
 
 func (v *ViewerAgent) reportPath() {
 	v.mu.Lock()
 	info := v.pathLocked()
-	key := info.Path + "|" + info.Remote
+	key := info.Path + "|" + info.Remote + "|" + info.NAT + "|" + strconv.Itoa(info.Candidates)
 	changed := key != v.lastPathKey
 	v.lastPathKey = key
 	v.mu.Unlock()
@@ -232,6 +320,11 @@ func (v *ViewerAgent) Close() {
 	}
 	v.mu.Unlock()
 	v.cancel()
+	v.carrierMu.Lock()
+	if v.carrierConn != nil {
+		v.carrierConn.Close()
+	}
+	v.carrierMu.Unlock()
 	v.conn.Close()
 }
 
@@ -251,7 +344,7 @@ func (v *ViewerAgent) punchLoop() {
 		if i > 0 {
 			v.sendPunchRequest()
 		}
-		v.sendPunchesTo(v.getDirect())
+		v.sendPunchesTo(v.getCandidates())
 		select {
 		case <-v.ctx.Done():
 			return
@@ -263,18 +356,155 @@ func (v *ViewerAgent) punchLoop() {
 	}
 }
 
-func (v *ViewerAgent) sendPunchesTo(peer *net.UDPAddr) {
-	if peer == nil {
+const (
+	viewerCarrierDial      = 5 * time.Second
+	viewerCarrierIdle      = 60 * time.Second
+	viewerCarrierKeepalive = 30 * time.Second
+	viewerCarrierRetryMax  = 5 * time.Second
+)
+
+// carrierLoop keeps the viewer's shared-carrier link alive. The link carries
+// the same opaque QUIC datagrams as UDP; when it drops, the agent reconnects
+// with backoff while the local client retransmits.
+func (v *ViewerAgent) carrierLoop() {
+	backoff := 500 * time.Millisecond
+	for {
+		started := time.Now()
+		err := v.runCarrierLink()
+		if v.ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			v.log.Warn("carrier link lost", "carrier", v.carrier, "error", err)
+		}
+		if time.Since(started) > 30*time.Second {
+			backoff = 500 * time.Millisecond
+		}
+		select {
+		case <-v.ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < viewerCarrierRetryMax {
+			backoff *= 2
+			if backoff > viewerCarrierRetryMax {
+				backoff = viewerCarrierRetryMax
+			}
+		}
+	}
+}
+
+func (v *ViewerAgent) runCarrierLink() error {
+	dialer := &net.Dialer{Timeout: viewerCarrierDial}
+	conn, err := dialer.DialContext(v.ctx, "tcp", v.carrier)
+	if err != nil {
+		return err
+	}
+	hello, err := json.Marshal(carrier.SharedViewerHello{HostID: v.cfg.HostID, Token: v.carrierToken})
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(viewerCarrierDial))
+	if _, err := io.WriteString(conn, carrier.MagicViewer+string(hello)+"\n"); err != nil {
+		conn.Close()
+		return err
+	}
+	send := carrier.NewFrameWriter(conn)
+	stop := make(chan struct{})
+	defer close(stop)
+	v.carrierMu.Lock()
+	v.carrierConn = conn
+	v.carrierSend = send
+	v.carrierMu.Unlock()
+	defer func() {
+		v.carrierMu.Lock()
+		if v.carrierConn == conn {
+			v.carrierConn = nil
+			v.carrierSend = nil
+		}
+		v.carrierMu.Unlock()
+		conn.Close()
+	}()
+	v.log.Info("carrier link established", "carrier", v.carrier)
+	go v.carrierKeepalive(conn, send, stop)
+
+	reader := carrier.NewFrameReader(conn)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(viewerCarrierIdle))
+		payload, err := reader.ReadFrame()
+		if err != nil {
+			return err
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		v.mu.Lock()
+		local := cloneAddr(v.local)
+		v.mu.Unlock()
+		if local != nil {
+			v.conn.WriteToUDP(payload, local)
+		}
+	}
+}
+
+func (v *ViewerAgent) carrierKeepalive(conn net.Conn, send *carrier.FrameWriter, stop <-chan struct{}) {
+	ticker := time.NewTicker(viewerCarrierKeepalive)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-v.ctx.Done():
+			return
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(viewerCarrierDial))
+			if err := send.WriteFrame(nil); err != nil {
+				conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// writeCarrier forwards one datagram to the host. Data is dropped while the
+// link is down; QUIC above the tunnel retransmits what matters.
+func (v *ViewerAgent) writeCarrier(payload []byte) {
+	v.carrierMu.Lock()
+	conn, send := v.carrierConn, v.carrierSend
+	v.carrierMu.Unlock()
+	if conn == nil || send == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(viewerCarrierDial))
+	if err := send.WriteFrame(payload); err != nil {
+		v.log.Warn("carrier write failed", "error", err)
+		conn.Close()
+	}
+}
+
+func (v *ViewerAgent) sendPunchesTo(peers []*net.UDPAddr) {
+	if len(peers) == 0 {
 		return
 	}
 	punch := wire.Encode(wire.Message{Type: wire.TypePunch, Nonce: v.nonce})
-	v.conn.WriteToUDP(punch, peer)
+	for _, peer := range peers {
+		if peer != nil {
+			v.conn.WriteToUDP(punch, peer)
+		}
+	}
 }
 
-func (v *ViewerAgent) getDirect() *net.UDPAddr {
+func (v *ViewerAgent) getCandidates() []*net.UDPAddr {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	return cloneAddr(v.direct)
+	out := make([]*net.UDPAddr, 0, len(v.candidates))
+	for _, addr := range v.candidates {
+		if cloned := cloneAddr(addr); cloned != nil {
+			out = append(out, cloned)
+		}
+	}
+	return out
 }
 
 func (v *ViewerAgent) readLoop() {
@@ -353,6 +583,10 @@ func (v *ViewerAgent) readLoop() {
 			v.timer = time.AfterFunc(v.cfg.DirectTimeout, v.onDirectTimeout)
 		}
 		v.mu.Unlock()
+		if v.carrierMode {
+			v.writeCarrier(data)
+			continue
+		}
 		if remote == nil {
 			continue
 		}
@@ -361,6 +595,9 @@ func (v *ViewerAgent) readLoop() {
 }
 
 func (v *ViewerAgent) onDirectPacket(src *net.UDPAddr) {
+	if v.carrierMode {
+		return
+	}
 	v.directOK.Store(true)
 	v.mu.Lock()
 	if !sameAddr(v.direct, src) {
@@ -413,16 +650,30 @@ func (v *ViewerAgent) handleControl(data []byte) {
 				v.mu.Unlock()
 			}
 		}
-		if msg.Candidate != "" {
-			peer, err := resolveUDP(msg.Candidate)
-			if err == nil && peer != nil {
-				v.mu.Lock()
-				if !sameAddr(v.direct, peer) {
-					v.direct = peer
+		if msg.Candidate != "" || len(msg.LocalAddrs) > 0 {
+			texts := make([]string, 0, len(msg.LocalAddrs)+1)
+			if msg.Candidate != "" {
+				texts = append(texts, msg.Candidate)
+			}
+			texts = append(texts, msg.LocalAddrs...)
+			v.mu.Lock()
+			merged := mergeCandidates(v.conn.LocalAddr().(*net.UDPAddr), addrList(v.candidates), texts)
+			if len(merged) > 0 {
+				v.candidates = merged
+				if !v.directOK.Load() {
+					v.direct = cloneAddr(merged[0])
+					if !v.latched {
+						v.remote = cloneAddr(merged[0])
+					}
 				}
-				v.mu.Unlock()
+				if msg.NATType != "" {
+					v.natType = msg.NATType
+				}
+			}
+			v.mu.Unlock()
+			if len(merged) > 0 {
 				v.punched.Store(true)
-				go v.sendPunchesTo(peer)
+				go v.sendPunchesTo(merged)
 			}
 		}
 	case wire.TypeBusy:
@@ -436,4 +687,30 @@ func addrText(a *net.UDPAddr) string {
 		return "none"
 	}
 	return a.String()
+}
+
+// checkHostBinding enforces the optional server pin and makes sure the lookup
+// fields agree with the signed binding. Without a pin this is a no-op: the
+// viewer cannot authenticate the server on its own.
+func checkHostBinding(serverPublicKey, hostID string, host lookupResult) error {
+	if serverPublicKey == "" {
+		return nil
+	}
+	if host.Binding == "" {
+		return fmt.Errorf("server %s did not sign the host binding; check --server-pubkey", host.ServerPublicKey)
+	}
+	if host.ServerPublicKey != "" && host.ServerPublicKey != serverPublicKey {
+		return fmt.Errorf("lookup came from an unexpected server identity")
+	}
+	binding, err := identity.VerifyHostBinding(host.Binding, serverPublicKey)
+	if err != nil {
+		return fmt.Errorf("verify host binding: %w", err)
+	}
+	if binding.ID != hostID {
+		return fmt.Errorf("server signed a binding for a different host id")
+	}
+	if host.PublicKey != binding.PublicKey || host.Fingerprint != binding.Fingerprint {
+		return fmt.Errorf("lookup fields do not match the signed host binding")
+	}
+	return nil
 }

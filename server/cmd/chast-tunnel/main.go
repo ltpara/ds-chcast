@@ -43,10 +43,12 @@ func runHost(args []string) error {
 	fs := flag.NewFlagSet("host", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "server key required by the API")
+	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	id := fs.String("id", "", "host id registered with the service")
 	key := fs.String("key", "", "host key, at least 8 characters")
 	fingerprint := fs.String("fingerprint", "", "certificate fingerprint shown in lookups")
 	local := fs.String("local", "127.0.0.1:4433", "chast-host QUIC listener")
+	carrierAddr := fs.String("carrier", "", "chast-host TCP carrier listener (127.0.0.1:P+1); empty disables the relay's TCP fallback")
 	listen := fs.String("listen", "0.0.0.0:14434", "public-facing UDP address of this agent")
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
 	verbose := fs.Bool("verbose", false, "debug logging")
@@ -72,15 +74,17 @@ func runHost(args []string) error {
 	}
 
 	h, err := agent.StartHost(ctx, agent.HostConfig{
-		ServerURL:   *server,
-		ServerKey:   *serverKey,
-		ID:          *id,
-		Key:         *key,
-		Fingerprint: *fingerprint,
-		LocalAddr:   *local,
-		ListenAddr:  *listen,
-		Keepalive:   *keepalive,
-		Logger:      log,
+		ServerURL:       *server,
+		ServerKey:       *serverKey,
+		ServerPublicKey: *serverPubKey,
+		ID:              *id,
+		Key:             *key,
+		Fingerprint:     *fingerprint,
+		LocalAddr:       *local,
+		CarrierAddr:     *carrierAddr,
+		ListenAddr:      *listen,
+		Keepalive:       *keepalive,
+		Logger:          log,
 		OnInfo: func(info agent.HostInfo) {
 			emitMu.Lock()
 			defer emitMu.Unlock()
@@ -92,6 +96,7 @@ func runHost(args []string) error {
 				Remote: info.Viewer,
 				Punch:  info.Punch,
 				Relay:  info.Relay,
+				NAT:    info.NAT,
 			}
 			if info.Viewer != "" {
 				event.Event = "viewer"
@@ -120,6 +125,7 @@ func runHost(args []string) error {
 		Remote: info.Viewer,
 		Punch:  info.Punch,
 		Relay:  info.Relay,
+		NAT:    info.NAT,
 	})
 	emitMu.Unlock()
 	log.Info("host agent online", "id", *id)
@@ -131,9 +137,10 @@ func runViewer(args []string) error {
 	fs := flag.NewFlagSet("viewer", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "server key required by the API")
+	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	id := fs.String("id", "", "host id to reach")
 	listen := fs.String("listen", "127.0.0.1:24434", "local UDP address for the QUIC client")
-	mode := fs.String("mode", agent.ModeAuto, "auto: direct then relay; direct; relay")
+	mode := fs.String("mode", agent.ModeAuto, "auto: direct, relay or carrier; direct; relay; carrier")
 	directTimeout := fs.Duration("direct-timeout", 2*time.Second, "how long auto waits for the direct path")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
@@ -153,20 +160,25 @@ func runViewer(args []string) error {
 	}
 
 	v, err := agent.StartViewer(ctx, agent.ViewerConfig{
-		ServerURL:     *server,
-		ServerKey:     *serverKey,
-		HostID:        *id,
-		ListenAddr:    *listen,
-		Mode:          *mode,
-		DirectTimeout: *directTimeout,
-		Logger:        log,
+		ServerURL:       *server,
+		ServerKey:       *serverKey,
+		ServerPublicKey: *serverPubKey,
+		HostID:          *id,
+		ListenAddr:      *listen,
+		Mode:            *mode,
+		DirectTimeout:   *directTimeout,
+		Logger:          log,
 		OnPath: func(info agent.PathInfo) {
 			emit(agentEvent{
-				Event:  "path",
-				Path:   info.Path,
-				Remote: info.Remote,
-				Direct: info.Direct,
-				Relay:  info.Relay,
+				Event:        "path",
+				Path:         info.Path,
+				Remote:       info.Remote,
+				Direct:       info.Direct,
+				Relay:        info.Relay,
+				NAT:          info.NAT,
+				Candidates:   info.Candidates,
+				Carrier:      info.Carrier,
+				CarrierToken: info.CarrierToken,
 			})
 		},
 	})
@@ -176,13 +188,17 @@ func runViewer(args []string) error {
 	defer v.Close()
 	info := v.PathInfo()
 	emit(agentEvent{
-		Event:  "ready",
-		Listen: v.LocalAddr().String(),
-		Host:   *id,
-		Path:   info.Path,
-		Remote: info.Remote,
-		Direct: info.Direct,
-		Relay:  info.Relay,
+		Event:        "ready",
+		Listen:       v.LocalAddr().String(),
+		Host:         *id,
+		Path:         info.Path,
+		Remote:       info.Remote,
+		Direct:       info.Direct,
+		Relay:        info.Relay,
+		NAT:          info.NAT,
+		Candidates:   info.Candidates,
+		Carrier:      info.Carrier,
+		CarrierToken: info.CarrierToken,
 	})
 	log.Info("viewer agent online", "host", *id)
 	<-ctx.Done()
@@ -190,14 +206,18 @@ func runViewer(args []string) error {
 }
 
 type agentEvent struct {
-	Event  string `json:"event"`
-	Listen string `json:"listen,omitempty"`
-	Host   string `json:"host,omitempty"`
-	Path   string `json:"path,omitempty"`
-	Remote string `json:"remote,omitempty"`
-	Punch  string `json:"punch,omitempty"`
-	Direct string `json:"direct,omitempty"`
-	Relay  string `json:"relay,omitempty"`
+	Event        string `json:"event"`
+	Listen       string `json:"listen,omitempty"`
+	Host         string `json:"host,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Remote       string `json:"remote,omitempty"`
+	Punch        string `json:"punch,omitempty"`
+	Direct       string `json:"direct,omitempty"`
+	Relay        string `json:"relay,omitempty"`
+	NAT          string `json:"nat,omitempty"`
+	Candidates   int    `json:"candidates,omitempty"`
+	Carrier      string `json:"carrier,omitempty"`
+	CarrierToken string `json:"carrier_token,omitempty"`
 }
 
 func newLogger(verbose bool) *slog.Logger {

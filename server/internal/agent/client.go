@@ -3,12 +3,15 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/identity"
 )
 
 type apiClient struct {
@@ -26,32 +29,51 @@ func newAPIClient(base, serverKey string) *apiClient {
 }
 
 type registerResult struct {
-	ID           string `json:"id"`
-	Relay        string `json:"relay"`
-	Punch        string `json:"punch"`
-	ExpiresInSec int64  `json:"expires_in_sec"`
+	ID              string   `json:"id"`
+	Relay           string   `json:"relay"`
+	Relays          []string `json:"relays"`
+	Punch           string   `json:"punch"`
+	Carrier         string   `json:"carrier"`
+	CarrierToken    string   `json:"carrier_token"`
+	ExpiresInSec    int64    `json:"expires_in_sec"`
+	PublicKey       string   `json:"public_key"`
+	ServerPublicKey string   `json:"server_public_key"`
+	Binding         string   `json:"binding"`
 }
 
 type lookupResult struct {
-	ID          string `json:"id"`
-	Online      bool   `json:"online"`
-	Candidate   string `json:"candidate"`
-	Relay       string `json:"relay"`
-	Punch       string `json:"punch"`
-	Fingerprint string `json:"fingerprint"`
-	LastSeenMS  int64  `json:"last_seen_ms"`
-	ExpiresInMS int64  `json:"expires_in_ms"`
+	ID              string   `json:"id"`
+	Online          bool     `json:"online"`
+	Candidate       string   `json:"candidate"`
+	Candidates      []string `json:"candidates"`
+	Relay           string   `json:"relay"`
+	Punch           string   `json:"punch"`
+	Carrier         string   `json:"carrier"`
+	CarrierToken    string   `json:"carrier_token"`
+	Fingerprint     string   `json:"fingerprint"`
+	PublicKey       string   `json:"public_key"`
+	ServerPublicKey string   `json:"server_public_key"`
+	Binding         string   `json:"binding"`
+	LocalAddrs      []string `json:"local_addrs"`
+	NATType         string   `json:"nat_type"`
+	LastSeenMS      int64    `json:"last_seen_ms"`
+	ExpiresInMS     int64    `json:"expires_in_ms"`
+	RelayOnly       bool     `json:"relay_only"`
+	Transport       string   `json:"transport"`
 }
 
 type apiError struct {
 	Error string `json:"error"`
 }
 
-func (c *apiClient) register(ctx context.Context, id, key, fingerprint string) (registerResult, error) {
-	body, err := json.Marshal(map[string]string{
+func (c *apiClient) register(ctx context.Context, id string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
+	timestamp := time.Now().Unix()
+	body, err := json.Marshal(map[string]any{
 		"id":          id,
-		"key":         key,
+		"public_key":  identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey)),
 		"fingerprint": fingerprint,
+		"timestamp":   timestamp,
+		"signature":   identity.Sign(privateKey, identity.RegisterMessage(id, fingerprint, timestamp)),
 	})
 	if err != nil {
 		return registerResult{}, err

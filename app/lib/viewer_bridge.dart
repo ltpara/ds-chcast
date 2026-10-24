@@ -152,6 +152,8 @@ class ViewerStatus {
     this.error = '',
     this.host = '',
     this.port = 0,
+    this.transport = 'quic',
+    this.transportError = '',
     this.codec = '',
     this.width = 0,
     this.height = 0,
@@ -275,6 +277,16 @@ class ViewerStatus {
   final String error;
   final String host;
   final int port;
+
+  /// The path the session settled on: `quic` (UDP), `tcp` or `ws` (the TCP
+  /// and WebSocket carriers). While connecting it is the requested mode, so
+  /// `auto` shows as `quic` until the first path answers.
+  final String transport;
+
+  /// Why the paths before [transport] were abandoned, joined with `; `.
+  /// Empty when the first path worked; kept after a fallback so the overlay
+  /// can explain why the session is not on UDP.
+  final String transportError;
   final String codec;
 
   /// The encoded picture size, which is what the decoder produces and the
@@ -575,6 +587,18 @@ class ViewerStatus {
       : (audioDevice.isEmpty ? '系统默认输出' : '输出设备');
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
 
+  /// "UDP", "TCP 回退" or "WebSocket 回退" for the stats overlay.
+  String get transportLabel {
+    switch (transport) {
+      case 'tcp':
+        return 'TCP 回退';
+      case 'ws':
+        return 'WebSocket 回退';
+      default:
+        return 'UDP';
+    }
+  }
+
   /// The sample rate as "48 kHz", the way the overlay shows it.
   String get audioSampleRateLabel {
     if (audioSampleRate <= 0) {
@@ -644,6 +668,10 @@ class ViewerStatus {
       error: asString(map['error']),
       host: asString(map['host']),
       port: asInt(map['port']),
+      transport: asString(map['transport']).isEmpty
+          ? 'quic'
+          : asString(map['transport']),
+      transportError: asString(map['transportError']),
       codec: asString(map['codec']),
       width: width,
       height: height,
@@ -801,6 +829,13 @@ class ViewerBridge {
   /// six-digit code for hosts that also require two-factor. [trustDevice]
   /// asks the host to remember this viewer's identity after a successful
   /// sign-in, so later connections skip the password.
+  ///
+  /// [transport] is `auto` (UDP first, then the TCP and WebSocket carriers),
+  /// `quic`, `tcp` or `ws`. [carrierHost]/[carrierPort] name the carrier
+  /// endpoint: a direct connection uses host:port+1, a tunnelled one uses the
+  /// relay or shared carrier the tunnel agent reported. Empty host means
+  /// [host] and port 0 means [port] + 1. [carrierHostId]/[carrierToken] select
+  /// this host on a shared carrier; leave them empty for a per-host port.
   static Future<void> start({
     required String host,
     required int port,
@@ -812,6 +847,11 @@ class ViewerBridge {
     String password = '',
     String totp = '',
     bool trustDevice = false,
+    String transport = 'auto',
+    String carrierHost = '',
+    int carrierPort = 0,
+    String carrierHostId = '',
+    String carrierToken = '',
   }) async {
     await _channel.invokeMethod<void>(
       'start',
@@ -826,6 +866,11 @@ class ViewerBridge {
         'password': password,
         'totp': totp,
         'trustDevice': trustDevice,
+        'transport': transport,
+        'carrierHost': carrierHost,
+        'carrierPort': carrierPort,
+        'carrierHostId': carrierHostId,
+        'carrierToken': carrierToken,
       },
     );
   }

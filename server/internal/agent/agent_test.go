@@ -131,6 +131,63 @@ func TestAutoPathThroughAgents(t *testing.T) {
 	testRoundTrip(t, ctx, s, ModeAuto)
 }
 
+func TestHostDetectsNATType(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := testutil.Start(t)
+	echo := startEcho(t)
+	host := startHostAgent(t, ctx, s.URL, echo.LocalAddr().String())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for host.Info().NAT == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("host never classified its NAT: %+v", host.Info())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := host.Info().NAT; got != NATAsymmetric {
+		t.Fatalf("loopback NAT type = %q, want %q", got, NATAsymmetric)
+	}
+
+	for {
+		record, ok := s.Registry.Lookup("devbox")
+		if ok && record.NATType == NATAsymmetric {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("registry NAT type = %q, ok=%v", record.NATType, ok)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	viewer, err := StartViewer(ctx, ViewerConfig{
+		ServerURL:     s.URL,
+		ServerKey:     testutil.ServerKey,
+		HostID:        "devbox",
+		ListenAddr:    "127.0.0.1:0",
+		Mode:          ModeAuto,
+		DirectTimeout: time.Second,
+		Logger:        quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start viewer agent: %v", err)
+	}
+	t.Cleanup(viewer.Close)
+	info := viewer.PathInfo()
+	if info.NAT != NATAsymmetric {
+		t.Fatalf("viewer NAT type = %q", info.NAT)
+	}
+	if info.Candidates < 1 || info.Direct == "" {
+		t.Fatalf("viewer did not receive direct candidates: %+v", info)
+	}
+	if info.Carrier == "" || info.CarrierToken == "" {
+		t.Fatalf("viewer did not receive the shared carrier: %+v", info)
+	}
+	if info.Carrier != s.Carrier {
+		t.Fatalf("viewer carrier = %q, want %q", info.Carrier, s.Carrier)
+	}
+}
+
 func TestViewerRequiresOnlineHost(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

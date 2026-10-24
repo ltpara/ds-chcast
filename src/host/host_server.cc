@@ -17,6 +17,7 @@
 #include "chast/audio.h"
 #include "chast/bitrate_controller.h"
 #include "chast/capture.h"
+#include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/desktop.h"
 #include "chast/display_mode.h"
@@ -356,6 +357,7 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
 
 HostServer::~HostServer() {
     stop();
+    carrier_.reset();
     session_.reset();
 }
 
@@ -373,6 +375,9 @@ void HostServer::stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+    if (carrier_) {
+        carrier_->stop();
+    }
 }
 
 void HostServer::wait() {
@@ -387,7 +392,13 @@ bool HostServer::running() const {
 
 HostStatus HostServer::status() const {
     std::lock_guard<std::mutex> lock(status_mutex_);
-    return status_;
+    HostStatus snapshot = status_;
+    if (carrier_) {
+        const CarrierServerStats stats = carrier_->stats();
+        snapshot.carrier_connections = stats.connections;
+        snapshot.carrier_active = stats.active;
+    }
+    return snapshot;
 }
 
 std::string HostServer::token() const {
@@ -428,6 +439,44 @@ bool HostServer::open_session(std::string* error) {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_.fingerprint = fingerprint;
         status_.token = settings_.access_token;
+    }
+    if (!carrier_ && settings_.carrier) {
+        if (settings_.port == 65535) {
+            {
+                std::lock_guard<std::mutex> lock(status_mutex_);
+                status_.carrier_error =
+                    "QUIC port 65535 leaves no port + 1 for the fallback";
+            }
+            log("carrier disabled: QUIC port 65535 leaves no port + 1");
+        } else {
+            CarrierServerConfig carrier;
+            carrier.bind_address = settings_.bind_address;
+            carrier.port = static_cast<uint16_t>(settings_.port + 1);
+            // The fallback's UDP side always dials the QUIC listener from the
+            // same machine; a wildcard bind reaches it over loopback.
+            const bool wildcard = settings_.bind_address.empty() ||
+                                  settings_.bind_address == "0.0.0.0" ||
+                                  settings_.bind_address == "::";
+            carrier.quic_address = wildcard ? "127.0.0.1" : settings_.bind_address;
+            carrier.quic_port = settings_.port;
+            carrier.log = [this](const std::string& message) { log(message); };
+            std::string carrier_error;
+            carrier_ = CarrierServer::create(carrier, &carrier_error);
+            uint16_t bound = 0;
+            {
+                std::lock_guard<std::mutex> lock(status_mutex_);
+                status_.carrier_listening = carrier_ != nullptr;
+                status_.carrier_port = carrier_ ? carrier_->port() : 0;
+                status_.carrier_error = carrier_ ? std::string() : carrier_error;
+                bound = status_.carrier_port;
+            }
+            if (carrier_) {
+                log("tcp/websocket carrier listening on " + settings_.bind_address + ":" +
+                    std::to_string(bound));
+            } else {
+                log("carrier unavailable, serving QUIC only: " + carrier_error);
+            }
+        }
     }
     if (security_) {
         // A reopened listener may see a new certificate; signed Hellos must
@@ -1015,6 +1064,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     encoder_config.gop_size = 0;
     encoder_config.width = first.nv12_width;
     encoder_config.height = first.nv12_height;
+    encoder_config.backend = config_.encoder_backend;
     const AdapterDevice adapter = capturer->adapter_device();
     std::unique_ptr<IVideoEncoder> encoder =
         create_encoder(adapter.device, encoder_config, error);

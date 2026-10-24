@@ -16,6 +16,8 @@ class TunnelEvent {
     this.remote = '',
     this.direct = '',
     this.relay = '',
+    this.carrier = '',
+    this.carrierToken = '',
   });
 
   final String event;
@@ -25,6 +27,8 @@ class TunnelEvent {
   final String remote;
   final String direct;
   final String relay;
+  final String carrier;
+  final String carrierToken;
 
   static TunnelEvent? decode(String line) {
     final String text = line.trim();
@@ -49,6 +53,8 @@ class TunnelEvent {
         remote: field('remote'),
         direct: field('direct'),
         relay: field('relay'),
+        carrier: field('carrier'),
+        carrierToken: field('carrier_token'),
       );
     } catch (_) {
       return null;
@@ -84,6 +90,9 @@ class TunnelAgent {
   Completer<void>? _ready;
   String _path = 'connecting';
   String _remote = '';
+  String _relay = '';
+  String _carrier = '';
+  String _carrierToken = '';
   int _port = 0;
   bool _running = true;
   bool _stopping = false;
@@ -178,6 +187,48 @@ class TunnelAgent {
   bool get running => _running;
   String get executable => _executable;
 
+  /// The relay address the server assigned to this host, "ip:port"; empty
+  /// until a ready/path event carried one. The service listens for carrier
+  /// TCP and WebSocket on the same numeric port as UDP, so this is the
+  /// fallback endpoint when the direct host port is unreachable.
+  String get relay => _relay;
+
+  /// Host part of [relay], without the brackets of an IPv6 literal.
+  String get relayHost {
+    final String text = _relay.trim();
+    if (text.startsWith('[')) {
+      final int end = text.indexOf(']');
+      return end > 1 ? text.substring(1, end) : '';
+    }
+    final int colon = text.lastIndexOf(':');
+    return colon > 0 ? text.substring(0, colon) : '';
+  }
+
+  /// Port part of [relay], or 0 when no relay arrived.
+  int get relayPort => parseListenPort(_relay) ?? 0;
+
+  /// Shared TCP/WebSocket carrier the server advertised for this host,
+  /// "ip:port"; empty when the server runs without one.
+  String get carrier => _carrier;
+
+  /// Host part of [carrier], without the brackets of an IPv6 literal.
+  String get carrierHost {
+    final String text = _carrier.trim();
+    if (text.startsWith('[')) {
+      final int end = text.indexOf(']');
+      return end > 1 ? text.substring(1, end) : '';
+    }
+    final int colon = text.lastIndexOf(':');
+    return colon > 0 ? text.substring(0, colon) : '';
+  }
+
+  /// Port part of [carrier], or 0 when the server has no shared carrier.
+  int get carrierPort => parseListenPort(_carrier) ?? 0;
+
+  /// Per-lease token that lets this viewer attach to its host slot on the
+  /// shared carrier. Empty when the server has no shared carrier.
+  String get carrierToken => _carrierToken;
+
   /// "直连"/"中继"/"连接中" for the session overlay.
   String get pathLabel {
     switch (_path) {
@@ -203,6 +254,15 @@ class TunnelAgent {
     }
     if (event.remote.isNotEmpty) {
       _remote = event.remote;
+    }
+    if (event.relay.isNotEmpty) {
+      _relay = event.relay;
+    }
+    if (event.carrier.isNotEmpty) {
+      _carrier = event.carrier;
+    }
+    if (event.carrierToken.isNotEmpty) {
+      _carrierToken = event.carrierToken;
     }
     if (event.event == 'ready') {
       final int? port = parseListenPort(event.listen);

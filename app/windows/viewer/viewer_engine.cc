@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "chast/audio.h"
+#include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/decoder.h"
 #include "chast/file_transfer.h"
@@ -211,7 +212,9 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                          std::string access_token, std::string password,
                          std::string totp,
                          std::shared_ptr<chast::DeviceIdentity> device_identity,
-                         bool trust_device) {
+                         bool trust_device, ViewerTransport transport,
+                         std::string carrier_host, uint16_t carrier_port,
+                         std::string carrier_host_id, std::string carrier_token) {
     if (running_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -251,6 +254,9 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         status_.host = host;
         status_.port = port;
         status_.state = ViewerState::kConnecting;
+        status_.transport = transport == ViewerTransport::kTcp
+                                ? "tcp"
+                                : transport == ViewerTransport::kWebSocket ? "ws" : "quic";
         status_.audio_device = std::move(selected_output);
         status_.audio_aec = microphone_aec_.load(std::memory_order_relaxed);
         status_.audio_noise_suppression =
@@ -295,7 +301,9 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
                           std::move(pinned_fingerprint), allow_unverified,
                           std::move(access_token), std::move(password),
-                          std::move(totp), trust_device);
+                          std::move(totp), trust_device, transport,
+                          std::move(carrier_host), carrier_port,
+                          std::move(carrier_host_id), std::move(carrier_token));
     return true;
 }
 
@@ -795,7 +803,9 @@ void ViewerEngine::SetState(ViewerState state, std::string error) {
 void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string pinned_fingerprint, bool allow_unverified,
                        std::string access_token, std::string password,
-                       std::string totp, bool trust_device) {
+                       std::string totp, bool trust_device, ViewerTransport transport,
+                       std::string carrier_host, uint16_t carrier_port,
+                       std::string carrier_host_id, std::string carrier_token) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -897,6 +907,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool logged_drop = false;
     uint64_t init_errors = 0;
     std::string failure;
+    // Scratch buffer for native constructors that report through a string.
+    std::string error;
+    // The path the connect loop settled on, empty until it starts trying, and
+    // the reasons earlier paths were abandoned. A successful fallback keeps
+    // them so the UI can explain why the session is not on UDP.
+    std::string active_transport;
+    std::string transport_error;
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
     std::unique_ptr<chast::IAudioPlayer> audio_player;
     // One reference per session: system-audio PCM feeds it while the player is
@@ -1088,6 +1105,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.stream_option_code = stream_option_code;
             status_.stream_option_error = stream_option_error;
             status_.stream_option_results = stream_option_results;
+            if (!active_transport.empty()) {
+                status_.transport = active_transport;
+            }
+            status_.transport_error = transport_error;
             status_.elapsed_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
             if (final) {
@@ -1105,27 +1126,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         failure = std::move(message);
     };
 
-    chast::QuicClientConfig client_config;
-    client_config.host = host;
-    client_config.port = port;
-    client_config.pinned_fingerprint = std::move(pinned_fingerprint);
-    client_config.allow_any_certificate = allow_unverified;
-    client_config.access_token = std::move(access_token);
-    client_config.password = std::move(password);
-    client_config.totp = std::move(totp);
-    client_config.device_identity = device_identity_.get();
-    client_config.trust_device = trust_device;
-    std::string error;
-    std::unique_ptr<chast::QuicSession> session =
-        chast::QuicSession::create_client(client_config, &error);
-    if (!session) {
-        fail("QUIC client: " + error);
-        sync_status(true);
-        std::fprintf(stderr, "viewer: %s\n", failure.c_str());
-        SetState(ViewerState::kFailed, failure);
-        running_.store(false, std::memory_order_release);
-        return;
-    }
+    // Both are assigned by the connect loop below. The bridge is declared
+    // first so it stays alive until after the session that speaks through it
+    // has been destroyed.
+    std::unique_ptr<chast::CarrierBridge> carrier_bridge;
+    std::unique_ptr<chast::QuicSession> session;
 
     // Stops the uplink: the capture thread first (it owns the endpoint), then
     // the CMIC stream, so the host sees the switch go off. `switch_off`
@@ -1164,20 +1169,119 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         }
     };
 
-    chast::Error connected = session->connect(std::chrono::seconds(15));
-    // The certificate callback records the presented fingerprint before it
-    // decides, so even a rejected identity is visible to the UI.
-    const std::string server_fingerprint = session->peer_fingerprint();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_.server_fingerprint = server_fingerprint;
+    const bool automatic = transport == ViewerTransport::kAuto;
+    std::vector<ViewerTransport> attempts;
+    if (automatic) {
+        // UDP first: when it works it is the best path. The carrier attempts
+        // below are short-lived on purpose, because a blocked UDP port is the
+        // very case this fallback exists for.
+        attempts = {ViewerTransport::kQuic, ViewerTransport::kTcp,
+                    ViewerTransport::kWebSocket};
+    } else {
+        attempts = {transport};
     }
-    if (!server_fingerprint.empty()) {
-        std::fprintf(stderr, "viewer: server identity SHA256 %s\n",
-                     chast::format_fingerprint(server_fingerprint).c_str());
+    // The host listens for carriers on QUIC port + 1. A relay or a forwarded
+    // port names its own endpoint; port 65535 has no adjacent port, so the
+    // caller has to pass one.
+    const std::string fallback_host = carrier_host.empty() ? host : carrier_host;
+    uint16_t fallback_port = carrier_port;
+    if (fallback_port == 0 && port != 65535) {
+        fallback_port = static_cast<uint16_t>(port + 1);
     }
-    if (!connected.ok()) {
-        fail("connect: " + connected.to_string());
+
+    auto note_attempt = [&](const std::string& label, const std::string& reason) {
+        if (!transport_error.empty()) {
+            transport_error += "; ";
+        }
+        transport_error += label + ": " + reason;
+        std::fprintf(stderr, "viewer: %s path: %s\n", label.c_str(), reason.c_str());
+    };
+
+    std::string server_fingerprint;
+    bool connected_ok = false;
+    for (const ViewerTransport mode : attempts) {
+        const bool over_carrier = mode != ViewerTransport::kQuic;
+        const std::string label = mode == ViewerTransport::kQuic
+                                      ? "udp"
+                                      : mode == ViewerTransport::kTcp ? "tcp" : "ws";
+        if (over_carrier) {
+            if (fallback_port == 0) {
+                note_attempt(label, "no fallback port (QUIC port 65535)");
+                continue;
+            }
+            chast::CarrierBridgeConfig bridge_config;
+            bridge_config.host = fallback_host;
+            bridge_config.port = fallback_port;
+            bridge_config.transport = mode == ViewerTransport::kTcp
+                                          ? chast::CarrierTransport::kTcp
+                                          : chast::CarrierTransport::kWebSocket;
+            bridge_config.connect_timeout = std::chrono::milliseconds(
+                automatic ? 3000 : 8000);
+            bridge_config.host_id = carrier_host_id;
+            bridge_config.token = carrier_token;
+            std::string bridge_error;
+            carrier_bridge = chast::CarrierBridge::open(bridge_config, &bridge_error);
+            if (!carrier_bridge) {
+                note_attempt(label, "carrier: " +
+                                        (bridge_error.empty() ? "connect failed"
+                                                              : bridge_error));
+                continue;
+            }
+            std::fprintf(stderr, "viewer: %s carrier %s:%u, local UDP %u\n",
+                         label.c_str(), fallback_host.c_str(), fallback_port,
+                         static_cast<unsigned>(carrier_bridge->local_port()));
+        }
+        chast::QuicClientConfig client_config;
+        client_config.host = over_carrier ? "127.0.0.1" : host;
+        client_config.port = over_carrier ? carrier_bridge->local_port() : port;
+        client_config.pinned_fingerprint = pinned_fingerprint;
+        client_config.allow_any_certificate = allow_unverified;
+        client_config.access_token = access_token;
+        client_config.password = password;
+        client_config.totp = totp;
+        client_config.device_identity = device_identity_.get();
+        client_config.trust_device = trust_device;
+        std::string create_error;
+        session = chast::QuicSession::create_client(client_config, &create_error);
+        if (!session) {
+            note_attempt(label, "QUIC client: " + create_error);
+            carrier_bridge.reset();
+            continue;
+        }
+        const std::chrono::seconds connect_timeout =
+            !over_carrier ? (automatic ? std::chrono::seconds(4)
+                                       : std::chrono::seconds(15))
+                          : std::chrono::seconds(10);
+        const chast::Error connected = session->connect(connect_timeout);
+        // The certificate callback records the presented fingerprint before
+        // it decides, so even a rejected identity is visible to the UI.
+        server_fingerprint = session->peer_fingerprint();
+        if (!server_fingerprint.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                status_.server_fingerprint = server_fingerprint;
+            }
+            std::fprintf(stderr, "viewer: server identity SHA256 %s\n",
+                         chast::format_fingerprint(server_fingerprint).c_str());
+        }
+        if (connected.ok()) {
+            active_transport = label;
+            connected_ok = true;
+            std::fprintf(stderr, "viewer: connected over %s\n", label.c_str());
+            break;
+        }
+        note_attempt(label, connected.to_string());
+        session.reset();
+        carrier_bridge.reset();
+        // A presented certificate means this path reached the server's TLS
+        // stack. Every other carrier would present the same identity, so a
+        // refusal is final instead of a reason to try again.
+        if (!server_fingerprint.empty()) {
+            break;
+        }
+    }
+    if (!connected_ok) {
+        fail("connect: " + transport_error);
     } else if (server_fingerprint.empty()) {
         failure = "the server presented no certificate";
     } else {

@@ -6,28 +6,42 @@
 package agent
 
 import (
+	"bufio"
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/carrier"
+	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
 type HostConfig struct {
-	ServerURL   string
-	ServerKey   string
-	ID          string
-	Key         string
-	Fingerprint string
+	ServerURL string
+	ServerKey string
+	// ServerPublicKey pins the rendezvous server identity. When set, the
+	// registration reply must contain a valid server-signed host binding.
+	ServerPublicKey string
+	ID              string
+	Key             string
+	Fingerprint     string
 	// LocalAddr is chast-host's QUIC listener, usually 127.0.0.1:4433.
 	LocalAddr string
 	// ListenAddr is the public-facing UDP socket used for all traffic.
 	ListenAddr string
-	Keepalive  time.Duration
-	Logger     *slog.Logger
+	// CarrierAddr is chast-host's local TCP carrier listener, usually
+	// 127.0.0.1:(QUIC port + 1). Empty disables the relay's TCP carrier.
+	CarrierAddr string
+	Keepalive   time.Duration
+	Logger      *slog.Logger
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
 	// goroutine, so it must not block.
@@ -45,28 +59,48 @@ type HostInfo struct {
 	Relay  string `json:"relay,omitempty"`
 	Viewer string `json:"viewer,omitempty"`
 	Path   string `json:"path,omitempty"`
+	// NAT is the classification derived from the mappings seen by the
+	// rendezvous and relay ports: asymmetric, symmetric or unknown.
+	NAT string `json:"nat,omitempty"`
 }
 
 type HostAgent struct {
-	cfg   HostConfig
-	conn  *net.UDPConn
-	api   *apiClient
-	log   *slog.Logger
-	local *net.UDPAddr
+	cfg        HostConfig
+	conn       *net.UDPConn
+	api        *apiClient
+	log        *slog.Logger
+	local      *net.UDPAddr
+	carrier    *net.TCPAddr
+	priv       ed25519.PrivateKey
+	publicKey  string
+	localAddrs []string
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu      sync.Mutex
-	punch   *net.UDPAddr
-	relay   *net.UDPAddr
-	refresh time.Duration
+	mu       sync.Mutex
+	punch    *net.UDPAddr
+	relay    *net.UDPAddr
+	relaySet []*net.UDPAddr
+	refresh  time.Duration
+	// sharedCarrier is the server-wide carrier endpoint advertised by the
+	// registration reply. When set it replaces the per-port relay carrier.
+	sharedCarrier string
+	// sharedCarrierToken is reissued on every lease; the host keeps it for
+	// diagnostics only, viewers receive it from their own lookup.
+	sharedCarrierToken string
 	// viewer and viewerPath describe the last path that delivered data. They
 	// are reported to the embedding UI; unlike remote they are not used for
 	// forwarding.
 	viewer     *net.UDPAddr
 	viewerPath string
 	lastInfo   string
+	// observedPunch and observedRelay are this host's public mappings as seen
+	// by the rendezvous port and by its relay port. Comparing them classifies
+	// the NAT without a second server.
+	observedPunch *net.UDPAddr
+	observedRelay *net.UDPAddr
+	natType       string
 
 	// remote is only touched by the read loop: it is the source of the last
 	// datagram that came from a viewer path (direct or via the relay).
@@ -74,8 +108,10 @@ type HostAgent struct {
 
 	keepaliveOnce  sync.Once
 	relayOnce      sync.Once
+	carrierOnce    sync.Once
 	keepaliveReady chan struct{}
 	relayReady     chan struct{}
+	carrierReady   chan struct{}
 }
 
 func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
@@ -88,6 +124,13 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	if cfg.ServerPublicKey != "" {
+		if _, err := identity.ParsePublicKey(cfg.ServerPublicKey); err != nil {
+			return nil, fmt.Errorf("--server-pubkey: %w", err)
+		}
+	}
+	privateKey := identity.PrivateKeyFromSecret(cfg.Key)
+	publicKey := identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey))
 	local, err := resolveUDP(cfg.LocalAddr)
 	if err != nil || local == nil {
 		return nil, fmt.Errorf("local chast-host address: %v", err)
@@ -100,6 +143,15 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", cfg.ListenAddr, err)
 	}
+	var carrierAddr *net.TCPAddr
+	if cfg.CarrierAddr != "" {
+		carrierAddr, err = net.ResolveTCPAddr("tcp", cfg.CarrierAddr)
+		if err != nil || carrierAddr == nil {
+			cfg.Logger.Warn("carrier link disabled: bad local carrier address",
+				"address", cfg.CarrierAddr, "error", err)
+			carrierAddr = nil
+		}
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 	h := &HostAgent{
@@ -108,19 +160,29 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		api:            newAPIClient(cfg.ServerURL, cfg.ServerKey),
 		log:            cfg.Logger.With("agent", "host", "id", cfg.ID),
 		local:          local,
+		carrier:        carrierAddr,
+		priv:           privateKey,
+		publicKey:      publicKey,
+		localAddrs:     localCandidates(conn.LocalAddr().(*net.UDPAddr)),
 		ctx:            ctx,
 		cancel:         cancel,
 		refresh:        20 * time.Second,
 		keepaliveReady: make(chan struct{}),
 		relayReady:     make(chan struct{}),
+		carrierReady:   make(chan struct{}),
 	}
 	registerCtx, registerCancel := context.WithTimeout(ctx, 10*time.Second)
-	reg, err := h.api.register(registerCtx, cfg.ID, cfg.Key, cfg.Fingerprint)
+	reg, err := h.api.register(registerCtx, cfg.ID, privateKey, cfg.Fingerprint)
 	registerCancel()
 	if err != nil {
 		conn.Close()
 		cancel()
 		return nil, fmt.Errorf("register: %w", err)
+	}
+	if err := h.checkRegistration(reg); err != nil {
+		conn.Close()
+		cancel()
+		return nil, err
 	}
 	h.applyRegistration(reg)
 
@@ -128,6 +190,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	go h.keepaliveLoop()
 	go h.relayHelloLoop()
 	go h.refreshLoop()
+	if h.carrier != nil {
+		go h.carrierLinkLoop()
+	}
 
 	h.log.Info("host agent listening", "on", conn.LocalAddr().String(), "forwarding_to", local.String(), "relay", reg.Relay)
 	h.reportInfo()
@@ -152,13 +217,14 @@ func (h *HostAgent) infoLocked() HostInfo {
 		Relay:  addrValue(h.relay),
 		Viewer: addrValue(h.viewer),
 		Path:   h.viewerPath,
+		NAT:    h.natType,
 	}
 }
 
 func (h *HostAgent) reportInfo() {
 	h.mu.Lock()
 	info := h.infoLocked()
-	key := info.Relay + "|" + info.Viewer + "|" + info.Path
+	key := info.Relay + "|" + info.Viewer + "|" + info.Path + "|" + info.NAT
 	changed := key != h.lastInfo
 	h.lastInfo = key
 	h.mu.Unlock()
@@ -173,14 +239,22 @@ func (h *HostAgent) Close() {
 }
 
 // WaitReady waits for the first keepalive acknowledgement, which is what makes
-// the host's observed address usable for punching. The relay acknowledgement is
-// waited for briefly but is not required: a direct-only deployment may not have
-// a relay.
+// the host's observed address usable for punching. An authenticated shared
+// carrier link is accepted instead: it is what keeps the host online when UDP
+// cannot leave its network. The relay acknowledgement is waited for briefly but
+// is not required: a direct-only deployment may not have a relay.
 func (h *HostAgent) WaitReady(ctx context.Context) error {
+	viaCarrier := false
 	select {
 	case <-h.keepaliveReady:
+	case <-h.carrierReady:
+		viaCarrier = true
+		h.log.Warn("keepalive has not answered; continuing on the carrier link")
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	if viaCarrier {
+		return nil
 	}
 	select {
 	case <-h.relayReady:
@@ -188,6 +262,29 @@ func (h *HostAgent) WaitReady(ctx context.Context) error {
 		return ctx.Err()
 	case <-time.After(2 * time.Second):
 		h.log.Warn("relay did not acknowledge yet; direct connections can still work")
+	}
+	return nil
+}
+
+// checkRegistration verifies the server's answer when the operator pinned the
+// server public key. Without a pin the fields are still checked for internal
+// consistency so a confused proxy cannot silently swap the host key.
+func (h *HostAgent) checkRegistration(reg registerResult) error {
+	if reg.PublicKey != "" && reg.PublicKey != h.publicKey {
+		return fmt.Errorf("server registered a different host public key")
+	}
+	if h.cfg.ServerPublicKey == "" {
+		return nil
+	}
+	if reg.ServerPublicKey != "" && reg.ServerPublicKey != h.cfg.ServerPublicKey {
+		return fmt.Errorf("server identity does not match the pinned --server-pubkey")
+	}
+	binding, err := identity.VerifyHostBinding(reg.Binding, h.cfg.ServerPublicKey)
+	if err != nil {
+		return fmt.Errorf("verified host binding: %w", err)
+	}
+	if binding.ID != h.cfg.ID || binding.PublicKey != h.publicKey || binding.Fingerprint != h.cfg.Fingerprint {
+		return fmt.Errorf("server signed a binding for a different host identity")
 	}
 	return nil
 }
@@ -201,6 +298,11 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	if err != nil {
 		h.log.Warn("registration returned an unusable relay address", "relay", reg.Relay, "error", err)
 	}
+	endpoints := reg.Relays
+	if len(endpoints) == 0 && reg.Relay != "" {
+		endpoints = []string{reg.Relay}
+	}
+	relaySet := resolveUDPAll(endpoints)
 	h.mu.Lock()
 	if punch != nil {
 		h.punch = punch
@@ -209,6 +311,15 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.relay = relay
 		h.log.Info("relay address updated", "relay", relay.String())
 	}
+	if len(relaySet) > 0 {
+		if relay != nil && !containsUDPAddr(relaySet, relay) {
+			relaySet = append(relaySet, cloneAddr(relay))
+		}
+		if !sameUDPAddrSet(h.relaySet, relaySet) {
+			h.log.Info("relay challenge set updated", "endpoints", addrList(relaySet))
+		}
+		h.relaySet = relaySet
+	}
 	if reg.ExpiresInSec > 0 {
 		refresh := time.Duration(reg.ExpiresInSec) * time.Second / 2
 		if refresh < 5*time.Second {
@@ -216,6 +327,11 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		}
 		h.refresh = refresh
 	}
+	if reg.Carrier != h.sharedCarrier {
+		h.sharedCarrier = reg.Carrier
+		h.log.Info("carrier endpoint updated", "carrier", reg.Carrier)
+	}
+	h.sharedCarrierToken = reg.CarrierToken
 	h.mu.Unlock()
 	h.reportInfo()
 }
@@ -230,6 +346,67 @@ func (h *HostAgent) getRelay() *net.UDPAddr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return cloneAddr(h.relay)
+}
+
+// relayEndpoints lists every advertised relay address plus the primary one.
+// A host may receive a challenge from any of them because they all reach the
+// same relay instance on the lease's port.
+func (h *HostAgent) relayEndpoints() []*net.UDPAddr {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]*net.UDPAddr, 0, len(h.relaySet)+1)
+	for _, addr := range h.relaySet {
+		out = append(out, cloneAddr(addr))
+	}
+	if h.relay != nil && !containsUDPAddr(out, h.relay) {
+		out = append(out, cloneAddr(h.relay))
+	}
+	return out
+}
+
+func (h *HostAgent) relayAllowed(src *net.UDPAddr) bool {
+	for _, addr := range h.relayEndpoints() {
+		if sameAddr(src, addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *HostAgent) getNATType() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.natType
+}
+
+// noteObserved records the public mapping each server port sees. Both probes
+// come from the same socket, so a cone NAT keeps the port stable while a
+// symmetric NAT allocates a different one per destination.
+func (h *HostAgent) noteObserved(primary bool, candidate string) {
+	if candidate == "" {
+		return
+	}
+	addr, err := resolveUDP(candidate)
+	if err != nil || addr == nil {
+		return
+	}
+	h.mu.Lock()
+	if primary {
+		h.observedPunch = addr
+	} else {
+		h.observedRelay = addr
+	}
+	nat := classifyNAT(h.observedPunch, h.observedRelay)
+	changed := nat != "" && nat != h.natType
+	if changed {
+		h.natType = nat
+	}
+	h.mu.Unlock()
+	if changed {
+		h.log.Info("NAT type detected", "nat", nat)
+		h.sendKeepalive()
+		h.reportInfo()
+	}
 }
 
 func (h *HostAgent) readLoop() {
@@ -247,12 +424,12 @@ func (h *HostAgent) readLoop() {
 		}
 		data := buf[:n]
 		h.mu.Lock()
-		punch, relay := cloneAddr(h.punch), cloneAddr(h.relay)
+		punch := cloneAddr(h.punch)
 		h.mu.Unlock()
 
 		if wire.IsControl(data) {
-			if sameAddr(src, punch) || sameAddr(src, relay) {
-				h.handleControl(data)
+			if sameAddr(src, punch) || h.relayAllowed(src) {
+				h.handleControl(data, src)
 			}
 			// A punch from a viewer is only a NAT probe; there is nothing to
 			// forward. The host's own punch was sent when the server notified it.
@@ -299,17 +476,32 @@ func (h *HostAgent) noteViewer(src *net.UDPAddr) {
 	h.reportInfo()
 }
 
-func (h *HostAgent) handleControl(data []byte) {
+func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 	msg, err := wire.Decode(data)
 	if err != nil {
 		return
 	}
 	switch msg.Type {
+	case wire.TypeKeepaliveChallenge:
+		if !sameAddr(src, h.getPunch()) || msg.HostID != h.cfg.ID || msg.Candidate == "" || msg.Nonce == "" {
+			return
+		}
+		signature := identity.Sign(h.priv, identity.KeepaliveMessage(h.cfg.ID, msg.Candidate, msg.Nonce))
+		h.conn.WriteToUDP(wire.Encode(wire.Message{
+			Type:       wire.TypeKeepaliveAuth,
+			HostID:     h.cfg.ID,
+			Nonce:      msg.Nonce,
+			Candidate:  msg.Candidate,
+			Signature:  signature,
+			LocalAddrs: h.localAddrs,
+			NATType:    h.getNATType(),
+		}), src)
 	case wire.TypeKeepaliveAck:
 		if !msg.OK {
 			h.log.Warn("keepalive refused", "error", msg.Error)
 			return
 		}
+		h.noteObserved(true, msg.Candidate)
 		h.keepaliveOnce.Do(func() { close(h.keepaliveReady) })
 	case wire.TypePunchPeer:
 		peer, err := resolveUDP(msg.Candidate)
@@ -318,6 +510,20 @@ func (h *HostAgent) handleControl(data []byte) {
 		}
 		h.log.Info("punch request from viewer", "candidate", peer.String())
 		go h.sendPunches(peer, msg.Nonce)
+	case wire.TypeRelayChallenge:
+		if !h.relayAllowed(src) || msg.HostID != h.cfg.ID ||
+			msg.Candidate == "" || msg.Nonce == "" {
+			return
+		}
+		signature := identity.Sign(h.priv, identity.RelayMessage(h.cfg.ID, src.Port, msg.Candidate, msg.Nonce))
+		h.noteObserved(false, msg.Candidate)
+		h.conn.WriteToUDP(wire.Encode(wire.Message{
+			Type:      wire.TypeRelayAuth,
+			HostID:    h.cfg.ID,
+			Nonce:     msg.Nonce,
+			Candidate: msg.Candidate,
+			Signature: signature,
+		}), src)
 	case wire.TypeRelayAck:
 		if !msg.OK {
 			h.log.Warn("relay refused the host", "error", msg.Error)
@@ -341,24 +547,25 @@ func (h *HostAgent) sendPunches(peer *net.UDPAddr, nonce string) {
 	}
 }
 
+func (h *HostAgent) sendKeepalive() {
+	punch := h.getPunch()
+	if punch == nil {
+		return
+	}
+	msg := wire.Message{Type: wire.TypeKeepalive, HostID: h.cfg.ID}
+	h.conn.WriteToUDP(wire.Encode(msg), punch)
+}
+
 func (h *HostAgent) keepaliveLoop() {
 	ticker := time.NewTicker(h.cfg.Keepalive)
 	defer ticker.Stop()
-	send := func() {
-		punch := h.getPunch()
-		if punch == nil {
-			return
-		}
-		msg := wire.Message{Type: wire.TypeKeepalive, HostID: h.cfg.ID, KeyHash: keyHash(h.cfg.Key)}
-		h.conn.WriteToUDP(wire.Encode(msg), punch)
-	}
-	send()
+	h.sendKeepalive()
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
-			send()
+			h.sendKeepalive()
 		}
 	}
 }
@@ -371,7 +578,7 @@ func (h *HostAgent) relayHelloLoop() {
 		if relay == nil {
 			return
 		}
-		msg := wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID, KeyHash: keyHash(h.cfg.Key)}
+		msg := wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID}
 		h.conn.WriteToUDP(wire.Encode(msg), relay)
 	}
 	send()
@@ -381,6 +588,196 @@ func (h *HostAgent) relayHelloLoop() {
 			return
 		case <-ticker.C:
 			send()
+		}
+	}
+}
+
+const (
+	carrierDial      = 5 * time.Second
+	carrierReadIdle  = 60 * time.Second
+	carrierKeepalive = 20 * time.Second
+	carrierRetryMax  = 10 * time.Second
+)
+
+// carrierLinkLoop keeps one authenticated TCP link to the relay so viewers on
+// networks that block UDP can still reach this host. It reconnects after any
+// failure until the agent closes.
+func (h *HostAgent) carrierLinkLoop() {
+	backoff := time.Second
+	for {
+		if h.ctx.Err() != nil {
+			return
+		}
+		target := h.carrierTarget()
+		if target == "" {
+			if !h.sleep(2 * time.Second) {
+				return
+			}
+			continue
+		}
+		started := time.Now()
+		err := h.runCarrierLink(target)
+		if h.ctx.Err() != nil {
+			return
+		}
+		h.log.Warn("carrier link lost", "carrier", target, "error", err)
+		if time.Since(started) > 30*time.Second {
+			backoff = time.Second
+		}
+		if !h.sleep(backoff) {
+			return
+		}
+		backoff *= 2
+		if backoff > carrierRetryMax {
+			backoff = carrierRetryMax
+		}
+	}
+}
+
+// carrierTarget prefers the server-wide carrier and falls back to the relay
+// port's own TCP twin. The per-host port stays valid for older servers.
+func (h *HostAgent) carrierTarget() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sharedCarrier != "" {
+		return h.sharedCarrier
+	}
+	if h.relay == nil {
+		return ""
+	}
+	return net.JoinHostPort(h.relay.IP.String(), strconv.Itoa(h.relay.Port))
+}
+
+func (h *HostAgent) sleep(d time.Duration) bool {
+	select {
+	case <-h.ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+func (h *HostAgent) runCarrierLink(relayAddr string) error {
+	local, err := net.DialTimeout("tcp", h.carrier.String(), carrierDial)
+	if err != nil {
+		return fmt.Errorf("local carrier %s: %w", h.carrier, err)
+	}
+	defer local.Close()
+	if _, err := io.WriteString(local, carrier.MagicRaw); err != nil {
+		return fmt.Errorf("local carrier magic: %w", err)
+	}
+	localFrames := carrier.NewFrameReader(bufio.NewReader(local))
+	localSend := carrier.NewFrameWriter(local)
+
+	conn, err := net.DialTimeout("tcp", relayAddr, carrierDial)
+	if err != nil {
+		return fmt.Errorf("relay carrier %s: %w", relayAddr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	hello, err := json.Marshal(carrier.HostHello{HostID: h.cfg.ID})
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(conn, carrier.MagicHost+string(hello)+"\n"); err != nil {
+		return fmt.Errorf("relay carrier hello: %w", err)
+	}
+	br := bufio.NewReader(conn)
+	line, err := carrier.ReadLine(br, carrier.MaxHandshake)
+	if err != nil {
+		return fmt.Errorf("relay carrier handshake: %w", err)
+	}
+	challengeText, ok := strings.CutPrefix(line, carrier.MagicChallenge)
+	if !ok {
+		return fmt.Errorf("relay carrier refused: %s", strings.TrimSpace(strings.TrimPrefix(line+"\n", carrier.MagicErrorPrefix)))
+	}
+	var challenge carrier.HostChallenge
+	if err := json.Unmarshal([]byte(challengeText), &challenge); err != nil || challenge.Nonce == "" {
+		return fmt.Errorf("relay carrier sent a malformed challenge")
+	}
+	auth, err := json.Marshal(carrier.HostAuth{
+		HostID:    h.cfg.ID,
+		Nonce:     challenge.Nonce,
+		Signature: identity.Sign(h.priv, identity.CarrierHostMessage(h.cfg.ID, "", challenge.Nonce)),
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(conn, carrier.MagicAuth+string(auth)+"\n"); err != nil {
+		return fmt.Errorf("relay carrier proof: %w", err)
+	}
+	line, err = carrier.ReadLine(br, carrier.MaxHandshake)
+	if err != nil {
+		return fmt.Errorf("relay carrier handshake: %w", err)
+	}
+	if line+"\n" != carrier.MagicOK {
+		reason := strings.TrimSpace(strings.TrimPrefix(line+"\n", carrier.MagicErrorPrefix))
+		if reason == "" {
+			reason = line
+		}
+		return fmt.Errorf("relay carrier refused: %s", reason)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	relayFrames := carrier.NewFrameReader(br)
+	relaySend := carrier.NewFrameWriter(conn)
+
+	h.carrierOnce.Do(func() { close(h.carrierReady) })
+	h.log.Info("carrier link established", "relay", relayAddr, "local", h.carrier.String())
+	defer h.log.Info("carrier link closed", "relay", relayAddr)
+
+	errs := make(chan error, 2)
+	go func() {
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(carrierReadIdle))
+			payload, err := relayFrames.ReadFrame()
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(payload) == 0 {
+				continue
+			}
+			if err := localSend.WriteFrame(payload); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			payload, err := localFrames.ReadFrame()
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(payload) == 0 {
+				continue
+			}
+			if err := relaySend.WriteFrame(payload); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(carrierKeepalive)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return h.ctx.Err()
+		case err := <-errs:
+			return err
+		case <-ticker.C:
+			if h.carrierTarget() != relayAddr {
+				return fmt.Errorf("carrier endpoint changed")
+			}
+			if err := relaySend.WriteFrame(nil); err != nil {
+				return err
+			}
+			if err := localSend.WriteFrame(nil); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -396,12 +793,19 @@ func (h *HostAgent) refreshLoop() {
 		case <-time.After(every):
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
-		reg, err := h.api.register(ctx, h.cfg.ID, h.cfg.Key, h.cfg.Fingerprint)
+		reg, err := h.api.register(ctx, h.cfg.ID, h.priv, h.cfg.Fingerprint)
 		cancel()
 		if err != nil {
 			h.log.Warn("registration refresh failed", "error", err)
 			h.mu.Lock()
 			h.refresh = 2 * time.Second
+			h.mu.Unlock()
+			continue
+		}
+		if err := h.checkRegistration(reg); err != nil {
+			h.log.Warn("registration refresh was not trusted", "error", err)
+			h.mu.Lock()
+			h.refresh = 5 * time.Second
 			h.mu.Unlock()
 			continue
 		}

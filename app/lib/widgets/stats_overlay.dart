@@ -90,6 +90,7 @@ class StatsOverlay extends StatelessWidget {
           const SizedBox(height: 7),
           _row('链路', target.label),
           if (path.isNotEmpty) _row('路径', path),
+          _row('传输', status.transportLabel),
           _row(
             '身份',
             status.serverFingerprint.isEmpty

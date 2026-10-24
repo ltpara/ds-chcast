@@ -301,6 +301,12 @@ void ViewerBridge::HandleMethodCall(
         std::string access_token;
         std::string password;
         std::string totp;
+        std::string transport_text = "auto";
+        std::string carrier_host;
+        int64_t carrier_port = 0;
+        std::string carrier_host_id;
+        std::string carrier_token;
+        ViewerTransport transport = ViewerTransport::kAuto;
         bool allow_unverified = false;
         bool trust_device = false;
         if (args == nullptr || !map_string(*args, "host", &host) ||
@@ -341,13 +347,41 @@ void ViewerBridge::HandleMethodCall(
             result->Error("bad_args", "totp must be at most 16 characters");
             return;
         }
+        if (map_string(*args, "transport", &transport_text)) {
+            if (transport_text.empty() || transport_text == "auto") {
+                transport = ViewerTransport::kAuto;
+            } else if (transport_text == "quic" || transport_text == "udp") {
+                transport = ViewerTransport::kQuic;
+            } else if (transport_text == "tcp") {
+                transport = ViewerTransport::kTcp;
+            } else if (transport_text == "ws" || transport_text == "websocket") {
+                transport = ViewerTransport::kWebSocket;
+            } else {
+                result->Error("bad_args", "transport must be auto, quic, tcp or ws");
+                return;
+            }
+        }
+        map_string(*args, "carrierHost", &carrier_host);
+        if (map_int(*args, "carrierPort", &carrier_port) &&
+            (carrier_port < 0 || carrier_port > 65535)) {
+            result->Error("bad_args", "carrierPort must be 0 or a TCP port");
+            return;
+        }
+        map_string(*args, "carrierHostId", &carrier_host_id);
+        map_string(*args, "carrierToken", &carrier_token);
+        if (carrier_host_id.size() > 64 || carrier_token.size() > 128) {
+            result->Error("bad_args", "carrier host id or token is too long");
+            return;
+        }
         EnsureIdentity();
         texture_sink_->SetOutput(reinterpret_cast<void*>(static_cast<intptr_t>(output)));
         if (!viewer_->Start(host, static_cast<uint16_t>(port),
                             static_cast<uint16_t>(display), std::move(fingerprint),
                             allow_unverified, std::move(access_token),
                             std::move(password), std::move(totp), identity_,
-                            trust_device)) {
+                            trust_device, transport, std::move(carrier_host),
+                            static_cast<uint16_t>(carrier_port),
+                            std::move(carrier_host_id), std::move(carrier_token))) {
             texture_sink_->SetOutput(nullptr);
             result->Error("busy", "a session is already running");
             return;
@@ -371,6 +405,8 @@ void ViewerBridge::HandleMethodCall(
         map[key("error")] = flutter::EncodableValue(status.error);
         map[key("host")] = flutter::EncodableValue(status.host);
         map[key("port")] = flutter::EncodableValue(static_cast<int32_t>(status.port));
+        map[key("transport")] = flutter::EncodableValue(status.transport);
+        map[key("transportError")] = flutter::EncodableValue(status.transport_error);
         map[key("codec")] = flutter::EncodableValue(
             std::string(status.codec == chast::VideoCodec::H264 ? "h264" : "hevc"));
         map[key("width")] = flutter::EncodableValue(static_cast<int32_t>(status.width));

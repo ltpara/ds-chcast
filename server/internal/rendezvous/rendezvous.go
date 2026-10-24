@@ -11,10 +11,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
@@ -29,6 +33,9 @@ type Server struct {
 	conn      *net.UDPConn
 	reg       *registry.Registry
 	relayAddr func(port int) string
+	identity  *identity.Server
+	punchLog  *punchlog.Log
+	ipChanges *ipchange.Tracker
 	log       *slog.Logger
 	limiter   *limiter
 	done      chan struct{}
@@ -59,6 +66,15 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 }
 
 func (s *Server) Addr() string { return s.conn.LocalAddr().String() }
+
+// SetIdentity enables server-signed host bindings in punch replies.
+func (s *Server) SetIdentity(server *identity.Server) { s.identity = server }
+
+// SetPunchLog records successful punch coordination for the admin console.
+func (s *Server) SetPunchLog(log *punchlog.Log) { s.punchLog = log }
+
+// SetIPChanges audits public address changes seen in authenticated keepalives.
+func (s *Server) SetIPChanges(tracker *ipchange.Tracker) { s.ipChanges = tracker }
 
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
@@ -97,17 +113,47 @@ func (s *Server) handle(msg wire.Message, src *net.UDPAddr) {
 	switch msg.Type {
 	case wire.TypeKeepalive:
 		s.handleKeepalive(msg, src)
+	case wire.TypeKeepaliveAuth:
+		s.handleKeepaliveAuth(msg, src)
 	case wire.TypePunchRequest:
 		s.handlePunchRequest(msg, src)
 	}
 }
 
+// handleKeepalive only starts the exchange. The host must prove its key over a
+// one-time nonce before the observed address is allowed to move, so a spoofed
+// source cannot redirect a host's mapping.
 func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
+	nonce, err := s.reg.IssueChallenge(msg.HostID, identity.DomainKeepalive)
+	if err != nil {
+		s.reply(src, wire.Message{Type: wire.TypeKeepaliveAck, Error: "host has no live registration"})
+		return
+	}
+	s.reply(src, wire.Message{
+		Type:      wire.TypeKeepaliveChallenge,
+		HostID:    msg.HostID,
+		Nonce:     nonce,
+		Candidate: src.String(),
+	})
+}
+
+func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	ack := wire.Message{Type: wire.TypeKeepaliveAck}
-	if err := s.reg.Touch(msg.HostID, msg.KeyHash, src.String()); err != nil {
+	candidate := src.String()
+	if msg.Candidate != "" && msg.Candidate != candidate {
+		ack.Error = "keepalive arrived from a different address than the challenge"
+		s.reply(src, ack)
+		return
+	}
+	message := identity.KeepaliveMessage(msg.HostID, candidate, msg.Nonce)
+	if err := s.reg.TouchChallenge(msg.HostID, msg.Nonce, candidate, msg.Signature,
+		string(message), msg.LocalAddrs, msg.NATType); err != nil {
 		ack.Error = err.Error()
 		s.reply(src, ack)
 		return
+	}
+	if s.ipChanges != nil {
+		s.ipChanges.Observe(msg.HostID, src.IP.String())
 	}
 	host, ok := s.reg.Lookup(msg.HostID)
 	if !ok {
@@ -116,11 +162,24 @@ func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
 		return
 	}
 	ack.OK = true
-	ack.Candidate = src.String()
+	ack.Candidate = candidate
+	ack.LocalAddrs = host.LocalAddrs
+	ack.NATType = host.NATType
+	ack.Fingerprint = host.Fingerprint
 	if host.RelayPort != 0 {
-		ack.Relay = s.relayAddr(host.RelayPort)
+		ack.Relay = s.relayFor(host)
 	}
 	s.reply(src, ack)
+}
+
+func (s *Server) relayFor(host registry.Host) string {
+	if host.RelayPort == 0 {
+		return ""
+	}
+	if host.RelayHost != "" {
+		return net.JoinHostPort(host.RelayHost, strconv.Itoa(host.RelayPort))
+	}
+	return s.relayAddr(host.RelayPort)
 }
 
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
@@ -152,6 +211,11 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
+	// Record only requests that can actually be coordinated, matching hbbs's
+	// record point after the target's online check.
+	if s.punchLog != nil {
+		s.punchLog.Record(src.IP.String(), hostAddr.IP.String(), host.ID)
+	}
 	// Tell the host to punch towards the viewer. Best effort: the viewer is
 	// also told the host candidate and will probe first.
 	s.reply(hostAddr, wire.Message{
@@ -162,6 +226,17 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	})
 	reply.OK = true
 	reply.Candidate = host.Candidate
+	reply.LocalAddrs = host.LocalAddrs
+	reply.NATType = host.NATType
+	reply.PublicKey = host.PublicKey
+	reply.Fingerprint = host.Fingerprint
+	if s.identity != nil && host.PublicKey != "" {
+		if pub, err := identity.ParsePublicKey(host.PublicKey); err == nil {
+			if binding, err := s.identity.SignHostBinding(host.ID, pub, host.Fingerprint, time.Now()); err == nil {
+				reply.Binding = binding
+			}
+		}
+	}
 	if host.RelayPort != 0 {
 		reply.Relay = s.relayAddr(host.RelayPort)
 	}

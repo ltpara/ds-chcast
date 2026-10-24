@@ -295,6 +295,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     try {
+      // Direct connections fall back to the host's adjacent TCP port; a
+      // tunnelled session prefers the server's shared carrier, which
+      // multiplexes every host on one port and needs this host's token.
+      final String carrierHost;
+      final int carrierPort;
+      final String carrierHostId;
+      final String carrierToken;
+      if (tunnel != null && tunnel.carrierPort != 0) {
+        carrierHost = tunnel.carrierHost;
+        carrierPort = tunnel.carrierPort;
+        carrierHostId = widget.target.hostId;
+        carrierToken = tunnel.carrierToken;
+      } else if (tunnel != null) {
+        carrierHost = tunnel.relayHost;
+        carrierPort = tunnel.relayPort;
+        carrierHostId = '';
+        carrierToken = '';
+      } else {
+        carrierHost = widget.target.host;
+        carrierPort =
+            widget.target.port < 65535 ? widget.target.port + 1 : 0;
+        carrierHostId = '';
+        carrierToken = '';
+      }
       await ViewerBridge.start(
         host: tunnel?.host ?? widget.target.host,
         port: tunnel?.port ?? widget.target.port,
@@ -306,6 +330,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         password: _password,
         totp: _totp,
         trustDevice: _trustDevice,
+        carrierHost: carrierHost,
+        carrierPort: carrierPort,
+        carrierHostId: carrierHostId,
+        carrierToken: carrierToken,
       );
       // The native session starts with clipboard sync on; reapply this page's
       // switch before the first poll can show it as enabled.
@@ -1765,7 +1793,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     switch (_status.state) {
       case ViewerState.idle:
       case ViewerState.connecting:
-        return '正在建立 QUIC 连接…';
+        return '正在建立连接…';
       case ViewerState.handshaking:
         return '正在协商视频流…';
       case ViewerState.streaming:

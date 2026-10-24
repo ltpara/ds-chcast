@@ -60,6 +60,17 @@ enum class ViewerState {
     kFailed,
 };
 
+// How the viewer reaches the host. Auto tries QUIC briefly, then the TCP
+// carrier and finally the WebSocket carrier; the forced modes skip the paths
+// before them, which lets a test or an operator choose one deliberately.
+// Every mode runs the same QUIC session, TLS and pinning end to end.
+enum class ViewerTransport {
+    kAuto,
+    kQuic,
+    kTcp,
+    kWebSocket,
+};
+
 // The viewer's upload queue, as the UI shows it. kHashing covers both waiting
 // for a folder to expand and the local SHA-256 pass that precedes the offer;
 // the last two are terminal states of the most recent attempt (the local file
@@ -78,6 +89,12 @@ struct ViewerStatus {
     std::string error;
     std::string host;
     uint16_t port = 0;
+    // The path the session actually uses: "quic" (UDP), "tcp" or "ws". It is
+    // the requested mode while connecting and the settled path afterwards.
+    // transport_error carries the paths that were abandoned before this one,
+    // so the UI can say why it fell back.
+    std::string transport = "quic";
+    std::string transport_error;
     chast::VideoCodec codec = chast::VideoCodec::H264;
     // The encoded picture size, which is what the decoder produces and the
     // texture holds. `source_width`/`source_height` are the captured desktop
@@ -315,7 +332,11 @@ public:
     // servers that do not gate access. `password` and `totp` answer an
     // interactive host's challenges; `device_identity` lets the host recognize
     // this viewer and skip two-factor, and `trust_device` asks it to remember
-    // the key after a successful sign-in. Fails when one is already running;
+    // the key after a successful sign-in. `transport` selects UDP or the
+    // TCP/WebSocket fallback; `carrier_host`/`carrier_port` name the fallback
+    // endpoint (empty host means `host`, port 0 means `port + 1`).
+    // `carrier_host_id`/`carrier_token` select a host on a shared carrier; they
+    // stay empty for a per-host relay port. Fails when one is already running;
     // call Stop() first to switch targets or displays.
     bool Start(const std::string& host, uint16_t port, uint16_t display,
                std::string pinned_fingerprint = {},
@@ -323,7 +344,10 @@ public:
                std::string access_token = {}, std::string password = {},
                std::string totp = {},
                std::shared_ptr<chast::DeviceIdentity> device_identity = {},
-               bool trust_device = false);
+               bool trust_device = false,
+               ViewerTransport transport = ViewerTransport::kAuto,
+               std::string carrier_host = {}, uint16_t carrier_port = 0,
+               std::string carrier_host_id = {}, std::string carrier_token = {});
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
@@ -430,7 +454,9 @@ private:
     void Run(std::string host, uint16_t port, uint16_t display,
              std::string pinned_fingerprint, bool allow_unverified,
              std::string access_token, std::string password, std::string totp,
-             bool trust_device);
+             bool trust_device, ViewerTransport transport,
+             std::string carrier_host, uint16_t carrier_port,
+             std::string carrier_host_id, std::string carrier_token);
     void SetState(ViewerState state, std::string error = {});
     // Expands dropped folders and hashes queued uploads on its own thread, so
     // a multi-gigabyte read never stalls the session's receive loop.

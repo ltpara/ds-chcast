@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/encoder.h"
 #include "chast/host_security.h"
@@ -184,6 +185,14 @@ struct HostStatus {
     uint64_t download_size = 0;
     uint64_t download_sent = 0;
     std::string download_error;
+    // TCP/WebSocket fallback. carrier_port is QUIC port + 1 and
+    // carrier_error stays empty while it is healthy; a failed bind leaves the
+    // host serving QUIC only. The counters are refreshed by status().
+    bool carrier_listening = false;
+    uint16_t carrier_port = 0;
+    std::string carrier_error;
+    uint64_t carrier_connections = 0;
+    uint64_t carrier_active = 0;
     ServerInfo stream;  // description from the last announce
     HostServerStats stats;
     std::string error;  // empty unless the run stopped on a failure
@@ -202,6 +211,9 @@ struct HostServerConfig {
     bool dry_run_input = false;
     bool want_hdr = true;
     bool capture_cursor = true;
+    // Which hardware encoder family to use. Auto keeps oneVPL first and falls
+    // back to FFmpeg's nvenc/amf/qsv; the command line can pin one for tests.
+    EncoderBackend encoder_backend = EncoderBackend::Auto;
     // End the run after the first session, however it ends. The command-line
     // server uses this; the tray keeps listening.
     bool serve_once = false;
@@ -372,6 +384,10 @@ private:
 
     // Owned by the host thread after start(); created in create().
     std::unique_ptr<QuicSession> session_;
+    // The fallback listener feeds session_'s UDP port. Created once next to
+    // the first session and kept across listener reopens because its target
+    // address does not change; stopped before the session is destroyed.
+    std::unique_ptr<CarrierServer> carrier_;
     bool run_clock_started_ = false;
     std::chrono::steady_clock::time_point run_start_;
 
