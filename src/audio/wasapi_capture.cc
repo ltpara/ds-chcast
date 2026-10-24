@@ -56,7 +56,21 @@ constexpr size_t kFadeMs = 5;
 
 class WasapiLoopbackCapture final : public ILoopbackCapture {
 public:
-    explicit WasapiLoopbackCapture(LoopbackCaptureConfig config) : config_(config) {}
+    explicit WasapiLoopbackCapture(LoopbackCaptureConfig config)
+        : config_(std::move(config)) {
+        if ((config_.echo_cancellation && config_.reference) ||
+            config_.noise_suppression) {
+            AudioDspConfig dsp_config;
+            dsp_config.near_channels = kCaptureChannels;
+            dsp_config.echo_cancellation = config_.echo_cancellation;
+            dsp_config.noise_suppression = config_.noise_suppression;
+            dsp_config.reference = config_.reference;
+            std::string dsp_error;
+            // A DSP that cannot open must not take system sound down: the
+            // capture falls back to sending the untouched mix.
+            dsp_ = AudioPreprocessor::create(dsp_config, &dsp_error);
+        }
+    }
     ~WasapiLoopbackCapture() override { close(); }
 
     // Spawns the worker and waits for it to open the endpoint.
@@ -82,6 +96,12 @@ public:
         stats.gated_frames = gated_frames_.load();
         stats.recoveries = recoveries_.load();
         stats.recovering = recovering_.load();
+        if (dsp_) {
+            const AudioDspStats dsp = dsp_->stats();
+            stats.processed_frames = dsp.processed_frames;
+            stats.reference_underruns = dsp.reference_underruns;
+            stats.dsp_resets = dsp.resets;
+        }
         return stats;
     }
 
@@ -127,6 +147,7 @@ private:
     bool client_started_ = false;
     wasapi::MixFormat format_;
     std::unique_ptr<IAudioEncoder> encoder_;
+    std::unique_ptr<AudioPreprocessor> dsp_;
     SwrContext* swr_ = nullptr;
     std::vector<int16_t> pcm_;
     std::vector<uint8_t> zero_input_;
@@ -295,10 +316,28 @@ bool WasapiLoopbackCapture::open_device(std::string* error) {
     }
 
     ComPtr<IMMDevice> device;
-    HRESULT hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, device.put());
-    if (FAILED(hr)) {
-        *error = wasapi::error_from_hresult(hr, "GetDefaultAudioEndpoint").to_string();
-        return false;
+    HRESULT hr = S_OK;
+    if (!config_.device_id.empty()) {
+        const std::wstring wanted = wasapi::widen_utf8(config_.device_id);
+        if (wanted.empty()) {
+            *error = "the selected audio output id is not valid UTF-8";
+            return false;
+        }
+        hr = enumerator_->GetDevice(wanted.c_str(), device.put());
+        if (FAILED(hr)) {
+            *error = wasapi::error_from_hresult(hr, "GetDevice(audio output)").to_string();
+            return false;
+        }
+        if (!wasapi::device_active(device.get())) {
+            *error = "the selected audio output is not active";
+            return false;
+        }
+    } else {
+        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, device.put());
+        if (FAILED(hr)) {
+            *error = wasapi::error_from_hresult(hr, "GetDefaultAudioEndpoint").to_string();
+            return false;
+        }
     }
     ComPtr<IAudioClient> client;
     hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
@@ -405,6 +444,9 @@ void WasapiLoopbackCapture::close_device() {
     last_capture_end_ms_ = 0;
     fade_remaining_ = 0;
     gated_ = false;
+    if (dsp_) {
+        dsp_->reset();
+    }
 }
 
 bool WasapiLoopbackCapture::start_client() {
@@ -422,6 +464,11 @@ bool WasapiLoopbackCapture::start_client() {
 bool WasapiLoopbackCapture::default_device_changed() {
     if (!wasapi::device_active(device_.get())) {
         return true;
+    }
+    if (!config_.device_id.empty()) {
+        // Pinned endpoint: keep retrying it instead of silently moving the
+        // session's audio to another device.
+        return false;
     }
     if (device_id_.empty()) {
         return false;
@@ -556,14 +603,20 @@ bool WasapiLoopbackCapture::process(const BYTE* data, UINT32 frames, DWORD flags
         return false;
     }
     const size_t out_frames = static_cast<size_t>(converted);
+    if (dsp_ && out_frames > 0) {
+        // Cancellation runs on the fixed 48 kHz stereo stream, after the
+        // device conversion and before the silence gate.
+        dsp_->process(pcm_.data(), out_frames);
+    }
 
     bool silent = silent_flag;
     if (!silent && out_frames > 0) {
         silent = true;
+        const int16_t threshold = config_.echo_cancellation ? 32 : 0;
         const int16_t* samples = pcm_.data();
         const size_t count = out_frames * kCaptureChannels;
         for (size_t i = 0; i < count; ++i) {
-            if (samples[i] != 0) {
+            if (samples[i] > threshold || samples[i] < -threshold) {
                 silent = false;
                 break;
             }

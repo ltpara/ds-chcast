@@ -587,7 +587,8 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "client speaks protocol version " + std::to_string(version));
         return false;
     }
-    if (hello.display != kDisplayAuto && hello.display >= kMaxDisplayCount) {
+    if (hello.display != kDisplayAuto && hello.display != kDisplayAll &&
+        hello.display >= kMaxDisplayCount) {
         set_error(error, "Hello asks for display " + std::to_string(hello.display) +
                              " outside the protocol limit");
         return false;
@@ -756,7 +757,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.audio.enabled ? kServerInfoAudioEnabled : 0) |
                         (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0) |
                         (info.microphone_enabled ? kServerInfoMicrophoneEnabled : 0) |
-                        (info.privacy_mode_enabled ? kServerInfoPrivacyModeEnabled : 0)));
+                        (info.privacy_mode_enabled ? kServerInfoPrivacyModeEnabled : 0) |
+                        (info.merged ? kServerInfoMergedLayout : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -842,6 +844,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
     info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
+    info.merged = (flags & kServerInfoMergedLayout) != 0;
     const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
@@ -988,9 +991,35 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck grants unknown permissions");
         return false;
     }
-    if (permissions != (flags & kServerInfoKnownFlags)) {
+    if (permissions != (flags & kServerInfoPermissionFlags)) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
         return false;
+    }
+    if (info.merged) {
+        if (info.displays.empty()) {
+            set_error(error, "HelloAck merged layout lists no displays");
+            return false;
+        }
+        int64_t left = info.displays.front().left;
+        int64_t top = info.displays.front().top;
+        int64_t right = info.displays.front().right;
+        int64_t bottom = info.displays.front().bottom;
+        for (const DisplayDescription& display : info.displays) {
+            left = std::min<int64_t>(left, display.left);
+            top = std::min<int64_t>(top, display.top);
+            right = std::max<int64_t>(right, display.right);
+            bottom = std::max<int64_t>(bottom, display.bottom);
+        }
+        const int64_t union_width = right - left;
+        const int64_t union_height = bottom - top;
+        // The host pads the union up to even dimensions so the NV12 picture
+        // can be encoded, so source may exceed the exact union by one pixel.
+        if (info.origin_x != left || info.origin_y != top ||
+            info.source_width < union_width || info.source_width - union_width > 1 ||
+            info.source_height < union_height || info.source_height - union_height > 1) {
+            set_error(error, "HelloAck merged geometry does not match its displays");
+            return false;
+        }
     }
     info.input_enabled = (permissions & kPermissionInput) != 0;
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
@@ -1834,11 +1863,78 @@ bool parse_file_reason(const std::string& reason, size_t limit, const char* what
     return true;
 }
 
+// A relative directory is a suggestion for the receiver, but it still has to
+// be unambiguous: no absolute roots, no drive letters, no "." or ".." and no
+// empty component. Returns false with the reason on anything suspicious.
+bool parse_file_relative_path(const std::string& path, std::string* error) {
+    if (path.empty()) {
+        return true;
+    }
+    if (path.size() > kMaxFileRelativePathBytes) {
+        set_error(error, "FileOffer relative path is too long");
+        return false;
+    }
+    if (!valid_utf8(path)) {
+        set_error(error, "FileOffer relative path is not UTF-8");
+        return false;
+    }
+    if (path.front() == '/' || path.back() == '/' || path.find('\\') != std::string::npos ||
+        path.find(':') != std::string::npos) {
+        set_error(error, "FileOffer relative path is not a plain relative directory");
+        return false;
+    }
+    size_t components = 0;
+    size_t start = 0;
+    for (;;) {
+        const size_t slash = path.find('/', start);
+        const size_t length = slash == std::string::npos ? path.size() - start : slash - start;
+        if (length == 0 || (length == 1 && path[start] == '.') ||
+            (length == 2 && path[start] == '.' && path[start + 1] == '.')) {
+            set_error(error, "FileOffer relative path has an unusable component");
+            return false;
+        }
+        if (++components > kMaxFileRelativeComponents) {
+            set_error(error, "FileOffer relative path is nested too deeply");
+            return false;
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
+
 }  // namespace
+
+std::string make_offer_relative_path(const std::string& top, const std::string& relative) {
+    size_t start = 0;
+    while (start < relative.size() &&
+           (relative[start] == '\\' || relative[start] == '/')) {
+        ++start;
+    }
+    if (start == relative.size() || (start + 1 == relative.size() && relative[start] == '.')) {
+        return top;
+    }
+    std::string joined = top;
+    if (!joined.empty()) {
+        joined.push_back('/');
+    }
+    for (size_t i = start; i < relative.size(); ++i) {
+        joined.push_back(relative[i] == '\\' ? '/' : relative[i]);
+    }
+    return joined;
+}
 
 std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
     const std::string name = truncate_utf8_reason(offer.name, kMaxFileNameBytes);
-    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size());
+    std::string relative = offer.relative_path;
+    if (relative.size() > kMaxFileRelativePathBytes) {
+        // The parser refuses over-long paths; clearing keeps the length field
+        // honest instead of truncating a UTF-8 byte sequence in half.
+        relative.clear();
+    }
+    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size() + 2 + relative.size());
     uint8_t* cursor = payload.data();
     put_u32(cursor, offer.transfer_id);
     put_u64(cursor, offer.size);
@@ -1848,6 +1944,11 @@ std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
     put_u16(cursor, static_cast<uint16_t>(name.size()));
     if (!name.empty()) {
         std::memcpy(cursor, name.data(), name.size());
+        cursor += name.size();
+    }
+    put_u16(cursor, static_cast<uint16_t>(relative.size()));
+    if (!relative.empty()) {
+        std::memcpy(cursor, relative.data(), relative.size());
     }
     return make_control(ControlType::FileOffer, payload);
 }
@@ -1878,9 +1979,19 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
         set_error(error, "FileOffer name overruns the message");
         return false;
     }
+    offer.relative_path.clear();
     if (!reader.at_end()) {
-        set_error(error, "FileOffer has trailing bytes");
-        return false;
+        // v22 appends the directory. A missing tail is a v21-style root
+        // offer; peers still have to agree on the version in the handshake.
+        uint16_t relative_size = 0;
+        if (!reader.u16(relative_size) ||
+            !reader.string(offer.relative_path, relative_size) || !reader.at_end()) {
+            set_error(error, "FileOffer relative path overruns the message");
+            return false;
+        }
+        if (!parse_file_relative_path(offer.relative_path, error)) {
+            return false;
+        }
     }
     if (offer.name.empty() || !valid_utf8(offer.name)) {
         set_error(error, "FileOffer carries an unusable name");

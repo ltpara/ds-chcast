@@ -132,6 +132,95 @@ std::unique_ptr<IAudioDecoder> create_opus_decoder(const AudioInfo& info, std::s
 // Dispatches on info.codec.
 std::unique_ptr<IAudioDecoder> create_audio_decoder(const AudioInfo& info, std::string* error);
 
+// ----- audio DSP (echo cancellation and noise suppression) -----
+
+// Playback reference shared by the side that renders audio and the side that
+// cancels its echo. Both directions need the same thing: the PCM that is (or
+// is about to be) audible, kept long enough that a fixed read delay can line
+// it up with the microphone. The format is fixed at 48 kHz stereo s16 because
+// both capture paths already run at 48 kHz. All methods are thread-safe; push
+// and read are called from different threads in practice.
+class AudioReference {
+public:
+    AudioReference();
+    ~AudioReference();
+    AudioReference(const AudioReference&) = delete;
+    AudioReference& operator=(const AudioReference&) = delete;
+
+    // Appends playback PCM. `channels` is 1 or 2; mono is duplicated to both
+    // sides. Ignored while inactive, so a paused player cannot seed stale
+    // history for the next one.
+    void push(const int16_t* samples, size_t frames, uint16_t channels);
+
+    // Writes `frames` stereo samples ending `delay_ms` before the newest push.
+    // Returns false (and zero-fills the missing part) while the reference is
+    // inactive or shorter than the requested span; callers use that as an
+    // underrun signal, not an error. The sample-accurate variant exists
+    // because the DSP adds a partial-frame delay of its own.
+    bool read_delayed(size_t frames, uint32_t delay_ms, int16_t* out) const;
+    bool read_delayed_frames(size_t frames, size_t delay_frames, int16_t* out) const;
+
+    // Opening/clearing the reference. Any transition drops the history: after
+    // a pause the old samples no longer describe what is audible. The echo
+    // canceller resets itself when this flips to false.
+    void set_active(bool active);
+    bool active() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+struct AudioDspConfig {
+    // Near-end channels: microphone upling is mono, loopback is stereo.
+    uint16_t near_channels = 1;
+    // Echo cancellation needs a reference. Enabling it without one makes
+    // create() fail instead of silently passing audio through.
+    bool echo_cancellation = false;
+    bool noise_suppression = false;
+    // How far back the reference is read, and the adaptive filter length
+    // (200 ms, fixed in the implementation). The default lines the reference
+    // up with the player's lead and the endpoint buffer.
+    uint32_t reference_delay_ms = 120;
+    std::shared_ptr<AudioReference> reference;
+};
+
+struct AudioDspStats {
+    uint64_t processed_frames = 0;
+    uint64_t reference_underruns = 0;  // 10 ms blocks without a full reference
+    uint64_t resets = 0;               // filter resets after reference loss
+};
+
+// 48 kHz s16 echo cancellation and noise suppression on 10 ms frames. Input
+// may be any size: short blocks are accumulated and the remainder is carried
+// to the next call. Processing is in place and never fails once created; when
+// the reference is inactive the echo path is bypassed (and reset), while noise
+// suppression, if enabled, keeps working.
+class AudioPreprocessor {
+public:
+    static std::unique_ptr<AudioPreprocessor> create(const AudioDspConfig& config,
+                                                     std::string* error);
+    ~AudioPreprocessor();
+    AudioPreprocessor(const AudioPreprocessor&) = delete;
+    AudioPreprocessor& operator=(const AudioPreprocessor&) = delete;
+
+    // `samples` holds `frames` interleaved near-end frames. `in` and `out` may
+    // be the same buffer. The number of samples is unchanged; a trailing
+    // partial frame is held until the next call.
+    void process(int16_t* samples, size_t frames);
+
+    // Drops the partial frame and resets the adaptive filter. Used when the
+    // capture endpoint is reopened.
+    void reset();
+
+    AudioDspStats stats() const;
+
+private:
+    AudioPreprocessor();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // ----- host capture -----
 
 struct LoopbackCaptureConfig {
@@ -145,6 +234,17 @@ struct LoopbackCaptureConfig {
     // timeline is unaffected: the next audible block re-anchors the encoder at
     // its capture time.
     uint32_t silence_gate_ms = 2000;
+    // Empty follows the default render endpoint; a non-empty id pins that
+    // device and keeps retrying it if it disappears.
+    std::string device_id;
+    // Echo cancellation against the session's microphone playback. The
+    // reference must be fed with the PCM the host renders to the same
+    // endpoint; without it the capture passes audio through untouched.
+    std::shared_ptr<AudioReference> reference;
+    bool echo_cancellation = false;
+    // Reserved for symmetry with the microphone path; loopback noise
+    // suppression is off by default because it would also shape music.
+    bool noise_suppression = false;
 };
 
 struct AudioCaptureStats {
@@ -155,6 +255,9 @@ struct AudioCaptureStats {
     uint64_t gate_transitions = 0; // silence gate opened or closed
     uint64_t gated_frames = 0;     // silent device frames skipped by the gate
     uint64_t recoveries = 0;       // reopened on a default/output-device change
+    uint64_t processed_frames = 0; // near-end frames through the DSP
+    uint64_t reference_underruns = 0;
+    uint64_t dsp_resets = 0;
     bool recovering = false;       // endpoint lost, waiting for a new default
 };
 
@@ -213,6 +316,11 @@ struct MicrophoneCaptureConfig {
     std::string device_id;
     uint32_t bitrate = 32000;
     size_t queue_packets = 16;
+    // Viewer-side echo cancellation and noise suppression. The reference is
+    // the system audio this viewer is playing; both switches are independent.
+    std::shared_ptr<AudioReference> reference;
+    bool echo_cancellation = false;
+    bool noise_suppression = false;
 };
 
 // Captures one microphone on its own thread, converts it to 48 kHz mono s16
@@ -240,7 +348,21 @@ std::unique_ptr<IMicrophoneCapture> create_microphone_capture(
 
 // ----- viewer playback -----
 
+// Active render endpoints, default console device first. Returns an empty
+// list (with `error`) when COM or the enumerator is unavailable.
+struct AudioOutputDevice {
+    std::string id;
+    std::string name;
+    bool is_default = false;
+};
+
+std::vector<AudioOutputDevice> list_audio_outputs(std::string* error);
+
 struct AudioPlayerConfig {
+    // Empty follows the default render endpoint. A non-empty id pins that
+    // device; when it disappears the player keeps retrying the same id and
+    // reports `recovering` instead of silently moving to another endpoint.
+    std::string device_id;
     // How far behind the sender timeline playback runs. This is the jitter
     // buffer; 80 ms covers a wide range of network conditions without a
     // noticeable lip-sync error.

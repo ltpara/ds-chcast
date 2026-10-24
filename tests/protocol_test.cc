@@ -56,6 +56,11 @@ void test_hello() {
     check(parses_hello(payload_of(chast::make_hello(sent)), got) && got.display == 3,
           "Hello keeps an explicit display index");
 
+    sent.display = chast::kDisplayAll;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+              got.display == chast::kDisplayAll,
+          "Hello accepts the merged display sentinel");
+
     sent.access_token = "correct horse battery staple";
     sent.password = "hunter2";
     sent.requested_permissions = chast::kPermissionInput | chast::kPermissionAudio;
@@ -306,7 +311,7 @@ void test_hello_ack() {
     std::vector<uint8_t> unknown_flags = ack_payload();
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
-    unknown_flags[kFlagsAt] = 0x40;
+    unknown_flags[kFlagsAt] = 0x80;
     unknown_flags[kFlagsAt + 1] = 0;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
@@ -381,6 +386,76 @@ void test_hello_ack() {
               !disabled.file_transfer_enabled && !disabled.audio.enabled &&
               !disabled.microphone_enabled && !disabled.privacy_mode_enabled,
           "HelloAck reports every permission disabled");
+}
+
+void test_merged_hello_ack() {
+    auto merged_info = [] {
+        chast::ServerInfo info;
+        info.codec = chast::VideoCodec::H264;
+        info.merged = true;
+        info.width = 3840;
+        info.height = 1080;
+        info.source_width = 3840;
+        info.source_height = 1080;
+        info.origin_x = -1920;
+        info.origin_y = 0;
+        info.framerate = 30;
+        info.bitrate = 8000000;
+        info.input_enabled = true;
+        info.encoder = "mfxhw64";
+        chast::DisplayDescription left;
+        left.name = "\\\\.\\DISPLAY1";
+        left.left = -1920;
+        left.right = 0;
+        left.bottom = 1080;
+        left.primary = true;
+        chast::DisplayDescription right;
+        right.name = "\\\\.\\DISPLAY2";
+        right.right = 1920;
+        right.bottom = 1080;
+        info.displays = {left, right};
+        return info;
+    };
+
+    std::string error;
+    chast::ServerInfo sent = merged_info();
+    chast::ServerInfo got;
+    const bool parsed =
+        chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), got, &error);
+    check(parsed, "a merged HelloAck round-trips");
+    if (!parsed) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+    check(got.merged, "a merged HelloAck keeps the merged flag");
+    check(got.origin_x == -1920 && got.origin_y == 0 &&
+              got.source_width == 3840 && got.source_height == 1080,
+          "a merged HelloAck keeps the union geometry");
+    check(got.displays.size() == 2, "a merged HelloAck lists its member displays");
+    check(got.input_enabled, "the merged flag does not disturb the permission mask");
+
+    chast::ServerInfo padded = merged_info();
+    padded.source_width = 3841;  // odd union padded up for NV12
+    padded.width = 3842;
+    chast::ServerInfo padded_got;
+    check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(padded)), padded_got, &error) &&
+              padded_got.source_width == 3841,
+          "a merged HelloAck accepts one pixel of even-size padding");
+
+    auto rejects = [&](const chast::ServerInfo& info, const char* what) {
+        chast::ServerInfo dropped;
+        check(!chast::parse_hello_ack(payload_of(chast::make_hello_ack(info)), dropped, &error),
+              what);
+    };
+    chast::ServerInfo wrong_origin = merged_info();
+    wrong_origin.origin_x = -1919;
+    rejects(wrong_origin, "a merged HelloAck whose origin misses the union is rejected");
+    chast::ServerInfo wrong_size = merged_info();
+    wrong_size.source_width = 3842;
+    rejects(wrong_size, "a merged HelloAck whose source misses the union is rejected");
+    chast::ServerInfo empty = merged_info();
+    empty.displays.clear();
+    rejects(empty, "a merged HelloAck with no member displays is rejected");
 }
 
 void test_permission_update() {
@@ -1795,19 +1870,66 @@ void test_file_transfer() {
     offer.size = 12;
     offer.resume = true;
     offer.name = "report-\xE6\x8A\xA5\xE5\x91\x8A.pdf";
+    offer.relative_path = "reports/2026";
     offer.sha256.fill(0xAB);
 
     chast::FileOffer got_offer;
     check(chast::parse_file_offer(payload_of(chast::make_file_offer(offer)), got_offer,
                                   &error) &&
               got_offer.transfer_id == 7 && got_offer.size == 12 && got_offer.resume &&
-              got_offer.name == offer.name && got_offer.sha256 == offer.sha256,
-          "FileOffer round-trips id, size, resume flag, digest and UTF-8 name");
+              got_offer.name == offer.name && got_offer.sha256 == offer.sha256 &&
+              got_offer.relative_path == offer.relative_path,
+          "FileOffer round-trips id, size, resume flag, digest, UTF-8 name and directory");
+
+    chast::FileOffer legacy_offer = offer;
+    legacy_offer.relative_path.clear();
+    std::vector<uint8_t> legacy = payload_of(chast::make_file_offer(legacy_offer));
+    legacy.resize(legacy.size() - 2);  // drop the empty v22 directory field
+    chast::FileOffer got_legacy;
+    check(chast::parse_file_offer(legacy, got_legacy, &error) &&
+              got_legacy.name == offer.name && got_legacy.relative_path.empty(),
+          "a FileOffer without the directory field still parses at the receive root");
+
+    check(chast::make_offer_relative_path("Trip", "2024\\07") == "Trip/2024/07" &&
+              chast::make_offer_relative_path("Trip", "2024/07") == "Trip/2024/07" &&
+              chast::make_offer_relative_path("Trip", ".") == "Trip" &&
+              chast::make_offer_relative_path("Trip", "") == "Trip" &&
+              chast::make_offer_relative_path("Trip", "\\2024") == "Trip/2024",
+          "upload directories convert native separators to '/' below the top folder");
 
     auto rejects_offer = [&](std::vector<uint8_t> payload, const char* what) {
         chast::FileOffer dropped;
         check(!chast::parse_file_offer(payload, dropped, &error), what);
     };
+    auto rejects_relative = [&](std::string relative, const char* what) {
+        chast::FileOffer bad = offer;
+        bad.relative_path = std::move(relative);
+        rejects_offer(payload_of(chast::make_file_offer(bad)), what);
+    };
+    rejects_relative("/absolute", "an absolute FileOffer directory is rejected");
+    rejects_relative("C:/Windows", "a drive-letter FileOffer directory is rejected");
+    rejects_relative("reports/../secret", "a FileOffer directory with .. is rejected");
+    rejects_relative("reports/./2026", "a FileOffer directory with . is rejected");
+    rejects_relative("reports//2026", "a FileOffer directory with an empty part is rejected");
+    rejects_relative("reports\\2026", "a FileOffer directory with a backslash is rejected");
+    // make_file_offer clears an over-long directory, so build the wire form by
+    // hand to prove the parser rejects it rather than truncating.
+    chast::FileOffer rooted = offer;
+    rooted.relative_path.clear();
+    std::vector<uint8_t> overlong = payload_of(chast::make_file_offer(rooted));
+    const size_t overlong_length = chast::kMaxFileRelativePathBytes + 1;
+    overlong.push_back(static_cast<uint8_t>(overlong_length & 0xFF));
+    overlong.push_back(static_cast<uint8_t>((overlong_length >> 8) & 0xFF));
+    overlong.insert(overlong.end(), overlong_length, 'a');
+    rejects_offer(std::move(overlong), "an over-long FileOffer directory is rejected");
+    std::string deep;
+    for (size_t i = 0; i <= chast::kMaxFileRelativeComponents; ++i) {
+        if (!deep.empty()) {
+            deep.push_back('/');
+        }
+        deep.push_back('a');
+    }
+    rejects_relative(std::move(deep), "a too-deep FileOffer directory is rejected");
     std::vector<uint8_t> unknown_flags = payload_of(chast::make_file_offer(offer));
     unknown_flags[12] = 0x02;  // id(4) + size(8), then flags
     rejects_offer(std::move(unknown_flags), "FileOffer with unknown flags is rejected");
@@ -2032,6 +2154,7 @@ int main(int argc, char** argv) {
     test_hello();
     test_access_denied();
     test_hello_ack();
+    test_merged_hello_ack();
     test_permission_update();
     test_sas();
     test_stream_options();

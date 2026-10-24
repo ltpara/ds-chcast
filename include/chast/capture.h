@@ -242,6 +242,16 @@ public:
     // remembers the value for when NV12 is configured.
     virtual Error set_nv12_scale(UINT percent) = 0;
 
+    // True when the picture is the merged union of several outputs rather than
+    // one captured display. display() then describes that union and
+    // merged_display_count() says how many outputs it contains.
+    virtual bool merged() const { return false; }
+    virtual size_t merged_display_count() const { return 1; }
+    // Scale the NV12 image actually runs at. A merged capturer may have to cap
+    // the requested value so the union fits the encoder's size budget, so this
+    // is the value adaptive resolution must compare against.
+    virtual UINT nv12_scale_percent() const { return 100; }
+
     // Last error from capture(), for logging alongside FatalError.
     virtual const Error& last_error() const = 0;
 };
@@ -259,5 +269,16 @@ std::unique_ptr<IDxgiCapturer> create_capturer(size_t display_index, const Captu
 std::unique_ptr<IDxgiCapturer> create_capturer(const DisplayInfo& display,
                                                const CaptureConfig& config,
                                                std::string* error = nullptr);
+
+// Creates a capturer that lays every display out in virtual-desktop order and
+// publishes the union as one picture. All displays must be on the same
+// adapter: their frames are copied into one canvas on that adapter's device,
+// so nothing crosses the PCIe bus. The layout is recomputed by reinitialize(),
+// which makes a hot-plug or mode change rebuild the canvas. `config.nv12` is
+// converted once for the whole canvas; the union is capped so the encoded
+// picture stays within the encoder's size budget.
+std::unique_ptr<IDxgiCapturer> create_merged_capturer(const std::vector<DisplayInfo>& displays,
+                                                      const CaptureConfig& config,
+                                                      std::string* error = nullptr);
 
 }  // namespace chast

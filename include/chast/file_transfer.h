@@ -19,12 +19,20 @@ inline constexpr size_t kMaxReceiveNameChars = 200;
 // Refuse an offer that would leave less than this on the receive volume, so
 // completing the transfer never fills the disk.
 inline constexpr uint64_t kMinReceiveFreeSpace = 64ull * 1024ull * 1024ull;
+// Deepest directory chain a single offer may create below the receive root.
+inline constexpr size_t kMaxReceivePathDepth = 32;
 
 // Makes a peer-supplied name safe to create inside one directory: takes the
 // last path component, replaces control characters and the Windows-invalid
 // set, strips trailing dots and spaces, avoids the reserved DOS device names
 // and returns "file" when nothing usable remains. The extension is kept.
 std::string sanitize_received_name(const std::string& utf8_name);
+
+// Sanitizes the directory part of an offer ('/'-separated, no file name) the
+// same way as a name, one component at a time. Empty means the receive root.
+// Returns false for absolute paths, drive letters, "." / "..", empty
+// components, over-long paths or more than kMaxReceivePathDepth components.
+bool sanitize_received_directory(const std::string& utf8_path, std::string& sanitized);
 
 // %USERPROFILE%\Downloads\chast, or an empty string when the shell cannot name
 // the Downloads folder. Hosts use it when no receive directory is configured.
@@ -35,6 +43,9 @@ struct FileReceiveOptions {
     std::string directory;
     // Raw peer name; sanitized by create().
     std::string name;
+    // Optional '/'-separated directory below `directory`; sanitized and
+    // created by create(). Empty places the file in `directory` itself.
+    std::string relative_path;
     uint64_t size = 0;
     std::array<uint8_t, 32> sha256{};
     // Honour an existing .part + sidecar for the same offer.

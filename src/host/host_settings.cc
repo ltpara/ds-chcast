@@ -410,6 +410,19 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_privacy_mode)) {
                 warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
             }
+        } else if (key == "audio_device") {
+            if (value.size() > 1024) {
+                warn(result.warning, "audio_device is too long; using the default output");
+            } else {
+                // An id that is missing right now is valid: the operator may
+                // have chosen a device that is currently unplugged, and the
+                // session reports audio unavailable rather than picking one.
+                settings.audio_device = value;
+            }
+        } else if (key == "audio_aec") {
+            if (!parse_bool(value, settings.audio_aec)) {
+                warn(result.warning, "audio_aec '" + value + "' is not a boolean");
+            }
         } else if (key == "auth_mode") {
             HostAuthMode mode = HostAuthMode::Both;
             if (!parse_auth_mode(value, mode)) {
@@ -649,6 +662,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
+         << "audio_device=" << settings.audio_device << "\n"
+         << "audio_aec=" << (settings.audio_aec ? 1 : 0) << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"

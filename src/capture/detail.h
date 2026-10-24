@@ -258,6 +258,28 @@ private:
     UINT surface_height_ = 0;  // height_ rounded up to 16
 };
 
+// The device a capturer runs on. The merged compositor creates one and hands
+// it to every child capturer so their textures can be copied between each
+// other without leaving the GPU.
+struct CaptureDevice {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    UINT vendor_id = 0;
+};
+
+// Creates the D3D11 device for an adapter by LUID, with the flags Desktop
+// Duplication and the NV12 video processor need.
+Error create_capture_device(const LUID& luid, CaptureDevice& out);
+
+// Creates a capturer that runs on an existing device and never releases or
+// recreates it. The caller keeps `device`/`context` alive for the capturer's
+// lifetime; they must belong to `display`'s adapter.
+std::unique_ptr<IDxgiCapturer> create_capturer_on_device(const DisplayInfo& display,
+                                                         const CaptureConfig& config,
+                                                         ID3D11Device* device,
+                                                         ID3D11DeviceContext* context,
+                                                         UINT vendor_id, std::string* error);
+
 // Decides what the capturer must do after a stage failed. Status::Unsupported
 // and InvalidCall are permanent: the same pass will fail on every frame, so
 // retrying is pointless. Everything else may be transient (device removed,

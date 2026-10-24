@@ -17,6 +17,10 @@ enum RemoteSpecialAction {
   sas,
 }
 
+/// The two microphone processing switches the long-press menu exposes above
+/// the device list.
+enum _MicSetting { aec, noiseSuppression }
+
 class RemoteToolbar extends StatelessWidget {
   const RemoteToolbar({
     super.key,
@@ -33,11 +37,17 @@ class RemoteToolbar extends StatelessWidget {
     required this.fileActive,
     required this.audioAvailable,
     required this.audioMuted,
+    required this.audioDevice,
+    required this.onLoadAudioOutputs,
+    required this.onSelectAudioOutput,
     required this.microphoneAvailable,
     required this.microphoneEnabled,
     required this.microphoneDevice,
+    required this.audioAec,
+    required this.audioNoiseSuppression,
     required this.onLoadMicrophones,
     required this.onSelectMicrophone,
+    required this.onSetAudioProcessing,
     required this.privacyAvailable,
     required this.privacyEnabled,
     required this.displays,
@@ -83,14 +93,23 @@ class RemoteToolbar extends StatelessWidget {
   final bool fileActive;
   final bool audioAvailable;
   final bool audioMuted;
+
+  /// The pinned playback endpoint id; empty follows the system default (the
+  /// menu marks that entry).
+  final String audioDevice;
+  final Future<List<ViewerAudioOutput>> Function() onLoadAudioOutputs;
+  final Future<void> Function(String deviceId) onSelectAudioOutput;
   final bool microphoneAvailable;
   final bool microphoneEnabled;
 
   /// The pinned capture endpoint id; empty follows the default communications
   /// device (the menu marks that entry).
   final String microphoneDevice;
+  final bool audioAec;
+  final bool audioNoiseSuppression;
   final Future<List<ViewerMicrophoneDevice>> Function() onLoadMicrophones;
   final Future<void> Function(String deviceId) onSelectMicrophone;
+  final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
   final List<ViewerDisplay> displays;
@@ -124,11 +143,11 @@ class RemoteToolbar extends StatelessWidget {
   final VoidCallback onClose;
   final ValueChanged<ViewFit> onFitChanged;
 
-  /// Lists the capture endpoints at the moment of the long press, so a device
-  /// plugged in after the session started is offered too.
-  Future<void> _openMicrophoneMenu(BuildContext context) async {
-    final List<ViewerMicrophoneDevice> devices = await onLoadMicrophones();
-    if (!context.mounted || devices.isEmpty) {
+  /// Lists the playback endpoints at the moment of the long press, so a
+  /// device plugged in after the session started is offered too.
+  Future<void> _openAudioOutputMenu(BuildContext context) async {
+    final List<ViewerAudioOutput> devices = await onLoadAudioOutputs();
+    if (!context.mounted) {
       return;
     }
     final RenderBox? box = context.findRenderObject() as RenderBox?;
@@ -147,20 +166,147 @@ class RemoteToolbar extends StatelessWidget {
       color: const Color(0xFF24252B),
       elevation: 8,
       items: <PopupMenuEntry<String>>[
+        _audioOutputItem('', '系统默认输出', '跟随 Windows 默认设备'),
+        for (final ViewerAudioOutput device in devices)
+          _audioOutputItem(device.id, device.label,
+              device.isDefault ? '系统默认设备' : '输出设备'),
+      ],
+    );
+    if (selected != null && selected != audioDevice) {
+      await onSelectAudioOutput(selected);
+    }
+  }
+
+  PopupMenuItem<String> _audioOutputItem(String id, String title, String detail) {
+    final bool selected = id == audioDevice;
+    return PopupMenuItem<String>(
+      value: id,
+      height: 46,
+      child: Row(
+        children: <Widget>[
+          Icon(
+            id.isEmpty ? Icons.speaker_rounded : Icons.volume_up_rounded,
+            size: 16,
+            color: selected ? kAccentBright : Colors.white54,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: selected ? kAccentBright : Colors.white70,
+                  ),
+                ),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+          if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+        ],
+      ),
+    );
+  }
+
+  /// Lists the processing switches and capture endpoints at the moment of the
+  /// long press, so a device plugged in after the session started is offered
+  /// too.
+  Future<void> _openMicrophoneMenu(BuildContext context) async {
+    final List<ViewerMicrophoneDevice> devices = await onLoadMicrophones();
+    if (!context.mounted) {
+      return;
+    }
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) {
+      return;
+    }
+    final Offset origin = box.localToGlobal(Offset.zero);
+    final Object? selected = await showMenu<Object>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        origin.dx,
+        origin.dy + box.size.height,
+        origin.dx + 300,
+        origin.dy + box.size.height,
+      ),
+      color: const Color(0xFF24252B),
+      elevation: 8,
+      items: <PopupMenuEntry<Object>>[
+        _processingItem(_MicSetting.aec, '回声消除', '用本机播放的系统声音作参考', audioAec),
+        _processingItem(_MicSetting.noiseSuppression, '噪声抑制', '抑制平稳底噪，语音优先',
+            audioNoiseSuppression),
+        const PopupMenuDivider(),
         _microphoneItem('', '系统默认麦克风', '跟随默认通信设备'),
         for (final ViewerMicrophoneDevice device in devices)
           _microphoneItem(device.id, device.label,
               device.isDefault ? '系统默认设备' : '输入设备'),
       ],
     );
-    if (selected != null && selected != microphoneDevice) {
+    if (selected is _MicSetting) {
+      await onSetAudioProcessing(
+        selected == _MicSetting.aec ? !audioAec : audioAec,
+        selected == _MicSetting.noiseSuppression ? !audioNoiseSuppression : audioNoiseSuppression,
+      );
+    } else if (selected is String && selected != microphoneDevice) {
       await onSelectMicrophone(selected);
     }
   }
 
-  PopupMenuItem<String> _microphoneItem(String id, String title, String detail) {
+  PopupMenuItem<Object> _processingItem(
+      _MicSetting setting, String title, String detail, bool enabled) {
+    return PopupMenuItem<Object>(
+      value: setting,
+      height: 44,
+      child: Row(
+        children: <Widget>[
+          Icon(
+            enabled ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+            size: 16,
+            color: enabled ? kAccentBright : Colors.white54,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: enabled ? kAccentBright : Colors.white70,
+                  ),
+                ),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<Object> _microphoneItem(String id, String title, String detail) {
     final bool selected = id == microphoneDevice;
-    return PopupMenuItem<String>(
+    return PopupMenuItem<Object>(
       value: id,
       height: 46,
       child: Row(
@@ -236,11 +382,12 @@ class RemoteToolbar extends StatelessWidget {
               active: activeDisplay,
               onSelected: onSelectDisplay,
             ),
-            _ResolutionButton(
-              modes: modes,
-              available: modeChangeAvailable,
-              onSelected: onSelectMode,
-            ),
+            if (activeDisplay != kViewerDisplayAll)
+              _ResolutionButton(
+                modes: modes,
+                available: modeChangeAvailable,
+                onSelected: onSelectMode,
+              ),
             _StreamOptionsButton(
               available: streamOptionsAvailable,
               codec: streamCodec,
@@ -294,11 +441,13 @@ class RemoteToolbar extends StatelessWidget {
               tooltip: !audioAvailable
                   ? '服务端未启用声音'
                   : audioMuted
-                      ? '取消静音'
-                      : '静音',
+                      ? '取消静音（长按选择输出设备）'
+                      : '静音（长按选择输出设备）',
               disabled: !audioAvailable,
               active: audioAvailable && !audioMuted,
               onTap: onToggleAudio,
+              onLongPress: (BuildContext context) =>
+                  unawaited(_openAudioOutputMenu(context)),
             ),
             _BarButton(
               icon: microphoneEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
@@ -644,6 +793,8 @@ class _DisplayButton extends StatelessWidget {
           return <PopupMenuEntry<int>>[
             _displayItem(kViewerDisplayAuto, '服务端默认', '由服务端选择输出',
                 Icons.auto_mode_rounded),
+            _displayItem(kViewerDisplayAll, '全部显示器（合并）',
+                _mergedDetail(displays), Icons.grid_view_rounded),
             for (final ViewerDisplay display in displays)
               _displayItem(
                 display.index,
@@ -675,6 +826,31 @@ class _DisplayButton extends StatelessWidget {
       text.write(' · ${display.rotation}°');
     }
     return text.toString();
+  }
+
+  /// The merged stream's canvas covers the union of every listed output, so
+  /// the subtitle reports that union instead of one display's size.
+  static String _mergedDetail(List<ViewerDisplay> displays) {
+    final ViewerDisplay first = displays.first;
+    int left = first.left;
+    int top = first.top;
+    int right = first.right;
+    int bottom = first.bottom;
+    for (final ViewerDisplay display in displays.skip(1)) {
+      if (display.left < left) {
+        left = display.left;
+      }
+      if (display.top < top) {
+        top = display.top;
+      }
+      if (display.right > right) {
+        right = display.right;
+      }
+      if (display.bottom > bottom) {
+        bottom = display.bottom;
+      }
+    }
+    return '${right - left}×${bottom - top} · ${displays.length} 块屏';
   }
 
   PopupMenuItem<int> _displayItem(int value, String title, String detail, IconData icon) {

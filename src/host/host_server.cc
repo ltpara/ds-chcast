@@ -164,15 +164,43 @@ bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomi
     return false;
 }
 
-// The description HelloAck and StreamInfo carry. `display` is the output the
-// capturer is reading, `attached` the full list from the moment of the call.
-// `source_width`/`source_height` are the captured frame; the encoder's size may
-// be smaller when adaptive resolution scaled it. `permissions` is the session
-// mask currently in force.
+// The outputs a merged stream actually composites: every attached display on
+// the capturer's adapter. Enumeration also reports outputs on other adapters,
+// whose frames cannot be copied into this canvas; leaving them in the
+// announced list would make its union disagree with the canvas geometry.
+std::vector<DisplayInfo> merged_members(const std::vector<DisplayInfo>& attached,
+                                        const DisplayInfo& merged) {
+    std::vector<DisplayInfo> members;
+    for (const DisplayInfo& listed : attached) {
+        if (listed.adapter_luid.LowPart == merged.adapter_luid.LowPart &&
+            listed.adapter_luid.HighPart == merged.adapter_luid.HighPart) {
+            members.push_back(listed);
+        }
+    }
+    // A hot-unplug can empty the adapter before the capturer notices; the
+    // synthetic union still describes the picture that is running.
+    if (members.empty()) {
+        members.push_back(merged);
+    }
+    return members;
+}
+
+// Label for HostStatus and logs. A merged stream has no single device name.
+std::string streamed_display_name(const IDxgiCapturer& capturer) {
+    return capturer.merged() ? std::string("all displays (merged)")
+                             : display_name_utf8(capturer.display());
+}
+
+// The description HelloAck and StreamInfo carry. `attached` is the full list
+// from the moment of the call; a merged capturer publishes its members instead
+// of the whole list. `source_width`/`source_height` are the captured frame (the
+// merged canvas); the encoder's size may be smaller when adaptive resolution
+// scaled it. `permissions` is the session mask currently in force.
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
-                           const DisplayInfo& display, const IVideoEncoder& encoder,
+                           const IDxgiCapturer& capturer, const IVideoEncoder& encoder,
                            UINT source_width, UINT source_height, uint16_t framerate,
                            uint16_t permissions, const AudioInfo& audio) {
+    const DisplayInfo& display = capturer.display();
     ServerInfo info;
     info.codec = encoder.codec();
     info.width = static_cast<uint16_t>(encoder.width());
@@ -183,21 +211,24 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.bitrate = encoder.bitrate();
     info.origin_x = display.rect.left;
     info.origin_y = display.rect.top;
+    info.merged = capturer.merged();
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
     info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
     info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
-    for (const DisplayInfo& listed : attached) {
+    const std::vector<DisplayInfo> listed =
+        capturer.merged() ? merged_members(attached, display) : attached;
+    for (const DisplayInfo& entry : listed) {
         DisplayDescription described;
-        described.name = display_name_utf8(listed);
-        described.left = listed.rect.left;
-        described.top = listed.rect.top;
-        described.right = listed.rect.right;
-        described.bottom = listed.rect.bottom;
-        described.rotation_degrees = static_cast<uint16_t>(listed.rotation_degrees);
-        described.primary = listed.primary;
+        described.name = display_name_utf8(entry);
+        described.left = entry.rect.left;
+        described.top = entry.rect.top;
+        described.right = entry.rect.right;
+        described.bottom = entry.rect.bottom;
+        described.rotation_degrees = static_cast<uint16_t>(entry.rotation_degrees);
+        described.primary = entry.primary;
         info.displays.push_back(std::move(described));
     }
     return info;
@@ -753,6 +784,7 @@ void HostServer::run() {
             status_.session_permissions = session_->permissions();
             status_.display_index = 0;
             status_.display_name.clear();
+            status_.display_merged = false;
             status_.stream = ServerInfo{};
         }
         publish_stats(stats);
@@ -849,6 +881,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     stats.sas_failures = 0;
     stats.resolution_percent = 100;
     stats.resolution_changes = 0;
+    // The last scale the ladder asked for. A merged canvas may cap it lower,
+    // and stats.resolution_percent reports what is actually encoded.
+    uint16_t resolution_request = 100;
     std::vector<DisplayInfo> attached = enumerate_displays();
     if (attached.empty()) {
         *error = "no displays are attached";
@@ -875,8 +910,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     }
 
     size_t display_index = attached.size();
+    bool merged_requested = false;
     const uint16_t requested = session_->requested_display();
-    if (requested != kDisplayAuto) {
+    if (requested == kDisplayAll) {
+        merged_requested = true;
+    } else if (requested != kDisplayAuto) {
         display_index = requested;
         if (display_index >= attached.size()) {
             *error = "the client asked for display " + std::to_string(display_index) +
@@ -907,8 +945,32 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     capture.nv12.enabled = true;
     capture.nv12.colorimetry = Nv12Colorimetry::Bt601Limited;
 
-    std::unique_ptr<IDxgiCapturer> capturer =
-        create_capturer(display_index, capture, error);
+    std::unique_ptr<IDxgiCapturer> capturer;
+    if (merged_requested) {
+        std::string merged_error;
+        capturer = create_merged_capturer(attached, capture, &merged_error);
+        if (!capturer) {
+            // A mixed-adapter or oversized layout still lets the viewer in:
+            // fall back to the host's default single display and say why.
+            display_index = settings_.display != kDisplayAuto &&
+                                    settings_.display < attached.size()
+                                ? settings_.display
+                                : size_t{0};
+            if (settings_.display == kDisplayAuto) {
+                for (size_t i = 0; i < attached.size(); ++i) {
+                    if (attached[i].primary) {
+                        display_index = i;
+                        break;
+                    }
+                }
+            }
+            log("merged view unavailable (" + merged_error + "); falling back to display " +
+                std::to_string(display_index));
+            capturer = create_capturer(display_index, capture, error);
+        }
+    } else {
+        capturer = create_capturer(display_index, capture, error);
+    }
     if (!capturer) {
         *error = "capturer creation failed: " + *error;
         return false;
@@ -920,13 +982,30 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // `first` is a view into the capturer's frame and goes stale once a
     // switch swaps the capturer; this is the only field read later.
     const bool initial_pointer_only = !first.desktop_updated;
+    stats.resolution_percent = static_cast<uint16_t>(capturer->nv12_scale_percent());
+    auto publish_current = [&](const ServerInfo& info) {
+        const size_t index =
+            capturer->merged() ? size_t{0} : find_display(attached, capturer->display());
+        publish_stream(info, index, streamed_display_name(*capturer));
+    };
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
-        status_.display_index = find_display(attached, capturer->display());
-        status_.display_name = display_name_utf8(capturer->display());
+        status_.display_index =
+            capturer->merged() ? size_t{0} : find_display(attached, capturer->display());
+        status_.display_name = streamed_display_name(*capturer);
+        status_.display_merged = capturer->merged();
     }
-    log("capturing display " + std::to_string(find_display(attached, capturer->display())) + " (" +
-        display_name_utf8(capturer->display()) + ")");
+    if (capturer->merged()) {
+        log("capturing " + std::to_string(capturer->merged_display_count()) +
+            " displays merged into " + std::to_string(first.width) + "x" +
+            std::to_string(first.height) + " at " + std::to_string(capturer->display().rect.left) +
+            "," + std::to_string(capturer->display().rect.top) +
+            "; encoded at " + std::to_string(stats.resolution_percent) + "%");
+    } else {
+        log("capturing display " +
+            std::to_string(find_display(attached, capturer->display())) + " (" +
+            display_name_utf8(capturer->display()) + ")");
+    }
 
     EncoderConfig encoder_config;
     encoder_config.codec = settings_.codec;
@@ -1073,20 +1152,31 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     };
     // The endpoint stays open for the whole session even if audio was denied
     // at approval: the operator can grant it back live, and rebuilding WASAPI
-    // mid-session would cost a fresh announcement for no benefit.
+    // mid-session would cost a fresh announcement for no benefit. The same
+    // endpoint plays the viewer's microphone, so its playback feeds the echo
+    // canceller the audio that actually comes out of this machine.
+    std::shared_ptr<AudioReference> audio_reference;
+    const bool audio_aec = settings_.allow_audio && settings_.audio_aec;
     if (settings_.allow_audio) {
+        if (audio_aec) {
+            audio_reference = std::make_shared<AudioReference>();
+        }
         std::string audio_error;
         if (config_.audio_capture) {
             audio_capture = config_.audio_capture(&audio_error);
         } else {
             LoopbackCaptureConfig audio_config;
+            audio_config.device_id = settings_.audio_device;
+            audio_config.reference = audio_reference;
+            audio_config.echo_cancellation = audio_aec;
             audio_capture = create_loopback_capture(audio_config, &audio_error);
         }
         if (audio_capture) {
             audio_info = audio_capture->info();
-            log("audio: AAC-LC " + std::to_string(audio_info.sample_rate / 1000u) + " kHz, " +
+            log("audio: Opus " + std::to_string(audio_info.sample_rate / 1000u) + " kHz, " +
                 std::to_string(audio_info.channels) + " ch, " +
-                std::to_string(audio_info.bitrate / 1000u) + " kbps");
+                std::to_string(audio_info.bitrate / 1000u) + " kbps" +
+                (audio_aec ? ", echo cancellation on" : ", echo cancellation off"));
         } else {
             ++stats.audio_errors;
             log("audio unavailable: " + audio_error);
@@ -1118,7 +1208,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                                    : std::min(configured_fps, stream_fps_cap);
     };
     uint32_t framerate = encoder->framerate();
-    BitrateController abr(base_video_budget, video_floor_bps, configured_fps);
+    BitrateController abr(base_video_budget, video_floor_bps, configured_fps,
+                          resolution_request);
     if (abr.ceiling_bps() != encoder->bitrate()) {
         log("video budget " + std::to_string(abr.ceiling_bps() / 1000u) +
             " kbps after reserving audio out of " + std::to_string(encoder->bitrate() / 1000u) +
@@ -1134,10 +1225,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     stats.framerate = static_cast<uint16_t>(framerate);
 
     ServerInfo stream_info =
-        describe_stream(attached, capturer->display(), *encoder, first.width, first.height,
+        describe_stream(attached, *capturer, *encoder, first.width, first.height,
                         static_cast<uint16_t>(framerate), granted_permissions, audio_info);
-    publish_stream(stream_info, find_display(attached, capturer->display()),
-                   display_name_utf8(capturer->display()));
+    publish_current(stream_info);
     if (config_.stream_announced) {
         config_.stream_announced(stream_info);
     }
@@ -1187,8 +1277,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         // A viewer that was denied audio at approval has no AAC config yet,
         // so a fresh description is what makes a restore usable.
         stream_info.audio.enabled = audio_info.enabled;
-        publish_stream(stream_info, find_display(attached, capturer->display()),
-                       display_name_utf8(capturer->display()));
+        publish_current(stream_info);
         Error refreshed = session_->refresh_stream(stream_info);
         if (!refreshed.ok()) {
             if (refreshed.status() == Status::Unavailable ||
@@ -1432,6 +1521,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             FileReceiveOptions options;
             options.directory = receive_directory;
             options.name = offer.name;
+            options.relative_path = offer.relative_path;
             options.size = offer.size;
             options.sha256 = offer.sha256;
             options.allow_resume = offer.resume;
@@ -1453,17 +1543,21 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             active->written = resume_offset;
             const uint32_t transfer_id = active->offer.transfer_id;
             const std::string name = active->receiver->name();
+            const std::string offered_path =
+                active->offer.relative_path.empty()
+                    ? name
+                    : active->offer.relative_path + "/" + name;
             upload = std::move(active);
             Error answered = session_->send_file_answer(transfer_id, FileCode::Ok,
                                                         resume_offset);
             if (!answered.ok()) {
                 upload.reset();
                 ++stats.file_failures;
-                log("file: cannot accept " + name + ": " + answered.to_string());
+                log("file: cannot accept " + offered_path + ": " + answered.to_string());
                 continue;
             }
-            log("file: receiving " + name + " (" + std::to_string(upload->offer.size) +
-                " bytes" +
+            log("file: receiving " + offered_path + " (" +
+                std::to_string(upload->offer.size) + " bytes" +
                 (resume_offset > 0 ? ", resuming at " + std::to_string(resume_offset) : "") +
                 ")");
         }
@@ -1954,8 +2048,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         audio_info = AudioInfo{};
         stats.audio_active = false;
         stream_info.audio = audio_info;
-        publish_stream(stream_info, find_display(attached, capturer->display()),
-                       display_name_utf8(capturer->display()));
+        publish_current(stream_info);
         Error refreshed = session_->refresh_stream(stream_info);
         if (!refreshed.ok()) {
             log("audio off: could not announce it: " + refreshed.to_string());
@@ -1970,6 +2063,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     uint64_t audio_send_drops = 0;
     uint64_t audio_recoveries_logged = 0;
+    uint64_t audio_dsp_resets_logged = 0;
     bool audio_recovering_logged = false;
     const uint64_t audio_base_ms = capture_clock_ms(start);
     auto drain_audio = [&] {
@@ -2019,6 +2113,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         stats.audio_dropped = audio_send_drops + captured.dropped;
         stats.audio_capture_recoveries = captured.recoveries;
         stats.audio_gate_transitions = captured.gate_transitions;
+        stats.audio_dsp_frames = captured.processed_frames;
+        stats.audio_dsp_resets = captured.dsp_resets;
         stats.audio_recovering = captured.recovering;
         if (captured.recoveries != audio_recoveries_logged) {
             audio_recoveries_logged = captured.recoveries;
@@ -2028,6 +2124,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             audio_recovering_logged = captured.recovering;
             log(captured.recovering ? "audio capture endpoint lost; retrying"
                                     : "audio capture endpoint recovered");
+        }
+        if (captured.dsp_resets != audio_dsp_resets_logged) {
+            audio_dsp_resets_logged = captured.dsp_resets;
+            log("audio echo canceller reset (" +
+                std::to_string(captured.dsp_resets) + " times)");
         }
         if (audio_capture->failed()) {
             ++stats.audio_errors;
@@ -2046,6 +2147,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     AudioInfo microphone_info;
     bool microphone_broken = false;
     auto stop_microphone = [&](const std::string& reason) {
+        if (audio_reference) {
+            audio_reference->set_active(false);
+        }
         if (microphone_player) {
             stats.microphone_underruns = microphone_player->stats().underruns;
             microphone_player->stop();
@@ -2115,6 +2219,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     // anchoring blocks on arrival keeps the 80 ms jitter
                     // buffer and recovers after a stall without LatencyReply.
                     player_config.arrival_anchored = true;
+                    // The same output as the system-sound capture: what the
+                    // reference models has to be what the speakers play.
+                    player_config.device_id = settings_.audio_device;
                     if (config_.microphone_player) {
                         microphone_player = config_.microphone_player(&setup_error);
                     } else {
@@ -2132,11 +2239,17 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                         microphone_decoder.reset();
                         log("microphone playback failed: " + started.to_string());
                     } else {
+                        if (audio_reference) {
+                            // Only live playback may train the canceller; the
+                            // pushed blocks are the reference for loopback.
+                            audio_reference->set_active(true);
+                        }
                         stats.microphone_active = true;
                         log("microphone: Opus " +
                             std::to_string(info.sample_rate / 1000u) + " kHz, " +
                             std::to_string(info.channels) + " ch, " +
-                            std::to_string(info.frame_samples) + " samples/frame");
+                            std::to_string(info.frame_samples) + " samples/frame" +
+                            (audio_reference ? ", feeding loopback AEC" : ""));
                     }
                 }
             }
@@ -2158,6 +2271,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             for (const DecodedAudio& block : decoded) {
                 if (block.channels != 0) {
                     stats.microphone_frames += block.samples.size() / block.channels;
+                }
+                if (audio_reference && block.channels >= 1 && block.channels <= 2) {
+                    audio_reference->push(block.samples.data(),
+                                          block.samples.size() / block.channels,
+                                          block.channels);
                 }
                 Error pushed = microphone_player->push(block);
                 if (!pushed.ok()) {
@@ -2366,8 +2484,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (fresh.empty()) {
             return refuse(DisplaySwitchCode::NotFound, "no displays are attached");
         }
+        const bool merged_target = requested_index == kDisplayAll;
         size_t target = fresh.size();
-        if (requested_index != kDisplayAuto) {
+        if (merged_target) {
+            // The union has no index; every attached output is a candidate
+            // and create_merged_capturer rejects a mixed-adapter layout.
+        } else if (requested_index != kDisplayAuto) {
             target = requested_index;
         } else if (settings_.display != kDisplayAuto) {
             target = settings_.display;
@@ -2380,43 +2502,78 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 }
             }
         }
-        if (target >= fresh.size()) {
+        if (!merged_target && target >= fresh.size()) {
             return refuse(DisplaySwitchCode::NotFound,
                           "display " + std::to_string(requested_index) + " is not attached");
         }
-        if (fresh[target].device_name == capturer->display().device_name) {
+        bool already_streaming = false;
+        if (merged_target && capturer->merged()) {
+            // Members can move or change size without changing count, so the
+            // union is compared too, not just the member count.
+            const std::vector<DisplayInfo> members = merged_members(fresh, capturer->display());
+            LONG left = members[0].rect.left;
+            LONG top = members[0].rect.top;
+            LONG right = members[0].rect.right;
+            LONG bottom = members[0].rect.bottom;
+            for (const DisplayInfo& member : members) {
+                left = std::min(left, member.rect.left);
+                top = std::min(top, member.rect.top);
+                right = std::max(right, member.rect.right);
+                bottom = std::max(bottom, member.rect.bottom);
+            }
+            const DisplayRect& running = capturer->display().rect;
+            already_streaming = members.size() == capturer->merged_display_count() &&
+                                left == running.left && top == running.top &&
+                                right == running.right && bottom == running.bottom;
+        } else if (!merged_target && !capturer->merged()) {
+            already_streaming = fresh[target].device_name == capturer->display().device_name;
+        }
+        if (already_streaming) {
             switched_once = true;
             last_switch_at = now;
             ++stats.display_switches;
             log("display switch: already streaming " +
-                display_name_utf8(capturer->display()));
+                streamed_display_name(*capturer));
             return answer(DisplaySwitchCode::Ok, std::string());
         }
 
         std::string switch_error;
-        std::unique_ptr<IDxgiCapturer> next = create_capturer(target, capture, &switch_error);
-        if (!next) {
-            return refuse(DisplaySwitchCode::Failed,
-                          "cannot capture display " + std::to_string(target) + ": " +
-                              switch_error);
+        std::unique_ptr<IDxgiCapturer> next;
+        if (merged_target) {
+            next = create_merged_capturer(fresh, capture, &switch_error);
+            if (!next) {
+                return refuse(DisplaySwitchCode::Failed,
+                              "cannot merge " + std::to_string(fresh.size()) +
+                                  " displays: " + switch_error);
+            }
+        } else {
+            next = create_capturer(target, capture, &switch_error);
+            if (!next) {
+                return refuse(DisplaySwitchCode::Failed,
+                              "cannot capture display " + std::to_string(target) + ": " +
+                                  switch_error);
+            }
         }
-        if (stats.resolution_percent != 100) {
-            Error scaled = next->set_nv12_scale(stats.resolution_percent);
+        // Carry the ladder's request across the switch. A merged canvas can
+        // cap it lower, so the effective value is read back after the first
+        // frame either way.
+        if (resolution_request != 100) {
+            Error scaled = next->set_nv12_scale(resolution_request);
             if (!scaled.ok()) {
-                // A screen that cannot scale still gets the switch; the ABR
-                // sees the new size as 100% from here on.
-                log("display switch: " + std::to_string(target) + " cannot scale to " +
-                    std::to_string(stats.resolution_percent) + "%; using 100%: " +
-                    scaled.to_string());
-                stats.resolution_percent = 100;
-                ++stats.resolution_changes;
+                log("display switch: cannot scale to " + std::to_string(resolution_request) +
+                    "%; using 100%: " + scaled.to_string());
+                resolution_request = 100;
             }
         }
         if (!wait_for_usable_frame(*next, true, stopping_, std::chrono::milliseconds(3000),
                                    &switch_error)) {
             return refuse(DisplaySwitchCode::Failed,
-                          "display " + std::to_string(target) + " produced no frame: " +
-                              switch_error);
+                          "the new output produced no frame: " + switch_error);
+        }
+        const uint16_t previous_percent = stats.resolution_percent;
+        stats.resolution_percent = static_cast<uint16_t>(next->nv12_scale_percent());
+        if (stats.resolution_percent != previous_percent) {
+            ++stats.resolution_changes;
         }
         const FrameInfo& next_frame = next->frame();
         EncoderConfig next_config = encoder_config;
@@ -2481,12 +2638,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         // must not keep placing the old sprite.
         cursor_sent_once = false;
         cursor_sent = CursorUpdate{};
-        const size_t new_index = find_display(attached, capturer->display());
-        stream_info = describe_stream(attached, capturer->display(), *encoder,
-                                      next_frame.width, next_frame.height,
-                                      static_cast<uint16_t>(framerate),
+        const size_t new_index =
+            capturer->merged() ? size_t{0} : find_display(attached, capturer->display());
+        stream_info = describe_stream(attached, *capturer, *encoder, next_frame.width,
+                                      next_frame.height, static_cast<uint16_t>(framerate),
                                       session_->permissions(), audio_info);
-        publish_stream(stream_info, new_index, display_name_utf8(capturer->display()));
+        publish_current(stream_info);
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
         }
@@ -2509,9 +2666,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         switched_once = true;
         last_switch_at = now;
         publish_stats(stats);
-        log("display switched to " + std::to_string(new_index) + " (" +
-            display_name_utf8(capturer->display()) + "), " +
-            std::to_string(stream_info.source_width) + "x" +
+        log("display switched to " +
+            (capturer->merged()
+                 ? "the merged view of " + std::to_string(capturer->merged_display_count()) +
+                       " displays"
+                 : std::to_string(new_index) + " (" +
+                       display_name_utf8(capturer->display()) + ")") +
+            ", " + std::to_string(stream_info.source_width) + "x" +
             std::to_string(stream_info.source_height) + " source, " +
             std::to_string(stream_info.width) + "x" + std::to_string(stream_info.height) +
             " coded");
@@ -2528,7 +2689,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         answer_list.display = requested_index;
         std::vector<DisplayInfo> fresh = enumerate_displays();
         std::string list_error;
-        if (fresh.empty()) {
+        if (capturer->merged()) {
+            answer_list.code = DisplayModeCode::Failed;
+            answer_list.reason = "the merged view does not support single display modes";
+        } else if (fresh.empty()) {
             answer_list.code = DisplayModeCode::NotFound;
             answer_list.reason = "no displays are attached";
         } else if (requested_index >= fresh.size()) {
@@ -2644,6 +2808,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         if (mode_changed_once && now - last_mode_change_at < std::chrono::seconds(1)) {
             return answer(DisplayModeCode::Busy, "a display mode change just happened");
+        }
+        if (capturer->merged()) {
+            return refuse(DisplayModeCode::Failed,
+                          "the merged view does not support single display modes");
         }
 
         // Re-enumerate like the switch path: a hotplug can renumber outputs.
@@ -2780,12 +2948,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         // `fresh` was read before ChangeDisplaySettingsExW, so its rects
         // describe the old mode. Announce the list as it is now.
         attached = enumerate_displays();
-        const size_t mode_index = find_display(attached, capturer->display());
-        stream_info = describe_stream(attached, capturer->display(), *encoder,
-                                      mode_frame.width, mode_frame.height,
-                                      static_cast<uint16_t>(framerate),
+        stream_info = describe_stream(attached, *capturer, *encoder, mode_frame.width,
+                                      mode_frame.height, static_cast<uint16_t>(framerate),
                                       session_->permissions(), audio_info);
-        publish_stream(stream_info, mode_index, display_name_utf8(capturer->display()));
+        publish_current(stream_info);
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
         }
@@ -2980,12 +3146,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             next_frame_due = now + frame_interval;
             force_keyframe = force_keyframe || keyframe_required;
             stream_info =
-                describe_stream(attached, capturer->display(), *encoder,
-                                stream_info.source_width, stream_info.source_height,
-                                static_cast<uint16_t>(framerate), session_->permissions(),
-                                audio_info);
-            publish_stream(stream_info, find_display(attached, capturer->display()),
-                           display_name_utf8(capturer->display()));
+                describe_stream(attached, *capturer, *encoder, stream_info.source_width,
+                                stream_info.source_height, static_cast<uint16_t>(framerate),
+                                session_->permissions(), audio_info);
+            publish_current(stream_info);
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
             }
@@ -3073,8 +3237,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         const bool rate_changed = decision.target_bps != stats.target_bitrate ||
                                   decision.framerate != stats.framerate;
-        const bool size_changed = !resolution_fixed &&
-                                  decision.resolution_percent != stats.resolution_percent;
+        // The ladder names a rung; a merged canvas may not be able to reach it.
+        // Compare against the request, not the effective scale, or the host
+        // would retry the same capped change every second.
+        const bool size_changed =
+            !resolution_fixed && decision.resolution_percent != resolution_request;
         if (!rate_changed && !size_changed) {
             return true;
         }
@@ -3114,24 +3281,32 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     "%; staying at " + std::to_string(stats.resolution_percent) +
                     "% for this session: " + scaled.to_string());
             } else {
-                stats.resolution_percent = decision.resolution_percent;
-                ++stats.resolution_changes;
-                force_keyframe = true;
-                extra_idrs = 1;
-                // The frame loop rebuilds the encoder at the new captured size
-                // and announces that description once the encoder accepted it;
-                // announcing the intended size here could disagree with what
-                // the encoder lands on.
-                announce_now = false;
-                log("adaptive resolution: " + std::string(decision.reason) + "; " +
-                    std::to_string(decision.resolution_percent) + "% of the captured frame");
+                resolution_request = decision.resolution_percent;
+                const uint16_t effective =
+                    static_cast<uint16_t>(capturer->nv12_scale_percent());
+                if (effective != stats.resolution_percent) {
+                    stats.resolution_percent = effective;
+                    ++stats.resolution_changes;
+                    force_keyframe = true;
+                    extra_idrs = 1;
+                    // The frame loop rebuilds the encoder at the new captured
+                    // size and announces that description once the encoder
+                    // accepted it; announcing the intended size here could
+                    // disagree with what the encoder lands on.
+                    announce_now = false;
+                    log("adaptive resolution: " + std::string(decision.reason) + "; " +
+                        std::to_string(effective) + "% of the captured frame");
+                } else {
+                    log("adaptive resolution: " + std::string(decision.reason) +
+                        "; requested " + std::to_string(decision.resolution_percent) +
+                        "%, the canvas stays at " + std::to_string(effective) + "%");
+                }
             }
         }
         if (announce_now) {
             stream_info.bitrate = stats.target_bitrate;
             stream_info.framerate = static_cast<uint16_t>(framerate);
-            publish_stream(stream_info, find_display(attached, capturer->display()),
-                           display_name_utf8(capturer->display()));
+            publish_current(stream_info);
             Error refreshed = session_->refresh_stream(stream_info);
             if (!refreshed.ok()) {
                 if (refreshed.status() == Status::Unavailable ||
@@ -3371,7 +3546,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (probe_pending && now - start >= std::chrono::milliseconds(2500)) {
             probe_pending = false;
             if (!resolution_fixed &&
-                config_.resolution_probe_percent != stats.resolution_percent) {
+                config_.resolution_probe_percent != resolution_request) {
                 Error scaled = capturer->set_nv12_scale(config_.resolution_probe_percent);
                 if (!scaled.ok()) {
                     resolution_fixed = true;
@@ -3379,7 +3554,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                         std::to_string(config_.resolution_probe_percent) + "%: " +
                         scaled.to_string());
                 } else {
-                    stats.resolution_percent = config_.resolution_probe_percent;
+                    resolution_request = config_.resolution_probe_percent;
+                    stats.resolution_percent =
+                        static_cast<uint16_t>(capturer->nv12_scale_percent());
                     ++stats.resolution_changes;
                     force_keyframe = true;
                     extra_idrs = 1;
@@ -3494,8 +3671,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             base_video_budget =
                 video_budget(encoder->bitrate(), bitrate_reserve(audio_info));
             video_floor_bps = video_floor(encoder->bitrate());
+            // A rebuilt merged canvas can change the cap under the running
+            // scale; report what capture now produces before anything reads it.
+            stats.resolution_percent = static_cast<uint16_t>(capturer->nv12_scale_percent());
             abr = BitrateController(quality_budget(stream_quality), video_floor_bps,
-                                    fps_ceiling(), stats.resolution_percent);
+                                    fps_ceiling(), resolution_request);
             framerate = abr.framerate();
             frame_interval = frame_duration(framerate);
             next_frame_due = Clock::now() + frame_interval;
@@ -3515,11 +3695,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             // the viewer is about to receive.
             attached = refreshed;
             stream_info =
-                describe_stream(refreshed, capturer->display(), *encoder, frame.width,
-                                frame.height, static_cast<uint16_t>(framerate),
-                                session_->permissions(), audio_info);
-            publish_stream(stream_info, find_display(refreshed, capturer->display()),
-                           display_name_utf8(capturer->display()));
+                describe_stream(refreshed, *capturer, *encoder, frame.width, frame.height,
+                                static_cast<uint16_t>(framerate), session_->permissions(),
+                                audio_info);
+            publish_current(stream_info);
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
             }
@@ -3566,14 +3745,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 if (!reverted.ok()) {
                     log("adaptive resolution: revert failed: " + reverted.to_string());
                 }
+                resolution_request = stats.resolution_percent;
                 log("adaptive resolution: encoder recreation at " +
                     std::to_string(frame.nv12_width) + "x" +
                     std::to_string(frame.nv12_height) + " failed; staying at " +
                     std::to_string(stats.resolution_percent) + "%: " + resize_error);
                 stream_info.bitrate = stats.target_bitrate;
                 stream_info.framerate = static_cast<uint16_t>(framerate);
-                publish_stream(stream_info, find_display(attached, capturer->display()),
-                               display_name_utf8(capturer->display()));
+                publish_current(stream_info);
                 Error refreshed = session_->refresh_stream(stream_info);
                 if (!refreshed.ok()) {
                     if (refreshed.status() == Status::Unavailable ||
@@ -3600,11 +3779,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stats.target_bitrate = encoder->bitrate();
             stats.framerate = static_cast<uint16_t>(framerate);
             stream_info =
-                describe_stream(attached, capturer->display(), *encoder, frame.width,
-                                frame.height, static_cast<uint16_t>(framerate),
-                                session_->permissions(), audio_info);
-            publish_stream(stream_info, find_display(attached, capturer->display()),
-                           display_name_utf8(capturer->display()));
+                describe_stream(attached, *capturer, *encoder, frame.width, frame.height,
+                                static_cast<uint16_t>(framerate), session_->permissions(),
+                                audio_info);
+            publish_current(stream_info);
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
             }
@@ -3690,6 +3868,7 @@ void HostServer::publish_stream(const ServerInfo& info, size_t display_index,
     status_.stream = info;
     status_.display_index = display_index;
     status_.display_name = display_name;
+    status_.display_merged = info.merged;
 }
 
 }  // namespace chast

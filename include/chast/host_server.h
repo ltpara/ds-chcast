@@ -110,6 +110,10 @@ struct HostServerStats {
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
+    // Near-end frames that passed through echo cancellation and how many times
+    // its adaptive filter restarted (playback start/stop or endpoint reopen).
+    uint64_t audio_dsp_frames = 0;
+    uint64_t audio_dsp_resets = 0;
     bool audio_recovering = false;
     // Privacy mode: whether the local screen is masked right now, and how many
     // viewer requests changed it (refusals included).
@@ -168,6 +172,10 @@ struct HostStatus {
     uint16_t requested_display = kDisplayAuto;
     size_t display_index = 0;
     std::string display_name;
+    // True when the stream is the merged union of every display on the
+    // compositor's adapter. display_index is 0 and display_name is a synthetic
+    // label in that case; stream.displays lists the members.
+    bool display_merged = false;
     // The operator's most recent download to the viewer. `download_active`
     // stays true while the offer is pending or bytes are flowing; the tray
     // shows the name and progress while it does.

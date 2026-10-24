@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -59,9 +60,10 @@ enum class ViewerState {
     kFailed,
 };
 
-// The viewer's single file upload, as the UI shows it. kHashing covers the
-// local SHA-256 pass that precedes the offer; the last two are terminal states
-// of the most recent attempt (the local file is never modified).
+// The viewer's upload queue, as the UI shows it. kHashing covers both waiting
+// for a folder to expand and the local SHA-256 pass that precedes the offer;
+// the last two are terminal states of the most recent attempt (the local file
+// is never modified).
 enum class FilePhase {
     kIdle = 0,
     kHashing = 1,
@@ -140,15 +142,24 @@ struct ViewerStatus {
     uint64_t clipboard_failed = 0;
     uint32_t clipboard_sent_formats = 0;
     uint32_t clipboard_received_formats = 0;
-    // The viewer's most recent upload. `file_phase` is a FilePhase value;
-    // `file_sent` counts bytes streamed in this attempt (resume offset
+    // The viewer's current or most recent upload. `file_phase` is a FilePhase
+    // value; `file_sent` counts bytes streamed in this attempt (resume offset
     // included). A failure keeps the local file in place and explains itself
-    // in `file_error`. The counters cover the whole session.
+    // in `file_error`. `file_relative_path` is the folder below the host's
+    // receive root and `file_queue` counts the entries not yet finished,
+    // including the current one. The counters cover the whole session.
     FilePhase file_phase = FilePhase::kIdle;
     std::string file_name;
+    std::string file_relative_path;
+    uint32_t file_queue = 0;
     uint64_t file_size = 0;
     uint64_t file_sent = 0;
     std::string file_error;
+    // The last entry that left the queue. The page pairs this name and reason
+    // with the counters below, because the active entry may already be the
+    // next file by the time it polls.
+    std::string last_file_name;
+    std::string last_file_error;
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
     // The host's most recent download. The bytes are written to the receive
@@ -188,6 +199,22 @@ struct ViewerStatus {
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
     std::string audio_error;
+    // The playback endpoint the player is using: empty follows the default
+    // output. Selecting another one rebuilds the player but keeps the decoder
+    // and the last clock offset. `audio_device_name` is the endpoint's
+    // friendly name, or empty when the default (or an unavailable id) is in
+    // use; a fallback to the default after a failed open is explained in
+    // `audio_error`.
+    std::string audio_device;
+    std::string audio_device_name;
+    // Microphone processing switches, both on by default. AEC uses the system
+    // audio this viewer plays as its reference; changing either switch
+    // reopens the capture within one poll. The counters below cover the
+    // session and count near-end frames processed with each switch enabled.
+    bool audio_aec = true;
+    bool audio_noise_suppression = true;
+    uint64_t microphone_aec_frames = 0;
+    uint64_t microphone_ns_frames = 0;
     // Microphone uplink to the host's speakers. `microphone_authorized`
     // mirrors the host permission; `microphone_enabled` means the local
     // capture thread and the CMIC stream are running. `microphone_device` is
@@ -228,9 +255,12 @@ struct ViewerStatus {
     std::string sas_error;
     uint64_t sas_updates = 0;
     // What the server announced in HelloAck. `displays` is the list the UI's
-    // picker shows; the streamed entry is the one whose rect starts at
-    // origin_x/origin_y and matches width x height.
+    // picker shows; a single-display stream's entry is the one whose rect
+    // starts at origin_x/origin_y and matches width x height. `merged_layout`
+    // means the picture is the union of every listed display, so no entry
+    // describes the streamed surface and per-display mode changes are off.
     std::vector<chast::DisplayDescription> displays;
+    bool merged_layout = false;
     // Display switches the host accepted (including a request for the output
     // already streaming) and the refusals this engine learned about, plus the
     // host's reason for the most recent refusal. A success clears the error.
@@ -341,12 +371,13 @@ public:
     // baseline, so whatever changed in between is not flushed to the host.
     // The host's own clipboard permission is applied on top of this.
     void SetClipboardSync(bool enabled);
-    // Queues one local file for upload (viewer -> host). Returns false when
-    // the session is not streaming, the host did not grant file transfer,
-    // another upload is still running, or the file is not a usable regular
-    // file. Hashing runs on its own thread; progress arrives through
-    // ViewerStatus::file_phase.
-    bool SendFile(const std::string& path);
+    // Queues local paths for upload (viewer -> host). Folders are expanded
+    // into their regular files, preserving the folder as the first relative
+    // directory component. Returns false when the session is not streaming,
+    // the host did not grant file transfer, or no path was usable. Hashing
+    // and folder walks run on the file worker; progress arrives through
+    // ViewerStatus::file_phase and the queue counters.
+    bool SendFiles(const std::vector<std::string>& paths);
 
     // Copies the newest pointer state the host sent, once per received update.
     // The sprite is only attached to the update that introduced a shape, so a
@@ -370,6 +401,18 @@ public:
     // running.
     bool SelectMicrophone(std::string device_id);
 
+    // Pins the playback endpoint. Empty follows the default output. A live
+    // player is rebuilt on the next poll with the same decoder and clock
+    // offset; an id that cannot be opened falls back to the default and
+    // explains itself in audio_error. Returns false when no session is
+    // running.
+    bool SelectAudioOutput(std::string device_id);
+    // Switches microphone echo cancellation and noise suppression. The
+    // capture reopens on the next poll (only when it is running), and the
+    // choices are kept for later sessions. Returns false when no session is
+    // running.
+    bool SetAudioProcessing(bool echo_cancellation, bool noise_suppression);
+
     // Queues a request to hide (true) or restore (false) the host's physical
     // display. Returns false when no session is streaming or the host did not
     // grant kPermissionPrivacyMode. Only the newest request is kept; the answer
@@ -389,9 +432,14 @@ private:
              std::string access_token, std::string password, std::string totp,
              bool trust_device);
     void SetState(ViewerState state, std::string error = {});
-    // Hashes the queued file on its own thread, so a multi-gigabyte read never
-    // stalls the session's receive loop.
-    void HashPendingFile();
+    // Expands dropped folders and hashes queued uploads on its own thread, so
+    // a multi-gigabyte read never stalls the session's receive loop.
+    void FileWorker();
+    void ExpandUploadRoot(const std::string& root, uint64_t epoch);
+    bool EnqueueUpload(const std::string& path, std::string relative_path, uint64_t epoch);
+    void EnqueueUploadFailure(std::string name, std::string relative_path, std::string error,
+                              uint64_t epoch);
+    bool HasHashableUploadLocked() const;
 
     FrameSink* sink_;
     // Kept alive for the whole session because QuicClientConfig borrows it.
@@ -410,6 +458,11 @@ private:
     std::atomic<bool> microphone_wanted_{false};
     mutable std::mutex microphone_mutex_;
     std::string microphone_device_id_;
+    // The playback choice survives reconnects, like the microphone device.
+    mutable std::mutex audio_output_mutex_;
+    std::string audio_output_device_id_;
+    std::atomic<bool> microphone_aec_{true};
+    std::atomic<bool> microphone_noise_{true};
 
     // Newest privacy request, for the same reason as the display switch: the
     // operator wants the state they picked last, not a replay of every toggle.
@@ -436,12 +489,13 @@ private:
     // the UI never moves clipboard bytes through Dart.
     std::atomic<bool> clipboard_sync_{true};
 
-    // The single upload and its hashing thread. `stage` is written by both the
-    // UI (SendFile resets it) and the session thread; fields are copied under
-    // the lock and the file itself is read outside it.
+    // Uploads wait in one queue. The session thread works on the front while
+    // the file worker expands folders and hashes upcoming entries; every
+    // field is read or written under file_mutex_. A terminal head is popped by
+    // the session thread after its counters have been accounted for.
     struct FileUpload {
         enum class Stage {
-            kNone,
+            kQueued,
             kHashing,
             kReady,
             kOffered,
@@ -450,9 +504,10 @@ private:
             kDone,
             kFailed,
         };
-        Stage stage = Stage::kNone;
+        Stage stage = Stage::kQueued;
         std::string path;
         std::string name;
+        std::string relative_path;
         uint64_t size = 0;
         uint64_t sent = 0;
         uint64_t resume_offset = 0;
@@ -480,10 +535,16 @@ private:
         std::string error;
     };
     mutable std::mutex file_mutex_;
-    FileUpload file_;
+    std::condition_variable file_work_cv_;
+    std::deque<FileUpload> uploads_;
+    std::deque<std::string> pending_upload_roots_;
+    FileUpload last_upload_;
     FileDownload download_;
-    std::thread hasher_;
-    std::atomic<bool> hash_cancel_{false};
+    std::thread file_worker_;
+    bool file_worker_stop_ = false;
+    // Bumped whenever the queue is purged; a worker that was walking a folder
+    // or hashing a file then discards its result instead of re-adding it.
+    uint64_t upload_epoch_ = 0;
     uint32_t next_file_id_ = 1;
 
     // Pointer state crosses the same way, but only the newest update is kept:

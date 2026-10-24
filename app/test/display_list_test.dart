@@ -152,6 +152,31 @@ void main() {
     expect(withoutList.streamedDisplayIndex, isNull);
   });
 
+  test('a merged stream has no single streamed output', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'mergedLayout': true,
+      'width': 3640,
+      'height': 1920,
+      'originX': -1080,
+      'originY': 0,
+      'displays': <Object?>[
+        display(name: r'\\.\DISPLAY1', rect: <int>[0, 0, 2560, 1440], primary: true),
+        display(name: r'\\.\DISPLAY2', rect: <int>[-1080, 0, 0, 1920], rotation: 90),
+      ],
+    });
+
+    expect(status.mergedLayout, isTrue);
+    expect(status.streamedDisplayIndex, isNull);
+    expect(status.displays.length, 2);
+    expect(status.originX, -1080);
+  });
+
+  test('an absent merged flag keeps the single-display path', () {
+    const ViewerStatus status = ViewerStatus();
+    expect(status.mergedLayout, isFalse);
+  });
+
   test('separates accepted switches from refusals', () {
     final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
       'state': 'streaming',

@@ -2,7 +2,7 @@
 //
 //   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio]
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
-//   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real] [--display-mode]
+//   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--microphone] [--privacy]
 //                      [--sas] [--stream-options]
 //
@@ -33,7 +33,8 @@
 // Hello arrives so the choice can be honoured. Without --display the client
 // leaves the choice to the server, whose own --display is the fallback
 // (primary when unset). verify always asks for display 0 and checks that the
-// announced origin and picture size are that display's rect.
+// announced origin and picture size are that display's rect; verify --merged
+// asks for the merged layout of every output instead.
 //
 // Access control: serve --token T requires Hello to carry T and spends it on
 // the first accepted viewer unless --token-reuse is given; --token auto
@@ -53,10 +54,11 @@
 //
 // verify also covers viewer file uploads when --file-upload is given: a fresh
 // 300 KiB file, a deliberately truncated first attempt that leaves a resumable
-// prefix, the same offer resumed from that prefix, and a file whose advertised
-// digest cannot match. The host must finalize the two complete files, keep the
-// prefix (its answer names the offset), and delete the refused upload's
-// partial file.
+// prefix, the same offer resumed from that prefix, one file placed below a
+// relative directory, and a file whose advertised digest cannot match. The
+// host must finalize the three complete files (the folder one in its nested
+// directory), keep the prefix (its answer names the offset), and delete the
+// refused upload's partial file.
 //
 // --file-download runs the same channel the other way: the host offers a
 // deterministic file, the viewer accepts it, checks the bytes against the
@@ -234,9 +236,9 @@ std::vector<uint8_t> file_probe_content(size_t size) {
     return bytes;
 }
 
-// The upload probe's four offers: a complete fresh file, the prefix of the
-// same payload under another name, the rest of that file, and an honest
-// payload with a digest that cannot match.
+// The upload probe's five offers: a complete fresh file, the prefix of the
+// same payload under another name, the rest of that file, a complete file with
+// a relative directory, and an honest payload with a digest that cannot match.
 inline constexpr size_t kFileProbeBytes = 300u * 1024u;
 inline constexpr size_t kFileResumePrefix = 100u * 1024u;
 inline constexpr size_t kFileDigestBytes = 64u * 1024u;
@@ -658,6 +660,9 @@ struct Options {
     // display does not report. The session runs long enough for the whole
     // walk because every step waits for the previous answer.
     bool display_mode = false;
+    // verify only: ask for the merged layout (kDisplayAll) instead of one
+    // output, then check the union geometry and the no-op merge switch.
+    bool merged = false;
     // verify only: upload a deterministic 300 KiB payload through CFIL and
     // check the host wrote it, byte for byte, into the receive directory.
     bool file_upload = false;
@@ -794,6 +799,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.input_real = true;
             } else if (arg == "--display-mode") {
                 options.display_mode = true;
+            } else if (arg == "--merged") {
+                options.merged = true;
             } else if (arg == "--file-upload") {
                 options.file_upload = true;
             } else if (arg == "--file-download") {
@@ -890,6 +897,18 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.stream_options && options.mode != "verify") {
         std::fprintf(stderr, "--stream-options only applies to verify\n");
+        return false;
+    }
+    if (options.merged && options.mode != "verify") {
+        std::fprintf(stderr, "--merged only applies to verify\n");
+        return false;
+    }
+    if (options.merged && options.display_set) {
+        std::fprintf(stderr, "--merged asks for every output; do not also give --display\n");
+        return false;
+    }
+    if (options.merged && options.display_mode) {
+        std::fprintf(stderr, "--merged and --display-mode are mutually exclusive\n");
         return false;
     }
     if (!options.send_clipboard.empty()) {
@@ -1065,6 +1084,8 @@ struct SenderStats {
     // Display switches the host accepted and refused during the session.
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
+    // True when the running stream is the merged union of the outputs.
+    bool display_merged = false;
     // Display mode changes the host applied (accepted requests, including a
     // no-op for the running mode) and refused.
     uint64_t display_mode_changes = 0;
@@ -1244,6 +1265,8 @@ struct ReceiverStats {
     std::string stream_option_alt_reason;
     bool stream_option_codec_restored = false;
     std::vector<chast::DisplayDescription> displays;
+    // HelloAck said the stream is the merged union of the outputs.
+    bool hello_merged = false;
     // StreamInfo messages received, and the description from the last one.
     uint64_t stream_updates = 0;
     chast::ServerInfo last_update;
@@ -1598,6 +1621,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.client_connected = status.stats.client_connected;
     stats.requested_display = status.requested_display;
     stats.display_index = status.display_index;
+    stats.display_merged = status.display_merged;
     stats.codec = status.stream.codec;
     stats.width = status.stream.width;
     stats.height = status.stream.height;
@@ -1841,6 +1865,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.input_enabled = info.input_enabled;
     stats.clipboard_enabled = info.clipboard_enabled;
     stats.displays = info.displays;
+    stats.hello_merged = info.merged;
     stats.target_bitrate = info.bitrate;
     stats.framerate = info.framerate;
     stats.audio_info = info.audio;
@@ -1865,7 +1890,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         static_cast<unsigned>(display.rotation_degrees),
                         display.primary ? " primary" : "");
         }
-        if (options.display_set) {
+        if (info.merged) {
+            std::printf("quic: the stream is the merged layout of %zu display%s\n",
+                        info.displays.size(), info.displays.size() == 1 ? "" : "s");
+        }
+        if (options.display_set && options.display == chast::kDisplayAll) {
+            std::printf("quic: asked the server for the merged layout\n");
+        } else if (options.display_set) {
             std::printf("quic: asked the server for display %zu\n", options.display);
         } else {
             std::printf("quic: let the server choose the display\n");
@@ -1972,10 +2003,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
 
     // ---- file upload probe (verify --file-upload) ----
-    // Four offers in sequence: a complete file, a truncated first attempt that
+    // Five offers in sequence: a complete file, a truncated first attempt that
     // leaves a resumable prefix, the rest of that file resumed at the prefix,
-    // and one whose advertised digest cannot match. The host checks the digest
-    // before it renames a file into place, so the bytes on disk close the loop.
+    // a file below a relative directory, and one whose advertised digest
+    // cannot match. The host checks the digest before it renames a file into
+    // place, so the bytes on disk close the loop.
     const uint32_t kFileProbeId = 0x0F11E001u;
     stats.file_probe = options.file_upload;
     struct FileProbeStage {
@@ -2027,6 +2059,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                   chast::FileCode::IoError, kFileResumePrefix, 0);
         add_stage("resumed", "chast-verify-resume.bin", kFileResumePrefix, payload.size(),
                   true, chast::FileCode::Ok, payload.size(), kFileResumePrefix);
+        // A folder upload: the host must create the relative chain below its
+        // receive root and land the leaf there.
+        add_stage("nested", "chast-verify-nested.bin", 0, payload.size(), false,
+                  chast::FileCode::Ok, payload.size(), 0);
+        file_stages.back().offer.relative_path = "chast-verify/nested";
         // The payload is honest; only the advertised digest is wrong. The host
         // can only discover that after the stream ends, so it accepts the
         // offer and refuses the finished file.
@@ -2348,11 +2385,16 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     // the end of the announced list (NotFound). They are spaced wider than the
     // host's 1 s switch rate limit.
     if (options.mode == "verify" && !info.displays.empty()) {
-        size_t target = options.display_set ? options.display : 0;
-        if (target >= info.displays.size()) {
-            target = 0;
+        if (options.merged) {
+            // Asking for the merge that is already running must be a no-op.
+            stats.switch_ok_index = chast::kDisplayAll;
+        } else {
+            size_t target = options.display_set ? options.display : 0;
+            if (target >= info.displays.size()) {
+                target = 0;
+            }
+            stats.switch_ok_index = static_cast<uint16_t>(target);
         }
-        stats.switch_ok_index = static_cast<uint16_t>(target);
         const size_t past = info.displays.size() + 2;
         if (past < chast::kMaxDisplayCount) {
             stats.switch_bad_index = static_cast<uint16_t>(past);
@@ -5666,7 +5708,7 @@ int run_verify(const Options& options) {
         local.seconds = 20.0;
     }
     if (local.file_upload) {
-        // Four serialized offers, two of which wait for the host to reject the
+        // Five serialized offers, two of which wait for the host to reject the
         // finished stream, need more than the default short session.
         if (local.seconds < 6.0) {
             local.seconds = 6.0;
@@ -5733,7 +5775,10 @@ int run_verify(const Options& options) {
     Options receiver_options = local;
     receiver_options.save.clear();
     // Exercise the wire request instead of leaving the choice to the server.
-    if (!receiver_options.display_set) {
+    if (receiver_options.merged) {
+        receiver_options.display_set = true;
+        receiver_options.display = chast::kDisplayAll;
+    } else if (!receiver_options.display_set) {
         receiver_options.display_set = true;
         receiver_options.display = 0;
     }
@@ -5785,6 +5830,7 @@ int run_verify(const Options& options) {
     // upload loop without trusting the viewer's own counters.
     bool fresh_file_on_disk_ok = false;
     bool resumed_file_on_disk_ok = false;
+    bool nested_file_on_disk_ok = false;
     bool digest_file_absent = false;
     bool no_partial_left = false;
     std::string file_check_detail;
@@ -5799,13 +5845,29 @@ int run_verify(const Options& options) {
                          std::istreambuf_iterator<char>());
             return true;
         };
+        // C++20 builds the path from the UTF-8 bytes the options carry.
+        auto from_utf8 = [](const std::string& text) {
+            return std::filesystem::path(std::u8string(text.begin(), text.end()));
+        };
+        const std::filesystem::path directory = from_utf8(local.file_receive_dir);
+        const std::filesystem::path nested_directory =
+            directory / "chast-verify" / "nested";
         std::vector<uint8_t> stored;
-        if (sent.received_file_paths.size() == 2) {
+        if (sent.received_file_paths.size() == 3) {
             fresh_file_on_disk_ok =
                 read_all(sent.received_file_paths[0], stored) && stored == expected;
             stored.clear();
             resumed_file_on_disk_ok =
                 read_all(sent.received_file_paths[1], stored) && stored == expected;
+            stored.clear();
+            const std::filesystem::path nested_path =
+                from_utf8(sent.received_file_paths[2]);
+            std::error_code nested_ec;
+            nested_file_on_disk_ok =
+                std::filesystem::equivalent(nested_path.parent_path(), nested_directory,
+                                            nested_ec) &&
+                !nested_ec && read_all(sent.received_file_paths[2], stored) &&
+                stored == expected;
         }
         file_check_detail =
             "the host reported " + std::to_string(sent.received_file_paths.size()) +
@@ -5813,11 +5875,6 @@ int run_verify(const Options& options) {
         for (const std::string& stored_path : sent.received_file_paths) {
             file_check_detail += "\n       " + stored_path;
         }
-        // C++20 builds the path from the UTF-8 bytes the options carry.
-        auto from_utf8 = [](const std::string& text) {
-            return std::filesystem::path(std::u8string(text.begin(), text.end()));
-        };
-        const std::filesystem::path directory = from_utf8(local.file_receive_dir);
         const std::filesystem::path digest_final = directory / "chast-verify-digest.bin";
         const std::filesystem::path digest_part = directory / "chast-verify-digest.bin.part";
         const std::filesystem::path digest_sidecar =
@@ -6140,6 +6197,49 @@ int run_verify(const Options& options) {
               "the stream update described the running stream");
     }
 
+    if (local.merged) {
+        check(sent.display_merged, "the host streamed the merged layout");
+        check(received.hello_merged, "HelloAck marked the stream as a merged layout");
+        check(sent.requested_display == chast::kDisplayAll,
+              "the server saw the viewer's merged-layout request");
+        check(!received.displays.empty(), "the merged layout listed its member displays");
+        bool union_matches = !received.displays.empty();
+        int32_t left = 0;
+        int32_t top = 0;
+        int32_t right = 0;
+        int32_t bottom = 0;
+        if (union_matches) {
+            left = received.displays.front().left;
+            top = received.displays.front().top;
+            right = received.displays.front().right;
+            bottom = received.displays.front().bottom;
+            for (const chast::DisplayDescription& display : received.displays) {
+                left = (std::min)(left, display.left);
+                top = (std::min)(top, display.top);
+                right = (std::max)(right, display.right);
+                bottom = (std::max)(bottom, display.bottom);
+            }
+            union_matches =
+                left == received.origin_x && top == received.origin_y &&
+                static_cast<uint32_t>(right - left) == received.source_width &&
+                static_cast<uint32_t>(bottom - top) == received.source_height;
+        }
+        check(union_matches, "the merged canvas is the union of its member displays");
+        bool inside_canvas = union_matches;
+        for (const chast::DisplayDescription& display : received.displays) {
+            inside_canvas = inside_canvas && display.left >= left && display.top >= top &&
+                            display.right <= right && display.bottom <= bottom;
+        }
+        check(inside_canvas, "every member display lies inside the merged canvas");
+        check(received.display_switch_results == 2 && received.display_switch_ok == 1,
+              "the host accepted the merge request while the merged stream ran");
+        check(received.display_switch_refused == 1 &&
+                  received.last_switch_code == chast::DisplaySwitchCode::NotFound,
+              "a switch past the merged member list was refused as not found");
+        check(sent.display_switches == 1 && sent.display_switch_failures == 1,
+              "the host counted the merged no-op and the refusal");
+    }
+
     if (local.input) {
         check(sent.input_enabled, "the server announced input as enabled");
         check(received.input_enabled, "the client saw input enabled in HelloAck");
@@ -6164,22 +6264,26 @@ int run_verify(const Options& options) {
             }
         }
         check(primary_count == 1, "exactly one display is marked primary");
-        check(captured_listed, "the captured output is listed among the displays");
+        if (!local.merged) {
+            check(captured_listed, "the captured output is listed among the displays");
+        }
         check(sent.requested_display == static_cast<uint16_t>(receiver_options.display),
               "the server saw the viewer's display choice");
-        check(sent.display_index == receiver_options.display,
-              "the server captured the display the viewer asked for");
-        bool requested_matches = receiver_options.display < received.displays.size();
-        if (requested_matches) {
-            const chast::DisplayDescription& chosen =
-                received.displays[receiver_options.display];
-            requested_matches =
-                chosen.left == sent.origin_x && chosen.top == sent.origin_y &&
-                static_cast<uint32_t>(chosen.right - chosen.left) == sent.source_width &&
-                static_cast<uint32_t>(chosen.bottom - chosen.top) == sent.source_height;
+        if (!local.merged) {
+            check(sent.display_index == receiver_options.display,
+                  "the server captured the display the viewer asked for");
+            bool requested_matches = receiver_options.display < received.displays.size();
+            if (requested_matches) {
+                const chast::DisplayDescription& chosen =
+                    received.displays[receiver_options.display];
+                requested_matches =
+                    chosen.left == sent.origin_x && chosen.top == sent.origin_y &&
+                    static_cast<uint32_t>(chosen.right - chosen.left) == sent.source_width &&
+                    static_cast<uint32_t>(chosen.bottom - chosen.top) == sent.source_height;
+            }
+            check(requested_matches,
+                  "the stream's origin and size are the requested display's rect");
         }
-        check(requested_matches,
-              "the stream's origin and size are the requested display's rect");
         check(sent.input_events.size() == received.input_sent.size(),
               "every input event reached the server");
         bool same = sent.input_events.size() == received.input_sent.size();
@@ -6193,20 +6297,22 @@ int run_verify(const Options& options) {
                   sent.input_stats.dropped == 0,
               "no input event was rejected, failed or dropped");
         check(sent.input_releases == 1, "the viewer's release request reached the server");
-        check(received.display_switch_results == 2,
-              "both mid-session switch requests were answered");
-        check(received.display_switch_ok == 1,
-              "the host accepted a switch to the output already streaming");
-        check(received.display_switch_refused == 1 &&
-                  received.last_switch_code == chast::DisplaySwitchCode::NotFound,
-              "a switch past the announced list was refused as not found");
-        check(received.switch_bad_index != chast::kDisplayAuto &&
-                  received.last_switch_index == received.switch_bad_index,
-              "the refusal named the index the viewer asked for");
-        check(!received.last_switch_reason.empty(),
-              "the refusal carried the host's reason");
-        check(sent.display_switches == 1 && sent.display_switch_failures == 1,
-              "the host counted one accepted and one refused switch");
+        if (!local.merged) {
+            check(received.display_switch_results == 2,
+                  "both mid-session switch requests were answered");
+            check(received.display_switch_ok == 1,
+                  "the host accepted a switch to the output already streaming");
+            check(received.display_switch_refused == 1 &&
+                      received.last_switch_code == chast::DisplaySwitchCode::NotFound,
+                  "a switch past the announced list was refused as not found");
+            check(received.switch_bad_index != chast::kDisplayAuto &&
+                      received.last_switch_index == received.switch_bad_index,
+                  "the refusal named the index the viewer asked for");
+            check(!received.last_switch_reason.empty(),
+                  "the refusal carried the host's reason");
+            check(sent.display_switches == 1 && sent.display_switch_failures == 1,
+                  "the host counted one accepted and one refused switch");
+        }
     }
 
     if (local.display_mode) {
@@ -6307,47 +6413,52 @@ int run_verify(const Options& options) {
 
     if (local.file_upload) {
         check(received.file_probe, "the viewer ran the file upload probe");
-        check(received.file_offers_sent == 4 && received.file_answers == 4,
-              "the viewer made four offers and the host answered each");
-        check(received.file_answer_codes.size() == 4 &&
+        check(received.file_offers_sent == 5 && received.file_answers == 5,
+              "the viewer made five offers and the host answered each");
+        check(received.file_answer_codes.size() == 5 &&
                   std::all_of(received.file_answer_codes.begin(),
                               received.file_answer_codes.end(),
                               [](chast::FileCode code) { return code == chast::FileCode::Ok; }),
-              "the host accepted all four offers");
-        check(received.file_answer_offsets.size() == 4 &&
+              "the host accepted all five offers");
+        check(received.file_answer_offsets.size() == 5 &&
                   received.file_answer_offsets[0] == 0 &&
                   received.file_answer_offsets[1] == 0 &&
                   received.file_answer_offsets[2] == kFileResumePrefix &&
-                  received.file_answer_offsets[3] == 0,
+                  received.file_answer_offsets[3] == 0 &&
+                  received.file_answer_offsets[4] == 0,
               "the retry resumed at the prefix the truncated upload left");
-        check(received.file_bytes_sent == 2 * kFileProbeBytes + kFileDigestBytes,
-              "the viewer streamed 664 KiB across the four offers");
-        check(received.file_results == 4 && received.file_result_codes.size() == 4 &&
+        check(received.file_bytes_sent == 3 * kFileProbeBytes + kFileDigestBytes,
+              "the viewer streamed 964 KiB across the five offers");
+        check(received.file_results == 5 && received.file_result_codes.size() == 5 &&
                   received.file_result_codes[0] == chast::FileCode::Ok &&
                   received.file_result_codes[1] == chast::FileCode::IoError &&
                   received.file_result_codes[2] == chast::FileCode::Ok &&
-                  received.file_result_codes[3] == chast::FileCode::IoError,
+                  received.file_result_codes[3] == chast::FileCode::Ok &&
+                  received.file_result_codes[4] == chast::FileCode::IoError,
               "the truncated and mis-hashed uploads were refused, the complete ones "
               "stored");
-        check(received.file_result_received.size() == 4 &&
+        check(received.file_result_received.size() == 5 &&
                   received.file_result_received[0] == kFileProbeBytes &&
                   received.file_result_received[1] == kFileResumePrefix &&
                   received.file_result_received[2] == kFileProbeBytes &&
-                  received.file_result_received[3] == kFileDigestBytes,
+                  received.file_result_received[3] == kFileProbeBytes &&
+                  received.file_result_received[4] == kFileDigestBytes,
               "every result reported the bytes the host actually holds");
-        check(received.file_result_reasons.size() == 4 &&
+        check(received.file_result_reasons.size() == 5 &&
                   !received.file_result_reasons[1].empty() &&
-                  !received.file_result_reasons[3].empty(),
+                  !received.file_result_reasons[4].empty(),
               "both refusals carried the host's reason");
         check(received.file_errors == 0, "the uploader saw no protocol errors");
-        check(sent.files_received == 2 && sent.file_bytes_received == 2 * kFileProbeBytes,
-              "the host finalized exactly the two complete files");
+        check(sent.files_received == 3 && sent.file_bytes_received == 3 * kFileProbeBytes,
+              "the host finalized exactly the three complete files");
         check(fresh_file_on_disk_ok, "the fresh upload matches the offered payload");
         check(resumed_file_on_disk_ok, "the resumed upload matches the offered payload");
+        check(nested_file_on_disk_ok,
+              "the folder upload landed below its relative directory");
         check(digest_file_absent && no_partial_left,
               "the digest refusal left neither the file nor a partial behind");
-        if (!fresh_file_on_disk_ok || !resumed_file_on_disk_ok || !digest_file_absent ||
-            !no_partial_left) {
+        if (!fresh_file_on_disk_ok || !resumed_file_on_disk_ok ||
+            !nested_file_on_disk_ok || !digest_file_absent || !no_partial_left) {
             std::printf("     %s\n", file_check_detail.c_str());
         }
     }

@@ -74,6 +74,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_file_transfer == b.allow_file_transfer &&
            a.file_receive_directory == b.file_receive_directory &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
+           a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
            a.allow_privacy_mode == b.allow_privacy_mode && a.auth_mode == b.auth_mode &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
@@ -99,6 +100,8 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
     settings.allow_microphone = true;
+    settings.audio_device = "{0.0.1.00000000}.{5f3a2c1b-9d4e-4a6f-8b7c-1234567890ab}";
+    settings.audio_aec = false;
     settings.allow_privacy_mode = true;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
@@ -163,6 +166,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.allow_audio, "a fresh host shares the system sound");
     check(!loaded.settings.allow_microphone,
           "a fresh host does not accept the viewer microphone");
+    check(loaded.settings.audio_device.empty(), "a fresh host follows the default output");
+    check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
     check(!loaded.settings.allow_privacy_mode, "a fresh host does not blank the local screen");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
@@ -192,6 +197,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "clipboard=perhaps\n"
                "file_transfer=perhaps\n"
                "audio=perhaps\n"
+               "audio_device=" + std::string(1100, 'd') + "\n"
+               "audio_aec=perhaps\n"
                "microphone=perhaps\n"
                "privacy_mode=perhaps\n"
                "approve=off\n"
@@ -219,6 +226,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.allow_clipboard, "an unparsable clipboard toggle keeps the default");
     check(settings.allow_file_transfer, "an unparsable file toggle keeps the default");
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
+    check(settings.audio_device.empty(), "an oversized output id is dropped");
+    check(settings.audio_aec, "an unparsable AEC toggle keeps the default");
     check(!settings.allow_microphone,
           "an unparsable microphone toggle keeps the private default");
     check(!settings.allow_privacy_mode,
@@ -239,7 +248,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
-                            "microphone", "privacy_mode", "token_mode", "token", "codec",
+                            "audio_device", "audio_aec", "microphone", "privacy_mode",
+                            "token_mode", "token", "codec",
                             "bitrate_kbps",
                             "framerate",
                             "quality", "display", "tunnel", "server_url", "server_key",
@@ -251,6 +261,22 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "unknown keys are accepted silently");
     check(loaded.warning.find("without '='") != std::string::npos,
           "a line without '=' is reported");
+}
+
+void test_audio_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "audio.ini";
+    write_text(path, "audio_device=\naudio_aec=off\n");
+    const chast::HostSettingsLoad empty = chast::load_host_settings(path.string());
+    check(empty.warning.empty() && empty.settings.audio_device.empty() &&
+              !empty.settings.audio_aec,
+          "an empty output id and AEC off load without warnings");
+
+    write_text(path, "audio_device={0.0.1.00000000}.{missing}\naudio_aec=1\n");
+    const chast::HostSettingsLoad pinned = chast::load_host_settings(path.string());
+    check(pinned.warning.empty() &&
+              pinned.settings.audio_device == "{0.0.1.00000000}.{missing}" &&
+              pinned.settings.audio_aec,
+          "a device id that is not plugged in is preserved for the session");
 }
 
 void test_tokens() {
@@ -485,6 +511,7 @@ int main() {
     test_round_trip(dir);
     test_missing_file(dir);
     test_invalid_values(dir);
+    test_audio_settings(dir);
     test_tokens();
     test_security_migration(dir);
     test_totp_storage();

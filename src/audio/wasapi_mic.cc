@@ -49,55 +49,6 @@ constexpr uint32_t kMicRate = 48000;
 constexpr uint16_t kMicChannels = 1;
 constexpr size_t kFadeMs = 5;
 
-// PKEY_Device_FriendlyName, spelled out so this file does not need the
-// function-discovery header's full property-key list.
-constexpr PROPERTYKEY kFriendlyNameKey = {
-    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
-
-std::wstring widen_utf8(const std::string& text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                                         static_cast<int>(text.size()), nullptr, 0);
-    if (size <= 0) {
-        return {};
-    }
-    std::wstring wide(static_cast<size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                        static_cast<int>(text.size()), wide.data(), size);
-    return wide;
-}
-
-std::string narrow_utf8(const wchar_t* text) {
-    if (!text || !*text) {
-        return {};
-    }
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-    if (size <= 1) {
-        return {};
-    }
-    std::string narrow(static_cast<size_t>(size - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow.data(), size, nullptr, nullptr);
-    return narrow;
-}
-
-std::string friendly_name(IMMDevice* device) {
-    ComPtr<IPropertyStore> store;
-    if (FAILED(device->OpenPropertyStore(STGM_READ, store.put()))) {
-        return {};
-    }
-    PROPVARIANT value;
-    PropVariantInit(&value);
-    std::string name;
-    if (SUCCEEDED(store->GetValue(kFriendlyNameKey, &value)) &&
-        value.vt == VT_LPWSTR) {
-        name = narrow_utf8(value.pwszVal);
-    }
-    PropVariantClear(&value);
-    return name;
-}
-
 ComPtr<IMMDevice> default_capture_device(IMMDeviceEnumerator* enumerator) {
     ComPtr<IMMDevice> device;
     if (FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, device.put()))) {
@@ -110,7 +61,20 @@ ComPtr<IMMDevice> default_capture_device(IMMDeviceEnumerator* enumerator) {
 class WasapiMicrophoneCapture final : public IMicrophoneCapture {
 public:
     explicit WasapiMicrophoneCapture(MicrophoneCaptureConfig config)
-        : config_(std::move(config)) {}
+        : config_(std::move(config)) {
+        if ((config_.echo_cancellation && config_.reference) ||
+            config_.noise_suppression) {
+            AudioDspConfig dsp_config;
+            dsp_config.near_channels = kMicChannels;
+            dsp_config.echo_cancellation = config_.echo_cancellation;
+            dsp_config.noise_suppression = config_.noise_suppression;
+            dsp_config.reference = config_.reference;
+            std::string dsp_error;
+            // A DSP that cannot open must not take the microphone down: the
+            // capture falls back to sending the raw signal.
+            dsp_ = AudioPreprocessor::create(dsp_config, &dsp_error);
+        }
+    }
     ~WasapiMicrophoneCapture() override { close(); }
 
     bool start_thread(std::string* error);
@@ -133,6 +97,12 @@ public:
         stats.capture_errors = capture_errors_.load();
         stats.recoveries = recoveries_.load();
         stats.recovering = recovering_.load();
+        if (dsp_) {
+            const AudioDspStats dsp = dsp_->stats();
+            stats.processed_frames = dsp.processed_frames;
+            stats.reference_underruns = dsp.reference_underruns;
+            stats.dsp_resets = dsp.resets;
+        }
         return stats;
     }
 
@@ -178,6 +148,7 @@ private:
     bool client_started_ = false;
     wasapi::MixFormat format_;
     std::unique_ptr<IAudioEncoder> encoder_;
+    std::unique_ptr<AudioPreprocessor> dsp_;
     SwrContext* swr_ = nullptr;
     std::vector<int16_t> pcm_;
     std::vector<uint8_t> zero_input_;
@@ -345,7 +316,7 @@ bool WasapiMicrophoneCapture::open_device(std::string* error) {
     ComPtr<IMMDevice> device;
     HRESULT hr = S_OK;
     if (!config_.device_id.empty()) {
-        const std::wstring wanted = widen_utf8(config_.device_id);
+        const std::wstring wanted = wasapi::widen_utf8(config_.device_id);
         if (wanted.empty()) {
             *error = "the selected microphone id is not valid UTF-8";
             return false;
@@ -466,6 +437,9 @@ void WasapiMicrophoneCapture::close_device() {
     zero_input_.clear();
     last_capture_end_ms_ = 0;
     fade_remaining_ = 0;
+    if (dsp_) {
+        dsp_->reset();
+    }
 }
 
 bool WasapiMicrophoneCapture::start_client() {
@@ -613,6 +587,11 @@ bool WasapiMicrophoneCapture::process(const BYTE* data, UINT32 frames, DWORD fla
         return false;
     }
     const size_t out_frames = static_cast<size_t>(converted);
+    if (dsp_ && out_frames > 0) {
+        // Echo cancellation and noise suppression run on the fixed 48 kHz
+        // mono stream, before the silence count and the encoder.
+        dsp_->process(pcm_.data(), out_frames);
+    }
 
     bool silent = silent_flag;
     if (!silent && out_frames > 0) {
@@ -743,8 +722,8 @@ std::vector<MicrophoneDevice> list_microphones(std::string* error) {
                 continue;
             }
             MicrophoneDevice entry;
-            entry.id = narrow_utf8(wasapi::device_id(device.get()).c_str());
-            entry.name = friendly_name(device.get());
+            entry.id = wasapi::narrow_utf8(wasapi::device_id(device.get()).c_str());
+            entry.name = wasapi::friendly_name(device.get());
             if (entry.name.empty()) {
                 entry.name = "Microphone " + std::to_string(i + 1);
             }

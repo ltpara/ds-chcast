@@ -233,7 +233,7 @@
   - 验证（2026-10-24，单机回环）：`chast-quic verify --privacy` 100 项断言全过，遮罩 1.32 s 开、3.54 s 关，期间视频持续且画面未变黑；关闭闸门的主机拒绝请求且不断流；181 个访问单元、摘要 `4DB1C6A97132DC4F`。`ctest -C Release` 12/12；`flutter analyze`、73 项测试、Windows Release 构建通过。
   - 已知限制：真实锁屏/UAC、服务态安全桌面采集与遮罩视觉仍需实机；虚拟显示器 M8.2 继续暂缓。
 
-## M9 — 输入与连接补全（进行中）
+## M9 — 输入与连接补全（已完成）
 
 计划与逐项记录见 `docs/m9-plan.md`。
 
@@ -285,10 +285,83 @@
   - 已知限制：无 HEVC 硬件时的拒绝文案、双机 HEVC 解码兼容性与不同网络
     下的画质体感仍待人工/双机验收；拒绝 Reset 的运行库上每次改码率都会有
     一次编码器重开。
+- 已完成：多文件与文件夹传输 M9.2（协议 v22）。
+  - 协议：`FileOffer = 21` 末尾追加可选的 `u16 relative_len` + UTF-8 相对目录
+    （不含文件名，空表示接收根目录）；长度 ≤1024 B、≤32 段、只允许 `/`，
+    拒绝绝对路径、盘符、`..`、`.`、空段和反斜杠；没有该字段的旧载荷按
+    根目录解析。
+  - 主机：相对目录逐段消毒后从接收根目录逐级创建，已存在的段必须是普通
+    目录且不是 reparse point；叶子文件沿用唯一名、`.part` sidecar 与摘要
+    校验，断点续传位置随目录变化；并发 offer 仍回答 `Busy`。
+  - 查看器：`SendFiles` 一次接收多个路径/文件夹；常驻工作线程递归展开
+    （跳过符号链接、设备、不可读项，空目录记一条失败）并逐个计算 SHA-256；
+    会话线程按顺序 offer、发送、收尾，单个失败不阻塞队列，权限撤销清空
+    整队；队列上限 10000 条。
+  - UI：选择器加 `OFN_ALLOWMULTISELECT | OFN_EXPLORER`，`WM_DROPFILES`
+    取回完整路径列表；进度覆盖层显示“相对目录/文件名 + 队列剩余 N 个”，
+    完成后用 `lastFileName`/`lastFileError` 弹一次结果提示。
+  - 验证（2026-10-24，单机回环）：`chast-protocol-test` 338 项、
+    `chast-file-transfer-test` 50 项断言全过；`ctest -C Release` 13/13；
+    `chast-quic verify --file-upload` 105 项断言、五个顺序 offer（含嵌套
+    目录）全部通过，传输 964 KiB、恰好 3 个完整文件落盘，嵌套文件位于
+    `<接收目录>/chast-verify/nested/`，本轮 181 个访问单元、摘要
+    `7F2D789FFC5DFFC4`；`flutter analyze` 无问题、92 项测试、Windows
+    Release 构建通过。
+  - 已知限制：查看器的递归展开尚无自动化断言，真实多选对话框、资源管理器
+    拖放和 GUI 队列/撤销体验仍待人工验收；不做并行传输、空目录和符号链接
+    跟随；主机 → 查看器下载仍为单文件。
+- 已完成：多显示器合并视图 M9.3（协议 v23）。
+  - 协议：Hello 的 `display` 接受 `kDisplayAll = 0xFFFE`；HelloAck/StreamInfo
+    flags 新增 `kServerInfoMergedLayout = 0x0040`（非权限位，权限掩码相等校验
+    改用 `kServerInfoPermissionFlags`）；`ServerInfo.merged` 由 flag 解码；
+    合并流要求成员列表非空、每个成员矩形都在并集内且并集等于原点/源尺寸
+    （允许 1 像素偶数对齐）。
+  - 主机：新增 `MergedCapturer`，在同一 D3D11 设备/上下文上为每块屏建子采集，
+    按虚拟桌面并集用 `CopySubresourceRegion` 合成 BGRA8 画布，只拷贝产生新帧
+    的显示器区域；画布统一做一次 NV12 转换，长边 >4096 或面积 >4096×2304 时
+    自动等比缩小；跨适配器明确拒绝，光标按并集坐标映射并取所在屏形状。会话
+    支持 Hello/会话内选 `kDisplayAll`、成员热插拔重建、合并空操作，合并流拒绝
+    单屏模式切换；ABR 把请求比例与实际 NV12 比例分开，避免重复决策。
+  - 查看器：`ViewerStatus.mergedLayout`、`kViewerDisplayAll`；显示器菜单新增
+    “全部显示器（合并）”并显示并集尺寸/成员数，合并流高亮该条目、隐藏分辨率
+    菜单；bridge 与 Start/SwitchDisplay 接受 `kDisplayAll`。
+  - 验证（2026-10-24，单机回环）：`chast-protocol-test` 348 项断言（含合并
+    HelloAck 往返、并集校验、空成员拒绝、权限位共存）；`chast-quic verify
+    --merged` 91 项断言全过，单屏 1920×1080 合成并 100% 编码，切
+    `kDisplayAll` 为空操作、越界索引被拒，150 个访问单元、摘要
+    `CD1D7253759BFE8D`；`ctest -C Release` 14/14；`flutter analyze` 无问题、
+    96 项测试、Windows Release 构建通过。
+  - 已知限制：真实多屏布局（负坐标、横竖混排、不同分辨率/DPI）、跨适配器
+    拒绝文案、热插拔重建与光标形状切换仍待多屏机器人工验收；不做每屏独立
+    流、跨适配器 CPU 合成、合并下的单屏模式设置和合并选择持久化。
+- 已完成：音频设备选择、回声消除与降噪 M9.4（协议仍 v23）。
+  - 音频参考：`AudioReference` 为固定 48 kHz 立体声环缓冲（约 2 s），播放
+    开始置 active、静音/停止置 inactive 并清零历史；主机以正在播放的远端
+    麦克风 PCM、查看器以解码后的系统声音为 AEC 参考，读取时固定回退 120 ms。
+  - DSP：`chast.audio` 引入 SpeexDSP，`AudioPreprocessor` 按 10 ms/480 样本
+    帧做 AEC（近端 1/2 声道、参考 2 声道、200 ms 滤波器），可选 DENOISE，
+    AGC/VAD 保持关闭；参考 inactive 时严格旁路并重置滤波器；统计处理帧、
+    欠载与重置次数，处理失败按原样通过。
+  - 设备：主机设置新增 `audio_device`（留空跟随默认）与 `audio_aec`（默认
+    开），同一 render 端点用于系统声音捕获与远端麦克风播放，托盘“高级”页可
+    选择并刷新；查看器音量按钮长按列出输出端点，会话内切换只重建播放器并
+    保留解码器与时钟偏移，固定端点失效时回退默认并在 `audioError` 说明；
+    查看器麦克风菜单新增 AEC/NS 开关，改动重建采集与 `CMIC` 流。
+  - 状态/UI：`audioDevice/audioDeviceName/audioAec/audioNoiseSuppression` 与
+    麦克风 `aecFrames/nsFrames` 贯通 bridge、Flutter 状态与提示。
+  - 验证（2026-10-24，单机回环）：新增 `chast-audio-dsp-test`，合成回声
+    ERLE 28.31 dB、双讲相关性 0.994、降噪 14.27 dB、谐波保留 85.04%，
+    严格旁路与欠载计数通过；`ctest -C Release` 15/15；普通回环 121 个访问
+    单元、摘要 `38EBB31B754CB099`，`verify --microphone` `CMIC` 96 包/
+    91848 帧、439 Hz、151 个访问单元、摘要 `22874510645B8DAB`；
+    `flutter analyze` 无问题、104 项测试、Windows Release 构建通过。
+  - 已知限制：真实扬声器-麦克风回路的 AEC 收敛与听感、设备热插拔、双机
+    外放回声仍需人工验收；不做 AGC、端点自动切换与虚拟声卡。
 
 ## M6 后续（未开始）
 
-- 音频质量调优：唇音同步校准、AEC/噪声抑制、设备热切换。
+- 音频质量调优：唇音同步校准、设备热插拔自动切换（AEC/降噪/设备选择已在
+  M9.4 完成）。
 - 更多采集/编码后端与其他平台。
 - M8 其余项（虚拟显示器、NVENC/AMF、安装器与 i18n）见 `docs/m8-plan.md`。
 

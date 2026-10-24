@@ -39,6 +39,17 @@ void main() {
     bool fileAvailable = true,
     bool fileActive = false,
     VoidCallback? onSendFile,
+    bool audioAvailable = true,
+    bool audioMuted = false,
+    String audioDevice = '',
+    Future<List<ViewerAudioOutput>> Function()? onLoadAudioOutputs,
+    Future<void> Function(String)? onSelectAudioOutput,
+    String microphoneDevice = '',
+    bool audioAec = true,
+    bool audioNoiseSuppression = true,
+    Future<List<ViewerMicrophoneDevice>> Function()? onLoadMicrophones,
+    Future<void> Function(String)? onSelectMicrophone,
+    Future<void> Function(bool, bool)? onSetAudioProcessing,
     bool specialKeysAvailable = false,
     ValueChanged<RemoteSpecialAction>? onSpecialAction,
     bool streamOptionsAvailable = true,
@@ -63,13 +74,21 @@ void main() {
           clipboardAvailable: true,
           fileAvailable: fileAvailable,
           fileActive: fileActive,
-          audioAvailable: true,
-          audioMuted: false,
+          audioAvailable: audioAvailable,
+          audioMuted: audioMuted,
+          audioDevice: audioDevice,
+          onLoadAudioOutputs: onLoadAudioOutputs ??
+              () async => const <ViewerAudioOutput>[],
+          onSelectAudioOutput: onSelectAudioOutput ?? (_) async {},
           microphoneAvailable: true,
           microphoneEnabled: false,
-          microphoneDevice: '',
-          onLoadMicrophones: () async => const <ViewerMicrophoneDevice>[],
-          onSelectMicrophone: (_) async {},
+          microphoneDevice: microphoneDevice,
+          audioAec: audioAec,
+          audioNoiseSuppression: audioNoiseSuppression,
+          onLoadMicrophones: onLoadMicrophones ??
+              () async => const <ViewerMicrophoneDevice>[],
+          onSelectMicrophone: onSelectMicrophone ?? (_) async {},
+          onSetAudioProcessing: onSetAudioProcessing ?? (_, _) async {},
           privacyAvailable: true,
           privacyEnabled: false,
           displays: announced,
@@ -139,6 +158,46 @@ void main() {
     await tester.tap(find.text('服务端默认'));
     await tester.pumpAndSettle();
     expect(picked, kViewerDisplayAuto);
+  });
+
+  testWidgets('offers the merged view with the union geometry', (WidgetTester tester) async {
+    int? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: kViewerDisplayAll,
+      onSelect: (int index) => picked = index,
+    ));
+
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('全部显示器（合并）'), findsOneWidget);
+    expect(find.text('3640×1920 · 2 块屏'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<int>, '全部显示器（合并）'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('全部显示器（合并）'));
+    await tester.pumpAndSettle();
+    expect(picked, kViewerDisplayAll);
+  });
+
+  testWidgets('the merged stream hides the resolution picker',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: kViewerDisplayAll,
+      onSelect: (int index) {},
+      modes: const <ViewerDisplayMode>[
+        ViewerDisplayMode(width: 1920, height: 1080, refresh: 60, current: true),
+      ],
+    ));
+
+    expect(find.byIcon(Icons.aspect_ratio_rounded), findsNothing);
   });
 
   testWidgets('the picker is inert before a list arrives', (WidgetTester tester) async {
@@ -333,5 +392,154 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('高清'), findsNothing);
     expect(quality, isNull);
+  });
+
+  testWidgets('the volume long press lists playback endpoints and reports the pick',
+      (WidgetTester tester) async {
+    String? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      audioDevice: '',
+      onLoadAudioOutputs: () async => const <ViewerAudioOutput>[
+        ViewerAudioOutput(id: 'out-1', name: '扬声器', isDefault: true),
+        ViewerAudioOutput(id: 'out-2', name: '耳机'),
+      ],
+      onSelectAudioOutput: (String id) async {
+        picked = id;
+      },
+    ));
+
+    await tester.longPress(find.byIcon(Icons.volume_up_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('系统默认输出'), findsOneWidget);
+    expect(find.text('扬声器'), findsOneWidget);
+    expect(find.text('耳机'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<String>, '系统默认输出'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('耳机'));
+    await tester.pumpAndSettle();
+    expect(picked, 'out-2');
+  });
+
+  testWidgets('the output menu marks the endpoint in use', (WidgetTester tester) async {
+    String? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      audioDevice: 'out-2',
+      onLoadAudioOutputs: () async => const <ViewerAudioOutput>[
+        ViewerAudioOutput(id: 'out-1', name: '扬声器', isDefault: true),
+        ViewerAudioOutput(id: 'out-2', name: '耳机'),
+      ],
+      onSelectAudioOutput: (String id) async {
+        picked = id;
+      },
+    ));
+
+    await tester.longPress(find.byIcon(Icons.volume_up_rounded));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<String>, '耳机'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('扬声器'));
+    await tester.pumpAndSettle();
+    expect(picked, 'out-1');
+  });
+
+  testWidgets('the microphone long press toggles echo cancellation and noise suppression',
+      (WidgetTester tester) async {
+    bool? pickedAec;
+    bool? pickedNoise;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      audioAec: true,
+      audioNoiseSuppression: true,
+      onSetAudioProcessing: (bool aec, bool noise) async {
+        pickedAec = aec;
+        pickedNoise = noise;
+      },
+    ));
+
+    await tester.longPress(find.byIcon(Icons.mic_off_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('回声消除'), findsOneWidget);
+    expect(find.text('噪声抑制'), findsOneWidget);
+    expect(find.text('系统默认麦克风'), findsOneWidget);
+
+    await tester.tap(find.text('噪声抑制'));
+    await tester.pumpAndSettle();
+    expect(pickedAec, isTrue);
+    expect(pickedNoise, isFalse);
+  });
+
+  testWidgets('the processing items follow the current switches',
+      (WidgetTester tester) async {
+    bool? pickedAec;
+    bool? pickedNoise;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      audioAec: false,
+      audioNoiseSuppression: true,
+      onSetAudioProcessing: (bool aec, bool noise) async {
+        pickedAec = aec;
+        pickedNoise = noise;
+      },
+    ));
+
+    await tester.longPress(find.byIcon(Icons.mic_off_rounded));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<Object>, '回声消除'),
+        matching: find.byIcon(Icons.check_box_outline_blank_rounded),
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('回声消除'));
+    await tester.pumpAndSettle();
+    expect(pickedAec, isTrue);
+    expect(pickedNoise, isTrue);
+  });
+
+  testWidgets('the volume menu stays inert when the host has no audio',
+      (WidgetTester tester) async {
+    String? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      audioAvailable: false,
+      onLoadAudioOutputs: () async => const <ViewerAudioOutput>[
+        ViewerAudioOutput(id: 'out-1', name: '扬声器', isDefault: true),
+      ],
+      onSelectAudioOutput: (String id) async {
+        picked = id;
+      },
+    ));
+
+    await tester.longPress(find.byIcon(Icons.volume_up_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('扬声器'), findsNothing);
+    expect(picked, isNull);
   });
 }

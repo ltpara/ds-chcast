@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 21.
+// The chast wire protocol, version 22.
 //
 // One QUIC connection carries:
 //
@@ -48,7 +48,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 21;
+inline constexpr uint16_t kProtocolVersion = 23;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -333,6 +333,10 @@ inline constexpr size_t kFileChunkBytes = 64u * 1024u;
 // Protocol ceiling; the host applies a smaller, configurable limit.
 inline constexpr uint64_t kMaxFileTransferBytes = 16ull * 1024ull * 1024ull * 1024ull;
 inline constexpr size_t kMaxFileNameBytes = 512;
+// Directory part of an offer, relative to the receiver's root and '/'
+// separated. Empty means the root itself.
+inline constexpr size_t kMaxFileRelativePathBytes = 1024;
+inline constexpr size_t kMaxFileRelativeComponents = 32;
 inline constexpr size_t kMaxFileReasonBytes = 256;
 inline constexpr uint8_t kFileOfferFlagResume = 0x01;
 inline constexpr uint8_t kFileOfferFlagsKnown = kFileOfferFlagResume;
@@ -353,6 +357,10 @@ struct FileOffer {
     bool resume = false;
     std::array<uint8_t, 32> sha256{};
     std::string name;
+    // Directory below the receiver's root, '/'-separated and without the
+    // file name. Empty keeps the file at the root. The receiver sanitizes
+    // each component before it creates anything.
+    std::string relative_path;
 };
 
 struct FileAnswer {
@@ -521,19 +529,27 @@ bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo
 // it that both sides may exchange clipboard content; bit 2 tells it the host
 // opened an audio stream and described the format in the audio block; bit 3
 // tells it that file offers are accepted; bit 4 that the viewer may open a
-// microphone stream; bit 5 that SetPrivacyMode is accepted.
+// microphone stream; bit 5 that SetPrivacyMode is accepted. Bit 6 is not a
+// permission: it says the picture is a merged layout of every attached output,
+// with origin/source covering their union.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
 inline constexpr uint16_t kServerInfoFileTransferEnabled = 0x0008;
 inline constexpr uint16_t kServerInfoMicrophoneEnabled = 0x0010;
 inline constexpr uint16_t kServerInfoPrivacyModeEnabled = 0x0020;
-inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoInputEnabled |
-                                                 kServerInfoClipboardEnabled |
-                                                 kServerInfoAudioEnabled |
-                                                 kServerInfoFileTransferEnabled |
-                                                 kServerInfoMicrophoneEnabled |
-                                                 kServerInfoPrivacyModeEnabled;
+inline constexpr uint16_t kServerInfoMergedLayout = 0x0040;
+// Flags that describe what the viewer may do. The permission mask appended to
+// HelloAck is the authority for these bits, so the parser compares it with
+// this mask rather than with every known flag.
+inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
+                                                       kServerInfoClipboardEnabled |
+                                                       kServerInfoAudioEnabled |
+                                                       kServerInfoFileTransferEnabled |
+                                                       kServerInfoMicrophoneEnabled |
+                                                       kServerInfoPrivacyModeEnabled;
+inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
+                                                  kServerInfoMergedLayout;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
@@ -577,6 +593,11 @@ struct DisplayDescription {
 // Hello display index meaning "whatever the server captures by default". The
 // server's fallback is its own configuration (primary when unset).
 inline constexpr uint16_t kDisplayAuto = 0xFFFF;
+// Hello display index meaning "every attached output, merged into one picture
+// in virtual-desktop layout". The host may refuse (no displays, adapters that
+// cannot share a device, an oversized union) and then answers with its default
+// single display; HelloAck's merged flag says which happened.
+inline constexpr uint16_t kDisplayAll = 0xFFFE;
 // Upper bound on a HelloAck display list; also the valid range of a Hello
 // display index. A machine with more outputs than this is not something the
 // viewer UI could present anyway, and the cap bounds the work a malformed
@@ -638,9 +659,10 @@ struct DisplayModeList {
 // gate: when false the viewer must not send InputEvents (they would be
 // dropped). `displays` lists every attached output; the one being streamed is
 // the entry whose rect starts at the origin and is `source_width` x
-// `source_height` pixels. `clipboard_enabled` mirrors the server's clipboard
-// gate: when false the viewer must not send clipboard content and will not
-// receive any. `file_transfer_enabled` gates FileOffer. `audio.enabled` says
+// `source_height` pixels; a merged stream has no such entry, `merged` is true,
+// and the lists are its members. `clipboard_enabled` mirrors the server's
+// clipboard gate: when false the viewer must not send clipboard content and
+// will not receive any. `file_transfer_enabled` gates FileOffer. `audio.enabled` says
 // whether an audio stream follows; when true, `audio` carries the codec, rate,
 // channel count and AudioSpecificConfig needed to decode it. Audio that fails
 // mid-session is turned off with a StreamInfo.
@@ -657,6 +679,10 @@ struct ServerInfo {
     bool input_enabled = false;
     bool clipboard_enabled = false;
     bool file_transfer_enabled = false;
+    // The picture is the union of every attached output (kDisplayAll), not a
+    // single captured output. `origin_x/y` and `source_width/height` describe
+    // that union; `displays` lists the members.
+    bool merged = false;
     // The viewer may open a microphone stream. This is the permission bit's
     // decoded form; it is not a separate wire field.
     bool microphone_enabled = false;
@@ -702,8 +728,9 @@ bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
                          std::string* error);
 
 // Hello asks the server to stream one display: `display` is an index into the
-// HelloAck display list from a previous session, or kDisplayAuto. The server
-// answers with the display it actually captured, which also fixes origin_x /
+// HelloAck display list from a previous session, kDisplayAuto, or kDisplayAll
+// for the merged view. The server answers with what it actually captured,
+// either one display or the merged union, and that answer fixes origin_x /
 // origin_y for the viewer's pointer mapping.
 //
 // Authentication travels in the same message. `access_token` is the legacy
@@ -989,6 +1016,10 @@ std::vector<uint8_t> make_display_mode_result(uint16_t display_index, uint16_t w
 bool parse_display_mode_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
                                uint16_t& width, uint16_t& height, uint16_t& refresh_hz,
                                DisplayModeCode& code, std::string& reason, std::string* error);
+// Joins the top-level upload folder and the native path below it into the
+// '/'-separated directory FileOffer carries. Empty or "." relatives mean the
+// top folder itself; a leading separator is ignored.
+std::string make_offer_relative_path(const std::string& top, const std::string& relative);
 // File transfer control messages. The makers truncate reasons/names on a
 // UTF-8 boundary; the parsers reject unknown codes, flags, empty or oversized
 // names and trailing bytes rather than repairing them.

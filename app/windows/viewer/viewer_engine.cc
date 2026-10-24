@@ -44,6 +44,9 @@ constexpr auto kFileSendBudget = std::chrono::milliseconds(8);
 constexpr double kFileUploadBytesPerSecond = 32.0 * 1024.0 * 1024.0;
 constexpr double kFileUploadBurst = 256.0 * 1024.0;
 constexpr size_t kMaxPendingInput = 256;
+// Safety valve for a folder that expands into a huge tree; the UI would
+// otherwise build an unbounded queue on the session thread.
+constexpr size_t kMaxQueuedUploads = 10000;
 
 std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
@@ -190,6 +193,11 @@ std::filesystem::path path_from_utf8(const std::string& path) {
         std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
 }
 
+std::string utf8_from_path(const std::filesystem::path& path) {
+    const std::u8string text = path.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+
 }  // namespace
 
 ViewerEngine::ViewerEngine(FrameSink* sink) : sink_(sink) {}
@@ -210,25 +218,43 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     if (thread_.joinable()) {
         thread_.join();
     }
-    // A previous session may have ended on its own while its hash was still
-    // running; the new one starts from a clean upload slot.
-    hash_cancel_.store(true, std::memory_order_release);
-    if (hasher_.joinable()) {
-        hasher_.join();
-    }
-    hash_cancel_.store(false, std::memory_order_release);
+    // A previous session may have ended on its own while its worker was still
+    // walking a folder or hashing a file; the new queue starts clean.
     {
         std::lock_guard<std::mutex> lock(file_mutex_);
-        file_ = FileUpload{};
+        file_worker_stop_ = true;
+        ++upload_epoch_;
+        pending_upload_roots_.clear();
+        uploads_.clear();
+        last_upload_ = FileUpload{};
+        last_upload_.stage = FileUpload::Stage::kDone;
         next_file_id_ = 1;
     }
+    file_work_cv_.notify_all();
+    if (file_worker_.joinable()) {
+        file_worker_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        file_worker_stop_ = false;
+    }
+    file_worker_ = std::thread(&ViewerEngine::FileWorker, this);
     device_identity_ = std::move(device_identity);
+    std::string selected_output;
+    {
+        std::lock_guard<std::mutex> lock(audio_output_mutex_);
+        selected_output = audio_output_device_id_;
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = ViewerStatus{};
         status_.host = host;
         status_.port = port;
         status_.state = ViewerState::kConnecting;
+        status_.audio_device = std::move(selected_output);
+        status_.audio_aec = microphone_aec_.load(std::memory_order_relaxed);
+        status_.audio_noise_suppression =
+            microphone_noise_.load(std::memory_order_relaxed);
         started_at_ = Clock::now();
     }
     {
@@ -278,11 +304,18 @@ void ViewerEngine::Stop() {
     if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
         thread_.join();
     }
-    // sha256_file() has no cancellation hook; the flag at least keeps a hash
-    // that has not started (or has just finished) from arming the slot again.
-    hash_cancel_.store(true, std::memory_order_release);
-    if (hasher_.joinable()) {
-        hasher_.join();
+    // The worker may be in the middle of a folder walk or a multi-gigabyte
+    // hash; the epoch makes its result unusable and the flag ends its wait.
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        file_worker_stop_ = true;
+        ++upload_epoch_;
+        pending_upload_roots_.clear();
+        uploads_.clear();
+    }
+    file_work_cv_.notify_all();
+    if (file_worker_.joinable()) {
+        file_worker_.join();
     }
     running_.store(false, std::memory_order_release);
 }
@@ -324,7 +357,7 @@ bool ViewerEngine::SwitchDisplay(uint16_t display) {
         if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
             return false;
         }
-        if (display != chast::kDisplayAuto &&
+        if (display != chast::kDisplayAuto && display != chast::kDisplayAll &&
             static_cast<size_t>(display) >= status_.displays.size()) {
             return false;
         }
@@ -340,7 +373,7 @@ bool ViewerEngine::RequestDisplayModes(uint16_t display) {
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.state != ViewerState::kStreaming ||
+        if (status_.state != ViewerState::kStreaming || status_.merged_layout ||
             static_cast<size_t>(display) >= status_.displays.size()) {
             return false;
         }
@@ -360,7 +393,8 @@ bool ViewerEngine::SetDisplayMode(uint16_t display, uint16_t width, uint16_t hei
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+        if (status_.state != ViewerState::kStreaming || !status_.input_enabled ||
+            status_.merged_layout) {
             return false;
         }
         if (static_cast<size_t>(display) >= status_.displays.size()) {
@@ -411,8 +445,8 @@ void ViewerEngine::SetClipboardSync(bool enabled) {
     clipboard_sync_.store(enabled, std::memory_order_release);
 }
 
-bool ViewerEngine::SendFile(const std::string& path) {
-    if (!running_.load(std::memory_order_acquire) || path.empty()) {
+bool ViewerEngine::SendFiles(const std::vector<std::string>& paths) {
+    if (!running_.load(std::memory_order_acquire) || paths.empty()) {
         return false;
     }
     {
@@ -422,78 +456,227 @@ bool ViewerEngine::SendFile(const std::string& path) {
             return false;
         }
     }
-    const std::filesystem::path source = path_from_utf8(path);
-    std::error_code code;
-    const uintmax_t size = std::filesystem::file_size(source, code);
-    if (code || !std::filesystem::is_regular_file(source, code) || code ||
-        size > chast::kMaxFileTransferBytes) {
-        return false;
-    }
-    const std::u8string u8name = source.filename().u8string();
-    std::string name(reinterpret_cast<const char*>(u8name.data()), u8name.size());
-    if (name.empty() || name.size() > chast::kMaxFileNameBytes) {
-        return false;
-    }
-    if (hasher_.joinable()) {
-        // Only a terminal slot reaches this point, so its hash has already
-        // published its result.
-        hasher_.join();
-    }
+    size_t added = 0;
     {
         std::lock_guard<std::mutex> lock(file_mutex_);
-        if (file_.stage != FileUpload::Stage::kNone &&
-            file_.stage != FileUpload::Stage::kDone &&
-            file_.stage != FileUpload::Stage::kFailed) {
-            return false;
+        for (const std::string& path : paths) {
+            if (path.empty()) {
+                continue;
+            }
+            if (pending_upload_roots_.size() + uploads_.size() >= kMaxQueuedUploads) {
+                break;
+            }
+            pending_upload_roots_.push_back(path);
+            ++added;
         }
-        file_ = FileUpload{};
-        file_.stage = FileUpload::Stage::kHashing;
-        file_.path = path;
-        file_.name = std::move(name);
-        file_.size = size;
-        file_.transfer_id = next_file_id_++;
     }
-    hasher_ = std::thread(&ViewerEngine::HashPendingFile, this);
+    if (added == 0) {
+        return false;
+    }
+    file_work_cv_.notify_all();
     return true;
 }
 
-void ViewerEngine::HashPendingFile() {
-    std::string path;
-    uint32_t transfer_id = 0;
-    {
-        std::lock_guard<std::mutex> lock(file_mutex_);
-        path = file_.path;
-        transfer_id = file_.transfer_id;
+bool ViewerEngine::HasHashableUploadLocked() const {
+    for (const FileUpload& upload : uploads_) {
+        if (upload.stage == FileUpload::Stage::kQueued) {
+            return true;
+        }
     }
-    uint64_t size = 0;
-    std::array<uint8_t, 32> digest{};
-    std::string error;
-    bool ok = chast::sha256_file(path, size, digest, &error);
-    if (ok && size > chast::kMaxFileTransferBytes) {
-        ok = false;
-        error = "the file exceeds the protocol's 16 GiB limit";
+    return false;
+}
+
+void ViewerEngine::FileWorker() {
+    std::unique_lock<std::mutex> lock(file_mutex_);
+    for (;;) {
+        file_work_cv_.wait(lock, [&] {
+            return file_worker_stop_ || !pending_upload_roots_.empty() ||
+                   HasHashableUploadLocked();
+        });
+        if (file_worker_stop_) {
+            return;
+        }
+        const uint64_t epoch = upload_epoch_;
+        std::string root;
+        FileUpload job;
+        bool hash_job = false;
+        if (!pending_upload_roots_.empty()) {
+            root = std::move(pending_upload_roots_.front());
+            pending_upload_roots_.pop_front();
+        } else {
+            for (FileUpload& upload : uploads_) {
+                if (upload.stage == FileUpload::Stage::kQueued) {
+                    upload.stage = FileUpload::Stage::kHashing;
+                    job = upload;
+                    hash_job = true;
+                    break;
+                }
+            }
+        }
+        lock.unlock();
+        if (!root.empty()) {
+            ExpandUploadRoot(root, epoch);
+            lock.lock();
+            continue;
+        }
+        if (hash_job) {
+            uint64_t size = 0;
+            std::array<uint8_t, 32> digest{};
+            std::string error;
+            bool ok = chast::sha256_file(job.path, size, digest, &error);
+            if (ok && size > chast::kMaxFileTransferBytes) {
+                ok = false;
+                error = "the file exceeds the protocol's 16 GiB limit";
+            }
+            lock.lock();
+            if (upload_epoch_ != epoch) {
+                continue;
+            }
+            for (FileUpload& upload : uploads_) {
+                if (upload.transfer_id != job.transfer_id) {
+                    continue;
+                }
+                if (upload.stage != FileUpload::Stage::kHashing) {
+                    break;
+                }
+                if (ok) {
+                    upload.size = size;
+                    upload.digest = digest;
+                    upload.stage = FileUpload::Stage::kReady;
+                    std::fprintf(stderr, "viewer: %s is %llu bytes\n",
+                                 job.path.c_str(),
+                                 static_cast<unsigned long long>(size));
+                } else {
+                    upload.stage = FileUpload::Stage::kFailed;
+                    upload.error = error.empty() ? "the file could not be hashed" : error;
+                    std::fprintf(stderr, "viewer: %s: %s\n", job.path.c_str(),
+                                 upload.error.c_str());
+                }
+                break;
+            }
+            continue;
+        }
+        lock.lock();
     }
-    if (hash_cancel_.load(std::memory_order_acquire)) {
-        ok = false;
-        error = "the upload was cancelled";
+}
+
+void ViewerEngine::ExpandUploadRoot(const std::string& root, uint64_t epoch) {
+    const std::filesystem::path source = path_from_utf8(root);
+    std::error_code ec;
+    const std::filesystem::file_status status =
+        std::filesystem::symlink_status(source, ec);
+    const std::string display_name =
+        source.filename().empty() ? root : utf8_from_path(source.filename());
+    if (ec) {
+        EnqueueUploadFailure(display_name, {},
+                             "the path cannot be read: " + ec.message(), epoch);
+        return;
+    }
+    if (!std::filesystem::exists(status)) {
+        EnqueueUploadFailure(display_name, {}, "the path no longer exists", epoch);
+        return;
+    }
+    if (std::filesystem::is_regular_file(status)) {
+        EnqueueUpload(root, {}, epoch);
+        return;
+    }
+    if (!std::filesystem::is_directory(status)) {
+        EnqueueUploadFailure(display_name, {},
+                             "only regular files and folders can be sent", epoch);
+        return;
+    }
+    const std::string top = chast::sanitize_received_name(display_name);
+    bool added = false;
+    size_t seen = 0;
+    std::filesystem::recursive_directory_iterator iterator(
+        source, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!ec && iterator != end) {
+        // A purged queue or a stopped engine must not keep walking a huge tree.
+        if ((++seen & 0xFF) == 0) {
+            {
+                std::lock_guard<std::mutex> lock(file_mutex_);
+                if (upload_epoch_ != epoch || file_worker_stop_) {
+                    return;
+                }
+            }
+        }
+        const std::filesystem::directory_entry& entry = *iterator;
+        std::error_code status_error;
+        const std::filesystem::file_status entry_status =
+            entry.symlink_status(status_error);
+        // Links are skipped on purpose: following them can leave the dropped
+        // tree, loop back and send the same bytes twice.
+        if (!status_error && std::filesystem::is_regular_file(entry_status)) {
+            const std::filesystem::path relative_dir =
+                entry.path().parent_path().lexically_relative(source);
+            // lexically_relative uses native separators; the wire wants '/'.
+            const std::string relative = chast::make_offer_relative_path(
+                top, utf8_from_path(relative_dir));
+            if (relative.size() <= chast::kMaxFileRelativePathBytes) {
+                if (!EnqueueUpload(utf8_from_path(entry.path()), std::move(relative),
+                                   epoch)) {
+                    break;
+                }
+                added = true;
+            }
+        }
+        iterator.increment(ec);
+        if (ec) {
+            std::fprintf(stderr, "viewer: folder %s: %s\n", root.c_str(),
+                         ec.message().c_str());
+            ec.clear();
+        }
+    }
+    if (!added) {
+        EnqueueUploadFailure(top, {},
+                             ec ? "the folder cannot be read"
+                                : "the folder contains no sendable files",
+                             epoch);
+    }
+}
+
+bool ViewerEngine::EnqueueUpload(const std::string& path, std::string relative_path,
+                                 uint64_t epoch) {
+    const std::filesystem::path source = path_from_utf8(path);
+    const std::string name = utf8_from_path(source.filename());
+    if (name.empty() || name.size() > chast::kMaxFileNameBytes) {
+        EnqueueUploadFailure(name.empty() ? "file" : name, std::move(relative_path),
+                             "the file name cannot be carried by an offer", epoch);
+        return true;
     }
     std::lock_guard<std::mutex> lock(file_mutex_);
-    if (file_.transfer_id != transfer_id ||
-        file_.stage != FileUpload::Stage::kHashing) {
+    if (upload_epoch_ != epoch) {
+        return true;
+    }
+    if (uploads_.size() >= kMaxQueuedUploads) {
+        std::fprintf(stderr, "viewer: upload queue is full; %s was dropped\n",
+                     path.c_str());
+        return false;
+    }
+    FileUpload upload;
+    upload.stage = FileUpload::Stage::kQueued;
+    upload.path = path;
+    upload.name = name;
+    upload.relative_path = std::move(relative_path);
+    upload.transfer_id = next_file_id_++;
+    uploads_.push_back(std::move(upload));
+    return true;
+}
+
+void ViewerEngine::EnqueueUploadFailure(std::string name, std::string relative_path,
+                                        std::string error, uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(file_mutex_);
+    if (upload_epoch_ != epoch || uploads_.size() >= kMaxQueuedUploads) {
         return;
     }
-    if (!ok) {
-        file_.stage = FileUpload::Stage::kFailed;
-        file_.error = error.empty() ? "the file could not be hashed" : error;
-        std::fprintf(stderr, "viewer: file %s: %s\n", file_.name.c_str(),
-                     file_.error.c_str());
-        return;
-    }
-    file_.size = size;
-    file_.digest = digest;
-    file_.stage = FileUpload::Stage::kReady;
-    std::fprintf(stderr, "viewer: file %s is %llu bytes\n", file_.name.c_str(),
-                 static_cast<unsigned long long>(size));
+    FileUpload upload;
+    upload.stage = FileUpload::Stage::kFailed;
+    upload.name = name.empty() ? "file" : std::move(name);
+    upload.relative_path = std::move(relative_path);
+    upload.error = std::move(error);
+    upload.transfer_id = next_file_id_++;
+    uploads_.push_back(std::move(upload));
 }
 
 bool ViewerEngine::TakeCursor(chast::CursorUpdate& update) {
@@ -536,6 +719,29 @@ bool ViewerEngine::SelectMicrophone(std::string device_id) {
     }
     std::lock_guard<std::mutex> lock(microphone_mutex_);
     microphone_device_id_ = std::move(device_id);
+    return true;
+}
+
+bool ViewerEngine::SelectAudioOutput(std::string device_id) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(audio_output_mutex_);
+    audio_output_device_id_ = std::move(device_id);
+    return true;
+}
+
+bool ViewerEngine::SetAudioProcessing(bool echo_cancellation, bool noise_suppression) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    microphone_aec_.store(echo_cancellation, std::memory_order_relaxed);
+    microphone_noise_.store(noise_suppression, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_.audio_aec = echo_cancellation;
+        status_.audio_noise_suppression = noise_suppression;
+    }
     return true;
 }
 
@@ -693,6 +899,31 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     std::string failure;
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
     std::unique_ptr<chast::IAudioPlayer> audio_player;
+    // One reference per session: system-audio PCM feeds it while the player is
+    // audible, and the microphone capture cancels against the same ring. It
+    // stays inactive until a player actually starts.
+    std::shared_ptr<chast::AudioReference> audio_reference =
+        std::make_shared<chast::AudioReference>();
+    // The endpoint the player was opened with (empty = default), so the menu
+    // knows what is actually rendering, plus the selection whose switch was
+    // last attempted. They differ after a fallback, which must not rebuild
+    // the player on every poll.
+    std::string audio_device;
+    std::string audio_output_requested;
+    {
+        std::lock_guard<std::mutex> lock(audio_output_mutex_);
+        audio_output_requested = audio_output_device_id_;
+    }
+    audio_device = audio_output_requested;
+    std::string audio_device_name;
+    // What the running microphone capture was opened with, plus the processed
+    // frame totals of captures that have already stopped this session.
+    bool microphone_processing_aec = microphone_aec_.load(std::memory_order_relaxed);
+    bool microphone_processing_ns = microphone_noise_.load(std::memory_order_relaxed);
+    uint64_t microphone_aec_base = 0;
+    uint64_t microphone_ns_base = 0;
+    uint64_t microphone_aec_frames = 0;
+    uint64_t microphone_ns_frames = 0;
 
     // Folds the worker's counters into the status the UI polls. Called from
     // this thread only; the window counters are reset once per second.
@@ -767,31 +998,40 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             }
             {
                 std::lock_guard<std::mutex> file_lock(file_mutex_);
-                status_.file_name = file_.name;
-                status_.file_size = file_.size;
-                status_.file_sent = file_.sent;
-                status_.file_error = file_.error;
-                switch (file_.stage) {
-                    case FileUpload::Stage::kNone:
-                        status_.file_phase = FilePhase::kIdle;
-                        break;
-                    case FileUpload::Stage::kHashing:
-                        status_.file_phase = FilePhase::kHashing;
-                        break;
-                    case FileUpload::Stage::kReady:
-                    case FileUpload::Stage::kOffered:
-                        status_.file_phase = FilePhase::kOffered;
-                        break;
-                    case FileUpload::Stage::kSending:
-                    case FileUpload::Stage::kFinishing:
-                        status_.file_phase = FilePhase::kSending;
-                        break;
-                    case FileUpload::Stage::kDone:
-                        status_.file_phase = FilePhase::kDone;
-                        break;
-                    case FileUpload::Stage::kFailed:
-                        status_.file_phase = FilePhase::kFailed;
-                        break;
+                const FileUpload& current =
+                    uploads_.empty() ? last_upload_ : uploads_.front();
+                status_.file_name = current.name;
+                status_.file_relative_path = current.relative_path;
+                status_.file_size = current.size;
+                status_.file_sent = current.sent;
+                status_.file_error = current.error;
+                status_.file_queue = static_cast<uint32_t>(
+                    std::min<size_t>(uploads_.size(), UINT32_MAX));
+                status_.last_file_name = last_upload_.name;
+                status_.last_file_error = last_upload_.error;
+                if (uploads_.empty() && current.name.empty()) {
+                    status_.file_phase = FilePhase::kIdle;
+                } else {
+                    switch (current.stage) {
+                        case FileUpload::Stage::kQueued:
+                        case FileUpload::Stage::kHashing:
+                            status_.file_phase = FilePhase::kHashing;
+                            break;
+                        case FileUpload::Stage::kReady:
+                        case FileUpload::Stage::kOffered:
+                            status_.file_phase = FilePhase::kOffered;
+                            break;
+                        case FileUpload::Stage::kSending:
+                        case FileUpload::Stage::kFinishing:
+                            status_.file_phase = FilePhase::kSending;
+                            break;
+                        case FileUpload::Stage::kDone:
+                            status_.file_phase = FilePhase::kDone;
+                            break;
+                        case FileUpload::Stage::kFailed:
+                            status_.file_phase = FilePhase::kFailed;
+                            break;
+                    }
                 }
             }
             status_.cursor_updates = cursor_updates;
@@ -809,6 +1049,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.audio_recovering = audio_recovering;
             status_.audio_buffer_ms = audio_buffer_ms;
             status_.audio_error = audio_error;
+            status_.audio_device = audio_device;
+            status_.audio_device_name = audio_device_name;
+            status_.audio_aec = microphone_aec_.load(std::memory_order_relaxed);
+            status_.audio_noise_suppression =
+                microphone_noise_.load(std::memory_order_relaxed);
+            status_.microphone_aec_frames = microphone_aec_frames;
+            status_.microphone_ns_frames = microphone_ns_frames;
             status_.microphone_authorized = microphone_authorized;
             status_.microphone_enabled = microphone_enabled;
             status_.microphone_device = microphone_device;
@@ -889,6 +1136,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             const chast::AudioCaptureStats stats = microphone_capture->stats();
             microphone_dropped = stats.dropped;
             microphone_recoveries = stats.recoveries;
+            // Fold this capture's DSP work into the session totals before the
+            // object (and its counters) goes away.
+            if (microphone_processing_aec) {
+                microphone_aec_base += stats.processed_frames;
+            }
+            if (microphone_processing_ns) {
+                microphone_ns_base += stats.processed_frames;
+            }
+            microphone_aec_frames = microphone_aec_base;
+            microphone_ns_frames = microphone_ns_base;
             microphone_capture->stop();
             microphone_capture.reset();
         }
@@ -959,6 +1216,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 status_.origin_x = info.origin_x;
                 status_.origin_y = info.origin_y;
                 status_.displays = info.displays;
+                status_.merged_layout = info.merged;
             }
             {
                 std::lock_guard<std::mutex> lock(input_mutex_);
@@ -979,8 +1237,69 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     audio_player->stop();
                     audio_player.reset();
                 }
+                audio_reference->set_active(false);
                 audio_decoder.reset();
                 audio_enabled = false;
+            };
+            // The menu labels the current endpoint with the name WASAPI
+            // reported; an unavailable pinned id stays unlabeled and the
+            // error text says what happened.
+            auto audio_output_name = [](const std::string& id) -> std::string {
+                std::string list_error;
+                for (const chast::AudioOutputDevice& device :
+                     chast::list_audio_outputs(&list_error)) {
+                    if (id.empty() ? device.is_default : device.id == id) {
+                        return device.name;
+                    }
+                }
+                return {};
+            };
+            // Opens and starts a player for `wanted`. A pinned endpoint that
+            // fails falls back to the default output so a stale pick never
+            // silences the session; `note` explains the fallback. Returns
+            // false with `note` set when no endpoint could be started.
+            auto open_audio_player = [&](const std::string& wanted,
+                                         std::string* note) -> bool {
+                std::string setup_error;
+                chast::AudioPlayerConfig player_config;
+                player_config.device_id = wanted;
+                std::unique_ptr<chast::IAudioPlayer> player =
+                    chast::create_audio_player(player_config, &setup_error);
+                std::string used = wanted;
+                if (!player && !wanted.empty()) {
+                    player_config.device_id.clear();
+                    std::string default_error;
+                    player = chast::create_audio_player(player_config, &default_error);
+                    if (player) {
+                        used.clear();
+                        *note = "the selected output could not be opened: " +
+                                setup_error + "; using the default output";
+                    } else {
+                        setup_error += "; default output: " + default_error;
+                    }
+                }
+                if (!player) {
+                    *note = setup_error;
+                    return false;
+                }
+                const bool muted = audio_muted_.load(std::memory_order_relaxed);
+                player->set_mute(muted);
+                if (clock_synced) {
+                    player->set_clock_offset(clock_offset_us / 1000);
+                }
+                chast::Error started = player->start();
+                if (!started.ok()) {
+                    *note = started.to_string();
+                    return false;
+                }
+                audio_player = std::move(player);
+                audio_muted_applied = muted;
+                audio_device = used;
+                audio_device_name = audio_output_name(used);
+                // A muted player renders silence, so it must not seed the
+                // echo reference.
+                audio_reference->set_active(!muted);
+                return true;
             };
             auto start_audio = [&](const chast::AudioInfo& audio) {
                 audio_announced = audio.enabled;
@@ -1001,28 +1320,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
                     return;
                 }
-                chast::AudioPlayerConfig player_config;
-                audio_player =
-                    chast::create_audio_player(player_config, &audio_setup_error);
-                if (!audio_player) {
-                    audio_decoder.reset();
-                    audio_error = "playback: " + audio_setup_error;
-                    std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
-                    return;
+                std::string wanted_device;
+                {
+                    std::lock_guard<std::mutex> lock(audio_output_mutex_);
+                    wanted_device = audio_output_device_id_;
                 }
-                const bool muted = audio_muted_.load(std::memory_order_relaxed);
-                audio_player->set_mute(muted);
-                audio_muted_applied = muted;
-                chast::Error audio_started = audio_player->start();
-                if (!audio_started.ok()) {
-                    audio_error = "playback: " + audio_started.to_string();
-                    std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
-                    audio_player.reset();
+                std::string note;
+                if (!open_audio_player(wanted_device, &note)) {
                     audio_decoder.reset();
+                    audio_device = wanted_device;
+                    audio_device_name.clear();
+                    audio_error = "playback: " + note;
+                    std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
                     return;
                 }
                 audio_enabled = true;
-                audio_error.clear();
+                audio_error = note;
+                if (!note.empty()) {
+                    std::fprintf(stderr, "viewer: audio %s\n", note.c_str());
+                }
                 std::fprintf(stderr,
                              "viewer: audio %s %u Hz %u ch %u kbps, decoder and "
                              "renderer running\n",
@@ -1306,43 +1622,111 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
-                // One upload at a time. The hash was computed off this thread;
-                // here the file is offered, opened at the host's resume
-                // offset and streamed in time-budgeted chunks so video, audio
-                // and input keep flowing.
+                // One upload at a time: the head of the queue is offered,
+                // opened at the host's resume offset and streamed in
+                // time-budgeted chunks so video, audio and input keep
+                // flowing. The worker fills the queue off this thread.
                 std::ifstream file_stream;
                 double file_tokens = kFileUploadBurst;
                 Clock::time_point file_token_time = Clock::now();
+
+                // Marks the head failed. The failure counter advances when a
+                // failed entry leaves the queue, so every failure is counted
+                // exactly once no matter which path reported it.
                 auto file_fail = [&](const std::string& message) {
                     uint32_t transfer_id = 0;
                     std::string name;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
-                        const FileUpload::Stage stage = file_.stage;
-                        if (stage == FileUpload::Stage::kNone ||
-                            stage == FileUpload::Stage::kDone ||
-                            stage == FileUpload::Stage::kFailed) {
+                        if (uploads_.empty()) {
                             return;
                         }
-                        transfer_id = file_.transfer_id;
-                        name = file_.name;
-                        file_.stage = FileUpload::Stage::kFailed;
-                        file_.error = message;
+                        FileUpload& head = uploads_.front();
+                        if (head.stage == FileUpload::Stage::kDone ||
+                            head.stage == FileUpload::Stage::kFailed) {
+                            return;
+                        }
+                        transfer_id = head.transfer_id;
+                        name = head.name;
+                        head.stage = FileUpload::Stage::kFailed;
+                        head.error = message;
                     }
                     file_stream.close();
                     // Frees the host's receive slot and its .part; harmless
                     // when the host already ended the transfer itself.
                     session->cancel_file_upload(transfer_id);
-                    ++file_failures;
                     std::fprintf(stderr, "viewer: file %s failed: %s\n", name.c_str(),
                                  message.c_str());
                 };
 
+                // A revoked grant drops the whole queue; the user should not
+                // receive one rejection per entry for a permission that is
+                // already gone.
+                auto purge_uploads = [&](const std::string& message) {
+                    uint32_t active_id = 0;
+                    std::string name;
+                    size_t dropped = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        // A folder walk or hash still in flight must not
+                        // repopulate the queue after the purge.
+                        ++upload_epoch_;
+                        if (!uploads_.empty()) {
+                            name = uploads_.front().name;
+                            FileUpload finished = std::move(uploads_.front());
+                            if (finished.stage == FileUpload::Stage::kOffered ||
+                                finished.stage == FileUpload::Stage::kSending ||
+                                finished.stage == FileUpload::Stage::kFinishing) {
+                                active_id = finished.transfer_id;
+                            }
+                            finished.stage = FileUpload::Stage::kFailed;
+                            finished.error = message;
+                            last_upload_ = std::move(finished);
+                            ++file_failures;
+                        }
+                        dropped = uploads_.size();
+                        uploads_.clear();
+                        pending_upload_roots_.clear();
+                    }
+                    file_stream.close();
+                    if (active_id != 0) {
+                        session->cancel_file_upload(active_id);
+                    }
+                    if (!name.empty()) {
+                        std::fprintf(stderr,
+                                     "viewer: file %s failed: %s (%zu queued entries "
+                                     "dropped)\n",
+                                     name.c_str(), message.c_str(), dropped);
+                    }
+                };
+
                 auto drive_file_upload = [&] {
+                    // A finished head hands over to last_upload_, which keeps
+                    // the last outcome visible after the queue drains.
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        while (!uploads_.empty()) {
+                            const FileUpload::Stage stage = uploads_.front().stage;
+                            if (stage != FileUpload::Stage::kDone &&
+                                stage != FileUpload::Stage::kFailed) {
+                                break;
+                            }
+                            if (stage == FileUpload::Stage::kFailed) {
+                                ++file_failures;
+                            } else {
+                                ++files_sent;
+                            }
+                            last_upload_ = std::move(uploads_.front());
+                            uploads_.pop_front();
+                        }
+                    }
                     FileUpload snapshot;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
-                        snapshot = file_;
+                        if (uploads_.empty()) {
+                            return;
+                        }
+                        snapshot = uploads_.front();
                     }
                     // Every result ends the attempt it belongs to, including
                     // a host-side cancellation of a stream we still own.
@@ -1351,20 +1735,22 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         if (result.transfer_id != snapshot.transfer_id) {
                             continue;
                         }
-                        const FileUpload::Stage stage = snapshot.stage;
-                        if (stage != FileUpload::Stage::kOffered &&
-                            stage != FileUpload::Stage::kSending &&
-                            stage != FileUpload::Stage::kFinishing) {
+                        if (snapshot.stage != FileUpload::Stage::kOffered &&
+                            snapshot.stage != FileUpload::Stage::kSending &&
+                            snapshot.stage != FileUpload::Stage::kFinishing) {
                             continue;
                         }
                         file_stream.close();
                         if (result.code == chast::FileCode::Ok) {
                             {
                                 std::lock_guard<std::mutex> lock(file_mutex_);
-                                file_.stage = FileUpload::Stage::kDone;
-                                file_.error.clear();
+                                if (!uploads_.empty() &&
+                                    uploads_.front().transfer_id ==
+                                        snapshot.transfer_id) {
+                                    uploads_.front().stage = FileUpload::Stage::kDone;
+                                    uploads_.front().error.clear();
+                                }
                             }
-                            ++files_sent;
                             std::fprintf(stderr,
                                          "viewer: file %s delivered (%llu bytes)\n",
                                          snapshot.name.c_str(),
@@ -1375,26 +1761,24 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                       : result.reason;
                             {
                                 std::lock_guard<std::mutex> lock(file_mutex_);
-                                file_.stage = FileUpload::Stage::kFailed;
-                                file_.error = reason;
+                                if (!uploads_.empty() &&
+                                    uploads_.front().transfer_id ==
+                                        snapshot.transfer_id) {
+                                    uploads_.front().stage = FileUpload::Stage::kFailed;
+                                    uploads_.front().error = reason;
+                                }
                             }
-                            ++file_failures;
                             std::fprintf(stderr, "viewer: file %s failed: %s\n",
                                          snapshot.name.c_str(), reason.c_str());
                         }
                         return;
                     }
-                    switch (snapshot.stage) {
-                        case FileUpload::Stage::kNone:
-                        case FileUpload::Stage::kHashing:
-                        case FileUpload::Stage::kDone:
-                        case FileUpload::Stage::kFailed:
-                            return;
-                        default:
-                            break;
-                    }
                     if ((permissions & chast::kPermissionFileTransfer) == 0) {
-                        file_fail("the host revoked file transfer");
+                        purge_uploads("the host revoked file transfer");
+                        return;
+                    }
+                    if (snapshot.stage == FileUpload::Stage::kQueued ||
+                        snapshot.stage == FileUpload::Stage::kHashing) {
                         return;
                     }
                     if (snapshot.stage == FileUpload::Stage::kReady) {
@@ -1404,6 +1788,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         offer.resume = true;
                         offer.sha256 = snapshot.digest;
                         offer.name = snapshot.name;
+                        offer.relative_path = snapshot.relative_path;
                         chast::Error sent = session->offer_file(offer);
                         if (!sent.ok()) {
                             file_fail("offer: " + sent.to_string());
@@ -1411,9 +1796,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         {
                             std::lock_guard<std::mutex> lock(file_mutex_);
-                            if (file_.transfer_id == snapshot.transfer_id &&
-                                file_.stage == FileUpload::Stage::kReady) {
-                                file_.stage = FileUpload::Stage::kOffered;
+                            if (!uploads_.empty() &&
+                                uploads_.front().transfer_id == snapshot.transfer_id &&
+                                uploads_.front().stage == FileUpload::Stage::kReady) {
+                                uploads_.front().stage = FileUpload::Stage::kOffered;
                             }
                         }
                         std::fprintf(stderr, "viewer: file %s offered (%llu bytes)\n",
@@ -1449,13 +1835,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             }
                             {
                                 std::lock_guard<std::mutex> lock(file_mutex_);
-                                if (file_.transfer_id != snapshot.transfer_id ||
-                                    file_.stage != FileUpload::Stage::kOffered) {
+                                if (uploads_.empty() ||
+                                    uploads_.front().transfer_id !=
+                                        snapshot.transfer_id ||
+                                    uploads_.front().stage != FileUpload::Stage::kOffered) {
                                     return;
                                 }
-                                file_.stage = FileUpload::Stage::kSending;
-                                file_.resume_offset = answer.resume_offset;
-                                file_.sent = answer.resume_offset;
+                                uploads_.front().stage = FileUpload::Stage::kSending;
+                                uploads_.front().resume_offset = answer.resume_offset;
+                                uploads_.front().sent = answer.resume_offset;
                             }
                             file_tokens = kFileUploadBurst;
                             file_token_time = Clock::now();
@@ -1511,9 +1899,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         sent += static_cast<uint64_t>(got);
                         file_tokens -= static_cast<double>(got);
                         std::lock_guard<std::mutex> lock(file_mutex_);
-                        if (file_.transfer_id == snapshot.transfer_id &&
-                            file_.stage == FileUpload::Stage::kSending) {
-                            file_.sent = sent;
+                        if (!uploads_.empty() &&
+                            uploads_.front().transfer_id == snapshot.transfer_id &&
+                            uploads_.front().stage == FileUpload::Stage::kSending) {
+                            uploads_.front().sent = sent;
                         }
                     }
                     if (sent >= snapshot.size) {
@@ -1525,9 +1914,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         {
                             std::lock_guard<std::mutex> lock(file_mutex_);
-                            if (file_.transfer_id == snapshot.transfer_id &&
-                                file_.stage == FileUpload::Stage::kSending) {
-                                file_.stage = FileUpload::Stage::kFinishing;
+                            if (!uploads_.empty() &&
+                                uploads_.front().transfer_id == snapshot.transfer_id &&
+                                uploads_.front().stage == FileUpload::Stage::kSending) {
+                                uploads_.front().stage = FileUpload::Stage::kFinishing;
                             }
                         }
                         std::fprintf(stderr, "viewer: file %s sent, waiting for the host\n",
@@ -1597,6 +1987,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         chast::FileReceiveOptions options;
                         options.directory = download_directory;
                         options.name = offer.name;
+                        options.relative_path = offer.relative_path;
                         options.size = offer.size;
                         options.sha256 = offer.sha256;
                         options.allow_resume = offer.resume;
@@ -1874,6 +2265,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 }
                                 break;
                             }
+                            // Feed the same PCM the player renders to the echo
+                            // reference. Muted output is silence and must not
+                            // train the canceller.
+                            if (!audio_muted_applied && block.channels >= 1 &&
+                                block.channels <= 2 && !block.samples.empty()) {
+                                audio_reference->push(
+                                    block.samples.data(),
+                                    block.samples.size() / block.channels,
+                                    block.channels);
+                            }
                         }
                         if (!audio_player->error().empty()) {
                             break;
@@ -1884,13 +2285,48 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         if (muted != audio_muted_applied) {
                             audio_player->set_mute(muted);
                             audio_muted_applied = muted;
+                            audio_reference->set_active(!muted);
                         }
-                        const std::string player_error = audio_player->error();
-                        if (!player_error.empty()) {
-                            audio_error = "playback: " + player_error;
-                            std::fprintf(stderr, "viewer: audio stopped: %s\n",
-                                         player_error.c_str());
-                            stop_audio_pipeline();
+                        // The picker may have moved the speaker. Rebuild only
+                        // the player: the decoder, the timeline and the last
+                        // clock offset stay, and a failed id falls back to the
+                        // default instead of ending audio.
+                        std::string wanted_output;
+                        {
+                            std::lock_guard<std::mutex> lock(audio_output_mutex_);
+                            wanted_output = audio_output_device_id_;
+                        }
+                        if (wanted_output != audio_output_requested) {
+                            audio_output_requested = wanted_output;
+                            audio_player->stop();
+                            audio_player.reset();
+                            audio_reference->set_active(false);
+                            std::string note;
+                            if (open_audio_player(wanted_output, &note)) {
+                                audio_enabled = true;
+                                audio_error = note;
+                                std::fprintf(stderr,
+                                             "viewer: audio output is now %s\n",
+                                             audio_device_name.empty()
+                                                 ? "the system default"
+                                                 : audio_device_name.c_str());
+                            } else {
+                                audio_enabled = false;
+                                audio_device = wanted_output;
+                                audio_device_name.clear();
+                                audio_error = "playback: " + note;
+                            }
+                            if (!note.empty()) {
+                                std::fprintf(stderr, "viewer: audio %s\n", note.c_str());
+                            }
+                        } else {
+                            const std::string player_error = audio_player->error();
+                            if (!player_error.empty()) {
+                                audio_error = "playback: " + player_error;
+                                std::fprintf(stderr, "viewer: audio stopped: %s\n",
+                                             player_error.c_str());
+                                stop_audio_pipeline();
+                            }
                         }
                     }
                     if ((audio_finished || audio_broken) && (audio_player || audio_decoder)) {
@@ -1917,14 +2353,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         std::lock_guard<std::mutex> lock(microphone_mutex_);
                         wanted_device = microphone_device_id_;
                     }
-                    if (microphone_capture && wanted_device != microphone_device) {
-                        // The picker chose another endpoint: close this
-                        // stream before opening the next one.
+                    const bool wanted_aec =
+                        microphone_aec_.load(std::memory_order_relaxed);
+                    const bool wanted_ns =
+                        microphone_noise_.load(std::memory_order_relaxed);
+                    if (microphone_capture &&
+                        (wanted_device != microphone_device ||
+                         wanted_aec != microphone_processing_aec ||
+                         wanted_ns != microphone_processing_ns)) {
+                        // The picker chose another endpoint or the processing
+                        // switches moved: close this stream before opening
+                        // the next one (the CMIC format stays the same).
                         stop_microphone({}, false);
                     }
                     if (!microphone_capture) {
                         chast::MicrophoneCaptureConfig config;
                         config.device_id = wanted_device;
+                        config.reference = wanted_aec ? audio_reference : nullptr;
+                        config.echo_cancellation = wanted_aec;
+                        config.noise_suppression = wanted_ns;
                         std::string setup_error;
                         microphone_capture =
                             chast::create_microphone_capture(config, &setup_error);
@@ -1958,14 +2405,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 break;
                             }
                         }
+                        microphone_processing_aec = wanted_aec;
+                        microphone_processing_ns = wanted_ns;
                         microphone_capture->start();
                         microphone_enabled = true;
                         microphone_error.clear();
                         std::fprintf(stderr,
-                                     "viewer: microphone %s %u Hz %u ch %u kbps, sending\n",
+                                     "viewer: microphone %s %u Hz %u ch %u kbps, "
+                                     "sending%s%s\n",
                                      audio_codec_name(microphone_info.codec),
                                      microphone_info.sample_rate, microphone_info.channels,
-                                     microphone_info.bitrate / 1000u);
+                                     microphone_info.bitrate / 1000u,
+                                     microphone_processing_aec ? ", echo cancellation on" : "",
+                                     microphone_processing_ns ? ", noise suppression on" : "");
                     }
                     if (microphone_capture->failed()) {
                         ++microphone_errors;
@@ -2003,6 +2455,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     microphone_dropped = stats.dropped + microphone_send_dropped;
                     microphone_recoveries = stats.recoveries;
                     microphone_recovering = stats.recovering;
+                    microphone_aec_frames =
+                        microphone_aec_base +
+                        (microphone_processing_aec ? stats.processed_frames : 0);
+                    microphone_ns_frames =
+                        microphone_ns_base +
+                        (microphone_processing_ns ? stats.processed_frames : 0);
                 };
 
                 // Adopts every PermissionUpdate the host sent. The transport
@@ -2369,6 +2827,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.origin_x = info.origin_x;
                             status_.origin_y = info.origin_y;
                             status_.displays = info.displays;
+                            status_.merged_layout = info.merged;
                         }
                         {
                             std::lock_guard<std::mutex> lock(input_mutex_);
@@ -2454,10 +2913,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_microphone();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
-                    FileUpload::Stage upload_stage = FileUpload::Stage::kNone;
+                    FileUpload::Stage upload_stage = FileUpload::Stage::kDone;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
-                        upload_stage = file_.stage;
+                        upload_stage = uploads_.empty() ? FileUpload::Stage::kDone
+                                                        : uploads_.front().stage;
                     }
                     const bool file_active = upload_stage == FileUpload::Stage::kOffered ||
                                              upload_stage == FileUpload::Stage::kSending ||
@@ -2620,25 +3080,50 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         pending_input_.clear();
     }
     // An upload that outlived the stream cannot continue on this connection.
+    // Bumping the epoch also voids any folder walk or hash still in flight.
     uint32_t cancelled_upload = 0;
     {
         std::lock_guard<std::mutex> lock(file_mutex_);
-        const FileUpload::Stage stage = file_.stage;
-        if (stage == FileUpload::Stage::kHashing ||
-            stage == FileUpload::Stage::kReady || stage == FileUpload::Stage::kOffered ||
-            stage == FileUpload::Stage::kSending ||
-            stage == FileUpload::Stage::kFinishing) {
-            cancelled_upload = file_.transfer_id;
-            file_.stage = FileUpload::Stage::kFailed;
-            file_.error = "the session ended before the file finished";
+        ++upload_epoch_;
+        // A result that arrived just before the stream ended still counts as
+        // finished; only the entries that cannot continue are failed.
+        while (!uploads_.empty()) {
+            const FileUpload::Stage stage = uploads_.front().stage;
+            if (stage != FileUpload::Stage::kDone &&
+                stage != FileUpload::Stage::kFailed) {
+                break;
+            }
+            if (stage == FileUpload::Stage::kFailed) {
+                ++file_failures;
+            } else {
+                ++files_sent;
+            }
+            last_upload_ = std::move(uploads_.front());
+            uploads_.pop_front();
         }
+        if (!uploads_.empty()) {
+            for (const FileUpload& upload : uploads_) {
+                if (upload.stage == FileUpload::Stage::kOffered ||
+                    upload.stage == FileUpload::Stage::kSending ||
+                    upload.stage == FileUpload::Stage::kFinishing) {
+                    cancelled_upload = upload.transfer_id;
+                    break;
+                }
+            }
+            last_upload_ = std::move(uploads_.front());
+            last_upload_.stage = FileUpload::Stage::kFailed;
+            last_upload_.error = "the session ended before the file finished";
+            uploads_.clear();
+        }
+        pending_upload_roots_.clear();
     }
-    hash_cancel_.store(true, std::memory_order_release);
     if (cancelled_upload != 0) {
         session->cancel_file_upload(cancelled_upload);
     }
     // The uplink cannot outlive the session: capture stops first, then the
-    // stream ends so the host tears down its decoder and player.
+    // stream ends so the host tears down its decoder and player. The echo
+    // reference goes inactive with the playback it described.
+    audio_reference->set_active(false);
     stop_microphone({}, true);
 
     if (handshaken) {

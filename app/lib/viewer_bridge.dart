@@ -117,6 +117,35 @@ class ViewerMicrophoneDevice {
   }
 }
 
+/// One active playback endpoint the viewer can render system audio to. [id]
+/// is the WASAPI endpoint id the picker sends back; empty selects the system
+/// default instead.
+class ViewerAudioOutput {
+  const ViewerAudioOutput({
+    required this.id,
+    required this.name,
+    this.isDefault = false,
+  });
+
+  final String id;
+  final String name;
+  final bool isDefault;
+
+  String get label => name.isEmpty ? '音频输出' : name;
+
+  static ViewerAudioOutput? fromMap(Map<Object?, Object?> map) {
+    final String id = map['id']?.toString() ?? '';
+    if (id.isEmpty) {
+      return null;
+    }
+    return ViewerAudioOutput(
+      id: id,
+      name: map['name']?.toString() ?? '',
+      isDefault: map['default'] == true,
+    );
+  }
+}
+
 class ViewerStatus {
   const ViewerStatus({
     this.state = ViewerState.idle,
@@ -165,9 +194,13 @@ class ViewerStatus {
     this.clipboardReceivedFormats = 0,
     this.filePhase = ViewerFilePhase.idle,
     this.fileName = '',
+    this.fileRelativePath = '',
+    this.fileQueue = 0,
     this.fileSize = 0,
     this.fileSent = 0,
     this.fileError = '',
+    this.lastFileName = '',
+    this.lastFileError = '',
     this.filesSent = 0,
     this.fileFailures = 0,
     this.downloadPhase = ViewerFilePhase.idle,
@@ -193,6 +226,12 @@ class ViewerStatus {
     this.audioRecovering = false,
     this.audioBufferMs = 0,
     this.audioError = '',
+    this.audioDevice = '',
+    this.audioDeviceName = '',
+    this.audioAec = true,
+    this.audioNoiseSuppression = true,
+    this.microphoneAecFrames = 0,
+    this.microphoneNsFrames = 0,
     this.microphoneAuthorized = false,
     this.microphoneEnabled = false,
     this.microphoneDevice = '',
@@ -229,6 +268,7 @@ class ViewerStatus {
     this.streamOptionError = '',
     this.streamOptionResults = 0,
     this.displays = const <ViewerDisplay>[],
+    this.mergedLayout = false,
   });
 
   final ViewerState state;
@@ -311,15 +351,27 @@ class ViewerStatus {
   final int clipboardSentFormats;
   final int clipboardReceivedFormats;
 
-  /// The most recent viewer-to-host upload. [filePhase] is a
+  /// The current or most recent viewer-to-host upload. [filePhase] is a
   /// [ViewerFilePhase] value; [fileSent] counts bytes streamed, resume offset
   /// included. A failure leaves the local file untouched and explains itself
-  /// in [fileError]. [filesSent] and [fileFailures] cover the session.
+  /// in [fileError]. [fileRelativePath] is the folder below the host's receive
+  /// root (empty at the root) and [fileQueue] counts the entries not yet
+  /// finished, including this one. [filesSent] and [fileFailures] cover the
+  /// session.
   final int filePhase;
   final String fileName;
+  final String fileRelativePath;
+  final int fileQueue;
   final int fileSize;
   final int fileSent;
   final String fileError;
+
+  /// The last upload that left the queue. [filesSent] and [fileFailures] are
+  /// advanced together with this name and reason, so a poll that sees a new
+  /// counter also has the name it belongs to (the active entry may already be
+  /// the next file).
+  final String lastFileName;
+  final String lastFileError;
   final int filesSent;
   final int fileFailures;
 
@@ -365,6 +417,20 @@ class ViewerStatus {
   final bool audioRecovering;
   final int audioBufferMs;
   final String audioError;
+
+  /// The playback endpoint the engine is using: empty follows the Windows
+  /// default. [audioDeviceName] is its friendly name (empty while the default
+  /// or an unavailable id is in use); a fallback to the default after a failed
+  /// open is explained in [audioError]. [audioAec] and
+  /// [audioNoiseSuppression] are the microphone processing switches;
+  /// [microphoneAecFrames]/[microphoneNsFrames] count processed near-end
+  /// frames under each switch this session.
+  final String audioDevice;
+  final String audioDeviceName;
+  final bool audioAec;
+  final bool audioNoiseSuppression;
+  final int microphoneAecFrames;
+  final int microphoneNsFrames;
 
   /// Microphone uplink. [microphoneAuthorized] mirrors the host permission;
   /// [microphoneEnabled] means the local capture and the CMIC stream are
@@ -419,6 +485,11 @@ class ViewerStatus {
   final int displaySwitchFailures;
   final String displaySwitchError;
   final List<ViewerDisplay> displays;
+
+  /// True when the host is streaming the union of [displays] as one picture.
+  /// No single entry then describes the streamed surface, and the host refuses
+  /// per-display mode changes.
+  final bool mergedLayout;
 
   /// The modes the host last reported for one output, the index that answer
   /// describes, and the host's DisplayModeCode (0 = Ok) with its reason. A new
@@ -498,6 +569,10 @@ class ViewerStatus {
   String get microphoneLabel => microphoneName.isNotEmpty
       ? microphoneName
       : (microphoneDevice.isEmpty ? '系统默认麦克风' : '麦克风');
+  // Where system audio goes, for the volume menu's menu entry.
+  String get audioOutputLabel => audioDeviceName.isNotEmpty
+      ? audioDeviceName
+      : (audioDevice.isEmpty ? '系统默认输出' : '输出设备');
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
 
   /// The sample rate as "48 kHz", the way the overlay shows it.
@@ -512,8 +587,11 @@ class ViewerStatus {
   String get audioChannelLabel => audioChannels >= 2 ? '立体声' : '单声道';
 
   /// The announced display whose rect is the stream's origin and source size,
-  /// or null while no list has arrived.
+  /// or null while no list has arrived or when the picture is a merged union.
   int? get streamedDisplayIndex {
+    if (mergedLayout) {
+      return null;
+    }
     for (final ViewerDisplay display in displays) {
       if (display.left == originX &&
           display.top == originY &&
@@ -608,9 +686,13 @@ class ViewerStatus {
       clipboardReceivedFormats: asInt(map['clipboardReceivedFormats']),
       filePhase: asInt(map['filePhase']),
       fileName: asString(map['fileName']),
+      fileRelativePath: asString(map['fileRelativePath']),
+      fileQueue: asInt(map['fileQueue']),
       fileSize: asInt(map['fileSize']),
       fileSent: asInt(map['fileSent']),
       fileError: asString(map['fileError']),
+      lastFileName: asString(map['lastFileName']),
+      lastFileError: asString(map['lastFileError']),
       filesSent: asInt(map['filesSent']),
       fileFailures: asInt(map['fileFailures']),
       downloadPhase: asInt(map['downloadPhase']),
@@ -636,6 +718,12 @@ class ViewerStatus {
       audioRecovering: map['audioRecovering'] == true,
       audioBufferMs: asInt(map['audioBufferMs']),
       audioError: asString(map['audioError']),
+      audioDevice: asString(map['audioDevice']),
+      audioDeviceName: asString(map['audioDeviceName']),
+      audioAec: map['audioAec'] != false,
+      audioNoiseSuppression: map['audioNoiseSuppression'] != false,
+      microphoneAecFrames: asInt(map['microphoneAecFrames']),
+      microphoneNsFrames: asInt(map['microphoneNsFrames']),
       microphoneAuthorized: map['microphoneAuthorized'] == true,
       microphoneEnabled: map['microphoneEnabled'] == true,
       microphoneDevice: asString(map['microphoneDevice']),
@@ -672,6 +760,7 @@ class ViewerStatus {
       streamOptionError: asString(map['streamOptionError']),
       streamOptionResults: asInt(map['streamOptionResults']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
+      mergedLayout: map['mergedLayout'] == true,
     );
   }
 
@@ -917,37 +1006,44 @@ class ViewerBridge {
     return _channel.invokeMethod<void>('setClipboardSync', enabled);
   }
 
-  /// Opens the system file picker and queues the chosen file for upload to
-  /// the host. Returns the picked path, or null when the dialog was
+  /// Opens the system file picker and queues the chosen files for upload to
+  /// the host. Returns how many roots were queued, or null when the dialog was
   /// cancelled. Throws a [PlatformException] when no session is streaming or
-  /// another upload is still running. Progress arrives through
+  /// the host does not allow file transfer. Progress arrives through
   /// [ViewerStatus.filePhase]; the page polls it with the status timer.
-  static Future<String?> sendFile() {
-    return _channel.invokeMethod<String>('sendFile');
+  static Future<int?> sendFile() {
+    return _channel.invokeMethod<int>('sendFile');
   }
 
-  /// Offers [path] to the host the same way [sendFile] does, but without a
-  /// picker. The native side queues it from a file dropped on the window.
-  static Future<String?> sendFileAt(String path) {
-    return _channel.invokeMethod<String>('sendFileAt', path);
+  /// Queues [paths] for upload the same way [sendFile] does, but without a
+  /// picker. Files and folders are both accepted; folders are expanded into
+  /// their files on the native side. Returns how many roots were queued.
+  static Future<int?> sendFileAt(List<String> paths) {
+    return _channel.invokeMethod<int>('sendFileAt', paths);
   }
 
   /// Installs the handler for files dropped on the viewer window. Only one
   /// page listens at a time; passing null detaches it.
-  static void setDropHandler(void Function(String path)? handler) {
+  static void setDropHandler(void Function(List<String> paths)? handler) {
     _dropHandler = handler;
     if (handler == null) {
       _channel.setMethodCallHandler(null);
       return;
     }
     _channel.setMethodCallHandler((MethodCall call) async {
-      if (call.method == 'droppedFile' && call.arguments is String) {
-        _dropHandler?.call(call.arguments as String);
+      if (call.method == 'droppedFiles' && call.arguments is List) {
+        final List<String> paths = (call.arguments as List)
+            .whereType<String>()
+            .where((String path) => path.isNotEmpty)
+            .toList(growable: false);
+        if (paths.isNotEmpty) {
+          _dropHandler?.call(paths);
+        }
       }
     });
   }
 
-  static void Function(String path)? _dropHandler;
+  static void Function(List<String> paths)? _dropHandler;
 
   /// Picks up whatever pointer state the host sent and installs it as this
   /// window's cursor while [enabled]. [scale] is the size the video is drawn
@@ -1028,6 +1124,45 @@ class ViewerBridge {
       }
     }
     return List<ViewerMicrophoneDevice>.unmodifiable(devices);
+  }
+
+  /// Pins the playback endpoint; an empty id follows the Windows default
+  /// output. A live player is rebuilt with the same decoder and clock offset.
+  static Future<bool> selectAudioOutput(String deviceId) async {
+    final bool? applied =
+        await _channel.invokeMethod<bool>('selectAudioOutput', deviceId);
+    return applied ?? false;
+  }
+
+  /// Switches microphone echo cancellation and noise suppression. The native
+  /// side reopens the capture on its next poll; the choices are kept.
+  static Future<bool> setAudioProcessing({
+    required bool aec,
+    required bool noiseSuppression,
+  }) async {
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'setAudioProcessing',
+      <String, bool>{'aec': aec, 'noiseSuppression': noiseSuppression},
+    );
+    return applied ?? false;
+  }
+
+  /// Lists the machine's active playback endpoints, default first.
+  static Future<List<ViewerAudioOutput>> listAudioOutputs() async {
+    final Object? result = await _channel.invokeMethod<Object?>('listAudioOutputs');
+    if (result is! List) {
+      return const <ViewerAudioOutput>[];
+    }
+    final List<ViewerAudioOutput> devices = <ViewerAudioOutput>[];
+    for (final Object? entry in result) {
+      if (entry is Map) {
+        final ViewerAudioOutput? device = ViewerAudioOutput.fromMap(entry);
+        if (device != null) {
+          devices.add(device);
+        }
+      }
+    }
+    return List<ViewerAudioOutput>.unmodifiable(devices);
   }
 }
 
@@ -1112,6 +1247,10 @@ const int kViewerWheelDelta = 120;
 /// Hello display index meaning "let the server choose the captured output"
 /// (chast::kDisplayAuto in chast/protocol.h).
 const int kViewerDisplayAuto = 0xFFFF;
+
+/// Hello display index meaning "merge every display into one picture"
+/// (chast::kDisplayAll in chast/protocol.h).
+const int kViewerDisplayAll = 0xFFFE;
 
 /// The permission mask a host announces (chast::Permission in
 /// chast/protocol.h). Input covers pointer and keyboard injection; clipboard

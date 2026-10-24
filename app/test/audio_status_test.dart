@@ -84,4 +84,47 @@ void main() {
     });
     expect(status.audioSampleRateLabel, '44.1 kHz');
   });
+
+  test('status carries the playback endpoint and processing switches', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'audioDevice': 'out-1',
+      'audioDeviceName': '扬声器',
+      'audioAec': false,
+      'audioNoiseSuppression': true,
+      'microphoneAecFrames': 4800,
+      'microphoneNsFrames': 2400,
+    });
+    expect(status.audioDevice, 'out-1');
+    expect(status.audioDeviceName, '扬声器');
+    expect(status.audioOutputLabel, '扬声器');
+    expect(status.audioAec, isFalse);
+    expect(status.audioNoiseSuppression, isTrue);
+    expect(status.microphoneAecFrames, 4800);
+    expect(status.microphoneNsFrames, 2400);
+  });
+
+  test('the default output and processing defaults are explicit', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'audioDevice': '',
+      'audioDeviceName': '',
+    });
+    expect(status.audioOutputLabel, '系统默认输出');
+    expect(status.audioAec, isTrue);
+    expect(status.audioNoiseSuppression, isTrue);
+    expect(status.microphoneAecFrames, 0);
+    expect(status.microphoneNsFrames, 0);
+  });
+
+  test('playback endpoint entries parse from the bridge map', () {
+    final ViewerAudioOutput? device = ViewerAudioOutput.fromMap(
+        <Object?, Object?>{'id': 'out-2', 'name': '耳机', 'default': false});
+    expect(device?.id, 'out-2');
+    expect(device?.label, '耳机');
+    expect(device?.isDefault, isFalse);
+    expect(
+      ViewerAudioOutput.fromMap(<Object?, Object?>{'name': 'no id'}),
+      isNull,
+    );
+  });
 }

@@ -41,6 +41,23 @@ class DxgiCapturer final : public IDxgiCapturer {
 public:
     DxgiCapturer(DisplayInfo display, CaptureConfig config)
         : display_(std::move(display)), config_(config) {}
+    // Runs on a device owned by the caller (the merged compositor). The
+    // capturer must never release it: its siblings and the compositor's canvas
+    // live on the same device.
+    DxgiCapturer(DisplayInfo display, CaptureConfig config, ID3D11Device* device,
+                 ID3D11DeviceContext* context, UINT vendor_id)
+        : display_(std::move(display)),
+          config_(config),
+          device_(device),
+          context_(context),
+          vendor_id_(vendor_id),
+          owns_device_(false) {
+        // ComPtr adopts a raw pointer, but these belong to the merged
+        // compositor; hold our own references so destruction cannot release
+        // the device or context out from under the canvas and siblings.
+        device_.add_ref();
+        context_.add_ref();
+    }
     ~DxgiCapturer() override { release_frame(); }
 
     Error initialize();
@@ -54,6 +71,7 @@ public:
     }
     Error reinitialize() override;
     Error set_nv12_scale(UINT percent) override;
+    UINT nv12_scale_percent() const override { return nv12_percent_; }
     const Error& last_error() const override { return last_error_; }
 
 private:
@@ -130,6 +148,8 @@ private:
     // the bytes are copied only when the shape actually changed.
     uint64_t published_content_id_ = 0;
     Error last_error_ = Error::success();
+    // False when the device belongs to a caller (the merged compositor).
+    bool owns_device_ = true;
     bool frame_held_ = false;
     // Set when the previous desktop texture stopped being valid outside the
     // frame path (a stage was dropped after a failure). The next acquired frame
@@ -139,9 +159,12 @@ private:
 };
 
 Error DxgiCapturer::initialize() {
-    Error err = create_device();
-    if (!err.ok()) {
-        return err;
+    Error err = Error::success();
+    if (owns_device_) {
+        err = create_device();
+        if (!err.ok()) {
+            return err;
+        }
     }
     err = create_duplication();
     if (!err.ok()) {
@@ -300,55 +323,15 @@ void DxgiCapturer::note(const Error& err) {
 }
 
 Error DxgiCapturer::create_device() {
-    ComPtr<IDXGIFactory1> factory;
-    Error err = check(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
-                                         reinterpret_cast<void**>(factory.put())),
-                      "CreateDXGIFactory1");
+    detail::CaptureDevice created;
+    Error err = detail::create_capture_device(display_.adapter_luid, created);
     if (!err.ok()) {
         return err;
     }
-
-    // Resolve the adapter by LUID: adapter indices shift when GPUs are
-    // hot-plugged or disabled, LUIDs do not.
-    ComPtr<IDXGIAdapter1> adapter;
-    for (UINT index = 0;; ++index) {
-        ComPtr<IDXGIAdapter1> candidate;
-        if (factory->EnumAdapters1(index, candidate.put()) == DXGI_ERROR_NOT_FOUND) {
-            break;
-        }
-        DXGI_ADAPTER_DESC1 desc{};
-        if (SUCCEEDED(candidate->GetDesc1(&desc)) &&
-            desc.AdapterLuid.LowPart == display_.adapter_luid.LowPart &&
-            desc.AdapterLuid.HighPart == display_.adapter_luid.HighPart) {
-            // Exported through adapter_device() so an encoder can pick the
-            // vendor's hardware encoder (RustDesk's AdapterDevice does the
-            // same); the reinit path re-resolves the adapter, so refresh it.
-            vendor_id_ = desc.VendorId;
-            adapter = std::move(candidate);
-            break;
-        }
-    }
-    if (!adapter) {
-        return Error(Status::Unavailable, "the display's adapter is no longer present");
-    }
-
-    // BGRA support is mandatory for the video processor. VIDEO_SUPPORT lets
-    // the device create the NV12 video-encoder binding the hardware encoder
-    // imports (hwcodec's encode device sets it for the same reason). WARP and
-    // the debug layer are pointless: a desktop can only be duplicated on a
-    // real output of a real adapter.
-    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    HRESULT hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
-                                   ARRAYSIZE(levels), D3D11_SDK_VERSION, device_.put(), &level,
-                                   context_.put());
-    if (hr == E_INVALIDARG) {
-        // Pre-Windows 8 runtimes reject 11_1 in the feature-level list.
-        hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, &levels[1],
-                               1, D3D11_SDK_VERSION, device_.put(), &level, context_.put());
-    }
-    return check(hr, "D3D11CreateDevice");
+    device_ = std::move(created.device);
+    context_ = std::move(created.context);
+    vendor_id_ = created.vendor_id;
+    return Error::success();
 }
 
 Error DxgiCapturer::create_duplication() {
@@ -909,8 +892,10 @@ Error DxgiCapturer::reinitialize() {
         }
     }
 
-    device_.reset();
-    context_.reset();
+    if (owns_device_) {
+        device_.reset();
+        context_.reset();
+    }
     // initialize() reads last_error_ through note() for non-fatal problems, so
     // a stale message from the previous device is cleared above.
     Error err = initialize();
@@ -921,6 +906,86 @@ Error DxgiCapturer::reinitialize() {
 }
 
 }  // namespace
+
+namespace detail {
+
+Error create_capture_device(const LUID& luid, CaptureDevice& out) {
+    ComPtr<IDXGIFactory1> factory;
+    Error err = check(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                                         reinterpret_cast<void**>(factory.put())),
+                      "CreateDXGIFactory1");
+    if (!err.ok()) {
+        return err;
+    }
+
+    // Resolve the adapter by LUID: adapter indices shift when GPUs are
+    // hot-plugged or disabled, LUIDs do not.
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIAdapter1> candidate;
+        if (factory->EnumAdapters1(index, candidate.put()) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(candidate->GetDesc1(&desc)) &&
+            desc.AdapterLuid.LowPart == luid.LowPart &&
+            desc.AdapterLuid.HighPart == luid.HighPart) {
+            // Exported through adapter_device() so an encoder can pick the
+            // vendor's hardware encoder (RustDesk's AdapterDevice does the
+            // same); the reinit path re-resolves the adapter, so refresh it.
+            out.vendor_id = desc.VendorId;
+            adapter = std::move(candidate);
+            break;
+        }
+    }
+    if (!adapter) {
+        return Error(Status::Unavailable, "the display's adapter is no longer present");
+    }
+
+    // BGRA support is mandatory for the video processor. VIDEO_SUPPORT lets
+    // the device create the NV12 video-encoder binding the hardware encoder
+    // imports (hwcodec's encode device sets it for the same reason). WARP and
+    // the debug layer are pointless: a desktop can only be duplicated on a
+    // real output of a real adapter.
+    const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    HRESULT hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
+                                   ARRAYSIZE(levels), D3D11_SDK_VERSION, out.device.put(), &level,
+                                   out.context.put());
+    if (hr == E_INVALIDARG) {
+        // Pre-Windows 8 runtimes reject 11_1 in the feature-level list.
+        hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, &levels[1],
+                               1, D3D11_SDK_VERSION, out.device.put(), &level,
+                               out.context.put());
+    }
+    return check(hr, "D3D11CreateDevice");
+}
+
+std::unique_ptr<IDxgiCapturer> create_capturer_on_device(const DisplayInfo& display,
+                                                         const CaptureConfig& config,
+                                                         ID3D11Device* device,
+                                                         ID3D11DeviceContext* context,
+                                                         UINT vendor_id, std::string* error) {
+    if (!device || !context) {
+        if (error) {
+            *error = "a shared capture device is required";
+        }
+        return nullptr;
+    }
+    auto capturer =
+        std::make_unique<DxgiCapturer>(display, config, device, context, vendor_id);
+    Error err = capturer->initialize();
+    if (!err.ok()) {
+        if (error) {
+            *error = err.to_string();
+        }
+        return nullptr;
+    }
+    return capturer;
+}
+
+}  // namespace detail
 
 bool duplication_supported() {
     // DuplicateOutput needs an attached output on an adapter DXGI can see;

@@ -100,6 +100,30 @@ std::string utf8_from_wide(const std::wstring& wide) {
     return out;
 }
 
+// OFN_EXPLORER|OFN_ALLOWMULTISELECT returns "dir\0name1\0name2\0\0"; a single
+// selection arrives as one full path in the same buffer.
+std::vector<std::string> selected_paths(const wchar_t* buffer) {
+    std::vector<std::string> paths;
+    const std::wstring first(buffer);
+    if (first.empty()) {
+        return paths;
+    }
+    const wchar_t* cursor = buffer + first.size() + 1;
+    if (*cursor == L'\0') {
+        paths.push_back(utf8_from_wide(first));
+        return paths;
+    }
+    const std::filesystem::path directory(first);
+    while (*cursor != L'\0') {
+        const std::wstring item(cursor);
+        if (!item.empty()) {
+            paths.push_back(utf8_from_wide((directory / item).wstring()));
+        }
+        cursor += item.size() + 1;
+    }
+    return paths;
+}
+
 bool map_bool(const flutter::EncodableMap& map, const char* name, bool* out) {
     const auto it = map.find(key(name));
     if (it == map.end()) {
@@ -287,8 +311,10 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         if (map_int(*args, "display", &display) && display != chast::kDisplayAuto &&
+            display != chast::kDisplayAll &&
             (display < 0 || display >= chast::kMaxDisplayCount)) {
-            result->Error("bad_args", "display must be an index in the announced list or auto");
+            result->Error("bad_args",
+                          "display must be an announced index, auto or the merged view");
             return;
         }
         map_bool(*args, "allowUnverified", &allow_unverified);
@@ -409,11 +435,17 @@ void ViewerBridge::HandleMethodCall(
         map[key("filePhase")] =
             flutter::EncodableValue(static_cast<int32_t>(status.file_phase));
         map[key("fileName")] = flutter::EncodableValue(status.file_name);
+        map[key("fileRelativePath")] =
+            flutter::EncodableValue(status.file_relative_path);
+        map[key("fileQueue")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_queue));
         map[key("fileSize")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_size));
         map[key("fileSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_sent));
         map[key("fileError")] = flutter::EncodableValue(status.file_error);
+        map[key("lastFileName")] = flutter::EncodableValue(status.last_file_name);
+        map[key("lastFileError")] = flutter::EncodableValue(status.last_file_error);
         map[key("filesSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.files_sent));
         map[key("fileFailures")] =
@@ -456,6 +488,15 @@ void ViewerBridge::HandleMethodCall(
         map[key("audioBufferMs")] =
             flutter::EncodableValue(static_cast<int64_t>(status.audio_buffer_ms));
         map[key("audioError")] = flutter::EncodableValue(status.audio_error);
+        map[key("audioDevice")] = flutter::EncodableValue(status.audio_device);
+        map[key("audioDeviceName")] = flutter::EncodableValue(status.audio_device_name);
+        map[key("audioAec")] = flutter::EncodableValue(status.audio_aec);
+        map[key("audioNoiseSuppression")] =
+            flutter::EncodableValue(status.audio_noise_suppression);
+        map[key("microphoneAecFrames")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.microphone_aec_frames));
+        map[key("microphoneNsFrames")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.microphone_ns_frames));
         map[key("microphoneAuthorized")] =
             flutter::EncodableValue(status.microphone_authorized);
         map[key("microphoneEnabled")] = flutter::EncodableValue(status.microphone_enabled);
@@ -539,6 +580,7 @@ void ViewerBridge::HandleMethodCall(
             displays.push_back(flutter::EncodableValue(std::move(entry)));
         }
         map[key("displays")] = flutter::EncodableValue(std::move(displays));
+        map[key("mergedLayout")] = flutter::EncodableValue(status.merged_layout);
         result->Success(flutter::EncodableValue(std::move(map)));
         return;
     }
@@ -574,10 +616,11 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "switchDisplay") {
         const auto* display = std::get_if<int32_t>(call.arguments());
-        if (display == nullptr || (*display != chast::kDisplayAuto &&
-                                   (*display < 0 || *display >= chast::kMaxDisplayCount))) {
+        if (display == nullptr ||
+            (*display != chast::kDisplayAuto && *display != chast::kDisplayAll &&
+             (*display < 0 || *display >= chast::kMaxDisplayCount))) {
             result->Error("bad_args",
-                          "switchDisplay wants an index in the announced list or auto");
+                          "switchDisplay wants an announced index, auto or the merged view");
             return;
         }
         const bool queued =
@@ -681,26 +724,38 @@ void ViewerBridge::HandleMethodCall(
             result->Error("unavailable", "no viewer session is running");
             return;
         }
-        const auto start_upload = [this, &result](const std::string& path) {
-            if (path.empty() || !viewer_->SendFile(path)) {
+        const auto start_upload = [this, &result](const std::vector<std::string>& paths) {
+            if (paths.empty() || !viewer_->SendFiles(paths)) {
                 result->Error("unavailable",
-                              "the file cannot be offered now (session busy or not permitted)");
+                              "the files cannot be queued now (session ended or not permitted)");
                 return;
             }
-            result->Success(flutter::EncodableValue(path));
+            result->Success(flutter::EncodableValue(static_cast<int32_t>(paths.size())));
         };
         if (method == "sendFileAt") {
-            // The path comes from a drop on the window, so it is already
-            // absolute; SendFile re-checks that it is one regular file.
-            const auto* path = std::get_if<std::string>(call.arguments());
-            if (path == nullptr) {
-                result->Error("bad_args", "sendFileAt wants a path");
+            // The paths come from a drop on the window, so they are already
+            // absolute; SendFiles expands folders and skips anything else.
+            std::vector<std::string> paths;
+            if (const auto* one = std::get_if<std::string>(call.arguments())) {
+                paths.push_back(*one);
+            } else if (const auto* list =
+                           std::get_if<flutter::EncodableList>(call.arguments())) {
+                for (const flutter::EncodableValue& item : *list) {
+                    if (const auto* item_path = std::get_if<std::string>(&item)) {
+                        paths.push_back(*item_path);
+                    }
+                }
+            }
+            if (paths.empty()) {
+                result->Error("bad_args", "sendFileAt wants a path or a list of paths");
                 return;
             }
-            start_upload(*path);
+            start_upload(paths);
             return;
         }
-        std::vector<wchar_t> selected(32768, L'\0');
+        // The multi-select format needs a 64 KiB buffer; longer selections
+        // come back as FNERR_BUFFERTOOSMALL instead of a truncated list.
+        std::vector<wchar_t> selected(65536, L'\0');
         OPENFILENAMEW dialog{};
         dialog.lStructSize = sizeof(dialog);
         dialog.hwndOwner = window_;
@@ -708,13 +763,13 @@ void ViewerBridge::HandleMethodCall(
         dialog.lpstrFile = selected.data();
         dialog.nMaxFile = static_cast<DWORD>(selected.size());
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR |
-                       OFN_HIDEREADONLY;
+                       OFN_HIDEREADONLY | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
         if (!GetOpenFileNameW(&dialog)) {
             // Cancelling is not an error; the picker simply closed.
             result->Success();
             return;
         }
-        start_upload(utf8_from_wide(selected.data()));
+        start_upload(selected_paths(selected.data()));
         return;
     }
 
@@ -751,6 +806,32 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "selectAudioOutput") {
+        const auto* id = std::get_if<std::string>(call.arguments());
+        if (id == nullptr) {
+            result->Error("bad_args", "selectAudioOutput wants a device id");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SelectAudioOutput(*id);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "setAudioProcessing") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        bool aec = false;
+        bool noise_suppression = false;
+        if (args == nullptr || !map_bool(*args, "aec", &aec) ||
+            !map_bool(*args, "noiseSuppression", &noise_suppression)) {
+            result->Error("bad_args", "setAudioProcessing wants aec and noiseSuppression");
+            return;
+        }
+        const bool applied =
+            viewer_ != nullptr && viewer_->SetAudioProcessing(aec, noise_suppression);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
     if (method == "setPrivacyMode") {
         const auto* enabled = std::get_if<bool>(call.arguments());
         if (enabled == nullptr) {
@@ -778,6 +859,26 @@ void ViewerBridge::HandleMethodCall(
         }
         flutter::EncodableList list;
         for (const chast::MicrophoneDevice& device : devices) {
+            flutter::EncodableMap entry;
+            entry[key("id")] = flutter::EncodableValue(device.id);
+            entry[key("name")] = flutter::EncodableValue(device.name);
+            entry[key("default")] = flutter::EncodableValue(device.is_default);
+            list.push_back(flutter::EncodableValue(std::move(entry)));
+        }
+        result->Success(flutter::EncodableValue(std::move(list)));
+        return;
+    }
+
+    if (method == "listAudioOutputs") {
+        std::string list_error;
+        const std::vector<chast::AudioOutputDevice> devices =
+            chast::list_audio_outputs(&list_error);
+        if (devices.empty() && !list_error.empty()) {
+            result->Error("audio", list_error);
+            return;
+        }
+        flutter::EncodableList list;
+        for (const chast::AudioOutputDevice& device : devices) {
             flutter::EncodableMap entry;
             entry[key("id")] = flutter::EncodableValue(device.id);
             entry[key("name")] = flutter::EncodableValue(device.name);
@@ -1005,16 +1106,29 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                 }
                 break;
             case WM_DROPFILES: {
-                // One file per transfer: extra entries in a multi-file drop
-                // are dropped here rather than silently queued.
                 HDROP drop = reinterpret_cast<HDROP>(wparam);
-                std::vector<wchar_t> path(32768, L'\0');
-                if (self->channel_ &&
-                    DragQueryFileW(drop, 0, path.data(),
-                                   static_cast<UINT>(path.size())) > 0) {
+                const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                flutter::EncodableList paths;
+                for (UINT index = 0; index < count; ++index) {
+                    const UINT length =
+                        DragQueryFileW(drop, index, nullptr, 0);
+                    if (length == 0) {
+                        continue;
+                    }
+                    std::vector<wchar_t> path(static_cast<size_t>(length) + 1, L'\0');
+                    if (DragQueryFileW(drop, index, path.data(),
+                                       static_cast<UINT>(path.size())) == 0) {
+                        continue;
+                    }
+                    const std::string utf8 = utf8_from_wide(path.data());
+                    if (!utf8.empty()) {
+                        paths.push_back(flutter::EncodableValue(utf8));
+                    }
+                }
+                if (self->channel_ && !paths.empty()) {
                     self->channel_->InvokeMethod(
-                        "droppedFile",
-                        std::make_unique<flutter::EncodableValue>(utf8_from_wide(path.data())));
+                        "droppedFiles",
+                        std::make_unique<flutter::EncodableValue>(paths));
                 }
                 DragFinish(drop);
                 return 0;

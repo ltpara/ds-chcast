@@ -74,6 +74,14 @@ struct HostSettings {
     // the microphone is a privacy feature, so the HelloAck reports it
     // unavailable and CMIC streams are refused.
     bool allow_microphone = false;
+    // Render endpoint used for system-sound capture and viewer-microphone
+    // playback, as a WASAPI id. Empty follows the default output; an id that
+    // is not present at session time makes audio unavailable instead of
+    // silently moving to another endpoint.
+    std::string audio_device;
+    // Cancel the viewer's microphone out of the loopback capture. Needs a live
+    // microphone playback reference; with no CMIC stream it stays bypassed.
+    bool audio_aec = true;
     // Let the viewer black out this machine's physical displays while the
     // session runs (privacy mode). Off by default: the overlay covers every
     // monitor, so a person sitting at the machine cannot see the desktop until

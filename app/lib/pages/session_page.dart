@@ -141,7 +141,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    ViewerBridge.setDropHandler(_sendDroppedFile);
+    ViewerBridge.setDropHandler(_sendDroppedFiles);
     _startPolling();
     _starting = _start();
     unawaited(_starting);
@@ -540,13 +540,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ));
     }
     if (fileDone) {
-      final String name = status.fileName;
+      final String name = status.lastFileName;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(name.isEmpty ? '文件已发送' : '文件已发送：$name'),
         duration: const Duration(seconds: 3),
       ));
     } else if (fileFailed) {
-      final String reason = status.fileError;
+      final String reason = status.lastFileError;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(reason.isEmpty ? '文件发送失败' : '文件发送失败：$reason'),
         duration: const Duration(seconds: 5),
@@ -734,20 +734,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _sendFile() => _startUpload(ViewerBridge.sendFile);
 
-  Future<void> _sendDroppedFile(String path) =>
-      _startUpload(() => ViewerBridge.sendFileAt(path));
+  Future<void> _sendDroppedFiles(List<String> paths) =>
+      _startUpload(() => ViewerBridge.sendFileAt(paths));
 
-  Future<void> _startUpload(Future<String?> Function() start) async {
+  Future<void> _startUpload(Future<int?> Function() start) async {
     if (_filePickBusy) {
       return;
     }
     _filePickBusy = true;
     try {
-      final String? path = await start();
-      if (path != null && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('已开始发送，进度显示在画面下方'),
-          duration: Duration(seconds: 2),
+      final int? queued = await start();
+      if (queued != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('已加入发送队列（$queued 项），进度显示在画面下方'),
+          duration: const Duration(seconds: 2),
         ));
       }
     } on PlatformException catch (error) {
@@ -956,14 +956,89 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Reads the live playback endpoints for the volume button's long-press
+  /// menu, so a device plugged in mid-session is offered too.
+  Future<List<ViewerAudioOutput>> _loadAudioOutputs() async {
+    try {
+      final List<ViewerAudioOutput> devices = await ViewerBridge.listAudioOutputs();
+      if (devices.isEmpty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('没有可用的音频输出设备'),
+          duration: Duration(seconds: 4),
+        ));
+      }
+      return devices;
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message ?? '无法列出音频输出设备')),
+        );
+      }
+      return const <ViewerAudioOutput>[];
+    } on MissingPluginException {
+      return const <ViewerAudioOutput>[];
+    }
+  }
+
+  Future<void> _selectAudioOutput(String deviceId) async {
+    try {
+      final bool applied = await ViewerBridge.selectAudioOutput(deviceId);
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('当前会话无法切换输出设备'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? '无法切换音频输出')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  Future<void> _setAudioProcessing(bool aec, bool noiseSuppression) async {
+    try {
+      final bool applied = await ViewerBridge.setAudioProcessing(
+        aec: aec,
+        noiseSuppression: noiseSuppression,
+      );
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('当前会话无法修改麦克风处理'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? '无法修改麦克风处理')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
   /// The output the toolbar should mark. A switch in flight is shown as
-  /// selected while the host works; otherwise an explicit request is
-  /// authoritative, and after "server chooses" the list is matched against
-  /// the stream's origin and size, which is how HelloAck identifies the
-  /// captured output.
+  /// selected while the host works; a merged stream has no single streamed
+  /// entry, so the merge item stays highlighted; otherwise an explicit
+  /// request is authoritative, and after "server chooses" the list is
+  /// matched against the stream's origin and size, which is how HelloAck
+  /// identifies the captured output.
   int get _activeDisplay {
     if (_pendingDisplay != null) {
       return _pendingDisplay!;
+    }
+    if (_status.mergedLayout) {
+      return kViewerDisplayAll;
     }
     if (_display != kViewerDisplayAuto) {
       return _display;
@@ -1812,11 +1887,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fileActive: _status.fileActive,
                         audioAvailable: _status.acceptsAudio,
                         audioMuted: _status.audioMuted,
+                        audioDevice: _status.audioDevice,
+                        onLoadAudioOutputs: _loadAudioOutputs,
+                        onSelectAudioOutput: _selectAudioOutput,
                         microphoneAvailable: _status.acceptsMicrophone,
                         microphoneEnabled: _status.microphoneEnabled,
                         microphoneDevice: _status.microphoneDevice,
+                        audioAec: _status.audioAec,
+                        audioNoiseSuppression: _status.audioNoiseSuppression,
                         onLoadMicrophones: _loadMicrophones,
                         onSelectMicrophone: _selectMicrophone,
+                        onSetAudioProcessing: _setAudioProcessing,
                         privacyAvailable: _status.acceptsPrivacy,
                         privacyEnabled: _status.privacyEnabled,
                         displays: _status.displays,
@@ -1827,7 +1908,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                                 _status.displayModesCode == 0
                             ? _status.displayModes
                             : const <ViewerDisplayMode>[],
-                        modeChangeAvailable: _status.acceptsInput,
+                        modeChangeAvailable: _status.acceptsInput &&
+                            !_status.mergedLayout,
                         onSelectMode: (ViewerDisplayMode mode) =>
                             unawaited(_changeDisplayMode(mode)),
                         streamOptionsAvailable: _status.isLive,
@@ -2010,6 +2092,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final String detail = status.fileSize > 0
         ? '${_formatBytes(status.fileSent)} / ${_formatBytes(status.fileSize)}'
         : '';
+    final String path = status.fileRelativePath.isEmpty
+        ? status.fileName
+        : '${status.fileRelativePath}/${status.fileName}';
+    // fileQueue counts the entry on screen too; the note is for the rest.
+    final String waiting = status.fileQueue > 1
+        ? '队列剩余 ${status.fileQueue - 1} 个'
+        : '';
     return IgnorePointer(
       child: Container(
         width: 340,
@@ -2029,7 +2118,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
-                    status.fileName,
+                    path,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(color: Colors.white70, fontSize: 10.5),
@@ -2052,11 +2141,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 valueColor: const AlwaysStoppedAnimation<Color>(kAccentBright),
               ),
             ),
-            if (detail.isNotEmpty) ...<Widget>[
+            if (detail.isNotEmpty || waiting.isNotEmpty) ...<Widget>[
               const SizedBox(height: 4),
-              Text(
-                detail,
-                style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+              Row(
+                children: <Widget>[
+                  if (detail.isNotEmpty)
+                    Text(
+                      detail,
+                      style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                    ),
+                  if (waiting.isNotEmpty) ...<Widget>[
+                    const Spacer(),
+                    Text(
+                      waiting,
+                      style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                    ),
+                  ],
+                ],
               ),
             ],
           ],

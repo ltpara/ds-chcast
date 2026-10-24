@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/audio.h"
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
@@ -825,6 +826,17 @@ void refresh_ui() {
         if (status.stats.input_events > 0) {
             stream += L" · 输入 " + std::to_wstring(status.stats.input_events);
         }
+        if (status.stats.audio_active) {
+            stream += L" · 音频";
+            if (status.stats.audio_dsp_frames > 0) {
+                stream += L" · AEC " + std::to_wstring(status.stats.audio_dsp_frames) +
+                          L" 帧";
+                if (status.stats.audio_dsp_resets > 0) {
+                    stream += L"（重置 " +
+                              std::to_wstring(status.stats.audio_dsp_resets) + L"）";
+                }
+            }
+        }
         if (status.download_active) {
             stream += L" · 发送 " + widen(status.download_name) + L" " +
                       std::to_wstring(status.download_sent) + L"/" +
@@ -1357,6 +1369,9 @@ enum SecurityDialogId {
     kSecTokenEdit,
     kSecTokenCopy,
     kSecTokenRotate,
+    kSecAudioDevice,
+    kSecAudioRefresh,
+    kSecAudioAec,
     kSecSave,
     kSecCancel,
 };
@@ -1389,6 +1404,11 @@ struct SecurityDialogState {
     HWND token_auth = nullptr;
     HWND one_time = nullptr;
     HWND token_edit = nullptr;
+    HWND audio_device = nullptr;
+    HWND audio_aec = nullptr;
+    // Parallel to the combo box: index 0 is the system default.
+    std::vector<std::string> audio_device_ids;
+    std::string selected_audio_device;
     std::vector<HWND> auth_page;
     std::vector<HWND> access_page;
     std::vector<HWND> advanced_page;
@@ -1460,6 +1480,54 @@ void show_security_page(SecurityDialogState& dialog, int page) {
     show(dialog.auth_page, page == 0);
     show(dialog.access_page, page == 1);
     show(dialog.advanced_page, page == 2);
+}
+
+void refresh_audio_devices(SecurityDialogState& dialog) {
+    if (dialog.audio_device == nullptr) {
+        return;
+    }
+    std::string selected = dialog.selected_audio_device;
+    const LRESULT current =
+        SendMessageW(dialog.audio_device, CB_GETCURSEL, 0, 0);
+    if (current >= 0 && static_cast<size_t>(current) < dialog.audio_device_ids.size()) {
+        selected = dialog.audio_device_ids[static_cast<size_t>(current)];
+    }
+
+    SendMessageW(dialog.audio_device, CB_RESETCONTENT, 0, 0);
+    dialog.audio_device_ids.clear();
+    SendMessageW(dialog.audio_device, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(L"系统默认（跟随 Windows）"));
+    dialog.audio_device_ids.emplace_back();
+    int chosen = 0;
+
+    std::string error;
+    for (const AudioOutputDevice& output : list_audio_outputs(&error)) {
+        if (output.id.empty()) {
+            continue;
+        }
+        std::wstring label = widen(output.name.empty() ? output.id : output.name);
+        if (output.is_default) {
+            label += L"（默认）";
+        }
+        const int index = static_cast<int>(dialog.audio_device_ids.size());
+        SendMessageW(dialog.audio_device, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(label.c_str()));
+        dialog.audio_device_ids.push_back(output.id);
+        if (output.id == selected) {
+            chosen = index;
+        }
+    }
+    // A saved id that is not plugged in right now stays selectable, so opening
+    // and saving this page never silently moves the session to another output.
+    if (!selected.empty() &&
+        dialog.audio_device_ids[static_cast<size_t>(chosen)] != selected) {
+        SendMessageW(dialog.audio_device, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(L"已选设备（当前不可用）"));
+        chosen = static_cast<int>(dialog.audio_device_ids.size());
+        dialog.audio_device_ids.push_back(selected);
+    }
+    dialog.selected_audio_device = dialog.audio_device_ids[static_cast<size_t>(chosen)];
+    SendMessageW(dialog.audio_device, CB_SETCURSEL, chosen, 0);
 }
 
 void security_enable_two_factor(SecurityDialogState& dialog) {
@@ -1614,6 +1682,16 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
             devices.end());
     }
 
+    if (dialog.audio_device != nullptr) {
+        const LRESULT selected = SendMessageW(dialog.audio_device, CB_GETCURSEL, 0, 0);
+        updated.audio_device =
+            selected >= 0 &&
+                    static_cast<size_t>(selected) < dialog.audio_device_ids.size()
+                ? dialog.audio_device_ids[static_cast<size_t>(selected)]
+                : dialog.selected_audio_device;
+    }
+    updated.audio_aec = is_checked(dialog.audio_aec);
+
     updated.token_auth = is_checked(dialog.token_auth);
     updated.token_mode = is_checked(dialog.one_time) ? HostTokenMode::OneTime
                                                      : HostTokenMode::Reusable;
@@ -1671,6 +1749,17 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                     set_text(dialog->token_edit, widen(generate_access_token()));
                     dialog->token_edited = true;
                     return 0;
+                case kSecAudioRefresh: {
+                    const LRESULT selected =
+                        SendMessageW(dialog->audio_device, CB_GETCURSEL, 0, 0);
+                    if (selected >= 0 &&
+                        static_cast<size_t>(selected) < dialog->audio_device_ids.size()) {
+                        dialog->selected_audio_device =
+                            dialog->audio_device_ids[static_cast<size_t>(selected)];
+                    }
+                    refresh_audio_devices(*dialog);
+                    return 0;
+                }
                 case kSecRevoke: {
                     const LRESULT selected =
                         SendMessageW(dialog->trusted_list, LB_GETCURSEL, 0, 0);
@@ -1947,6 +2036,21 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", L"查看器首次连接时固定此指纹；变更后会提示身份不匹配。", SS_LEFT, 0, 32,
         266, 540, 20, 0, nullptr, &dialog.advanced_page);
 
+    add(L"STATIC", L"系统声音输出（捕获与查看者麦克风共用）", SS_LEFT, 0, 32, 300, 500, 20,
+        0, nullptr, &dialog.advanced_page);
+    dialog.audio_device = add(L"COMBOBOX", L"",
+                              CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+                              WS_EX_CLIENTEDGE, 32, 322, 460, 200, kSecAudioDevice, nullptr,
+                              &dialog.advanced_page);
+    add(L"BUTTON", L"刷新", BS_PUSHBUTTON | WS_TABSTOP, 0, 500, 321, 76, 28,
+        kSecAudioRefresh, nullptr, &dialog.advanced_page);
+    dialog.audio_aec =
+        add(L"BUTTON", L"回声消除（以查看者麦克风播放为参考）",
+            BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 358, 400, 24, kSecAudioAec, nullptr,
+            &dialog.advanced_page);
+    add(L"STATIC", L"留空跟随系统默认；固定设备不可用时系统声音不会启动。", SS_LEFT, 0, 32,
+        386, 540, 20, 0, nullptr, &dialog.advanced_page);
+
     add(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 410, 514, 90, 32, kSecSave,
         nullptr, nullptr);
     add(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 510, 514, 90, 32, kSecCancel,
@@ -1974,6 +2078,9 @@ bool edit_security_settings(HostSettings& result) {
     set_text(fingerprint,
              g_app->server ? widen(format_fingerprint(g_app->server->status().fingerprint))
                            : std::wstring(L"共享未启动"));
+    dialog.selected_audio_device = settings.audio_device;
+    set_check(dialog.audio_aec, settings.audio_aec);
+    refresh_audio_devices(dialog);
 
     if (!settings.totp_secret.empty()) {
         set_text(dialog.two_factor_state, L"已启用");

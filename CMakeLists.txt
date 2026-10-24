@@ -62,7 +62,8 @@ add_library(chast.dxgi STATIC
     src/capture/rotation_pass.cc
     src/capture/nv12_pass.cc
     src/capture/cursor.cc
-    src/capture/dxgi_capturer.cc)
+    src/capture/dxgi_capturer.cc
+    src/capture/merged_capturer.cc)
 
 target_include_directories(chast.dxgi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.dxgi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -134,16 +135,31 @@ target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg
 # Kept out of chast.codec so a build that only needs video does not link the
 # audio endpoints; it has no capture-stack dependency beyond the headers
 # protocol.h pulls in.
+#
+# SpeexDSP (BSD-3-Clause) supplies the echo canceller and preprocessor. vcpkg
+# ships no CMake package for it, so the install prefix is located directly.
+if(NOT DEFINED SPEEXDSP_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static/include/speex/speex_echo.h")
+    set(SPEEXDSP_ROOT "D:/vcpkg/installed/x64-windows-static" CACHE PATH "SpeexDSP install prefix")
+endif()
+if(NOT DEFINED SPEEXDSP_ROOT OR NOT EXISTS "${SPEEXDSP_ROOT}/include/speex/speex_echo.h")
+    message(FATAL_ERROR "SpeexDSP not found; set SPEEXDSP_ROOT to an install prefix with include/speex and lib/speexdsp.lib")
+endif()
+add_library(SpeexDSP::speexdsp STATIC IMPORTED)
+set_target_properties(SpeexDSP::speexdsp PROPERTIES
+    IMPORTED_LOCATION "${SPEEXDSP_ROOT}/lib/speexdsp.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${SPEEXDSP_ROOT}/include")
+
 add_library(chast.audio STATIC
     src/audio/aac_codec.cc
     src/audio/opus_codec.cc
+    src/audio/audio_dsp.cc
     src/audio/wasapi_capture.cc
     src/audio/wasapi_mic.cc
     src/audio/wasapi_player.cc)
 
 target_include_directories(chast.audio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.audio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(chast.audio PUBLIC chast.base chast.ffmpeg Opus::opus ole32 propsys)
+target_link_libraries(chast.audio PUBLIC chast.base chast.ffmpeg Opus::opus SpeexDSP::speexdsp ole32 propsys)
 
 # MsQuic. The vcpkg install ships a config package under share/msquic; point
 # MSQUIC_ROOT at the install prefix when find_package cannot see it.
@@ -365,6 +381,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-audio-codec-test tests/audio_codec_test.cc)
     target_link_libraries(chast-audio-codec-test PRIVATE chast.audio)
 
+    # Echo cancellation and noise suppression against synthetic far/near
+    # signals: no device, no network, deterministic.
+    add_executable(chast-audio-dsp-test tests/audio_dsp_test.cc)
+    target_link_libraries(chast-audio-dsp-test PRIVATE chast.audio)
+
     # Receive-side file handling: name sanitizing, resumable .part files and
     # digest verification, all inside a temporary directory.
     add_executable(chast-file-transfer-test tests/file_transfer_test.cc)
@@ -386,6 +407,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
+    add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
@@ -399,4 +421,9 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_stream_options
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
+    # The merged view builds its canvas from every output, so its handshake,
+    # union geometry and no-op merge switch get their own loopback.
+    add_test(NAME quic_merged
+        COMMAND chast-quic verify --port 45435 --merged --quiet)
+    set_tests_properties(quic_merged PROPERTIES TIMEOUT 120)
 endif()
