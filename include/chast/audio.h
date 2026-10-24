@@ -41,7 +41,7 @@ namespace chast {
 // ----- audio codec -----
 
 struct AudioEncoderConfig {
-    AudioCodec codec = AudioCodec::AAC;
+    AudioCodec codec = AudioCodec::Opus;
     uint32_t sample_rate = 48000;
     uint16_t channels = 2;
     uint32_t bitrate = 160000;  // bits per second
@@ -83,22 +83,19 @@ public:
     virtual uint16_t channels() const noexcept = 0;
     virtual uint16_t frame_samples() const noexcept = 0;
     virtual uint32_t bitrate() const noexcept = 0;
-    // AAC AudioSpecificConfig or OpusHead, as announced in AudioInfo.
+    // OpusHead, as announced in AudioInfo.
     virtual const std::vector<uint8_t>& extradata() const noexcept = 0;
 };
 
-// Opens FFmpeg's native AAC-LC encoder. The rate must be one AAC supports
-// (44.1 or 48 kHz in practice); channels 1 or 2.
-std::unique_ptr<IAudioEncoder> create_aac_encoder(const AudioEncoderConfig& config,
-                                                  std::string* error);
-
 // Opens the standalone libopus encoder. Only 48 kHz is accepted, channels 1 or
 // 2, and one packet is always 20 ms. The returned AudioInfo carries a 19-byte
-// OpusHead whose pre-skip comes from OPUS_GET_LOOKAHEAD.
+// OpusHead whose pre-skip comes from OPUS_GET_LOOKAHEAD. This is the only
+// encoder the product creates: system sound and microphone both use it.
 std::unique_ptr<IAudioEncoder> create_opus_encoder(const AudioEncoderConfig& config,
                                                    std::string* error);
 
-// Dispatches on config.codec.
+// Dispatches on config.codec. AAC encoding is intentionally unavailable; the
+// enum stays on the wire so older AudioInfo values still decode.
 std::unique_ptr<IAudioEncoder> create_audio_encoder(const AudioEncoderConfig& config,
                                                     std::string* error);
 

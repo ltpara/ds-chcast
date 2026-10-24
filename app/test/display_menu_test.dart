@@ -39,6 +39,15 @@ void main() {
     bool fileAvailable = true,
     bool fileActive = false,
     VoidCallback? onSendFile,
+    bool specialKeysAvailable = false,
+    ValueChanged<RemoteSpecialAction>? onSpecialAction,
+    bool streamOptionsAvailable = true,
+    ViewerStreamCodec streamCodec = ViewerStreamCodec.auto,
+    ViewerStreamQuality streamQuality = ViewerStreamQuality.high,
+    int streamMaxFps = 0,
+    ValueChanged<ViewerStreamCodec>? onSelectStreamCodec,
+    ValueChanged<ViewerStreamQuality>? onSelectStreamQuality,
+    ValueChanged<int>? onSelectStreamFps,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -56,16 +65,34 @@ void main() {
           fileActive: fileActive,
           audioAvailable: true,
           audioMuted: false,
+          microphoneAvailable: true,
+          microphoneEnabled: false,
+          microphoneDevice: '',
+          onLoadMicrophones: () async => const <ViewerMicrophoneDevice>[],
+          onSelectMicrophone: (_) async {},
+          privacyAvailable: true,
+          privacyEnabled: false,
           displays: announced,
           activeDisplay: active,
           onSelectDisplay: onSelect,
           modes: modes,
           modeChangeAvailable: modeChangeAvailable,
           onSelectMode: onSelectMode ?? (_) {},
+          streamOptionsAvailable: streamOptionsAvailable,
+          streamCodec: streamCodec,
+          streamQuality: streamQuality,
+          streamMaxFps: streamMaxFps,
+          onSelectStreamCodec: onSelectStreamCodec ?? (_) {},
+          onSelectStreamQuality: onSelectStreamQuality ?? (_) {},
+          onSelectStreamFps: onSelectStreamFps ?? (_) {},
           onToggleControl: () {},
+          specialKeysAvailable: specialKeysAvailable,
+          onSpecialAction: onSpecialAction ?? (_) {},
           onToggleClipboard: () {},
           onSendFile: onSendFile ?? () {},
           onToggleAudio: () {},
+          onToggleMicrophone: () {},
+          onTogglePrivacy: () {},
           onTogglePin: () {},
           onToggleStats: () {},
           onToggleFullscreen: () {},
@@ -204,5 +231,107 @@ void main() {
     ));
     await tester.tap(find.byIcon(Icons.upload_file_rounded));
     expect(taps, 1);
+  });
+
+  testWidgets('the special-key menu reports the chosen shortcut',
+      (WidgetTester tester) async {
+    RemoteSpecialAction? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      specialKeysAvailable: true,
+      onSpecialAction: (RemoteSpecialAction action) => picked = action,
+    ));
+
+    await tester.tap(find.byIcon(Icons.keyboard_command_key_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('Alt+Tab'), findsOneWidget);
+    expect(find.text('Ctrl+Alt+Del'), findsOneWidget);
+
+    await tester.tap(find.text('Ctrl+Alt+Del'));
+    await tester.pumpAndSettle();
+    expect(picked, RemoteSpecialAction.sas);
+  });
+
+  testWidgets('special keys stay inert while control is off',
+      (WidgetTester tester) async {
+    RemoteSpecialAction? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onSpecialAction: (RemoteSpecialAction action) => picked = action,
+    ));
+
+    await tester.tap(find.byIcon(Icons.keyboard_command_key_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('Alt+Tab'), findsNothing);
+    expect(picked, isNull);
+  });
+
+  testWidgets('the picture menu reports quality, frame cap and encoder picks',
+      (WidgetTester tester) async {
+    ViewerStreamQuality? quality;
+    int? fps;
+    ViewerStreamCodec? codec;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      streamQuality: ViewerStreamQuality.balanced,
+      streamMaxFps: 30,
+      onSelectStreamQuality: (ViewerStreamQuality value) => quality = value,
+      onSelectStreamFps: (int value) => fps = value,
+      onSelectStreamCodec: (ViewerStreamCodec value) => codec = value,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('画质'), findsOneWidget);
+    expect(find.text('帧率上限'), findsOneWidget);
+    expect(find.text('编码器'), findsOneWidget);
+    expect(find.text('高清'), findsOneWidget);
+    expect(find.text('均衡'), findsOneWidget);
+    expect(find.text('流畅'), findsOneWidget);
+    expect(find.text('自动'), findsNWidgets(2));
+    expect(find.text('15 fps'), findsOneWidget);
+    expect(find.text('30 fps'), findsOneWidget);
+    expect(find.text('60 fps'), findsOneWidget);
+    expect(find.text('H.264'), findsOneWidget);
+    expect(find.text('HEVC'), findsOneWidget);
+
+    await tester.tap(find.text('流畅'));
+    await tester.pumpAndSettle();
+    expect(quality, ViewerStreamQuality.smooth);
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('60 fps'));
+    await tester.pumpAndSettle();
+    expect(fps, 60);
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('HEVC'));
+    await tester.pumpAndSettle();
+    expect(codec, ViewerStreamCodec.hevc);
+  });
+
+  testWidgets('the picture menu is inert before the stream is live',
+      (WidgetTester tester) async {
+    ViewerStreamQuality? quality;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      streamOptionsAvailable: false,
+      onSelectStreamQuality: (ViewerStreamQuality value) => quality = value,
+    ));
+
+    await tester.tap(find.byIcon(Icons.tune_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('高清'), findsNothing);
+    expect(quality, isNull);
   });
 }

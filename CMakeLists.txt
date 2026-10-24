@@ -199,13 +199,15 @@ add_library(chast.net STATIC
     src/net/identity.cc
     src/net/protocol.cc
     src/net/quic.cc
+    src/win/desktop.cc
     src/win/input.cc)
 
 target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
-# user32 supplies SendInput/GetSystemMetrics for the injector.
-target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32)
+# user32 supplies SendInput/GetSystemMetrics for the injector; wtsapi32 the
+# session lock state behind the desktop tracker.
+target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32 wtsapi32)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -215,7 +217,9 @@ add_library(chast.host STATIC
     src/host/bitrate_controller.cc
     src/host/host_security.cc
     src/host/host_settings.cc
-    src/host/host_server.cc)
+    src/host/host_server.cc
+    src/win/privacy.cc
+    src/win/sas.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -333,6 +337,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
+    # The input-desktop tracker against the live session. Needs an interactive
+    # desktop; the secure-desktop path cannot be produced from a test.
+    add_executable(chast-desktop-test tests/desktop_test.cc)
+    target_link_libraries(chast-desktop-test PRIVATE chast.net)
+
     # Cryptographic primitives against published vectors, plus a DPAPI and
     # device-key round trip in the user's own profile.
     add_executable(chast-security-test tests/security_test.cc)
@@ -370,6 +379,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME desktop COMMAND chast-desktop-test)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
@@ -382,6 +392,11 @@ if(CHAST_BUILD_TESTS)
     # tools, so it is not part of the pure-logic set.
     add_test(NAME quic_loopback
         COMMAND chast-quic verify --port 45433 --seconds 4 --request-keyframe-ms 1200
-                --file-upload --file-download --quiet)
+                --file-upload --file-download --privacy --quiet)
     set_tests_properties(quic_loopback PROPERTIES TIMEOUT 120)
+    # The preference probe switches codec families mid-session, so it runs on
+    # its own port and the plain loopback above keeps the offline replay check.
+    add_test(NAME quic_stream_options
+        COMMAND chast-quic verify --port 45434 --stream-options --quiet)
+    set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
 endif()

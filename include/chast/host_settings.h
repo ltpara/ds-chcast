@@ -74,6 +74,11 @@ struct HostSettings {
     // the microphone is a privacy feature, so the HelloAck reports it
     // unavailable and CMIC streams are refused.
     bool allow_microphone = false;
+    // Let the viewer black out this machine's physical displays while the
+    // session runs (privacy mode). Off by default: the overlay covers every
+    // monitor, so a person sitting at the machine cannot see the desktop until
+    // the session ends or the operator revokes the permission.
+    bool allow_privacy_mode = false;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.

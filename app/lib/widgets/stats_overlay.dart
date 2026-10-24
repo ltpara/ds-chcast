@@ -131,7 +131,7 @@ class StatsOverlay extends StatelessWidget {
               '音频',
               '${status.audioMuted ? '已静音 · ' : ''}'
                   '${status.audioRecovering ? '设备恢复中 · ' : ''}'
-                  'AAC-LC ${status.audioSampleRateLabel} ${status.audioChannelLabel}',
+                  '${status.audioSampleRateLabel} ${status.audioChannelLabel}',
             ),
             _row(
               '缓冲',
@@ -146,11 +146,29 @@ class StatsOverlay extends StatelessWidget {
                   ? (status.audioError.isEmpty ? '本机无法播放' : status.audioError)
                   : '服务端未启用',
             ),
-          if (anomalies > 0 || status.audioErrors > 0)
+          if (status.microphoneEnabled)
+            _row(
+              '麦克风',
+              '${status.microphoneRecovering ? '设备恢复中 · ' : ''}'
+                  '${status.microphoneLabel} · 发 ${status.microphonePackets}'
+                  '${status.microphoneDropped > 0 ? ' · 丢 ${status.microphoneDropped}' : ''}',
+            )
+          else if (!status.acceptsMicrophone)
+            _row('麦克风', '服务端未开放')
+          else
+            _row(
+              '麦克风',
+              status.microphoneError.isEmpty ? '已关闭' : status.microphoneError,
+              color: status.microphoneError.isEmpty
+                  ? const Color(0xB3FFFFFF)
+                  : const Color(0xFFFFB74D),
+            ),
+          if (anomalies > 0 || status.audioErrors > 0 || status.microphoneErrors > 0)
             _row(
               '异常',
               'CRC ${status.crcErrors} · 解码 ${status.decodeErrors} · 缺口 ${status.gaps}'
-                  '${status.audioErrors > 0 ? ' · 音频 ${status.audioErrors}' : ''}',
+                  '${status.audioErrors > 0 ? ' · 音频 ${status.audioErrors}' : ''}'
+                  '${status.microphoneErrors > 0 ? ' · 麦克风 ${status.microphoneErrors}' : ''}',
               color: const Color(0xFFFFB74D),
             ),
         ],

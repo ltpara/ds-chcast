@@ -89,6 +89,34 @@ class ViewerDisplayMode {
   }
 }
 
+/// One active capture endpoint the host machine exposes as a microphone
+/// source. [id] is the WASAPI endpoint id the picker sends back.
+class ViewerMicrophoneDevice {
+  const ViewerMicrophoneDevice({
+    required this.id,
+    required this.name,
+    this.isDefault = false,
+  });
+
+  final String id;
+  final String name;
+  final bool isDefault;
+
+  String get label => name.isEmpty ? '麦克风' : name;
+
+  static ViewerMicrophoneDevice? fromMap(Map<Object?, Object?> map) {
+    final String id = map['id']?.toString() ?? '';
+    if (id.isEmpty) {
+      return null;
+    }
+    return ViewerMicrophoneDevice(
+      id: id,
+      name: map['name']?.toString() ?? '',
+      isDefault: map['default'] == true,
+    );
+  }
+}
+
 class ViewerStatus {
   const ViewerStatus({
     this.state = ViewerState.idle,
@@ -165,6 +193,26 @@ class ViewerStatus {
     this.audioRecovering = false,
     this.audioBufferMs = 0,
     this.audioError = '',
+    this.microphoneAuthorized = false,
+    this.microphoneEnabled = false,
+    this.microphoneDevice = '',
+    this.microphoneName = '',
+    this.microphonePackets = 0,
+    this.microphoneDropped = 0,
+    this.microphoneErrors = 0,
+    this.microphoneRecoveries = 0,
+    this.microphoneRecovering = false,
+    this.microphoneError = '',
+    this.privacySupported = false,
+    this.privacyEnabled = false,
+    this.privacyCode = 0,
+    this.privacyError = '',
+    this.privacyUpdates = 0,
+    this.desktop = ViewerDesktopKind.defaultDesktop,
+    this.desktopUpdates = 0,
+    this.sasCode = 0,
+    this.sasError = '',
+    this.sasUpdates = 0,
     this.displaySwitches = 0,
     this.displaySwitchFailures = 0,
     this.displaySwitchError = '',
@@ -176,6 +224,10 @@ class ViewerStatus {
     this.displayModeChanges = 0,
     this.displayModeFailures = 0,
     this.displayModeError = '',
+    this.streamQuality = 0,
+    this.streamOptionCode = 0,
+    this.streamOptionError = '',
+    this.streamOptionResults = 0,
     this.displays = const <ViewerDisplay>[],
   });
 
@@ -314,6 +366,49 @@ class ViewerStatus {
   final int audioBufferMs;
   final String audioError;
 
+  /// Microphone uplink. [microphoneAuthorized] mirrors the host permission;
+  /// [microphoneEnabled] means the local capture and the CMIC stream are
+  /// running. [microphoneDevice] is the pinned endpoint id (empty follows the
+  /// default communications device) and [microphoneName] what the picker
+  /// shows. A failure never touches video or system sound and explains itself
+  /// in [microphoneError].
+  final bool microphoneAuthorized;
+  final bool microphoneEnabled;
+  final String microphoneDevice;
+  final String microphoneName;
+  final int microphonePackets;
+  final int microphoneDropped;
+  final int microphoneErrors;
+  final int microphoneRecoveries;
+  final bool microphoneRecovering;
+  final String microphoneError;
+
+  /// Privacy mode hides the host's own screen while the stream continues.
+  /// [privacySupported] mirrors the host's permission; [privacyEnabled] is the
+  /// overlay state from the host's most recent answer, and every session starts
+  /// off. [privacyCode] is the host's PrivacyModeCode (0 = Ok) and
+  /// [privacyError] its reason for a refusal or a host-initiated disable.
+  /// [privacyUpdates] counts answers so the page can pair one with its poll.
+  final bool privacySupported;
+  final bool privacyEnabled;
+  final int privacyCode;
+  final String privacyError;
+  final int privacyUpdates;
+
+  /// Which desktop the host's video is capturing: the user desktop, a secure
+  /// desktop (lock screen, UAC, credential prompt) or none. The picture pauses
+  /// while the host cannot follow it and resumes when the user desktop returns.
+  final ViewerDesktopKind desktop;
+  final int desktopUpdates;
+
+  /// Ctrl+Alt+Del answers. [sasCode] is the host's [ViewerSasCode] (0 = Ok),
+  /// [sasError] its explanation, and [sasUpdates] counts answers so the page
+  /// can pair each one with its poll. Only the host's service mode can send
+  /// the sequence; the tray reports that it is unsupported.
+  final int sasCode;
+  final String sasError;
+  final int sasUpdates;
+
   /// Display switches the host accepted this session, and the refusals the
   /// engine saw (including requests it could not send), with the host's reason
   /// for the most recent refusal (cleared by an accepted switch). A refused
@@ -346,6 +441,18 @@ class ViewerStatus {
   final int displayModeFailures;
   final String displayModeError;
 
+  /// Stream preferences the host actually runs. [streamQuality] is a
+  /// [ViewerStreamQuality] value; the effective encoder and frame rate are
+  /// [codec] and [framerate], which the host's StreamInfo also updates.
+  /// [streamOptionCode] is the host's [ViewerStreamOptionsCode] (0 = Ok) for
+  /// the most recent answer and [streamOptionError] its refusal reason
+  /// (cleared by an accepted change). [streamOptionResults] counts answers,
+  /// including local send failures, so the page can pair one with its poll.
+  final int streamQuality;
+  final int streamOptionCode;
+  final String streamOptionError;
+  final int streamOptionResults;
+
   bool get hasFrame => published > 0 && width > 0 && height > 0;
   bool get isLive => state == ViewerState.streaming;
   bool get isOver =>
@@ -376,6 +483,21 @@ class ViewerStatus {
       : (downloadReceived / downloadSize).clamp(0.0, 1.0);
   // The speaker button and the overlay's audio row need a live local pipeline.
   bool get acceptsAudio => audioEnabled && isLive;
+  // The microphone button needs a live session and the host's microphone bit.
+  bool get acceptsMicrophone =>
+      isLive && (permissions & ViewerPermission.microphone) != 0;
+  // The privacy button needs a live session and the host's privacy bit.
+  bool get acceptsPrivacy =>
+      isLive && (permissions & ViewerPermission.privacyMode) != 0;
+  // True while the host captures a secure desktop (lock screen, UAC) or no
+  // desktop at all; the picture is frozen and input is not delivered.
+  bool get secureDesktop =>
+      desktop == ViewerDesktopKind.secure ||
+      desktop == ViewerDesktopKind.unavailable;
+  // Where the uplink captures from, for the tooltip and the overlay.
+  String get microphoneLabel => microphoneName.isNotEmpty
+      ? microphoneName
+      : (microphoneDevice.isEmpty ? '系统默认麦克风' : '麦克风');
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
 
   /// The sample rate as "48 kHz", the way the overlay shows it.
@@ -514,6 +636,26 @@ class ViewerStatus {
       audioRecovering: map['audioRecovering'] == true,
       audioBufferMs: asInt(map['audioBufferMs']),
       audioError: asString(map['audioError']),
+      microphoneAuthorized: map['microphoneAuthorized'] == true,
+      microphoneEnabled: map['microphoneEnabled'] == true,
+      microphoneDevice: asString(map['microphoneDevice']),
+      microphoneName: asString(map['microphoneName']),
+      microphonePackets: asInt(map['microphonePackets']),
+      microphoneDropped: asInt(map['microphoneDropped']),
+      microphoneErrors: asInt(map['microphoneErrors']),
+      microphoneRecoveries: asInt(map['microphoneRecoveries']),
+      microphoneRecovering: map['microphoneRecovering'] == true,
+      microphoneError: asString(map['microphoneError']),
+      privacySupported: map['privacySupported'] == true,
+      privacyEnabled: map['privacyEnabled'] == true,
+      privacyCode: asInt(map['privacyCode']),
+      privacyError: asString(map['privacyError']),
+      privacyUpdates: asInt(map['privacyUpdates']),
+      desktop: ViewerDesktopKind.fromCode(asInt(map['desktop'])),
+      desktopUpdates: asInt(map['desktopUpdates']),
+      sasCode: asInt(map['sasCode']),
+      sasError: asString(map['sasError']),
+      sasUpdates: asInt(map['sasUpdates']),
       displaySwitches: asInt(map['displaySwitches']),
       displaySwitchFailures: asInt(map['displaySwitchFailures']),
       displaySwitchError: asString(map['displaySwitchError']),
@@ -525,6 +667,10 @@ class ViewerStatus {
       displayModeChanges: asInt(map['displayModeChanges']),
       displayModeFailures: asInt(map['displayModeFailures']),
       displayModeError: asString(map['displayModeError']),
+      streamQuality: asInt(map['streamQuality']),
+      streamOptionCode: asInt(map['streamOptionCode']),
+      streamOptionError: asString(map['streamOptionError']),
+      streamOptionResults: asInt(map['streamOptionResults']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
     );
   }
@@ -722,6 +868,40 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// Asks the host to change the stream's encoder, frame-rate cap and quality
+  /// preset. [codec] is a [ViewerStreamCodec] value, [maxFps] 0 follows the
+  /// host's configured rate, and [quality] is a [ViewerStreamQuality] value.
+  /// No input permission is needed. False means the request was not queued
+  /// (no session); the host's answer arrives in [ViewerStatus.streamOptionCode]
+  /// and reports the values it actually runs in [ViewerStatus.codec],
+  /// [ViewerStatus.framerate] and [ViewerStatus.streamQuality].
+  static Future<bool> setStreamOptions({
+    required int codec,
+    required int maxFps,
+    required int quality,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'setStreamOptions',
+      <String, Object>{
+        'codec': codec,
+        'maxFps': maxFps,
+        'quality': quality,
+      },
+    );
+    return queued ?? false;
+  }
+
+  /// Asks the host to inject Ctrl+Alt+Del. This is not a key chord: Windows
+  /// only accepts the Secure Attention Sequence through `SendSAS`, which the
+  /// installed service can call. False means the request was not queued (no
+  /// live session or view-only access); the host's answer then arrives in
+  /// [ViewerStatus.sasCode] / [ViewerStatus.sasError], counted by
+  /// [ViewerStatus.sasUpdates].
+  static Future<bool> sendSas() async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendSas');
+    return queued ?? false;
+  }
+
   /// While remote control is on, an active local IME must not turn physical
   /// keys into VK_PROCESSKEY (the engine drops those before Dart sees them).
   /// Turning this off restores the IME for local text fields.
@@ -804,6 +984,50 @@ class ViewerBridge {
   static Future<bool> setAudioMuted(bool mute) async {
     final bool? muted = await _channel.invokeMethod<bool>('setAudioMuted', mute);
     return muted ?? false;
+  }
+
+  /// Switches the microphone uplink on or off. The native side opens the
+  /// capture device and the CMIC stream; switching off releases them.
+  /// Returns false when the host did not grant the microphone, so the caller
+  /// can explain the tap.
+  static Future<bool> setMicrophone(bool enabled) async {
+    final bool? applied = await _channel.invokeMethod<bool>('setMicrophone', enabled);
+    return applied ?? false;
+  }
+
+  /// Asks the host to mask its own screen while the stream continues. The
+  /// answer arrives through [ViewerStatus.privacyEnabled]; returns false when
+  /// the host did not grant the privacy bit.
+  static Future<bool> setPrivacyMode(bool enabled) async {
+    final bool? applied =
+        await _channel.invokeMethod<bool>('setPrivacyMode', enabled);
+    return applied ?? false;
+  }
+
+  /// Pins the capture endpoint; an empty id follows the default
+  /// communications device. An open uplink is reopened on the new device.
+  static Future<bool> selectMicrophone(String deviceId) async {
+    final bool? applied =
+        await _channel.invokeMethod<bool>('selectMicrophone', deviceId);
+    return applied ?? false;
+  }
+
+  /// Lists the machine's active capture endpoints, default first.
+  static Future<List<ViewerMicrophoneDevice>> listMicrophones() async {
+    final Object? result = await _channel.invokeMethod<Object?>('listMicrophones');
+    if (result is! List) {
+      return const <ViewerMicrophoneDevice>[];
+    }
+    final List<ViewerMicrophoneDevice> devices = <ViewerMicrophoneDevice>[];
+    for (final Object? entry in result) {
+      if (entry is Map) {
+        final ViewerMicrophoneDevice? device = ViewerMicrophoneDevice.fromMap(entry);
+        if (device != null) {
+          devices.add(device);
+        }
+      }
+    }
+    return List<ViewerMicrophoneDevice>.unmodifiable(devices);
   }
 }
 
@@ -897,6 +1121,79 @@ abstract final class ViewerPermission {
   static const int clipboard = 0x0002;
   static const int audio = 0x0004;
   static const int fileTransfer = 0x0008;
+  static const int microphone = 0x0010;
+  static const int privacyMode = 0x0020;
+}
+
+/// Why Ctrl+Alt+Del did not reach the host's secure desktop
+/// (chast::SasCode in chast/protocol.h).
+enum ViewerSasCode {
+  ok(0),
+  denied(1),
+  unsupported(2),
+  failed(3);
+
+  const ViewerSasCode(this.code);
+  final int code;
+}
+
+/// Encoder preference for a session (chast::StreamCodecPreference in
+/// chast/protocol.h). Auto keeps the host's tier ladder, which prefers HEVC
+/// when the GPU supports it.
+enum ViewerStreamCodec {
+  auto(0, '自动'),
+  h264(1, 'H.264'),
+  hevc(2, 'HEVC');
+
+  const ViewerStreamCodec(this.code, this.label);
+  final int code;
+  final String label;
+}
+
+/// Quality preset (chast::StreamQuality). It scales the host's video bitrate
+/// budget; adaptive bitrate can still go below the preset when the link
+/// degrades.
+enum ViewerStreamQuality {
+  high(0, '高清'),
+  balanced(1, '均衡'),
+  smooth(2, '流畅');
+
+  const ViewerStreamQuality(this.code, this.label);
+  final int code;
+  final String label;
+}
+
+/// Why the host refused new stream preferences (chast::StreamOptionsCode).
+enum ViewerStreamOptionsCode {
+  ok(0),
+  unsupported(1),
+  failed(2),
+  busy(3);
+
+  const ViewerStreamOptionsCode(this.code);
+  final int code;
+}
+
+/// Which desktop the host is capturing (chast::DesktopKind in
+/// chast/protocol.h). A secure desktop or an unreachable one pauses the
+/// picture until the user desktop comes back.
+enum ViewerDesktopKind {
+  defaultDesktop(0),
+  secure(1),
+  unavailable(2);
+
+  const ViewerDesktopKind(this.code);
+
+  final int code;
+
+  static ViewerDesktopKind fromCode(int code) {
+    for (final ViewerDesktopKind kind in values) {
+      if (kind.code == code) {
+        return kind;
+      }
+    }
+    return defaultDesktop;
+  }
 }
 
 /// The viewer's upload state (chast_viewer::FilePhase in

@@ -304,15 +304,18 @@ int main(int argc, char** argv) {
             std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >=
                 static_cast<long long>(options.change_bitrate_ms)) {
             bitrate_changed = true;
-            const chast::Error change =
-                encoder->set_rate(options.change_bitrate_kbps * 1000u, options.framerate);
+            bool keyframe_required = true;
+            const chast::Error change = encoder->set_rate(
+                options.change_bitrate_kbps * 1000u, options.framerate, &keyframe_required);
             if (!change.ok()) {
                 std::fprintf(stderr, "set_rate failed: %s\n", change.to_string().c_str());
                 ++errors;
             } else if (!options.quiet) {
-                std::printf("bitrate switched to %u kbps at %u ms\n", encoder->bitrate() / 1000u,
-                            options.change_bitrate_ms);
+                std::printf("bitrate switched to %u kbps at %u ms (%s)\n",
+                            encoder->bitrate() / 1000u, options.change_bitrate_ms,
+                            keyframe_required ? "IDR required" : "sequence continued");
             }
+            force_keyframe = force_keyframe || keyframe_required;
         }
 
         // A pointer-only frame re-uses the previous NV12 image. It is still a

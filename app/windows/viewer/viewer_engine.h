@@ -188,6 +188,45 @@ struct ViewerStatus {
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
     std::string audio_error;
+    // Microphone uplink to the host's speakers. `microphone_authorized`
+    // mirrors the host permission; `microphone_enabled` means the local
+    // capture thread and the CMIC stream are running. `microphone_device` is
+    // the endpoint id the capture is pinned to (empty selects the default
+    // communications device) and `microphone_name` is what the picker shows.
+    // Failures never touch video or system sound and explain themselves in
+    // `microphone_error`.
+    bool microphone_authorized = false;
+    bool microphone_enabled = false;
+    std::string microphone_device;
+    std::string microphone_name;
+    uint64_t microphone_packets = 0;
+    uint64_t microphone_dropped = 0;
+    uint64_t microphone_errors = 0;
+    uint64_t microphone_recoveries = 0;
+    bool microphone_recovering = false;
+    std::string microphone_error;
+    // Privacy mode hides the host's own screen while the stream continues.
+    // `privacy_supported` mirrors the host's permission; `privacy_enabled` is
+    // the overlay state from the most recent PrivacyModeState, and every
+    // session starts off. A refusal or a host-initiated disable explains itself
+    // in `privacy_error`; `privacy_updates` lets the UI pair an answer with the
+    // poll that saw it.
+    bool privacy_supported = false;
+    bool privacy_enabled = false;
+    int privacy_code = 0;
+    std::string privacy_error;
+    uint64_t privacy_updates = 0;
+    // Which desktop the host's video is capturing. Secure means the lock
+    // screen, UAC or a credential prompt is up; the picture pauses while the
+    // host cannot follow it and resumes when the user desktop returns.
+    chast::DesktopKind desktop = chast::DesktopKind::Default;
+    uint64_t desktop_updates = 0;
+    // Secure Attention Sequence (Ctrl+Alt+Del). The host answers every request
+    // with one SasResult; `sas_code` is that answer (0 = Ok), `sas_error` its
+    // explanation, and `sas_updates` lets the UI pair one answer with a poll.
+    int sas_code = 0;
+    std::string sas_error;
+    uint64_t sas_updates = 0;
     // What the server announced in HelloAck. `displays` is the list the UI's
     // picker shows; the streamed entry is the one whose rect starts at
     // origin_x/origin_y and matches width x height.
@@ -217,6 +256,17 @@ struct ViewerStatus {
     uint64_t display_mode_changes = 0;
     uint64_t display_mode_failures = 0;
     std::string display_mode_error;
+    // Stream preferences. `stream_quality` is the host's effective
+    // StreamQuality (0 = High); the effective codec and frame rate are the
+    // existing `codec`/`framerate`, which the host's StreamInfo also updates.
+    // `stream_option_code` is the StreamOptionsCode of the newest answer
+    // (0 = Ok) and `stream_option_error` its refusal reason; a success clears
+    // it. `stream_option_results` counts answers (including local send
+    // failures), so the UI can pair one answer with a poll.
+    int stream_quality = 0;
+    int stream_option_code = 0;
+    std::string stream_option_error;
+    uint64_t stream_option_results = 0;
 };
 
 class ViewerEngine {
@@ -276,6 +326,16 @@ public:
     // a newer one replaces an unsent one.
     bool SetDisplayMode(uint16_t display, uint16_t width, uint16_t height,
                         uint16_t refresh_hz);
+    // Queues stream preferences: encoder choice, frame-rate cap and quality
+    // preset. Returns false when no session is running or a value is outside
+    // its wire range. Accepted as soon as the session starts, before the first
+    // frame, so a page can re-apply its choices right after Start(). One
+    // request is kept: a newer one replaces an unsent one. The host answers
+    // through ViewerStatus::stream_option_code, and reports the values it
+    // actually runs in codec/framerate/stream_quality (so a refusal also
+    // returns the menus to reality). No input permission is required.
+    bool SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
+                          chast::StreamQuality quality);
     // Pauses or resumes the native rich-clipboard bridge. While paused neither
     // direction touches the local clipboard; resuming starts from a fresh
     // baseline, so whatever changed in between is not flushed to the host.
@@ -297,6 +357,29 @@ public:
     // thread applies it to the render session. Returns false when no audio
     // pipeline is running, so the caller knows the tap had no effect.
     bool SetAudioMuted(bool mute);
+
+    // Turns the microphone uplink on or off. Opening the capture device and
+    // the CMIC stream happens on the session thread; switching off stops them
+    // and ends the stream immediately. Returns false when no session is
+    // running or the host did not grant kPermissionMicrophone (a revocation
+    // also clears the switch and reports why in microphone_error).
+    bool SetMicrophone(bool enabled);
+    // Pins the capture endpoint. Empty follows the default communications
+    // device. An open capture is reopened on the new id within one poll; the
+    // choice is kept for later switches. Returns false when no session is
+    // running.
+    bool SelectMicrophone(std::string device_id);
+
+    // Queues a request to hide (true) or restore (false) the host's physical
+    // display. Returns false when no session is streaming or the host did not
+    // grant kPermissionPrivacyMode. Only the newest request is kept; the answer
+    // arrives through ViewerStatus::privacy_enabled/privacy_code/privacy_error.
+    bool SetPrivacyMode(bool enabled);
+    // Queues one Ctrl+Alt+Del request. Returns false when no session is
+    // streaming or the host did not grant input control. The answer arrives
+    // through ViewerStatus::sas_code/sas_error/sas_updates; a newer request
+    // replaces one that has not been sent yet.
+    bool SendSas();
 
     ViewerStatus Snapshot() const;
 
@@ -321,6 +404,20 @@ private:
     std::atomic<bool> running_{false};
     // Survives reconnects: the speaker stays off until the user turns it on.
     std::atomic<bool> audio_muted_{false};
+    // The microphone switch only crosses as a flag; the session thread owns
+    // the capture thread and the CMIC stream. Every session starts off, and a
+    // missing permission clears the flag rather than leaving it queued.
+    std::atomic<bool> microphone_wanted_{false};
+    mutable std::mutex microphone_mutex_;
+    std::string microphone_device_id_;
+
+    // Newest privacy request, for the same reason as the display switch: the
+    // operator wants the state they picked last, not a replay of every toggle.
+    mutable std::mutex privacy_mutex_;
+    std::optional<bool> pending_privacy_;
+    // SAS is an action, not a state: one pending request is enough, and a
+    // second tap replaces an unsent one instead of queueing a burst.
+    std::atomic<bool> pending_sas_{false};
 
     // Input crosses from the UI thread to the session thread here. The queue
     // is bounded: a stalled transport drops the newest events instead of
@@ -413,6 +510,11 @@ private:
     mutable std::mutex mode_mutex_;
     std::optional<uint16_t> pending_mode_list_;
     std::optional<PendingMode> pending_mode_set_;
+
+    // Stream preferences are a snapshot, not a queue: the operator wants the
+    // menu's last choice applied, not every intermediate one.
+    mutable std::mutex stream_option_mutex_;
+    std::optional<chast::StreamOptions> pending_stream_options_;
 };
 
 }  // namespace chast_viewer

@@ -49,6 +49,16 @@ std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
 }
 
+const char* audio_codec_name(chast::AudioCodec codec) {
+    switch (codec) {
+        case chast::AudioCodec::AAC:
+            return "AAC-LC";
+        case chast::AudioCodec::Opus:
+            return "Opus";
+    }
+    return "unknown";
+}
+
 const char* switch_code_name(chast::DisplaySwitchCode code) {
     switch (code) {
         case chast::DisplaySwitchCode::Ok:
@@ -75,6 +85,72 @@ const char* mode_code_name(chast::DisplayModeCode code) {
             return "the host is still settling the previous change";
     }
     return "the host refused the change";
+}
+
+const char* stream_quality_name(chast::StreamQuality quality) {
+    switch (quality) {
+        case chast::StreamQuality::High:
+            return "high";
+        case chast::StreamQuality::Balanced:
+            return "balanced";
+        case chast::StreamQuality::Smooth:
+            return "smooth";
+    }
+    return "unknown";
+}
+
+const char* stream_option_code_name(chast::StreamOptionsCode code) {
+    switch (code) {
+        case chast::StreamOptionsCode::Ok:
+            return "the change was accepted";
+        case chast::StreamOptionsCode::Unsupported:
+            return "the host cannot provide that encoder or setting";
+        case chast::StreamOptionsCode::Failed:
+            return "the host could not apply the streaming options";
+        case chast::StreamOptionsCode::Busy:
+            return "the host is still settling the previous encoder change";
+    }
+    return "the host refused the streaming options";
+}
+
+const char* privacy_code_name(chast::PrivacyModeCode code) {
+    switch (code) {
+        case chast::PrivacyModeCode::Ok:
+            return "the request was accepted";
+        case chast::PrivacyModeCode::Denied:
+            return "privacy mode is not permitted by the host";
+        case chast::PrivacyModeCode::Unsupported:
+            return "the host cannot hide its display";
+        case chast::PrivacyModeCode::Failed:
+            return "the host could not show or remove the mask";
+    }
+    return "the host refused privacy mode";
+}
+
+const char* sas_code_name(chast::SasCode code) {
+    switch (code) {
+        case chast::SasCode::Ok:
+            return "Ctrl+Alt+Del was sent";
+        case chast::SasCode::Denied:
+            return "input control is not permitted by the host";
+        case chast::SasCode::Unsupported:
+            return "this host cannot send Ctrl+Alt+Del";
+        case chast::SasCode::Failed:
+            return "the host could not send Ctrl+Alt+Del";
+    }
+    return "the host refused Ctrl+Alt+Del";
+}
+
+const char* desktop_kind_name(chast::DesktopKind kind) {
+    switch (kind) {
+        case chast::DesktopKind::Default:
+            return "the user desktop";
+        case chast::DesktopKind::Secure:
+            return "a secure desktop";
+        case chast::DesktopKind::Unavailable:
+            return "no accessible desktop";
+    }
+    return "an unknown desktop";
 }
 
 uint32_t formats_mask(const chast::ClipboardContent& content) {
@@ -174,6 +250,20 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_mode_list_.reset();
         pending_mode_set_.reset();
     }
+    {
+        std::lock_guard<std::mutex> lock(stream_option_mutex_);
+        pending_stream_options_.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(privacy_mutex_);
+        pending_privacy_.reset();
+    }
+    // A SAS request queued for a session that ended must not fire into the
+    // next one.
+    pending_sas_.store(false, std::memory_order_release);
+    // Microphone capture is a per-session privacy decision: every session
+    // starts with the uplink off, while the chosen device is remembered.
+    microphone_wanted_.store(false, std::memory_order_relaxed);
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
@@ -284,6 +374,36 @@ bool ViewerEngine::SetDisplayMode(uint16_t display, uint16_t width, uint16_t hei
     pending.height = height;
     pending.refresh_hz = refresh_hz;
     pending_mode_set_ = pending;
+    return true;
+}
+
+bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
+                                    chast::StreamQuality quality) {
+    if (!running_.load(std::memory_order_acquire) || max_fps > chast::kMaxStreamFps) {
+        return false;
+    }
+    switch (codec) {
+        case chast::StreamCodecPreference::Auto:
+        case chast::StreamCodecPreference::H264:
+        case chast::StreamCodecPreference::Hevc:
+            break;
+        default:
+            return false;
+    }
+    switch (quality) {
+        case chast::StreamQuality::High:
+        case chast::StreamQuality::Balanced:
+        case chast::StreamQuality::Smooth:
+            break;
+        default:
+            return false;
+    }
+    chast::StreamOptions options;
+    options.codec = codec;
+    options.max_fps = max_fps;
+    options.quality = quality;
+    std::lock_guard<std::mutex> lock(stream_option_mutex_);
+    pending_stream_options_ = options;
     return true;
 }
 
@@ -399,6 +519,55 @@ bool ViewerEngine::SetAudioMuted(bool mute) {
     return true;
 }
 
+bool ViewerEngine::SetMicrophone(bool enabled) {
+    if (enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_.microphone_authorized) {
+            return false;
+        }
+    }
+    microphone_wanted_.store(enabled, std::memory_order_relaxed);
+    return true;
+}
+
+bool ViewerEngine::SelectMicrophone(std::string device_id) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(microphone_mutex_);
+    microphone_device_id_ = std::move(device_id);
+    return true;
+}
+
+bool ViewerEngine::SetPrivacyMode(bool enabled) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.privacy_supported) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(privacy_mutex_);
+    pending_privacy_ = enabled;
+    return true;
+}
+
+bool ViewerEngine::SendSas() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+            return false;
+        }
+    }
+    pending_sas_.store(true, std::memory_order_release);
+    return true;
+}
+
 ViewerStatus ViewerEngine::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     ViewerStatus status = status_;
@@ -467,6 +636,29 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
     std::string audio_error;
+    std::unique_ptr<chast::IMicrophoneCapture> microphone_capture;
+    bool microphone_authorized = false;
+    bool microphone_enabled = false;
+    bool microphone_stream_open = false;
+    std::string microphone_device;
+    std::string microphone_name;
+    uint64_t microphone_packets = 0;
+    uint64_t microphone_dropped = 0;
+    uint64_t microphone_send_dropped = 0;
+    uint64_t microphone_errors = 0;
+    uint64_t microphone_recoveries = 0;
+    bool microphone_recovering = false;
+    std::string microphone_error;
+    bool privacy_supported = false;
+    bool privacy_enabled = false;
+    int privacy_code = 0;
+    std::string privacy_error;
+    uint64_t privacy_updates = 0;
+    chast::DesktopKind desktop = chast::DesktopKind::Default;
+    uint64_t desktop_updates = 0;
+    int sas_code = 0;
+    std::string sas_error;
+    uint64_t sas_updates = 0;
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
@@ -475,6 +667,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t display_mode_failures = 0;
     std::string display_mode_error;
     std::string display_modes_error;
+    int stream_quality = 0;
+    int stream_option_code = 0;
+    std::string stream_option_error;
+    uint64_t stream_option_results = 0;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
     bool clock_synced = false;
@@ -613,6 +809,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.audio_recovering = audio_recovering;
             status_.audio_buffer_ms = audio_buffer_ms;
             status_.audio_error = audio_error;
+            status_.microphone_authorized = microphone_authorized;
+            status_.microphone_enabled = microphone_enabled;
+            status_.microphone_device = microphone_device;
+            status_.microphone_name = microphone_name;
+            status_.microphone_packets = microphone_packets;
+            status_.microphone_dropped = microphone_dropped;
+            status_.microphone_errors = microphone_errors;
+            status_.microphone_recoveries = microphone_recoveries;
+            status_.microphone_recovering = microphone_recovering;
+            status_.microphone_error = microphone_error;
+            status_.privacy_supported = privacy_supported;
+            status_.privacy_enabled = privacy_enabled;
+            status_.privacy_code = privacy_code;
+            status_.privacy_error = privacy_error;
+            status_.privacy_updates = privacy_updates;
+            status_.desktop = desktop;
+            status_.desktop_updates = desktop_updates;
+            status_.sas_code = sas_code;
+            status_.sas_error = sas_error;
+            status_.sas_updates = sas_updates;
             status_.display_switches = display_switches;
             status_.display_switch_failures = display_switch_failures;
             status_.display_switch_error = display_switch_error;
@@ -621,6 +837,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.display_mode_failures = display_mode_failures;
             status_.display_mode_error = display_mode_error;
             status_.display_modes_error = display_modes_error;
+            status_.stream_quality = stream_quality;
+            status_.stream_option_code = stream_option_code;
+            status_.stream_option_error = stream_option_error;
+            status_.stream_option_results = stream_option_results;
             status_.elapsed_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
             if (final) {
@@ -659,6 +879,33 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         running_.store(false, std::memory_order_release);
         return;
     }
+
+    // Stops the uplink: the capture thread first (it owns the endpoint), then
+    // the CMIC stream, so the host sees the switch go off. `switch_off`
+    // clears the UI's request too, which is what a failure and a revocation
+    // want; closing the stream is also how the host stops decoding.
+    auto stop_microphone = [&](const std::string& reason, bool switch_off) {
+        if (microphone_capture) {
+            const chast::AudioCaptureStats stats = microphone_capture->stats();
+            microphone_dropped = stats.dropped;
+            microphone_recoveries = stats.recoveries;
+            microphone_capture->stop();
+            microphone_capture.reset();
+        }
+        if (microphone_stream_open) {
+            session->stop_microphone();
+            microphone_stream_open = false;
+        }
+        microphone_recovering = false;
+        microphone_enabled = false;
+        if (switch_off) {
+            microphone_wanted_.store(false, std::memory_order_relaxed);
+        }
+        if (!reason.empty()) {
+            microphone_error = reason;
+            std::fprintf(stderr, "viewer: microphone stopped: %s\n", reason.c_str());
+        }
+    };
 
     chast::Error connected = session->connect(std::chrono::seconds(15));
     // The certificate callback records the presented fingerprint before it
@@ -746,7 +993,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     return;
                 }
                 std::string audio_setup_error;
-                audio_decoder = chast::create_aac_decoder(audio, &audio_setup_error);
+                // The host chooses the codec (Opus for system sound since
+                // protocol v18); dispatch instead of assuming AAC.
+                audio_decoder = chast::create_audio_decoder(audio, &audio_setup_error);
                 if (!audio_decoder) {
                     audio_error = "decoder: " + audio_setup_error;
                     std::fprintf(stderr, "viewer: audio %s\n", audio_error.c_str());
@@ -775,9 +1024,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 audio_enabled = true;
                 audio_error.clear();
                 std::fprintf(stderr,
-                             "viewer: audio AAC-LC %u Hz %u ch %u kbps, decoder and "
+                             "viewer: audio %s %u Hz %u ch %u kbps, decoder and "
                              "renderer running\n",
-                             audio.sample_rate, audio.channels, audio.bitrate / 1000u);
+                             audio_codec_name(audio.codec), audio.sample_rate,
+                             audio.channels, audio.bitrate / 1000u);
             };
             start_audio(info.audio);
 
@@ -793,6 +1043,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 ++permission_updates;
                 const bool input = (mask & chast::kPermissionInput) != 0;
                 const bool clipboard = (mask & chast::kPermissionClipboard) != 0;
+                const bool microphone = (mask & chast::kPermissionMicrophone) != 0;
+                const bool privacy = (mask & chast::kPermissionPrivacyMode) != 0;
                 {
                     std::lock_guard<std::mutex> lock(input_mutex_);
                     input_enabled_ = input;
@@ -801,12 +1053,21 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 }
                 clipboard_enabled = clipboard;
+                microphone_authorized = microphone;
+                privacy_supported = privacy;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.permissions = mask;
                     status_.permission_updates = permission_updates;
                     status_.input_enabled = input;
                     status_.clipboard_enabled = clipboard;
+                    status_.microphone_authorized = microphone;
+                    status_.privacy_supported = privacy;
+                }
+                // The transport aborts the stream on revocation; stopping here
+                // releases the microphone at once and tells the UI why.
+                if (!microphone && (microphone_capture || microphone_stream_open)) {
+                    stop_microphone("the host revoked the microphone", true);
                 }
             };
             apply_permissions(session->permissions());
@@ -1637,6 +1898,113 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Microphone uplink. The UI only sets the wanted flag and the
+                // device id; this thread opens the capture, opens the CMIC
+                // stream and moves packets so a stalled microphone can never
+                // stall video or system sound. Switching the device or the
+                // permission off rebuilds or ends the stream from here.
+                chast::AudioInfo microphone_info;
+                auto drain_microphone = [&] {
+                    if (!microphone_authorized ||
+                        !microphone_wanted_.load(std::memory_order_relaxed)) {
+                        if (microphone_capture || microphone_stream_open) {
+                            stop_microphone({}, true);
+                        }
+                        return;
+                    }
+                    std::string wanted_device;
+                    {
+                        std::lock_guard<std::mutex> lock(microphone_mutex_);
+                        wanted_device = microphone_device_id_;
+                    }
+                    if (microphone_capture && wanted_device != microphone_device) {
+                        // The picker chose another endpoint: close this
+                        // stream before opening the next one.
+                        stop_microphone({}, false);
+                    }
+                    if (!microphone_capture) {
+                        chast::MicrophoneCaptureConfig config;
+                        config.device_id = wanted_device;
+                        std::string setup_error;
+                        microphone_capture =
+                            chast::create_microphone_capture(config, &setup_error);
+                        if (!microphone_capture) {
+                            ++microphone_errors;
+                            microphone_error = "capture: " + setup_error;
+                            std::fprintf(stderr, "viewer: microphone %s\n",
+                                         microphone_error.c_str());
+                            microphone_wanted_.store(false, std::memory_order_relaxed);
+                            return;
+                        }
+                        microphone_info = microphone_capture->info();
+                        chast::Error opened = session->start_microphone(microphone_info);
+                        if (!opened.ok()) {
+                            ++microphone_errors;
+                            microphone_error = "stream: " + opened.to_string();
+                            std::fprintf(stderr, "viewer: microphone %s\n",
+                                         microphone_error.c_str());
+                            stop_microphone({}, true);
+                            return;
+                        }
+                        microphone_stream_open = true;
+                        microphone_device = wanted_device;
+                        microphone_name.clear();
+                        std::string list_error;
+                        for (const chast::MicrophoneDevice& device :
+                             chast::list_microphones(&list_error)) {
+                            if ((wanted_device.empty() && device.is_default) ||
+                                device.id == wanted_device) {
+                                microphone_name = device.name;
+                                break;
+                            }
+                        }
+                        microphone_capture->start();
+                        microphone_enabled = true;
+                        microphone_error.clear();
+                        std::fprintf(stderr,
+                                     "viewer: microphone %s %u Hz %u ch %u kbps, sending\n",
+                                     audio_codec_name(microphone_info.codec),
+                                     microphone_info.sample_rate, microphone_info.channels,
+                                     microphone_info.bitrate / 1000u);
+                    }
+                    if (microphone_capture->failed()) {
+                        ++microphone_errors;
+                        const std::string reason = microphone_capture->error();
+                        stop_microphone("capture: " + reason, true);
+                        return;
+                    }
+                    chast::EncodedAudio packet;
+                    while (microphone_capture->take_packet(packet)) {
+                        chast::AudioHeader header;
+                        header.codec = microphone_info.codec;
+                        header.sample_rate = microphone_info.sample_rate;
+                        header.channels = microphone_info.channels;
+                        header.frame_samples = microphone_info.frame_samples;
+                        header.pts_ms = packet.capture_ms;
+                        header.capture_ms = packet.capture_ms;
+                        chast::Error sent = session->send_microphone(
+                            header, packet.data.data(), packet.data.size());
+                        if (sent.status() == chast::Status::WaitTimeout) {
+                            ++microphone_send_dropped;
+                            continue;
+                        }
+                        if (!sent.ok()) {
+                            ++microphone_errors;
+                            if (sent.status() == chast::Status::PermissionDenied) {
+                                stop_microphone("the host revoked the microphone", true);
+                            } else {
+                                stop_microphone("send: " + sent.to_string(), true);
+                            }
+                            return;
+                        }
+                        ++microphone_packets;
+                    }
+                    const chast::AudioCaptureStats stats = microphone_capture->stats();
+                    microphone_dropped = stats.dropped + microphone_send_dropped;
+                    microphone_recoveries = stats.recoveries;
+                    microphone_recovering = stats.recovering;
+                };
+
                 // Adopts every PermissionUpdate the host sent. The transport
                 // enforces the same mask on its side; this keeps the UI's
                 // gates and the queues consistent with it immediately.
@@ -1646,6 +2014,127 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         apply_permissions(updated);
                         std::fprintf(stderr, "viewer: permissions are now 0x%04x\n",
                                      updated);
+                    }
+                };
+
+                // Sends the state the operator picked last. A request that
+                // fails locally (permission revoked between the queue and the
+                // send) is reported like a refusal, so the switch returns to
+                // what the host actually has.
+                auto drain_privacy = [&] {
+                    std::optional<bool> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(privacy_mutex_);
+                        requested.swap(pending_privacy_);
+                    }
+                    if (!requested) {
+                        return;
+                    }
+                    chast::Error sent = session->set_privacy_mode(*requested);
+                    if (!sent.ok()) {
+                        privacy_error = "request: " + sent.to_string();
+                        ++privacy_updates;
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.privacy_error = privacy_error;
+                        status_.privacy_updates = privacy_updates;
+                        std::fprintf(stderr, "viewer: privacy mode: %s\n",
+                                     sent.to_string().c_str());
+                    }
+                };
+
+                // Adopts the overlay state. A host-initiated disable (the
+                // operator revoked the permission) arrives here too, so the
+                // switch always follows what the host actually did.
+                auto receive_privacy = [&] {
+                    bool enabled = false;
+                    chast::PrivacyModeCode code = chast::PrivacyModeCode::Ok;
+                    std::string reason;
+                    while (session->take_privacy_mode_state(enabled, code, reason)) {
+                        privacy_enabled = enabled;
+                        privacy_code = static_cast<int>(code);
+                        privacy_error = code == chast::PrivacyModeCode::Ok
+                                            ? std::string()
+                                            : (reason.empty() ? privacy_code_name(code)
+                                                              : reason);
+                        ++privacy_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.privacy_enabled = privacy_enabled;
+                            status_.privacy_code = privacy_code;
+                            status_.privacy_error = privacy_error;
+                            status_.privacy_updates = privacy_updates;
+                        }
+                        std::fprintf(stderr, "viewer: privacy mode %s%s%s\n",
+                                     enabled ? "on" : "off",
+                                     privacy_error.empty() ? "" : ": ",
+                                     privacy_error.c_str());
+                    }
+                };
+
+                // Sends a queued Ctrl+Alt+Del request. A local failure is
+                // reported as a SasResult would be, so the UI always gets an
+                // answer even when the permission was revoked in between.
+                auto drain_sas = [&] {
+                    if (!pending_sas_.exchange(false, std::memory_order_acq_rel)) {
+                        return;
+                    }
+                    chast::Error sent = session->request_sas();
+                    if (sent.ok()) {
+                        return;
+                    }
+                    sas_code = static_cast<int>(chast::SasCode::Failed);
+                    sas_error = "request: " + sent.to_string();
+                    ++sas_updates;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.sas_code = sas_code;
+                    status_.sas_error = sas_error;
+                    status_.sas_updates = sas_updates;
+                    std::fprintf(stderr, "viewer: send Ctrl+Alt+Del: %s\n",
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts the host's answer. Every request gets one, so a
+                // refusal explains itself instead of leaving the UI waiting.
+                auto receive_sas = [&] {
+                    chast::SasCode code = chast::SasCode::Failed;
+                    std::string reason;
+                    while (session->take_sas_result(code, reason)) {
+                        sas_code = static_cast<int>(code);
+                        sas_error = code == chast::SasCode::Ok
+                                        ? std::string()
+                                        : (reason.empty() ? sas_code_name(code) : reason);
+                        ++sas_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.sas_code = sas_code;
+                            status_.sas_error = sas_error;
+                            status_.sas_updates = sas_updates;
+                        }
+                        std::fprintf(stderr, "viewer: Ctrl+Alt+Del %s%s%s\n",
+                                     code == chast::SasCode::Ok ? "sent" : "refused",
+                                     sas_error.empty() ? "" : ": ",
+                                     sas_error.c_str());
+                    }
+                };
+
+                // Adopts the desktop the host is capturing. Secure is the lock
+                // screen, UAC or a credential prompt; the host pauses video
+                // while it cannot follow and sends Default when it resumes.
+                auto receive_desktop = [&] {
+                    chast::DesktopKind kind = chast::DesktopKind::Default;
+                    while (session->take_desktop_state(kind)) {
+                        if (desktop_updates != 0 && kind == desktop) {
+                            continue;
+                        }
+                        desktop = kind;
+                        ++desktop_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.desktop = desktop;
+                            status_.desktop_updates = desktop_updates;
+                        }
+                        std::fprintf(stderr, "viewer: host desktop is %s\n",
+                                     desktop_kind_name(desktop));
                     }
                 };
 
@@ -1779,6 +2268,69 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the newest stream preferences. One slot, like the
+                // display pickers: the menu's last choice is what matters.
+                auto drain_stream_options = [&] {
+                    std::optional<chast::StreamOptions> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(stream_option_mutex_);
+                        requested.swap(pending_stream_options_);
+                    }
+                    if (!requested) {
+                        return;
+                    }
+                    chast::Error sent = session->request_stream_options(*requested);
+                    if (sent.ok()) {
+                        return;
+                    }
+                    stream_option_code = static_cast<int>(chast::StreamOptionsCode::Failed);
+                    stream_option_error = "request: " + sent.to_string();
+                    ++stream_option_results;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.stream_option_code = stream_option_code;
+                        status_.stream_option_error = stream_option_error;
+                        status_.stream_option_results = stream_option_results;
+                    }
+                    std::fprintf(stderr, "viewer: set stream options: %s\n",
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts the host's answer. It reports the values it actually
+                // runs even on a refusal, so the menus can return to reality
+                // without waiting for a StreamInfo.
+                auto receive_stream_options = [&] {
+                    chast::StreamOptionsResult result;
+                    while (session->take_stream_options_result(result)) {
+                        stream_option_code = static_cast<int>(result.code);
+                        stream_option_error =
+                            result.code == chast::StreamOptionsCode::Ok
+                                ? std::string()
+                                : (result.reason.empty()
+                                       ? stream_option_code_name(result.code)
+                                       : result.reason);
+                        stream_quality = static_cast<int>(result.quality);
+                        ++stream_option_results;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.stream_option_code = stream_option_code;
+                            status_.stream_option_error = stream_option_error;
+                            status_.stream_option_results = stream_option_results;
+                            status_.stream_quality = stream_quality;
+                            status_.codec = result.codec;
+                            status_.framerate = result.fps;
+                        }
+                        std::fprintf(stderr,
+                                     "viewer: stream options %s: %s, %u fps, quality %s%s%s\n",
+                                     result.code == chast::StreamOptionsCode::Ok ? "accepted"
+                                                                                 : "refused",
+                                     codec_name(result.codec).c_str(), result.fps,
+                                     stream_quality_name(result.quality),
+                                     stream_option_error.empty() ? "" : ": ",
+                                     stream_option_error.c_str());
+                    }
+                };
+
                 // Applies StreamInfo messages: the captured output changed
                 // size, rotation or origin after the server rebuilt its
                 // duplication. Frames keep flowing on the same stream, so only
@@ -1863,11 +2415,18 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         break;
                     }
                     receive_permissions();
+                    drain_privacy();
+                    receive_privacy();
+                    drain_sas();
+                    receive_sas();
+                    receive_desktop();
                     receive_display_switch();
                     receive_display_modes();
                     receive_display_mode_results();
+                    receive_stream_options();
                     drain_display_switch();
                     drain_display_modes();
+                    drain_stream_options();
                     {
                         const auto probe_now = Clock::now();
                         if (probe_now - last_probe >= kProbeInterval) {
@@ -1892,6 +2451,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_download_cancels();
                     receive_cursor();
                     drain_audio();
+                    drain_microphone();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
                     FileUpload::Stage upload_stage = FileUpload::Stage::kNone;
@@ -1905,16 +2465,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     const bool fast_media_poll =
                         (permissions & (chast::kPermissionInput |
                                         chast::kPermissionClipboard)) != 0 ||
-                        file_active || audio_announced;
+                        file_active || audio_announced || microphone_enabled ||
+                        microphone_wanted_.load(std::memory_order_relaxed);
                     chast::Error received_frame = session->receive_frame(
                         header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
-                    // Audio packets arrive on their own stream and never wake
-                    // receive_frame(), so drain them as soon as the wait ends.
+                    // Audio and microphone packets arrive on their own streams
+                    // and never wake receive_frame(), so drain them as soon as
+                    // the wait ends.
                     drain_audio();
+                    drain_microphone();
                     receive_permissions();
+                    drain_privacy();
+                    receive_privacy();
+                    drain_sas();
+                    receive_sas();
+                    receive_desktop();
                     receive_display_switch();
                     receive_display_modes();
                     receive_display_mode_results();
+                    receive_stream_options();
                     const auto now = Clock::now();
 
                     if (received_frame.status() == chast::Status::WaitTimeout) {
@@ -2068,6 +2637,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     if (cancelled_upload != 0) {
         session->cancel_file_upload(cancelled_upload);
     }
+    // The uplink cannot outlive the session: capture stops first, then the
+    // stream ends so the host tears down its decoder and player.
+    stop_microphone({}, true);
 
     if (handshaken) {
         chast::ClientStats closing;

@@ -96,6 +96,9 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.microphone_enabled) {
         mask |= kPermissionMicrophone;
     }
+    if (info.privacy_mode_enabled) {
+        mask |= kPermissionPrivacyMode;
+    }
     return mask;
 }
 
@@ -542,6 +545,36 @@ struct QuicSession::Impl {
     DisplayModeCode display_mode_code = DisplayModeCode::Ok;
     std::string display_mode_reason;
     uint64_t display_mode_results_seen = 0;
+    // Server: the newest SetPrivacyMode request. Client: the newest state the
+    // host sent, also used for a host-initiated disable.
+    bool privacy_mode_request_ready = false;
+    bool privacy_mode_requested = false;
+    uint64_t privacy_mode_requests_seen = 0;
+    bool privacy_mode_state_ready = false;
+    bool privacy_mode_enabled = false;
+    PrivacyModeCode privacy_mode_code = PrivacyModeCode::Ok;
+    std::string privacy_mode_reason;
+    uint64_t privacy_mode_states_seen = 0;
+    // Client: the newest desktop kind the host announced.
+    bool desktop_state_ready = false;
+    DesktopKind desktop_kind = DesktopKind::Default;
+    uint64_t desktop_states_seen = 0;
+    // Server: SAS requests waiting for the host loop, and the total seen.
+    // Client: the newest answer, with its own counter.
+    size_t sas_requests_pending = 0;
+    uint64_t sas_requests_seen = 0;
+    bool sas_result_ready = false;
+    SasCode sas_code = SasCode::Ok;
+    std::string sas_reason;
+    uint64_t sas_results_seen = 0;
+    // Server: the newest SetStreamOptions request. Client: the newest answer,
+    // carrying the effective settings even when the request was refused.
+    bool stream_options_request_ready = false;
+    StreamOptions stream_options_request;
+    uint64_t stream_options_requests_seen = 0;
+    bool stream_options_result_ready = false;
+    StreamOptionsResult stream_options_result;
+    uint64_t stream_options_results_seen = 0;
     // Server: the mask the viewer was granted, and the ceiling that grant
     // established. Mid-session changes may only stay inside the ceiling.
     // Client: the mask the host last announced. Atomic because the transport
@@ -1838,6 +1871,146 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::SetPrivacyMode: {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionPrivacyMode) == 0) {
+                    // The HelloAck already told the viewer whether privacy mode
+                    // is available; a request without the permission is
+                    // dropped, not fatal.
+                    break;
+                }
+                bool enabled = false;
+                if (!parse_set_privacy_mode(payload, enabled, &error)) {
+                    note_transport_failure("SetPrivacyMode: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    privacy_mode_requested = enabled;
+                    privacy_mode_request_ready = true;
+                    ++privacy_mode_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::PrivacyModeState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                bool enabled = false;
+                PrivacyModeCode code = PrivacyModeCode::Failed;
+                std::string reason;
+                if (!parse_privacy_mode_state(payload, enabled, code, reason, &error)) {
+                    note_transport_failure("PrivacyModeState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    privacy_mode_enabled = enabled;
+                    privacy_mode_code = code;
+                    privacy_mode_reason = std::move(reason);
+                    privacy_mode_state_ready = true;
+                    ++privacy_mode_states_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DesktopState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                DesktopKind kind = DesktopKind::Default;
+                if (!parse_desktop_state(payload, kind, &error)) {
+                    note_transport_failure("DesktopState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    desktop_kind = kind;
+                    desktop_state_ready = true;
+                    ++desktop_states_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SendSas: {
+                if (role != Role::Server) {
+                    break;
+                }
+                if (!parse_send_sas(payload, &error)) {
+                    note_transport_failure("SendSas: " + error);
+                    break;
+                }
+                // Deliberately not gated on the permission mask here: the
+                // host answers Denied itself, which is more useful to the
+                // viewer than a request that silently disappears.
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++sas_requests_pending;
+                    ++sas_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SasResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                SasCode code = SasCode::Failed;
+                std::string reason;
+                if (!parse_sas_result(payload, code, reason, &error)) {
+                    note_transport_failure("SasResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    sas_code = code;
+                    sas_reason = std::move(reason);
+                    sas_result_ready = true;
+                    ++sas_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SetStreamOptions: {
+                if (role != Role::Server) {
+                    break;
+                }
+                // Deliberately not gated on a permission bit: these choices
+                // change only what this viewer receives, not the host's
+                // desktop, unlike a display switch.
+                StreamOptions options;
+                if (!parse_set_stream_options(payload, options, &error)) {
+                    note_transport_failure("SetStreamOptions: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    stream_options_request = options;
+                    stream_options_request_ready = true;
+                    ++stream_options_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::StreamOptionsResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                StreamOptionsResult result;
+                if (!parse_stream_options_result(payload, result, &error)) {
+                    note_transport_failure("StreamOptionsResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    stream_options_result = std::move(result);
+                    stream_options_result_ready = true;
+                    ++stream_options_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::ClipboardUpdate: {
                 if (role == Role::Server &&
                     (session_permissions.load() & kPermissionClipboard) == 0) {
@@ -2231,6 +2404,29 @@ struct QuicSession::Impl {
             display_mode_code = DisplayModeCode::Ok;
             display_mode_reason.clear();
             display_mode_results_seen = 0;
+            privacy_mode_request_ready = false;
+            privacy_mode_requested = false;
+            privacy_mode_requests_seen = 0;
+            privacy_mode_state_ready = false;
+            privacy_mode_enabled = false;
+            privacy_mode_code = PrivacyModeCode::Ok;
+            privacy_mode_reason.clear();
+            privacy_mode_states_seen = 0;
+            desktop_state_ready = false;
+            desktop_kind = DesktopKind::Default;
+            desktop_states_seen = 0;
+            sas_requests_pending = 0;
+            sas_requests_seen = 0;
+            sas_result_ready = false;
+            sas_code = SasCode::Ok;
+            sas_reason.clear();
+            sas_results_seen = 0;
+            stream_options_request_ready = false;
+            stream_options_request = StreamOptions{};
+            stream_options_requests_seen = 0;
+            stream_options_result_ready = false;
+            stream_options_result = StreamOptionsResult{};
+            stream_options_results_seen = 0;
             session_permissions = 0;
             permission_ceiling = 0;
             permission_update_ready = false;
@@ -2290,6 +2486,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_microphone) {
             mask |= kPermissionMicrophone;
+        }
+        if (server_config.allow_privacy_mode) {
+            mask |= kPermissionPrivacyMode;
         }
         return mask;
     }
@@ -2873,6 +3072,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     ack.microphone_enabled = (granted & kPermissionMicrophone) != 0;
+    ack.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -2957,6 +3157,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.clipboard_enabled = (granted & kPermissionClipboard) != 0;
     update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     update.microphone_enabled = (granted & kPermissionMicrophone) != 0;
+    update.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -3092,6 +3293,206 @@ bool QuicSession::take_display_mode_result(uint16_t& display_index, uint16_t& wi
 uint64_t QuicSession::display_mode_results() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->display_mode_results_seen;
+}
+
+bool QuicSession::take_privacy_mode_request(bool& enabled) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->privacy_mode_request_ready) {
+        return false;
+    }
+    impl_->privacy_mode_request_ready = false;
+    if ((impl_->session_permissions.load() & kPermissionPrivacyMode) == 0) {
+        // The permission was revoked between the request and this drain; the
+        // host must not act on a request it can no longer honor.
+        return false;
+    }
+    enabled = impl_->privacy_mode_requested;
+    return true;
+}
+
+Error QuicSession::send_privacy_mode_state(bool enabled, PrivacyModeCode code,
+                                           const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_privacy_mode_state is a server operation");
+    }
+    if (enabled && code != PrivacyModeCode::Ok) {
+        return Error(Status::InvalidCall, "a failed privacy state cannot be enabled");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_privacy_mode_state(enabled, code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::send_desktop_state(DesktopKind kind) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_desktop_state is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_desktop_state(kind),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::set_privacy_mode(bool enabled) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "set_privacy_mode is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionPrivacyMode) == 0) {
+            return Error(Status::PermissionDenied, "privacy mode is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_set_privacy_mode(enabled),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_privacy_mode_state(bool& enabled, PrivacyModeCode& code,
+                                          std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->privacy_mode_state_ready) {
+        return false;
+    }
+    enabled = impl_->privacy_mode_enabled;
+    code = impl_->privacy_mode_code;
+    reason = impl_->privacy_mode_reason;
+    impl_->privacy_mode_state_ready = false;
+    return true;
+}
+
+bool QuicSession::take_desktop_state(DesktopKind& kind) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->desktop_state_ready) {
+        return false;
+    }
+    kind = impl_->desktop_kind;
+    impl_->desktop_state_ready = false;
+    return true;
+}
+
+bool QuicSession::take_sas_request() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->sas_requests_pending == 0) {
+        return false;
+    }
+    --impl_->sas_requests_pending;
+    return true;
+}
+
+uint64_t QuicSession::sas_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->sas_requests_seen;
+}
+
+Error QuicSession::send_sas_result(SasCode code, const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_sas_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_sas_result(code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_sas() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_sas is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+            return Error(Status::PermissionDenied, "input control is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_send_sas(), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_sas_result(SasCode& code, std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->sas_result_ready) {
+        return false;
+    }
+    code = impl_->sas_code;
+    reason = impl_->sas_reason;
+    impl_->sas_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::sas_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->sas_results_seen;
+}
+
+bool QuicSession::take_stream_options_request(StreamOptions& options) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->stream_options_request_ready) {
+        return false;
+    }
+    options = impl_->stream_options_request;
+    impl_->stream_options_request_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::stream_options_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->stream_options_requests_seen;
+}
+
+Error QuicSession::send_stream_options_result(const StreamOptionsResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_stream_options_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_stream_options_result(result),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_stream_options(const StreamOptions& options) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_stream_options is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_set_stream_options(options),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_stream_options_result(StreamOptionsResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->stream_options_result_ready) {
+        return false;
+    }
+    result = impl_->stream_options_result;
+    impl_->stream_options_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::stream_options_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->stream_options_results_seen;
 }
 
 Error QuicSession::send_frame(FrameHeader header, const uint8_t* payload, size_t size) {

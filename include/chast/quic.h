@@ -140,6 +140,11 @@ struct QuicServerConfig {
     // sees a stream at all. announce() clears microphone_enabled when false,
     // and the transport aborts CMIC streams opened anyway.
     bool allow_microphone = false;
+    // Accept SetPrivacyMode from the viewer. Off by default for the same
+    // reason as allow_microphone: the overlay hides the operator's own screen.
+    // announce() clears privacy_mode_enabled when false, and requests are
+    // dropped by the transport.
+    bool allow_privacy_mode = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -380,6 +385,42 @@ public:
     Error send_display_mode_result(uint16_t display_index, uint16_t width, uint16_t height,
                                    uint16_t refresh_hz, DisplayModeCode code,
                                    const std::string& reason = {});
+    // Pops the newest SetPrivacyMode request. Only the newest is kept: a viewer
+    // that toggles twice wants the final state. The host answers each taken
+    // request with send_privacy_mode_state(). Requires the privacy-mode
+    // permission; a request without it is dropped by the transport.
+    bool take_privacy_mode_request(bool& enabled);
+    // Answers a privacy-mode request or announces a state the host changed on
+    // its own (permission revoked, desktop switch). `enabled` is the resulting
+    // overlay state; a code other than Ok always travels with enabled=false.
+    Error send_privacy_mode_state(bool enabled, PrivacyModeCode code,
+                                  const std::string& reason = {});
+    // Tells the viewer which desktop the video stream is capturing. Sent when
+    // the host switches between the user desktop and a secure desktop.
+    Error send_desktop_state(DesktopKind kind);
+    // Pops one pending SendSas request. The host answers every request with
+    // send_sas_result(); the permission check is the host's, so a viewer
+    // without input control gets Denied instead of silence.
+    bool take_sas_request();
+    // Number of SendSas requests received. Observation hook for tools and the
+    // host's own counters.
+    uint64_t sas_requests() const;
+    // Answers SendSas. A reason is kept for every code so the viewer can show
+    // why the secure desktop was not reached.
+    Error send_sas_result(SasCode code, const std::string& reason = {});
+    // Pops the newest SetStreamOptions request. Only the newest is kept: a
+    // viewer that changes several menus in a row wants the final combination.
+    // The host answers each taken request with send_stream_options_result().
+    // No permission gates this: the preferences only change the viewer's own
+    // picture.
+    bool take_stream_options_request(StreamOptions& options);
+    // Number of SetStreamOptions requests received. Observation hook for tools
+    // and the host's own counters.
+    uint64_t stream_options_requests() const;
+    // Answers SetStreamOptions. The effective fields must describe the stream
+    // that is actually running, including when the request was refused, so the
+    // viewer can restore its menu to reality.
+    Error send_stream_options_result(const StreamOptionsResult& result);
     // Drains the input events received since the last call, in order. They
     // were already injected by the session's own InputInjector when
     // QuicServerConfig::allow_input is set; this is the observation hook for
@@ -493,6 +534,40 @@ public:
                                   std::string& reason);
     // Total DisplayModeResults received. Observation hook for tools.
     uint64_t display_mode_results() const;
+    // Asks the host to hide or restore its physical display. Requires the
+    // handshake and kPermissionPrivacyMode; the host answers through
+    // take_privacy_mode_state(). Privacy mode is per session and always starts
+    // off after a reconnect.
+    Error set_privacy_mode(bool enabled);
+    // Pops the newest privacy-mode state. `enabled` is the resulting overlay
+    // state; a refusal carries the host's UTF-8 reason.
+    bool take_privacy_mode_state(bool& enabled, PrivacyModeCode& code, std::string& reason);
+    // Pops the newest desktop state the host sent. The first message follows
+    // HelloAck, so a viewer that connects while the host is locked learns it
+    // without waiting for a switch.
+    bool take_desktop_state(DesktopKind& kind);
+    // Asks the host to inject Ctrl+Alt+Del. Requires the handshake and input
+    // permission; the answer arrives through take_sas_result(). Unlike a key
+    // event this is one explicit request: Windows only accepts SAS through
+    // SendSAS(), which the service worker can call.
+    Error request_sas();
+    // Pops the newest SAS answer. `reason` is the host's UTF-8 explanation,
+    // empty when it has none.
+    bool take_sas_result(SasCode& code, std::string& reason);
+    // Total SAS answers received. Observation hook for tools.
+    uint64_t sas_results() const;
+    // Asks the host to change this session's video preferences (encoder,
+    // frame-rate ceiling and quality preset). The host can only lower its own
+    // budget; the answer arrives through take_stream_options_result(). No
+    // permission is required because the change only affects this viewer's
+    // picture. Unlike display switches, a changed preference survives a
+    // reconnect only by being sent again.
+    Error request_stream_options(const StreamOptions& options);
+    // Pops the newest StreamOptionsResult. The effective fields describe the
+    // running stream even on a refusal, so a menu can roll back to reality.
+    bool take_stream_options_result(StreamOptionsResult& result);
+    // Total StreamOptionsResults received. Observation hook for tools.
+    uint64_t stream_options_results() const;
     // SHA-256 fingerprint of the certificate the server presented (uppercase
     // hex). Empty until the TLS handshake reached the validation callback;
     // available even when the pin rejected it, which is what makes a mismatch

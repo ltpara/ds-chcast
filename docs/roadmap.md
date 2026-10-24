@@ -1,6 +1,6 @@
 # chast 开发路线图
 
-更新时间：2026-10-22。按依赖顺序排列，已完成项保留在这里作为基线。
+更新时间：2026-10-24。按依赖顺序排列，已完成项保留在这里作为基线。
 
 ## 已完成
 
@@ -217,11 +217,80 @@
   - 待办：关闭一次未能复现的 COMCTL32 崩溃；完成查看器密码/2FA 对话框的
     人工 GUI 验收。
 
+## M8 — 发射端加固（进行中）
+
+计划与逐项记录见 `docs/m8-plan.md`。
+
+- 已完成：麦克风与双向音频 M8.5（协议 v18）。
+  - 编码统一走 vcpkg 的独立 Opus：系统声音 48 kHz 立体声 128 kbps，麦克风 48 kHz 单声道 32 kbps、20 ms/960 样本；`OpusHead` 携带 pre-skip。AAC 编码器与工厂已删除，`create_audio_encoder()` 只接受 Opus；`AudioCodec::AAC` 仅保留解码兼容，生产不产生 AAC 流。
+  - 传输：查看器发起 `CMIC` 单向流（20 字节自描述头 + `OpusHead`），`kPermissionMicrophone` 由主机权限掩码控制，默认关闭；流打开/关闭就是麦克风开/关，权限收回会立即 abort。主机按流创建 Opus 解码器与 WASAPI 播放器，采用到达时间锚定 80 ms lead；查看器采集与编码在独立线程，帧循环队满只丢当前包，不阻塞视频。
+  - 查看器：`ViewerEngine` 暴露授权/发送状态、设备、包数、丢弃与错误；原生桥提供 `setMicrophone/listMicrophones/selectMicrophone`；Flutter 工具栏麦克风按钮 + 设备菜单，状态浮层显示上行包数与丢弃。
+  - 验证（2026-10-24，单机回环）：`chast-quic verify --microphone` 全部断言通过，`CMIC` 上行 90 包、主机解码 86088 帧、注入播放器测得 440 Hz/RMS 6864，关闭闸门的主机拒绝 `CMIC` 且视频继续；179 个访问单元、摘要 `CB960C0EAC53FDE2`。`ctest -C Release` 11/11；`flutter analyze`、68 项 `flutter test`、Windows Release 构建通过。
+  - 已知限制：真实麦克风“打开即响、关闭/收回即停”与双机回声/延迟仍需实机；AEC、噪声抑制、唇音同步不在本轮。
+- 已完成：锁屏/UAC 与隐私模式 M8.6（协议 v19）。
+  - 主机每秒读取输入桌面并通过 `DesktopState` 公告：能打开 Winlogon 的服务态按设计继续采集与注入（待实机验证），托盘态打不开时暂停采集并在解锁后自动重建，不结束会话；注入线程同样跟随桌面，切换时清空按键/按钮持有状态。
+  - 隐私模式：`kPermissionPrivacyMode`（默认关闭）控制 `SetPrivacyMode`，主机用 `WDA_EXCLUDEFROMCAPTURE` 的置顶穿透黑色遮罩遮挡本机屏幕，DXGI 采集不变；权限收回或会话结束立即撤罩。查看器提供盾牌开关、应答提示与安全桌面横幅。
+  - 验证（2026-10-24，单机回环）：`chast-quic verify --privacy` 100 项断言全过，遮罩 1.32 s 开、3.54 s 关，期间视频持续且画面未变黑；关闭闸门的主机拒绝请求且不断流；181 个访问单元、摘要 `4DB1C6A97132DC4F`。`ctest -C Release` 12/12；`flutter analyze`、73 项测试、Windows Release 构建通过。
+  - 已知限制：真实锁屏/UAC、服务态安全桌面采集与遮罩视觉仍需实机；虚拟显示器 M8.2 继续暂缓。
+
+## M9 — 输入与连接补全（进行中）
+
+计划与逐项记录见 `docs/m9-plan.md`。
+
+- 已完成：Ctrl+Alt+Del、系统组合键与断线自动重连 M9.0（协议 v20）。
+  - 协议：`SendSas = 28`（空载荷）与 `SasResult = 29`（`u8 code` + 原因），
+    结果码 `Ok/Denied/Unsupported/Failed`；无输入权限不丢包，由主机明确拒绝。
+  - 主机：`sas.dll` 运行时加载；只有服务态调用 `SendSAS`，托盘态回答
+    `Unsupported`，测试可注入 `HostServerConfig::send_sas` 回调；失败只回传
+    查看器，不结束会话；统计新增 `sas_requests/sas_failures`。
+  - 查看器：特殊按键菜单（Win、Alt+Tab、Alt+F4、Ctrl+Shift+Esc）复用现有
+    `InputEvent`，按下再抬起、每条携带修饰键位图；Ctrl+Alt+Del 走独立请求，
+    状态新增 `sasCode/sasError/sasUpdates` 并按计数弹一次结果提示。
+  - 自动重连：只在已出过首帧后 `state == failed`、无接入拒绝、无指纹变化时
+    触发，退避 1/2/4/8/15 s、最多 5 次；复用隧道/密码/显示器选择，等待卡片
+    显示第 n/5 次并可取消；首帧、手动重连和显示器/分辨率切换都会清零计数。
+  - 验证（2026-10-24，单机回环）：`chast-protocol-test` 覆盖 SAS 两种消息；
+    `chast-quic verify --sas` 96 项断言全过（主回环 1.62 s 回答 `Ok`、主机
+    仅一次请求零失败；无回调主机回答 `Unsupported` 且视频继续），131 个访问
+    单元、摘要 `C895EAB372C09B59`；`ctest -C Release` 12/12；
+    `flutter analyze` 无问题、85 项测试通过、Windows Release 构建成功。
+  - 已知限制：真实 `SendSAS` 的安全桌面效果、托盘态提示文案与真实断网重连
+    节奏仍待人工/双机验收；单机只能验证请求/应答通道与退避策略。
+- 已完成：查看器画质、帧率与编码器偏好 M9.1（协议 v21）。
+  - 协议：`SetStreamOptions = 30`（u8 编码器偏好、u16 帧率上限、u8 画质档）
+    与 `StreamOptionsResult = 31`（结果码 + 生效编码器/帧率/画质 + 原因），
+    结果码 `Ok/Unsupported/Failed/Busy`；0 fps 表示跟随主机，未知枚举、
+    越界帧率与尾随字节由解析器拒绝。
+  - 主机：画质在“总预算减音频预留”的视频预算内取 100/75/50%，帧率上限取
+    `min(主机配置, 查看器上限)`，两者经 ABR 与 `set_rate` 生效并重发
+    StreamInfo；编码器切换先建替换实例、校验实际编码族再替换，失败时旧流
+    不动，1 s 内重复切换回答 `Busy`；统计新增请求/生效/失败计数。
+  - 编码器：H.264 的纯码率变化走
+    `mfxExtEncoderResetOption{StartNewSequence=OFF}` 的连续 reset，参考帧
+    保留、不插 IDR（初始化关闭 HRD/VUI 计时，SPS 不随码率变化）；帧率变化、
+    首帧前与编码器替换仍要求 IDR，主机只按 `set_rate` 的
+    `keyframe_required` 决定是否强制关键帧。mfx-gen 的 HEVC VDEnc 拒绝
+    `MFXVideoENCODE_Reset`（连原样参数也返回 -14），`MfxEncoder` 改为同一
+    VPL 会话关闭/重开兜底、失败恢复旧码率；顺带修复 HEVC 主机启动音频预留
+    与 HEVC ABR 一直静默失败的问题。
+  - 查看器：工具栏“画面”菜单（画质/帧率上限/编码器），选择立即下发并按
+    结果计数确认或回滚，拒绝时用 SnackBar 显示主机原因；状态新增结果码、
+    原因、计数与生效画质档；重连后重新下发同一组偏好。
+  - 验证（2026-10-24，单机回环）：`chast-quic verify --stream-options`
+    H.264 基线 295 个访问单元（仅画质 2636↔1977↔2636 kbps 往返时关键帧
+    零增长）、HEVC 基线 294 个访问单元（重开产生 1 个关键帧），全部断言
+    通过（含真实 HEVC 产出与回切）；`chast-encode --bitrate-switch` 在
+    H.264 上确认 `keyframes=1`、HEVC 上 `keyframes=2`；`ctest -C Release`
+    13/13；`flutter analyze` 无问题、91 项测试、Windows Release 构建通过。
+  - 已知限制：无 HEVC 硬件时的拒绝文案、双机 HEVC 解码兼容性与不同网络
+    下的画质体感仍待人工/双机验收；拒绝 Reset 的运行库上每次改码率都会有
+    一次编码器重开。
+
 ## M6 后续（未开始）
 
-- 文件传输。
-- 音频质量调优：唇音同步校准、设备热切换、麦克风/双向语音。
+- 音频质量调优：唇音同步校准、AEC/噪声抑制、设备热切换。
 - 更多采集/编码后端与其他平台。
+- M8 其余项（虚拟显示器、NVENC/AMF、安装器与 i18n）见 `docs/m8-plan.md`。
 
 ## 推进原则
 

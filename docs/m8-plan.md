@@ -2,8 +2,9 @@
 
 更新时间：2026-10-24
 分支：`feat/m7-security`（M7 未提交的收尾与 M8 工作在同一分支继续）
-基线：M7 完成；M8.0（协议 v14）、M8.1（协议 v15）、M8.4（协议 v17）已完成；
-M8.5 将协议升到 v18（Opus + 麦克风上行）
+基线：M7 完成；M8.0（协议 v14）、M8.1（协议 v15）、M8.4（协议 v17）、
+M8.5（协议 v18，Opus + 麦克风上行）、M8.6（协议 v19，锁屏/UAC 与隐私模式）
+已完成
 参考：`D:\rustdesk` @ `c7f212d`（只做能力对照，不复制实现）
 
 ## 状态标记约定
@@ -64,17 +65,21 @@ M8.5 将协议升到 v18（Opus + 麦克风上行）
 - `[ ]` **M8.3 编码后端 NVENC/AMF**：保持采集/转换/编码同卡 LUID 绑定，
   沿用现有三级硬件阶梯的试编与回退机制。
 - `[~]` **M8.4 富剪贴板与文件传输**：协议 v17；HTML/RTF/DIB、查看器
-  上传、续传/摘要、GUI 1 GiB 验收已完成（见 6.6、8）。文件传输现为
+  上传、续传/摘要、GUI 1 GiB 验收已完成（见 6.6、9）。文件传输现为
   双向：主机可经托盘把文件发到查看器，查看器支持工具栏选择与资源
   管理器拖放上传，回环探针覆盖两个方向。双机浏览器富剪贴板人工核对
   与双机 GUI 文件往返仍待实机。
-- `[~]` **M8.5 麦克风与双向音频**：协议 v18；系统声音与麦克风统一走
+- `[x]` **M8.5 麦克风与双向音频**：协议 v18；系统声音与麦克风统一走
   Opus；查看器麦克风上行到主机扬声器，与主机系统声音下行构成双工。
-  协议、Opus 编解码、传输层 `CMIC` 与主机侧接入已完成（见 7.7、8）；
-  查看器采集/桥接/Flutter 工具栏与 `verify --microphone` 探针待收尾。
-  AEC/噪声抑制单独评估。
-- `[ ]` **M8.6 锁屏/UAC 与隐私模式**：服务态输入桌面切换、安全桌面采集路径、
-  排除捕获/虚拟屏遮罩。
+  协议、Opus 编解码、传输层 `CMIC`、主机侧接入、查看器采集/桥接/
+  Flutter 工具栏与 `verify --microphone` 探针均已完成（见 7.7、9）；
+  真实麦克风与双机回声验收待实机。AEC/噪声抑制单独评估。
+- `[x]` **M8.6 锁屏/UAC 与隐私模式**：协议 v19；主机每秒跟随输入桌面，
+  能打开安全桌面的服务态继续采集/注入，托盘态打不开时暂停而不是断开会话；
+  隐私模式用 `WDA_EXCLUDEFROMCAPTURE` 的置顶穿透遮罩遮挡本机屏幕，采集
+  不受影响。虚拟显示器按 M8.2 结论继续暂缓。回环 `verify --privacy` 与
+  关闭闸门探针已通过（第 8 节）；真实锁屏/UAC、服务态安全桌面与遮罩
+  视觉仍需实机。
 - `[ ]` **M8.7 安装包、自动更新与 i18n**：MSI/签名、更新通道、界面多语言。
 
 ## 4. M8.0 会话内显示器切换
@@ -548,8 +553,8 @@ Win32 剪贴板：
 
 Opus 直接使用 vcpkg 安装的独立 `opus.lib`（`Opus::opus`），编码/解码调用
 `opus_encode`/`opus_decode`，**不经 FFmpeg 的 libopus 封装**。FFmpeg 只
-继续承担 AAC 与 libswresample；`chast.ffmpeg` 因编解码器注册表仍需链接
-`Opus::opus`，但那只是链接依赖，Opus 数据路径不经过它。
+继续承担 AAC 解码与 libswresample；`chast.ffmpeg` 因编解码器注册表仍需
+链接 `Opus::opus`，但那只是链接依赖，Opus 数据路径不经过它。
 
 - 系统声音：48 kHz 立体声，20 ms（960 样本），128 kbps，`OPUS_APPLICATION_AUDIO`。
 - 麦克风：48 kHz 单声道，20 ms（960 样本），32 kbps，`OPUS_APPLICATION_VOIP`。
@@ -558,10 +563,13 @@ Opus 直接使用 vcpkg 安装的独立 `opus.lib`（`Opus::opus`），编码/�
   丢弃这段预热样本，之后的包按 `AudioHeader` 时间戳调度。
 - 时间轴沿用现有规则：编码器内部按 `capture_ms` 给每个包打上首样本的
   主机/查看器 capture 时间，超过 100 ms 的空隙会把残帧补静音后重锚。
-- AAC-LC 的编解码实现保留（协议枚举不删除、单测继续覆盖），但生产路径
-  不再创建 AAC 流；解码器按 `AudioInfo.codec` 分派，未知 codec 明确失败。
-- AAC 的解码预热固定为 1024 样本；Opus 的 pre-skip 由 `OpusHead` 交给
-  FFmpeg 处理，解码器不再额外丢弃整帧。
+- **编码端不再保留 AAC**：`create_audio_encoder()` 只接受
+  `AudioCodec::Opus`，对 AAC 返回 `Unsupported` 并说明音频统一走 Opus；
+  AAC 编码器实现与工厂已删除，`AudioEncoderConfig` 的默认 codec 也是
+  Opus。`AudioCodec::AAC = 1` 仅为线上兼容保留，解码器仍按
+  `AudioInfo.codec` 分派，未知 codec 明确失败。
+- AAC 的解码预热固定为 1024 样本；Opus 的 pre-skip 由解码器从
+  `OpusHead` 读取，FFmpeg 的解码路径不参与 Opus。
 
 ### 7.3 采集与播放双工
 
@@ -635,13 +643,16 @@ M8.1 记录过“同步重建采集/编码器约 1.5 s，会丢几包音频”�
   采样率/声道/extradata 超限、保留位非零被拒绝；麦克风权限位与
   HelloAck flags 往返。
 - `[x]` `chast-audio-codec-test`：Opus 立体声与单声道往返（能量、频率、
-  时间戳、帧长 960），以及未知 codec 拒绝；AAC 既有用例保持通过。
-- `[ ]` `chast-quic verify --microphone`：主机授予麦克风，查看器用合成
+  时间戳、帧长 960），未知 codec 拒绝，以及“AAC 编码不可用、错误文案
+  指向 Opus”的断言；AAC 解码仍保留缺 AudioSpecificConfig 的拒绝用例。
+  测试不再依赖 FFmpeg 的 AAC 编码器。
+- `[x]` `chast-quic verify --microphone`：主机授予麦克风，查看器用合成
   麦克风源发送 440 Hz 单声道 Opus；主机端注入的内存播放器断言收到
   包数、解码帧数、音调频率与 RMS，`stop_microphone()` 后主机流结束；
   再以未授权配置连接，断言 `CMIC` 被拒绝且视频会话不受影响。
-- `[~]` `ctest -C Release` 11/11 全过，普通回环（系统声音改 Opus 后）
-  继续通过；`flutter analyze`/`test`/Release 构建待查看器接入后执行。
+- `[x]` `ctest -C Release` 11/11 全过；普通回环（系统声音改 Opus 后）
+  继续通过；`flutter analyze` 无问题、`flutter test` 68 项通过、
+  `flutter build windows --release` 成功。
 - `[ ]` 单机人工：真实麦克风开启后主机扬声器能听到；关闭/收回权限后
   立即停止。单机扬声器与麦克风同处一室会有回声，需耳机复核。
 - `[!]` 双机与真实设备回声/延迟的主观验收需第二台机器；本轮只做
@@ -663,7 +674,142 @@ M8.1 记录过“同步重建采集/编码器约 1.5 s，会丢几包音频”�
 - **帧循环停顿**：与 M8.1 相同，重建期间会短暂断流；已通过播放器重锚
   限制为一段静音。
 
-## 8. 开发记录
+## 8. M8.6 锁屏/UAC 与隐私模式
+
+目标：锁屏或 UAC 出现时输入桌面切到安全桌面，主机不能因此断流；能打开
+安全桌面的进程继续采集和注入，打不开的进程明确暂停并在解锁后恢复。
+隐私模式让主机本地屏幕被遮挡，远端继续看到桌面。M8.2 已暂缓，这里不引入
+虚拟显示器，遮挡只覆盖真实输出。
+
+### 8.1 协议 v19
+
+版本从 18 升到 19；ALPN 不变。新增权限位与三条控制消息：
+
+| 名称 | 值 | 含义 |
+| --- | --- | --- |
+| `kPermissionPrivacyMode` | `0x0020` | 会话内允许 `SetPrivacyMode` |
+| `kServerInfoPrivacyModeEnabled` | `0x0020` | HelloAck/StreamInfo flags 的能力位 |
+
+| 类型 | 方向 | 载荷 |
+| --- | --- | --- |
+| `SetPrivacyMode = 25` | 查看器 → 主机 | `u8 enabled` |
+| `PrivacyModeState = 26` | 主机 → 查看器 | `u8 enabled`、`u8 code`、`u16 reason_len`、UTF-8 reason（≤256 B） |
+| `DesktopState = 27` | 主机 → 查看器 | `u8 kind` |
+
+`PrivacyModeCode`：0 Ok、1 Denied、2 Unsupported、3 Failed。`DesktopKind`：
+0 Default（用户桌面）、1 Secure（锁屏/UAC/凭据提示）、2 Unavailable
+（无法查询，例如托盘主机打不开 Winlogon）。`PrivacyModeState` 的
+`enabled=1` 只与 `Ok` 同时出现；其余 code 都表示遮罩处于关闭。
+
+`ServerInfo::privacy_mode_enabled` 由权限掩码推导，不增加 HelloAck 固定
+字段；权限位仍走现有 `PermissionUpdate`。重连后隐私状态总是从“关”开始，
+实际遮罩状态由 `PrivacyModeState` 单独携带。`DesktopState` 在变化时发送，
+HelloAck 后也发一次（即使当前是 Default），会话从锁屏开始也能立即显示
+横幅。
+
+### 8.2 输入桌面跟随
+
+新增 `include/chast/desktop.h` + `src/win/desktop.cc`：
+
+- `input_desktop_status()`：`OpenInputDesktop` + `UOI_NAME`，并用
+  `WTSQuerySessionInformationW(WTSSessionInfoEx)` 读取锁屏标志；桌面名不是
+  `Default` 即判为安全桌面，查询失败且已锁屏也按安全桌面处理。
+- `follow_input_desktop()`：必要时 `SetThreadDesktop` 到输入桌面，请求
+  `DESKTOP_SWITCHDESKTOP | GENERIC_WRITE`；只在真正切换时返回 `switched`，
+  调用者据此判断采集对象已失效。线程不能拥有窗口或钩子。
+- 主机帧循环每 1 s 检查一次：先发 `DesktopState`，再跟随桌面；发生切换
+  或从暂停恢复时 `reinitialize()` 采集器、丢弃编码器、强制关键帧并重置
+  输入重复帧与光标状态。
+- 跟随失败（托盘主机打不开 Winlogon）时只暂停采集并每秒重试，不结束
+  会话；解锁后同一条检查路径恢复采集。
+- `InputInjector` 每 250 ms 跟随一次，`SendInput` 返回 0 时提前重查；
+  真正切换桌面后清空按键/按钮持有状态与锁键基线，等查看器下一次修饰键
+  位图重新按下仍按住的键。
+- 只有以 SYSTEM 在用户会话内运行的进程能打开安全桌面：服务态工作进程
+  可继续采集与注入（未实机验证）；托盘主机报 `Unavailable`，靠暂停/恢复
+  保证会话存活。
+
+### 8.3 主机隐私模式
+
+- `HostSettings::allow_privacy_mode` 默认 `false`；`privacy_mode=` 持久化，
+  解析失败保留关闭；权限掩码与 HelloAck/StreamInfo 的
+  `privacy_mode_enabled` 自动联动。
+- 托盘菜单与安全设置页均可开关。监听器的能力上限在创建时固定：从关闭
+  改为开启需要下一次连接（托盘会提示），从开启改为关闭实时生效。
+- `PrivacyOverlay`（`include/chast/privacy.h`、`src/win/privacy.cc`）：
+  - 独立窗口线程先显式挂到 `Default` 桌面（即使主机线程已跟随到 Winlogon）；
+  - 顶层 `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+    WS_EX_TOOLWINDOW` 黑色窗口，覆盖整个虚拟屏幕，不抢焦点、不进
+    Alt+Tab、不拦截本地输入；
+  - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 让 DXGI 采集看不到
+    遮罩；系统低于 Windows 10 2004（19041）或 affinity 失败时 `create()`
+    直接拒绝，绝不显示一个会把远端也涂黑的遮罩；
+  - 1 s 定时器与 `WM_DISPLAYCHANGE` 重新铺满虚拟屏幕，覆盖后插入的
+    顶层窗口。
+- 每个会话一个遮罩。开启成功回 `PrivacyModeState(true, Ok)`；重复开启回
+  当前状态；不支持回 `Unsupported`；创建/显示失败回 `Failed` 并带系统
+  错误。关闭、权限收回或会话结束都会撤罩；权限收回还会主动发一条
+  `PrivacyModeState(false, Denied, …)`，避免查看器显示过期状态。
+- `HostServerStats` 增加 `privacy_mode_active` 与 `privacy_mode_changes`。
+
+### 8.4 查看器
+
+- `ViewerStatus` 增加 `privacySupported`（权限位）、`privacyEnabled`、
+  `privacyCode`、`privacyError`、`privacyUpdates`、`desktop`、
+  `desktopUpdates`；`acceptsPrivacy = 串流中 && 权限位`，
+  `secureDesktop = Secure || Unavailable`。
+- `ViewerEngine` 用“最新值覆盖”的单槽保存开关请求，由会话线程调用
+  `QuicSession::set_privacy_mode()`；接收循环在取帧前后都 drain 控制消息，
+  保证开关应答不被视频帧延迟。
+- 原生桥新增 `setPrivacyMode(bool)` 与状态序列化；Flutter 工具栏新增盾牌
+  按钮（无权限置灰），应答到达时用 SnackBar 显示成功/拒绝原因。
+- 安全桌面期间没有新帧时，会话页显示“主机已进入安全桌面（锁屏或 UAC）”
+  横幅；`Unavailable` 提示无法采集，恢复后自动继续。右下角状态徽标显示
+  隐私模式是否开启。
+- `app/test/privacy_status_test.dart` 覆盖字段解析、默认值、未知桌面码
+  回退、非串流不接受隐私开关、`Unavailable` 计入安全桌面。
+
+### 8.5 验收标准
+
+- `[x]` `chast-protocol-test`：三条消息往返；非法 enabled 值、尾随/空载荷、
+  未知 code、`enabled=1` 搭配失败 code、超长 reason、坏 UTF-8 均被拒绝；
+  HelloAck 的隐私标志与权限掩码往返。
+- `[x]` `chast-quic verify --privacy`（端口 45499，6 s）：主机在 1.32 s
+  开启遮罩（code 0），3.54 s 关闭（code 0）；主机统计 2 次变化、结束时
+  遮罩已撤下；遮罩期间采集持续、画面不是黑色（luma 与开启前差值 ≤30），
+  关闭后视频继续；查看器收到 Default 桌面公告。另一台默认关闭隐私的
+  主机拒绝请求且不断流。100 项断言、181 个访问单元/181 帧解码、摘要
+  `4DB1C6A97132DC4F`。
+- `[x]` `chast-desktop-test`：普通会话报告 Default、桌面名可读、线程已在
+  输入桌面时 `follow_input_desktop` 返回 no-op；安全桌面本身无法在自动化
+  会话里构造。
+- `[x]` `ctest -C Release` 12/12（31.92 s）；`quic_loopback` 已加入
+  `--privacy`，每次回归都会覆盖遮罩开关与视频连续性。
+- `[x]` `flutter analyze` 无问题、`flutter test` 73 项全过、
+  `flutter build windows --release` 成功。
+- `[~]` 实机人工：真实锁屏/UAC 下的安全桌面采集与输入、托盘态暂停/恢复、
+  服务态 Winlogon 采集；遮罩在多显示器与不同 DPI 下的视觉覆盖。本机只有
+  1 个输出，无法自动合成键盘/鼠标与锁屏事件，以上均待实机。
+- 虚拟显示器不参与本轮验收；隐私模式不改变采集分辨率或编码参数。
+
+### 8.6 风险
+
+- `WDA_EXCLUDEFROMCAPTURE` 需要 19041+；旧系统直接回 `Unsupported`，
+  用户可以继续串流但没有隐私模式。
+- 遮罩只存在于 Default 桌面。锁屏/UAC 时本地屏幕本来就是安全桌面，
+  遮罩不可见；若服务态继续采集安全桌面，远端会看到该桌面，隐私模式
+  不会遮盖它。需要同时隐藏安全桌面时应关闭采集或断开。
+- 托盘主机在安全桌面期间暂停采集，查看器停留在最后一帧并显示横幅；
+  会话不断，但输入事件会被系统丢弃（计入 failed），解锁后恢复。
+- `SetThreadDesktop` 要求线程没有窗口/钩子；主机的采集与注入都在专用
+  线程上，若未来把窗口逻辑移入这些线程会失败并保持旧桌面。
+- 顶层遮罩可能与其他顶层窗口竞争 Z 序；1 s 定时器会重新置顶。它从不
+  激活、不接管鼠标，本地操作不受影响。
+- 监听器的隐私能力上限固定；运行中从关闭改为开启要等下一次连接。
+- 安全桌面路径依赖服务态进程的权限与桌面访问掩码，回环无法覆盖，
+  仍以实机服务安装后的验收为准。
+
+## 9. 开发记录
 
 ### 2026-10-23
 
@@ -825,7 +971,7 @@ M8.1 记录过“同步重建采集/编码器约 1.5 s，会丢几包音频”�
   `opus_encode`/`opus_decode`，不经过 FFmpeg 的 Opus 封装。系统声音
   48 kHz 立体声 128 kbps，麦克风 48 kHz 单声道 32 kbps，20 ms/960
   样本，19 字节 `OpusHead`，pre-skip 由 `OPUS_GET_LOOKAHEAD` 写入并在
-  解码首包丢弃。AAC 实现保留用于兼容与单测。
+  解码首包丢弃。
 - `[x]` M8.5 音频双工库：`wasapi_capture` 的系统声音改为 Opus；
   新增 `wasapi_mic.cc`（活动采集端点枚举、通信角色默认设备、设备
   消失后每秒重试）与 `opus_codec.cc`；播放器支持
@@ -841,12 +987,78 @@ M8.1 记录过“同步重建采集/编码器约 1.5 s，会丢几包音频”�
   安全设置页均可开关；`HostServerStats` 增加麦克风计数；帧循环按需
   创建 Opus 解码器与 WASAPI 播放器，权限收回/流结束/解码失败时释放。
   `HostServerConfig::microphone_player` 供回环探针注入内存播放器。
-- `[~]` M8.5 查看器接入待完成：`ViewerEngine` 的麦克风状态、采集线程、
-  `CMIC` 打开/发送/关闭、设备切换，原生桥
-  `setMicrophone/listMicrophones/selectMicrophone` 与 Flutter 工具栏
-  尚未接入。因此本轮尚未跑 `verify --microphone`。
+- `[x]` M8.5 查看器接入：`ViewerEngine` 新增麦克风会被授权/正在发送/
+  当前设备与名称/包数/丢弃/错误/恢复次数/最近错误，UI 线程只写“想开”
+  与设备 id；会话线程负责创建设备、`start_microphone()`、每轮 drain 并
+  `send_microphone()`，停止/权限收回/设备切换/失败时关闭 `CMIC` 并释放
+  采集器。原生桥新增 `setMicrophone/listMicrophones/selectMicrophone`
+  与状态字段；Flutter 工具栏新增麦克风按钮，长按或菜单选择输入设备，
+  未授权、恢复中与错误均有说明，状态浮层显示包数与丢弃数。
+- `[x]` M8.5 编码端去掉 AAC：`create_audio_encoder()` 只接受 Opus，
+  对 AAC 返回 `Unsupported` 并提示音频统一走 Opus；
+  `create_aac_encoder()` 与 `AacEncoder` 实现删除，
+  `AudioEncoderConfig` 默认 codec 改为 Opus。AAC 解码器保留用于协议
+  枚举与历史 `AudioInfo`，生产路径不再创建任何 AAC 流。
 - `[x]` M8.5 阶段性回归：`chast-protocol-test`、`chast-audio-codec-test`
   与 `chast-host-settings-test` 全部通过；`chast-quic`、`chast-host`、
   `chast-service` Release 链接通过（仅既有的 LNK4098 警告）；
   `ctest -C Release` 11/11（31.63 s），普通回环在系统声音改 Opus 后
-  继续通过。Flutter 回归待查看器接入后执行。
+  继续通过。
+- `[x]` M8.5 回环 `verify --microphone`（端口 46230，6 s）：主机授予
+  麦克风，合成单声道 Opus 通过 `CMIC` 上行 90 包/7251 B，主机解码
+  86088 帧（约 90×960 减去 pre-skip），注入播放器记录 440 Hz、RMS 6864；
+  `stop_microphone()` 后主机流在 3.54 s 结束。关闭闸门探针的另一台
+  主机拒绝 `CMIC`，同会话视频继续。179 个访问单元、179 帧解码，
+  摘要 `CB960C0EAC53FDE2`，全部断言通过。
+- `[x]` M8.5 测试与构建收尾：`chast-audio-codec-test` 改为 Opus-only，
+  新增“AAC 编码不可用且文案指向 Opus”断言；`ctest -C Release`
+  11/11（33.18 s）；`flutter analyze` 无问题、`flutter test` 68 项通过、
+  `flutter build windows --release` 成功（73.7 s）。移除 AAC 编码器后
+  复跑 `verify --microphone`（端口 46233）通过：`CMIC` 32 包/2592 B、
+  主机解码 30408 帧、440 Hz、RMS 6895，88 个访问单元、摘要
+  `EAE78CA8810C73DC`；包数随本机采集启动快慢浮动，断言只看“有包、
+  全到达、可解码、音调与能量正确”。
+- `[x]` 主机麦克风日志从 CMIC 头没有的 bitrate 改为打印
+  `960 samples/frame`，避免出现 `0 kbps` 的误导输出。
+- `[ ]` M8.5 真实麦克风人工验收：本机没有可自动合成的输入设备事件，
+  需在带麦克风与耳机的机器上确认“打开即响、关闭/收回即停”；单机扬声器
+  与麦克风同处一室会有回声，双机主观验收仍需第二台机器。
+- `[x]` M8.6 协议 v19：`kPermissionPrivacyMode`/`kServerInfoPrivacyModeEnabled`
+  （`0x0020`）、`SetPrivacyMode=25`、`PrivacyModeState=26`、
+  `DesktopState=27` 与 `PrivacyModeCode`/`DesktopKind` 编解码；reason 上限
+  256 B。`ServerInfo::privacy_mode_enabled` 由权限掩码推导，HelloAck 固定
+  布局不变。
+- `[x]` M8.6 桌面跟随：新增 `chast/desktop`（`input_desktop_status`、
+  `on_input_desktop`、`follow_input_desktop`），按 `OpenInputDesktop` 与
+  WTS 锁屏标志区分 Default/Secure/Unavailable；主机帧循环每秒公告
+  `DesktopState` 并跟随输入桌面，切换后重建采集器、丢编码器、强制关键帧；
+  托盘主机打不开 Winlogon 时暂停采集并重试，不结束会话。`InputInjector`
+  每 250 ms 跟随，切换后清空按键/按钮持有状态。
+- `[x]` M8.6 主机隐私模式：`HostSettings::allow_privacy_mode`（默认关）
+  与权限掩码/托盘菜单/设置页联动；`PrivacyOverlay` 在独立线程挂到
+  Default 桌面，建立穿透、不激活的顶层黑色窗口并用
+  `WDA_EXCLUDEFROMCAPTURE` 排除采集，1 s 定时器与显示变化时重新铺满；
+  低于 19041 或 affinity 失败直接拒绝。开启/关闭/权限收回/会话结束的
+  状态与统计已接入。
+- `[x]` M8.6 查看器：`ViewerStatus` 增加隐私与桌面字段、`acceptsPrivacy`/
+  `secureDesktop`；引擎单槽排队 `setPrivacyMode`，接收循环前后 drain 控制
+  消息；原始桥与 Flutter 盾牌按钮、应答 SnackBar、安全桌面横幅、状态
+  徽标完成；新增 5 项 `privacy_status_test.dart` 用例。
+- `[x]` M8.6 回环 `verify --privacy`（端口 45499，6 s）：100 项断言全过；
+  遮罩 1.32 s 开（code 0）、3.54 s 关（code 0），主机 `changes=2` 且结束时
+  `active=false`；遮罩期间采集持续、画面未变黑，关闭后视频继续；
+  默认关闭隐私的主机拒绝请求且不断流。会话共 181 个访问单元/181 帧，
+  摘要 `4DB1C6A97132DC4F`。
+- 回环发现并修复：客户端 `permission_mask_from_info()` 只映射输入、剪贴板、
+  音频、文件与麦克风，漏了隐私位，导致主机已授权时 `set_privacy_mode`
+  仍回 `PermissionDenied` 并提前结束接收；补齐后全链路通过。
+- `[x]` M8.6 回归：`ctest -C Release` 12/12（31.92 s）；`quic_loopback`
+  已加入 `--privacy`，隐私开关与视频连续性进入常规回归；
+  `flutter analyze` 无问题、`flutter test` 73 项全过、
+  `flutter build windows --release` 成功。
+- `[~]` M8.6 实机人工验收未做：真实锁屏/UAC 的安全桌面采集与注入、
+  托盘态暂停/恢复、服务态 Winlogon 路径、遮罩在多显示器/不同 DPI/物理
+  显示器上的视觉效果，都需要第二台机器或人工锁屏；本机单输出且不能
+  合成系统级键盘/锁屏事件。
+- `[!]` 虚拟显示器 M8.2 继续暂缓：没有可用的已签名开源驱动；隐私模式
+  的“虚拟屏遮罩”按字面只落到真实输出的捕获排除浮层，不引入驱动。

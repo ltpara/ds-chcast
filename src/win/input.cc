@@ -12,6 +12,8 @@
 #include <cstring>
 #include <vector>
 
+#include "chast/desktop.h"
+
 namespace chast {
 
 namespace {
@@ -264,7 +266,41 @@ UINT InputInjector::send(const INPUT& input) {
     // coordinate conversion, held-key tracking) runs exactly as it does for a
     // real event, so a loopback check covers all of our code and none of the
     // desktop's.
-    return dry_run_ ? 1u : SendInput(1, const_cast<INPUT*>(&input), sizeof(input));
+    if (dry_run_) {
+        return 1u;
+    }
+    const UINT inserted = SendInput(1, const_cast<INPUT*>(&input), sizeof(input));
+    if (inserted == 0) {
+        // The desktop can change between the check in run() and this call;
+        // SendInput then drops the event. Look again before the next one.
+        desktop_check_due_ = true;
+    }
+    return inserted;
+}
+
+void InputInjector::follow_input_desktop_if_due() {
+    const auto now = std::chrono::steady_clock::now();
+    if (!desktop_check_due_ &&
+        now - last_desktop_follow_ < std::chrono::milliseconds(250)) {
+        return;
+    }
+    desktop_check_due_ = false;
+    last_desktop_follow_ = now;
+    std::string error;
+    bool switched = false;
+    if (!follow_input_desktop(&error, &switched)) {
+        // A tray host cannot open Winlogon; events keep going to the old
+        // desktop (and are dropped there) until the user comes back.
+        return;
+    }
+    if (switched) {
+        // Keys and buttons belong to the desktop they were pressed on. The
+        // new one starts with everything up, so forget the old state and let
+        // the peer's next modifier bitmap press what is still held.
+        held_keys_.clear();
+        held_buttons_ = 0;
+        locks_seeded_ = false;
+    }
 }
 
 InputInjector::~InputInjector() {
@@ -335,6 +371,7 @@ void InputInjector::run() {
             // the desktop is busy, and submit() must stay non-blocking.
             lock.unlock();
             for (const Pending& pending : batch) {
+                follow_input_desktop_if_due();
                 if (pending.release) {
                     release_all();
                 } else {

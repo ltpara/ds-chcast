@@ -83,6 +83,7 @@ enum ControlId {
     kSendFileButton,
     kAudioCheck,
     kMicrophoneCheck,
+    kPrivacyModeCheck,
     kAutostartCheck,
     kSecurityButton,
     kFirewallButton,
@@ -113,6 +114,7 @@ struct HostApp {
     HWND clipboard_check = nullptr;
     HWND audio_check = nullptr;
     HWND microphone_check = nullptr;
+    HWND privacy_check = nullptr;
     HWND autostart_check = nullptr;
     HWND toggle_button = nullptr;
     HWND log_edit = nullptr;
@@ -131,6 +133,9 @@ struct HostApp {
     // The listener's microphone gate is fixed at creation; the UI uses this to
     // tell an operator whether enabling it applies now or next session.
     bool listener_microphone = false;
+    // Same for the privacy-mode gate: requests are dropped by a listener that
+    // was created before the feature was enabled.
+    bool listener_privacy = false;
     std::string startup_warning;
     bool startup_created = false;
     std::string startup_save_error;
@@ -248,6 +253,7 @@ enum ApprovalDialogId {
     kApprovalFile,
     kApprovalAudio,
     kApprovalMicrophone,
+    kApprovalPrivacy,
     kApprovalAllow,
     kApprovalDeny,
 };
@@ -259,6 +265,7 @@ struct ApprovalDialogState {
     HWND file = nullptr;
     HWND audio = nullptr;
     HWND microphone = nullptr;
+    HWND privacy = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
@@ -294,6 +301,9 @@ void finish_approval(ApprovalDialogState& dialog, bool allowed) {
         }
         if (SendMessageW(dialog.microphone, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionMicrophone;
+        }
+        if (SendMessageW(dialog.privacy, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            mask |= kPermissionPrivacyMode;
         }
         dialog.result = mask;
     }
@@ -477,6 +487,9 @@ ClientApproval server_approve(const ClientRequest& request) {
     dialog.microphone =
         permission_check(L"麦克风（上行）", kPermissionMicrophone, 20, 244,
                          kApprovalMicrophone);
+    dialog.privacy =
+        permission_check(L"隐私模式（黑屏）", kPermissionPrivacyMode, 170, 244,
+                         kApprovalPrivacy);
 
     add(L"BUTTON", L"允许", BS_DEFPUSHBUTTON | WS_TABSTOP, 250, 278, 90, 32, kApprovalAllow,
         nullptr);
@@ -608,6 +621,7 @@ void start_server() {
         return;
     }
     g_app->listener_microphone = g_app->settings.allow_microphone;
+    g_app->listener_privacy = g_app->settings.allow_privacy_mode;
     g_app->server->start();
     append_log_line(L"正在等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）");
     start_tunnel();
@@ -737,6 +751,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionMicrophone) != 0) {
         add(L"麦克风");
     }
+    if ((mask & kPermissionPrivacyMode) != 0) {
+        add(L"隐私模式");
+    }
     return text.empty() ? L"只看" : text;
 }
 
@@ -745,6 +762,8 @@ uint16_t current_gate_mask() {
                                  (g_app->settings.allow_clipboard ? kPermissionClipboard : 0) |
                                  (g_app->settings.allow_audio ? kPermissionAudio : 0) |
                                  (g_app->settings.allow_microphone ? kPermissionMicrophone : 0) |
+                                 (g_app->settings.allow_privacy_mode ? kPermissionPrivacyMode
+                                                                     : 0) |
                                  (g_app->settings.allow_file_transfer ? kPermissionFileTransfer
                                                                       : 0));
 }
@@ -766,7 +785,11 @@ std::wstring session_permission_text(const HostStatus& status) {
     if (status.state != HostState::Streaming) {
         return L"本次会话权限：—";
     }
-    return L"本次会话权限：" + permission_label(status.session_permissions);
+    std::wstring text = L"本次会话权限：" + permission_label(status.session_permissions);
+    if (status.stats.privacy_mode_active) {
+        text += L" · 本地屏幕已遮挡（隐私模式）";
+    }
+    return text;
 }
 
 // Reads the live state and updates every label. Called on a timer, so it only
@@ -846,6 +869,7 @@ void refresh_ui() {
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
     set_check(g_app->audio_check, g_app->settings.allow_audio);
     set_check(g_app->microphone_check, g_app->settings.allow_microphone);
+    set_check(g_app->privacy_check, g_app->settings.allow_privacy_mode);
     set_check(g_app->autostart_check, g_app->settings.autostart);
     set_text(g_app->toggle_button, running ? L"停止共享" : L"开始共享");
 
@@ -999,6 +1023,8 @@ void create_controls() {
                                          120, 24, kAutostartCheck, nullptr);
     g_app->microphone_check = add_control(L"BUTTON", L"接收查看者麦克风", BS_AUTOCHECKBOX, 0, 24,
                                           408, 200, 24, kMicrophoneCheck, nullptr);
+    g_app->privacy_check = add_control(L"BUTTON", L"允许隐私模式", BS_AUTOCHECKBOX, 0, 240, 408,
+                                       200, 24, kPrivacyModeCheck, nullptr);
 
     add_control(L"BUTTON", L"安全设置…", BS_PUSHBUTTON, 0, 24, 444, 116, 30, kSecurityButton,
                 nullptr);
@@ -1028,6 +1054,7 @@ void create_controls() {
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
     set_check(g_app->audio_check, g_app->settings.allow_audio);
     set_check(g_app->microphone_check, g_app->settings.allow_microphone);
+    set_check(g_app->privacy_check, g_app->settings.allow_privacy_mode);
     set_check(g_app->autostart_check, g_app->settings.autostart);
 }
 
@@ -1323,6 +1350,7 @@ enum SecurityDialogId {
     kSecAllowFile,
     kSecAllowAudio,
     kSecAllowMicrophone,
+    kSecAllowPrivacy,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1356,6 +1384,7 @@ struct SecurityDialogState {
     HWND allow_file = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
+    HWND allow_privacy = nullptr;
     HWND allow_change = nullptr;
     HWND token_auth = nullptr;
     HWND one_time = nullptr;
@@ -1516,6 +1545,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_file_transfer = is_checked(dialog.allow_file);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
+    updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
     updated.allow_permission_change = is_checked(dialog.allow_change);
 
     std::string whitelist = narrow(control_text(dialog.whitelist));
@@ -1876,6 +1906,9 @@ bool edit_security_settings(HostSettings& result) {
     dialog.allow_microphone =
         add(L"BUTTON", L"麦克风（上行）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 150, 394, 130, 24,
             kSecAllowMicrophone, nullptr, &dialog.access_page);
+    dialog.allow_privacy =
+        add(L"BUTTON", L"隐私模式（本机黑屏）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 400, 366,
+            160, 24, kSecAllowPrivacy, nullptr, &dialog.access_page);
     const std::string receive_directory = g_app->settings.file_receive_directory.empty()
                                               ? chast::default_receive_directory()
                                               : g_app->settings.file_receive_directory;
@@ -1933,6 +1966,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_file, settings.allow_file_transfer);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
+    set_check(dialog.allow_privacy, settings.allow_privacy_mode);
     set_check(dialog.allow_change, settings.allow_permission_change);
     set_check(dialog.token_auth, settings.token_auth);
     set_check(dialog.one_time, settings.token_mode == HostTokenMode::OneTime);
@@ -2059,6 +2093,8 @@ void show_tray_menu() {
                 L"共享系统声音");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_microphone ? MF_CHECKED : 0),
                 kMicrophoneCheck, L"接收查看者麦克风");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_privacy_mode ? MF_CHECKED : 0),
+                kPrivacyModeCheck, L"允许查看者开启隐私模式");
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
                 L"开机自动启动");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2246,6 +2282,27 @@ void handle_command(int id) {
                 append_log_line(g_app->settings.allow_microphone
                                     ? L"接收查看者麦克风已开启"
                                     : L"接收查看者麦克风已关闭");
+            }
+            break;
+        case kPrivacyModeCheck:
+            g_app->settings.allow_privacy_mode = !g_app->settings.allow_privacy_mode;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                if (g_app->settings.allow_privacy_mode && !g_app->listener_privacy) {
+                    // The listener gate is fixed at creation, so the permission
+                    // cannot be raised until the next connection.
+                    append_log_line(
+                        L"已允许隐私模式；当前监听器未启用，将在下次连接时生效");
+                } else if (g_app->settings.allow_privacy_mode) {
+                    append_log_line(L"已允许隐私模式（本次会话实时生效）");
+                } else {
+                    append_log_line(L"隐私模式已关闭（本次会话实时生效，遮罩会立即撤下）");
+                }
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_privacy_mode ? L"已允许隐私模式"
+                                                                   : L"隐私模式已关闭");
             }
             break;
         case kAutostartCheck: {

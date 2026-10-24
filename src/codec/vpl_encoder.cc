@@ -276,7 +276,7 @@ public:
                  std::vector<EncodedPacket>& out) override;
     Error encode_repeat(uint64_t pts_ms, bool force_keyframe,
                         std::vector<EncodedPacket>& out) override;
-    Error set_rate(UINT bits_per_second, UINT framerate) override;
+    Error set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_required) override;
     UINT bitrate() const noexcept override { return bitrate_; }
     UINT framerate() const noexcept override { return framerate_; }
     VideoCodec codec() const noexcept override { return codec_; }
@@ -289,6 +289,7 @@ private:
     void close();
     void discard_session();
     Error start_tier(const ImplCandidate& implementation, const EncodeTier& tier);
+    Error reopen(UINT bits_per_second, UINT framerate);
     Error probe_encode();
     Error import_surface(ID3D11Texture2D* texture, mfxFrameSurface1** surface);
     Error submit(mfxFrameSurface1* surface, bool force_keyframe,
@@ -339,12 +340,18 @@ private:
     // The parameters the encoder was initialised with (as corrected by
     // MFXVideoENCODE_Query). MFXVideoENCODE_Reset takes a complete description,
     // not a patch, so set_rate() edits these and resets with them; the
-    // signal buffer lives beside them because the extension list points into
-    // it.
+    // extension buffers live beside them because the extension list points
+    // into them.
     mfxExtVideoSignalInfo signal_{};
+    // H.264 only: keeps HRD and picture timing out of the SPS, so the headers
+    // do not encode the target bitrate. Without it every rate change alters
+    // the sequence header, which a continuous reset cannot hand to a decoder
+    // that is not expecting one.
+    mfxExtCodingOption sequence_options_{};
     // Owns the extension pointer list carried by params_ so it stays valid for
     // the whole session (a local array would dangle after initialize()).
-    mfxExtBuffer* extensions_[1] = {nullptr};
+    mfxExtBuffer* extensions_[2] = {nullptr, nullptr};
+    mfxU16 extension_count_ = 1;
     mfxVideoParam params_{};
 
     VideoCodec codec_ = VideoCodec::H264;
@@ -641,8 +648,25 @@ Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& t
     signal.TransferCharacteristics = 6;       // SMPTE 170M
     signal.MatrixCoefficients = 6;            // SMPTE 170M (BT.601)
     extensions_[0] = &signal.Header;
+    // An AVC encoder normally writes HRD parameters with the target rate into
+    // the VUI and a pic_timing SEI with the CPB schedule. Both would change on
+    // every set_rate, and a continuous reset promises the decoder that the
+    // sequence stays as it was. Turning them off keeps the SPS stable; the
+    // stream needs neither for low-delay screen sharing.
+    extension_count_ = 1;
+    extensions_[1] = nullptr;
+    if (codec_ == VideoCodec::H264) {
+        sequence_options_ = {};
+        sequence_options_.Header.BufferId = MFX_EXTBUFF_CODING_OPTION;
+        sequence_options_.Header.BufferSz = sizeof(sequence_options_);
+        sequence_options_.NalHrdConformance = MFX_CODINGOPTION_OFF;
+        sequence_options_.VuiNalHrdParameters = MFX_CODINGOPTION_OFF;
+        sequence_options_.PicTimingSEI = MFX_CODINGOPTION_OFF;
+        extensions_[1] = &sequence_options_.Header;
+        extension_count_ = 2;
+    }
     params.ExtParam = extensions_;
-    params.NumExtParam = 1;
+    params.NumExtParam = extension_count_;
 
     sts = MFXVideoENCODE_Query(session_, &params, &params);
     if (sts < MFX_ERR_NONE) {
@@ -999,12 +1023,69 @@ Error MfxEncoder::submit(mfxFrameSurface1* surface, bool force_keyframe,
     return Error::success();
 }
 
-Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate) {
+Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate, bool* keyframe_required) {
+    if (keyframe_required) {
+        *keyframe_required = true;
+    }
     if (!session_ || !encode_open_) {
         return Error(Status::NotCurrentlyAvailable, "encoder is not initialized");
     }
     const UINT kbps = (std::clamp)(bits_per_second / 1000u, 1u, 0xFFFFu);
     const UINT fps = (std::clamp)(framerate == 0 ? framerate_ : framerate, 1u, 0xFFFFu);
+    if (kbps == static_cast<UINT>(params_.mfx.TargetKbps) && fps == framerate_) {
+        // Same effective rate and cadence: no reset, and no IDR, are needed.
+        if (keyframe_required) {
+            *keyframe_required = false;
+        }
+        return Error::success();
+    }
+
+    // A bitrate change can be applied inside the running sequence: the runtime
+    // confirms through Query that StartNewSequence=OFF is honoured, and only
+    // bitrate-like parameters may change that way. The encoder then keeps its
+    // reference frames and the viewer decodes on without an IDR. Frame rate is
+    // not one of those parameters, and before the first real frame the only
+    // reference is the probe image the peer never received, so both take the
+    // ordinary reset below.
+    if (codec_ == VideoCodec::H264 && has_input_ && fps == framerate_) {
+        mfxVideoParam candidate = params_;
+        // Query may rewrite extension fields; never let a rejected query
+        // mutate the configuration the live session is using.
+        mfxExtVideoSignalInfo signal = signal_;
+        mfxExtCodingOption sequence = sequence_options_;
+        mfxExtEncoderResetOption option{};
+        option.Header.BufferId = MFX_EXTBUFF_ENCODER_RESET_OPTION;
+        option.Header.BufferSz = sizeof(option);
+        option.StartNewSequence = MFX_CODINGOPTION_OFF;
+        mfxExtBuffer* buffers[3] = {&signal.Header, &sequence.Header, &option.Header};
+        candidate.ExtParam = buffers;
+        candidate.NumExtParam = 3;
+        candidate.mfx.TargetKbps = static_cast<mfxU16>(kbps);
+        mfxStatus sts = MFXVideoENCODE_Query(session_, &candidate, &candidate);
+        if (sts >= MFX_ERR_NONE && option.StartNewSequence == MFX_CODINGOPTION_OFF) {
+            sts = MFXVideoENCODE_Reset(session_, &candidate);
+            if (sts >= MFX_ERR_NONE && option.StartNewSequence == MFX_CODINGOPTION_OFF) {
+                // Keep the corrected fields and buffers, but point the session
+                // description at the member-owned extension list again: the
+                // locals above (including the reset-only buffer) must not
+                // escape into the next reset.
+                params_ = candidate;
+                params_.ExtParam = extensions_;
+                params_.NumExtParam = extension_count_;
+                signal_ = signal;
+                sequence_options_ = sequence;
+                bitrate_ = static_cast<UINT>(params_.mfx.TargetKbps) * 1000u;
+                framerate_ = static_cast<UINT>(params_.mfx.FrameInfo.FrameRateExtN);
+                if (keyframe_required) {
+                    *keyframe_required = false;
+                }
+                return Error::success();
+            }
+        }
+        // The runtime refused to continue the sequence. The ordinary reset
+        // below restarts it, which needs an IDR.
+    }
+
     // The reset needs a full description, not just the fields that change: the
     // runtime compares it against what is running. Everything else is carried
     // over from initialisation.
@@ -1014,18 +1095,108 @@ Error MfxEncoder::set_rate(UINT bits_per_second, UINT framerate) {
     reset.mfx.FrameInfo.FrameRateExtN = static_cast<mfxU16>(fps);
     reset.mfx.FrameInfo.FrameRateExtD = 1;
     reset.ExtParam = extensions_;
-    reset.NumExtParam = 1;
+    reset.NumExtParam = extension_count_;
     const mfxStatus sts = MFXVideoENCODE_Reset(session_, &reset);
     // A positive status is a warning the runtime already resolved (mfx-gen
     // answers MFX_WRN_INCOMPATIBLE_VIDEO_PARAM while applying the new rate) and
     // the reset has taken effect.
     if (sts < MFX_ERR_NONE) {
+        // mfx-gen's HEVC VDEnc rejects Reset even when it repeats the running
+        // configuration, so those sessions can only be reprogrammed by opening
+        // the codec again.
+        if (sts == MFX_ERR_INCOMPATIBLE_VIDEO_PARAM) {
+            return reopen(bits_per_second, fps);
+        }
         return mfx_error(sts, "MFXVideoENCODE_Reset(rate)");
     }
     params_.mfx.TargetKbps = reset.mfx.TargetKbps;
     params_.mfx.FrameInfo.FrameRateExtN = reset.mfx.FrameInfo.FrameRateExtN;
     bitrate_ = static_cast<UINT>(reset.mfx.TargetKbps) * 1000u;
     framerate_ = static_cast<UINT>(reset.mfx.FrameInfo.FrameRateExtN);
+    return Error::success();
+}
+
+// Close and re-init the codec on the existing session. The VPL session keeps
+// the D3D11 handle (and the legacy frame allocator), so only the encoder state
+// is rebuilt; the first frame after this is a fresh IDR. If the new rate cannot
+// be opened, the previous configuration is restored so the stream keeps
+// running at the old rate.
+Error MfxEncoder::reopen(UINT bits_per_second, UINT framerate) {
+    if (!session_) {
+        return Error(Status::NotCurrentlyAvailable, "encoder is not initialized");
+    }
+    if (imported_surface_) {
+        if (imported_surface_->FrameInterface) {
+            imported_surface_->FrameInterface->Release(imported_surface_);
+        }
+        imported_surface_ = nullptr;
+    }
+    imported_texture_ = nullptr;
+    import_shared_ = false;
+    legacy_surface_ = {};
+    if (encode_open_) {
+        MFXVideoENCODE_Close(session_);
+        encode_open_ = false;
+    }
+    memory_interface_ = nullptr;
+    // The old imported surface belonged to the closed session, and the repeat
+    // path cannot reuse it. The host falls back to encoding the live capture
+    // texture when a repeat is refused.
+    has_input_ = false;
+
+    const mfxVideoParam previous = params_;
+    mfxVideoParam next = params_;
+    next.mfx.TargetKbps =
+        static_cast<mfxU16>((std::clamp)(bits_per_second / 1000u, 1u, 0xFFFFu));
+    next.mfx.FrameInfo.FrameRateExtN = static_cast<mfxU16>(framerate);
+    next.mfx.FrameInfo.FrameRateExtD = 1;
+    next.ExtParam = extensions_;
+    next.NumExtParam = extension_count_;
+
+    auto open = [&](mfxVideoParam& params) -> mfxStatus {
+        mfxVideoParam queried = params;
+        mfxStatus status = MFXVideoENCODE_Query(session_, &queried, &queried);
+        if (status < MFX_ERR_NONE) {
+            return status;
+        }
+        status = MFXVideoENCODE_Init(session_, &queried);
+        if (status >= MFX_ERR_NONE) {
+            params = queried;
+        }
+        return status;
+    };
+    auto mark_open = [&](const mfxVideoParam& params) -> Error {
+        encode_open_ = true;
+        params_ = params;
+        bitrate_ = static_cast<UINT>(params.mfx.TargetKbps) * 1000u;
+        framerate_ = static_cast<UINT>(params.mfx.FrameInfo.FrameRateExtN);
+        bitstream_.DataOffset = 0;
+        bitstream_.DataLength = 0;
+        if (!legacy_memory_) {
+            const mfxStatus status = MFXGetMemoryInterface(session_, &memory_interface_);
+            if (status != MFX_ERR_NONE || !memory_interface_) {
+                encode_open_ = false;
+                return mfx_error(status, "MFXGetMemoryInterface");
+            }
+        }
+        return Error::success();
+    };
+
+    const mfxStatus opened = open(next);
+    if (opened < MFX_ERR_NONE) {
+        const Error failure = mfx_error(opened, "MFXVideoENCODE_Init(rate)");
+        mfxVideoParam fallback = previous;
+        fallback.ExtParam = extensions_;
+        fallback.NumExtParam = extension_count_;
+        if (open(fallback) >= MFX_ERR_NONE) {
+            (void)mark_open(fallback);
+        }
+        return failure;
+    }
+    Error ready = mark_open(next);
+    if (!ready.ok()) {
+        return ready;
+    }
     return Error::success();
 }
 

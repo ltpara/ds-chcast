@@ -755,7 +755,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.clipboard_enabled ? kServerInfoClipboardEnabled : 0) |
                         (info.audio.enabled ? kServerInfoAudioEnabled : 0) |
                         (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0) |
-                        (info.microphone_enabled ? kServerInfoMicrophoneEnabled : 0)));
+                        (info.microphone_enabled ? kServerInfoMicrophoneEnabled : 0) |
+                        (info.privacy_mode_enabled ? kServerInfoPrivacyModeEnabled : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -800,6 +801,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     if (info.microphone_enabled) {
         permissions |= kPermissionMicrophone;
+    }
+    if (info.privacy_mode_enabled) {
+        permissions |= kPermissionPrivacyMode;
     }
     put_u16(cursor, permissions);
     return payload;
@@ -992,6 +996,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
+    info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
     return true;
 }
 
@@ -1569,6 +1574,239 @@ bool parse_display_mode_result(const std::vector<uint8_t>& payload, uint16_t& di
         set_error(error, "DisplayModeResult carries a malformed reason");
         return false;
     }
+    return true;
+}
+
+std::vector<uint8_t> make_set_privacy_mode(bool enabled) {
+    std::vector<uint8_t> payload(1);
+    payload[0] = enabled ? 1 : 0;
+    return make_control(ControlType::SetPrivacyMode, payload);
+}
+
+bool parse_set_privacy_mode(const std::vector<uint8_t>& payload, bool& enabled,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw = 0;
+    if (!reader.u8(raw) || !reader.at_end() || raw > 1) {
+        set_error(error, "malformed SetPrivacyMode");
+        return false;
+    }
+    enabled = raw != 0;
+    return true;
+}
+
+std::vector<uint8_t> make_privacy_mode_state(bool enabled, PrivacyModeCode code,
+                                             const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxPrivacyModeReason);
+    std::vector<uint8_t> payload(4 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, enabled ? 1 : 0);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::PrivacyModeState, payload);
+}
+
+bool parse_privacy_mode_state(const std::vector<uint8_t>& payload, bool& enabled,
+                              PrivacyModeCode& code, std::string& reason,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_enabled = 0;
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_enabled) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed PrivacyModeState");
+        return false;
+    }
+    if (raw_enabled > 1) {
+        set_error(error, "PrivacyModeState carries an invalid enabled flag");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(PrivacyModeCode::Failed)) {
+        set_error(error, "unknown privacy mode code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxPrivacyModeReason) {
+        set_error(error, "PrivacyModeState reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "PrivacyModeState carries a malformed reason");
+        return false;
+    }
+    if (raw_code != static_cast<uint8_t>(PrivacyModeCode::Ok) && raw_enabled != 0) {
+        set_error(error, "PrivacyModeState reports a failure as enabled");
+        return false;
+    }
+    enabled = raw_enabled != 0;
+    code = static_cast<PrivacyModeCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_desktop_state(DesktopKind kind) {
+    std::vector<uint8_t> payload(1);
+    payload[0] = static_cast<uint8_t>(kind);
+    return make_control(ControlType::DesktopState, payload);
+}
+
+bool parse_desktop_state(const std::vector<uint8_t>& payload, DesktopKind& kind,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw = 0;
+    if (!reader.u8(raw) || !reader.at_end() ||
+        raw > static_cast<uint8_t>(DesktopKind::Unavailable)) {
+        set_error(error, "malformed DesktopState");
+        return false;
+    }
+    kind = static_cast<DesktopKind>(raw);
+    return true;
+}
+
+std::vector<uint8_t> make_send_sas() {
+    return make_control(ControlType::SendSas, {});
+}
+
+bool parse_send_sas(const std::vector<uint8_t>& payload, std::string* error) {
+    if (!payload.empty()) {
+        set_error(error, "SendSas must carry no payload");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_sas_result(SasCode code, const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxSasReason);
+    std::vector<uint8_t> payload(3 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::SasResult, payload);
+}
+
+bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
+                      std::string& reason, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed SasResult");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(SasCode::Failed)) {
+        set_error(error, "unknown SAS result code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxSasReason) {
+        set_error(error, "SasResult reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "SasResult carries a malformed reason");
+        return false;
+    }
+    code = static_cast<SasCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_set_stream_options(const StreamOptions& options) {
+    std::vector<uint8_t> payload(4);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(options.codec));
+    put_u16(cursor, options.max_fps);
+    put_u8(cursor, static_cast<uint8_t>(options.quality));
+    return make_control(ControlType::SetStreamOptions, payload);
+}
+
+bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions& options,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_codec = 0;
+    uint8_t raw_quality = 0;
+    if (!reader.u8(raw_codec) || !reader.u16(options.max_fps) ||
+        !reader.u8(raw_quality) || !reader.at_end()) {
+        set_error(error, "malformed SetStreamOptions");
+        return false;
+    }
+    if (raw_codec > static_cast<uint8_t>(StreamCodecPreference::Hevc)) {
+        set_error(error, "unknown stream codec preference " + std::to_string(raw_codec));
+        return false;
+    }
+    if (options.max_fps > kMaxStreamFps) {
+        set_error(error, "SetStreamOptions frame cap " + std::to_string(options.max_fps) +
+                             " is outside 0.." + std::to_string(kMaxStreamFps));
+        return false;
+    }
+    if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
+        set_error(error, "unknown stream quality " + std::to_string(raw_quality));
+        return false;
+    }
+    options.codec = static_cast<StreamCodecPreference>(raw_codec);
+    options.quality = static_cast<StreamQuality>(raw_quality);
+    return true;
+}
+
+std::vector<uint8_t> make_stream_options_result(const StreamOptionsResult& result) {
+    const std::string text = truncate_utf8_reason(result.reason, kMaxStreamOptionReason);
+    std::vector<uint8_t> payload(7 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u8(cursor, codec_wire(result.codec));
+    put_u16(cursor, result.fps);
+    put_u8(cursor, static_cast<uint8_t>(result.quality));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::StreamOptionsResult, payload);
+}
+
+bool parse_stream_options_result(const std::vector<uint8_t>& payload,
+                                 StreamOptionsResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint8_t raw_codec = 0;
+    uint8_t raw_quality = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u8(raw_codec) || !reader.u16(result.fps) ||
+        !reader.u8(raw_quality) || !reader.u16(reason_size) ||
+        !reader.string(result.reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed StreamOptionsResult");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(StreamOptionsCode::Busy)) {
+        set_error(error, "unknown stream options code " + std::to_string(raw_code));
+        return false;
+    }
+    if (!codec_from_wire(raw_codec, result.codec)) {
+        set_error(error, "unknown stream options codec " + std::to_string(raw_codec));
+        return false;
+    }
+    if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
+        set_error(error, "unknown stream quality " + std::to_string(raw_quality));
+        return false;
+    }
+    if (result.fps > kMaxStreamFps) {
+        set_error(error, "stream options frame rate " + std::to_string(result.fps) +
+                             " is outside 0.." + std::to_string(kMaxStreamFps));
+        return false;
+    }
+    if (result.reason.size() > kMaxStreamOptionReason) {
+        set_error(error, "StreamOptionsResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "StreamOptionsResult carries a malformed reason");
+        return false;
+    }
+    result.code = static_cast<StreamOptionsCode>(raw_code);
+    result.quality = static_cast<StreamQuality>(raw_quality);
     return true;
 }
 

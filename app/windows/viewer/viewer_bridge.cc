@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "chast/audio.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
 #include "chast/security.h"
@@ -455,6 +456,38 @@ void ViewerBridge::HandleMethodCall(
         map[key("audioBufferMs")] =
             flutter::EncodableValue(static_cast<int64_t>(status.audio_buffer_ms));
         map[key("audioError")] = flutter::EncodableValue(status.audio_error);
+        map[key("microphoneAuthorized")] =
+            flutter::EncodableValue(status.microphone_authorized);
+        map[key("microphoneEnabled")] = flutter::EncodableValue(status.microphone_enabled);
+        map[key("microphoneDevice")] = flutter::EncodableValue(status.microphone_device);
+        map[key("microphoneName")] = flutter::EncodableValue(status.microphone_name);
+        map[key("microphonePackets")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.microphone_packets));
+        map[key("microphoneDropped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.microphone_dropped));
+        map[key("microphoneErrors")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.microphone_errors));
+        map[key("microphoneRecoveries")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.microphone_recoveries));
+        map[key("microphoneRecovering")] =
+            flutter::EncodableValue(status.microphone_recovering);
+        map[key("microphoneError")] = flutter::EncodableValue(status.microphone_error);
+        map[key("privacySupported")] = flutter::EncodableValue(status.privacy_supported);
+        map[key("privacyEnabled")] = flutter::EncodableValue(status.privacy_enabled);
+        map[key("privacyCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.privacy_code));
+        map[key("privacyError")] = flutter::EncodableValue(status.privacy_error);
+        map[key("privacyUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.privacy_updates));
+        map[key("desktop")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.desktop));
+        map[key("desktopUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.desktop_updates));
+        map[key("sasCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.sas_code));
+        map[key("sasError")] = flutter::EncodableValue(status.sas_error);
+        map[key("sasUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.sas_updates));
         map[key("displaySwitches")] =
             flutter::EncodableValue(static_cast<int64_t>(status.display_switches));
         map[key("displaySwitchFailures")] =
@@ -473,6 +506,14 @@ void ViewerBridge::HandleMethodCall(
         map[key("displayModesCode")] =
             flutter::EncodableValue(static_cast<int32_t>(status.display_modes_code));
         map[key("displayModesError")] = flutter::EncodableValue(status.display_modes_error);
+        map[key("streamQuality")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.stream_quality));
+        map[key("streamOptionCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.stream_option_code));
+        map[key("streamOptionError")] =
+            flutter::EncodableValue(status.stream_option_error);
+        map[key("streamOptionResults")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.stream_option_results));
         flutter::EncodableList modes;
         for (const chast::DisplayModeInfo& mode : status.display_modes) {
             flutter::EncodableMap entry;
@@ -586,6 +627,32 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setStreamOptions") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "setStreamOptions wants an argument map");
+            return;
+        }
+        int64_t codec = 0;
+        int64_t max_fps = 0;
+        int64_t quality = 0;
+        if (!map_int(*args, "codec", &codec) || !map_int(*args, "maxFps", &max_fps) ||
+            !map_int(*args, "quality", &quality) || codec < 0 || codec > 2 ||
+            max_fps < 0 || max_fps > chast::kMaxStreamFps || quality < 0 || quality > 2) {
+            result->Error("bad_args",
+                          "setStreamOptions wants codec and quality in 0..2 and maxFps in "
+                          "0..240");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->SetStreamOptions(static_cast<chast::StreamCodecPreference>(codec),
+                                      static_cast<uint16_t>(max_fps),
+                                      static_cast<chast::StreamQuality>(quality));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
     if (method == "sendInput") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         if (args == nullptr) {
@@ -659,6 +726,65 @@ void ViewerBridge::HandleMethodCall(
         }
         const bool applied = viewer_ != nullptr && viewer_->SetAudioMuted(*mute);
         result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "setMicrophone") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setMicrophone wants a bool");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SetMicrophone(*enabled);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "selectMicrophone") {
+        const auto* id = std::get_if<std::string>(call.arguments());
+        if (id == nullptr) {
+            result->Error("bad_args", "selectMicrophone wants a device id");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SelectMicrophone(*id);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "setPrivacyMode") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setPrivacyMode wants a bool");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SetPrivacyMode(*enabled);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "sendSas") {
+        const bool queued = viewer_ != nullptr && viewer_->SendSas();
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "listMicrophones") {
+        std::string list_error;
+        const std::vector<chast::MicrophoneDevice> devices =
+            chast::list_microphones(&list_error);
+        if (devices.empty() && !list_error.empty()) {
+            result->Error("audio", list_error);
+            return;
+        }
+        flutter::EncodableList list;
+        for (const chast::MicrophoneDevice& device : devices) {
+            flutter::EncodableMap entry;
+            entry[key("id")] = flutter::EncodableValue(device.id);
+            entry[key("name")] = flutter::EncodableValue(device.name);
+            entry[key("default")] = flutter::EncodableValue(device.is_default);
+            list.push_back(flutter::EncodableValue(std::move(entry)));
+        }
+        result->Success(flutter::EncodableValue(std::move(list)));
         return;
     }
 

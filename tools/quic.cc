@@ -3,7 +3,8 @@
 //   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio]
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--input-real] [--display-mode]
-//                      [--file-upload] [--file-download]
+//                      [--file-upload] [--file-download] [--microphone] [--privacy]
+//                      [--sas] [--stream-options]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -69,6 +70,23 @@
 // generated 440 Hz tone (encoded by the real AAC codec) so it can assert packet
 // counts, CRCs, decoded duration and energy without a sound card, and probes a
 // server whose audio gate is closed.
+//
+// With --microphone verify also covers the viewer uplink: a synthetic 440 Hz
+// mono Opus source opens a CMIC stream on a host that granted the microphone,
+// and an injected in-memory player on the host records the decoded PCM so the
+// check can assert packet/frame counts, the tone's frequency and its RMS. The
+// viewer then closes the stream, and a second probe connects to a host whose
+// microphone gate is closed to prove CMIC is refused without disturbing video.
+//
+// With --stream-options verify walks the viewer's picture preferences on the
+// running loopback stream: an explicit request for the encoder already in use,
+// then Balanced at a 15 fps ceiling, the restore to High at the configured
+// rate, a quality-only Balancing at that same rate (which must not add an IDR
+// on H.264), and finally the other encoder family. The host must answer each
+// one with the effective values, send a StreamInfo after every change, and
+// report the other family either as produced (then restored) or as
+// Unsupported. The flag is named after the channel because --quality already
+// sets the VPL encoder quality for serve/connect/verify.
 
 #include <algorithm>
 #include <atomic>
@@ -237,16 +255,30 @@ bool same_clipboard_content(const chast::ClipboardContent& left,
     return true;
 }
 
-// verify's stand-in for the WASAPI loopback endpoint: a 440 Hz stereo tone at
-// the encoder's rate, paced against the steady clock and encoded with the real
-// AAC codec. It makes the loopback check cover encode -> wire -> decode
-// without depending on a sound card.
-class SyntheticCapture final : public chast::ILoopbackCapture {
+const char* audio_codec_name(chast::AudioCodec codec) {
+    switch (codec) {
+        case chast::AudioCodec::AAC:
+            return "AAC-LC";
+        case chast::AudioCodec::Opus:
+            return "Opus";
+    }
+    return "unknown";
+}
+
+// verify's stand-in for a real capture endpoint: a 440 Hz tone at the
+// encoder's rate, paced against the steady clock and encoded with the real
+// codec. It makes the loopback check cover encode -> wire -> decode without
+// depending on a sound card. The system-sound probe uses the loopback interface
+// with an AAC stereo encoder; the microphone probe uses the capture interface
+// with a mono Opus encoder.
+template <typename Base>
+class SyntheticToneCapture final : public Base {
 public:
-    explicit SyntheticCapture(std::unique_ptr<chast::IAudioEncoder> encoder)
+    SyntheticToneCapture(std::unique_ptr<chast::IAudioEncoder> encoder,
+                         chast::AudioCodec codec)
         : encoder_(std::move(encoder)) {
         info_.enabled = true;
-        info_.codec = chast::AudioCodec::AAC;
+        info_.codec = codec;
         info_.sample_rate = encoder_->sample_rate();
         info_.channels = encoder_->channels();
         info_.bitrate = encoder_->bitrate();
@@ -254,14 +286,14 @@ public:
         info_.extradata = encoder_->extradata();
     }
 
-    ~SyntheticCapture() override { stop(); }
+    ~SyntheticToneCapture() override { stop(); }
 
     void start() override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (thread_.joinable() || stopping_.load()) {
             return;
         }
-        thread_ = std::thread(&SyntheticCapture::run, this);
+        thread_ = std::thread(&SyntheticToneCapture::run, this);
     }
 
     void stop() override {
@@ -391,14 +423,151 @@ private:
     std::string error_;
 };
 
+using SyntheticCapture = SyntheticToneCapture<chast::ILoopbackCapture>;
+using SyntheticMicrophoneCapture = SyntheticToneCapture<chast::IMicrophoneCapture>;
+
 std::unique_ptr<chast::ILoopbackCapture> make_synthetic_capture(std::string* error) {
+    // Mirrors WasapiLoopbackCapture: 48 kHz stereo Opus at the loopback path's
+    // default bitrate. AAC is still supported by the library, but the tool and
+    // the host's real capture must exercise the same codec.
     chast::AudioEncoderConfig config;
-    std::unique_ptr<chast::IAudioEncoder> encoder = chast::create_aac_encoder(config, error);
+    config.codec = chast::AudioCodec::Opus;
+    config.sample_rate = 48000;
+    config.channels = 2;
+    config.bitrate = 128000;
+    std::unique_ptr<chast::IAudioEncoder> encoder = chast::create_opus_encoder(config, error);
     if (!encoder) {
         return nullptr;
     }
-    return std::make_unique<SyntheticCapture>(std::move(encoder));
+    return std::make_unique<SyntheticCapture>(std::move(encoder), chast::AudioCodec::Opus);
 }
+
+std::unique_ptr<chast::IMicrophoneCapture> make_synthetic_microphone_capture(
+    std::string* error) {
+    chast::AudioEncoderConfig config;
+    config.codec = chast::AudioCodec::Opus;
+    config.sample_rate = 48000;
+    config.channels = 1;
+    config.bitrate = 32000;
+    config.voice = true;
+    std::unique_ptr<chast::IAudioEncoder> encoder =
+        chast::create_opus_encoder(config, error);
+    if (!encoder) {
+        return nullptr;
+    }
+    return std::make_unique<SyntheticMicrophoneCapture>(std::move(encoder),
+                                                       chast::AudioCodec::Opus);
+}
+
+// Host-side stand-in for the speaker renderer, injected through
+// HostServerConfig::microphone_player. It keeps the decoded PCM so verify can
+// assert the microphone stream carried the expected tone instead of trusting
+// counters alone.
+class MicrophoneRecorder {
+public:
+    void record(const chast::DecodedAudio& block) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++packets_;
+        const size_t channels = block.channels == 0 ? 1 : block.channels;
+        sample_rate_ = block.sample_rate;
+        channels_ = block.channels;
+        sample_count_ += block.samples.size() / channels;
+        if (samples_.size() < kMaxSamples) {
+            const size_t room = kMaxSamples - samples_.size();
+            const size_t take = (std::min)(room, block.samples.size());
+            samples_.insert(samples_.end(), block.samples.begin(),
+                            block.samples.begin() + static_cast<std::ptrdiff_t>(take));
+        }
+    }
+
+    uint64_t packets() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return packets_;
+    }
+
+    struct Result {
+        uint64_t packets = 0;
+        uint64_t samples = 0;
+        uint32_t sample_rate = 0;
+        uint16_t channels = 0;
+        double rms = 0.0;
+        double frequency_hz = 0.0;
+    };
+
+    Result result() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Result out;
+        out.packets = packets_;
+        out.samples = sample_count_;
+        out.sample_rate = sample_rate_;
+        out.channels = channels_;
+        if (channels_ != 1 || samples_.size() < 2 || sample_rate_ == 0) {
+            return out;
+        }
+        // Ignore the first and last 50 ms so the codec's priming and the
+        // truncation at stop cannot bias the estimate.
+        const size_t margin = (std::min)(samples_.size() / 4,
+                                         static_cast<size_t>(sample_rate_ / 20));
+        double energy = 0.0;
+        size_t counted = 0;
+        uint64_t positive_crossings = 0;
+        for (size_t i = 0; i < samples_.size(); ++i) {
+            const double value = static_cast<double>(samples_[i]);
+            if (i < margin || i + margin >= samples_.size()) {
+                continue;
+            }
+            energy += value * value;
+            ++counted;
+            if (i > 0 && samples_[i - 1] <= 0 && samples_[i] > 0) {
+                ++positive_crossings;
+            }
+        }
+        if (counted == 0) {
+            return out;
+        }
+        out.rms = std::sqrt(energy / static_cast<double>(counted));
+        out.frequency_hz = static_cast<double>(positive_crossings) *
+                           static_cast<double>(sample_rate_) / static_cast<double>(counted);
+        return out;
+    }
+
+private:
+    static constexpr size_t kMaxSamples = 48000 * 20;
+    mutable std::mutex mutex_;
+    uint64_t packets_ = 0;
+    uint64_t sample_count_ = 0;
+    uint32_t sample_rate_ = 0;
+    uint16_t channels_ = 0;
+    std::vector<int16_t> samples_;
+};
+
+class RecordingMicrophonePlayer final : public chast::IAudioPlayer {
+public:
+    explicit RecordingMicrophonePlayer(std::shared_ptr<MicrophoneRecorder> recorder)
+        : recorder_(std::move(recorder)) {}
+
+    chast::Error start() override { return chast::Error::success(); }
+    void stop() override {}
+    chast::Error push(const chast::DecodedAudio& audio) override {
+        recorder_->record(audio);
+        return chast::Error::success();
+    }
+    void set_clock_offset(int64_t) override {}
+    void set_lead_ms(uint32_t) override {}
+    void set_mute(bool mute) override { muted_ = mute; }
+    bool muted() const override { return muted_; }
+
+    chast::AudioPlayerStats stats() const override {
+        chast::AudioPlayerStats stats;
+        stats.packets = recorder_->packets();
+        return stats;
+    }
+    std::string error() const override { return {}; }
+
+private:
+    std::shared_ptr<MicrophoneRecorder> recorder_;
+    bool muted_ = false;
+};
 
 struct Options {
     std::string mode;
@@ -435,6 +604,27 @@ struct Options {
     // verify only: the host encodes a generated 440 Hz tone instead of opening
     // the real loopback endpoint, so the check needs no sound card.
     bool synthetic_audio = false;
+    // verify only: cover the viewer microphone uplink. The host grants the
+    // microphone and gets an in-memory player; the viewer sends a synthetic
+    // mono Opus tone through CMIC. A second probe checks the closed gate.
+    bool microphone = false;
+    // verify only: cover privacy mode on a host that allows it. The viewer
+    // turns the overlay on, checks the stream still carries desktop content,
+    // then turns it off; a second probe checks the closed gate.
+    bool privacy = false;
+    // verify only: cover Ctrl+Alt+Del. The host gets an in-memory send callback
+    // that reports success, so the request/answer channel runs without touching
+    // the real secure desktop; a second probe checks a host with no callback
+    // answers Unsupported instead.
+    bool sas = false;
+    // verify only: walk the viewer's picture preferences. A quality/frame-rate
+    // change and its restore must be answered with the effective values and
+    // followed by a StreamInfo; the other encoder family is requested to prove
+    // that Ok and Unsupported both describe what the host can really produce.
+    bool stream_options = false;
+    // The in-memory host player the microphone probe injects, shared with
+    // run_verify so it can inspect the decoded PCM after the session.
+    std::shared_ptr<MicrophoneRecorder> microphone_recorder;
     // connect only: upload this text once after the handshake, for checking a
     // host's real clipboard write path. Implies --clipboard.
     std::string send_clipboard;
@@ -581,6 +771,14 @@ bool parse_args(int argc, char** argv, Options& options) {
             } else if (arg == "--play") {
                 options.audio = true;
                 options.play = true;
+            } else if (arg == "--microphone") {
+                options.microphone = true;
+            } else if (arg == "--privacy") {
+                options.privacy = true;
+            } else if (arg == "--sas") {
+                options.sas = true;
+            } else if (arg == "--stream-options") {
+                options.stream_options = true;
             } else if (arg == "--send-clipboard" && i + 1 < argc) {
                 options.send_clipboard = argv[++i];
                 options.clipboard = true;
@@ -676,6 +874,22 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.file_download && options.mode != "verify") {
         std::fprintf(stderr, "--file-download only applies to verify\n");
+        return false;
+    }
+    if (options.microphone && options.mode != "verify") {
+        std::fprintf(stderr, "--microphone only applies to verify\n");
+        return false;
+    }
+    if (options.privacy && options.mode != "verify") {
+        std::fprintf(stderr, "--privacy only applies to verify\n");
+        return false;
+    }
+    if (options.sas && options.mode != "verify") {
+        std::fprintf(stderr, "--sas only applies to verify\n");
+        return false;
+    }
+    if (options.stream_options && options.mode != "verify") {
+        std::fprintf(stderr, "--stream-options only applies to verify\n");
         return false;
     }
     if (!options.send_clipboard.empty()) {
@@ -816,6 +1030,31 @@ struct SenderStats {
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
     bool audio_recovering = false;
+    // Viewer microphone (verify --microphone). What the host announced, the
+    // CMIC streams it accepted, the packets it decoded, and the PCM its
+    // injected player recorded for the tone checks.
+    bool microphone_enabled = false;
+    bool microphone_active = false;
+    uint64_t microphone_streams = 0;
+    uint64_t microphone_packets = 0;
+    uint64_t microphone_bytes = 0;
+    uint64_t microphone_frames = 0;
+    uint64_t microphone_errors = 0;
+    uint64_t microphone_underruns = 0;
+    MicrophoneRecorder::Result microphone_recording;
+    // Privacy mode (verify --privacy): changes the host applied and whether
+    // the overlay was still up when the session ended. Both requests in the
+    // probe are counted, so two changes prove the on and off were applied.
+    uint64_t privacy_mode_changes = 0;
+    bool privacy_mode_active = false;
+    // SAS requests the host handled (verify --sas) and the answers it refused.
+    uint64_t sas_requests = 0;
+    uint64_t sas_failures = 0;
+    // Viewer picture preferences the host handled (verify --stream-options):
+    // every request, the ones that changed the running stream, and refusals.
+    uint64_t stream_option_requests = 0;
+    uint64_t stream_option_changes = 0;
+    uint64_t stream_option_failures = 0;
     // CursorUpdates the server sent (shapes carrying a sprite included).
     uint64_t cursor_sent = 0;
     std::vector<chast::DisplayDescription> displays;
@@ -876,6 +1115,9 @@ struct ReceiverStats {
     std::vector<chast::InputEvent> input_sent;
     bool input_enabled = false;
     uint64_t input_errors = 0;
+    // The host's desktop reports: a clean loopback stays on Default.
+    uint64_t desktop_states = 0;
+    chast::DesktopKind desktop_kind = chast::DesktopKind::Default;
     // Clipboard items this receiver sent and every rich item it received.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
@@ -935,6 +1177,72 @@ struct ReceiverStats {
     uint64_t audio_player_recoveries = 0;
     uint32_t audio_buffer_ms = 0;
     std::string audio_player_error;
+    // Microphone uplink probe (verify --microphone): the host grant, the CMIC
+    // stream the viewer opened and closed, and the packets it handed to the
+    // transport. Send errors are separated from intentional drops.
+    bool microphone_announced = false;
+    bool microphone_started = false;
+    bool microphone_stopped = false;
+    chast::AudioInfo microphone_info;
+    uint64_t microphone_packets = 0;
+    uint64_t microphone_bytes = 0;
+    uint64_t microphone_dropped = 0;
+    uint64_t microphone_send_errors = 0;
+    // Privacy mode probe (verify --privacy): the two answers, the luma of the
+    // last frame before the overlay went up and of the frames captured while
+    // it was up, and how many frames arrived after it came down.
+    uint64_t privacy_updates = 0;
+    bool privacy_on_seen = false;
+    bool privacy_off_seen = false;
+    bool privacy_last_enabled = false;
+    chast::PrivacyModeCode privacy_last_code = chast::PrivacyModeCode::Ok;
+    std::string privacy_last_reason;
+    double privacy_luma_before = -1.0;
+    double privacy_luma_last = 0.0;
+    uint64_t privacy_frames = 0;
+    uint64_t privacy_frames_after_off = 0;
+    double last_frame_luma = 0.0;
+    bool privacy_probe = false;
+    // SAS probe (verify --sas): the answers the host sent back, and whether
+    // one of them reported the secure desktop as reached.
+    bool sas_probe = false;
+    uint64_t sas_updates = 0;
+    bool sas_ok_seen = false;
+    chast::SasCode sas_last_code = chast::SasCode::Ok;
+    std::string sas_last_reason;
+    // Stream preference probe (verify --stream-options): every answer, the
+    // effective values of the last one, and the StreamInfo the host announced
+    // after each applied quality/frame-rate change. The other encoder family
+    // either arrived (then the original was restored) or was refused as
+    // Unsupported with a reason.
+    bool stream_options_probe = false;
+    uint64_t stream_option_results = 0;
+    chast::StreamOptionsCode stream_option_last_code = chast::StreamOptionsCode::Ok;
+    chast::VideoCodec stream_option_last_codec = chast::VideoCodec::H264;
+    uint16_t stream_option_last_fps = 0;
+    chast::StreamQuality stream_option_last_quality = chast::StreamQuality::High;
+    std::string stream_option_last_reason;
+    chast::VideoCodec stream_option_base_codec = chast::VideoCodec::H264;
+    uint16_t stream_option_change_fps = 0;
+    chast::StreamQuality stream_option_change_quality = chast::StreamQuality::High;
+    bool stream_option_change_update_seen = false;
+    uint32_t stream_option_change_update_fps = 0;
+    bool stream_option_restore_update_seen = false;
+    uint32_t stream_option_restore_update_fps = 0;
+    uint32_t stream_option_restore_update_bitrate = 0;
+    // A quality-only step (Balanced with the frame-rate ceiling unchanged):
+    // the StreamInfo it announced, whether the bitrate moved, and how many
+    // keyframes it cost. H.264 continues the coded sequence, so that count
+    // stays zero; HEVC reopens its session and pays one.
+    bool stream_option_rate_update_seen = false;
+    uint32_t stream_option_rate_update_bitrate = 0;
+    uint64_t stream_option_rate_keyframes = 0;
+    bool stream_option_alt_seen = false;
+    bool stream_option_alt_ok = false;
+    bool stream_option_alt_unsupported = false;
+    chast::VideoCodec stream_option_alt_codec = chast::VideoCodec::H264;
+    std::string stream_option_alt_reason;
+    bool stream_option_codec_restored = false;
     std::vector<chast::DisplayDescription> displays;
     // StreamInfo messages received, and the description from the last one.
     uint64_t stream_updates = 0;
@@ -1119,9 +1427,22 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.allow_input = options.input;
     config.settings.allow_clipboard = options.clipboard;
     config.settings.allow_audio = options.audio;
+    config.settings.allow_microphone = options.microphone;
+    config.settings.allow_privacy_mode = options.privacy;
+    if (options.sas) {
+        // The real secure desktop is never involved: the loopback only proves
+        // the request reaches the host and the answer reaches the viewer.
+        config.send_sas = [](std::string*) { return true; };
+    }
     if (options.synthetic_audio) {
         config.audio_capture = [](std::string* capture_error) {
             return make_synthetic_capture(capture_error);
+        };
+    }
+    if (options.microphone && options.microphone_recorder) {
+        std::shared_ptr<MicrophoneRecorder> recorder = options.microphone_recorder;
+        config.microphone_player = [recorder](std::string*) -> std::unique_ptr<chast::IAudioPlayer> {
+            return std::make_unique<RecordingMicrophonePlayer>(recorder);
         };
     }
     config.settings.token_mode = options.token_reuse ? chast::HostTokenMode::Reusable
@@ -1304,6 +1625,24 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.audio_capture_recoveries = status.stats.audio_capture_recoveries;
     stats.audio_gate_transitions = status.stats.audio_gate_transitions;
     stats.audio_recovering = status.stats.audio_recovering;
+    stats.microphone_enabled = status.stream.microphone_enabled;
+    stats.microphone_active = status.stats.microphone_active;
+    stats.microphone_streams = status.stats.microphone_streams;
+    stats.microphone_packets = status.stats.microphone_packets;
+    stats.microphone_bytes = status.stats.microphone_bytes;
+    stats.microphone_frames = status.stats.microphone_frames;
+    stats.microphone_errors = status.stats.microphone_errors;
+    stats.microphone_underruns = status.stats.microphone_underruns;
+    stats.privacy_mode_changes = status.stats.privacy_mode_changes;
+    stats.privacy_mode_active = status.stats.privacy_mode_active;
+    stats.sas_requests = status.stats.sas_requests;
+    stats.sas_failures = status.stats.sas_failures;
+    stats.stream_option_requests = status.stats.stream_option_requests;
+    stats.stream_option_changes = status.stats.stream_option_changes;
+    stats.stream_option_failures = status.stats.stream_option_failures;
+    if (options.microphone_recorder) {
+        stats.microphone_recording = options.microphone_recorder->result();
+    }
     stats.stats_received = status.stats.stats_received;
     stats.peer = status.stats.peer;
     stats.peer_left = status.stats.peer_left;
@@ -1382,7 +1721,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         "packets=%llu bytes=%llu dropped=%llu errors=%llu "
                         "recoveries=%llu gates=%llu recovering=%d\n",
                         stats.audio_announced ? 1 : 0, stats.audio_active ? 1 : 0,
-                        stats.audio_info.codec == chast::AudioCodec::AAC ? "AAC-LC" : "?",
+                        audio_codec_name(stats.audio_info.codec),
                         stats.audio_info.sample_rate, stats.audio_info.channels,
                         stats.audio_info.bitrate / 1000u,
                         static_cast<unsigned long long>(stats.audio_packets),
@@ -1392,6 +1731,21 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                         static_cast<unsigned long long>(stats.audio_capture_recoveries),
                         static_cast<unsigned long long>(stats.audio_gate_transitions),
                         stats.audio_recovering ? 1 : 0);
+        }
+        if (options.microphone) {
+            std::printf("sender: microphone announced=%d active=%d streams=%llu "
+                        "packets=%llu bytes=%llu frames=%llu errors=%llu underruns=%llu "
+                        "recorded=%llu samples rms=%.0f tone=%.0f Hz\n",
+                        stats.microphone_enabled ? 1 : 0, stats.microphone_active ? 1 : 0,
+                        static_cast<unsigned long long>(stats.microphone_streams),
+                        static_cast<unsigned long long>(stats.microphone_packets),
+                        static_cast<unsigned long long>(stats.microphone_bytes),
+                        static_cast<unsigned long long>(stats.microphone_frames),
+                        static_cast<unsigned long long>(stats.microphone_errors),
+                        static_cast<unsigned long long>(stats.microphone_underruns),
+                        static_cast<unsigned long long>(stats.microphone_recording.samples),
+                        stats.microphone_recording.rms,
+                        stats.microphone_recording.frequency_hz);
         }
     }
     stats.ok = stats.error.empty();
@@ -1491,6 +1845,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.framerate = info.framerate;
     stats.audio_info = info.audio;
     stats.audio_announced = info.audio.enabled;
+    stats.microphone_announced = info.microphone_enabled;
     if (!options.quiet) {
         std::printf("quic: connected, server streams %s %ux%u from %ux%u at %u kbps (%s)\n",
                     chast_tools::codec_name(info.codec), info.width, info.height,
@@ -1527,9 +1882,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (options.audio) {
             std::printf("quic: server audio %s (%s %u Hz %u ch %u kbps)\n",
                         info.audio.enabled ? "enabled" : "disabled",
-                        info.audio.codec == chast::AudioCodec::AAC ? "AAC-LC" : "?",
-                        info.audio.sample_rate, info.audio.channels,
-                        info.audio.bitrate / 1000u);
+                        audio_codec_name(info.audio.codec), info.audio.sample_rate,
+                        info.audio.channels, info.audio.bitrate / 1000u);
+        }
+        if (options.microphone) {
+            std::printf("quic: server microphone %s\n",
+                        info.microphone_enabled ? "granted" : "not granted");
         }
     }
     if (options.input) {
@@ -1919,7 +2277,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         audio_decoder.reset();
         std::string audio_error;
-        audio_decoder = chast::create_aac_decoder(audio, &audio_error);
+        audio_decoder = chast::create_audio_decoder(audio, &audio_error);
         if (!audio_decoder) {
             stats.error = "audio decoder creation failed: " + audio_error;
             return false;
@@ -1933,6 +2291,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!ensure_audio_decoder(info.audio)) {
             return fail(stats.error);
         }
+    }
+    if (options.microphone && !info.microphone_enabled) {
+        return fail("the server did not grant the microphone (serve with --microphone)");
     }
     std::unique_ptr<chast::IAudioPlayer> audio_player;
     if (options.play) {
@@ -1999,6 +2360,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
     bool switch_ok_sent = false;
     bool switch_bad_sent = false;
+    auto switch_bad_at = start + std::chrono::milliseconds(2400);
 
     // StreamInfo and the pictures travel on different QUIC streams, so the
     // first picture at a new size can arrive before its announcement. Track
@@ -2103,6 +2465,54 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.cursor_visible = update.visible;
             stats.cursor_x = update.x;
             stats.cursor_y = update.y;
+        }
+    };
+
+    auto drain_desktop_state = [&] {
+        chast::DesktopKind kind = chast::DesktopKind::Default;
+        while (session->take_desktop_state(kind)) {
+            ++stats.desktop_states;
+            stats.desktop_kind = kind;
+        }
+    };
+
+    auto drain_privacy_state = [&] {
+        bool enabled = false;
+        chast::PrivacyModeCode code = chast::PrivacyModeCode::Ok;
+        std::string reason;
+        while (session->take_privacy_mode_state(enabled, code, reason)) {
+            ++stats.privacy_updates;
+            stats.privacy_last_enabled = enabled;
+            stats.privacy_last_code = code;
+            stats.privacy_last_reason = reason;
+            if (enabled && code == chast::PrivacyModeCode::Ok) {
+                stats.privacy_on_seen = true;
+            } else if (!enabled && code == chast::PrivacyModeCode::Ok) {
+                stats.privacy_off_seen = true;
+            }
+            if (!options.quiet) {
+                std::printf("quic: privacy mode %s: code %u%s%s\n",
+                            enabled ? "on" : "off", static_cast<unsigned>(code),
+                            reason.empty() ? "" : ": ", reason.c_str());
+            }
+        }
+    };
+
+    auto drain_sas_result = [&] {
+        chast::SasCode code = chast::SasCode::Ok;
+        std::string reason;
+        while (session->take_sas_result(code, reason)) {
+            ++stats.sas_updates;
+            stats.sas_last_code = code;
+            stats.sas_last_reason = reason;
+            if (code == chast::SasCode::Ok) {
+                stats.sas_ok_seen = true;
+            }
+            if (!options.quiet) {
+                std::printf("quic: SAS result: code %u%s%s\n",
+                            static_cast<unsigned>(code), reason.empty() ? "" : ": ",
+                            reason.c_str());
+            }
         }
     };
 
@@ -2544,6 +2954,445 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
     };
 
+    // ---- microphone uplink probe (verify --microphone) ----
+    // The synthetic source stands in for a WASAPI capture endpoint: mono Opus
+    // at 48 kHz. Opening the stream is the switch; closing it must end the
+    // host's CMIC stream without touching video or system sound.
+    std::unique_ptr<chast::IMicrophoneCapture> microphone_capture;
+    if (options.microphone) {
+        std::string microphone_error;
+        microphone_capture = make_synthetic_microphone_capture(&microphone_error);
+        if (!microphone_capture) {
+            return fail("synthetic microphone: " + microphone_error);
+        }
+        stats.microphone_info = microphone_capture->info();
+        if (stats.microphone_info.codec != chast::AudioCodec::Opus ||
+            stats.microphone_info.sample_rate != 48000 ||
+            stats.microphone_info.channels != 1 ||
+            stats.microphone_info.frame_samples != chast::kOpusFrameSamples) {
+            return fail("the synthetic microphone format is not 48 kHz mono Opus");
+        }
+    }
+    auto drain_microphone = [&] {
+        if (!microphone_capture) {
+            return;
+        }
+        chast::EncodedAudio packet;
+        while (microphone_capture->take_packet(packet)) {
+            chast::AudioHeader header;
+            header.codec = stats.microphone_info.codec;
+            header.sample_rate = stats.microphone_info.sample_rate;
+            header.channels = stats.microphone_info.channels;
+            header.frame_samples = stats.microphone_info.frame_samples;
+            header.pts_ms = packet.capture_ms;
+            header.capture_ms = packet.capture_ms;
+            chast::Error sent = session->send_microphone(
+                header, packet.data.data(), packet.data.size());
+            if (sent.ok()) {
+                ++stats.microphone_packets;
+                stats.microphone_bytes += packet.data.size();
+            } else if (sent.status() == chast::Status::WaitTimeout) {
+                ++stats.microphone_dropped;
+            } else {
+                ++stats.microphone_send_errors;
+                if (stats.microphone_send_errors == 1) {
+                    std::fprintf(stderr, "send_microphone: %s\n",
+                                 sent.to_string().c_str());
+                }
+            }
+        }
+        if (microphone_capture->failed()) {
+            ++stats.microphone_send_errors;
+            stats.error = "microphone capture: " + microphone_capture->error();
+        }
+    };
+    const auto microphone_start_at = start + std::chrono::milliseconds(800);
+    const auto microphone_stop_at = start + std::chrono::milliseconds(2500);
+    auto stop_microphone_probe = [&] {
+        if (!microphone_capture || !stats.microphone_started || stats.microphone_stopped) {
+            return;
+        }
+        drain_microphone();
+        session->stop_microphone();
+        microphone_capture->stop();
+        stats.microphone_dropped += microphone_capture->stats().dropped;
+        stats.microphone_stopped = true;
+        if (!options.quiet) {
+            std::printf("quic: microphone stream closed after %llu packets\n",
+                        static_cast<unsigned long long>(stats.microphone_packets));
+        }
+    };
+
+    // Privacy mode: turn the host's overlay on, hold it long enough to keep
+    // decoding frames under it, then turn it off. The answers arrive on the
+    // control stream; only the host knows whether the overlay is real.
+    stats.privacy_probe = options.mode == "verify" && options.privacy;
+    bool privacy_on_sent = false;
+    bool privacy_off_sent = false;
+    const auto privacy_on_at = start + std::chrono::milliseconds(800);
+    const auto privacy_off_at = start + std::chrono::milliseconds(2600);
+    // SAS: ask once the stream is live and let the host's answer come back on
+    // the control stream. The loopback host answers through its test callback.
+    stats.sas_probe = options.mode == "verify" && options.sas;
+    bool sas_sent = false;
+    const auto sas_at = start + std::chrono::milliseconds(1200);
+
+    // Stream preferences: request the encoder already running, change the
+    // quality and frame ceiling, restore them, then change the quality alone
+    // (the coded sequence must survive it without an IDR on H.264), restore
+    // it, and ask for the other encoder family. Each step waits for its answer
+    // and, when the change was applied, for the StreamInfo announcing the new
+    // picture, so the host is never sent a request it has not caught up with.
+    stats.stream_options_probe = options.mode == "verify" && options.stream_options;
+    enum class StreamOptionStep {
+        WaitStart,
+        WaitSameCodec,
+        WaitChange,
+        WaitChangeUpdate,
+        WaitRestore,
+        WaitRestoreUpdate,
+        WaitRestoreSettle,
+        WaitRateOnly,
+        WaitRateOnlyUpdate,
+        WaitRateOnlyCheck,
+        WaitRateOnlyRestore,
+        WaitRateOnlyRestoreUpdate,
+        WaitAlt,
+        WaitAltUpdate,
+        WaitAltRestore,
+        WaitAltRestoreAnswer,
+        WaitAltRestoreUpdate,
+        Done,
+    };
+    StreamOptionStep stream_step = StreamOptionStep::WaitStart;
+    const uint16_t probe_fps = 15;
+    // The host encodes at this rate until a viewer caps it; zero in the tool
+    // means the encoder's own default, which is what the host would report.
+    const uint16_t host_fps =
+        static_cast<uint16_t>(options.framerate == 0 ? 30 : options.framerate);
+    const uint16_t capped_fps = (std::min)(host_fps, probe_fps);
+    const chast::VideoCodec stream_base_codec = info.codec;
+    const chast::VideoCodec stream_alt_codec = stream_base_codec == chast::VideoCodec::Hevc
+                                                   ? chast::VideoCodec::H264
+                                                   : chast::VideoCodec::Hevc;
+    stats.stream_option_base_codec = stream_base_codec;
+    auto stream_next_send = start + std::chrono::milliseconds(3200);
+    uint64_t stream_updates_before = 0;
+    // Let the IDR the preceding step forced land before sampling the keyframe
+    // count for the rate-only step; frames and time keep a slow host from
+    // being sampled too early.
+    uint64_t stream_settle_frames = 0;
+    auto stream_settle_at = start;
+    uint64_t stream_rate_frames = 0;
+    auto stream_rate_check_at = start;
+    uint64_t stream_rate_keyframes_before = 0;
+    auto stream_preference = [](chast::VideoCodec codec) {
+        return codec == chast::VideoCodec::Hevc ? chast::StreamCodecPreference::Hevc
+                                                : chast::StreamCodecPreference::H264;
+    };
+    auto send_stream_options = [&](chast::StreamCodecPreference codec, uint16_t max_fps,
+                                   chast::StreamQuality quality) -> bool {
+        chast::StreamOptions request;
+        request.codec = codec;
+        request.max_fps = max_fps;
+        request.quality = quality;
+        if (chast::Error sent = session->request_stream_options(request); !sent.ok()) {
+            stats.error = "request_stream_options: " + sent.to_string();
+            return false;
+        }
+        stream_updates_before = stats.stream_updates;
+        return true;
+    };
+    auto stream_answer_matches = [](const chast::StreamOptionsResult& result,
+                                    chast::VideoCodec codec, uint16_t fps,
+                                    chast::StreamQuality quality) {
+        return result.codec == codec && result.fps == fps && result.quality == quality;
+    };
+    auto stream_answer_detail = [](const chast::StreamOptionsResult& result) {
+        std::string detail = std::string(chast_tools::codec_name(result.codec)) + " at " +
+                             std::to_string(result.fps) + " fps, quality " +
+                             std::to_string(static_cast<unsigned>(result.quality));
+        if (!result.reason.empty()) {
+            detail += ": " + result.reason;
+        }
+        return detail;
+    };
+    auto advance_stream_options = [&]() -> bool {
+        if (!stats.stream_options_probe || stream_step == StreamOptionStep::Done) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        chast::StreamOptionsResult result;
+        while (session->take_stream_options_result(result)) {
+            ++stats.stream_option_results;
+            stats.stream_option_last_code = result.code;
+            stats.stream_option_last_codec = result.codec;
+            stats.stream_option_last_fps = result.fps;
+            stats.stream_option_last_quality = result.quality;
+            stats.stream_option_last_reason = result.reason;
+            if (!options.quiet) {
+                std::printf("quic: stream options: %s\n", stream_answer_detail(result).c_str());
+            }
+            if (result.code != chast::StreamOptionsCode::Ok && result.reason.empty()) {
+                stats.error = "a stream-option refusal carried no reason";
+                return false;
+            }
+            switch (stream_step) {
+                case StreamOptionStep::WaitSameCodec:
+                    if (result.code != chast::StreamOptionsCode::Ok) {
+                        stats.error =
+                            "the request for the running encoder was refused: " + result.reason;
+                        return false;
+                    }
+                    if (!stream_answer_matches(result, stream_base_codec, host_fps,
+                                               chast::StreamQuality::High)) {
+                        stats.error =
+                            "the request for the running encoder was answered with " +
+                            stream_answer_detail(result);
+                        return false;
+                    }
+                    if (!send_stream_options(chast::StreamCodecPreference::Auto, probe_fps,
+                                             chast::StreamQuality::Balanced)) {
+                        return false;
+                    }
+                    stream_step = StreamOptionStep::WaitChange;
+                    break;
+                case StreamOptionStep::WaitChange:
+                    if (result.code != chast::StreamOptionsCode::Ok) {
+                        stats.error =
+                            "the quality/frame-rate change was refused: " + result.reason;
+                        return false;
+                    }
+                    if (!stream_answer_matches(result, stream_base_codec, capped_fps,
+                                               chast::StreamQuality::Balanced)) {
+                        stats.error = "the quality/frame-rate change was answered with " +
+                                      stream_answer_detail(result);
+                        return false;
+                    }
+                    stats.stream_option_change_fps = result.fps;
+                    stats.stream_option_change_quality = result.quality;
+                    stream_step = StreamOptionStep::WaitChangeUpdate;
+                    break;
+                case StreamOptionStep::WaitRestore:
+                    if (result.code != chast::StreamOptionsCode::Ok) {
+                        stats.error = "restoring the quality and frame rate was refused: " +
+                                      result.reason;
+                        return false;
+                    }
+                    if (!stream_answer_matches(result, stream_base_codec, host_fps,
+                                               chast::StreamQuality::High)) {
+                        stats.error = "restoring the quality and frame rate was answered with " +
+                                      stream_answer_detail(result);
+                        return false;
+                    }
+                    stream_step = StreamOptionStep::WaitRestoreUpdate;
+                    break;
+                case StreamOptionStep::WaitRateOnly:
+                    if (result.code != chast::StreamOptionsCode::Ok) {
+                        stats.error =
+                            "the quality-only change was refused: " + result.reason;
+                        return false;
+                    }
+                    if (!stream_answer_matches(result, stream_base_codec, host_fps,
+                                               chast::StreamQuality::Balanced)) {
+                        stats.error = "the quality-only change was answered with " +
+                                      stream_answer_detail(result);
+                        return false;
+                    }
+                    stream_step = StreamOptionStep::WaitRateOnlyUpdate;
+                    break;
+                case StreamOptionStep::WaitRateOnlyRestore:
+                    if (result.code != chast::StreamOptionsCode::Ok) {
+                        stats.error = "restoring the quality alone was refused: " + result.reason;
+                        return false;
+                    }
+                    if (!stream_answer_matches(result, stream_base_codec, host_fps,
+                                               chast::StreamQuality::High)) {
+                        stats.error = "restoring the quality alone was answered with " +
+                                      stream_answer_detail(result);
+                        return false;
+                    }
+                    stream_step = StreamOptionStep::WaitRateOnlyRestoreUpdate;
+                    break;
+                case StreamOptionStep::WaitAlt:
+                    stats.stream_option_alt_seen = true;
+                    if (result.code == chast::StreamOptionsCode::Ok) {
+                        if (!stream_answer_matches(result, stream_alt_codec, host_fps,
+                                                   chast::StreamQuality::High)) {
+                            stats.error = "the other encoder family was answered with " +
+                                          stream_answer_detail(result);
+                            return false;
+                        }
+                        stats.stream_option_alt_ok = true;
+                        stats.stream_option_alt_codec = result.codec;
+                        stream_step = StreamOptionStep::WaitAltUpdate;
+                    } else if (result.code == chast::StreamOptionsCode::Unsupported) {
+                        if (result.codec != stream_base_codec) {
+                            stats.error = "the Unsupported answer described " +
+                                          stream_answer_detail(result);
+                            return false;
+                        }
+                        stats.stream_option_alt_unsupported = true;
+                        stats.stream_option_alt_reason = result.reason;
+                        stream_step = StreamOptionStep::Done;
+                    } else {
+                        stats.error = "the request for the other encoder family failed: " +
+                                      stream_answer_detail(result);
+                        return false;
+                    }
+                    break;
+                case StreamOptionStep::WaitAltRestoreAnswer:
+                    if (result.code != chast::StreamOptionsCode::Ok) {
+                        stats.error = "restoring the original encoder was refused: " +
+                                      result.reason;
+                        return false;
+                    }
+                    if (!stream_answer_matches(result, stream_base_codec, host_fps,
+                                               chast::StreamQuality::High)) {
+                        stats.error = "restoring the original encoder was answered with " +
+                                      stream_answer_detail(result);
+                        return false;
+                    }
+                    stream_step = StreamOptionStep::WaitAltRestoreUpdate;
+                    break;
+                case StreamOptionStep::WaitStart:
+                case StreamOptionStep::WaitChangeUpdate:
+                case StreamOptionStep::WaitRestoreUpdate:
+                case StreamOptionStep::WaitRestoreSettle:
+                case StreamOptionStep::WaitRateOnlyUpdate:
+                case StreamOptionStep::WaitRateOnlyCheck:
+                case StreamOptionStep::WaitRateOnlyRestoreUpdate:
+                case StreamOptionStep::WaitAltUpdate:
+                case StreamOptionStep::WaitAltRestore:
+                case StreamOptionStep::WaitAltRestoreUpdate:
+                case StreamOptionStep::Done:
+                    // These steps wait on a StreamInfo or on the pacing timer,
+                    // not on an answer.
+                    break;
+            }
+        }
+        if (stream_step == StreamOptionStep::WaitStart && now >= stream_next_send) {
+            if (!send_stream_options(stream_preference(stream_base_codec), 0,
+                                     chast::StreamQuality::High)) {
+                return false;
+            }
+            stream_step = StreamOptionStep::WaitSameCodec;
+        } else if (stream_step == StreamOptionStep::WaitChangeUpdate &&
+                   stats.stream_updates > stream_updates_before) {
+            stats.stream_option_change_update_fps = stats.last_update.framerate;
+            if (stats.last_update.codec != stream_base_codec ||
+                stats.last_update.framerate != capped_fps) {
+                stats.error = std::string("the quality/frame-rate change announced ") +
+                              chast_tools::codec_name(stats.last_update.codec) + " at " +
+                              std::to_string(stats.last_update.framerate) + " fps";
+                return false;
+            }
+            stats.stream_option_change_update_seen = true;
+            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+                                     chast::StreamQuality::High)) {
+                return false;
+            }
+            stream_step = StreamOptionStep::WaitRestore;
+        } else if (stream_step == StreamOptionStep::WaitRestoreUpdate &&
+                   stats.stream_updates > stream_updates_before) {
+            stats.stream_option_restore_update_fps = stats.last_update.framerate;
+            if (stats.last_update.codec != stream_base_codec ||
+                stats.last_update.framerate != host_fps) {
+                stats.error = std::string("the restored stream was announced as ") +
+                              chast_tools::codec_name(stats.last_update.codec) + " at " +
+                              std::to_string(stats.last_update.framerate) + " fps";
+                return false;
+            }
+            stats.stream_option_restore_update_seen = true;
+            stats.stream_option_restore_update_bitrate = stats.last_update.bitrate;
+            // The restore forced an IDR (the frame rate changed). Let it land
+            // before the keyframe baseline, so only pictures caused by the
+            // rate-only request can move the count afterwards.
+            stream_settle_frames = stats.received + 8;
+            stream_settle_at = now + std::chrono::milliseconds(350);
+            stream_step = StreamOptionStep::WaitRestoreSettle;
+        } else if (stream_step == StreamOptionStep::WaitRestoreSettle &&
+                   now >= stream_settle_at && stats.received >= stream_settle_frames) {
+            stream_rate_keyframes_before = stats.keyframes;
+            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+                                     chast::StreamQuality::Balanced)) {
+                return false;
+            }
+            stream_step = StreamOptionStep::WaitRateOnly;
+        } else if (stream_step == StreamOptionStep::WaitRateOnlyUpdate &&
+                   stats.stream_updates > stream_updates_before) {
+            if (stats.last_update.codec != stream_base_codec ||
+                stats.last_update.framerate != host_fps) {
+                stats.error = std::string("the quality-only change re-announced ") +
+                              chast_tools::codec_name(stats.last_update.codec) + " at " +
+                              std::to_string(stats.last_update.framerate) + " fps";
+                return false;
+            }
+            if (stats.last_update.bitrate >= stats.stream_option_restore_update_bitrate) {
+                stats.error = "the Balanced quality step did not lower the announced bitrate";
+                return false;
+            }
+            stats.stream_option_rate_update_seen = true;
+            stats.stream_option_rate_update_bitrate = stats.last_update.bitrate;
+            stream_rate_frames = stats.received + 8;
+            stream_rate_check_at = now + std::chrono::milliseconds(400);
+            stream_step = StreamOptionStep::WaitRateOnlyCheck;
+        } else if (stream_step == StreamOptionStep::WaitRateOnlyCheck &&
+                   now >= stream_rate_check_at && stats.received >= stream_rate_frames) {
+            stats.stream_option_rate_keyframes =
+                stats.keyframes - stream_rate_keyframes_before;
+            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+                                     chast::StreamQuality::High)) {
+                return false;
+            }
+            stream_step = StreamOptionStep::WaitRateOnlyRestore;
+        } else if (stream_step == StreamOptionStep::WaitRateOnlyRestoreUpdate &&
+                   stats.stream_updates > stream_updates_before) {
+            if (stats.last_update.codec != stream_base_codec ||
+                stats.last_update.framerate != host_fps ||
+                stats.last_update.bitrate <= stats.stream_option_rate_update_bitrate) {
+                stats.error = std::string("restoring the quality alone was announced as ") +
+                              chast_tools::codec_name(stats.last_update.codec) + " at " +
+                              std::to_string(stats.last_update.framerate) + " fps, " +
+                              std::to_string(stats.last_update.bitrate / 1000u) + " kbps";
+                return false;
+            }
+            if (!send_stream_options(stream_preference(stream_alt_codec), 0,
+                                     chast::StreamQuality::High)) {
+                return false;
+            }
+            stream_step = StreamOptionStep::WaitAlt;
+        } else if (stream_step == StreamOptionStep::WaitAltUpdate &&
+                   stats.stream_updates > stream_updates_before) {
+            if (stats.last_update.codec != stream_alt_codec) {
+                stats.error = std::string("the other encoder family was announced as ") +
+                              chast_tools::codec_name(stats.last_update.codec);
+                return false;
+            }
+            // The host refuses a second codec rebuild within one second of the
+            // first, so the restore waits that cooldown out.
+            stream_next_send = now + std::chrono::milliseconds(1200);
+            stream_step = StreamOptionStep::WaitAltRestore;
+        } else if (stream_step == StreamOptionStep::WaitAltRestore &&
+                   now >= stream_next_send) {
+            if (!send_stream_options(chast::StreamCodecPreference::Auto, 0,
+                                     chast::StreamQuality::High)) {
+                return false;
+            }
+            stream_step = StreamOptionStep::WaitAltRestoreAnswer;
+        } else if (stream_step == StreamOptionStep::WaitAltRestoreUpdate &&
+                   stats.stream_updates > stream_updates_before) {
+            if (stats.last_update.codec != stream_base_codec) {
+                stats.error = std::string("the restored encoder was announced as ") +
+                              chast_tools::codec_name(stats.last_update.codec);
+                return false;
+            }
+            stats.stream_option_codec_restored = true;
+            stream_step = StreamOptionStep::Done;
+        }
+        return true;
+    };
+
     while (std::chrono::steady_clock::now() < deadline) {
         // The mode probe's answers arrive on the control stream, so take them
         // before waiting on video: a host that is rebuilding capture sends no
@@ -2578,8 +3427,51 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             return fail(stats.download_error.empty() ? stats.error : stats.download_error);
         }
         drain_cursor();
+        drain_desktop_state();
+        drain_privacy_state();
+        drain_sas_result();
+        if (!advance_stream_options()) {
+            return fail(stats.error);
+        }
         drain_display_switch_results();
         drain_audio(std::chrono::milliseconds(0));
+        if (options.microphone && !stats.microphone_started &&
+            std::chrono::steady_clock::now() >= microphone_start_at) {
+            if (chast::Error started = session->start_microphone(stats.microphone_info);
+                !started.ok()) {
+                return fail("start_microphone: " + started.to_string());
+            }
+            stats.microphone_started = true;
+            microphone_capture->start();
+        }
+        if (options.microphone && stats.microphone_started &&
+            std::chrono::steady_clock::now() >= microphone_stop_at) {
+            stop_microphone_probe();
+        }
+        if (stats.privacy_probe) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!privacy_on_sent && now >= privacy_on_at) {
+                stats.privacy_luma_before =
+                    stats.decoded > 0 ? stats.last_frame_luma : -1.0;
+                if (chast::Error sent = session->set_privacy_mode(true); !sent.ok()) {
+                    return fail("set_privacy_mode: " + sent.to_string());
+                }
+                privacy_on_sent = true;
+            } else if (privacy_on_sent && !privacy_off_sent && stats.privacy_on_seen &&
+                       now >= privacy_off_at) {
+                if (chast::Error sent = session->set_privacy_mode(false); !sent.ok()) {
+                    return fail("set_privacy_mode: " + sent.to_string());
+                }
+                privacy_off_sent = true;
+            }
+        }
+        if (stats.sas_probe && !sas_sent && std::chrono::steady_clock::now() >= sas_at) {
+            if (chast::Error requested = session->request_sas(); !requested.ok()) {
+                return fail("request_sas: " + requested.to_string());
+            }
+            sas_sent = true;
+        }
+        drain_microphone();
         {
             const auto probe_now = std::chrono::steady_clock::now();
             if (probe_now - last_probe >= std::chrono::seconds(1)) {
@@ -2605,11 +3497,20 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         chast::FrameHeader header;
         std::vector<uint8_t> payload;
+        // Control slots keep only the newest message, so a long wait on video
+        // can swallow an announcement that a later one replaces. Wake often
+        // enough that each StreamInfo and switch answer is taken on its own.
         chast::Error received =
-            session->receive_frame(header, payload, std::chrono::milliseconds(2000));
+            session->receive_frame(header, payload, std::chrono::milliseconds(250));
         // Audio is on its own stream and does not wake this call; drain it
         // right after every video wait so it never queues behind a stall.
         drain_audio(std::chrono::milliseconds(0));
+        drain_microphone();
+        drain_privacy_state();
+        drain_sas_result();
+        if (!advance_stream_options()) {
+            return fail(stats.error);
+        }
         drain_display_switch_results();
         if (received.status() == chast::Status::WaitTimeout) {
             if (session->async_error().ok() && !session->video_finished() &&
@@ -2679,9 +3580,14 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 !sent_switch.ok()) {
                 return fail("request_display_switch: " + sent_switch.to_string());
             }
+            // The refusal has to reach the host a full rate-limit window after
+            // the accepted request. Measuring from the send rather than from
+            // start keeps them apart when a frame stall delays both.
+            switch_bad_at = (std::max)(switch_bad_at,
+                                       last_frame + std::chrono::milliseconds(1200));
         }
         if (!switch_bad_sent && stats.switch_bad_index != chast::kDisplayAuto &&
-            last_frame - start >= std::chrono::milliseconds(2400)) {
+            last_frame >= switch_bad_at) {
             switch_bad_sent = true;
             if (chast::Error sent_switch =
                     session->request_display_switch(stats.switch_bad_index);
@@ -2767,12 +3673,25 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.digest = chast::mix_frame_hash(stats.digest, frame.hash);
             stats.width = frame.width;
             stats.height = frame.height;
+            if (stats.privacy_probe) {
+                stats.last_frame_luma = frame.luma_mean;
+                if (privacy_on_sent && stats.privacy_on_seen && !privacy_off_sent) {
+                    ++stats.privacy_frames;
+                    stats.privacy_luma_last = frame.luma_mean;
+                } else if (privacy_off_sent && stats.privacy_off_seen) {
+                    ++stats.privacy_frames_after_off;
+                }
+            }
         }
     }
 
     std::vector<chast::DecodedFrame> tail;
     drain_clipboard();
     drain_cursor();
+    drain_desktop_state();
+    drain_privacy_state();
+    drain_sas_result();
+    stop_microphone_probe();
     if (stats.file_probe && file_step != FileStep::Done) {
         // The result normally arrives while video is still streaming; if the
         // stream ended first, give the host time to answer the remaining
@@ -2949,6 +3868,21 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                                 stats.audio_player_error.c_str());
                 }
             }
+            if (options.microphone) {
+                std::printf("receiver: microphone announced=%d started=%d stopped=%d "
+                            "packets=%llu bytes=%llu dropped=%llu send-errors=%llu "
+                            "format=%s %u Hz %u ch\n",
+                            stats.microphone_announced ? 1 : 0,
+                            stats.microphone_started ? 1 : 0,
+                            stats.microphone_stopped ? 1 : 0,
+                            static_cast<unsigned long long>(stats.microphone_packets),
+                            static_cast<unsigned long long>(stats.microphone_bytes),
+                            static_cast<unsigned long long>(stats.microphone_dropped),
+                            static_cast<unsigned long long>(stats.microphone_send_errors),
+                            audio_codec_name(stats.microphone_info.codec),
+                            stats.microphone_info.sample_rate,
+                            stats.microphone_info.channels);
+            }
         }
     }
     stats.ok = stats.error.empty() && stats.received > 0 && stats.decoded > 0 &&
@@ -2967,6 +3901,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
     if (options.play) {
         stats.ok = stats.ok && stats.audio_player_error.empty() && stats.audio_played > 0;
+    }
+    if (options.microphone) {
+        stats.ok = stats.ok && stats.microphone_announced && stats.microphone_started &&
+                   stats.microphone_stopped && stats.microphone_packets > 0 &&
+                   stats.microphone_send_errors == 0;
     }
     return stats;
 }
@@ -4037,6 +4976,292 @@ std::unique_ptr<chast::HostServer> start_probe_host(
     return server;
 }
 
+// A host whose microphone gate is closed must not announce the grant, must
+// refuse the viewer's CMIC open with PermissionDenied, and must keep streaming
+// video afterwards. Real capture is used for the video half, so a rejected
+// microphone cannot be mistaken for a broken stream.
+bool microphone_gate_works(uint16_t port, std::string* detail) {
+    std::string error;
+    std::unique_ptr<chast::HostServer> host = start_probe_host(
+        port, [](chast::HostSettings&) {}, &error);
+    if (!host) {
+        *detail = "microphone-disabled host: " + error;
+        return false;
+    }
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 5000;
+    client_config.pinned_fingerprint = host->status().fingerprint;
+    client_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        host->stop();
+        return false;
+    }
+    chast::ServerInfo info;
+    chast::Error connected = client->connect(std::chrono::seconds(10));
+    chast::Error handshaken =
+        connected.ok() ? client->handshake(info, std::chrono::seconds(10),
+                                           chast::kDisplayAuto)
+                       : connected;
+    if (!handshaken.ok()) {
+        *detail = "the viewer did not connect: " + handshaken.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (info.microphone_enabled) {
+        *detail = "HelloAck granted the microphone despite the closed gate";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    std::unique_ptr<chast::IMicrophoneCapture> capture =
+        make_synthetic_microphone_capture(&error);
+    if (!capture) {
+        *detail = "synthetic microphone: " + error;
+        client.reset();
+        host->stop();
+        return false;
+    }
+    const chast::Error opened = client->start_microphone(capture->info());
+    if (opened.status() != chast::Status::PermissionDenied) {
+        *detail = "the viewer opened CMIC without permission: " + opened.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // The refusal must not have disturbed the video stream.
+    chast::FrameHeader header;
+    std::vector<uint8_t> payload;
+    const chast::Error received =
+        client->receive_frame(header, payload, std::chrono::seconds(10));
+    const bool frame_ok =
+        received.ok() && !payload.empty() && payload.size() == header.payload_size &&
+        chast::crc32(payload.data(), payload.size()) == header.payload_crc32;
+    client.reset();
+    host->stop();
+    if (!frame_ok) {
+        *detail = "video did not survive the refused microphone: " +
+                  (received.ok() ? std::string("frame payload did not verify")
+                                 : received.to_string());
+        return false;
+    }
+    return true;
+}
+
+// A host whose privacy gate is closed must not announce the permission, must
+// refuse the viewer's request with PermissionDenied before anything reaches
+// the wire, and must keep streaming video afterwards. Real capture is used so
+// the closed gate cannot be mistaken for a broken stream.
+bool privacy_gate_works(uint16_t port, std::string* detail) {
+    std::string error;
+    std::unique_ptr<chast::HostServer> host = start_probe_host(
+        port, [](chast::HostSettings&) {}, &error);
+    if (!host) {
+        *detail = "privacy-disabled host: " + error;
+        return false;
+    }
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 5000;
+    client_config.pinned_fingerprint = host->status().fingerprint;
+    client_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        host->stop();
+        return false;
+    }
+    chast::ServerInfo info;
+    chast::Error connected = client->connect(std::chrono::seconds(10));
+    chast::Error handshaken =
+        connected.ok() ? client->handshake(info, std::chrono::seconds(10),
+                                           chast::kDisplayAuto)
+                       : connected;
+    if (!handshaken.ok()) {
+        *detail = "the viewer did not connect: " + handshaken.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (info.privacy_mode_enabled) {
+        *detail = "HelloAck granted privacy mode despite the closed gate";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    const chast::Error requested = client->set_privacy_mode(true);
+    if (requested.status() != chast::Status::PermissionDenied) {
+        *detail = "the viewer requested privacy mode without permission: " +
+                  requested.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // The refusal must not have disturbed the video stream.
+    chast::FrameHeader header;
+    std::vector<uint8_t> payload;
+    const chast::Error received =
+        client->receive_frame(header, payload, std::chrono::seconds(10));
+    const bool frame_ok =
+        received.ok() && !payload.empty() && payload.size() == header.payload_size &&
+        chast::crc32(payload.data(), payload.size()) == header.payload_crc32;
+    client.reset();
+    host->stop();
+    if (!frame_ok) {
+        *detail = "video did not survive the refused privacy mode: " +
+                  (received.ok() ? std::string("frame payload did not verify")
+                                 : received.to_string());
+        return false;
+    }
+    return true;
+}
+
+// A host without a test callback, running outside service mode, cannot reach
+// the secure desktop. It must still answer Unsupported so the viewer gets
+// feedback instead of a timeout, and the stream must keep running.
+bool sas_unsupported_works(uint16_t port, std::string* detail) {
+    std::string error;
+    std::unique_ptr<chast::HostServer> host = start_probe_host(
+        port, [](chast::HostSettings& settings) { settings.allow_input = true; }, &error);
+    if (!host) {
+        *detail = "SAS-unsupported host: " + error;
+        return false;
+    }
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 5000;
+    client_config.pinned_fingerprint = host->status().fingerprint;
+    client_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        host->stop();
+        return false;
+    }
+    chast::ServerInfo info;
+    chast::Error connected = client->connect(std::chrono::seconds(10));
+    chast::Error handshaken =
+        connected.ok() ? client->handshake(info, std::chrono::seconds(10),
+                                           chast::kDisplayAuto)
+                       : connected;
+    if (!handshaken.ok()) {
+        *detail = "the viewer did not connect: " + handshaken.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (!info.input_enabled) {
+        *detail = "the probe host did not grant input";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // Wait for the stream before asking, like a real viewer: the host only
+    // drains control requests from its running session loop.
+    chast::FrameHeader first_header;
+    std::vector<uint8_t> first_payload;
+    const chast::Error first_frame =
+        client->receive_frame(first_header, first_payload, std::chrono::seconds(10));
+    if (!first_frame.ok() || first_payload.empty()) {
+        const chast::HostStatus probe_status = host->status();
+        *detail = "the probe host did not start streaming: " +
+                  (first_frame.ok() ? std::string("empty frame")
+                                    : first_frame.to_string()) +
+                  " (host state " +
+                  std::to_string(static_cast<int>(probe_status.state)) + ", error " +
+                  (probe_status.error.empty() ? std::string("none")
+                                              : probe_status.error) +
+                  ")";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    const chast::Error requested = client->request_sas();
+    if (!requested.ok()) {
+        *detail = "the viewer could not ask for SAS: " + requested.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    chast::SasCode code = chast::SasCode::Ok;
+    std::string reason;
+    bool answered = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (client->take_sas_result(code, reason)) {
+            answered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    // The host publishes its stats on its own cadence, so give the counters a
+    // moment to catch up with the answer that already arrived.
+    uint64_t failures = host->status().stats.sas_failures;
+    const auto count_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (failures != 1 && std::chrono::steady_clock::now() < count_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        failures = host->status().stats.sas_failures;
+    }
+    if (!answered) {
+        const chast::HostStatus probe_status = host->status();
+        *detail = "the host never answered the SAS request (requests " +
+                  std::to_string(probe_status.stats.sas_requests) + ", failures " +
+                  std::to_string(probe_status.stats.sas_failures) + ", error " +
+                  (probe_status.error.empty() ? std::string("none")
+                                              : probe_status.error) +
+                  ")";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (code != chast::SasCode::Unsupported) {
+        *detail = "a host without the secure-desktop path answered code " +
+                  std::to_string(static_cast<unsigned>(code)) +
+                  (reason.empty() ? std::string() : ": " + reason);
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (reason.empty()) {
+        *detail = "the host did not say why SAS is unsupported";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (failures != 1) {
+        *detail = "the host counted " + std::to_string(failures) +
+                  " SAS failure(s), want 1";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    chast::FrameHeader header;
+    std::vector<uint8_t> payload;
+    const chast::Error received =
+        client->receive_frame(header, payload, std::chrono::seconds(10));
+    const bool frame_ok =
+        received.ok() && !payload.empty() && payload.size() == header.payload_size &&
+        chast::crc32(payload.data(), payload.size()) == header.payload_crc32;
+    client.reset();
+    host->stop();
+    if (!frame_ok) {
+        *detail = "video did not survive the unsupported SAS answer: " +
+                  (received.ok() ? std::string("frame payload did not verify")
+                                 : received.to_string());
+        return false;
+    }
+    return true;
+}
+
 // Two-factor and trusted devices through the host settings and policy, then
 // lockout and the allow-list. The trusted device is remembered by a real
 // connection and skips only the second factor: the password is still checked.
@@ -4391,6 +5616,37 @@ int run_verify(const Options& options) {
     // check runs the same path without touching the machine's sound devices.
     local.audio = true;
     local.synthetic_audio = true;
+    if (local.microphone) {
+        // The host plays the uplink into an in-memory recorder, and the viewer
+        // needs about two seconds between opening and closing CMIC.
+        local.microphone_recorder = std::make_shared<MicrophoneRecorder>();
+        if (local.seconds < 5.0) {
+            local.seconds = 5.0;
+        }
+    }
+    if (local.privacy) {
+        // The overlay is held for about a second and a half so frames keep
+        // arriving while it is up, then released; the session must outlive
+        // both answers.
+        if (local.seconds < 6.0) {
+            local.seconds = 6.0;
+        }
+    }
+    if (local.sas) {
+        // The request goes out 1.2 s in; keep the session open long enough for
+        // the answer and the frames that follow it.
+        if (local.seconds < 4.0) {
+            local.seconds = 4.0;
+        }
+    }
+    if (local.stream_options) {
+        // Four serialized requests wait for their answers and the StreamInfo
+        // that follows each applied change; a codec switch also waits out the
+        // host's one-second rebuild cooldown before it is restored.
+        if (local.seconds < 10.0) {
+            local.seconds = 10.0;
+        }
+    }
     // Cover the mid-session description path: the sender re-announces the
     // current stream two seconds in.
     local.reannounce = true;
@@ -4659,6 +5915,43 @@ int run_verify(const Options& options) {
             std::printf("     audio gate probe: %s\n", detail.c_str());
         }
     }
+    if (local.microphone) {
+        std::string detail;
+        const bool passed =
+            microphone_gate_works(static_cast<uint16_t>(probe_base + 18), &detail);
+        check(passed, "a microphone-disabled host refuses CMIC and keeps streaming video");
+        if (!passed) {
+            std::printf("     microphone gate probe: %s\n", detail.c_str());
+        }
+    }
+    if (local.privacy) {
+        std::string detail;
+        const bool passed =
+            privacy_gate_works(static_cast<uint16_t>(probe_base + 19), &detail);
+        check(passed, "a privacy-disabled host refuses the request and keeps streaming video");
+        if (!passed) {
+            std::printf("     privacy gate probe: %s\n", detail.c_str());
+        }
+    }
+    if (local.sas) {
+        check(received.sas_updates >= 1, "the host answered the Ctrl+Alt+Del request");
+        check(received.sas_ok_seen, "the host reported the SAS as sent");
+        check(sent.sas_requests == 1, "the host counted one SAS request");
+        check(sent.sas_failures == 0, "the host recorded no SAS failure");
+        if (!received.sas_ok_seen) {
+            std::printf("     SAS answer: code %u%s%s\n",
+                        static_cast<unsigned>(received.sas_last_code),
+                        received.sas_last_reason.empty() ? "" : ": ",
+                        received.sas_last_reason.c_str());
+        }
+        std::string detail;
+        const bool passed =
+            sas_unsupported_works(static_cast<uint16_t>(probe_base + 20), &detail);
+        check(passed, "a host without the secure-desktop path reports SAS unsupported");
+        if (!passed) {
+            std::printf("     SAS gate probe: %s\n", detail.c_str());
+        }
+    }
     {
         std::string detail;
         const bool passed =
@@ -4699,6 +5992,92 @@ int run_verify(const Options& options) {
           "every received frame carried its capture timestamp");
     check(received.last_frame_age_ms >= -100.0 && received.last_frame_age_ms <= 1000.0,
           "the measured frame age is plausible");
+    check(received.desktop_states > 0 && received.desktop_kind == chast::DesktopKind::Default,
+          "the host reported the Default desktop to the viewer");
+    if (local.privacy) {
+        check(received.privacy_updates >= 2, "the host answered both privacy requests");
+        check(received.privacy_on_seen, "the host reported the overlay as active");
+        check(received.privacy_off_seen && !received.privacy_last_enabled,
+              "the host reported the overlay as off again");
+        check(sent.privacy_mode_changes == 2,
+              "the host applied the on and off requests");
+        check(!sent.privacy_mode_active, "the overlay was gone when the session ended");
+        check(received.privacy_frames > 0,
+              "capture kept running while the overlay was up");
+        const bool shown_desktop = received.privacy_luma_before < 0.0
+                                       ? received.privacy_luma_last > 5.0
+                                       : std::fabs(received.privacy_luma_last -
+                                                   received.privacy_luma_before) <= 30.0;
+        check(shown_desktop, "the captured picture was not the black overlay");
+        check(received.privacy_frames_after_off > 0,
+              "video continued after privacy mode ended");
+        if (!shown_desktop) {
+            std::printf("     privacy frames: %llu under the overlay, luma %.1f before %.1f\n",
+                        static_cast<unsigned long long>(received.privacy_frames),
+                        received.privacy_luma_last, received.privacy_luma_before);
+        }
+    }
+    if (local.stream_options) {
+        const uint16_t host_fps =
+            static_cast<uint16_t>(options.framerate == 0 ? 30 : options.framerate);
+        const uint16_t capped_fps = (std::min)(host_fps, static_cast<uint16_t>(15));
+        check(received.stream_option_results >= 4,
+              "the host answered every stream preference request");
+        check(received.stream_option_change_update_seen &&
+                  received.stream_option_change_fps == capped_fps &&
+                  received.stream_option_change_quality == chast::StreamQuality::Balanced,
+              "a Balanced request with a 15 fps ceiling was applied and announced");
+        check(received.stream_option_restore_update_seen &&
+                  received.stream_option_restore_update_fps == host_fps,
+              "the restored quality and frame rate were announced");
+        check(received.stream_option_rate_update_seen,
+              "a quality-only change was applied and announced");
+        if (received.stream_option_base_codec == chast::VideoCodec::H264) {
+            check(received.stream_option_rate_keyframes == 0,
+                  "a bitrate-only change kept the coded sequence (no IDR)");
+        } else {
+            // mfx-gen's HEVC encoder cannot reset its session, so the host
+            // reopens it and pays the IDR. Other drivers may continue instead.
+            std::printf("     rate-only change: %llu keyframe(s) on %s\n",
+                        static_cast<unsigned long long>(received.stream_option_rate_keyframes),
+                        chast_tools::codec_name(received.stream_option_base_codec));
+        }
+        check(received.stream_option_alt_seen, "the host answered the other encoder family");
+        if (received.stream_option_alt_ok) {
+            check(received.stream_option_codec_restored,
+                  "the host produced the other encoder family and switched back");
+        } else {
+            check(received.stream_option_alt_unsupported,
+                  "the host reported the other encoder family unsupported");
+            if (received.stream_option_alt_unsupported) {
+                const chast::VideoCodec alt_codec =
+                    received.stream_option_base_codec == chast::VideoCodec::Hevc
+                        ? chast::VideoCodec::H264
+                        : chast::VideoCodec::Hevc;
+                std::printf("     encoder probe: %s is unavailable: %s\n",
+                            chast_tools::codec_name(alt_codec),
+                            received.stream_option_alt_reason.c_str());
+            }
+        }
+        const uint64_t expected_requests = received.stream_option_alt_ok ? 7u : 6u;
+        const uint64_t expected_changes = received.stream_option_alt_ok ? 6u : 4u;
+        const uint64_t expected_failures = received.stream_option_alt_unsupported ? 1u : 0u;
+        check(sent.stream_option_requests == expected_requests,
+              "the host counted every stream preference request");
+        check(sent.stream_option_changes == expected_changes,
+              "the host applied exactly the requests that changed the stream");
+        check(sent.stream_option_failures == expected_failures,
+              "the host counted the encoder refusal");
+        if (sent.stream_option_requests != expected_requests ||
+            sent.stream_option_changes != expected_changes ||
+            sent.stream_option_failures != expected_failures) {
+            std::printf("     stream options: %llu request(s), %llu change(s), "
+                        "%llu failure(s)\n",
+                        static_cast<unsigned long long>(sent.stream_option_requests),
+                        static_cast<unsigned long long>(sent.stream_option_changes),
+                        static_cast<unsigned long long>(sent.stream_option_failures));
+        }
+    }
     check(received.target_bitrate > 0, "the viewer saw the server's target bitrate");
     check(sent.target_bitrate > 0, "the server exposed adaptive-bitrate telemetry");
     check(sent.rtt_ms > 0.0, "the host sampled transport RTT");
@@ -4739,7 +6118,8 @@ int run_verify(const Options& options) {
     check(received.width == sent.width && received.height == sent.height,
           "decoded picture size matches the encoded size");
     const uint64_t expected_updates =
-        (resize_expected ? 2 : 1) + (local.display_mode ? 3 : 0);
+        (resize_expected ? 2 : 1) + (local.display_mode ? 3 : 0) +
+        (local.stream_options ? (received.stream_option_alt_ok ? 6u : 4u) : 0u);
     check(sent.stream_updates_sent == expected_updates,
           "the server re-announced the stream mid-session");
     check(received.stream_updates == sent.stream_updates_sent,
@@ -4991,11 +6371,11 @@ int run_verify(const Options& options) {
     if (local.audio) {
         check(sent.audio_announced, "the server announced the synthetic audio stream");
         check(received.audio_announced, "the client saw audio enabled in HelloAck");
-        check(sent.audio_info.codec == chast::AudioCodec::AAC &&
+        check(sent.audio_info.codec == chast::AudioCodec::Opus &&
                   sent.audio_info.sample_rate == 48000 && sent.audio_info.channels == 2 &&
-                  sent.audio_info.frame_samples == 1024,
-              "the announced audio format is AAC-LC 48 kHz stereo, 1024-sample frames");
-        check(!sent.audio_info.extradata.empty(), "the server announced the AAC decoder config");
+                  sent.audio_info.frame_samples == chast::kOpusFrameSamples,
+              "the announced audio format is Opus 48 kHz stereo, 960-sample frames");
+        check(!sent.audio_info.extradata.empty(), "the server announced the Opus config");
         check(sent.audio_packets > 0 && sent.audio_bytes > 0, "the server sent audio packets");
         if (local.display_mode) {
             // Rebuilding capture and the encoder holds the host loop for a
@@ -5022,14 +6402,63 @@ int run_verify(const Options& options) {
               "the decoded tone carried the expected energy");
     }
 
-    const StreamDigest replay = digest_saved_stream(path, sent.codec);
-    if (!replay.error.empty()) {
-        std::printf("     replay: %s\n", replay.error.c_str());
+    if (local.microphone) {
+        check(sent.microphone_enabled, "the server announced the microphone as granted");
+        check(received.microphone_announced,
+              "the client saw the microphone grant in HelloAck");
+        check(received.microphone_started && received.microphone_stopped,
+              "the viewer opened and closed the CMIC stream");
+        check(received.microphone_packets > 0 && received.microphone_send_errors == 0,
+              "the viewer sent every microphone packet it captured");
+        check(received.microphone_info.codec == chast::AudioCodec::Opus &&
+                  received.microphone_info.sample_rate == 48000 &&
+                  received.microphone_info.channels == 1 &&
+                  received.microphone_info.frame_samples == chast::kOpusFrameSamples,
+              "the CMIC stream carried 48 kHz mono Opus in 960-sample packets");
+        check(sent.microphone_streams == 1, "the host accepted exactly one CMIC stream");
+        check(sent.microphone_packets == received.microphone_packets,
+              "every sent microphone packet reached the host");
+        check(sent.microphone_bytes > 0 && sent.microphone_frames > 0,
+              "the host decoded microphone frames");
+        check(!sent.microphone_active, "closing CMIC ended the host's microphone stream");
+        check(sent.microphone_errors == 0 && sent.microphone_underruns == 0,
+              "the host's microphone path reported no errors or underruns");
+        const MicrophoneRecorder::Result& recording = sent.microphone_recording;
+        check(recording.packets > 0 && recording.samples > 0,
+              "the injected host player received decoded microphone audio");
+        check(recording.frequency_hz > 400.0 && recording.frequency_hz < 480.0,
+              "the decoded microphone tone is 440 Hz");
+        check(recording.rms > 1000.0 && recording.rms < 15000.0,
+              "the decoded microphone tone carried the expected energy");
+        if (!(recording.frequency_hz > 400.0 && recording.frequency_hz < 480.0) ||
+            !(recording.rms > 1000.0 && recording.rms < 15000.0)) {
+            std::printf("     microphone recording: %.0f Hz rms %.0f, %llu blocks, "
+                        "%llu samples\n",
+                        recording.frequency_hz, recording.rms,
+                        static_cast<unsigned long long>(recording.packets),
+                        static_cast<unsigned long long>(recording.samples));
+        }
     }
-    check(replay.error.empty(), "the sent stream can be replayed offline");
-    check(replay.units == sent.encoded, "the saved stream splits into the sent access units");
-    check(replay.decoded == received.decoded, "offline decode produces the same frame count");
-    check(replay.digest == received.digest, "offline decode produces the same content digest");
+
+    // A run that exercised the encoder preference switched codec families
+    // mid-session, so the saved file holds two elementary streams back to back.
+    // The single-codec replay below cannot read that by design; the plain
+    // loopback (no --stream-options) keeps the check.
+    if (!local.stream_options) {
+        const StreamDigest replay = digest_saved_stream(path, sent.codec);
+        if (!replay.error.empty()) {
+            std::printf("     replay: %s\n", replay.error.c_str());
+        }
+        check(replay.error.empty(), "the sent stream can be replayed offline");
+        check(replay.units == sent.encoded,
+              "the saved stream splits into the sent access units");
+        check(replay.decoded == received.decoded,
+              "offline decode produces the same frame count");
+        check(replay.digest == received.digest,
+              "offline decode produces the same content digest");
+    } else {
+        std::printf("     replay skipped: the preference probe mixed two codecs in one stream\n");
+    }
 
     if (!keep_file) {
         std::remove(path.c_str());

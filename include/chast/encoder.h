@@ -95,7 +95,15 @@ public:
     // rate control divides the bitrate over the frame rate, so a caller that
     // captures slower must move both or every frame gets a budget for a frame
     // it is not sending. The new rates take effect from the next frame.
-    virtual Error set_rate(UINT bits_per_second, UINT framerate) = 0;
+    //
+    // `keyframe_required` reports whether the next frame has to be an IDR. A
+    // bitrate-only change can continue the coded sequence (the encoder keeps
+    // its reference frames, so the viewer decodes on), while a frame-rate
+    // change, a sequence restart or an encoder reopen cannot. The caller must
+    // honour it: without the IDR a peer that lost the sequence never recovers,
+    // and forcing one anyway wastes a whole frame on every quality step.
+    virtual Error set_rate(UINT bits_per_second, UINT framerate,
+                           bool* keyframe_required = nullptr) = 0;
 
     virtual UINT bitrate() const noexcept = 0;
     virtual UINT framerate() const noexcept = 0;

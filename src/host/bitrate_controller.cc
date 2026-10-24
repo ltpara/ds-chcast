@@ -117,6 +117,45 @@ uint16_t BitrateController::resolution_for(uint32_t target_bps, uint32_t ceiling
 // frame rate and resolution always follow the target, so they are recomputed
 // every call and a ceiling change (audio toggled) shows up without waiting on
 // the transport.
+BitrateDecision BitrateController::set_ceiling(uint32_t ceiling_bps) {
+    const uint32_t next = std::max<uint32_t>(ceiling_bps, floor_bps_);
+    BitrateDecision decision;
+    decision.target_bps = target_bps_;
+    decision.framerate = framerate_;
+    decision.resolution_percent = resolution_percent_;
+    if (next == ceiling_bps_ && target_bps_ == next) {
+        return decision;
+    }
+    ceiling_bps_ = next;
+    target_bps_ = next;
+    framerate_ = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
+    // A preset change is a deliberate budget decision, not congestion, so it
+    // clears both cooldowns: the next sample may adjust immediately.
+    healthy_ms_ = 0;
+    down_cooldown_ms_ = 0;
+    up_cooldown_ms_ = 0;
+    decision.changed = true;
+    decision.target_bps = target_bps_;
+    decision.framerate = framerate_;
+    decision.reason = "quality";
+    return decision;
+}
+
+BitrateDecision BitrateController::set_top_framerate(uint16_t framerate) {
+    ceiling_fps_ = framerate == 0 ? 30 : framerate;
+    const uint16_t next = framerate_for(target_bps_, ceiling_bps_, ceiling_fps_);
+    BitrateDecision decision;
+    decision.target_bps = target_bps_;
+    decision.framerate = next;
+    decision.resolution_percent = resolution_percent_;
+    if (next != framerate_) {
+        framerate_ = next;
+        decision.changed = true;
+        decision.reason = "framerate";
+    }
+    return decision;
+}
+
 BitrateDecision BitrateController::settle() {
     BitrateDecision decision;
     decision.target_bps = target_bps_;

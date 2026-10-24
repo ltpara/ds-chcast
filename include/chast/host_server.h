@@ -111,6 +111,21 @@ struct HostServerStats {
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
     bool audio_recovering = false;
+    // Privacy mode: whether the local screen is masked right now, and how many
+    // viewer requests changed it (refusals included).
+    bool privacy_mode_active = false;
+    uint64_t privacy_mode_changes = 0;
+    // Ctrl+Alt+Del requests and how many were refused or failed. Every request
+    // is answered, so a failed one never ends the session.
+    uint64_t sas_requests = 0;
+    uint64_t sas_failures = 0;
+    // Viewer stream preferences: every request handled, the ones that changed
+    // the encoder or its rate, and the refusals (unsupported codec, failed
+    // rebuild or a busy cooldown). A request that already matched the stream
+    // is counted only in requests.
+    uint64_t stream_option_requests = 0;
+    uint64_t stream_option_changes = 0;
+    uint64_t stream_option_failures = 0;
     // Viewer microphone. microphone_active says whether the viewer currently
     // has a CMIC stream open; the counters cover decoded blocks played on the
     // host, packets and bytes that failed to decode, and the player's
@@ -246,6 +261,11 @@ struct HostServerConfig {
     // the loopback check substitutes a sink that only counts frames so it does
     // not make noise. Created lazily, the first time a viewer opens CMIC.
     std::function<std::unique_ptr<IAudioPlayer>(std::string*)> microphone_player;
+    // Injects Ctrl+Alt+Del. Empty uses the platform SendSAS in service mode and
+    // answers Unsupported otherwise (the tray host cannot call it). The
+    // loopback check substitutes a callback so it never touches the real
+    // secure desktop; returning false fills the reason and reports Failed.
+    std::function<bool(std::string*)> send_sas;
 };
 
 class HostServer {

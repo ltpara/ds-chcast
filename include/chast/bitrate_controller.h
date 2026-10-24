@@ -93,6 +93,19 @@ public:
     uint16_t framerate() const noexcept { return framerate_; }
     uint16_t resolution_percent() const noexcept { return resolution_percent_; }
 
+    // Applies a viewer quality preset: a new ceiling with the target restarted
+    // at it, because the operator just asked for that budget and the ladder
+    // walks it back down from transport samples. The current resolution rung
+    // is kept so a preference change does not trigger an encoder recreation;
+    // the caller's own scale and the next samples settle it. Clamped to the
+    // floor, which is far below any quality preset in practice.
+    BitrateDecision set_ceiling(uint32_t ceiling_bps);
+
+    // Changes the top of the frame-rate ladder (the viewer's cap versus the
+    // host's configured rate). The frame rate is recomputed from the current
+    // target/ceiling ratio; the target itself does not move.
+    BitrateDecision set_top_framerate(uint16_t framerate);
+
     // The ladder: the capture rate for `target_bps` out of `ceiling_bps`.
     // Public because the host recomputes it after a ceiling change (audio
     // toggled) without waiting for a transport sample.

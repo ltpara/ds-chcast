@@ -407,10 +407,14 @@ std::unique_ptr<IAudioDecoder> create_opus_decoder(const AudioInfo& info, std::s
 std::unique_ptr<IAudioEncoder> create_audio_encoder(const AudioEncoderConfig& config,
                                                     std::string* error) {
     switch (config.codec) {
-        case AudioCodec::AAC:
-            return create_aac_encoder(config, error);
         case AudioCodec::Opus:
             return create_opus_encoder(config, error);
+        case AudioCodec::AAC:
+            if (error) {
+                *error =
+                    "unsupported: AAC encoding is disabled; system audio and microphone use Opus";
+            }
+            return nullptr;
     }
     if (error) {
         *error = "unknown audio codec " + std::to_string(static_cast<int>(config.codec));

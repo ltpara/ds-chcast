@@ -18,8 +18,11 @@
 #include "chast/bitrate_controller.h"
 #include "chast/capture.h"
 #include "chast/clipboard.h"
+#include "chast/desktop.h"
 #include "chast/display_mode.h"
 #include "chast/file_transfer.h"
+#include "chast/privacy.h"
+#include "chast/sas.h"
 
 namespace chast {
 
@@ -60,6 +63,44 @@ SecretScope secret_scope(IdentityScope scope) {
                                                 : SecretScope::CurrentUser;
 }
 
+const char* stream_quality_name(StreamQuality quality) {
+    switch (quality) {
+        case StreamQuality::High:
+            return "high";
+        case StreamQuality::Balanced:
+            return "balanced";
+        case StreamQuality::Smooth:
+            return "smooth";
+    }
+    return "unknown";
+}
+
+uint32_t stream_quality_percent(StreamQuality quality) {
+    switch (quality) {
+        case StreamQuality::High:
+            return 100;
+        case StreamQuality::Balanced:
+            return 75;
+        case StreamQuality::Smooth:
+            return 50;
+    }
+    return 100;
+}
+
+const char* sas_code_name(SasCode code) {
+    switch (code) {
+        case SasCode::Ok:
+            return "ok";
+        case SasCode::Denied:
+            return "denied";
+        case SasCode::Unsupported:
+            return "unsupported";
+        case SasCode::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
 uint16_t settings_permissions(const HostSettings& settings) {
     uint16_t mask = 0;
     if (settings.allow_input) {
@@ -76,6 +117,9 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_file_transfer) {
         mask |= kPermissionFileTransfer;
+    }
+    if (settings.allow_privacy_mode) {
+        mask |= kPermissionPrivacyMode;
     }
     return mask;
 }
@@ -142,6 +186,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
     info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
+    info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
     info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
     for (const DisplayInfo& listed : attached) {
@@ -329,6 +374,7 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_file_transfer = settings_.allow_file_transfer;
     quic.allow_audio = settings_.allow_audio;
     quic.allow_microphone = settings_.allow_microphone;
+    quic.allow_privacy_mode = settings_.allow_privacy_mode;
     quic.allow_permission_change = settings_.allow_permission_change;
     quic.dry_run_input = config_.dry_run_input;
     // The one-shot tool reports a refused password instead of waiting for the
@@ -797,6 +843,10 @@ void HostServer::run() {
 bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
     stats.audio_active = false;
+    stats.privacy_mode_active = false;
+    stats.privacy_mode_changes = 0;
+    stats.sas_requests = 0;
+    stats.sas_failures = 0;
     stats.resolution_percent = 100;
     stats.resolution_changes = 0;
     std::vector<DisplayInfo> attached = enumerate_displays();
@@ -812,6 +862,17 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     std::unique_ptr<DisplayModeChange> mode_change = std::make_unique<DisplayModeChange>();
     ModeRestoreGuard mode_guard(mode_change,
                                 [this](const std::string& message) { log(message); });
+
+    // A workstation can already be locked or showing a UAC prompt when the
+    // session starts. The service worker runs as SYSTEM in the user session
+    // and can attach to that desktop, so unattended access keeps working; a
+    // tray host stays on Default and capture creation fails below.
+    {
+        std::string follow_error;
+        if (!follow_input_desktop(&follow_error)) {
+            log("cannot follow the input desktop: " + follow_error);
+        }
+    }
 
     size_t display_index = attached.size();
     const uint16_t requested = session_->requested_display();
@@ -897,6 +958,119 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     std::unique_ptr<ILoopbackCapture> audio_capture;
     AudioInfo audio_info;
     const uint16_t granted_permissions = session_->permissions();
+
+    // Privacy mode is per session and the overlay is owned here: every return
+    // path destroys it, which is what puts the operator's screen back when the
+    // viewer leaves without turning it off first. The transport drops requests
+    // when the host did not opt in, and the permission bit can still be
+    // revoked mid-session, so both are checked before acting.
+    std::unique_ptr<PrivacyOverlay> privacy_overlay;
+    bool privacy_active = false;
+    auto send_privacy_state = [&](bool enabled, PrivacyModeCode code,
+                                  const std::string& reason) -> bool {
+        Error sent = session_->send_privacy_mode_state(enabled, code, reason);
+        if (sent.ok()) {
+            return true;
+        }
+        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "privacy_mode_state: " + sent.to_string();
+        }
+        return false;
+    };
+    auto set_privacy_mode = [&](bool wanted) -> bool {
+        if (!wanted) {
+            if (privacy_active) {
+                privacy_overlay->disable();
+                privacy_active = false;
+                stats.privacy_mode_active = false;
+                ++stats.privacy_mode_changes;
+                log("privacy mode is off: the local screen is visible again");
+            }
+            return send_privacy_state(false, PrivacyModeCode::Ok, {});
+        }
+        if ((session_->permissions() & kPermissionPrivacyMode) == 0) {
+            ++stats.privacy_mode_changes;
+            return send_privacy_state(false, PrivacyModeCode::Denied,
+                                      "privacy mode is not permitted by the host");
+        }
+        if (privacy_active) {
+            return send_privacy_state(true, PrivacyModeCode::Ok, {});
+        }
+        if (!privacy_mode_supported()) {
+            ++stats.privacy_mode_changes;
+            return send_privacy_state(false, PrivacyModeCode::Unsupported,
+                                      "privacy mode needs Windows 10 version 2004 or newer");
+        }
+        if (!privacy_overlay) {
+            std::string overlay_error;
+            privacy_overlay = PrivacyOverlay::create(&overlay_error);
+            if (!privacy_overlay) {
+                ++stats.privacy_mode_changes;
+                log("privacy mode is unavailable: " + overlay_error);
+                return send_privacy_state(false, PrivacyModeCode::Failed, overlay_error);
+            }
+        }
+        std::string enable_error;
+        if (!privacy_overlay->enable(&enable_error)) {
+            ++stats.privacy_mode_changes;
+            log("privacy mode cannot be shown: " + enable_error);
+            return send_privacy_state(false, PrivacyModeCode::Failed, enable_error);
+        }
+        privacy_active = true;
+        stats.privacy_mode_active = true;
+        ++stats.privacy_mode_changes;
+        log("privacy mode is on: the local screen is masked, the viewer keeps the stream");
+        return send_privacy_state(true, PrivacyModeCode::Ok, {});
+    };
+    // Ctrl+Alt+Del is not a key chord here: Windows only accepts it through
+    // SendSAS(), which needs the service worker's LocalSystem token. Every
+    // request is answered, and a refusal or platform failure stays local to
+    // this action instead of ending the session.
+    auto send_sas = [&]() -> bool {
+        ++stats.sas_requests;
+        SasCode code = SasCode::Ok;
+        std::string reason;
+        if ((session_->permissions() & kPermissionInput) == 0) {
+            code = SasCode::Denied;
+            reason = "input control is not permitted by the host";
+        } else if (config_.send_sas) {
+            if (!config_.send_sas(&reason)) {
+                code = SasCode::Failed;
+                if (reason.empty()) {
+                    reason = "the SAS callback failed";
+                }
+            }
+        } else if (!config_.service_mode) {
+            code = SasCode::Unsupported;
+            reason = "Ctrl+Alt+Del is only available through the Windows service";
+        } else if (!sas_available()) {
+            code = SasCode::Unsupported;
+            reason = "this Windows installation does not expose SendSAS";
+        } else if (!send_secure_attention(&reason)) {
+            code = SasCode::Failed;
+        }
+        if (code == SasCode::Ok) {
+            log("Ctrl+Alt+Del sent to the secure desktop");
+        } else {
+            ++stats.sas_failures;
+            log(std::string("Ctrl+Alt+Del refused (") + sas_code_name(code) + "): " +
+                (reason.empty() ? "no reason given" : reason));
+        }
+        Error sent = session_->send_sas_result(code, reason);
+        if (sent.ok()) {
+            return true;
+        }
+        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "sas_result: " + sent.to_string();
+        }
+        return false;
+    };
     // The endpoint stays open for the whole session even if audio was denied
     // at approval: the operator can grant it back live, and rebuilding WASAPI
     // mid-session would cost a fresh announcement for no benefit.
@@ -923,10 +1097,28 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
     // The configured bitrate is the whole session's budget, audio included;
     // the video encoder starts at what is left after reserving it. The
-    // controller only ever lowers that and later climbs back to it.
+    // controller only ever lowers that and later climbs back to it. The base
+    // stays fixed for the session: a viewer quality preset scales it, and a
+    // rebuilt encoder reuses it instead of reading back its own rate.
+    uint32_t base_video_budget =
+        video_budget(encoder->bitrate(), bitrate_reserve(audio_info));
+    uint32_t video_floor_bps = video_floor(encoder->bitrate());
+    const uint16_t configured_fps = static_cast<uint16_t>(encoder->framerate());
+    StreamCodecPreference codec_preference = StreamCodecPreference::Auto;
+    StreamQuality stream_quality = StreamQuality::High;
+    uint16_t stream_fps_cap = 0;
+    auto quality_budget = [&](StreamQuality quality) {
+        return std::max(
+            video_floor_bps,
+            static_cast<uint32_t>(static_cast<uint64_t>(base_video_budget) *
+                                  stream_quality_percent(quality) / 100u));
+    };
+    auto fps_ceiling = [&]() -> uint16_t {
+        return stream_fps_cap == 0 ? configured_fps
+                                   : std::min(configured_fps, stream_fps_cap);
+    };
     uint32_t framerate = encoder->framerate();
-    BitrateController abr(video_budget(encoder->bitrate(), bitrate_reserve(audio_info)),
-                          video_floor(encoder->bitrate()), static_cast<uint16_t>(framerate));
+    BitrateController abr(base_video_budget, video_floor_bps, configured_fps);
     if (abr.ceiling_bps() != encoder->bitrate()) {
         log("video budget " + std::to_string(abr.ceiling_bps() / 1000u) +
             " kbps after reserving audio out of " + std::to_string(encoder->bitrate() / 1000u) +
@@ -977,6 +1169,20 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.session_permissions = now_mask;
         }
+        // A revoked permission must take the mask down with it: leaving the
+        // operator's screen black after they turned the feature off would be
+        // a privacy mode they cannot cancel from the viewer.
+        if (privacy_active && (now_mask & kPermissionPrivacyMode) == 0) {
+            privacy_overlay->disable();
+            privacy_active = false;
+            stats.privacy_mode_active = false;
+            ++stats.privacy_mode_changes;
+            log("privacy mode is off: the permission was revoked");
+            if (!send_privacy_state(false, PrivacyModeCode::Denied,
+                                    "privacy mode was turned off by the host")) {
+                return false;
+            }
+        }
         // Audio and clipboard availability travel in the stream description.
         // A viewer that was denied audio at approval has no AAC config yet,
         // so a fresh description is what makes a restore usable.
@@ -1014,7 +1220,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // The capture cadence follows the controller's frame rate; 0 disables
     // pacing entirely (capture() then waits on the desktop itself).
     auto frame_duration = [&](uint32_t fps) {
-        return settings_.framerate == 0 || fps == 0
+        // settings_.framerate == 0 means the host did not ask for pacing; a
+        // viewer cap still needs it, or the cap would only reach the encoder.
+        return (settings_.framerate == 0 && stream_fps_cap == 0) || fps == 0
                    ? Clock::duration::zero()
                    : std::chrono::duration_cast<Clock::duration>(
                          std::chrono::duration<double>(1.0 / static_cast<double>(fps)));
@@ -1928,7 +2136,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                         log("microphone: Opus " +
                             std::to_string(info.sample_rate / 1000u) + " kHz, " +
                             std::to_string(info.channels) + " ch, " +
-                            std::to_string(info.bitrate / 1000u) + " kbps");
+                            std::to_string(info.frame_samples) + " samples/frame");
                     }
                 }
             }
@@ -2221,9 +2429,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return refuse(DisplaySwitchCode::Failed,
                           "encoder creation failed: " + switch_error);
         }
-        if (next_encoder->codec() != settings_.codec) {
-            log(std::string("the encoder fell back: requested ") + codec_name(settings_.codec) +
-                ", producing " + codec_name(next_encoder->codec()));
+        if (next_encoder->codec() != encoder_config.codec) {
+            log(std::string("the encoder fell back: requested ") +
+                codec_name(encoder_config.codec) + ", producing " +
+                codec_name(next_encoder->codec()));
         }
         // The replacement starts at the configured bitrate, so the audio
         // reserve and any ABR step-down have to be applied again.
@@ -2542,9 +2751,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (!mode_encoder) {
             return rollback("encoder creation failed: " + mode_error);
         }
-        if (mode_encoder->codec() != settings_.codec) {
-            log(std::string("the encoder fell back: requested ") + codec_name(settings_.codec) +
-                ", producing " + codec_name(mode_encoder->codec()));
+        if (mode_encoder->codec() != encoder_config.codec) {
+            log(std::string("the encoder fell back: requested ") +
+                codec_name(encoder_config.codec) + ", producing " +
+                codec_name(mode_encoder->codec()));
         }
         // The replacement starts at the configured bitrate; the audio reserve
         // and the ABR's current step have to be applied again.
@@ -2602,6 +2812,210 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             " at " + std::to_string(refresh_hz) + " Hz, " +
             std::to_string(stream_info.width) + "x" + std::to_string(stream_info.height) +
             " coded");
+        return true;
+    };
+
+    // The viewer's own picture preferences. A codec change builds the
+    // replacement beside the running encoder and swaps only after it produced
+    // the requested family; quality and frame rate are set_rate calls that
+    // need no rebuild. Every request is answered exactly once.
+    bool codec_changed_once = false;
+    Clock::time_point last_codec_change_at{};
+    auto apply_stream_options = [&](const StreamOptions& options) -> bool {
+        ++stats.stream_option_requests;
+        const auto now = Clock::now();
+        auto answer = [&](StreamOptionsCode code, const std::string& reason) -> bool {
+            StreamOptionsResult result;
+            result.code = code;
+            result.codec = encoder ? encoder->codec() : settings_.codec;
+            result.fps = fps_ceiling();
+            result.quality = stream_quality;
+            result.reason = reason;
+            Error sent = session_->send_stream_options_result(result);
+            if (sent.ok()) {
+                return true;
+            }
+            if (sent.status() == Status::Unavailable ||
+                sent.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "send_stream_options_result: " + sent.to_string();
+            }
+            return false;
+        };
+        auto refuse = [&](StreamOptionsCode code, const std::string& reason) {
+            ++stats.stream_option_failures;
+            log("stream options refused: " + reason);
+            return answer(code, reason);
+        };
+
+        const bool quality_change = options.quality != stream_quality;
+        const bool cap_change = options.max_fps != stream_fps_cap;
+        const bool preference_change = options.codec != codec_preference;
+        if (!quality_change && !cap_change && !preference_change) {
+            return answer(StreamOptionsCode::Ok, std::string());
+        }
+
+        VideoCodec wanted_codec = encoder->codec();
+        bool codec_rebuild = false;
+        if (preference_change) {
+            if (options.codec == StreamCodecPreference::Auto) {
+                wanted_codec = settings_.codec;
+            } else {
+                wanted_codec = options.codec == StreamCodecPreference::Hevc
+                                   ? VideoCodec::Hevc
+                                   : VideoCodec::H264;
+            }
+            codec_rebuild = wanted_codec != encoder->codec();
+        }
+        if (codec_rebuild && codec_changed_once &&
+            now - last_codec_change_at < std::chrono::seconds(1)) {
+            return refuse(StreamOptionsCode::Busy, "a codec change just happened");
+        }
+
+        // Work the new rate out on a copy first: a refused codec rebuild must
+        // leave the running stream exactly as it was.
+        BitrateController next_abr = abr;
+        bool rate_change = false;
+        if (cap_change) {
+            const uint16_t top = options.max_fps == 0
+                                     ? configured_fps
+                                     : std::min(configured_fps, options.max_fps);
+            rate_change = next_abr.set_top_framerate(top).changed || rate_change;
+        }
+        if (quality_change) {
+            rate_change =
+                next_abr.set_ceiling(quality_budget(options.quality)).changed || rate_change;
+        }
+
+        std::unique_ptr<IVideoEncoder> replacement;
+        if (codec_rebuild) {
+            EncoderConfig next_config = encoder_config;
+            next_config.codec = wanted_codec;
+            next_config.width = encoder->width();
+            next_config.height = encoder->height();
+            // Start the replacement at the rate the stream runs at; runtimes
+            // that cannot reprogram a session would otherwise open it twice.
+            next_config.bitrate = next_abr.target_bps();
+            if (next_abr.framerate() != 0) {
+                next_config.framerate = next_abr.framerate();
+            }
+            const AdapterDevice codec_adapter = capturer->adapter_device();
+            std::string codec_error;
+            replacement = create_encoder(codec_adapter.device, next_config, &codec_error);
+            if (!replacement) {
+                return refuse(options.codec == StreamCodecPreference::Hevc
+                                  ? StreamOptionsCode::Unsupported
+                                  : StreamOptionsCode::Failed,
+                              "encoder creation failed: " + codec_error);
+            }
+            if (options.codec != StreamCodecPreference::Auto &&
+                replacement->codec() != wanted_codec) {
+                log(std::string("the encoder fell back: requested ") +
+                    codec_name(wanted_codec) + ", producing " +
+                    codec_name(replacement->codec()));
+                return refuse(StreamOptionsCode::Unsupported,
+                              std::string("the host cannot produce ") +
+                                  codec_name(wanted_codec));
+            }
+            const uint16_t target_fps = next_abr.framerate();
+            if (replacement->bitrate() != next_abr.target_bps() ||
+                (target_fps != 0 && replacement->framerate() != target_fps)) {
+                Error rated = replacement->set_rate(next_abr.target_bps(), target_fps);
+                if (!rated.ok()) {
+                    return refuse(StreamOptionsCode::Failed,
+                                  "cannot apply the current bitrate: " + rated.to_string());
+                }
+            }
+        }
+
+        bool applied = false;
+        // A replacement encoder always starts from a fresh reference state;
+        // only set_rate on the running encoder can report a continued
+        // sequence that needs no IDR.
+        bool keyframe_required = true;
+        if (replacement) {
+            encoder = std::move(replacement);
+            abr = next_abr;
+            encoder_config.codec = options.codec == StreamCodecPreference::Auto
+                                       ? settings_.codec
+                                       : wanted_codec;
+            codec_preference = options.codec;
+            codec_changed_once = true;
+            last_codec_change_at = now;
+            // A new encoder starts from a fresh reference state. Two IDRs let
+            // the viewer decode once it applied the StreamInfo announcing the
+            // codec change.
+            have_input = false;
+            extra_idrs = 1;
+            applied = true;
+        } else if (rate_change) {
+            Error rated = encoder->set_rate(next_abr.target_bps(), next_abr.framerate(),
+                                            &keyframe_required);
+            if (!rated.ok()) {
+                return refuse(StreamOptionsCode::Failed,
+                              "cannot apply the current bitrate: " + rated.to_string());
+            }
+            abr = next_abr;
+            applied = true;
+        } else if (preference_change) {
+            // No rebuild was needed, but later capture rebuilds must follow
+            // the preference that just became current.
+            encoder_config.codec = options.codec == StreamCodecPreference::Auto
+                                       ? settings_.codec
+                                       : wanted_codec;
+            codec_preference = options.codec;
+        }
+
+        stream_quality = options.quality;
+        stream_fps_cap = options.max_fps;
+
+        if (applied) {
+            ++stats.stream_option_changes;
+            stats.target_bitrate = encoder->bitrate();
+            stats.framerate = static_cast<uint16_t>(abr.framerate());
+            framerate = abr.framerate();
+            frame_interval = frame_duration(framerate);
+            next_frame_due = now + frame_interval;
+            force_keyframe = force_keyframe || keyframe_required;
+            stream_info =
+                describe_stream(attached, capturer->display(), *encoder,
+                                stream_info.source_width, stream_info.source_height,
+                                static_cast<uint16_t>(framerate), session_->permissions(),
+                                audio_info);
+            publish_stream(stream_info, find_display(attached, capturer->display()),
+                           display_name_utf8(capturer->display()));
+            if (config_.stream_announced) {
+                config_.stream_announced(stream_info);
+            }
+            log("stream options: " + std::string(codec_name(encoder->codec())) + ", " +
+                std::to_string(stream_info.bitrate / 1000u) + " kbps at " +
+                std::to_string(framerate) + " fps, quality " +
+                stream_quality_name(stream_quality) +
+                (stream_fps_cap == 0
+                     ? ""
+                     : " (viewer cap " + std::to_string(stream_fps_cap) + " fps)"));
+        }
+
+        if (!answer(StreamOptionsCode::Ok, std::string())) {
+            return false;
+        }
+        if (applied) {
+            Error refreshed = session_->refresh_stream(stream_info);
+            if (!refreshed.ok()) {
+                if (refreshed.status() == Status::Unavailable ||
+                    refreshed.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                } else {
+                    ++stats.send_errors;
+                    *error = "refresh_stream: " + refreshed.to_string();
+                }
+                return false;
+            }
+            ++stats.stream_updates;
+            publish_stats(stats);
+        }
         return true;
     };
 
@@ -2666,7 +3080,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
 
         if (rate_changed) {
-            Error applied = encoder->set_rate(decision.target_bps, decision.framerate);
+            bool keyframe_required = true;
+            Error applied =
+                encoder->set_rate(decision.target_bps, decision.framerate, &keyframe_required);
             if (!applied.ok()) {
                 log("adaptive bitrate: cannot apply " +
                     std::to_string(decision.target_bps / 1000u) + " kbps at " +
@@ -2677,11 +3093,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             stats.target_bitrate = decision.target_bps;
             stats.framerate = decision.framerate;
             ++stats.abr_changes;
-            // The encoder reset invalidates its reference state, and the
-            // capture cadence has to follow the rate the encoder now divides
-            // its budget over, or every frame keeps a budget for a frame
-            // nobody sends.
-            force_keyframe = true;
+            // The capture cadence has to follow the rate the encoder now
+            // divides its budget over, or every frame keeps a budget for a
+            // frame nobody sends. A pure bitrate step continues the coded
+            // sequence, so an IDR is only forced when the encoder says the
+            // references are gone.
+            force_keyframe = force_keyframe || keyframe_required;
             framerate = decision.framerate;
             frame_interval = frame_duration(framerate);
             next_frame_due = now + frame_interval;
@@ -2741,6 +3158,90 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
+    // The viewer is told which desktop is on screen; the first report is sent
+    // even when it is Default so a session that starts at the lock screen
+    // shows its banner without waiting for a change.
+    DesktopKind reported_desktop = static_cast<DesktopKind>(0xFF);
+    bool desktop_paused = false;
+    bool desktop_reinitialized = false;
+    auto send_desktop_state = [&](DesktopKind kind) -> bool {
+        if (kind == reported_desktop) {
+            return true;
+        }
+        Error sent = session_->send_desktop_state(kind);
+        if (!sent.ok()) {
+            if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "send_desktop_state: " + sent.to_string();
+            }
+            return false;
+        }
+        reported_desktop = kind;
+        return true;
+    };
+    // Follows the input desktop: a lock screen or UAC prompt moves input to a
+    // secure desktop, where the capturer has to be built again. When this
+    // process may not open that desktop (a tray host), capture pauses instead
+    // of ending the session and the same check resumes it after unlock.
+    auto sync_desktop = [&](bool force_report) -> bool {
+        if (force_report) {
+            reported_desktop = static_cast<DesktopKind>(0xFF);
+        }
+        const InputDesktopStatus status = input_desktop_status();
+        const DesktopKind kind =
+            status.kind == InputDesktopKind::Default
+                ? DesktopKind::Default
+                : status.kind == InputDesktopKind::Secure ? DesktopKind::Secure
+                                                          : DesktopKind::Unavailable;
+        if (!send_desktop_state(kind)) {
+            return false;
+        }
+        std::string follow_error;
+        bool switched = false;
+        if (!follow_input_desktop(&follow_error, &switched)) {
+            if (!desktop_paused) {
+                desktop_paused = true;
+                log("capture paused: cannot follow the input desktop: " + follow_error);
+            }
+            return true;
+        }
+        desktop_reinitialized = false;
+        if (!switched && !desktop_paused) {
+            return true;
+        }
+        if (switched) {
+            log("the input desktop is now " +
+                (status.name.empty() ? std::string("not Default") : "\"" + status.name + "\""));
+        }
+        Error rebuilt = capturer->reinitialize();
+        if (!rebuilt.ok()) {
+            if (!desktop_paused) {
+                log("capture paused: cannot capture the current desktop yet: " +
+                    rebuilt.to_string());
+            }
+            desktop_paused = true;
+            return true;
+        }
+        if (desktop_paused) {
+            log("capture resumed");
+        }
+        desktop_paused = false;
+        desktop_reinitialized = true;
+        encoder.reset();
+        have_input = false;
+        force_keyframe = true;
+        next_frame_due = Clock::now();
+        return true;
+    };
+    if (!sync_desktop(true)) {
+        const bool clean = error->empty();
+        drain_peer();
+        return clean;
+    }
+    auto next_desktop_check = Clock::now() + std::chrono::seconds(1);
+
     // The frame captured before the handshake is the first one on the wire.
     ++stats.frames;
     if (initial_pointer_only) {
@@ -2785,10 +3286,39 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             drain_peer();
             return clean;
         }
+        StreamOptions options;
+        if (session_->take_stream_options_request(options) &&
+            !apply_stream_options(options)) {
+            const bool clean = error->empty();
+            drain_peer();
+            return clean;
+        }
         if (!apply_pending_permissions()) {
             const bool clean = error->empty();
             drain_peer();
             return clean;
+        }
+        bool privacy_requested = false;
+        if (session_->take_privacy_mode_request(privacy_requested) &&
+            !set_privacy_mode(privacy_requested)) {
+            const bool clean = error->empty();
+            drain_peer();
+            return clean;
+        }
+        while (session_->take_sas_request()) {
+            if (!send_sas()) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
+        }
+        if (now >= next_desktop_check) {
+            next_desktop_check = now + std::chrono::seconds(1);
+            if (!sync_desktop(false)) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
         }
         drain_audio();
         drain_microphone();
@@ -2858,6 +3388,15 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             }
         }
 
+        if (desktop_paused) {
+            // The desktop that receives input cannot be captured from here
+            // (the tray at the lock screen). Keep the session, input and audio
+            // alive and retry from the next desktop check instead of asking a
+            // capturer that has no desktop to duplicate.
+            sleep_unless_stopping(std::chrono::milliseconds(200));
+            continue;
+        }
+
         if (frame_interval != Clock::duration::zero()) {
             const auto wait_now = Clock::now();
             if (next_frame_due > wait_now) {
@@ -2886,6 +3425,16 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 continue;
             case CaptureResult::ReinitNeeded: {
                 log("reinitializing: " + capturer->last_error().to_string());
+                // The common cause is a desktop switch: the duplication was
+                // attached to the old desktop. Follow first, then rebuild.
+                if (!sync_desktop(false)) {
+                    const bool clean = error->empty();
+                    drain_peer();
+                    return clean;
+                }
+                if (desktop_paused || desktop_reinitialized) {
+                    continue;
+                }
                 Error err = capturer->reinitialize();
                 if (!err.ok()) {
                     *error = "reinit failed: " + err.to_string();
@@ -2897,10 +3446,21 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 force_keyframe = true;
                 continue;
             }
-            case CaptureResult::FatalError:
-                *error = "capture failed: " + capturer->last_error().to_string();
+            case CaptureResult::FatalError: {
+                const std::string failure = capturer->last_error().to_string();
+                log("capture failed: " + failure);
+                if (!sync_desktop(false)) {
+                    const bool clean = error->empty();
+                    drain_peer();
+                    return clean;
+                }
+                if (desktop_paused || desktop_reinitialized) {
+                    continue;
+                }
+                *error = "capture failed: " + failure;
                 drain_peer();
                 return false;
+            }
             case CaptureResult::Frame:
                 break;
         }
@@ -2922,14 +3482,21 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 drain_peer();
                 return false;
             }
-            // A rebuilt encoder starts from the configured bitrate again, so
-            // the controller starts over with the budget as its ceiling and
-            // the configured frame rate at the top of the ladder.
-            abr = BitrateController(video_budget(encoder->bitrate(), bitrate_reserve(audio_info)),
-                                    video_floor(encoder->bitrate()),
-                                    static_cast<uint16_t>(encoder->framerate()),
-                                    stats.resolution_percent);
-            framerate = encoder->framerate();
+            if (encoder->codec() != encoder_config.codec) {
+                log(std::string("the encoder fell back: requested ") +
+                    codec_name(encoder_config.codec) + ", producing " +
+                    codec_name(encoder->codec()));
+            }
+            // A rebuilt encoder starts from the configured bitrate again, and
+            // an automatic rate may differ after a desktop or size change.
+            // Recompute the session budget from it, then reapply the viewer's
+            // quality preset and frame-rate cap.
+            base_video_budget =
+                video_budget(encoder->bitrate(), bitrate_reserve(audio_info));
+            video_floor_bps = video_floor(encoder->bitrate());
+            abr = BitrateController(quality_budget(stream_quality), video_floor_bps,
+                                    fps_ceiling(), stats.resolution_percent);
+            framerate = abr.framerate();
             frame_interval = frame_duration(framerate);
             next_frame_due = Clock::now() + frame_interval;
             if (abr.ceiling_bps() != encoder->bitrate()) {
