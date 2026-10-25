@@ -39,6 +39,8 @@ void main() {
     bool fileAvailable = true,
     bool fileActive = false,
     VoidCallback? onSendFile,
+    bool chatOpen = false,
+    VoidCallback? onToggleChat,
     bool audioAvailable = true,
     bool audioMuted = false,
     String audioDevice = '',
@@ -109,6 +111,8 @@ void main() {
           onSpecialAction: onSpecialAction ?? (_) {},
           onToggleClipboard: () {},
           onSendFile: onSendFile ?? () {},
+          chatOpen: chatOpen,
+          onToggleChat: onToggleChat ?? () {},
           onToggleAudio: () {},
           onToggleMicrophone: () {},
           onTogglePrivacy: () {},
@@ -290,6 +294,30 @@ void main() {
     ));
     await tester.tap(find.byIcon(Icons.upload_file_rounded));
     expect(taps, 1);
+  });
+
+  testWidgets('the chat button mirrors the panel state and reports taps',
+      (WidgetTester tester) async {
+    int taps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onToggleChat: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.forum_outlined));
+    expect(taps, 1);
+
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      chatOpen: true,
+      onToggleChat: () => ++taps,
+    ));
+    expect(find.byIcon(Icons.forum_outlined), findsNothing);
+    await tester.tap(find.byIcon(Icons.forum_rounded));
+    expect(taps, 2);
   });
 
   testWidgets('the special-key menu reports the chosen shortcut',

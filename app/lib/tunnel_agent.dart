@@ -116,6 +116,7 @@ class TunnelAgent {
     required String server,
     required String hostId,
     required TunnelMode mode,
+    String key = '',
   }) {
     return <String>[
       'viewer',
@@ -127,6 +128,7 @@ class TunnelAgent {
       '$loopback:0',
       '--mode',
       mode.name,
+      if (key.isNotEmpty) ...<String>['--server-key', key],
     ];
   }
 
@@ -144,7 +146,12 @@ class TunnelAgent {
     }
     final String exe = executable ?? defaultExecutable();
     final List<String> args = argumentOverride ??
-        arguments(server: server.url, hostId: hostId, mode: server.mode);
+        arguments(
+          server: server.url,
+          hostId: hostId,
+          mode: server.mode,
+          key: server.key,
+        );
     final Process process;
     try {
       process = await Process.start(exe, args, runInShell: false);

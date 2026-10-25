@@ -254,6 +254,10 @@ class ViewerStatus {
     this.sasCode = 0,
     this.sasError = '',
     this.sasUpdates = 0,
+    this.chatSent = 0,
+    this.chatReceived = 0,
+    this.chatFailures = 0,
+    this.chatError = '',
     this.displaySwitches = 0,
     this.displaySwitchFailures = 0,
     this.displaySwitchError = '',
@@ -486,6 +490,16 @@ class ViewerStatus {
   final int sasCode;
   final String sasError;
   final int sasUpdates;
+
+  /// Session chat counters. Both directions are ungated once the host admits
+  /// the viewer. [chatFailures] counts queued lines the transport failed to
+  /// send, with [chatError] explaining the most recent one. Inbound text is
+  /// taken separately through [ViewerBridge.takeChat], so a status poll never
+  /// carries conversation content.
+  final int chatSent;
+  final int chatReceived;
+  final int chatFailures;
+  final String chatError;
 
   /// Display switches the host accepted this session, and the refusals the
   /// engine saw (including requests it could not send), with the host's reason
@@ -772,6 +786,10 @@ class ViewerStatus {
       sasCode: asInt(map['sasCode']),
       sasError: asString(map['sasError']),
       sasUpdates: asInt(map['sasUpdates']),
+      chatSent: asInt(map['chatSent']),
+      chatReceived: asInt(map['chatReceived']),
+      chatFailures: asInt(map['chatFailures']),
+      chatError: asString(map['chatError']),
       displaySwitches: asInt(map['displaySwitches']),
       displaySwitchFailures: asInt(map['displaySwitchFailures']),
       displaySwitchError: asString(map['displaySwitchError']),
@@ -1034,6 +1052,20 @@ class ViewerBridge {
   static Future<bool> sendSas() async {
     final bool? queued = await _channel.invokeMethod<bool>('sendSas');
     return queued ?? false;
+  }
+
+  /// Queues one UTF-8 chat line for the host. False means it was not queued:
+  /// no streaming session, empty or oversized text (over 4096 bytes), or a
+  /// full outgoing queue. The host's lines arrive through [takeChat].
+  static Future<bool> sendChat(String text) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendChat', text);
+    return queued ?? false;
+  }
+
+  /// Pops the oldest line the host sent, or null when none is waiting. The
+  /// page drains this on its poll timer, so a burst arrives in order.
+  static Future<String?> takeChat() {
+    return _channel.invokeMethod<String>('takeChat');
   }
 
   /// While remote control is on, an active local IME must not turn physical

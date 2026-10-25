@@ -62,6 +62,7 @@ constexpr UINT kTunnelMessage = WM_APP + 4;
 constexpr UINT kTunnelExitMessage = WM_APP + 5;
 constexpr UINT kSecurityMessage = WM_APP + 6;
 constexpr UINT kSecurityPageMessage = WM_APP + 7;
+constexpr UINT kChatMessage = WM_APP + 8;
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -96,7 +97,14 @@ enum ControlId {
     kReloadButton,
     kHideButton,
     kQuitButton,
+    kChatButton,
     kLogEdit,
+};
+
+enum ChatDialogId {
+    kChatHistory = 5000,
+    kChatInput,
+    kChatSend,
 };
 
 struct HostApp {
@@ -151,9 +159,18 @@ struct HostApp {
     std::string tunnel_viewer_remote;
     std::string tunnel_error;
     std::deque<std::wstring> log_lines;
+    // Chat is a modeless window so the operator can keep it open next to the
+    // main page. History is cleared when a new viewer starts streaming.
+    HWND chat_window = nullptr;
+    HWND chat_history = nullptr;
+    HWND chat_input = nullptr;
+    bool chat_live = false;
+    std::deque<std::wstring> chat_lines;
 };
 
 HostApp* g_app = nullptr;
+
+void append_chat_line(const std::wstring& text);
 
 int px(int value) {
     return MulDiv(value, g_app->dpi, 96);
@@ -228,6 +245,13 @@ void server_token_changed(const std::string& token) {
 void server_trusted_devices_changed(const std::vector<TrustedDevice>& devices) {
     auto* copy = new std::vector<TrustedDevice>(devices);
     if (!PostMessageW(g_app->window, kSecurityMessage, 0, reinterpret_cast<LPARAM>(copy))) {
+        delete copy;
+    }
+}
+
+void server_chat(const std::string& text) {
+    auto* copy = new std::string(text);
+    if (!PostMessageW(g_app->window, kChatMessage, 0, reinterpret_cast<LPARAM>(copy))) {
         delete copy;
     }
 }
@@ -615,6 +639,7 @@ void start_server() {
     config.log = server_log;
     config.token_changed = server_token_changed;
     config.trusted_devices_changed = server_trusted_devices_changed;
+    config.chat_message = server_chat;
     std::string error;
     g_app->server = HostServer::create(std::move(config), &error);
     if (!g_app->server) {
@@ -812,6 +837,19 @@ void refresh_ui() {
         status = g_app->server->status();
     }
     const bool running = g_app->server && g_app->server->running();
+
+    // Chat history belongs to one viewer: clear it when a session starts so a
+    // later viewer never sees the previous conversation.
+    const bool streaming = g_app->server != nullptr && status.state == HostState::Streaming;
+    if (streaming != g_app->chat_live) {
+        g_app->chat_live = streaming;
+        if (streaming) {
+            g_app->chat_lines.clear();
+            append_chat_line(L"—— 查看者已连接，可以开始聊天 ——");
+        } else {
+            append_chat_line(L"—— 查看者已断开 ——");
+        }
+    }
 
     set_text(g_app->state_label, L"状态：" + (g_app->server ? state_text(status.state, status)
                                                            : std::wstring(L"已停止")));
@@ -1033,8 +1071,10 @@ void create_controls() {
 
     g_app->security_summary = add_control(L"STATIC", L"接入：—", SS_LEFT, 0, 24, 330, 572, 20,
                                           kSecuritySummary, nullptr);
-    g_app->session_label = add_control(L"STATIC", L"本次会话权限：—", SS_LEFT, 0, 24, 352, 572,
+    g_app->session_label = add_control(L"STATIC", L"本次会话权限：—", SS_LEFT, 0, 24, 352, 440,
                                        20, kSessionLabel, nullptr);
+    add_control(L"BUTTON", L"会话聊天…", BS_PUSHBUTTON, 0, 476, 348, 120, 28, kChatButton,
+                nullptr);
 
     g_app->input_check = add_control(L"BUTTON", L"接受远程输入", BS_AUTOCHECKBOX, 0, 24, 380,
                                      140, 24, kInputCheck, nullptr);
@@ -1123,6 +1163,180 @@ std::string trim_ascii(std::string text) {
     }
     const size_t last = text.find_last_not_of(" \t\r\n");
     return text.substr(first, last - first + 1);
+}
+
+constexpr wchar_t kChatWindowClass[] = L"ChastChatWindow";
+
+void chat_refresh_history() {
+    if (g_app->chat_history == nullptr) {
+        return;
+    }
+    std::wstring all;
+    for (const std::wstring& line : g_app->chat_lines) {
+        all += line;
+        all += L"\r\n";
+    }
+    SetWindowTextW(g_app->chat_history, all.c_str());
+    SendMessageW(g_app->chat_history, EM_SETSEL, static_cast<WPARAM>(all.size()),
+                 static_cast<LPARAM>(all.size()));
+    SendMessageW(g_app->chat_history, EM_SCROLLCARET, 0, 0);
+}
+
+void append_chat_line(const std::wstring& text) {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[16]{};
+    swprintf_s(stamp, std::size(stamp), L"[%02u:%02u] ", now.wHour, now.wMinute);
+    g_app->chat_lines.push_back(std::wstring(stamp) + text);
+    while (g_app->chat_lines.size() > 300) {
+        g_app->chat_lines.pop_front();
+    }
+    chat_refresh_history();
+}
+
+void send_chat_from_input();
+
+LRESULT CALLBACK chat_input_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+                                 UINT_PTR, DWORD_PTR) {
+    if (message == WM_KEYDOWN && wparam == VK_RETURN) {
+        send_chat_from_input();
+        return 0;
+    }
+    return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void send_chat_from_input() {
+    if (g_app->server == nullptr) {
+        append_chat_line(L"系统：共享没有运行，消息未发送");
+        return;
+    }
+    const std::string text = trim_ascii(narrow(control_text(g_app->chat_input)));
+    if (!valid_chat_text(text)) {
+        append_chat_line(L"系统：消息不能为空，最长 4096 字节");
+        return;
+    }
+    if (!g_app->server->send_chat(text)) {
+        append_chat_line(L"系统：没有正在连接的查看者，或待发队列已满");
+        return;
+    }
+    append_chat_line(L"[主机] " + widen(text));
+    SetWindowTextW(g_app->chat_input, L"");
+    SetFocus(g_app->chat_input);
+}
+
+LRESULT CALLBACK chat_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+        case WM_COMMAND:
+            if (HIWORD(wparam) == 0 && LOWORD(wparam) == kChatSend) {
+                send_chat_from_input();
+            }
+            return 0;
+        case WM_CLOSE:
+            // Keep the window and its history; a new session clears both.
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        case WM_DESTROY:
+            g_app->chat_window = nullptr;
+            g_app->chat_history = nullptr;
+            g_app->chat_input = nullptr;
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+void show_chat_window(bool focus) {
+    if (g_app->chat_window == nullptr) {
+        static bool class_ready = false;
+        if (!class_ready) {
+            WNDCLASSEXW window_class{};
+            window_class.cbSize = sizeof(window_class);
+            window_class.style = CS_HREDRAW | CS_VREDRAW;
+            window_class.lpfnWndProc = chat_dialog_proc;
+            window_class.hInstance = g_app->instance;
+            window_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+            window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+            window_class.lpszClassName = kChatWindowClass;
+            if (RegisterClassExW(&window_class) == 0) {
+                append_log_line(L"无法创建聊天窗口");
+                return;
+            }
+            class_ready = true;
+        }
+        const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+        RECT frame{0, 0, px(520), px(440)};
+        AdjustWindowRectEx(&frame, style, FALSE, 0);
+        const int width = frame.right - frame.left;
+        const int height = frame.bottom - frame.top;
+        RECT work{};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        // Ownerless so it still opens while the main window sits in the tray.
+        const HWND window = CreateWindowExW(0, kChatWindowClass, L"chast 会话聊天", style, 0, 0,
+                                            width, height, nullptr, nullptr, g_app->instance,
+                                            nullptr);
+        if (window == nullptr) {
+            append_log_line(L"无法创建聊天窗口");
+            return;
+        }
+        g_app->chat_window = window;
+        RECT main{};
+        if (g_app->window != nullptr) {
+            GetWindowRect(g_app->window, &main);
+        }
+        int x = main.right - width;
+        int y = main.top + px(80);
+        if (x < work.left) {
+            x = work.left + px(16);
+        }
+        if (x + width > work.right) {
+            x = work.right - width;
+        }
+        if (y + height > work.bottom) {
+            y = work.bottom - height;
+        }
+        if (y < work.top) {
+            y = work.top;
+        }
+        SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+        const auto add = [window](const wchar_t* cls, const wchar_t* text, DWORD control_style,
+                                  DWORD ex_style, int left, int top, int w, int h, int id) {
+            HWND control = CreateWindowExW(
+                ex_style, cls, text, WS_CHILD | WS_VISIBLE | control_style, px(left), px(top),
+                px(w), px(h), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                g_app->instance, nullptr);
+            if (control != nullptr) {
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->font), TRUE);
+            }
+            return control;
+        };
+        add(L"STATIC", L"会话聊天 · 消息只在本会话中传输", SS_LEFT, 0, 16, 12, 480, 20, 0);
+        g_app->chat_history =
+            add(L"EDIT", L"",
+                ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP,
+                WS_EX_CLIENTEDGE, 16, 38, 472, 310, kChatHistory);
+        g_app->chat_input =
+            add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 360, 372, 28,
+                kChatInput);
+        add(L"BUTTON", L"发送", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 398, 358, 90, 32, kChatSend);
+        add(L"STATIC", L"按 Enter 发送 · 最多 4096 字节", SS_LEFT, 0, 16, 396, 360, 18, 0);
+        SetWindowSubclass(g_app->chat_input, chat_input_proc, 1, 0);
+        chat_refresh_history();
+    }
+    ShowWindow(g_app->chat_window, focus ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
+    if (focus) {
+        SetForegroundWindow(g_app->chat_window);
+        SetFocus(g_app->chat_input);
+    } else {
+        FLASHWINFO flash{};
+        flash.cbSize = sizeof(flash);
+        flash.hwnd = g_app->chat_window;
+        flash.dwFlags = FLASHW_TRAY;
+        flash.uCount = 2;
+        FlashWindowEx(&flash);
+    }
 }
 
 bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, std::string& error) {
@@ -2210,6 +2424,9 @@ void show_tray_menu() {
                           (status.session_permissions & kPermissionFileTransfer) != 0;
     AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
                 L"发送文件到查看器…");
+    const bool can_chat = running && status.state == HostState::Streaming;
+    AppendMenuW(menu, MF_STRING | (can_chat ? 0 : MF_GRAYED), kChatButton,
+                L"与查看者聊天…");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
                 L"共享系统声音");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_microphone ? MF_CHECKED : 0),
@@ -2356,6 +2573,9 @@ void handle_command(int id) {
             }
             break;
         }
+        case kChatButton:
+            show_chat_window(true);
+            break;
         case kFileTransferCheck:
             g_app->settings.allow_file_transfer = !g_app->settings.allow_file_transfer;
             save_settings();
@@ -2581,6 +2801,15 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             refresh_ui();
             return 0;
         }
+        case kChatMessage: {
+            auto* text = reinterpret_cast<std::string*>(lparam);
+            append_chat_line(L"[查看器] " + widen(*text));
+            delete text;
+            // Show it without taking focus away from whatever the operator is
+            // doing; the taskbar flash announces the message.
+            show_chat_window(false);
+            return 0;
+        }
         case kTunnelMessage:
             process_tunnel_events();
             return 0;
@@ -2618,6 +2847,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         case WM_DESTROY:
             KillTimer(hwnd, kStatusTimer);
             g_app->quitting.store(true);
+            if (g_app->chat_window != nullptr) {
+                DestroyWindow(g_app->chat_window);
+            }
             g_app->tunnel.stop();
             if (g_app->server) {
                 g_app->server_stopping.store(true);

@@ -565,6 +565,13 @@ void ViewerBridge::HandleMethodCall(
         map[key("sasError")] = flutter::EncodableValue(status.sas_error);
         map[key("sasUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.sas_updates));
+        map[key("chatSent")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.chat_sent));
+        map[key("chatReceived")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.chat_received));
+        map[key("chatFailures")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.chat_failures));
+        map[key("chatError")] = flutter::EncodableValue(status.chat_error);
         map[key("displaySwitches")] =
             flutter::EncodableValue(static_cast<int64_t>(status.display_switches));
         map[key("displaySwitchFailures")] =
@@ -882,6 +889,28 @@ void ViewerBridge::HandleMethodCall(
     if (method == "sendSas") {
         const bool queued = viewer_ != nullptr && viewer_->SendSas();
         result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "sendChat") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        if (text == nullptr) {
+            result->Error("bad_args", "sendChat wants the message text");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->SendChat(*text);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "takeChat") {
+        std::string text;
+        if (viewer_ == nullptr || !viewer_->TakeChat(text)) {
+            // Null is the normal "nothing waiting" answer, not an error.
+            result->Success();
+            return;
+        }
+        result->Success(flutter::EncodableValue(std::move(text)));
         return;
     }
 

@@ -85,23 +85,34 @@ String normalizeServerUrl(String input) {
 }
 
 class ServerSettings {
-  const ServerSettings({this.url = '', this.mode = TunnelMode.auto});
+  const ServerSettings({
+    this.url = '',
+    this.mode = TunnelMode.auto,
+    this.key = '',
+  });
 
   final String url;
   final TunnelMode mode;
 
+  /// Bearer key for the connection service; empty when the service runs
+  /// without `--server-key`. The viewer now needs it to resolve a host and to
+  /// prove its punch requests, so it belongs with the service, not a device.
+  final String key;
+
   bool get configured => url.isNotEmpty;
 
-  ServerSettings copyWith({String? url, TunnelMode? mode}) {
+  ServerSettings copyWith({String? url, TunnelMode? mode, String? key}) {
     return ServerSettings(
       url: url ?? this.url,
       mode: mode ?? this.mode,
+      key: key ?? this.key,
     );
   }
 
   Map<String, Object?> toJson() => <String, Object?>{
         'url': url,
         'mode': mode.name,
+        'key': key,
       };
 
   static ServerSettings fromJson(Object? value) {
@@ -109,7 +120,11 @@ class ServerSettings {
       return const ServerSettings();
     }
     final String url = normalizeServerUrl(value['url']?.toString() ?? '');
-    return ServerSettings(url: url, mode: TunnelModeName.parse(value['mode']));
+    return ServerSettings(
+      url: url,
+      mode: TunnelModeName.parse(value['mode']),
+      key: value['key']?.toString().trim() ?? '',
+    );
   }
 }
 

@@ -111,7 +111,7 @@ func TestRelayRotationAndStickyLease(t *testing.T) {
 	if err := s.Registry.Touch("beta", "198.51.100.9:5000", []string{"192.168.1.9:5000"}, "port-restricted"); err != nil {
 		t.Fatal(err)
 	}
-	_, body := request(t, http.MethodGet, s.URL+"/v1/hosts/beta", "", "")
+	_, body := request(t, http.MethodGet, s.URL+"/v1/hosts/beta", "", testutil.ServerKey)
 	var host hostReply
 	if err := json.Unmarshal(body, &host); err != nil {
 		t.Fatal(err)

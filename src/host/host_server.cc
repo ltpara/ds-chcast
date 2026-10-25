@@ -679,6 +679,24 @@ void HostServer::set_permissions(uint16_t permissions) {
     permission_update_pending_.store(true);
 }
 
+bool HostServer::send_chat(const std::string& text) {
+    if (!valid_chat_text(text)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        if (status_.state != HostState::Streaming) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    if (pending_chat_.size() >= 16) {
+        return false;
+    }
+    pending_chat_.push_back(text);
+    return true;
+}
+
 bool HostServer::start_file_download(const std::string& utf8_path, std::string* error) {
     const auto fail = [error](const std::string& text) {
         if (error != nullptr) {
@@ -923,6 +941,10 @@ void HostServer::run() {
 
 bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool* peer_left) {
     *peer_left = false;
+    {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        pending_chat_.clear();
+    }
     stats.audio_active = false;
     stats.privacy_mode_active = false;
     stats.privacy_mode_changes = 0;
@@ -3535,6 +3557,31 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 const bool clean = error->empty();
                 drain_peer();
                 return clean;
+            }
+        }
+        std::string chat_text;
+        while (session_->take_chat(chat_text)) {
+            ++stats.chat_received;
+            log("chat: received " + std::to_string(chat_text.size()) + " bytes");
+            if (config_.chat_message) {
+                config_.chat_message(chat_text);
+            }
+        }
+        {
+            std::deque<std::string> outbox;
+            {
+                std::lock_guard<std::mutex> lock(chat_mutex_);
+                outbox.swap(pending_chat_);
+            }
+            for (const std::string& text : outbox) {
+                Error sent = session_->send_chat(text);
+                if (!sent.ok()) {
+                    ++stats.send_errors;
+                    log("chat: send failed: " + sent.to_string());
+                    break;
+                }
+                ++stats.chat_sent;
+                log("chat: sent " + std::to_string(text.size()) + " bytes");
             }
         }
         if (now >= next_desktop_check) {

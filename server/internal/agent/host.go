@@ -95,6 +95,9 @@ type HostAgent struct {
 	viewer     *net.UDPAddr
 	viewerPath string
 	lastInfo   string
+	// softwareSeen remembers the last advertised update version so a renewal
+	// every few seconds does not repeat the same notice.
+	softwareSeen string
 	// observedPunch and observedRelay are this host's public mappings as seen
 	// by the rendezvous port and by its relay port. Comparing them classifies
 	// the NAT without a second server.
@@ -332,7 +335,21 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.log.Info("carrier endpoint updated", "carrier", reg.Carrier)
 	}
 	h.sharedCarrierToken = reg.CarrierToken
+	var notice *softwareInfo
+	if reg.Software.updateAvailable() {
+		if h.softwareSeen != reg.Software.Version {
+			h.softwareSeen = reg.Software.Version
+			offer := *reg.Software
+			notice = &offer
+		}
+	} else {
+		h.softwareSeen = ""
+	}
 	h.mu.Unlock()
+	if notice != nil {
+		h.log.Info("software update available",
+			"version", notice.Version, "current", Version, "url", notice.URL)
+	}
 	h.reportInfo()
 }
 

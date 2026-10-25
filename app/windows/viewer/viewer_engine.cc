@@ -293,6 +293,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     // A SAS request queued for a session that ended must not fire into the
     // next one.
     pending_sas_.store(false, std::memory_order_release);
+    // Chat belongs to one viewer session in both directions.
+    {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        pending_chat_.clear();
+        received_chat_.clear();
+    }
     // Microphone capture is a per-session privacy decision: every session
     // starts with the uplink off, while the chosen device is remembered.
     microphone_wanted_.store(false, std::memory_order_relaxed);
@@ -782,6 +788,37 @@ bool ViewerEngine::SendSas() {
     return true;
 }
 
+bool ViewerEngine::SendChat(const std::string& text) {
+    if (!chast::valid_chat_text(text)) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    if (pending_chat_.size() >= 16) {
+        return false;
+    }
+    pending_chat_.push_back(text);
+    return true;
+}
+
+bool ViewerEngine::TakeChat(std::string& text) {
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    if (received_chat_.empty()) {
+        return false;
+    }
+    text = std::move(received_chat_.front());
+    received_chat_.pop_front();
+    return true;
+}
+
 ViewerStatus ViewerEngine::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     ViewerStatus status = status_;
@@ -827,6 +864,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     uint64_t clipboard_failed = 0;
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
+    uint64_t chat_failures = 0;
     uint32_t clipboard_sent_formats = 0;
     uint32_t clipboard_received_formats = 0;
     uint64_t files_sent = 0;
@@ -2679,6 +2719,58 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Chat is ungated: an admitted session is the authorization.
+                // Text goes into the UI queue; the status only carries counts,
+                // so a 4 KiB line never inflates the poll.
+                auto receive_chat = [&] {
+                    std::string text;
+                    while (session->take_chat(text)) {
+                        ++chat_received;
+                        {
+                            std::lock_guard<std::mutex> lock(chat_mutex_);
+                            if (received_chat_.size() < 64) {
+                                received_chat_.push_back(text);
+                            }
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.chat_received = chat_received;
+                        }
+                        std::fprintf(stderr, "viewer: chat received (%zu bytes)\n",
+                                     text.size());
+                    }
+                };
+
+                // Sends the lines the UI queued. A failure is reported in the
+                // status and ends the drain: the link is no longer usable.
+                auto drain_chat = [&] {
+                    std::deque<std::string> outbox;
+                    {
+                        std::lock_guard<std::mutex> lock(chat_mutex_);
+                        outbox.swap(pending_chat_);
+                    }
+                    for (const std::string& text : outbox) {
+                        chast::Error sent = session->send_chat(text);
+                        if (!sent.ok()) {
+                            ++chat_failures;
+                            {
+                                std::lock_guard<std::mutex> lock(mutex_);
+                                status_.chat_failures = chat_failures;
+                                status_.chat_error = "send: " + sent.to_string();
+                            }
+                            std::fprintf(stderr, "viewer: send chat: %s\n",
+                                         sent.to_string().c_str());
+                            break;
+                        }
+                        ++chat_sent;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.chat_sent = chat_sent;
+                        }
+                        std::fprintf(stderr, "viewer: chat sent (%zu bytes)\n", text.size());
+                    }
+                };
+
                 // Adopts the desktop the host is capturing. Secure is the lock
                 // screen, UAC or a credential prompt; the host pauses video
                 // while it cannot follow and sends Default when it resumes.
@@ -2982,6 +3074,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_privacy();
                     drain_sas();
                     receive_sas();
+                    receive_chat();
+                    drain_chat();
                     receive_desktop();
                     receive_display_switch();
                     receive_display_modes();
@@ -3043,6 +3137,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_privacy();
                     drain_sas();
                     receive_sas();
+                    receive_chat();
+                    drain_chat();
                     receive_desktop();
                     receive_display_switch();
                     receive_display_modes();

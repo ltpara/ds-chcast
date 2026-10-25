@@ -26,15 +26,15 @@ const (
 	probeReplyWait = time.Second
 )
 
-// ProbeTarget resolves --test-punch into a UDP endpoint. An empty target means
-// the check is skipped; auto only runs when advertise is unset or loopback, and
-// otherwise reports why it was skipped. An explicit host:port is always used.
+// ProbeTarget resolves --test-punch into a UDP endpoint. Empty and "auto" both
+// run the local self-check, matching RustDesk's TEST_HBBS default; no/off/false
+// disable it, and an explicit host:port is always used. Auto only runs when
+// advertise is unset or loopback, and otherwise reports why it was skipped.
 func ProbeTarget(value, advertise, bound string) (target, skip string, err error) {
 	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
 	switch {
-	case value == "":
-		return "", "disabled", nil
-	case strings.EqualFold(value, "auto"):
+	case value == "" || lower == "auto":
 		host, port, splitErr := net.SplitHostPort(bound)
 		if splitErr != nil {
 			return "", "", fmt.Errorf("test punch sees listener %q: %w", bound, splitErr)
@@ -52,10 +52,13 @@ func ProbeTarget(value, advertise, bound string) (target, skip string, err error
 		// "localhost" can resolve to the other address family than the one the
 		// socket actually bound, so stay on the listener's loopback.
 		return loopbackTarget(host, port), "", nil
+	case lower == "no" || lower == "off" || lower == "false" || lower == "0" ||
+		lower == "disable" || lower == "disabled":
+		return "", "disabled", nil
 	default:
 		host, port, splitErr := net.SplitHostPort(value)
 		if splitErr != nil || strings.TrimSpace(host) == "" {
-			return "", "", fmt.Errorf("--test-punch %q must be auto or host:port", value)
+			return "", "", fmt.Errorf("--test-punch %q must be auto, no or host:port", value)
 		}
 		number, convErr := strconv.Atoi(port)
 		if convErr != nil || number < 1 || number > 65535 {

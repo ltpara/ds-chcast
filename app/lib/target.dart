@@ -9,6 +9,7 @@ class ConnectTarget {
     this.hostId = '',
     this.displayName = '',
     this.mode = TunnelMode.auto,
+    this.serverKey = '',
   });
 
   final String host;
@@ -25,6 +26,7 @@ class ConnectTarget {
   final String hostId;
   final String displayName;
   final TunnelMode mode;
+  final String serverKey;
 
   bool get viaServer => server.isNotEmpty;
 
@@ -75,6 +77,7 @@ ConnectTarget? parseConnectInput(
       server: server.url,
       hostId: text,
       mode: server.mode,
+      serverKey: server.key,
     );
   }
   return parseConnectTarget(text, token: key);

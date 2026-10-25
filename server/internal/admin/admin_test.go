@@ -58,6 +58,9 @@ func TestConsoleCommands(t *testing.T) {
 	if _, err := s.Registry.Register(registry.RegisterRequest{
 		ID:        "devbox",
 		PublicKey: identity.PublicKeyText(priv.Public().(ed25519.PublicKey)),
+		Hostname:  "Dev Box",
+		Platform:  "windows/amd64",
+		Version:   "1.0.0",
 		TTL:       time.Minute,
 	}); err != nil {
 		t.Fatalf("register host: %v", err)
@@ -93,7 +96,7 @@ func TestConsoleCommands(t *testing.T) {
 	})
 
 	help := send(t, c.Addr(), "h")
-	for _, want := range []string{"stats", "hosts", "punch-requests", "ip-blocker", "ip-changes", "relay-servers", "test-geo", "relay-only"} {
+	for _, want := range []string{"stats", "hosts", "peers", "alias", "tags", "punch-requests", "ip-blocker", "ip-changes", "relay-servers", "test-geo", "relay-only"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -108,6 +111,29 @@ func TestConsoleCommands(t *testing.T) {
 		if !strings.Contains(stats, want) {
 			t.Fatalf("stats missing %q:\n%s", want, stats)
 		}
+	}
+
+	peers := send(t, c.Addr(), "peers")
+	for _, want := range []string{"devbox online=true", "hostname=Dev Box", "platform=windows/amd64", "version=1.0.0", "alias=-", "tags=-"} {
+		if !strings.Contains(peers, want) {
+			t.Fatalf("peers missing %q:\n%s", want, peers)
+		}
+	}
+	if out := send(t, c.Addr(), "alias devbox Studio PC"); out != "devbox alias=Studio PC\n" {
+		t.Fatalf("alias output = %q", out)
+	}
+	if out := send(t, c.Addr(), "tags devbox office,prod,office"); out != "devbox tags=office,prod\n" {
+		t.Fatalf("tags output = %q", out)
+	}
+	peers = send(t, c.Addr(), "peers")
+	if !strings.Contains(peers, "alias=Studio PC tags=office,prod") {
+		t.Fatalf("labels missing from peers:\n%s", peers)
+	}
+	if out := send(t, c.Addr(), "tags devbox"); out != "devbox tags cleared\n" {
+		t.Fatalf("clear tags output = %q", out)
+	}
+	if out := send(t, c.Addr(), "alias missing name"); !strings.Contains(out, "unknown peer missing") {
+		t.Fatalf("unknown alias output = %q", out)
 	}
 
 	if out := send(t, c.Addr(), "sb 32"); out != "32.00Mb/s\n" {

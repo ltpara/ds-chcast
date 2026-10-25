@@ -364,6 +364,27 @@
     `flutter analyze` 无问题、104 项测试、Windows Release 构建通过。
   - 已知限制：真实扬声器-麦克风回路的 AEC 收敛与听感、设备热插拔、双机
     外放回声仍需人工验收；不做 AGC、端点自动切换与虚拟声卡。
+- 已完成：会话聊天 M9.5（协议 v24）。
+  - 协议：`ControlType::ChatMessage = 32`，载荷为 UTF-8 文本（1–4096 字节、
+    不含 NUL、必须是合法 UTF-8），走有序控制流；通过 Hello 与审批的会话即可
+    聊天，不新增权限位。
+  - 主机：`HostServer::send_chat`/`take_chat` 双向队列（出 16/入 64，队列满
+    丢弃最新），统计 `chat_sent`/`chat_received`；托盘菜单与主界面共用无主
+    Win32 聊天窗口（300 行历史、Enter 发送、连接/断开分隔行），查看者消息经
+    `WM_APP+8` 回到 UI 线程。
+  - 查看器：引擎双向队列与 `chatSent`/`chatReceived`/`chatFailures`/
+    `chatError` 状态，bridge 暴露 `sendChat`/`takeChat`；Flutter 面板按 UTF-8
+    字节校验长度、Enter 发送、收到消息自动展开、保留 200 条记录，工具栏新增
+    聊天按钮。
+  - 键盘：聊天输入获得焦点时释放远端已按下的键并关闭原生按键捕获（恢复本地
+    IME），页面停止向主机转发按键；失焦后按控制状态恢复，鼠标转发不受影响。
+  - 验证（2026-10-25，单机回环）：protocol 单测覆盖往返、换行、4096 上限、
+    超长/空/NUL/孤立代理项/坏 UTF-8 拒绝；`chast-quic verify --port 45533
+    --seconds 4 --quiet` 新增 5 项断言（双向逐字内容与双向计数），全过；
+    `flutter analyze` 无问题、195 项 `flutter test`、Windows Release 构建通过。
+  - 已知限制：聊天记录只在内存中，重连即清空；没有未读角标、系统通知、
+    文件/图片/链接卡片、离线消息或多查看者会话；收到消息自动展开面板（不抢
+    键盘焦点），实际打断程度与主机窗口布局仍需人工验收。
 
 ## M10 — 传输回退（已完成）
 
@@ -403,7 +424,8 @@
 - 已完成：持久身份、挑战应答、候选遥测与共享载体（协议仍 v23，
   `docs/m10.1-plan.md`）。
   - 身份：ID 与 Ed25519 公钥永久绑定（`chast-register-v1` 签名 + 时间戳），
-    `chast-server-state.json` 持久化，离线查询仍返回身份与服务器签名的
+    `chast-server-state.json` 持久化（P1 起为 SQLite `chast-server-state.db`），
+    离线查询仍返回身份与服务器签名的
     `CHASTB1.<payload>.<sig>` 绑定；`/v1/server` 公布服务器公钥，
     `DELETE /v1/identities/{id}` 是丢失密钥的人工出口。
   - 挑战：keepalive、UDP 中继、TCP/WS 载体分别使用 30 s 单次 nonce，
@@ -615,21 +637,552 @@
     成对引号；布尔值额外接受 `Y/N`。`cmd/chast-server` 与 `cmd/chast-relay`
     新增 `--config`、`--env-file`，在读取任何业务参数之前应用。RustDesk 的
     `BIND`/`PORT`、`RELAY-SERVERS`、`RMEM`、`TEST_HBBS`、`ALWAYS_USE_RELAY`、
-    `MAX_PUNCH_REQUESTS` 作为别名可用，同层 canonical 键优先。
+    `MAX_PUNCH_REQUESTS`（→`punch-log-max`）作为别名可用，同层 canonical 键优先。
   - 接收缓冲：`--rmem` 为会合套接字和全部中继 UDP 端口（含按租约地址重绑）
     设置并回读 `SO_RCVBUF`，失败只告警；`/v1/server`、`/v1/stats` 与
     `/metrics` 暴露生效值。共享载体只有 TCP/WebSocket，没有 UDP 侧。
   - 默认名单与自检：名单路径留空时自动加载工作目录 `blacklist.txt`/
-    `blocklist.txt` 并记录实际路径；`--test-punch`（`TEST_HBBS`）支持空值跳过、
-    `auto` 本机探测和显式 `host:port`，注册临时 ID 后每秒重试，12 s 无应答
-    失败退出，成功记录 RTT。
+    `blocklist.txt` 并记录实际路径；`--test-punch`（`TEST_HBBS`）默认 `auto`，
+    空值与 `auto` 等价（本机探测），`no`/`off` 关闭，也可给显式 `host:port`；
+    注册临时 ID 后每秒重试，12 s 无应答失败退出，成功记录 RTT。
   - 验证：单机回环覆盖显式 flag > INI > .env > 环境变量、1 MiB 接收缓冲在
     `/v1/server`/`/v1/stats`/`/metrics` 一致、默认名单在控制台 `b`/`B` 可见、
     自检成功（RTT 2 ms）与关闭端口 12 s 失败（exit=1）；`go vet`/`go build`/
     `go test ./... -count=1` 通过。
   - 已知限制：配置只在启动时读取，不支持热重载；INI 无分节层级；dotenv 不
-    展开变量；`--test-punch` 仅 `chast-server` 提供；`DB_URL`/SQLite 持久化
-    不在范围内（状态仍用 JSON 文件）。
+    展开变量；`--test-punch` 仅 `chast-server` 提供；`DB_URL` 等 hbbs 配置键
+    仍不兼容（P1 已把状态持久化升级为 SQLite，见下节）。
+
+## P1 — 对等记录与 SQLite（进行中）
+
+- 已完成：SQLite 对等数据库（`modernc.org/sqlite`，纯 Go、无 CGO）。
+  - `--state` 默认 `chast-server-state.db`；`peers` 表保存 ID、公钥、指纹、
+    `hostname`、`platform`、`version`、`created_at`、`last_seen`。WAL +
+    `busy_timeout`，连接数 1 与 registry 的串行化对应；加载时校验 ID、公钥与
+    指纹，损坏的库直接启动失败而不是清空重建。
+  - 迁移：同路径的版本 1 JSON 先完整校验，再改名为 `<state>.legacy` 并原地
+    建库；`state.db` 不存在而同目录有同名 `.json` 时导入，成功后把旧文件改名
+    为 `.json.imported`。导入失败会删除半成品库并恢复旧文件。
+  - 元数据：`chast-tunnel host` 注册时上报 `hostname`、`platform`
+    （GOOS/GOARCH）、`version`（`-ldflags -X .../internal/agent.Version` 可覆盖）；
+    服务端去除控制字符并按 128/64/64 字符截断，空字段保留上一次的值。
+    元数据不参与注册签名，仅用于展示，不能作为安全判断。
+  - 查询与管理：lookup 返回 `hostname`/`platform`/`version`；离线记录仍带
+    `last_seen_ms`（最近一次注册时间）。管理台新增 `peers [count]`，列出含
+    离线主机的持久记录与在线状态。
+  - 批量在线查询：`GET /v1/hosts?ids=<id,...>` 复用单机 lookup 的完整响应，
+    一次最多 200 个 ID、自动去重；未知 ID 列入 `missing` 而不使整批失败，
+    供地址簿一次刷新所有对等记录。
+  - 别名与标签：运营者可通过 `PATCH /v1/identities/{id}`（Bearer）或管理台
+    `alias <id> [text]`、`tags <id> [a,b]` 维护展示信息；主机注册与续约不会
+    覆盖。别名最长 128 字符，标签最多 16 个、每个 32 字符，重复项丢弃；
+    SQLite 以 JSON 文本保存标签，旧库启动时用 `PRAGMA table_info` +
+    `ALTER TABLE` 原地加列；单机与批量 lookup 都返回 `alias`/`tags`。
+  - 查看器地址簿：首页把同一服务器的设备合并为一次
+    `GET /v1/hosts?ids=...` 刷新（超过 200 个自动分片），服务端无记录的 ID
+    显示为离线，不再把整组标成“服务不可达”；`HostInfo` 解析 `alias`/`tags`，
+    设备卡在本地名称缺失时显示运营者别名，并把标签显示为 `#tag`。本地重命名
+    仍然优先，标签存在时副标题优先展示标签而非服务器 URL。
+  - 查看器编辑标签：已保存的服务端设备在卡片菜单中选择“服务端别名/标签”，
+    对话框预填当前值；标签按英文/中文逗号拆分、去重并校验 128/16/32 字符
+    上限，再以 `PATCH /v1/identities/{id}` 提交（Bearer server-key）。成功后
+    提示并立即刷新在线状态；失败（如 401）保留对话框并显示服务端错误。
+  - 账号与账号地址簿（服务端）：`--state` 的同一 SQLite 文件新增 `users`、
+    `user_tokens`、`address_book` 表；密码以 PBKDF2-SHA256（210000 轮、
+    16 字节随机盐、32 字节派生密钥、自描述哈希串）保存，登录签发 32 字节随机
+    Bearer 令牌（库中只存 SHA-256，TTL 720 h），改密在同一事务里吊销该用户
+    全部令牌，删除用户经外键级联清理令牌与地址簿。HTTP 新增
+    `POST /v1/account/login|logout`、`GET /v1/account`、
+    `GET /v1/addressbook` 与 `PATCH|DELETE /v1/addressbook/peers/{id}`；
+    地址簿按用户隔离，名称/标签支持部分更新、去重与 128/16/32 字符上限。
+    账号令牌只解锁账号路由，运营者 server-key 不能代替，反之亦然；
+    `--state ""` 时这些路由返回 503 且 `/v1/server` 的 `accounts=false`。
+    回环管理台新增 `user list|add|passwd|del`（省略密码时生成并只打印一次）
+    与 `ab <username> [count]`。
+  - 查看器账号同步：侧栏“账号”卡片登录当前连接服务的账号，令牌、用户名与
+    过期时间写入 `%APPDATA%\chast\account.json`（明文，依赖用户目录 ACL）；
+    启动时只恢复同一服务且未过期的会话并静默同步一次。同步发送上次应用的
+    地址簿修订号 `GET /v1/addressbook?since=N`：服务端返回当前 `revision`、
+    完整存活条目与 `since` 之后的变更（含删除墓碑），查看器先用墓碑移除本地
+    对应的已保存设备并禁止重新上传，再按整表合并：服务端独有条目加入本地
+    地址簿，服务端名称与标签只填补本地空值，未保存的最近连接提升为已保存。
+    本地已保存条目的非空名称/标签连同上次读到的 `revision` 通过
+    `PATCH /v1/addressbook/peers/{id}` 上传（后续加入条目级 `if_revision`，
+    见地址簿乐观并发控制）；只改名称
+    的上传省略标签字段，不会清空服务端标签。清空全部标签或把设备移出分组会
+    在 `Device` 上记录 `tagsCleared`/`groupCleared` 意图并随 `devices.json`
+    持久化：离线期间合并不会用服务端旧标签/分组回填，下一次同步把空列表或空
+    分组作为显式更新上传；只有即时推送成功、同步上传成功或服务端本已为空时
+    才撤销标记。本地新增、改名、编辑标签、保存
+    最近连接与删除都会尽力即时推送，失败不撤销本地修改；任一次调用返回 401
+    就清除会话并回到登录表单。本机删除先写入与 `devices.json` 同目录的
+    `pending_deletions.json`（按服务 URL、用户名与 peer ID 隔离）；每次同步
+    开始前重试待办删除，成功或 404 才移除，网络失败保留并在同步摘要显示
+    “待删除重试 N”，期间服务端仍返回的存活条目不会重新加入本地或再次上传。
+    设备卡显示的 `#tag` 优先使用账号标签，本地
+    未设置时才回退到运营者维护的主机标签。
+    登出先调用 `POST /v1/account/logout` 吊销令牌，再清除本地会话。切换连接
+    服务会丢弃旧服务的本地会话，避免令牌被带到另一台服务器。
+  - 服务端地址簿修订：同一 SQLite 的 `users.book_revision` 与
+    `address_book.revision/deleted` 记录每条写入；新增/更新与删除都在事务内
+    递增用户修订号，删除改为写墓碑而非物理删除，`PATCH` 可复活墓碑。旧库
+    启动时用 `PRAGMA table_info` + `ALTER TABLE` 加列，并给存量行回填一个
+    修订号。`GET /v1/addressbook?since=` 对负数/非数字返回 400，越界或过期
+    的 `since` 回落为全量历史，避免漏掉删除；`PATCH` 响应也带 `revision`。
+  - 共享地址簿（只读/读写/完全控制）：同一 SQLite 新增 `address_book_grants`
+    （owner/grantee 复合主键、权限级 read/write/control、禁止自共享、按 grantee
+    建索引），旧库通过 `ALTER TABLE` 补 `permission` 列并默认为 read。
+    `POST /v1/addressbook/grants` 按用户名不区分大小写授权且重复授权幂等，可带
+    `permission` 升级/降级；`GET /v1/addressbook/grants` 返回授出/收到两组授权
+    及权限；`DELETE /v1/addressbook/grants/{username}` 撤销（不存在为 404）；
+    `GET /v1/addressbook/shared` 返回授权给我的完整地址簿（属主、权限、修订号、
+    名称与标签）。读写权限还可以
+    `POST /v1/addressbook/shared/{owner}/peers` 向属主地址簿新增条目，用
+    `PATCH`/`DELETE /v1/addressbook/shared/{owner}/peers/{id}` 修改或删除已有
+    条目（写入计入属主修订号，删除写墓碑）；完全控制额外允许
+    `GET`/`POST`/`DELETE /v1/addressbook/shared/{owner}/grants` 查看、授出与
+    撤销该地址簿的授权（含自撤销）。权限不足为 403，未知属主/无授权统一为
+    404。查看器侧栏“共享地址簿”
+    对话框显示权限徽标，授出时可选择只读/读写/完全控制并可调整已有授权；
+    读写/完全控制下可新增条目，条目菜单可编辑名称/标签或删除；完全控制下可
+    打开“管理授权”子对话框授出/撤销该地址簿的访问。
+  - 地址簿分组：同一 SQLite 新增 `address_book_groups`（`(user_id, group_id)`
+    主键，含 name/updated_at/revision/deleted），`address_book` 增加 `group_id`
+    列，旧库启动时自动补列；`PATCH`/`DELETE /v1/addressbook/groups/{id}`
+    创建、改名、删除分组，名称去空白且最长 64 字符。删组先写分组墓碑，再按
+    peer ID 顺序把组内存活条目解绑并各自推进修订号；条目 `PATCH` 接受
+    `group_id`（空串清除），只移动分组时要求条目与目标分组都存活。
+    `GET /v1/addressbook` 增加存活 `groups` 与增量 `group_changes`。查看器
+    `AddressBookGroup`/`AddressBookPeer.groupId` 解析快照，`Device` 持久化
+    `groupId` 并参与合并与上传；启动后的首次同步固定 `since=0` 以取得仅存在
+    内存中的分组名称，之后增量同步；本地非空分组优先并上传，本地分组 ID 已不
+    存在时归一为未分组；`mergeAddressBookGroups` 在全量读取时替换、增量时按
+    `group_changes` 合并。首页“我的设备”按分组分区并可折叠，保留“未分组”
+    分区；标题栏“分组”打开管理对话框（新建/改名/删除，删除提示组内设备只会
+    移到未分组），设备菜单“移动到分组”先写本地 `devices.json` 再尽力上传。
+  - 地址簿搜索与标签筛选：首页“我的设备”标题下新增搜索框与标签芯片。搜索
+    大小写不敏感匹配名称、设备 ID、账号标签、主机别名与主机自报标签；标签
+    芯片来自所有已保存设备卡片上实际展示的标签（账号标签优先，否则主机自报
+    标签），多选按并集匹配，并与搜索同时生效。筛选只作用于“我的设备”，标题
+    计数显示“命中/总数”；分组标题、成员计数与“未分组”随筛选收窄或隐藏，
+    无匹配时显示空状态和“清除筛选”，标题栏同样提供“清除筛选”，搜索框右侧
+    可单独清除文本。已选标签若已从所有卡片上消失会自动失效，避免隐藏条目。
+  - 地址簿条目级乐观并发控制：`address_book.revision` 作为每个条目的不透明版本
+    令牌，`PATCH /v1/addressbook/peers/{id}` 接受可选的正整数 `if_revision`；
+    事务内重新读取当前修订号与墓碑，令牌不匹配、条目已删除或从未以该令牌存在
+    时返回 409 且不写入，`0`/负数返回 400。省略时保持最后写入者优先以兼容旧
+    客户端。查看器 `Device` 持久化
+    `revision`，同步合并与即时编辑（标签、移动到分组）都携带令牌，成功响应
+    立即把新修订号写回本地；409 时不重试旧值，改为全量拉取快照并用服务器的
+    名称/标签/分组/修订号覆盖本地条目（服务端已删除则移除本地行），同步摘要
+    显示冲突数，单条编辑提示“已刷新为服务器版本”。共享地址簿的
+    `PATCH`/`DELETE /v1/addressbook/shared/{owner}/peers/{id}` 也接受
+    `if_revision`（删除用查询参数），与属主自己的写入共用条目修订号；查看器
+    共享对话框携带条目修订号，409 后重新读取共享地址簿并用服务器条目覆盖、
+    提示已刷新；共享新增仍为最后写入者优先。
+  - 账号安全：登录失败锁定与设备会话（2026-10-25）。
+    - `internal/authlimit` 以“用户名小写 + 客户端 IP”为键统计失败：默认
+      10 分钟窗口内 5 次失败后锁定 1 分钟，锁定期返回 `429` 与 `Retry-After`，
+      正确密码也拒绝；成功登录清零；窗口过期或锁定结束都会重置预算。空闲
+      30 分钟的键被清理，最多 65536 个键，超限淘汰最久未使用的键；
+      `--login-max-failures`/`--login-window`/`--login-lockout` 可调，
+      失败上限为 0 时关闭。
+    - `user_tokens` 新增 `session_id`/`device_id`/`device_name`；登录接受可选
+      `device_id`/`device_name`（去控制字符、限 64/128 字符），每次登录生成
+      12 字节随机公开会话 ID。旧库启动时补列并为存量令牌回填 ID，公开 ID 上
+      建部分唯一索引，令牌本身仍只存哈希。
+      `GET /v1/account/sessions` 返回本账号未过期会话（设备名、创建/到期
+      时间与 `current`），`DELETE /v1/account/sessions/{id}` 只允许撤销本人
+      会话，不存在或跨用户为 404；撤销当前会话会使本设备令牌失效。
+    - 查看器：登录默认携带本机主机名；账号对话框新增“设备会话”，列出设备、
+      标记当前设备、退出其他设备，失败可刷新重试；HTTP 429 统一提示
+      “请求过于频繁，请稍后再试”。
+    - 自助改密：`POST /v1/account/password` 校验当前密码后写入新哈希，保留
+      调用者的当前会话并撤销同账号其他令牌，原密码错误返回 403（不冒充令牌
+      失效），新密码沿用 8–128 字节规则（违规为 400）。查看器账号对话框新增
+      “修改密码”，本地校验长度与两次输入是否一致，成功后提示其他设备已退出。
+      管理台 `user passwd` 仍是忘记密码时的重置入口。
+    - 一键退出其他设备（2026-10-25）：`POST
+      /v1/account/sessions/revoke-others` 保留调用者令牌、删除该账号其余会话，
+      返回 `{"revoked":N}` 并写入 `session_revoke` 审计；空令牌在存储层被拒绝，
+      不会误删全部会话。查看器设备会话对话框新增“退出其他设备”，成功后只保留
+      当前设备并提示退出数量，失败保留列表与原因。验证：`internal/account`
+      覆盖跨用户隔离、重复调用为 0 与空令牌拒绝；`internal/api` 覆盖
+      200/计数、其他会话 401、当前会话保留、无令牌 401、无持久状态 503 与
+      审计说明；`server_api_test` 覆盖方法与计数解析，
+      `account_sessions_dialog_test` 覆盖批量退出、失败保留与仅当前设备时禁用。
+    - 设备会话改名（2026-10-25）：`PATCH /v1/account/sessions/{id}` 接受
+      `device_name`，沿用登录时的清洗规则（去首尾空白、去控制字符、最长 128
+      字符），空名或仅控制字符返回 400；只更新本账号未过期会话的显示名，不存在、
+      已过期或跨用户返回 404，当前设备也可改名且令牌不受影响。成功与失败分别
+      写入 `session_rename` 审计（成功说明会话 ID，失败区分空名/未知会话/
+      内部错误）。查看器设备会话对话框每项新增编辑按钮，预填原名，本地校验
+      非空后提交并就地更新列表；失败保留原名并显示原因。验证：
+      `internal/account` 覆盖清洗、空名拒绝且不改库、未知/跨用户/过期会话
+      返回 false；`internal/api` 覆盖 204/400/404/跨用户/无令牌 401、
+      无持久状态 503、列表反映新名称与审计成功/失败说明；`server_api_test`
+      覆盖 PATCH 方法、鉴权、去空白负载与空名本地拒绝，
+      `account_sessions_dialog_test` 覆盖改名成功、失败保留与空名不提交。
+      `go vet ./...`、`go test ./... -count=1`、`go build ./...`、
+      `flutter analyze` 与全量 `flutter test`（230 项）通过。
+    - 账号两步验证（TOTP，2026-10-25）：`GET /v1/account` 返回 `two_factor`；
+      `POST /v1/account/2fa/start` 生成 20 字节 base32 密钥与 `otpauth://`
+      URI，`enable` 用 RFC 6238（HMAC-SHA1、6 位、30 秒、前后各 1 步偏差）
+      验证码激活，`disable` 同时要求当前密码和当前有效验证码。启用与登录都会
+      持久化已消费的时间步并拒绝重放；启用后的登录缺少 `totp_code` 返回 401
+      与 `X-Chast-2FA: required`（不计入失败锁定），错误/重放返回 `invalid`
+      并计入。管理台新增 `user 2fa <name> off` 作为验证器丢失时的人工出口。
+      查看器登录表单在服务端要求时显示验证码输入框，账号对话框新增“两步验证”：
+      显示密钥/URI 供手动录入、确认启用、密码+验证码关闭，状态加载失败可重试。
+    - 验证（2026-10-25）：`internal/account` 的 `totp_test` 覆盖 RFC 6238
+      标准向量、±1 步偏差与 URI 转义，`store_test` 覆盖启用前不生效、错误/
+      重放验证码、登录要求与重放拒绝、关闭需密码+验证码、管理员重置、重开
+      数据库后仍生效；`internal/api` 覆盖缺少/错误/重放验证码的 401 头部与
+      限流行为、启用/关闭状态与 503；`internal/admin` 覆盖 `user 2fa` 帮助、
+      重置与用法错误；`server_api_test` 覆盖登录 `totp_code` 负载、响应头映射、
+      状态/启用/关闭请求；`two_factor_dialog_test` 覆盖录入、启用、关闭校验、
+      失败保留与重试；`home_page_test` 覆盖两步验证码输入与二次提交。
+      `go vet ./...`、`go test ./... -count=1`、`go build ./...`、
+      `flutter analyze`、全量 `flutter test`（221 项）通过。
+    - 两步验证恢复码（2026-10-25）：`POST /v1/account/2fa/recovery` 要求当前
+      密码和有效验证码，每次签发 10 个 `XXXX-XXXX-XXXX-XXXX` 一次性恢复码，
+      明文只返回一次；服务端只存规范化后的 SHA-256 哈希。登录可用
+      `recovery_code` 代替 `totp_code`（同时提供时优先 TOTP），匹配与令牌
+      签发在同一事务内完成，已用/重放返回 401 与 `X-Chast-2FA: invalid`。
+      重新生成会废弃旧码；关闭两步验证与管理台重置也会清空全部恢复码。
+      `GET /v1/account` 返回剩余数量；查看器两步验证对话框显示剩余数、生成
+      入口与可复制的一次性列表，登录表单可切换到恢复码输入。
+    - 验证（2026-10-25）：`internal/account` 覆盖错误凭据/验证码、10 个唯一
+      分组码、大小写与分隔符容错、消费计数、重放拒绝、TOTP 登录不消耗恢复码、
+      重新生成使旧码失效、关闭与重置清空、未启用拒绝，并验证重开数据库后
+      仍可恢复登录；`internal/api` 覆盖 401/403/400/503、剩余数量、登录与
+      重放头部、重新生成、审计成功/失败；`server_api_test` 覆盖登录优先级与
+      请求负载、生成请求/解析与错误映射；`two_factor_dialog_test` 覆盖生成
+      校验、一次性列表展示与失败保留；`home_page_test` 覆盖切换恢复码与
+      空值校验。`go vet ./...`、`go test ./... -count=1`、`go build ./...`、
+      `flutter analyze`、全量 `flutter test`（236 项）通过。
+    - 账号安全审计（2026-10-25）：新增 SQLite `audit_events` 表，记录登录
+      尝试（含未知用户）的时间、尝试的用户名、客户端 IP（遵循
+      `--proxy-header`）、结果与说明；成功登录记录设备名与是否使用两步验证，
+      失败区分凭据错误、两步验证缺失/错误、锁定拒绝与内部错误。登出（含失效
+      令牌）、自助改密、两步验证启用/关闭、管理台重置两步验证与会话撤销也写入
+      同一张表，失败原因保留在 `detail`。管理台手动解锁登录锁定另写
+      `login_unlock`。审计写入失败只写服务器日志，不改变
+      原操作响应；表内保留最近 10000 条。新增 `GET /v1/audit`（Bearer
+      server-key，`limit` 1–200 默认 50、`action` 精确过滤）返回倒序事件，
+      管理台新增 `audit [count]`。验证：`internal/account` 覆盖追加/倒序/
+      条数上限/动作过滤/重开数据库持久化与空动作拒绝；`internal/api` 覆盖
+      失败/成功/未知用户事件与 IP、各变更动作的成功与失败审计、审计端点的
+      鉴权/过滤/分页校验/无存储 503，并在锁定测试中断言“触发锁定”和
+      “锁定期拒绝”两类事件；`internal/admin` 覆盖帮助、事件输出、两步验证
+      重置审计与无持久状态提示。
+    - 连接审计（2026-10-25）：新增 SQLite `connection_events` 表，查看器在会话
+      结束时（首帧到达后才开始计时，纯握手失败不计入）向
+      `POST /v1/account/connections` 上报对端 ID、起止时间、成功标志与可选说明；
+      服务端从账号令牌推导用户名、从请求推导客户端 IP，校验空对端、结束早于
+      开始、跨度超过 30 天与非法方向，并按 ID 保留最新 10000 条。查看器可用
+      `GET /v1/account/connections` 读取自己的记录；运营者可用
+      `GET /v1/audit/connections`（Bearer server-key，`username` 大小写不敏感
+      过滤、`limit` 1–200 默认 50）或管理台 `connections [count]` 查看全部，
+      均按上报顺序倒序（最新在前）。查看器上报是尽力而为，任何错误静默忽略，不影响会话
+      生命周期。验证：`internal/account` 覆盖文本规范化、按账号/用户名过滤、
+      倒序与条数上限、非法输入、时间回退与重开数据库持久化；`internal/api`
+      覆盖三类端点的 401/400/503、IP 推导、过滤与条数校验；`internal/admin`
+      覆盖输出格式、用法错误与无存储提示；`server_api_test` 覆盖上报负载、
+      Bearer 令牌与空对端不发请求。真实服务端探针（隔离 `build/conn-smoke`，
+      31 项）新增“拒绝倒置时间”和“上报后账号可读回用户名、方向、起止毫秒、
+      时长、结果、说明与 `127.0.0.1` 来源”两项；同一实例上运营者
+      `GET /v1/audit/connections?username=viewer` 返回同一条记录，管理台
+      `connections 5` 输出 `ok ip=127.0.0.1 duration=3m0s`，非法条数回落到用法
+      提示，SQLite `connection_events` 中可见该行。`go vet ./...`、
+      `go test ./... -count=1`、`go build ./...`、`flutter analyze`、全量
+      `flutter test`（239 项）与 Windows Release 构建通过。剩余缺口：
+      `SessionPage` 的触发时机（首帧起算，正常结束/断开/重连/销毁上报）只有
+      代码路径，没有组件测试；探针直接调用 `ServerApi`，没有驱动真实 GUI
+      会话，因此“查看器 UI 自动上报”尚未端到端验收。
+    - 文件传输审计（2026-10-25）：新增 SQLite `file_events` 表，查看器在上传/
+      下载完成或失败后的下一次状态轮询窗口中，向
+      `POST /v1/account/file-transfers` 上报方向（upload/download）、最后文件名
+      与大小、文件数、结果与可选说明；同一窗口内多个文件聚合成一条记录，
+      文件名/大小描述最后完成的那一个，失败记录不带大小。服务端从账号令牌
+      推导用户名、从请求推导客户端 IP，校验空对端、未知方向、负数大小与
+      0 或超过 1000 的文件数，并按 ID 保留最新 10000 条。
+      查看器可用 `GET /v1/account/file-transfers` 读取自己的记录；运营者可用
+      `GET /v1/audit/file-transfers`（Bearer server-key，`username` 大小写不敏感
+      过滤、`limit` 1–200 默认 50）或管理台 `transfers [count]` 查看全部，均按
+      上报顺序倒序（最新在前）。查看器上报尽力而为，任何错误静默忽略，不影响传输 UI。
+      验证：`internal/account` 覆盖文本规范化、方向/大小/文件数校验、账号隔离、
+      用户名过滤、倒序与条数上限、缺省时间回退与重开数据库持久化；`internal/api`
+      覆盖三类端点的 401/400/503、默认值、IP 推导、过滤与条数校验；
+      `internal/admin` 覆盖输出格式、`files` 别名、用法错误与无存储提示；
+      `server_api_test` 覆盖上报负载、Bearer 令牌、成功/失败、聚合文件数、
+      `occurred_at_ms`，以及空对端或未知方向不发请求。真实服务端探针（隔离
+      `build/conn-smoke`，32 项）新增下载上报后账号读回方向、文件名、大小、
+      文件数、发生毫秒、结果与 `127.0.0.1` 来源；同一实例上运营者
+      `GET /v1/audit/file-transfers?username=viewer` 返回该记录，管理台
+      `transfers 5` 输出 `download name=photos.zip size=900 files=3`，
+      SQLite `file_events` 可见该行。`go vet ./...`、`go test ./... -count=1`、
+      `go build ./...`、`flutter analyze`、全量 `flutter test`（241 项）与
+      Windows Release 构建通过。剩余缺口：聚合窗口只保留最后文件名/大小，没有逐文件
+      明细或传输中进度，也没有主机侧入站/发出传输审计；`SessionPage` 的触发
+      时机同样只有代码路径，探针直接调用 `ServerApi`，未经真实 GUI 验收。
+    - 登录锁定持久化（2026-10-25）：`internal/authlimit` 新增 `Backend` 接口与
+      `NewPersistent`，失败计数、窗口起点、锁定截止与最后活动时间通过读写穿透
+      落在存储层；存储错误按失败开放处理（记日志后仍按内存语义放行/计数），
+      成功登录删除记录。每 5 分钟顺带清理空闲 30 分钟的未锁定键与已过期的锁定
+      记录。`internal/account` 建 `login_locks` 表（键、失败数、窗口起点、锁定
+      截止、最后活动，毫秒时间戳）与 `last_seen` 索引，实现加载/覆盖写/删除/
+      清理，重开数据库后记录仍在。`chast-server` 在配置 `--state` 时使用持久化
+      限流器，未配置时保持纯内存。验证：`internal/authlimit` 新增 4 项覆盖
+      “重启后第三次失败即锁定”“成功清零”“存储错误不阻断登录”“按空闲/过期
+      清理”；`internal/account` 新增 2 项覆盖生命周期、重开库持久化与清理边界；
+      `internal/api` 新增 `TestPersistentLoginLockout`，在持久化模式下设两错一
+      对再两错，第三次返回 429，且新建的持久化限流器同样看到该锁定，正确密码
+      经 API 仍为 429。真实服务端探针（隔离 `build/lockout-smoke`，同一
+      `state.db` 连续重启三次）：首次运行两错后第三次 429 `Retry-After: 15`，
+      `login_locks` 可见 `locktest|127.0.0.1` 行；重启后旧锁定到期，正确密码
+      200、两错后第三次 429 `Retry-After: 120`；再次重启后正确密码仍 429
+      `Retry-After: 108`，证明锁定跨进程重启保留。当时已知限制：多个实例共享
+      同一数据库时，并发失败更新按最后写入者覆盖；该问题随后由原子计数修复。
+      没有持久封禁名单，解锁出口为锁定到期、成功登录或管理台手动解锁。
+    - 登录锁定手动解锁（2026-10-25）：`account.Store.ClearLoginLocks` 按小写
+      用户名删除 `login_locks` 中该用户名在所有客户端 IP 上的记录（前缀长度用
+      SQLite `length` 计算，兼容非 ASCII 的失败用户名；空用户名拒绝）。管理台
+      新增 `user unlock <name>`，输出清除的键数并写入 `login_unlock` 审计
+      （`ip=admin-console`，说明含数量）；重复执行返回 0，不影响其他用户名。
+      验证：`internal/account` 覆盖大小写与空白归一、跨 IP 清除、相似用户名与
+      其他用户保留、非 ASCII 用户名、重复清零与空名拒绝；`internal/admin`
+      覆盖帮助文本、两个键的清除输出、目标外记录保留、重复为 0、缺参用法与
+      审计；隔离实例探针（`build/unlock-smoke`，阈值 2）：首次错误 401、第二次
+      429 `Retry-After: 120`、正确密码仍 429；管理台 `user unlock alice` 返回
+      `cleared (1 keys)` 后正确登录 200，重复解锁为 0，`audit` 含
+      `login_unlock`，SQLite `login_locks` 为空。
+    - 持久锁定原子计数（2026-10-25）：`authlimit.AtomicBackend` 新增可选
+      `UpdateLoginLock(key, update)`；持久化限流器检测到后端实现该接口时，
+      在一次存储事务内完成读取、应用失败策略与写回，否则退回原有
+      `Load`/`Save`。`account.Store` 用 `BEGIN IMMEDIATE` 取得写锁后读取并
+      UPSERT，两个进程共享同一 SQLite 文件时失败次数按事务串行累计，不再出现
+      最后写入者覆盖；事务错误沿用失败开放策略并上报。验证：`authlimit`
+      新增 2 项覆盖原子路径（3 次更新、无 Load/Save、锁定期间返回剩余时间、
+      锁定过期后重置为新窗口、原子错误不写记录且仅上报一次）；`internal/account`
+      新增并发测试——两个 `Store`/限流器共享同一 `state.db`，20 个并发失败在
+      `MaxFailures=20` 下恰好锁定一次，最终记录 `failures=0`、
+      `locked_until=now+1m`，另一实例 `Allow` 返回 1 分钟。真实双实例探针
+      （隔离 `build/atomic-smoke`，两个 `chast-server` 同时冷启动并共享同一
+      `state.db`，阈值 10）中 10 个并发错误登录为 9 个 401、1 个 429
+      `Retry-After: 120`，随后两个实例上的正确密码均为 429，SQLite 只有一行
+      `failures=0` 且 `locked_until` 在未来。探针同时暴露并修复了冷启动竞态：
+      `busy_timeout` 先于 `journal_mode` 设置，WAL 切换遇 `SQLITE_BUSY` 最多
+      重试 5 秒，`ALTER TABLE ... ADD COLUMN` 遇其他实例已加列时按成功处理；
+      `registry` 打开共享数据库时也采用同样的重试与幂等加列。`internal/account`
+      与 `internal/registry` 各新增并发打开同一新库的测试，连续 10 次通过；
+      `go vet ./...`、`go test ./... -count=1` 与 `go build ./...` 通过。
+    - 查看器 Wake-on-LAN（2026-10-25）：新增 `wake_on_lan.dart`，把
+      `AA:BB:CC:DD:EE:FF`、连字符、点号、空白或无分隔的 12 位十六进制统一成
+      大写冒号格式，生成 6 个 `0xFF` 加 16 份 MAC 的 102 字节魔法包，经绑定
+      随机端口的 `RawDatagramSocket` 广播到 `255.255.255.255:9`；发送字节数
+      不足即抛错。`Device` 新增本地 `mac` 字段（JSON 持久化，加载时重新规范化，
+      无效值丢弃），`updateMac` 保存或清空；`touch`/`save` 保留已有 MAC。
+      查看器设备菜单新增“唤醒”，对话框预填已存 MAC、校验 12 位十六进制并说明
+      仅限局域网，保存后立即发包并以 SnackBar 报告成功或失败；发送函数可注入，
+      组件测试不触碰真实网络。验证：`wake_on_lan_test` 覆盖四种格式归一、
+      102 字节/16 份拷贝布局、非法输入拒绝与 UDP 回环收发一致；
+      `device_store_test` 覆盖规范化落盘、重载/touch/save 保留、清空与原始 JSON
+      中的无效值；`home_page_test` 覆盖菜单入口、非法输入提示、连字符输入
+      发送、MAC 持久化与成功提示。`flutter analyze` 零问题、全量
+      `flutter test`（246 项）与 Windows Release 构建通过。
+    - Wake-on-LAN 已知限制：只在查看器所在广播域内有效，没有跨网段、中继或
+      由在线对等主机代发的变体，也不支持 RustDesk 的“远程唤醒后自动连接”；
+      MAC 仅本地保存、不同步账号，换机或重装后需重新填写；未在真实网卡/主板
+      上验收实际开机，测试只证明包格式与 UDP 发送路径。
+    - 验证（2026-10-25，单机与组件测试）：`internal/authlimit` 7 项覆盖
+      失败预算/锁定/锁定到期/成功清零/窗口过期/键淘汰/禁用；`internal/account`
+      覆盖设备字段、当前标记、跨用户与重复撤销、旧库回填，以及改密的原密码
+      校验、弱密码拒绝、保留当前会话、撤销其他令牌、新旧密码登录结果；
+      `internal/api` 覆盖连续失败后的 429 + `Retry-After`、锁定期间正确密码
+      仍 429、其他用户不受影响、解锁后恢复、会话列表与撤销，以及改密的
+      403/400/204、其他设备 401、旧密码失效与新密码登录；`server_api_test`
+      覆盖 `device_name` 负载、会话解析与 `DELETE` 路径、改密负载与 403
+      提示，`account_sessions_dialog_test` 覆盖列表/当前标记/撤销/失败保留/
+      重试/空状态，`change_password_dialog_test` 覆盖成功提交、长度/确认校验
+      与服务端拒绝保留对话框。`go vet ./...`、`go test ./... -count=1`、
+      `go build ./...`、`flutter analyze`、全量 `flutter test` 通过。
+    - 已知限制：失败计数默认在内存中，配置 `--state` 后写入 SQLite
+      `login_locks` 并跨重启、同库实例共享，失败计数通过 `BEGIN IMMEDIATE`
+      事务原子累计，但没有持久封禁名单（管理台 `user unlock` 可手动解锁）；两步验证已支持 TOTP
+      与一次性恢复码，但没有短信/邮件备用通道或
+      WebAuthn，查看器不提供二维码扫描；会话管理没有刷新令牌；账号安全审计
+      记录 IP 但不做地理位置解析；连接与文件传输审计只覆盖查看器发起的事件
+      （文件按轮询窗口聚合），不含主机侧入站会话、逐文件明细或传输中进度，
+      保留期按条数而非时间且不能导出；查看器不允许在
+      界面内撤销当前会话（仍可用退出登录）；改密没有忘记密码/邮件找回流程，
+      忘记密码仍由管理台重置。
+  - 软件更新：对齐 hbbs 的 `SoftwareUpdate`，`--software-version` 与
+    `--software-url` 成对启用；注册、单机/批量查询与 `/v1/server` 返回
+    `software{version,url}`。主机与查看者代理发现版本不同时记录一次提示
+    （续约去重）；查看器首页在版本不同于 `chastVersion` 时显示前端横幅，
+    可查看/复制下载地址并按版本忽略；均不自动下载。未配置时字段缺省，
+    URL 仅接受 http/https。查看器版本常量集中在 `app_info.dart`，关于
+    对话框与侧栏共用。
+  - 验证（2026-10-25，单机回环）：主机代理注册后 lookup 返回主机名/平台/
+    版本，`peers` 显示 `online=true`；删除租约后元数据仍可查；同一数据库由
+    第二个服务端重新打开后记录仍在；版本 1 JSON 旁路导入成功并改名为
+    `.json.imported`；PATCH 别名/标签后 lookup 与 `peers` 立即可见，停主机并
+    用同一数据库重启服务端后离线记录仍保留 `alias`/`tags`，空值清除生效；
+    启用软件更新后四个响应位置均带 `software`，版本为 `dev` 的主机与查看者
+    代理各记录一次提示且续约不重复；Go 全量测试通过。查看器改用批量刷新后
+    `flutter analyze` 与全量 `flutter test`（121 项）通过，按服务器分组、
+    200 条分片、缺失 ID 离线、别名/标签展示与更新横幅/忽略/下载地址对话框
+    由 `server_api_test`/`home_page_test` 覆盖；别名/标签编辑用例覆盖 PATCH
+    方法/路径/Bearer/去重与 401，以及菜单打开、保存后刷新和失败保留对话框；
+    并用真实服务端与主机代理在回环验证 `ServerApi.lookupBatch` 的去重、
+    `missing`、401、`software` 与中文别名/标签往返，`ServerApi.updateLabels`
+    写入中文别名与标签后批量查询回读一致、清空生效，Windows Release 构建通过。
+  - 验证（账号与地址簿，2026-10-25，单机回环）：管理台建号后
+    `user list` 只显示用户名/ID/创建时间；错误密码 401、正确密码返回 720 h
+    令牌，`server-key` 访问账号路由为 401；地址簿从空开始，PATCH 提交
+    `{"name":"办公室","tags":["lab","lab","vip"]}` 回读为去重后的
+    `lab,vip`，只提交标签时名称保留，非法 ID 为 400、删除不存在的条目为
+    404；登出后原令牌 401；用同一 `state.db` 重启服务端后，重启前签发的令牌、
+    中文名称、标签与密码登录均保留，管理台 `ab livetest` 同步可见。
+    `internal/account` 覆盖 PBKDF2-SHA256 标准向量（`password`/`salt`/1）、
+    模拟时钟过期、用户隔离、重开数据库与级联删除，`internal/api` 与
+    `internal/admin` 覆盖上述 HTTP 与管理台路径；`go vet ./...`、
+    `go test ./... -count=1` 与三个程序构建通过。
+  - 验证（查看器账号同步与增量地址簿，2026-10-25，单机回环）：
+    `AccountSessionStore` 覆盖缺失文件、读写往返（含 `bookRevision`）与
+    损坏/规范化输入（4 项）；`DeviceStore` 覆盖删除待办按账号持久化、移除与
+    损坏文件容错（2 项）；`ServerApi` 全量 25 项（含账号登录/登出、
+    地址簿修订号/墓碑解析、`since` 查询、旧服务端缺省、部分更新/删除、
+    401/503）；`planAddressBookSync` 覆盖服务端新增、名称/标签回填、最近提升、
+    本地名称与标签优先、仅本机上传、重复同步幂等、墓碑删除且禁止重传、
+    存活条目覆盖同名墓碑、待办删除抑制存活条目（7 项）；`home_page_test`
+    覆盖登录后保存会话与修订号
+    并自动同步、401 清除会话并回到登录表单、登出吊销令牌并清除本地会话、
+    卡片菜单编辑账号标签并上传（含清空）、墓碑移除本地设备且不上传、离线
+    删除进入待办并在恢复后重试且不被服务端拉回（12 项）。
+    `internal/account` 新增修订号单调递增、墓碑、越界游标、复活、用户隔离与
+    旧库列迁移/回填用例，`internal/api` 覆盖
+    `since` 增量、墓碑响应、非法游标与已同步空变更。`go vet ./...`、
+    `go test ./... -count=1`、`flutter analyze`、全量 `flutter test`（186 项）
+    与 Windows Release 构建通过。真实服务端 + `app/tool/account_sync_smoke.dart`
+    回环 29 项：登录、非法令牌 401、中文名称与标签去重、服务端独有条目及标签
+    合并、本地名称/标签冲突上传、仅本机条目及标签上传、正修订号、增量变更、
+    清空标签保留名称、分组创建/改名/移动、失效本地分组归一且不误传、分组
+    增量游标、删组墓碑并解绑、未知分组 404、非法分组 ID 400、删除墓碑、墓碑
+    移除且不重传、已追平游标无变更、离线删除待办持久化、待办抑制存活条目、
+    重试成功后清理、删除
+    探针、登出后 401、会话文件保存/读取/清除；用同一 `state.db` 重启服务端后，
+    同一 `account.json` 的未过期令牌、修订号、标签、分组名与成员关系仍保留，
+    重启后的条目/分组删除可通过持久化游标读到墓碑。
+  - 验证（共享地址簿权限，2026-10-25，单机回环）：管理台建 `smoke-owner`、
+    `smoke-grantee` 与 `smoke-control` 三个账号后，
+    `app/tool/account_sync_smoke.dart ... share` 验证默认只读授权、重复授权
+    幂等、双方列表权限、只读被授权者可读但改/删/列授权均 403 且属主条目不变、
+    升级读写后修改属主条目（含修订号推进）、删除写墓碑、属主复活条目、新增
+    条目落入属主地址簿且不复制给被授权者、升级完全控制后列出/授出/撤销第三方
+    授权、第三方只读 403、完全控制者自撤销、属主重新授权、自共享 400、未知
+    用户 404、撤销后共享列表清空、重复撤销 404，共 34 项；随后原有账号探针
+    29 项与同一 `state.db` 重启后的 5 项持久化检查仍通过。`internal/account`
+    覆盖权限校验、共享写、共享新增、授权管理与重开数据库，`internal/api`
+    覆盖共享写/新增/授权管理路由与 400/403/404，查看器
+    `server_api_test`/`shared_books_dialog_test` 覆盖权限解析、共享写/新增与
+    授权管理请求、权限选择/修改、条目新增/编辑/删除、完全控制子对话框与错误
+    显示；`go test`、`flutter analyze`、全量 `flutter test`（186 项）与 Windows
+    Release 构建通过。
+  - 验证（地址簿分组，2026-10-25，单机回环）：`internal/account` 覆盖分组修订
+    序列 1..10、按名称排序、同组移动 no-op、删组墓碑与逐条解绑、增量快照、
+    墓碑复活，旧库迁移用例验证 `group_id` 默认空与分组表可用；`internal/api`
+    覆盖分组创建/改名/删除、peer 只改分组、400/404、增量与分组墓碑。
+    Flutter 新增分组同步合并、`Device` 分组持久化、`ServerApi` 分组
+    PATCH/DELETE 与 peer `group_id`、分组管理对话框、首页分组分区/折叠/移动/
+    管理按钮组件测试。真实服务端探针新增 8 项（名称去空白、改名推进修订、
+    移动后快照、失效分组归一且不误传、已追平游标、删组墓碑并解绑、重复删除
+    404、非法 ID 400），账号探针合计 29 项；重启探针验证分组名与成员关系跨
+    重启、删组墓碑可见；共享地址簿 34 项回归通过。`go vet ./...`、
+    `go test ./... -count=1`、`flutter analyze`、全量 `flutter test`（186 项）
+    与 Windows Release 构建通过。
+  - 验证（地址簿搜索与标签筛选，2026-10-25，本机组件测试）：`home_page_test`
+    新增 3 项，覆盖按名称/ID/大小写不敏感标签搜索、搜索清除按钮、标签芯片
+    单选与多选并集、“全部”复位、无匹配空状态与“清除筛选”、搜索与标签同时
+    生效，以及筛选后分组标题与成员计数收窄、空分组隐藏、复位后分组还原，
+    主机别名与主机自报标签可搜索并成为芯片。`flutter analyze`、全量
+    `flutter test`（186 项）与 Windows Release 构建通过。
+  - 验证（离线清空标签与分组，2026-10-25，本机组件测试）：`device_store_test`
+    覆盖清空记录意图、触摸保留意图、`markPushSettled` 分别撤销与写入非空值
+    自动清除意图；`address_book_sync_test` 覆盖离线清空后按空标签/空分组
+    上传且不回填、服务端已匹配时直接撤销意图且不产生上传、非空值上的陈旧
+    意图归一；`home_page_test` 覆盖离线清空标签与移出分组后同步重试仍保持
+    本地空值，恢复在线后上传空值并撤销意图、卡片不再显示旧标签/分组。
+    `flutter analyze`、全量 `flutter test`（186 项）与 Windows Release 构建
+    通过。
+  - 验证（地址簿乐观并发，2026-10-25）：`internal/account` 新增用例覆盖匹配
+    令牌推进修订、名称/标签/分组三种陈旧写入 409 且不改数据、无条件写入继续
+    成功、未知条目带令牌 409 而无令牌可创建、删除后陈旧编辑 409、无令牌复活
+    墓碑；HTTP 用例覆盖创建后匹配 `if_revision` 成功、旧令牌 409 且消息含
+    “changed elsewhere”、仅移动分组匹配 200、`0`/`-2` 400。查看器
+    `device_store_test` 覆盖修订号跨保存/触摸持久化与非法值归一，
+    `address_book_sync_test` 覆盖拉取刷新修订号不计为字段更新且上传携带
+    对应令牌，`home_page_test` 覆盖陈旧编辑 409 后采用服务器行并提示刷新。
+    共享地址簿存储/HTTP 用例覆盖陈旧改名与删除 409、匹配令牌成功删除、非正
+    令牌 400，`shared_books_dialog_test` 覆盖共享编辑携带修订号及 409 后刷新
+    服务器行。`go vet ./...`、`go test ./... -count=1`、`go build ./...`、
+    `flutter analyze`、全量 251 项 Flutter 测试与 Windows Release 构建通过。
+  - 已知限制：共享地址簿虽有只读/读写/完全控制三级权限，但没有按地址簿分组
+    或按分组的授权；共享条目没有保存密码或导入导出；共享只共享条目，被授权者
+    连接目标仍需目标主机自己的密码与审批。地址簿分组不支持嵌套或拖拽排序，
+    也不参与共享（被授权者看到的是属主的平铺条目）；分组名称只在查看器内存中
+    缓存，重启后的首次同步必须全量读取，离线只能保留旧分组 ID 且无法新建/
+    改名/删除分组；账号标签只是逐设备标签，没有按组授权。搜索与标签筛选只
+    作用于“我的设备”，不覆盖最近连接、共享地址簿对话框或分组标题，只做
+    大小写不敏感的子串匹配，没有拼音/模糊匹配、按分组/在线状态筛选，筛选
+    状态不跨重启保存。地址簿逐条乐观并发控制只覆盖查看器对自有地址簿的
+    `PATCH`：省略 `if_revision` 的旧客户端、共享新增以及分组改名/删除
+    仍是最后写入者优先；冲突后查看器放弃本地未上传的旧值并采用服务器版本，
+    不提供逐字段合并或自动重试；墓碑会长期保留（尚未按时间或已同步水位清理），
+    查看器只在已保存条目上应用删除，最近连接不受墓碑影响；删除已有按账号隔离
+    的本地待办并在每次同步前重试（成功/404 清理，401 保留）；清空标签/分组的
+    意图会持久化并在恢复后上传，但跨设备同时编辑的意图在 409 后会被服务器版本替换。
+    令牌明文保存在 `account.json` 且是长期 Bearer，没有刷新/轮换；设备会话
+    可以列出、改名并撤销其他设备，也可以一键退出全部其他设备，但没有登录
+    地点审计；密码可在查看器自助修改，但没有忘记密码/邮件找回流程，忘记密码仍由回环
+    管理台重置；登录有按“用户名+IP”的失败
+    锁定，配置 `--state` 后写入 SQLite `login_locks` 并跨重启共享，失败计数
+    通过 `BEGIN IMMEDIATE` 事务原子累计；没有持久封禁（管理台 `user unlock` 可手动解锁）；账号级 TOTP 两步验证与一次性
+    恢复码已支持，但没有短信/邮件备用验证方式；连接与文件传输审计只覆盖
+    查看器发起的事件（文件按轮询窗口聚合），没有主机侧入站会话、逐文件明细
+    或地理位置，保留期按条数且不能导出；地址簿
+    只保存 peer ID、名称、标签与分组 ID，不保存连接参数；Wake-on-LAN
+    的 MAC 只写入本地设备条目，不随账号同步。主机
+    自报元数据未签名；别名/标签可从查看器设备菜单或回环管理台编辑，但前者
+    要求配置 server-key；软件更新在主机端只写代理日志，查看器显示一次性横幅
+    与可复制的下载地址，不自动下载或安装；租约、中继分配与打洞地址仍只在
+    内存中（重连后重建，与 hbbs 一致）。
+
+## P0 — 查看者鉴权（已完成）
+
+- 已完成：补齐 RustDesk “server-key 约束查看者”的缺口，协议仍为 v23，控制报文
+  只增字段。
+  - 查询鉴权：配置 `--server-key` 后，`GET /v1/hosts/{id}` 必须带 Bearer；
+    未授权返回 401，不再下发候选、共享载体或 `carrier_token`。
+  - 打洞证明：`punch_request` 新增 `timestamp` 与 HMAC-SHA256 证明
+    （`chast-punch-v1`，±60 s 时间窗），服务器先验证再交换地址；空密钥保持
+    原有开放行为。
+  - 中继准入：UDP 中继新增 `relay_viewer`/`relay_viewer_ack` 控制报文，查看者
+    用查询得到的 `carrier_token` 证明槽位，未认证来源的数据报直接丢弃；TCP/WS
+    载体在首条 hello 校验同一令牌，独立 `chast-relay` 同样启用。
+  - 客户端：`chast-tunnel viewer` 自动附带 Bearer、打洞证明和中继令牌（含
+    direct→relay 回退）；Flutter 的“连接服务”对话框新增服务端密钥字段，
+    持久化到 `server.json`，在线状态、查找和隧道参数共用同一份配置。
+  - 验证（2026-10-25，单机回环）：带密钥服务器上无密钥/错误密钥查询均为 401，
+    正确密钥为 200；无密钥/错误密钥查看者在 lookup 阶段退出；带密钥查看者
+    auto 得到 `path=direct`，relay 得到 `relay viewer token accepted`，服务器
+    记录 `relay viewer authenticated`；无密钥服务器的两条路径仍正常。
+    `flutter analyze` 零问题、`flutter test` 110 项通过；Go `vet`/`build`/
+    `test ./... -count=1` 通过。
+  - 已知限制：旧版查看者连接启用 server-key 的服务会得到 401，必须升级并填写
+    密钥；密钥目前明文保存在 `server.json` 与进程参数中，依赖用户目录 ACL；
+    打洞证明只覆盖会合请求，媒体仍由端到端 QUIC TLS 与令牌保护。
 
 ## M6 后续（未开始）
 

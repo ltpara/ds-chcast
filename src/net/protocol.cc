@@ -1202,6 +1202,36 @@ bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate
     return true;
 }
 
+bool valid_chat_text(const std::string& text) {
+    return !text.empty() && text.size() <= kMaxChatBytes && valid_utf8(text);
+}
+
+std::vector<uint8_t> make_chat_message(const std::string& text) {
+    if (!valid_chat_text(text)) {
+        return {};
+    }
+    return make_control(ControlType::ChatMessage,
+                        std::vector<uint8_t>(text.begin(), text.end()));
+}
+
+bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
+                        std::string* error) {
+    if (payload.empty()) {
+        set_error(error, "ChatMessage carries no text");
+        return false;
+    }
+    if (payload.size() > kMaxChatBytes) {
+        set_error(error, "ChatMessage text is too long");
+        return false;
+    }
+    text.assign(payload.begin(), payload.end());
+    if (!valid_utf8(text)) {
+        set_error(error, "ChatMessage text is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
 // CursorUpdate: flags u8, reserved u8, x/y u32, hotspot u16 x2, shape id u64,
 // width/height u16 x2, then width*height*4 premultiplied BGRA bytes or none.
 constexpr size_t kCursorFixedSize = 1 + 1 + 4 + 4 + 2 + 2 + 8 + 2 + 2;

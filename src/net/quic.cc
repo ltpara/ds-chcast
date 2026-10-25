@@ -641,6 +641,10 @@ struct QuicSession::Impl {
     size_t pending_clipboard_bytes = 0;
     std::deque<ClipboardContent> clipboard_contents;
     uint64_t clipboard_contents_seen = 0;
+    // Chat lines waiting for the application. Chat is low-rate; a full queue
+    // drops the newest message rather than replaying stale conversation.
+    std::deque<std::string> chats;
+    uint64_t chats_seen = 0;
     std::deque<FileOffer> file_offers;
     uint64_t file_offers_seen = 0;
     std::deque<FileChunk> file_chunks;
@@ -2030,6 +2034,23 @@ struct QuicSession::Impl {
                     }
                     clipboard_updates.push_back(std::move(update));
                     ++clipboard_received;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::ChatMessage: {
+                std::string text;
+                if (!parse_chat_message(payload, text, &error)) {
+                    note_transport_failure("ChatMessage: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (chats.size() >= 64) {
+                        break;
+                    }
+                    chats.push_back(std::move(text));
+                    ++chats_seen;
                 }
                 cv.notify_all();
                 break;
@@ -4297,6 +4318,36 @@ bool QuicSession::take_clipboard_content(ClipboardContent& content) {
 uint64_t QuicSession::clipboard_contents_received() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->clipboard_contents_seen;
+}
+
+Error QuicSession::send_chat(const std::string& text) {
+    Impl& impl = *impl_;
+    if (impl.role == Impl::Role::Client) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    std::vector<uint8_t> message = make_chat_message(text);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid chat text");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_chat(std::string& text) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->chats.empty()) {
+        return false;
+    }
+    text = std::move(impl_->chats.front());
+    impl_->chats.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::chats_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->chats_seen;
 }
 
 bool QuicSession::take_file_offer(FileOffer& offer) {

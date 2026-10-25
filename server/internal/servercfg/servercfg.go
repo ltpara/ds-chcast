@@ -67,7 +67,7 @@ func (l *Layer) lookupAlias(flagName, current string) (string, bool) {
 		return l.lookupKey("test_hbbs")
 	case "relay-only":
 		return l.lookupKey("always_use_relay")
-	case "punch-rate-max":
+	case "punch-log-max":
 		return l.lookupKey("max_punch_requests")
 	}
 	return "", false

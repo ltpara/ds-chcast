@@ -24,6 +24,8 @@ const (
 	TypeRelayChallenge     = "relay_challenge"
 	TypeRelayAuth          = "relay_auth"
 	TypeRelayAck           = "relay_hello_ack"
+	TypeRelayViewer        = "relay_viewer"
+	TypeRelayViewerAck     = "relay_viewer_ack"
 	TypeBusy               = "busy"
 )
 
@@ -42,6 +44,9 @@ type Message struct {
 	PublicKey   string   `json:"public_key,omitempty"`
 	Binding     string   `json:"binding,omitempty"`
 	Signature   string   `json:"signature,omitempty"`
+	Auth        string   `json:"auth,omitempty"`
+	Token       string   `json:"token,omitempty"`
+	Timestamp   int64    `json:"timestamp,omitempty"`
 	Relay       string   `json:"relay,omitempty"`
 	OK          bool     `json:"ok"`
 	Error       string   `json:"error,omitempty"`

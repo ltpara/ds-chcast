@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
 
+import '../account_store.dart';
+import '../server_api.dart';
 import '../server_settings.dart';
 import '../target.dart';
 import '../theme.dart';
@@ -13,14 +15,19 @@ import '../remote_key_sequence.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
 import '../viewer_bridge.dart';
+import '../widgets/chat_panel.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
 
 class SessionPage extends StatefulWidget {
-  const SessionPage({super.key, required this.target});
+  const SessionPage({super.key, required this.target, this.account});
 
   final ConnectTarget target;
+
+  /// The signed-in account, if any. It is only used to report a finished
+  /// remote session for the server-side connection audit.
+  final AccountSession? account;
 
   @override
   State<SessionPage> createState() => _SessionPageState();
@@ -44,6 +51,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // One picker at a time; the native side also refuses an upload while the
   // previous one is active, this just keeps the dialog from stacking.
   bool _filePickBusy = false;
+  // Session chat. The page owns the transcript and the native transport; the
+  // panel is a modeless overlay. While its input holds focus, physical keys
+  // belong to the text field, so remote forwarding and the native key-capture
+  // switch pause until focus leaves.
+  final List<ChatEntry> _chatEntries = <ChatEntry>[];
+  final FocusNode _chatInputFocus = FocusNode(debugLabel: 'chat-input');
+  bool _chatOpen = false;
+  bool _chatTyping = false;
+  bool _chatDraining = false;
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -128,6 +144,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // their first frame.
   final AutoReconnectPolicy _autoPolicy = AutoReconnectPolicy();
   Timer? _autoTimer;
+  // The first frame marks a real remote session; a terminal state reports it
+  // once to the signed-in account's server. Handshake failures stay out of
+  // this trail because no session existed yet.
+  DateTime? _auditStartedAt;
 
   bool get _inputActive => _controlEnabled && _status.acceptsInput && _startError == null;
 
@@ -141,6 +161,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _chatInputFocus.addListener(_onChatFocusChanged);
     ViewerBridge.setDropHandler(_sendDroppedFiles);
     _startPolling();
     _starting = _start();
@@ -155,9 +176,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     _autoTimer?.cancel();
+    _chatInputFocus.removeListener(_onChatFocusChanged);
+    _chatInputFocus.dispose();
     _focus.dispose();
     _setKeyCapture(false);
     _clearCursor();
+    final DateTime? auditStartedAt = _auditStartedAt;
+    _auditStartedAt = null;
+    if (auditStartedAt != null) {
+      unawaited(_reportFinishedSession(auditStartedAt, 'closed'));
+    }
     unawaited(_shutdown());
     super.dispose();
   }
@@ -171,6 +199,60 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // reach the page; lift them here and tell the host to drop whatever it
     // still holds. Control stays on for when the window comes back.
     _releaseRemoteInput();
+  }
+
+  Future<void> _reportFinishedSession(DateTime startedAt, String detail) async {
+    final AccountSession? account = widget.account;
+    if (account == null || !account.isActiveAt(DateTime.now())) {
+      return;
+    }
+    final String peer = widget.target.hostId.isNotEmpty
+        ? widget.target.hostId
+        : widget.target.label;
+    try {
+      await ServerApi.reportConnection(
+        ServerSettings(url: account.server),
+        account.token,
+        peerId: peer,
+        startedAt: startedAt,
+        endedAt: DateTime.now(),
+        detail: detail,
+      );
+    } catch (_) {
+      // Audit delivery must not disturb the session or the returned page.
+    }
+  }
+
+  Future<void> _reportFileEvent(
+    String direction,
+    String name,
+    int size,
+    int files,
+    bool success,
+    String detail,
+  ) async {
+    final AccountSession? account = widget.account;
+    if (account == null || !account.isActiveAt(DateTime.now())) {
+      return;
+    }
+    final String peer = widget.target.hostId.isNotEmpty
+        ? widget.target.hostId
+        : widget.target.label;
+    try {
+      await ServerApi.reportFileTransfers(
+        ServerSettings(url: account.server),
+        account.token,
+        peerId: peer,
+        direction: direction,
+        name: name,
+        size: size,
+        files: files,
+        success: success,
+        detail: detail,
+      );
+    } catch (_) {
+      // Audit delivery is best effort, exactly like the session report.
+    }
   }
 
   Future<void> _start() async {
@@ -230,6 +312,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       server: ServerSettings(
         url: widget.target.server,
         mode: widget.target.mode,
+        key: widget.target.serverKey,
       ),
       hostId: widget.target.hostId,
     );
@@ -468,6 +551,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         _isCredentialChallenge(status.denial);
     final bool nowOver = status.isOver && !challenge;
     final bool justOver = nowOver && !_over;
+    if (status.hasFrame && _auditStartedAt == null) {
+      _auditStartedAt = DateTime.now();
+    }
     if (status.hasFrame && !_sawFrame) {
       _sawFrame = true;
       _collapsed = false;
@@ -511,6 +597,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final bool downloadDone = status.filesReceived > _status.filesReceived;
     final bool downloadFailed =
         status.fileReceiveFailures > _status.fileReceiveFailures;
+    // A poll can swallow several completions, especially for small files.
+    // The audit keeps the count and the last name/size seen in this window.
+    final int uploadsDone = status.filesSent - _status.filesSent;
+    final int uploadsFailed = status.fileFailures - _status.fileFailures;
+    final int downloadsDone = status.filesReceived - _status.filesReceived;
+    final int downloadsFailed =
+        status.fileReceiveFailures - _status.fileReceiveFailures;
+    final bool chatArrived = status.chatReceived > _status.chatReceived;
+    final bool chatFailed = status.chatFailures > _status.chatFailures;
     if (modeChangeAccepted) {
       _modesRefreshPending = true;
       _modesRequestedFor = null;
@@ -551,6 +646,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ));
     }
     if (justOver) {
+      final DateTime? auditStartedAt = _auditStartedAt;
+      _auditStartedAt = null;
+      if (auditStartedAt != null) {
+        unawaited(_reportFinishedSession(auditStartedAt, status.error));
+      }
       _maybeStartAutoReconnect(status);
     }
     if (switchRefused) {
@@ -593,6 +693,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         duration: const Duration(seconds: 5),
       ));
     }
+    if (uploadsDone > 0) {
+      unawaited(_reportFileEvent('upload', status.lastFileName,
+          uploadsDone == 1 ? status.fileSize : 0, uploadsDone, true, ''));
+    }
+    if (uploadsFailed > 0) {
+      unawaited(_reportFileEvent('upload', status.lastFileName, 0,
+          uploadsFailed, false, status.lastFileError));
+    }
+    if (downloadsDone > 0) {
+      unawaited(_reportFileEvent('download', status.downloadName,
+          downloadsDone == 1 ? status.downloadSize : 0, downloadsDone, true, ''));
+    }
+    if (downloadsFailed > 0) {
+      unawaited(_reportFileEvent('download', status.downloadName, 0,
+          downloadsFailed, false, status.downloadError));
+    }
     // A microphone failure stops only the uplink; video and system sound keep
     // running. The counter tells a new failure from the stale reason text.
     if (!nowOver && status.microphoneErrors > _status.microphoneErrors) {
@@ -634,6 +750,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(text),
         duration: const Duration(seconds: 4),
+      ));
+    }
+    if (chatArrived) {
+      unawaited(_drainChat());
+    }
+    if (!nowOver && chatFailed) {
+      final String reason = status.chatError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '聊天消息发送失败' : '聊天消息发送失败：$reason'),
+        duration: const Duration(seconds: 5),
       ));
     }
     if (droppedControl) {
@@ -1432,6 +1558,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     await _starting;
     _teardown = null;
+    // A manual reconnect ends a live session; report it before the teardown.
+    final DateTime? auditStartedAt = _auditStartedAt;
+    _auditStartedAt = null;
+    if (auditStartedAt != null) {
+      unawaited(_reportFinishedSession(auditStartedAt, '重新连接'));
+    }
     await _stopSession();
     _clearCursor();
     if (!mounted) {
@@ -1449,7 +1581,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelY = 0;
       _heldButtons = 0;
       _heldKeys.clear();
+      _chatEntries.clear();
+      _chatOpen = false;
+      _chatTyping = false;
     });
+    if (_chatInputFocus.hasFocus) {
+      _chatInputFocus.unfocus();
+    }
     _setKeyCapture(false);
     _startPolling();
     _starting = _start();
@@ -1505,6 +1643,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (_chatTyping) {
+      // The chat input has the keyboard: characters, Enter and IME belong to
+      // the text field, not the host.
+      return KeyEventResult.ignored;
+    }
     if (_inputActive) {
       if (event is KeyRepeatEvent) {
         // The host generates its own auto-repeat; forwarding these would
@@ -1530,6 +1673,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     if (event is! KeyDownEvent) {
       return KeyEventResult.ignored;
+    }
+    if (_chatOpen && event.logicalKey == LogicalKeyboardKey.escape) {
+      _closeChat();
+      return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.escape) {
       if (_fullscreen) {
@@ -1564,9 +1711,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelX = 0;
       _wheelY = 0;
     });
-    _setKeyCapture(_inputActive);
+    if (_controlEnabled && _chatTyping) {
+      // Turning control back on while the chat input owns the keyboard would
+      // leave every keystroke local; hand the keyboard back to the session.
+      _chatInputFocus.unfocus();
+    }
+    _setKeyCapture(_inputActive && !_chatTyping);
     _syncCursor();
-    if (_controlEnabled) {
+    if (_controlEnabled && !_chatTyping) {
       // The toolbar button may claim focus while it handles the tap; take it
       // back once the frame settles so keys go to the host immediately.
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1597,6 +1749,117 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Even if an Up above was lost, or the host saw a press this page never
     // recorded, this lifts whatever it still holds.
     unawaited(_guardSend(ViewerBridge.releaseInput()));
+  }
+
+  void _onChatFocusChanged() {
+    final bool focused = _chatInputFocus.hasFocus;
+    if (_chatTyping == focused) {
+      return;
+    }
+    if (focused) {
+      // Keys already down on the host must not stay down while the text field
+      // takes the keyboard.
+      _releaseRemoteInput();
+    }
+    setState(() => _chatTyping = focused);
+    _setKeyCapture(_inputActive && !focused);
+  }
+
+  void _toggleChat() {
+    if (_chatOpen) {
+      _closeChat();
+    } else {
+      _openChat();
+    }
+  }
+
+  void _openChat() {
+    if (!_chatOpen) {
+      setState(() => _chatOpen = true);
+    }
+    // The toolbar tap leaves focus on its button; hand it to the input once
+    // the panel is laid out so typing works immediately.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _chatOpen) {
+        _chatInputFocus.requestFocus();
+      }
+    });
+  }
+
+  void _closeChat() {
+    if (_chatInputFocus.hasFocus) {
+      _chatInputFocus.unfocus();
+    }
+    setState(() => _chatOpen = false);
+    _setKeyCapture(_inputActive);
+    if (_inputActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _inputActive && !_chatTyping) {
+          _focus.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _appendChat(ChatEntry entry) {
+    _chatEntries.add(entry);
+    if (_chatEntries.length > 200) {
+      _chatEntries.removeRange(0, _chatEntries.length - 200);
+    }
+  }
+
+  /// Moves host lines out of the native queue. The status counter is only a
+  /// wake-up: the queue itself decides how many lines are waiting, so a burst
+  /// arriving between polls is never half-read.
+  Future<void> _drainChat() async {
+    if (_chatDraining) {
+      return;
+    }
+    _chatDraining = true;
+    try {
+      while (mounted) {
+        final String? text = await ViewerBridge.takeChat();
+        if (text == null || text.isEmpty) {
+          break;
+        }
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _appendChat(ChatEntry(text: text, mine: false, at: DateTime.now()));
+          // A message is worth surfacing even while the panel is closed; the
+          // input is not focused, so remote keyboard forwarding keeps working.
+          _chatOpen = true;
+        });
+      }
+    } on PlatformException {
+      // A closing session rejects calls; the status poll reports why.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      _chatDraining = false;
+    }
+  }
+
+  Future<bool> _sendChat(String text) async {
+    try {
+      final bool queued = await ViewerBridge.sendChat(text);
+      if (!queued) {
+        return false;
+      }
+      if (!mounted) {
+        return true;
+      }
+      setState(() {
+        _appendChat(ChatEntry(text: text, mine: true, at: DateTime.now()));
+        _chatOpen = true;
+      });
+      return true;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
   }
 
   void _setKeyCapture(bool enable) {
@@ -1956,6 +2219,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_sendSpecialAction(action)),
                         onToggleClipboard: _toggleClipboardSync,
                         onSendFile: () => unawaited(_sendFile()),
+                        chatOpen: _chatOpen,
+                        onToggleChat: _toggleChat,
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
                         onToggleMicrophone: () => unawaited(_toggleMicrophone()),
                         onTogglePrivacy: () => unawaited(_togglePrivacy()),
@@ -2053,6 +2318,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   ),
                 if (hasFrame &&
                     !showOverlay &&
+                    !_chatOpen &&
                     (_status.privacyEnabled ||
                         (_status.acceptsAudio && _status.audioMuted)))
                   Positioned(
@@ -2073,6 +2339,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             _statusBadge(Icons.volume_off_rounded, '已静音'),
                         ],
                       ),
+                    ),
+                  ),
+                if (hasFrame && !showOverlay && _chatOpen)
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: ChatPanel(
+                      entries: _chatEntries,
+                      sent: _status.chatSent,
+                      received: _status.chatReceived,
+                      onSend: _sendChat,
+                      onClose: _closeChat,
+                      inputFocusNode: _chatInputFocus,
                     ),
                   ),
               ],

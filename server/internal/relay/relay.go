@@ -66,6 +66,11 @@ type Manager struct {
 	bindIP net.IP
 	closed bool
 
+	// requireViewerToken admits only viewers that first prove the lookup
+	// carrier token over the relay port. It is enabled with the server key so
+	// unauthenticated deployments keep the original first-source behavior.
+	requireViewerToken bool
+
 	wantedReadBuffer int
 	readBuffer       int
 }
@@ -78,6 +83,12 @@ type Option func(*Manager)
 // system default.
 func WithReadBuffer(size int) Option {
 	return func(m *Manager) { m.wantedReadBuffer = size }
+}
+
+// WithViewerTokenRequired makes every relay viewer prove the per-lease carrier
+// token before its datagrams are forwarded, matching hbbr's key check.
+func WithViewerTokenRequired(required bool) Option {
+	return func(m *Manager) { m.requireViewerToken = required }
 }
 
 type port struct {
@@ -98,6 +109,11 @@ type port struct {
 	toViewer   uint64
 	busy       uint64
 	dropped    uint64
+
+	// viewerAuthAddr is the source that proved the carrier token. It is not
+	// tied to viewerAddr so a viewer reconnect from a new port can replace a
+	// stale association after authenticating again.
+	viewerAuthAddr *net.UDPAddr
 
 	// hostLink is the host agent's authenticated TCP carrier link. It outlives
 	// viewers so the next one can pair without a new handshake.
@@ -455,6 +471,7 @@ func (m *Manager) Allocate(hostID string) (int, error) {
 			p.hostID = hostID
 			p.hostAddr = nil
 			p.viewerAddr = nil
+			p.viewerAuthAddr = nil
 			p.hostSeen = time.Time{}
 			p.viewerSeen = time.Time{}
 			if p.udpSession != nil {
@@ -485,6 +502,7 @@ func (m *Manager) Release(hostID string) {
 		p.hostID = ""
 		p.hostAddr = nil
 		p.viewerAddr = nil
+		p.viewerAuthAddr = nil
 		p.hostSeen = time.Time{}
 		p.viewerSeen = time.Time{}
 		if p.udpSession != nil {
@@ -712,6 +730,9 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 		case wire.TypeRelayAuth:
 			p.handleAuth(conn, msg, src, now)
 			return
+		case wire.TypeRelayViewer:
+			p.handleViewerAuth(conn, msg, src)
+			return
 		}
 	}
 
@@ -738,6 +759,11 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 	}
 
 	if p.hostAddr == nil || now.Sub(p.hostSeen) > hostIdle {
+		p.dropped++
+		return
+	}
+	if p.manager.requireViewerToken &&
+		(p.viewerAuthAddr == nil || !sameAddr(p.viewerAuthAddr, src)) {
 		p.dropped++
 		return
 	}
@@ -849,6 +875,29 @@ func (p *port) reply(conn *net.UDPConn, to *net.UDPAddr, m wire.Message) {
 	conn.WriteToUDP(wire.Encode(m), to)
 }
 
+// handleViewerAuth is the UDP counterpart of the carrier viewer hello. A valid
+// token reserves the source address, and a new valid source supersedes a stale
+// viewer association so a reconnect does not have to wait for viewerIdle.
+func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr) {
+	ack := wire.Message{Type: wire.TypeRelayViewerAck}
+	switch {
+	case p.hostID == "" || msg.HostID != p.hostID:
+		ack.Error = "no relay reservation for this host"
+	case p.manager.auth == nil || !p.manager.auth.VerifyCarrier(msg.HostID, msg.Token):
+		ack.Error = "viewer token was not accepted"
+	default:
+		if p.viewerAuthAddr == nil || !sameAddr(p.viewerAuthAddr, src) {
+			if p.viewerAddr != nil && !sameAddr(p.viewerAddr, src) {
+				p.detachUDPViewerLocked()
+			}
+			p.viewerAuthAddr = cloneAddr(src)
+		}
+		p.manager.log.Info("relay viewer authenticated", "port", p.number, "remote", src.String())
+		ack.OK = true
+	}
+	p.reply(conn, src, ack)
+}
+
 // serveTCP accepts both raw carriers and WebSocket upgrades on the relay port.
 func (p *port) serveTCP(tcp net.Listener) {
 	for {
@@ -880,6 +929,13 @@ func (p *port) handleTCP(conn net.Conn) {
 			conn.Close()
 			return
 		}
+		if p.manager.requireViewerToken {
+			body, err := ws.ReadMessage()
+			if err != nil || !p.viewerHelloOK(body) {
+				conn.Close()
+				return
+			}
+		}
 		_ = conn.SetDeadline(time.Time{})
 		p.serveViewer(&carrierViewer{
 			conn: conn,
@@ -894,6 +950,26 @@ func (p *port) handleTCP(conn net.Conn) {
 		}
 		switch line + "\n" {
 		case carrier.MagicRaw:
+			if p.manager.requireViewerToken {
+				hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
+				if err != nil || !p.viewerHelloTextOK(hello) {
+					p.refuseConn(conn, "viewer token was not accepted")
+					return
+				}
+			}
+			_ = conn.SetDeadline(time.Time{})
+			p.serveViewer(&carrierViewer{
+				conn:   conn,
+				send:   carrier.NewFrameWriter(conn),
+				frames: carrier.NewFrameReader(br),
+				peer:   conn.RemoteAddr().String(),
+			})
+		case carrier.MagicViewer:
+			hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
+			if err != nil || !p.viewerHelloTextOK(hello) {
+				p.refuseConn(conn, "viewer token was not accepted")
+				return
+			}
 			_ = conn.SetDeadline(time.Time{})
 			p.serveViewer(&carrierViewer{
 				conn:   conn,
@@ -919,7 +995,7 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	}
 	var hello carrier.HostHello
 	if err := json.Unmarshal([]byte(line), &hello); err != nil {
-		p.refuseHost(conn, "malformed host hello")
+		p.refuseConn(conn, "malformed host hello")
 		return
 	}
 	p.mu.Lock()
@@ -927,17 +1003,17 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	p.mu.Unlock()
 	if reserved == "" || hello.HostID != reserved || p.manager.auth == nil ||
 		!p.manager.auth.VerifyHost(hello.HostID, p.number) {
-		p.refuseHost(conn, "host was not accepted")
+		p.refuseConn(conn, "host was not accepted")
 		return
 	}
 	nonce, err := p.manager.auth.IssueChallenge(hello.HostID, identity.DomainCarrierHost)
 	if err != nil {
-		p.refuseHost(conn, "host has no live registration")
+		p.refuseConn(conn, "host has no live registration")
 		return
 	}
 	challenge, err := json.Marshal(carrier.HostChallenge{Nonce: nonce})
 	if err != nil {
-		p.refuseHost(conn, "could not issue a challenge")
+		p.refuseConn(conn, "could not issue a challenge")
 		return
 	}
 	if _, err := io.WriteString(conn, carrier.MagicChallenge+string(challenge)+"\n"); err != nil {
@@ -951,18 +1027,18 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	}
 	authText, ok := strings.CutPrefix(line, carrier.MagicAuth)
 	if !ok {
-		p.refuseHost(conn, "host did not answer the challenge")
+		p.refuseConn(conn, "host did not answer the challenge")
 		return
 	}
 	var auth carrier.HostAuth
 	if err := json.Unmarshal([]byte(authText), &auth); err != nil {
-		p.refuseHost(conn, "malformed host proof")
+		p.refuseConn(conn, "malformed host proof")
 		return
 	}
 	message := identity.CarrierHostMessage(hello.HostID, "", auth.Nonce)
 	if auth.HostID != hello.HostID || auth.Nonce != nonce ||
 		!p.manager.auth.CheckChallenge(hello.HostID, identity.DomainCarrierHost, auth.Nonce, string(message), auth.Signature) {
-		p.refuseHost(conn, "host proof was not accepted")
+		p.refuseConn(conn, "host proof was not accepted")
 		return
 	}
 	if _, err := io.WriteString(conn, carrier.MagicOK); err != nil {
@@ -1056,10 +1132,31 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	p.manager.log.Info("relay carrier host link closed", "port", p.number)
 }
 
-func (p *port) refuseHost(conn net.Conn, reason string) {
+func (p *port) refuseConn(conn net.Conn, reason string) {
 	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, _ = io.WriteString(conn, carrier.MagicErrorPrefix+reason+"\n")
 	conn.Close()
+}
+
+func (p *port) viewerHelloTextOK(line string) bool {
+	var hello carrier.SharedViewerHello
+	if json.Unmarshal([]byte(line), &hello) != nil {
+		return false
+	}
+	return p.viewerTokenOK(hello.HostID, hello.Token)
+}
+
+func (p *port) viewerHelloOK(body []byte) bool {
+	var hello carrier.SharedViewerHello
+	if json.Unmarshal(body, &hello) != nil {
+		return false
+	}
+	return p.viewerTokenOK(hello.HostID, hello.Token)
+}
+
+func (p *port) viewerTokenOK(id, token string) bool {
+	return p.hostID != "" && id == p.hostID && p.manager.auth != nil &&
+		p.manager.auth.VerifyCarrier(id, token)
 }
 
 func (p *port) serveViewer(v *carrierViewer) {

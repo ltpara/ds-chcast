@@ -26,6 +26,7 @@ import (
 
 const (
 	punchTTL        = 30 * time.Second
+	punchAuthWindow = time.Minute
 	DefaultRateMax  = 30
 	defaultRateSpan = 10 * time.Second
 )
@@ -33,6 +34,7 @@ const (
 type options struct {
 	readBuffer int
 	rateMax    int
+	serverKey  string
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -51,6 +53,12 @@ func WithPunchRateMax(max int) Option {
 	return func(o *options) { o.rateMax = max }
 }
 
+// WithServerKey requires viewers to prove knowledge of the server key before a
+// punch is coordinated. An empty key keeps public rendezvous behavior.
+func WithServerKey(key string) Option {
+	return func(o *options) { o.serverKey = key }
+}
+
 type Server struct {
 	conn       *net.UDPConn
 	reg        *registry.Registry
@@ -60,6 +68,7 @@ type Server struct {
 	ipChanges  *ipchange.Tracker
 	log        *slog.Logger
 	limiter    *limiter
+	serverKey  string
 	readBuffer int
 	done       chan struct{}
 	closeOnce  sync.Once
@@ -93,6 +102,7 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		relayAddr:  relayAddr,
 		log:        log,
 		limiter:    newLimiter(cfg.rateMax, defaultRateSpan),
+		serverKey:  cfg.serverKey,
 		readBuffer: readBuffer,
 		done:       make(chan struct{}),
 	}, nil
@@ -228,6 +238,12 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	}
 	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
 		reply.Error = "nonce must be 8..64 characters"
+		s.reply(src, reply)
+		return
+	}
+	if !identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth,
+		msg.Timestamp, time.Now(), punchAuthWindow) {
+		reply.Error = "punch authentication failed"
 		s.reply(src, reply)
 		return
 	}

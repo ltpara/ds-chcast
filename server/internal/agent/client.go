@@ -8,11 +8,29 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 )
+
+// Version is reported to the server as peer metadata and can be overridden at
+// build time with -ldflags "-X .../internal/agent.Version=<version>".
+var Version = "dev"
+
+// softwareInfo is the server's SoftwareUpdate equivalent.
+type softwareInfo struct {
+	Version string `json:"version"`
+	URL     string `json:"url"`
+}
+
+// updateAvailable mirrors RustDesk's SoftwareUpdate check: the server only
+// answers when its version differs from the client's, so ordering is not used.
+func (s *softwareInfo) updateAvailable() bool {
+	return s != nil && s.URL != "" && s.Version != "" && s.Version != Version
+}
 
 type apiClient struct {
 	base      string
@@ -29,37 +47,39 @@ func newAPIClient(base, serverKey string) *apiClient {
 }
 
 type registerResult struct {
-	ID              string   `json:"id"`
-	Relay           string   `json:"relay"`
-	Relays          []string `json:"relays"`
-	Punch           string   `json:"punch"`
-	Carrier         string   `json:"carrier"`
-	CarrierToken    string   `json:"carrier_token"`
-	ExpiresInSec    int64    `json:"expires_in_sec"`
-	PublicKey       string   `json:"public_key"`
-	ServerPublicKey string   `json:"server_public_key"`
-	Binding         string   `json:"binding"`
+	ID              string        `json:"id"`
+	Relay           string        `json:"relay"`
+	Relays          []string      `json:"relays"`
+	Punch           string        `json:"punch"`
+	Carrier         string        `json:"carrier"`
+	CarrierToken    string        `json:"carrier_token"`
+	ExpiresInSec    int64         `json:"expires_in_sec"`
+	PublicKey       string        `json:"public_key"`
+	ServerPublicKey string        `json:"server_public_key"`
+	Binding         string        `json:"binding"`
+	Software        *softwareInfo `json:"software"`
 }
 
 type lookupResult struct {
-	ID              string   `json:"id"`
-	Online          bool     `json:"online"`
-	Candidate       string   `json:"candidate"`
-	Candidates      []string `json:"candidates"`
-	Relay           string   `json:"relay"`
-	Punch           string   `json:"punch"`
-	Carrier         string   `json:"carrier"`
-	CarrierToken    string   `json:"carrier_token"`
-	Fingerprint     string   `json:"fingerprint"`
-	PublicKey       string   `json:"public_key"`
-	ServerPublicKey string   `json:"server_public_key"`
-	Binding         string   `json:"binding"`
-	LocalAddrs      []string `json:"local_addrs"`
-	NATType         string   `json:"nat_type"`
-	LastSeenMS      int64    `json:"last_seen_ms"`
-	ExpiresInMS     int64    `json:"expires_in_ms"`
-	RelayOnly       bool     `json:"relay_only"`
-	Transport       string   `json:"transport"`
+	ID              string        `json:"id"`
+	Online          bool          `json:"online"`
+	Candidate       string        `json:"candidate"`
+	Candidates      []string      `json:"candidates"`
+	Relay           string        `json:"relay"`
+	Punch           string        `json:"punch"`
+	Carrier         string        `json:"carrier"`
+	CarrierToken    string        `json:"carrier_token"`
+	Fingerprint     string        `json:"fingerprint"`
+	PublicKey       string        `json:"public_key"`
+	ServerPublicKey string        `json:"server_public_key"`
+	Binding         string        `json:"binding"`
+	LocalAddrs      []string      `json:"local_addrs"`
+	NATType         string        `json:"nat_type"`
+	LastSeenMS      int64         `json:"last_seen_ms"`
+	ExpiresInMS     int64         `json:"expires_in_ms"`
+	RelayOnly       bool          `json:"relay_only"`
+	Transport       string        `json:"transport"`
+	Software        *softwareInfo `json:"software"`
 }
 
 type apiError struct {
@@ -68,10 +88,14 @@ type apiError struct {
 
 func (c *apiClient) register(ctx context.Context, id string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
 	timestamp := time.Now().Unix()
+	hostname, _ := os.Hostname()
 	body, err := json.Marshal(map[string]any{
 		"id":          id,
 		"public_key":  identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey)),
 		"fingerprint": fingerprint,
+		"hostname":    hostname,
+		"platform":    runtime.GOOS + "/" + runtime.GOARCH,
+		"version":     Version,
 		"timestamp":   timestamp,
 		"signature":   identity.Sign(privateKey, identity.RegisterMessage(id, fingerprint, timestamp)),
 	})

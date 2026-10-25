@@ -108,7 +108,10 @@ func run() error {
 	}
 
 	auth := relaynode.NewAuthenticator()
-	manager, err := relay.NewManager(*relayListen, ports, auth, log, relay.WithReadBuffer(*rmem))
+	manager, err := relay.NewManager(*relayListen, ports, auth, log,
+		relay.WithReadBuffer(*rmem),
+		relay.WithViewerTokenRequired(true),
+	)
 	if err != nil {
 		return err
 	}

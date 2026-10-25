@@ -271,6 +271,14 @@ struct ViewerStatus {
     int sas_code = 0;
     std::string sas_error;
     uint64_t sas_updates = 0;
+    // Session chat. Both directions are ungated once the host admits the
+    // viewer. `chat_error` explains a queued line that the transport then
+    // failed to send; inbound text is taken through TakeChat() so the status
+    // poll never carries conversation content.
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
+    uint64_t chat_failures = 0;
+    std::string chat_error;
     // What the server announced in HelloAck. `displays` is the list the UI's
     // picker shows; a single-display stream's entry is the one whose rect
     // starts at origin_x/origin_y and matches width x height. `merged_layout`
@@ -448,6 +456,13 @@ public:
     // replaces one that has not been sent yet.
     bool SendSas();
 
+    // Queues one UTF-8 chat line for the host. Returns false for empty or
+    // oversized text, when no session is streaming, or when the outgoing queue
+    // is full. Host lines are popped one at a time through TakeChat().
+    bool SendChat(const std::string& text);
+    // Pops the oldest line the host sent. Returns false when none is waiting.
+    bool TakeChat(std::string& text);
+
     ViewerStatus Snapshot() const;
 
 private:
@@ -497,6 +512,13 @@ private:
     // SAS is an action, not a state: one pending request is enough, and a
     // second tap replaces an unsent one instead of queueing a burst.
     std::atomic<bool> pending_sas_{false};
+
+    // Chat crosses in both directions. The outgoing queue is bounded and
+    // cleared when a session starts; the session thread appends host lines for
+    // the UI to pop, dropping the newest when the UI falls too far behind.
+    mutable std::mutex chat_mutex_;
+    std::deque<std::string> pending_chat_;
+    std::deque<std::string> received_chat_;
 
     // Input crosses from the UI thread to the session thread here. The queue
     // is bounded: a stalled transport drops the newest events instead of

@@ -70,6 +70,27 @@ void main() {
         'relay',
       ],
     );
+    expect(
+      TunnelAgent.arguments(
+        server: 'https://chast.example',
+        hostId: 'devbox',
+        mode: TunnelMode.relay,
+        key: 'dev-secret',
+      ),
+      <String>[
+        'viewer',
+        '--server',
+        'https://chast.example',
+        '--id',
+        'devbox',
+        '--listen',
+        '127.0.0.1:0',
+        '--mode',
+        'relay',
+        '--server-key',
+        'dev-secret',
+      ],
+    );
   });
 
   test('a missing executable is reported as a tunnel failure', () async {

@@ -1,11 +1,15 @@
 package registry
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,12 +21,42 @@ func hostKey(secret string) (ed25519.PrivateKey, string) {
 	return priv, identity.PublicKeyText(priv.Public().(ed25519.PublicKey))
 }
 
+func TestConcurrentStoreOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			reg, err := NewPersistent(10*time.Second, path)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			reg.Close()
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("instance %d: %v", i+1, err)
+		}
+	}
+	reg, err := NewPersistent(10*time.Second, path)
+	if err != nil {
+		t.Fatalf("reopen shared database: %v", err)
+	}
+	reg.Close()
+}
+
 func TestRegisterLookupAndPersistence(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
+	path := filepath.Join(t.TempDir(), "state.db")
 	reg, err := NewPersistent(10*time.Second, path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer reg.Close()
 	now := time.Unix(1000, 0)
 	reg.SetClock(func() time.Time { return now })
 
@@ -61,6 +95,7 @@ func TestRegisterLookupAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer reloaded.Close()
 	if _, ok := reloaded.Identity("devbox"); !ok {
 		t.Fatal("identity did not survive a restart")
 	}
@@ -205,6 +240,184 @@ func TestChallengeIsOneTimeAndBound(t *testing.T) {
 	}
 }
 
+func TestPeerMetadataPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(10*time.Second, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(7000, 0)
+	reg.SetClock(func() time.Time { return now })
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{
+		ID:          "devbox",
+		PublicKey:   pub,
+		Fingerprint: "AB12",
+		Hostname:    "Studio PC",
+		Platform:    "windows/amd64",
+		Version:     "1.2.3",
+		TTL:         time.Minute,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	record, ok := reg.Identity("devbox")
+	if !ok {
+		t.Fatal("peer record missing after registration")
+	}
+	if record.Hostname != "Studio PC" || record.Platform != "windows/amd64" || record.Version != "1.2.3" {
+		t.Fatalf("metadata = %+v", record)
+	}
+	if !record.CreatedAt.Equal(now) || !record.LastSeen.Equal(now) {
+		t.Fatalf("times = created %v last seen %v", record.CreatedAt, record.LastSeen)
+	}
+	peers := reg.Identities()
+	if len(peers) != 1 || peers[0].ID != "devbox" {
+		t.Fatalf("peer list = %+v", peers)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reloaded, err := NewPersistent(10*time.Second, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	record, ok = reloaded.Identity("devbox")
+	if !ok {
+		t.Fatal("peer record did not survive a restart")
+	}
+	if record.Hostname != "Studio PC" || record.Platform != "windows/amd64" ||
+		record.Version != "1.2.3" || record.Fingerprint != "AB12" {
+		t.Fatalf("reloaded metadata = %+v", record)
+	}
+	if !record.LastSeen.Equal(now) {
+		t.Fatalf("reloaded last seen = %v", record.LastSeen)
+	}
+}
+
+func TestPeerMetadataSanitizedAndMerged(t *testing.T) {
+	reg := New(time.Minute)
+	now := time.Unix(7100, 0)
+	reg.SetClock(func() time.Time { return now })
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{
+		ID:        "devbox",
+		PublicKey: pub,
+		Hostname:  "  Studio\x00 PC\x07  ",
+		Platform:  strings.Repeat("p", maxPlatform+10),
+		TTL:       time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, _ := reg.Identity("devbox")
+	if record.Hostname != "Studio PC" {
+		t.Fatalf("hostname = %q", record.Hostname)
+	}
+	if len([]rune(record.Platform)) != maxPlatform {
+		t.Fatalf("platform length = %d", len([]rune(record.Platform)))
+	}
+
+	now = now.Add(5 * time.Second)
+	if err := reg.Touch("devbox", "192.0.2.9:4000", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reg.Identity("devbox")
+	if !record.LastSeen.Equal(now) {
+		t.Fatalf("last seen = %v", record.LastSeen)
+	}
+
+	// A renewal without metadata keeps what the host reported earlier.
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reg.Identity("devbox")
+	if record.Hostname != "Studio PC" || record.Platform == "" {
+		t.Fatalf("empty renewal cleared metadata: %+v", record)
+	}
+	if _, err := reg.Register(RegisterRequest{
+		ID: "devbox", PublicKey: pub, Platform: "linux/arm64", Version: "2.0", TTL: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reg.Identity("devbox")
+	if record.Hostname != "Studio PC" || record.Platform != "linux/arm64" || record.Version != "2.0" {
+		t.Fatalf("renewal merge = %+v", record)
+	}
+}
+
+func TestLegacyJSONStateMigratesNextToDatabase(t *testing.T) {
+	dir := t.TempDir()
+	_, pub := hostKey("host-secret")
+	legacy := filepath.Join(dir, "chast-server-state.json")
+	state := fmt.Sprintf(`{"version":1,"identities":[{"id":"devbox","public_key":%q,"fingerprint":"AB12"}]}`, pub)
+	if err := os.WriteFile(legacy, []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, "chast-server-state.db")
+	reg, err := NewPersistent(time.Minute, dbPath)
+	if err != nil {
+		t.Fatalf("import legacy state: %v", err)
+	}
+	record, ok := reg.Identity("devbox")
+	if !ok || record.Fingerprint != "AB12" {
+		t.Fatalf("imported record = %+v", record)
+	}
+	if _, err := os.Stat(legacy + ".imported"); err != nil {
+		t.Fatalf("legacy state was not archived: %v", err)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewPersistent(time.Minute, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	if _, ok := reloaded.Identity("devbox"); !ok {
+		t.Fatal("imported peer did not survive a restart")
+	}
+}
+
+func TestLegacyJSONStateMigratesInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	_, pub := hostKey("host-secret")
+	state := fmt.Sprintf(`{"version":1,"identities":[{"id":"devbox","public_key":%q}]}`, pub)
+	if err := os.WriteFile(path, []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatalf("migrate in place: %v", err)
+	}
+	if _, ok := reg.Identity("devbox"); !ok {
+		t.Fatal("in-place migration lost the peer")
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(data, []byte(sqliteHeader)) {
+		t.Fatalf("state was not rewritten as SQLite: %q", data[:min(len(data), 16)])
+	}
+	if _, err := os.Stat(path + ".legacy"); err != nil {
+		t.Fatalf("legacy state was not archived: %v", err)
+	}
+}
+
+func TestStoreRejectsCorruptDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	if err := os.WriteFile(path, []byte(sqliteHeader+"this is not a database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewPersistent(time.Minute, path); err == nil {
+		t.Fatal("corrupt SQLite state was accepted")
+	}
+}
+
 func TestStoreRejectsCorruptState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	if err := os.WriteFile(path, []byte(`{"version":1,"identities":[{"id":"bad id","public_key":"x"}]}`), 0o600); err != nil {
@@ -281,5 +494,122 @@ func TestHostOnlineTracksLease(t *testing.T) {
 	now = now.Add(21 * time.Second)
 	if reg.HostOnline("devbox") {
 		t.Fatal("expired host reported online")
+	}
+}
+
+func TestLabelsPersistAndSurviveRegistration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, Hostname: "Dev Box", TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	alias := "Studio PC"
+	tags := []string{"office", "prod", "office", ""}
+	record, found, err := reg.SetLabels("devbox", &alias, &tags)
+	if err != nil || !found {
+		t.Fatalf("set labels: %v %v", found, err)
+	}
+	if record.Alias != "Studio PC" || len(record.Tags) != 2 || record.Tags[0] != "office" || record.Tags[1] != "prod" {
+		t.Fatalf("labels = %+v", record)
+	}
+	if _, found, err := reg.SetLabels("missing", &alias, nil); err != nil || found {
+		t.Fatalf("labels for an unknown peer: found=%v err=%v", found, err)
+	}
+
+	// A host renewal updates host-reported metadata but never operator labels.
+	if _, err := reg.Register(RegisterRequest{
+		ID: "devbox", PublicKey: pub, Hostname: "Renamed", Version: "2.0", TTL: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reg.Identity("devbox")
+	if record.Alias != "Studio PC" || len(record.Tags) != 2 || record.Hostname != "Renamed" {
+		t.Fatalf("labels after renewal: %+v", record)
+	}
+
+	reloaded, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	record, ok := reloaded.Identity("devbox")
+	if !ok || record.Alias != "Studio PC" || len(record.Tags) != 2 {
+		t.Fatalf("labels after reopen: %+v ok=%v", record, ok)
+	}
+	empty, emptyTags := "", []string{}
+	record, found, err = reloaded.SetLabels("devbox", &empty, &emptyTags)
+	if err != nil || !found {
+		t.Fatalf("clear labels: %v %v", found, err)
+	}
+	if record.Alias != "" || len(record.Tags) != 0 {
+		t.Fatalf("cleared labels = %+v", record)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStoreUpgradesPreLabelSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE peers (
+		id          TEXT PRIMARY KEY,
+		public_key  TEXT NOT NULL,
+		fingerprint TEXT NOT NULL DEFAULT '',
+		hostname    TEXT NOT NULL DEFAULT '',
+		platform    TEXT NOT NULL DEFAULT '',
+		version     TEXT NOT NULL DEFAULT '',
+		created_at  INTEGER NOT NULL,
+		last_seen   INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	_, pub := hostKey("host-secret")
+	if _, err := db.Exec(`INSERT INTO peers
+		(id, public_key, fingerprint, hostname, platform, version, created_at, last_seen)
+		VALUES (?, ?, '', '', '', '', 1000, 0)`, "devbox", pub); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("open pre-label schema: %v", err)
+	}
+	ids, err := store.Load()
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("load pre-label schema: %v %d", err, len(ids))
+	}
+	if ids[0].Alias != "" || len(ids[0].Tags) != 0 {
+		t.Fatalf("unexpected labels in old row: %+v", ids[0])
+	}
+	ids[0].Alias = "Legacy"
+	ids[0].Tags = []string{"migrated"}
+	if err := store.Save(ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	ids, err = reopened.Load()
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("reload upgraded schema: %v %d", err, len(ids))
+	}
+	if ids[0].Alias != "Legacy" || len(ids[0].Tags) != 1 || ids[0].Tags[0] != "migrated" {
+		t.Fatalf("labels after upgrade: %+v", ids[0])
 	}
 }

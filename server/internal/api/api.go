@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
+	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
@@ -72,6 +74,9 @@ type Config struct {
 	Logger    *slog.Logger
 	// Limiter caps HTTP requests per client IP. Nil or disabled means no cap.
 	Limiter *ratelimit.Limiter
+	// LoginLimiter locks a username+IP out after repeated wrong passwords.
+	// Nil or disabled leaves login attempts uncounted beyond Limiter.
+	LoginLimiter *authlimit.Limiter
 	// ProxyHeader names the header carrying the client address when the API
 	// sits behind a trusted proxy (for example X-Forwarded-For). Empty means
 	// the TCP peer address is used.
@@ -81,6 +86,13 @@ type Config struct {
 	// PunchReadBuffer is the kernel-reported SO_RCVBUF of the rendezvous
 	// socket. Zero means the system default or an unreadable value.
 	PunchReadBuffer int
+	// SoftwareVersion and SoftwareURL advertise a client/host update the same
+	// way hbbs answers SoftwareUpdate. Both empty disables the notice.
+	SoftwareVersion string
+	SoftwareURL     string
+	// Accounts backs user login and the per-user address book. Nil means the
+	// server runs without persistent state, so those routes report 503.
+	Accounts *account.Store
 }
 
 type server struct {
@@ -111,12 +123,48 @@ func New(cfg Config) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/hosts", s.register)
+	mux.HandleFunc("GET /v1/hosts", s.lookupBatch)
 	mux.HandleFunc("GET /v1/hosts/{id}", s.lookup)
 	mux.HandleFunc("DELETE /v1/hosts/{id}", s.unregister)
 	mux.HandleFunc("DELETE /v1/identities/{id}", s.resetIdentity)
+	mux.HandleFunc("PATCH /v1/identities/{id}", s.updateIdentity)
+	mux.HandleFunc("POST /v1/account/login", s.login)
+	mux.HandleFunc("POST /v1/account/logout", s.logout)
+	mux.HandleFunc("GET /v1/account", s.accountInfo)
+	mux.HandleFunc("POST /v1/account/password", s.changeAccountPassword)
+	mux.HandleFunc("POST /v1/account/2fa/start", s.startAccountTwoFactor)
+	mux.HandleFunc("POST /v1/account/2fa/enable", s.enableAccountTwoFactor)
+	mux.HandleFunc("POST /v1/account/2fa/disable", s.disableAccountTwoFactor)
+	mux.HandleFunc("POST /v1/account/2fa/recovery", s.generateAccountRecoveryCodes)
+	mux.HandleFunc("GET /v1/account/sessions", s.accountSessions)
+	mux.HandleFunc("POST /v1/account/sessions/revoke-others", s.revokeOtherAccountSessions)
+	mux.HandleFunc("PATCH /v1/account/sessions/{id}", s.renameAccountSession)
+	mux.HandleFunc("DELETE /v1/account/sessions/{id}", s.revokeAccountSession)
+	mux.HandleFunc("GET /v1/addressbook", s.addressBook)
+	mux.HandleFunc("GET /v1/addressbook/grants", s.addressBookGrants)
+	mux.HandleFunc("POST /v1/addressbook/grants", s.shareAddressBook)
+	mux.HandleFunc("DELETE /v1/addressbook/grants/{username}", s.unshareAddressBook)
+	mux.HandleFunc("GET /v1/addressbook/shared", s.sharedAddressBooks)
+	mux.HandleFunc("GET /v1/addressbook/shared/{owner}/grants", s.sharedAddressBookGrants)
+	mux.HandleFunc("POST /v1/addressbook/shared/{owner}/grants", s.shareSharedAddressBook)
+	mux.HandleFunc("DELETE /v1/addressbook/shared/{owner}/grants/{username}", s.unshareSharedAddressBook)
+	mux.HandleFunc("PATCH /v1/addressbook/shared/{owner}/peers/{id}", s.updateSharedAddressBookPeer)
+	mux.HandleFunc("DELETE /v1/addressbook/shared/{owner}/peers/{id}", s.deleteSharedAddressBookPeer)
+	mux.HandleFunc("POST /v1/addressbook/shared/{owner}/peers", s.addSharedAddressBookPeer)
+	mux.HandleFunc("PATCH /v1/addressbook/peers/{id}", s.updateAddressBookPeer)
+	mux.HandleFunc("DELETE /v1/addressbook/peers/{id}", s.deleteAddressBookPeer)
+	mux.HandleFunc("PATCH /v1/addressbook/groups/{id}", s.updateAddressBookGroup)
+	mux.HandleFunc("DELETE /v1/addressbook/groups/{id}", s.deleteAddressBookGroup)
 	mux.HandleFunc("GET /v1/server", s.serverInfo)
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /v1/stats", s.stats)
+	mux.HandleFunc("GET /v1/audit", s.auditLog)
+	mux.HandleFunc("GET /v1/audit/connections", s.auditConnections)
+	mux.HandleFunc("POST /v1/account/connections", s.recordAccountConnection)
+	mux.HandleFunc("GET /v1/account/connections", s.accountConnections)
+	mux.HandleFunc("GET /v1/audit/file-transfers", s.auditFileTransfers)
+	mux.HandleFunc("POST /v1/account/file-transfers", s.recordAccountFileTransfer)
+	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return s.instrument(mux)
 }
@@ -125,21 +173,32 @@ type registerRequest struct {
 	ID          string `json:"id"`
 	PublicKey   string `json:"public_key"`
 	Fingerprint string `json:"fingerprint"`
+	Hostname    string `json:"hostname"`
+	Platform    string `json:"platform"`
+	Version     string `json:"version"`
 	Timestamp   int64  `json:"timestamp"`
 	Signature   string `json:"signature"`
 }
 
 type registerResponse struct {
-	ID              string   `json:"id"`
-	Relay           string   `json:"relay"`
-	Relays          []string `json:"relays,omitempty"`
-	Punch           string   `json:"punch"`
-	ExpiresInSec    int64    `json:"expires_in_sec"`
-	PublicKey       string   `json:"public_key,omitempty"`
-	ServerPublicKey string   `json:"server_public_key,omitempty"`
-	Binding         string   `json:"binding,omitempty"`
-	Carrier         string   `json:"carrier,omitempty"`
-	CarrierToken    string   `json:"carrier_token,omitempty"`
+	ID              string        `json:"id"`
+	Relay           string        `json:"relay"`
+	Relays          []string      `json:"relays,omitempty"`
+	Punch           string        `json:"punch"`
+	ExpiresInSec    int64         `json:"expires_in_sec"`
+	PublicKey       string        `json:"public_key,omitempty"`
+	ServerPublicKey string        `json:"server_public_key,omitempty"`
+	Binding         string        `json:"binding,omitempty"`
+	Carrier         string        `json:"carrier,omitempty"`
+	CarrierToken    string        `json:"carrier_token,omitempty"`
+	Software        *softwareInfo `json:"software,omitempty"`
+}
+
+// softwareInfo mirrors RustDesk's SoftwareUpdate reply: the newest version and
+// where to download it. Clients compare it with their own build.
+type softwareInfo struct {
+	Version string `json:"version"`
+	URL     string `json:"url"`
 }
 
 type lookupResponse struct {
@@ -155,6 +214,11 @@ type lookupResponse struct {
 	Binding         string   `json:"binding,omitempty"`
 	LocalAddrs      []string `json:"local_addrs,omitempty"`
 	NATType         string   `json:"nat_type,omitempty"`
+	Hostname        string   `json:"hostname,omitempty"`
+	Platform        string   `json:"platform,omitempty"`
+	Version         string   `json:"version,omitempty"`
+	Alias           string   `json:"alias,omitempty"`
+	Tags            []string `json:"tags,omitempty"`
 	LastSeenMS      int64    `json:"last_seen_ms,omitempty"`
 	ExpiresInMS     int64    `json:"expires_in_ms"`
 	Carrier         string   `json:"carrier,omitempty"`
@@ -164,7 +228,14 @@ type lookupResponse struct {
 	// candidate was reported, carrier when only the shared carrier link proves
 	// the host alive, relay otherwise. It is a hint; viewers may still try
 	// every candidate.
-	Transport string `json:"transport,omitempty"`
+	Transport string        `json:"transport,omitempty"`
+	Software  *softwareInfo `json:"software,omitempty"`
+}
+
+type batchLookupResponse struct {
+	Hosts    []lookupResponse `json:"hosts"`
+	Missing  []string         `json:"missing,omitempty"`
+	Software *softwareInfo    `json:"software,omitempty"`
 }
 
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +282,9 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		ID:          req.ID,
 		PublicKey:   req.PublicKey,
 		Fingerprint: req.Fingerprint,
+		Hostname:    req.Hostname,
+		Platform:    req.Platform,
+		Version:     req.Version,
 		TTL:         s.cfg.TTL,
 	})
 	if err != nil {
@@ -239,6 +313,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		ServerPublicKey: s.cfg.Identity.PublicKeyText(),
 		Carrier:         carrier,
 		CarrierToken:    host.CarrierToken,
+		Software:        s.software(),
 	}
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
@@ -249,19 +324,87 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+		return
+	}
 	id := r.PathValue("id")
 	if !registry.ValidID(id) {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return
 	}
+	resp, ok := s.hostLookup(id, time.Now(), s.relayOnly())
+	if !ok {
+		writeError(w, http.StatusNotFound, "host is not registered")
+		return
+	}
+	resp.Software = s.software()
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// lookupBatch answers address-book refreshes with one round trip. Unknown IDs
+// are reported separately instead of failing the request, so a viewer can
+// render the peers it does know about while flagging stale entries.
+func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+		return
+	}
+	ids, err := parseIDs(r.URL.Query().Get("ids"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	now := time.Now()
 	relayOnly := s.relayOnly()
+	resp := batchLookupResponse{
+		Hosts:    make([]lookupResponse, 0, len(ids)),
+		Software: s.software(),
+	}
+	for _, id := range ids {
+		host, ok := s.hostLookup(id, now, relayOnly)
+		if !ok {
+			resp.Missing = append(resp.Missing, id)
+			continue
+		}
+		resp.Hosts = append(resp.Hosts, host)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+const maxBatchIDs = 200
+
+func parseIDs(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	ids := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			return nil, errors.New("ids must be a comma-separated list of host ids")
+		}
+		if !registry.ValidID(id) {
+			return nil, fmt.Errorf("id %q must be 1..64 characters of [A-Za-z0-9_.-]", id)
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		if len(ids) > maxBatchIDs {
+			return nil, fmt.Errorf("at most %d ids per request", maxBatchIDs)
+		}
+	}
+	return ids, nil
+}
+
+// hostLookup builds the response shared by the single and batch endpoints.
+func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupResponse, bool) {
 	host, live := s.cfg.Registry.Lookup(id)
 	if !live {
 		record, ok := s.cfg.Registry.Identity(id)
 		if !ok {
-			writeError(w, http.StatusNotFound, "host is not registered")
-			return
+			return lookupResponse{}, false
 		}
 		// An expired lease keeps the ID -> key binding. Peers can still learn
 		// the identity (and verify it later) but cannot connect until the host
@@ -290,6 +433,14 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 		PublicKey:       host.PublicKey,
 		ServerPublicKey: s.cfg.Identity.PublicKeyText(),
 		RelayOnly:       relayOnly,
+	}
+	record, hasRecord := s.cfg.Registry.Identity(host.ID)
+	if hasRecord {
+		resp.Hostname = record.Hostname
+		resp.Platform = record.Platform
+		resp.Version = record.Version
+		resp.Alias = record.Alias
+		resp.Tags = record.Tags
 	}
 	if !relayOnly {
 		resp.LocalAddrs = host.LocalAddrs
@@ -324,11 +475,15 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 	}
 	if !host.LastSeen.IsZero() {
 		resp.LastSeenMS = now.Sub(host.LastSeen).Milliseconds()
+	} else if hasRecord && !record.LastSeen.IsZero() {
+		// An offline peer still reports when it was last registered, matching
+		// hbbs's last_online for peers without a live lease.
+		resp.LastSeenMS = now.Sub(record.LastSeen).Milliseconds()
 	}
 	if live {
 		resp.ExpiresInMS = host.ExpiresAt.Sub(now).Milliseconds()
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return resp, true
 }
 
 func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +535,51 @@ func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type identityLabelsRequest struct {
+	Alias *string   `json:"alias"`
+	Tags  *[]string `json:"tags"`
+}
+
+type identityLabelsResponse struct {
+	ID    string   `json:"id"`
+	Alias string   `json:"alias,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
+}
+
+// updateIdentity sets operator-managed display labels. Unlike host-reported
+// metadata, these survive host renewals and are never accepted from the host
+// registration body.
+func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+		return
+	}
+	id := r.PathValue("id")
+	if !registry.ValidID(id) {
+		writeError(w, http.StatusNotFound, "host identity is unknown")
+		return
+	}
+	var req identityLabelsRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Alias == nil && req.Tags == nil {
+		writeError(w, http.StatusBadRequest, "alias or tags is required")
+		return
+	}
+	record, found, err := s.cfg.Registry.SetLabels(id, req.Alias, req.Tags)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not persist identity labels")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "host identity is unknown")
+		return
+	}
+	writeJSON(w, http.StatusOK, identityLabelsResponse{ID: record.ID, Alias: record.Alias, Tags: record.Tags})
+}
+
 func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 	carrier := ""
 	if port := s.cfg.Relay.CarrierPort(); port != 0 {
@@ -397,11 +597,25 @@ func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 		"relay_only":            s.relayOnly(),
 		"punch_udp_read_buffer": s.cfg.PunchReadBuffer,
 		"relay_udp_read_buffer": s.cfg.Relay.ReadBuffer(),
+		"accounts":              s.cfg.Accounts != nil,
 	}
 	if s.cfg.RelayPool != nil {
 		info["relay_nodes"] = s.cfg.RelayPool.Status()
 	}
+	if software := s.software(); software != nil {
+		info["software"] = software
+	}
 	writeJSON(w, http.StatusOK, info)
+}
+
+// software returns the advertised update, or nil when the operator did not
+// configure one. RustDesk sends SoftwareUpdate only when its URL-derived
+// version is non-empty, so an unset server stays silent.
+func (s *server) software() *softwareInfo {
+	if s.cfg.SoftwareVersion == "" || s.cfg.SoftwareURL == "" {
+		return nil
+	}
+	return &softwareInfo{Version: s.cfg.SoftwareVersion, URL: s.cfg.SoftwareURL}
 }
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {

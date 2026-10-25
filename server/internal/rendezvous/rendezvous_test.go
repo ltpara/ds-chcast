@@ -39,7 +39,7 @@ func recv(t *testing.T, conn *net.UDPConn) wire.Message {
 	return msg
 }
 
-func startMeet(t *testing.T) (*Server, *registry.Registry, *net.UDPAddr, ed25519.PrivateKey) {
+func startMeet(t *testing.T, opts ...Option) (*Server, *registry.Registry, *net.UDPAddr, ed25519.PrivateKey) {
 	t.Helper()
 	priv := identity.PrivateKeyFromSecret("host-secret")
 	pub := identity.PublicKeyText(priv.Public().(ed25519.PublicKey))
@@ -52,7 +52,8 @@ func startMeet(t *testing.T) (*Server, *registry.Registry, *net.UDPAddr, ed25519
 		t.Fatalf("register: %v", err)
 	}
 	reg.SetRelay("devbox", 41000, "")
-	meet, err := New("127.0.0.1:0", reg, func(port int) string { return "192.0.2.1:41000" }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	meet, err := New("127.0.0.1:0", reg, func(port int) string { return "192.0.2.1:41000" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)), opts...)
 	if err != nil {
 		t.Fatalf("rendezvous: %v", err)
 	}
@@ -199,6 +200,48 @@ func TestKeepaliveRejectsCandidateMismatch(t *testing.T) {
 	ack := recv(t, host)
 	if ack.OK || ack.Error == "" {
 		t.Fatalf("mismatched candidate accepted: %+v", ack)
+	}
+}
+
+func TestPunchRequiresServerKey(t *testing.T) {
+	const serverKey = "viewer-secret"
+	_, _, meetAddr, priv := startMeet(t, WithServerKey(serverKey))
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	if ack := keepalive(t, host, meetAddr, priv); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	if reply := recv(t, viewer); reply.OK || reply.Error != "punch authentication failed" {
+		t.Fatalf("unauthenticated punch: %+v", reply)
+	}
+	stamp := time.Now().Unix()
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type:      wire.TypePunchRequest,
+		HostID:    "devbox",
+		Nonce:     nonce,
+		Timestamp: stamp - 120,
+		Auth:      identity.PunchAuth(serverKey, "devbox", nonce, stamp-120),
+	}), meetAddr)
+	if reply := recv(t, viewer); reply.OK {
+		t.Fatalf("stale punch was accepted: %+v", reply)
+	}
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type:      wire.TypePunchRequest,
+		HostID:    "devbox",
+		Nonce:     nonce,
+		Timestamp: stamp,
+		Auth:      identity.PunchAuth(serverKey, "devbox", nonce, stamp),
+	}), meetAddr)
+	reply := recv(t, viewer)
+	if !reply.OK || reply.Candidate == "" {
+		t.Fatalf("authenticated punch: %+v", reply)
+	}
+	if notify := recv(t, host); notify.Type != wire.TypePunchPeer {
+		t.Fatalf("host notification: %+v", notify)
 	}
 }
 

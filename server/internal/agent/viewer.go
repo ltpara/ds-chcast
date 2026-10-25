@@ -93,6 +93,8 @@ type ViewerAgent struct {
 	timerArmed  bool
 	directOK    atomic.Bool
 	punched     atomic.Bool
+	relayAuthOK atomic.Bool
+	relayAuth   sync.Once
 	fellBack    bool
 	nonce       string
 	lastPathKey string
@@ -157,6 +159,10 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		conn.Close()
 		cancel()
 		return nil, fmt.Errorf("host %s is registered but offline", cfg.HostID)
+	}
+	if host.Software.updateAvailable() {
+		v.log.Info("software update available",
+			"version", host.Software.Version, "current", Version, "url", host.Software.URL)
 	}
 	v.punch, err = resolveUDP(host.Punch)
 	if err != nil {
@@ -242,6 +248,9 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	v.carrierMode = useCarrier
 
 	go v.readLoop()
+	if v.remote != nil && v.relay != nil && sameAddr(v.remote, v.relay) {
+		v.startRelayAuth()
+	}
 	if v.carrierMode {
 		go v.carrierLoop()
 	} else if cfg.Mode != ModeRelay && !host.RelayOnly && v.punch != nil && v.direct != nil {
@@ -333,7 +342,50 @@ func (v *ViewerAgent) sendPunchRequest() {
 		return
 	}
 	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce}
+	if v.cfg.ServerKey != "" {
+		msg.Timestamp = time.Now().Unix()
+		msg.Auth = identity.PunchAuth(v.cfg.ServerKey, v.cfg.HostID, v.nonce, msg.Timestamp)
+	}
 	v.conn.WriteToUDP(wire.Encode(msg), v.punch)
+}
+
+const (
+	relayAuthAttempts = 6
+	relayAuthInterval = 500 * time.Millisecond
+)
+
+// startRelayAuth proves the lookup token to the relay before the first QUIC
+// datagram. It is safe to call on both the initial relay path and a fallback.
+func (v *ViewerAgent) startRelayAuth() {
+	if v.relay == nil {
+		return
+	}
+	v.relayAuth.Do(func() { go v.relayAuthLoop() })
+}
+
+func (v *ViewerAgent) relayAuthLoop() {
+	if v.carrierToken == "" {
+		v.log.Warn("relay did not return a viewer token")
+		return
+	}
+	msg := wire.Encode(wire.Message{
+		Type:   wire.TypeRelayViewer,
+		HostID: v.cfg.HostID,
+		Token:  v.carrierToken,
+	})
+	for i := 0; i < relayAuthAttempts; i++ {
+		if v.relayAuthOK.Load() {
+			return
+		}
+		if _, err := v.conn.WriteToUDP(msg, v.relay); err != nil {
+			v.log.Debug("relay viewer auth write", "error", err)
+		}
+		select {
+		case <-v.ctx.Done():
+			return
+		case <-time.After(relayAuthInterval):
+		}
+	}
 }
 
 func (v *ViewerAgent) punchLoop() {
@@ -629,6 +681,7 @@ func (v *ViewerAgent) onDirectTimeout() {
 	v.remote = cloneAddr(v.relay)
 	v.log.Warn("direct path did not answer; using relay", "relay", v.relay.String())
 	v.mu.Unlock()
+	v.startRelayAuth()
 	v.reportPath()
 }
 
@@ -678,6 +731,13 @@ func (v *ViewerAgent) handleControl(data []byte) {
 		}
 	case wire.TypeBusy:
 		v.log.Warn("relay is busy", "error", msg.Error)
+	case wire.TypeRelayViewerAck:
+		if msg.OK {
+			v.relayAuthOK.Store(true)
+			v.log.Info("relay viewer token accepted")
+		} else {
+			v.log.Warn("relay viewer token refused", "error", msg.Error)
+		}
 	}
 	v.reportPath()
 }

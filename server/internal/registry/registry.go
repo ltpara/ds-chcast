@@ -10,12 +10,10 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -37,11 +35,22 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 // ValidID keeps IDs readable (they end up in URLs and logs) and bounded.
 func ValidID(id string) bool { return idPattern.MatchString(id) }
 
+// Identity is the durable peer record: the permanent key binding plus the
+// last metadata the host reported. Alias and Tags are operator-managed labels;
+// they are never overwritten by a host registration. RustDesk keeps the same
+// information in its SQLite peer table so an offline peer still has a name and
+// a version.
 type Identity struct {
 	ID          string    `json:"id"`
 	PublicKey   string    `json:"public_key"`
 	Fingerprint string    `json:"fingerprint,omitempty"`
+	Hostname    string    `json:"hostname,omitempty"`
+	Platform    string    `json:"platform,omitempty"`
+	Version     string    `json:"version,omitempty"`
+	Alias       string    `json:"alias,omitempty"`
+	Tags        []string  `json:"tags,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
+	LastSeen    time.Time `json:"last_seen,omitempty"`
 }
 
 type Host struct {
@@ -78,7 +87,12 @@ type RegisterRequest struct {
 	ID          string
 	PublicKey   string
 	Fingerprint string
-	TTL         time.Duration
+	// Hostname, Platform and Version are display metadata. Empty values keep
+	// whatever a previous registration reported.
+	Hostname string
+	Platform string
+	Version  string
+	TTL      time.Duration
 }
 
 type Registry struct {
@@ -112,13 +126,17 @@ func New(offlineAfter time.Duration) *Registry {
 	}
 }
 
-// NewPersistent loads the identity database at path. A missing file starts
-// empty; an unreadable or malformed file is an error instead of silently
-// discarding identities.
+// NewPersistent loads the peer database at path. A missing file starts empty;
+// a pre-SQLite JSON state file at that path (or next to state.db) is imported
+// once instead of being silently discarded. An unreadable or malformed file is
+// an error.
 func NewPersistent(offlineAfter time.Duration, path string) (*Registry, error) {
 	r := New(offlineAfter)
 	if path == "" {
 		return r, nil
+	}
+	if err := prepareStore(path); err != nil {
+		return nil, err
 	}
 	store, err := NewStore(path)
 	if err != nil {
@@ -167,13 +185,24 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 		if record.PublicKey != req.PublicKey {
 			return Host{}, ErrKeyMismatch
 		}
-		if req.Fingerprint != "" && req.Fingerprint != record.Fingerprint {
-			updated := record
+		updated := record
+		if req.Fingerprint != "" {
 			updated.Fingerprint = req.Fingerprint
-			if err := r.saveIdentityLocked(updated); err != nil {
+		}
+		if req.Hostname != "" {
+			updated.Hostname = normalizeMetadata(req.Hostname, maxHostname)
+		}
+		if req.Platform != "" {
+			updated.Platform = normalizeMetadata(req.Platform, maxPlatform)
+		}
+		if req.Version != "" {
+			updated.Version = normalizeMetadata(req.Version, maxVersion)
+		}
+		updated.LastSeen = now
+		if identityChanged(record, updated) {
+			if err := r.storeIdentityLocked(updated); err != nil {
 				return Host{}, err
 			}
-			r.identities[req.ID] = updated
 			record = updated
 		}
 	} else {
@@ -181,12 +210,15 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 			ID:          req.ID,
 			PublicKey:   req.PublicKey,
 			Fingerprint: req.Fingerprint,
+			Hostname:    normalizeMetadata(req.Hostname, maxHostname),
+			Platform:    normalizeMetadata(req.Platform, maxPlatform),
+			Version:     normalizeMetadata(req.Version, maxVersion),
 			CreatedAt:   now,
+			LastSeen:    now,
 		}
-		if err := r.saveIdentityLocked(record); err != nil {
+		if err := r.storeIdentityLocked(record); err != nil {
 			return Host{}, err
 		}
-		r.identities[req.ID] = record
 	}
 
 	host, ok := r.hosts[req.ID]
@@ -217,19 +249,14 @@ func newCarrierToken() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-func (r *Registry) saveIdentityLocked(record Identity) error {
-	if r.store == nil {
-		return nil
-	}
-	ids := make([]Identity, 0, len(r.identities)+1)
-	for id, existing := range r.identities {
-		if id == record.ID {
-			continue
+func (r *Registry) storeIdentityLocked(record Identity) error {
+	if r.store != nil {
+		if err := r.store.Save(record); err != nil {
+			return err
 		}
-		ids = append(ids, existing)
 	}
-	ids = append(ids, record)
-	return r.store.Save(ids)
+	r.identities[record.ID] = record
+	return nil
 }
 
 func (r *Registry) SetRelay(id string, port int, host string) {
@@ -292,6 +319,10 @@ func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natTyp
 		return ErrUnknownHost
 	}
 	host.LastSeen = r.now()
+	if record, ok := r.identities[id]; ok {
+		record.LastSeen = host.LastSeen
+		r.identities[id] = record
+	}
 	if candidate != "" {
 		host.Candidate = candidate
 	}
@@ -337,22 +368,16 @@ func (r *Registry) Remove(id string) (Host, bool) {
 func (r *Registry) RemoveIdentity(id string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	record, ok := r.identities[id]
-	if !ok {
+	if _, ok := r.identities[id]; !ok {
 		return false, nil
 	}
-	delete(r.identities, id)
-	delete(r.hosts, id)
 	if r.store != nil {
-		ids := make([]Identity, 0, len(r.identities))
-		for _, existing := range r.identities {
-			ids = append(ids, existing)
-		}
-		if err := r.store.Save(ids); err != nil {
-			r.identities[record.ID] = record
+		if err := r.store.Delete(id); err != nil {
 			return false, err
 		}
 	}
+	delete(r.identities, id)
+	delete(r.hosts, id)
 	return true, nil
 }
 
@@ -392,6 +417,49 @@ func (r *Registry) Identity(id string) (Identity, bool) {
 	defer r.mu.Unlock()
 	record, ok := r.identities[id]
 	return record, ok
+}
+
+// SetLabels updates operator-managed display labels without touching the
+// public-key binding or host-reported metadata. A nil field is left unchanged;
+// an empty alias or tag list clears it.
+func (r *Registry) SetLabels(id string, alias *string, tags *[]string) (Identity, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.identities[id]
+	if !ok {
+		return Identity{}, false, nil
+	}
+	if alias != nil {
+		record.Alias = normalizeMetadata(*alias, maxAlias)
+	}
+	if tags != nil {
+		record.Tags = normalizeTags(*tags)
+	}
+	if err := r.storeIdentityLocked(record); err != nil {
+		return Identity{}, true, err
+	}
+	return record, true, nil
+}
+
+// Identities returns every durable peer record sorted by ID, including peers
+// that are currently offline. The admin console uses it as the peer list.
+func (r *Registry) Identities() []Identity {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Identity, 0, len(r.identities))
+	for _, record := range r.identities {
+		out = append(out, record)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Close releases the persistent store.
+func (r *Registry) Close() error {
+	if r.store == nil {
+		return nil
+	}
+	return r.store.Close()
 }
 
 // PublicKey returns the verified Ed25519 key bound to id.
@@ -554,96 +622,64 @@ func normalizeAddrs(addrs []string) []string {
 	return out
 }
 
-// Store is the on-disk identity database. It only stores permanent bindings,
-// not leases or relay assignments; those are rebuilt by host re-registration.
-type Store struct {
-	path string
-	mu   sync.Mutex
+const (
+	maxHostname = 128
+	maxPlatform = 64
+	maxVersion  = 64
+	maxAlias    = 128
+	maxTag      = 32
+	maxTags     = 16
+)
+
+func identityChanged(a, b Identity) bool {
+	return a.ID != b.ID ||
+		a.PublicKey != b.PublicKey ||
+		a.Fingerprint != b.Fingerprint ||
+		a.Hostname != b.Hostname ||
+		a.Platform != b.Platform ||
+		a.Version != b.Version ||
+		a.Alias != b.Alias ||
+		!slices.Equal(a.Tags, b.Tags) ||
+		!a.CreatedAt.Equal(b.CreatedAt) ||
+		!a.LastSeen.Equal(b.LastSeen)
 }
 
-func NewStore(path string) (*Store, error) {
-	if path == "" {
-		return nil, errors.New("identity store path is empty")
-	}
-	return &Store{path: path}, nil
-}
-
-type stateFile struct {
-	Version    int        `json:"version"`
-	Identities []Identity `json:"identities"`
-}
-
-func (s *Store) Load() ([]Identity, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	data, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read state %s: %w", s.path, err)
-	}
-	var state stateFile
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("parse state %s: %w", s.path, err)
-	}
-	if state.Version != 1 {
-		return nil, fmt.Errorf("state %s has unsupported version %d", s.path, state.Version)
-	}
-	seen := make(map[string]struct{}, len(state.Identities))
-	for i := range state.Identities {
-		id := state.Identities[i]
-		if !ValidID(id.ID) {
-			return nil, fmt.Errorf("state %s contains invalid id %q", s.path, id.ID)
+// normalizeTags keeps operator labels bounded and duplicate-free. Empty tags
+// are dropped rather than rejected so a comma-heavy edit does not fail.
+func normalizeTags(tags []string) []string {
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		tag = normalizeMetadata(tag, maxTag)
+		if tag == "" {
+			continue
 		}
-		if _, err := identity.ParsePublicKey(id.PublicKey); err != nil {
-			return nil, fmt.Errorf("state %s: host %s: %w", s.path, id.ID, err)
+		if _, ok := seen[tag]; ok {
+			continue
 		}
-		if _, ok := seen[id.ID]; ok {
-			return nil, fmt.Errorf("state %s contains duplicate id %q", s.path, id.ID)
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+		if len(out) == maxTags {
+			break
 		}
-		seen[id.ID] = struct{}{}
 	}
-	return state.Identities, nil
+	return out
 }
 
-func (s *Store) Save(ids []Identity) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sorted := append([]Identity(nil), ids...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
-	data, err := json.MarshalIndent(stateFile{Version: 1, Identities: sorted}, "", "  ")
-	if err != nil {
-		return err
+// normalizeMetadata keeps peer metadata display-safe. A malformed hostname
+// must not fail registration, so control characters are dropped and the value
+// is truncated instead of rejected.
+func normalizeMetadata(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
+	if runes := []rune(value); len(runes) > limit {
+		value = string(runes[:limit])
 	}
-	data = append(data, '\n')
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("state directory %s: %w", dir, err)
-	}
-	tmp, err := os.CreateTemp(dir, ".chast-state-*")
-	if err != nil {
-		return fmt.Errorf("state %s: %w", s.path, err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("state %s: %w", s.path, err)
-	}
-	return nil
+	return value
 }
+

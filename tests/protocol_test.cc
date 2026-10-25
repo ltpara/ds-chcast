@@ -1390,6 +1390,41 @@ void test_clipboard() {
           "a truncated ClipboardUpdate is rejected");
 }
 
+void test_chat() {
+    std::string error;
+    const std::string text = "请在主机上确认订单 😀\n第二行";
+    const std::vector<uint8_t> message = chast::make_chat_message(text);
+    check(message.size() == chast::kControlHeaderSize + text.size(),
+          "ChatMessage carries the UTF-8 text as its payload");
+    check(message.size() > 7 &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::ChatMessage),
+          "ChatMessage names its control type");
+    std::string got;
+    check(chast::parse_chat_message(payload_of(message), got, &error) && got == text,
+          "ChatMessage round-trips UTF-8 text and newlines");
+
+    const std::string largest(chast::kMaxChatBytes, 'a');
+    check(chast::valid_chat_text(largest), "the chat length limit is accepted");
+    check(chast::parse_chat_message(payload_of(chast::make_chat_message(largest)), got,
+                                    &error) &&
+              got == largest,
+          "a chat message at the length limit round-trips");
+    check(chast::make_chat_message(largest + "a").empty(),
+          "a chat message past the length limit is not encoded");
+    check(!chast::valid_chat_text(""), "an empty chat message is rejected");
+    check(!chast::valid_chat_text(std::string("a\0b", 3)),
+          "a chat message with NUL is rejected");
+    check(!chast::valid_chat_text("\xED\xA0\x80"), "a chat surrogate is rejected");
+
+    check(!chast::parse_chat_message({}, got, &error),
+          "a ChatMessage without text is rejected");
+    check(!chast::parse_chat_message(std::vector<uint8_t>(chast::kMaxChatBytes + 1, 'a'),
+                                     got, &error),
+          "an oversized ChatMessage is rejected");
+    check(!chast::parse_chat_message({0xED, 0xA0, 0x80}, got, &error),
+          "a ChatMessage with invalid UTF-8 is rejected");
+}
+
 void test_cursor_update() {
     std::string error;
     chast::CursorUpdate update;
@@ -2169,6 +2204,7 @@ int main(int argc, char** argv) {
     test_audio_parser();
     test_latency_probe();
     test_clipboard();
+    test_chat();
     test_cursor_update();
     test_stream_info();
     test_input_events();

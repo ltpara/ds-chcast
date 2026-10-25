@@ -226,6 +226,17 @@ struct FakeClipboard {
     bool update_sent = false;
 };
 
+// In-memory chat transcript shared by verify's host and its test driver. Each
+// side records exactly what the other sent, so a missing, duplicated or
+// reordered line fails the loopback's exact-match checks.
+struct ChatProbe {
+    std::mutex mutex;
+    std::vector<std::string> host_received;
+};
+
+inline constexpr char kHostChatLine[] = "chast chat: host to viewer";
+inline constexpr char kViewerChatLine[] = "chast chat: viewer to host";
+
 // Deterministic payload for verify --file-upload. Several 64 KiB CFIL chunks
 // of pseudo-random bytes, so a truncated or reordered transfer cannot match.
 std::vector<uint8_t> file_probe_content(size_t size) {
@@ -652,6 +663,10 @@ struct Options {
     // verify only: the server's clipboard backend and the test driver's view.
     // When set, the real clipboard is never touched.
     std::shared_ptr<FakeClipboard> fake_clipboard;
+    // verify only: the shared chat transcript. The host greets the viewer when
+    // the stream is announced and records the viewer's reply; the viewer sends
+    // its line once the stream is live.
+    std::shared_ptr<ChatProbe> chat_probe;
     // serve only: accept input but stop at the OS boundary. Lets the Flutter
     // viewer exercise its full send path against a server on the same machine
     // without the injected events looping back into the viewer's own window.
@@ -1152,6 +1167,10 @@ struct SenderStats {
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     bool clipboard_enabled = false;
+    // Chat lines the host sent and received (verify's built-in exchange).
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
+    bool chat_greeting_queued = false;
     // Audio format the host announced, whether it stayed active, and the
     // HostServer counters for packets it handed to the transport.
     chast::AudioInfo audio_info;
@@ -1261,6 +1280,13 @@ struct ReceiverStats {
     uint64_t clipboard_received = 0;
     uint64_t clipboard_errors = 0;
     bool clipboard_enabled = false;
+    // Chat probe: the lines the viewer sent and received, and any transport
+    // refusal. The host's side is recorded in ChatProbe.
+    bool chat_probe = false;
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
+    uint64_t chat_errors = 0;
+    std::vector<std::string> chat_texts;
     // The verify probe first injects a CCLB blob whose declared size is past
     // the protocol limit, then sends a valid item to prove the session is
     // still alive and old content was kept.
@@ -1695,16 +1721,30 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         stats.file_bytes_received += bytes;
         stats.received_file_paths.push_back(path);
     };
+    if (options.chat_probe) {
+        std::shared_ptr<ChatProbe> chat = options.chat_probe;
+        config.chat_message = [chat](const std::string& text) {
+            std::lock_guard<std::mutex> lock(chat->mutex);
+            chat->host_received.push_back(text);
+        };
+    }
 
     std::string error;
     std::unique_ptr<chast::HostServer> server;
-    if (options.file_download) {
-        // Queue the download once the viewer is attached: start_file_download
-        // only accepts a live session with the file-transfer bit granted.
-        config.stream_announced = [&server, &stats,
-                                   source = options.download_source](
-                                      const chast::ServerInfo&) {
-            if (stats.download_queued) {
+    if (options.file_download || options.chat_probe) {
+        // Both probes start from the announcement: the stream is live, so a
+        // queued line is accepted and the offered file has a viewer to take it.
+        std::shared_ptr<ChatProbe> chat = options.chat_probe;
+        const bool download = options.file_download;
+        config.stream_announced = [&server, &stats, source = options.download_source,
+                                   chat, download](const chast::ServerInfo&) {
+            if (chat && !stats.chat_greeting_queued) {
+                stats.chat_greeting_queued = true;
+                if (!server->send_chat(kHostChatLine)) {
+                    stats.error = "send_chat: the host refused the greeting";
+                }
+            }
+            if (!download || stats.download_queued) {
                 return;
             }
             stats.download_queued = true;
@@ -1781,6 +1821,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.privacy_mode_active = status.stats.privacy_mode_active;
     stats.sas_requests = status.stats.sas_requests;
     stats.sas_failures = status.stats.sas_failures;
+    stats.chat_sent = status.stats.chat_sent;
+    stats.chat_received = status.stats.chat_received;
     stats.stream_option_requests = status.stats.stream_option_requests;
     stats.stream_option_changes = status.stats.stream_option_changes;
     stats.stream_option_failures = status.stats.stream_option_failures;
@@ -2725,6 +2767,18 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
     };
 
+    auto drain_chat = [&] {
+        std::string text;
+        while (session->take_chat(text)) {
+            ++stats.chat_received;
+            stats.chat_texts.push_back(text);
+            if (!options.quiet) {
+                std::printf("quic: chat from host (%zu bytes): %s\n", text.size(),
+                            text.c_str());
+            }
+        }
+    };
+
     auto drain_display_switch_results = [&] {
         uint16_t index = 0;
         chast::DisplaySwitchCode code = chast::DisplaySwitchCode::Ok;
@@ -3245,6 +3299,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.sas_probe = options.mode == "verify" && options.sas;
     bool sas_sent = false;
     const auto sas_at = start + std::chrono::milliseconds(1200);
+    // Chat: the host's greeting was queued at the stream announcement; send
+    // the reply once the stream is live and drain whatever arrived each pass.
+    stats.chat_probe = options.chat_probe != nullptr;
+    bool chat_sent = false;
+    const auto chat_at = start + std::chrono::milliseconds(1500);
 
     // Stream preferences: request the encoder already running, change the
     // quality and frame ceiling, restore them, then change the quality alone
@@ -3640,6 +3699,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         drain_desktop_state();
         drain_privacy_state();
         drain_sas_result();
+        drain_chat();
         if (!advance_stream_options()) {
             return fail(stats.error);
         }
@@ -3681,6 +3741,16 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             sas_sent = true;
         }
+        if (stats.chat_probe && !chat_sent &&
+            std::chrono::steady_clock::now() >= chat_at) {
+            chat_sent = true;
+            if (chast::Error sent = session->send_chat(kViewerChatLine); !sent.ok()) {
+                ++stats.chat_errors;
+                std::fprintf(stderr, "send_chat: %s\n", sent.to_string().c_str());
+            } else {
+                ++stats.chat_sent;
+            }
+        }
         drain_microphone();
         {
             const auto probe_now = std::chrono::steady_clock::now();
@@ -3718,6 +3788,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         drain_microphone();
         drain_privacy_state();
         drain_sas_result();
+        drain_chat();
         if (!advance_stream_options()) {
             return fail(stats.error);
         }
@@ -3901,6 +3972,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     drain_desktop_state();
     drain_privacy_state();
     drain_sas_result();
+    drain_chat();
     stop_microphone_probe();
     if (stats.file_probe && file_step != FileStep::Done) {
         // The result normally arrives while video is still streaming; if the
@@ -4050,6 +4122,12 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             static_cast<unsigned long long>(stats.clipboard_sent),
                             static_cast<unsigned long long>(stats.clipboard_received),
                             static_cast<unsigned long long>(stats.clipboard_errors));
+            }
+            if (stats.chat_probe) {
+                std::printf("receiver: chat sent=%llu received=%llu errors=%llu\n",
+                            static_cast<unsigned long long>(stats.chat_sent),
+                            static_cast<unsigned long long>(stats.chat_received),
+                            static_cast<unsigned long long>(stats.chat_errors));
             }
             std::printf("receiver: cursor updates=%llu shapes=%llu visible=%d at=%d,%d\n",
                         static_cast<unsigned long long>(stats.cursor_updates),
@@ -5834,6 +5912,10 @@ int run_verify(const Options& options) {
     // backend, so the real clipboard is never read or written.
     local.clipboard = true;
     local.fake_clipboard = std::make_shared<FakeClipboard>();
+    // Chat is covered both ways too: the host greets the viewer at the stream
+    // announcement, the viewer replies once live, and both sides record what
+    // they received for the exact-match checks below.
+    local.chat_probe = std::make_shared<ChatProbe>();
     // Audio is covered with a generated tone and the real AAC codec, so the
     // check runs the same path without touching the machine's sound devices.
     local.audio = true;
@@ -6585,8 +6667,7 @@ int run_verify(const Options& options) {
     }
 
     if (local.clipboard) {
-        check(sent.clipboard_enabled, "the server announced clipboard as enabled");
-        check(received.clipboard_enabled, "the client saw clipboard enabled in HelloAck");
+        check(sent.clipboard_enabled, "the server announced clipboard as enabled");        check(received.clipboard_enabled, "the client saw clipboard enabled in HelloAck");
         check(received.clipboard_over_limit_sent && received.clipboard_followup_sent,
               "the viewer injected an over-limit CCLB blob and a follow-up item");
         check(received.clipboard_sent == 2 && received.clipboard_errors == 0,
@@ -6609,6 +6690,30 @@ int run_verify(const Options& options) {
                   same_clipboard_content(received.clipboard_contents.front(),
                                          local.fake_clipboard->updated),
               "the received item carried the host's text, HTML, RTF and DIB");
+    }
+
+    if (local.chat_probe) {
+        std::vector<std::string> host_lines;
+        {
+            std::lock_guard<std::mutex> lock(local.chat_probe->mutex);
+            host_lines = local.chat_probe->host_received;
+        }
+        check(received.chat_probe, "the viewer ran the chat probe");
+        check(received.chat_sent == 1 && received.chat_errors == 0,
+              "the viewer sent exactly one chat line");
+        check(received.chat_received == 1 && received.chat_texts.size() == 1 &&
+                  received.chat_texts.front() == kHostChatLine,
+              "the viewer received the host's chat line verbatim");
+        check(host_lines.size() == 1 && host_lines.front() == kViewerChatLine,
+              "the host received the viewer's chat line verbatim");
+        check(sent.chat_sent == 1 && sent.chat_received == 1,
+              "the host counted one chat line in each direction");
+        if (received.chat_texts.size() != 1 || host_lines.size() != 1) {
+            std::printf("     chat: viewer received %zu, host received %zu, "
+                        "viewer errors %llu\n",
+                        received.chat_texts.size(), host_lines.size(),
+                        static_cast<unsigned long long>(received.chat_errors));
+        }
     }
 
     if (local.file_upload) {

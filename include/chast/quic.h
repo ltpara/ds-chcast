@@ -615,6 +615,17 @@ public:
     // Total CCLB blobs received since the connection started.
     uint64_t clipboard_contents_received() const;
 
+    // ----- session chat (both roles, protocol v24) -----
+
+    // Sends one chat line. Empty, oversized or invalid UTF-8 text returns
+    // InvalidCall. The client requires the completed handshake; no permission
+    // bit gates chat, since an admitted session is the authorization.
+    Error send_chat(const std::string& text);
+    // Pops the oldest chat line the peer sent since the last call.
+    bool take_chat(std::string& text);
+    // Total ChatMessages received since the connection started.
+    uint64_t chats_received() const;
+
     // ----- file transfer (both directions) -----
     //
     // The side that offers a file is the sender; the side that answers is the

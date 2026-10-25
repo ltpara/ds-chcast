@@ -44,6 +44,11 @@ func recvFrom(t *testing.T, conn *net.UDPConn, timeout time.Duration) ([]byte, *
 
 func startRelay(t *testing.T, id, secret string) (*Manager, *registry.Registry, *net.UDPAddr, ed25519.PrivateKey) {
 	t.Helper()
+	return startRelayWith(t, id, secret)
+}
+
+func startRelayWith(t *testing.T, id, secret string, opts ...Option) (*Manager, *registry.Registry, *net.UDPAddr, ed25519.PrivateKey) {
+	t.Helper()
 	priv := identity.PrivateKeyFromSecret(secret)
 	reg := registry.New(time.Minute)
 	if _, err := reg.Register(registry.RegisterRequest{
@@ -53,7 +58,7 @@ func startRelay(t *testing.T, id, secret string) (*Manager, *registry.Registry, 
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog)
+	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog, opts...)
 	if err != nil {
 		t.Fatalf("manager: %v", err)
 	}
@@ -151,6 +156,49 @@ func TestBindHostKeepsRelaySourceAddress(t *testing.T) {
 	}
 	if !from.IP.Equal(net.ParseIP(assigned)) || from.Port != target.Port {
 		t.Fatalf("viewer saw relay source %s, want %s", from, target)
+	}
+}
+
+func TestRelayRequiresViewerToken(t *testing.T) {
+	_, reg, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(true))
+	record, ok := reg.Lookup("devbox")
+	if !ok || record.CarrierToken == "" {
+		t.Fatal("registry did not issue a carrier token")
+	}
+	token := record.CarrierToken
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+	if ack := relayHandshake(t, host, relayAddr, "devbox", priv); !ack.OK {
+		t.Fatalf("relay handshake: %+v", ack)
+	}
+
+	viewer.WriteToUDP([]byte("before-auth"), relayAddr)
+	host.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	buf := make([]byte, 64)
+	if n, _, err := host.ReadFromUDP(buf); err == nil {
+		t.Fatalf("viewer data was forwarded before auth: %q", buf[:n])
+	}
+
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type:   wire.TypeRelayViewer,
+		HostID: "devbox",
+		Token:  "wrong-token",
+	}), relayAddr)
+	if ack, err := wire.Decode(recv(t, viewer, 2*time.Second)); err != nil || ack.OK || ack.Error == "" {
+		t.Fatalf("wrong viewer token: %v %+v", err, ack)
+	}
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type:   wire.TypeRelayViewer,
+		HostID: "devbox",
+		Token:  token,
+	}), relayAddr)
+	if ack, err := wire.Decode(recv(t, viewer, 2*time.Second)); err != nil || !ack.OK {
+		t.Fatalf("viewer token: %v %+v", err, ack)
+	}
+
+	viewer.WriteToUDP([]byte("after-auth"), relayAddr)
+	if got := string(recv(t, host, 2*time.Second)); got != "after-auth" {
+		t.Fatalf("host received %q", got)
 	}
 }
 

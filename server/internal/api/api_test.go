@@ -29,6 +29,11 @@ type hostReply struct {
 	ServerPublicKey string   `json:"server_public_key"`
 	Binding         string   `json:"binding"`
 	LocalAddrs      []string `json:"local_addrs"`
+	Hostname        string   `json:"hostname"`
+	Platform        string   `json:"platform"`
+	Version         string   `json:"version"`
+	Alias           string   `json:"alias"`
+	Tags            []string `json:"tags"`
 	LastSeenMS      int64    `json:"last_seen_ms"`
 	ExpiresInMS     int64    `json:"expires_in_ms"`
 	NATType         string   `json:"nat_type"`
@@ -43,11 +48,19 @@ func hostKey(secret string) (ed25519.PrivateKey, string) {
 
 func registerBody(t *testing.T, id, secret, fingerprint string, timestamp int64) string {
 	t.Helper()
+	return registerBodyWithInfo(t, id, secret, fingerprint, "", "", "", timestamp)
+}
+
+func registerBodyWithInfo(t *testing.T, id, secret, fingerprint, hostname, platform, version string, timestamp int64) string {
+	t.Helper()
 	priv, pub := hostKey(secret)
 	body, err := json.Marshal(map[string]any{
 		"id":          id,
 		"public_key":  pub,
 		"fingerprint": fingerprint,
+		"hostname":    hostname,
+		"platform":    platform,
+		"version":     version,
 		"timestamp":   timestamp,
 		"signature":   identity.Sign(priv, identity.RegisterMessage(id, fingerprint, timestamp)),
 	})
@@ -125,7 +138,13 @@ func TestRegisterLookupAndDelete(t *testing.T) {
 		t.Fatalf("binding contents: %+v", binding)
 	}
 
-	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "")
+	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("lookup without a server key = %d, want 401", status)
+	}
+	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "wrong-key"); status != http.StatusUnauthorized {
+		t.Fatalf("lookup with a wrong server key = %d, want 401", status)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
 	if status != http.StatusOK {
 		t.Fatalf("lookup: %d %s", status, body)
 	}
@@ -147,7 +166,7 @@ func TestRegisterLookupAndDelete(t *testing.T) {
 	if err := s.Registry.Touch("devbox", "198.51.100.9:5000", []string{"192.168.1.9:5000"}, "port-restricted"); err != nil {
 		t.Fatal(err)
 	}
-	_, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "")
+	_, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
 	json.Unmarshal(body, &host)
 	if !host.Online || host.Candidate != "198.51.100.9:5000" || host.LastSeenMS < 0 {
 		t.Fatalf("host after keepalive: %+v", host)
@@ -170,7 +189,7 @@ func TestRegisterLookupAndDelete(t *testing.T) {
 		t.Fatalf("delete: %d %s", status, body)
 	}
 	// The live lease is gone but the ID -> key binding outlives it.
-	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "")
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
 	if status != http.StatusOK {
 		t.Fatalf("lookup after delete: %d %s", status, body)
 	}
@@ -187,8 +206,222 @@ func TestRegisterLookupAndDelete(t *testing.T) {
 	if status, body := request(t, http.MethodDelete, s.URL+"/v1/identities/devbox", "", testutil.ServerKey); status != http.StatusNoContent {
 		t.Fatalf("reset identity: %d %s", status, body)
 	}
-	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", ""); status != http.StatusNotFound {
+	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey); status != http.StatusNotFound {
 		t.Fatalf("lookup after identity reset: %d", status)
+	}
+}
+
+func TestPeerMetadataInLookup(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "office-pc", "office host key", "AB12",
+			"Office PC", "windows/amd64", "1.2.3", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	lookup := func() hostReply {
+		t.Helper()
+		status, body := request(t, http.MethodGet, s.URL+"/v1/hosts/office-pc", "", testutil.ServerKey)
+		if status != http.StatusOK {
+			t.Fatalf("lookup: %d %s", status, body)
+		}
+		var host hostReply
+		if err := json.Unmarshal(body, &host); err != nil {
+			t.Fatal(err)
+		}
+		return host
+	}
+	host := lookup()
+	if host.Hostname != "Office PC" || host.Platform != "windows/amd64" || host.Version != "1.2.3" {
+		t.Fatalf("lookup metadata: %+v", host)
+	}
+
+	// A renewal without metadata keeps the earlier report.
+	status, body = request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "office-pc", "office host key", "AB12", now+1), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("renew: %d %s", status, body)
+	}
+	host = lookup()
+	if host.Hostname != "Office PC" || host.Platform != "windows/amd64" || host.Version != "1.2.3" {
+		t.Fatalf("metadata after renewal: %+v", host)
+	}
+
+	// The durable record still answers after the lease is gone, like hbbs's
+	// peer list for offline peers.
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/hosts/office-pc", "", testutil.ServerKey); status != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", status, body)
+	}
+	host = lookup()
+	if host.Online || host.Hostname != "Office PC" || host.Version != "1.2.3" {
+		t.Fatalf("offline peer metadata: %+v", host)
+	}
+}
+
+func TestBatchLookup(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	peers := []struct {
+		id, secret, hostname, platform, version string
+	}{
+		{"alpha", "alpha host key", "Alpha", "windows/amd64", "1.0.0"},
+		{"beta", "beta host key", "Beta", "linux/amd64", "2.0.0"},
+	}
+	for _, peer := range peers {
+		status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+			registerBodyWithInfo(t, peer.id, peer.secret, "", peer.hostname, peer.platform, peer.version, now), testutil.ServerKey)
+		if status != http.StatusOK {
+			t.Fatalf("register %s: %d %s", peer.id, status, body)
+		}
+	}
+	if err := s.Registry.Touch("alpha", "198.51.100.7:5000", nil, "cone"); err != nil {
+		t.Fatal(err)
+	}
+
+	status, body := request(t, http.MethodGet, s.URL+"/v1/hosts?ids=alpha,beta,ghost,alpha", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("batch lookup: %d %s", status, body)
+	}
+	var batch struct {
+		Hosts   []hostReply `json:"hosts"`
+		Missing []string    `json:"missing"`
+	}
+	if err := json.Unmarshal(body, &batch); err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Hosts) != 2 || batch.Hosts[0].ID != "alpha" || batch.Hosts[1].ID != "beta" {
+		t.Fatalf("batch hosts: %+v", batch.Hosts)
+	}
+	if len(batch.Missing) != 1 || batch.Missing[0] != "ghost" {
+		t.Fatalf("batch missing: %+v", batch.Missing)
+	}
+	if !batch.Hosts[0].Online || batch.Hosts[0].Hostname != "Alpha" || batch.Hosts[0].CarrierToken == "" {
+		t.Fatalf("online peer: %+v", batch.Hosts[0])
+	}
+	if batch.Hosts[1].Online || batch.Hosts[1].Hostname != "Beta" || batch.Hosts[1].CarrierToken != "" {
+		t.Fatalf("offline peer: %+v", batch.Hosts[1])
+	}
+	for _, host := range batch.Hosts {
+		if _, err := identity.VerifyHostBinding(host.Binding, s.Identity.PublicKeyText()); err != nil {
+			t.Fatalf("binding for %s: %v", host.ID, err)
+		}
+	}
+
+	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts?ids=alpha", "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("batch lookup without a server key = %d, want 401", status)
+	}
+	for _, query := range []string{"", "?ids=", "?ids=alpha,,beta", "?ids=bad%20id", "?ids=" + strings.Repeat("a", 65)} {
+		if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts"+query, "", testutil.ServerKey); status != http.StatusBadRequest {
+			t.Fatalf("batch lookup %q = %d, want 400", query, status)
+		}
+	}
+
+	ids := make([]string, 200)
+	for i := range ids {
+		ids[i] = "peer-" + strconv.Itoa(i)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts?ids="+strings.Join(ids, ","), "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("batch at the limit: %d %s", status, body)
+	}
+	json.Unmarshal(body, &batch)
+	if len(batch.Hosts) != 0 || len(batch.Missing) != len(ids) {
+		t.Fatalf("batch at the limit: %d hosts, %d missing", len(batch.Hosts), len(batch.Missing))
+	}
+	ids = append(ids, "peer-over")
+	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts?ids="+strings.Join(ids, ","), "", testutil.ServerKey); status != http.StatusBadRequest {
+		t.Fatalf("batch over the limit = %d, want 400", status)
+	}
+}
+
+func TestIdentityLabels(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "devbox", "devbox key", "AB12", "Dev Box", "windows/amd64", "1.0.0", now),
+		testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	patch := func(id, body, key string) (int, []byte) {
+		t.Helper()
+		return request(t, http.MethodPatch, s.URL+"/v1/identities/"+id, body, key)
+	}
+	lookup := func() hostReply {
+		t.Helper()
+		status, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
+		if status != http.StatusOK {
+			t.Fatalf("lookup: %d %s", status, body)
+		}
+		var host hostReply
+		if err := json.Unmarshal(body, &host); err != nil {
+			t.Fatal(err)
+		}
+		return host
+	}
+
+	if status, _ := patch("devbox", `{"alias":"Studio PC"}`, ""); status != http.StatusUnauthorized {
+		t.Fatalf("labels without a server key = %d, want 401", status)
+	}
+	if status, _ := patch("ghost", `{"alias":"Studio PC"}`, testutil.ServerKey); status != http.StatusNotFound {
+		t.Fatalf("labels for an unknown peer = %d, want 404", status)
+	}
+	if status, _ := patch("devbox", `{}`, testutil.ServerKey); status != http.StatusBadRequest {
+		t.Fatalf("empty labels = %d, want 400", status)
+	}
+	status, body := patch("devbox", `{"alias":"Studio PC"}`, testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("set alias: %d %s", status, body)
+	}
+	var labels struct {
+		ID    string   `json:"id"`
+		Alias string   `json:"alias"`
+		Tags  []string `json:"tags"`
+	}
+	json.Unmarshal(body, &labels)
+	if labels.ID != "devbox" || labels.Alias != "Studio PC" {
+		t.Fatalf("alias response: %+v", labels)
+	}
+	host := lookup()
+	if host.Alias != "Studio PC" || len(host.Tags) != 0 || host.Hostname != "Dev Box" {
+		t.Fatalf("lookup after alias: %+v", host)
+	}
+
+	if status, body := patch("devbox", `{"tags":["office","prod","office",""]}`, testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("set tags: %d %s", status, body)
+	}
+	host = lookup()
+	if host.Alias != "Studio PC" || len(host.Tags) != 2 || host.Tags[0] != "office" || host.Tags[1] != "prod" {
+		t.Fatalf("lookup after tags: %+v", host)
+	}
+
+	// Host metadata renewal must not wipe operator labels.
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "devbox", "devbox key", "AB12", "Renamed", "windows/amd64", "2.0.0", now+1),
+		testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("renew: %d %s", status, body)
+	}
+	host = lookup()
+	if host.Alias != "Studio PC" || len(host.Tags) != 2 || host.Hostname != "Renamed" {
+		t.Fatalf("labels after renewal: %+v", host)
+	}
+
+	_, body = request(t, http.MethodGet, s.URL+"/v1/hosts?ids=devbox", "", testutil.ServerKey)
+	var batch struct {
+		Hosts []hostReply `json:"hosts"`
+	}
+	json.Unmarshal(body, &batch)
+	if len(batch.Hosts) != 1 || batch.Hosts[0].Alias != "Studio PC" || len(batch.Hosts[0].Tags) != 2 {
+		t.Fatalf("labels in batch lookup: %+v", batch.Hosts)
+	}
+
+	if status, body := patch("devbox", `{"alias":"","tags":[]}`, testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("clear labels: %d %s", status, body)
+	}
+	host = lookup()
+	if host.Alias != "" || len(host.Tags) != 0 {
+		t.Fatalf("labels were not cleared: %+v", host)
 	}
 }
 
@@ -202,7 +435,7 @@ func TestLookupRelayOnly(t *testing.T) {
 	if err := s.Registry.Touch("devbox", "198.51.100.9:5000", []string{"192.168.1.9:5000"}, "port-restricted"); err != nil {
 		t.Fatal(err)
 	}
-	_, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "")
+	_, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
 	var host hostReply
 	if err := json.Unmarshal(body, &host); err != nil {
 		t.Fatal(err)
@@ -324,7 +557,7 @@ func TestRuntimeRelayOnlyToggle(t *testing.T) {
 	}
 	lookup := func() hostReply {
 		t.Helper()
-		_, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "")
+		_, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
 		var host hostReply
 		if err := json.Unmarshal(body, &host); err != nil {
 			t.Fatal(err)
@@ -450,6 +683,83 @@ func TestHealthServerInfoAndStats(t *testing.T) {
 	}
 	if len(stats.Relay.Ports) != 2 {
 		t.Fatalf("relay ports in stats: %+v", stats)
+	}
+}
+
+func TestSoftwareUpdateAdvertisement(t *testing.T) {
+	s := testutil.StartWith(t, testutil.Options{
+		SoftwareVersion: "2.1.0",
+		SoftwareURL:     "https://downloads.example.com/chast-2.1.0.exe",
+	})
+	now := time.Now().Unix()
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "update-pc", "update secret", "CD34", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	type software struct {
+		Version string `json:"version"`
+		URL     string `json:"url"`
+	}
+	var reg struct {
+		Software *software `json:"software"`
+	}
+	if err := json.Unmarshal(body, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Software == nil || reg.Software.Version != "2.1.0" ||
+		reg.Software.URL != "https://downloads.example.com/chast-2.1.0.exe" {
+		t.Fatalf("register software = %+v", reg.Software)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/server", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("server info: %d %s", status, body)
+	}
+	var info struct {
+		Software *software `json:"software"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil || info.Software == nil || info.Software.Version != "2.1.0" {
+		t.Fatalf("server info software = %+v (%v)", info.Software, err)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/update-pc", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("lookup: %d %s", status, body)
+	}
+	var single struct {
+		ID       string    `json:"id"`
+		Software *software `json:"software"`
+	}
+	if err := json.Unmarshal(body, &single); err != nil || single.Software == nil || single.Software.Version != "2.1.0" {
+		t.Fatalf("lookup software = %+v (%v)", single.Software, err)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts?ids=update-pc", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("batch: %d %s", status, body)
+	}
+	var batch struct {
+		Hosts    []json.RawMessage `json:"hosts"`
+		Software *software         `json:"software"`
+	}
+	if err := json.Unmarshal(body, &batch); err != nil || batch.Software == nil || batch.Software.Version != "2.1.0" {
+		t.Fatalf("batch software = %+v (%v)", batch.Software, err)
+	}
+	if len(batch.Hosts) != 1 {
+		t.Fatalf("batch hosts = %d", len(batch.Hosts))
+	}
+}
+
+func TestSoftwareUpdateAbsentByDefault(t *testing.T) {
+	s := testutil.Start(t)
+	_, body := request(t, http.MethodGet, s.URL+"/v1/server", "", "")
+	var info map[string]any
+	if err := json.Unmarshal(body, &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := info["software"]; ok {
+		t.Fatalf("server without --software-url advertised software: %s", body)
 	}
 }
 

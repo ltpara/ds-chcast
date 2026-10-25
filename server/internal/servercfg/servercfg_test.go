@@ -108,6 +108,7 @@ func TestApplyRustDeskAliases(t *testing.T) {
 	relayOnly := fs.Bool("relay-only", false, "")
 	testPunch := fs.String("test-punch", "", "")
 	rateMax := fs.Int("punch-rate-max", 30, "")
+	punchLog := fs.Int("punch-log-max", 100000, "")
 	rmem := fs.Int("rmem", 0, "")
 	ini, _ := LoadINI(writeFile(t, "hbbs.ini", `
 BIND=0.0.0.0
@@ -131,8 +132,11 @@ RELAY-SERVERS=relay.example.com
 	if *testPunch != "auto" {
 		t.Fatalf("test-punch = %q", *testPunch)
 	}
-	if *rateMax != 12 {
-		t.Fatalf("punch-rate-max = %d", *rateMax)
+	if *rateMax != 30 {
+		t.Fatalf("punch-rate-max = %d, want the default 30", *rateMax)
+	}
+	if *punchLog != 12 {
+		t.Fatalf("punch-log-max = %d", *punchLog)
 	}
 	if *rmem != 1048576 {
 		t.Fatalf("rmem = %d", *rmem)

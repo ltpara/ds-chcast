@@ -7,13 +7,16 @@ import (
 	"log/slog"
 	"net"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
+	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/api"
+	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
@@ -46,10 +49,22 @@ type Options struct {
 	RelayNodeKey string
 	// RelayNodeHealth overrides the node health probe interval.
 	RelayNodeHealth time.Duration
+	// SoftwareVersion and SoftwareURL advertise an update like hbbs.
+	SoftwareVersion string
+	SoftwareURL     string
+	// NoAccounts leaves login and address-book routes unavailable, matching a
+	// server started with --state "".
+	NoAccounts bool
+	// LoginLimiter locks repeated wrong passwords out. Nil disables it.
+	LoginLimiter *authlimit.Limiter
+	// LoginPersistent enables the default 3-failures/1-minute lockout backed
+	// by the account database instead of process memory.
+	LoginPersistent bool
 }
 
 type Server struct {
 	Registry   *registry.Registry
+	Accounts   *account.Store
 	Relay      *relay.Manager
 	Rendezvous *rendezvous.Server
 	Identity   *identity.Server
@@ -74,11 +89,21 @@ func StartWith(t testing.TB, opts Options) *Server {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := registry.New(5 * time.Second)
+	var accounts *account.Store
+	if !opts.NoAccounts {
+		var err error
+		accounts, err = account.Open(filepath.Join(t.TempDir(), "accounts.db"))
+		if err != nil {
+			t.Fatalf("accounts: %v", err)
+		}
+	}
 	serverIdentity, err := identity.GenerateServer()
 	if err != nil {
 		t.Fatalf("server identity: %v", err)
 	}
-	rm, err := relay.NewManager("127.0.0.1", []int{0, 0}, reg, log)
+	rm, err := relay.NewManager("127.0.0.1", []int{0, 0}, reg, log,
+		relay.WithViewerTokenRequired(true),
+	)
 	if err != nil {
 		t.Fatalf("relay: %v", err)
 	}
@@ -88,7 +113,9 @@ func StartWith(t testing.TB, opts Options) *Server {
 	relayAddr := func(port int) string {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	}
-	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log)
+	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log,
+		rendezvous.WithServerKey(ServerKey),
+	)
 	if err != nil {
 		rm.Close()
 		t.Fatalf("rendezvous: %v", err)
@@ -127,6 +154,14 @@ func StartWith(t testing.TB, opts Options) *Server {
 		}
 		pool.Start()
 	}
+	loginLimiter := opts.LoginLimiter
+	if loginLimiter == nil && opts.LoginPersistent && accounts != nil {
+		loginLimiter = authlimit.NewPersistent(authlimit.Config{
+			Window:      time.Minute,
+			MaxFailures: 3,
+			Lockout:     time.Minute,
+		}, accounts, nil)
+	}
 	handler := api.New(api.Config{
 		Registry:        reg,
 		Relay:           rm,
@@ -137,6 +172,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		TTL:             60 * time.Second,
 		Logger:          log,
 		Limiter:         ratelimit.New(opts.RateLimit, opts.RateBurst),
+		LoginLimiter:    loginLimiter,
 		ProxyHeader:     opts.ProxyHeader,
 		TLS:             opts.TLS,
 		RelayOnly:       relayOnly,
@@ -146,10 +182,14 @@ func StartWith(t testing.TB, opts Options) *Server {
 		RelayAddrs:      relayAddrs,
 		RelayPool:       pool,
 		PunchReadBuffer: meet.ReadBuffer(),
+		SoftwareVersion: opts.SoftwareVersion,
+		SoftwareURL:     opts.SoftwareURL,
+		Accounts:        accounts,
 	})
 	hs := httptest.NewServer(handler)
 	s := &Server{
 		Registry:   reg,
+		Accounts:   accounts,
 		Relay:      rm,
 		Rendezvous: meet,
 		Identity:   serverIdentity,
@@ -166,6 +206,9 @@ func StartWith(t testing.TB, opts Options) *Server {
 	}
 	t.Cleanup(func() {
 		hs.Close()
+		if accounts != nil {
+			accounts.Close()
+		}
 		meet.Close()
 		rm.Close()
 		if pool != nil {

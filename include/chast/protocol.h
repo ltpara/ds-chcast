@@ -48,7 +48,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 23;
+inline constexpr uint16_t kProtocolVersion = 24;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -196,6 +196,12 @@ enum class ControlType : uint16_t {
     // effective fields describe the stream that is actually running, even
     // when the request was refused, so the viewer can restore its menu.
     StreamOptionsResult = 31,
+    // Either role: one UTF-8 chat line. Payload: the text bytes (at most
+    // kMaxChatBytes, no NUL). The control stream is ordered, so messages keep
+    // their send order. No permission bit gates chat: an admitted session is
+    // the authorization, and either side can ignore or close the chat UI.
+    // Protocol v24.
+    ChatMessage = 32,
 };
 
 // ----- input -----
@@ -835,6 +841,15 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
 std::vector<uint8_t> make_clipboard_update(uint64_t seq, const std::string& text);
 bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate& update,
                             std::string* error);
+// Session chat (protocol v24). One non-empty UTF-8 line of at most
+// kMaxChatBytes; NUL and invalid UTF-8 are rejected. The text is sent as-is,
+// newlines included, so a peer may compose multi-line messages.
+inline constexpr size_t kMaxChatBytes = 4096;
+bool valid_chat_text(const std::string& text);
+// Returns an empty vector when `text` fails valid_chat_text().
+std::vector<uint8_t> make_chat_message(const std::string& text);
+bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
+                        std::string* error);
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that
 // keep the sprite can send the same update again with an empty one.

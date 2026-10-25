@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -90,6 +91,10 @@ struct HostServerStats {
     // out (local changes). Both stay zero when clipboard sync is disabled.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
+    // Chat lines sent to the viewer and received from it. Both directions are
+    // ungated by permissions; an admitted session is the authorization.
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
     // Viewer uploads that were verified and renamed into place, their total
     // size, and offers that were refused or failed before that.
     uint64_t files_received = 0;
@@ -269,6 +274,9 @@ struct HostServerConfig {
     // never touches the operator's clipboard.
     std::function<bool(ClipboardContent&)> clipboard_read;
     std::function<bool(const ClipboardContent&)> clipboard_write;
+    // Called on the host thread for every ChatMessage the viewer sent. The
+    // operator UI appends it to the chat window; the message is not echoed.
+    std::function<void(const std::string&)> chat_message;
     // Called after an upload passed its digest and was renamed into place.
     std::function<void(const std::string& path, uint64_t bytes)> file_received;
     // Creates the system-audio source. Empty opens the default render
@@ -336,6 +344,11 @@ public:
     // Returns false with `error` for an unusable path, an active transfer or
     // a missing session.
     bool start_file_download(const std::string& utf8_path, std::string* error);
+
+    // Queues one chat line for the current viewer. Returns false for empty or
+    // oversized UTF-8, or when no viewer is streaming. Safe to call from the
+    // UI thread; the frame loop sends it on the control stream.
+    bool send_chat(const std::string& text);
 
 private:
     explicit HostServer(HostServerConfig config)
@@ -425,6 +438,11 @@ private:
     std::thread send_hasher_;
     uint32_t next_send_id_ = 1;
     std::string pending_download_path_;
+
+    // Chat queued by the operator UI. Cleared when a session starts so a line
+    // typed while nobody was connected never reaches the next viewer.
+    mutable std::mutex chat_mutex_;
+    std::deque<std::string> pending_chat_;
 
     mutable std::mutex status_mutex_;
     HostStatus status_;

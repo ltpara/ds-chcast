@@ -268,7 +268,7 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 	waitUntil(t, 2*time.Second, "node carrier snapshot", func() bool {
 		return s.Pool.HostLinked(node.url, "devbox")
 	})
-	status, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", "")
+	status, body := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
 	if status != http.StatusOK {
 		t.Fatalf("lookup: %d %s", status, body)
 	}

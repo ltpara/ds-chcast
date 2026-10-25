@@ -68,6 +68,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSpecialAction,
     required this.onToggleClipboard,
     required this.onSendFile,
+    required this.chatOpen,
+    required this.onToggleChat,
     required this.onToggleAudio,
     required this.onToggleMicrophone,
     required this.onTogglePrivacy,
@@ -132,6 +134,8 @@ class RemoteToolbar extends StatelessWidget {
   final ValueChanged<RemoteSpecialAction> onSpecialAction;
   final VoidCallback onToggleClipboard;
   final VoidCallback onSendFile;
+  final bool chatOpen;
+  final VoidCallback onToggleChat;
   final VoidCallback onToggleAudio;
   final VoidCallback onToggleMicrophone;
   final VoidCallback onTogglePrivacy;
@@ -435,6 +439,12 @@ class RemoteToolbar extends StatelessWidget {
               disabled: !fileAvailable || fileActive,
               active: fileActive,
               onTap: onSendFile,
+            ),
+            _BarButton(
+              icon: chatOpen ? Icons.forum_rounded : Icons.forum_outlined,
+              tooltip: chatOpen ? '关闭会话聊天' : '会话聊天',
+              active: chatOpen,
+              onTap: onToggleChat,
             ),
             _BarButton(
               icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,

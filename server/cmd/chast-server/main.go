@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,8 +19,10 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
+	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/admin"
 	"github.com/ltpara/ds-chcast/server/internal/api"
+	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
@@ -53,14 +56,19 @@ func run() error {
 		relayNodeKey = flag.String("relay-node-key", "", "control key shared with every --relay-nodes entry")
 		relayHealth  = flag.Duration("relay-node-health", 10*time.Second, "how often standalone relay nodes are probed")
 		serverKey    = flag.String("server-key", "", "required for registration unless empty")
+		softwareVer  = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
+		softwareURL  = flag.String("software-url", "", "download URL advertised with --software-version")
 		hostTTL      = flag.Duration("host-ttl", 60*time.Second, "how long a registration survives without renewal")
 		offline      = flag.Duration("offline-after", 30*time.Second, "keepalive silence that makes a host offline")
-		stateFile    = flag.String("state", "chast-server-state.json", "persistent ID/public-key bindings; empty disables persistence")
+		stateFile    = flag.String("state", "chast-server-state.db", "persistent SQLite peer database; a legacy .json next to it is imported once; empty disables persistence")
 		identityFile = flag.String("identity", "chast-server-identity.key", "Ed25519 server identity seed; created on first run, empty for ephemeral")
 		tlsCert      = flag.String("tls-cert", "", "PEM certificate for the HTTP API; requires --tls-key")
 		tlsKey       = flag.String("tls-key", "", "PEM private key for the HTTP API; requires --tls-cert")
 		apiRate      = flag.Float64("api-rate", 50, "sustained HTTP requests per second per client IP; 0 disables the limiter")
 		apiBurst     = flag.Int("api-burst", 100, "HTTP burst allowance per client IP")
+		loginFails   = flag.Int("login-max-failures", 5, "failed account logins per username and client IP before a lockout; 0 disables it")
+		loginWindow  = flag.Duration("login-window", 10*time.Minute, "window for counting failed account logins")
+		loginLockout = flag.Duration("login-lockout", time.Minute, "how long a locked username and client IP stay refused")
 		proxyHeader  = flag.String("proxy-header", "", "header carrying the client IP behind a trusted proxy, e.g. X-Forwarded-For")
 		relayOnly    = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
 		adminListen  = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
@@ -76,7 +84,7 @@ func run() error {
 		envFile        = flag.String("env-file", ".env", "dotenv file with flag values; empty disables it")
 		rmem           = flag.Int("rmem", 0, "UDP receive buffer in bytes for rendezvous and relay sockets; 0 keeps the system default")
 		punchRateMax   = flag.Int("punch-rate-max", rendezvous.DefaultRateMax, "punch requests per client IP per 10s; 0 disables the limiter")
-		testPunch      = flag.String("test-punch", "", "startup UDP self-check: empty skips, auto probes a local endpoint, or host:port")
+		testPunch      = flag.String("test-punch", "auto", "startup UDP self-check: auto probes a local endpoint, no disables it, or an explicit host:port")
 		punchLogMax    = flag.Int("punch-log-max", 100000, "retained punch request records; 0 disables the log")
 		regMax         = flag.Int("register-max", 30, "registration attempts per IP per window; 0 disables the rate check")
 		regWindow      = flag.Duration("register-window", time.Minute, "registration rate window")
@@ -107,6 +115,20 @@ func run() error {
 	if err := servercfg.Apply(flag.CommandLine, layers...); err != nil {
 		return err
 	}
+	softwareVersion := strings.TrimSpace(*softwareVer)
+	softwareDownload := strings.TrimSpace(*softwareURL)
+	if (softwareVersion == "") != (softwareDownload == "") {
+		return fmt.Errorf("--software-version and --software-url must be set together")
+	}
+	if softwareDownload != "" {
+		parsed, err := url.Parse(softwareDownload)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("--software-url must be an absolute http or https URL")
+		}
+		if len(softwareDownload) > 1024 || len(softwareVersion) > 64 {
+			return fmt.Errorf("--software-url is limited to 1024 characters and --software-version to 64")
+		}
+	}
 
 	level := slog.LevelInfo
 	if *verbose {
@@ -119,6 +141,15 @@ func run() error {
 	}
 	if *apiBurst < 1 {
 		return errors.New("--api-burst must be at least 1")
+	}
+	if *loginFails < 0 {
+		return errors.New("--login-max-failures must not be negative")
+	}
+	if *loginFails > 0 && *loginWindow < time.Second {
+		return errors.New("--login-window must be at least 1s")
+	}
+	if *loginFails > 0 && *loginLockout < time.Second {
+		return errors.New("--login-lockout must be at least 1s")
 	}
 	if *punchLogMax < 0 {
 		return errors.New("--punch-log-max must not be negative")
@@ -189,6 +220,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer reg.Close()
+	var accounts *account.Store
+	if *stateFile != "" {
+		accounts, err = account.Open(*stateFile)
+		if err != nil {
+			return fmt.Errorf("accounts: %w", err)
+		}
+		defer accounts.Close()
+	} else {
+		log.Warn("persistent state disabled; viewer accounts and address books are unavailable")
+	}
 	relayOnlyFlag := &atomic.Bool{}
 	relayOnlyFlag.Store(*relayOnly)
 	punchLog := punchlog.New(*punchLogMax, 60*time.Second)
@@ -205,7 +247,10 @@ func run() error {
 	relayAddr := func(port int) string {
 		return net.JoinHostPort(advertised, strconv.Itoa(port))
 	}
-	relayManager, err := relay.NewManager(*relayListen, ports, reg, log, relay.WithReadBuffer(*rmem))
+	relayManager, err := relay.NewManager(*relayListen, ports, reg, log,
+		relay.WithReadBuffer(*rmem),
+		relay.WithViewerTokenRequired(*serverKey != ""),
+	)
 	if err != nil {
 		return err
 	}
@@ -250,6 +295,7 @@ func run() error {
 	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log,
 		rendezvous.WithReadBuffer(*rmem),
 		rendezvous.WithPunchRateMax(*punchRateMax),
+		rendezvous.WithServerKey(*serverKey),
 	)
 	if err != nil {
 		return err
@@ -268,20 +314,18 @@ func run() error {
 	defer stop()
 	go meet.Serve()
 
-	if *testPunch != "" {
-		target, skip, err := rendezvous.ProbeTarget(*testPunch, *advertise, meet.Addr())
+	target, skip, err := rendezvous.ProbeTarget(*testPunch, *advertise, meet.Addr())
+	if err != nil {
+		return err
+	}
+	if skip != "" {
+		log.Info("startup punch self-check skipped", "reason", skip)
+	} else {
+		rtt, err := rendezvous.Probe(ctx, target, reg, log)
 		if err != nil {
-			return err
+			return fmt.Errorf("--test-punch: %w", err)
 		}
-		if skip != "" {
-			log.Info("startup punch self-check skipped", "reason", skip)
-		} else {
-			rtt, err := rendezvous.Probe(ctx, target, reg, log)
-			if err != nil {
-				return fmt.Errorf("--test-punch: %w", err)
-			}
-			log.Info("startup punch self-check passed", "target", target, "rtt", rtt.Round(time.Millisecond))
-		}
+		log.Info("startup punch self-check passed", "target", target, "rtt", rtt.Round(time.Millisecond))
 	}
 
 	var console *admin.Console
@@ -292,6 +336,7 @@ func run() error {
 			Relay:      relayManager,
 			Punch:      punchLog,
 			Blocker:    blocker,
+			Accounts:   accounts,
 			IPChanges:  ipChanges,
 			RelayAddrs: relayAddrs,
 			RelayPool:  pool,
@@ -307,24 +352,32 @@ func run() error {
 	}
 
 	handler := api.New(api.Config{
-		Registry:        reg,
-		Relay:           relayManager,
-		Identity:        serverIdentity,
-		PunchAddr:       punchAddr,
-		RelayHost:       advertised,
-		ServerKey:       *serverKey,
-		TTL:             *hostTTL,
-		RelayOnly:       relayOnlyFlag,
-		Blocker:         blocker,
-		PunchLog:        punchLog,
-		IPChanges:       ipChanges,
-		RelayAddrs:      relayAddrs,
-		RelayPool:       pool,
-		Logger:          log,
-		Limiter:         ratelimit.New(*apiRate, float64(*apiBurst)),
+		Registry:   reg,
+		Relay:      relayManager,
+		Identity:   serverIdentity,
+		PunchAddr:  punchAddr,
+		RelayHost:  advertised,
+		ServerKey:  *serverKey,
+		TTL:        *hostTTL,
+		RelayOnly:  relayOnlyFlag,
+		Blocker:    blocker,
+		Accounts:   accounts,
+		PunchLog:   punchLog,
+		IPChanges:  ipChanges,
+		RelayAddrs: relayAddrs,
+		RelayPool:  pool,
+		Logger:     log,
+		Limiter:    ratelimit.New(*apiRate, float64(*apiBurst)),
+		LoginLimiter: newLoginLimiter(accounts, authlimit.Config{
+			Window:      *loginWindow,
+			MaxFailures: *loginFails,
+			Lockout:     *loginLockout,
+		}, log),
 		ProxyHeader:     *proxyHeader,
 		TLS:             tlsConfig != nil,
 		PunchReadBuffer: meet.ReadBuffer(),
+		SoftwareVersion: softwareVersion,
+		SoftwareURL:     softwareDownload,
 	})
 	httpServer := &http.Server{
 		Addr:              *httpListen,
@@ -377,6 +430,8 @@ func run() error {
 		"punch_read_buffer", meet.ReadBuffer(),
 		"relay_read_buffer", relayManager.ReadBuffer(),
 		"punch_rate_max", *punchRateMax,
+		"software_version", softwareVersion,
+		"software_url", softwareDownload,
 	)
 	<-ctx.Done()
 
@@ -385,6 +440,18 @@ func run() error {
 	_ = httpServer.Shutdown(shutdownCtx)
 	log.Info("chast-server stopped")
 	return nil
+}
+
+// newLoginLimiter persists lockout state when accounts are enabled, so a
+// restart does not clear an active lockout. Without persistent state login is
+// unavailable anyway, but the in-memory limiter keeps the config paths uniform.
+func newLoginLimiter(accounts *account.Store, cfg authlimit.Config, log *slog.Logger) *authlimit.Limiter {
+	if accounts == nil {
+		return authlimit.New(cfg)
+	}
+	return authlimit.NewPersistent(cfg, accounts, func(err error) {
+		log.Error("login lockout state", "error", err)
+	})
 }
 
 func expireLoop(ctx context.Context, reg *registry.Registry, relayManager *relay.Manager, pool *relaypool.Pool, log *slog.Logger) {

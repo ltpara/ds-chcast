@@ -5,9 +5,12 @@ package identity
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +32,8 @@ const (
 	DomainCarrierHost = "chast-carrier-host-v1"
 	// DomainHostBinding covers the server-signed id/public-key/fingerprint blob.
 	DomainHostBinding = "chast-host-binding-v1"
+	// DomainPunch covers the viewer's server-key proof in a punch request.
+	DomainPunch = "chast-punch-v1"
 )
 
 var (
@@ -96,6 +101,36 @@ func RelayMessage(id string, port int, candidate, nonce string) []byte {
 
 func CarrierHostMessage(id, candidate, nonce string) []byte {
 	return fieldsMessage(DomainCarrierHost, id, candidate, nonce)
+}
+
+func PunchMessage(id, nonce string, unix int64) []byte {
+	return fieldsMessage(DomainPunch, id, nonce, strconv.FormatInt(unix, 10))
+}
+
+// PunchAuth proves knowledge of the server key without putting the key itself
+// on the wire. Punch datagrams are UDP and may be observed, so a MAC over the
+// target and timestamp is used instead of a bearer value.
+func PunchAuth(serverKey, id, nonce string, unix int64) string {
+	mac := hmac.New(sha256.New, []byte(serverKey))
+	mac.Write(PunchMessage(id, nonce, unix))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// CheckPunchAuth verifies a punch proof and bounds its age. An empty server
+// key keeps deployments that do not use authentication working unchanged.
+func CheckPunchAuth(serverKey, id, nonce, auth string, unix int64, now time.Time, window time.Duration) bool {
+	if serverKey == "" {
+		return true
+	}
+	delta := now.Unix() - unix
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > int64(window/time.Second) {
+		return false
+	}
+	expected := PunchAuth(serverKey, id, nonce, unix)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(auth)) == 1
 }
 
 // HostBinding is the server-signed proof that a host public key and optional
