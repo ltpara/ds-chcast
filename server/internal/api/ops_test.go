@@ -103,6 +103,8 @@ func TestMetricsExposeStats(t *testing.T) {
 		"chast_http_rate_limited_total 0",
 		`chast_http_requests_total{endpoint="POST /v1/hosts",code="200"} 1`,
 		`chast_http_request_duration_seconds_count{endpoint="POST /v1/hosts"}`,
+		"chast_punch_udp_read_buffer_bytes 0",
+		"chast_relay_udp_read_buffer_bytes 0",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("metrics missing %q in:\n%s", want, text)

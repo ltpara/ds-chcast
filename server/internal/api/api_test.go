@@ -413,9 +413,11 @@ func TestHealthServerInfoAndStats(t *testing.T) {
 		t.Fatalf("server info: %d %s", status, body)
 	}
 	var info struct {
-		PublicKey string `json:"public_key"`
-		Version   string `json:"version"`
-		Carrier   string `json:"carrier"`
+		PublicKey       string `json:"public_key"`
+		Version         string `json:"version"`
+		Carrier         string `json:"carrier"`
+		PunchReadBuffer *int   `json:"punch_udp_read_buffer"`
+		RelayReadBuffer *int   `json:"relay_udp_read_buffer"`
 	}
 	json.Unmarshal(body, &info)
 	if info.PublicKey != s.Identity.PublicKeyText() || info.Version == "" {
@@ -423,6 +425,9 @@ func TestHealthServerInfoAndStats(t *testing.T) {
 	}
 	if info.Carrier != s.Carrier {
 		t.Fatalf("server info carrier = %q, want %q", info.Carrier, s.Carrier)
+	}
+	if info.PunchReadBuffer == nil || info.RelayReadBuffer == nil {
+		t.Fatalf("server info omits UDP receive buffers: %s", body)
 	}
 
 	if status, _ := request(t, http.MethodGet, s.URL+"/v1/stats", "", ""); status != http.StatusUnauthorized {

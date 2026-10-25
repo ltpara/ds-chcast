@@ -499,6 +499,23 @@ func canonicalIP(value string) string {
 	return value
 }
 
+// DefaultListFile returns explicit when it is non-empty. Otherwise it picks the
+// first candidate that names a regular file in the working directory, matching
+// hbbr's automatic load of ./blacklist.txt and ./blocklist.txt. An empty result
+// means the list stays in memory only.
+func DefaultListFile(explicit string, candidates ...string) string {
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	for _, name := range candidates {
+		info, err := os.Stat(name)
+		if err == nil && info.Mode().IsRegular() {
+			return name
+		}
+	}
+	return ""
+}
+
 func loadIPList(path string) (map[string]struct{}, error) {
 	out := make(map[string]struct{})
 	path = strings.TrimSpace(path)

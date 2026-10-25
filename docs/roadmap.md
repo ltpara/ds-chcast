@@ -232,11 +232,12 @@
   - 隐私模式：`kPermissionPrivacyMode`（默认关闭）控制 `SetPrivacyMode`，主机用 `WDA_EXCLUDEFROMCAPTURE` 的置顶穿透黑色遮罩遮挡本机屏幕，DXGI 采集不变；权限收回或会话结束立即撤罩。查看器提供盾牌开关、应答提示与安全桌面横幅。
   - 验证（2026-10-24，单机回环）：`chast-quic verify --privacy` 100 项断言全过，遮罩 1.32 s 开、3.54 s 关，期间视频持续且画面未变黑；关闭闸门的主机拒绝请求且不断流；181 个访问单元、摘要 `4DB1C6A97132DC4F`。`ctest -C Release` 12/12；`flutter analyze`、73 项测试、Windows Release 构建通过。
   - 已知限制：真实锁屏/UAC、服务态安全桌面采集与遮罩视觉仍需实机；虚拟显示器 M8.2 继续暂缓。
-- 进行中：编码后端 FFmpeg 硬件兜底 M8.3（协议仍 v23，`docs/m8-plan.md` 第 9 节）。
+- 已完成：编码后端 FFmpeg 硬件兜底 M8.3（NVENC/AMF 实机验收待补；协议仍 v23，`docs/m8-plan.md` 第 9 节）。
   - 选择：`EncoderBackend::Auto` 仍先走 oneVPL 三级阶梯，全部失败后再创建 vcpkg FFmpeg 编码器（NVIDIA NVENC / AMD AMF / Intel QSV，按采集适配器厂商选，HEVC 可在同厂商退 H.264）；`Vpl`/`Ffmpeg` 固定后端失败不回退，工程不含软件编码。`HostServerConfig` 与工具新增 `--encoder auto|vpl|ffmpeg`。
   - 零拷贝：编码器自有 D3D11VA 帧池，采集 NV12 用同卡 `CopySubresourceRegion` 拷入；QSV 从采集设备派生并一次映射池帧，mfx-gen 要求设备开启 `ID3D10Multithread`，否则 SetHandle 返回 -16。`shared_import()` 对 FFmpeg 后端为 false（GPU 拷入而非共享导入）。
   - 速率：NVENC/AMF 纯码率变化原地更新、不打断编码序列，帧率变化延迟重建并强制 IDR；QSV 每次码率/帧率变化由 libavcodec reset 会话，要求一次 IDR，主机按 `keyframe_required` 执行。RustDesk 的 QSV（原生 mfx 与 ffmpeg_vram）同样以不带 reset option 的 reset 开始新序列，由硬件插入 IDR；其 NVENC/AMF 与我们一样不插入，其自适应帧率只改采集节奏、不写进编码器。一级 oneVPL 路径的纯码率变化用 `StartNewSequence=OFF`，不插 IDR。
   - 验证（2026-10-24，单机 QSV）：`chast-encode --encoder ffmpeg` H.264/HEVC 各 3 s 通过（52.6/48.7 fps、292/256 KB）；新增 `quic_loopback_ffmpeg` 与 `quic_stream_options_ffmpeg`，与原有 VPL 两条回环 4/4 通过；回放切分支持无 AUD 的 QSV 流（SEI+slice 按 VCL 边界成组）。
+  - 复核（2026-10-25）：同步远端后重新 Release 编译，`ctest -C Release -R ffmpeg` 2/2 通过（33.75/31.74 s）；`chast-encode --encoder ffmpeg` 在 2560×1440 上 H.264 54.9 fps、HEVC 41.0 fps，`errors=0`、`import: copy`。
   - 已知限制：本机无 NVIDIA/AMD 显卡，NVENC/AMF 仅通过编译、厂商映射与可用性检查，真实编码与零拷贝待实机。
 
 ## M9 — 输入与连接补全（已完成）
@@ -605,22 +606,30 @@
     不与节点共享；降级只降不升；真实跨机整形效果与时钟偏差下的降级判定仍需
     部署复核。
 
-## M10.8 — 配置来源、UDP 接收缓冲与启动自检（部分完成）
+## M10.8 — 配置来源、UDP 接收缓冲与启动自检（已完成）
 
-- 进行中：hbbs/hbbr 式的运维入口（协议仍 v23，`docs/m10.8-plan.md`）。
-  - 已完成：`internal/servercfg` 提供「显式 flag > `--config` INI > `--env-file`
+- 已完成：hbbs/hbbr 式的运维入口（协议仍 v23，`docs/m10.8-plan.md`）。
+  - 配置来源：`internal/servercfg` 提供「显式 flag > `--config` INI > `--env-file`
     dotenv > 环境变量」四级来源；键名大小写不敏感，`-`/`_` 等价，接受
     `CHAST_<KEY>` 或 `<KEY>`；INI 跳过分节与注释，dotenv 支持 `export ` 与
     成对引号；布尔值额外接受 `Y/N`。`cmd/chast-server` 与 `cmd/chast-relay`
-    新增 `--config`、`--env-file`，在读取任何业务参数之前应用。单测 6 项，
-    `gofmt`/`vet`/`build`/`test` 全部通过。
-  - 待办：`--rmem`（会合/中继/共享载体三处 UDP 接收缓冲，失败只告警）；
-    名单文件留空时回退工作目录 `blacklist.txt`/`blocklist.txt`；
-    `--test-punch` 启动 UDP 自检（对应 `TEST_HBBS`）；`BIND`/`PORT`/
-    `RELAY-SERVERS`/`RMEM`/`TEST_HBBS`/`ALWAYS_USE_RELAY`/
-    `MAX_PUNCH_REQUESTS` 等 RustDesk 原名别名；README 与真实二进制回环验证。
+    新增 `--config`、`--env-file`，在读取任何业务参数之前应用。RustDesk 的
+    `BIND`/`PORT`、`RELAY-SERVERS`、`RMEM`、`TEST_HBBS`、`ALWAYS_USE_RELAY`、
+    `MAX_PUNCH_REQUESTS` 作为别名可用，同层 canonical 键优先。
+  - 接收缓冲：`--rmem` 为会合套接字和全部中继 UDP 端口（含按租约地址重绑）
+    设置并回读 `SO_RCVBUF`，失败只告警；`/v1/server`、`/v1/stats` 与
+    `/metrics` 暴露生效值。共享载体只有 TCP/WebSocket，没有 UDP 侧。
+  - 默认名单与自检：名单路径留空时自动加载工作目录 `blacklist.txt`/
+    `blocklist.txt` 并记录实际路径；`--test-punch`（`TEST_HBBS`）支持空值跳过、
+    `auto` 本机探测和显式 `host:port`，注册临时 ID 后每秒重试，12 s 无应答
+    失败退出，成功记录 RTT。
+  - 验证：单机回环覆盖显式 flag > INI > .env > 环境变量、1 MiB 接收缓冲在
+    `/v1/server`/`/v1/stats`/`/metrics` 一致、默认名单在控制台 `b`/`B` 可见、
+    自检成功（RTT 2 ms）与关闭端口 12 s 失败（exit=1）；`go vet`/`go build`/
+    `go test ./... -count=1` 通过。
   - 已知限制：配置只在启动时读取，不支持热重载；INI 无分节层级；dotenv 不
-    展开变量；`DB_URL`/SQLite 持久化不在范围内（状态仍用 JSON 文件）。
+    展开变量；`--test-punch` 仅 `chast-server` 提供；`DB_URL`/SQLite 持久化
+    不在范围内（状态仍用 JSON 文件）。
 
 ## M6 后续（未开始）
 

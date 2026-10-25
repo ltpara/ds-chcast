@@ -102,6 +102,96 @@ func TestApplyReportsBadValue(t *testing.T) {
 	}
 }
 
+func TestApplyRustDeskAliases(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	punch := fs.String("punch-listen", "0.0.0.0:8444", "")
+	relayOnly := fs.Bool("relay-only", false, "")
+	testPunch := fs.String("test-punch", "", "")
+	rateMax := fs.Int("punch-rate-max", 30, "")
+	rmem := fs.Int("rmem", 0, "")
+	ini, _ := LoadINI(writeFile(t, "hbbs.ini", `
+BIND=0.0.0.0
+PORT=21116
+ALWAYS_USE_RELAY=Y
+TEST_HBBS=auto
+MAX_PUNCH_REQUESTS=12
+RMEM=1048576
+RELAY-SERVERS=relay.example.com
+`))
+	relayServers := fs.String("relay-servers", "", "")
+	if err := Apply(fs, ini); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if *punch != "0.0.0.0:21116" {
+		t.Fatalf("punch-listen = %q", *punch)
+	}
+	if !*relayOnly {
+		t.Fatal("ALWAYS_USE_RELAY was not applied")
+	}
+	if *testPunch != "auto" {
+		t.Fatalf("test-punch = %q", *testPunch)
+	}
+	if *rateMax != 12 {
+		t.Fatalf("punch-rate-max = %d", *rateMax)
+	}
+	if *rmem != 1048576 {
+		t.Fatalf("rmem = %d", *rmem)
+	}
+	if *relayServers != "relay.example.com" {
+		t.Fatalf("relay-servers = %q", *relayServers)
+	}
+}
+
+func TestPunchListenPortKeepsCurrentHost(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	punch := fs.String("punch-listen", "127.0.0.1:8444", "")
+	ini, _ := LoadINI(writeFile(t, "hbbs.ini", "PORT=21116\n"))
+	if err := Apply(fs, ini); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if *punch != "127.0.0.1:21116" {
+		t.Fatalf("punch-listen = %q", *punch)
+	}
+}
+
+func TestAliasCanonicalAndExplicitWin(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	punch := fs.String("punch-listen", "0.0.0.0:8444", "")
+	if err := fs.Parse([]string{"--punch-listen", "127.0.0.1:9001"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	ini, _ := LoadINI(writeFile(t, "hbbs.ini", "BIND=0.0.0.0\nPORT=21116\n"))
+	if err := Apply(fs, ini); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if *punch != "127.0.0.1:9001" {
+		t.Fatalf("explicit flag was overwritten: %q", *punch)
+	}
+
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	punch = fs.String("punch-listen", "0.0.0.0:8444", "")
+	canonical, _ := LoadINI(writeFile(t, "canonical.ini", "punch-listen=127.0.0.1:9000\nBIND=0.0.0.0\nPORT=21116\n"))
+	if err := Apply(fs, canonical); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if *punch != "127.0.0.1:9000" {
+		t.Fatalf("canonical key lost to an alias: %q", *punch)
+	}
+}
+
+func TestAliasFollowsLayerPrecedence(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	punch := fs.String("punch-listen", "0.0.0.0:8444", "")
+	ini, _ := LoadINI(writeFile(t, "hbbs.ini", "PORT=21116\n"))
+	env, _ := LoadEnvFile(writeFile(t, ".env", "PUNCH_LISTEN=127.0.0.1:9999\n"))
+	if err := Apply(fs, ini, env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if *punch != "0.0.0.0:21116" {
+		t.Fatalf("higher-priority alias lost: %q", *punch)
+	}
+}
+
 func TestFromEnvPrefixedKeyWins(t *testing.T) {
 	t.Setenv("PORT", "5000")
 	t.Setenv("CHAST_PORT", "5001")

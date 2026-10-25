@@ -78,6 +78,9 @@ type Config struct {
 	ProxyHeader string
 	// TLS reports whether clients reach this API over HTTPS.
 	TLS bool
+	// PunchReadBuffer is the kernel-reported SO_RCVBUF of the rendezvous
+	// socket. Zero means the system default or an unreadable value.
+	PunchReadBuffer int
 }
 
 type server struct {
@@ -383,15 +386,17 @@ func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 		carrier = net.JoinHostPort(s.cfg.RelayHost, strconv.Itoa(port))
 	}
 	info := map[string]any{
-		"version":          apiVer,
-		"public_key":       s.cfg.Identity.PublicKeyText(),
-		"punch":            s.cfg.PunchAddr,
-		"carrier":          carrier,
-		"tls":              s.cfg.TLS,
-		"host_ttl_sec":     int64(s.cfg.TTL / time.Second),
-		"relay_configured": s.cfg.RelayHost != "",
-		"relay_servers":    s.relayServers(),
-		"relay_only":       s.relayOnly(),
+		"version":               apiVer,
+		"public_key":            s.cfg.Identity.PublicKeyText(),
+		"punch":                 s.cfg.PunchAddr,
+		"carrier":               carrier,
+		"tls":                   s.cfg.TLS,
+		"host_ttl_sec":          int64(s.cfg.TTL / time.Second),
+		"relay_configured":      s.cfg.RelayHost != "",
+		"relay_servers":         s.relayServers(),
+		"relay_only":            s.relayOnly(),
+		"punch_udp_read_buffer": s.cfg.PunchReadBuffer,
+		"relay_udp_read_buffer": s.cfg.Relay.ReadBuffer(),
 	}
 	if s.cfg.RelayPool != nil {
 		info["relay_nodes"] = s.cfg.RelayPool.Status()
@@ -580,6 +585,8 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 	gauge("chast_relay_ports_assigned", "Relay ports bound to a host.", assigned)
 	gauge("chast_relay_ports_host_online", "Relay ports with a host link or recent traffic.", online)
 	gauge("chast_relay_ports_busy", "Relay ports with a live viewer.", busyPorts)
+	gauge("chast_punch_udp_read_buffer_bytes", "Kernel-reported SO_RCVBUF of the rendezvous socket; 0 means the default.", s.cfg.PunchReadBuffer)
+	gauge("chast_relay_udp_read_buffer_bytes", "Smallest kernel-reported SO_RCVBUF across relay sockets; 0 means the default.", stats.ReadBuffer)
 	counterPair("chast_relay_bytes_total", "UDP relay bytes.", `direction="to_host"`, toHost, `direction="to_viewer"`, toViewer)
 	counter("chast_relay_datagrams_dropped_total", "Datagrams dropped by the UDP relay.", "", dropped)
 	counter("chast_relay_busy_total", "UDP relay viewers refused because the port was busy.", "", udpBusy)

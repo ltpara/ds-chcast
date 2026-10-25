@@ -70,10 +70,13 @@ func run() error {
 		relayBlacklist = flag.Float64("relay-blacklist-speed", 32, "relay bandwidth for blacklisted IPs in Mbit/s")
 		relayDowngrade = flag.Duration("relay-downgrade-after", 30*time.Minute, "session age before a sustained relay is downgraded")
 		relayRatio     = flag.Float64("relay-downgrade-threshold", 0.66, "speed/limit ratio that triggers downgrade, 0..1")
-		relayBlackFile = flag.String("relay-blacklist-file", "", "IP list file that receives the slower relay rate")
-		relayBlockFile = flag.String("relay-blocklist-file", "", "IP list file whose viewers are disconnected")
+		relayBlackFile = flag.String("relay-blacklist-file", "", "IP list file that receives the slower relay rate; empty probes ./blacklist.txt")
+		relayBlockFile = flag.String("relay-blocklist-file", "", "IP list file whose viewers are disconnected; empty probes ./blocklist.txt")
 		configFile     = flag.String("config", "", "INI file with flag values; an explicit flag still wins")
 		envFile        = flag.String("env-file", ".env", "dotenv file with flag values; empty disables it")
+		rmem           = flag.Int("rmem", 0, "UDP receive buffer in bytes for rendezvous and relay sockets; 0 keeps the system default")
+		punchRateMax   = flag.Int("punch-rate-max", rendezvous.DefaultRateMax, "punch requests per client IP per 10s; 0 disables the limiter")
+		testPunch      = flag.String("test-punch", "", "startup UDP self-check: empty skips, auto probes a local endpoint, or host:port")
 		punchLogMax    = flag.Int("punch-log-max", 100000, "retained punch request records; 0 disables the log")
 		regMax         = flag.Int("register-max", 30, "registration attempts per IP per window; 0 disables the rate check")
 		regWindow      = flag.Duration("register-window", time.Minute, "registration rate window")
@@ -119,6 +122,12 @@ func run() error {
 	}
 	if *punchLogMax < 0 {
 		return errors.New("--punch-log-max must not be negative")
+	}
+	if *rmem < 0 {
+		return errors.New("--rmem must not be negative")
+	}
+	if *punchRateMax < 0 {
+		return errors.New("--punch-rate-max must not be negative")
 	}
 	if *regMax < 0 || *regMaxIDs < 0 {
 		return errors.New("--register-max and --register-max-ids must not be negative")
@@ -196,14 +205,22 @@ func run() error {
 	relayAddr := func(port int) string {
 		return net.JoinHostPort(advertised, strconv.Itoa(port))
 	}
-	relayManager, err := relay.NewManager(*relayListen, ports, reg, log)
+	relayManager, err := relay.NewManager(*relayListen, ports, reg, log, relay.WithReadBuffer(*rmem))
 	if err != nil {
 		return err
 	}
 	defer relayManager.Close()
+	blackFile := relay.DefaultListFile(*relayBlackFile, "blacklist.txt")
+	if strings.TrimSpace(*relayBlackFile) == "" && blackFile != "" {
+		log.Info("using the default relay blacklist file", "path", blackFile)
+	}
+	blockFile := relay.DefaultListFile(*relayBlockFile, "blocklist.txt")
+	if strings.TrimSpace(*relayBlockFile) == "" && blockFile != "" {
+		log.Info("using the default relay blocklist file", "path", blockFile)
+	}
 	if err := relayManager.SetPolicyConfig(relay.ConfigFromMbit(
 		*relaySingle, *relayTotal, *relayBlacklist,
-		*relayRatio, *relayDowngrade, *relayBlackFile, *relayBlockFile,
+		*relayRatio, *relayDowngrade, blackFile, blockFile,
 	)); err != nil {
 		return fmt.Errorf("relay policy: %w", err)
 	}
@@ -230,7 +247,10 @@ func run() error {
 		log.Info("relay nodes configured", "nodes", pool.NodeURLs(), "health_interval", *relayHealth)
 	}
 
-	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log)
+	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log,
+		rendezvous.WithReadBuffer(*rmem),
+		rendezvous.WithPunchRateMax(*punchRateMax),
+	)
 	if err != nil {
 		return err
 	}
@@ -243,6 +263,26 @@ func run() error {
 		return err
 	}
 	punchAddr := net.JoinHostPort(advertised, punchPortText)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go meet.Serve()
+
+	if *testPunch != "" {
+		target, skip, err := rendezvous.ProbeTarget(*testPunch, *advertise, meet.Addr())
+		if err != nil {
+			return err
+		}
+		if skip != "" {
+			log.Info("startup punch self-check skipped", "reason", skip)
+		} else {
+			rtt, err := rendezvous.Probe(ctx, target, reg, log)
+			if err != nil {
+				return fmt.Errorf("--test-punch: %w", err)
+			}
+			log.Info("startup punch self-check passed", "target", target, "rtt", rtt.Round(time.Millisecond))
+		}
+	}
 
 	var console *admin.Console
 	if *adminListen != "" {
@@ -267,23 +307,24 @@ func run() error {
 	}
 
 	handler := api.New(api.Config{
-		Registry:    reg,
-		Relay:       relayManager,
-		Identity:    serverIdentity,
-		PunchAddr:   punchAddr,
-		RelayHost:   advertised,
-		ServerKey:   *serverKey,
-		TTL:         *hostTTL,
-		RelayOnly:   relayOnlyFlag,
-		Blocker:     blocker,
-		PunchLog:    punchLog,
-		IPChanges:   ipChanges,
-		RelayAddrs:  relayAddrs,
-		RelayPool:   pool,
-		Logger:      log,
-		Limiter:     ratelimit.New(*apiRate, float64(*apiBurst)),
-		ProxyHeader: *proxyHeader,
-		TLS:         tlsConfig != nil,
+		Registry:        reg,
+		Relay:           relayManager,
+		Identity:        serverIdentity,
+		PunchAddr:       punchAddr,
+		RelayHost:       advertised,
+		ServerKey:       *serverKey,
+		TTL:             *hostTTL,
+		RelayOnly:       relayOnlyFlag,
+		Blocker:         blocker,
+		PunchLog:        punchLog,
+		IPChanges:       ipChanges,
+		RelayAddrs:      relayAddrs,
+		RelayPool:       pool,
+		Logger:          log,
+		Limiter:         ratelimit.New(*apiRate, float64(*apiBurst)),
+		ProxyHeader:     *proxyHeader,
+		TLS:             tlsConfig != nil,
+		PunchReadBuffer: meet.ReadBuffer(),
 	})
 	httpServer := &http.Server{
 		Addr:              *httpListen,
@@ -301,10 +342,6 @@ func run() error {
 		return fmt.Errorf("HTTP listen %q: %w", *httpListen, err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	go meet.Serve()
 	go func() {
 		var serveErr error
 		if tlsConfig != nil {
@@ -336,6 +373,10 @@ func run() error {
 		"punch_log_max", *punchLogMax,
 		"register_max", *regMax,
 		"register_max_ids", *regMaxIDs,
+		"rmem", *rmem,
+		"punch_read_buffer", meet.ReadBuffer(),
+		"relay_read_buffer", relayManager.ReadBuffer(),
+		"punch_rate_max", *punchRateMax,
 	)
 	<-ctx.Done()
 

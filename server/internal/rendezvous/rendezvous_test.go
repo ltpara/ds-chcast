@@ -273,4 +273,11 @@ func TestRateLimiter(t *testing.T) {
 	if !l.allow("198.51.100.1") {
 		t.Fatal("window did not reset")
 	}
+
+	disabled := newLimiter(0, time.Second)
+	for i := 0; i < 100; i++ {
+		if !disabled.allow("198.51.100.3") {
+			t.Fatal("zero limit still refused a request")
+		}
+	}
 }

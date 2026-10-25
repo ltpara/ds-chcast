@@ -27,6 +27,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -64,6 +65,19 @@ type Manager struct {
 	policy *Policy
 	bindIP net.IP
 	closed bool
+
+	wantedReadBuffer int
+	readBuffer       int
+}
+
+// Option customizes the relay manager before its ports are bound.
+type Option func(*Manager)
+
+// WithReadBuffer sets the UDP receive buffer (SO_RCVBUF) requested for every
+// relay port, including ports rebound for a lease address. Zero keeps the
+// system default.
+func WithReadBuffer(size int) Option {
+	return func(m *Manager) { m.wantedReadBuffer = size }
 }
 
 type port struct {
@@ -176,7 +190,7 @@ func peerIP(peer string) string {
 // bound the port keeps serving UDP without a carrier. A port of 0 asks the
 // kernel for an ephemeral port and is useful in tests; callers use Ports to
 // learn the actual numbers.
-func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger) (*Manager, error) {
+func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, opts ...Option) (*Manager, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -196,6 +210,9 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger) 
 		log:    log,
 		policy: policy,
 		bindIP: ip,
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 	for _, wanted := range ports {
 		conn, tcp, err := m.listenPort(ip, wanted)
@@ -231,6 +248,7 @@ func (m *Manager) listenPort(ip net.IP, wanted int) (*net.UDPConn, net.Listener,
 			return nil, nil, fmt.Errorf("relay port %d: %w", wanted, err)
 		}
 		actual := udp.LocalAddr().(*net.UDPAddr).Port
+		m.tuneReadBuffer(udp, actual)
 		tcp, err := net.ListenTCP("tcp", &net.TCPAddr{IP: ip, Port: actual})
 		if err == nil {
 			return udp, tcp, nil
@@ -245,6 +263,7 @@ func (m *Manager) listenPort(ip net.IP, wanted int) (*net.UDPConn, net.Listener,
 		if err != nil {
 			return nil, nil, fmt.Errorf("relay port %d: %w", wanted, err)
 		}
+		m.tuneReadBuffer(udp, wanted)
 		return udp, nil, nil
 	}
 	return nil, nil, errors.New("relay port 0: no UDP port with a free TCP twin")
@@ -257,6 +276,7 @@ func (m *Manager) listenOn(ip net.IP, number int) (*net.UDPConn, net.Listener, e
 	if err != nil {
 		return nil, nil, err
 	}
+	m.tuneReadBuffer(udp, number)
 	tcp, err := net.ListenTCP("tcp", &net.TCPAddr{IP: ip, Port: number})
 	if err != nil {
 		m.log.Warn("relay carrier disabled: cannot bind the TCP twin",
@@ -351,6 +371,37 @@ func (m *Manager) BindHost(number int, host string) error {
 		go p.serveTCP(tcp)
 	}
 	return nil
+}
+
+// tuneReadBuffer applies the configured receive buffer to one relay socket.
+// Failure is advisory, matching hbbr: the port keeps serving with the system
+// default instead of preventing startup.
+func (m *Manager) tuneReadBuffer(conn *net.UDPConn, port int) {
+	if m.wantedReadBuffer <= 0 {
+		return
+	}
+	size, err := netutil.SetUDPReadBuffer(conn, m.wantedReadBuffer)
+	if err != nil {
+		m.log.Warn("relay UDP receive buffer was not applied",
+			"port", port, "requested", m.wantedReadBuffer, "error", err)
+		return
+	}
+	if size <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.readBuffer == 0 || size < m.readBuffer {
+		m.readBuffer = size
+	}
+	m.mu.Unlock()
+}
+
+// ReadBuffer is the smallest SO_RCVBUF value reported by the kernel across the
+// relay sockets, or zero when the default was kept or could not be read back.
+func (m *Manager) ReadBuffer() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.readBuffer
 }
 
 func (m *Manager) isClosed() bool {
@@ -566,6 +617,9 @@ type Stats struct {
 	SharedCarrier *SharedCarrierStats `json:"shared_carrier,omitempty"`
 	Policy        PolicyStats         `json:"policy"`
 	Sessions      []SessionUsage      `json:"sessions,omitempty"`
+	// ReadBuffer is the effective SO_RCVBUF on the relay sockets; zero means
+	// the system default.
+	ReadBuffer int `json:"udp_read_buffer_bytes"`
 }
 
 // Policy exposes the relay policy for console commands and tests.
@@ -580,7 +634,7 @@ func (m *Manager) Stats() Stats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
-	out := Stats{Ports: make([]PortStats, 0, len(m.order))}
+	out := Stats{Ports: make([]PortStats, 0, len(m.order)), ReadBuffer: m.readBuffer}
 	for _, number := range m.order {
 		p := m.ports[number]
 		p.mu.Lock()

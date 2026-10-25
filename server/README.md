@@ -179,7 +179,7 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 | `GET` | `/v1/hosts/{id}` | 无 | 身份、绑定、在线状态、候选、NAT、租约中继/会合地址、`transport` 与 `relay_only`；共享载体与令牌只在该主机在线时返回 |
 | `DELETE` | `/v1/hosts/{id}` | Bearer server-key | 主机主动下线并释放中继端口，保留永久身份 |
 | `DELETE` | `/v1/identities/{id}` | Bearer server-key | 管理员重置丢失密钥的主机身份 |
-| `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体、中继地址列表、独立节点健康、TTL、是否启用 TLS |
+| `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体、中继地址列表、独立节点健康、TTL、是否启用 TLS，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
 | `GET` | `/metrics` | 配置了 server-key 时需要 | Prometheus 文本格式指标 |
 | `GET` | `/healthz` | 无 | 存活检查 |
@@ -292,6 +292,7 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   --tls-cert /etc/chast/fullchain.pem --tls-key /etc/chast/privkey.pem \
   --api-rate 50 --api-burst 100 --admin-listen 127.0.0.1:8446 \
   --register-max 30 --register-max-ids 300 --punch-log-max 100000 \
+  --rmem 4194304 \
   --relay-single-bandwidth 128 --relay-total-bandwidth 1024 \
   --relay-blacklist-speed 32 \
   --relay-blacklist-file /var/lib/chast/blacklist.txt \
@@ -335,7 +336,28 @@ scrape_configs:
   优先匹配 `CHAST_<KEY>` 再匹配 `<KEY>`，例如 `CHAST_HOST_TTL=90s`、
   `relay-single-bandwidth=64`。布尔参数也接受 `Y/N`。坏值在启动时报
   `config <flag>=<value>: …` 并退出，不会带病运行。`chast-relay` 使用同一套
-  来源与优先级。
+  来源与优先级。RustDesk 的运维键名可以直接沿用：`BIND`/`PORT` 合并为
+  `punch-listen`（`PORT` 覆盖 `BIND` 内的端口，仅给 `PORT` 时保留当前主机）、
+  `RELAY-SERVERS`→`relay-servers`、`RMEM`→`rmem`、`TEST_HBBS`→`test-punch`、
+  `ALWAYS_USE_RELAY`→`relay-only`、`MAX_PUNCH_REQUESTS`→`punch-rate-max`。
+  同一来源内 canonical 键（如 `punch-listen`）优先于别名；显式 flag 始终最高。
+- `--rmem` 为会合套接字、每个中继 UDP 端口（含按租约地址重绑后的端口）统一
+  请求 `SO_RCVBUF`，`0` 保持系统默认。设置失败只写警告并继续启动，与 hbbr
+  一致；实际生效值由内核回读，`/v1/server` 的 `punch_udp_read_buffer` /
+  `relay_udp_read_buffer`、`/v1/stats` 的 `relay.udp_read_buffer_bytes` 与
+  `/metrics` 的 `chast_punch_udp_read_buffer_bytes` /
+  `chast_relay_udp_read_buffer_bytes` 暴露。中继侧取所有套接字中的最小值；
+  `0` 表示使用系统默认或无法回读。共享载体只有 TCP/WebSocket，没有 UDP 侧。
+- 名单文件路径留空时，两个二进制都会探测工作目录下的 `blacklist.txt` 与
+  `blocklist.txt`，存在则加载并在启动日志给出实际路径；显式路径始终优先。
+  这样 `hbbr` 风格的 `./blacklist.txt` 部署无需再传参数，未找到文件时名单
+  只保留在内存中，控制台增删后仍会原子回写到已加载的路径。
+- `--test-punch`（别名 `TEST_HBBS`）在启动时做一次真实 UDP 自检：空值跳过；
+  `auto` 仅在 `--advertise` 未配置或为回环地址时探测本机监听地址，否则记录
+  跳过原因；显式 `host:port` 无条件探测。自检会注册一个临时 ID，每秒重发
+  一次签名 keepalive，12 s 内无应答则打印目标与最后错误并退出，成功时日志
+  记录 RTT。探测目标不是 `chast-relay`：节点没有会合端口，其 UDP 中继端口
+  需要有效租约才应答。
 
 ### 独立中继节点（chast-relay）
 
@@ -345,7 +367,7 @@ scrape_configs:
 chast-relay --http-listen 0.0.0.0:8447 --relay-listen 0.0.0.0 \
   --relay-ports 41000-41099 --carrier-listen 0.0.0.0:8448 \
   --advertise 203.0.113.7 --key "$CHAST_RELAY_NODE_KEY" \
-  --node-id relay-1 --admin-listen 127.0.0.1:8449 \
+  --node-id relay-1 --admin-listen 127.0.0.1:8449 --rmem 4194304 \
   --relay-single-bandwidth 128 --relay-total-bandwidth 1024 \
   --relay-blacklist-speed 32 \
   --tls-cert /etc/chast/relay-fullchain.pem --tls-key /etc/chast/relay-privkey.pem
@@ -393,7 +415,10 @@ chast-server ... \
   `--relay-downgrade-after`（默认 30m）控制持续高带宽会话的自动降级。
   名单文件可选：`--relay-blacklist-file` 命中后限速，
   `--relay-blocklist-file` 命中后拒绝新会话并断开已有会话；每行取第一个字段，
-  支持 `ip note` 写法。未给路径时名单只在内存中，控制台增删后原子回写。
+  支持 `ip note` 写法。两者留空时自动加载工作目录下的 `blacklist.txt` /
+  `blocklist.txt`，启动日志给出实际路径；未找到文件时名单只在内存中，控制台
+  增删后原子回写到显式路径。节点同样接受 `--rmem`，其生效值出现在启动日志与
+  租约统计的 `relay.udp_read_buffer_bytes` 中。
 - 节点控制协议：
 
   | 方法 | 路径 | 认证 | 说明 |
@@ -460,6 +485,7 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   `chast_registration_tracked_ips`、`chast_punch_requests_total`、
   `chast_punch_requests_deduped_total`、`chast_punch_log_entries`、
   `chast_ip_change_events_total`、`chast_ip_change_tracked`、
+  `chast_punch_udp_read_buffer_bytes`、`chast_relay_udp_read_buffer_bytes`、
   `chast_relay_servers`、`chast_relay_nodes` 与
   `chast_relay_nodes_healthy`；中继策略另见
   `chast_relay_single_bandwidth_bps`、`chast_relay_total_bandwidth_bps`、
@@ -832,6 +858,35 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   名单、降级、命令与配置，`policy_relay_test.go` 覆盖 UDP 限速、阻断拒绝与
   释放、每端口与共享载体阻断，`internal/admin` 覆盖 `PolicyOnly` 控制台，
   `internal/api` 覆盖策略指标。
+
+2026-10-25，配置来源、UDP 接收缓冲、默认名单与启动自检（M10.8）在单机回环上验证：
+
+- 拓扑：`chast-server` 在 `build/m108` 工作目录读取 `config.ini`、`.env` 与
+  进程环境变量，`--punch-listen 127.0.0.1:18444`、`--relay-ports
+  42100-42102` 为显式参数；管理台 `127.0.0.1:18446`，工作目录预置
+  `blacklist.txt`/`blocklist.txt`。
+- 优先级：显式 `--punch-listen`/`--relay-ports` 覆盖 INI 的
+  `18443`/`42000-42002`；INI 的 `http-listen=18843` 与 `rmem=1048576` 覆盖
+  `.env` 的 `18842`/`524288` 和环境变量的 `18841`/`262144`；`.env` 的
+  `ALWAYS_USE_RELAY=Y` 覆盖环境变量的 `N`，`/v1/server` 为
+  `relay_only:true`。去掉 `--config` 后 `.env` 的 18842/18442/524288/Y 覆盖
+  环境变量的 18841/18441/262144/N，自检目标 `127.0.0.1:18442`。
+- 生效值：`/v1/server` 的 `punch_udp_read_buffer` 与
+  `relay_udp_read_buffer` 均为 `1048576`，`/v1/stats` 的
+  `relay.udp_read_buffer_bytes` 与 `/metrics` 的
+  `chast_punch_udp_read_buffer_bytes`/`chast_relay_udp_read_buffer_bytes`
+  一致。
+- 默认名单：启动日志输出 `using the default relay blacklist file
+  path=blacklist.txt` 与 `blocklist.txt`；`/v1/stats` 为 `blacklist:1
+  blocklist:1`，管理台 `b`/`B` 分别返回 `203.0.113.9` 与 `198.51.100.7`。
+  `chast-relay` 同样加载两份名单，ready 日志为 `rmem=1048576
+  relay_read_buffer=1048576`。
+- 自检：`TEST_HBBS=auto` 回环启动输出 `startup punch self-check passed
+  target=127.0.0.1:18444 rtt=2ms`；`--test-punch 127.0.0.1:18449`（关闭端口）
+  运行 12 s 后 `exit=1`，报 `no keepalive acknowledgement … within 12s`。
+- 自动化：改动文件经 LF 规范化后 `gofmt -l` 无输出，`go vet ./...`、
+  `go build ./...`、`go test ./... -count=1` 通过（18 个有测试的包）。
+  共享载体只有 TCP/WebSocket，`--rmem` 不作用于不存在的“载体 UDP 侧”。
 
 环境边界：单机回环只有一张网卡，`symmetric` NAT 分类、局域网候选与真实 IPv6
 跨网行为需要双机复核；共享载体尚未经过真实 HTTP 代理/CDN；证书轮换、ACME

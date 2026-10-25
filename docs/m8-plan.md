@@ -1,10 +1,10 @@
 # M8 — 发射端加固计划
 
-更新时间：2026-10-24
+更新时间：2026-10-25
 分支：`feat/m7-security`（M7 未提交的收尾与 M8 工作在同一分支继续）
-基线：M7 完成；M8.0（协议 v14）、M8.1（协议 v15）、M8.4（协议 v17）、
-M8.5（协议 v18，Opus + 麦克风上行）、M8.6（协议 v19，锁屏/UAC 与隐私模式）
-已完成
+基线：M7 完成；M8.0（协议 v14）、M8.1（协议 v15）、M8.3（FFmpeg 硬件
+兜底）、M8.4（协议 v17）、M8.5（协议 v18，Opus + 麦克风上行）、
+M8.6（协议 v19，锁屏/UAC 与隐私模式）已完成
 参考：`D:\rustdesk` @ `c7f212d`（只做能力对照，不复制实现）
 
 ## 状态标记约定
@@ -62,10 +62,10 @@ M8.5（协议 v18，Opus + 麦克风上行）、M8.6（协议 v19，锁屏/UAC �
   IddCx 示例同样绕不开签名，未签名驱动在强制驱动签名的系统上无法加载。
   2026-10-23 决定暂缓，等 M8.7 安装器/签名链路具备后再评估；本轮不引入
   驱动依赖，也不复制 RustDesk 驱动。
-- `[~]` **M8.3 编码后端 NVENC/AMF**：新增 vcpkg FFmpeg 硬件后端
+- `[x]` **M8.3 编码后端 FFmpeg 硬件兜底**：新增 vcpkg FFmpeg 硬件后端
   （NVENC/AMF/QSV），Auto 先试 oneVPL、失败再试 FFmpeg；D3D11VA 帧池
   与同卡 GPU 拷贝保持零拷贝，无软件编码。QSV 已在本机完成编码与回环
-  验证；NVENC/AMF 缺实机，仅编译与可用性检查通过（见第 9 节）。
+  验证；NVENC/AMF 实机验收待补（见第 9 节）。
 - `[~]` **M8.4 富剪贴板与文件传输**：协议 v17；HTML/RTF/DIB、查看器
   上传、续传/摘要、GUI 1 GiB 验收已完成（见 6.6、9）。文件传输现为
   双向：主机可经托盘把文件发到查看器，查看器支持工具栏选择与资源
@@ -1156,3 +1156,13 @@ HelloAck 后也发一次（即使当前是 Default），会话从锁屏开始也
   `quic_stream_options_ffmpeg`，连同原有两条 VPL 回环 4/4 通过。
 - `[ ]` M8.3 实机验收：NVENC/AMF 需要 NVIDIA/AMD 机器；本机只有 Intel
   Iris Xe，QSV 已完成验证。
+
+### 2026-10-25
+
+- `[x]` M8.3 复核：同步远端后重新配置并 Release 编译（新增 M9.4 依赖
+  SpeexDSP 1.2.1 静态库），`ctest --test-dir build -C Release -R ffmpeg`
+  2/2 通过（`quic_loopback_ffmpeg` 33.75 s、`quic_stream_options_ffmpeg`
+  31.74 s）。`chast-encode --encoder ffmpeg` 在 2560×1440 输出上
+  H.264 165 帧/168668 B/54.9 fps、HEVC 123 帧/52834 B/41.0 fps，
+  `errors=0`、`keyframes=1`、`import: copy`。
+- `[ ]` M8.3 实机验收继续保持未完成：NVENC/AMF 需要 NVIDIA/AMD 显卡。

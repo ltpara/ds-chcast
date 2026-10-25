@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"strings"
 )
@@ -39,12 +40,72 @@ func (l *Layer) Lookup(flagName string) (string, bool) {
 	if l == nil {
 		return "", false
 	}
-	key := normalizeKey(flagName)
+	return l.lookupKey(flagName)
+}
+
+func (l *Layer) lookupKey(key string) (string, bool) {
+	key = normalizeKey(key)
 	if value, ok := l.values["CHAST_"+key]; ok {
 		return value, true
 	}
 	value, ok := l.values[key]
 	return value, ok
+}
+
+// lookupAlias maps hbbs/hbbr key names onto chast flags. It is only consulted
+// when the flag's own key is absent from the layer, so a canonical key always
+// wins inside one source. RELAY-SERVERS and RMEM need no entry: normalizing '-'
+// to '_' already makes them the flag names.
+func (l *Layer) lookupAlias(flagName, current string) (string, bool) {
+	if l == nil {
+		return "", false
+	}
+	switch flagName {
+	case "punch-listen":
+		return l.lookupPunchListen(current)
+	case "test-punch":
+		return l.lookupKey("test_hbbs")
+	case "relay-only":
+		return l.lookupKey("always_use_relay")
+	case "punch-rate-max":
+		return l.lookupKey("max_punch_requests")
+	}
+	return "", false
+}
+
+// lookupPunchListen combines RustDesk's BIND (address) and PORT (port) keys.
+// A port inside BIND is accepted but PORT wins when both are present; when only
+// PORT is set the flag's current address keeps its host.
+func (l *Layer) lookupPunchListen(current string) (string, bool) {
+	bind, hasBind := l.lookupKey("bind")
+	port, hasPort := l.lookupKey("port")
+	if !hasBind && !hasPort {
+		return "", false
+	}
+	host, currentPort := "", ""
+	if h, p, err := net.SplitHostPort(current); err == nil {
+		host, currentPort = h, p
+	} else {
+		host = strings.Trim(current, "[]")
+	}
+	if hasBind {
+		bind = strings.TrimSpace(bind)
+		if h, p, err := net.SplitHostPort(bind); err == nil {
+			host = h
+			if p != "" {
+				currentPort = p
+			}
+		} else {
+			host = strings.Trim(bind, "[]")
+		}
+	}
+	if hasPort {
+		currentPort = strings.TrimSpace(port)
+	}
+	if currentPort == "" {
+		return host, true
+	}
+	return net.JoinHostPort(strings.Trim(host, "[]"), currentPort), true
 }
 
 // FromEnv snapshots the process environment.
@@ -128,6 +189,9 @@ func Apply(fs *flag.FlagSet, layers ...*Layer) error {
 		}
 		for _, layer := range layers {
 			value, ok := layer.Lookup(f.Name)
+			if !ok {
+				value, ok = layer.lookupAlias(f.Name, f.Value.String())
+			}
 			if !ok {
 				continue
 			}

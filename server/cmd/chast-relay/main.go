@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,10 +48,11 @@ func run() error {
 		blacklistSpeed  = flag.Float64("relay-blacklist-speed", 32, "relay bandwidth for blacklisted IPs in Mbit/s")
 		downgradeAfter  = flag.Duration("relay-downgrade-after", 30*time.Minute, "session age before a sustained relay is downgraded")
 		downgradeRatio  = flag.Float64("relay-downgrade-threshold", 0.66, "speed/limit ratio that triggers downgrade, 0..1")
-		blacklistFile   = flag.String("relay-blacklist-file", "", "IP list file that receives the slower relay rate")
-		blocklistFile   = flag.String("relay-blocklist-file", "", "IP list file whose viewers are disconnected")
+		blacklistFile   = flag.String("relay-blacklist-file", "", "IP list file that receives the slower relay rate; empty probes ./blacklist.txt")
+		blocklistFile   = flag.String("relay-blocklist-file", "", "IP list file whose viewers are disconnected; empty probes ./blocklist.txt")
 		configFile      = flag.String("config", "", "INI file with flag values; an explicit flag still wins")
 		envFile         = flag.String("env-file", ".env", "dotenv file with flag values; empty disables it")
+		rmem            = flag.Int("rmem", 0, "UDP receive buffer in bytes for relay sockets; 0 keeps the system default")
 		verbose         = flag.Bool("verbose", false, "debug logging")
 	)
 	flag.Parse()
@@ -89,6 +91,9 @@ func run() error {
 	if *janitor < time.Second {
 		return errors.New("--lease-janitor must be at least 1s")
 	}
+	if *rmem < 0 {
+		return errors.New("--rmem must not be negative")
+	}
 	tlsConfig, err := netutil.LoadTLSConfig(*tlsCert, *tlsKey)
 	if err != nil {
 		return err
@@ -103,14 +108,22 @@ func run() error {
 	}
 
 	auth := relaynode.NewAuthenticator()
-	manager, err := relay.NewManager(*relayListen, ports, auth, log)
+	manager, err := relay.NewManager(*relayListen, ports, auth, log, relay.WithReadBuffer(*rmem))
 	if err != nil {
 		return err
 	}
 	defer manager.Close()
+	blackFile := relay.DefaultListFile(*blacklistFile, "blacklist.txt")
+	if strings.TrimSpace(*blacklistFile) == "" && blackFile != "" {
+		log.Info("using the default relay blacklist file", "path", blackFile)
+	}
+	blockFile := relay.DefaultListFile(*blocklistFile, "blocklist.txt")
+	if strings.TrimSpace(*blocklistFile) == "" && blockFile != "" {
+		log.Info("using the default relay blocklist file", "path", blockFile)
+	}
 	if err := manager.SetPolicyConfig(relay.ConfigFromMbit(
 		*singleBandwidth, *totalBandwidth, *blacklistSpeed,
-		*downgradeRatio, *downgradeAfter, *blacklistFile, *blocklistFile,
+		*downgradeRatio, *downgradeAfter, blackFile, blockFile,
 	)); err != nil {
 		return fmt.Errorf("relay policy: %w", err)
 	}
@@ -188,6 +201,8 @@ func run() error {
 		"carrier", manager.CarrierAddr(),
 		"tls", tlsConfig != nil,
 		"janitor", *janitor,
+		"rmem", *rmem,
+		"relay_read_buffer", manager.ReadBuffer(),
 	)
 	<-ctx.Done()
 

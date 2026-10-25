@@ -88,6 +88,24 @@ func writeSelfSigned(t *testing.T) (string, string) {
 	return certFile, keyFile
 }
 
+func TestSetUDPReadBufferReportsEffectiveSize(t *testing.T) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if size, err := SetUDPReadBuffer(conn, 0); err != nil || size != 0 {
+		t.Fatalf("disabled buffer = %d, %v", size, err)
+	}
+	size, err := SetUDPReadBuffer(conn, 1<<20)
+	if err != nil {
+		t.Fatalf("set read buffer: %v", err)
+	}
+	if size <= 0 {
+		t.Fatalf("effective read buffer = %d", size)
+	}
+}
+
 func TestLoadTLSConfig(t *testing.T) {
 	if cfg, err := LoadTLSConfig("", ""); err != nil || cfg != nil {
 		t.Fatalf("empty TLS flags = %v, %v", cfg, err)

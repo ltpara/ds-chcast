@@ -18,6 +18,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
@@ -25,25 +26,51 @@ import (
 
 const (
 	punchTTL        = 30 * time.Second
-	defaultRateMax  = 30
+	DefaultRateMax  = 30
 	defaultRateSpan = 10 * time.Second
 )
 
+type options struct {
+	readBuffer int
+	rateMax    int
+}
+
+// Option customizes the rendezvous socket without changing the call sites that
+// only need the defaults.
+type Option func(*options)
+
+// WithReadBuffer sets the UDP receive buffer (SO_RCVBUF) requested at bind
+// time. Zero keeps the system default.
+func WithReadBuffer(size int) Option {
+	return func(o *options) { o.readBuffer = size }
+}
+
+// WithPunchRateMax caps punch requests per client IP per ten seconds. A
+// non-positive value disables the limiter.
+func WithPunchRateMax(max int) Option {
+	return func(o *options) { o.rateMax = max }
+}
+
 type Server struct {
-	conn      *net.UDPConn
-	reg       *registry.Registry
-	relayAddr func(port int) string
-	identity  *identity.Server
-	punchLog  *punchlog.Log
-	ipChanges *ipchange.Tracker
-	log       *slog.Logger
-	limiter   *limiter
-	done      chan struct{}
-	closeOnce sync.Once
+	conn       *net.UDPConn
+	reg        *registry.Registry
+	relayAddr  func(port int) string
+	identity   *identity.Server
+	punchLog   *punchlog.Log
+	ipChanges  *ipchange.Tracker
+	log        *slog.Logger
+	limiter    *limiter
+	readBuffer int
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 // New binds the meeting port. bind is an IP:port; port 0 lets the kernel pick.
-func New(bind string, reg *registry.Registry, relayAddr func(port int) string, log *slog.Logger) (*Server, error) {
+func New(bind string, reg *registry.Registry, relayAddr func(port int) string, log *slog.Logger, opts ...Option) (*Server, error) {
+	cfg := options{rateMax: DefaultRateMax}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	addr, err := net.ResolveUDPAddr("udp", bind)
 	if err != nil {
 		return nil, fmt.Errorf("punch listen %q: %w", bind, err)
@@ -55,15 +82,25 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 	if log == nil {
 		log = slog.Default()
 	}
+	readBuffer, err := netutil.SetUDPReadBuffer(conn, cfg.readBuffer)
+	if err != nil {
+		log.Warn("punch UDP receive buffer was not applied",
+			"requested", cfg.readBuffer, "error", err)
+	}
 	return &Server{
-		conn:      conn,
-		reg:       reg,
-		relayAddr: relayAddr,
-		log:       log,
-		limiter:   newLimiter(defaultRateMax, defaultRateSpan),
-		done:      make(chan struct{}),
+		conn:       conn,
+		reg:        reg,
+		relayAddr:  relayAddr,
+		log:        log,
+		limiter:    newLimiter(cfg.rateMax, defaultRateSpan),
+		readBuffer: readBuffer,
+		done:       make(chan struct{}),
 	}, nil
 }
+
+// ReadBuffer is the SO_RCVBUF value reported by the kernel, or zero when the
+// default was kept or the option could not be read back.
+func (s *Server) ReadBuffer() int { return s.readBuffer }
 
 func (s *Server) Addr() string { return s.conn.LocalAddr().String() }
 
@@ -268,6 +305,9 @@ func newLimiter(max int, span time.Duration) *limiter {
 }
 
 func (l *limiter) allow(ip string) bool {
+	if l.max <= 0 {
+		return true
+	}
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
