@@ -207,6 +207,52 @@ std::wstring sanitize_wide(std::wstring name) {
     return clean;
 }
 
+// Walks the relative directory one component at a time. Existing components
+// must be plain directories; nothing is created through a reparse point.
+bool ensure_subdirectory_chain(const std::wstring& root, const std::wstring& relative,
+                               std::wstring& final_directory, std::string* error) {
+    final_directory = root;
+    size_t start = 0;
+    while (start < relative.size()) {
+        const size_t slash = relative.find(L'/', start);
+        const std::wstring part =
+            relative.substr(start, slash == std::wstring::npos ? std::wstring::npos
+                                                               : slash - start);
+        const std::wstring next = join(final_directory, part);
+        DWORD attributes = GetFileAttributesW(long_path(next).c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryW(long_path(next).c_str(), nullptr) &&
+                GetLastError() != ERROR_ALREADY_EXISTS) {
+                if (error) {
+                    *error = "cannot create the receive directory (error " +
+                             std::to_string(GetLastError()) + ")";
+                }
+                return false;
+            }
+            attributes = GetFileAttributesW(long_path(next).c_str());
+        }
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            if (error) {
+                *error = "the receive path crosses a file named " + wide_to_utf8(part);
+            }
+            return false;
+        }
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            if (error) {
+                *error = "the receive path is a reparse point";
+            }
+            return false;
+        }
+        final_directory = next;
+        if (slash == std::wstring::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
+
 std::wstring unique_name(const std::wstring& directory, const std::wstring& name,
                          std::string* error) {
     if (!path_exists(join(directory, name))) {
@@ -307,6 +353,53 @@ std::string sanitize_received_name(const std::string& utf8_name) {
     }
     const std::string name = wide_to_utf8(sanitize_wide(wide));
     return name.empty() ? "file" : name;
+}
+
+bool sanitize_received_directory(const std::string& utf8_path, std::string& sanitized) {
+    sanitized.clear();
+    if (utf8_path.empty()) {
+        return true;
+    }
+    if (utf8_path.size() > kMaxFileRelativePathBytes) {
+        return false;
+    }
+    const std::wstring wide = utf8_to_wide(utf8_path);
+    if (wide.empty() || wide.front() == L'/' || wide.back() == L'/' ||
+        wide.find(L'\\') != std::wstring::npos ||
+        wide.find(L':') != std::wstring::npos) {
+        return false;
+    }
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= wide.size()) {
+        const size_t end = wide.find(L'/', start);
+        const size_t stop = end == std::wstring::npos ? wide.size() : end;
+        std::wstring part = wide.substr(start, stop - start);
+        if (part.empty() || part == L"." || part == L"..") {
+            return false;
+        }
+        part = sanitize_wide(std::move(part));
+        if (part.empty() || part == L"." || part == L"..") {
+            return false;
+        }
+        parts.push_back(std::move(part));
+        if (parts.size() > kMaxReceivePathDepth) {
+            return false;
+        }
+        if (end == std::wstring::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    std::wstring joined;
+    for (const std::wstring& part : parts) {
+        if (!joined.empty()) {
+            joined.push_back(L'/');
+        }
+        joined += part;
+    }
+    sanitized = wide_to_utf8(joined);
+    return !sanitized.empty() && sanitized.size() <= kMaxFileRelativePathBytes;
 }
 
 std::string default_receive_directory() {
@@ -457,15 +550,27 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
     if (!ensure_directory(directory, error)) {
         return nullptr;
     }
-    impl.directory = directory;
+    std::string relative;
+    if (!sanitize_received_directory(options.relative_path, relative)) {
+        if (error) {
+            *error = "the offered folder path is not usable";
+        }
+        return nullptr;
+    }
+    std::wstring final_directory;
+    if (!ensure_subdirectory_chain(directory, utf8_to_wide(relative), final_directory,
+                                   error)) {
+        return nullptr;
+    }
+    impl.directory = final_directory;
 
     const std::wstring sanitized = sanitize_wide(utf8_to_wide(options.name));
     impl.name = wide_to_utf8(sanitized);
-    impl.final_name = unique_name(directory, sanitized, error);
+    impl.final_name = unique_name(final_directory, sanitized, error);
     if (impl.final_name.empty()) {
         return nullptr;
     }
-    impl.final_path = join(directory, impl.final_name);
+    impl.final_path = join(final_directory, impl.final_name);
     impl.part_path = impl.final_path + L".part";
     impl.sidecar_path = impl.part_path + L".chast";
 

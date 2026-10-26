@@ -56,6 +56,11 @@ void test_hello() {
     check(parses_hello(payload_of(chast::make_hello(sent)), got) && got.display == 3,
           "Hello keeps an explicit display index");
 
+    sent.display = chast::kDisplayAll;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+              got.display == chast::kDisplayAll,
+          "Hello accepts the merged display sentinel");
+
     sent.access_token = "correct horse battery staple";
     sent.password = "hunter2";
     sent.requested_permissions = chast::kPermissionInput | chast::kPermissionAudio;
@@ -119,7 +124,7 @@ void test_hello() {
     rejects_hello(long_password, "Hello with an oversized password is rejected");
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
-    unknown_permissions[8] = 0x10;  // version, display, token length, password length
+    unknown_permissions[8] = 0x40;  // version, display, token length, password length
     unknown_permissions[9] = 0;
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
@@ -191,6 +196,8 @@ void test_hello_ack() {
     sent.input_enabled = true;
     sent.clipboard_enabled = true;
     sent.file_transfer_enabled = true;
+    sent.microphone_enabled = true;
+    sent.privacy_mode_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -231,8 +238,11 @@ void test_hello_ack() {
     check(got.input_enabled, "HelloAck keeps the input flag");
     check(got.clipboard_enabled, "HelloAck keeps the clipboard flag");
     check(got.file_transfer_enabled, "HelloAck keeps the file transfer flag");
+    check(got.microphone_enabled, "HelloAck keeps the microphone flag");
+    check(got.privacy_mode_enabled, "HelloAck keeps the privacy mode flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
-              got.file_transfer_enabled,
+              got.file_transfer_enabled && got.microphone_enabled &&
+              got.privacy_mode_enabled,
           "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
@@ -251,6 +261,26 @@ void test_hello_ack() {
               got.audio.frame_samples == sent.audio.frame_samples &&
               got.audio.extradata == sent.audio.extradata,
           "HelloAck keeps the audio description and decoder config");
+
+    chast::ServerInfo opus = sent;
+    opus.audio.codec = chast::AudioCodec::Opus;
+    opus.audio.frame_samples = chast::kOpusFrameSamples;
+    opus.audio.bitrate = 128000;
+    opus.audio.extradata.assign(19, 0);
+    std::memcpy(opus.audio.extradata.data(), "OpusHead", 8);
+    opus.audio.extradata[8] = 1;
+    opus.audio.extradata[9] = 2;
+    opus.audio.extradata[10] = 0x38;
+    opus.audio.extradata[11] = 0x01;  // pre-skip 312, for a 6.5 ms lead
+    opus.audio.extradata[14] = 0x80;  // input rate 48000
+    opus.audio.extradata[15] = 0xBB;
+    chast::ServerInfo opus_got;
+    check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(opus)), opus_got, &error) &&
+              opus_got.audio.codec == chast::AudioCodec::Opus &&
+              opus_got.audio.frame_samples == chast::kOpusFrameSamples &&
+              opus_got.audio.extradata == opus.audio.extradata &&
+              opus_got.microphone_enabled,
+          "HelloAck round-trips an Opus description with the microphone permission");
 
     auto ack_payload = [&] { return payload_of(chast::make_hello_ack(sent)); };
     const size_t display_count_at = 24 + sent.encoder.size();
@@ -281,7 +311,7 @@ void test_hello_ack() {
     std::vector<uint8_t> unknown_flags = ack_payload();
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
-    unknown_flags[kFlagsAt] = 0x10;
+    unknown_flags[kFlagsAt] = 0x80;
     unknown_flags[kFlagsAt + 1] = 0;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
@@ -297,7 +327,7 @@ void test_hello_ack() {
     rejects_ack(std::move(audio_block_only),
                 "a HelloAck that announces audio without the flag is rejected");
     std::vector<uint8_t> unknown_audio_codec = ack_payload();
-    unknown_audio_codec[audio_at + 1] = 2;
+    unknown_audio_codec[audio_at + 1] = 3;
     rejects_ack(std::move(unknown_audio_codec),
                 "a HelloAck with an unknown audio codec is rejected");
     std::vector<uint8_t> no_extradata = ack_payload();
@@ -338,7 +368,7 @@ void test_hello_ack() {
     rejects_ack(std::move(mask_mismatch),
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
-    unknown_permissions[unknown_permissions.size() - 2] = 0x10;
+    unknown_permissions[unknown_permissions.size() - 2] = 0x40;
     unknown_permissions[unknown_permissions.size() - 1] = 0;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
@@ -346,13 +376,86 @@ void test_hello_ack() {
     sent.input_enabled = false;
     sent.clipboard_enabled = false;
     sent.file_transfer_enabled = false;
+    sent.microphone_enabled = false;
+    sent.privacy_mode_enabled = false;
     sent.audio.enabled = false;
     sent.audio.extradata.clear();
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
               !disabled.input_enabled && !disabled.clipboard_enabled &&
-              !disabled.file_transfer_enabled && !disabled.audio.enabled,
-          "HelloAck reports input, clipboard, file transfer and audio disabled");
+              !disabled.file_transfer_enabled && !disabled.audio.enabled &&
+              !disabled.microphone_enabled && !disabled.privacy_mode_enabled,
+          "HelloAck reports every permission disabled");
+}
+
+void test_merged_hello_ack() {
+    auto merged_info = [] {
+        chast::ServerInfo info;
+        info.codec = chast::VideoCodec::H264;
+        info.merged = true;
+        info.width = 3840;
+        info.height = 1080;
+        info.source_width = 3840;
+        info.source_height = 1080;
+        info.origin_x = -1920;
+        info.origin_y = 0;
+        info.framerate = 30;
+        info.bitrate = 8000000;
+        info.input_enabled = true;
+        info.encoder = "mfxhw64";
+        chast::DisplayDescription left;
+        left.name = "\\\\.\\DISPLAY1";
+        left.left = -1920;
+        left.right = 0;
+        left.bottom = 1080;
+        left.primary = true;
+        chast::DisplayDescription right;
+        right.name = "\\\\.\\DISPLAY2";
+        right.right = 1920;
+        right.bottom = 1080;
+        info.displays = {left, right};
+        return info;
+    };
+
+    std::string error;
+    chast::ServerInfo sent = merged_info();
+    chast::ServerInfo got;
+    const bool parsed =
+        chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), got, &error);
+    check(parsed, "a merged HelloAck round-trips");
+    if (!parsed) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+    check(got.merged, "a merged HelloAck keeps the merged flag");
+    check(got.origin_x == -1920 && got.origin_y == 0 &&
+              got.source_width == 3840 && got.source_height == 1080,
+          "a merged HelloAck keeps the union geometry");
+    check(got.displays.size() == 2, "a merged HelloAck lists its member displays");
+    check(got.input_enabled, "the merged flag does not disturb the permission mask");
+
+    chast::ServerInfo padded = merged_info();
+    padded.source_width = 3841;  // odd union padded up for NV12
+    padded.width = 3842;
+    chast::ServerInfo padded_got;
+    check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(padded)), padded_got, &error) &&
+              padded_got.source_width == 3841,
+          "a merged HelloAck accepts one pixel of even-size padding");
+
+    auto rejects = [&](const chast::ServerInfo& info, const char* what) {
+        chast::ServerInfo dropped;
+        check(!chast::parse_hello_ack(payload_of(chast::make_hello_ack(info)), dropped, &error),
+              what);
+    };
+    chast::ServerInfo wrong_origin = merged_info();
+    wrong_origin.origin_x = -1919;
+    rejects(wrong_origin, "a merged HelloAck whose origin misses the union is rejected");
+    chast::ServerInfo wrong_size = merged_info();
+    wrong_size.source_width = 3842;
+    rejects(wrong_size, "a merged HelloAck whose source misses the union is rejected");
+    chast::ServerInfo empty = merged_info();
+    empty.displays.clear();
+    rejects(empty, "a merged HelloAck with no member displays is rejected");
 }
 
 void test_permission_update() {
@@ -373,7 +476,7 @@ void test_permission_update() {
           "PermissionUpdate round-trips every permission");
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
-    unknown[0] = 0x10;
+    unknown[0] = 0x40;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -382,6 +485,237 @@ void test_permission_update() {
           "PermissionUpdate with trailing bytes is rejected");
     check(!chast::parse_permission_update(std::vector<uint8_t>(1), permissions, &error),
           "short PermissionUpdate is rejected");
+}
+
+void test_sas() {
+    std::string error;
+    check(chast::parse_send_sas(payload_of(chast::make_send_sas()), &error),
+          "SendSas round-trips an empty request");
+    check(payload_of(chast::make_send_sas()).empty(), "SendSas has no payload");
+    std::vector<uint8_t> trailing = payload_of(chast::make_send_sas());
+    trailing.push_back(0);
+    check(!chast::parse_send_sas(trailing, &error),
+          "SendSas with trailing bytes is rejected");
+
+    chast::SasCode code = chast::SasCode::Failed;
+    std::string reason;
+    check(chast::parse_sas_result(
+              payload_of(chast::make_sas_result(chast::SasCode::Ok, {})), code, reason,
+              &error) &&
+              code == chast::SasCode::Ok && reason.empty(),
+          "SasResult round-trips a success");
+    check(chast::parse_sas_result(
+              payload_of(chast::make_sas_result(
+                  chast::SasCode::Unsupported,
+                  "Ctrl+Alt+Del needs the Windows service")),
+              code, reason, &error) &&
+              code == chast::SasCode::Unsupported &&
+              reason == "Ctrl+Alt+Del needs the Windows service",
+          "SasResult round-trips a refusal with its reason");
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_sas_result(chast::SasCode::Denied, {}));
+    unknown_code[0] = 4;
+    check(!chast::parse_sas_result(unknown_code, code, reason, &error),
+          "SasResult with an unknown code is rejected");
+    const std::string long_reason(400, 'x');
+    check(chast::parse_sas_result(
+              payload_of(chast::make_sas_result(chast::SasCode::Failed, long_reason)),
+              code, reason, &error) &&
+              reason.size() == chast::kMaxSasReason,
+          "SasResult truncates an oversized reason to the protocol limit");
+    std::vector<uint8_t> bad_utf8 =
+        payload_of(chast::make_sas_result(chast::SasCode::Failed, {}));
+    bad_utf8[1] = 1;
+    bad_utf8[2] = 0;
+    bad_utf8.push_back(0xFF);
+    check(!chast::parse_sas_result(bad_utf8, code, reason, &error),
+          "SasResult with a malformed reason is rejected");
+    check(!chast::parse_sas_result(std::vector<uint8_t>(), code, reason, &error),
+          "empty SasResult is rejected");
+}
+
+void test_stream_options() {
+    std::string error;
+    chast::StreamOptions options;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(options)), options, &error) &&
+              options.codec == chast::StreamCodecPreference::Auto && options.max_fps == 0 &&
+              options.quality == chast::StreamQuality::High,
+          "SetStreamOptions round-trips the defaults");
+
+    chast::StreamOptions asked;
+    asked.codec = chast::StreamCodecPreference::Hevc;
+    asked.max_fps = 60;
+    asked.quality = chast::StreamQuality::Smooth;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error) &&
+              options.codec == chast::StreamCodecPreference::Hevc &&
+              options.max_fps == 60 &&
+              options.quality == chast::StreamQuality::Smooth,
+          "SetStreamOptions round-trips explicit preferences");
+
+    asked.max_fps = chast::kMaxStreamFps;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error) &&
+              options.max_fps == chast::kMaxStreamFps,
+          "SetStreamOptions accepts the top of the frame-cap range");
+    asked.max_fps = chast::kMaxStreamFps + 1;
+    check(!chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error),
+          "SetStreamOptions rejects a frame cap past the range");
+
+    std::vector<uint8_t> unknown_codec =
+        payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
+    unknown_codec[0] = 3;
+    check(!chast::parse_set_stream_options(unknown_codec, options, &error),
+          "SetStreamOptions with an unknown codec is rejected");
+    std::vector<uint8_t> unknown_quality =
+        payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
+    unknown_quality[3] = 3;
+    check(!chast::parse_set_stream_options(unknown_quality, options, &error),
+          "SetStreamOptions with an unknown quality is rejected");
+    std::vector<uint8_t> trailing =
+        payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
+    trailing.push_back(0);
+    check(!chast::parse_set_stream_options(trailing, options, &error),
+          "SetStreamOptions with trailing bytes is rejected");
+    check(!chast::parse_set_stream_options(std::vector<uint8_t>(3), options, &error),
+          "short SetStreamOptions is rejected");
+
+    chast::StreamOptionsResult result;
+    chast::StreamOptionsResult sent;
+    sent.code = chast::StreamOptionsCode::Ok;
+    sent.codec = chast::VideoCodec::Hevc;
+    sent.fps = 30;
+    sent.quality = chast::StreamQuality::Balanced;
+    check(chast::parse_stream_options_result(
+              payload_of(chast::make_stream_options_result(sent)), result, &error) &&
+              result.code == chast::StreamOptionsCode::Ok &&
+              result.codec == chast::VideoCodec::Hevc && result.fps == 30 &&
+              result.quality == chast::StreamQuality::Balanced && result.reason.empty(),
+          "StreamOptionsResult round-trips an acceptance");
+
+    sent.code = chast::StreamOptionsCode::Unsupported;
+    sent.reason = "no HEVC encoder is available";
+    check(chast::parse_stream_options_result(
+              payload_of(chast::make_stream_options_result(sent)), result, &error) &&
+              result.code == chast::StreamOptionsCode::Unsupported &&
+              result.reason == "no HEVC encoder is available",
+          "StreamOptionsResult round-trips a refusal with its reason");
+
+    std::vector<uint8_t> unknown_result =
+        payload_of(chast::make_stream_options_result(sent));
+    unknown_result[0] = 4;
+    check(!chast::parse_stream_options_result(unknown_result, result, &error),
+          "StreamOptionsResult with an unknown code is rejected");
+    std::vector<uint8_t> unknown_result_codec =
+        payload_of(chast::make_stream_options_result(sent));
+    unknown_result_codec[1] = 3;
+    check(!chast::parse_stream_options_result(unknown_result_codec, result, &error),
+          "StreamOptionsResult with an unknown codec is rejected");
+    std::vector<uint8_t> unknown_result_quality =
+        payload_of(chast::make_stream_options_result(sent));
+    unknown_result_quality[4] = 3;
+    check(!chast::parse_stream_options_result(unknown_result_quality, result, &error),
+          "StreamOptionsResult with an unknown quality is rejected");
+    std::vector<uint8_t> high_fps =
+        payload_of(chast::make_stream_options_result(sent));
+    high_fps[2] = static_cast<uint8_t>((chast::kMaxStreamFps + 1) & 0xFF);
+    high_fps[3] = static_cast<uint8_t>((chast::kMaxStreamFps + 1) >> 8);
+    check(!chast::parse_stream_options_result(high_fps, result, &error),
+          "StreamOptionsResult with an out-of-range frame rate is rejected");
+
+    sent.reason = std::string(400, 'x');
+    check(chast::parse_stream_options_result(
+              payload_of(chast::make_stream_options_result(sent)), result, &error) &&
+              result.reason.size() == chast::kMaxStreamOptionReason,
+          "StreamOptionsResult truncates an oversized reason to the protocol limit");
+
+    std::vector<uint8_t> bad_utf8 =
+        payload_of(chast::make_stream_options_result(chast::StreamOptionsResult{}));
+    bad_utf8[5] = 1;
+    bad_utf8[6] = 0;
+    bad_utf8.push_back(0xFF);
+    check(!chast::parse_stream_options_result(bad_utf8, result, &error),
+          "StreamOptionsResult with a malformed reason is rejected");
+    check(!chast::parse_stream_options_result(std::vector<uint8_t>(), result, &error),
+          "empty StreamOptionsResult is rejected");
+}
+
+void test_privacy_mode() {
+    std::string error;
+    bool enabled = false;
+    check(chast::parse_set_privacy_mode(
+              payload_of(chast::make_set_privacy_mode(true)), enabled, &error) &&
+              enabled,
+          "SetPrivacyMode round-trips an enable request");
+    check(chast::parse_set_privacy_mode(
+              payload_of(chast::make_set_privacy_mode(false)), enabled, &error) &&
+              !enabled,
+          "SetPrivacyMode round-trips a disable request");
+    std::vector<uint8_t> bad_flag = payload_of(chast::make_set_privacy_mode(true));
+    bad_flag[0] = 2;
+    check(!chast::parse_set_privacy_mode(bad_flag, enabled, &error),
+          "SetPrivacyMode with an invalid flag is rejected");
+    std::vector<uint8_t> trailing = payload_of(chast::make_set_privacy_mode(true));
+    trailing.push_back(0);
+    check(!chast::parse_set_privacy_mode(trailing, enabled, &error),
+          "SetPrivacyMode with trailing bytes is rejected");
+    check(!chast::parse_set_privacy_mode(std::vector<uint8_t>(), enabled, &error),
+          "empty SetPrivacyMode is rejected");
+
+    chast::PrivacyModeCode code = chast::PrivacyModeCode::Failed;
+    std::string reason;
+    check(chast::parse_privacy_mode_state(
+              payload_of(chast::make_privacy_mode_state(true, chast::PrivacyModeCode::Ok, {})),
+              enabled, code, reason, &error) &&
+              enabled && code == chast::PrivacyModeCode::Ok && reason.empty(),
+          "PrivacyModeState round-trips an enabled state");
+    check(chast::parse_privacy_mode_state(
+              payload_of(chast::make_privacy_mode_state(false, chast::PrivacyModeCode::Denied,
+                                                         "permission revoked")),
+              enabled, code, reason, &error) &&
+              !enabled && code == chast::PrivacyModeCode::Denied &&
+              reason == "permission revoked",
+          "PrivacyModeState round-trips a refusal with its reason");
+    std::vector<uint8_t> inconsistent =
+        payload_of(chast::make_privacy_mode_state(false, chast::PrivacyModeCode::Failed, {}));
+    inconsistent[0] = 1;
+    check(!chast::parse_privacy_mode_state(inconsistent, enabled, code, reason, &error),
+          "PrivacyModeState that reports a failure as enabled is rejected");
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_privacy_mode_state(false, chast::PrivacyModeCode::Denied, {}));
+    unknown_code[1] = 4;
+    check(!chast::parse_privacy_mode_state(unknown_code, enabled, code, reason, &error),
+          "PrivacyModeState with an unknown code is rejected");
+    const std::string long_reason(400, 'x');
+    check(chast::parse_privacy_mode_state(
+              payload_of(chast::make_privacy_mode_state(
+                  false, chast::PrivacyModeCode::Failed, long_reason)),
+              enabled, code, reason, &error) &&
+              reason.size() == chast::kMaxPrivacyModeReason,
+          "PrivacyModeState truncates an oversized reason to the protocol limit");
+    std::vector<uint8_t> bad_utf8 =
+        payload_of(chast::make_privacy_mode_state(false, chast::PrivacyModeCode::Failed, {}));
+    bad_utf8[2] = 1;
+    bad_utf8[3] = 0;
+    bad_utf8.push_back(0xFF);
+    check(!chast::parse_privacy_mode_state(bad_utf8, enabled, code, reason, &error),
+          "PrivacyModeState with a malformed reason is rejected");
+
+    chast::DesktopKind kind = chast::DesktopKind::Unavailable;
+    check(chast::parse_desktop_state(payload_of(chast::make_desktop_state(
+                                         chast::DesktopKind::Secure)),
+                                     kind, &error) &&
+              kind == chast::DesktopKind::Secure,
+          "DesktopState round-trips a secure desktop");
+    std::vector<uint8_t> unknown_kind =
+        payload_of(chast::make_desktop_state(chast::DesktopKind::Default));
+    unknown_kind[0] = 3;
+    check(!chast::parse_desktop_state(unknown_kind, kind, &error),
+          "DesktopState with an unknown kind is rejected");
+    check(!chast::parse_desktop_state(std::vector<uint8_t>(2), kind, &error),
+          "DesktopState with trailing bytes is rejected");
 }
 
 void test_display_switch() {
@@ -782,6 +1116,136 @@ void test_audio_header() {
           "a short AudioHeader is rejected");
 }
 
+void test_microphone_stream_header() {
+    chast::AudioInfo sent;
+    sent.enabled = true;
+    sent.codec = chast::AudioCodec::Opus;
+    sent.sample_rate = 48000;
+    sent.channels = 1;
+    sent.frame_samples = chast::kOpusFrameSamples;
+    sent.extradata.assign(19, 0);
+    std::memcpy(sent.extradata.data(), "OpusHead", 8);
+    sent.extradata[8] = 1;
+    sent.extradata[9] = 1;
+    sent.extradata[10] = 0x38;
+    sent.extradata[11] = 0x01;
+    sent.extradata[14] = 0x80;
+    sent.extradata[15] = 0xBB;
+
+    std::string error;
+    const std::vector<uint8_t> wire = chast::make_microphone_stream_header(sent);
+    check(wire.size() == chast::kMicrophoneStreamHeaderSize + sent.extradata.size(),
+          "the microphone stream header is 20 bytes plus its config");
+    check(wire.size() >= 4 && std::memcmp(wire.data(), "CMIC", 4) == 0,
+          "the microphone stream header starts with the CMIC magic");
+    check(chast::microphone_stream_header_length(wire.data(), wire.size()) == wire.size(),
+          "the microphone stream length names the full header");
+    check(chast::microphone_stream_header_length(wire.data(),
+                                                 chast::kMicrophoneStreamHeaderSize) ==
+              wire.size(),
+          "the microphone stream length is known before the config arrives");
+    check(chast::microphone_stream_header_length(
+              wire.data(), chast::kMicrophoneStreamHeaderSize - 1) == 0,
+          "the microphone stream length waits for the fixed header");
+    std::vector<uint8_t> zero_config = wire;
+    std::fill(zero_config.begin() + 16, zero_config.begin() + 18, 0);
+    check(chast::microphone_stream_header_length(zero_config.data(), zero_config.size()) == 0,
+          "the microphone stream length rejects an empty config");
+    std::vector<uint8_t> huge_config = wire;
+    huge_config[16] = 0xFF;
+    huge_config[17] = 0x00;
+    check(chast::microphone_stream_header_length(huge_config.data(), huge_config.size()) == 0,
+          "the microphone stream length rejects an oversized config");
+    std::vector<uint8_t> no_magic = wire;
+    no_magic[0] = 'X';
+    check(chast::microphone_stream_header_length(no_magic.data(), no_magic.size()) == 0,
+          "the microphone stream length rejects another magic");
+    check(chast::make_microphone_stream_header(chast::AudioInfo{}).empty(),
+          "the encoder refuses a microphone config that is not Opus at 48 kHz");
+    chast::AudioInfo wrong_rate = sent;
+    wrong_rate.sample_rate = 44100;
+    check(chast::make_microphone_stream_header(wrong_rate).empty(),
+          "the encoder refuses a microphone config at another sample rate");
+
+    chast::AudioInfo got;
+    size_t consumed = 0;
+    const bool parsed = chast::decode_microphone_stream_header(
+        wire.data(), wire.size(), got, consumed, &error);
+    check(parsed, "the microphone stream header round-trips");
+    if (parsed) {
+        check(consumed == wire.size() && got.codec == chast::AudioCodec::Opus &&
+                  got.sample_rate == sent.sample_rate && got.channels == sent.channels &&
+                  got.frame_samples == sent.frame_samples &&
+                  got.extradata == sent.extradata,
+              "the microphone stream header keeps the encoder description");
+    }
+    std::vector<uint8_t> with_packet = wire;
+    with_packet.push_back(0xAA);
+    check(chast::decode_microphone_stream_header(with_packet.data(), with_packet.size(), got,
+                                                 consumed, &error) &&
+              consumed == wire.size(),
+          "the microphone stream header stops before the first audio packet");
+
+    auto set_u16 = [](std::vector<uint8_t>& header, size_t at, uint16_t value) {
+        header[at] = static_cast<uint8_t>(value);
+        header[at + 1] = static_cast<uint8_t>(value >> 8);
+    };
+    auto set_u32 = [](std::vector<uint8_t>& header, size_t at, uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+            header[at + i] = static_cast<uint8_t>(value >> (8 * i));
+        }
+    };
+    auto rejects_header = [&](std::vector<uint8_t> header, const char* what) {
+        chast::AudioInfo dropped;
+        size_t dropped_consumed = 0;
+        check(!chast::decode_microphone_stream_header(header.data(), header.size(), dropped,
+                                                      dropped_consumed, &error),
+              what);
+    };
+    rejects_header(std::vector<uint8_t>(wire.begin(), wire.begin() + 19),
+                   "a truncated microphone stream header is rejected");
+    std::vector<uint8_t> bad_magic = wire;
+    bad_magic[0] = 'X';
+    rejects_header(std::move(bad_magic), "a microphone stream header with bad magic is rejected");
+    std::vector<uint8_t> old_version = wire;
+    old_version[4] = chast::kMicrophoneStreamVersion + 1;
+    rejects_header(std::move(old_version),
+                   "a microphone stream header from another version is rejected");
+    std::vector<uint8_t> aac_codec = wire;
+    aac_codec[5] = 1;
+    rejects_header(std::move(aac_codec), "a microphone stream using AAC is rejected");
+    std::vector<uint8_t> unknown_codec = wire;
+    unknown_codec[5] = 3;
+    rejects_header(std::move(unknown_codec), "a microphone stream with an unknown codec is rejected");
+    std::vector<uint8_t> reserved = wire;
+    reserved[6] = 1;
+    rejects_header(std::move(reserved),
+                   "a microphone stream header with a non-zero reserved field is rejected");
+    std::vector<uint8_t> tail_reserved = wire;
+    tail_reserved[18] = 1;
+    rejects_header(std::move(tail_reserved),
+                   "a microphone stream header with a non-zero trailing reserved field is rejected");
+    std::vector<uint8_t> bad_rate = wire;
+    set_u32(bad_rate, 8, 44100);
+    rejects_header(std::move(bad_rate), "a microphone stream at another sample rate is rejected");
+    std::vector<uint8_t> bad_channels = wire;
+    set_u16(bad_channels, 12, 3);
+    rejects_header(std::move(bad_channels),
+                   "a microphone stream with an unsupported channel count is rejected");
+    std::vector<uint8_t> bad_frame = wire;
+    set_u16(bad_frame, 14, chast::kAudioFrameSamples);
+    rejects_header(std::move(bad_frame),
+                   "a microphone stream with an unsupported frame length is rejected");
+    std::vector<uint8_t> no_config = wire;
+    set_u16(no_config, 16, 0);
+    rejects_header(std::move(no_config), "a microphone stream without its config is rejected");
+    std::vector<uint8_t> long_config = wire;
+    set_u16(long_config, 16, static_cast<uint16_t>(chast::kMaxAudioExtradata + 1));
+    rejects_header(std::move(long_config), "an oversized microphone config is rejected");
+    rejects_header(std::vector<uint8_t>(wire.begin(), wire.begin() + 25),
+                   "a microphone stream whose config is cut short is rejected");
+}
+
 void test_audio_parser() {
     chast::AudioHeader sent;
     sent.seq = 9;
@@ -924,6 +1388,41 @@ void test_clipboard() {
     std::vector<uint8_t> short_message(7, 0);
     check(!chast::parse_clipboard_update(short_message, got, &error),
           "a truncated ClipboardUpdate is rejected");
+}
+
+void test_chat() {
+    std::string error;
+    const std::string text = "请在主机上确认订单 😀\n第二行";
+    const std::vector<uint8_t> message = chast::make_chat_message(text);
+    check(message.size() == chast::kControlHeaderSize + text.size(),
+          "ChatMessage carries the UTF-8 text as its payload");
+    check(message.size() > 7 &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::ChatMessage),
+          "ChatMessage names its control type");
+    std::string got;
+    check(chast::parse_chat_message(payload_of(message), got, &error) && got == text,
+          "ChatMessage round-trips UTF-8 text and newlines");
+
+    const std::string largest(chast::kMaxChatBytes, 'a');
+    check(chast::valid_chat_text(largest), "the chat length limit is accepted");
+    check(chast::parse_chat_message(payload_of(chast::make_chat_message(largest)), got,
+                                    &error) &&
+              got == largest,
+          "a chat message at the length limit round-trips");
+    check(chast::make_chat_message(largest + "a").empty(),
+          "a chat message past the length limit is not encoded");
+    check(!chast::valid_chat_text(""), "an empty chat message is rejected");
+    check(!chast::valid_chat_text(std::string("a\0b", 3)),
+          "a chat message with NUL is rejected");
+    check(!chast::valid_chat_text("\xED\xA0\x80"), "a chat surrogate is rejected");
+
+    check(!chast::parse_chat_message({}, got, &error),
+          "a ChatMessage without text is rejected");
+    check(!chast::parse_chat_message(std::vector<uint8_t>(chast::kMaxChatBytes + 1, 'a'),
+                                     got, &error),
+          "an oversized ChatMessage is rejected");
+    check(!chast::parse_chat_message({0xED, 0xA0, 0x80}, got, &error),
+          "a ChatMessage with invalid UTF-8 is rejected");
 }
 
 void test_cursor_update() {
@@ -1406,19 +1905,66 @@ void test_file_transfer() {
     offer.size = 12;
     offer.resume = true;
     offer.name = "report-\xE6\x8A\xA5\xE5\x91\x8A.pdf";
+    offer.relative_path = "reports/2026";
     offer.sha256.fill(0xAB);
 
     chast::FileOffer got_offer;
     check(chast::parse_file_offer(payload_of(chast::make_file_offer(offer)), got_offer,
                                   &error) &&
               got_offer.transfer_id == 7 && got_offer.size == 12 && got_offer.resume &&
-              got_offer.name == offer.name && got_offer.sha256 == offer.sha256,
-          "FileOffer round-trips id, size, resume flag, digest and UTF-8 name");
+              got_offer.name == offer.name && got_offer.sha256 == offer.sha256 &&
+              got_offer.relative_path == offer.relative_path,
+          "FileOffer round-trips id, size, resume flag, digest, UTF-8 name and directory");
+
+    chast::FileOffer legacy_offer = offer;
+    legacy_offer.relative_path.clear();
+    std::vector<uint8_t> legacy = payload_of(chast::make_file_offer(legacy_offer));
+    legacy.resize(legacy.size() - 2);  // drop the empty v22 directory field
+    chast::FileOffer got_legacy;
+    check(chast::parse_file_offer(legacy, got_legacy, &error) &&
+              got_legacy.name == offer.name && got_legacy.relative_path.empty(),
+          "a FileOffer without the directory field still parses at the receive root");
+
+    check(chast::make_offer_relative_path("Trip", "2024\\07") == "Trip/2024/07" &&
+              chast::make_offer_relative_path("Trip", "2024/07") == "Trip/2024/07" &&
+              chast::make_offer_relative_path("Trip", ".") == "Trip" &&
+              chast::make_offer_relative_path("Trip", "") == "Trip" &&
+              chast::make_offer_relative_path("Trip", "\\2024") == "Trip/2024",
+          "upload directories convert native separators to '/' below the top folder");
 
     auto rejects_offer = [&](std::vector<uint8_t> payload, const char* what) {
         chast::FileOffer dropped;
         check(!chast::parse_file_offer(payload, dropped, &error), what);
     };
+    auto rejects_relative = [&](std::string relative, const char* what) {
+        chast::FileOffer bad = offer;
+        bad.relative_path = std::move(relative);
+        rejects_offer(payload_of(chast::make_file_offer(bad)), what);
+    };
+    rejects_relative("/absolute", "an absolute FileOffer directory is rejected");
+    rejects_relative("C:/Windows", "a drive-letter FileOffer directory is rejected");
+    rejects_relative("reports/../secret", "a FileOffer directory with .. is rejected");
+    rejects_relative("reports/./2026", "a FileOffer directory with . is rejected");
+    rejects_relative("reports//2026", "a FileOffer directory with an empty part is rejected");
+    rejects_relative("reports\\2026", "a FileOffer directory with a backslash is rejected");
+    // make_file_offer clears an over-long directory, so build the wire form by
+    // hand to prove the parser rejects it rather than truncating.
+    chast::FileOffer rooted = offer;
+    rooted.relative_path.clear();
+    std::vector<uint8_t> overlong = payload_of(chast::make_file_offer(rooted));
+    const size_t overlong_length = chast::kMaxFileRelativePathBytes + 1;
+    overlong.push_back(static_cast<uint8_t>(overlong_length & 0xFF));
+    overlong.push_back(static_cast<uint8_t>((overlong_length >> 8) & 0xFF));
+    overlong.insert(overlong.end(), overlong_length, 'a');
+    rejects_offer(std::move(overlong), "an over-long FileOffer directory is rejected");
+    std::string deep;
+    for (size_t i = 0; i <= chast::kMaxFileRelativeComponents; ++i) {
+        if (!deep.empty()) {
+            deep.push_back('/');
+        }
+        deep.push_back('a');
+    }
+    rejects_relative(std::move(deep), "a too-deep FileOffer directory is rejected");
     std::vector<uint8_t> unknown_flags = payload_of(chast::make_file_offer(offer));
     unknown_flags[12] = 0x02;  // id(4) + size(8), then flags
     rejects_offer(std::move(unknown_flags), "FileOffer with unknown flags is rejected");
@@ -1643,16 +2189,22 @@ int main(int argc, char** argv) {
     test_hello();
     test_access_denied();
     test_hello_ack();
+    test_merged_hello_ack();
     test_permission_update();
+    test_sas();
+    test_stream_options();
+    test_privacy_mode();
     test_display_switch();
     test_display_modes();
     test_file_transfer();
     test_clipboard_container();
     test_frame_header();
     test_audio_header();
+    test_microphone_stream_header();
     test_audio_parser();
     test_latency_probe();
     test_clipboard();
+    test_chat();
     test_cursor_update();
     test_stream_info();
     test_input_events();

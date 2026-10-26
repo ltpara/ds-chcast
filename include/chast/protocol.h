@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 16.
+// The chast wire protocol, version 22.
 //
 // One QUIC connection carries:
 //
@@ -9,16 +9,22 @@
 //   * a server-initiated unidirectional video stream: a sequence of access
 //     units, each prefixed by a fixed FrameHeader,
 //   * when the host shares system audio, a second server-initiated
-//     unidirectional stream of AAC-LC access units, each prefixed by an
+//     unidirectional stream of Opus access units, each prefixed by an
 //     AudioHeader,
+//   * when the viewer's microphone is granted, a viewer-initiated
+//     unidirectional microphone stream (`CMIC`): a format header followed by
+//     Opus access units,
 //   * one unidirectional stream per clipboard change (`CCLB`), opened by the
 //     side that copied, and
-//   * one unidirectional stream per file upload (`CFIL`), viewer to host.
+//   * one unidirectional stream per file transfer (`CFIL`), opened by the
+//     side that offered the file: the viewer uploads to the host and the host
+//     downloads to the viewer.
 //
 // The streams are told apart by their packet magic, not by the order the
 // streams were opened: QUIC does not promise that the first bytes of a later
-// stream arrive after an earlier one. Video is `CFRM`, audio is `CAUD`,
-// clipboard content is `CCLB` and file data is `CFIL`.
+// stream arrive after an earlier one. Video is `CFRM`, system audio is
+// `CAUD`, the microphone is `CMIC`, clipboard content is `CCLB` and file data
+// is `CFIL`.
 //
 // QUIC streams give the media reliable, ordered delivery; the sequence number
 // is still carried so the receiver can report gaps and so a future version can
@@ -42,7 +48,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 16;
+inline constexpr uint16_t kProtocolVersion = 24;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -137,24 +143,65 @@ enum class ControlType : uint16_t {
     // means the mode is in effect and a StreamInfo follows; every other code
     // leaves the previous mode and stream in place. See DisplayModeCode.
     DisplayModeResult = 20,
-    // Viewer -> host, one file upload. Payload: transfer id (u32), size
-    // (u64), flags (u8), SHA-256 of the whole file (32 B), name length (u16)
-    // and UTF-8 name. The host answers with FileAnswer; accepted bytes follow
-    // on a client-initiated CFIL stream.
+    // Sender -> receiver, one file transfer (a viewer upload or a host
+    // download). Payload: transfer id (u32), size (u64), flags (u8), SHA-256
+    // of the whole file (32 B), name length (u16) and UTF-8 name. The
+    // receiver answers with FileAnswer; accepted bytes follow on a CFIL
+    // stream opened by the sender.
     FileOffer = 21,
-    // Host -> viewer answer to FileOffer. Payload: transfer id (u32), code
-    // (u8), resume offset (u64), reason length (u16), UTF-8 reason. Ok means
-    // the viewer should open the CFIL stream at resume_offset.
+    // Receiver -> sender answer to FileOffer. Payload: transfer id (u32),
+    // code (u8), resume offset (u64), reason length (u16), UTF-8 reason. Ok
+    // means the sender should open the CFIL stream at resume_offset.
     FileAnswer = 22,
-    // Host -> viewer final result. Payload: transfer id (u32), code (u8),
+    // Receiver -> sender final result. Payload: transfer id (u32), code (u8),
     // bytes written (u64), reason length (u16), UTF-8 reason. Sent once the
     // CFIL stream ended and the digest was checked, or when the transfer was
     // aborted.
     FileResult = 23,
-    // Viewer -> host cancellation. Payload: transfer id (u32), code (u8),
-    // reason length (u16), UTF-8 reason. The host closes and removes the
+    // Either side cancels a transfer. Payload: transfer id (u32), code (u8),
+    // reason length (u16), UTF-8 reason. The receiver closes and removes the
     // partial file.
     FileCancel = 24,
+    // Viewer -> host: hide or restore the host's physical display. Payload:
+    // enabled (u8). Requires the privacy-mode permission; the host answers
+    // with PrivacyModeState. Enabling is refused rather than negotiated when
+    // the host's settings or the platform do not allow it.
+    SetPrivacyMode = 25,
+    // Host -> viewer: the privacy overlay's state. Payload: enabled (u8),
+    // code (u8), reason length (u16), UTF-8 reason. Sent as the answer to
+    // SetPrivacyMode and unsolicited when the host turns the overlay off
+    // itself (permission revoked, session ending). See PrivacyModeCode.
+    PrivacyModeState = 26,
+    // Host -> viewer: which desktop the stream is showing. Payload: kind
+    // (u8). Sent when it changes and once after HelloAck. See DesktopKind.
+    DesktopState = 27,
+    // Viewer -> host: inject the Secure Attention Sequence (Ctrl+Alt+Del).
+    // No payload. Windows only accepts it through SendSAS() from LocalSystem
+    // or a policy-enabled process, so it cannot be synthesized as a key
+    // chord. Requires input permission; the host answers with SasResult.
+    SendSas = 28,
+    // Host -> viewer: the outcome of SendSas. Payload: code (u8), reason
+    // length (u16), UTF-8 reason. See SasCode.
+    SasResult = 29,
+    // Viewer -> host: the video preferences for this session. Payload:
+    // codec (u8, see StreamCodecPreference), maximum frame rate (u16,
+    // 0 = the host's configured rate), and quality (u8, see StreamQuality).
+    // The host can only lower its own budget, never raise it; the answer is
+    // StreamOptionsResult. Changing preferences does not require input
+    // permission because it only affects this viewer's picture.
+    SetStreamOptions = 30,
+    // Host -> viewer: the outcome of SetStreamOptions. Payload: code (u8),
+    // effective codec (u8, 1 = H.264, 2 = HEVC), effective frame rate (u16),
+    // effective quality (u8), reason length (u16), UTF-8 reason. The
+    // effective fields describe the stream that is actually running, even
+    // when the request was refused, so the viewer can restore its menu.
+    StreamOptionsResult = 31,
+    // Either role: one UTF-8 chat line. Payload: the text bytes (at most
+    // kMaxChatBytes, no NUL). The control stream is ordered, so messages keep
+    // their send order. No permission bit gates chat: an admitted session is
+    // the authorization, and either side can ignore or close the chat UI.
+    // Protocol v24.
+    ChatMessage = 32,
 };
 
 // ----- input -----
@@ -280,9 +327,10 @@ struct ClipboardUpdate {
 
 // ----- file transfer -----
 //
-// An upload starts with FileOffer on the control stream and, once the host
-// answers Ok, a client-initiated unidirectional CFIL stream carrying the
-// bytes. The control stream never carries file data.
+// A transfer starts with FileOffer on the control stream and, once the
+// receiver answers Ok, a unidirectional CFIL stream from the sender carrying
+// the bytes. Either side may start one: the viewer uploads to the host and the
+// host downloads to the viewer. The control stream never carries file data.
 inline constexpr char kFileStreamMagic[4] = {'C', 'F', 'I', 'L'};
 inline constexpr uint8_t kFileStreamVersion = 1;
 // magic (4) + version (1) + reserved (3) + transfer id (4) + offset (8).
@@ -291,6 +339,10 @@ inline constexpr size_t kFileChunkBytes = 64u * 1024u;
 // Protocol ceiling; the host applies a smaller, configurable limit.
 inline constexpr uint64_t kMaxFileTransferBytes = 16ull * 1024ull * 1024ull * 1024ull;
 inline constexpr size_t kMaxFileNameBytes = 512;
+// Directory part of an offer, relative to the receiver's root and '/'
+// separated. Empty means the root itself.
+inline constexpr size_t kMaxFileRelativePathBytes = 1024;
+inline constexpr size_t kMaxFileRelativeComponents = 32;
 inline constexpr size_t kMaxFileReasonBytes = 256;
 inline constexpr uint8_t kFileOfferFlagResume = 0x01;
 inline constexpr uint8_t kFileOfferFlagsKnown = kFileOfferFlagResume;
@@ -311,6 +363,10 @@ struct FileOffer {
     bool resume = false;
     std::array<uint8_t, 32> sha256{};
     std::string name;
+    // Directory below the receiver's root, '/'-separated and without the
+    // file name. Empty keeps the file at the root. The receiver sanitizes
+    // each component before it creates anything.
+    std::string relative_path;
 };
 
 struct FileAnswer {
@@ -381,16 +437,21 @@ struct CursorUpdate {
 
 // ----- audio -----
 //
-// The host's system sound travels one way, on its own server-initiated stream.
-// Packet payloads are raw AAC-LC access units; the AudioSpecificConfig needed
-// to decode them rides in AudioInfo (HelloAck / StreamInfo) so the stream
-// itself needs no side channel.
+// System sound travels one way on a server-initiated `CAUD` stream; the
+// viewer's microphone travels the other way on a viewer-initiated `CMIC`
+// stream. Both carry raw Opus access units in production. The decoder config
+// for `CAUD` rides in AudioInfo (HelloAck / StreamInfo); `CMIC` self-describes
+// with a header before its first packet, because the viewer chooses the
+// device and therefore the format. AAC-LC remains decodable for older
+// recordings and the codec tests, but no session creates an AAC stream.
 enum class AudioCodec : uint8_t {
-    AAC = 1,  // AAC-LC, raw access units
+    AAC = 1,   // AAC-LC, raw access units
+    Opus = 2,  // raw Opus packets, 20 ms frames
 };
 
 inline constexpr size_t kMaxAudioExtradata = 64;
 inline constexpr uint32_t kAudioFrameSamples = 1024;
+inline constexpr uint32_t kOpusFrameSamples = 960;  // 20 ms at 48 kHz
 
 struct AudioInfo {
     bool enabled = false;
@@ -399,8 +460,8 @@ struct AudioInfo {
     uint16_t channels = 2;
     uint32_t bitrate = 0;  // bits per second, informational
     uint16_t frame_samples = kAudioFrameSamples;
-    // AudioSpecificConfig. Empty when audio is disabled; the decoder needs it
-    // before the first packet.
+    // Codec config: OpusHead for Opus, AudioSpecificConfig for AAC. Empty
+    // when audio is disabled; the decoder needs it before the first packet.
     std::vector<uint8_t> extradata;
 };
 
@@ -440,36 +501,80 @@ struct AudioHeader {
     uint32_t sample_rate = 0;
     uint16_t frame_samples = 0;  // decoded samples per channel
     uint16_t channels = 0;
-    AudioCodec codec = AudioCodec::AAC;
+    AudioCodec codec = AudioCodec::Opus;
 };
+
+// ----- microphone uplink -----
+//
+// The viewer opens one client-initiated unidirectional stream per microphone
+// session. Its first bytes describe the device format; the rest are
+// AudioHeader + payload packets exactly like `CAUD`. Opening the stream turns
+// the microphone on and closing it turns it off, so no control message is
+// needed and a denied or revoked permission is simply a refused stream.
+inline constexpr char kMicrophoneStreamMagic[4] = {'C', 'M', 'I', 'C'};
+inline constexpr size_t kMicrophoneStreamHeaderSize = 20;
+inline constexpr uint8_t kMicrophoneStreamVersion = 1;
+
+// Fixed 20-byte header followed by AudioInfo::extradata. The header carries
+// the codec, rate, channel count, frame length and extradata size; trim
+// nothing, the returned vector is exactly what goes on the stream.
+std::vector<uint8_t> make_microphone_stream_header(const AudioInfo& info);
+// Full header length (20 + extradata) once the fixed part has arrived, or 0
+// while it is incomplete or names an unusable extradata size. A receiver uses
+// it to wait for a split header without rejecting a legitimately truncated
+// first packet.
+size_t microphone_stream_header_length(const uint8_t* data, size_t size);
+// Parses the fixed part and the extradata. `consumed` is 20 + extradata size,
+// which is where the first AudioHeader starts. Rejects a truncated header,
+// unknown version/codec, unsupported rate, mono/stereo-plus channels, an
+// extradata overrun, and any non-zero reserved field.
+bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo& info,
+                                     size_t& consumed, std::string* error);
 
 // HelloAck flags. Bit 0 tells the viewer it may send InputEvents; bit 1 tells
 // it that both sides may exchange clipboard content; bit 2 tells it the host
 // opened an audio stream and described the format in the audio block; bit 3
-// tells it that file offers are accepted.
+// tells it that file offers are accepted; bit 4 that the viewer may open a
+// microphone stream; bit 5 that SetPrivacyMode is accepted. Bit 6 is not a
+// permission: it says the picture is a merged layout of every attached output,
+// with origin/source covering their union.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
 inline constexpr uint16_t kServerInfoFileTransferEnabled = 0x0008;
-inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoInputEnabled |
-                                                 kServerInfoClipboardEnabled |
-                                                 kServerInfoAudioEnabled |
-                                                 kServerInfoFileTransferEnabled;
+inline constexpr uint16_t kServerInfoMicrophoneEnabled = 0x0010;
+inline constexpr uint16_t kServerInfoPrivacyModeEnabled = 0x0020;
+inline constexpr uint16_t kServerInfoMergedLayout = 0x0040;
+// Flags that describe what the viewer may do. The permission mask appended to
+// HelloAck is the authority for these bits, so the parser compares it with
+// this mask rather than with every known flag.
+inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
+                                                       kServerInfoClipboardEnabled |
+                                                       kServerInfoAudioEnabled |
+                                                       kServerInfoFileTransferEnabled |
+                                                       kServerInfoMicrophoneEnabled |
+                                                       kServerInfoPrivacyModeEnabled;
+inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
+                                                  kServerInfoMergedLayout;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
 // ServerInfo booleans are its decoded form. Input covers pointer and
 // keyboard injection; clipboard governs clipboard streams in both directions;
-// audio is present only while an audio stream is open; file transfer gates
-// FileOffer.
+// audio is present only while an audio stream is open; microphone allows the
+// viewer to open a `CMIC` uplink; file transfer gates FileOffer; privacy mode
+// gates SetPrivacyMode.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
     kPermissionAudio = 0x0004,
     kPermissionFileTransfer = 0x0008,
+    kPermissionMicrophone = 0x0010,
+    kPermissionPrivacyMode = 0x0020,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
-                                           kPermissionAudio | kPermissionFileTransfer;
+                                           kPermissionAudio | kPermissionFileTransfer |
+                                           kPermissionMicrophone | kPermissionPrivacyMode;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -494,6 +599,11 @@ struct DisplayDescription {
 // Hello display index meaning "whatever the server captures by default". The
 // server's fallback is its own configuration (primary when unset).
 inline constexpr uint16_t kDisplayAuto = 0xFFFF;
+// Hello display index meaning "every attached output, merged into one picture
+// in virtual-desktop layout". The host may refuse (no displays, adapters that
+// cannot share a device, an oversized union) and then answers with its default
+// single display; HelloAck's merged flag says which happened.
+inline constexpr uint16_t kDisplayAll = 0xFFFE;
 // Upper bound on a HelloAck display list; also the valid range of a Hello
 // display index. A machine with more outputs than this is not something the
 // viewer UI could present anyway, and the cap bounds the work a malformed
@@ -555,9 +665,10 @@ struct DisplayModeList {
 // gate: when false the viewer must not send InputEvents (they would be
 // dropped). `displays` lists every attached output; the one being streamed is
 // the entry whose rect starts at the origin and is `source_width` x
-// `source_height` pixels. `clipboard_enabled` mirrors the server's clipboard
-// gate: when false the viewer must not send clipboard content and will not
-// receive any. `file_transfer_enabled` gates FileOffer. `audio.enabled` says
+// `source_height` pixels; a merged stream has no such entry, `merged` is true,
+// and the lists are its members. `clipboard_enabled` mirrors the server's
+// clipboard gate: when false the viewer must not send clipboard content and
+// will not receive any. `file_transfer_enabled` gates FileOffer. `audio.enabled` says
 // whether an audio stream follows; when true, `audio` carries the codec, rate,
 // channel count and AudioSpecificConfig needed to decode it. Audio that fails
 // mid-session is turned off with a StreamInfo.
@@ -574,6 +685,17 @@ struct ServerInfo {
     bool input_enabled = false;
     bool clipboard_enabled = false;
     bool file_transfer_enabled = false;
+    // The picture is the union of every attached output (kDisplayAll), not a
+    // single captured output. `origin_x/y` and `source_width/height` describe
+    // that union; `displays` lists the members.
+    bool merged = false;
+    // The viewer may open a microphone stream. This is the permission bit's
+    // decoded form; it is not a separate wire field.
+    bool microphone_enabled = false;
+    // The host accepts SetPrivacyMode. Decoded from the permission mask, like
+    // the other booleans; the overlay's current state travels separately in
+    // PrivacyModeState because a reconnect always starts with it off.
+    bool privacy_mode_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;
@@ -612,8 +734,9 @@ bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
                          std::string* error);
 
 // Hello asks the server to stream one display: `display` is an index into the
-// HelloAck display list from a previous session, or kDisplayAuto. The server
-// answers with the display it actually captured, which also fixes origin_x /
+// HelloAck display list from a previous session, kDisplayAuto, or kDisplayAll
+// for the merged view. The server answers with what it actually captured,
+// either one display or the merged union, and that answer fixes origin_x /
 // origin_y for the viewer's pointer mapping.
 //
 // Authentication travels in the same message. `access_token` is the legacy
@@ -718,6 +841,15 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
 std::vector<uint8_t> make_clipboard_update(uint64_t seq, const std::string& text);
 bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate& update,
                             std::string* error);
+// Session chat (protocol v24). One non-empty UTF-8 line of at most
+// kMaxChatBytes; NUL and invalid UTF-8 are rejected. The text is sent as-is,
+// newlines included, so a peer may compose multi-line messages.
+inline constexpr size_t kMaxChatBytes = 4096;
+bool valid_chat_text(const std::string& text);
+// Returns an empty vector when `text` fails valid_chat_text().
+std::vector<uint8_t> make_chat_message(const std::string& text);
+bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
+                        std::string* error);
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that
 // keep the sprite can send the same update again with an empty one.
@@ -729,6 +861,138 @@ bool parse_cursor_update(const std::vector<uint8_t>& payload, CursorUpdate& upda
 std::vector<uint8_t> make_permission_update(uint16_t permissions);
 bool parse_permission_update(const std::vector<uint8_t>& payload,
                              uint16_t& permissions, std::string* error);
+
+// ----- privacy mode and desktop state -----
+//
+// Privacy mode hides the host's physical display behind a topmost overlay
+// while leaving the captured picture untouched, so the remote viewer keeps
+// seeing the desktop. It is requested by the viewer and answered with the
+// resulting state; the host may also send a state message on its own when it
+// turns the overlay off (permission revoked, session ending).
+
+// Why a privacy-mode request was refused. Ok means the resulting state matches
+// the request; every other code leaves the overlay off.
+enum class PrivacyModeCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // no permission, or the host settings do not allow it
+    Unsupported = 2,  // this Windows build or session cannot hide the display
+    Failed = 3,       // the overlay could not be shown or removed
+};
+inline constexpr size_t kMaxPrivacyModeReason = 256;
+
+// Which desktop the video stream is capturing. A secure desktop (the lock
+// screen, UAC, a credential prompt) is a different Windows desktop; the host
+// announces the change so the viewer can explain a paused or changed picture.
+enum class DesktopKind : uint8_t {
+    Default = 0,      // the interactive user's desktop
+    Secure = 1,       // a secure desktop: lock screen, UAC, credential prompt
+    Unavailable = 2,  // no desktop is accessible (sign-out, session switch)
+};
+
+std::vector<uint8_t> make_set_privacy_mode(bool enabled);
+bool parse_set_privacy_mode(const std::vector<uint8_t>& payload, bool& enabled,
+                            std::string* error);
+// The maker truncates `reason` on a UTF-8 boundary; the parser rejects an
+// over-long or malformed reason instead of truncating it.
+std::vector<uint8_t> make_privacy_mode_state(bool enabled, PrivacyModeCode code,
+                                             const std::string& reason);
+bool parse_privacy_mode_state(const std::vector<uint8_t>& payload, bool& enabled,
+                              PrivacyModeCode& code, std::string& reason,
+                              std::string* error);
+std::vector<uint8_t> make_desktop_state(DesktopKind kind);
+bool parse_desktop_state(const std::vector<uint8_t>& payload, DesktopKind& kind,
+                         std::string* error);
+
+// ----- secure attention sequence -----
+//
+// Ctrl+Alt+Del is not an ordinary key chord: Windows only accepts it from
+// SendSAS(), callable by LocalSystem services (the service worker) or a
+// process covered by the SoftwareSASGeneration policy. The viewer therefore
+// asks for it explicitly instead of injecting E0/E2/E4.
+//
+// The host checks input permission itself and answers every request, so a
+// viewer that lost control learns why instead of getting silence. The tray
+// host reports Unsupported because it cannot call SendSAS.
+
+// Why a Secure Attention Sequence request did not reach the secure desktop.
+enum class SasCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // input control is not granted to this viewer
+    Unsupported = 2,  // this host cannot send SAS (tray host, older Windows)
+    Failed = 3,       // sas.dll is missing or the call could not be made
+};
+inline constexpr size_t kMaxSasReason = 256;
+
+std::vector<uint8_t> make_send_sas();
+bool parse_send_sas(const std::vector<uint8_t>& payload, std::string* error);
+// The maker truncates `reason` on a UTF-8 boundary; the parser rejects an
+// over-long or malformed reason instead of truncating it.
+std::vector<uint8_t> make_sas_result(SasCode code, const std::string& reason);
+bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
+                      std::string& reason, std::string* error);
+
+// ----- stream options -----
+//
+// The viewer chooses how its own picture is produced: encoder family, a
+// frame-rate ceiling, and a quality preset that scales the host's video
+// budget. The host keeps its configured bitrate as a hard ceiling and never
+// follows a preference beyond it, so a viewer can only ask for less. The
+// choice lives for the session; a reconnect starts from the host's defaults
+// until the viewer sends it again.
+
+enum class StreamCodecPreference : uint8_t {
+    Auto = 0,  // follow the host's configured encoder
+    H264 = 1,  // require H.264
+    Hevc = 2,  // require HEVC; refused when the host cannot produce it
+};
+
+enum class StreamQuality : uint8_t {
+    High = 0,      // the full video budget
+    Balanced = 1,  // 75% of it
+    Smooth = 2,    // 50% of it
+};
+
+// Why a preference change did not fully take effect. Ok means the stream now
+// matches the request (or already did); every other code leaves the running
+// stream untouched.
+enum class StreamOptionsCode : uint8_t {
+    Ok = 0,
+    Unsupported = 1,  // the host cannot produce the requested encoder
+    Failed = 2,       // the encoder could not be rebuilt or reprogrammed
+    Busy = 3,         // a codec change just happened; retry after a moment
+};
+// The host setting's own range; a viewer cap outside it is malformed.
+inline constexpr uint16_t kMaxStreamFps = 240;
+inline constexpr size_t kMaxStreamOptionReason = 256;
+
+struct StreamOptions {
+    StreamCodecPreference codec = StreamCodecPreference::Auto;
+    // 0 means the host's configured rate, otherwise 1..kMaxStreamFps. This is
+    // a ceiling: the adaptive ladder may still go below it.
+    uint16_t max_fps = 0;
+    StreamQuality quality = StreamQuality::High;
+};
+
+struct StreamOptionsResult {
+    StreamOptionsCode code = StreamOptionsCode::Ok;
+    // What the running encoder actually produces, and the frame-rate ceiling
+    // and quality preset now in effect. On a refusal these describe the
+    // unchanged stream.
+    VideoCodec codec = VideoCodec::H264;
+    uint16_t fps = 0;
+    StreamQuality quality = StreamQuality::High;
+    std::string reason;
+};
+
+std::vector<uint8_t> make_set_stream_options(const StreamOptions& options);
+bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions& options,
+                              std::string* error);
+// The maker truncates `reason` on a UTF-8 boundary; the parser rejects an
+// over-long or malformed reason and an unknown code instead of repairing it.
+std::vector<uint8_t> make_stream_options_result(const StreamOptionsResult& result);
+bool parse_stream_options_result(const std::vector<uint8_t>& payload,
+                                 StreamOptionsResult& result, std::string* error);
+
 // Viewer -> host display switch. `display_index` is any u16; the host decides
 // whether it names one of its outputs (kDisplayAuto always means its default).
 std::vector<uint8_t> make_switch_display(uint16_t display_index);
@@ -767,6 +1031,10 @@ std::vector<uint8_t> make_display_mode_result(uint16_t display_index, uint16_t w
 bool parse_display_mode_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
                                uint16_t& width, uint16_t& height, uint16_t& refresh_hz,
                                DisplayModeCode& code, std::string& reason, std::string* error);
+// Joins the top-level upload folder and the native path below it into the
+// '/'-separated directory FileOffer carries. Empty or "." relatives mean the
+// top folder itself; a leading separator is ignored.
+std::string make_offer_relative_path(const std::string& top, const std::string& relative);
 // File transfer control messages. The makers truncate reasons/names on a
 // UTF-8 boundary; the parsers reject unknown codes, flags, empty or oversized
 // names and trailing bytes rather than repairing them.

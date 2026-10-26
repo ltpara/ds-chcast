@@ -206,12 +206,22 @@ bool codec_from_wire(uint8_t value, VideoCodec& codec) {
 }
 
 uint8_t audio_codec_wire(AudioCodec codec) {
-    return codec == AudioCodec::AAC ? 1 : 0;
+    switch (codec) {
+        case AudioCodec::AAC:
+            return 1;
+        case AudioCodec::Opus:
+            return 2;
+    }
+    return 0;
 }
 
 bool audio_codec_from_wire(uint8_t value, AudioCodec& codec) {
     if (value == 1) {
         codec = AudioCodec::AAC;
+        return true;
+    }
+    if (value == 2) {
+        codec = AudioCodec::Opus;
         return true;
     }
     return false;
@@ -395,6 +405,117 @@ bool decode_audio_header(const uint8_t* data, size_t size, AudioHeader& header,
     return true;
 }
 
+std::vector<uint8_t> make_microphone_stream_header(const AudioInfo& info) {
+    if (info.codec != AudioCodec::Opus || info.sample_rate != 48000 ||
+        (info.channels != 1 && info.channels != 2) ||
+        info.frame_samples != kOpusFrameSamples ||
+        info.extradata.empty() || info.extradata.size() > kMaxAudioExtradata) {
+        return {};
+    }
+    std::vector<uint8_t> header(kMicrophoneStreamHeaderSize + info.extradata.size());
+    uint8_t* cursor = header.data();
+    std::memcpy(cursor, kMicrophoneStreamMagic, sizeof(kMicrophoneStreamMagic));
+    cursor += sizeof(kMicrophoneStreamMagic);
+    put_u8(cursor, kMicrophoneStreamVersion);
+    put_u8(cursor, audio_codec_wire(info.codec));
+    put_u16(cursor, 0);
+    put_u32(cursor, info.sample_rate);
+    put_u16(cursor, info.channels);
+    put_u16(cursor, static_cast<uint16_t>(info.frame_samples));
+    put_u16(cursor, static_cast<uint16_t>(info.extradata.size()));
+    put_u16(cursor, 0);
+    std::memcpy(cursor, info.extradata.data(), info.extradata.size());
+    return header;
+}
+
+size_t microphone_stream_header_length(const uint8_t* data, size_t size) {
+    if (size < kMicrophoneStreamHeaderSize ||
+        std::memcmp(data, kMicrophoneStreamMagic, sizeof(kMicrophoneStreamMagic)) != 0) {
+        return 0;
+    }
+    const uint16_t extradata_size = static_cast<uint16_t>(
+        data[16] | (static_cast<uint16_t>(data[17]) << 8));
+    if (extradata_size == 0 || extradata_size > kMaxAudioExtradata) {
+        return 0;
+    }
+    return kMicrophoneStreamHeaderSize + extradata_size;
+}
+
+bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo& info,
+                                     size_t& consumed, std::string* error) {
+    consumed = 0;
+    if (size < kMicrophoneStreamHeaderSize) {
+        set_error(error, "short microphone stream header");
+        return false;
+    }
+    if (std::memcmp(data, kMicrophoneStreamMagic, sizeof(kMicrophoneStreamMagic)) != 0) {
+        set_error(error, "bad microphone stream magic");
+        return false;
+    }
+    Reader reader(data + sizeof(kMicrophoneStreamMagic),
+                  kMicrophoneStreamHeaderSize - sizeof(kMicrophoneStreamMagic));
+    uint8_t version = 0;
+    uint8_t codec = 0;
+    uint16_t reserved = 0;
+    uint16_t tail_reserved = 0;
+    uint16_t channels = 0;
+    uint16_t frame_samples = 0;
+    uint16_t extradata_size = 0;
+    if (!reader.u8(version) || !reader.u8(codec) || !reader.u16(reserved) ||
+        !reader.u32(info.sample_rate) || !reader.u16(channels) ||
+        !reader.u16(frame_samples) || !reader.u16(extradata_size) ||
+        !reader.u16(tail_reserved)) {
+        set_error(error, "truncated microphone stream header");
+        return false;
+    }
+    if (version != kMicrophoneStreamVersion) {
+        set_error(error, "unsupported microphone stream version " +
+                             std::to_string(version));
+        return false;
+    }
+    if (!audio_codec_from_wire(codec, info.codec) || info.codec != AudioCodec::Opus) {
+        set_error(error, "microphone stream names unsupported codec " +
+                             std::to_string(codec));
+        return false;
+    }
+    if (reserved != 0 || tail_reserved != 0) {
+        set_error(error, "microphone stream header carries non-zero reserved fields");
+        return false;
+    }
+    if (info.sample_rate != 48000) {
+        set_error(error, "microphone stream sample rate " +
+                             std::to_string(info.sample_rate) + " is not supported");
+        return false;
+    }
+    if (channels != 1 && channels != 2) {
+        set_error(error, "microphone stream has " + std::to_string(channels) +
+                             " channels");
+        return false;
+    }
+    if (frame_samples != kOpusFrameSamples) {
+        set_error(error, "microphone stream frame length " +
+                             std::to_string(frame_samples) + " is not supported");
+        return false;
+    }
+    if (extradata_size == 0 || extradata_size > kMaxAudioExtradata) {
+        set_error(error, "microphone stream config size " +
+                             std::to_string(extradata_size) + " is outside the limit");
+        return false;
+    }
+    if (size < kMicrophoneStreamHeaderSize + extradata_size) {
+        set_error(error, "microphone stream config is truncated");
+        return false;
+    }
+    info.enabled = true;
+    info.channels = channels;
+    info.frame_samples = frame_samples;
+    info.bitrate = 0;
+    info.extradata.assign(data + kMicrophoneStreamHeaderSize,
+                          data + kMicrophoneStreamHeaderSize + extradata_size);
+    consumed = kMicrophoneStreamHeaderSize + extradata_size;
+    return true;
+}
+
 std::vector<uint8_t> make_hello(const ClientHello& hello) {
     const size_t token_size =
         hello.access_token.size() > kMaxAccessTokenLength ? kMaxAccessTokenLength
@@ -466,7 +587,8 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "client speaks protocol version " + std::to_string(version));
         return false;
     }
-    if (hello.display != kDisplayAuto && hello.display >= kMaxDisplayCount) {
+    if (hello.display != kDisplayAuto && hello.display != kDisplayAll &&
+        hello.display >= kMaxDisplayCount) {
         set_error(error, "Hello asks for display " + std::to_string(hello.display) +
                              " outside the protocol limit");
         return false;
@@ -633,7 +755,10 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.input_enabled ? kServerInfoInputEnabled : 0) |
                         (info.clipboard_enabled ? kServerInfoClipboardEnabled : 0) |
                         (info.audio.enabled ? kServerInfoAudioEnabled : 0) |
-                        (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0)));
+                        (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0) |
+                        (info.microphone_enabled ? kServerInfoMicrophoneEnabled : 0) |
+                        (info.privacy_mode_enabled ? kServerInfoPrivacyModeEnabled : 0) |
+                        (info.merged ? kServerInfoMergedLayout : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -676,6 +801,12 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.file_transfer_enabled) {
         permissions |= kPermissionFileTransfer;
     }
+    if (info.microphone_enabled) {
+        permissions |= kPermissionMicrophone;
+    }
+    if (info.privacy_mode_enabled) {
+        permissions |= kPermissionPrivacyMode;
+    }
     put_u16(cursor, permissions);
     return payload;
 }
@@ -713,6 +844,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
     info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
+    info.merged = (flags & kServerInfoMergedLayout) != 0;
     const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
@@ -814,9 +946,16 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
                              std::to_string(info.audio.sample_rate) + " is not supported");
         return false;
     }
-    if (info.audio.frame_samples != kAudioFrameSamples) {
+    const uint32_t expected_frame_samples =
+        info.audio.codec == AudioCodec::Opus ? kOpusFrameSamples : kAudioFrameSamples;
+    if (info.audio.frame_samples != expected_frame_samples) {
         set_error(error, "HelloAck audio frame length " +
                              std::to_string(info.audio.frame_samples) + " is not supported");
+        return false;
+    }
+    if (info.audio.enabled && info.audio.codec == AudioCodec::Opus &&
+        info.audio.sample_rate != 48000) {
+        set_error(error, "HelloAck Opus audio is not at 48 kHz");
         return false;
     }
     if (extradata_size > kMaxAudioExtradata || extradata_size > reader.remaining()) {
@@ -852,13 +991,41 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck grants unknown permissions");
         return false;
     }
-    if (permissions != (flags & kServerInfoKnownFlags)) {
+    if (permissions != (flags & kServerInfoPermissionFlags)) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
         return false;
+    }
+    if (info.merged) {
+        if (info.displays.empty()) {
+            set_error(error, "HelloAck merged layout lists no displays");
+            return false;
+        }
+        int64_t left = info.displays.front().left;
+        int64_t top = info.displays.front().top;
+        int64_t right = info.displays.front().right;
+        int64_t bottom = info.displays.front().bottom;
+        for (const DisplayDescription& display : info.displays) {
+            left = std::min<int64_t>(left, display.left);
+            top = std::min<int64_t>(top, display.top);
+            right = std::max<int64_t>(right, display.right);
+            bottom = std::max<int64_t>(bottom, display.bottom);
+        }
+        const int64_t union_width = right - left;
+        const int64_t union_height = bottom - top;
+        // The host pads the union up to even dimensions so the NV12 picture
+        // can be encoded, so source may exceed the exact union by one pixel.
+        if (info.origin_x != left || info.origin_y != top ||
+            info.source_width < union_width || info.source_width - union_width > 1 ||
+            info.source_height < union_height || info.source_height - union_height > 1) {
+            set_error(error, "HelloAck merged geometry does not match its displays");
+            return false;
+        }
     }
     info.input_enabled = (permissions & kPermissionInput) != 0;
     info.clipboard_enabled = (permissions & kPermissionClipboard) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
+    info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
+    info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
     return true;
 }
 
@@ -1030,6 +1197,36 @@ bool parse_clipboard_update(const std::vector<uint8_t>& payload, ClipboardUpdate
     reader.string(update.text, reader.remaining());
     if (!valid_clipboard_text(update.text)) {
         set_error(error, "ClipboardUpdate carries invalid clipboard text");
+        return false;
+    }
+    return true;
+}
+
+bool valid_chat_text(const std::string& text) {
+    return !text.empty() && text.size() <= kMaxChatBytes && valid_utf8(text);
+}
+
+std::vector<uint8_t> make_chat_message(const std::string& text) {
+    if (!valid_chat_text(text)) {
+        return {};
+    }
+    return make_control(ControlType::ChatMessage,
+                        std::vector<uint8_t>(text.begin(), text.end()));
+}
+
+bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
+                        std::string* error) {
+    if (payload.empty()) {
+        set_error(error, "ChatMessage carries no text");
+        return false;
+    }
+    if (payload.size() > kMaxChatBytes) {
+        set_error(error, "ChatMessage text is too long");
+        return false;
+    }
+    text.assign(payload.begin(), payload.end());
+    if (!valid_utf8(text)) {
+        set_error(error, "ChatMessage text is not valid UTF-8");
         return false;
     }
     return true;
@@ -1439,6 +1636,239 @@ bool parse_display_mode_result(const std::vector<uint8_t>& payload, uint16_t& di
     return true;
 }
 
+std::vector<uint8_t> make_set_privacy_mode(bool enabled) {
+    std::vector<uint8_t> payload(1);
+    payload[0] = enabled ? 1 : 0;
+    return make_control(ControlType::SetPrivacyMode, payload);
+}
+
+bool parse_set_privacy_mode(const std::vector<uint8_t>& payload, bool& enabled,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw = 0;
+    if (!reader.u8(raw) || !reader.at_end() || raw > 1) {
+        set_error(error, "malformed SetPrivacyMode");
+        return false;
+    }
+    enabled = raw != 0;
+    return true;
+}
+
+std::vector<uint8_t> make_privacy_mode_state(bool enabled, PrivacyModeCode code,
+                                             const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxPrivacyModeReason);
+    std::vector<uint8_t> payload(4 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, enabled ? 1 : 0);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::PrivacyModeState, payload);
+}
+
+bool parse_privacy_mode_state(const std::vector<uint8_t>& payload, bool& enabled,
+                              PrivacyModeCode& code, std::string& reason,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_enabled = 0;
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_enabled) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed PrivacyModeState");
+        return false;
+    }
+    if (raw_enabled > 1) {
+        set_error(error, "PrivacyModeState carries an invalid enabled flag");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(PrivacyModeCode::Failed)) {
+        set_error(error, "unknown privacy mode code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxPrivacyModeReason) {
+        set_error(error, "PrivacyModeState reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "PrivacyModeState carries a malformed reason");
+        return false;
+    }
+    if (raw_code != static_cast<uint8_t>(PrivacyModeCode::Ok) && raw_enabled != 0) {
+        set_error(error, "PrivacyModeState reports a failure as enabled");
+        return false;
+    }
+    enabled = raw_enabled != 0;
+    code = static_cast<PrivacyModeCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_desktop_state(DesktopKind kind) {
+    std::vector<uint8_t> payload(1);
+    payload[0] = static_cast<uint8_t>(kind);
+    return make_control(ControlType::DesktopState, payload);
+}
+
+bool parse_desktop_state(const std::vector<uint8_t>& payload, DesktopKind& kind,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw = 0;
+    if (!reader.u8(raw) || !reader.at_end() ||
+        raw > static_cast<uint8_t>(DesktopKind::Unavailable)) {
+        set_error(error, "malformed DesktopState");
+        return false;
+    }
+    kind = static_cast<DesktopKind>(raw);
+    return true;
+}
+
+std::vector<uint8_t> make_send_sas() {
+    return make_control(ControlType::SendSas, {});
+}
+
+bool parse_send_sas(const std::vector<uint8_t>& payload, std::string* error) {
+    if (!payload.empty()) {
+        set_error(error, "SendSas must carry no payload");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_sas_result(SasCode code, const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxSasReason);
+    std::vector<uint8_t> payload(3 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::SasResult, payload);
+}
+
+bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
+                      std::string& reason, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed SasResult");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(SasCode::Failed)) {
+        set_error(error, "unknown SAS result code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxSasReason) {
+        set_error(error, "SasResult reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "SasResult carries a malformed reason");
+        return false;
+    }
+    code = static_cast<SasCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_set_stream_options(const StreamOptions& options) {
+    std::vector<uint8_t> payload(4);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(options.codec));
+    put_u16(cursor, options.max_fps);
+    put_u8(cursor, static_cast<uint8_t>(options.quality));
+    return make_control(ControlType::SetStreamOptions, payload);
+}
+
+bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions& options,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_codec = 0;
+    uint8_t raw_quality = 0;
+    if (!reader.u8(raw_codec) || !reader.u16(options.max_fps) ||
+        !reader.u8(raw_quality) || !reader.at_end()) {
+        set_error(error, "malformed SetStreamOptions");
+        return false;
+    }
+    if (raw_codec > static_cast<uint8_t>(StreamCodecPreference::Hevc)) {
+        set_error(error, "unknown stream codec preference " + std::to_string(raw_codec));
+        return false;
+    }
+    if (options.max_fps > kMaxStreamFps) {
+        set_error(error, "SetStreamOptions frame cap " + std::to_string(options.max_fps) +
+                             " is outside 0.." + std::to_string(kMaxStreamFps));
+        return false;
+    }
+    if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
+        set_error(error, "unknown stream quality " + std::to_string(raw_quality));
+        return false;
+    }
+    options.codec = static_cast<StreamCodecPreference>(raw_codec);
+    options.quality = static_cast<StreamQuality>(raw_quality);
+    return true;
+}
+
+std::vector<uint8_t> make_stream_options_result(const StreamOptionsResult& result) {
+    const std::string text = truncate_utf8_reason(result.reason, kMaxStreamOptionReason);
+    std::vector<uint8_t> payload(7 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u8(cursor, codec_wire(result.codec));
+    put_u16(cursor, result.fps);
+    put_u8(cursor, static_cast<uint8_t>(result.quality));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::StreamOptionsResult, payload);
+}
+
+bool parse_stream_options_result(const std::vector<uint8_t>& payload,
+                                 StreamOptionsResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint8_t raw_codec = 0;
+    uint8_t raw_quality = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u8(raw_codec) || !reader.u16(result.fps) ||
+        !reader.u8(raw_quality) || !reader.u16(reason_size) ||
+        !reader.string(result.reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed StreamOptionsResult");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(StreamOptionsCode::Busy)) {
+        set_error(error, "unknown stream options code " + std::to_string(raw_code));
+        return false;
+    }
+    if (!codec_from_wire(raw_codec, result.codec)) {
+        set_error(error, "unknown stream options codec " + std::to_string(raw_codec));
+        return false;
+    }
+    if (raw_quality > static_cast<uint8_t>(StreamQuality::Smooth)) {
+        set_error(error, "unknown stream quality " + std::to_string(raw_quality));
+        return false;
+    }
+    if (result.fps > kMaxStreamFps) {
+        set_error(error, "stream options frame rate " + std::to_string(result.fps) +
+                             " is outside 0.." + std::to_string(kMaxStreamFps));
+        return false;
+    }
+    if (result.reason.size() > kMaxStreamOptionReason) {
+        set_error(error, "StreamOptionsResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "StreamOptionsResult carries a malformed reason");
+        return false;
+    }
+    result.code = static_cast<StreamOptionsCode>(raw_code);
+    result.quality = static_cast<StreamQuality>(raw_quality);
+    return true;
+}
+
 namespace {
 
 bool parse_file_code(uint8_t raw, FileCode& code, std::string* error) {
@@ -1463,11 +1893,78 @@ bool parse_file_reason(const std::string& reason, size_t limit, const char* what
     return true;
 }
 
+// A relative directory is a suggestion for the receiver, but it still has to
+// be unambiguous: no absolute roots, no drive letters, no "." or ".." and no
+// empty component. Returns false with the reason on anything suspicious.
+bool parse_file_relative_path(const std::string& path, std::string* error) {
+    if (path.empty()) {
+        return true;
+    }
+    if (path.size() > kMaxFileRelativePathBytes) {
+        set_error(error, "FileOffer relative path is too long");
+        return false;
+    }
+    if (!valid_utf8(path)) {
+        set_error(error, "FileOffer relative path is not UTF-8");
+        return false;
+    }
+    if (path.front() == '/' || path.back() == '/' || path.find('\\') != std::string::npos ||
+        path.find(':') != std::string::npos) {
+        set_error(error, "FileOffer relative path is not a plain relative directory");
+        return false;
+    }
+    size_t components = 0;
+    size_t start = 0;
+    for (;;) {
+        const size_t slash = path.find('/', start);
+        const size_t length = slash == std::string::npos ? path.size() - start : slash - start;
+        if (length == 0 || (length == 1 && path[start] == '.') ||
+            (length == 2 && path[start] == '.' && path[start + 1] == '.')) {
+            set_error(error, "FileOffer relative path has an unusable component");
+            return false;
+        }
+        if (++components > kMaxFileRelativeComponents) {
+            set_error(error, "FileOffer relative path is nested too deeply");
+            return false;
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
+
 }  // namespace
+
+std::string make_offer_relative_path(const std::string& top, const std::string& relative) {
+    size_t start = 0;
+    while (start < relative.size() &&
+           (relative[start] == '\\' || relative[start] == '/')) {
+        ++start;
+    }
+    if (start == relative.size() || (start + 1 == relative.size() && relative[start] == '.')) {
+        return top;
+    }
+    std::string joined = top;
+    if (!joined.empty()) {
+        joined.push_back('/');
+    }
+    for (size_t i = start; i < relative.size(); ++i) {
+        joined.push_back(relative[i] == '\\' ? '/' : relative[i]);
+    }
+    return joined;
+}
 
 std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
     const std::string name = truncate_utf8_reason(offer.name, kMaxFileNameBytes);
-    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size());
+    std::string relative = offer.relative_path;
+    if (relative.size() > kMaxFileRelativePathBytes) {
+        // The parser refuses over-long paths; clearing keeps the length field
+        // honest instead of truncating a UTF-8 byte sequence in half.
+        relative.clear();
+    }
+    std::vector<uint8_t> payload(4 + 8 + 1 + 32 + 2 + name.size() + 2 + relative.size());
     uint8_t* cursor = payload.data();
     put_u32(cursor, offer.transfer_id);
     put_u64(cursor, offer.size);
@@ -1477,6 +1974,11 @@ std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
     put_u16(cursor, static_cast<uint16_t>(name.size()));
     if (!name.empty()) {
         std::memcpy(cursor, name.data(), name.size());
+        cursor += name.size();
+    }
+    put_u16(cursor, static_cast<uint16_t>(relative.size()));
+    if (!relative.empty()) {
+        std::memcpy(cursor, relative.data(), relative.size());
     }
     return make_control(ControlType::FileOffer, payload);
 }
@@ -1507,9 +2009,19 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
         set_error(error, "FileOffer name overruns the message");
         return false;
     }
+    offer.relative_path.clear();
     if (!reader.at_end()) {
-        set_error(error, "FileOffer has trailing bytes");
-        return false;
+        // v22 appends the directory. A missing tail is a v21-style root
+        // offer; peers still have to agree on the version in the handshake.
+        uint16_t relative_size = 0;
+        if (!reader.u16(relative_size) ||
+            !reader.string(offer.relative_path, relative_size) || !reader.at_end()) {
+            set_error(error, "FileOffer relative path overruns the message");
+            return false;
+        }
+        if (!parse_file_relative_path(offer.relative_path, error)) {
+            return false;
+        }
     }
     if (offer.name.empty() || !valid_utf8(offer.name)) {
         set_error(error, "FileOffer carries an unusable name");

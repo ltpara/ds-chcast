@@ -43,18 +43,36 @@ void main() {
       'permissions': ViewerPermission.fileTransfer,
       'filePhase': ViewerFilePhase.sending,
       'fileName': 'report.pdf',
+      'fileRelativePath': 'reports/2026',
+      'fileQueue': 3,
       'fileSize': 1000,
       'fileSent': 250,
       'fileError': '',
+      'lastFileName': 'previous.bin',
+      'lastFileError': 'the host refused it',
       'filesSent': 1,
       'fileFailures': 2,
     });
     expect(status.fileActive, isTrue);
     expect(status.fileProgress, 0.25);
     expect(status.fileName, 'report.pdf');
+    expect(status.fileRelativePath, 'reports/2026');
+    expect(status.fileQueue, 3);
+    expect(status.lastFileName, 'previous.bin');
+    expect(status.lastFileError, 'the host refused it');
     expect(status.filesSent, 1);
     expect(status.fileFailures, 2);
     expect(status.acceptsFiles, isTrue);
+  });
+
+  test('an upload without a queue reports the root directory', () {
+    final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'filePhase': ViewerFilePhase.hashing,
+      'fileName': 'one.bin',
+    });
+    expect(status.fileRelativePath, '');
+    expect(status.fileQueue, 0);
   });
 
   test('an upload phase or a missing gate never offers a transfer', () {

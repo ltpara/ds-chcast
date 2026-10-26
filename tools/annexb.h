@@ -1,7 +1,7 @@
 // Annex B access-unit splitting shared by the decoder harness and the QUIC
 // loopback verifier. Both must cut the elementary stream at exactly the units
-// the encoder emitted (one AUD-prefixed access unit per packet), otherwise the
-// per-frame content digests cannot be compared.
+// the encoder emitted (one access unit per packet), otherwise the per-frame
+// content digests cannot be compared.
 
 #pragma once
 
@@ -60,13 +60,22 @@ inline bool is_idr(unsigned type, chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? type == 5 : (type == 19 || type == 20);
 }
 
+// Slice/coded-picture NALs: exactly one of these starts every access unit.
+// Everything else (SPS, PPS, SEI) belongs to the picture that follows it.
+inline bool is_vcl(unsigned type, chast::VideoCodec codec) {
+    return codec == chast::VideoCodec::H264 ? (type >= 1 && type <= 5) : type < 32;
+}
+
 struct AccessUnit {
     std::vector<uint8_t> bytes;
     bool keyframe = false;
 };
 
-// Splits at AUDs; when the stream carries no AUD every NAL becomes its own
-// unit, which is still decodable because each starts with its own slice.
+// Splits at AUDs when the stream carries them (oneVPL prefixes each frame with
+// one). Streams without AUDs (libavcodec's QSV encoder emits SEI + slice per
+// frame) split at VCL NAL boundaries instead, so the leading SEI and parameter
+// sets stay attached to the picture they describe rather than becoming units
+// of their own.
 inline std::vector<AccessUnit> split_access_units(const std::vector<uint8_t>& data,
                                                   chast::VideoCodec codec) {
     std::vector<AccessUnit> units;
@@ -84,10 +93,13 @@ inline std::vector<AccessUnit> split_access_units(const std::vector<uint8_t>& da
 
     size_t unit_start = nals.front().start;
     bool unit_key = false;
+    bool unit_has_vcl = false;
     for (size_t i = 0; i < nals.size(); ++i) {
         const NalUnit& nal = nals[i];
         const unsigned type = nal_type(data, nal, codec);
-        const bool boundary = has_aud ? is_aud(type, codec) : i != 0;
+        const bool vcl = is_vcl(type, codec);
+        const bool boundary =
+            has_aud ? is_aud(type, codec) : (vcl && unit_has_vcl);
         if (boundary && i != 0) {
             AccessUnit unit;
             unit.bytes.assign(data.begin() + unit_start, data.begin() + nal.start);
@@ -97,6 +109,10 @@ inline std::vector<AccessUnit> split_access_units(const std::vector<uint8_t>& da
             }
             unit_start = nal.start;
             unit_key = false;
+            unit_has_vcl = false;
+        }
+        if (vcl) {
+            unit_has_vcl = true;
         }
         if (is_sequence_header(type, codec) || is_idr(type, codec)) {
             unit_key = true;

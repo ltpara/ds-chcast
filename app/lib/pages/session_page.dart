@@ -5,20 +5,29 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
 
+import '../account_store.dart';
+import '../server_api.dart';
 import '../server_settings.dart';
 import '../target.dart';
 import '../theme.dart';
+import '../reconnect_policy.dart';
+import '../remote_key_sequence.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
 import '../viewer_bridge.dart';
+import '../widgets/chat_panel.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
 
 class SessionPage extends StatefulWidget {
-  const SessionPage({super.key, required this.target});
+  const SessionPage({super.key, required this.target, this.account});
 
   final ConnectTarget target;
+
+  /// The signed-in account, if any. It is only used to report a finished
+  /// remote session for the server-side connection audit.
+  final AccountSession? account;
 
   @override
   State<SessionPage> createState() => _SessionPageState();
@@ -42,6 +51,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // One picker at a time; the native side also refuses an upload while the
   // previous one is active, this just keeps the dialog from stacking.
   bool _filePickBusy = false;
+  // Session chat. The page owns the transcript and the native transport; the
+  // panel is a modeless overlay. While its input holds focus, physical keys
+  // belong to the text field, so remote forwarding and the native key-capture
+  // switch pause until focus leaves.
+  final List<ChatEntry> _chatEntries = <ChatEntry>[];
+  final FocusNode _chatInputFocus = FocusNode(debugLabel: 'chat-input');
+  bool _chatOpen = false;
+  bool _chatTyping = false;
+  bool _chatDraining = false;
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -77,6 +95,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   int _modesRequestedLists = 0;
   DateTime _modesRequestedAt = DateTime.fromMillisecondsSinceEpoch(0);
   bool _modesRefreshPending = false;
+  // Picture preferences for this session. A fresh host session starts with its
+  // own defaults, so the page keeps the choices and re-sends them after every
+  // start. A change is optimistic: a refusal restores the previous selection
+  // and explains itself in a snack bar.
+  ViewerStreamCodec _streamCodec = ViewerStreamCodec.auto;
+  ViewerStreamQuality _streamQuality = ViewerStreamQuality.high;
+  int _streamMaxFps = 0;
+  // Answers already consumed and requests still in flight, so a stale answer
+  // cannot overwrite a newer menu choice.
+  int _streamOptionSeen = 0;
+  int _streamPending = 0;
+  _StreamOptionSnapshot? _streamRollback;
   // Logical pixels per captured pixel, as the frame is currently drawn. The
   // host's pointer is scaled by this times the window's device pixel ratio.
   double _viewScale = 1.0;
@@ -107,6 +137,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // the host sees a stable NAT mapping and the selected path survives.
   TunnelAgent? _tunnel;
   Future<TunnelAgent>? _tunnelStarting;
+  // Automatic reconnect after an unexpected drop. The policy holds the
+  // attempt count and backoff; [_autoTimer] is the pending delay. The series
+  // starts only after a session has shown frames, so a refused password or a
+  // changed identity never spins here; it survives attempts that fail before
+  // their first frame.
+  final AutoReconnectPolicy _autoPolicy = AutoReconnectPolicy();
+  Timer? _autoTimer;
+  // The first frame marks a real remote session; a terminal state reports it
+  // once to the signed-in account's server. Handshake failures stay out of
+  // this trail because no session existed yet.
+  DateTime? _auditStartedAt;
 
   bool get _inputActive => _controlEnabled && _status.acceptsInput && _startError == null;
 
@@ -120,6 +161,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _chatInputFocus.addListener(_onChatFocusChanged);
+    ViewerBridge.setDropHandler(_sendDroppedFiles);
     _startPolling();
     _starting = _start();
     unawaited(_starting);
@@ -129,11 +172,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
+    ViewerBridge.setDropHandler(null);
     _pollTimer?.cancel();
     _hideTimer?.cancel();
+    _autoTimer?.cancel();
+    _chatInputFocus.removeListener(_onChatFocusChanged);
+    _chatInputFocus.dispose();
     _focus.dispose();
     _setKeyCapture(false);
     _clearCursor();
+    final DateTime? auditStartedAt = _auditStartedAt;
+    _auditStartedAt = null;
+    if (auditStartedAt != null) {
+      unawaited(_reportFinishedSession(auditStartedAt, 'closed'));
+    }
     unawaited(_shutdown());
     super.dispose();
   }
@@ -149,6 +201,60 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _releaseRemoteInput();
   }
 
+  Future<void> _reportFinishedSession(DateTime startedAt, String detail) async {
+    final AccountSession? account = widget.account;
+    if (account == null || !account.isActiveAt(DateTime.now())) {
+      return;
+    }
+    final String peer = widget.target.hostId.isNotEmpty
+        ? widget.target.hostId
+        : widget.target.label;
+    try {
+      await ServerApi.reportConnection(
+        ServerSettings(url: account.server),
+        account.token,
+        peerId: peer,
+        startedAt: startedAt,
+        endedAt: DateTime.now(),
+        detail: detail,
+      );
+    } catch (_) {
+      // Audit delivery must not disturb the session or the returned page.
+    }
+  }
+
+  Future<void> _reportFileEvent(
+    String direction,
+    String name,
+    int size,
+    int files,
+    bool success,
+    String detail,
+  ) async {
+    final AccountSession? account = widget.account;
+    if (account == null || !account.isActiveAt(DateTime.now())) {
+      return;
+    }
+    final String peer = widget.target.hostId.isNotEmpty
+        ? widget.target.hostId
+        : widget.target.label;
+    try {
+      await ServerApi.reportFileTransfers(
+        ServerSettings(url: account.server),
+        account.token,
+        peerId: peer,
+        direction: direction,
+        name: name,
+        size: size,
+        files: files,
+        success: success,
+        detail: detail,
+      );
+    } catch (_) {
+      // Audit delivery is best effort, exactly like the session report.
+    }
+  }
+
   Future<void> _start() async {
     for (int attempt = 0; ; ++attempt) {
       try {
@@ -156,6 +262,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       } on MissingPluginException {
         if (attempt > 0 || !mounted) {
+          _cancelAutoReconnect();
           if (mounted) {
             setState(() => _startError = '原生查看器尚未加载');
           }
@@ -167,11 +274,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           return;
         }
       } on PlatformException catch (error) {
+        _cancelAutoReconnect();
         if (mounted) {
           setState(() => _startError = error.message ?? error.code);
         }
         return;
       } on TunnelException catch (error) {
+        // A connection service that cannot start is not a transient drop;
+        // retrying it in a loop would just hide the failure.
+        _cancelAutoReconnect();
         if (mounted) {
           setState(() => _startError = '无法通过连接服务打开设备：${error.message}');
         }
@@ -201,6 +312,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       server: ServerSettings(
         url: widget.target.server,
         mode: widget.target.mode,
+        key: widget.target.serverKey,
       ),
       hostId: widget.target.hostId,
     );
@@ -266,6 +378,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     try {
+      // Direct connections fall back to the host's adjacent TCP port; a
+      // tunnelled session prefers the server's shared carrier, which
+      // multiplexes every host on one port and needs this host's token.
+      final String carrierHost;
+      final int carrierPort;
+      final String carrierHostId;
+      final String carrierToken;
+      if (tunnel != null && tunnel.carrierPort != 0) {
+        carrierHost = tunnel.carrierHost;
+        carrierPort = tunnel.carrierPort;
+        carrierHostId = widget.target.hostId;
+        carrierToken = tunnel.carrierToken;
+      } else if (tunnel != null) {
+        carrierHost = tunnel.relayHost;
+        carrierPort = tunnel.relayPort;
+        carrierHostId = '';
+        carrierToken = '';
+      } else {
+        carrierHost = widget.target.host;
+        carrierPort =
+            widget.target.port < 65535 ? widget.target.port + 1 : 0;
+        carrierHostId = '';
+        carrierToken = '';
+      }
       await ViewerBridge.start(
         host: tunnel?.host ?? widget.target.host,
         port: tunnel?.port ?? widget.target.port,
@@ -277,6 +413,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         password: _password,
         totp: _totp,
         trustDevice: _trustDevice,
+        carrierHost: carrierHost,
+        carrierPort: carrierPort,
+        carrierHostId: carrierHostId,
+        carrierToken: carrierToken,
       );
       // The native session starts with clipboard sync on; reapply this page's
       // switch before the first poll can show it as enabled.
@@ -286,6 +426,29 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         // The session is already gone; start would have thrown otherwise.
       } on MissingPluginException {
         throw StateError('the viewer is not available');
+      }
+      // Same for the picture preferences: a new host session starts with its
+      // defaults. Queue the page's choice before the first poll so the menus
+      // do not briefly show the host's defaults.
+      if (_streamCodec != ViewerStreamCodec.auto ||
+          _streamQuality != ViewerStreamQuality.high ||
+          _streamMaxFps != 0) {
+        ++_streamPending;
+        try {
+          if (!await ViewerBridge.setStreamOptions(
+            codec: _streamCodec.code,
+            maxFps: _streamMaxFps,
+            quality: _streamQuality.code,
+          )) {
+            --_streamPending;
+          }
+        } on PlatformException {
+          --_streamPending;
+          // The session is already gone; start would have thrown otherwise.
+        } on MissingPluginException {
+          --_streamPending;
+          throw StateError('the viewer is not available');
+        }
       }
     } catch (_) {
       await _stopSession();
@@ -355,6 +518,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     final int previousPermissions = _status.permissions;
     final int previousPermissionUpdates = _status.permissionUpdates;
+    // A new native session restarts these counters at zero; that first poll is
+    // not an answer to anything sent before the restart.
+    if (status.streamOptionResults < _streamOptionSeen) {
+      _streamOptionSeen = status.streamOptionResults;
+      _streamPending = 0;
+      _streamRollback = null;
+    }
+    final bool streamAnswered = status.streamOptionResults > _streamOptionSeen;
+    _StreamOptionSnapshot? streamRollback;
+    bool streamRefused = false;
+    if (streamAnswered) {
+      _streamOptionSeen = status.streamOptionResults;
+      if (_streamPending > 0) {
+        --_streamPending;
+      }
+      streamRefused = status.streamOptionCode != 0;
+      if (_streamPending == 0) {
+        if (streamRefused) {
+          streamRollback = _streamRollback;
+        }
+        _streamRollback = null;
+      }
+    }
+    final bool streamSettled = streamAnswered && _streamPending == 0;
     // A refused password or one-time code is a step, not an end: the session
     // is dead, but the card stays away while the dialog collects fresh
     // credentials and reconnects.
@@ -363,9 +550,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         !_over &&
         _isCredentialChallenge(status.denial);
     final bool nowOver = status.isOver && !challenge;
+    final bool justOver = nowOver && !_over;
+    if (status.hasFrame && _auditStartedAt == null) {
+      _auditStartedAt = DateTime.now();
+    }
     if (status.hasFrame && !_sawFrame) {
       _sawFrame = true;
       _collapsed = false;
+      // The series did its job: the next drop starts a fresh one.
+      _autoTimer?.cancel();
+      _autoTimer = null;
+      _autoPolicy.reset();
       _scheduleHide();
     }
     if (nowOver && !_over) {
@@ -399,6 +594,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // the reason stay in the status until the next upload starts.
     final bool fileDone = status.filesSent > _status.filesSent;
     final bool fileFailed = status.fileFailures > _status.fileFailures;
+    final bool downloadDone = status.filesReceived > _status.filesReceived;
+    final bool downloadFailed =
+        status.fileReceiveFailures > _status.fileReceiveFailures;
+    // A poll can swallow several completions, especially for small files.
+    // The audit keeps the count and the last name/size seen in this window.
+    final int uploadsDone = status.filesSent - _status.filesSent;
+    final int uploadsFailed = status.fileFailures - _status.fileFailures;
+    final int downloadsDone = status.filesReceived - _status.filesReceived;
+    final int downloadsFailed =
+        status.fileReceiveFailures - _status.fileReceiveFailures;
+    final bool chatArrived = status.chatReceived > _status.chatReceived;
+    final bool chatFailed = status.chatFailures > _status.chatFailures;
     if (modeChangeAccepted) {
       _modesRefreshPending = true;
       _modesRequestedFor = null;
@@ -410,9 +617,42 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (switchAccepted || switchRefused || nowOver) {
         _pendingDisplay = null;
       }
+      if (streamSettled) {
+        if (streamRefused) {
+          if (streamRollback != null) {
+            _streamCodec = streamRollback.codec;
+            _streamQuality = streamRollback.quality;
+            _streamMaxFps = streamRollback.maxFps;
+          } else {
+            // A preference re-applied after a reconnect was refused; show the
+            // values the host actually runs.
+            _streamCodec = status.codec == 'hevc'
+                ? ViewerStreamCodec.hevc
+                : ViewerStreamCodec.h264;
+            _streamQuality = _streamQualityFor(status.streamQuality);
+          }
+        } else {
+          _streamQuality = _streamQualityFor(status.streamQuality);
+        }
+      }
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    if (streamSettled && streamRefused) {
+      final String reason = status.streamOptionError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '画面设置未生效' : '画面设置未生效：$reason'),
+        duration: const Duration(seconds: 4),
+      ));
+    }
+    if (justOver) {
+      final DateTime? auditStartedAt = _auditStartedAt;
+      _auditStartedAt = null;
+      if (auditStartedAt != null) {
+        unawaited(_reportFinishedSession(auditStartedAt, status.error));
+      }
+      _maybeStartAutoReconnect(status);
+    }
     if (switchRefused) {
       final String reason = status.displaySwitchError;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -428,15 +668,97 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ));
     }
     if (fileDone) {
-      final String name = status.fileName;
+      final String name = status.lastFileName;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(name.isEmpty ? '文件已发送' : '文件已发送：$name'),
         duration: const Duration(seconds: 3),
       ));
     } else if (fileFailed) {
-      final String reason = status.fileError;
+      final String reason = status.lastFileError;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         content: Text(reason.isEmpty ? '文件发送失败' : '文件发送失败：$reason'),
+        duration: const Duration(seconds: 5),
+      ));
+    }
+    if (downloadDone) {
+      final String name = status.downloadName;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(name.isEmpty ? '文件已接收' : '文件已接收：$name'),
+        duration: const Duration(seconds: 3),
+      ));
+    } else if (downloadFailed) {
+      final String reason = status.downloadError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '文件接收失败' : '文件接收失败：$reason'),
+        duration: const Duration(seconds: 5),
+      ));
+    }
+    if (uploadsDone > 0) {
+      unawaited(_reportFileEvent('upload', status.lastFileName,
+          uploadsDone == 1 ? status.fileSize : 0, uploadsDone, true, ''));
+    }
+    if (uploadsFailed > 0) {
+      unawaited(_reportFileEvent('upload', status.lastFileName, 0,
+          uploadsFailed, false, status.lastFileError));
+    }
+    if (downloadsDone > 0) {
+      unawaited(_reportFileEvent('download', status.downloadName,
+          downloadsDone == 1 ? status.downloadSize : 0, downloadsDone, true, ''));
+    }
+    if (downloadsFailed > 0) {
+      unawaited(_reportFileEvent('download', status.downloadName, 0,
+          downloadsFailed, false, status.downloadError));
+    }
+    // A microphone failure stops only the uplink; video and system sound keep
+    // running. The counter tells a new failure from the stale reason text.
+    if (!nowOver && status.microphoneErrors > _status.microphoneErrors) {
+      final String reason = status.microphoneError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '麦克风已停止' : '麦克风已停止：$reason'),
+        duration: const Duration(seconds: 5),
+      ));
+    }
+    // Every privacy answer is one event. A refusal or a host-initiated
+    // disable explains itself; a success just confirms the new state.
+    if (!nowOver && status.privacyUpdates > _status.privacyUpdates) {
+      final String reason = status.privacyError;
+      final String text;
+      if (status.privacyCode != 0) {
+        text = reason.isEmpty
+            ? _privacyCodeText(status.privacyCode)
+            : '${_privacyCodeText(status.privacyCode)}：$reason';
+      } else {
+        text = status.privacyEnabled ? '隐私模式已开启：主机本地画面已被遮挡' : '隐私模式已关闭：主机本地画面已恢复';
+      }
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(text),
+        duration: const Duration(seconds: 4),
+      ));
+    }
+    // Every Ctrl+Alt+Del request gets one answer. A refusal or unsupported
+    // host explains itself; success confirms the sequence was injected.
+    if (!nowOver && status.sasUpdates > _status.sasUpdates) {
+      final String reason = status.sasError;
+      final String text;
+      if (status.sasCode == ViewerSasCode.ok.code) {
+        text = 'Ctrl+Alt+Del 已发送到主机';
+      } else {
+        final String detail =
+            reason.isEmpty ? _sasCodeText(status.sasCode) : reason;
+        text = 'Ctrl+Alt+Del 未发送：$detail';
+      }
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(text),
+        duration: const Duration(seconds: 4),
+      ));
+    }
+    if (chatArrived) {
+      unawaited(_drainChat());
+    }
+    if (!nowOver && chatFailed) {
+      final String reason = status.chatError;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(reason.isEmpty ? '聊天消息发送失败' : '聊天消息发送失败：$reason'),
         duration: const Duration(seconds: 5),
       ));
     }
@@ -564,17 +886,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _sendFile() async {
+  Future<void> _sendFile() => _startUpload(ViewerBridge.sendFile);
+
+  Future<void> _sendDroppedFiles(List<String> paths) =>
+      _startUpload(() => ViewerBridge.sendFileAt(paths));
+
+  Future<void> _startUpload(Future<int?> Function() start) async {
     if (_filePickBusy) {
       return;
     }
     _filePickBusy = true;
     try {
-      final String? path = await ViewerBridge.sendFile();
-      if (path != null && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('已开始发送，进度显示在画面下方'),
-          duration: Duration(seconds: 2),
+      final int? queued = await start();
+      if (queued != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('已加入发送队列（$queued 项），进度显示在画面下方'),
+          duration: const Duration(seconds: 2),
         ));
       }
     } on PlatformException catch (error) {
@@ -683,14 +1010,189 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _toggleMicrophone() async {
+    if (!_status.acceptsMicrophone) {
+      return;
+    }
+    final bool turnOn = !_status.microphoneEnabled;
+    try {
+      final bool applied = await ViewerBridge.setMicrophone(turnOn);
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('主机未授权麦克风，无法开启'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? '无法切换麦克风')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  Future<void> _togglePrivacy() async {
+    if (!_status.acceptsPrivacy) {
+      return;
+    }
+    final bool turnOn = !_status.privacyEnabled;
+    try {
+      final bool applied = await ViewerBridge.setPrivacyMode(turnOn);
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('主机未授权隐私模式，无法切换'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? '无法切换隐私模式')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  /// The host's PrivacyModeCode (chast::PrivacyModeCode) in the page's words.
+  String _privacyCodeText(int code) {
+    switch (code) {
+      case 1:
+        return '主机不允许隐私模式';
+      case 2:
+        return '主机系统不支持隐私模式';
+      case 3:
+        return '主机无法开启隐私模式';
+      default:
+        return '隐私模式未能切换';
+    }
+  }
+
+  /// Reads the live endpoint list for the toolbar's long-press menu, so a
+  /// device plugged in mid-session is offered too.
+  Future<List<ViewerMicrophoneDevice>> _loadMicrophones() async {
+    try {
+      final List<ViewerMicrophoneDevice> devices = await ViewerBridge.listMicrophones();
+      if (devices.isEmpty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('没有可用的麦克风设备'),
+          duration: Duration(seconds: 4),
+        ));
+      }
+      return devices;
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message ?? '无法列出麦克风设备')),
+        );
+      }
+      return const <ViewerMicrophoneDevice>[];
+    } on MissingPluginException {
+      return const <ViewerMicrophoneDevice>[];
+    }
+  }
+
+  Future<void> _selectMicrophone(String deviceId) async {
+    try {
+      await ViewerBridge.selectMicrophone(deviceId);
+    } on PlatformException {
+      // The session is closing; the next poll reports the final state.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  /// Reads the live playback endpoints for the volume button's long-press
+  /// menu, so a device plugged in mid-session is offered too.
+  Future<List<ViewerAudioOutput>> _loadAudioOutputs() async {
+    try {
+      final List<ViewerAudioOutput> devices = await ViewerBridge.listAudioOutputs();
+      if (devices.isEmpty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('没有可用的音频输出设备'),
+          duration: Duration(seconds: 4),
+        ));
+      }
+      return devices;
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message ?? '无法列出音频输出设备')),
+        );
+      }
+      return const <ViewerAudioOutput>[];
+    } on MissingPluginException {
+      return const <ViewerAudioOutput>[];
+    }
+  }
+
+  Future<void> _selectAudioOutput(String deviceId) async {
+    try {
+      final bool applied = await ViewerBridge.selectAudioOutput(deviceId);
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('当前会话无法切换输出设备'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? '无法切换音频输出')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  Future<void> _setAudioProcessing(bool aec, bool noiseSuppression) async {
+    try {
+      final bool applied = await ViewerBridge.setAudioProcessing(
+        aec: aec,
+        noiseSuppression: noiseSuppression,
+      );
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('当前会话无法修改麦克风处理'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? '无法修改麦克风处理')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
   /// The output the toolbar should mark. A switch in flight is shown as
-  /// selected while the host works; otherwise an explicit request is
-  /// authoritative, and after "server chooses" the list is matched against
-  /// the stream's origin and size, which is how HelloAck identifies the
-  /// captured output.
+  /// selected while the host works; a merged stream has no single streamed
+  /// entry, so the merge item stays highlighted; otherwise an explicit
+  /// request is authoritative, and after "server chooses" the list is
+  /// matched against the stream's origin and size, which is how HelloAck
+  /// identifies the captured output.
   int get _activeDisplay {
     if (_pendingDisplay != null) {
       return _pendingDisplay!;
+    }
+    if (_status.mergedLayout) {
+      return kViewerDisplayAll;
     }
     if (_display != kViewerDisplayAuto) {
       return _display;
@@ -804,6 +1306,65 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Applies one menu choice. The selection moves immediately; the host's
+  /// answer either confirms it or restores the previous one. No input
+  /// permission is needed, so this works in a view-only session.
+  Future<void> _changeStreamOptions({
+    ViewerStreamCodec? codec,
+    ViewerStreamQuality? quality,
+    int? maxFps,
+  }) async {
+    final ViewerStreamCodec nextCodec = codec ?? _streamCodec;
+    final ViewerStreamQuality nextQuality = quality ?? _streamQuality;
+    final int nextFps = maxFps ?? _streamMaxFps;
+    if (nextCodec == _streamCodec &&
+        nextQuality == _streamQuality &&
+        nextFps == _streamMaxFps) {
+      return;
+    }
+    final _StreamOptionSnapshot previous =
+        _StreamOptionSnapshot(_streamCodec, _streamQuality, _streamMaxFps);
+    setState(() {
+      _streamCodec = nextCodec;
+      _streamQuality = nextQuality;
+      _streamMaxFps = nextFps;
+      _streamRollback = previous;
+    });
+    // Count the request before awaiting the platform reply: the host's answer
+    // can be seen by a poll before this continuation resumes.
+    ++_streamPending;
+    bool queued = false;
+    try {
+      queued = await ViewerBridge.setStreamOptions(
+        codec: nextCodec.code,
+        maxFps: nextFps,
+        quality: nextQuality.code,
+      );
+    } on PlatformException {
+      queued = false;
+    } on MissingPluginException {
+      queued = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (queued) {
+      return;
+    }
+    // Nothing was sent, so no answer will arrive; put the menu back now.
+    --_streamPending;
+    setState(() {
+      _streamCodec = previous.codec;
+      _streamQuality = previous.quality;
+      _streamMaxFps = previous.maxFps;
+      _streamRollback = null;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('当前无法修改画面设置'),
+      duration: Duration(seconds: 3),
+    ));
+  }
+
   /// True when the server proved a different identity than the one stored for
   /// this endpoint. The native side refuses that connection; the card then
   /// offers to replace the pin explicitly.
@@ -840,6 +1401,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
       if ((mask & ViewerPermission.audio) != 0) {
         parts.add('音频');
+      }
+      if ((mask & ViewerPermission.microphone) != 0) {
+        parts.add('麦克风');
+      }
+      if ((mask & ViewerPermission.privacyMode) != 0) {
+        parts.add('隐私模式');
       }
       return parts.join('、');
     }
@@ -924,9 +1491,58 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _reconnect();
   }
 
-  Future<void> _reconnect() async {
+  /// Ends an automatic-reconnect series. A manual reconnect or a display
+  /// switch also resets the attempt count, so the next drop starts its own
+  /// 1/2/4/8/15 s ladder.
+  void _cancelAutoReconnect() {
+    _autoTimer?.cancel();
+    _autoTimer = null;
+    _autoPolicy.reset();
+  }
+
+  /// Arms the next automatic attempt after an unexpected failure. The first
+  /// attempt needs a frame from this connection; later attempts keep the
+  /// series alive even if the host stays down and no frame arrives.
+  void _maybeStartAutoReconnect(ViewerStatus status) {
+    if (_closing || _autoTimer != null) {
+      return;
+    }
+    final bool eligible = _startError == null &&
+        status.state == ViewerState.failed &&
+        status.denial == 0 &&
+        !_identityChanged;
+    if (!eligible) {
+      _cancelAutoReconnect();
+      return;
+    }
+    final bool seriesActive =
+        _autoPolicy.waiting && _autoPolicy.attempt > 0;
+    if (!seriesActive && !_sawFrame) {
+      return;
+    }
+    final Duration? delay = _autoPolicy.next();
+    if (delay == null) {
+      // The ladder is exhausted: fall back to the normal card, whose manual
+      // reconnect starts a fresh series.
+      setState(() {});
+      return;
+    }
+    setState(() {});
+    _autoTimer = Timer(delay, () {
+      _autoTimer = null;
+      if (!mounted || _closing) {
+        return;
+      }
+      unawaited(_reconnect(automatic: true));
+    });
+  }
+
+  Future<void> _reconnect({bool automatic = false}) async {
     if (_reconnecting) {
       return;
+    }
+    if (!automatic) {
+      _cancelAutoReconnect();
     }
     setState(() {
       _reconnecting = true;
@@ -942,6 +1558,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     await _starting;
     _teardown = null;
+    // A manual reconnect ends a live session; report it before the teardown.
+    final DateTime? auditStartedAt = _auditStartedAt;
+    _auditStartedAt = null;
+    if (auditStartedAt != null) {
+      unawaited(_reportFinishedSession(auditStartedAt, '重新连接'));
+    }
     await _stopSession();
     _clearCursor();
     if (!mounted) {
@@ -959,7 +1581,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelY = 0;
       _heldButtons = 0;
       _heldKeys.clear();
+      _chatEntries.clear();
+      _chatOpen = false;
+      _chatTyping = false;
     });
+    if (_chatInputFocus.hasFocus) {
+      _chatInputFocus.unfocus();
+    }
     _setKeyCapture(false);
     _startPolling();
     _starting = _start();
@@ -985,6 +1613,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return;
     }
     _closing = true;
+    _autoTimer?.cancel();
+    _autoTimer = null;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     if (_fullscreen) {
@@ -1000,6 +1630,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _cleanupAfterPop() {
+    _autoTimer?.cancel();
+    _autoTimer = null;
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     if (_fullscreen) {
@@ -1011,6 +1643,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (_chatTyping) {
+      // The chat input has the keyboard: characters, Enter and IME belong to
+      // the text field, not the host.
+      return KeyEventResult.ignored;
+    }
     if (_inputActive) {
       if (event is KeyRepeatEvent) {
         // The host generates its own auto-repeat; forwarding these would
@@ -1036,6 +1673,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     if (event is! KeyDownEvent) {
       return KeyEventResult.ignored;
+    }
+    if (_chatOpen && event.logicalKey == LogicalKeyboardKey.escape) {
+      _closeChat();
+      return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.escape) {
       if (_fullscreen) {
@@ -1070,9 +1711,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelX = 0;
       _wheelY = 0;
     });
-    _setKeyCapture(_inputActive);
+    if (_controlEnabled && _chatTyping) {
+      // Turning control back on while the chat input owns the keyboard would
+      // leave every keystroke local; hand the keyboard back to the session.
+      _chatInputFocus.unfocus();
+    }
+    _setKeyCapture(_inputActive && !_chatTyping);
     _syncCursor();
-    if (_controlEnabled) {
+    if (_controlEnabled && !_chatTyping) {
       // The toolbar button may claim focus while it handles the tap; take it
       // back once the frame settles so keys go to the host immediately.
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1103,6 +1749,117 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Even if an Up above was lost, or the host saw a press this page never
     // recorded, this lifts whatever it still holds.
     unawaited(_guardSend(ViewerBridge.releaseInput()));
+  }
+
+  void _onChatFocusChanged() {
+    final bool focused = _chatInputFocus.hasFocus;
+    if (_chatTyping == focused) {
+      return;
+    }
+    if (focused) {
+      // Keys already down on the host must not stay down while the text field
+      // takes the keyboard.
+      _releaseRemoteInput();
+    }
+    setState(() => _chatTyping = focused);
+    _setKeyCapture(_inputActive && !focused);
+  }
+
+  void _toggleChat() {
+    if (_chatOpen) {
+      _closeChat();
+    } else {
+      _openChat();
+    }
+  }
+
+  void _openChat() {
+    if (!_chatOpen) {
+      setState(() => _chatOpen = true);
+    }
+    // The toolbar tap leaves focus on its button; hand it to the input once
+    // the panel is laid out so typing works immediately.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _chatOpen) {
+        _chatInputFocus.requestFocus();
+      }
+    });
+  }
+
+  void _closeChat() {
+    if (_chatInputFocus.hasFocus) {
+      _chatInputFocus.unfocus();
+    }
+    setState(() => _chatOpen = false);
+    _setKeyCapture(_inputActive);
+    if (_inputActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _inputActive && !_chatTyping) {
+          _focus.requestFocus();
+        }
+      });
+    }
+  }
+
+  void _appendChat(ChatEntry entry) {
+    _chatEntries.add(entry);
+    if (_chatEntries.length > 200) {
+      _chatEntries.removeRange(0, _chatEntries.length - 200);
+    }
+  }
+
+  /// Moves host lines out of the native queue. The status counter is only a
+  /// wake-up: the queue itself decides how many lines are waiting, so a burst
+  /// arriving between polls is never half-read.
+  Future<void> _drainChat() async {
+    if (_chatDraining) {
+      return;
+    }
+    _chatDraining = true;
+    try {
+      while (mounted) {
+        final String? text = await ViewerBridge.takeChat();
+        if (text == null || text.isEmpty) {
+          break;
+        }
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _appendChat(ChatEntry(text: text, mine: false, at: DateTime.now()));
+          // A message is worth surfacing even while the panel is closed; the
+          // input is not focused, so remote keyboard forwarding keeps working.
+          _chatOpen = true;
+        });
+      }
+    } on PlatformException {
+      // A closing session rejects calls; the status poll reports why.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      _chatDraining = false;
+    }
+  }
+
+  Future<bool> _sendChat(String text) async {
+    try {
+      final bool queued = await ViewerBridge.sendChat(text);
+      if (!queued) {
+        return false;
+      }
+      if (!mounted) {
+        return true;
+      }
+      setState(() {
+        _appendChat(ChatEntry(text: text, mine: true, at: DateTime.now()));
+        _chatOpen = true;
+      });
+      return true;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
   }
 
   void _setKeyCapture(bool enable) {
@@ -1143,6 +1900,88 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       down: down,
       modifiers: _inputState(),
     ));
+  }
+
+  /// Like [_sendKey], but with an explicit bitmap so a synthetic chord can
+  /// describe the modifiers it is holding instead of what this machine's
+  /// keyboard happens to have down.
+  Future<void> _sendKeyWithBits(int usage, bool down, int modifiers) {
+    return _guardSend(ViewerBridge.sendKey(
+      usage: usage,
+      down: down,
+      modifiers: modifiers,
+    ));
+  }
+
+  /// Sends one toolbar shortcut as a press chord: modifiers down, the key
+  /// down and up, then the modifiers up in reverse order. Every event carries
+  /// the bitmap at that instant, matching a physical chord on the host.
+  Future<void> _sendChord(List<int> modifierUsages, int keyUsage) async {
+    for (final RemoteKeyEvent event
+        in buildRemoteChord(modifierUsages, keyUsage, _inputState())) {
+      await _sendKeyWithBits(event.usage, event.down, event.modifiers);
+    }
+  }
+
+  /// Win is itself a modifier, so a tap clears its bit before the key-up event
+  /// rather than sending a second, duplicate down.
+  Future<void> _sendWinTap() async {
+    for (final RemoteKeyEvent event
+        in buildRemoteWinTap(_inputState(), ViewerModifier.leftGui)) {
+      await _sendKeyWithBits(event.usage, event.down, event.modifiers);
+    }
+  }
+
+  Future<void> _sendSpecialAction(RemoteSpecialAction action) async {
+    if (!_inputActive) {
+      return;
+    }
+    if (action == RemoteSpecialAction.sas) {
+      bool queued = false;
+      try {
+        queued = await ViewerBridge.sendSas();
+      } on PlatformException {
+        queued = false;
+      } on MissingPluginException {
+        queued = false;
+      }
+      if (!queued && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪'),
+          duration: Duration(seconds: 3),
+        ));
+      }
+      return;
+    }
+    switch (action) {
+      case RemoteSpecialAction.win:
+        await _sendWinTap();
+        return;
+      case RemoteSpecialAction.altTab:
+        await _sendChord(<int>[0xE2], 0x2B);
+        return;
+      case RemoteSpecialAction.altF4:
+        await _sendChord(<int>[0xE2], 0x3D);
+        return;
+      case RemoteSpecialAction.taskManager:
+        await _sendChord(<int>[0xE0, 0xE1], 0x29);
+        return;
+      case RemoteSpecialAction.sas:
+        return;
+    }
+  }
+
+  String _sasCodeText(int code) {
+    if (code == ViewerSasCode.denied.code) {
+      return '主机未授予输入权限';
+    }
+    if (code == ViewerSasCode.unsupported.code) {
+      return '主机不支持发送 Ctrl+Alt+Del（托盘主机需改用服务运行）';
+    }
+    if (code == ViewerSasCode.failed.code) {
+      return '主机调用 SendSAS 失败';
+    }
+    return '主机未发送 Ctrl+Alt+Del';
   }
 
   // Input travels in captured-desktop pixels; the encoded picture may be
@@ -1217,7 +2056,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     switch (_status.state) {
       case ViewerState.idle:
       case ViewerState.connecting:
-        return '正在建立 QUIC 连接…';
+        return '正在建立连接…';
       case ViewerState.handshaking:
         return '正在协商视频流…';
       case ViewerState.streaming:
@@ -1313,7 +2152,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   )
                 else
                   const ColoredBox(color: Colors.black),
-                if (showOverlay)
+                if (_autoPolicy.waiting && showOverlay)
+                  _buildAutoReconnect(hasFrame)
+                else if (showOverlay)
                   _buildDisconnected(hasFrame)
                 else if (!hasFrame)
                   _buildWaiting(),
@@ -1337,6 +2178,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         fileActive: _status.fileActive,
                         audioAvailable: _status.acceptsAudio,
                         audioMuted: _status.audioMuted,
+                        audioDevice: _status.audioDevice,
+                        onLoadAudioOutputs: _loadAudioOutputs,
+                        onSelectAudioOutput: _selectAudioOutput,
+                        microphoneAvailable: _status.acceptsMicrophone,
+                        microphoneEnabled: _status.microphoneEnabled,
+                        microphoneDevice: _status.microphoneDevice,
+                        audioAec: _status.audioAec,
+                        audioNoiseSuppression: _status.audioNoiseSuppression,
+                        onLoadMicrophones: _loadMicrophones,
+                        onSelectMicrophone: _selectMicrophone,
+                        onSetAudioProcessing: _setAudioProcessing,
+                        privacyAvailable: _status.acceptsPrivacy,
+                        privacyEnabled: _status.privacyEnabled,
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
                         onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
@@ -1345,13 +2199,31 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                                 _status.displayModesCode == 0
                             ? _status.displayModes
                             : const <ViewerDisplayMode>[],
-                        modeChangeAvailable: _status.acceptsInput,
+                        modeChangeAvailable: _status.acceptsInput &&
+                            !_status.mergedLayout,
                         onSelectMode: (ViewerDisplayMode mode) =>
                             unawaited(_changeDisplayMode(mode)),
+                        streamOptionsAvailable: _status.isLive,
+                        streamCodec: _streamCodec,
+                        streamQuality: _streamQuality,
+                        streamMaxFps: _streamMaxFps,
+                        onSelectStreamCodec: (ViewerStreamCodec codec) =>
+                            unawaited(_changeStreamOptions(codec: codec)),
+                        onSelectStreamQuality: (ViewerStreamQuality quality) =>
+                            unawaited(_changeStreamOptions(quality: quality)),
+                        onSelectStreamFps: (int fps) =>
+                            unawaited(_changeStreamOptions(maxFps: fps)),
                         onToggleControl: _toggleControl,
+                        specialKeysAvailable: _inputActive,
+                        onSpecialAction: (RemoteSpecialAction action) =>
+                            unawaited(_sendSpecialAction(action)),
                         onToggleClipboard: _toggleClipboardSync,
                         onSendFile: () => unawaited(_sendFile()),
+                        chatOpen: _chatOpen,
+                        onToggleChat: _toggleChat,
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
+                        onToggleMicrophone: () => unawaited(_toggleMicrophone()),
+                        onTogglePrivacy: () => unawaited(_togglePrivacy()),
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
                         onToggleFullscreen: _toggleFullscreen,
@@ -1359,6 +2231,40 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onExpand: _expand,
                         onClose: _leave,
                         onFitChanged: _setFit,
+                      ),
+                    ),
+                  ),
+                if (hasFrame && !showOverlay && _status.secureDesktop)
+                  Positioned(
+                    top: 54,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: IgnorePointer(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 7),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.68),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: Colors.amber.withValues(alpha: 0.45)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              const Icon(Icons.lock_rounded,
+                                  size: 14, color: Colors.amberAccent),
+                              const SizedBox(width: 7),
+                              Text(
+                                _status.desktop == ViewerDesktopKind.secure
+                                    ? '主机已进入安全桌面（锁屏或 UAC），画面暂停'
+                                    : '主机暂时无法采集桌面（锁屏或 UAC），恢复后自动继续',
+                                style: const TextStyle(
+                                    color: Colors.white70, fontSize: 11),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -1391,43 +2297,90 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
-                if (hasFrame && !showOverlay && _status.fileActive)
+                if (hasFrame &&
+                    !showOverlay &&
+                    (_status.fileActive || _status.downloadActive))
                   Positioned(
                     left: 0,
                     right: 0,
                     bottom: 46,
-                    child: Center(child: _buildFileProgress()),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: <Widget>[
+                          if (_status.downloadActive) _buildDownloadProgress(),
+                          if (_status.downloadActive && _status.fileActive)
+                            const SizedBox(height: 6),
+                          if (_status.fileActive) _buildFileProgress(),
+                        ],
+                      ),
+                    ),
                   ),
-                if (hasFrame && !showOverlay && _status.acceptsAudio && _status.audioMuted)
+                if (hasFrame &&
+                    !showOverlay &&
+                    !_chatOpen &&
+                    (_status.privacyEnabled ||
+                        (_status.acceptsAudio && _status.audioMuted)))
                   Positioned(
                     right: 10,
                     bottom: 10,
                     child: IgnorePointer(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.55),
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: Colors.white12),
-                        ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: <Widget>[
-                            Icon(Icons.volume_off_rounded, size: 13, color: Colors.white54),
-                            SizedBox(width: 5),
-                            Text(
-                              '已静音',
-                              style: TextStyle(color: Colors.white54, fontSize: 10.5),
-                            ),
-                          ],
-                        ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: <Widget>[
+                          if (_status.privacyEnabled)
+                            _statusBadge(Icons.shield_rounded, '隐私模式'),
+                          if (_status.privacyEnabled &&
+                              _status.acceptsAudio &&
+                              _status.audioMuted)
+                            const SizedBox(height: 6),
+                          if (_status.acceptsAudio && _status.audioMuted)
+                            _statusBadge(Icons.volume_off_rounded, '已静音'),
+                        ],
                       ),
+                    ),
+                  ),
+                if (hasFrame && !showOverlay && _chatOpen)
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: ChatPanel(
+                      entries: _chatEntries,
+                      sent: _status.chatSent,
+                      received: _status.chatReceived,
+                      onSend: _sendChat,
+                      onClose: _closeChat,
+                      inputFocusNode: _chatInputFocus,
                     ),
                   ),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  /// A small bottom-right note for a state that does not stop the stream.
+  Widget _statusBadge(IconData icon, String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(icon, size: 13, color: Colors.white54),
+          const SizedBox(width: 5),
+          Text(
+            text,
+            style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+          ),
+        ],
       ),
     );
   }
@@ -1445,6 +2398,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     };
     final String detail = status.fileSize > 0
         ? '${_formatBytes(status.fileSent)} / ${_formatBytes(status.fileSize)}'
+        : '';
+    final String path = status.fileRelativePath.isEmpty
+        ? status.fileName
+        : '${status.fileRelativePath}/${status.fileName}';
+    // fileQueue counts the entry on screen too; the note is for the rest.
+    final String waiting = status.fileQueue > 1
+        ? '队列剩余 ${status.fileQueue - 1} 个'
         : '';
     return IgnorePointer(
       child: Container(
@@ -1465,7 +2425,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
-                    status.fileName,
+                    path,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(color: Colors.white70, fontSize: 10.5),
@@ -1483,6 +2443,81 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               borderRadius: BorderRadius.circular(2),
               child: LinearProgressIndicator(
                 value: sending ? status.fileProgress : null,
+                minHeight: 3,
+                backgroundColor: Colors.white12,
+                valueColor: const AlwaysStoppedAnimation<Color>(kAccentBright),
+              ),
+            ),
+            if (detail.isNotEmpty || waiting.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 4),
+              Row(
+                children: <Widget>[
+                  if (detail.isNotEmpty)
+                    Text(
+                      detail,
+                      style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                    ),
+                  if (waiting.isNotEmpty) ...<Widget>[
+                    const Spacer(),
+                    Text(
+                      waiting,
+                      style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The host's download, drawn below the upload when both run at once. The
+  /// bytes are already in the receive directory, so this only reports them.
+  Widget _buildDownloadProgress() {
+    final ViewerStatus status = _status;
+    final String detail = status.downloadSize > 0
+        ? '${_formatBytes(status.downloadReceived)} / '
+            '${_formatBytes(status.downloadSize)}'
+        : '';
+    return IgnorePointer(
+      child: Container(
+        width: 340,
+        padding: const EdgeInsets.fromLTRB(10, 8, 10, 9),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.62),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                const Icon(Icons.download_rounded, size: 13, color: Colors.white70),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    status.downloadName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white70, fontSize: 10.5),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Text(
+                  '正在接收',
+                  style: TextStyle(color: Colors.white38, fontSize: 9.5),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(2),
+              child: LinearProgressIndicator(
+                value: status.downloadProgress,
                 minHeight: 3,
                 backgroundColor: Colors.white12,
                 valueColor: const AlwaysStoppedAnimation<Color>(kAccentBright),
@@ -1561,6 +2596,77 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               label: const Text('取消连接'),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// Shown while an unexpected drop is waiting out its backoff. The native
+  /// session is already gone; the page only holds the texture and the tunnel
+  /// until the next attempt, so leaving remains safe and immediate.
+  Widget _buildAutoReconnect(bool hasFrame) {
+    final String detail = _status.error;
+    return Container(
+      color: hasFrame ? Colors.black.withValues(alpha: 0.55) : Colors.black,
+      child: Center(
+        child: Container(
+          width: 384,
+          padding: const EdgeInsets.fromLTRB(26, 26, 26, 22),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1C1D22),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: Colors.white12),
+            boxShadow: const <BoxShadow>[
+              BoxShadow(color: Color(0x80000000), blurRadius: 30, offset: Offset(0, 12)),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const SizedBox(
+                width: 30,
+                height: 30,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.4,
+                  color: kAccentBright,
+                  backgroundColor: Colors.white12,
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                '连接中断',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '正在自动重连（第 ${_autoPolicy.attempt}/${AutoReconnectPolicy.limit} 次）',
+                style: const TextStyle(color: Colors.white54, fontSize: 12.5),
+              ),
+              if (detail.isNotEmpty) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  detail,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                      color: Colors.white38, fontSize: 11.5, height: 1.4),
+                ),
+              ],
+              const SizedBox(height: 18),
+              TextButton.icon(
+                onPressed: _leave,
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white54,
+                  textStyle: const TextStyle(fontSize: 12),
+                ),
+                icon: const Icon(Icons.close_rounded, size: 15),
+                label: const Text('取消连接'),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -1872,4 +2978,23 @@ String _formatBytes(int bytes) {
     ++unit;
   }
   return '${value.toStringAsFixed(value >= 100 ? 0 : 1)} ${units[unit]}';
+}
+
+/// What the picture menu showed before an optimistic change, so a refused
+/// request can put it back.
+class _StreamOptionSnapshot {
+  const _StreamOptionSnapshot(this.codec, this.quality, this.maxFps);
+
+  final ViewerStreamCodec codec;
+  final ViewerStreamQuality quality;
+  final int maxFps;
+}
+
+ViewerStreamQuality _streamQualityFor(int code) {
+  for (final ViewerStreamQuality quality in ViewerStreamQuality.values) {
+    if (quality.code == code) {
+      return quality;
+    }
+  }
+  return ViewerStreamQuality.high;
 }

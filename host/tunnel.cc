@@ -211,6 +211,17 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     add(L"--key", widen(settings.tunnel_key));
     add(L"--local", L"127.0.0.1:" + std::to_wstring(local_port));
     add(L"--listen", widen(settings.tunnel_listen));
+    if (settings.carrier && local_port != 0 && local_port < 65535) {
+        // The carrier binds the same address as QUIC, but the agent always
+        // reaches it over loopback when QUIC listens on a wildcard.
+        const std::wstring carrier_host =
+            (settings.bind_address.empty() || settings.bind_address == "0.0.0.0" ||
+             settings.bind_address == "::")
+                ? L"127.0.0.1"
+                : widen(settings.bind_address);
+        add(L"--carrier",
+            carrier_host + L":" + std::to_wstring(static_cast<unsigned>(local_port) + 1));
+    }
     if (!settings.server_key.empty()) {
         add(L"--server-key", widen(settings.server_key));
     }

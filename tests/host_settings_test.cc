@@ -69,11 +69,13 @@ bool same_devices(const std::vector<chast::TrustedDevice>& a,
 }
 
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
-    return a.bind_address == b.bind_address && a.port == b.port &&
+    return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.allow_file_transfer == b.allow_file_transfer &&
            a.file_receive_directory == b.file_receive_directory &&
-           a.allow_audio == b.allow_audio && a.auth_mode == b.auth_mode &&
+           a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
+           a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
+           a.allow_privacy_mode == b.allow_privacy_mode && a.auth_mode == b.auth_mode &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
            a.allow_permission_change == b.allow_permission_change &&
@@ -92,11 +94,16 @@ void test_round_trip(const std::filesystem::path& dir) {
     chast::HostSettings settings;
     settings.bind_address = "192.168.1.5";
     settings.port = 6100;
+    settings.carrier = false;
     settings.allow_input = false;
     settings.allow_clipboard = false;
     settings.allow_file_transfer = false;
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
+    settings.allow_microphone = true;
+    settings.audio_device = "{0.0.1.00000000}.{5f3a2c1b-9d4e-4a6f-8b7c-1234567890ab}";
+    settings.audio_aec = false;
+    settings.allow_privacy_mode = true;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
     settings.password_hash =
@@ -151,6 +158,7 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.warning.empty(), "a missing file is not a warning");
     check(loaded.settings.port == 4433 && loaded.settings.bind_address == "0.0.0.0",
           "missing file yields the documented defaults");
+    check(loaded.settings.carrier, "a fresh host accepts the TCP/WebSocket fallback");
     check(loaded.settings.allow_input && loaded.settings.require_approval,
           "a fresh host accepts input behind an approval");
     check(loaded.settings.allow_clipboard, "a fresh host syncs the clipboard");
@@ -158,6 +166,11 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.file_receive_directory.empty(),
           "a fresh host uses the default receive directory");
     check(loaded.settings.allow_audio, "a fresh host shares the system sound");
+    check(!loaded.settings.allow_microphone,
+          "a fresh host does not accept the viewer microphone");
+    check(loaded.settings.audio_device.empty(), "a fresh host follows the default output");
+    check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
+    check(!loaded.settings.allow_privacy_mode, "a fresh host does not blank the local screen");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
     check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
@@ -186,6 +199,10 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "clipboard=perhaps\n"
                "file_transfer=perhaps\n"
                "audio=perhaps\n"
+               "audio_device=" + std::string(1100, 'd') + "\n"
+               "audio_aec=perhaps\n"
+               "microphone=perhaps\n"
+               "privacy_mode=perhaps\n"
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
@@ -211,6 +228,12 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.allow_clipboard, "an unparsable clipboard toggle keeps the default");
     check(settings.allow_file_transfer, "an unparsable file toggle keeps the default");
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
+    check(settings.audio_device.empty(), "an oversized output id is dropped");
+    check(settings.audio_aec, "an unparsable AEC toggle keeps the default");
+    check(!settings.allow_microphone,
+          "an unparsable microphone toggle keeps the private default");
+    check(!settings.allow_privacy_mode,
+          "an unparsable privacy toggle keeps the private default");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -227,7 +250,10 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
-                            "token_mode", "token", "codec", "bitrate_kbps", "framerate",
+                            "audio_device", "audio_aec", "microphone", "privacy_mode",
+                            "token_mode", "token", "codec",
+                            "bitrate_kbps",
+                            "framerate",
                             "quality", "display", "tunnel", "server_url", "server_key",
                             "tunnel_id", "tunnel_key", "tunnel_listen"}) {
         check(loaded.warning.find(key) != std::string::npos,
@@ -237,6 +263,22 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "unknown keys are accepted silently");
     check(loaded.warning.find("without '='") != std::string::npos,
           "a line without '=' is reported");
+}
+
+void test_audio_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "audio.ini";
+    write_text(path, "audio_device=\naudio_aec=off\n");
+    const chast::HostSettingsLoad empty = chast::load_host_settings(path.string());
+    check(empty.warning.empty() && empty.settings.audio_device.empty() &&
+              !empty.settings.audio_aec,
+          "an empty output id and AEC off load without warnings");
+
+    write_text(path, "audio_device={0.0.1.00000000}.{missing}\naudio_aec=1\n");
+    const chast::HostSettingsLoad pinned = chast::load_host_settings(path.string());
+    check(pinned.warning.empty() &&
+              pinned.settings.audio_device == "{0.0.1.00000000}.{missing}" &&
+              pinned.settings.audio_aec,
+          "a device id that is not plugged in is preserved for the session");
 }
 
 void test_tokens() {
@@ -285,7 +327,7 @@ void test_security_migration(const std::filesystem::path& dir) {
                "auth_mode=click\n"
                "approve=0\n"
                "token_auth=0\n"
-               "permissions=5\n"
+               "permissions=37\n"
                "input=0\n"
                "clipboard=1\n"
                "audio=0\n");
@@ -297,6 +339,8 @@ void test_security_migration(const std::filesystem::path& dir) {
     check(loaded.settings.allow_input && !loaded.settings.allow_clipboard &&
               loaded.settings.allow_audio && !loaded.settings.allow_file_transfer,
           "the permissions mask wins over the legacy switches");
+    check(loaded.settings.allow_privacy_mode,
+          "the permissions mask carries the privacy-mode grant");
 
     const std::filesystem::path broken = dir / "broken-security.ini";
     write_text(broken,
@@ -469,6 +513,7 @@ int main() {
     test_round_trip(dir);
     test_missing_file(dir);
     test_invalid_values(dir);
+    test_audio_settings(dir);
     test_tokens();
     test_security_migration(dir);
     test_totp_storage();

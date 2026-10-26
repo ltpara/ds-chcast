@@ -7,6 +7,7 @@ void main() {
   const ServerSettings configured = ServerSettings(
     url: 'http://chast.example:8443',
     mode: TunnelMode.relay,
+    key: 'dev-secret',
   );
 
   test('a bare id goes through the configured service', () {
@@ -16,6 +17,7 @@ void main() {
     expect(target.server, 'http://chast.example:8443');
     expect(target.hostId, 'devbox');
     expect(target.mode, TunnelMode.relay);
+    expect(target.serverKey, 'dev-secret');
     expect(target.token, 't');
     expect(target.label, 'devbox');
     expect(target.trustKey, 'server:http://chast.example:8443/devbox');
@@ -28,6 +30,7 @@ void main() {
     expect(target!.viaServer, isFalse);
     expect(target.host, '10.0.0.2');
     expect(target.port, 5555);
+    expect(target.serverKey, isEmpty);
     expect(target.trustKey, '10.0.0.2:5555');
   });
 

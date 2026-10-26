@@ -384,6 +384,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             } else {
                 settings.port = static_cast<uint16_t>(port);
             }
+        } else if (key == "carrier") {
+            if (!parse_bool(value, settings.carrier)) {
+                warn(result.warning, "carrier '" + value + "' is not a boolean");
+            }
         } else if (key == "input") {
             if (!parse_bool(value, settings.allow_input)) {
                 warn(result.warning, "input '" + value + "' is not a boolean");
@@ -401,6 +405,27 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         } else if (key == "audio") {
             if (!parse_bool(value, settings.allow_audio)) {
                 warn(result.warning, "audio '" + value + "' is not a boolean");
+            }
+        } else if (key == "microphone") {
+            if (!parse_bool(value, settings.allow_microphone)) {
+                warn(result.warning, "microphone '" + value + "' is not a boolean");
+            }
+        } else if (key == "privacy_mode") {
+            if (!parse_bool(value, settings.allow_privacy_mode)) {
+                warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
+            }
+        } else if (key == "audio_device") {
+            if (value.size() > 1024) {
+                warn(result.warning, "audio_device is too long; using the default output");
+            } else {
+                // An id that is missing right now is valid: the operator may
+                // have chosen a device that is currently unplugged, and the
+                // session reports audio unavailable rather than picking one.
+                settings.audio_device = value;
+            }
+        } else if (key == "audio_aec") {
+            if (!parse_bool(value, settings.audio_aec)) {
+                warn(result.warning, "audio_aec '" + value + "' is not a boolean");
             }
         } else if (key == "auth_mode") {
             HostAuthMode mode = HostAuthMode::Both;
@@ -597,7 +622,9 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_input = (permissions_mask & kPermissionInput) != 0;
         settings.allow_clipboard = (permissions_mask & kPermissionClipboard) != 0;
         settings.allow_audio = (permissions_mask & kPermissionAudio) != 0;
+        settings.allow_microphone = (permissions_mask & kPermissionMicrophone) != 0;
         settings.allow_file_transfer = (permissions_mask & kPermissionFileTransfer) != 0;
+        settings.allow_privacy_mode = (permissions_mask & kPermissionPrivacyMode) != 0;
     }
     return result;
 }
@@ -617,11 +644,14 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_input ? kPermissionInput : 0) |
         (settings.allow_clipboard ? kPermissionClipboard : 0) |
         (settings.allow_audio ? kPermissionAudio : 0) |
-        (settings.allow_file_transfer ? kPermissionFileTransfer : 0);
+        (settings.allow_microphone ? kPermissionMicrophone : 0) |
+        (settings.allow_file_transfer ? kPermissionFileTransfer : 0) |
+        (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
          << "port=" << settings.port << "\n"
+         << "carrier=" << (settings.carrier ? 1 : 0) << "\n"
          << "# security\n"
          << "auth_mode=" << auth_mode_name(settings.auth_mode) << "\n"
          << "password_hash=" << settings.password_hash << "\n"
@@ -637,6 +667,10 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
+         << "audio_device=" << settings.audio_device << "\n"
+         << "audio_aec=" << (settings.audio_aec ? 1 : 0) << "\n"
+         << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
+         << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

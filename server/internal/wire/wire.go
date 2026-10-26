@@ -13,14 +13,20 @@ import (
 const Magic = "CHASTC1\n"
 
 const (
-	TypeKeepalive    = "keepalive"
-	TypeKeepaliveAck = "keepalive_ack"
-	TypePunchRequest = "punch_request"
-	TypePunchPeer    = "punch_peer"
-	TypePunch        = "punch"
-	TypeRelayHello   = "relay_hello"
-	TypeRelayAck     = "relay_hello_ack"
-	TypeBusy         = "busy"
+	TypeKeepalive          = "keepalive"
+	TypeKeepaliveChallenge = "keepalive_challenge"
+	TypeKeepaliveAuth      = "keepalive_auth"
+	TypeKeepaliveAck       = "keepalive_ack"
+	TypePunchRequest       = "punch_request"
+	TypePunchPeer          = "punch_peer"
+	TypePunch              = "punch"
+	TypeRelayHello         = "relay_hello"
+	TypeRelayChallenge     = "relay_challenge"
+	TypeRelayAuth          = "relay_auth"
+	TypeRelayAck           = "relay_hello_ack"
+	TypeRelayViewer        = "relay_viewer"
+	TypeRelayViewerAck     = "relay_viewer_ack"
+	TypeBusy               = "busy"
 )
 
 // MaxControlSize bounds a control datagram. The agents use the same limit when
@@ -28,15 +34,23 @@ const (
 const MaxControlSize = 2048
 
 type Message struct {
-	Type      string `json:"type"`
-	HostID    string `json:"host_id,omitempty"`
-	KeyHash   string `json:"key_hash,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
-	Candidate string `json:"candidate,omitempty"`
-	Relay     string `json:"relay,omitempty"`
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-	ExpiresMS int64  `json:"expires_ms,omitempty"`
+	Type        string   `json:"type"`
+	HostID      string   `json:"host_id,omitempty"`
+	Nonce       string   `json:"nonce,omitempty"`
+	Candidate   string   `json:"candidate,omitempty"`
+	LocalAddrs  []string `json:"local_addrs,omitempty"`
+	NATType     string   `json:"nat_type,omitempty"`
+	Fingerprint string   `json:"fingerprint,omitempty"`
+	PublicKey   string   `json:"public_key,omitempty"`
+	Binding     string   `json:"binding,omitempty"`
+	Signature   string   `json:"signature,omitempty"`
+	Auth        string   `json:"auth,omitempty"`
+	Token       string   `json:"token,omitempty"`
+	Timestamp   int64    `json:"timestamp,omitempty"`
+	Relay       string   `json:"relay,omitempty"`
+	OK          bool     `json:"ok"`
+	Error       string   `json:"error,omitempty"`
+	ExpiresMS   int64    `json:"expires_ms,omitempty"`
 }
 
 var ErrNotControl = errors.New("not a control datagram")

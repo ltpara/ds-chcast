@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -30,6 +31,7 @@ struct ID3D11Texture2D;
 
 namespace chast {
 class DeviceIdentity;
+class FileReceiver;
 }
 
 namespace chast_viewer {
@@ -58,9 +60,21 @@ enum class ViewerState {
     kFailed,
 };
 
-// The viewer's single file upload, as the UI shows it. kHashing covers the
-// local SHA-256 pass that precedes the offer; the last two are terminal states
-// of the most recent attempt (the local file is never modified).
+// How the viewer reaches the host. Auto tries QUIC briefly, then the TCP
+// carrier and finally the WebSocket carrier; the forced modes skip the paths
+// before them, which lets a test or an operator choose one deliberately.
+// Every mode runs the same QUIC session, TLS and pinning end to end.
+enum class ViewerTransport {
+    kAuto,
+    kQuic,
+    kTcp,
+    kWebSocket,
+};
+
+// The viewer's upload queue, as the UI shows it. kHashing covers both waiting
+// for a folder to expand and the local SHA-256 pass that precedes the offer;
+// the last two are terminal states of the most recent attempt (the local file
+// is never modified).
 enum class FilePhase {
     kIdle = 0,
     kHashing = 1,
@@ -75,6 +89,12 @@ struct ViewerStatus {
     std::string error;
     std::string host;
     uint16_t port = 0;
+    // The path the session actually uses: "quic" (UDP), "tcp" or "ws". It is
+    // the requested mode while connecting and the settled path afterwards.
+    // transport_error carries the paths that were abandoned before this one,
+    // so the UI can say why it fell back.
+    std::string transport = "quic";
+    std::string transport_error;
     chast::VideoCodec codec = chast::VideoCodec::H264;
     // The encoded picture size, which is what the decoder produces and the
     // texture holds. `source_width`/`source_height` are the captured desktop
@@ -139,17 +159,36 @@ struct ViewerStatus {
     uint64_t clipboard_failed = 0;
     uint32_t clipboard_sent_formats = 0;
     uint32_t clipboard_received_formats = 0;
-    // The viewer's most recent upload. `file_phase` is a FilePhase value;
-    // `file_sent` counts bytes streamed in this attempt (resume offset
+    // The viewer's current or most recent upload. `file_phase` is a FilePhase
+    // value; `file_sent` counts bytes streamed in this attempt (resume offset
     // included). A failure keeps the local file in place and explains itself
-    // in `file_error`. The counters cover the whole session.
+    // in `file_error`. `file_relative_path` is the folder below the host's
+    // receive root and `file_queue` counts the entries not yet finished,
+    // including the current one. The counters cover the whole session.
     FilePhase file_phase = FilePhase::kIdle;
     std::string file_name;
+    std::string file_relative_path;
+    uint32_t file_queue = 0;
     uint64_t file_size = 0;
     uint64_t file_sent = 0;
     std::string file_error;
+    // The last entry that left the queue. The page pairs this name and reason
+    // with the counters below, because the active entry may already be the
+    // next file by the time it polls.
+    std::string last_file_name;
+    std::string last_file_error;
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
+    // The host's most recent download. The bytes are written to the receive
+    // directory as they arrive, so `download_received` counts bytes on disk;
+    // a resume starts at the partial length already on disk.
+    FilePhase download_phase = FilePhase::kIdle;
+    std::string download_name;
+    uint64_t download_size = 0;
+    uint64_t download_received = 0;
+    std::string download_error;
+    uint64_t files_received = 0;
+    uint64_t file_receive_failures = 0;
     // Pointer: updates received, and whether one is waiting for the UI. The
     // sprite is deliberately not part of ViewerStatus: it can be a quarter of
     // a megabyte and the UI polls the status four times a second, so it is
@@ -177,10 +216,76 @@ struct ViewerStatus {
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
     std::string audio_error;
+    // The playback endpoint the player is using: empty follows the default
+    // output. Selecting another one rebuilds the player but keeps the decoder
+    // and the last clock offset. `audio_device_name` is the endpoint's
+    // friendly name, or empty when the default (or an unavailable id) is in
+    // use; a fallback to the default after a failed open is explained in
+    // `audio_error`.
+    std::string audio_device;
+    std::string audio_device_name;
+    // Microphone processing switches, both on by default. AEC uses the system
+    // audio this viewer plays as its reference; changing either switch
+    // reopens the capture within one poll. The counters below cover the
+    // session and count near-end frames processed with each switch enabled.
+    bool audio_aec = true;
+    bool audio_noise_suppression = true;
+    uint64_t microphone_aec_frames = 0;
+    uint64_t microphone_ns_frames = 0;
+    // Microphone uplink to the host's speakers. `microphone_authorized`
+    // mirrors the host permission; `microphone_enabled` means the local
+    // capture thread and the CMIC stream are running. `microphone_device` is
+    // the endpoint id the capture is pinned to (empty selects the default
+    // communications device) and `microphone_name` is what the picker shows.
+    // Failures never touch video or system sound and explain themselves in
+    // `microphone_error`.
+    bool microphone_authorized = false;
+    bool microphone_enabled = false;
+    std::string microphone_device;
+    std::string microphone_name;
+    uint64_t microphone_packets = 0;
+    uint64_t microphone_dropped = 0;
+    uint64_t microphone_errors = 0;
+    uint64_t microphone_recoveries = 0;
+    bool microphone_recovering = false;
+    std::string microphone_error;
+    // Privacy mode hides the host's own screen while the stream continues.
+    // `privacy_supported` mirrors the host's permission; `privacy_enabled` is
+    // the overlay state from the most recent PrivacyModeState, and every
+    // session starts off. A refusal or a host-initiated disable explains itself
+    // in `privacy_error`; `privacy_updates` lets the UI pair an answer with the
+    // poll that saw it.
+    bool privacy_supported = false;
+    bool privacy_enabled = false;
+    int privacy_code = 0;
+    std::string privacy_error;
+    uint64_t privacy_updates = 0;
+    // Which desktop the host's video is capturing. Secure means the lock
+    // screen, UAC or a credential prompt is up; the picture pauses while the
+    // host cannot follow it and resumes when the user desktop returns.
+    chast::DesktopKind desktop = chast::DesktopKind::Default;
+    uint64_t desktop_updates = 0;
+    // Secure Attention Sequence (Ctrl+Alt+Del). The host answers every request
+    // with one SasResult; `sas_code` is that answer (0 = Ok), `sas_error` its
+    // explanation, and `sas_updates` lets the UI pair one answer with a poll.
+    int sas_code = 0;
+    std::string sas_error;
+    uint64_t sas_updates = 0;
+    // Session chat. Both directions are ungated once the host admits the
+    // viewer. `chat_error` explains a queued line that the transport then
+    // failed to send; inbound text is taken through TakeChat() so the status
+    // poll never carries conversation content.
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
+    uint64_t chat_failures = 0;
+    std::string chat_error;
     // What the server announced in HelloAck. `displays` is the list the UI's
-    // picker shows; the streamed entry is the one whose rect starts at
-    // origin_x/origin_y and matches width x height.
+    // picker shows; a single-display stream's entry is the one whose rect
+    // starts at origin_x/origin_y and matches width x height. `merged_layout`
+    // means the picture is the union of every listed display, so no entry
+    // describes the streamed surface and per-display mode changes are off.
     std::vector<chast::DisplayDescription> displays;
+    bool merged_layout = false;
     // Display switches the host accepted (including a request for the output
     // already streaming) and the refusals this engine learned about, plus the
     // host's reason for the most recent refusal. A success clears the error.
@@ -206,6 +311,17 @@ struct ViewerStatus {
     uint64_t display_mode_changes = 0;
     uint64_t display_mode_failures = 0;
     std::string display_mode_error;
+    // Stream preferences. `stream_quality` is the host's effective
+    // StreamQuality (0 = High); the effective codec and frame rate are the
+    // existing `codec`/`framerate`, which the host's StreamInfo also updates.
+    // `stream_option_code` is the StreamOptionsCode of the newest answer
+    // (0 = Ok) and `stream_option_error` its refusal reason; a success clears
+    // it. `stream_option_results` counts answers (including local send
+    // failures), so the UI can pair one answer with a poll.
+    int stream_quality = 0;
+    int stream_option_code = 0;
+    std::string stream_option_error;
+    uint64_t stream_option_results = 0;
 };
 
 class ViewerEngine {
@@ -224,7 +340,11 @@ public:
     // servers that do not gate access. `password` and `totp` answer an
     // interactive host's challenges; `device_identity` lets the host recognize
     // this viewer and skip two-factor, and `trust_device` asks it to remember
-    // the key after a successful sign-in. Fails when one is already running;
+    // the key after a successful sign-in. `transport` selects UDP or the
+    // TCP/WebSocket fallback; `carrier_host`/`carrier_port` name the fallback
+    // endpoint (empty host means `host`, port 0 means `port + 1`).
+    // `carrier_host_id`/`carrier_token` select a host on a shared carrier; they
+    // stay empty for a per-host relay port. Fails when one is already running;
     // call Stop() first to switch targets or displays.
     bool Start(const std::string& host, uint16_t port, uint16_t display,
                std::string pinned_fingerprint = {},
@@ -232,7 +352,10 @@ public:
                std::string access_token = {}, std::string password = {},
                std::string totp = {},
                std::shared_ptr<chast::DeviceIdentity> device_identity = {},
-               bool trust_device = false);
+               bool trust_device = false,
+               ViewerTransport transport = ViewerTransport::kAuto,
+               std::string carrier_host = {}, uint16_t carrier_port = 0,
+               std::string carrier_host_id = {}, std::string carrier_token = {});
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
@@ -265,17 +388,28 @@ public:
     // a newer one replaces an unsent one.
     bool SetDisplayMode(uint16_t display, uint16_t width, uint16_t height,
                         uint16_t refresh_hz);
+    // Queues stream preferences: encoder choice, frame-rate cap and quality
+    // preset. Returns false when no session is running or a value is outside
+    // its wire range. Accepted as soon as the session starts, before the first
+    // frame, so a page can re-apply its choices right after Start(). One
+    // request is kept: a newer one replaces an unsent one. The host answers
+    // through ViewerStatus::stream_option_code, and reports the values it
+    // actually runs in codec/framerate/stream_quality (so a refusal also
+    // returns the menus to reality). No input permission is required.
+    bool SetStreamOptions(chast::StreamCodecPreference codec, uint16_t max_fps,
+                          chast::StreamQuality quality);
     // Pauses or resumes the native rich-clipboard bridge. While paused neither
     // direction touches the local clipboard; resuming starts from a fresh
     // baseline, so whatever changed in between is not flushed to the host.
     // The host's own clipboard permission is applied on top of this.
     void SetClipboardSync(bool enabled);
-    // Queues one local file for upload (viewer -> host). Returns false when
-    // the session is not streaming, the host did not grant file transfer,
-    // another upload is still running, or the file is not a usable regular
-    // file. Hashing runs on its own thread; progress arrives through
-    // ViewerStatus::file_phase.
-    bool SendFile(const std::string& path);
+    // Queues local paths for upload (viewer -> host). Folders are expanded
+    // into their regular files, preserving the folder as the first relative
+    // directory component. Returns false when the session is not streaming,
+    // the host did not grant file transfer, or no path was usable. Hashing
+    // and folder walks run on the file worker; progress arrives through
+    // ViewerStatus::file_phase and the queue counters.
+    bool SendFiles(const std::vector<std::string>& paths);
 
     // Copies the newest pointer state the host sent, once per received update.
     // The sprite is only attached to the update that introduced a shape, so a
@@ -287,17 +421,66 @@ public:
     // pipeline is running, so the caller knows the tap had no effect.
     bool SetAudioMuted(bool mute);
 
+    // Turns the microphone uplink on or off. Opening the capture device and
+    // the CMIC stream happens on the session thread; switching off stops them
+    // and ends the stream immediately. Returns false when no session is
+    // running or the host did not grant kPermissionMicrophone (a revocation
+    // also clears the switch and reports why in microphone_error).
+    bool SetMicrophone(bool enabled);
+    // Pins the capture endpoint. Empty follows the default communications
+    // device. An open capture is reopened on the new id within one poll; the
+    // choice is kept for later switches. Returns false when no session is
+    // running.
+    bool SelectMicrophone(std::string device_id);
+
+    // Pins the playback endpoint. Empty follows the default output. A live
+    // player is rebuilt on the next poll with the same decoder and clock
+    // offset; an id that cannot be opened falls back to the default and
+    // explains itself in audio_error. Returns false when no session is
+    // running.
+    bool SelectAudioOutput(std::string device_id);
+    // Switches microphone echo cancellation and noise suppression. The
+    // capture reopens on the next poll (only when it is running), and the
+    // choices are kept for later sessions. Returns false when no session is
+    // running.
+    bool SetAudioProcessing(bool echo_cancellation, bool noise_suppression);
+
+    // Queues a request to hide (true) or restore (false) the host's physical
+    // display. Returns false when no session is streaming or the host did not
+    // grant kPermissionPrivacyMode. Only the newest request is kept; the answer
+    // arrives through ViewerStatus::privacy_enabled/privacy_code/privacy_error.
+    bool SetPrivacyMode(bool enabled);
+    // Queues one Ctrl+Alt+Del request. Returns false when no session is
+    // streaming or the host did not grant input control. The answer arrives
+    // through ViewerStatus::sas_code/sas_error/sas_updates; a newer request
+    // replaces one that has not been sent yet.
+    bool SendSas();
+
+    // Queues one UTF-8 chat line for the host. Returns false for empty or
+    // oversized text, when no session is streaming, or when the outgoing queue
+    // is full. Host lines are popped one at a time through TakeChat().
+    bool SendChat(const std::string& text);
+    // Pops the oldest line the host sent. Returns false when none is waiting.
+    bool TakeChat(std::string& text);
+
     ViewerStatus Snapshot() const;
 
 private:
     void Run(std::string host, uint16_t port, uint16_t display,
              std::string pinned_fingerprint, bool allow_unverified,
              std::string access_token, std::string password, std::string totp,
-             bool trust_device);
+             bool trust_device, ViewerTransport transport,
+             std::string carrier_host, uint16_t carrier_port,
+             std::string carrier_host_id, std::string carrier_token);
     void SetState(ViewerState state, std::string error = {});
-    // Hashes the queued file on its own thread, so a multi-gigabyte read never
-    // stalls the session's receive loop.
-    void HashPendingFile();
+    // Expands dropped folders and hashes queued uploads on its own thread, so
+    // a multi-gigabyte read never stalls the session's receive loop.
+    void FileWorker();
+    void ExpandUploadRoot(const std::string& root, uint64_t epoch);
+    bool EnqueueUpload(const std::string& path, std::string relative_path, uint64_t epoch);
+    void EnqueueUploadFailure(std::string name, std::string relative_path, std::string error,
+                              uint64_t epoch);
+    bool HasHashableUploadLocked() const;
 
     FrameSink* sink_;
     // Kept alive for the whole session because QuicClientConfig borrows it.
@@ -310,6 +493,32 @@ private:
     std::atomic<bool> running_{false};
     // Survives reconnects: the speaker stays off until the user turns it on.
     std::atomic<bool> audio_muted_{false};
+    // The microphone switch only crosses as a flag; the session thread owns
+    // the capture thread and the CMIC stream. Every session starts off, and a
+    // missing permission clears the flag rather than leaving it queued.
+    std::atomic<bool> microphone_wanted_{false};
+    mutable std::mutex microphone_mutex_;
+    std::string microphone_device_id_;
+    // The playback choice survives reconnects, like the microphone device.
+    mutable std::mutex audio_output_mutex_;
+    std::string audio_output_device_id_;
+    std::atomic<bool> microphone_aec_{true};
+    std::atomic<bool> microphone_noise_{true};
+
+    // Newest privacy request, for the same reason as the display switch: the
+    // operator wants the state they picked last, not a replay of every toggle.
+    mutable std::mutex privacy_mutex_;
+    std::optional<bool> pending_privacy_;
+    // SAS is an action, not a state: one pending request is enough, and a
+    // second tap replaces an unsent one instead of queueing a burst.
+    std::atomic<bool> pending_sas_{false};
+
+    // Chat crosses in both directions. The outgoing queue is bounded and
+    // cleared when a session starts; the session thread appends host lines for
+    // the UI to pop, dropping the newest when the UI falls too far behind.
+    mutable std::mutex chat_mutex_;
+    std::deque<std::string> pending_chat_;
+    std::deque<std::string> received_chat_;
 
     // Input crosses from the UI thread to the session thread here. The queue
     // is bounded: a stalled transport drops the newest events instead of
@@ -328,12 +537,13 @@ private:
     // the UI never moves clipboard bytes through Dart.
     std::atomic<bool> clipboard_sync_{true};
 
-    // The single upload and its hashing thread. `stage` is written by both the
-    // UI (SendFile resets it) and the session thread; fields are copied under
-    // the lock and the file itself is read outside it.
+    // Uploads wait in one queue. The session thread works on the front while
+    // the file worker expands folders and hashes upcoming entries; every
+    // field is read or written under file_mutex_. A terminal head is popped by
+    // the session thread after its counters have been accounted for.
     struct FileUpload {
         enum class Stage {
-            kNone,
+            kQueued,
             kHashing,
             kReady,
             kOffered,
@@ -342,9 +552,10 @@ private:
             kDone,
             kFailed,
         };
-        Stage stage = Stage::kNone;
+        Stage stage = Stage::kQueued;
         std::string path;
         std::string name;
+        std::string relative_path;
         uint64_t size = 0;
         uint64_t sent = 0;
         uint64_t resume_offset = 0;
@@ -352,10 +563,36 @@ private:
         uint32_t transfer_id = 0;
         std::string error;
     };
+    // The single incoming download. The session thread owns the receiver;
+    // the UI reads a snapshot under the same lock.
+    struct FileDownload {
+        enum class Stage {
+            kNone,
+            kReceiving,
+            kDone,
+            kFailed,
+        };
+        Stage stage = Stage::kNone;
+        uint32_t transfer_id = 0;
+        std::string name;
+        std::string path;
+        uint64_t size = 0;
+        uint64_t received = 0;
+        std::chrono::steady_clock::time_point answer_time;
+        std::unique_ptr<chast::FileReceiver> receiver;
+        std::string error;
+    };
     mutable std::mutex file_mutex_;
-    FileUpload file_;
-    std::thread hasher_;
-    std::atomic<bool> hash_cancel_{false};
+    std::condition_variable file_work_cv_;
+    std::deque<FileUpload> uploads_;
+    std::deque<std::string> pending_upload_roots_;
+    FileUpload last_upload_;
+    FileDownload download_;
+    std::thread file_worker_;
+    bool file_worker_stop_ = false;
+    // Bumped whenever the queue is purged; a worker that was walking a folder
+    // or hashing a file then discards its result instead of re-adding it.
+    uint64_t upload_epoch_ = 0;
     uint32_t next_file_id_ = 1;
 
     // Pointer state crosses the same way, but only the newest update is kept:
@@ -382,6 +619,11 @@ private:
     mutable std::mutex mode_mutex_;
     std::optional<uint16_t> pending_mode_list_;
     std::optional<PendingMode> pending_mode_set_;
+
+    // Stream preferences are a snapshot, not a queue: the operator wants the
+    // menu's last choice applied, not every intermediate one.
+    mutable std::mutex stream_option_mutex_;
+    std::optional<chast::StreamOptions> pending_stream_options_;
 };
 
 }  // namespace chast_viewer

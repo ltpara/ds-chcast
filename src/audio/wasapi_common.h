@@ -9,6 +9,7 @@
 #include <audioclient.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
+#include <propsys.h>
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -195,6 +196,58 @@ inline AVChannelLayout input_layout(const MixFormat& format) {
         av_channel_layout_default(&layout, format.channels);
     }
     return layout;
+}
+
+inline std::wstring widen_utf8(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                         static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) {
+        return {};
+    }
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                        static_cast<int>(text.size()), wide.data(), size);
+    return wide;
+}
+
+inline std::string narrow_utf8(const wchar_t* text) {
+    if (!text || !*text) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) {
+        return {};
+    }
+    std::string narrow(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow.data(), size, nullptr, nullptr);
+    return narrow;
+}
+
+// PKEY_Device_FriendlyName, spelled out so callers do not need the
+// function-discovery header's full property-key list.
+inline constexpr PROPERTYKEY kFriendlyNameKey = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+
+inline std::string friendly_name(IMMDevice* device) {
+    if (!device) {
+        return {};
+    }
+    ComPtr<IPropertyStore> store;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, store.put()))) {
+        return {};
+    }
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    std::string name;
+    if (SUCCEEDED(store->GetValue(kFriendlyNameKey, &value)) &&
+        value.vt == VT_LPWSTR) {
+        name = narrow_utf8(value.pwszVal);
+    }
+    PropVariantClear(&value);
+    return name;
 }
 
 }  // namespace chast::wasapi

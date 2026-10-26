@@ -38,10 +38,12 @@ void main() {
     await store.save(const ServerSettings(
       url: 'https://chast.example/',
       mode: TunnelMode.relay,
+      key: 'dev-secret',
     ));
     final ServerSettings loaded = await store.load();
     expect(loaded.url, 'https://chast.example');
     expect(loaded.mode, TunnelMode.relay);
+    expect(loaded.key, 'dev-secret');
     expect(loaded.configured, isTrue);
   });
 
@@ -54,5 +56,6 @@ void main() {
     final ServerSettings loaded = await ServerSettingsStore(file: file).load();
     expect(loaded.configured, isFalse);
     expect(loaded.mode, TunnelMode.auto);
+    expect(loaded.key, isEmpty);
   });
 }

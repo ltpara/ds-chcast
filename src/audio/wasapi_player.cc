@@ -12,7 +12,9 @@
 // If the endpoint disappears or the default output changes, the renderer
 // rebuilds itself on the new default and keeps decoding: only this thread
 // touches the endpoint, so the session and the audio stream stay up while it
-// retries. The first block after every start, gap or reopen is faded in.
+// retries. A pinned device is retried by id instead, so a user's explicit
+// output choice never follows Windows' default. The first block after every
+// start, gap or reopen is faded in.
 
 #include "chast/audio.h"
 
@@ -242,10 +244,28 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
     }
 
     ComPtr<IMMDevice> device;
-    HRESULT hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, device.put());
-    if (FAILED(hr)) {
-        *error = wasapi::error_from_hresult(hr, "GetDefaultAudioEndpoint").to_string();
-        return false;
+    HRESULT hr = S_OK;
+    if (!config_.device_id.empty()) {
+        const std::wstring wanted = wasapi::widen_utf8(config_.device_id);
+        if (wanted.empty()) {
+            *error = "the selected playback device id is not valid UTF-8";
+            return false;
+        }
+        hr = enumerator_->GetDevice(wanted.c_str(), device.put());
+        if (FAILED(hr)) {
+            *error = wasapi::error_from_hresult(hr, "GetDevice(audio player)").to_string();
+            return false;
+        }
+        if (!wasapi::device_active(device.get())) {
+            *error = "the selected playback device is not active";
+            return false;
+        }
+    } else {
+        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, device.put());
+        if (FAILED(hr)) {
+            *error = wasapi::error_from_hresult(hr, "GetDefaultAudioEndpoint").to_string();
+            return false;
+        }
     }
     ComPtr<IAudioClient> client;
     hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
@@ -387,6 +407,11 @@ void WasapiPlayer::close_endpoint() {
 bool WasapiPlayer::default_device_changed() {
     if (!wasapi::device_active(device_.get())) {
         return true;
+    }
+    if (!config_.device_id.empty()) {
+        // Pinned endpoint: retry the same device rather than moving playback
+        // somewhere the user did not choose.
+        return false;
     }
     if (device_id_.empty()) {
         return false;
@@ -763,6 +788,15 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             // waiting for the first probe.
             offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
             have_offset_.store(true);
+        } else if (config_.arrival_anchored && last_end_local_ms_ > 0 &&
+                   wasapi::now_ms() > last_end_local_ms_ + 100) {
+            // Microphone bursts carry the sender's clock and have no
+            // LatencyReply. After a stall the old offset would place every
+            // queued block in the past; re-anchor the new burst at arrival and
+            // let the renderer drop what is left of the stale one.
+            offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
+            queue_.clear();
+            queued_frames_ = 0;
         }
         Block block;
         block.pcm = std::move(pcm);
@@ -789,6 +823,9 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
 }
 
 void WasapiPlayer::set_clock_offset(int64_t host_minus_local_ms) {
+    if (config_.arrival_anchored) {
+        return;
+    }
     offset_ms_.store(host_minus_local_ms);
     have_offset_.store(true);
     if (event_) {
@@ -838,6 +875,71 @@ void WasapiPlayer::fail(const std::string& message) {
 }
 
 }  // namespace
+
+std::vector<AudioOutputDevice> list_audio_outputs(std::string* error) {
+    std::vector<AudioOutputDevice> devices;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        if (error) {
+            *error = wasapi::error_from_hresult(hr, "CoInitializeEx(outputs)").to_string();
+        }
+        return devices;
+    }
+
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                          IID_PPV_ARGS(enumerator.put()));
+    if (FAILED(hr)) {
+        if (error) {
+            *error = wasapi::error_from_hresult(hr, "MMDeviceEnumerator").to_string();
+        }
+        if (uninitialize) {
+            CoUninitialize();
+        }
+        return devices;
+    }
+    const std::wstring default_id = wasapi::default_render_device_id(enumerator.get());
+
+    ComPtr<IMMDeviceCollection> collection;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, collection.put());
+    if (FAILED(hr)) {
+        if (error) {
+            *error = wasapi::error_from_hresult(hr, "EnumAudioEndpoints(render)").to_string();
+        }
+        if (uninitialize) {
+            CoUninitialize();
+        }
+        return devices;
+    }
+    UINT32 count = 0;
+    if (SUCCEEDED(collection->GetCount(&count))) {
+        devices.reserve(count);
+        for (UINT32 i = 0; i < count; ++i) {
+            ComPtr<IMMDevice> device;
+            if (FAILED(collection->Item(i, device.put()))) {
+                continue;
+            }
+            AudioOutputDevice entry;
+            const std::wstring id = wasapi::device_id(device.get());
+            entry.id = wasapi::narrow_utf8(id.c_str());
+            entry.name = wasapi::friendly_name(device.get());
+            if (entry.name.empty()) {
+                entry.name = "Output " + std::to_string(i + 1);
+            }
+            entry.is_default = !default_id.empty() && id == default_id;
+            devices.push_back(std::move(entry));
+        }
+    }
+    std::stable_sort(devices.begin(), devices.end(),
+                     [](const AudioOutputDevice& left, const AudioOutputDevice& right) {
+                         return left.is_default && !right.is_default;
+                     });
+    if (uninitialize) {
+        CoUninitialize();
+    }
+    return devices;
+}
 
 std::unique_ptr<IAudioPlayer> create_audio_player(const AudioPlayerConfig& config,
                                                   std::string* error) {

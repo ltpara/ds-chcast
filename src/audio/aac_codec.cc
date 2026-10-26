@@ -1,16 +1,13 @@
-// AAC-LC codec through FFmpeg's native encoder and decoder.
+// AAC-LC decoder through FFmpeg, retained for the protocol enum and any
+// AudioInfo that still names AAC. chast never encodes AAC: system sound and
+// microphone both use the standalone Opus encoder (opus_codec.cc).
 //
-// Only the compressed access units cross this boundary; the PCM that goes in
-// and comes out is s16 interleaved because that is what WASAPI hands over in
-// the common mix formats and what the player schedules. libswresample does the
-// planar/interleaved conversion, and on the player side also adapts the host's
-// rate and channel count to whatever endpoint the viewer has.
+// Only the compressed access units cross this boundary; the PCM that comes out
+// is s16 interleaved because that is what the player schedules. libswresample
+// adapts the host's rate and channel count to whatever endpoint the viewer has.
 //
-// Timestamps are assigned here, not borrowed from FFmpeg: the native AAC
-// encoder's packet pts is not a stable real-time clock across flush and gap
-// handling, while the capture timeline is. Each packet therefore carries the
-// host steady-clock time of its first sample, derived from the caller's
-// capture_ms and the number of samples already encoded.
+// The decoder still removes FFmpeg's fixed 1024-sample priming on the first
+// block, so a viewer that joins mid-stream starts on the announced timeline.
 
 #include "chast/audio.h"
 
@@ -27,7 +24,6 @@ extern "C" {
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <deque>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -36,8 +32,6 @@ extern "C" {
 namespace chast {
 
 namespace {
-
-constexpr int64_t kGapThresholdUs = 100 * 1000;
 
 Error av_error(int code, std::string_view what) {
     char text[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -48,331 +42,6 @@ Error av_error(int code, std::string_view what) {
 
 std::string channels_text(uint16_t channels) {
     return channels == 1 ? "mono" : std::to_string(channels) + " channels";
-}
-
-class AacEncoder final : public IAudioEncoder {
-public:
-    explicit AacEncoder(AudioEncoderConfig config) : config_(config) {}
-    ~AacEncoder() override { close(); }
-
-    Error open();
-    Error encode(const int16_t* samples, size_t frames, uint64_t capture_ms,
-                 std::vector<EncodedAudio>& out) override;
-    Error flush(std::vector<EncodedAudio>& out) override;
-
-    uint32_t sample_rate() const noexcept override { return config_.sample_rate; }
-    uint16_t channels() const noexcept override { return config_.channels; }
-    uint16_t frame_samples() const noexcept override { return frame_size_; }
-    uint32_t bitrate() const noexcept override { return config_.bitrate; }
-    const std::vector<uint8_t>& extradata() const noexcept override { return extradata_; }
-
-private:
-    void close();
-    Error encode_frame(const int16_t* samples, uint64_t pts_ms,
-                       std::vector<EncodedAudio>& out);
-    Error drain(std::vector<EncodedAudio>& out);
-    Error pad_pending(std::vector<EncodedAudio>& out);
-    size_t pending_frames() const {
-        return pending_.size() / config_.channels - pending_offset_;
-    }
-    const int16_t* pending_data() const {
-        return pending_.data() + pending_offset_ * config_.channels;
-    }
-    int64_t pending_duration_us() const {
-        return pending_frames() * 1000000 / config_.sample_rate;
-    }
-    void compact_pending();
-
-    AudioEncoderConfig config_;
-    const AVCodec* codec_ = nullptr;
-    AVCodecContext* context_ = nullptr;
-    AVFrame* frame_ = nullptr;
-    AVPacket* packet_ = nullptr;
-    SwrContext* swr_ = nullptr;
-    std::vector<uint8_t> extradata_;
-
-    std::vector<int16_t> pending_;
-    size_t pending_offset_ = 0;  // in frames
-    int64_t pending_start_us_ = 0;
-    bool have_start_ = false;
-    bool flushed_ = false;
-    uint16_t frame_size_ = 0;
-    uint64_t frame_duration_ms_ = 0;
-
-    // The native AAC encoder delays its output, so a packet returned by
-    // receive_packet() belongs to an earlier submitted frame. The queue keeps
-    // one timestamp per accepted frame; packets pop from the front.
-    std::deque<uint64_t> packet_times_;
-    uint64_t last_packet_ms_ = 0;
-};
-
-Error AacEncoder::open() {
-    if (config_.channels < 1 || config_.channels > 2) {
-        return Error(Status::Unsupported,
-                     "AAC capture supports mono or stereo, not " +
-                         channels_text(config_.channels));
-    }
-    if (config_.sample_rate < 8000 || config_.sample_rate > 96000) {
-        return Error(Status::Unsupported,
-                     "the device mixes at " + std::to_string(config_.sample_rate) +
-                         " Hz, which this AAC encoder cannot represent");
-    }
-
-    codec_ = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    if (!codec_) {
-        return Error(Status::Unsupported, "this FFmpeg build has no AAC encoder");
-    }
-    context_ = avcodec_alloc_context3(codec_);
-    packet_ = av_packet_alloc();
-    frame_ = av_frame_alloc();
-    if (!context_ || !packet_ || !frame_) {
-        return Error(Status::CaptureFailed, "FFmpeg AAC encoder allocation failed");
-    }
-
-    context_->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    context_->sample_rate = static_cast<int>(config_.sample_rate);
-    context_->bit_rate = static_cast<int64_t>(config_.bitrate);
-    context_->profile = AV_PROFILE_AAC_LOW;
-    context_->time_base = AVRational{1, static_cast<int>(config_.sample_rate)};
-    context_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    // One frame in flight keeps encode() synchronous; a thread pool would only
-    // add latency to a 21 ms access unit.
-    context_->thread_count = 1;
-    av_channel_layout_default(&context_->ch_layout, config_.channels);
-
-    int status = avcodec_open2(context_, codec_, nullptr);
-    if (status < 0) {
-        return av_error(status, "avcodec_open2(AAC encoder)");
-    }
-    if (context_->frame_size != static_cast<int>(kAudioFrameSamples)) {
-        return Error(Status::Unsupported,
-                     "the AAC encoder uses " + std::to_string(context_->frame_size) +
-                         " samples per frame, the protocol requires " +
-                         std::to_string(kAudioFrameSamples));
-    }
-    frame_size_ = static_cast<uint16_t>(context_->frame_size);
-    frame_duration_ms_ = (static_cast<uint64_t>(frame_size_) * 1000 +
-                          config_.sample_rate / 2) /
-                         config_.sample_rate;
-    if (frame_duration_ms_ == 0) {
-        frame_duration_ms_ = 1;
-    }
-    if (context_->extradata_size <= 0 ||
-        static_cast<size_t>(context_->extradata_size) > kMaxAudioExtradata) {
-        return Error(Status::CaptureFailed,
-                     "the AAC encoder produced no usable AudioSpecificConfig");
-    }
-    extradata_.assign(context_->extradata,
-                      context_->extradata + context_->extradata_size);
-
-    AVChannelLayout in_layout;
-    AVChannelLayout out_layout;
-    av_channel_layout_default(&in_layout, config_.channels);
-    av_channel_layout_default(&out_layout, config_.channels);
-    status = swr_alloc_set_opts2(&swr_, &out_layout, context_->sample_fmt,
-                                 context_->sample_rate, &in_layout, AV_SAMPLE_FMT_S16,
-                                 context_->sample_rate, 0, nullptr);
-    av_channel_layout_uninit(&in_layout);
-    av_channel_layout_uninit(&out_layout);
-    if (status < 0 || !swr_) {
-        return av_error(status < 0 ? status : AVERROR(ENOMEM), "swr_alloc_set_opts2");
-    }
-    status = swr_init(swr_);
-    if (status < 0) {
-        return av_error(status, "swr_init");
-    }
-    return Error::success();
-}
-
-void AacEncoder::close() {
-    if (swr_) {
-        swr_free(&swr_);
-    }
-    if (frame_) {
-        av_frame_free(&frame_);
-    }
-    if (packet_) {
-        av_packet_free(&packet_);
-    }
-    if (context_) {
-        avcodec_free_context(&context_);
-    }
-}
-
-void AacEncoder::compact_pending() {
-    if (pending_offset_ == 0) {
-        return;
-    }
-    const size_t frames = pending_frames();
-    if (frames == 0) {
-        pending_.clear();
-        pending_offset_ = 0;
-        return;
-    }
-    std::memmove(pending_.data(), pending_data(),
-                 frames * config_.channels * sizeof(int16_t));
-    pending_.resize(frames * config_.channels);
-    pending_offset_ = 0;
-}
-
-Error AacEncoder::encode(const int16_t* samples, size_t frames, uint64_t capture_ms,
-                         std::vector<EncodedAudio>& out) {
-    if (flushed_) {
-        return Error(Status::InvalidCall, "encode after the AAC encoder was flushed");
-    }
-    if (!samples && frames > 0) {
-        return Error(Status::InvalidCall, "the AAC encoder needs samples");
-    }
-    if (frames == 0) {
-        return Error::success();
-    }
-
-    const int64_t start_us = static_cast<int64_t>(capture_ms) * 1000;
-    if (have_start_) {
-        const int64_t expected_us =
-            pending_start_us_ + pending_duration_us();
-        if (start_us > expected_us + kGapThresholdUs) {
-            // The loopback was idle: close the partial frame so the timeline
-            // resumes at the real capture time instead of drifting behind.
-            Error padded = pad_pending(out);
-            if (!padded.ok()) {
-                return padded;
-            }
-            have_start_ = false;
-        }
-    }
-    if (!have_start_) {
-        pending_start_us_ = start_us;
-        have_start_ = true;
-    }
-
-    compact_pending();
-    const size_t old_frames = pending_frames();
-    pending_.resize((old_frames + frames) * config_.channels);
-    std::memcpy(pending_.data() + old_frames * config_.channels, samples,
-                frames * config_.channels * sizeof(int16_t));
-
-    while (pending_frames() >= frame_size_) {
-        const uint64_t pts_ms =
-            static_cast<uint64_t>((pending_start_us_ + 500) / 1000);
-        Error encoded = encode_frame(pending_data(), pts_ms, out);
-        if (!encoded.ok()) {
-            return encoded;
-        }
-        pending_offset_ += frame_size_;
-        pending_start_us_ +=
-            static_cast<int64_t>(frame_size_) * 1000000 / config_.sample_rate;
-    }
-    compact_pending();
-    return Error::success();
-}
-
-Error AacEncoder::pad_pending(std::vector<EncodedAudio>& out) {
-    while (pending_frames() > 0) {
-        const size_t fill = frame_size_ - pending_frames();
-        const size_t old_frames = pending_frames();
-        pending_.resize((old_frames + fill) * config_.channels, 0);
-        const uint64_t pts_ms = static_cast<uint64_t>((pending_start_us_ + 500) / 1000);
-        Error encoded = encode_frame(pending_data(), pts_ms, out);
-        if (!encoded.ok()) {
-            return encoded;
-        }
-        pending_offset_ += frame_size_;
-        pending_start_us_ +=
-            static_cast<int64_t>(frame_size_) * 1000000 / config_.sample_rate;
-    }
-    compact_pending();
-    return Error::success();
-}
-
-Error AacEncoder::encode_frame(const int16_t* samples, uint64_t pts_ms,
-                               std::vector<EncodedAudio>& out) {
-    av_frame_unref(frame_);
-    frame_->nb_samples = frame_size_;
-    frame_->format = context_->sample_fmt;
-    frame_->sample_rate = context_->sample_rate;
-    frame_->pts = static_cast<int64_t>(pts_ms);
-    int status = av_channel_layout_copy(&frame_->ch_layout, &context_->ch_layout);
-    if (status < 0) {
-        return av_error(status, "av_channel_layout_copy");
-    }
-    status = av_frame_get_buffer(frame_, 0);
-    if (status < 0) {
-        return av_error(status, "av_frame_get_buffer");
-    }
-
-    const uint8_t* input = reinterpret_cast<const uint8_t*>(samples);
-    const int converted = swr_convert(swr_, frame_->extended_data, frame_size_, &input,
-                                      static_cast<int>(frame_size_));
-    if (converted < 0) {
-        return av_error(converted, "swr_convert(AAC input)");
-    }
-    if (converted < frame_size_) {
-        for (int channel = 0; channel < config_.channels; ++channel) {
-            auto* plane = reinterpret_cast<float*>(frame_->extended_data[channel]);
-            std::fill(plane + converted, plane + frame_size_, 0.0f);
-        }
-    }
-
-    for (;;) {
-        status = avcodec_send_frame(context_, frame_);
-        if (status != AVERROR(EAGAIN)) {
-            break;
-        }
-        Error drained = drain(out);
-        if (!drained.ok()) {
-            return drained;
-        }
-    }
-    if (status < 0) {
-        return av_error(status, "avcodec_send_frame(AAC)");
-    }
-    packet_times_.push_back(pts_ms);
-    return drain(out);
-}
-
-Error AacEncoder::drain(std::vector<EncodedAudio>& out) {
-    for (;;) {
-        const int status = avcodec_receive_packet(context_, packet_);
-        if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) {
-            return Error::success();
-        }
-        if (status < 0) {
-            return av_error(status, "avcodec_receive_packet(AAC)");
-        }
-        uint64_t pts_ms = last_packet_ms_;
-        if (!packet_times_.empty()) {
-            pts_ms = packet_times_.front();
-            packet_times_.pop_front();
-        } else if (last_packet_ms_ > 0) {
-            // The AAC encoder can emit one more packet than it consumed (its
-            // priming/delay frame). That packet follows the last timestamped
-            // frame on the timeline.
-            pts_ms = last_packet_ms_ + frame_duration_ms_;
-        }
-        last_packet_ms_ = pts_ms;
-        EncodedAudio packet;
-        packet.data.assign(packet_->data, packet_->data + packet_->size);
-        packet.capture_ms = pts_ms;
-        out.push_back(std::move(packet));
-        av_packet_unref(packet_);
-    }
-}
-
-Error AacEncoder::flush(std::vector<EncodedAudio>& out) {
-    if (flushed_) {
-        return Error::success();
-    }
-    flushed_ = true;
-    Error padded = pad_pending(out);
-    if (!padded.ok()) {
-        return padded;
-    }
-    const int status = avcodec_send_frame(context_, nullptr);
-    if (status < 0 && status != AVERROR_EOF) {
-        return av_error(status, "avcodec_send_frame(AAC flush)");
-    }
-    return drain(out);
 }
 
 class AacDecoder final : public IAudioDecoder {
@@ -616,19 +285,6 @@ Error AacDecoder::flush(std::vector<DecodedAudio>& out) {
 }
 
 }  // namespace
-
-std::unique_ptr<IAudioEncoder> create_aac_encoder(const AudioEncoderConfig& config,
-                                                  std::string* error) {
-    auto encoder = std::make_unique<AacEncoder>(config);
-    Error opened = encoder->open();
-    if (!opened.ok()) {
-        if (error) {
-            *error = opened.to_string();
-        }
-        return nullptr;
-    }
-    return encoder;
-}
 
 std::unique_ptr<IAudioDecoder> create_aac_decoder(const AudioInfo& info, std::string* error) {
     auto decoder = std::make_unique<AacDecoder>(info);

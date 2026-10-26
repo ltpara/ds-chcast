@@ -14,6 +14,7 @@ namespace {
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"chast-host";
 constexpr wchar_t kHostRuleName[] = L"chast host";
+constexpr wchar_t kHostTcpRuleName[] = L"chast host tcp";
 constexpr wchar_t kTunnelRuleName[] = L"chast tunnel";
 
 bool run_hidden(const std::wstring& command, DWORD* exit_code) {
@@ -96,7 +97,8 @@ bool set_autostart(bool enabled, std::string* error) {
     return true;
 }
 
-int add_firewall_rule(const wchar_t* name, const std::wstring& executable, uint16_t port) {
+int add_firewall_rule(const wchar_t* name, const std::wstring& executable, uint16_t port,
+                      const wchar_t* protocol) {
     const std::wstring netsh = L"netsh.exe";
     // A rule with the same name is replaced rather than duplicated, and the
     // program scope keeps every other binary out.
@@ -105,7 +107,7 @@ int add_firewall_rule(const wchar_t* name, const std::wstring& executable, uint1
     const std::wstring add =
         netsh + L" advfirewall firewall add rule name=\"" + name +
         L"\" dir=in action=allow program=\"" + executable +
-        L"\" protocol=UDP localport=" + std::to_wstring(port) +
+        L"\" protocol=" + protocol + L" localport=" + std::to_wstring(port) +
         L" profile=any enable=yes";
     DWORD code = 1;
     if (!run_hidden(add, &code)) {
@@ -115,26 +117,41 @@ int add_firewall_rule(const wchar_t* name, const std::wstring& executable, uint1
 }
 
 int apply_firewall_rule(uint16_t port, uint16_t tunnel_port) {
-    // Drop the tunnel rule first so disabling the service does not leave a
+    // Drop the tunnel and TCP rules first so disabling them does not leave a
     // stale allowance behind.
     DWORD ignored = 0;
     run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
                    std::wstring(kTunnelRuleName) + L"\"",
                &ignored);
-    const int host_code = add_firewall_rule(kHostRuleName, executable_path(), port);
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kHostTcpRuleName) + L"\"",
+               &ignored);
+    const int host_code = add_firewall_rule(kHostRuleName, executable_path(), port, L"UDP");
     if (host_code != 0) {
         return host_code;
+    }
+    // The TCP/WebSocket fallback listens on the next port; port 65535 has no
+    // adjacent port and the host cannot start it there either.
+    if (port < 65535) {
+        const int carrier_code = add_firewall_rule(kHostTcpRuleName, executable_path(),
+                                                   static_cast<uint16_t>(port + 1), L"TCP");
+        if (carrier_code != 0) {
+            return carrier_code;
+        }
     }
     if (tunnel_port == 0) {
         return 0;
     }
-    return add_firewall_rule(kTunnelRuleName, tunnel_executable(), tunnel_port);
+    return add_firewall_rule(kTunnelRuleName, tunnel_executable(), tunnel_port, L"UDP");
 }
 
 void remove_firewall_rules() {
     DWORD ignored = 0;
     run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
                    std::wstring(kHostRuleName) + L"\"",
+               &ignored);
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kHostTcpRuleName) + L"\"",
                &ignored);
     run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
                    std::wstring(kTunnelRuleName) + L"\"",

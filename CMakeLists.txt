@@ -62,7 +62,8 @@ add_library(chast.dxgi STATIC
     src/capture/rotation_pass.cc
     src/capture/nv12_pass.cc
     src/capture/cursor.cc
-    src/capture/dxgi_capturer.cc)
+    src/capture/dxgi_capturer.cc
+    src/capture/merged_capturer.cc)
 
 target_include_directories(chast.dxgi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.dxgi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -82,6 +83,18 @@ target_link_libraries(chast.dxgi PUBLIC
 
 target_link_options(chast.dxgi PUBLIC "/DELAYLOAD:d3dcompiler_47.dll")
 
+# Standalone Opus from vcpkg. FFmpeg's static build also registers an Opus
+# decoder, so its registry still needs these symbols, but chast calls
+# opus_encode/opus_decode itself through Opus::opus instead of the libopus
+# wrapper inside FFmpeg.
+if(NOT DEFINED OPUS_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static/share/opus")
+    set(OPUS_ROOT "D:/vcpkg/installed/x64-windows-static" CACHE PATH "Opus install prefix")
+endif()
+if(DEFINED OPUS_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH "${OPUS_ROOT}")
+endif()
+find_package(Opus CONFIG REQUIRED)
+
 # FFmpeg static build for hardware decoding. D3D11VA lives in libavutil and
 # libavcodec supplies the H.264/HEVC decoders; vcpkg's x64-windows-static
 # triplet ships both, so the receiver needs no FFmpeg DLLs at run time.
@@ -99,7 +112,7 @@ target_link_libraries(chast.ffmpeg PUBLIC
     "${FFMPEG_ROOT}/lib/swresample.lib"
     # avcodec's codec registry pulls the Opus objects, which are the only
     # external codec in this static build.
-    "${FFMPEG_ROOT}/lib/opus.lib"
+    Opus::opus
     VPL::dispatcher
     mfuuid
     strmiids
@@ -109,6 +122,8 @@ target_link_libraries(chast.ffmpeg PUBLIC
 # dependency on the vendor runtime; it consumes what the capturer publishes.
 # The decoder is FFmpeg D3D11VA; the oneVPL decoder is shelved in favour of it.
 add_library(chast.codec STATIC
+    src/codec/encoder_factory.cc
+    src/codec/ffmpeg_encoder.cc
     src/codec/vpl_encoder.cc
     src/codec/ffmpeg_decoder.cc)
 
@@ -117,18 +132,36 @@ target_include_directories(chast.codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(chast.codec PRIVATE ONEVPL_EXPERIMENTAL)
 target_link_libraries(chast.codec PUBLIC chast.dxgi VPL::dispatcher chast.ffmpeg)
 
-# System audio: AAC-LC through the same static FFmpeg build, plus WASAPI
-# loopback capture (host) and render (viewer). Kept out of chast.codec so a
-# build that only needs video does not link the audio endpoints; it has no
-# capture-stack dependency beyond the headers protocol.h pulls in.
+# Audio: Opus on the wire, WASAPI loopback capture and render (host) plus
+# microphone capture (viewer). AAC-LC stays for older recordings and tests.
+# Kept out of chast.codec so a build that only needs video does not link the
+# audio endpoints; it has no capture-stack dependency beyond the headers
+# protocol.h pulls in.
+#
+# SpeexDSP (BSD-3-Clause) supplies the echo canceller and preprocessor. vcpkg
+# ships no CMake package for it, so the install prefix is located directly.
+if(NOT DEFINED SPEEXDSP_ROOT AND EXISTS "D:/vcpkg/installed/x64-windows-static/include/speex/speex_echo.h")
+    set(SPEEXDSP_ROOT "D:/vcpkg/installed/x64-windows-static" CACHE PATH "SpeexDSP install prefix")
+endif()
+if(NOT DEFINED SPEEXDSP_ROOT OR NOT EXISTS "${SPEEXDSP_ROOT}/include/speex/speex_echo.h")
+    message(FATAL_ERROR "SpeexDSP not found; set SPEEXDSP_ROOT to an install prefix with include/speex and lib/speexdsp.lib")
+endif()
+add_library(SpeexDSP::speexdsp STATIC IMPORTED)
+set_target_properties(SpeexDSP::speexdsp PROPERTIES
+    IMPORTED_LOCATION "${SPEEXDSP_ROOT}/lib/speexdsp.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${SPEEXDSP_ROOT}/include")
+
 add_library(chast.audio STATIC
     src/audio/aac_codec.cc
+    src/audio/opus_codec.cc
+    src/audio/audio_dsp.cc
     src/audio/wasapi_capture.cc
+    src/audio/wasapi_mic.cc
     src/audio/wasapi_player.cc)
 
 target_include_directories(chast.audio PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.audio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(chast.audio PUBLIC chast.base chast.ffmpeg ole32)
+target_link_libraries(chast.audio PUBLIC chast.base chast.ffmpeg Opus::opus SpeexDSP::speexdsp ole32 propsys)
 
 # MsQuic. The vcpkg install ships a config package under share/msquic; point
 # MSQUIC_ROOT at the install prefix when find_package cannot see it.
@@ -181,16 +214,19 @@ target_link_libraries(chast.transfer PUBLIC chast.base chast.security shell32)
 # DXGI or VPL dependency, so the receiver side links this without the capture
 # stack.
 add_library(chast.net STATIC
+    src/net/carrier.cc
     src/net/identity.cc
     src/net/protocol.cc
     src/net/quic.cc
+    src/win/desktop.cc
     src/win/input.cc)
 
 target_include_directories(chast.net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # QuicAddrFromString() lives in msquic_winuser.h and calls ntdll's
 # RtlIpv*StringToAddressEx, which the imported target does not declare.
-# user32 supplies SendInput/GetSystemMetrics for the injector.
-target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32)
+# user32 supplies SendInput/GetSystemMetrics for the injector; wtsapi32 the
+# session lock state behind the desktop tracker.
+target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard msquic crypt32 ncrypt ws2_32 ntdll user32 wtsapi32)
 
 # Host product code shared by the tray application and the command-line
 # server: settings persistence and the capture/encode/serve loop. It sits on
@@ -200,7 +236,9 @@ add_library(chast.host STATIC
     src/host/bitrate_controller.cc
     src/host/host_security.cc
     src/host/host_settings.cc
-    src/host/host_server.cc)
+    src/host/host_server.cc
+    src/win/privacy.cc
+    src/win/sas.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -223,7 +261,7 @@ target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi3
 # Notification-area host application. It is product code, so it is built even
 # when the test tools are switched off.
 add_executable(chast-host WIN32 host/main.cc)
-target_link_libraries(chast-host PRIVATE chast.host.tray comctl32)
+target_link_libraries(chast-host PRIVATE chast.host.tray comctl32 comdlg32)
 add_custom_command(TARGET chast-host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-host>
@@ -318,6 +356,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
+    # The input-desktop tracker against the live session. Needs an interactive
+    # desktop; the secure-desktop path cannot be produced from a test.
+    add_executable(chast-desktop-test tests/desktop_test.cc)
+    target_link_libraries(chast-desktop-test PRIVATE chast.net)
+
     # Cryptographic primitives against published vectors, plus a DPAPI and
     # device-key round trip in the user's own profile.
     add_executable(chast-security-test tests/security_test.cc)
@@ -341,6 +384,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-audio-codec-test tests/audio_codec_test.cc)
     target_link_libraries(chast-audio-codec-test PRIVATE chast.audio)
 
+    # Echo cancellation and noise suppression against synthetic far/near
+    # signals: no device, no network, deterministic.
+    add_executable(chast-audio-dsp-test tests/audio_dsp_test.cc)
+    target_link_libraries(chast-audio-dsp-test PRIVATE chast.audio)
+
     # Receive-side file handling: name sanitizing, resumable .part files and
     # digest verification, all inside a temporary directory.
     add_executable(chast-file-transfer-test tests/file_transfer_test.cc)
@@ -351,22 +399,58 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
     target_link_libraries(chast-host-tunnel-test PRIVATE chast.host.tray)
 
+    # Raw TCP and WebSocket carrier framing against a loopback UDP echo,
+    # including the RFC 6455 handshake, bad frames and the connection limit.
+    add_executable(chast-carrier-test tests/carrier_test.cc)
+    target_link_libraries(chast-carrier-test PRIVATE chast.net)
+
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME desktop COMMAND chast-desktop-test)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
+    add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
+    add_test(NAME carrier COMMAND chast-carrier-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.
     add_test(NAME quic_loopback
         COMMAND chast-quic verify --port 45433 --seconds 4 --request-keyframe-ms 1200
-                --file-upload --quiet)
+                --file-upload --file-download --privacy --quiet)
     set_tests_properties(quic_loopback PROPERTIES TIMEOUT 120)
+    # The preference probe switches codec families mid-session, so it runs on
+    # its own port and the plain loopback above keeps the offline replay check.
+    add_test(NAME quic_stream_options
+        COMMAND chast-quic verify --port 45434 --stream-options --quiet)
+    set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
+    # The FFmpeg backend serves the adapters oneVPL does not cover and is the
+    # second attempt on Intel. Pin it to exercise its D3D11VA frame pool, rate
+    # programming and replay path instead of Auto's oneVPL choice.
+    add_test(NAME quic_loopback_ffmpeg
+        COMMAND chast-quic verify --port 45463 --seconds 4 --request-keyframe-ms 1200
+                --file-upload --file-download --privacy --encoder ffmpeg --quiet)
+    set_tests_properties(quic_loopback_ffmpeg PROPERTIES TIMEOUT 120)
+    add_test(NAME quic_stream_options_ffmpeg
+        COMMAND chast-quic verify --port 45473 --stream-options --encoder ffmpeg --quiet)
+    set_tests_properties(quic_stream_options_ffmpeg PROPERTIES TIMEOUT 120)
+    # The merged view builds its canvas from every output, so its handshake,
+    # union geometry and no-op merge switch get their own loopback.
+    add_test(NAME quic_merged
+        COMMAND chast-quic verify --port 45435 --merged --quiet)
+    set_tests_properties(quic_merged PROPERTIES TIMEOUT 120)
+    # The same loopback over each carrier: the host still terminates QUIC and
+    # encodes video, while the viewer's datagrams travel inside TCP/WebSocket.
+    add_test(NAME quic_carrier_tcp
+        COMMAND chast-quic verify --port 45443 --transport tcp --quiet)
+    set_tests_properties(quic_carrier_tcp PROPERTIES TIMEOUT 120)
+    add_test(NAME quic_carrier_ws
+        COMMAND chast-quic verify --port 45453 --transport ws --quiet)
+    set_tests_properties(quic_carrier_ws PROPERTIES TIMEOUT 120)
 endif()

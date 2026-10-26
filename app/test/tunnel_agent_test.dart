@@ -19,6 +19,25 @@ void main() {
     expect(ready.remote, '203.0.113.7:13434');
 
     expect(TunnelEvent.decode('{"event":"path","path":"relay"}')?.path, 'relay');
+    expect(
+      TunnelEvent.decode(
+        '{"event":"path","path":"relay","relay":"203.0.113.5:41007"}',
+      )?.relay,
+      '203.0.113.5:41007',
+    );
+    expect(
+      TunnelEvent.decode(
+        '{"event":"ready","listen":"127.0.0.1:45678","relay":"[::1]:41007"}',
+      )?.relay,
+      '[::1]:41007',
+    );
+    expect(
+      TunnelEvent.decode(
+        '{"event":"path","path":"relay","carrier":"203.0.113.5:8445",'
+        '"carrier_token":"0123456789abcdef"}',
+      )?.carrierToken,
+      '0123456789abcdef',
+    );
     expect(TunnelEvent.decode('time=... level=INFO msg=online'), isNull);
     expect(TunnelEvent.decode('{"event":"other"}'), isNull);
     expect(TunnelEvent.decode('{broken'), isNull);
@@ -51,6 +70,27 @@ void main() {
         'relay',
       ],
     );
+    expect(
+      TunnelAgent.arguments(
+        server: 'https://chast.example',
+        hostId: 'devbox',
+        mode: TunnelMode.relay,
+        key: 'dev-secret',
+      ),
+      <String>[
+        'viewer',
+        '--server',
+        'https://chast.example',
+        '--id',
+        'devbox',
+        '--listen',
+        '127.0.0.1:0',
+        '--mode',
+        'relay',
+        '--server-key',
+        'dev-secret',
+      ],
+    );
   });
 
   test('a missing executable is reported as a tunnel failure', () async {
@@ -68,7 +108,9 @@ void main() {
 
   test('starts a child agent and adopts its ready event', () async {
     final File script = await _bat(
-      '@echo {"event":"ready","listen":"127.0.0.1:45678","path":"relay"}\r\n',
+      '@echo {"event":"ready","listen":"127.0.0.1:45678","path":"relay",'
+      '"relay":"203.0.113.5:41007","carrier":"[2001:db8::5]:8445",'
+      '"carrier_token":"secret-token"}\r\n',
     );
     final TunnelAgent agent = await _start(script);
     addTearDown(agent.stop);
@@ -77,6 +119,13 @@ void main() {
     expect(agent.port, 45678);
     expect(agent.path, 'relay');
     expect(agent.pathLabel, '中继');
+    expect(agent.relay, '203.0.113.5:41007');
+    expect(agent.relayHost, '203.0.113.5');
+    expect(agent.relayPort, 41007);
+    expect(agent.carrier, '[2001:db8::5]:8445');
+    expect(agent.carrierHost, '2001:db8::5');
+    expect(agent.carrierPort, 8445);
+    expect(agent.carrierToken, 'secret-token');
   }, skip: !Platform.isWindows);
 
   test('a failed agent carries its exit code and stderr', () async {

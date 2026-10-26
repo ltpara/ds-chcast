@@ -13,12 +13,14 @@
 // single thread and lets the network callback return promptly.
 //
 // Injection is subject to UIPI: a lower-integrity process cannot inject into a
-// higher one, and events sent while the secure desktop (UAC, lock screen) is up
-// are discarded by the OS. Both show up as `failed` in Stats, not as an error
-// the session has to handle.
+// higher one, and events sent while the thread is attached to a desktop that
+// does not receive input (UAC, lock screen) are discarded by the OS. Both show
+// up as `failed` in Stats, not as an error the session has to handle. The
+// injection thread follows the input desktop where its process may open it.
 
 #include <windows.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -96,6 +98,11 @@ private:
     void apply_key(const KeyEvent& event);
     void release_all();
     UINT send(const INPUT& input);
+    // Moves the injection thread onto the desktop that currently receives
+    // input, at most every 250 ms or immediately after SendInput rejected an
+    // event. An actual switch forgets held keys and buttons: they do not
+    // travel between desktops.
+    void follow_input_desktop_if_due();
 
     bool dry_run_ = false;
     mutable std::mutex mutex_;
@@ -129,6 +136,9 @@ private:
     // changes the real desktop.
     bool locks_seeded_ = false;
     uint16_t host_locks_ = 0;
+    // Started due so the first event checks the desktop before injecting.
+    bool desktop_check_due_ = true;
+    std::chrono::steady_clock::time_point last_desktop_follow_{};
 
     mutable std::mutex stats_mutex_;
     InputStats stats_;

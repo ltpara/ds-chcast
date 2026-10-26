@@ -54,6 +54,10 @@ struct HostSettings {
     // 0.0.0.0 serves the LAN; 127.0.0.1 keeps everything local.
     std::string bind_address = "0.0.0.0";
     uint16_t port = 4433;
+    // Accept the TCP/WebSocket fallback on port + 1. QUIC needs UDP, which
+    // some client networks block; the fallback carries the same QUIC
+    // datagrams over a TCP stream without changing the session protocol.
+    bool carrier = true;
     // The gate belongs to the host, and a remote-desktop host is not useful
     // without it; access control is the token and the approval, not this.
     bool allow_input = true;
@@ -70,6 +74,23 @@ struct HostSettings {
     // Send the system sound to the viewer. Off means no audio stream is
     // opened and the HelloAck reports audio unavailable.
     bool allow_audio = true;
+    // Accept the viewer's microphone into the host's speakers. Off by default:
+    // the microphone is a privacy feature, so the HelloAck reports it
+    // unavailable and CMIC streams are refused.
+    bool allow_microphone = false;
+    // Render endpoint used for system-sound capture and viewer-microphone
+    // playback, as a WASAPI id. Empty follows the default output; an id that
+    // is not present at session time makes audio unavailable instead of
+    // silently moving to another endpoint.
+    std::string audio_device;
+    // Cancel the viewer's microphone out of the loopback capture. Needs a live
+    // microphone playback reference; with no CMIC stream it stays bypassed.
+    bool audio_aec = true;
+    // Let the viewer black out this machine's physical displays while the
+    // session runs (privacy mode). Off by default: the overlay covers every
+    // monitor, so a person sitting at the machine cannot see the desktop until
+    // the session ends or the operator revokes the permission.
+    bool allow_privacy_mode = false;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.

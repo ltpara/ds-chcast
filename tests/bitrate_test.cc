@@ -293,6 +293,56 @@ void test_resolution_ladder() {
     check(snapped.resolution_percent() == 75, "an unknown rung snaps to a real one");
 }
 
+void test_stream_option_adjustments() {
+    chast::BitrateController controller(10000000, 1000000, 30, 75);
+    chast::BitrateDecision decision = controller.set_ceiling(5000000);
+    check(decision.changed && decision.target_bps == 5000000 && decision.framerate == 30 &&
+              decision.resolution_percent == 75,
+          "a quality preset restarts the target at the new ceiling and keeps the rung");
+    check(controller.ceiling_bps() == 5000000 && controller.target_bps() == 5000000,
+          "the controller remembers the preset ceiling");
+
+    decision = controller.set_top_framerate(15);
+    check(decision.changed && decision.framerate == 15 && decision.target_bps == 5000000,
+          "a viewer frame cap lowers the top of the ladder without moving the target");
+    check(!controller.set_top_framerate(15).changed, "a repeated frame cap is a no-op");
+
+    controller.update(healthy_sample(1000), 1000);
+    chast::BitrateSample lossy = healthy_sample(1100);
+    lossy.lost_packets = 20;
+    controller.update(lossy, 1000);
+    check(controller.target_bps() == 3500000 && controller.framerate() == 15,
+          "a 30% cut at a 15 fps cap still keeps the top rate");
+
+    lossy.sent_packets += 100;
+    lossy.lost_packets += 20;
+    controller.update(lossy, 1600);
+    check(controller.target_bps() == 2450000 && controller.framerate() == 10,
+          "the frame ladder scales with the viewer cap");
+
+    decision = controller.set_top_framerate(30);
+    check(decision.changed && decision.framerate == 20,
+          "lifting the cap recomputes the frame rate from the same ratio");
+    decision = controller.set_top_framerate(0);
+    check(!decision.changed && decision.framerate == 20 && controller.framerate() == 20,
+          "a zero cap and an explicit 30 fps top are the same ceiling");
+
+    // Recovery stops at the preset ceiling, not at the session's original
+    // budget.
+    uint64_t packets = lossy.sent_packets;
+    for (int i = 0; i < 400; ++i) {
+        packets += 100;
+        controller.update(healthy_sample(packets), 1000);
+    }
+    check(controller.target_bps() == 5000000 && controller.ceiling_bps() == 5000000,
+          "recovery cannot climb past the preset ceiling");
+
+    decision = controller.set_ceiling(100000);
+    check(decision.changed && controller.ceiling_bps() == 1000000 &&
+              controller.target_bps() == 1000000,
+          "a preset below the floor is clamped to it");
+}
+
 void test_audio_budget() {
     using chast::BitrateController;
     check(chast::video_floor(10000000) == 1000000, "the video floor is a tenth of the budget");
@@ -334,6 +384,7 @@ int main() {
     test_no_congestion_window();
     test_framerate_ladder();
     test_resolution_ladder();
+    test_stream_option_adjustments();
     test_audio_budget();
     if (failures != 0) {
         std::printf("bitrate checks FAILED (%d)\n", failures);

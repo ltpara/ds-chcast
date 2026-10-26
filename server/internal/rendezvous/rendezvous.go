@@ -11,32 +11,75 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/netutil"
+	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
 const (
 	punchTTL        = 30 * time.Second
-	defaultRateMax  = 30
+	punchAuthWindow = time.Minute
+	DefaultRateMax  = 30
 	defaultRateSpan = 10 * time.Second
 )
 
+type options struct {
+	readBuffer int
+	rateMax    int
+	serverKey  string
+}
+
+// Option customizes the rendezvous socket without changing the call sites that
+// only need the defaults.
+type Option func(*options)
+
+// WithReadBuffer sets the UDP receive buffer (SO_RCVBUF) requested at bind
+// time. Zero keeps the system default.
+func WithReadBuffer(size int) Option {
+	return func(o *options) { o.readBuffer = size }
+}
+
+// WithPunchRateMax caps punch requests per client IP per ten seconds. A
+// non-positive value disables the limiter.
+func WithPunchRateMax(max int) Option {
+	return func(o *options) { o.rateMax = max }
+}
+
+// WithServerKey requires viewers to prove knowledge of the server key before a
+// punch is coordinated. An empty key keeps public rendezvous behavior.
+func WithServerKey(key string) Option {
+	return func(o *options) { o.serverKey = key }
+}
+
 type Server struct {
-	conn      *net.UDPConn
-	reg       *registry.Registry
-	relayAddr func(port int) string
-	log       *slog.Logger
-	limiter   *limiter
-	done      chan struct{}
-	closeOnce sync.Once
+	conn       *net.UDPConn
+	reg        *registry.Registry
+	relayAddr  func(port int) string
+	identity   *identity.Server
+	punchLog   *punchlog.Log
+	ipChanges  *ipchange.Tracker
+	log        *slog.Logger
+	limiter    *limiter
+	serverKey  string
+	readBuffer int
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 // New binds the meeting port. bind is an IP:port; port 0 lets the kernel pick.
-func New(bind string, reg *registry.Registry, relayAddr func(port int) string, log *slog.Logger) (*Server, error) {
+func New(bind string, reg *registry.Registry, relayAddr func(port int) string, log *slog.Logger, opts ...Option) (*Server, error) {
+	cfg := options{rateMax: DefaultRateMax}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	addr, err := net.ResolveUDPAddr("udp", bind)
 	if err != nil {
 		return nil, fmt.Errorf("punch listen %q: %w", bind, err)
@@ -48,17 +91,37 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 	if log == nil {
 		log = slog.Default()
 	}
+	readBuffer, err := netutil.SetUDPReadBuffer(conn, cfg.readBuffer)
+	if err != nil {
+		log.Warn("punch UDP receive buffer was not applied",
+			"requested", cfg.readBuffer, "error", err)
+	}
 	return &Server{
-		conn:      conn,
-		reg:       reg,
-		relayAddr: relayAddr,
-		log:       log,
-		limiter:   newLimiter(defaultRateMax, defaultRateSpan),
-		done:      make(chan struct{}),
+		conn:       conn,
+		reg:        reg,
+		relayAddr:  relayAddr,
+		log:        log,
+		limiter:    newLimiter(cfg.rateMax, defaultRateSpan),
+		serverKey:  cfg.serverKey,
+		readBuffer: readBuffer,
+		done:       make(chan struct{}),
 	}, nil
 }
 
+// ReadBuffer is the SO_RCVBUF value reported by the kernel, or zero when the
+// default was kept or the option could not be read back.
+func (s *Server) ReadBuffer() int { return s.readBuffer }
+
 func (s *Server) Addr() string { return s.conn.LocalAddr().String() }
+
+// SetIdentity enables server-signed host bindings in punch replies.
+func (s *Server) SetIdentity(server *identity.Server) { s.identity = server }
+
+// SetPunchLog records successful punch coordination for the admin console.
+func (s *Server) SetPunchLog(log *punchlog.Log) { s.punchLog = log }
+
+// SetIPChanges audits public address changes seen in authenticated keepalives.
+func (s *Server) SetIPChanges(tracker *ipchange.Tracker) { s.ipChanges = tracker }
 
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
@@ -97,17 +160,47 @@ func (s *Server) handle(msg wire.Message, src *net.UDPAddr) {
 	switch msg.Type {
 	case wire.TypeKeepalive:
 		s.handleKeepalive(msg, src)
+	case wire.TypeKeepaliveAuth:
+		s.handleKeepaliveAuth(msg, src)
 	case wire.TypePunchRequest:
 		s.handlePunchRequest(msg, src)
 	}
 }
 
+// handleKeepalive only starts the exchange. The host must prove its key over a
+// one-time nonce before the observed address is allowed to move, so a spoofed
+// source cannot redirect a host's mapping.
 func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
+	nonce, err := s.reg.IssueChallenge(msg.HostID, identity.DomainKeepalive)
+	if err != nil {
+		s.reply(src, wire.Message{Type: wire.TypeKeepaliveAck, Error: "host has no live registration"})
+		return
+	}
+	s.reply(src, wire.Message{
+		Type:      wire.TypeKeepaliveChallenge,
+		HostID:    msg.HostID,
+		Nonce:     nonce,
+		Candidate: src.String(),
+	})
+}
+
+func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	ack := wire.Message{Type: wire.TypeKeepaliveAck}
-	if err := s.reg.Touch(msg.HostID, msg.KeyHash, src.String()); err != nil {
+	candidate := src.String()
+	if msg.Candidate != "" && msg.Candidate != candidate {
+		ack.Error = "keepalive arrived from a different address than the challenge"
+		s.reply(src, ack)
+		return
+	}
+	message := identity.KeepaliveMessage(msg.HostID, candidate, msg.Nonce)
+	if err := s.reg.TouchChallenge(msg.HostID, msg.Nonce, candidate, msg.Signature,
+		string(message), msg.LocalAddrs, msg.NATType); err != nil {
 		ack.Error = err.Error()
 		s.reply(src, ack)
 		return
+	}
+	if s.ipChanges != nil {
+		s.ipChanges.Observe(msg.HostID, src.IP.String())
 	}
 	host, ok := s.reg.Lookup(msg.HostID)
 	if !ok {
@@ -116,11 +209,24 @@ func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
 		return
 	}
 	ack.OK = true
-	ack.Candidate = src.String()
+	ack.Candidate = candidate
+	ack.LocalAddrs = host.LocalAddrs
+	ack.NATType = host.NATType
+	ack.Fingerprint = host.Fingerprint
 	if host.RelayPort != 0 {
-		ack.Relay = s.relayAddr(host.RelayPort)
+		ack.Relay = s.relayFor(host)
 	}
 	s.reply(src, ack)
+}
+
+func (s *Server) relayFor(host registry.Host) string {
+	if host.RelayPort == 0 {
+		return ""
+	}
+	if host.RelayHost != "" {
+		return net.JoinHostPort(host.RelayHost, strconv.Itoa(host.RelayPort))
+	}
+	return s.relayAddr(host.RelayPort)
 }
 
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
@@ -132,6 +238,12 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	}
 	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
 		reply.Error = "nonce must be 8..64 characters"
+		s.reply(src, reply)
+		return
+	}
+	if !identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth,
+		msg.Timestamp, time.Now(), punchAuthWindow) {
+		reply.Error = "punch authentication failed"
 		s.reply(src, reply)
 		return
 	}
@@ -152,6 +264,11 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
+	// Record only requests that can actually be coordinated, matching hbbs's
+	// record point after the target's online check.
+	if s.punchLog != nil {
+		s.punchLog.Record(src.IP.String(), hostAddr.IP.String(), host.ID)
+	}
 	// Tell the host to punch towards the viewer. Best effort: the viewer is
 	// also told the host candidate and will probe first.
 	s.reply(hostAddr, wire.Message{
@@ -162,6 +279,17 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	})
 	reply.OK = true
 	reply.Candidate = host.Candidate
+	reply.LocalAddrs = host.LocalAddrs
+	reply.NATType = host.NATType
+	reply.PublicKey = host.PublicKey
+	reply.Fingerprint = host.Fingerprint
+	if s.identity != nil && host.PublicKey != "" {
+		if pub, err := identity.ParsePublicKey(host.PublicKey); err == nil {
+			if binding, err := s.identity.SignHostBinding(host.ID, pub, host.Fingerprint, time.Now()); err == nil {
+				reply.Binding = binding
+			}
+		}
+	}
 	if host.RelayPort != 0 {
 		reply.Relay = s.relayAddr(host.RelayPort)
 	}
@@ -193,6 +321,9 @@ func newLimiter(max int, span time.Duration) *limiter {
 }
 
 func (l *limiter) allow(ip string) bool {
+	if l.max <= 0 {
+		return true
+	}
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()

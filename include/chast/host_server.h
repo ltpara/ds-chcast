@@ -14,9 +14,11 @@
 // Everything runs on one host thread; callbacks are invoked from it and must
 // return promptly. status() may be read from any thread.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -24,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/encoder.h"
 #include "chast/host_security.h"
@@ -35,6 +38,7 @@
 namespace chast {
 
 class ILoopbackCapture;
+class IAudioPlayer;
 
 enum class HostState {
     Stopped,    // not started, or the run ended
@@ -87,11 +91,20 @@ struct HostServerStats {
     // out (local changes). Both stay zero when clipboard sync is disabled.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
+    // Chat lines sent to the viewer and received from it. Both directions are
+    // ungated by permissions; an admitted session is the authorization.
+    uint64_t chat_sent = 0;
+    uint64_t chat_received = 0;
     // Viewer uploads that were verified and renamed into place, their total
     // size, and offers that were refused or failed before that.
     uint64_t files_received = 0;
     uint64_t file_bytes_received = 0;
     uint64_t file_failures = 0;
+    // Operator downloads the viewer accepted and verified, their total size,
+    // and attempts that failed before the viewer confirmed the digest.
+    uint64_t files_sent = 0;
+    uint64_t file_bytes_sent = 0;
+    uint64_t file_send_failures = 0;
     // System sound. audio_active says whether the current session announced
     // and is still sending audio; the counters cover packets handed to the
     // transport, encoded bytes, packets dropped by the capture or send queues,
@@ -103,7 +116,39 @@ struct HostServerStats {
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
+    // Near-end frames that passed through echo cancellation and how many times
+    // its adaptive filter restarted (playback start/stop or endpoint reopen).
+    uint64_t audio_dsp_frames = 0;
+    uint64_t audio_dsp_resets = 0;
     bool audio_recovering = false;
+    // Privacy mode: whether the local screen is masked right now, and how many
+    // viewer requests changed it (refusals included).
+    bool privacy_mode_active = false;
+    uint64_t privacy_mode_changes = 0;
+    // Ctrl+Alt+Del requests and how many were refused or failed. Every request
+    // is answered, so a failed one never ends the session.
+    uint64_t sas_requests = 0;
+    uint64_t sas_failures = 0;
+    // Viewer stream preferences: every request handled, the ones that changed
+    // the encoder or its rate, and the refusals (unsupported codec, failed
+    // rebuild or a busy cooldown). A request that already matched the stream
+    // is counted only in requests.
+    uint64_t stream_option_requests = 0;
+    uint64_t stream_option_changes = 0;
+    uint64_t stream_option_failures = 0;
+    // Viewer microphone. microphone_active says whether the viewer currently
+    // has a CMIC stream open; the counters cover decoded blocks played on the
+    // host, packets and bytes that failed to decode, and the player's
+    // underruns (a gap the queue could not cover).
+    bool microphone_active = false;
+    uint64_t microphone_packets = 0;
+    uint64_t microphone_bytes = 0;
+    uint64_t microphone_frames = 0;
+    uint64_t microphone_errors = 0;
+    uint64_t microphone_underruns = 0;
+    // Streams opened over the session, including reconnects after the viewer
+    // toggled the microphone off and on.
+    uint64_t microphone_streams = 0;
     // Pointer traffic. cursor_sent counts the CursorUpdates handed to the
     // transport; cursor_shapes is how many of them carried a sprite and
     // cursor_bytes their total sprite size. cursor_dropped counts updates the
@@ -133,6 +178,26 @@ struct HostStatus {
     uint16_t requested_display = kDisplayAuto;
     size_t display_index = 0;
     std::string display_name;
+    // True when the stream is the merged union of every display on the
+    // compositor's adapter. display_index is 0 and display_name is a synthetic
+    // label in that case; stream.displays lists the members.
+    bool display_merged = false;
+    // The operator's most recent download to the viewer. `download_active`
+    // stays true while the offer is pending or bytes are flowing; the tray
+    // shows the name and progress while it does.
+    bool download_active = false;
+    std::string download_name;
+    uint64_t download_size = 0;
+    uint64_t download_sent = 0;
+    std::string download_error;
+    // TCP/WebSocket fallback. carrier_port is QUIC port + 1 and
+    // carrier_error stays empty while it is healthy; a failed bind leaves the
+    // host serving QUIC only. The counters are refreshed by status().
+    bool carrier_listening = false;
+    uint16_t carrier_port = 0;
+    std::string carrier_error;
+    uint64_t carrier_connections = 0;
+    uint64_t carrier_active = 0;
     ServerInfo stream;  // description from the last announce
     HostServerStats stats;
     std::string error;  // empty unless the run stopped on a failure
@@ -151,6 +216,9 @@ struct HostServerConfig {
     bool dry_run_input = false;
     bool want_hdr = true;
     bool capture_cursor = true;
+    // Which hardware encoder family to use. Auto keeps oneVPL first and falls
+    // back to FFmpeg's nvenc/amf/qsv; the command line can pin one for tests.
+    EncoderBackend encoder_backend = EncoderBackend::Auto;
     // End the run after the first session, however it ends. The command-line
     // server uses this; the tray keeps listening.
     bool serve_once = false;
@@ -206,6 +274,9 @@ struct HostServerConfig {
     // never touches the operator's clipboard.
     std::function<bool(ClipboardContent&)> clipboard_read;
     std::function<bool(const ClipboardContent&)> clipboard_write;
+    // Called on the host thread for every ChatMessage the viewer sent. The
+    // operator UI appends it to the chat window; the message is not echoed.
+    std::function<void(const std::string&)> chat_message;
     // Called after an upload passed its digest and was renamed into place.
     std::function<void(const std::string& path, uint64_t bytes)> file_received;
     // Creates the system-audio source. Empty opens the default render
@@ -214,6 +285,15 @@ struct HostServerConfig {
     // when settings.allow_audio is set; returning nullptr (with `error`) means
     // this session streams video only.
     std::function<std::unique_ptr<ILoopbackCapture>(std::string*)> audio_capture;
+    // Creates the microphone player. Empty opens the default render endpoint;
+    // the loopback check substitutes a sink that only counts frames so it does
+    // not make noise. Created lazily, the first time a viewer opens CMIC.
+    std::function<std::unique_ptr<IAudioPlayer>(std::string*)> microphone_player;
+    // Injects Ctrl+Alt+Del. Empty uses the platform SendSAS in service mode and
+    // answers Unsupported otherwise (the tray host cannot call it). The
+    // loopback check substitutes a callback so it never touches the real
+    // secure desktop; returning false fills the reason and reports Failed.
+    std::function<bool(std::string*)> send_sas;
 };
 
 class HostServer {
@@ -257,6 +337,18 @@ public:
     // and to the settings gates; the viewer is told through PermissionUpdate.
     // Ignored while no session is streaming.
     void set_permissions(uint16_t permissions);
+
+    // Queues one file to send to the current viewer. Only valid while a viewer
+    // is streaming and file transfer is allowed; the host thread hashes the
+    // file off the frame loop, offers it and streams it in budgeted chunks.
+    // Returns false with `error` for an unusable path, an active transfer or
+    // a missing session.
+    bool start_file_download(const std::string& utf8_path, std::string* error);
+
+    // Queues one chat line for the current viewer. Returns false for empty or
+    // oversized UTF-8, or when no viewer is streaming. Safe to call from the
+    // UI thread; the frame loop sends it on the control stream.
+    bool send_chat(const std::string& text);
 
 private:
     explicit HostServer(HostServerConfig config)
@@ -305,8 +397,52 @@ private:
 
     // Owned by the host thread after start(); created in create().
     std::unique_ptr<QuicSession> session_;
+    // The fallback listener feeds session_'s UDP port. Created once next to
+    // the first session and kept across listener reopens because its target
+    // address does not change; stopped before the session is destroyed.
+    std::unique_ptr<CarrierServer> carrier_;
     bool run_clock_started_ = false;
     std::chrono::steady_clock::time_point run_start_;
+
+    // The operator download. Queued by the UI, hashed off the frame loop,
+    // then offered and streamed from the host thread.
+    struct FileSend {
+        enum class Stage {
+            kNone,
+            kHashing,
+            kReady,
+            kOffered,
+            kSending,
+            kFinishing,
+            kDone,
+            kFailed,
+        };
+        Stage stage = Stage::kNone;
+        uint32_t transfer_id = 0;
+        std::string path;
+        std::string name;
+        std::string error;
+        uint64_t size = 0;
+        uint64_t sent = 0;
+        uint64_t resume_offset = 0;
+        std::array<uint8_t, 32> digest{};
+        std::chrono::steady_clock::time_point answer_time;
+        // Set once the frame loop has counted this failure, so a terminal
+        // state is not tallied again on every pass.
+        bool counted = false;
+    };
+    void publish_download();
+
+    mutable std::mutex download_mutex_;
+    FileSend send_;
+    std::thread send_hasher_;
+    uint32_t next_send_id_ = 1;
+    std::string pending_download_path_;
+
+    // Chat queued by the operator UI. Cleared when a session starts so a line
+    // typed while nobody was connected never reaches the next viewer.
+    mutable std::mutex chat_mutex_;
+    std::deque<std::string> pending_chat_;
 
     mutable std::mutex status_mutex_;
     HostStatus status_;

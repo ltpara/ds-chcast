@@ -5,8 +5,14 @@
 // The encoder consumes FrameInfo::nv12_texture, the GPU-resident NV12 texture
 // the capture pipeline already produced, so no frame crosses into system
 // memory on the way in; only the compressed bitstream comes back out. That is
-// the same deal RustDesk's VRAM encoder strikes with ffmpeg's *_{qsv,nvenc,amf}
-// encoders, except the API here is Intel oneVPL directly instead of libavcodec.
+// the same deal RustDesk's VRAM encoder strikes with its ffmpeg *_{qsv,nvenc,amf}
+// encoders and with oneVPL.
+//
+// Two backends implement this: oneVPL directly (the primary path on Intel
+// iGPUs) and FFmpeg's libavcodec encoders (nvenc on NVIDIA, amf on AMD, qsv on
+// Intel). The FFmpeg backend gives NVIDIA and AMD adapters a hardware path
+// without oneVPL; it copies the capture texture into an encoder-owned D3D11VA
+// frame pool on the GPU, so the frame still never reaches system memory.
 //
 // Like capture, this has no CPU fallback: a GPU the vendor runtime refuses to
 // encode on makes create_encoder() fail, it does not silently switch to a
@@ -17,14 +23,16 @@
 // either maps the texture (shared import) or GPU-copies it into its internal
 // surface pool (import by copy). Legacy Media SDK ABI 1.x runtimes (mfxhw64,
 // shipped for older Intel iGPUs) have no memory interface; there the texture is
-// wrapped by the encoder's own frame allocator and read in place. None of these
-// paths stages the image through RAM or the CPU.
+// wrapped by the encoder's own frame allocator and read in place. The FFmpeg
+// backend always GPU-copies into its own pool. None of these paths stages the
+// image through RAM or the CPU.
 
 #include <windows.h>
 #include <d3d11.h>
 
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "chast/error.h"
@@ -35,6 +43,19 @@ enum class VideoCodec {
     H264,
     Hevc,
 };
+
+// Which implementation create_encoder() may use. Auto tries oneVPL first and
+// falls back to FFmpeg's vendor encoder when no VPL implementation can be
+// opened on the capture adapter. Vpl and Ffmpeg pin one backend; neither ever
+// falls back to a software encoder.
+enum class EncoderBackend {
+    Auto,
+    Vpl,
+    Ffmpeg,
+};
+
+const char* encoder_backend_name(EncoderBackend backend);
+bool parse_encoder_backend(std::string_view text, EncoderBackend& backend);
 
 // Encoder tuning, mirroring what RustDesk's VRAM path asks ffmpeg for:
 // CBR, no B-frames, an effectively infinite GOP (key frames are requested per
@@ -53,6 +74,9 @@ struct EncoderConfig {
     // RustDesk's Quality knob, applied on top of base_bitrate() only when
     // `bitrate` is zero: Best 1.5, Balanced 0.67, Low 0.5.
     float quality_ratio = 0.67f;
+    // Implementation family to create. Auto prefers oneVPL and falls back to
+    // FFmpeg; see EncoderBackend.
+    EncoderBackend backend = EncoderBackend::Auto;
 };
 
 // One compressed access unit.
@@ -95,7 +119,15 @@ public:
     // rate control divides the bitrate over the frame rate, so a caller that
     // captures slower must move both or every frame gets a budget for a frame
     // it is not sending. The new rates take effect from the next frame.
-    virtual Error set_rate(UINT bits_per_second, UINT framerate) = 0;
+    //
+    // `keyframe_required` reports whether the next frame has to be an IDR. A
+    // bitrate-only change can continue the coded sequence (the encoder keeps
+    // its reference frames, so the viewer decodes on), while a frame-rate
+    // change, a sequence restart or an encoder reopen cannot. The caller must
+    // honour it: without the IDR a peer that lost the sequence never recovers,
+    // and forcing one anyway wastes a whole frame on every quality step.
+    virtual Error set_rate(UINT bits_per_second, UINT framerate,
+                           bool* keyframe_required = nullptr) = 0;
 
     virtual UINT bitrate() const noexcept = 0;
     virtual UINT framerate() const noexcept = 0;
@@ -124,15 +156,17 @@ public:
 
 // Which encoders can be used on this machine, for a UI or an auto-selection
 // step. True when a hardware implementation of `codec` (H.264 or HEVC) with
-// D3D11 acceleration is enumerated, on either a oneVPL 2.10+ runtime or the
-// legacy Media SDK runtime that older Intel iGPUs use.
+// D3D11 acceleration is available through `backend`: a oneVPL 2.10+ runtime or
+// the legacy Media SDK runtime for Vpl, NVENC/AMF/QSV for Ffmpeg, either for
+// Auto.
 //
 // When `device` is given, implementations are restricted to the adapter that
 // device lives on, which is the adapter the frames come from. HEVC counts as
 // available when an HEVC implementation exists, or when an H.264 one does:
 // create_encoder() may fall back to the AVC tiers for an HEVC request. The
 // device is not opened.
-bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device = nullptr);
+bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device = nullptr,
+                                EncoderBackend backend = EncoderBackend::Auto);
 
 // RustDesk's base_bitrate(): the bitrate table from libs/scrap codec.rs, in
 // kbit/s, for a screen of the given size. Unknown sizes fall back to 1080p.
@@ -144,16 +178,18 @@ UINT base_bitrate(UINT width, UINT height);
 UINT hardware_bitrate(UINT width, UINT height, float quality_ratio, bool h264);
 
 // Creates a hardware encoder for `config.width x config.height` on `device`.
-// The device is the adapter selection: VPL implementations reporting a
-// different DXGI LUID are rejected, so encoding always stays on the card that
-// captured and converted the frame. Encoding tiers are tried in order --
-// VDENC+HEVC, VDENC+AVC, VME+AVC -- and each tier must return a test frame
-// before it is accepted, so a runtime that opens a session but cannot encode
-// does not become the stream's encoder. codec() reports the tier that won; an
-// H.264 request starts at VDENC+AVC and never upgrades to HEVC, while an HEVC
-// request may fall back to AVC. The frame geometry must be unrotated; the
-// encoder has no rotation support, so a caller with a rotated desktop has to
-// convert before encoding.
+// The device is the adapter selection: implementations on another DXGI LUID
+// are rejected, so encoding always stays on the card that captured and
+// converted the frame. With Auto, oneVPL is tried first and FFmpeg's vendor
+// encoder is the fallback; a pinned backend does not fall back at all.
+//
+// VPL encoding tiers are tried in order -- VDENC+HEVC, VDENC+AVC, VME+AVC --
+// and each tier must return a test frame before it is accepted, so a runtime
+// that opens a session but cannot encode does not become the stream's encoder.
+// codec() reports what won; an H.264 request never upgrades to HEVC, while an
+// HEVC request may fall back to AVC on either backend. The frame geometry must
+// be unrotated; the encoder has no rotation support, so a caller with a
+// rotated desktop has to convert before encoding.
 std::unique_ptr<IVideoEncoder> create_encoder(ID3D11Device* device, const EncoderConfig& config,
                                               std::string* error);
 

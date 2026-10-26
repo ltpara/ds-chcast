@@ -1,8 +1,10 @@
 # M8 — 发射端加固计划
 
-更新时间：2026-10-23
+更新时间：2026-10-25
 分支：`feat/m7-security`（M7 未提交的收尾与 M8 工作在同一分支继续）
-基线：M7 完成；M8.0（协议 v14）、M8.1（协议 v15）已完成；M8.4 将协议升到 v16
+基线：M7 完成；M8.0（协议 v14）、M8.1（协议 v15）、M8.3（FFmpeg 硬件
+兜底）、M8.4（协议 v17）、M8.5（协议 v18，Opus + 麦克风上行）、
+M8.6（协议 v19，锁屏/UAC 与隐私模式）已完成
 参考：`D:\rustdesk` @ `c7f212d`（只做能力对照，不复制实现）
 
 ## 状态标记约定
@@ -40,7 +42,7 @@
 | 会话内切换显示器 | 需断开重连（`host_server.cc` Hello 时固定输出） | `SwitchDisplay` 会话内切换 | P0（M8.0） |
 | 远程修改分辨率 | 无 | `change_resolution` + 虚拟屏 | P0（M8.1） |
 | 无头/虚拟显示器 | DXGI 无输出即建不了采集器 | IDD / usbmmidd 虚拟屏 | P0（M8.2） |
-| 编码后端覆盖 | 仅 Intel oneVPL | NVENC/QSV/AMF/VAAPI | P1（M8.3） |
+| 编码后端覆盖 | oneVPL + FFmpeg 硬件兜底（NVENC/AMF/QSV） | NVENC/QSV/AMF/VAAPI | P1（M8.3） |
 | 富剪贴板/文件传输 | 纯文本 256 KiB | 文本/HTML/RTF/图片/SVG/文件 | P1（M8.4） |
 | 麦克风/双向音频 | 仅系统声音 AAC-LC | loopback + 麦克风 + Opus | P2（M8.5） |
 | 锁屏/UAC | 注入被系统丢弃 | 检测 prelogin、切换输入桌面 | P2（M8.6） |
@@ -60,15 +62,26 @@
   IddCx 示例同样绕不开签名，未签名驱动在强制驱动签名的系统上无法加载。
   2026-10-23 决定暂缓，等 M8.7 安装器/签名链路具备后再评估；本轮不引入
   驱动依赖，也不复制 RustDesk 驱动。
-- `[ ]` **M8.3 编码后端 NVENC/AMF**：保持采集/转换/编码同卡 LUID 绑定，
-  沿用现有三级硬件阶梯的试编与回退机制。
-- `[~]` **M8.4 富剪贴板与文件传输**：协议 v16；HTML/RTF/DIB 与查看器
-  上传、续传/摘要、GUI 1 GiB 验收已完成（见 6.6、7）。双机浏览器富
-  剪贴板人工核对仍待实机；拖放与主机→查看器下载留待后续。
-- `[ ]` **M8.5 麦克风与双向音频**：设备选择、Opus、采集/播放双工；
-  AEC/噪声抑制单独评估。
-- `[ ]` **M8.6 锁屏/UAC 与隐私模式**：服务态输入桌面切换、安全桌面采集路径、
-  排除捕获/虚拟屏遮罩。
+- `[x]` **M8.3 编码后端 FFmpeg 硬件兜底**：新增 vcpkg FFmpeg 硬件后端
+  （NVENC/AMF/QSV），Auto 先试 oneVPL、失败再试 FFmpeg；D3D11VA 帧池
+  与同卡 GPU 拷贝保持零拷贝，无软件编码。QSV 已在本机完成编码与回环
+  验证；NVENC/AMF 实机验收待补（见第 9 节）。
+- `[~]` **M8.4 富剪贴板与文件传输**：协议 v17；HTML/RTF/DIB、查看器
+  上传、续传/摘要、GUI 1 GiB 验收已完成（见 6.6、9）。文件传输现为
+  双向：主机可经托盘把文件发到查看器，查看器支持工具栏选择与资源
+  管理器拖放上传，回环探针覆盖两个方向。双机浏览器富剪贴板人工核对
+  与双机 GUI 文件往返仍待实机。
+- `[x]` **M8.5 麦克风与双向音频**：协议 v18；系统声音与麦克风统一走
+  Opus；查看器麦克风上行到主机扬声器，与主机系统声音下行构成双工。
+  协议、Opus 编解码、传输层 `CMIC`、主机侧接入、查看器采集/桥接/
+  Flutter 工具栏与 `verify --microphone` 探针均已完成（见 7.7、9）；
+  真实麦克风与双机回声验收待实机。AEC/噪声抑制单独评估。
+- `[x]` **M8.6 锁屏/UAC 与隐私模式**：协议 v19；主机每秒跟随输入桌面，
+  能打开安全桌面的服务态继续采集/注入，托盘态打不开时暂停而不是断开会话；
+  隐私模式用 `WDA_EXCLUDEFROMCAPTURE` 的置顶穿透遮罩遮挡本机屏幕，采集
+  不受影响。虚拟显示器按 M8.2 结论继续暂缓。回环 `verify --privacy` 与
+  关闭闸门探针已通过（第 8 节）；真实锁屏/UAC、服务态安全桌面与遮罩
+  视觉仍需实机。
 - `[ ]` **M8.7 安装包、自动更新与 i18n**：MSI/签名、更新通道、界面多语言。
 
 ## 4. M8.0 会话内显示器切换
@@ -277,20 +290,23 @@
 ## 6. M8.4 富剪贴板与文件传输
 
 目标：剪贴板在文本之外支持 HTML、RTF 与 DIB 位图；查看器可以向主机
-上传文件，支持断点续传和 SHA-256 校验。第一版不做主机→查看器下载和
-资源管理器拖放，协议与 UI 预留扩展位。
+上传文件，主机也可以把文件发给查看器，两个方向都支持断点续传和
+SHA-256 校验。查看器接受工具栏选择与资源管理器拖放，主机经托盘的
+“发送文件到查看器…”选择文件。
 
-### 6.1 协议 v16
+### 6.1 协议 v16 → v17
 
-版本从 15 升到 16；ALPN 不变。控制消息继续只承载协商与元数据，剪贴板
-内容和文件字节走各自独立的单向流，避免 1 MiB 控制载荷上限，也避免大块
-数据阻塞输入/切屏消息。
+版本从 15 升到 16，文件传输双向化时升到 17；ALPN 不变。控制消息继续
+只承载协商与元数据，剪贴板内容和文件字节走各自独立的单向流，避免
+1 MiB 控制载荷上限，也避免大块数据阻塞输入/切屏消息。v17 没有新增
+消息：同四条文件消息把角色对调即可，Offer 由发送方发出，Answer/Result
+由接收方回答，Cancel 任一方都可发出；`CFIL` 由发送方打开。
 
 新增权限位与能力标记：
 
 | 名称 | 值 | 含义 |
 | --- | --- | --- |
-| `kPermissionFileTransfer` | `0x0008` | 会话内允许向主机上传文件 |
+| `kPermissionFileTransfer` | `0x0008` | 会话内允许文件传输（两个方向） |
 | `kPermissionAll` | `0x000F` | 现有权限位并集 |
 | `kServerInfoFileTransferEnabled` | `0x0008` | HelloAck/StreamInfo 声明可用 |
 | `kServerInfoKnownFlags` | `0x000F` | 未知位仍被拒绝 |
@@ -299,10 +315,10 @@
 
 | 类型 | 方向 | 载荷 |
 | --- | --- | --- |
-| `FileOffer = 21` | 查看器 → 主机 | `u32 transfer_id`、`u64 size`、`u8 flags`、32 B SHA-256、`u16 name_len`、UTF-8 name（≤512 B） |
-| `FileAnswer = 22` | 主机 → 查看器 | `u32 transfer_id`、`u8 code`、`u64 resume_offset`、`u16 reason_len`、reason（≤256 B） |
-| `FileResult = 23` | 主机 → 查看器 | `u32 transfer_id`、`u8 code`、`u64 received`、`u16 reason_len`、reason（≤256 B） |
-| `FileCancel = 24` | 查看器 → 主机 | `u32 transfer_id`、`u8 code`、`u16 reason_len`、reason（≤256 B） |
+| `FileOffer = 21` | 发送方 → 接收方 | `u32 transfer_id`、`u64 size`、`u8 flags`、32 B SHA-256、`u16 name_len`、UTF-8 name（≤512 B） |
+| `FileAnswer = 22` | 接收方 → 发送方 | `u32 transfer_id`、`u8 code`、`u64 resume_offset`、`u16 reason_len`、reason（≤256 B） |
+| `FileResult = 23` | 接收方 → 发送方 | `u32 transfer_id`、`u8 code`、`u64 received`、`u16 reason_len`、reason（≤256 B） |
+| `FileCancel = 24` | 任一方 → 对方 | `u32 transfer_id`、`u8 code`、`u16 reason_len`、reason（≤256 B） |
 
 `FileOffer.flags` bit0 表示查看器可按 `resume_offset` 续传，其余位必须为 0。
 结果码统一为：0 Ok、1 Refused、2 Busy、3 NotFound、4 DigestMismatch、
@@ -326,7 +342,8 @@ format_count × (u8 format | u8 reserved | u16 reserved | u32 length | bytes)
 上限：Text 256 KiB、Html/Rtf 各 4 MiB、Dib 32 MiB、单条流总量 40 MiB、
 format 数 4。超限时接收端中止该流并保留上一条剪贴板内容，不断开会话。
 
-文件数据流 `CFIL`（查看器 → 主机的单向流，每个传输一条）：
+文件数据流 `CFIL`（发送方 → 接收方的单向流，每个传输一条；上传时由
+查看器打开，下载时由主机打开）：
 
 ```
 "CFIL" | u8 version=1 | u8 reserved[3] | u32 transfer_id
@@ -334,8 +351,8 @@ format 数 4。超限时接收端中止该流并保留上一条剪贴板内容�
 ```
 
 `offset` 必须等于 `FileAnswer.resume_offset`，字节数必须等于
-`size - offset`；主机边收边写，流结束（FIN）后校验长度和 SHA-256，
-再原子改名。协议单文件上限 16 GiB，主机默认再限 4 GiB。
+`size - offset`；接收方边收边写，流结束（FIN）后校验长度和 SHA-256，
+再原子改名。协议单文件上限 16 GiB，主机接收默认再限 4 GiB。
 
 ### 6.2 QuicSession
 
@@ -412,6 +429,10 @@ Win32 剪贴板：
 - 统计：新增 `files_received`、`file_bytes`、`file_failures`、
   `file_resume_bytes`、`clipboard_rich_sent/received`；`HostStatus` 暴露
   当前传输 `transfer_id/name/size/received`，供托盘显示进度。
+- 主机→查看器下载：`HostServer::start_file_download(path)` 由托盘
+  “发送文件到查看器…”（`GetOpenFileNameW`）排队；哈希在独立线程完成，
+  帧循环按 8 ms/轮、32 MiB/s 令牌桶发送，队满时从 `sent` 偏移重读。
+  `HostStatus` 增加 `download_active/name/size/sent/error`。
 - 审批窗口与设置页加入“文件传输”开关；`set_permissions()` 降低权限时
   立即取消进行中的传输并回 `Cancelled`。
 
@@ -426,6 +447,13 @@ Win32 剪贴板：
   `file_name`、`file_size`、`file_sent`、`file_error`，以及剪贴板富格式
   计数。Flutter 工具栏加“发送文件”，底部显示进度条与失败 SnackBar。
 - 收到主机不支持/拒绝/摘要错误时保留本地文件，允许重试。
+- 资源管理器拖放：`DragAcceptFiles` 挂在 `FLUTTERVIEW` 子类窗口，
+  `WM_DROPFILES` 取第一条路径经 `droppedFile` 交给 Dart，与工具栏
+  共用同一上传流程。
+- 下载接收：`ViewerEngine` 用共享 `FileReceiver` 把主机文件写到
+  `Downloads\chast`，边收边更新 `ViewerStatus` 的
+  `download_phase/name/size/received/error` 与 `files_received/
+  file_receive_failures`；Flutter 显示接收进度条，完成/失败弹提示。
 
 ### 6.6 验收标准
 
@@ -439,6 +467,10 @@ Win32 剪贴板：
   Offer/Answer/Result、落盘摘要一致、字节数一致；截断后续传
   （`resume_offset = 102400`）；篡改摘要断言 `DigestMismatch` 且
   `.part` 被删除。更大数据量的实测见下方的 GUI 8 MiB 与 1 GiB。
+- `[x]` `chast-quic verify --file-download`：同一探针反向运行。主机在
+  HelloAck 后排队下载，查看器接受 `FileOffer`、收集 300 KiB、校验
+  Offer 摘要并回 `FileResult`；断言主机 `files_sent == 1`、字节数一致、
+  无失败。可与 `--file-upload` 同时启用，覆盖两个方向并发。
 - `[~]` 回环 + 本机富剪贴板人工：单机主机与查看器共用同一系统剪贴板，
   无法区分写入方；真实路径只从查看器日志确认发送过一次 DIB
   （`formats 0x8`）。浏览器 HTML/图片的双向人工核对需双机，未做。
@@ -447,7 +479,7 @@ Win32 剪贴板：
 
 ### 6.7 实施阶段
 
-1. 协议 v16 + 单测（含增量 SHA-256）。
+1. 协议 v16 + 单测（含增量 SHA-256）；双向化时升 v17，不新增消息。
 2. QuicSession 多单向流、`CCLB`/`CFIL` 分类与队列。
 3. `chast.clipboard`/`chast.transfer` 共享库与 Win32 实现。
 4. 主机接入剪贴板与文件接收、设置/权限/统计。
@@ -471,7 +503,384 @@ Win32 剪贴板：
 - 续传依赖边车与 `.part`；用户手动改动 `.part` 时摘要会失败并重来，
   不会把错误内容写成最终文件。
 
-## 7. 开发记录
+## 7. M8.5 麦克风与双向音频
+
+目标：主机系统声音继续下行到查看器，同时把查看器麦克风上行到主机默认
+扬声器，两个方向可同时工作。音频统一改为 Opus；麦克风是独立权限，默认
+不启用。设备选择先覆盖查看器采集端（通信角色默认设备或指定设备），
+主机播放仍跟随系统默认输出。AEC、噪声抑制与回声消除不在本轮。
+
+### 7.1 协议 v17 → v18
+
+版本从 17 升到 18；ALPN 不变。新增能力都沿用“独立单向流 + 首字节魔数”
+的既有模型，不放宽控制流载荷上限。
+
+| 名称 | 值 | 含义 |
+| --- | --- | --- |
+| `AudioCodec::Opus` | `2` | 原始 Opus 包，无 Ogg 封装 |
+| `kPermissionMicrophone` | `0x0010` | 允许查看器打开麦克风上行流 |
+| `kServerInfoMicrophoneEnabled` | `0x0010` | HelloAck flags 中对应的能力位 |
+| `CMIC` | 4 字节魔数 | 查看器发起的麦克风单向流 |
+
+- `kPermissionAll` 增加麦克风位；HelloAck/StreamInfo 的权限掩码与
+  `PermissionUpdate` 自动携带它。旧位保持不变。
+- `ServerInfo` 不再新增线上字段：麦克风能力由权限掩码推导，解码后写入
+  `ServerInfo::microphone_enabled`，编码时由该布尔值回填掩码。这样
+  HelloAck 与 StreamInfo 的布局只多一个 flags 位，不改变固定字段顺序。
+- `AudioInfo` 继续描述音频格式；系统声音仍由主机在 HelloAck 的 audio
+  块里公布 Opus 参数，麦克风格式则由 `CMIC` 流的头部自描述。
+- `kMaxAudioExtradata` 保持 64 字节；Opus 的 `OpusHead` 为 19 字节。
+
+`CMIC` 流头部固定 20 字节，后跟 `extradata_size` 字节：
+
+| 偏移 | 字段 | 类型 |
+| --- | --- | --- |
+| 0 | `"CMIC"` | 4 字节 |
+| 4 | 版本 = 1 | u8 |
+| 5 | codec（Opus） | u8 |
+| 6 | 保留 = 0 | u16 |
+| 8 | sample_rate | u32 |
+| 12 | channels | u16 |
+| 14 | frame_samples | u16 |
+| 16 | extradata_size | u16 |
+| 18 | 保留 = 0 | u16 |
+| 20 | extradata | `extradata_size` 字节 |
+
+头部之后是连续的 `AudioHeader + payload`，与 `CAUD` 完全相同的打包规则；
+`AudioHeader` 的 `capture_ms` 是查看器 steady clock，主机只把它当相对
+时间轴，不要求与主机时钟同源。流的打开/关闭就是麦克风的开启/关闭：
+没有额外的控制消息，也不存在“已授权但流未建立”的中间态。
+
+### 7.2 编解码
+
+Opus 直接使用 vcpkg 安装的独立 `opus.lib`（`Opus::opus`），编码/解码调用
+`opus_encode`/`opus_decode`，**不经 FFmpeg 的 libopus 封装**。FFmpeg 只
+继续承担 AAC 解码与 libswresample；`chast.ffmpeg` 因编解码器注册表仍需
+链接 `Opus::opus`，但那只是链接依赖，Opus 数据路径不经过它。
+
+- 系统声音：48 kHz 立体声，20 ms（960 样本），128 kbps，`OPUS_APPLICATION_AUDIO`。
+- 麦克风：48 kHz 单声道，20 ms（960 样本），32 kbps，`OPUS_APPLICATION_VOIP`。
+- 编码器通过 `opus_encoder_ctl(OPUS_GET_LOOKAHEAD)` 取得 pre-skip，写出
+  标准 19 字节 `OpusHead` 作为 extradata；解码器从中读取 pre-skip，首包
+  丢弃这段预热样本，之后的包按 `AudioHeader` 时间戳调度。
+- 时间轴沿用现有规则：编码器内部按 `capture_ms` 给每个包打上首样本的
+  主机/查看器 capture 时间，超过 100 ms 的空隙会把残帧补静音后重锚。
+- **编码端不再保留 AAC**：`create_audio_encoder()` 只接受
+  `AudioCodec::Opus`，对 AAC 返回 `Unsupported` 并说明音频统一走 Opus；
+  AAC 编码器实现与工厂已删除，`AudioEncoderConfig` 的默认 codec 也是
+  Opus。`AudioCodec::AAC = 1` 仅为线上兼容保留，解码器仍按
+  `AudioInfo.codec` 分派，未知 codec 明确失败。
+- AAC 的解码预热固定为 1024 样本；Opus 的 pre-skip 由解码器从
+  `OpusHead` 读取，FFmpeg 的解码路径不参与 Opus。
+
+### 7.3 采集与播放双工
+
+| 端 | 下行（主机 → 查看器） | 上行（查看器 → 主机） |
+| --- | --- | --- |
+| 主机 | WASAPI loopback 采集 + Opus 编码 | Opus 解码 + WASAPI 默认输出播放 |
+| 查看器 | Opus 解码 + WASAPI 默认输出播放 | WASAPI 麦克风采集 + Opus 编码 |
+
+- 主机的 loopback 采集与查看器的麦克风采集各自独占线程，格式转换由
+  libswresample 完成；会话线程只负责把已编码包交给传输层，不阻塞采集。
+- 麦克风采集使用 `eCapture`、共享模式、事件回调。未指定设备时优先
+  `eCommunications` 角色（通话音设备），没有则退回 `eConsole`；指定
+  设备时按 endpoint id 打开，设备消失后每秒重试同一 id。
+- 查看器麦克风默认关闭，必须同时满足：主机授予 `kPermissionMicrophone`、
+  用户在 UI 打开、设备成功打开。任一条不满足都不建立 `CMIC` 流。
+- 主机在收到 `CMIC` 头部后创建 Opus 解码器与播放器；流结束、权限被
+  收回、解码/播放失败或会话结束时停止并释放。播放器沿用现有 80 ms
+  lead 与 500 ms 队列上限。
+- 麦克风播放采用“到达时间锚定”：首个包把 `capture_ms` 对齐到本机
+  now + lead，不依赖 `LatencyReply`；队列因停顿被清空后下一包重新锚定，
+  避免一次长时间停顿让后续音频永久判为过期。系统声音仍使用
+  `LatencyReply` 的主机时钟偏移。
+- 权限收回：主机 `set_permissions()` 去掉麦克风位时立即 abort `CMIC`，
+  查看器在下一轮看到掩码变化后停止采集并关闭本地流；之后重新授权不会
+  复用旧流，需要重新打开。
+
+### 7.4 帧循环位置评估
+
+M8.1 记录过“同步重建采集/编码器约 1.5 s，会丢几包音频”。本轮评估结论
+是**暂不把音频发送移出帧循环**：`QuicSession` 的所有公开方法按单线程
+所有权设计，音视频共用发送队列；把音频放到独立线程需要给发送路径加锁
+并重新定义队列顺序，风险高于收益。麦克风沿用同一模型：
+
+- 采集/编码在各自线程，帧循环只做 `take_packet` + `send_microphone`，
+  队满返回 `WaitTimeout` 并丢当前包，绝不阻塞视频。
+- 1.5 s 的同步重建仍会让麦克风短暂断流；播放器清空过期队列后按新包
+  重锚，恢复为一段静音而不是永久延迟。
+- 若后续要让重建期间也连续，单独开“音频 I/O 线程 + 传输层并发发送”
+  的改造，需要独立的协议/线程安全评审。
+
+### 7.5 主机接入
+
+- `HostSettings::allow_microphone`，默认 `false`（隐私优先）。解析/保存
+  与现有布尔项一致；关闭时默认权限掩码不含麦克风位，传输层拒绝 `CMIC`。
+- 审批窗口新增“麦克风”复选框，只能从认证阶段的上限里做减法；会话中
+  的权限窗口可实时收回。
+- 主界面、托盘菜单与“安全设置 → 新连接的默认权限”都提供“接收查看器
+  麦克风”开关；监听器的麦克风门禁在创建时固定，运行中从关闭改为开启
+  要等下一次连接，托盘会明确提示。日志明确记录授权、上行包数、解码帧数
+  与停止原因。
+- `HostServerStats` 新增 `microphone_active/packets/bytes/errors/
+  frames/underruns/streams`，`HostStatus` 经现有状态快照暴露给托盘。
+- 麦克风播放器可通过 `HostServerConfig` 注入，回环探针用一个内存
+  捕获播放器验证解码内容，真实路径仍用 `create_audio_player()`。
+
+### 7.6 查看器接入
+
+- `ViewerEngine` 新增麦克风状态：是否被授权、是否正在发送、当前设备、
+  已发包/字节/错误/丢弃，以及最近的错误文本。
+- UI 线程只设置“想开/想关”和所选设备；会话线程负责创建设备、打开
+  `CMIC`、 drains 编码包并发送。切换设备等同于停止后按新 id 重开。
+- 原生桥新增 `setMicrophone(bool)`、`listMicrophones`、
+  `selectMicrophone(id)` 与状态序列化；Flutter 会话工具栏新增麦克风
+  按钮，长按/菜单列出活动采集设备，未授权时置灰并说明原因。
+- 会话结束、权限收回、设备打开失败、传输持续拒绝都会把错误写回状态，
+  UI 用 SnackBar/提示展示，不影响视频与系统声音。
+
+### 7.7 验收标准
+
+- `[x]` `chast-protocol-test`：`CMIC` 头部往返；截断、版本/codec/
+  采样率/声道/extradata 超限、保留位非零被拒绝；麦克风权限位与
+  HelloAck flags 往返。
+- `[x]` `chast-audio-codec-test`：Opus 立体声与单声道往返（能量、频率、
+  时间戳、帧长 960），未知 codec 拒绝，以及“AAC 编码不可用、错误文案
+  指向 Opus”的断言；AAC 解码仍保留缺 AudioSpecificConfig 的拒绝用例。
+  测试不再依赖 FFmpeg 的 AAC 编码器。
+- `[x]` `chast-quic verify --microphone`：主机授予麦克风，查看器用合成
+  麦克风源发送 440 Hz 单声道 Opus；主机端注入的内存播放器断言收到
+  包数、解码帧数、音调频率与 RMS，`stop_microphone()` 后主机流结束；
+  再以未授权配置连接，断言 `CMIC` 被拒绝且视频会话不受影响。
+- `[x]` `ctest -C Release` 11/11 全过；普通回环（系统声音改 Opus 后）
+  继续通过；`flutter analyze` 无问题、`flutter test` 68 项通过、
+  `flutter build windows --release` 成功。
+- `[ ]` 单机人工：真实麦克风开启后主机扬声器能听到；关闭/收回权限后
+  立即停止。单机扬声器与麦克风同处一室会有回声，需耳机复核。
+- `[!]` 双机与真实设备回声/延迟的主观验收需第二台机器；本轮只做
+  单机回环与合成源。
+
+### 7.8 风险
+
+- **回声**：主机播放查看器麦克风时，loopback 会把这段声音再次采进
+  下行流，查看器听到自己的延迟声音；单机测试更明显。本轮不做 AEC，
+  文档建议耳机，后续单独评估 WebRTC AEC/噪声抑制。
+- **Opus 切换是破坏性协议变化**：v17 与 v18 不能互通，版本号已提升；
+  回环、GUI 与命令行工具必须同版本构建。
+- **设备热切换**：麦克风被拔出或默认通信设备改变时，采集线程按 1 s
+  重试；UI 可能短暂显示“恢复中”，不会结束会话。
+- **时钟锚定**：麦克风以到达时间锚定，不保证与主机系统声音相位一致；
+  语音场景不需要唇音同步，若未来要做双向对齐需把查看者时钟偏移带回。
+- **权限模型**：麦克风默认关闭，审批只能减少权限；但一旦授予，查看器
+  可以持续发送直到关闭或收回，主机端没有逐包确认，符合现有音频模型。
+- **帧循环停顿**：与 M8.1 相同，重建期间会短暂断流；已通过播放器重锚
+  限制为一段静音。
+
+## 8. M8.6 锁屏/UAC 与隐私模式
+
+目标：锁屏或 UAC 出现时输入桌面切到安全桌面，主机不能因此断流；能打开
+安全桌面的进程继续采集和注入，打不开的进程明确暂停并在解锁后恢复。
+隐私模式让主机本地屏幕被遮挡，远端继续看到桌面。M8.2 已暂缓，这里不引入
+虚拟显示器，遮挡只覆盖真实输出。
+
+### 8.1 协议 v19
+
+版本从 18 升到 19；ALPN 不变。新增权限位与三条控制消息：
+
+| 名称 | 值 | 含义 |
+| --- | --- | --- |
+| `kPermissionPrivacyMode` | `0x0020` | 会话内允许 `SetPrivacyMode` |
+| `kServerInfoPrivacyModeEnabled` | `0x0020` | HelloAck/StreamInfo flags 的能力位 |
+
+| 类型 | 方向 | 载荷 |
+| --- | --- | --- |
+| `SetPrivacyMode = 25` | 查看器 → 主机 | `u8 enabled` |
+| `PrivacyModeState = 26` | 主机 → 查看器 | `u8 enabled`、`u8 code`、`u16 reason_len`、UTF-8 reason（≤256 B） |
+| `DesktopState = 27` | 主机 → 查看器 | `u8 kind` |
+
+`PrivacyModeCode`：0 Ok、1 Denied、2 Unsupported、3 Failed。`DesktopKind`：
+0 Default（用户桌面）、1 Secure（锁屏/UAC/凭据提示）、2 Unavailable
+（无法查询，例如托盘主机打不开 Winlogon）。`PrivacyModeState` 的
+`enabled=1` 只与 `Ok` 同时出现；其余 code 都表示遮罩处于关闭。
+
+`ServerInfo::privacy_mode_enabled` 由权限掩码推导，不增加 HelloAck 固定
+字段；权限位仍走现有 `PermissionUpdate`。重连后隐私状态总是从“关”开始，
+实际遮罩状态由 `PrivacyModeState` 单独携带。`DesktopState` 在变化时发送，
+HelloAck 后也发一次（即使当前是 Default），会话从锁屏开始也能立即显示
+横幅。
+
+### 8.2 输入桌面跟随
+
+新增 `include/chast/desktop.h` + `src/win/desktop.cc`：
+
+- `input_desktop_status()`：`OpenInputDesktop` + `UOI_NAME`，并用
+  `WTSQuerySessionInformationW(WTSSessionInfoEx)` 读取锁屏标志；桌面名不是
+  `Default` 即判为安全桌面，查询失败且已锁屏也按安全桌面处理。
+- `follow_input_desktop()`：必要时 `SetThreadDesktop` 到输入桌面，请求
+  `DESKTOP_SWITCHDESKTOP | GENERIC_WRITE`；只在真正切换时返回 `switched`，
+  调用者据此判断采集对象已失效。线程不能拥有窗口或钩子。
+- 主机帧循环每 1 s 检查一次：先发 `DesktopState`，再跟随桌面；发生切换
+  或从暂停恢复时 `reinitialize()` 采集器、丢弃编码器、强制关键帧并重置
+  输入重复帧与光标状态。
+- 跟随失败（托盘主机打不开 Winlogon）时只暂停采集并每秒重试，不结束
+  会话；解锁后同一条检查路径恢复采集。
+- `InputInjector` 每 250 ms 跟随一次，`SendInput` 返回 0 时提前重查；
+  真正切换桌面后清空按键/按钮持有状态与锁键基线，等查看器下一次修饰键
+  位图重新按下仍按住的键。
+- 只有以 SYSTEM 在用户会话内运行的进程能打开安全桌面：服务态工作进程
+  可继续采集与注入（未实机验证）；托盘主机报 `Unavailable`，靠暂停/恢复
+  保证会话存活。
+
+### 8.3 主机隐私模式
+
+- `HostSettings::allow_privacy_mode` 默认 `false`；`privacy_mode=` 持久化，
+  解析失败保留关闭；权限掩码与 HelloAck/StreamInfo 的
+  `privacy_mode_enabled` 自动联动。
+- 托盘菜单与安全设置页均可开关。监听器的能力上限在创建时固定：从关闭
+  改为开启需要下一次连接（托盘会提示），从开启改为关闭实时生效。
+- `PrivacyOverlay`（`include/chast/privacy.h`、`src/win/privacy.cc`）：
+  - 独立窗口线程先显式挂到 `Default` 桌面（即使主机线程已跟随到 Winlogon）；
+  - 顶层 `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
+    WS_EX_TOOLWINDOW` 黑色窗口，覆盖整个虚拟屏幕，不抢焦点、不进
+    Alt+Tab、不拦截本地输入；
+  - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 让 DXGI 采集看不到
+    遮罩；系统低于 Windows 10 2004（19041）或 affinity 失败时 `create()`
+    直接拒绝，绝不显示一个会把远端也涂黑的遮罩；
+  - 1 s 定时器与 `WM_DISPLAYCHANGE` 重新铺满虚拟屏幕，覆盖后插入的
+    顶层窗口。
+- 每个会话一个遮罩。开启成功回 `PrivacyModeState(true, Ok)`；重复开启回
+  当前状态；不支持回 `Unsupported`；创建/显示失败回 `Failed` 并带系统
+  错误。关闭、权限收回或会话结束都会撤罩；权限收回还会主动发一条
+  `PrivacyModeState(false, Denied, …)`，避免查看器显示过期状态。
+- `HostServerStats` 增加 `privacy_mode_active` 与 `privacy_mode_changes`。
+
+### 8.4 查看器
+
+- `ViewerStatus` 增加 `privacySupported`（权限位）、`privacyEnabled`、
+  `privacyCode`、`privacyError`、`privacyUpdates`、`desktop`、
+  `desktopUpdates`；`acceptsPrivacy = 串流中 && 权限位`，
+  `secureDesktop = Secure || Unavailable`。
+- `ViewerEngine` 用“最新值覆盖”的单槽保存开关请求，由会话线程调用
+  `QuicSession::set_privacy_mode()`；接收循环在取帧前后都 drain 控制消息，
+  保证开关应答不被视频帧延迟。
+- 原生桥新增 `setPrivacyMode(bool)` 与状态序列化；Flutter 工具栏新增盾牌
+  按钮（无权限置灰），应答到达时用 SnackBar 显示成功/拒绝原因。
+- 安全桌面期间没有新帧时，会话页显示“主机已进入安全桌面（锁屏或 UAC）”
+  横幅；`Unavailable` 提示无法采集，恢复后自动继续。右下角状态徽标显示
+  隐私模式是否开启。
+- `app/test/privacy_status_test.dart` 覆盖字段解析、默认值、未知桌面码
+  回退、非串流不接受隐私开关、`Unavailable` 计入安全桌面。
+
+### 8.5 验收标准
+
+- `[x]` `chast-protocol-test`：三条消息往返；非法 enabled 值、尾随/空载荷、
+  未知 code、`enabled=1` 搭配失败 code、超长 reason、坏 UTF-8 均被拒绝；
+  HelloAck 的隐私标志与权限掩码往返。
+- `[x]` `chast-quic verify --privacy`（端口 45499，6 s）：主机在 1.32 s
+  开启遮罩（code 0），3.54 s 关闭（code 0）；主机统计 2 次变化、结束时
+  遮罩已撤下；遮罩期间采集持续、画面不是黑色（luma 与开启前差值 ≤30），
+  关闭后视频继续；查看器收到 Default 桌面公告。另一台默认关闭隐私的
+  主机拒绝请求且不断流。100 项断言、181 个访问单元/181 帧解码、摘要
+  `4DB1C6A97132DC4F`。
+- `[x]` `chast-desktop-test`：普通会话报告 Default、桌面名可读、线程已在
+  输入桌面时 `follow_input_desktop` 返回 no-op；安全桌面本身无法在自动化
+  会话里构造。
+- `[x]` `ctest -C Release` 12/12（31.92 s）；`quic_loopback` 已加入
+  `--privacy`，每次回归都会覆盖遮罩开关与视频连续性。
+- `[x]` `flutter analyze` 无问题、`flutter test` 73 项全过、
+  `flutter build windows --release` 成功。
+- `[~]` 实机人工：真实锁屏/UAC 下的安全桌面采集与输入、托盘态暂停/恢复、
+  服务态 Winlogon 采集；遮罩在多显示器与不同 DPI 下的视觉覆盖。本机只有
+  1 个输出，无法自动合成键盘/鼠标与锁屏事件，以上均待实机。
+- 虚拟显示器不参与本轮验收；隐私模式不改变采集分辨率或编码参数。
+
+### 8.6 风险
+
+- `WDA_EXCLUDEFROMCAPTURE` 需要 19041+；旧系统直接回 `Unsupported`，
+  用户可以继续串流但没有隐私模式。
+- 遮罩只存在于 Default 桌面。锁屏/UAC 时本地屏幕本来就是安全桌面，
+  遮罩不可见；若服务态继续采集安全桌面，远端会看到该桌面，隐私模式
+  不会遮盖它。需要同时隐藏安全桌面时应关闭采集或断开。
+- 托盘主机在安全桌面期间暂停采集，查看器停留在最后一帧并显示横幅；
+  会话不断，但输入事件会被系统丢弃（计入 failed），解锁后恢复。
+- `SetThreadDesktop` 要求线程没有窗口/钩子；主机的采集与注入都在专用
+  线程上，若未来把窗口逻辑移入这些线程会失败并保持旧桌面。
+- 顶层遮罩可能与其他顶层窗口竞争 Z 序；1 s 定时器会重新置顶。它从不
+  激活、不接管鼠标，本地操作不受影响。
+- 监听器的隐私能力上限固定；运行中从关闭改为开启要等下一次连接。
+- 安全桌面路径依赖服务态进程的权限与桌面访问掩码，回环无法覆盖，
+  仍以实机服务安装后的验收为准。
+
+## 9. M8.3 编码后端（FFmpeg 硬件兜底）
+
+### 9.1 后端与选择
+
+- `EncoderBackend { Auto, Vpl, Ffmpeg }` 经 `EncoderConfig::backend` 与
+  `HostServerConfig::encoder_backend` 传递；`chast-encode` 与
+  `chast-quic serve/verify` 新增 `--encoder auto|vpl|ffmpeg`。
+- Auto 保持既有 Intel 路径：先 oneVPL（VDENC HEVC → VDENC AVC → VME AVC
+  三级试编），全部失败后才创建 FFmpeg 编码器；固定后端失败不回退，便于
+  定位。`has_encoder_available()` 与工具共用同一套判定。
+- FFmpeg 后端按采集适配器厂商选编码器：NVIDIA `h264_nvenc`/`hevc_nvenc`、
+  AMD `h264_amf`/`hevc_amf`、Intel `h264_qsv`/`hevc_qsv`；HEVC 不可用时
+  同一厂商退到 H.264，`codec()` 报告实际格式。工程仍不含任何软件编码器。
+
+### 9.2 零拷贝路径
+
+- NVENC/AMF：编码器自有 D3D11VA 帧池（`initial_pool_size=1`，
+  `BindFlags=D3D11_BIND_RENDER_TARGET`），采集 NV12 纹理用
+  `CopySubresourceRegion` 拷进池纹理，再以 `AV_PIX_FMT_D3D11` 送入
+  libavcodec；两端都在显存，只有压缩包回到 CPU。
+- QSV：从同一 D3D11 设备派生 QSV 设备
+  （`av_hwdevice_ctx_create_derived`），池帧映射一次得到可写 D3D11
+  纹理，之后每帧同卡 GPU 拷入。派生前必须对采集设备开启
+  `ID3D10Multithread`，否则 mfx-gen 的 `MFXVideoCORE_SetHandle`
+  返回 `MFX_ERR_DEVICE_FAILED`（-16）。
+- `shared_import()` 对 FFmpeg 后端恒为 false：这是“GPU 拷入编码器池”，
+  不是共享导入；工具输出 `import: copy (GPU to GPU, no system memory)`。
+
+### 9.3 参数与码率
+
+- 对齐 RustDesk 的 VRAM 编码：CBR、无 B 帧、GOP 无限（仅按需 IDR）、
+  单切片、低延迟、BT.601 limited、H.264 High / HEVC Main；码率缺省用
+  `hardware_bitrate()`。
+- `set_rate()`：NVENC/AMF 原地更新 `bit_rate`/`rc_max_rate`，纯码率变化
+  继续编码序列；帧率变化延迟到下一帧前重建编码器并要求 IDR。QSV 的
+  libavcodec 在码率或帧率变化时刷新并 `MFXVideoENCODE_Reset` 会话；
+  oneVPL 规定不带 `mfxExtEncoderResetOption` 的 reset 会开始新编码序列
+  （含 IDR），所以只有这条 FFmpeg 兜底路径每次速率变化补一次 IDR，主机
+  按 `keyframe_required` 决定是否强制。
+- RustDesk 对照：它的 QSV 路径同样会插入 IDR——原生 mfx 的
+  `mfx_set_bitrate()` 也是不带 reset option 的 `MFXVideoENCODE_Reset`，
+  `ffmpeg_vram` 只是写 `c->bit_rate` 后交给 libavcodec 做同一个 reset；
+  它的 NVENC `Reconfigure`/AMF `SetProperty` 不打断序列，与我们的原地
+  更新一致。RustDesk 不把自适应帧率写进编码器（mfx 的
+  `mfx_set_framerate` 返回“不支持”，Rust 侧只暴露 `set_bitrate`），
+  只改采集节奏；我们把 ABR 帧率同步给编码器，因此跨帧率档位会多一次
+  IDR（档内纯码率变化仍是连续序列）。
+- `encode_repeat()` 在内容未更新时复用池中上一帧，不重复拷贝；设备丢失
+  /复位返回 DeviceRemoved/DeviceReset，由上层重建。
+
+### 9.4 验收
+
+- 本机（Intel Iris Xe、mfx-gen 与 FFmpeg 8.1.1）：
+  `chast-encode --encoder ffmpeg --codec h264/hevc` 均输出 1920×1080、
+  52.6/48.7 fps、292/256 KB（3 s），`import: copy`。
+- 新增 CTest：`quic_loopback_ffmpeg`（端口 45463，含关键帧请求、文件
+  上传/下载、隐私）与 `quic_stream_options_ffmpeg`（端口 45473），后者
+  验证 H.264→HEVC 切换、15 fps 上限、纯码率变化（QSV 预期一次 IDR）
+  与恢复。两条均通过，原有 VPL `quic_loopback`/`quic_stream_options`
+  无回归。
+- 回放切分修正：QSV 每帧输出 SEI+slice、无 AUD，`split_access_units()`
+  改为无 AUD 时按 VCL NAL 边界成组，保存流仍与发送访问单元一一对应。
+
+### 9.5 限制
+
+- 本机没有 NVIDIA/AMD 显卡：NVENC/AMF 只验证了编译、厂商映射与负向
+  可用性，真实编码、驱动差异与零拷贝行为待实机。
+- 不改线协议（仍 v23）；编码器实现名只用于日志与 StreamInfo 展示。
+
+## 10. 开发记录
 
 ### 2026-10-23
 
@@ -595,6 +1004,29 @@ Win32 剪贴板：
   区分写入方；真实路径只确认真实 DIB 发送一次（查看器日志
   `formats 0x8`）。从浏览器复制含图内容、HTML 文本与反向图片的人工
   核对需要第二台机器，未做。
+- `[x]` M8.4 第 6 阶段：文件传输双向化（协议 v17）。传输层去掉角色
+  限制：`FileOffer/Answer/Result/Cancel` 与 `CFIL` 按发送方/接收方
+  工作，权限位不变；服务端在 `announce()` 发出 HelloAck 后标记
+  握手完成，主机才能发出 Offer。`HostServer` 新增
+  `start_file_download()` 与帧循环下载泵（独立哈希线程、8 ms/轮、
+  32 MiB/s 令牌桶、队满回退）；查看器用 `FileReceiver` 接收并暴露
+  `download_*` 状态；托盘新增“发送文件到查看器…”，Flutter 显示接收
+  进度与完成/失败提示。
+- `[x]` M8.4 查看器拖放上传：`DragAcceptFiles` + `WM_DROPFILES` 挂在
+  Flutter 视图子类窗口，首条路径经 `droppedFile` 桥接给 Dart，与
+  工具栏上传共用校验/进度/SnackBar 流程。
+- `[x]` M8.4 双向探针（`chast-quic verify --port 46013
+  --file-upload --file-download`）：全部断言通过，181 个访问单元 /
+  181 帧解码，摘要 `32B8B69C7B5EC213`。下载侧覆盖主机在 HelloAck 后
+  排队、查看器接受 300 KiB、摘要一致并回 `FileResult`，主机统计
+  `files_sent=1`、无失败；与上传探针并发运行互不干扰。
+- `[x]` M8.4 回归：根目录 Release 构建通过；`ctest -C Release`
+  11/11（33.76 s，`quic_loopback` 已加入 `--file-download`）；
+  `flutter analyze` 无问题、`flutter test` 68 项通过；
+  `flutter build windows --release` 成功。
+- `[~]` M8.4 单机 GUI 文件往返未人工点选：托盘文件对话框、查看器
+  连接/批准与拖放需要交互，回环只覆盖协议与引擎收发路径。双机文件
+  往返与富剪贴板人工核对仍需实机。
 - `[x]` 收尾构建已重新链接全部目标：早先 `[!]` 记录的
   `build/Release/chast-host.exe` 被占用问题已解除，当前无残留测试
   进程。
@@ -607,3 +1039,166 @@ Win32 剪贴板：
   stats 与 applied/pending，旧输出的回滚基准不再被新输出覆盖。
   合并后 Release 构建通过，`ctest -C Release` 11/11（36.11 s，
   `quic_loopback` 32.29 s）。
+
+### 2026-10-24
+
+- `[x]` M8.5 协议 v18：`AudioCodec::Opus`、`kPermissionMicrophone`、
+  `kServerInfoMicrophoneEnabled`、`CMIC` 流魔数与 20 字节头部；
+  `make/decode_microphone_stream_header()` 与
+  `microphone_stream_header_length()` 负责先判断完整头部再解码。
+  HelloAck/StreamInfo 的麦克风能力由权限掩码推导，固定字段布局不变。
+- `[x]` M8.5 Opus 编解码：直接链接 vcpkg 的 `Opus::opus`，调用
+  `opus_encode`/`opus_decode`，不经过 FFmpeg 的 Opus 封装。系统声音
+  48 kHz 立体声 128 kbps，麦克风 48 kHz 单声道 32 kbps，20 ms/960
+  样本，19 字节 `OpusHead`，pre-skip 由 `OPUS_GET_LOOKAHEAD` 写入并在
+  解码首包丢弃。
+- `[x]` M8.5 音频双工库：`wasapi_capture` 的系统声音改为 Opus；
+  新增 `wasapi_mic.cc`（活动采集端点枚举、通信角色默认设备、设备
+  消失后每秒重试）与 `opus_codec.cc`；播放器支持
+  `arrival_anchored`，麦克风以到达时间锚定 80 ms lead，停顿超过
+  100 ms 后重新锚定并清空旧队列。
+- `[x]` M8.5 传输层 `CMIC`：`QuicServerConfig::allow_microphone`
+  （默认 false）、单活动上行流、头部校验、权限门禁与实时收回；
+  `receive_microphone/start_microphone/send_microphone/stop_microphone`
+  与 `microphone_finished/microphone_streams` 公开 API。流关闭、会话
+  重置与权限撤销都会释放句柄，迟到的旧句柄事件被忽略。
+- `[x]` M8.5 主机接入：`HostSettings::allow_microphone`（默认 false，
+  解析/保存 `microphone=` 与权限掩码）；审批窗口、主界面、托盘菜单与
+  安全设置页均可开关；`HostServerStats` 增加麦克风计数；帧循环按需
+  创建 Opus 解码器与 WASAPI 播放器，权限收回/流结束/解码失败时释放。
+  `HostServerConfig::microphone_player` 供回环探针注入内存播放器。
+- `[x]` M8.5 查看器接入：`ViewerEngine` 新增麦克风会被授权/正在发送/
+  当前设备与名称/包数/丢弃/错误/恢复次数/最近错误，UI 线程只写“想开”
+  与设备 id；会话线程负责创建设备、`start_microphone()`、每轮 drain 并
+  `send_microphone()`，停止/权限收回/设备切换/失败时关闭 `CMIC` 并释放
+  采集器。原生桥新增 `setMicrophone/listMicrophones/selectMicrophone`
+  与状态字段；Flutter 工具栏新增麦克风按钮，长按或菜单选择输入设备，
+  未授权、恢复中与错误均有说明，状态浮层显示包数与丢弃数。
+- `[x]` M8.5 编码端去掉 AAC：`create_audio_encoder()` 只接受 Opus，
+  对 AAC 返回 `Unsupported` 并提示音频统一走 Opus；
+  `create_aac_encoder()` 与 `AacEncoder` 实现删除，
+  `AudioEncoderConfig` 默认 codec 改为 Opus。AAC 解码器保留用于协议
+  枚举与历史 `AudioInfo`，生产路径不再创建任何 AAC 流。
+- `[x]` M8.5 阶段性回归：`chast-protocol-test`、`chast-audio-codec-test`
+  与 `chast-host-settings-test` 全部通过；`chast-quic`、`chast-host`、
+  `chast-service` Release 链接通过（仅既有的 LNK4098 警告）；
+  `ctest -C Release` 11/11（31.63 s），普通回环在系统声音改 Opus 后
+  继续通过。
+- `[x]` M8.5 回环 `verify --microphone`（端口 46230，6 s）：主机授予
+  麦克风，合成单声道 Opus 通过 `CMIC` 上行 90 包/7251 B，主机解码
+  86088 帧（约 90×960 减去 pre-skip），注入播放器记录 440 Hz、RMS 6864；
+  `stop_microphone()` 后主机流在 3.54 s 结束。关闭闸门探针的另一台
+  主机拒绝 `CMIC`，同会话视频继续。179 个访问单元、179 帧解码，
+  摘要 `CB960C0EAC53FDE2`，全部断言通过。
+- `[x]` M8.5 测试与构建收尾：`chast-audio-codec-test` 改为 Opus-only，
+  新增“AAC 编码不可用且文案指向 Opus”断言；`ctest -C Release`
+  11/11（33.18 s）；`flutter analyze` 无问题、`flutter test` 68 项通过、
+  `flutter build windows --release` 成功（73.7 s）。移除 AAC 编码器后
+  复跑 `verify --microphone`（端口 46233）通过：`CMIC` 32 包/2592 B、
+  主机解码 30408 帧、440 Hz、RMS 6895，88 个访问单元、摘要
+  `EAE78CA8810C73DC`；包数随本机采集启动快慢浮动，断言只看“有包、
+  全到达、可解码、音调与能量正确”。
+- `[x]` 主机麦克风日志从 CMIC 头没有的 bitrate 改为打印
+  `960 samples/frame`，避免出现 `0 kbps` 的误导输出。
+- `[ ]` M8.5 真实麦克风人工验收：本机没有可自动合成的输入设备事件，
+  需在带麦克风与耳机的机器上确认“打开即响、关闭/收回即停”；单机扬声器
+  与麦克风同处一室会有回声，双机主观验收仍需第二台机器。
+- `[x]` M8.6 协议 v19：`kPermissionPrivacyMode`/`kServerInfoPrivacyModeEnabled`
+  （`0x0020`）、`SetPrivacyMode=25`、`PrivacyModeState=26`、
+  `DesktopState=27` 与 `PrivacyModeCode`/`DesktopKind` 编解码；reason 上限
+  256 B。`ServerInfo::privacy_mode_enabled` 由权限掩码推导，HelloAck 固定
+  布局不变。
+- `[x]` M8.6 桌面跟随：新增 `chast/desktop`（`input_desktop_status`、
+  `on_input_desktop`、`follow_input_desktop`），按 `OpenInputDesktop` 与
+  WTS 锁屏标志区分 Default/Secure/Unavailable；主机帧循环每秒公告
+  `DesktopState` 并跟随输入桌面，切换后重建采集器、丢编码器、强制关键帧；
+  托盘主机打不开 Winlogon 时暂停采集并重试，不结束会话。`InputInjector`
+  每 250 ms 跟随，切换后清空按键/按钮持有状态。
+- `[x]` M8.6 主机隐私模式：`HostSettings::allow_privacy_mode`（默认关）
+  与权限掩码/托盘菜单/设置页联动；`PrivacyOverlay` 在独立线程挂到
+  Default 桌面，建立穿透、不激活的顶层黑色窗口并用
+  `WDA_EXCLUDEFROMCAPTURE` 排除采集，1 s 定时器与显示变化时重新铺满；
+  低于 19041 或 affinity 失败直接拒绝。开启/关闭/权限收回/会话结束的
+  状态与统计已接入。
+- `[x]` M8.6 查看器：`ViewerStatus` 增加隐私与桌面字段、`acceptsPrivacy`/
+  `secureDesktop`；引擎单槽排队 `setPrivacyMode`，接收循环前后 drain 控制
+  消息；原始桥与 Flutter 盾牌按钮、应答 SnackBar、安全桌面横幅、状态
+  徽标完成；新增 5 项 `privacy_status_test.dart` 用例。
+- `[x]` M8.6 回环 `verify --privacy`（端口 45499，6 s）：100 项断言全过；
+  遮罩 1.32 s 开（code 0）、3.54 s 关（code 0），主机 `changes=2` 且结束时
+  `active=false`；遮罩期间采集持续、画面未变黑，关闭后视频继续；
+  默认关闭隐私的主机拒绝请求且不断流。会话共 181 个访问单元/181 帧，
+  摘要 `4DB1C6A97132DC4F`。
+- 回环发现并修复：客户端 `permission_mask_from_info()` 只映射输入、剪贴板、
+  音频、文件与麦克风，漏了隐私位，导致主机已授权时 `set_privacy_mode`
+  仍回 `PermissionDenied` 并提前结束接收；补齐后全链路通过。
+- `[x]` M8.6 回归：`ctest -C Release` 12/12（31.92 s）；`quic_loopback`
+  已加入 `--privacy`，隐私开关与视频连续性进入常规回归；
+  `flutter analyze` 无问题、`flutter test` 73 项全过、
+  `flutter build windows --release` 成功。
+- `[~]` M8.6 实机人工验收未做：真实锁屏/UAC 的安全桌面采集与注入、
+  托盘态暂停/恢复、服务态 Winlogon 路径、遮罩在多显示器/不同 DPI/物理
+  显示器上的视觉效果，都需要第二台机器或人工锁屏；本机单输出且不能
+  合成系统级键盘/锁屏事件。
+- `[!]` 虚拟显示器 M8.2 继续暂缓：没有可用的已签名开源驱动；隐私模式
+  的“虚拟屏遮罩”按字面只落到真实输出的捕获排除浮层，不引入驱动。
+- `[x]` M8.3 FFmpeg 硬件兜底：`EncoderBackend`（Auto/Vpl/Ffmpeg）进入
+  `EncoderConfig`、`HostServerConfig` 与工具 `--encoder`；`create_encoder()`
+  在 Auto 下先 oneVPL、失败再 FFmpeg，固定后端不回退。新增
+  `src/codec/ffmpeg_encoder.cc`，按采集适配器厂商映射 NVENC/AMF/QSV 的
+  H.264/HEVC，HEVC 可在同厂商退 H.264，不引用软件编码器。
+- `[x]` M8.3 零拷贝：D3D11VA 帧池 + 同卡 `CopySubresourceRegion`；
+  QSV 由采集设备派生并一次映射池帧。定位并修复派生失败：mfx-gen 要求
+  采集设备开启 `ID3D10Multithread`，否则 SetHandle 返回 -16；独立工具
+  与 `verify` 复跑均通过。
+- `[x]` M8.3 速率：NVENC/AMF 原地改码率、帧率变化延迟重建；QSV 按
+  libavcodec 语义在码率/帧率变化时 reset 并要求 IDR。流参数探针按
+  实现区分：QSV 纯码率变化预期一次 IDR，oneVPL H.264 仍要求 0 次。
+  对照 RustDesk：其 QSV（原生 mfx 与 ffmpeg_vram）同样以 reset 开始新
+  序列、由硬件插入 IDR，NVENC/AMF 不插入；其自适应帧率只改采集节奏、
+  不进编码器。我们的一级 oneVPL 路径用 `StartNewSequence=OFF`，纯码率
+  变化不插 IDR，比 RustDesk 的 mfx 路径更细。
+- `[x]` M8.3 回放切分：`tools/annexb.h` 无 AUD 时按 VCL 边界成组，
+  QSV 的 SEI+slice 不再被拆成两个访问单元。
+- `[x]` M8.3 验证：`chast-encode --encoder ffmpeg` H.264/HEVC 各 3 s
+  通过（52.6/48.7 fps，292/256 KB）；新增 `quic_loopback_ffmpeg` 与
+  `quic_stream_options_ffmpeg`，连同原有两条 VPL 回环 4/4 通过。
+- `[ ]` M8.3 实机验收：NVENC/AMF 需要 NVIDIA/AMD 机器；本机只有 Intel
+  Iris Xe，QSV 已完成验证。
+
+### 2026-10-25
+
+- `[x]` M8.3 复核：同步远端后重新配置并 Release 编译（新增 M9.4 依赖
+  SpeexDSP 1.2.1 静态库），`ctest --test-dir build -C Release -R ffmpeg`
+  2/2 通过（`quic_loopback_ffmpeg` 33.75 s、`quic_stream_options_ffmpeg`
+  31.74 s）。`chast-encode --encoder ffmpeg` 在 2560×1440 输出上
+  H.264 165 帧/168668 B/54.9 fps、HEVC 123 帧/52834 B/41.0 fps，
+  `errors=0`、`keyframes=1`、`import: copy`。
+- `[ ]` M8.3 实机验收继续保持未完成：NVENC/AMF 需要 NVIDIA/AMD 显卡。
+
+### 2026-10-26
+
+- `[x]` 重构同步：本地 `main` 合入 `origin/feat/m7-security`
+  （`24b8303`，216 个文件，协议 v24，M8.5–M10.8）。文本冲突只有
+  `src/host/host_server.cc` 与本文档。远程重构已把分辨率模型改为
+  `resolution_request` + 采集器读回的 `stats.resolution_percent`
+  （`nv12_scale_percent()`），并自带缩放失败回退与 `resolution_fixed`
+  锁定；主线 2026-10-23 的 `applied/pending_resolution_percent` 随之
+  删除，合并时统一采用重构模型。
+- `[x]` 保留两项主线修正：切屏时候选采集器的缩放与有效百分比先局部
+  暂存为 `next_scale_request`/`next_effective_percent`，交换成功后才
+  提交 `resolution_request` 与 stats（切换失败时旧输出状态不动）；
+  `frames_without_nv12` 连续三帧无 NV12 的会话失败保护继续生效。
+- `[x]` 移除主线的 `resolution_fixed` 致命断言：重构的合并画布会合法
+  改变输出尺寸，此时由编码器重建路径处理，而不是直接结束会话。
+- `[x]` 同步重构带来的新依赖：Opus（已在 vcpkg）与 SpeexDSP 1.2.1
+  （本机补装 `speexdsp:x64-windows-static`），CMake 的
+  `SpeexDSP_ROOT` 缺失会直接 FATAL_ERROR。
+- `[x]` 合并后验证：Release 构建通过（仅既有 LNK4098/LNK4199 与
+  `pwsh.exe` 缺失提示）；`ctest -C Release` 20/20（236.85 s），其中
+  `quic_loopback` 39.56 s、`quic_stream_options` 33.68 s、
+  `quic_loopback_ffmpeg` 32.34 s、`quic_stream_options_ffmpeg`
+  33.84 s、`quic_merged` 30.36 s、`quic_carrier_tcp`/`ws`
+  30.43/30.49 s；`flutter analyze` 无问题、`flutter test` 251 项通过、
+  `flutter build windows --release` 成功（183.5 s）。合并处唯一的
+  新警告 C4244（`next_scale_request` 为 `UINT`）已加显式窄化转换。

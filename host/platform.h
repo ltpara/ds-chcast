@@ -19,14 +19,15 @@ std::string narrow(const std::wstring& text);
 // host with --tray, so autostart does not open a window at login.
 bool set_autostart(bool enabled, std::string* error);
 
-// Applies the inbound UDP rules for the host and, when tunnel_port is
-// non-zero, for its sibling chast-tunnel.exe (a separate executable needs its
-// own program-scoped rule). Runs netsh; the caller must already be elevated.
-// Returns the netsh exit code (0 on success).
+// Applies the inbound rules for the host and, when tunnel_port is non-zero,
+// for its sibling chast-tunnel.exe (a separate executable needs its own
+// program-scoped rule). The host gets UDP on its QUIC port and TCP on port + 1
+// for the weak-network fallback. Runs netsh; the caller must already be
+// elevated. Returns the netsh exit code (0 on success).
 int apply_firewall_rule(uint16_t port, uint16_t tunnel_port);
 
-// Deletes both program-scoped rules (host and tunnel). Used by the service
-// uninstaller, which cannot leave a stale allowance behind.
+// Deletes every program-scoped rule (host UDP/TCP and tunnel). Used by the
+// service uninstaller, which cannot leave a stale allowance behind.
 void remove_firewall_rules();
 
 // Relaunches this executable with --firewall <port> [<tunnel_port>] through
