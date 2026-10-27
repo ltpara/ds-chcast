@@ -18,6 +18,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/configpush"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
@@ -41,18 +42,33 @@ punch-requests(pr) [start] [count] | pr -
 ip-blocker(ib) [ip] | ib -
 ip-changes(ic) [id|start] [count] | ic <id> - | ic -
 relay-servers(rs) [host1,host2 | -]
+rendezvous-servers(rv) [url1,url2 | serial <n> <url1,url2|-> | clear]
 test-geo(tg) <ip1> [ip2]
 relay-only(aur) [Y|N]
 user list | user add <name> [password] | user passwd <name> [password] | user del <name>
+user role <name> admin|user | user ban <name> | user unban <name>
+user email <name> <email|-> | user recover <name>
+user phone <name> <phone|-> | user sms <name>
 user 2fa <name> off | user unlock <name>
-ab <username> [count]
-audit [count]
+ab <username> [count] | ab prune <days>
+audit [count] | audit prune <days>
 connections [count]
 transfers [count]
 relay bandwidth: sb|tb|ls [Mbit/s], dt [0..1], t [seconds]
 relay lists: ba|br|b and Ba|Br|B
 relay usage: u
 `
+
+// Mailer sends password-reset mail from the user recover command. Nil leaves
+// the command printing a token for out-of-band delivery.
+type Mailer interface {
+	SendPasswordReset(to, username, token, link string, ttl time.Duration) error
+}
+
+// SMS sends password-reset codes from the user sms command. Nil disables it.
+type SMS interface {
+	SendPasswordReset(to, username, code string, ttl time.Duration) error
+}
 
 type Config struct {
 	Listen     string
@@ -65,6 +81,16 @@ type Config struct {
 	RelayAddrs *relayaddr.List
 	RelayPool  *relaypool.Pool
 	RelayOnly  *atomic.Bool
+	// Rendezvous is the pushed alternative-server list. Nil disables the
+	// rendezvous-servers command.
+	Rendezvous *configpush.Config
+	// Mailer, RecoveryURL and RecoveryTTL drive the user recover command.
+	Mailer      Mailer
+	RecoveryURL string
+	RecoveryTTL time.Duration
+	// SMS and SMSTTL drive the user phone and user sms commands.
+	SMS    SMS
+	SMSTTL time.Duration
 	// PolicyOnly trims the help text to the relay console used by chast-relay.
 	PolicyOnly bool
 	Logger     *slog.Logger
@@ -180,6 +206,8 @@ func (c *Console) execute(line string) string {
 		return c.ipChangesText(fields[1:])
 	case "relay-servers", "rs":
 		return c.relayText(fields[1:])
+	case "rendezvous-servers", "rv":
+		return c.rendezvousText(fields[1:])
 	case "test-geo", "tg":
 		return c.testGeoText(fields[1:])
 	case "relay-only", "aur":
@@ -580,6 +608,58 @@ func formatRelayAddrs(addrs []string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// rendezvousText shows or replaces the list pushed to hosts and viewers. The
+// serial always moves forward so clients can ignore a stale update, matching
+// hbbs's ConfigureUpdate check.
+func (c *Console) rendezvousText(args []string) string {
+	if c.cfg.Rendezvous == nil {
+		return "rendezvous configuration is not enabled\n"
+	}
+	serial, servers := c.cfg.Rendezvous.Snapshot()
+	if len(args) == 0 {
+		var b strings.Builder
+		fmt.Fprintf(&b, "serial=%d\n", serial)
+		for _, server := range servers {
+			b.WriteString(server)
+			b.WriteString("\n")
+		}
+		if len(servers) == 0 {
+			b.WriteString("no rendezvous servers\n")
+		}
+		return b.String()
+	}
+	switch strings.ToLower(args[0]) {
+	case "clear", "-":
+		next, err := c.cfg.Rendezvous.Set(nil)
+		if err != nil {
+			return fmt.Sprintf("rendezvous-servers: %v\n", err)
+		}
+		return fmt.Sprintf("serial=%d cleared\n", next)
+	case "serial":
+		if len(args) != 3 {
+			return "usage: rendezvous-servers serial <n> <url1,url2|->\n"
+		}
+		serial, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			return "serial must be an integer\n"
+		}
+		var servers []string
+		if args[2] != "-" {
+			servers = strings.Split(args[2], ",")
+		}
+		if err := c.cfg.Rendezvous.Update(serial, servers); err != nil {
+			return fmt.Sprintf("rendezvous-servers: %v\n", err)
+		}
+		return fmt.Sprintf("serial=%d\n", serial)
+	default:
+		next, err := c.cfg.Rendezvous.Set(strings.Split(strings.Join(args, ","), ","))
+		if err != nil {
+			return fmt.Sprintf("rendezvous-servers: %v\n", err)
+		}
+		return fmt.Sprintf("serial=%d\n", next)
+	}
 }
 
 func (c *Console) testGeoText(args []string) string {

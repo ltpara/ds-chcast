@@ -21,6 +21,7 @@ type stubNode struct {
 	url       string
 	relayHost string
 	carrier   string
+	carrierV6 string
 	server    *httptest.Server
 
 	mu            sync.Mutex
@@ -146,6 +147,7 @@ func (n *stubNode) handleLease(w http.ResponseWriter, r *http.Request) {
 	n.ttls[req.ID] = req.TTLSeconds
 	n.carrierTokens[req.ID] = req.CarrierToken
 	carrier := n.carrier
+	carrierV6 := n.carrierV6
 	n.mu.Unlock()
 	reply := map[string]any{
 		"id":             req.ID,
@@ -155,6 +157,9 @@ func (n *stubNode) handleLease(w http.ResponseWriter, r *http.Request) {
 	}
 	if carrier != "" {
 		reply["carrier"] = carrier
+	}
+	if carrierV6 != "" {
+		reply["carrier_v6"] = carrierV6
 	}
 	writeStubJSON(w, http.StatusOK, reply)
 }
@@ -209,6 +214,7 @@ func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() boo
 
 func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 	node := newStubNode(t, "relay-a.example", "relay-a.example:8448")
+	node.carrierV6 = "[2001:db8::5]:8448"
 	node.setLinked("devbox")
 	s := testutil.StartWith(t, testutil.Options{
 		RelayNodes:      []string{node.url},
@@ -220,6 +226,7 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 		Relay        string   `json:"relay"`
 		Relays       []string `json:"relays"`
 		Carrier      string   `json:"carrier"`
+		CarrierV6    string   `json:"carrier_v6"`
 		CarrierToken string   `json:"carrier_token"`
 	} {
 		t.Helper()
@@ -232,6 +239,7 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 			Relay        string   `json:"relay"`
 			Relays       []string `json:"relays"`
 			Carrier      string   `json:"carrier"`
+			CarrierV6    string   `json:"carrier_v6"`
 			CarrierToken string   `json:"carrier_token"`
 		}
 		if err := json.Unmarshal(body, &reply); err != nil {
@@ -250,6 +258,9 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 	if first.Carrier != "relay-a.example:8448" {
 		t.Fatalf("remote carrier = %q", first.Carrier)
 	}
+	if first.CarrierV6 != "[2001:db8::5]:8448" {
+		t.Fatalf("remote carrier v6 = %q", first.CarrierV6)
+	}
 	ttl, pub, calls := node.leaseRequest("devbox")
 	if calls != 1 || ttl != 120 {
 		t.Fatalf("lease request: ttl=%d calls=%d", ttl, calls)
@@ -260,7 +271,8 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 	}
 	lease, ok := s.Registry.Lookup("devbox")
 	if !ok || lease.RelayNode != node.url || lease.RelayHost != "relay-a.example" ||
-		lease.RelayPort != 41001 || lease.Carrier != "relay-a.example:8448" {
+		lease.RelayPort != 41001 || lease.Carrier != "relay-a.example:8448" ||
+		lease.CarrierV6 != "[2001:db8::5]:8448" {
 		t.Fatalf("registry lease: %+v (found=%v)", lease, ok)
 	}
 
@@ -277,7 +289,8 @@ func TestRemoteRelayRegistrationAndLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !host.Online || host.Transport != "carrier" || host.Relay != first.Relay ||
-		host.Carrier != first.Carrier || host.CarrierToken != first.CarrierToken {
+		host.Carrier != first.Carrier || host.CarrierV6 != first.CarrierV6 ||
+		host.CarrierToken != first.CarrierToken {
 		t.Fatalf("lookup after registration: %+v", host)
 	}
 

@@ -37,7 +37,8 @@ type connectionView struct {
 }
 
 type connectionsResponse struct {
-	Connections []connectionView `json:"connections"`
+	Connections  []connectionView `json:"connections"`
+	NextBeforeID int64            `json:"next_before_id,omitempty"`
 }
 
 func connectionToView(event account.ConnectionEvent) connectionView {
@@ -56,6 +57,29 @@ func connectionToView(event account.ConnectionEvent) connectionView {
 		Success:     event.Success,
 		Detail:      event.Detail,
 	}
+}
+
+// listBeforeID parses the cursor shared by the paged event lists.
+func (s *server) listBeforeID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get("before_id"))
+	if raw == "" {
+		return 0, true
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, "before_id must be a positive integer")
+		return 0, false
+	}
+	return id, true
+}
+
+// nextBeforeID is the cursor for the following page. It is set only when the
+// page is full, so a short page ends the walk without a total count.
+func nextBeforeID(lastID int64, count, limit int) int64 {
+	if count < limit {
+		return 0
+	}
+	return lastID
 }
 
 func (s *server) connectionLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
@@ -120,7 +144,11 @@ func (s *server) accountConnections(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, err := s.cfg.Accounts.Connections(user.ID, limit)
+	beforeID, ok := s.listBeforeID(w, r)
+	if !ok {
+		return
+	}
+	events, err := s.cfg.Accounts.ConnectionsBefore(user.ID, beforeID, limit)
 	if err != nil {
 		s.cfg.Logger.Error("account connection query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the connection log")
@@ -129,6 +157,10 @@ func (s *server) accountConnections(w http.ResponseWriter, r *http.Request) {
 	out := connectionsResponse{Connections: make([]connectionView, 0, len(events))}
 	for _, event := range events {
 		out.Connections = append(out.Connections, connectionToView(event))
+	}
+	if len(out.Connections) > 0 {
+		out.NextBeforeID = nextBeforeID(out.Connections[len(out.Connections)-1].ID,
+			len(out.Connections), limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -144,7 +176,17 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return
 	}
+	if asCSV, ok := exportRequest(w, r); !ok {
+		return
+	} else if asCSV {
+		s.connectionsCSV(w, r)
+		return
+	}
 	limit, ok := s.connectionLimit(w, r)
+	if !ok {
+		return
+	}
+	beforeID, ok := s.listBeforeID(w, r)
 	if !ok {
 		return
 	}
@@ -153,9 +195,9 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 		err    error
 	)
 	if host := strings.TrimSpace(r.URL.Query().Get("host")); host != "" {
-		events, err = s.cfg.Accounts.ConnectionsForHost(host, limit)
+		events, err = s.cfg.Accounts.ConnectionsForHostBefore(host, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.ConnectionsFor(r.URL.Query().Get("username"), limit)
+		events, err = s.cfg.Accounts.ConnectionsForBefore(r.URL.Query().Get("username"), beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account connection audit query", "error", err)
@@ -165,6 +207,10 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	out := connectionsResponse{Connections: make([]connectionView, 0, len(events))}
 	for _, event := range events {
 		out.Connections = append(out.Connections, connectionToView(event))
+	}
+	if len(out.Connections) > 0 {
+		out.NextBeforeID = nextBeforeID(out.Connections[len(out.Connections)-1].ID,
+			len(out.Connections), limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

@@ -254,7 +254,7 @@ func TestCarrierKeepsHostOnlineWithoutRendezvous(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	api := newAPIClient(s.URL, testutil.ServerKey)
+	api := newAPIClient(s.URL, testutil.ServerKey, nil)
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
 	host, err := api.lookup(lookupCtx, "devbox")
 	lookupCancel()
@@ -282,6 +282,121 @@ func TestCarrierKeepsHostOnlineWithoutRendezvous(t *testing.T) {
 		t.Fatalf("carrier fallback path info: %+v", info)
 	}
 	viewerRoundTrip(t, viewer, []byte("quic-datagram-carrier-fallback"))
+}
+
+// TestViewerCarrierIPv6Fallback opens the shared carrier over IPv6 when the
+// IPv4 endpoint is unreachable. The host stays on IPv4; the relay bridges both
+// endpoints by host ID.
+func TestViewerCarrierIPv6Fallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := testutil.StartWith(t, testutil.Options{CarrierV6: true})
+	if s.CarrierV6 == "" {
+		t.Fatal("test server has no IPv6 carrier endpoint")
+	}
+	echo := startEcho(t)
+	localCarrier := startEchoCarrier(t)
+	startHostAgentCarrier(t, ctx, s.URL, echo.LocalAddr().String(), localCarrier.Addr().String())
+	waitForSharedHost(t, s)
+	token := carrierTokenFor(t, s, "devbox")
+
+	local, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	v := &ViewerAgent{
+		cfg:          ViewerConfig{HostID: "devbox"},
+		conn:         conn,
+		log:          quietLogger(),
+		ctx:          ctx,
+		carrier:      "127.0.0.1:1",
+		carrierV6:    s.CarrierV6,
+		carrierToken: token,
+		local:        local.LocalAddr().(*net.UDPAddr),
+	}
+	candidates := v.carrierCandidates()
+	if len(candidates) != 2 {
+		t.Fatalf("carrier candidates = %v, want both address families", candidates)
+	}
+	for _, candidate := range candidates {
+		if candidate == s.CarrierV6 {
+			goto dial
+		}
+	}
+	t.Fatalf("carrier candidates = %v, want %s", candidates, s.CarrierV6)
+
+dial:
+	linkErr := make(chan error, 1)
+	go func() { linkErr <- v.runCarrierLink() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		v.carrierMu.Lock()
+		up := v.carrierConn != nil
+		v.carrierMu.Unlock()
+		if up && v.carrierEndpoint() == s.CarrierV6 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("viewer never fell back to the IPv6 carrier: candidates=%v used=%q",
+				candidates, v.carrierEndpoint())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	payload := []byte("ipv6-carrier-datagram")
+	v.writeCarrier(payload)
+	buf := make([]byte, 2048)
+	_ = local.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := local.ReadFromUDP(buf)
+	if err != nil || string(buf[:n]) != string(payload) {
+		t.Fatalf("IPv6 carrier round trip = %q, %v", buf[:n], err)
+	}
+
+	v.carrierMu.Lock()
+	if v.carrierConn != nil {
+		v.carrierConn.Close()
+	}
+	v.carrierMu.Unlock()
+	select {
+	case <-linkErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("carrier link did not stop")
+	}
+}
+
+// TestHostCarrierTargets checks that the host dials the shared carrier pair
+// before falling back to the per-port relay twin.
+func TestHostCarrierTargets(t *testing.T) {
+	h := &HostAgent{
+		sharedCarrier:   "198.51.100.5:8445",
+		sharedCarrierV6: "[2001:db8::5]:8445",
+	}
+	targets := h.carrierTargets()
+	if len(targets) != 2 {
+		t.Fatalf("shared carrier targets = %v, want both families", targets)
+	}
+	for _, target := range targets {
+		if !h.carrierTargetActive(target) {
+			t.Fatalf("target %q is not active: %v", target, targets)
+		}
+	}
+	if h.carrierTargetActive("203.0.113.9:8445") {
+		t.Fatal("an unadvertised endpoint reported as active")
+	}
+
+	h.sharedCarrier = ""
+	h.sharedCarrierV6 = ""
+	h.relay = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 41000}
+	targets = h.carrierTargets()
+	if len(targets) != 1 || targets[0] != "127.0.0.1:41000" {
+		t.Fatalf("relay twin fallback = %v", targets)
+	}
 }
 
 func TestRelayOnlyForcesRelayAndRefusesDirect(t *testing.T) {

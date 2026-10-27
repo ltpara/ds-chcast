@@ -25,11 +25,16 @@ type loginRequest struct {
 	DeviceName   string `json:"device_name"`
 	TOTPCode     string `json:"totp_code"`
 	RecoveryCode string `json:"recovery_code"`
+	SMSCode      string `json:"sms_code"`
+	EmailCode    string `json:"email_code"`
 }
 
 type accountView struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
+	Role     string `json:"role"`
+	Email    string `json:"email,omitempty"`
+	Phone    string `json:"phone,omitempty"`
 }
 
 type loginResponse struct {
@@ -178,7 +183,13 @@ type sharedAddressBooksResponse struct {
 }
 
 func viewAccount(user account.User) accountView {
-	return accountView{ID: user.ID, Username: user.Username}
+	return accountView{
+		ID:       user.ID,
+		Username: user.Username,
+		Role:     user.Role,
+		Email:    user.Email,
+		Phone:    user.Phone,
+	}
 }
 
 func viewAccountSession(session account.Session) accountSessionView {
@@ -248,8 +259,9 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		writeLoginLocked(w, retry)
 		return
 	}
-	user, token, _, refresh, _, err := s.cfg.Accounts.LoginWithRefresh(
-		req.Username, req.Password, req.DeviceID, req.DeviceName, req.TOTPCode, req.RecoveryCode,
+	user, token, _, refresh, _, err := s.cfg.Accounts.LoginWithRefreshFactors(
+		req.Username, req.Password, req.DeviceID, req.DeviceName,
+		req.TOTPCode, req.RecoveryCode, req.SMSCode, req.EmailCode,
 	)
 	if errors.Is(err, account.ErrTwoFactorRequired) {
 		s.auditLogin(r, req.Username, "two-factor required", false)
@@ -266,6 +278,11 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		s.auditLogin(r, req.Username, "two-factor invalid", false)
 		w.Header().Set(twoFactorHeader, "invalid")
 		writeError(w, http.StatusUnauthorized, "two-factor code was not accepted")
+		return
+	}
+	if errors.Is(err, account.ErrAccountBanned) {
+		s.auditLogin(r, req.Username, "account banned", false)
+		writeError(w, http.StatusForbidden, "account is banned")
 		return
 	}
 	if errors.Is(err, account.ErrInvalidCredentials) {
@@ -294,6 +311,10 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		detail = "password+two-factor"
 	} else if strings.TrimSpace(req.RecoveryCode) != "" {
 		detail = "password+recovery-code"
+	} else if strings.TrimSpace(req.SMSCode) != "" {
+		detail = "password+sms-code"
+	} else if strings.TrimSpace(req.EmailCode) != "" {
+		detail = "password+email-code"
 	}
 	if device := strings.TrimSpace(req.DeviceName); device != "" {
 		detail += " device=" + device
@@ -336,6 +357,11 @@ func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, account.ErrInvalidToken) {
 		s.recordAudit(r, "-", account.AuditRefresh, "invalid token", false)
 		writeError(w, http.StatusUnauthorized, "refresh token was not accepted")
+		return
+	}
+	if errors.Is(err, account.ErrAccountBanned) {
+		s.recordAudit(r, "-", account.AuditRefresh, "account banned", false)
+		writeError(w, http.StatusForbidden, "account is banned")
 		return
 	}
 	if err != nil {

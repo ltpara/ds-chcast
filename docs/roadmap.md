@@ -470,7 +470,9 @@
     `/v1/server` 的 `tls:true`、TLS 1.2/1.3 均可协商且证书校验通过，明文
     请求被 400 拒绝；`/metrics` 未认证 401、带 key 后内容与 `/v1/stats`
     一致。
-  - 已知限制：证书轮换/ACME/mTLS 不在范围内；限流基于内存桶，重启后清零，
+  - 已知限制：证书文件替换热加载已于 2026-10-27 补齐（P2-14），ACME 自动
+    申请已于 2026-10-28 补齐（P2-20，mTLS 与私有 CA 见 P2-11）；限流基于
+    内存桶，重启后清零，
     多实例部署需要前置网关统一限流；真实反向代理头与多客户端压力需部署
     环境复核。
 
@@ -802,7 +804,8 @@
       调用者的当前会话并撤销同账号其他令牌，原密码错误返回 403（不冒充令牌
       失效），新密码沿用 8–128 字节规则（违规为 400）。查看器账号对话框新增
       “修改密码”，本地校验长度与两次输入是否一致，成功后提示其他设备已退出。
-      管理台 `user passwd` 仍是忘记密码时的重置入口。
+      管理台 `user passwd` 可重置忘记的密码（2026-10-28 起另有邮件令牌/短信
+      验证码自助找回与管理台 `user recover`/`user sms`）。
     - 一键退出其他设备（2026-10-25）：`POST
       /v1/account/sessions/revoke-others` 保留调用者令牌、删除该账号其余会话，
       返回 `{"revoked":N}` 并写入 `session_revoke` 审计；空令牌在存储层被拒绝，
@@ -1010,21 +1013,26 @@
       `go build ./...`、`flutter analyze`、全量 `flutter test` 通过。
     - 已知限制：失败计数默认在内存中，配置 `--state` 后写入 SQLite
       `login_locks` 并跨重启、同库实例共享，失败计数通过 `BEGIN IMMEDIATE`
-      事务原子累计，但没有持久封禁名单（管理台 `user unlock` 可手动解锁）；两步验证已支持 TOTP
-      与一次性恢复码，但没有短信/邮件备用通道或
-      WebAuthn，查看器不提供二维码扫描；会话管理没有刷新令牌；账号安全审计
+      事务原子累计，但没有持久封禁名单（管理台 `user unlock` 可手动解锁）；两步验证已支持 TOTP、
+      一次性恢复码、短信登录码与邮件登录码（后两者需先分别绑定找回手机/邮箱），
+      WebAuthn 安全密钥已于 2026-10-28 补齐（P2-19，密码 + Windows Hello/
+      FIDO2），查看器不提供 TOTP 二维码扫描；会话管理没有刷新令牌；账号安全审计
       记录 IP 但不做地理位置解析；连接与文件传输审计只覆盖查看器发起的事件
       （文件按轮询窗口聚合），不含主机侧入站会话、逐文件明细或传输中进度，
       保留期按条数而非时间且不能导出；查看器不允许在
-      界面内撤销当前会话（仍可用退出登录）；改密没有忘记密码/邮件找回流程，
-      忘记密码仍由管理台重置。
+      界面内撤销当前会话（仍可用退出登录）；忘记密码已可用邮件令牌或短信
+      验证码在查看器登录页自助重置（API、管理台与查看器均可），账号对话框
+      可设置/清除找回邮箱与手机；WebAuthn 安全密钥已于 2026-10-28 补齐（P2-19）。
   - 软件更新：对齐 hbbs 的 `SoftwareUpdate`，`--software-version` 与
     `--software-url` 成对启用；注册、单机/批量查询与 `/v1/server` 返回
-    `software{version,url}`。主机与查看者代理发现版本不同时记录一次提示
-    （续约去重）；查看器首页在版本不同于 `chastVersion` 时显示前端横幅，
-    可查看/复制下载地址并按版本忽略；均不自动下载。未配置时字段缺省，
-    URL 仅接受 http/https。查看器版本常量集中在 `app_info.dart`，关于
-    对话框与侧栏共用。
+    `software{version,url}`。可选 `--software-dir` 让服务端在
+    `/software/{name}` 只读托管该文件（单层文件名、无目录列表），启动时计算
+    SHA-256 与大小并用服务器身份签名，`software` 块因此附带
+    `sha256`/`size`/`signature`（`chast-software-v1`）。主机与查看者代理发现
+    版本不同时记录一次提示（续约去重）；查看器首页在版本不同于
+    `chastVersion` 时显示前端横幅，可查看/复制下载地址并按版本忽略；均不
+    自动下载。未配置时字段缺省，URL 仅接受 http/https。查看器版本常量集中
+    在 `app_info.dart`，关于对话框与侧栏共用。
   - 验证（2026-10-25，单机回环）：主机代理注册后 lookup 返回主机名/平台/
     版本，`peers` 显示 `online=true`；删除租约后元数据仍可查；同一数据库由
     第二个服务端重新打开后记录仍在；版本 1 JSON 旁路导入成功并改名为
@@ -1039,6 +1047,12 @@
     并用真实服务端与主机代理在回环验证 `ServerApi.lookupBatch` 的去重、
     `missing`、401、`software` 与中文别名/标签往返，`ServerApi.updateLabels`
     写入中文别名与标签后批量查询回读一致、清空生效，Windows Release 构建通过。
+  - 验证（软件托管与签名，2026-10-27，单机回环）：设置 `--software-dir`
+    启动后，`GET /software/chast-2.2.0.exe` 与源文件逐字节一致且 SHA-256
+    相同，缺失文件与目录路径 404；`/v1/server` 的 `software` 带
+    `sha256`/`size`/`signature`，用响应公钥按 `chast-software-v1` 规范消息
+    OpenSSL 验签成功、篡改版本被拒；`internal/software` 与 `internal/api`
+    自动化覆盖。
   - 验证（账号与地址簿，2026-10-25，单机回环）：管理台建号后
     `user list` 只显示用户名/ID/创建时间；错误密码 401、正确密码返回 720 h
     令牌，`server-key` 访问账号路由为 401；地址簿从空开始，PATCH 提交
@@ -1146,19 +1160,21 @@
     意图会持久化并在恢复后上传，但跨设备同时编辑的意图在 409 后会被服务器版本替换。
     令牌明文保存在 `account.json` 且是长期 Bearer，没有刷新/轮换；设备会话
     可以列出、改名并撤销其他设备，也可以一键退出全部其他设备，但没有登录
-    地点审计；密码可在查看器自助修改，但没有忘记密码/邮件找回流程，忘记密码仍由回环
-    管理台重置；登录有按“用户名+IP”的失败
+    地点审计；密码可在查看器自助修改；忘记密码可用邮件令牌或短信验证码在
+    查看器登录页或管理台重置，账号对话框可设置/清除找回邮箱与手机；WebAuthn
+    安全密钥已于 2026-10-28 补齐（P2-19）；登录有按“用户名+IP”的失败
     锁定，配置 `--state` 后写入 SQLite `login_locks` 并跨重启共享，失败计数
-    通过 `BEGIN IMMEDIATE` 事务原子累计；没有持久封禁（管理台 `user unlock` 可手动解锁）；账号级 TOTP 两步验证与一次性
-    恢复码已支持，但没有短信/邮件备用验证方式；连接与文件传输审计只覆盖
+    通过 `BEGIN IMMEDIATE` 事务原子累计；没有持久封禁（管理台 `user unlock` 可手动解锁）；账号级 TOTP 两步验证、一次性
+    恢复码、短信登录码与邮件登录码已支持（需先绑定找回手机/邮箱）；连接与文件传输审计只覆盖
     查看器发起的事件（文件按轮询窗口聚合），没有主机侧入站会话、逐文件明细
     或地理位置，保留期按条数且不能导出；地址簿
     只保存 peer ID、名称、标签与分组 ID，不保存连接参数；Wake-on-LAN
     的 MAC 只写入本地设备条目，不随账号同步。主机
     自报元数据未签名；别名/标签可从查看器设备菜单或回环管理台编辑，但前者
-    要求配置 server-key；软件更新在主机端只写代理日志，查看器显示一次性横幅
-    与可复制的下载地址，不自动下载或安装；租约、中继分配与打洞地址仍只在
-    内存中（重连后重建，与 hbbs 一致）。
+    要求配置 server-key；软件更新可由服务端托管并签名（`--software-dir`），
+    主机端只写代理日志，查看器显示一次性横幅与可复制的下载地址，不自动下载
+    或安装；租约、中继分配与打洞地址仍只在内存中（重连后重建，与 hbbs
+    一致）。
 
 ## P0 — 查看者鉴权（已完成）
 
@@ -1213,8 +1229,12 @@
      主机全端点 `relay_hello`、查看者按 socket 族选择、主机按全部端点判定中继
      路径。回环验收通过——`[::1]` 查看者经 `relay [::1]:41200` 完成 H.264
      1920×1080 QUIC 会话（842 帧、0 CRC/解码错误、RTT 1.4 ms）。
+     共享 TCP 载体的 v6 入口（2026-10-27 完成）：`--carrier-listen-v6` 同端口
+     双栈监听，`carrier_v6` 随注册/查询/`/v1/server` 与节点租约下发，代理按
+     可达地址族排序并回退；回环验证查看者从 IPv4 首选回退 `[::1]` 完成载体
+     数据报往返（`TestViewerCarrierIPv6Fallback`）。
      剩余：纯 IPv6 主机经 IPv4 会合注册的降级路径（代理单 socket 不能跨族写
-     本地转发）、共享 TCP 载体的 v6 入口、双机跨网复核。
+     本地转发）、双机跨网复核。
   2. **P0 查看器固定服务器公钥**：RustDesk 内置 `RS_PUB_KEY` 并有
      `KeyExchange`/`get_key_confirmed`；我们只有 CLI `--server-pubkey`，
      Flutter 查看器只保存 `serverKey`。要点：首次连接展示指纹（TOFU）、
@@ -1310,7 +1330,204 @@
      干净、`flutter test` 303 项通过（VT/键序列 24 项、面板 widget 3 项）、
      Release 构建成功。未做：真实 GUI 点击复核、双机/中继验收。
      详见 `docs/m11-p2-terminal-plan.md`。
- 12. **P2 剩余**：基于会合的 HTTP API 代理（`HttpProxyRequest`，价值低）。
+ 12. **P2-5 账号角色与管理 API**（2026-10-27 完成）：`users.role`（`admin`/
+     `user`），首个账号与旧库最早账号为 admin；管理台 `user role <name>
+     admin|user` 与 `user list` 角色列。`/v1/accounts` 支持列出、创建（可生成
+     一次性密码）、改角色、删除、重置密码与清除两步验证，鉴权接受 server-key
+     或 admin 账号令牌，普通账号令牌 403。系统始终保留至少一个 admin：最后
+     admin 不能降级，库中还有别的账号时也不能删除；全部删光后再建账号会重新
+     成为 admin。操作写入 `account_create`/`account_delete`/
+     `account_password_reset`/`role_change` 审计。验证：store 角色/回填/最后
+     admin 单测、API 鉴权与全流程单测、管理台角色与帮助单测，`go vet ./...`
+     与 `go test ./...` 通过。
+ 13. **P2-6 历史游标分页与时间保留**（2026-10-27 完成）：`/v1/audit`、
+     `/v1/audit/connections`、`/v1/audit/file-transfers` 与账号侧对应列表
+     统一支持 `before_id` 游标；响应在该页已满时给出 `next_before_id`，非法
+     游标 400。`Store.PruneBefore` 在一个事务里清理账号安全审计、连接与文件
+     传输三类历史，拒绝零截止时间；新增 `--audit-retention-days`（启动与每
+     6 小时清理）与管理台 `audit prune <days>`。验证：store 分页/保留单测、
+     五种端点续页与坏游标 API 单测、管理台 prune 与 usage 单测，全量测试通过。
+ 14. **P2-7 账号持久封禁**（2026-10-27 完成）：`users.banned` 迁移与
+     `SetBanned`；封禁在同一事务里吊销该账号全部访问与刷新令牌，密码正确时
+     登录返回 403（错误密码仍是普通失败，不泄露封禁状态）；最后一个可用
+     admin 不能封禁或降级，已封禁 admin 不影响删除/降级判定。管理面新增
+     `POST|DELETE /v1/accounts/{username}/ban`、管理台 `user ban|unban`、
+     `user list` 的 `banned=true`，写入 `account_ban`/`account_unban` 审计。
+     验证：store 封禁/解封/令牌吊销/最后 admin 单测、API 与管理台单测，
+     全量测试通过。
+ 15. **P2-8 日志轮转与归档**（2026-10-27 完成）：新增 `internal/logging`，
+     slog 文本日志可同时写 stderr 与 `--log-file`；写满 `--log-max-size`
+     （默认 100 MiB）后关闭并以 `20060102-150405.000000000` 时间戳重命名，
+     可选 `--log-compress` gzip 归档（Windows 上先关闭全部句柄再删除原文件），
+     `--log-max-backups`（默认 5，0 保留全部）与 `--log-max-age`（默认 0）
+     按目录内容在每次轮转与重启打开时清理，进程被杀留下的归档同样受控；
+     并发的 slog 写入串行化。`chast-server` 与 `chast-relay` 旗标同名。
+     验证：`internal/logging` 单测（轮转、压缩、按年龄/数量清理、并发写入
+     不丢行）、`cmd/chast-server` 日志接线单测，全量测试通过。
+ 16. **P2-9 地址簿墓碑保留**（2026-10-27 完成）：`PruneTombstones` 在一个事务里
+     删除 `updated_at` 早于截止时间的条目与分组墓碑，存活条目不受影响；
+     `--addressbook-tombstone-days`（默认 0 保留全部）在启动与每 6 小时执行，
+     管理台新增 `ab prune <days>`。离线超过保留窗口的客户端会错过墓碑，需整本
+     快照才能收敛，README 明确该窗口应长于最长离线时间。验证：store 与
+     管理台单测（过期/近期墓碑、存活条目、零截止时间拒绝），全量测试通过。
+ 17. **P2-10 请求链路 tracing**（2026-10-27 完成）：新增零依赖的
+     `internal/tracing`，按 OTLP/HTTP JSON 批量导出服务端 span（
+     `POST <endpoint>/v1/traces`，resource `service.name`、scope `chast`，
+     `kind=SERVER`，属性含方法、路由、协议与状态码，HTTP ≥500 标记错误）；
+     接受 W3C `traceparent` 的上游 trace ID 与采样位并回写响应头，队列满或
+     collector 慢/不可达时直接丢弃，不阻塞业务请求。`chast-server` 在 API
+     入口为每个请求记录 span（含 429 拒绝），`chast-relay` 包装节点控制面；
+     新增 `--trace-endpoint`（默认空关闭）、`--trace-sample`（默认 1）、
+     `--trace-service`。验证：`internal/tracing` 单测（导出、父子传播、
+     未采样父级、采样关闭、collector 故障、Close 不阻塞、nil 惰性）、API
+     集成测试（路由名、状态码与响应 traceparent），全量测试通过。
+ 18. **P2-11 mTLS 与私有 CA**（2026-10-27 完成）：`--tls-client-ca` 让
+     `chast-server` 与 `chast-relay` 的 HTTPS 入口要求并校验客户端证书；
+     客户端侧新增 `netutil.ClientTLSConfig`，主机/查看者代理与 `chast-tunnel`
+     用 `--tls-ca`（追加到系统根）/`--tls-client-cert`/`--tls-client-key`
+     访问私有 CA 与 mTLS 服务端，节点池用 `--relay-node-ca`/
+     `--relay-node-client-cert`/`--relay-node-client-key` 走独立 transport。
+     全部旗标为空时行为与之前一致。验证：`internal/netutil` 用临时 CA 覆盖
+     有/无客户端证书的握手与配置错误，`internal/relaypool` 用
+     `httptest.NewTLSServer` 覆盖未信任→不健康、信任后探测与租约成功；
+     回环用临时 CA 实测两端无证书时 `alert certificate required`、带证书
+     返回 200，节点池经 mTLS 探测为健康，主机代理拿到节点租约，
+     查看者解析成功，无证书代理以 `tls: certificate required` 退出；
+     全量测试通过。
+ 19. **P2-12 软件更新托管与签名**（2026-10-27 完成）：可选 `--software-dir`
+     把发布文件以 `GET/HEAD /software/{name}` 只读公布（单层文件名白名单、
+     无目录列表，Range/ETag/Last-Modified 由 `http.ServeContent` 提供）；
+     启动时对 `--software-url` 指向的文件计算 SHA-256 与大小，并用服务器
+     Ed25519 身份对 `chast-software-v1` 域下的版本/URL/摘要/大小签名，随
+     注册、查询与 `/v1/server` 的 `software` 块下发 `sha256`/`size`/
+     `signature`。客户端固定服务器公钥即可同时校验通告与下载内容；未设置
+     目录时保持原行为（URL 指向 `/software/` 但无目录只警告）。验证：
+     `internal/software` 单测、API 集成测试与真实进程回环（下载逐字节一致、
+     OpenSSL 验签通过、篡改版本被拒）。
+ 20. **P2-13 内嵌 Web 管理台**（2026-10-27 完成）：新增 `internal/webadmin`，
+     用 `//go:embed` 把 `index.html`/`app.js`/`style.css` 打入二进制，挂载在
+     `GET /admin/`（`/admin` 301），严格文件名白名单并附加 CSP、nosniff、
+     no-store、no-referrer 与 `X-Frame-Options: DENY`；页面无内联脚本/样式与
+     `innerHTML`，登录只输入 server-key（存于 `sessionStorage`，401 自动锁屏），
+     覆盖总览、设备（新增 `GET /v1/identities` 全量含离线、搜索/在线过滤、别名
+     标签与身份重置）、账号、三类审计分页与 CSV、服务器与软件更新信息。验证：
+     `internal/webadmin` 资源/响应头/405/404/CSP 扫描单测，`internal/api` 真实
+     服务器路由集成测试，真实进程回环与浏览器登录、账号封禁、审计翻页；顺带
+     修复 `internal/relay` 端口 0 的 TCP twin 绑定未重试问题。全量测试通过。
+ 21. **P2-14 TLS 证书热加载（服务端/中继）**（2026-10-27 完成）：
+     `netutil.LoadReloadingTLSConfig` 用 `GetCertificate` 回调按 5 秒间隔惰性
+     重读 `--tls-cert`/`--tls-key`，对 PEM 求 SHA-256 仅在内容变化时原子替换；
+     坏文件保留旧证书并按错误去重告警，`chast-server` 与 `chast-relay` 均已
+     接入，certbot 式续期无需重启。`--tls-client-ca` 仍只在启动时读取。验证：
+     `internal/netutil` 单测覆盖真实握手下的证书轮换、坏文件保留与恢复、mTLS
+     字段与参数回退；真实进程回环从 `CN=first-cert` 在 6 秒内切到
+     `CN=second-cert`，写入垃圾后仍出示 `second-cert` 并记录
+     `TLS certificate reload skipped`。全量 `go test ./...` 通过。
+ 22. **P2-15 邮箱与密码找回**（2026-10-28 完成）：`users.email` 唯一且大小写
+     不敏感，`password_resets` 只存令牌 SHA-256、单账号仅一个未用令牌，默认
+     30 分钟过期；`POST /v1/account/recover` 固定 202 防枚举并按客户端
+     IP+用户名每分钟限流，`POST /v1/account/recover/complete` 一次消费并吊销
+     该账号全部会话；自助改邮箱要当前密码，管理 API/回环管理台可代设邮箱或
+     生成重置令牌。新增 `internal/mail`（STARTTLS 默认、隐式 TLS、无 TLS 与
+     可选 PLAIN 认证）与 `--smtp-*`/`--recovery-url`/`--recovery-ttl`；未配置
+     SMTP 时管理台打印令牌供线下交付。验证：account/mail/api/admin 单测覆盖
+     唯一性、单活/过期/重放令牌、202、限流与完整重置流程；真实进程回环接
+     临时 SMTP sink 收到邮件并完成重置，旧会话与旧密码失效。查看器登录页
+     已提供“忘记密码？”两步流程（申请 → 令牌 + 新密码），账号对话框可
+     设置/清除找回邮箱（2026-10-28，组件测试）；`flutter analyze`、全量
+     318 项 Flutter 测试与 Windows Release 构建通过。
+ 23. **P2-16 短信找回**（2026-10-28 完成）：`users.phone` 归一后唯一，
+     `phone_resets` 只存 8 位验证码 SHA-256、单账号仅一个未用验证码（默认
+     10 分钟，`--sms-ttl` 1m–1h，5 次错误即作废）；`POST
+     /v1/account/recover/sms` 固定 202 防枚举并按客户端 IP+用户名每分钟限流，
+     同名短信与邮件限流键互不影响；`POST /v1/account/recover/sms/complete`
+     一次消费并吊销该账号全部会话，自助改手机要当前密码，管理 API/回环管理台
+     可代设手机、签发并发送验证码（不打印验证码）。新增 `internal/sms` 通用
+     HTTP webhook（JSON `{to,text,from}`、可选 Bearer、10s 超时、2xx 判定）
+     与 `--sms-url`/`--sms-token`/`--sms-from`/`--sms-ttl`。验证：
+     account/sms/api/admin 单测覆盖号码归一/唯一、验证码单活/过期/错误 5 次
+     作废/改绑作废、202 与限流、网关失败、弱密码不消耗验证码与完整重置；
+     真实进程回环接本地 HTTP 网关完成两轮发送与三次改密，旧会话/旧密码失效、
+     验证码重放 400。查看器登录页“忘记密码？”新增邮箱/短信通道切换，账号
+     对话框新增“找回手机”（2026-10-28，组件测试）；`flutter analyze`、全量
+     329 项 Flutter 测试与 Windows Release 构建通过。
+ 24. **P2-17 短信登录码（两步验证备用通道）**（2026-10-28 完成）：
+     `login_sms_codes` 只存 8 位验证码 SHA-256、单账号仅一个未用验证码
+     （默认 10 分钟、`--sms-ttl`、5 次错误即作废）；`POST
+     /v1/account/login/sms` 要求用户名+密码，先校验再签发，对外一律 202
+     （未启用两步验证/未绑手机/网关失败均不泄露），密码错误 401、封禁 403、
+     IP+用户名每分钟限流且限流在生成新码之前（不替换已发出的验证码）；
+     登录接受 `sms_code`，优先级 TOTP > 恢复码 > 短信码，消费在签发令牌的
+     同一事务内完成；密码/手机/两步验证变更与封禁清空未用登录码。
+     `internal/sms` 新增 `SendLoginCode` 复用同一网关。验证：account/sms/
+     api 单测覆盖密码校验、封禁、未启用/未绑手机、验证码单活/过期/错误 5 次
+     作废/重放/清理、202 与限流、缺码/错码 401 与审计；真实进程回环接本地
+     HTTP 网关完成发送、限流不换码、登录成功与重放拒绝。查看器登录表单可
+     切换短信验证码模式（发送、重发、8 位校验，组件测试）；`flutter analyze`、
+     全量 332 项 Flutter 测试与 Windows Release 构建通过。
+ 25. **P2-18 邮件登录码（两步验证备用通道）**（2026-10-28 完成）：
+     `login_email_codes` 与短信码共用通用通道实现，只存 8 位验证码 SHA-256、
+     单账号仅一个未用验证码（有效期复用 `--recovery-ttl`，默认 30 分钟、5 次
+     错误即作废）；`POST /v1/account/login/email` 要求用户名+密码，先校验再
+     签发并通过 SMTP 发送，对外一律 202（未启用两步验证/未绑邮箱/发信失败均
+     不泄露），密码错误 401、封禁 403、IP+用户名每分钟限流且限流在生成新码
+     之前；登录接受 `email_code`，优先级 TOTP > 恢复码 > 短信码 > 邮件码，
+     消费在签发令牌的同一事务内完成；密码/邮箱/两步验证变更与封禁清空未用
+     登录码。`internal/mail` 新增 `SendLoginCode` 复用现有 SMTP 配置。
+     验证：account/mail/api 单测覆盖密码校验、封禁、未启用/未绑邮箱、验证码
+     单活/过期/错误 5 次作废/重放/清理、优先级、202 与限流、缺码/错码 401
+     与审计；真实进程回环接本地 SMTP sink 完成发信、限流不换码、登录成功与
+     重放拒绝。查看器登录表单可切换邮件验证码模式（发送、重发、8 位校验，
+     组件测试）；`flutter analyze`、全量 335 项 Flutter 测试与 Windows
+     Release 构建通过。
+ 26. **P2-19 WebAuthn 安全密钥**（2026-10-28 完成）：账号可用 Windows Hello /
+     FIDO2 平台认证器作为登录第二因素（密码仍必填），并在账号对话框注册、
+     命名、删除安全密钥；只改 HTTP 账号 API，会话协议保持 v27，查看器原生桥
+     直接调用 `webauthn.dll`。`internal/webauthn` 极简 CBOR 解码，支持
+     ES256/RS256/EdDSA，校验 clientDataJSON 的 type/challenge/origin/
+     crossOrigin、rpIdHash、UP 与签名，attestation 接受 `none`/`packed`
+     但不校验证书链；挑战 32 字节、5 分钟、按 `(user_id, purpose)` 单活，
+     登录成功与签发令牌同一事务消费，重放必然失败；签名计数非零回退拒绝。
+     六个接口：注册 begin/finish、凭据列表/删除、登录 begin/finish；
+     配置 `--webauthn-rp-id` 与 `--webauthn-origin`（缺一关闭并返回 503）。
+     验证：`internal/webauthn`/`account`/`api` 单测覆盖三种算法、错误
+     origin/rpId/challenge、限流、封禁、重放与审计；新增
+     `server/cmd/chast-webauthn-smoke` 用软件认证器连接真实 `chast-server`
+     完成 18 项回环检查全部通过；查看器新增安全密钥对话框与登录“使用安全
+     密钥”入口（`webauthn_api_test`/`security_key_test`/
+     `security_key_dialog_test`），`flutter analyze`、全量 354 项 Flutter
+     测试与 Windows Release 构建通过；真实 Windows Hello 弹窗保留人工验收。
+ 27. **P2-20 ACME 自动证书**（2026-10-28 完成）：`--acme-domain` 用
+     `golang.org/x/crypto/acme/autocert` 为 HTTP API 自动申请与续期证书
+     （HTTP-01），支持多域名、联系邮箱、EAB 与自定义 ACME 目录；
+     `--acme-cache` 默认在 `--state` 同目录，缓存命中即用、未命中才签发；
+     `--acme-http-listen` 独立监听挑战应答与 HTTPS 跳转；与
+     `--tls-cert`/`--tls-key` 互斥，可与 `--tls-client-ca`（mTLS）组合。
+     校验裸 DNS 名（拒绝通配符/IP/端口/无点）、EAB 成对与挑战端口不冲突。
+     验证：`internal/acmecert` 单测覆盖域名解析、EAB 四种编码、无效配置、
+     缓存命中与白名单外主机、mTLS 组合、302/404/403；真实进程回环用预置
+     `acme.test` 缓存证书启动，HTTPS `/v1/server` 返回 `"tls":true`，
+     挑战监听 `/` 302、未知挑战 404，六项负向校验均在启动前退出 1；
+     `go vet ./...`、`go test ./... -count=1`、`go build ./...` 通过；
+     真实 CA 签发需要公网域名、DNS 与 80 端口，保留人工验收。
+ 28. **P2-21 版本化 schema 迁移**（2026-10-28 完成）：新增
+     `internal/schemamig`，账号库与对等库分别用 `schema_migrations`/
+     `registry_schema_migrations` 记录版本；`Open`/`NewStore` 只执行未记录
+     的步骤，基线 v1 即原有幂等建表、加列与回填，旧库启动时自动补记。
+     数据库版本高于二进制时拒绝启动（`schema version N is newer than this
+     binary supports (M)`）。验证：迁移框架与两个存储的单测覆盖全新库、
+     旧库升级、重复打开不重跑、跳号/空表/非法表名与未来版本拒绝；真实
+     `chast-server` 回环确认两张版本表均为 v1、重启幂等、删除版本表后自动
+     补记、任一表写入 v2 后退出 1。Postgres 仍未实现（本机无 PostgreSQL/
+     Docker），见下一项。设计与边界见 `docs/m11-p2-schema-migrations-plan.md`。
+ 29. **P2 剩余**：Postgres。基于会合的 HTTP API 代理
+     （`HttpProxyRequest`）已判定不适用（2026-10-28）：开源 hbbs 1.1.17 与
+     上游 master 均不处理这两个消息，且 chast 的 UDP 会合与 TCP HTTP API 可
+     直接共用端口号（`--punch-listen 127.0.0.1:P --http-listen 127.0.0.1:P`
+     回环已验证），单端口部署无需自定义代理协议。（`/metrics` 请求
+     延迟直方图已于 2026-10-27 补齐，14 个 `le` 分桶 + `+Inf`；审计/连接/
+     文件传输 `format=csv` 整表导出也于同日补齐；邮件找回已于 2026-10-28
+     补齐，短信找回、短信登录码与邮件登录码也于同日补齐。）
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

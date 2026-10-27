@@ -2,10 +2,14 @@ package api_test
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +29,7 @@ type hostReply struct {
 	Relays          []string `json:"relays"`
 	Punch           string   `json:"punch"`
 	Carrier         string   `json:"carrier"`
+	CarrierV6       string   `json:"carrier_v6"`
 	CarrierToken    string   `json:"carrier_token"`
 	Fingerprint     string   `json:"fingerprint"`
 	PublicKey       string   `json:"public_key"`
@@ -915,6 +920,99 @@ func TestSoftwareUpdateAdvertisement(t *testing.T) {
 	}
 	if len(batch.Hosts) != 1 {
 		t.Fatalf("batch hosts = %d", len(batch.Hosts))
+	}
+}
+
+func TestHostedSoftwareArtifact(t *testing.T) {
+	dir := t.TempDir()
+	const name = "chast-2.2.0.exe"
+	content := []byte("chast update payload")
+	if err := os.WriteFile(filepath.Join(dir, name), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := testutil.StartWith(t, testutil.Options{
+		SoftwareVersion: "2.2.0",
+		SoftwareURL:     "https://downloads.example.com/software/" + name,
+		SoftwareDir:     dir,
+	})
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	type software struct {
+		Version   string `json:"version"`
+		URL       string `json:"url"`
+		SHA256    string `json:"sha256"`
+		Size      int64  `json:"size"`
+		Signature string `json:"signature"`
+	}
+	pub, err := identity.ParsePublicKey(s.Identity.PublicKeyText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkNotice := func(where string, sw *software) {
+		t.Helper()
+		if sw == nil {
+			t.Fatalf("%s carried no software notice", where)
+		}
+		if sw.Version != "2.2.0" || sw.SHA256 != digest || sw.Size != int64(len(content)) {
+			t.Fatalf("%s software = %+v", where, sw)
+		}
+		msg := identity.SoftwareMessage(sw.Version, sw.URL, sw.SHA256, sw.Size)
+		if !identity.Verify(pub, msg, sw.Signature) {
+			t.Fatalf("%s signature does not verify", where)
+		}
+	}
+
+	now := time.Now().Unix()
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "artifact-pc", "artifact secret", "EF56", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	var reg struct {
+		Software *software `json:"software"`
+	}
+	if err := json.Unmarshal(body, &reg); err != nil {
+		t.Fatal(err)
+	}
+	checkNotice("register", reg.Software)
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/server", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("server info: %d %s", status, body)
+	}
+	var info struct {
+		Software *software `json:"software"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		t.Fatal(err)
+	}
+	checkNotice("server info", info.Software)
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/artifact-pc", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("lookup: %d %s", status, body)
+	}
+	var single struct {
+		Software *software `json:"software"`
+	}
+	if err := json.Unmarshal(body, &single); err != nil {
+		t.Fatal(err)
+	}
+	checkNotice("lookup", single.Software)
+
+	status, body = request(t, http.MethodGet, s.URL+"/software/"+name, "", "")
+	if status != http.StatusOK || string(body) != string(content) {
+		t.Fatalf("download: %d %q", status, body)
+	}
+	if got := sha256.Sum256(body); hex.EncodeToString(got[:]) != digest {
+		t.Fatalf("download digest = %x, want %s", got, digest)
+	}
+	if status, _ := request(t, http.MethodGet, s.URL+"/software/missing.exe", "", ""); status != http.StatusNotFound {
+		t.Fatalf("missing artifact: %d", status)
+	}
+	if status, _ := request(t, http.MethodGet, s.URL+"/software/", "", ""); status != http.StatusNotFound {
+		t.Fatalf("directory listing: %d", status)
 	}
 }
 

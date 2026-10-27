@@ -11,20 +11,25 @@
 ## 结论
 
 没有根本性的架构偏差：注册/在线、打洞、中继、中继节点、限速与名单、软件
-更新、批量在线、别名/标签等 hbbs 基线能力均已具备，账号、地址簿分组/共享/
-条目级 OCC、审计、聊天、Wake-on-LAN 属于我们自研的增量。差异集中在两类：
+更新、批量在线、别名/标签等 hbbs 基线能力均已具备，账号（含 `admin`/`user`
+角色与 `/v1/accounts*` 管理 API）、地址簿分组/共享/条目级 OCC、审计（含游标
+分页与时间保留）、聊天、Wake-on-LAN 属于我们自研的增量。差异集中在两类：
 
 1. **有意偏差**：控制协议格式、数据传输形态、权限模型、中继分配方式、
    授权与部署模型。这些是既定设计，不按 RustDesk 修改。
 2. **真实缺口**：IPv6 双栈、查看器固定服务器公钥、主机 ID 迁移、UPnP、
-   基于会合的 HTTP API 代理、局域网发现、审计关联 ID、账号令牌生命周期与
-   登录地点。这些需要修正计划并补齐，其中前两项为 P0。截至 2026-10-26，
-   IPv6 双栈、服务器公钥固定、主机 ID 迁移、审计关联 ID、令牌生命周期、
-   UPnP、GeoIP 登录地点与局域网发现均已补齐（P1 全部完成，P2-2 完成）；
-   端口转发原生链路与 CLI 回环验收完成（协议 v26，属主机/会话层，
-   见 `docs/m11-p2-port-forward-plan.md`）；远程终端与查看器 Flutter 面板完成
-   （协议 v27，见 `docs/m11-p2-terminal-plan.md`），端口转发 GUI 也已接入。
-   剩余 HTTP 代理（低价值），以及所有跨网/双机验收。
+   局域网发现、审计关联 ID、账号令牌生命周期与登录地点。这些需要修正计划并
+   补齐，其中前两项为 P0。截至 2026-10-26，IPv6 双栈、服务器公钥固定、主机
+   ID 迁移、审计关联 ID、令牌生命周期、UPnP、GeoIP 登录地点与局域网发现均已
+   补齐（P1 全部完成，P2-2 完成）；端口转发原生链路与 CLI 回环验收完成
+   （协议 v26，属主机/会话层，见 `docs/m11-p2-port-forward-plan.md`）；
+   远程终端与查看器 Flutter 面板完成（协议 v27，见
+   `docs/m11-p2-terminal-plan.md`），端口转发 GUI 也已接入。基于会合的 HTTP
+   API 代理（P2-1）于 2026-10-28 判定不适用（开源 hbbs 未实现该消息，chast
+   以 UDP/TCP 同端口号绑定即可单端口部署）；ACME 自动证书（P2-20）同日补齐
+   （HTTP-01 自动申请与续期），SQLite schema 版本化迁移（P2-21）也于同日
+   补齐（旧库自动补记、重复启动不重跑、拒绝更新版本库）。剩余为跨网/双机
+   人工验收。
 
 ## 1. 已对齐（hbbs 基线）
 
@@ -39,7 +44,7 @@
 | 中继 | `RequestRelay`/`RelayResponse.relay_server`、每次连接一个 `uuid` | 端口租约 + `relay_hello/challenge/auth`、查看者令牌、`uuid` 防会话复用 |
 | 中继节点 | hbbr | `chast-relay`：健康检查、租约、共享载体、带宽/黑白名单/降级 |
 | 中继限速与名单 | hbbs/hbbr `single/total bandwidth`、`blacklist` | `internal/relay/policy.go`、管理台 `sb/tb/ba/br` |
-| 软件更新 | `SoftwareUpdate` | `--software-version/url` → 注册/lookup/`/v1/server` 的 `software` |
+| 软件更新 | `SoftwareUpdate` | `--software-version/url` → 注册/lookup/`/v1/server` 的 `software`；可选 `--software-dir` 在 `/software/{name}` 托管文件并附 SHA-256/大小/服务器签名 |
 | 别名/标签 | Pro 侧能力 | `PATCH /v1/identities/{id}`、管理台 `alias`/`tags` |
 | 服务器地址轮换 | `rendezvous_servers`/`ConfigUpdate` | `rs` 轮换、粘性续约、`relay-servers` 列表 |
 
@@ -88,7 +93,12 @@
   `path=relay`；主机绑定双栈 `[::]`、经 IPv4 注册/保活并转发到 IPv4 本地
   QUIC 端点的部署形态也通过（842 帧、RTT 1.9 ms）。剩余：显式绑定 `[::1]`
   的单族主机无法跨族访问 IPv4 会合与本地转发（应绑 `[::]`，README 已注明）、
-  共享 TCP 载体仍只在 IPv4 主入口、双机跨网复核。
+  双机跨网复核。
+  共享载体部分（2026-10-27 补齐）：`--carrier-listen-v6` 在同一端口号上增加
+  IPv6 TCP 监听，`--advertise-v6` 让注册/查询/`/v1/server` 与节点租约额外
+  下发 `carrier_v6`；主机与查看者代理按本机可达地址族排序两个端点并在拨号
+  失败时回退，路径事件报告实际端点。回环验收：主机经 IPv4 建链、查看者
+  首选 IPv4 失败后回退 `[::1]` 完成数据报往返（`TestViewerCarrierIPv6Fallback`）。
 
 ### P0-2 查看器固定服务器公钥
 
@@ -252,14 +262,107 @@
   地点写入账号安全审计 `location` 与登录会话 `login_ip`/`location`，管理台
   审计与查看器设备会话对话框展示。单测覆盖最长前缀、坏行/缺文件、落库与
   API 响应；边界是表质量由运维负责，来源地址仍受 `--proxy-header` 影响。
+- 邮箱与密码找回（2026-10-28 完成，补充 P1-4）：RustDesk 的公开源码不含账号
+  服务端，找回流程只能按行为目标自建。`users.email` 唯一且大小写不敏感，
+  自助改邮箱要求当前密码；`password_resets` 只存令牌 SHA-256，单账号仅一个
+  未用令牌、默认 30 分钟过期。`POST /v1/account/recover` 对未知账号、无邮箱
+  与发信失败统一返回 202，并按客户端 IP+用户名每分钟限流一次；
+  `POST /v1/account/recover/complete` 原子消费令牌、改密并吊销该账号全部
+  访问与刷新令牌。管理员可用 `POST /v1/accounts/{username}/email` 或管理台
+  `user email`/`user recover` 代设与签发；配置 `--smtp-*` 时直接发信
+  （正文含令牌，`--recovery-url` 另附链接），未配置时管理台打印一次令牌由
+  运营者线下交付。验证：account/mail/api/admin 单测与真实进程回环（临时
+  SMTP sink）覆盖唯一邮箱、令牌单活/过期/重放、202 与限流、完整重置及旧
+  会话失效；查看器登录页也提供“忘记密码？”两步流程，账号对话框可设置/清除
+  找回邮箱（2026-10-28）。边界是内嵌重置页；WebAuthn 安全密钥已于 2026-10-28
+  补齐（见下）。
+- 短信与密码找回（2026-10-28 完成，补充 P1-4）：`users.phone` 归一后唯一，
+  自助改手机要求当前密码；`phone_resets` 只存 8 位验证码 SHA-256，单账号仅
+  一个未用验证码、默认 10 分钟（`--sms-ttl` 1m–1h）、5 次错误即作废。
+  `POST /v1/account/recover/sms` 对未知账号、未设手机与网关失败统一返回 202，
+  并按客户端 IP+用户名每分钟限流一次（与邮件限流键独立）；
+  `POST /v1/account/recover/sms/complete` 原子消费验证码、改密并吊销该账号
+  全部访问与刷新令牌。`internal/sms` 是通用 HTTP webhook 网关（JSON
+  `{to,text,from}`、可选 Bearer、10s 超时、2xx 判定），由 `--sms-url`/
+  `--sms-token`/`--sms-from` 配置；管理员可用
+  `POST /v1/accounts/{username}/phone`/`sms` 或管理台 `user phone`/`user sms`
+  代设与签发（不打印验证码）。验证：account/sms/api/admin 单测与真实进程
+  回环（本地 HTTP 网关）覆盖号码归一/唯一、验证码单活/过期/错误 5 次作废、
+  202 与限流、网关失败、完整重置及旧会话失效；查看器登录页“忘记密码？”
+  可在邮箱/短信通道间切换，账号对话框可设置/清除找回手机（2026-10-28）。
+  边界是不内置短信服务商的签名/模板/回执，网关失败不重试；WebAuthn 安全密钥
+  已于 2026-10-28 补齐（见下）。
+- 短信登录码（2026-10-28 完成，补充 P1-4 的两步验证备用通道）：启用两步验证
+  且绑定找回手机的账号可先 `POST /v1/account/login/sms`（用户名+密码）请求
+  8 位一次性验证码，再以 `sms_code` 登录；`login_sms_codes` 只存哈希、单账号
+  仅一个未用码、默认 10 分钟（`--sms-ttl`）、5 次错误作废。接口先校验密码再
+  签发，对外一律 202（未启用两步验证/未绑手机/网关失败不泄露），密码错误
+  401、封禁 403、IP+用户名每分钟限流且限流在生成新码之前；登录优先级
+  TOTP > 恢复码 > 短信码，消费与签发令牌同一事务，密码/手机/两步验证变更与
+  封禁清空未用登录码。验证：account/sms/api 单测与真实进程回环（本地 HTTP
+  网关）覆盖完整流程、限流不换码、重放拒绝与审计；查看器登录表单可切换短信
+  验证码（2026-10-28）。边界是短信需先绑定手机。
+- 邮件登录码（2026-10-28 完成，P1-4 的第二条两步验证备用通道）：启用两步验证
+  且绑定找回邮箱的账号可先 `POST /v1/account/login/email`（用户名+密码）请求
+  8 位一次性验证码，再以 `email_code` 登录；`login_email_codes` 只存哈希、
+  单账号仅一个未用码、有效期复用 `--recovery-ttl`（默认 30 分钟）、5 次错误
+  作废。接口先校验密码再签发并经 SMTP 发信，对外一律 202（未启用两步验证/
+  未绑邮箱/发信失败不泄露），密码错误 401、封禁 403、IP+用户名每分钟限流且
+  限流在生成新码之前；登录优先级 TOTP > 恢复码 > 短信码 > 邮件码，消费与
+  签发令牌同一事务，密码/邮箱/两步验证变更与封禁清空未用登录码。验证：
+  account/mail/api 单测与真实进程回环（本地 SMTP sink）覆盖完整流程、限流
+  不换码、重放拒绝与审计；查看器登录表单可切换邮件验证码（2026-10-28）。
+  边界是邮件需先绑定邮箱，SMTP 失败不重试。
+- WebAuthn 安全密钥（2026-10-28 完成，P1-4 的强认证补充）：RustDesk 的两步
+  验证只有 TOTP 与恢复码，没有 WebAuthn，这项按 chast 自有设计补齐。密码仍
+  是第一因素，Windows Hello / FIDO2 平台认证器作为第二因素；只改 HTTP 账号
+  API，会话协议保持 v27。服务端 `internal/webauthn` 用极简 CBOR 解码支持
+  ES256/RS256/EdDSA，校验 clientDataJSON 的 type/challenge/origin/
+  crossOrigin、rpIdHash、UP 与签名，attestation 接受 `none`/`packed` 但不
+  校验证书链；挑战 32 字节、5 分钟、按 `(user_id, purpose)` 单活，登录成功
+  与签发令牌同一事务消费，重放必然失败，签名计数非零回退拒绝。六个接口：
+  `POST /v1/account/webauthn/register/{begin,finish}`、
+  `GET /v1/account/webauthn/credentials`、
+  `POST /v1/account/webauthn/credentials/remove`、
+  `POST /v1/account/login/webauthn/{begin,finish}`；`--webauthn-rp-id` 与
+  `--webauthn-origin` 缺一关闭，相关路由返回 503。登录开始时无凭据返回 202
+  以免枚举；管理员 `user reset-2fa` 与删号清空凭据与挑战，封禁保留凭据但
+  登录 403，改密不删除凭据。验证：`internal/webauthn`/`account`/`api` 单测
+  覆盖三种算法、origin/rpId/challenge/UP/计数器/格式错误、限流、封禁、重放
+  与审计；`server/cmd/chast-webauthn-smoke` 用软件认证器连接真实
+  `chast-server` 完成 18 项回环检查（注册 → 列表 → 断言登录 → 重放拒绝 →
+  错误签名拒绝 → 删除）全部通过；查看器账号对话框可注册/命名/删除安全密钥，
+  登录页“使用安全密钥”完成密码 + 断言（2026-10-28，组件测试）。边界：
+  attestation 不校验证书链（安全依赖注册时的密码认证），不支持 passkey
+  无密码登录与跨设备同步；真实 Windows Hello 弹窗保留人工验收。
+- ACME 自动证书（2026-10-28 完成，P2-20，chast 自有设计）：hbbs 没有内建
+  ACME，官方部署依赖反向代理或手工证书；chast 用 `--acme-domain` 由
+  `golang.org/x/crypto/acme/autocert` 直接完成 HTTP-01 申请与续期，支持
+  多域名、联系邮箱、EAB 与自定义 ACME 目录，证书和账户密钥缓存到
+  `--acme-cache`（默认在 `--state` 同目录）；`--acme-http-listen` 只做挑战
+  应答与 HTTPS 跳转，不暴露业务 API；与 `--tls-cert`/`--tls-key` 互斥，可与
+  `--tls-client-ca` 组合，挑战端口不能与 `--http-listen` 相同。验证：
+  `internal/acmecert` 单测覆盖域名解析、EAB、缓存命中、白名单外主机、mTLS
+  与 302/404/403；真实进程回环用预置 `acme.test` 缓存证书启动，HTTPS
+  `/v1/server` 返回 `"tls":true`，挑战监听 302/404，六项负向校验按预期
+  拒绝；真实 CA 签发需公网域名与 80 端口，保留人工验收。
 
 
-### P2-1 基于会合的 HTTP API 代理（`HttpProxyRequest`）
+### P2-1 基于会合的 HTTP API 代理（`HttpProxyRequest`）——不适用（2026-10-28）
 
-- RustDesk：`HttpProxyRequest`/`HttpProxyResponse`（`rendezvous.proto:262`），
-  客户端经会合服务器 TCP 代理访问主机的 HTTP API（`common.rs:1413-1520`）。
-- 我们直接暴露 HTTP API（可配 TLS）；在反向代理/内网部署下不缺能力，
-  价值主要在“只开一个端口”，排 P2。
+- RustDesk 客户端：`tcp_proxy_request`（`src/common.rs:1196-1257`）连接会合
+  服务器的 TCP 端口，发送 `HttpProxyRequest` 并等待 `HttpProxyResponse`，
+  用于直连 API 失败或 5xx 时经会合服务器回退（`src/common.rs:1401-1467`）。
+- 服务端核实：开源 hbbs 1.1.17（本地参考 `/d/ref/rustdesk-server`）与上游
+  master（`src/rendezvous_server.rs` 的消息分发）都没有处理这两个消息的分支；
+  该能力只在支持此消息的服务端（Pro/第三方实现）可用，开源 hbbs 本身不提供
+  对照实现。
+- chast 不需要等价协议：会合走 UDP、HTTP API 走 TCP，两者可以直接绑定同一
+  端口号；单端口部署靠配置即可完成，TLS/mTLS 沿用现有旗标。
+- 验证（2026-10-28，单机真实进程）：`--punch-listen 127.0.0.1:18447
+  --http-listen 127.0.0.1:18447` 由同一进程同时绑定 UDP 与 TCP 18447，
+  `curl http://127.0.0.1:18447/v1/server` 返回完整服务器信息（含 `punch`、
+  `carrier`、`public_key`），`netstat` 同时看到 UDP 与 TCP LISTEN。
 
 ### P2-2 局域网发现（`PeerDiscovery`）——已完成
 
@@ -323,8 +426,11 @@
     槽位与统计，`relays` 同时下发 v4 主入口与 v6 端点，主机全端点认证、
     查看者按 socket 族选择、主机按全部端点判定中继路径。单机双栈回环已验证
     双族注册、双族候选、`[::1]` 直连与 `[::1]` 中继上的完整 H.264 QUIC
-    会话（842 帧、0 错误）。剩余：纯 IPv6 主机经 IPv4 会合的降级路径、
-    共享 TCP 载体的 v6 入口、真实跨网 IPv6 双机复核。
+    会话（842 帧、0 错误）。共享 TCP 载体也已补齐 v6 入口（2026-10-27）：
+    `--carrier-listen-v6` 双栈监听、`carrier_v6` 随注册/查询/服务器信息与
+    节点租约下发，代理按地址族选择并回退，回环验证查看者经 `[::1]` 载体
+    完成往返。剩余：纯 IPv6 主机经 IPv4 会合的降级路径、真实跨网 IPv6
+    双机复核。
 - **M11 P0-2 查看器固定服务器公钥**
   - `Target`/`account_store` 之外新增服务器身份记录：首次连接展示指纹并
     TOFU 保存，允许显式固定/更换；不匹配时拒绝查询与打洞。
@@ -354,7 +460,10 @@
   （2026-10-27，协议 v27，主机 ConPTY + 查看器原生通道 + Flutter 面板，
   `verify --terminal` 真实 cmd.exe 回显通过，`flutter test` 303 项与
   Release 构建通过；剩余双机/中继验收与真实 GUI 点击复核，详见
-  `docs/m11-p2-terminal-plan.md`）；HTTP API 代理保留但价值低（我们直接
+  `docs/m11-p2-terminal-plan.md`）；WebAuthn 安全密钥完成（2026-10-28，
+  密码 + Windows Hello/FIDO2 作为第二因素，六个 HTTP 接口，真实进程软件
+  认证器回环 18 项通过，详见
+  `docs/m11-p2-webauthn-plan.md`）；HTTP API 代理保留但价值低（我们直接
   暴露 HTTP/TLS API）。
 
 ## 5. 完成标准
@@ -370,14 +479,41 @@
 1. **验证边界（最高优先）**：双机跨 NAT 打洞/中继、真实跨网 IPv6、真实路由器
    UPnP 续租与对称 NAT、多网卡/DNS 轮换、`--relay-servers` 多地址、共享 TCP
    载体在反代/CDN 之后、多节点负载与带外故障、真实链路带宽整形——目前全部只有
-   单机回环证据。共享 TCP 载体只在 IPv4 主入口提供；纯 IPv6 主机经 IPv4 会合
-   的降级路径未做。
-2. **功能缺口**：无角色/RBAC（`User` 只有 `id`/`username`）、无按组授权与配额；
-   管理台是回环 CLI（非回环地址直接拒绝），没有 Web 管理台；HTTP API 代理
-   （`HttpProxyRequest` 等价）未做且价值低；软件更新只下发版本与 URL，不托管、
-   不签名、不自动下载安装。
-3. **运维与规模化**：审计/连接/文件传输列表无分页与导出，只按 10000 条截断，
-   无时间保留策略；地址簿墓碑不清理；`/metrics` 覆盖中继与打洞，缺请求延迟
-   直方图与 tracing；日志无轮转归档；TLS 仅证书文件，无 ACME 与 mTLS；
-   SQLite 单连接（`SetMaxOpenConns(1)`），无 Postgres/水平扩展与版本化迁移
-   工具；账号无持久封禁、无邮件/短信找回、无 WebAuthn。
+   单机回环证据。共享 TCP 载体已有 v6 入口与代理回退（单机回环），纯 IPv6
+   主机经 IPv4 会合的降级路径未做。
+2. **功能缺口**：已补账号角色（`admin`/`user`）、最后 admin 保护与
+   `/v1/accounts*` 管理 API（server-key 或 admin 令牌）；仍无按组授权与配额；
+   管理台已有回环 CLI 与内嵌 Web 管理台（`/admin/`，2026-10-27 补齐：总览、
+   设备别名/标签与身份重置、账号管理、三类审计分页与 CSV、服务器/软件信息；
+   页面只接受 server-key，无独立前端进程、多运营者或只读角色区分）；HTTP API
+   代理（`HttpProxyRequest`）判定不适用（2026-10-28：开源 hbbs 亦未实现；
+   chast 的 UDP 会合与 TCP HTTP 可共用端口号，单端口绑定已回环验证）；软件
+   更新已能托管发布文件并在通告中附带 SHA-256/大小/服务器签名
+   （`--software-dir`），仍不自动下载安装。
+3. **运维与规模化**：审计/连接/文件传输列表已支持 `before_id` 游标分页、
+   `--audit-retention-days` 时间清理（管理台 `audit prune <days>`）与
+   `format=csv` 整表导出（沿用 `action`/`username`/`host` 过滤，仍无外部
+   归档或定时导出）；身份列表新增 `GET /v1/identities`（全量含离线、搜索、
+   在线过滤与分页，供 Web 管理台设备页使用）；地址簿墓碑已有可选的按天清理（`--addressbook-tombstone-days`
+   与管理台 `ab prune`）；`/metrics` 已含按端点的请求延迟
+   直方图；HTTP 请求 span 可经 OTLP/HTTP JSON 导出（`--trace-endpoint`，
+   支持 W3C `traceparent` 传播，`chast-server` 与 `chast-relay` 同名旗标）；
+   日志已支持按大小轮转、gzip 归档与数量/年龄清理
+   （`--log-file` 等旗标，`chast-relay` 同名）；TLS 已支持客户端 CA 校验
+   （`--tls-client-ca`，`chast-relay` 同名）与客户端侧的私有 CA/客户端
+   证书（代理、`chast-tunnel` 的 `--tls-ca`/`--tls-client-cert`/
+   `--tls-client-key`，节点池的 `--relay-node-*`）；服务端与中继会在
+   `--tls-cert`/`--tls-key` 文件被替换后约 5 秒内热加载（坏文件保留旧证书），
+   相当于 certbot 续期免重启；ACME 自动申请已于 2026-10-28 补齐（P2-20，
+   HTTP-01、缓存未命中才签发、可与 mTLS 组合），CA 客户端证书热加载需
+   重启；SQLite 单连接（`SetMaxOpenConns(1)`），已加前向版本化 schema 迁移
+   （2026-10-28，P2-21：`schema_migrations`/`registry_schema_migrations`
+   记录版本，旧库自动补记，旧二进制拒绝打开新版本库），仍无 Postgres/
+   水平扩展；账号持久封禁已补齐（封禁吊销全部令牌、拒绝密码登录，
+   最后一个可用 admin 不能封禁）；邮件找回已于 2026-10-28 补齐（自助申请 +
+   令牌重置 + SMTP/管理台线下交付，查看器登录页也提供“忘记密码？”流程与
+   找回邮箱设置），短信找回也于同日补齐（通用 HTTP 网关、验证码 5 次错误
+   作废、管理台代设/代发、查看器短信找回通道），同日还补齐了短信登录码与
+   邮件登录码（两步验证备用通道，`POST /v1/account/login/sms|email` +
+   `sms_code|email_code`），WebAuthn 安全密钥也于 2026-10-28 补齐（密码 +
+   Windows Hello/FIDO2，服务端只存公钥）。

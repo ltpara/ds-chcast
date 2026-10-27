@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
@@ -33,60 +35,86 @@ func (s *softwareInfo) updateAvailable() bool {
 }
 
 type apiClient struct {
+	mu        sync.Mutex
 	base      string
 	serverKey string
 	http      *http.Client
 }
 
-func newAPIClient(base, serverKey string) *apiClient {
+func newAPIClient(base, serverKey string, tlsConfig *tls.Config) *apiClient {
+	client := &http.Client{Timeout: 5 * time.Second}
+	if tlsConfig != nil {
+		client.Transport = &http.Transport{TLSClientConfig: tlsConfig.Clone()}
+	}
 	return &apiClient{
 		base:      strings.TrimRight(base, "/"),
 		serverKey: serverKey,
-		http:      &http.Client{Timeout: 5 * time.Second},
+		http:      client,
 	}
 }
 
+// setBase points the client at another rendezvous server after a failover.
+// In-flight requests keep the base they already read.
+func (c *apiClient) setBase(base string) {
+	base = strings.TrimRight(base, "/")
+	c.mu.Lock()
+	c.base = base
+	c.mu.Unlock()
+}
+
+func (c *apiClient) endpoint() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.base
+}
+
 type registerResult struct {
-	ID              string        `json:"id"`
-	Relay           string        `json:"relay"`
-	Relays          []string      `json:"relays"`
-	Punch           string        `json:"punch"`
-	PunchV6         string        `json:"punch_v6"`
-	Carrier         string        `json:"carrier"`
-	CarrierToken    string        `json:"carrier_token"`
-	ExpiresInSec    int64         `json:"expires_in_sec"`
-	PublicKey       string        `json:"public_key"`
-	ServerPublicKey string        `json:"server_public_key"`
-	Binding         string        `json:"binding"`
-	MigratedFrom    string        `json:"migrated_from"`
-	Software        *softwareInfo `json:"software"`
+	ID                string        `json:"id"`
+	Relay             string        `json:"relay"`
+	Relays            []string      `json:"relays"`
+	Punch             string        `json:"punch"`
+	PunchV6           string        `json:"punch_v6"`
+	Carrier           string        `json:"carrier"`
+	CarrierV6         string        `json:"carrier_v6"`
+	CarrierToken      string        `json:"carrier_token"`
+	ExpiresInSec      int64         `json:"expires_in_sec"`
+	PublicKey         string        `json:"public_key"`
+	ServerPublicKey   string        `json:"server_public_key"`
+	Binding           string        `json:"binding"`
+	MigratedFrom      string        `json:"migrated_from"`
+	Software          *softwareInfo `json:"software"`
+	ConfigSerial      int64         `json:"config_serial"`
+	RendezvousServers []string      `json:"rendezvous_servers"`
 }
 
 type lookupResult struct {
-	ID              string        `json:"id"`
-	Online          bool          `json:"online"`
-	Candidate       string        `json:"candidate"`
-	CandidateV6     string        `json:"candidate_v6"`
-	Candidates      []string      `json:"candidates"`
-	Relay           string        `json:"relay"`
-	Relays          []string      `json:"relays"`
-	Punch           string        `json:"punch"`
-	PunchV6         string        `json:"punch_v6"`
-	Carrier         string        `json:"carrier"`
-	CarrierToken    string        `json:"carrier_token"`
-	Fingerprint     string        `json:"fingerprint"`
-	PublicKey       string        `json:"public_key"`
-	ServerPublicKey string        `json:"server_public_key"`
-	Binding         string        `json:"binding"`
-	LocalAddrs      []string      `json:"local_addrs"`
-	LocalAddrsV6    []string      `json:"local_addrs_v6"`
-	NATType         string        `json:"nat_type"`
-	UpnpPort        int           `json:"upnp_port"`
-	LastSeenMS      int64         `json:"last_seen_ms"`
-	ExpiresInMS     int64         `json:"expires_in_ms"`
-	RelayOnly       bool          `json:"relay_only"`
-	Transport       string        `json:"transport"`
-	Software        *softwareInfo `json:"software"`
+	ID                string        `json:"id"`
+	Online            bool          `json:"online"`
+	Candidate         string        `json:"candidate"`
+	CandidateV6       string        `json:"candidate_v6"`
+	Candidates        []string      `json:"candidates"`
+	Relay             string        `json:"relay"`
+	Relays            []string      `json:"relays"`
+	Punch             string        `json:"punch"`
+	PunchV6           string        `json:"punch_v6"`
+	Carrier           string        `json:"carrier"`
+	CarrierV6         string        `json:"carrier_v6"`
+	CarrierToken      string        `json:"carrier_token"`
+	Fingerprint       string        `json:"fingerprint"`
+	PublicKey         string        `json:"public_key"`
+	ServerPublicKey   string        `json:"server_public_key"`
+	Binding           string        `json:"binding"`
+	LocalAddrs        []string      `json:"local_addrs"`
+	LocalAddrsV6      []string      `json:"local_addrs_v6"`
+	NATType           string        `json:"nat_type"`
+	UpnpPort          int           `json:"upnp_port"`
+	LastSeenMS        int64         `json:"last_seen_ms"`
+	ExpiresInMS       int64         `json:"expires_in_ms"`
+	RelayOnly         bool          `json:"relay_only"`
+	Transport         string        `json:"transport"`
+	Software          *softwareInfo `json:"software"`
+	ConfigSerial      int64         `json:"config_serial"`
+	RendezvousServers []string      `json:"rendezvous_servers"`
 }
 
 type apiError struct {
@@ -138,7 +166,8 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
+	base := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, method, base+path, reader)
 	if err != nil {
 		return err
 	}

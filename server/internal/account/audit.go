@@ -20,6 +20,17 @@ const (
 	AuditSessionRevoke     = "session_revoke"
 	AuditSessionRename     = "session_rename"
 	AuditLoginUnlock       = "login_unlock"
+	AuditRoleChange        = "role_change"
+	AuditAccountCreate     = "account_create"
+	AuditAccountDelete     = "account_delete"
+	AuditAccountPassword   = "account_password_reset"
+	AuditAccountBan        = "account_ban"
+	AuditAccountUnban      = "account_unban"
+	AuditAccountEmail      = "account_email"
+	AuditAccountPhone      = "account_phone"
+	AuditAccountRecover    = "account_recover"
+	AuditWebAuthnRegister  = "webauthn_register"
+	AuditWebAuthnRemove    = "webauthn_remove"
 )
 
 // auditRetention keeps the table bounded without an external maintenance job.
@@ -80,6 +91,13 @@ func (s *Store) AuditEvents(limit int) ([]AuditEvent, error) {
 
 // AuditEventsFor filters by exact action; an empty action returns every kind.
 func (s *Store) AuditEventsFor(action string, limit int) ([]AuditEvent, error) {
+	return s.AuditEventsForBefore(action, 0, limit)
+}
+
+// AuditEventsForBefore returns one page older than beforeID; 0 starts at the
+// newest row. The cursor is an ID rather than an offset so rows appended while
+// an operator pages do not shift the window.
+func (s *Store) AuditEventsForBefore(action string, beforeID int64, limit int) ([]AuditEvent, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -87,14 +105,23 @@ func (s *Store) AuditEventsFor(action string, limit int) ([]AuditEvent, error) {
 		limit = 500
 	}
 	action = strings.TrimSpace(action)
-	query := `SELECT id, created_at, username, action, detail, client_ip, location, success
-		 FROM audit_events ORDER BY id DESC LIMIT ?`
-	args := []any{limit}
+	clauses := make([]string, 0, 2)
+	args := make([]any, 0, 3)
 	if action != "" {
-		query = `SELECT id, created_at, username, action, detail, client_ip, location, success
-		 FROM audit_events WHERE action = ? ORDER BY id DESC LIMIT ?`
-		args = []any{action, limit}
+		clauses = append(clauses, "action = ?")
+		args = append(args, action)
 	}
+	if beforeID > 0 {
+		clauses = append(clauses, "id < ?")
+		args = append(args, beforeID)
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = " WHERE " + strings.Join(clauses, " AND ")
+	}
+	args = append(args, limit)
+	query := `SELECT id, created_at, username, action, detail, client_ip, location, success
+		 FROM audit_events` + where + ` ORDER BY id DESC LIMIT ?`
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(query, args...)

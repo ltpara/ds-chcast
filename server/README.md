@@ -2,20 +2,25 @@
 
 Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打洞协调和不可达时
 的中继/载体回退。服务端只转发加密的 QUIC 数据报，不解析、不终止 chast 协议，
-因此协议 v25 的令牌、审批、证书指纹和输入通道都保持端到端语义。
+因此协议 v27 的令牌、审批、证书指纹和输入通道都保持端到端语义。
 
 参考实现是 RustDesk 的 `hbbs`（会合/信令）与 `hbbr`（中继）：
 
 | RustDesk | 本服务 | 说明 |
 | --- | --- | --- |
 | `RegisterPk` 首次登记 ID 公钥 | `POST /v1/hosts` + Ed25519 注册签名 | 公钥与 ID 永久绑定，续约必须用同一私钥签名 |
-| `Peer` 记录持久化 | SQLite `chast-server-state.db`（`peers` 表）+ 服务器签名 `binding` | 离线仍可查询身份、主机名/平台/版本与最近在线时间；旧 JSON 状态自动一次性导入 |
+| `Peer` 记录持久化 | SQLite `chast-server-state.db`（`peers` 表）+ 服务器签名 `binding` | 离线仍可查询身份、主机名/平台/版本与最近在线时间；旧 JSON 状态自动一次性导入；状态库带前向版本化迁移（P2-21） |
 | 地址簿批量在线查询 | `GET /v1/hosts?ids=<id,...>` | 一次最多 200 个 ID、自动去重；未知 ID 列入 `missing`，整批查询不因个别失效条目失败 |
 | 对等记录别名与标签 | `PATCH /v1/identities/{id}` + 管理台 `alias`/`tags` | 运营者维护的展示名称与标签持久化到 SQLite，主机续约不会覆盖；单机与批量查询随记录返回，查看器地址簿在配置 server-key 后可从设备菜单直接编辑 |
-| 用户账号与账号地址簿 | `POST /v1/account/login` 等 + 管理台 `user`/`ab`/`audit` | PBKDF2-SHA256 密码换取 30 min 访问令牌与 720 h 刷新令牌（库中只存令牌哈希），刷新即轮换、重放即撤销整个会话；可选 TOTP 两步验证与一次性恢复码、设备会话改名/撤销与持久化账号安全审计；每个用户拥有独立的名称/标签地址簿，账号令牌与运营者 server-key 互不通用；查看器侧栏可登录并自动续期同步该地址簿，设备菜单可编辑账号标签 |
+| 用户账号与账号地址簿 | `POST /v1/account/login` 等 + 管理台 `user`/`ab`/`audit` | PBKDF2-SHA256 密码换取 30 min 访问令牌与 720 h 刷新令牌（库中只存令牌哈希），刷新即轮换、重放即撤销整个会话；可选 TOTP 两步验证与一次性恢复码、设备会话改名/撤销与持久化账号安全审计；每个用户拥有独立的名称/标签地址簿，账号令牌与运营者 server-key 互不通用；查看器侧栏可登录并自动续期同步该地址簿，设备菜单可编辑账号标签；可选找回邮箱与一次性密码重置令牌（库中只存 SHA-256、默认 30 min、单账号仅一个有效令牌、成功即吊销全部会话）与可选找回手机与 8 位短信验证码（只存 SHA-256、默认 10 min、单账号单活、5 次错误即作废、成功后同样吊销全部会话），找回请求固定返回 202 以防账号枚举 |
+| WebAuthn 安全密钥 | `--webauthn-rp-id`/`--webauthn-origin` + `/v1/account/webauthn/*` 与 `/v1/account/login/webauthn/*` | 密码 + Windows Hello / FIDO2 平台认证器作为登录第二因素；服务端只存 COSE 公钥，挑战 32 字节、5 分钟单活并在登录成功时与令牌同一事务消费，重放必然失败；支持 ES256/RS256/EdDSA，attestation 接受 `none`/`packed` 但不校验证书链；查看器账号对话框可注册/命名/删除，登录页提供“使用安全密钥”；未配置时相关接口返回 503 |
 | 登录地点（GeoIP） | `--geoip-file` + 审计 `location` / 会话 `location` | 可选离线表，每行 `CIDR 地点`，按最长前缀把登录 IP 映射为地点（IPv4、IPv6 与 IPv4-mapped 归一）；写入账号安全审计与设备会话列表，管理台与查看器会话对话框显示；缺省不解析，只记录 IP |
+| 日志轮转与归档 | `--log-file` + `--log-max-size`/`--log-max-backups`/`--log-max-age`/`--log-compress` | slog 文本日志同时写 stderr 与文件；按大小轮转为时间戳文件，可选 gzip，按数量与年龄清理旧归档；`chast-relay` 同名旗标 |
+| 请求链路 tracing | `--trace-endpoint` + `--trace-sample`/`--trace-service` | 每个 HTTP 请求按 OTLP/HTTP JSON 导出 span（`service.name`、路由、方法、状态码、≥500 标记错误），接受上游 W3C `traceparent` 并在响应回写；默认关闭，collector 不可达或队列满时丢弃 span，不阻塞请求；`chast-server` 覆盖 API（含 429），`chast-relay` 覆盖节点控制面 |
+| HTTPS 与 mTLS | `--tls-cert`/`--tls-key` 或 `--acme-domain` + `--tls-client-ca`；代理与隧道 `--tls-ca`/`--tls-client-cert`/`--tls-client-key` | 服务端与节点控制面可直接 HTTPS；给出客户端 CA 时要求并校验客户端证书。证书既可来自文件，也可由内建 ACME（HTTP-01）自动申请与续期；文件证书在替换后自动热加载（最迟 5 秒，坏文件保留旧证书），客户端 CA 仍只在启动时读取。代理、`chast-tunnel` 与节点池可信任私有 CA 并出示客户端证书，未配置时行为不变 |
 | 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤 |
 | 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤，同样保留最新 10000 条 |
+| Web 管理台（RustDesk 仅在 Pro 侧提供） | `GET /admin/`（与 HTTP API 同端口的内嵌页面） | 无需额外进程或前端构建：登录只输入 server-key（存于浏览器 `sessionStorage`，不设 cookie 或服务端会话），覆盖总览、设备（全量含离线、搜索/在线过滤、别名标签、重置身份）、账号（创建/角色/封禁/密码/2FA/删除）、三类审计分页与 CSV 下载、服务器与软件更新信息；401 自动锁屏，调用仍是同源 Bearer `/v1/*` |
 | 主机入站审计 | `POST /v1/hosts/{id}/audit` + `GET /v1/audit/connections?host=` + `GET /v1/audit/file-transfers?host=` | 查看器每会话生成 `audit_ref` 随 Hello 传给主机（协议 v25）；主机把会话与入站上传写 JSONL spool，`chast-tunnel host --audit-spool` 用主机 Ed25519 密钥逐条签名上报。服务端按引用合并两侧，会话一条主记录（`source`=viewer/host/both），文件保留主机逐文件行；运营者可按主机过滤 |
 | 地址簿分组 | `/v1/addressbook/groups/{id}` + peer `group_id` | 每个账号可创建、改名、删除分组；条目通过 `group_id` 归组，删除分组只解除归组且每个被移动条目各自推进修订号；查看器“我的设备”按分组分区并可移动条目 |
 | 地址簿搜索与筛选 | 查看器本地 | 名称/ID/标签的大小写不敏感子串搜索；标签芯片多选按并集匹配，筛选同时收窄分组标题与成员计数，可一键清除 |
@@ -23,7 +28,7 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | 离线清空标签/分组 | 查看器本地意图 + 同步 `PATCH` | 清空全部标签或移出分组会持久化显式意图；离线期间不被服务端旧值回填，恢复后上传空值，成功或服务端已匹配才撤销意图 |
 | Wake-on-LAN | 查看器本地广播 | 设备菜单可为已保存或最近设备填写 MAC，向 `255.255.255.255:9` 发送 102 字节魔法包；MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
 | `PeerDiscovery` 局域网发现 | `chast-tunnel host --lan-discovery` + `chast-tunnel discover` | 主机在 UDP 21129 应答 `CHASTL1` ping，返回 ID/主机名/用户名/平台/版本/MAC；`discover` 向受限广播、各网卡定向广播与回环探测，并按 ID 合并同一主机的多个来源地址。无认证、只暴露展示元数据、不授权连接；主机侧默认开启，可 `--lan-discovery=false` 关闭 |
-| `SoftwareUpdate` | `--software-version`/`--software-url` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；主机代理记录提示，查看器首页显示可忽略的更新横幅，均不自动下载 |
+| `SoftwareUpdate` | `--software-version`/`--software-url`（+ 可选 `--software-dir`）+ `software` 响应块 | 向主机与查看者通告最新版本与下载地址；设置 `--software-dir` 时由服务端在 `/software/{name}` 只读托管发布文件，并在通告中附 SHA-256、大小与服务器 Ed25519 签名；主机代理记录提示，查看器首页显示可忽略的更新横幅，均不自动下载 |
 | `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 交换观察到的公网地址并让双方互发探针 |
 | `FetchLocalAddr` | `local_addrs` + `nat_type` | 主机上报局域网候选与 NAT 分类 |
 | UPnP 端口映射 | `--upnp` + `upnp_port`（keepalive、punch、查询） | 代理向本地 IGD 申请 UDP 端口映射并每 15 min 续租，服务端把映射外部端口随双方候选转发；缺省关闭，只有 IPv4 |
@@ -110,8 +115,9 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   模式下列出全部本地地址、节点模式下只含该节点租约端点，代理接受其中任意
   地址（含同一主机的其他解析结果）发来的挑战，避免 DNS 轮换或多地址部署
   把主机钉在单一入口；
-- 注册响应包含 `carrier` 时，优先向共享载体建立 `CHASTT-HOST2` 链路；没有
-  共享载体则回退到中继端口的 TCP 载体；
+- 注册响应包含 `carrier` 时，优先向共享载体建立 `CHASTT-HOST2` 链路；同时
+  下发 `carrier_v6` 时按本机可达的地址族排序，首选端点建链失败自动回退到
+  另一个；没有共享载体则回退到中继端口的 TCP 载体；
 - 收到 `punch_peer` 后向查看者候选地址发探针（含查看者上报的 `upnp_port`
   拼出的外部端点），打开本侧 NAT；
 - 收到的查看者数据报（直连来源、中继来源或载体帧）转发给 `--local` 指定的
@@ -125,7 +131,8 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   `transport`（`direct`/`relay`/`carrier`）；离线主机仍返回持久记录与
   `last_seen_ms`，但不返回候选或令牌；
   查询返回的 `relay` 是该租约的主中继地址，续约不变，查看者无需在多个
-  地址间自行选择；主机在线时还会得到共享载体地址与 `carrier_token`；
+  地址间自行选择；主机在线时还会得到共享载体地址（`carrier`，双栈时另有
+  `carrier_v6`）与 `carrier_token`；
 - `relay_only` 为真时服务器不返回任何直连候选，`nat_type` 固定为
   `symmetric`；此时 `direct` 模式直接报错，`auto` 只会选择载体或中继；
 - `auto` 模式在有候选时先向主机候选地址发真实 QUIC 数据报并打洞，
@@ -133,7 +140,8 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   `transport=carrier` 时直接使用共享载体；
 - `relay` 优先 UDP 中继，主机只报告 `transport=carrier` 时改用载体；
   `carrier` 模式强制 `CHASTT-V2` 共享载体，链路断开按 0.5 s→5 s 退避重连，
-  空闲每 30 s 发空帧保活；
+  空闲每 30 s 发空帧保活；有 `carrier_v6` 时两个端点按本地地址族排序、
+  拨号失败自动回退，路径事件报告实际使用的端点；
 - `direct` / `relay` / `carrier` 模式用于强制验证各条路径。
 
 局域网内查看者也可以不经过代理，直接用查询到的候选地址连接 `chast-host`；
@@ -174,7 +182,9 @@ register  : domain | host_id | fingerprint | unix_timestamp
 
 `--carrier-listen 0.0.0.0:8445`（空值禁用）让所有主机共用一个 TCP 端口；
 `GET /chast` 完成 RFC 6455 握手（子协议 `chast-carrier.v1`）后走 binary
-message，其余连接按首字节区分原始 TCP：
+message，其余连接按首字节区分原始 TCP。`--carrier-listen-v6 ::` 会在同一
+端口号上再开一组 IPv6 监听，`--advertise-v6` 配置后注册与查询额外返回
+`carrier_v6`；两个端点共享同一套主机链路与令牌。
 
 | 角色 | 握手 |
 | --- | --- |
@@ -198,23 +208,49 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、`carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
-| `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、`transport`、`relay_only` 与可选的 `software`；共享载体与令牌只在该主机在线时返回 |
+| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
+| `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、`transport`、`relay_only` 与可选的 `software`；共享载体（`carrier`/`carrier_v6`）与令牌只在该主机在线时返回 |
 | `GET` | `/v1/hosts?ids=<id,...>` | 配置了 server-key 时需要 Bearer server-key | 批量查询，逗号分隔、最多 200 个 ID；返回 `hosts` 数组（字段同单机查询）、`missing` 未知 ID 列表与顶层 `software` |
 | `PATCH` | `/v1/identities/{id}` | Bearer server-key | 设置或清除运营者别名/标签；省略字段保持不变，`""`/`[]` 表示清除 |
-| `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code` 或 `recovery_code`） | 返回 `token`、`expires_in_ms`（30 min）、`refresh_token`、`refresh_expires_in_ms`（720 h）与 `user`；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码或恢复码返回 401 与 `X-Chast-2FA: invalid`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
+| `GET` | `/v1/identities?q=&online=&limit=&offset=` | Bearer server-key | 全量持久身份（含离线）：`identities`（注册表字段 + `online`、在线时的 `relay`/`candidate`、`last_seen_ms`）、过滤后的 `total` 与 `online`；`q` 对 ID/指纹/主机名/平台/版本/别名/标签做大小写不敏感子串匹配，`online=1`（或 `true`）只返回在线；`limit` 1–1000 默认 200、`offset` 0–1000000 |
+| `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code`、`recovery_code`、`sms_code` 或 `email_code`） | 返回 `token`、`expires_in_ms`（30 min）、`refresh_token`、`refresh_expires_in_ms`（720 h）与 `user`；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码、恢复码、短信码或邮件码返回 401 与 `X-Chast-2FA: invalid`；多种验证码同时提供时优先 TOTP，其次恢复码，再次短信码，最后邮件码；密码正确但账号被封禁返回 403 `account is banned`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
+| `POST` | `/v1/account/login/sms` | 用户名 + 密码 | 为启用两步验证且绑定了找回手机的账号发送 8 位短信登录码，成功返回 202 `{"status":"accepted"}`；未启用两步验证、未绑手机与网关失败同样 202，不泄露账号状态；密码错误 401、封禁 403；同一客户端 IP+用户名每分钟最多请求一次（429），被限流的请求不会替换已发出的验证码；验证码默认 10 分钟（`--sms-ttl`）有效、5 次错误后作废，登录成功时在签发令牌的同一事务中消费 |
+| `POST` | `/v1/account/login/email` | 用户名 + 密码 | 为启用两步验证且绑定了找回邮箱的账号发送 8 位邮件登录码，成功返回 202 `{"status":"accepted"}`；未启用两步验证、未绑邮箱与 SMTP 发信失败同样 202，不泄露账号状态；密码错误 401、封禁 403；同一客户端 IP+用户名每分钟最多请求一次（429），被限流的请求不会替换已发出的验证码；验证码默认 30 分钟（`--recovery-ttl`）有效、5 次错误后作废，登录成功时在签发令牌的同一事务中消费 |
 | `POST` | `/v1/account/refresh` | `refresh_token` | 轮换同一会话的访问/刷新令牌，返回与登录相同的字段；旧访问令牌立即失效；已轮换的刷新令牌再次提交视为泄漏/重放，返回 401 并撤销整个会话；过期或未知令牌返回 401；结果写入 `session_refresh` 审计 |
 | `POST` | `/v1/account/logout` | Bearer account token | 撤销当前会话（访问令牌与刷新令牌），返回 204 |
-| `GET` | `/v1/account` | Bearer account token | 当前用户、两步验证状态与剩余恢复码数 `{"user":{"id","username"},"two_factor":false,"recovery_codes":0}` |
+| `GET` | `/v1/account` | Bearer account token | 当前用户、角色、可选找回邮箱/手机、两步验证状态与剩余恢复码数 `{"user":{"id","username","role","email","phone"},"two_factor":false,"recovery_codes":0}`；未设置邮箱或手机时省略对应字段 |
 | `POST` | `/v1/account/password` | Bearer account token | 提交 `current_password` 与 `new_password`；原密码错误为 403、新密码不合规为 400，成功返回 204 并撤销该账号其他设备令牌，当前令牌保留 |
+| `POST` | `/v1/account/email` | Bearer account token | 提交 `email` 与 `password` 设置或清除（空 `email`）找回邮箱；密码错误 403，非法邮箱 400，被其他账号占用 409；成功返回 `{"email":...}` 并写入 `account_email` 审计 |
+| `POST` | `/v1/account/phone` | Bearer account token | 提交 `phone` 与 `password` 设置或清除（空 `phone`）找回手机，号码去空白/`-`/`(`/`)`/`.` 与开头 `+` 后须为 6–15 位数字；密码错误 403，非法号码 400，被其他账号占用 409；成功返回 `{"phone":...}`、写入 `account_phone` 审计并作废该账号未使用的短信验证码 |
+| `POST` | `/v1/account/recover` | 无（仅用户名与 HTTP 限流） | 提交 `username`；无论账号是否存在、是否有邮箱、发信是否成功都返回 202 `{"status":"accepted"}`，未知用户不发信也不泄露；同一客户端 IP+用户名每分钟最多触发一次；未配置 SMTP 或账号存储返回 503；成功发信写入 `account_recover` 审计 |
+| `POST` | `/v1/account/recover/complete` | 无 | 提交 `token` 与 `password`；令牌一次性、默认 30 分钟（`--recovery-ttl`）有效，成功返回 `{"username":...}` 并吊销该账号全部访问/刷新令牌；弱密码 400 且不消耗令牌，未知、过期、已用或被替换的令牌均为 400 |
+| `POST` | `/v1/account/recover/sms` | 无（仅用户名与 HTTP 限流） | 提交 `username`；与邮件找回一样只有 202 `{"status":"accepted"}`，未知账号、未设手机与网关失败都不泄露；同一客户端 IP+用户名每分钟最多一条；未配置短信网关或账号存储返回 503；成功发送写入 `account_recover` 审计 |
+| `POST` | `/v1/account/recover/sms/complete` | 无 | 提交 `username`、8 位 `code`（可含空格/短横线）与 `password`；验证码一次性、默认 10 分钟（`--sms-ttl`，最长 1h）有效，5 次错误后作废，成功返回 `{"username":...}` 并吊销全部访问/刷新令牌；弱密码 400 且不消耗验证码，未知、过期、已用或错误验证码均为 400 |
 | `POST` | `/v1/account/2fa/start` | Bearer account token | 生成待确认的 TOTP 密钥，返回 `secret`（base32、无填充）与 `otpauth_uri`；已启用时返回 409 |
 | `POST` | `/v1/account/2fa/enable` | Bearer account token | 提交身份验证器的 6 位 `code` 激活待确认密钥，返回 204；未生成密钥为 400、验证码不匹配为 403 |
 | `POST` | `/v1/account/2fa/disable` | Bearer account token | 提交 `password` 与 `code` 关闭两步验证，返回 204；凭据或验证码错误均为 403，未启用为 400；关闭会同时清除全部恢复码 |
 | `POST` | `/v1/account/2fa/recovery` | Bearer account token | 提交 `password` 与当前 `code`，重新生成 10 个一次性恢复码并返回 `{"codes":[...]}`（仅此一次）；凭据或验证码错误为 403，未启用为 400；旧恢复码全部失效 |
+| `POST` | `/v1/account/webauthn/register/begin` | Bearer account token + `password` | 校验密码后签发 5 分钟注册挑战，返回 `challenge`、`rp_id`、`user_id`、`username`、`display_name`、`timeout_ms` 与现有凭据排除列表 `exclude_credentials`；密码错误 403，未配置 WebAuthn 503 |
+| `POST` | `/v1/account/webauthn/register/finish` | Bearer account token | 提交 `name`、`client_data_json` 与 `attestation_object`（base64url）；校验 origin/challenge/rpIdHash/UP 与证明后保存 COSE 公钥，返回凭据视图；origin 或证明无效 403、载荷格式错误 400、重复凭据 409 |
+| `GET` | `/v1/account/webauthn/credentials` | Bearer account token | 列出自己的安全密钥：`id`、`alg`、`name`、`created_at_ms`、`last_used_at_ms` |
+| `POST` | `/v1/account/webauthn/credentials/remove` | Bearer account token + `password` | 提交 `password` 与 `credential_id` 删除一枚安全密钥，成功 204；密码错误 403、凭据不存在 404 |
+| `POST` | `/v1/account/login/webauthn/begin` | 用户名 + 密码 | 密码正确且存在凭据时返回断言选项（`challenge`、`rp_id`、`credentials` 等）；无凭据返回 202 `{"status":"accepted"}` 以免枚举；密码错误 401、封禁 403，按用户名+IP 计入登录限流 |
+| `POST` | `/v1/account/login/webauthn/finish` | 无 | 提交 `username`、`credential_id`、`client_data_json`、`authenticator_data`、`signature`（base64url）与可选 `device_id`/`device_name`；校验断言并原子消费挑战，返回与 `/v1/account/login` 相同的令牌字段；签名/挑战无效、凭据不属于该账号或重放 401，封禁 403 |
 | `GET` | `/v1/account/sessions` | Bearer account token | 当前账号未过期的登录会话：公开 `id`、`device_id`、`device_name`、创建/到期毫秒时间、`current`，以及登录来源 `login_ip`/`location`（未配置 GeoIP 时地点为空） |
 | `POST` | `/v1/account/sessions/revoke-others` | Bearer account token | 保留当前会话令牌并撤销该账号全部其他会话，返回 `{"revoked":N}`；无其他会话时为 0 |
 | `PATCH` | `/v1/account/sessions/{id}` | Bearer account token | 提交 `device_name` 改名本账号的一个会话（去空白/控制字符、最长 128 字符），返回 204；空名为 400，不存在、已过期或属于他人为 404 |
 | `DELETE` | `/v1/account/sessions/{id}` | Bearer account token | 撤销本账号的一个会话，返回 204；不存在或属于他人返回 404；撤销当前会话会使本设备令牌失效 |
+| `GET` | `/v1/accounts` | Bearer server-key 或 admin 账号令牌 | 列出全部账号（`id`、`username`、`role`、可选 `email`/`phone`、`created_at_ms`，被封禁时带 `banned:true`）；普通账号令牌返回 403，未启用账号存储返回 503 |
+| `POST` | `/v1/accounts` | Bearer server-key 或 admin 账号令牌 | 提交 `username`、`password`（省略时生成一次性随机密码并在响应中返回）、可选 `role`（`admin`/`user`，默认 `user`）与可选 `email`/`phone`；重复用户名/邮箱/手机 409，非法用户名/密码/角色/邮箱/手机 400 |
+| `PATCH` | `/v1/accounts/{username}` | Bearer server-key 或 admin 账号令牌 | 修改 `role`；不允许自我降级，目标为最后一个 admin 时返回 409，未知账号 404 |
+| `DELETE` | `/v1/accounts/{username}` | Bearer server-key 或 admin 账号令牌 | 删除账号及其令牌与地址簿，返回 204；目标为最后一个 admin 且库中还有其他账号时 409，未知账号 404 |
+| `POST` | `/v1/accounts/{username}/ban` | Bearer server-key 或 admin 账号令牌 | 封禁账号：删除其全部访问与刷新令牌，密码登录返回 403；最后一个可用 admin 不能封禁（409），未知账号 404；写入 `account_ban` 审计 |
+| `DELETE` | `/v1/accounts/{username}/ban` | Bearer server-key 或 admin 账号令牌 | 解除封禁，下次登录恢复；写入 `account_unban` 审计；未知账号 404 |
+| `POST` | `/v1/accounts/{username}/password` | Bearer server-key 或 admin 账号令牌 | 重置密码（空 body 生成一次性随机密码并在响应中返回）并吊销该账号全部会话；未知账号 404 |
+| `POST` | `/v1/accounts/{username}/email` | Bearer server-key 或 admin 账号令牌 | 提交 `email` 设置或清除（空串）账号的找回邮箱；重复邮箱 409、非法邮箱 400、未知账号 404，写入 `account_email` 审计 |
+| `POST` | `/v1/accounts/{username}/phone` | Bearer server-key 或 admin 账号令牌 | 提交 `phone` 设置或清除（空串）账号的找回手机并作废未用验证码；重复手机 409、非法号码 400、未知账号 404，写入 `account_phone` 审计 |
+| `POST` | `/v1/accounts/{username}/sms` | Bearer server-key 或 admin 账号令牌 | 为账号签发一个短信验证码并交给网关，返回 202 `{"status":"sent"}`，响应与审计都不含验证码；未知账号或未设手机 400，网关失败 502，未配置短信 503 |
+| `POST` | `/v1/accounts/{username}/2fa/reset` | Bearer server-key 或 admin 账号令牌 | 清除账号的两步验证密钥，返回 204；未知账号 404 |
 | `GET` | `/v1/addressbook?since=N` | Bearer account token | 返回当前 `revision`、存活条目 `peers`、存活分组 `groups`，以及 `since` 之后的条目变更/墓碑 `changes` 与分组变更 `group_changes`；省略 `since` 时从 0 开始，越界值回落到全量历史 |
 | `PATCH` | `/v1/addressbook/peers/{id}` | Bearer account token | 添加或部分更新名称/标签/`group_id`；省略字段保持不变，`""`/`[]` 清除，标签去重；只带 `group_id` 时要求条目与目标分组都存在；可选正整数 `if_revision` 作为条目级并发令牌，过期/缺失/已删除返回 409，省略时仍为最后写入者优先 |
 | `DELETE` | `/v1/addressbook/peers/{id}` | Bearer account token | 删除条目；不存在返回 404 |
@@ -233,17 +269,19 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 | `DELETE` | `/v1/hosts/{id}` | Bearer server-key | 主机主动下线并释放中继端口，保留永久身份 |
 | `DELETE` | `/v1/identities/{id}` | Bearer server-key | 管理员重置丢失密钥的主机身份 |
 | `POST` | `/v1/hosts/{id}/audit` | 主机 Ed25519 签名（按 `audit_ref`） | 主机上报一条入站审计：`kind`（`session`/`file`）、`audit_ref`、时间/方向/文件名/大小/结果/说明，以及 `signature`。签名覆盖域分隔的规范消息 `chast-host-audit-v1`；未知主机 404、签名无效 401、时间偏差超过 2 分钟或字段非法 400。会话与查看器记录按引用合并，文件保存为主机逐文件行；返回 201 与规范化后的记录 |
-| `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
+| `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体（`carrier`/`carrier_v6`）、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
-| `GET` | `/v1/audit?limit=N&action=<action>` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤；返回 `events`，每项含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`；未启用账号存储返回 503 |
+| `GET` | `/v1/audit?limit=N&action=<action>&before_id=<id>&format=json\|csv` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤，`before_id` 取上一页返回的 `next_before_id` 续页；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数），未启用账号存储返回 503 |
 | `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail` 与 `direction`；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大或方向非法返回 400 |
-| `GET` | `/v1/account/connections?limit=N` | Bearer account token | 当前账号自己的连接记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50） |
-| `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50）；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；未启用账号存储返回 503 |
+| `GET` | `/v1/account/connections?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的连接记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
+| `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>&before_id=<id>&format=json\|csv` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；`format=csv` 下载整表并沿用 `username`/`host` 过滤，忽略分页参数；未启用账号存储返回 503 |
 | `POST` | `/v1/account/file-transfers` | Bearer account token | 查看器上报一个轮询窗口内结束的文件传输：`peer_id`、`direction`（`upload`/`download`）、可选 `name`/`size`、`files`（默认 1）、`success`、可选 `detail` 与 `occurred_at_ms`；返回 201；空对端、未知方向、负大小或文件数越界返回 400 |
-| `GET` | `/v1/account/file-transfers?limit=N` | Bearer account token | 当前账号自己的文件传输记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50） |
-| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50）；主机逐文件行与查看器汇总行并存；未启用账号存储返回 503 |
+| `GET` | `/v1/account/file-transfers?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的文件传输记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
+| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>&before_id=<id>&format=json\|csv` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；主机逐文件行与查看器汇总行并存；`format=csv` 下载整表并沿用过滤，忽略分页参数；未启用账号存储返回 503 |
 | `GET` | `/metrics` | 配置了 server-key 时需要 | Prometheus 文本格式指标 |
 | `GET` | `/healthz` | 无 | 存活检查 |
+| `GET`/`HEAD` | `/admin/` | 无（页面内以 server-key 调用 `/v1/*`） | 内嵌 Web 管理台：只提供 `index.html`、`app.js`、`style.css`，其他路径一律 404；响应带 CSP（仅同源、无内联脚本/样式）、`nosniff`、`no-store`、`no-referrer` 与 `X-Frame-Options: DENY`；`GET /admin` 以 301 跳到 `/admin/` |
+| `GET`/`HEAD` | `/software/{name}` | 无 | 仅设置 `--software-dir` 时注册：公布该目录下单层发布文件（名称限 `[A-Za-z0-9._-]`，无目录列表，其他路径一律 404），带 `application/octet-stream` 与附件名，支持 Range/ETag/Last-Modified |
 
 主机私钥由 `--key` 派生（`SHA-256("chast-host-identity-v1\n" + key)` 作为
 Ed25519 种子），服务端只保存公钥与可选指纹。首次注册把 ID 永久绑定到该公钥；
@@ -270,7 +308,8 @@ POST /v1/hosts
        "punch":"203.0.113.5:8444",
        "expires_in_sec":60,"public_key":"<base64url>",
        "server_public_key":"<base64url>","binding":"CHASTB1...",
-       "carrier":"203.0.113.5:8445","carrier_token":"<32 hex>",
+       "carrier":"203.0.113.5:8445","carrier_v6":"[2001:db8::5]:8445",
+       "carrier_token":"<32 hex>",
        "software":{"version":"2.1.0","url":"https://downloads.example.com/chast-2.1.0.exe"}}
 
 GET /v1/hosts/devbox
@@ -397,7 +436,15 @@ MAC），目标端口 9。MAC 接受 `AA:BB:CC:DD:EE:FF`、`AA-BB-...` 与无分
 16 字节随机盐、32 字节派生密钥）保存，格式为自描述的
 `pbkdf2-sha256$210000$<salt>$<hash>`；登录令牌是 32 字节随机值，数据库只存
 其 SHA-256，修改密码会删除该用户全部令牌。用户名大小写不敏感，地址簿按
-用户隔离，删除用户时令牌与地址簿随外键级联删除。
+用户隔离，删除用户时令牌与地址簿随外键级联删除。账号分 `admin` 与 `user`
+两种角色：首个创建的账号（以及旧库升级时最早创建的账号）为 `admin`，其余
+默认 `user`。`/v1/accounts*` 管理接口同时接受 server-key 与 admin 账号令牌，
+普通账号令牌返回 403；支持列出、创建（可生成一次性密码）、改角色、删除、
+封禁/解封、重置密码与清除两步验证。系统始终保留至少一个可用 admin：最后一个
+admin 不能降级或封禁；只有当库中还有别的账号时也不能删除最后一个 admin
+（删除全部账号后，下一个新建账号会重新成为 admin）。封禁会立即吊销该账号
+全部访问与刷新令牌，密码正确时登录返回 403，但错误密码仍按普通失败处理，
+不向未通过密码校验的人暴露封禁状态。角色变更与管理操作写入账号安全审计。
 
 登录失败在 10 分钟窗口内累计 5 次后，把“用户名小写 + 客户端 IP”锁定 1 分钟，
 期间返回 `429` 与 `Retry-After`，正确密码也不会放行；成功登录清零。可用
@@ -423,7 +470,39 @@ MAC），目标端口 9。MAC 接受 `AA:BB:CC:DD:EE:FF`、`AA-BB-...` 与无分
 修改密码：`POST /v1/account/password` 校验
 当前密码（错误返回 403，不当作令牌失效），新密码沿用 8–128 字节规则；
 成功后当前会话保留、该账号其他令牌全部撤销，其他设备必须用新密码重新登录。
-管理台重置密码（`user passwd`）仍是忘记密码时的人工出口。
+管理台重置密码（`user passwd`）与邮件令牌找回是忘记密码时的两个出口。
+
+账号可选设置唯一的找回邮箱（大小写不敏感比较，一个邮箱只能属于一个账号）：
+已登录用户用 `POST /v1/account/email` 设置或清空，管理员用 `POST
+/v1/accounts/{username}/email` 或管理台 `user email` 代设，两种自助修改都要求
+当前密码，避免被借用的令牌把后续找回邮件改到攻击者邮箱。忘记密码时
+`POST /v1/account/recover` 只接收用户名：账号存在且有邮箱时生成 32 字节随机
+令牌，库中只存 SHA-256，同一账号再次请求会让旧令牌失效，默认有效期 30 分钟
+（`--recovery-ttl`）；邮件正文含令牌，配置 `--recovery-url` 时另带
+`?token=` 链接供页面直接打开。无论账号不存在、未设邮箱还是 SMTP 发信失败，
+响应都是 202 且内容一致；同一客户端 IP+用户名每分钟最多触发一封，
+未配置 SMTP 时接口整体返回 503。`POST /v1/account/recover/complete` 用令牌与
+新密码一次性消费，新密码沿用 8–128 字节规则，成功后该账号全部访问与刷新令牌
+立即失效；过期、已用或被替换的令牌返回 400。管理台 `user recover <name>`
+在配置 SMTP 时直接发信，否则打印一次令牌与可选链接，由运营者线下交付。
+查看器账号对话框提供“找回邮箱”（读取/设置/清除，需当前密码）与登录页
+“忘记密码？”入口：先按用户名申请，随后粘贴邮件中的令牌并设置新密码，
+成功后回到登录表单并提示重新登录。
+
+账号还可绑定唯一的找回手机：号码去掉空白、`-`、`(`、`)`、`.` 与开头 `+`
+后须为 6–15 位数字，一个号码只能属于一个账号；已登录用户用
+`POST /v1/account/phone` 设置或清空（同样要求当前密码），管理员用
+`POST /v1/accounts/{username}/phone` 或管理台 `user phone` 代设。忘记密码时
+`POST /v1/account/recover/sms` 生成 8 位数字验证码，库中只存其 SHA-256，
+同一账号只保留最新一个（默认 10 分钟，`--sms-ttl` 可调 1m–1h，5 次错误即
+作废），并通过 `--sms-url` 配置的 HTTP 网关以 JSON `{to,text,from}` POST
+投递，可选 `--sms-token` 以 Bearer 认证；账号不存在、未设手机或网关失败一律
+返回 202，同一客户端 IP+用户名每分钟最多触发一条。
+`POST /v1/account/recover/sms/complete` 用用户名、验证码与新密码一次消费，
+成功后同样吊销该账号全部访问与刷新令牌；改绑或清除手机会立即作废未使用的
+验证码。管理台 `user sms <name>` 直接签发并投递，但不会打印验证码。
+查看器账号对话框提供“找回手机”，登录页“忘记密码？”可在邮箱与短信两个
+通道间切换；短信验证码允许带空格或短横线输入。
 
 令牌分为短期访问令牌（30 min）与会话刷新令牌（720 h）。刷新令牌保存在独立
 的 `refresh_tokens` 表，携带公开 `session_id`；每次
@@ -442,10 +521,12 @@ MAC），目标端口 9。MAC 接受 `AA:BB:CC:DD:EE:FF`、`AA-BB-...` 与无分
 登出（含失效令牌）、自助改密、两步验证启用/关闭与恢复码签发、管理台重置两步
 验证与会话撤销/改名也写入同一张表，失败原因保留在 `detail` 中。审计写入失败只写
 服务器错误日志，不改变原操作响应，避免状态文件繁忙时把用户锁在门外。表内最多
-保留 10000 条，超出后按 ID 删除最旧记录。运营者可用 `GET /v1/audit`（Bearer
-server-key）或管理台 `audit [count]` 按时间倒序读取；HTTP 版本支持
-`action` 精确过滤与 `limit`（默认 50、最大 200），管理台默认 20 条、最多
-200 条。
+保留 10000 条，超出后按 ID 删除最旧记录；配置 `--audit-retention-days` 后还会
+按时间清理。运营者可用 `GET /v1/audit`（Bearer server-key）或管理台
+`audit [count]` 按时间倒序读取；HTTP 版本支持 `action` 精确过滤、`limit`
+（默认 50、最大 200）与 `before_id` 游标续页（该页已满时返回
+`next_before_id`），管理台默认 20 条、最多 200 条。`audit prune <days>` 立即
+按时间清理账号安全审计、连接和文件传输三类历史。
 
 连接审计与账号安全审计分开存放：查看器在会话结束时（首帧到达后才开始计时，
 纯握手失败不计入）向 `POST /v1/account/connections` 上报对端 ID、起止时间、
@@ -469,6 +550,15 @@ server-key）或管理台 `connections [count]` 查看全部账号并可按用�
 过滤；保留最新 10000 条。查看器一侧按轮询窗口聚合，主机一侧由签名审计上报逐
 文件记录，两侧按 `audit_ref` 合并；不含传输中的实时进度。
 
+三类运营者历史都支持 CSV 导出：在 `/v1/audit`、`/v1/audit/connections` 与
+`/v1/audit/file-transfers` 上加 `format=csv` 即返回
+`text/csv; charset=utf-8` 附件，`Content-Disposition` 的文件名带 UTC 时间戳。
+导出一次读取整表并沿用 `action`/`username`/`host` 过滤，忽略 `limit` 与
+`before_id`；分批每页 500 行，受每表 10000 条的保留上限约束，因此整表可以
+在写出响应前读完并在失败时返回 500。时间列是 UTC RFC3339Nano，`detail` 等
+含逗号、引号或换行的字段按 RFC 4180 转义。`format` 只接受空值、`json` 或
+`csv`，其他值返回 400；不带 `format` 仍是原来的分页 JSON。
+
 账号可启用 TOTP 两步验证：`POST /v1/account/2fa/start` 生成 20 字节随机密钥
 （base32、无填充），返回一次性的 `secret` 与
 `otpauth://totp/chast:<username>?...` URI；确认前登录仍只需密码。
@@ -489,6 +579,26 @@ URI 供手动录入身份验证器（不内置二维码扫描），并可在同�
 重新绑定验证器后继承旧码。`GET /v1/account` 返回剩余可用数量，查看器在两步
 验证对话框里显示剩余数量、生成入口和一次性明文列表（可复制）。登录表单在
 服务端要求两步验证时可切换为恢复码输入。
+
+两步验证还支持短信作为备用通道：启用两步验证且绑定了找回手机的账号可先调用
+`POST /v1/account/login/sms`（用户名 + 密码）让服务端生成 8 位一次性登录码
+（与短信找回共用 `--sms-ttl`、号码归一和错误 5 次作废规则），再用
+`sms_code` 代替 `totp_code` 登录；两者同时提供时优先 TOTP，其次恢复码，再次
+短信码。请求接口只对密码正确的账号发送，对外一律 202，未启用两步验证、未绑
+手机与网关失败都不泄露；同一客户端 IP+用户名每分钟最多一条，被限流的请求在
+生成新码之前就被拒绝，不会让已发出的验证码失效。密码、手机、两步验证状态
+变更与封禁都会作废未用的登录码。查看器登录表单可切换到短信验证码模式并
+重新发送，验证码只接受 8 位数字。
+
+两步验证还支持邮件作为第二条备用通道：启用两步验证且绑定了找回邮箱的账号可
+先调用 `POST /v1/account/login/email`（用户名 + 密码）让服务端生成 8 位一次性
+登录码并通过 SMTP 发到找回邮箱（有效期复用 `--recovery-ttl`，默认 30 分钟，
+错误 5 次作废），再用 `email_code` 登录；优先级为 TOTP > 恢复码 > 短信码 >
+邮件码，未提供其他验证码时才使用邮件码。请求接口同样只对密码正确的账号
+发信，对外一律 202，未启用两步验证、未绑邮箱与发信失败都不泄露；同一客户端
+IP+用户名每分钟最多一条，限流检查在生成新码之前。密码、邮箱、两步验证状态
+变更与封禁都会作废未用的邮件登录码。查看器登录表单可切换到邮件验证码模式并
+重新发送，验证码只接受 8 位数字。
 
 查看器 Flutter 端在侧栏“账号”卡片登录当前连接服务，会话保存在
 `%APPDATA%\chast\account.json`；启动时仅恢复同一服务且未过期的令牌并静默
@@ -559,6 +669,11 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   `<state>.legacy` 后原地建库；`<state>.db` 不存在而同目录有同名 `.json`
   时导入并把它改名为 `.json.imported`。WAL 旁文件 `.db-wal`/`.db-shm` 属于
   状态的一部分；备份时应停服，或用 SQLite 的在线备份接口，不要只复制主文件。
+  状态库带前向版本化迁移：账号与对等记录分别在 `schema_migrations`/
+  `registry_schema_migrations` 记录版本，启动只执行未应用的步骤；没有版本表
+  的旧库会自动补跑基线并补记 v1，版本高于当前二进制时服务端拒绝启动并提示
+  升级（`schema version N is newer than this binary supports (M)`）。升级前
+  应停止旧实例；只支持前向迁移，降级需从备份恢复。
 - `--relay-servers a,b` 控制注册返回的中继入口：按轮询为新租约选择 `relay`，
   同时用 `relays` 下发全部端点（已拼上该租约的端口）。续约沿用
   `Host.RelayHost`，不会因刷新而漂移；地址被 `rs` 移除后才重新选择。
@@ -585,8 +700,8 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
 - **服务端密钥**：`--server-key` 保护注册、查询、统计、指标和下线。查询不再是
   公开接口：没有密钥就无法枚举主机，也拿不到候选、共享载体与令牌。公钥换绑与
   指纹变更会被拒绝，管理员只能用 `DELETE /v1/identities/{id}` 显式重置。公网
-  部署应启用原生 TLS（`--tls-cert`/`--tls-key`）或在前置反向代理终止 TLS，避免
-  server-key 与注册签名之外的元数据明文传输。
+  部署应启用原生 TLS（`--tls-cert`/`--tls-key` 或 `--acme-domain`）或在前置
+  反向代理终止 TLS，避免 server-key 与注册签名之外的元数据明文传输。
 - **会合、中继与载体认证**：配置 server-key 后，`punch_request` 必须携带
   `timestamp` 与 HMAC-SHA256 证明（`chast-punch-v1`，±60 s 时间窗），未通过
   验证的请求不会交换候选或触发打洞。UDP 中继要求查看者先发送 `relay_viewer`
@@ -620,12 +735,14 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   --carrier-listen 0.0.0.0:8445 --advertise 203.0.113.5 \
   --relay-servers 203.0.113.5,203.0.113.6 \
   --software-version 2.1.0 \
-  --software-url https://downloads.example.com/chast-2.1.0.exe \
+  --software-url https://chast.example.com/software/chast-2.1.0.exe \
+  --software-dir /var/lib/chast/releases \
   --server-key "$CHAST_SERVER_KEY" \
   --state /var/lib/chast/server.db --identity /var/lib/chast/identity.key \
   --tls-cert /etc/chast/fullchain.pem --tls-key /etc/chast/privkey.pem \
   --api-rate 50 --api-burst 100 --admin-listen 127.0.0.1:8446 \
   --register-max 30 --register-max-ids 300 --punch-log-max 100000 \
+  --audit-retention-days 90 \
   --rmem 4194304 \
   --relay-single-bandwidth 128 --relay-total-bandwidth 1024 \
   --relay-blacklist-speed 32 \
@@ -634,9 +751,33 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
 ```
 
 - `--tls-cert` / `--tls-key` 同时给出时 HTTP API 直接以 HTTPS 监听（最低
-  TLS 1.2），证书在启动时加载，文件错误直接退出；只给一个视为配置错误。
-  都不给则保持明文，适合已有反向代理终止 TLS 的部署。`/v1/server` 的
-  `tls` 字段反映当前模式。代理的 `--server https://…` 无需其他改动。
+  TLS 1.2），启动时加载证书，文件错误直接退出；只给一个视为配置错误。
+  运行中替换这两个文件即可热加载（如 certbot 续期后）：服务端与
+  `chast-relay` 在距上次检查至少 5 秒后的下一次握手时重新读取文件，内容
+  变化才换用新证书并记录 `TLS certificate reloaded`。替换文件损坏或只有
+  一半时保留上一份证书继续服务，日志按错误去重记录 `TLS certificate reload
+  skipped`；证书与私钥必须成对替换，否则同样按坏文件处理。都不给则保持
+  明文，适合已有反向代理终止 TLS 的部署。`/v1/server` 的 `tls` 字段反映
+  当前模式。代理的 `--server https://…` 无需其他改动。
+- `--tls-client-ca` 让 HTTPS 入口要求 mTLS：客户端证书必须由该 PEM CA 签发，
+  否则 TLS 握手失败；它可与 `--tls-cert`/`--tls-key` 组合，也可在反向代理
+  终止 TLS 时单独留给代理校验。客户端一侧：主机/查看者代理与 `chast-tunnel
+  host|viewer` 用 `--tls-ca` 信任私有 CA（追加到系统根）、
+  `--tls-client-cert`/`--tls-client-key` 出示客户端证书；`chast-relay` 接受
+  同名的 `--tls-client-ca`，服务端用 `--relay-node-ca`/
+  `--relay-node-client-cert`/`--relay-node-client-key` 访问要求 mTLS 的节点。
+  三项都留空时完全沿用系统根与明文 HTTP，旧部署无需改动。`--tls-client-ca`
+  本身只在启动时读取，轮换 CA 需要重启；热加载只覆盖服务端证书与私钥。
+- `--acme-domain`（逗号分隔的裸 DNS 名称）开启 ACME HTTP-01 自动申请与
+  续期，替代 `--tls-cert`/`--tls-key` 与手工 certbot：证书和账户密钥缓存在
+  `--acme-cache`（空时取 `--state` 同目录的 `acme-cache`，无状态文件时为
+  `./acme-cache`），`--acme-http-listen`（默认 `:80`）只做挑战应答与到
+  `https://<host>` 的 302 跳转，`--acme-email` 是注册到 CA 的联系邮箱；
+  `--acme-directory-url` 可切 Let's Encrypt staging 或自建 ACME，
+  `--acme-eab-kid`/`--acme-eab-key` 用于要求外部账户绑定的 CA。启用时禁止
+  `--tls-cert`/`--tls-key`，可与 `--tls-client-ca` 组合；挑战监听端口不能与
+  `--http-listen` 相同。缓存未命中时首次握手可能等待数秒完成签发，续期对该
+  监听透明；只支持 HTTP-01，不含泛域名与 DNS-01。
 - `--relay-servers`（空值回退 `--advertise`）列出本实例可达的中继入口，
   每项是主机名或 IP，不带端口；注册时轮询选中主入口，并以 `relays` 下发
   全部端点。多网卡或 NAT 多映射时，每个地址都必须路由到同一实例，且中继
@@ -656,16 +797,31 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   主机代理向 `relays` 里的每个端点发 `relay_hello`，两族监听都能接受该主机
   的 `relay_challenge/auth`；查看者按自己 socket 的地址族选择端点。
   `relays` 由 `--advertise`/`--relay-servers` 加 `--advertise-v6` 组成，主
-  入口仍是轮换选中的 IPv4 地址，因此共享 TCP 载体仍只在主入口上提供服务。
+  入口仍是轮换选中的 IPv4 地址。
   纯 IPv6 主机需要 `--listen` 与转发目标 `--local` 同族（或用双栈 socket）：
   代理的单个 UDP socket 同时承担中继与本地转发，绑定 `[::1]` 时无法写往
   `127.0.0.1`，日志会记录 `IPv4 keepalive write failed` 并在 v6 路径正常
   工作。
+- `--carrier-listen-v6` 为共享载体在同一端口号上再开一组 IPv6 TCP 监听，
+  例如 `--carrier-listen 0.0.0.0:8445 --carrier-listen-v6 ::`；`--advertise-v6`
+  同时给出时，注册、查询与 `/v1/server` 会在 `carrier` 之外下发
+  `carrier_v6`。只开监听而不配置 `--advertise-v6` 时仍只公布 IPv4 端点（启动
+  日志会警告）。主机与查看者代理按本机可达的地址族排序两个端点，首选端点
+  拨号失败时自动回退到另一个，路径事件报告实际使用的端点；`chast-relay`
+  的节点租约同样带 `carrier_v6`，旗标同名。
 - `--software-version` 与 `--software-url` 必须同时设置，对应 hbbs 的
   `SoftwareUpdate`：服务端在注册、单机/批量查询与 `/v1/server` 中附带
   `software{version,url}`；主机与查看者代理发现自身版本不同时记录
   `software update available`，不做自动下载。URL 只接受绝对的
   `http`/`https` 地址，未配置时响应中不出现该字段。
+- `--software-dir` 让服务端自己托管更新文件：目录下的单层文件以
+  `GET/HEAD /software/{name}` 只读公布，文件名限 `[A-Za-z0-9._-]`，无目录
+  列表，`..`、子路径与非法名称一律 404。启动时读取 `--software-url` 指向的
+  文件，计算 SHA-256 与大小，并用服务器身份对
+  `chast-software-v1` 域下的版本、URL、摘要与大小签名，随 `software` 块
+  下发 `sha256`/`size`/`signature`；客户端固定服务器公钥即可同时校验通告
+  与下载内容。设置该旗标时 URL 必须指向 `/software/` 下的文件名；URL 在
+  `/software/` 下但未设置目录时启动只警告，由其他主机负责下载。
 - `--api-rate`（默认 50 请求/秒）与 `--api-burst`（默认 100）是所有 HTTP
   路径共用的按 IP 令牌桶，`--api-rate 0` 关闭。超限返回 `429` 和
   `Retry-After: 1`，计入 `chast_http_rate_limited_total`。默认按 TCP 对端
@@ -677,6 +833,36 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `--login-max-failures 0` 关闭；启用时窗口与锁定时长至少 1s。计数持久化在
   `state.db` 的 `login_locks` 表，重启后仍生效，同库实例共享；无持久状态时
   退回进程内存。来源地址与 HTTP 限流一致，可受 `--proxy-header` 影响。
+- `--smtp-addr`（默认空，关闭邮件找回）、`--smtp-from`（发件人，设置
+  `--smtp-addr` 时必填）、`--smtp-user`/`--smtp-pass`（可选 PLAIN 认证）与
+  `--smtp-tls`（默认 `starttls`，可选 `implicit` 或 `none`）配置找回邮件的
+  发信通道；密码建议放在 `--env-file` 而不是命令行。`--recovery-url` 指定
+  重置链接指向的绝对 http(s) 页面（令牌始终也在邮件正文中），
+  `--recovery-ttl`（默认 30m）控制令牌有效期且至少 1m。设置 SMTP 但缺少
+  发件人、只给认证/发件人却未配置服务器、或链接不是绝对 http(s) 时启动失败。
+  同一 SMTP 也发送两步验证的登录邮件码（`POST /v1/account/login/email`，
+  复用 `--recovery-ttl`）；未配置 SMTP 时该接口返回 503。
+- `--sms-url`（默认空，关闭短信找回）指定接收 `{"to","text","from"}` JSON
+  的 HTTP 短信网关地址；`--sms-token` 以 Bearer 头认证、`--sms-from` 作为
+  可选发送方标识，`--sms-ttl`（默认 10m，范围 1m–1h）控制验证码有效期。
+  只给 token/from 而未配置 URL、URL 不是绝对 http(s)、或 token/from 含
+  控制字符时启动失败。网关须返回 2xx；非 2xx 或超时只记日志并按发送失败
+  处理（对外仍是 202），令牌同样建议放在 `--env-file`。同一网关也发送两步
+  验证的登录短信码（`POST /v1/account/login/sms`，复用 `--sms-ttl`）；未配置
+  网关时该接口返回 503。
+- `--webauthn-rp-id`（默认空，关闭安全密钥）是 WebAuthn 依赖方标识（裸主机名）；
+  `--webauthn-origin` 是逗号分隔的 `scheme://host[:port]` 白名单。两者必须同时
+  设置，缺一即关闭，相关接口返回 503。每个 origin 的主机必须等于 rp-id 或是其
+  子域，clientDataJSON 里的 origin 必须与白名单逐字匹配。查看器以 Windows
+  Hello 平台认证器完成注册与断言，服务端只保存 COSE 公钥，不校验证书链。
+- `--audit-retention-days`（默认 0，只保留行数上限）在启动时与每 6 小时按时间
+  清理 `audit_events`、`connection_events` 与 `file_events` 中早于该天数的行，
+  启动清理后只在确有删除时记录一行日志；管理台 `audit prune <days>` 可随时
+  手工执行。值为 0 或负数表示不按时间清理，只保留行数上限。
+- `--addressbook-tombstone-days`（默认 0，保留全部）在启动与每 6 小时删除
+  早于该天数的地址簿条目与分组墓碑（管理台 `ab prune <days>` 可手工执行），
+  存活条目不删除。离线时间超过保留窗口的客户端会错过墓碑，需一次整本快照
+  才能收敛，因此窗口应长于最长预期离线时间。
 - `--geoip-file`（默认空）读取离线 GeoIP 表，把登录来源映射为“登录地点”。
   文件为 UTF-8 文本，每行 `CIDR 地点`（如 `203.0.113.0/24 Tokyo, JP`），
   `#` 开头为注释；支持 IPv4 与 IPv6，按最长前缀匹配，`::ffff:` 映射地址归一
@@ -685,8 +871,24 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   留空、文件未命中或未配置时地点为空，行为与之前相同。服务端不做在线查询，
   也不内置地点数据：识别效果取决于运维提供的表；来源地址同样受
   `--proxy-header` 影响，启用前应确认代理会覆盖该头。
+- `--log-file`（默认空）在 stderr 之外再把 slog 文本日志追加到文件；留空只写
+  stderr。`--log-max-size`（默认 100，单位 MiB）写满后把当前文件重命名为
+  `<name>.<20060102-150405.000000000>` 并新建，`--log-compress`（默认开）把
+  轮转文件 gzip 为 `.gz`。`--log-max-backups`（默认 5，0 保留全部）与
+  `--log-max-age`（默认 0，不按年龄删除）在每次轮转和重启打开时按目录内容
+  统一清理，进程被杀后残留的归档也受同一策略约束。`chast-relay` 提供同名
+  旗标。
+- `--trace-endpoint`（默认空，关闭）把 HTTP 请求 span 以 OTLP/HTTP JSON
+  批量 `POST` 到 `<endpoint>/v1/traces`（每 2 s 或 128 条一批），
+  `--trace-sample`（默认 1，范围 0..1）控制本地采样，`--trace-service`
+  （默认 `chast-server` / `chast-relay`）作为资源 `service.name`。请求带
+  上游 `traceparent` 时沿用其 trace ID 与采样位，否则新建 trace；响应总带
+  `traceparent`，便于把客户端日志与导出的 span 关联。导出失败或队列满只
+  丢弃 span，不阻塞业务请求；退出时最多等待 3 s 冲刷。`chast-relay` 旗标
+  相同，覆盖节点控制面。
 - `GET /metrics` 输出 Prometheus 文本格式，配置 `--server-key` 后需要 Bearer
-  认证。采集器示例：
+  认证。API 请求延迟以 `chast_http_request_duration_seconds` 直方图暴露，
+  按端点分标签，分桶 0.001–10 秒加 `+Inf`，同时给出 `_sum`/`_count`。采集器示例：
 
 ```yaml
 scrape_configs:
@@ -754,10 +956,16 @@ chast-relay --http-listen 0.0.0.0:8447 --relay-listen 0.0.0.0 \
 
 - `--key` 必填，与 hbbs 的 `--relay-node-key` 相同；控制面 `/v1/leases`、
   `/v1/leases/{id}`、`/v1/stats` 都要求 Bearer key，`/healthz` 公开。
-  `--tls-cert`/`--tls-key` 让控制面直接走 HTTPS，也可放在反向代理后。
+  `--tls-cert`/`--tls-key` 让控制面直接走 HTTPS，也可放在反向代理后；
+  `--tls-client-ca` 再要求客户端证书由该 CA 签发（hbbs 侧用
+  `--relay-node-ca`/`--relay-node-client-cert`/`--relay-node-client-key`
+  配套）。
 - `--relay-ports` 是节点预绑定的 UDP/TCP 端口集合，端口在租约申请后按
   `--advertise` 解析出的本机地址重绑；`--carrier-listen` 非空时节点提供共享
-  载体并在租约响应里返回其地址。`--lease-janitor` 控制到期租约的清理周期。
+  载体并在租约响应里返回其地址。`--carrier-listen-v6` 与 `--advertise-v6`
+  让节点同时公布 IPv6 载体端点（`carrier_v6` 与 `carrier` 同端口），要求
+  两者都配置；只有 `--carrier-listen-v6` 时节点仍按 IPv4 公布。
+  `--lease-janitor` 控制到期租约的清理周期。
 - 节点只保存 hbbs 下发的公钥与 `carrier_token`，`relay_hello`/`relay_auth`
   与载体握手都在节点本地校验，不需要回连 hbbs。响应里的 `relay`、
   `carrier` 必须从主机和查看者都可达，否则它们仍会拨到节点但连接失败。
@@ -797,7 +1005,7 @@ chast-server ... \
 
   | 方法 | 路径 | 认证 | 说明 |
   | --- | --- | --- | --- |
-  | `POST` | `/v1/leases` | Bearer key | `{"id","public_key","carrier_token","ttl_sec"}`，幂等续约 |
+  | `POST` | `/v1/leases` | Bearer key | `{"id","public_key","carrier_token","ttl_sec"}`，幂等续约；返回 `relay`、`carrier` 与可选的 `carrier_v6` |
   | `DELETE` | `/v1/leases/{id}` | Bearer key | 释放租约、端口与链路 |
   | `GET` | `/healthz` | 无 | `{"ok","node","leases","linked"}` |
   | `GET` | `/v1/stats` | Bearer key | 租约、UDP/TCP 端口与共享载体计数 |
@@ -823,14 +1031,22 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   | `peers [count]` | 持久对等记录（默认 20），含在线状态、主机名、平台、版本、别名/标签与最近注册时间；离线主机也在列表中 |
   | `alias <id> [text]` | 设置或清除运营者别名（省略 `text` 清除，最长 128 字符） |
   | `tags <id> [tag1,tag2]` | 设置或清除标签（省略列表清除，最多 16 个、每个 32 字符） |
-  | `user`/`user list` | 列出账号、ID 与创建时间；`--state ""` 时提示需要持久状态 |
+  | `user`/`user list` | 列出账号、角色、ID、创建时间与找回邮箱/手机；被封禁账号带 `banned=true`；`--state ""` 时提示需要持久状态 |
   | `user add <name> [password]` | 新建账号；省略密码时生成 18 字节随机密码并只打印一次 |
   | `user passwd <name> [password]` | 重置密码并吊销该账号的全部令牌 |
+  | `user role <name> admin\|user` | 设置账号角色；写入 `role_change` 审计，最后一个 admin 不能降级 |
+  | `user ban <name>` / `user unban <name>` | 封禁/解封账号；封禁立即吊销全部会话并写入 `account_ban` 审计，解封写入 `account_unban`；最后一个可用 admin 不能封禁 |
   | `user 2fa <name> off` | 清除账号的两步验证密钥（验证器丢失时的人工出口），下次登录只需密码；重置写入 `2fa_reset` 审计 |
   | `user unlock <name>` | 清除该用户名在所有客户端 IP 上的登录失败与锁定记录（大小写不敏感），写入 `login_unlock` 审计 |
-  | `user del <name>` | 删除账号及其令牌与地址簿 |
+  | `user email <name> <email\|->` | 设置或清除账号的找回邮箱（`-` 清除，唯一且大小写不敏感）；写入 `account_email` 审计 |
+  | `user phone <name> <phone\|->` | 设置或清除账号的找回手机（`-` 清除，归一后 6–15 位数字且唯一）并作废未用验证码；写入 `account_phone` 审计 |
+  | `user sms <name>` | 签发 8 位短信验证码并交给网关（不打印验证码），写入 `account_recover` 审计；未配置网关、未设手机或发送失败会提示 |
+  | `user recover <name>` | 生成一次性密码重置令牌：配置 SMTP 时直接发信，否则打印令牌与可选链接一次；有效期默认 30m，旧令牌立即失效；写入 `account_recover` 审计 |
+  | `user del <name>` | 删除账号及其令牌与地址簿；最后一个 admin 且还有其他账号时拒绝 |
   | `ab <username> [count]` | 查看某账号的地址簿（默认 20 条），含名称、标签与更新时间 |
-  | `audit [count]` | 按时间倒序查看账号安全审计（默认 20 条，最多 200 条），含登录、登出、改密、两步验证、会话撤销与改名、手动解锁、用户名、结果、IP 与说明 |
+  | `ab prune <days>` | 删除早于指定天数的地址簿条目与分组墓碑并输出两类行数；存活条目不受影响，`0` 或负数被拒绝 |
+  | `audit [count]` | 按时间倒序查看账号安全审计（默认 20 条，最多 200 条），含登录、登出、改密、两步验证、会话撤销与改名、角色变更、封禁/解封、手动解锁、用户名、结果、IP 与说明 |
+  | `audit prune <days>` | 删除早于指定天数的账号安全审计、连接与文件传输记录，输出三类删除行数；`0` 或负数被拒绝 |
   | `connections [count]` | 按上报顺序倒序查看查看器上报的连接记录（默认 20 条，最多 200 条），含用户名、对端、方向、结果、IP、时长与说明 |
   | `transfers [count]` | 按上报顺序倒序查看文件传输记录（默认 20 条，最多 200 条），含用户名、对端、方向、文件名/大小/数量、结果、IP 与说明 |
   | `punch-requests`/`pr [start] [count]`、`pr -` | 分页查看/清空打洞日志 |
@@ -884,6 +1100,30 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   `chast_relay_downgraded_sessions_total` 与
   `chast_carrier_blocked_total`。
 
+### Web 管理台
+
+同一 HTTP 监听还提供内嵌管理台，适合没有 SSH/回环终端的环境：
+
+- 浏览器打开 `https://<http-listen>/admin/`（默认监听 `0.0.0.0:8443`，
+  本机可开 `http://127.0.0.1:8443/admin/`），输入 `--server-key` 后连接。
+  密钥只放在
+  浏览器 `sessionStorage`，关闭标签页即清除；页面不写 cookie、不在服务端建
+  会话，所有请求仍是同源 `Authorization: Bearer` 调用公开 API。密钥错误或
+  服务端更换密钥时，任一 401 都会清空密钥并回到登录界面。
+- 页面分五个页签：总览（注册/身份/中继/打洞计数、中继节点健康、带宽与名单
+  策略、端口分配）、设备（`GET /v1/identities` 全量含离线；ID/主机名/别名/
+  标签搜索与仅在线过滤；编辑别名/标签、重置身份或只释放租约）、账号
+  （创建、改角色、封禁/解封、重置密码（可生成一次性密码）、重置两步验证、
+  删除；最后一个 admin 的保护与 API 一致）、审计（账号安全事件、连接、
+  文件传输三类，`before_id` 游标翻页与 `format=csv` 下载）、服务器（版本、
+  公钥、TTL、TLS/中继模式、软件更新签名与会合服务器列表）。
+- 总览与设备页每 15 s 自动刷新，页面隐藏时暂停；审计与账号表格不自动刷新，
+  避免翻页或输入时被打断。
+- 静态资源在编译时用 `//go:embed` 打入二进制，只放行上述三个文件名；CSP
+  禁止内联脚本、内联样式与外部资源，页面用 DOM 构建函数而不是 `innerHTML`。
+  公网部署仍应经 TLS（或反向代理）访问并设置非空 `--server-key`，否则任何
+  能访问端口的人都能读取和改写管理数据。
+
 ## 目录
 
 ```
@@ -902,10 +1142,13 @@ server/
   internal/api/          HTTP API
   internal/agent/        代理的注册、保活、路径选择与转发
   internal/admin/        回环明文管理通道
+  internal/webadmin/     内嵌 Web 管理台（静态资源、CSP 与严格白名单）
   internal/abuse/        注册速率与 ID 洪泛阻断
   internal/punchlog/     打洞请求环形审计日志
   internal/ipchange/     公网地址变更审计（hbbs IP_CHANGES）
   internal/relayaddr/    中继地址列表、轮换与粘性分配
+  internal/logging/      slog 文件日志轮转、gzip 归档与清理
+  internal/tracing/      OTLP/HTTP JSON span 导出（零第三方依赖）
 ```
 
 ## 构建与运行
@@ -967,7 +1210,9 @@ stdout 是面向嵌入方的 JSON Lines 事件流（诊断仍在 stderr）：
 
 `ready` 表示本地监听已就绪，`path` 在首次选定路径或 `auto` 回退到中继时输出。
 `carrier`/`carrier_token` 由认证查询取得；会话页在二者存在时优先把共享载体
-交给载体桥，否则回退到中继端口的 TCP 载体或直连的 `host:(P+1)`。
+交给载体桥，否则回退到中继端口的 TCP 载体或直连的 `host:(P+1)`。查询带了
+`carrier_v6` 时，代理在内部完成地址族选择与回退，事件里的 `carrier` 是实际
+使用的端点。
 证书指纹 pin 使用逻辑身份 `server:<url>/<id>`，不是代理的 loopback 端口。
 
 ## 局域网发现（M11 P2-2）
@@ -1430,6 +1675,21 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
 - 自动化：`internal/api` 覆盖四个响应位置与默认缺省，`internal/agent` 覆盖
   版本比较与续约去重；`go vet`、三程序构建与全量测试通过。
 
+2026-10-27，软件更新托管与签名在单机回环上验证：
+
+- 以 `--software-version 2.2.0 --software-url
+  http://127.0.0.1:19043/software/chast-2.2.0.exe --software-dir <dir>`
+  启动后，日志记录 `software update artifact name=chast-2.2.0.exe size=28
+  sha256=4edd...`，ready 行带目录与摘要。
+- `/v1/server` 的 `software` 块同时给出 `sha256`、`size` 与 `signature`；
+  `GET /software/chast-2.2.0.exe` 返回 200，内容与源文件逐字节一致且
+  SHA-256 相同；缺失文件与 `/software/` 目录路径均为 404。
+- 用响应里的 `public_key` 重建 Ed25519 公钥，按 `chast-software-v1` 的
+  长度前缀规范消息用 OpenSSL 验签成功；把版本改为 9.9.9 后验签被拒。
+- 自动化：`internal/software` 覆盖文件名规则、URL 解析、摘要、HEAD/Range
+  与路径穿越 404；`internal/api` 覆盖托管下载、注册/`/v1/server`/单机查询
+  的摘要与签名（`identity.Verify`）；全量测试通过。
+
 2026-10-25，账号与账号地址簿（P1）在单机回环上验证：
 
 - 管理台 `user add livetest LivePass123` 返回
@@ -1553,9 +1813,11 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   同步前重试（成功/404 清理，401 保留）；清空标签/分组的意图会持久化并在恢复
   后上传，但跨设备同时编辑的意图在 409 后会被服务器版本替换；访问令牌与刷新令牌
   都以明文保存在 `account.json`，刷新令牌轮换但文件本身未加密；登录地点默认只记录
-  IP，配置 `--geoip-file` 时按离线表补充，地点质量与更新由运维负责；密码可在查看器自助修改，但忘记密码仍只能由回环
-  管理台重置，没有邮件找回；账号级 TOTP 两步验证与一次性恢复码已支持，但没有
-  短信/邮件备用通道或 WebAuthn，查看器只显示密钥文本、不提供二维码扫描；登录失败
+  IP，配置 `--geoip-file` 时按离线表补充，地点质量与更新由运维负责；密码可在查看器自助修改，忘记密码可用邮件令牌或短信验证码在查看器登录页自助重置，
+  或由回环管理台重置；账号对话框可设置/清除找回邮箱与找回手机；账号级 TOTP
+  两步验证、一次性恢复码、短信登录码与邮件登录码已支持，WebAuthn 安全密钥
+  （密码 + Windows Hello/FIDO2）也已于 2026-10-28 补齐（P2-19），查看器只显示
+  TOTP 密钥文本、不提供二维码扫描；登录失败
   锁定已持久化到 `state.db`（重启保留、同库实例共享，空闲 30 分钟清理），
   跨实例失败通过 `BEGIN IMMEDIATE` 事务原子累计；操作者可用管理台
   `user unlock <name>`
@@ -1671,6 +1933,289 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   不分发数据、不做在线查询）；地点只用于展示与审计，不参与拦截或计费；
   来源地址仍受 `--proxy-header` 影响。
 
+2026-10-27，mTLS 与私有 CA 实现并验证：
+
+- 服务端与节点：`--tls-client-ca` 把 HTTPS 入口切到
+  `RequireAndVerifyClientCert`，`--tls-cert`/`--tls-key` 仍负责服务端证书，
+  `chast-relay` 接受同名额旗标。客户端一侧：代理与 `chast-tunnel host|viewer`
+  用 `--tls-ca` 把私有 CA 追加到系统根、`--tls-client-cert`/
+  `--tls-client-key` 出示客户端证书；节点池用 `--relay-node-ca`/
+  `--relay-node-client-cert`/`--relay-node-client-key`，独立 transport 只作用于
+  节点请求。三项都留空时沿用系统根，旧部署无需改动。
+- 单测：`internal/netutil` 用临时 CA 签发服务端/客户端证书，验证无客户端
+  证书的握手被拒、带证书请求回显客户端 CN，以及 `ClientTLSConfig` 的空值、
+  缺文件、坏 PEM 与证书/密钥不配对；`internal/relaypool` 用
+  `httptest.NewTLSServer` 验证未配置 CA 时节点被判不健康、配置 `RootCAs` 后
+  健康探测与租约申请都经 HTTPS 成功。
+- 回环实测（临时 CA，服务器与中继都要求客户端证书）：`openssl s_client`
+  不带证书时两端都返回 `alert certificate required`，带证书时 `/healthz`
+  与 `/v1/server` 返回 200；服务器经 `--relay-nodes https://…` 与
+  `--relay-node-*` 把节点探测为 `healthy:true`；`chast-tunnel host` 与
+  `viewer` 带 `--tls-ca`/`--tls-client-cert`/`--tls-client-key` 依次就绪，
+  主机拿到 mTLS 节点租约 `relay=127.0.0.1:41400`，查看者解析到同一主机并
+  选中 direct；不带客户端证书的主机代理以 `register: POST /v1/hosts: …
+  tls: certificate required` 退出（exit 1）。
+- 边界：只在回环用临时 CA 验证；真实企业 CA 未覆盖，证书热加载见下文，
+  当时 ACME 未覆盖（后由 P2-20 补齐，见下文）。
+
+2026-10-27，内嵌 Web 管理台（M11 P2-13）实现并验证：
+
+- 实现：`internal/webadmin` 用 `//go:embed` 打包 `index.html`/`app.js`/`style.css`，
+  `GET /admin/` 只放行这三个文件名（`GET`/`HEAD`，其他路径 404、其他方法 405），
+  并附加 CSP、`nosniff`、`no-store`、`no-referrer` 与 `X-Frame-Options: DENY`；
+  `GET /admin` 301 到 `/admin/`。页面无内联脚本/样式、无 `innerHTML`，登录只需
+  server-key 并保存在 `sessionStorage`；新增 `GET /v1/identities` 提供全量身份、
+  搜索、在线过滤与分页。
+- 单测：`internal/webadmin` 覆盖挂载、资源类型、HEAD 无 body、POST/PUT 405 +
+  `Allow`、未列名与穿越路径 404，并扫描资源禁止内联事件/`<style>`/`innerHTML`/
+  `document.write`/`insertAdjacentHTML`/`eval`；`internal/api` 通过真实服务器
+  验证 `/admin/` 200 与安全头、`/admin` 301、`app.js` 类型、POST 405 与缺失
+  资源 404。
+- 回环实测（`127.0.0.1:21990 --server-key admin-secret`，隔离身份与状态库）：
+  curl 确认 `/admin/` 响应头、`/admin` 301、无 Bearer 的 `/v1/stats` 401；
+  浏览器打开管理台，错误密钥显示提示，正确密钥进入总览（计数卡、策略与端口）；
+  设备编辑别名/标签后刷新仍保留；创建账号、最后一个 admin 封禁被 409 拒绝并
+  显示原因、普通账号封禁/解封成功；审计页出现 `account_create`/`account_ban`/
+  `account_unban`，三类记录按游标翻页；`/v1/audit?format=csv` 带 key 返回整表、
+  无 key 401。
+- 顺带修复：`internal/relay` 的 `newPortSet` 在端口 0 的 TCP twin 绑定失败时
+  没有按注释重试，Windows 上并发测试会偶发 `socket … forbidden`；现在端口 0
+  的绑定失败最多重试 10 次。
+- 边界：只在 Chromium 内核浏览器与回环验证；未自动化浏览器下载（CSV 仅验证
+  服务端导出），也没有多运营者权限区分——页面只接受 server-key，账号管理
+  API 的 admin 账号令牌未在页面使用。
+
+2026-10-27，TLS 证书热加载（M11 P2-14）实现并验证：
+
+- 实现：`netutil.LoadReloadingTLSConfig` 用 `GetCertificate` 回调替代静态
+  证书，按 `CertificateReloadInterval`（5 秒）惰性重读 `--tls-cert`/
+  `--tls-key`；对两份 PEM 求 SHA-256，内容变化才原子替换并记
+  `TLS certificate reloaded`。新文件读取或解析失败时保留旧证书，日志按错误
+  文本去重记录 `TLS certificate reload skipped`；`chast-server` 与
+  `chast-relay` 都改用该加载器，未设置轮转间隔时回退到原有的启动加载。
+- 单测：`internal/netutil` 覆盖真实 TLS 握手下的证书替换（20 ms 间隔，序列号
+  从旧变新）、坏文件替换后 150 ms 内仍出示旧证书且恢复有效文件后继续轮换、
+  空旗标返回 nil、只给证书报错、mTLS 字段与缺失 CA 报错、间隔 0 回退静态模式。
+- 回环实测（真实 `chast-server` 进程，`openssl` 自签 `first-cert`）：HTTPS
+  `/healthz` 200 且对端主题为 `CN=first-cert`；把 cert/key 换成 `second-cert`
+  后 6 秒内新握手得到 `CN=second-cert`，日志出现 `TLS certificate reloaded`；
+  把 `cert.pem` 写成垃圾内容后仍出示 `CN=second-cert`，日志出现
+  `TLS certificate reload skipped … failed to find any PEM data`。
+- 边界：`--tls-client-ca` 仍只在启动时读取；当时没有 ACME 自动申请，续期依赖
+  外部工具替换文件（ACME 已于 2026-10-28 由 P2-20 补齐）。
+
+2026-10-28，邮箱与密码找回（M11 P2-15）实现并验证：
+
+- 实现：`users.email` 唯一（大小写不敏感），`password_resets` 只存令牌
+  SHA-256、单账号仅一个未用令牌，`--recovery-ttl` 默认 30 分钟；API 提供
+  自助设置邮箱、找回申请（固定 202、IP+用户名每分钟限流）与凭令牌重置
+  （成功吊销全部会话）；管理 API 与回环管理台可代设邮箱、生成或发送重置
+  令牌；`internal/mail` 实现 SMTP（STARTTLS 默认、隐式 TLS、无 TLS 三种模式
+  与可选 PLAIN 认证），`chast-server` 新增 `--smtp-*`、`--recovery-url` 与
+  `--recovery-ttl`。
+- 单测：`internal/account` 覆盖邮箱归一/唯一/清除与令牌单活、过期、重放；
+  `internal/mail` 覆盖三种 TLS 模式、认证头与错误；`internal/api` 覆盖自助与
+  管理改邮箱、完整找回流程（邮件字段、未知用户/无邮箱/发信失败均 202、限流
+  不发第二封、弱密码 400、成功后旧令牌 401、令牌复用/过期/被替换 400）；
+  `internal/admin` 覆盖 `user email`/`user recover` 与无 SMTP 时的线下令牌。
+- 回环实测（真实 `chast-server` + 临时 SMTP sink）：`user add` 后设置邮箱，
+  `POST /v1/account/recover` 收到含令牌与链接的邮件，重复请求被限流且不再
+  发信，未知用户同样 202；`recover/complete` 返回 200，旧访问令牌随即 401，
+  令牌重放 400，旧密码登录 401、新密码 200；管理台 `user recover` 发送第二封
+  邮件，`user list` 显示邮箱。
+- 查看器（2026-10-28，组件测试）：账号对话框新增“找回邮箱”（进入时读取
+  当前邮箱，设置/清除都要当前密码，非法地址与重复邮箱就地提示），登录页
+  新增“忘记密码？”两步对话框（申请后固定进入令牌页并提示查收，令牌与新
+  密码一次提交，成功后回填用户名并提示重新登录）；`server_api_test` 覆盖
+  三个新接口的负载、202 无密钥请求与 400/409 错误映射，`recovery_dialog_test`
+  覆盖读取/保存/清除/格式校验/加载失败仍可保存与申请失败留在表单，
+  `home_page_test` 覆盖入口可见与重置后回到登录表单。`flutter analyze`
+  无问题，全量 318 项 Flutter 测试与 Windows Release 构建通过。
+- 边界：没有账号自助注册；WebAuthn 安全密钥已于 2026-10-28 补齐（见 P2-19），
+  查看器不内嵌重置页
+  （`--recovery-url` 指向外部页面），令牌需手工粘贴；限流按进程内存计数，
+  多实例不共享；用户删除后令牌级联删除。
+
+2026-10-28，短信找回（M11 P2-16）实现并验证：
+
+- 实现：`users.phone` 归一后唯一，`phone_resets` 只存 8 位验证码的 SHA-256、
+  单账号仅一个未用验证码（默认 10 分钟、`--sms-ttl` 1m–1h、5 次错误即作废）；
+  API 提供自助设置手机、找回申请（固定 202、IP+用户名每分钟限流）与凭用户名、
+  验证码和新密码的重置（成功吊销全部会话）；管理 API 与管理台可代设手机、
+  签发并发送验证码；`internal/sms` 实现通用 HTTP webhook（POST JSON
+  `{to,text,from}`、可选 Bearer、10s 超时、2xx 判定），`chast-server` 新增
+  `--sms-url`/`--sms-token`/`--sms-from`/`--sms-ttl`。
+- 单测：`internal/account` 覆盖号码归一/唯一/清除、验证码单活、过期、错误
+  5 次作废与改绑作废旧码；`internal/sms` 覆盖配置校验、请求字段、控制字符
+  拒绝、网关 429 与超时；`internal/api` 覆盖自助/管理改手机、完整短信找回
+  （未知用户/未设手机/限流/网关失败均 202、弱密码 400 不消耗验证码、成功后
+  旧令牌 401、验证码重放/过期 400）；`internal/admin` 覆盖 `user phone`/
+  `user sms` 与未配置网关时的错误。
+- 回环实测（真实 `chast-server` + 本地 HTTP 短信网关）：管理 API 建号并归一
+  手机，找回请求 202 且网关收到一条带 Bearer、发送方与 8 位验证码的 JSON；
+  重复请求与未知用户/未设手机账号均 202 且不再发信；错误验证码与弱密码 400，
+  正确验证码（带短横线）200，旧密码 401、旧会话 401、新密码 200，重放 400；
+  管理 `POST /v1/accounts/alice/sms` 发送第二个验证码并完成第三次改密，改绑/
+  清空手机与非法号码按 400/200 生效。
+- 查看器（2026-10-28，组件测试）：账号对话框新增“找回手机”（读取/设置/
+  清除，需当前密码，非法号码与重复号码就地提示）；“忘记密码？”增加邮箱/
+  短信通道切换，短信模式校验 8 位验证码并提示查收；`server_api_test` 覆盖
+  三个新接口、手机解析与错误映射，`recovery_dialog_test` 覆盖读取/保存/
+  清除/格式校验与短信通道完整流程，`home_page_test` 覆盖入口可见。
+  `flutter analyze` 无问题，全量 329 项 Flutter 测试与 Windows Release
+  构建通过。
+- 边界：网关是通用 JSON webhook，不内置任何短信服务商的签名、模板或回执；
+  验证码只存哈希且不打印，网关不可用时不重试也不入队；限流按进程内存计数，
+  多实例不共享。
+
+2026-10-28，短信登录码（M11 P2-17）实现并验证：
+
+- 实现：`login_sms_codes` 只存 8 位验证码的 SHA-256，单账号仅一个未用验证码
+  （默认 10 分钟、`--sms-ttl`、5 次错误即作废）；`POST /v1/account/login/sms`
+  先校验密码再签发并发送，对外一律 202（未启用两步验证、未绑手机、网关失败均
+  不泄露），密码错误 401、封禁 403、IP+用户名每分钟限流；限流检查在生成新码
+  之前，避免拒绝请求让已发出的验证码失效；登录接受 `sms_code`，与 TOTP/恢复码
+  的优先级为 TOTP > 恢复码 > 短信码，消费在签发令牌的同一事务内完成；密码、
+  手机、两步验证变更与封禁都会清空未用登录码。`internal/sms` 新增
+  `SendLoginCode`，复用同一网关与 Bearer 配置。
+- 单测：`internal/account` 覆盖密码校验、封禁、未启用两步验证/未绑手机、
+  验证码单活、过期、错误 5 次作废、重放与清理；`internal/sms` 覆盖登录码
+  请求字段与控制字符拒绝；`internal/api` 覆盖完整登录流程（错误密码/未知账号
+  401 不发信、202 发信、重复请求 429 不换码、缺码 401 `required`、错码/重放
+  401 `invalid`、带空格验证码成功、未绑手机 202 不发信且仍要求两步验证、
+  封禁 403、未配置网关 503）与审计。
+- 回环实测（真实 `chast-server` + 本地 HTTP 短信网关）：网关收到带 Bearer 与
+  8 位验证码的 JSON；重复请求 429 且不替换验证码，随后用首次收到的验证码
+  登录成功；验证码重放 401；未绑手机与未启用两步验证的账号 202 且不发信；
+  封禁账号请求 403；审计记录 `login SMS sent`/`login SMS throttled`/
+  `login SMS unavailable`。
+- 查看器（2026-10-28，组件测试）：登录表单在服务端要求两步验证时可切换到
+  短信验证码，自动请求并显示“已发送”提示，支持重新发送与 8 位数字校验；
+  `server_api_test` 覆盖发送接口、验证码优先级与错误映射，`home_page_test`
+  覆盖请求、输入与登录全流程。`flutter analyze` 无问题，全量 332 项 Flutter
+  测试与 Windows Release 构建通过。
+- 边界：短信通道依赖用户已绑定手机，未绑定时仍只能用 TOTP 或恢复码；验证码
+  与找回短信共用网关与有效期；限流按进程内存计数，多实例不共享。邮件备用
+  通道随后由 P2-18 补齐。
+
+2026-10-28，邮件登录码（M11 P2-18）实现并验证：
+
+- 实现：登录码抽成通用通道（`internal/account/login_code.go`），短信与邮件
+  共用密码校验、封禁检查、单活替换、5 次错误作废、过期清理和常量时间比较，
+  仅表名、哈希域（`login-sms:`/`login-email:`）、目标字段与缺失错误不同；
+  `login_email_codes` 只存 8 位验证码的 SHA-256，单账号仅一个未用验证码，
+  有效期复用 `--recovery-ttl`（默认 30 分钟）。`POST /v1/account/login/email`
+  先校验密码再签发并调用 `internal/mail` 新增的 `SendLoginCode` 发送，对外
+  一律 202（未启用两步验证、未绑邮箱、SMTP 失败均不泄露），密码错误 401、
+  封禁 403、IP+用户名每分钟限流；限流检查在生成新码之前，避免拒绝请求让已
+  发出的验证码失效。登录接受 `email_code`，优先级 TOTP > 恢复码 > 短信码 >
+  邮件码，消费在签发令牌的同一事务内完成；密码、邮箱、两步验证变更与封禁
+  都会清空未用邮件登录码。
+- 单测：`internal/account` 覆盖密码校验、封禁、未启用两步验证/未绑邮箱、
+  验证码单活、过期、错误 5 次作废、重放、换邮箱/改密/重置两步验证后的清理，
+  以及 TOTP/短信/邮件同时提供时的优先级；`internal/mail` 覆盖登录码邮件的
+  收件人、主题、账号名、8 位验证码、有效期与头注入拒绝；`internal/api`
+  覆盖完整登录流程（错误密码/未知账号 401 不发信、202 发信、重复请求 429
+  不换码、缺码 401 `required`、错码/重放 401 `invalid`、带空格验证码成功、
+  未绑邮箱 202 不发信且仍要求两步验证、封禁 403、未配置 SMTP 503）与审计。
+- 回环实测（真实 `chast-server` + 本地 SMTP sink，`--smtp-tls none`）：管理台
+  建号并设置邮箱、经 API 启用 TOTP 两步验证后，请求邮件码返回 202 且 sink
+  收到含 `To`、`Subject: chast login code`、账号名、8 位验证码与 `30m0s` 的
+  邮件；错误密码、未知账号与重复请求（429）都不发信且不替换首次验证码，
+  带空格的首次验证码登录成功，重放 401；未绑邮箱账号与未启用两步验证账号的
+  请求均 202 且不发信（后者登录不要求两步验证）；封禁账号 403；审计记录
+  `login email sent`。
+- 查看器（2026-10-28，组件测试）：登录表单在服务端要求两步验证时可切换到
+  邮件验证码，自动请求并显示“已发送”提示，支持重新发送与 8 位数字校验，
+  可在 TOTP/恢复码/短信/邮件之间切换；`server_api_test` 覆盖发送接口、验证码
+  优先级与错误映射，`home_page_test` 覆盖请求、输入与登录全流程。
+  `flutter analyze` 无问题，全量 335 项 Flutter 测试与 Windows Release
+  构建通过。
+- 边界：邮件通道依赖用户已绑定找回邮箱，SMTP 失败不重试；限流按进程内存
+  计数，多实例不共享。
+
+2026-10-28，WebAuthn 安全密钥（M11 P2-19）实现并验证：
+
+- 实现：密码仍是第一因素，Windows Hello / FIDO2 平台认证器作为第二因素；
+  只改 HTTP 账号 API，会话协议保持 v27。`internal/webauthn` 用极简 CBOR
+  解码支持 ES256/RS256/EdDSA，校验 clientDataJSON 的
+  type/challenge/origin/crossOrigin、rpIdHash、UP 与签名，attestation
+  接受 `none`/`packed` 但不校验证书链；挑战 32 字节、5 分钟、按
+  `(user_id, purpose)` 单活，登录成功与签发令牌同一事务消费，重放必然失败；
+  签名计数非零回退拒绝。六个接口见 HTTP 表；`--webauthn-rp-id` 与
+  `--webauthn-origin` 缺一关闭，相关路由返回 503。无凭据的登录 begin 返回
+  202 以免枚举；`user reset-2fa` 与删号清空凭据与挑战，封禁保留凭据但登录
+  403，改密不删除凭据。审计记录 `webauthn_register`/`webauthn_remove`/
+  `login webauthn`。
+- 单测：`internal/webauthn` 覆盖三种算法、origin/rpId/challenge/UP/计数器/
+  格式错误；`internal/account`/`internal/api` 覆盖注册、列表、删除、登录、
+  202、限流、封禁、重放与审计。
+- 回环实测：新增 `cmd/chast-webauthn-smoke`，用 `webauthntest` 软件认证器
+  连接真实 `chast-server`（隔离 `state.db`，`--webauthn-rp-id 127.0.0.1`，
+  `--webauthn-origin http://127.0.0.1:18443`）完成 18 项检查全部通过：
+  管理台建号 → 密码登录 → 错误密码拒绝注册 → 注册选项 → 保存凭据 → 列表 →
+  第二次注册的排除列表 → 登录 begin → 断言登录并签发访问/刷新令牌 → 令牌
+  可用 → 重放 401 → 篡改签名 401 → 失败后挑战仍可用 → 错误密码拒绝删除 →
+  删除 204 → 列表清空 → 无凭据 begin 202 → 审计包含三类事件。
+- 查看器（2026-10-28，组件测试）：账号对话框新增“安全密钥（Windows Hello）”，
+  可查看平台认证器可用性、列出/注册/删除凭据（注册与删除都要求当前密码）；
+  登录表单在要求两步验证时新增“使用安全密钥”，以密码 + 断言完成登录。
+  `webauthn_api_test` 覆盖六个接口的负载与错误映射，`security_key_test` 覆盖
+  原生桥参数、平台错误码与完整登录，`security_key_dialog_test` 覆盖列表、
+  注册、删除与失败重试，`home_page_test` 覆盖安全密钥登录入口。
+  `flutter analyze` 无问题，全量 354 项 Flutter 测试与 Windows Release 构建
+  通过。
+- 边界：真实 Windows Hello 弹窗需要已配置 PIN/生物识别的机器人工验收（当前
+  测试机不具备）；attestation 不校验证书链，安全模型依赖注册时的密码认证；
+  不支持 passkey 无密码登录与跨设备同步。
+
+2026-10-28，ACME 自动证书（M11 P2-20）实现并验证：
+
+- 实现：`--acme-domain` 用 `golang.org/x/crypto/acme/autocert` 为 HTTP API
+  自动申请与续期证书（HTTP-01），支持多域名、联系邮箱、EAB 与自定义 ACME
+  目录；缓存目录默认在 `--state` 同目录，证书缓存命中即用、未命中才签发，
+  续期透明。`--acme-http-listen` 独立监听挑战与 HTTPS 跳转，不暴露业务 API；
+  与 `--tls-cert`/`--tls-key` 互斥，可与 `--tls-client-ca`（mTLS）组合。
+  校验：域名为裸 DNS 名（拒绝通配符/IP/端口/无点），其它 `--acme-*` 旗标
+  依赖域名，EAB 必须成对，挑战端口不能与 `--http-listen` 相同。
+- 单测：`internal/acmecert` 覆盖域名解析与非法输入、EAB 四种 base64 编码、
+  五个无效配置、缓存证书命中与白名单外主机拒绝、mTLS 组合与缺失 CA、
+  挑战监听的 302/404/403。
+- 回环实测：预置自签 `acme.test` 到缓存目录，`chast-server --acme-domain
+  acme.test --acme-cache <dir> --acme-http-listen 127.0.0.1:18450
+  --http-listen 127.0.0.1:18443` 启动成功；`curl -k --resolve
+  acme.test:18443:127.0.0.1 https://acme.test:18443/v1/server` 返回
+  `"tls":true`，启动日志含 `ACME manager configured`、`ACME HTTP-01
+  listening` 与 ready 行 `acme=acme.test acme_http=127.0.0.1:18450`；
+  挑战监听对 `/` 返回 302 `Location: https://acme.test/`、未知挑战 404。
+  六项负向校验（与文件证书并用、只给邮箱、同端口、`localhost`、EAB 半对、
+  空挑战地址）均在启动前退出 1 并给出对应错误。
+- 边界：真实 CA 签发需要公网域名、DNS 解析与 CA 可达的 80 端口，保留人工
+  验收（可先用 `--acme-directory-url` 演练 staging）；只支持 HTTP-01，
+  不含泛域名、DNS-01 与 TLS-ALPN-01，`--tls-client-ca` 轮换仍需重启。
+
+2026-10-28，版本化 schema 迁移（M11 P2-21）实现并验证：
+
+- 实现：新增 `internal/schemamig` 前向迁移框架；账号库用 `schema_migrations`、
+  对等库用 `registry_schema_migrations` 记录 `version`/`name`/`applied_at`。
+  `account.Open` 与 `registry.NewStore` 只执行尚未记录的步骤，基线 v1 为原有
+  幂等建表、加列与回填（授权范围重建、会话 ID、管理员角色、地址簿修订、
+  `peers` 的 alias/tags），旧库启动时自动补记 v1。库版本高于二进制支持时
+  启动退出 1，错误为 `schema version N is newer than this binary supports
+  (M); upgrade the server binary`。
+- 单测：`internal/schemamig` 覆盖全新库、重复运行不重跑、只补缺失步骤、
+  未来版本返回 `TooNewError` 且不执行步骤、空列表/跳号/缺 Apply/非法表名；
+  `internal/account` 重开不重跑回填并拒绝 v2；`internal/registry` 记录 v1、
+  重开单行并拒绝 v2；原有旧库迁移、并发打开与 JSON 导入用例全部保持通过。
+- 回环实测：全新 `--state state.db` 启动后两张版本表均为 `version=1
+  name=baseline`；重启 ready；删除两张表后重启自动补记（模拟旧库升级）；
+  分别向 `schema_migrations`/`registry_schema_migrations` 写入 v2 后启动，
+  均退出 1 并打印上述错误；`go vet ./...`、`go test ./... -count=1`、
+  `go build ./...` 通过。
+- 边界：只做前向迁移，无回滚/降级路径；Postgres 后端仍未实现（开发机无
+  PostgreSQL/Docker，无法做真实库验收）；升级需停止旧实例，不支持新旧
+  二进制同时写同一状态库。
+
 环境边界：单机回环只有一张网卡，`symmetric` NAT 分类、局域网候选与跨网行为需要
 双机复核。IPv6 会合、打洞与中继已在单机双栈回环验证（服务端
 `--punch-listen [::1] --relay-listen 127.0.0.1 --relay-listen-v6 ::1`、
@@ -1678,10 +2223,15 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
 H.264 1920×1080 的 QUIC 会话，842 帧、0 CRC/解码错误）。实际部署形态也验证过：
 主机绑定双栈 `[::]:15434`、经 IPv4 注册与保活、`--local 127.0.0.1:14433`，
 `[::1]` 查看者仍选中 v6 中继并完成同样 842 帧、RTT 1.9 ms 的会话。真实跨网
-IPv6、双机中继与 IPv6 中继的 NAT 映射仍需双机部署复核；共享 TCP 载体仍只在
-主入口（IPv4）提供。共享载体尚未
-经过真实 HTTP 代理/CDN；证书轮换、ACME
-与 mTLS 不在本阶段范围。`--relay-servers` 的多地址轮换只在回环别名上验证，
+IPv6、双机中继与 IPv6 中继的 NAT 映射仍需双机部署复核；共享 TCP 载体的
+IPv6 入口已在单机回环验证（`--carrier-listen-v6 ::1` + `--advertise-v6 ::1`，
+主机走 IPv4、查看者经 `carrier_v6` 回退建链并完成数据报往返），真实跨网 v6
+载体仍需双机复核。共享载体尚未
+经过真实 HTTP 代理/CDN；mTLS 与私有 CA 已在回环完成握手正/负向验证，
+证书文件替换热加载也已在回环验证，ACME 自动申请已用预置缓存完成回环验证
+（真实 CA 签发需公网域名与 80 端口，保留人工验收），`--tls-client-ca`
+轮换仍需重启。
+邮件找回只在本地临时 SMTP sink 上验证，真实邮件服务商的投递、退信与速率限制需部署复核；短信找回同样只在本地回环 HTTP 网关验证，真实短信服务商的签名、模板审核与投递回执需部署复核。`--relay-servers` 的多地址轮换只在回环别名上验证，
 多网卡与 DNS 轮换仍需真实部署复核。M10.6 的独立节点、故障回退与恢复已在单机
 回环验证，但真实跨机时延、节点带外故障与多节点负载分配仍需真实部署复核。
 M10.7 的令牌桶、名单与降级只在回环的低速率下验证，真实链路上的整形效果、

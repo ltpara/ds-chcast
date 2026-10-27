@@ -26,6 +26,7 @@ type loginReply struct {
 	User               struct {
 		ID       string `json:"id"`
 		Username string `json:"username"`
+		Role     string `json:"role"`
 	} `json:"user"`
 }
 
@@ -2009,7 +2010,8 @@ type connectionReply struct {
 }
 
 type connectionsReply struct {
-	Connections []connectionReply `json:"connections"`
+	Connections  []connectionReply `json:"connections"`
+	NextBeforeID int64             `json:"next_before_id"`
 }
 
 func TestConnectionAudit(t *testing.T) {
@@ -2159,7 +2161,8 @@ type fileTransferReply struct {
 }
 
 type fileTransfersReply struct {
-	Transfers []fileTransferReply `json:"transfers"`
+	Transfers    []fileTransferReply `json:"transfers"`
+	NextBeforeID int64               `json:"next_before_id"`
 }
 
 func TestFileTransferAudit(t *testing.T) {

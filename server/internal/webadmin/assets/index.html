@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>chast 管理台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>chast 管理台</span>
+    </div>
+    <div class="auth">
+      <form id="login-form" class="login" autocomplete="off">
+        <label class="sr-only" for="server-key">服务器密钥</label>
+        <input id="server-key" type="password" placeholder="服务器密钥（未设置可留空）" spellcheck="false" autocomplete="off">
+        <button type="submit" class="primary">连接</button>
+      </form>
+      <div id="session-bar" class="session hidden">
+        <span class="pill ok" id="session-label">已连接</span>
+        <button type="button" id="logout" class="ghost">断开</button>
+      </div>
+    </div>
+  </header>
+
+  <p id="login-note" class="login-note muted"></p>
+
+  <main id="workspace" class="hidden">
+    <nav class="tabs" id="tabs" role="tablist">
+      <button type="button" class="tab active" data-tab="overview" role="tab">概览</button>
+      <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
+      <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
+      <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
+      <button type="button" class="tab" data-tab="server" role="tab">服务</button>
+    </nav>
+
+    <section id="panel-overview" class="panel-page active">
+      <div id="stat-cards" class="cards"></div>
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>中继节点池</h2></div>
+          <div id="relay-nodes" class="stack"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>中继策略</h2></div>
+          <dl id="relay-policy" class="kv"></dl>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>中继端口</h2><span id="relay-updated" class="muted"></span></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>端口</th><th>主机</th><th>查看者</th><th>主机 → 查看者</th><th>查看者 → 主机</th><th>TCP</th><th>丢弃</th></tr>
+            </thead>
+            <tbody id="relay-ports"></tbody>
+          </table>
+        </div>
+        <p id="relay-ports-empty" class="muted hidden">暂无中继端口</p>
+      </div>
+    </section>
+
+    <section id="panel-devices" class="panel-page">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>设备</h2>
+          <div class="toolbar">
+            <input id="device-query" type="search" placeholder="搜索 ID / 别名 / 主机名 / 标签" spellcheck="false">
+            <label class="check"><input id="device-online" type="checkbox"> 仅在线</label>
+            <button type="button" id="device-refresh">刷新</button>
+          </div>
+        </div>
+        <p id="device-summary" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>别名</th><th>标签</th><th>主机名</th><th>平台</th><th>版本</th><th>状态</th><th>中继 / 地址</th><th>最近在线</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="device-rows"></tbody>
+          </table>
+        </div>
+        <p id="device-empty" class="muted hidden">没有匹配的设备</p>
+      </div>
+    </section>
+
+    <section id="panel-accounts" class="panel-page">
+      <div class="panel">
+        <div class="panel-head"><h2>新建账号</h2></div>
+        <form id="account-create" class="inline-form" autocomplete="off">
+          <label>用户名<input id="account-username" required minlength="3" maxlength="64" spellcheck="false" autocomplete="off"></label>
+          <label>密码（留空自动生成）<input id="account-password" type="password" maxlength="128" autocomplete="new-password"></label>
+          <label>角色
+            <select id="account-role">
+              <option value="user">user</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+          <button type="submit" class="primary">创建</button>
+        </form>
+        <p class="muted">账号接口也接受管理员账号令牌；此处使用服务器密钥。封禁、重置密码与重置 2FA 立即生效并写入审计。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>账号列表</h2><button type="button" id="account-refresh">刷新</button></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>用户名</th><th>角色</th><th>创建时间</th><th>状态</th><th class="actions-col">操作</th></tr></thead>
+            <tbody id="account-rows"></tbody>
+          </table>
+        </div>
+        <p id="account-empty" class="muted hidden">还没有账号</p>
+      </div>
+    </section>
+
+    <section id="panel-audit" class="panel-page">
+      <div class="panel">
+        <div class="subtabs">
+          <div id="audit-subtabs" class="subtab-group">
+            <button type="button" class="subtab active" data-audit="events">账号审计</button>
+            <button type="button" class="subtab" data-audit="connections">连接记录</button>
+            <button type="button" class="subtab" data-audit="files">文件传输</button>
+          </div>
+          <span class="spacer"></span>
+          <input id="audit-filter" type="search" placeholder="动作" spellcheck="false">
+          <input id="audit-host" class="hidden" type="search" placeholder="主机 ID（可选）" spellcheck="false">
+          <button type="button" id="audit-reload">查询</button>
+          <button type="button" id="audit-csv" class="ghost">导出 CSV</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead id="audit-head"></thead>
+            <tbody id="audit-rows"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span id="audit-summary" class="muted"></span>
+          <button type="button" id="audit-more" class="hidden">加载更多</button>
+        </div>
+        <p id="audit-empty" class="muted hidden">没有记录</p>
+      </div>
+    </section>
+
+    <section id="panel-server" class="panel-page">
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>服务信息</h2><button type="button" id="server-copy" class="ghost">复制公钥</button></div>
+          <dl id="server-info" class="kv"></dl>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>软件更新</h2></div>
+          <div id="software-info" class="stack"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>联动会合配置</h2></div>
+        <div id="rendezvous-info" class="stack"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <dialog id="device-dialog">
+    <form id="device-form" method="dialog">
+      <h2>编辑设备标签</h2>
+      <p id="device-dialog-id" class="mono muted"></p>
+      <label>别名<input id="device-alias" maxlength="128" spellcheck="false"></label>
+      <label>标签（逗号分隔，最多 16 个）<input id="device-tags" placeholder="lab, vip" spellcheck="false"></label>
+      <div class="dialog-actions">
+        <button type="button" id="device-cancel">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

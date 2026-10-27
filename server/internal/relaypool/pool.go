@@ -7,6 +7,7 @@ package relaypool
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,9 @@ type Config struct {
 	// Timeout bounds one control request. Zero defaults to 2s.
 	Timeout time.Duration
 	Logger  *slog.Logger
+	// TLS configures HTTPS control requests: a private CA bundle, a client
+	// certificate for mTLS, or both. Nil keeps the default transport.
+	TLS *tls.Config
 }
 
 type Lease struct {
@@ -36,6 +40,7 @@ type Lease struct {
 	Port         int    `json:"port"`
 	Relay        string `json:"relay"`
 	Carrier      string `json:"carrier,omitempty"`
+	CarrierV6    string `json:"carrier_v6,omitempty"`
 	ExpiresInSec int64  `json:"expires_in_sec,omitempty"`
 }
 
@@ -126,9 +131,13 @@ func New(cfg Config) (*Pool, error) {
 	if len(nodes) == 0 {
 		return nil, errors.New("relay pool needs at least one node URL")
 	}
+	client := &http.Client{Timeout: cfg.Timeout}
+	if cfg.TLS != nil {
+		client.Transport = &http.Transport{TLSClientConfig: cfg.TLS.Clone()}
+	}
 	return &Pool{
 		cfg:    cfg,
-		client: &http.Client{Timeout: cfg.Timeout},
+		client: client,
 		log:    cfg.Logger,
 		nodes:  nodes,
 		done:   make(chan struct{}),

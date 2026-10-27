@@ -17,7 +17,8 @@ type auditEventView struct {
 }
 
 type auditResponse struct {
-	Events []auditEventView `json:"events"`
+	Events       []auditEventView `json:"events"`
+	NextBeforeID int64            `json:"next_before_id,omitempty"`
 }
 
 // auditLog exposes the persisted account-security trail to operators holding
@@ -31,6 +32,12 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return
 	}
+	if asCSV, ok := exportRequest(w, r); !ok {
+		return
+	} else if asCSV {
+		s.auditCSV(w, r)
+		return
+	}
 	limit := 50
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -40,7 +47,12 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	events, err := s.cfg.Accounts.AuditEventsFor(r.URL.Query().Get("action"), limit)
+	beforeID, ok := s.listBeforeID(w, r)
+	if !ok {
+		return
+	}
+	events, err := s.cfg.Accounts.AuditEventsForBefore(
+		r.URL.Query().Get("action"), beforeID, limit)
 	if err != nil {
 		s.cfg.Logger.Error("account audit query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the audit log")
@@ -57,6 +69,10 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 			ClientIP:    event.ClientIP,
 			Success:     event.Success,
 		})
+	}
+	if len(out.Events) > 0 {
+		out.NextBeforeID = nextBeforeID(out.Events[len(out.Events)-1].ID,
+			len(out.Events), limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

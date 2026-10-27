@@ -16,6 +16,7 @@
 #include <iterator>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -24,14 +25,28 @@
 #include "chast/protocol.h"
 #include "chast/security.h"
 #include "gpu_frame_sink.h"
+#include "security_key.h"
 
 namespace chast_viewer {
 
 namespace {
 
 constexpr UINT_PTR kViewSubclassId = 1;
+constexpr UINT_PTR kWindowSubclassId = 2;
+// Posted by a security-key worker thread once Windows Hello returns. The
+// LPARAM owns a SecurityKeyCompletion that only the platform thread may answer.
+constexpr UINT kSecurityKeyDoneMessage = WM_APP + 0x51;
 // The Dart side uses a server URL or host:port as the password-store key.
 constexpr size_t kMaxTrustKeyLength = 512;
+
+// A finished Windows Hello ceremony waiting for the platform thread.
+struct SecurityKeyCompletion {
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
+    flutter::EncodableMap value;
+    std::string error_code;
+    std::string error;
+    bool ok = false;
+};
 
 const char* state_name(ViewerState state) {
     switch (state) {
@@ -215,6 +230,8 @@ ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
         std::fprintf(stderr, "chast_viewer: GPU display is not available: %s\n",
                      texture_sink_->error().c_str());
     }
+    SetWindowSubclass(window_, &ViewerBridge::WindowSubclassProc, kWindowSubclassId,
+                      reinterpret_cast<DWORD_PTR>(this));
     view_ = FindWindowExW(window_, nullptr, L"FLUTTERVIEW", nullptr);
     if (view_ != nullptr) {
         SetWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId,
@@ -240,6 +257,9 @@ void ViewerBridge::Shutdown() {
             RemoveWindowSubclass(view_, &ViewerBridge::ViewSubclassProc, kViewSubclassId);
         }
         view_ = nullptr;
+    }
+    if (window_ != nullptr) {
+        RemoveWindowSubclass(window_, &ViewerBridge::WindowSubclassProc, kWindowSubclassId);
     }
     if (channel_) {
         channel_->SetMethodCallHandler(nullptr);
@@ -1227,7 +1247,162 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "securityKeyAvailable") {
+        result->Success(flutter::EncodableValue(QuerySecurityKeyAvailability().available));
+        return;
+    }
+
+    if (method == "securityKeyMakeCredential" || method == "securityKeyGetAssertion") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "security key ceremony wants an argument map");
+            return;
+        }
+        StartSecurityKey(*args, method == "securityKeyMakeCredential", std::move(result));
+        return;
+    }
+
     result->NotImplemented();
+}
+
+void ViewerBridge::StartSecurityKey(
+    const flutter::EncodableMap& args, bool make_credential,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+    SecurityKeyOptions options;
+    std::string user_id;
+    std::string username;
+    std::string display_name;
+    int64_t timeout_ms = 120000;
+    if (!map_string(args, "rpId", &options.rp_id) || options.rp_id.empty() ||
+        options.rp_id.size() > 253) {
+        result->Error("bad_args", "security key ceremony wants a relying party id");
+        return;
+    }
+    if (!map_string(args, "challenge", &options.challenge) || options.challenge.empty() ||
+        options.challenge.size() > 128) {
+        result->Error("bad_args", "security key ceremony wants a base64url challenge");
+        return;
+    }
+    map_string(args, "origin", &options.origin);
+    if (options.origin.size() > 512) {
+        result->Error("bad_args", "origin is too long");
+        return;
+    }
+    const auto credentials = args.find(key("credentials"));
+    if (credentials != args.end()) {
+        const auto* list = std::get_if<flutter::EncodableList>(&credentials->second);
+        if (list == nullptr || list->size() > 32) {
+            result->Error("bad_args", "credentials must be a list of at most 32 ids");
+            return;
+        }
+        options.credential_ids.reserve(list->size());
+        for (const flutter::EncodableValue& item : *list) {
+            const auto* id = std::get_if<std::string>(&item);
+            if (id == nullptr || id->empty() || id->size() > 1024) {
+                result->Error("bad_args", "credential ids must be non-empty base64url");
+                return;
+            }
+            options.credential_ids.push_back(*id);
+        }
+    }
+    if (map_int(args, "timeoutMs", &timeout_ms)) {
+        if (timeout_ms < 15000 || timeout_ms > 300000) {
+            result->Error("bad_args", "timeoutMs must be between 15000 and 300000");
+            return;
+        }
+        options.timeout_ms = static_cast<int>(timeout_ms);
+    }
+    if (make_credential) {
+        if (!map_string(args, "userId", &user_id) || user_id.empty() || user_id.size() > 128 ||
+            !map_string(args, "username", &username) || username.empty() || username.size() > 256) {
+            result->Error("bad_args", "registration wants a user id and a user name");
+            return;
+        }
+        map_string(args, "displayName", &display_name);
+        if (display_name.size() > 256) {
+            result->Error("bad_args", "display name is too long");
+            return;
+        }
+    } else if (options.credential_ids.empty()) {
+        result->Error("bad_args", "assertion wants at least one credential id");
+        return;
+    }
+
+    bool idle = false;
+    if (!security_key_busy_.compare_exchange_strong(idle, true)) {
+        result->Error("busy", "another Windows Hello prompt is still open");
+        return;
+    }
+
+    auto* completion = new SecurityKeyCompletion();
+    completion->result = std::move(result);
+    const HWND window = window_;
+    std::thread([window, completion, make_credential, options = std::move(options),
+                 user_id = std::move(user_id), username = std::move(username),
+                 display_name = std::move(display_name)]() {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::string error;
+        std::string error_code;
+        if (make_credential) {
+            const SecurityKeyCredential credential = MakeSecurityKeyCredential(
+                window, options, user_id, username, display_name, &error, &error_code);
+            if (error_code.empty() && !credential.credential_id.empty()) {
+                completion->ok = true;
+                completion->value = flutter::EncodableMap{
+                    {key("credentialId"), flutter::EncodableValue(credential.credential_id)},
+                    {key("clientDataJSON"), flutter::EncodableValue(credential.client_data_json)},
+                    {key("attestationObject"),
+                     flutter::EncodableValue(credential.attestation_object)},
+                };
+            }
+        } else {
+            const SecurityKeyAssertion assertion =
+                GetSecurityKeyAssertion(window, options, &error, &error_code);
+            if (error_code.empty() && !assertion.credential_id.empty()) {
+                completion->ok = true;
+                completion->value = flutter::EncodableMap{
+                    {key("credentialId"), flutter::EncodableValue(assertion.credential_id)},
+                    {key("clientDataJSON"), flutter::EncodableValue(assertion.client_data_json)},
+                    {key("authenticatorData"),
+                     flutter::EncodableValue(assertion.authenticator_data)},
+                    {key("signature"), flutter::EncodableValue(assertion.signature)},
+                };
+            }
+        }
+        if (!completion->ok) {
+            completion->error_code = error_code.empty() ? "failed" : error_code;
+            completion->error =
+                error.empty() ? "Windows Hello returned no result" : error;
+        }
+        if (SUCCEEDED(com)) {
+            CoUninitialize();
+        }
+        if (window == nullptr ||
+            !PostMessageW(window, kSecurityKeyDoneMessage, 0,
+                          reinterpret_cast<LPARAM>(completion))) {
+            delete completion;
+        }
+    }).detach();
+}
+
+LRESULT CALLBACK ViewerBridge::WindowSubclassProc(HWND window, UINT message, WPARAM wparam,
+                                                  LPARAM lparam, UINT_PTR id,
+                                                  DWORD_PTR ref_data) {
+    if (message == kSecurityKeyDoneMessage) {
+        auto* bridge = reinterpret_cast<ViewerBridge*>(ref_data);
+        auto* completion = reinterpret_cast<SecurityKeyCompletion*>(lparam);
+        if (bridge != nullptr && completion != nullptr) {
+            bridge->security_key_busy_ = false;
+            if (completion->ok) {
+                completion->result->Success(flutter::EncodableValue(completion->value));
+            } else {
+                completion->result->Error(completion->error_code, completion->error);
+            }
+        }
+        delete completion;
+        return 0;
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
 }
 
 void ViewerBridge::SendInput(

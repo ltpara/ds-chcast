@@ -9,7 +9,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,7 +29,13 @@ import (
 
 type HostConfig struct {
 	ServerURL string
+	// Servers seeds the failover list before the first registration. The
+	// server's pushed list replaces it after a successful reply.
+	Servers   []string
 	ServerKey string
+	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
+	// client certificate for mTLS, or both. Nil uses the system roots.
+	TLS *tls.Config
 	// ServerPublicKey pins the rendezvous server identity. When set, the
 	// registration reply must contain a valid server-signed host binding.
 	ServerPublicKey string
@@ -88,6 +96,7 @@ type HostAgent struct {
 	cfg          HostConfig
 	conn         *net.UDPConn
 	api          *apiClient
+	servers      *serverPool
 	log          *slog.Logger
 	local        *net.UDPAddr
 	carrier      *net.TCPAddr
@@ -105,9 +114,11 @@ type HostAgent struct {
 	relay    *net.UDPAddr
 	relaySet []*net.UDPAddr
 	refresh  time.Duration
-	// sharedCarrier is the server-wide carrier endpoint advertised by the
-	// registration reply. When set it replaces the per-port relay carrier.
-	sharedCarrier string
+	// sharedCarrier and sharedCarrierV6 are the server-wide carrier endpoints
+	// advertised by the registration reply. When set they replace the per-port
+	// relay carrier; the agent prefers the address family it can reach.
+	sharedCarrier   string
+	sharedCarrierV6 string
 	// sharedCarrierToken is reissued on every lease; the host keeps it for
 	// diagnostics only, viewers receive it from their own lookup.
 	sharedCarrierToken string
@@ -158,6 +169,10 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 			return nil, fmt.Errorf("--server-pubkey: %w", err)
 		}
 	}
+	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
+	if err != nil {
+		return nil, fmt.Errorf("rendezvous servers: %w", err)
+	}
 	privateKey := identity.PrivateKeyFromSecret(cfg.Key)
 	publicKey := identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey))
 	local, err := resolveUDP(cfg.LocalAddr)
@@ -187,7 +202,8 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	h := &HostAgent{
 		cfg:            cfg,
 		conn:           conn,
-		api:            newAPIClient(cfg.ServerURL, cfg.ServerKey),
+		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS),
+		servers:        servers,
 		log:            cfg.Logger.With("agent", "host", "id", cfg.ID),
 		local:          local,
 		carrier:        carrierAddr,
@@ -202,9 +218,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		relayReady:     make(chan struct{}),
 		carrierReady:   make(chan struct{}),
 	}
-	registerCtx, registerCancel := context.WithTimeout(ctx, 10*time.Second)
-	reg, err := h.api.register(registerCtx, cfg.ID, cfg.OldID, privateKey, cfg.Fingerprint)
-	registerCancel()
+	reg, err := h.registerWithFailover(ctx)
 	if err != nil {
 		conn.Close()
 		cancel()
@@ -318,6 +332,37 @@ func (h *HostAgent) WaitReady(ctx context.Context) error {
 	return nil
 }
 
+// registerWithFailover tries every endpoint once. A server that answers with
+// an application error still causes a rotation, so a single broken node cannot
+// keep the host offline while a healthy one is known.
+func (h *HostAgent) registerWithFailover(ctx context.Context) (registerResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < h.servers.Len(); attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		reg, err := h.api.register(attemptCtx, h.cfg.ID, h.cfg.OldID, h.priv, h.cfg.Fingerprint)
+		cancel()
+		if err == nil {
+			return reg, nil
+		}
+		lastErr = err
+		if next, ok := h.servers.Next(); ok {
+			h.api.setBase(next)
+			h.log.Warn("registration failed; trying the next rendezvous server", "server", next, "error", err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no rendezvous server answered")
+	}
+	return registerResult{}, lastErr
+}
+
+func (h *HostAgent) rotateServer(reason string) {
+	if next, ok := h.servers.Next(); ok {
+		h.api.setBase(next)
+		h.log.Warn("switching rendezvous server", "server", next, "reason", reason)
+	}
+}
+
 // checkRegistration verifies the server's answer when the operator pinned the
 // server public key. Without a pin the fields are still checked for internal
 // consistency so a confused proxy cannot silently swap the host key.
@@ -342,6 +387,12 @@ func (h *HostAgent) checkRegistration(reg registerResult) error {
 }
 
 func (h *HostAgent) applyRegistration(reg registerResult) {
+	if reg.ConfigSerial > 0 && len(reg.RendezvousServers) > 0 {
+		if h.servers.Apply(reg.ConfigSerial, reg.RendezvousServers) {
+			h.log.Info("rendezvous configuration updated",
+				"serial", reg.ConfigSerial, "servers", h.servers.List())
+		}
+	}
 	punch, err := resolveUDP(reg.Punch)
 	if err != nil {
 		h.log.Warn("registration returned an unusable punch address", "punch", reg.Punch, "error", err)
@@ -389,9 +440,10 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		}
 		h.refresh = refresh
 	}
-	if reg.Carrier != h.sharedCarrier {
+	if reg.Carrier != h.sharedCarrier || reg.CarrierV6 != h.sharedCarrierV6 {
 		h.sharedCarrier = reg.Carrier
-		h.log.Info("carrier endpoint updated", "carrier", reg.Carrier)
+		h.sharedCarrierV6 = reg.CarrierV6
+		h.log.Info("carrier endpoint updated", "carrier", reg.Carrier, "carrier_v6", reg.CarrierV6)
 	}
 	h.sharedCarrierToken = reg.CarrierToken
 	var notice *softwareInfo
@@ -732,19 +784,31 @@ func (h *HostAgent) carrierLinkLoop() {
 		if h.ctx.Err() != nil {
 			return
 		}
-		target := h.carrierTarget()
-		if target == "" {
+		targets := h.carrierTargets()
+		if len(targets) == 0 {
 			if !h.sleep(2 * time.Second) {
 				return
 			}
 			continue
 		}
 		started := time.Now()
-		err := h.runCarrierLink(target)
-		if h.ctx.Err() != nil {
-			return
+		target := targets[0]
+		established := false
+		var err error
+		for _, candidate := range targets {
+			target = candidate
+			established, err = h.runCarrierLink(candidate)
+			if h.ctx.Err() != nil {
+				return
+			}
+			if err == nil || established {
+				break
+			}
+			h.log.Warn("carrier dial failed", "carrier", candidate, "error", err)
 		}
-		h.log.Warn("carrier link lost", "carrier", target, "error", err)
+		if err != nil {
+			h.log.Warn("carrier link lost", "carrier", target, "error", err)
+		}
 		if time.Since(started) > 30*time.Second {
 			backoff = time.Second
 		}
@@ -758,18 +822,31 @@ func (h *HostAgent) carrierLinkLoop() {
 	}
 }
 
-// carrierTarget prefers the server-wide carrier and falls back to the relay
-// port's own TCP twin. The per-host port stays valid for older servers.
-func (h *HostAgent) carrierTarget() string {
+// carrierTargets lists the endpoints worth dialing, preferred address family
+// first. The server-wide carrier replaces the relay port's own TCP twin; the
+// per-host port stays valid for older servers.
+func (h *HostAgent) carrierTargets() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.sharedCarrier != "" {
-		return h.sharedCarrier
+	if h.sharedCarrier != "" || h.sharedCarrierV6 != "" {
+		return carrierCandidateOrder(h.sharedCarrier, h.sharedCarrierV6, preferIPv6Outbound())
 	}
 	if h.relay == nil {
-		return ""
+		return nil
 	}
-	return net.JoinHostPort(h.relay.IP.String(), strconv.Itoa(h.relay.Port))
+	return []string{net.JoinHostPort(h.relay.IP.String(), strconv.Itoa(h.relay.Port))}
+}
+
+// carrierTargetActive reports whether target is still among the current
+// candidates, so an established link only drops when its endpoint really went
+// away rather than when the preferred family changed.
+func (h *HostAgent) carrierTargetActive(target string) bool {
+	for _, candidate := range h.carrierTargets() {
+		if candidate == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *HostAgent) sleep(d time.Duration) bool {
@@ -781,43 +858,46 @@ func (h *HostAgent) sleep(d time.Duration) bool {
 	}
 }
 
-func (h *HostAgent) runCarrierLink(relayAddr string) error {
+// runCarrierLink dials one carrier endpoint and pumps frames until the link
+// closes. The boolean reports whether the handshake completed, so the caller
+// only falls back to another endpoint when the dial itself failed.
+func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	local, err := net.DialTimeout("tcp", h.carrier.String(), carrierDial)
 	if err != nil {
-		return fmt.Errorf("local carrier %s: %w", h.carrier, err)
+		return false, fmt.Errorf("local carrier %s: %w", h.carrier, err)
 	}
 	defer local.Close()
 	if _, err := io.WriteString(local, carrier.MagicRaw); err != nil {
-		return fmt.Errorf("local carrier magic: %w", err)
+		return false, fmt.Errorf("local carrier magic: %w", err)
 	}
 	localFrames := carrier.NewFrameReader(bufio.NewReader(local))
 	localSend := carrier.NewFrameWriter(local)
 
 	conn, err := net.DialTimeout("tcp", relayAddr, carrierDial)
 	if err != nil {
-		return fmt.Errorf("relay carrier %s: %w", relayAddr, err)
+		return false, fmt.Errorf("relay carrier %s: %w", relayAddr, err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	hello, err := json.Marshal(carrier.HostHello{HostID: h.cfg.ID})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := io.WriteString(conn, carrier.MagicHost+string(hello)+"\n"); err != nil {
-		return fmt.Errorf("relay carrier hello: %w", err)
+		return false, fmt.Errorf("relay carrier hello: %w", err)
 	}
 	br := bufio.NewReader(conn)
 	line, err := carrier.ReadLine(br, carrier.MaxHandshake)
 	if err != nil {
-		return fmt.Errorf("relay carrier handshake: %w", err)
+		return false, fmt.Errorf("relay carrier handshake: %w", err)
 	}
 	challengeText, ok := strings.CutPrefix(line, carrier.MagicChallenge)
 	if !ok {
-		return fmt.Errorf("relay carrier refused: %s", strings.TrimSpace(strings.TrimPrefix(line+"\n", carrier.MagicErrorPrefix)))
+		return false, fmt.Errorf("relay carrier refused: %s", strings.TrimSpace(strings.TrimPrefix(line+"\n", carrier.MagicErrorPrefix)))
 	}
 	var challenge carrier.HostChallenge
 	if err := json.Unmarshal([]byte(challengeText), &challenge); err != nil || challenge.Nonce == "" {
-		return fmt.Errorf("relay carrier sent a malformed challenge")
+		return false, fmt.Errorf("relay carrier sent a malformed challenge")
 	}
 	auth, err := json.Marshal(carrier.HostAuth{
 		HostID:    h.cfg.ID,
@@ -825,21 +905,21 @@ func (h *HostAgent) runCarrierLink(relayAddr string) error {
 		Signature: identity.Sign(h.priv, identity.CarrierHostMessage(h.cfg.ID, "", challenge.Nonce)),
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := io.WriteString(conn, carrier.MagicAuth+string(auth)+"\n"); err != nil {
-		return fmt.Errorf("relay carrier proof: %w", err)
+		return false, fmt.Errorf("relay carrier proof: %w", err)
 	}
 	line, err = carrier.ReadLine(br, carrier.MaxHandshake)
 	if err != nil {
-		return fmt.Errorf("relay carrier handshake: %w", err)
+		return false, fmt.Errorf("relay carrier handshake: %w", err)
 	}
 	if line+"\n" != carrier.MagicOK {
 		reason := strings.TrimSpace(strings.TrimPrefix(line+"\n", carrier.MagicErrorPrefix))
 		if reason == "" {
 			reason = line
 		}
-		return fmt.Errorf("relay carrier refused: %s", reason)
+		return false, fmt.Errorf("relay carrier refused: %s", reason)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	relayFrames := carrier.NewFrameReader(br)
@@ -889,18 +969,18 @@ func (h *HostAgent) runCarrierLink(relayAddr string) error {
 	for {
 		select {
 		case <-h.ctx.Done():
-			return h.ctx.Err()
+			return true, h.ctx.Err()
 		case err := <-errs:
-			return err
+			return true, err
 		case <-ticker.C:
-			if h.carrierTarget() != relayAddr {
-				return fmt.Errorf("carrier endpoint changed")
+			if !h.carrierTargetActive(relayAddr) {
+				return true, fmt.Errorf("carrier endpoint changed")
 			}
 			if err := relaySend.WriteFrame(nil); err != nil {
-				return err
+				return true, err
 			}
 			if err := localSend.WriteFrame(nil); err != nil {
-				return err
+				return true, err
 			}
 		}
 	}
@@ -921,6 +1001,7 @@ func (h *HostAgent) refreshLoop() {
 		cancel()
 		if err != nil {
 			h.log.Warn("registration refresh failed", "error", err)
+			h.rotateServer("registration refresh failed")
 			h.mu.Lock()
 			h.refresh = 2 * time.Second
 			h.mu.Unlock()
@@ -928,6 +1009,7 @@ func (h *HostAgent) refreshLoop() {
 		}
 		if err := h.checkRegistration(reg); err != nil {
 			h.log.Warn("registration refresh was not trusted", "error", err)
+			h.rotateServer("registration refresh was not trusted")
 			h.mu.Lock()
 			h.refresh = 5 * time.Second
 			h.mu.Unlock()

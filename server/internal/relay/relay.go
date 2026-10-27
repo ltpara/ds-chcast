@@ -70,7 +70,11 @@ type Manager struct {
 	// mapping per family.
 	bind6IP  net.IP
 	bind6Err error
-	closed   bool
+	// carrierBind6IP is the optional IPv6 address for the shared carrier. It
+	// uses the same port as the primary carrier listener.
+	carrierBind6IP  net.IP
+	carrierBind6Err error
+	closed          bool
 
 	// requireViewerToken admits only viewers that first prove the lookup
 	// carrier token over the relay port. It is enabled with the server key so
@@ -112,6 +116,24 @@ func WithBind6(bind string) Option {
 			return
 		}
 		m.bind6IP = ip
+	}
+}
+
+// WithCarrierBind6 listens on an additional IPv6 address for the shared
+// carrier, using the same port as --carrier-listen. The relay IPv6 option is
+// separate because carriers can be enabled without per-port TCP twins.
+func WithCarrierBind6(bind string) Option {
+	return func(m *Manager) {
+		bind = strings.TrimSpace(bind)
+		if bind == "" {
+			return
+		}
+		ip := net.ParseIP(bind)
+		if ip == nil || ip.To4() != nil {
+			m.carrierBind6Err = fmt.Errorf("carrier IPv6 bind %q is not an IPv6 address", bind)
+			return
+		}
+		m.carrierBind6IP = ip
 	}
 }
 
@@ -272,6 +294,9 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 	if m.bind6Err != nil {
 		return nil, m.bind6Err
 	}
+	if m.carrierBind6Err != nil {
+		return nil, m.carrierBind6Err
+	}
 	if m.bind6IP != nil && m.bindIP.To4() == nil {
 		return nil, errors.New("relay IPv6 bind is redundant when the primary bind is already IPv6")
 	}
@@ -302,6 +327,10 @@ func (m *Manager) newPortSet(wanted int) (*portSet, error) {
 	for attempt := 0; attempt < attempts; attempt++ {
 		udp, tcp, number, err := m.listenPort(m.bindIP, wanted)
 		if err != nil {
+			lastErr = err
+			if wanted == 0 {
+				continue
+			}
 			return nil, err
 		}
 		set := &portSet{manager: m, number: number}
@@ -728,7 +757,7 @@ func (m *Manager) Close() {
 // EnableSharedCarrier starts the single-port carrier used by hosts whose
 // registration names it. It is optional: per-port TCP carriers stay available.
 func (m *Manager) EnableSharedCarrier(bind string) error {
-	sc, err := newSharedCarrier(bind, m.auth, m.policy, m.log)
+	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.policy, m.log)
 	if err != nil {
 		return err
 	}
@@ -761,6 +790,35 @@ func (m *Manager) CarrierPort() int {
 		return 0
 	}
 	return m.shared.Port()
+}
+
+// CarrierAddrs lists every shared-carrier listener, primary first. It is empty
+// when the carrier is disabled.
+func (m *Manager) CarrierAddrs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shared == nil {
+		return nil
+	}
+	return m.shared.Addrs()
+}
+
+// CarrierV6Addr returns the IPv6 listener address of the shared carrier, or an
+// empty string when no IPv6 listener was configured.
+func (m *Manager) CarrierV6Addr() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shared == nil {
+		return ""
+	}
+	for _, addr := range m.shared.Addrs() {
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+				return addr
+			}
+		}
+	}
+	return ""
 }
 
 // HostLinked reports whether the host has an authenticated shared-carrier

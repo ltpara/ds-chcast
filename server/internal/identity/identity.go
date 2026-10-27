@@ -42,6 +42,10 @@ const (
 	// file. The host key that owns the id signs the canonical fields, so a
 	// leaked server key alone cannot fabricate host-side records.
 	DomainHostAudit = "chast-host-audit-v1"
+	// DomainSoftware covers the advertised software update: version, download
+	// URL, SHA-256 and size. Clients that pin the server key can reject a
+	// notice or binary swapped between the server and the download host.
+	DomainSoftware = "chast-software-v1"
 )
 
 var (
@@ -128,6 +132,23 @@ func HostAuditFileMessage(hostID, auditRef, direction, name string, size, occurr
 	return fieldsMessage(DomainHostAudit, "file", hostID, auditRef, direction, name,
 		strconv.FormatInt(size, 10), strconv.FormatInt(occurredAt, 10),
 		boolText(success), detail)
+}
+
+// SoftwareMessage binds the update notice fields a client verifies before
+// trusting a downloaded binary.
+func SoftwareMessage(version, downloadURL, digest string, size int64) []byte {
+	return fieldsMessage(DomainSoftware, version, downloadURL, digest, strconv.FormatInt(size, 10))
+}
+
+// SignSoftware signs one update notice with the server identity.
+func (s *Server) SignSoftware(version, downloadURL, digest string, size int64) (string, error) {
+	if s == nil {
+		return "", errors.New("software notice needs a server identity")
+	}
+	if version == "" || downloadURL == "" || digest == "" || size <= 0 {
+		return "", errors.New("software notice needs version, url, digest and a positive size")
+	}
+	return Sign(s.priv, SoftwareMessage(version, downloadURL, digest, size)), nil
 }
 
 func KeepaliveMessage(id, candidate, nonce string) []byte {

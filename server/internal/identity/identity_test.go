@@ -97,6 +97,39 @@ func TestServerBinding(t *testing.T) {
 	}
 }
 
+func TestSoftwareSignature(t *testing.T) {
+	server, err := GenerateServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := server.SignSoftware("2.1.0", "https://downloads.example.com/software/chast-2.1.0.exe", "ab12", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := ParsePublicKey(server.PublicKeyText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := SoftwareMessage("2.1.0", "https://downloads.example.com/software/chast-2.1.0.exe", "ab12", 4096)
+	if !Verify(pub, message, sig) {
+		t.Fatal("software signature did not verify")
+	}
+	tampered := SoftwareMessage("2.1.1", "https://downloads.example.com/software/chast-2.1.0.exe", "ab12", 4096)
+	if Verify(pub, tampered, sig) {
+		t.Fatal("signature covered the wrong version")
+	}
+	if _, err := server.SignSoftware("", "https://example.com/x", "ab12", 1); err == nil {
+		t.Fatal("empty version was signed")
+	}
+	if _, err := server.SignSoftware("2.1.0", "https://example.com/x", "ab12", 0); err == nil {
+		t.Fatal("zero size was signed")
+	}
+	var missing *Server
+	if _, err := missing.SignSoftware("2.1.0", "https://example.com/x", "ab12", 1); err == nil {
+		t.Fatal("nil identity signed a notice")
+	}
+}
+
 func TestLoadOrCreateServerPersistsSeed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server-identity")
 	first, err := LoadOrCreateServer(path)

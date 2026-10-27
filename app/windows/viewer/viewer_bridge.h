@@ -66,6 +66,16 @@ private:
     static LRESULT CALLBACK ViewSubclassProc(HWND window, UINT message, WPARAM wparam,
                                              LPARAM lparam, UINT_PTR id, DWORD_PTR ref_data);
 
+    // Runs a Windows Hello ceremony on a worker thread and answers the method
+    // result on the platform thread through the message posted by
+    // WindowSubclassProc.
+    void StartSecurityKey(const flutter::EncodableMap& args, bool make_credential,
+                          std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+    // Installed on the runner window to deliver security-key results posted by
+    // the worker thread.
+    static LRESULT CALLBACK WindowSubclassProc(HWND window, UINT message, WPARAM wparam,
+                                               LPARAM lparam, UINT_PTR id, DWORD_PTR ref_data);
+
     flutter::FlutterEngine* engine_ = nullptr;
     HWND window_ = nullptr;
     HWND view_ = nullptr;
@@ -85,6 +95,9 @@ private:
     std::unique_ptr<ViewerEngine> viewer_;
     std::shared_ptr<chast::DeviceIdentity> identity_;
     bool identity_loaded_ = false;
+    // One Windows Hello prompt at a time: webauthn.dll would otherwise stack
+    // verification windows from concurrent Dart calls.
+    std::atomic<bool> security_key_busy_{false};
     bool fullscreen_ = false;
     LONG_PTR saved_style_ = 0;
     WINDOWPLACEMENT saved_placement_{};

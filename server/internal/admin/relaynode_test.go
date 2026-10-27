@@ -78,7 +78,7 @@ func TestConsoleRelayNodes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register host: %v", err)
 	}
-	s.Registry.SetRemoteRelay("devbox", node.URL, 41001, "relay-a.example", "relay-a.example:8448")
+	s.Registry.SetRemoteRelay("devbox", node.URL, 41001, "relay-a.example", "relay-a.example:8448", "")
 
 	relays, err := relayaddr.New([]string{"127.0.0.1"})
 	if err != nil {

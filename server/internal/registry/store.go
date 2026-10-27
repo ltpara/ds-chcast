@@ -16,6 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/schemamig"
 )
 
 const sqliteHeader = "SQLite format 3\x00"
@@ -58,25 +59,9 @@ func NewStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("state %s: PRAGMA journal_mode=WAL: %w", path, err)
 	}
-	const schema = `CREATE TABLE IF NOT EXISTS peers (
-		id          TEXT PRIMARY KEY,
-		public_key  TEXT NOT NULL,
-		fingerprint TEXT NOT NULL DEFAULT '',
-		hostname    TEXT NOT NULL DEFAULT '',
-		platform    TEXT NOT NULL DEFAULT '',
-		version     TEXT NOT NULL DEFAULT '',
-		alias       TEXT NOT NULL DEFAULT '',
-		tags        TEXT NOT NULL DEFAULT '',
-		created_at  INTEGER NOT NULL,
-		last_seen   INTEGER NOT NULL DEFAULT 0
-	)`
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := schemamig.Run(db, "registry_schema_migrations", registryMigrations); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("state %s: create schema: %w", path, err)
-	}
-	if err := ensurePeerColumns(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("state %s: upgrade schema: %w", path, err)
+		return nil, fmt.Errorf("state %s: %w", path, err)
 	}
 	return &Store{path: path, db: db}, nil
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,8 @@ import (
 // except that only the control plane is multiplexed: each host still keeps its
 // own UDP relay port because the relay cannot demultiplex opaque QUIC.
 type SharedCarrier struct {
-	ln     net.Listener
+	lns    []net.Listener
+	addrs  []string
 	auth   Authenticator
 	policy *Policy
 	log    *slog.Logger
@@ -51,34 +53,89 @@ type sharedHost struct {
 }
 
 type SharedCarrierStats struct {
-	Addr          string `json:"addr,omitempty"`
-	Hosts         int    `json:"hosts"`
-	HostLinks     uint64 `json:"host_links"`
-	Viewers       uint64 `json:"viewers"`
-	Busy          uint64 `json:"busy"`
-	Rejected      uint64 `json:"rejected"`
-	Blocked       uint64 `json:"blocked_sessions"`
-	ToHostBytes   uint64 `json:"to_host_bytes"`
-	ToViewerBytes uint64 `json:"to_viewer_bytes"`
+	Addr          string   `json:"addr,omitempty"`
+	Addrs         []string `json:"addrs,omitempty"`
+	Hosts         int      `json:"hosts"`
+	HostLinks     uint64   `json:"host_links"`
+	Viewers       uint64   `json:"viewers"`
+	Busy          uint64   `json:"busy"`
+	Rejected      uint64   `json:"rejected"`
+	Blocked       uint64   `json:"blocked_sessions"`
+	ToHostBytes   uint64   `json:"to_host_bytes"`
+	ToViewerBytes uint64   `json:"to_viewer_bytes"`
 }
 
-func newSharedCarrier(bind string, auth Authenticator, policy *Policy, log *slog.Logger) (*SharedCarrier, error) {
-	ln, err := net.Listen("tcp", bind)
+// listenSharedCarrier binds the shared carrier on the primary address and,
+// when bind6 is set, on the same port of that IPv6 address. Two listeners are
+// needed because a dual-stack peer reaches them through different source
+// mappings, the same reason the per-port relay keeps separate family sockets.
+func listenSharedCarrier(bind string, bind6 net.IP) ([]net.Listener, error) {
+	_, portText, err := net.SplitHostPort(bind)
 	if err != nil {
 		return nil, fmt.Errorf("carrier listen %q: %w", bind, err)
 	}
+	attempts := 1
+	if portText == "0" {
+		// The ephemeral port picked for the primary family must also be free on
+		// the IPv6 family, so retry a few times like the relay port binder.
+		attempts = 10
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		ln, err := net.Listen("tcp", bind)
+		if err != nil {
+			return nil, fmt.Errorf("carrier listen %q: %w", bind, err)
+		}
+		if bind6 == nil {
+			return []net.Listener{ln}, nil
+		}
+		if addr, ok := ln.Addr().(*net.TCPAddr); !ok || addr.IP.To4() == nil {
+			ln.Close()
+			return nil, errors.New("carrier IPv6 bind is redundant when the primary bind is already IPv6")
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		v6Bind := net.JoinHostPort(bind6.String(), strconv.Itoa(port))
+		v6, err := net.Listen("tcp", v6Bind)
+		if err == nil {
+			return []net.Listener{ln, v6}, nil
+		}
+		ln.Close()
+		lastErr = fmt.Errorf("carrier IPv6 listen %q: %w", v6Bind, err)
+	}
+	return nil, lastErr
+}
+
+func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, policy *Policy, log *slog.Logger) (*SharedCarrier, error) {
+	lns, err := listenSharedCarrier(bind, bind6)
+	if err != nil {
+		return nil, err
+	}
 	sc := &SharedCarrier{
-		ln:     ln,
+		lns:    lns,
+		addrs:  make([]string, 0, len(lns)),
 		auth:   auth,
 		policy: policy,
 		log:    log,
 		hosts:  make(map[string]*sharedHost),
 	}
-	go sc.serve()
+	for _, ln := range lns {
+		sc.addrs = append(sc.addrs, ln.Addr().String())
+		go sc.serve(ln)
+	}
 	return sc, nil
 }
 
-func (sc *SharedCarrier) Addr() string { return sc.ln.Addr().String() }
+func (sc *SharedCarrier) Addr() string {
+	if len(sc.addrs) == 0 {
+		return ""
+	}
+	return sc.addrs[0]
+}
+
+// Addrs lists every listener, primary first.
+func (sc *SharedCarrier) Addrs() []string {
+	return append([]string(nil), sc.addrs...)
+}
 
 // HostLinked reports whether the host currently holds an authenticated link.
 // The link is removed when its read deadline expires, so a dead TCP path stops
@@ -90,7 +147,10 @@ func (sc *SharedCarrier) HostLinked(hostID string) bool {
 }
 
 func (sc *SharedCarrier) Port() int {
-	if addr, ok := sc.ln.Addr().(*net.TCPAddr); ok {
+	if len(sc.lns) == 0 {
+		return 0
+	}
+	if addr, ok := sc.lns[0].Addr().(*net.TCPAddr); ok {
 		return addr.Port
 	}
 	return 0
@@ -101,6 +161,7 @@ func (sc *SharedCarrier) Stats() SharedCarrierStats {
 	defer sc.mu.Unlock()
 	return SharedCarrierStats{
 		Addr:          sc.Addr(),
+		Addrs:         sc.Addrs(),
 		Hosts:         len(sc.hosts),
 		HostLinks:     sc.links,
 		Viewers:       sc.viewers,
@@ -114,7 +175,9 @@ func (sc *SharedCarrier) Stats() SharedCarrierStats {
 
 func (sc *SharedCarrier) Close() {
 	sc.closeOnce.Do(func() {
-		_ = sc.ln.Close()
+		for _, ln := range sc.lns {
+			_ = ln.Close()
+		}
 		sc.mu.Lock()
 		sc.closed = true
 		hosts := make([]*sharedHost, 0, len(sc.hosts))
@@ -137,12 +200,12 @@ func (sc *SharedCarrier) Close() {
 	})
 }
 
-func (sc *SharedCarrier) serve() {
+func (sc *SharedCarrier) serve(ln net.Listener) {
 	for {
-		conn, err := sc.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				sc.log.Warn("shared carrier accept", "error", err)
+				sc.log.Warn("shared carrier accept", "on", ln.Addr().String(), "error", err)
 			}
 			return
 		}

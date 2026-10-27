@@ -478,8 +478,10 @@ void main() {
       await request.response.close();
     });
 
-    final AccountLoginResult result =
-        await ServerApi.refresh(settings, ' old-refresh ');
+    final AccountLoginResult result = await ServerApi.refresh(
+      settings,
+      ' old-refresh ',
+    );
     expect(requested?.path, '/v1/account/refresh');
     expect(authorization, isNull);
     expect(body, <String, Object?>{'refresh_token': 'old-refresh'});
@@ -747,6 +749,369 @@ void main() {
     );
   });
 
+  test(
+    'changeRecoveryEmail posts the address with the current password',
+    () async {
+      String? method;
+      Uri? requested;
+      String? authorization;
+      Object? body;
+      server.listen((HttpRequest request) async {
+        method = request.method;
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        body = jsonDecode(await utf8.decoder.bind(request).join());
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{'email': 'alice@example.com'}),
+        );
+        await request.response.close();
+      });
+
+      final String stored = await ServerApi.changeRecoveryEmail(
+        settings,
+        'account-token',
+        email: ' alice@example.com ',
+        password: 'secret123',
+      );
+      expect(method, 'POST');
+      expect(requested?.path, '/v1/account/email');
+      expect(authorization, 'Bearer account-token');
+      expect(body, <String, Object?>{
+        'email': 'alice@example.com',
+        'password': 'secret123',
+      });
+      expect(stored, 'alice@example.com');
+    },
+  );
+
+  test('changeRecoveryEmail reports a duplicate address', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.conflict;
+      request.response.write('{"error":"email is already in use"}');
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.changeRecoveryEmail(
+        settings,
+        'account-token',
+        email: 'taken@example.com',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '该邮箱已被其他账号使用',
+        ),
+      ),
+    );
+  });
+
+  test(
+    'requestPasswordRecovery posts a name, accepts 202 and sends no key',
+    () async {
+      Uri? requested;
+      String? authorization;
+      Object? body;
+      server.listen((HttpRequest request) async {
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        body = jsonDecode(await utf8.decoder.bind(request).join());
+        request.response.statusCode = HttpStatus.accepted;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write('{"status":"accepted"}');
+        await request.response.close();
+      });
+
+      await ServerApi.requestPasswordRecovery(
+        settings.copyWith(key: 'server-key'),
+        username: ' alice ',
+      );
+      expect(requested?.path, '/v1/account/recover');
+      expect(authorization, isNull);
+      expect(body, <String, Object?>{'username': 'alice'});
+    },
+  );
+
+  test('requestPasswordRecovery reports a server without mail', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      request.response.write('{"error":"email recovery is not configured"}');
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.requestPasswordRecovery(settings, username: 'alice'),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '连接服务未配置账号或邮件找回',
+        ),
+      ),
+    );
+  });
+
+  test('completePasswordRecovery posts the token and new password', () async {
+    Uri? requested;
+    Object? body;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{'username': 'alice'}),
+      );
+      await request.response.close();
+    });
+
+    final String username = await ServerApi.completePasswordRecovery(
+      settings,
+      token: ' reset-token ',
+      password: 'new secret 1',
+    );
+    expect(requested?.path, '/v1/account/recover/complete');
+    expect(body, <String, Object?>{
+      'token': 'reset-token',
+      'password': 'new secret 1',
+    });
+    expect(username, 'alice');
+  });
+
+  test('completePasswordRecovery reports an expired token', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write(
+        '{"error":"password reset token is invalid or expired"}',
+      );
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.completePasswordRecovery(
+        settings,
+        token: 'expired',
+        password: 'new secret 1',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '重置令牌无效、已过期或密码不符合要求',
+        ),
+      ),
+    );
+  });
+
+  test(
+    'changeRecoveryPhone posts the number with the current password',
+    () async {
+      String? method;
+      Uri? requested;
+      String? authorization;
+      Object? body;
+      server.listen((HttpRequest request) async {
+        method = request.method;
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        body = jsonDecode(await utf8.decoder.bind(request).join());
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{'phone': '+86 138 0013 8000'}),
+        );
+        await request.response.close();
+      });
+
+      final String stored = await ServerApi.changeRecoveryPhone(
+        settings,
+        'account-token',
+        phone: ' +86 138 0013 8000 ',
+        password: 'secret123',
+      );
+      expect(method, 'POST');
+      expect(requested?.path, '/v1/account/phone');
+      expect(authorization, 'Bearer account-token');
+      expect(body, <String, Object?>{
+        'phone': '+86 138 0013 8000',
+        'password': 'secret123',
+      });
+      expect(stored, '+86 138 0013 8000');
+    },
+  );
+
+  test('changeRecoveryPhone validates the number before calling', () async {
+    int calls = 0;
+    server.listen((HttpRequest request) async {
+      calls += 1;
+      request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.changeRecoveryPhone(
+        settings,
+        'account-token',
+        phone: '12345',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '手机号需为 6–15 位数字',
+        ),
+      ),
+    );
+    expect(calls, 0);
+  });
+
+  test(
+    'changeRecoveryPhone reports a duplicate number and a wrong password',
+    () async {
+      int calls = 0;
+      server.listen((HttpRequest request) async {
+        calls += 1;
+        request.response.statusCode = calls == 1
+            ? HttpStatus.conflict
+            : HttpStatus.forbidden;
+        request.response.write('{"error":"phone"}');
+        await request.response.close();
+      });
+
+      await expectLater(
+        ServerApi.changeRecoveryPhone(
+          settings,
+          'account-token',
+          phone: '13800138000',
+          password: 'secret123',
+        ),
+        throwsA(
+          isA<ServerApiException>().having(
+            (ServerApiException e) => e.message,
+            'message',
+            '该手机号已被其他账号使用',
+          ),
+        ),
+      );
+      await expectLater(
+        ServerApi.changeRecoveryPhone(
+          settings,
+          'account-token',
+          phone: '13800138000',
+          password: 'wrong-password',
+        ),
+        throwsA(
+          isA<ServerApiException>().having(
+            (ServerApiException e) => e.message,
+            'message',
+            '当前密码不正确',
+          ),
+        ),
+      );
+      expect(calls, 2);
+    },
+  );
+
+  test(
+    'requestSMSRecovery posts a name and accepts 202 without a key',
+    () async {
+      Uri? requested;
+      String? authorization;
+      Object? body;
+      server.listen((HttpRequest request) async {
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        body = jsonDecode(await utf8.decoder.bind(request).join());
+        request.response.statusCode = HttpStatus.accepted;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write('{"status":"accepted"}');
+        await request.response.close();
+      });
+
+      await ServerApi.requestSMSRecovery(
+        settings.copyWith(key: 'server-key'),
+        username: ' alice ',
+      );
+      expect(requested?.path, '/v1/account/recover/sms');
+      expect(authorization, isNull);
+      expect(body, <String, Object?>{'username': 'alice'});
+    },
+  );
+
+  test('requestSMSRecovery reports a server without SMS', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      request.response.write('{"error":"sms recovery is not configured"}');
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.requestSMSRecovery(settings, username: 'alice'),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '连接服务未配置账号或短信找回',
+        ),
+      ),
+    );
+  });
+
+  test('completeSMSRecovery posts the name, code and new password', () async {
+    Uri? requested;
+    Object? body;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{'username': 'alice'}),
+      );
+      await request.response.close();
+    });
+
+    final String username = await ServerApi.completeSMSRecovery(
+      settings,
+      username: ' alice ',
+      code: ' 1234-5678 ',
+      password: 'new secret 1',
+    );
+    expect(requested?.path, '/v1/account/recover/sms/complete');
+    expect(body, <String, Object?>{
+      'username': 'alice',
+      'code': '12345678',
+      'password': 'new secret 1',
+    });
+    expect(username, 'alice');
+  });
+
+  test('completeSMSRecovery reports an invalid code', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write(
+        '{"error":"sms reset code is invalid or expired"}',
+      );
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.completeSMSRecovery(
+        settings,
+        username: 'alice',
+        code: '00000000',
+        password: 'new secret 1',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '短信验证码无效、已过期或密码不符合要求',
+        ),
+      ),
+    );
+  });
+
   test('login sends the two-factor code when one is supplied', () async {
     Object? body;
     server.listen((HttpRequest request) async {
@@ -803,13 +1168,61 @@ void main() {
       throwsA(
         isA<ServerApiException>()
             .having((ServerApiException e) => e.code, 'code', 'totp_invalid')
-            .having((ServerApiException e) => e.message, 'message', '验证码或恢复码不正确'),
+            .having(
+              (ServerApiException e) => e.message,
+              'message',
+              '验证码或恢复码不正确',
+            ),
       ),
     );
     expect(calls, 2);
   });
 
-  test('login sends a recovery code instead of the authenticator code', () async {
+  test(
+    'login sends a recovery code instead of the authenticator code',
+    () async {
+      Object? body;
+      server.listen((HttpRequest request) async {
+        body = jsonDecode(await utf8.decoder.bind(request).join());
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'token': 'account-token',
+            'expires_in_ms': 1000,
+            'user': <String, Object?>{'username': 'alice'},
+          }),
+        );
+        await request.response.close();
+      });
+
+      await ServerApi.login(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+        totpCode: '123456',
+        recoveryCode: ' abcd-efgh-ijkl-mnop ',
+      );
+      expect(body, <String, Object?>{
+        'username': 'alice',
+        'password': 'secret123',
+        'totp_code': '123456',
+      });
+
+      await ServerApi.login(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+        recoveryCode: ' abcd-efgh-ijkl-mnop ',
+      );
+      expect(body, <String, Object?>{
+        'username': 'alice',
+        'password': 'secret123',
+        'recovery_code': 'abcd-efgh-ijkl-mnop',
+      });
+    },
+  );
+
+  test('login sends an SMS code only when no other factor is set', () async {
     Object? body;
     server.listen((HttpRequest request) async {
       body = jsonDecode(await utf8.decoder.bind(request).join());
@@ -828,8 +1241,20 @@ void main() {
       settings,
       username: 'alice',
       password: 'secret123',
+      smsCode: ' 1234 5678 ',
+    );
+    expect(body, <String, Object?>{
+      'username': 'alice',
+      'password': 'secret123',
+      'sms_code': '12345678',
+    });
+
+    await ServerApi.login(
+      settings,
+      username: 'alice',
+      password: 'secret123',
       totpCode: '123456',
-      recoveryCode: ' abcd-efgh-ijkl-mnop ',
+      smsCode: '12345678',
     );
     expect(body, <String, Object?>{
       'username': 'alice',
@@ -837,46 +1262,306 @@ void main() {
       'totp_code': '123456',
     });
 
-    await ServerApi.login(
-      settings,
-      username: 'alice',
-      password: 'secret123',
-      recoveryCode: ' abcd-efgh-ijkl-mnop ',
+    await expectLater(
+      ServerApi.login(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+        smsCode: '1234',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '短信验证码需为 8 位数字',
+        ),
+      ),
     );
-    expect(body, <String, Object?>{
-      'username': 'alice',
-      'password': 'secret123',
-      'recovery_code': 'abcd-efgh-ijkl-mnop',
-    });
   });
 
-  test('accountInfo reads the two-factor flag', () async {
-    Uri? requested;
-    String? authorization;
+  test('requestLoginSMS posts credentials and reports rejections', () async {
+    final List<Object?> bodies = <Object?>[];
+    final List<String> paths = <String>[];
+    int status = HttpStatus.accepted;
     server.listen((HttpRequest request) async {
-      requested = request.uri;
-      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      paths.add(request.uri.path);
+      bodies.add(jsonDecode(await utf8.decoder.bind(request).join()));
+      request.response.statusCode = status;
       request.response.headers.contentType = ContentType.json;
       request.response.write(
         jsonEncode(<String, Object?>{
-          'user': <String, Object?>{'id': 'u1', 'username': 'alice'},
-          'two_factor': true,
-          'recovery_codes': 4,
+          if (status == HttpStatus.accepted) 'status': 'accepted',
         }),
       );
       await request.response.close();
     });
 
-    final AccountInfo info = await ServerApi.accountInfo(
+    await ServerApi.requestLoginSMS(
       settings,
-      'account-token',
+      username: ' alice ',
+      password: 'secret123',
     );
-    expect(requested?.path, '/v1/account');
-    expect(authorization, 'Bearer account-token');
-    expect(info.username, 'alice');
-    expect(info.twoFactor, isTrue);
-    expect(info.recoveryCodes, 4);
+    expect(paths, <String>['/v1/account/login/sms']);
+    expect(bodies.single, <String, Object?>{
+      'username': 'alice',
+      'password': 'secret123',
+    });
+
+    status = HttpStatus.unauthorized;
+    await expectLater(
+      ServerApi.requestLoginSMS(
+        settings,
+        username: 'alice',
+        password: 'wrong horse',
+      ),
+      throwsA(
+        isA<ServerApiException>()
+            .having((ServerApiException e) => e.message, 'message', '用户名或密码不正确')
+            .having((ServerApiException e) => e.statusCode, 'status', 401),
+      ),
+    );
+
+    status = HttpStatus.forbidden;
+    await expectLater(
+      ServerApi.requestLoginSMS(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '账号已被封禁',
+        ),
+      ),
+    );
+
+    status = HttpStatus.tooManyRequests;
+    await expectLater(
+      ServerApi.requestLoginSMS(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '请求过于频繁，请稍后再试',
+        ),
+      ),
+    );
+
+    await expectLater(
+      ServerApi.requestLoginSMS(settings, username: '', password: 'secret123'),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '请输入用户名和密码',
+        ),
+      ),
+    );
   });
+
+  test('login sends an email code only when no other factor is set', () async {
+    Object? body;
+    server.listen((HttpRequest request) async {
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'token': 'account-token',
+          'expires_in_ms': 1000,
+          'user': <String, Object?>{'username': 'alice'},
+        }),
+      );
+      await request.response.close();
+    });
+
+    await ServerApi.login(
+      settings,
+      username: 'alice',
+      password: 'secret123',
+      emailCode: ' 1234 5678 ',
+    );
+    expect(body, <String, Object?>{
+      'username': 'alice',
+      'password': 'secret123',
+      'email_code': '12345678',
+    });
+
+    await ServerApi.login(
+      settings,
+      username: 'alice',
+      password: 'secret123',
+      smsCode: '12345678',
+      emailCode: '87654321',
+    );
+    expect(body, <String, Object?>{
+      'username': 'alice',
+      'password': 'secret123',
+      'sms_code': '12345678',
+    });
+
+    await ServerApi.login(
+      settings,
+      username: 'alice',
+      password: 'secret123',
+      totpCode: '123456',
+      emailCode: '87654321',
+    );
+    expect(body, <String, Object?>{
+      'username': 'alice',
+      'password': 'secret123',
+      'totp_code': '123456',
+    });
+
+    await expectLater(
+      ServerApi.login(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+        emailCode: '1234',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '邮件验证码需为 8 位数字',
+        ),
+      ),
+    );
+  });
+
+  test('requestLoginEmail posts credentials and reports rejections', () async {
+    final List<Object?> bodies = <Object?>[];
+    final List<String> paths = <String>[];
+    int status = HttpStatus.accepted;
+    server.listen((HttpRequest request) async {
+      paths.add(request.uri.path);
+      bodies.add(jsonDecode(await utf8.decoder.bind(request).join()));
+      request.response.statusCode = status;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          if (status == HttpStatus.accepted) 'status': 'accepted',
+        }),
+      );
+      await request.response.close();
+    });
+
+    await ServerApi.requestLoginEmail(
+      settings,
+      username: ' alice ',
+      password: 'secret123',
+    );
+    expect(paths, <String>['/v1/account/login/email']);
+    expect(bodies.single, <String, Object?>{
+      'username': 'alice',
+      'password': 'secret123',
+    });
+
+    status = HttpStatus.unauthorized;
+    await expectLater(
+      ServerApi.requestLoginEmail(
+        settings,
+        username: 'alice',
+        password: 'wrong horse',
+      ),
+      throwsA(
+        isA<ServerApiException>()
+            .having((ServerApiException e) => e.message, 'message', '用户名或密码不正确')
+            .having((ServerApiException e) => e.statusCode, 'status', 401),
+      ),
+    );
+
+    status = HttpStatus.forbidden;
+    await expectLater(
+      ServerApi.requestLoginEmail(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '账号已被封禁',
+        ),
+      ),
+    );
+
+    status = HttpStatus.serviceUnavailable;
+    await expectLater(
+      ServerApi.requestLoginEmail(
+        settings,
+        username: 'alice',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '连接服务未配置账号或邮件登录',
+        ),
+      ),
+    );
+
+    await expectLater(
+      ServerApi.requestLoginEmail(
+        settings,
+        username: '',
+        password: 'secret123',
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          '请输入用户名和密码',
+        ),
+      ),
+    );
+  });
+
+  test(
+    'accountInfo reads the two-factor flag and the recovery phone',
+    () async {
+      Uri? requested;
+      String? authorization;
+      server.listen((HttpRequest request) async {
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode(<String, Object?>{
+            'user': <String, Object?>{
+              'id': 'u1',
+              'username': 'alice',
+              'email': 'alice@example.com',
+              'phone': '+86 138 0013 8000',
+            },
+            'two_factor': true,
+            'recovery_codes': 4,
+          }),
+        );
+        await request.response.close();
+      });
+
+      final AccountInfo info = await ServerApi.accountInfo(
+        settings,
+        'account-token',
+      );
+      expect(requested?.path, '/v1/account');
+      expect(authorization, 'Bearer account-token');
+      expect(info.username, 'alice');
+      expect(info.email, 'alice@example.com');
+      expect(info.phone, '+86 138 0013 8000');
+      expect(info.twoFactor, isTrue);
+      expect(info.recoveryCodes, 4);
+    },
+  );
 
   test('startTwoFactor posts an enrollment and parses the secret', () async {
     String? method;
@@ -1098,58 +1783,58 @@ void main() {
     expect(method, 'POST');
     expect(requested?.path, '/v1/account/2fa/recovery');
     expect(authorization, 'Bearer account-token');
-    expect(body, <String, Object?>{
-      'password': 'secret123',
-      'code': '654321',
-    });
+    expect(body, <String, Object?>{'password': 'secret123', 'code': '654321'});
     expect(codes, <String>['ABCD-EFGH-IJKL-MNOP', 'QRST-UVWX-YZ23-4567']);
   });
 
-  test('generateRecoveryCodes maps rejected proofs and disabled state', () async {
-    int calls = 0;
-    server.listen((HttpRequest request) async {
-      calls += 1;
-      if (calls == 1) {
-        request.response.statusCode = HttpStatus.forbidden;
-        request.response.write('{"error":"credentials"}');
-      } else {
-        request.response.statusCode = HttpStatus.badRequest;
-        request.response.write('{"error":"not enabled"}');
-      }
-      await request.response.close();
-    });
+  test(
+    'generateRecoveryCodes maps rejected proofs and disabled state',
+    () async {
+      int calls = 0;
+      server.listen((HttpRequest request) async {
+        calls += 1;
+        if (calls == 1) {
+          request.response.statusCode = HttpStatus.forbidden;
+          request.response.write('{"error":"credentials"}');
+        } else {
+          request.response.statusCode = HttpStatus.badRequest;
+          request.response.write('{"error":"not enabled"}');
+        }
+        await request.response.close();
+      });
 
-    await expectLater(
-      ServerApi.generateRecoveryCodes(
-        settings,
-        'account-token',
-        password: 'wrong',
-        code: '000000',
-      ),
-      throwsA(
-        isA<ServerApiException>().having(
-          (ServerApiException e) => e.message,
-          'message',
-          '密码或两步验证码不正确',
+      await expectLater(
+        ServerApi.generateRecoveryCodes(
+          settings,
+          'account-token',
+          password: 'wrong',
+          code: '000000',
         ),
-      ),
-    );
-    await expectLater(
-      ServerApi.generateRecoveryCodes(
-        settings,
-        'account-token',
-        password: 'secret123',
-        code: '000000',
-      ),
-      throwsA(
-        isA<ServerApiException>().having(
-          (ServerApiException e) => e.message,
-          'message',
-          '两步验证未启用',
+        throwsA(
+          isA<ServerApiException>().having(
+            (ServerApiException e) => e.message,
+            'message',
+            '密码或两步验证码不正确',
+          ),
         ),
-      ),
-    );
-  });
+      );
+      await expectLater(
+        ServerApi.generateRecoveryCodes(
+          settings,
+          'account-token',
+          password: 'secret123',
+          code: '000000',
+        ),
+        throwsA(
+          isA<ServerApiException>().having(
+            (ServerApiException e) => e.message,
+            'message',
+            '两步验证未启用',
+          ),
+        ),
+      );
+    },
+  );
 
   test('generateRecoveryCodes rejects an empty code before sending', () async {
     int calls = 0;
@@ -1819,10 +2504,7 @@ void main() {
                   ],
                   'scopes': <Object?>[
                     <String, Object?>{'permission': 'read'},
-                    <String, Object?>{
-                      'group_id': 'lab',
-                      'permission': 'write',
-                    },
+                    <String, Object?>{'group_id': 'lab', 'permission': 'write'},
                   ],
                   'peers': <Object?>[
                     <String, Object?>{'id': 'devbox', 'group_id': 'lab'},
@@ -2032,51 +2714,53 @@ void main() {
     expect(calls, 0);
   });
 
-  test('file transfer reports carry direction, count and account token',
-      () async {
-    String? method;
-    Uri? requested;
-    String? authorization;
-    Map<String, Object?>? body;
-    server.listen((HttpRequest request) async {
-      method = request.method;
-      requested = request.uri;
-      authorization = request.headers.value(HttpHeaders.authorizationHeader);
-      body =
-          jsonDecode(await utf8.decoder.bind(request).join())
-              as Map<String, Object?>;
-      request.response.statusCode = HttpStatus.created;
-      request.response.headers.contentType = ContentType.json;
-      request.response.write(jsonEncode(<String, Object?>{'id': 9}));
-      await request.response.close();
-    });
+  test(
+    'file transfer reports carry direction, count and account token',
+    () async {
+      String? method;
+      Uri? requested;
+      String? authorization;
+      Map<String, Object?>? body;
+      server.listen((HttpRequest request) async {
+        method = request.method;
+        requested = request.uri;
+        authorization = request.headers.value(HttpHeaders.authorizationHeader);
+        body =
+            jsonDecode(await utf8.decoder.bind(request).join())
+                as Map<String, Object?>;
+        request.response.statusCode = HttpStatus.created;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode(<String, Object?>{'id': 9}));
+        await request.response.close();
+      });
 
-    final DateTime occurred = DateTime.utc(2026, 10, 25, 12);
-    await ServerApi.reportFileTransfers(
-      settings,
-      'account-token',
-      peerId: ' devbox ',
-      direction: 'download',
-      name: ' photos.zip ',
-      size: 900,
-      files: 3,
-      success: false,
-      detail: 'disk full',
-      occurredAt: occurred,
-    );
+      final DateTime occurred = DateTime.utc(2026, 10, 25, 12);
+      await ServerApi.reportFileTransfers(
+        settings,
+        'account-token',
+        peerId: ' devbox ',
+        direction: 'download',
+        name: ' photos.zip ',
+        size: 900,
+        files: 3,
+        success: false,
+        detail: 'disk full',
+        occurredAt: occurred,
+      );
 
-    expect(method, 'POST');
-    expect(requested?.path, '/v1/account/file-transfers');
-    expect(authorization, 'Bearer account-token');
-    expect(body?['peer_id'], 'devbox');
-    expect(body?['direction'], 'download');
-    expect(body?['name'], 'photos.zip');
-    expect(body?['size'], 900);
-    expect(body?['files'], 3);
-    expect(body?['success'], isFalse);
-    expect(body?['detail'], 'disk full');
-    expect(body?['occurred_at_ms'], occurred.millisecondsSinceEpoch);
-  });
+      expect(method, 'POST');
+      expect(requested?.path, '/v1/account/file-transfers');
+      expect(authorization, 'Bearer account-token');
+      expect(body?['peer_id'], 'devbox');
+      expect(body?['direction'], 'download');
+      expect(body?['name'], 'photos.zip');
+      expect(body?['size'], 900);
+      expect(body?['files'], 3);
+      expect(body?['success'], isFalse);
+      expect(body?['detail'], 'disk full');
+      expect(body?['occurred_at_ms'], occurred.millisecondsSinceEpoch);
+    },
+  );
 
   test('an empty peer or unknown direction issues no file request', () async {
     int calls = 0;

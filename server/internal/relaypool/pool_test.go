@@ -1,6 +1,8 @@
 package relaypool
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +37,11 @@ type fakeNode struct {
 }
 
 func newFakeNode(t *testing.T, relayHost string) *fakeNode {
+	t.Helper()
+	return newNode(t, relayHost, false)
+}
+
+func newNode(t *testing.T, relayHost string, useTLS bool) *fakeNode {
 	t.Helper()
 	node := &fakeNode{
 		healthy:   true,
@@ -99,7 +106,11 @@ func newFakeNode(t *testing.T, relayHost string) *fakeNode {
 		node.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})
-	node.server = httptest.NewServer(mux)
+	if useTLS {
+		node.server = httptest.NewTLSServer(mux)
+	} else {
+		node.server = httptest.NewServer(mux)
+	}
 	t.Cleanup(node.server.Close)
 	return node
 }
@@ -399,6 +410,42 @@ func TestRelease(t *testing.T) {
 			t.Fatalf("async release did not arrive: %v", released)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestTLSNodeUsesConfiguredRoots(t *testing.T) {
+	node := newNode(t, "node1.example", true)
+
+	untrusted, err := New(Config{Nodes: []string{node.server.URL}, Key: testKey, Interval: 20 * time.Millisecond, Timeout: time.Second, Logger: testLog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(untrusted.Close)
+	untrusted.Start()
+	status := waitStatus(t, untrusted, func(s Status) bool { return s.Nodes[0].Checked })
+	if status.Nodes[0].Healthy || status.Nodes[0].Error == "" {
+		t.Fatalf("self-signed node verified without a CA: %+v", status.Nodes[0])
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(node.server.Certificate())
+	pool, err := New(Config{
+		Nodes: []string{node.server.URL}, Key: testKey, Interval: 20 * time.Millisecond,
+		Timeout: time.Second, Logger: testLog, TLS: &tls.Config{RootCAs: roots},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	pool.Start()
+	waitStatus(t, pool, func(s Status) bool { return s.Nodes[0].Checked && s.Nodes[0].Healthy })
+
+	lease, err := pool.Provision("devbox", "pk", "token", time.Minute, "")
+	if err != nil {
+		t.Fatalf("provision over TLS: %v", err)
+	}
+	if lease.Node != node.server.URL || lease.Port == 0 {
+		t.Fatalf("lease = %+v", lease)
 	}
 }
 

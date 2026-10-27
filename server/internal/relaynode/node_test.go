@@ -156,6 +156,8 @@ func TestNewValidatesConfig(t *testing.T) {
 		{name: "no advertise", cfg: Config{Key: "k"}, auth: auth, mgr: m},
 		{name: "port in advertise", cfg: Config{Advertise: "127.0.0.1:41000", Key: "k"}, auth: auth, mgr: m},
 		{name: "long node id", cfg: Config{Advertise: "127.0.0.1", Key: "k", NodeID: string(make([]byte, 65))}, auth: auth, mgr: m},
+		{name: "v4 IPv6 advertise", cfg: Config{Advertise: "127.0.0.1", AdvertiseV6: "127.0.0.1", Key: "k"}, auth: auth, mgr: m},
+		{name: "IPv6 advertise without listener", cfg: Config{Advertise: "127.0.0.1", AdvertiseV6: "::1", Key: "k"}, auth: auth, mgr: m},
 	}
 	for _, tc := range cases {
 		if _, err := New(tc.cfg, tc.mgr, tc.auth); err == nil {
@@ -177,6 +179,75 @@ func TestNormalizeAdvertise(t *testing.T) {
 			t.Fatalf("normalizeAdvertise(%q) = %q, %v", tc.in, got, err)
 		}
 	}
+}
+
+func TestNormalizeAdvertiseV6(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"::1", "::1"},
+		{" [2001:db8::5] ", "2001:db8::5"},
+	}
+	for _, tc := range cases {
+		got, err := normalizeAdvertiseV6(tc.in)
+		if err != nil || got != tc.want {
+			t.Fatalf("normalizeAdvertiseV6(%q) = %q, %v", tc.in, got, err)
+		}
+	}
+	for _, in := range []string{"127.0.0.1", "relay.example.com"} {
+		if _, err := normalizeAdvertiseV6(in); err == nil {
+			t.Fatalf("normalizeAdvertiseV6(%q) accepted a non-IPv6 value", in)
+		}
+	}
+}
+
+func TestNodeCarrierV6Lease(t *testing.T) {
+	auth := NewAuthenticator()
+	m, err := relay.NewManager("127.0.0.1", []int{0}, auth, testLog,
+		relay.WithCarrierBind6("::1"))
+	if err != nil {
+		t.Fatalf("relay manager: %v", err)
+	}
+	defer m.Close()
+	if err := m.EnableSharedCarrier("127.0.0.1:0"); err != nil {
+		t.Fatalf("shared carrier: %v", err)
+	}
+	s, err := New(Config{
+		NodeID:      "relay-1",
+		Advertise:   "127.0.0.1",
+		AdvertiseV6: "::1",
+		Key:         testNodeKey,
+		Logger:      testLog,
+	}, m, auth)
+	if err != nil {
+		t.Fatalf("relay node: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	defer func() {
+		ts.Close()
+		s.Close()
+	}()
+
+	_, pub := testKey("host-a")
+	lease := provisionLease(t, ts, "devbox", pub, "carrier-token", 60)
+	if lease.Carrier == "" || lease.CarrierV6 == "" {
+		t.Fatalf("lease carrier endpoints: %+v", lease)
+	}
+	_, carrierPort, err := net.SplitHostPort(lease.Carrier)
+	if err != nil {
+		t.Fatalf("carrier: %v", err)
+	}
+	host, port, err := net.SplitHostPort(lease.CarrierV6)
+	if err != nil {
+		t.Fatalf("carrier_v6: %v", err)
+	}
+	if host != "::1" || port != carrierPort {
+		t.Fatalf("carrier_v6 = %q, want [::1]:%s", lease.CarrierV6, carrierPort)
+	}
+	conn, err := net.DialTimeout("tcp", lease.CarrierV6, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial carrier_v6: %v", err)
+	}
+	conn.Close()
 }
 
 func TestControlAPIRefusesMissingKey(t *testing.T) {

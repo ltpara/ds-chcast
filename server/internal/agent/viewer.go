@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,7 +30,12 @@ const (
 
 type ViewerConfig struct {
 	ServerURL string
+	// Servers seeds the failover list before the first lookup.
+	Servers   []string
 	ServerKey string
+	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
+	// client certificate for mTLS, or both. Nil uses the system roots.
+	TLS *tls.Config
 	// ServerPublicKey pins the rendezvous server identity. When set, lookups
 	// must carry a valid server-signed binding for the host.
 	ServerPublicKey string
@@ -64,10 +71,11 @@ type PathInfo struct {
 }
 
 type ViewerAgent struct {
-	cfg  ViewerConfig
-	conn *net.UDPConn
-	api  *apiClient
-	log  *slog.Logger
+	cfg     ViewerConfig
+	conn    *net.UDPConn
+	api     *apiClient
+	servers *serverPool
+	log     *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -77,9 +85,10 @@ type ViewerAgent struct {
 	direct *net.UDPAddr
 	relay  *net.UDPAddr
 
-	// carrier and carrierToken come from the authenticated lookup. The token
+	// carrier and carrierV6 come from the authenticated lookup. The token
 	// authorizes this viewer's slot while the host's lease is live.
 	carrier      string
+	carrierV6    string
 	carrierToken string
 	// relayOnly means the server hides direct candidates; transport is its
 	// hint (direct, relay or carrier). carrierMode forwards local datagrams
@@ -90,6 +99,9 @@ type ViewerAgent struct {
 	carrierConn net.Conn
 	carrierMu   sync.Mutex
 	carrierSend *carrier.FrameWriter
+	// carrierUsed records the endpoint the live link reached, which can be
+	// either address family. It is empty while no link is up.
+	carrierUsed atomic.Value
 
 	mu          sync.Mutex
 	remote      *net.UDPAddr
@@ -130,6 +142,10 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 			return nil, fmt.Errorf("--server-pubkey: %w", err)
 		}
 	}
+	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
+	if err != nil {
+		return nil, fmt.Errorf("rendezvous servers: %w", err)
+	}
 	listen, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen address %q: %w", cfg.ListenAddr, err)
@@ -140,18 +156,17 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	v := &ViewerAgent{
-		cfg:    cfg,
-		conn:   conn,
-		api:    newAPIClient(cfg.ServerURL, cfg.ServerKey),
-		log:    cfg.Logger.With("agent", "viewer", "id", cfg.HostID),
-		ctx:    ctx,
-		cancel: cancel,
-		nonce:  newNonce(),
+		cfg:     cfg,
+		conn:    conn,
+		api:     newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS),
+		servers: servers,
+		log:     cfg.Logger.With("agent", "viewer", "id", cfg.HostID),
+		ctx:     ctx,
+		cancel:  cancel,
+		nonce:   newNonce(),
 	}
 
-	lookupCtx, lookupCancel := context.WithTimeout(ctx, 10*time.Second)
-	host, err := v.api.lookup(lookupCtx, cfg.HostID)
-	lookupCancel()
+	host, err := v.lookupWithFailover(ctx)
 	if err != nil {
 		conn.Close()
 		cancel()
@@ -161,6 +176,12 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		conn.Close()
 		cancel()
 		return nil, err
+	}
+	if host.ConfigSerial > 0 && len(host.RendezvousServers) > 0 {
+		if v.servers.Apply(host.ConfigSerial, host.RendezvousServers) {
+			v.log.Info("rendezvous configuration updated",
+				"serial", host.ConfigSerial, "servers", v.servers.List())
+		}
 	}
 	if !host.Online {
 		conn.Close()
@@ -215,6 +236,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	}
 	v.natType = host.NATType
 	v.carrier = host.Carrier
+	v.carrierV6 = host.CarrierV6
 	v.carrierToken = host.CarrierToken
 	v.relayOnly = host.RelayOnly
 	v.transport = host.Transport
@@ -228,7 +250,7 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel()
 		return nil, fmt.Errorf("relay address %q is not reachable from %s", strings.Join(relayTexts, ", "), cfg.ListenAddr)
 	}
-	carrierReady := v.carrier != "" && v.carrierToken != ""
+	carrierReady := v.carrierToken != "" && len(v.carrierCandidates()) > 0
 	useCarrier := false
 
 	switch cfg.Mode {
@@ -297,13 +319,36 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	}
 	path := "relay " + addrText(v.relay)
 	if v.carrierMode {
-		path = "carrier " + v.carrier
+		path = "carrier " + v.carrierEndpoint()
 	} else if v.remote != nil && sameAddr(v.remote, v.direct) {
 		path = "direct " + addrText(v.direct)
 	}
 	v.log.Info("viewer agent listening", "on", conn.LocalAddr().String(), "path", path)
 	v.reportPath()
 	return v, nil
+}
+
+// lookupWithFailover tries every known endpoint once so a viewer is not stuck
+// on a broken node from its seed list.
+func (v *ViewerAgent) lookupWithFailover(ctx context.Context) (lookupResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < v.servers.Len(); attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		host, err := v.api.lookup(attemptCtx, v.cfg.HostID)
+		cancel()
+		if err == nil {
+			return host, nil
+		}
+		lastErr = err
+		if next, ok := v.servers.Next(); ok {
+			v.api.setBase(next)
+			v.log.Warn("lookup failed; trying the next rendezvous server", "server", next, "error", err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no rendezvous server answered")
+	}
+	return lookupResult{}, lastErr
 }
 
 func (v *ViewerAgent) LocalAddr() net.Addr { return v.conn.LocalAddr() }
@@ -319,9 +364,10 @@ func (v *ViewerAgent) PathInfo() PathInfo {
 func (v *ViewerAgent) pathLocked() PathInfo {
 	path := "connecting"
 	remote := addrValue(v.remote)
+	carrier := v.carrierEndpoint()
 	if v.carrierMode {
 		path = "carrier"
-		remote = v.carrier
+		remote = carrier
 	} else if v.remote != nil {
 		if v.relay != nil && sameAddr(v.remote, v.relay) {
 			path = "relay"
@@ -336,7 +382,7 @@ func (v *ViewerAgent) pathLocked() PathInfo {
 		Relay:        addrValue(v.relay),
 		NAT:          v.natType,
 		Candidates:   len(v.candidates),
-		Carrier:      v.carrier,
+		Carrier:      carrier,
 		CarrierToken: v.carrierToken,
 	}
 }
@@ -459,6 +505,25 @@ const (
 	viewerCarrierRetryMax  = 5 * time.Second
 )
 
+// carrierCandidates orders the shared-carrier endpoints, preferring the address
+// family this machine can reach. The server sends both when the relay listens
+// on IPv4 and IPv6.
+func (v *ViewerAgent) carrierCandidates() []string {
+	return carrierCandidateOrder(v.carrier, v.carrierV6, preferIPv6Outbound())
+}
+
+// carrierEndpoint reports the endpoint in use, or the preferred one while the
+// link is down.
+func (v *ViewerAgent) carrierEndpoint() string {
+	if used, ok := v.carrierUsed.Load().(string); ok && used != "" {
+		return used
+	}
+	if candidates := v.carrierCandidates(); len(candidates) > 0 {
+		return candidates[0]
+	}
+	return ""
+}
+
 // carrierLoop keeps the viewer's shared-carrier link alive. The link carries
 // the same opaque QUIC datagrams as UDP; when it drops, the agent reconnects
 // with backoff while the local client retransmits.
@@ -471,7 +536,7 @@ func (v *ViewerAgent) carrierLoop() {
 			return
 		}
 		if err != nil {
-			v.log.Warn("carrier link lost", "carrier", v.carrier, "error", err)
+			v.log.Warn("carrier link lost", "carrier", v.carrierEndpoint(), "error", err)
 		}
 		if time.Since(started) > 30*time.Second {
 			backoff = 500 * time.Millisecond
@@ -492,8 +557,24 @@ func (v *ViewerAgent) carrierLoop() {
 
 func (v *ViewerAgent) runCarrierLink() error {
 	dialer := &net.Dialer{Timeout: viewerCarrierDial}
-	conn, err := dialer.DialContext(v.ctx, "tcp", v.carrier)
-	if err != nil {
+	var conn net.Conn
+	var err error
+	endpoint := ""
+	for _, candidate := range v.carrierCandidates() {
+		conn, err = dialer.DialContext(v.ctx, "tcp", candidate)
+		if err == nil {
+			endpoint = candidate
+			break
+		}
+		if v.ctx.Err() != nil {
+			return err
+		}
+		v.log.Warn("carrier dial failed", "carrier", candidate, "error", err)
+	}
+	if conn == nil {
+		if err == nil {
+			err = errors.New("host has no shared carrier address")
+		}
 		return err
 	}
 	hello, err := json.Marshal(carrier.SharedViewerHello{HostID: v.cfg.HostID, Token: v.carrierToken})
@@ -513,16 +594,18 @@ func (v *ViewerAgent) runCarrierLink() error {
 	v.carrierConn = conn
 	v.carrierSend = send
 	v.carrierMu.Unlock()
+	v.carrierUsed.Store(endpoint)
 	defer func() {
 		v.carrierMu.Lock()
 		if v.carrierConn == conn {
 			v.carrierConn = nil
 			v.carrierSend = nil
+			v.carrierUsed.Store("")
 		}
 		v.carrierMu.Unlock()
 		conn.Close()
 	}()
-	v.log.Info("carrier link established", "carrier", v.carrier)
+	v.log.Info("carrier link established", "carrier", endpoint)
 	go v.carrierKeepalive(conn, send, stop)
 
 	reader := carrier.NewFrameReader(conn)

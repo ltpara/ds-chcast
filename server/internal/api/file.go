@@ -39,7 +39,8 @@ type fileTransferView struct {
 }
 
 type fileTransfersResponse struct {
-	Transfers []fileTransferView `json:"transfers"`
+	Transfers    []fileTransferView `json:"transfers"`
+	NextBeforeID int64              `json:"next_before_id,omitempty"`
 }
 
 func fileTransferToView(event account.FileEvent) fileTransferView {
@@ -110,7 +111,11 @@ func (s *server) accountFileTransfers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, err := s.cfg.Accounts.FileTransfers(user.ID, limit)
+	beforeID, ok := s.listBeforeID(w, r)
+	if !ok {
+		return
+	}
+	events, err := s.cfg.Accounts.FileTransfersBefore(user.ID, beforeID, limit)
 	if err != nil {
 		s.cfg.Logger.Error("account file transfer query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the file transfer log")
@@ -119,6 +124,10 @@ func (s *server) accountFileTransfers(w http.ResponseWriter, r *http.Request) {
 	out := fileTransfersResponse{Transfers: make([]fileTransferView, 0, len(events))}
 	for _, event := range events {
 		out.Transfers = append(out.Transfers, fileTransferToView(event))
+	}
+	if len(out.Transfers) > 0 {
+		out.NextBeforeID = nextBeforeID(out.Transfers[len(out.Transfers)-1].ID,
+			len(out.Transfers), limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -134,7 +143,17 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return
 	}
+	if asCSV, ok := exportRequest(w, r); !ok {
+		return
+	} else if asCSV {
+		s.fileTransfersCSV(w, r)
+		return
+	}
 	limit, ok := s.connectionLimit(w, r)
+	if !ok {
+		return
+	}
+	beforeID, ok := s.listBeforeID(w, r)
 	if !ok {
 		return
 	}
@@ -143,9 +162,9 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 		err    error
 	)
 	if host := strings.TrimSpace(r.URL.Query().Get("host")); host != "" {
-		events, err = s.cfg.Accounts.FileTransfersForHost(host, limit)
+		events, err = s.cfg.Accounts.FileTransfersForHostBefore(host, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.FileTransfersFor(r.URL.Query().Get("username"), limit)
+		events, err = s.cfg.Accounts.FileTransfersForBefore(r.URL.Query().Get("username"), beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account file transfer audit query", "error", err)
@@ -155,6 +174,10 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 	out := fileTransfersResponse{Transfers: make([]fileTransferView, 0, len(events))}
 	for _, event := range events {
 		out.Transfers = append(out.Transfers, fileTransferToView(event))
+	}
+	if len(out.Transfers) > 0 {
+		out.NextBeforeID = nextBeforeID(out.Transfers[len(out.Transfers)-1].ID,
+			len(out.Transfers), limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

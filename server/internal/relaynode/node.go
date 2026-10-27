@@ -31,8 +31,12 @@ const (
 type Config struct {
 	NodeID    string
 	Advertise string
-	Key       string
-	Logger    *slog.Logger
+	// AdvertiseV6 is the public IPv6 address of the shared carrier. Empty
+	// keeps the IPv4-only behaviour; setting it requires an IPv6 carrier
+	// listener on the node.
+	AdvertiseV6 string
+	Key         string
+	Logger      *slog.Logger
 }
 
 type Server struct {
@@ -54,6 +58,7 @@ type Lease struct {
 	Port         int    `json:"port"`
 	Relay        string `json:"relay"`
 	Carrier      string `json:"carrier,omitempty"`
+	CarrierV6    string `json:"carrier_v6,omitempty"`
 	ExpiresInSec int64  `json:"expires_in_sec"`
 }
 
@@ -87,6 +92,12 @@ func New(cfg Config, manager *relay.Manager, auth *Authenticator) (*Server, erro
 		return nil, err
 	}
 	cfg.Advertise = advertise
+	if cfg.AdvertiseV6, err = normalizeAdvertiseV6(cfg.AdvertiseV6); err != nil {
+		return nil, err
+	}
+	if cfg.AdvertiseV6 != "" && manager.CarrierV6Addr() == "" {
+		return nil, errors.New("relay node advertises an IPv6 carrier but has no IPv6 carrier listener")
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -118,6 +129,23 @@ func normalizeAdvertise(advertise string) (string, error) {
 		return "", fmt.Errorf("relay advertise %q must not include a port", advertise)
 	}
 	return strings.ToLower(advertise), nil
+}
+
+// normalizeAdvertiseV6 accepts an empty value (IPv4-only node) or a literal
+// IPv6 address without brackets or port.
+func normalizeAdvertiseV6(advertise string) (string, error) {
+	advertise = strings.TrimSpace(advertise)
+	if advertise == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(advertise, "[") && strings.HasSuffix(advertise, "]") {
+		advertise = advertise[1 : len(advertise)-1]
+	}
+	ip := net.ParseIP(advertise)
+	if ip == nil || ip.To4() != nil {
+		return "", fmt.Errorf("relay IPv6 advertise %q must be an IPv6 address", advertise)
+	}
+	return ip.String(), nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -236,6 +264,9 @@ func (s *Server) leaseResponse(info LeaseInfo) Lease {
 	}
 	if carrier := s.manager.CarrierPort(); carrier != 0 {
 		out.Carrier = net.JoinHostPort(s.cfg.Advertise, fmt.Sprint(carrier))
+		if s.cfg.AdvertiseV6 != "" {
+			out.CarrierV6 = net.JoinHostPort(s.cfg.AdvertiseV6, fmt.Sprint(carrier))
+		}
 	}
 	return out
 }

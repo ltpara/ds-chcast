@@ -9,6 +9,7 @@ import '../address_book_sync.dart';
 import '../app_info.dart';
 import '../device_store.dart';
 import '../lan_discovery.dart';
+import '../security_key.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
@@ -20,41 +21,76 @@ import 'session_page.dart';
 import 'groups_dialog.dart';
 import 'account_sessions_dialog.dart';
 import 'change_password_dialog.dart';
+import 'recovery_dialog.dart';
+import 'security_key_dialog.dart';
 import 'shared_books_dialog.dart';
 import 'two_factor_dialog.dart';
 
-typedef HostLookup = Future<BatchLookupResult> Function(
-    ServerSettings server, List<String> hostIds);
-typedef LabelsUpdater = Future<void> Function(
-  ServerSettings server,
-  String hostId, {
-  required String alias,
-  required List<String> tags,
-});
-typedef AccountLogin = Future<AccountLoginResult> Function(
-  ServerSettings server, {
-  required String username,
-  required String password,
-  String totpCode,
-  String recoveryCode,
-});
-typedef AccountRefresh = Future<AccountLoginResult> Function(
-    ServerSettings server, String refreshToken);
-typedef AccountLogout = Future<void> Function(
-    ServerSettings server, String token);
-typedef AddressBookFetcher = Future<AddressBookSnapshot> Function(
-    ServerSettings server, String token, int since);
-typedef AddressBookPeerWriter = Future<AddressBookPeer> Function(
-  ServerSettings server,
-  String token,
-  String peerId, {
-  String? name,
-  List<String>? tags,
-  String? groupId,
-  int? ifRevision,
-});
-typedef AddressBookPeerDeleter = Future<void> Function(
-    ServerSettings server, String token, String peerId);
+typedef HostLookup =
+    Future<BatchLookupResult> Function(
+      ServerSettings server,
+      List<String> hostIds,
+    );
+typedef LabelsUpdater =
+    Future<void> Function(
+      ServerSettings server,
+      String hostId, {
+      required String alias,
+      required List<String> tags,
+    });
+typedef AccountLogin =
+    Future<AccountLoginResult> Function(
+      ServerSettings server, {
+      required String username,
+      required String password,
+      String totpCode,
+      String recoveryCode,
+      String smsCode,
+      String emailCode,
+    });
+typedef LoginSMSRequester =
+    Future<void> Function(
+      ServerSettings server, {
+      required String username,
+      required String password,
+    });
+typedef LoginEmailRequester =
+    Future<void> Function(
+      ServerSettings server, {
+      required String username,
+      required String password,
+    });
+typedef AccountSecurityKeyLogin =
+    Future<AccountLoginResult> Function(
+      ServerSettings server, {
+      required String username,
+      required String password,
+    });
+typedef AccountRefresh =
+    Future<AccountLoginResult> Function(
+      ServerSettings server,
+      String refreshToken,
+    );
+typedef AccountLogout =
+    Future<void> Function(ServerSettings server, String token);
+typedef AddressBookFetcher =
+    Future<AddressBookSnapshot> Function(
+      ServerSettings server,
+      String token,
+      int since,
+    );
+typedef AddressBookPeerWriter =
+    Future<AddressBookPeer> Function(
+      ServerSettings server,
+      String token,
+      String peerId, {
+      String? name,
+      List<String>? tags,
+      String? groupId,
+      int? ifRevision,
+    });
+typedef AddressBookPeerDeleter =
+    Future<void> Function(ServerSettings server, String token, String peerId);
 
 class HomePage extends StatefulWidget {
   const HomePage({
@@ -68,6 +104,9 @@ class HomePage extends StatefulWidget {
     this.lookupBatch,
     this.labelsUpdater,
     this.accountLogin,
+    this.accountLoginSMS,
+    this.accountLoginEmail,
+    this.accountSecurityKeyLogin,
     this.accountRefresh,
     this.accountLogout,
     this.addressBookFetcher,
@@ -88,6 +127,9 @@ class HomePage extends StatefulWidget {
   final HostLookup? lookupBatch;
   final LabelsUpdater? labelsUpdater;
   final AccountLogin? accountLogin;
+  final LoginSMSRequester? accountLoginSMS;
+  final LoginEmailRequester? accountLoginEmail;
+  final AccountSecurityKeyLogin? accountSecurityKeyLogin;
   final AccountRefresh? accountRefresh;
   final AccountLogout? accountLogout;
   final AddressBookFetcher? addressBookFetcher;
@@ -116,6 +158,9 @@ class _HomePageState extends State<HomePage> {
   late final HostLookup _lookupBatch;
   late final LabelsUpdater _updateLabels;
   late final AccountLogin _loginAccount;
+  late final LoginSMSRequester _requestLoginSMS;
+  late final LoginEmailRequester _requestLoginEmail;
+  late final AccountSecurityKeyLogin _loginWithSecurityKey;
   late final AccountRefresh _refreshAccount;
   late final AccountLogout _logoutAccount;
   late final AddressBookFetcher _fetchAddressBook;
@@ -130,8 +175,7 @@ class _HomePageState extends State<HomePage> {
   bool _groupsSynced = false;
   ServerSettings _server = const ServerSettings();
   Map<String, String> _trust = <String, String>{};
-  Map<String, ServerIdentityPin> _serverPins =
-      <String, ServerIdentityPin>{};
+  Map<String, ServerIdentityPin> _serverPins = <String, ServerIdentityPin>{};
   AccountSession? _account;
   bool _syncing = false;
   final Map<String, DevicePresence> _presence = <String, DevicePresence>{};
@@ -160,32 +204,80 @@ class _HomePageState extends State<HomePage> {
     _wakeSender = widget.wakeSender ?? WakeOnLan.send;
     _lanDiscovery = widget.lanDiscovery ?? const LanDiscovery();
     _updateLabels = widget.labelsUpdater ?? ServerApi.updateLabels;
-    _loginAccount = widget.accountLogin ??
-        (ServerSettings server,
-                {required String username,
-                required String password,
-                String totpCode = '',
-                String recoveryCode = ''}) =>
-            ServerApi.login(
-              server,
-              username: username,
-              password: password,
-              totpCode: totpCode,
-              recoveryCode: recoveryCode,
-              deviceName: _hostname,
-            );
-    _logoutAccount = widget.accountLogout ??
-        (ServerSettings server, String token) => ServerApi.logout(server, token);
+    _loginAccount =
+        widget.accountLogin ??
+        (
+          ServerSettings server, {
+          required String username,
+          required String password,
+          String totpCode = '',
+          String recoveryCode = '',
+          String smsCode = '',
+          String emailCode = '',
+        }) => ServerApi.login(
+          server,
+          username: username,
+          password: password,
+          totpCode: totpCode,
+          recoveryCode: recoveryCode,
+          smsCode: smsCode,
+          emailCode: emailCode,
+          deviceName: _hostname,
+        );
+    _requestLoginSMS =
+        widget.accountLoginSMS ??
+        (
+          ServerSettings server, {
+          required String username,
+          required String password,
+        }) => ServerApi.requestLoginSMS(
+          server,
+          username: username,
+          password: password,
+        );
+    _requestLoginEmail =
+        widget.accountLoginEmail ??
+        (
+          ServerSettings server, {
+          required String username,
+          required String password,
+        }) => ServerApi.requestLoginEmail(
+          server,
+          username: username,
+          password: password,
+        );
+    _loginWithSecurityKey =
+        widget.accountSecurityKeyLogin ??
+        (
+          ServerSettings server, {
+          required String username,
+          required String password,
+        }) => loginWithSecurityKey(
+          server,
+          username: username,
+          password: password,
+          deviceName: _hostname,
+        );
+    _logoutAccount =
+        widget.accountLogout ??
+        (ServerSettings server, String token) =>
+            ServerApi.logout(server, token);
     _refreshAccount = widget.accountRefresh ?? ServerApi.refresh;
-    _fetchAddressBook = widget.addressBookFetcher ??
+    _fetchAddressBook =
+        widget.addressBookFetcher ??
         (ServerSettings server, String token, int since) =>
             ServerApi.addressBook(server, token, since: since);
-    _writeAddressBookPeer = widget.addressBookPeerWriter ??
-        (ServerSettings server, String token, String peerId,
-            {String? name,
-            List<String>? tags,
-            String? groupId,
-            int? ifRevision}) {
+    _writeAddressBookPeer =
+        widget.addressBookPeerWriter ??
+        (
+          ServerSettings server,
+          String token,
+          String peerId, {
+          String? name,
+          List<String>? tags,
+          String? groupId,
+          int? ifRevision,
+        }) {
           return ServerApi.updateAddressBookPeer(
             server,
             token,
@@ -196,7 +288,8 @@ class _HomePageState extends State<HomePage> {
             ifRevision: ifRevision,
           );
         };
-    _deleteAddressBookPeer = widget.addressBookPeerDeleter ??
+    _deleteAddressBookPeer =
+        widget.addressBookPeerDeleter ??
         (ServerSettings server, String token, String peerId) =>
             ServerApi.deleteAddressBookPeer(server, token, peerId);
     try {
@@ -284,8 +377,10 @@ class _HomePageState extends State<HomePage> {
     }
     _renewing = true;
     try {
-      final AccountLoginResult renewed =
-          await _refreshAccount(_server, account.refreshToken);
+      final AccountLoginResult renewed = await _refreshAccount(
+        _server,
+        account.refreshToken,
+      );
       if (!mounted || !identical(_account, account)) {
         return;
       }
@@ -293,8 +388,9 @@ class _HomePageState extends State<HomePage> {
       final AccountSession session = account.copyWith(
         token: renewed.token,
         expiresAt: issued.add(Duration(milliseconds: renewed.expiresInMs)),
-        refreshToken:
-            renewed.refreshToken.isEmpty ? null : renewed.refreshToken,
+        refreshToken: renewed.refreshToken.isEmpty
+            ? null
+            : renewed.refreshToken,
         refreshExpiresAt: renewed.refreshToken.isEmpty
             ? null
             : issued.add(Duration(milliseconds: renewed.refreshExpiresInMs)),
@@ -335,8 +431,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _refreshPresence() async {
-    final List<Device> devices =
-        _devices.where((Device device) => device.viaServer).toList();
+    final List<Device> devices = _devices
+        .where((Device device) => device.viaServer)
+        .toList();
     if (devices.isEmpty) {
       if ((_presence.isNotEmpty || _software != null) && mounted) {
         setState(() {
@@ -452,8 +549,11 @@ class _HomePageState extends State<HomePage> {
       setState(() => _error = '访问令牌过长，最多 128 字节');
       return;
     }
-    final ConnectTarget? target =
-        parseConnectInput(text, token: token, server: _server);
+    final ConnectTarget? target = parseConnectInput(
+      text,
+      token: token,
+      server: _server,
+    );
     if (target == null) {
       setState(() => _error = '格式无效：请输入设备 ID 或 主机:端口');
       return;
@@ -509,13 +609,15 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(builder: (BuildContext context) {
-        return SessionPage(
-          target: target,
-          account: _account,
-          identityStore: _identityStore,
-        );
-      }),
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) {
+          return SessionPage(
+            target: target,
+            account: _account,
+            identityStore: _identityStore,
+          );
+        },
+      ),
     );
     if (!mounted) {
       return;
@@ -535,8 +637,11 @@ class _HomePageState extends State<HomePage> {
 
   Device _deviceForTarget(ConnectTarget target) {
     if (target.viaServer) {
-      final String key =
-          Device(id: target.hostId, addedAt: DateTime.now(), server: target.server).key;
+      final String key = Device(
+        id: target.hostId,
+        addedAt: DateTime.now(),
+        server: target.server,
+      ).key;
       for (final Device device in _devices) {
         if (device.key == key) {
           return device;
@@ -687,7 +792,10 @@ class _HomePageState extends State<HomePage> {
     if (tags == null) {
       return;
     }
-    final List<Device> devices = await _deviceStore.updateTags(device.key, tags);
+    final List<Device> devices = await _deviceStore.updateTags(
+      device.key,
+      tags,
+    );
     if (!mounted) {
       return;
     }
@@ -708,16 +816,16 @@ class _HomePageState extends State<HomePage> {
     }
     final String? choice = await showDialog<String>(
       context: context,
-      builder: (BuildContext context) => _GroupPickerDialog(
-        groups: _groups,
-        selected: device.groupId,
-      ),
+      builder: (BuildContext context) =>
+          _GroupPickerDialog(groups: _groups, selected: device.groupId),
     );
     if (choice == null || !mounted) {
       return;
     }
-    final List<Device> devices =
-        await _deviceStore.updateGroup(device.key, choice);
+    final List<Device> devices = await _deviceStore.updateGroup(
+      device.key,
+      choice,
+    );
     if (!mounted) {
       return;
     }
@@ -735,8 +843,10 @@ class _HomePageState extends State<HomePage> {
         groupId: choice,
         ifRevision: updated.revision > 0 ? updated.revision : null,
       );
-      List<Device> settled =
-          await _deviceStore.setPeerRevision(device.key, written.revision);
+      List<Device> settled = await _deviceStore.setPeerRevision(
+        device.key,
+        written.revision,
+      );
       if (choice.isEmpty) {
         settled = await _deviceStore.markPushSettled(device.key, group: true);
       }
@@ -777,7 +887,8 @@ class _HomePageState extends State<HomePage> {
         counts[device.groupId] = (counts[device.groupId] ?? 0) + 1;
       }
     }
-    final bool changed = await showDialog<bool>(
+    final bool changed =
+        await showDialog<bool>(
           context: context,
           builder: (BuildContext context) => GroupsDialog(
             server: _server,
@@ -811,7 +922,9 @@ class _HomePageState extends State<HomePage> {
             ),
             FilledButton(
               onPressed: () => Navigator.of(context).pop(true),
-              style: FilledButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.error,
+              ),
               child: const Text('删除'),
             ),
           ],
@@ -822,7 +935,8 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final AccountSession? account = _account;
-    final bool tracked = device.saved &&
+    final bool tracked =
+        device.saved &&
         device.viaServer &&
         device.server == _server.url &&
         account != null &&
@@ -831,12 +945,14 @@ class _HomePageState extends State<HomePage> {
     if (tracked) {
       // Queue first so an offline delete is retried instead of being pulled
       // back as a server-only peer on the next sync.
-      await _deviceStore.queueDeletion(PendingDeletion(
-        server: account.server,
-        username: account.username,
-        id: device.id,
-        deletedAt: DateTime.now(),
-      ));
+      await _deviceStore.queueDeletion(
+        PendingDeletion(
+          server: account.server,
+          username: account.username,
+          id: device.id,
+          deletedAt: DateTime.now(),
+        ),
+      );
     }
     final List<Device> devices = await _deviceStore.remove(device.key);
     if (mounted) {
@@ -849,7 +965,8 @@ class _HomePageState extends State<HomePage> {
   Future<void> _editLabels(Device device) async {
     final DevicePresence presence =
         _presence[device.key] ?? DevicePresence.unknown;
-    final bool saved = await showDialog<bool>(
+    final bool saved =
+        await showDialog<bool>(
           context: context,
           builder: (BuildContext context) {
             return _LabelsDialog(
@@ -869,9 +986,9 @@ class _HomePageState extends State<HomePage> {
     if (!saved || !mounted) {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('服务端别名与标签已保存')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('服务端别名与标签已保存')));
     unawaited(_refreshPresence());
   }
 
@@ -883,6 +1000,9 @@ class _HomePageState extends State<HomePage> {
           server: _server,
           account: _account,
           login: _loginAccount,
+          requestLoginSMS: _requestLoginSMS,
+          requestLoginEmail: _requestLoginEmail,
+          securityKeyLogin: _loginWithSecurityKey,
           syncing: _syncing,
           groups: _groups,
         );
@@ -905,12 +1025,14 @@ class _HomePageState extends State<HomePage> {
       await _syncAddressBook();
     } else if (result.sharedPeer != null) {
       final AddressBookPeer peer = result.sharedPeer!;
-      await _connectDevice(Device(
-        id: peer.id,
-        name: peer.name,
-        server: _server.url,
-        addedAt: DateTime.now(),
-      ));
+      await _connectDevice(
+        Device(
+          id: peer.id,
+          name: peer.name,
+          server: _server.url,
+          addedAt: DateTime.now(),
+        ),
+      );
     }
   }
 
@@ -970,8 +1092,8 @@ class _HomePageState extends State<HomePage> {
     }
     setState(() => _syncing = true);
     try {
-      final List<PendingDeletion> queued =
-          await _deviceStore.loadPendingDeletions();
+      final List<PendingDeletion> queued = await _deviceStore
+          .loadPendingDeletions();
       for (final PendingDeletion deletion in queued) {
         if (deletion.server != _server.url ||
             deletion.username != account.username) {
@@ -1005,8 +1127,11 @@ class _HomePageState extends State<HomePage> {
       // The group cache lives in memory, so the first sync after launch reads
       // the whole book to learn group names even when the peer cursor is old.
       final int since = _groupsSynced ? account.bookRevision : 0;
-      final AddressBookSnapshot snapshot =
-          await _fetchAddressBook(_server, account.token, since);
+      final AddressBookSnapshot snapshot = await _fetchAddressBook(
+        _server,
+        account.token,
+        since,
+      );
       final List<AddressBookGroup> groups = mergeAddressBookGroups(
         current: _groups,
         snapshot: snapshot,
@@ -1064,13 +1189,15 @@ class _HomePageState extends State<HomePage> {
           // retried next sync; the server never applied the stale write.
         }
       }
-      final Map<String, AddressBookPeer> refreshedById = <String, AddressBookPeer>{
-        if (refreshed != null)
-          for (final AddressBookPeer peer in refreshed.peers) peer.id: peer,
-      };
+      final Map<String, AddressBookPeer> refreshedById =
+          <String, AddressBookPeer>{
+            if (refreshed != null)
+              for (final AddressBookPeer peer in refreshed.peers) peer.id: peer,
+          };
       final List<Device> merged = <Device>[];
       for (final Device item in plan.devices) {
-        final bool conflicted = refreshed != null &&
+        final bool conflicted =
+            refreshed != null &&
             conflicts.contains(item.id) &&
             item.saved &&
             item.server == _server.url;
@@ -1082,15 +1209,17 @@ class _HomePageState extends State<HomePage> {
         if (peer == null) {
           continue;
         }
-        merged.add(item.copyWith(
-          name: peer.name,
-          tags: peer.tags,
-          groupId: peer.groupId,
-          revision: peer.revision,
-          tagsCleared: false,
-          groupCleared: false,
-          saved: true,
-        ));
+        merged.add(
+          item.copyWith(
+            name: peer.name,
+            tags: peer.tags,
+            groupId: peer.groupId,
+            revision: peer.revision,
+            tagsCleared: false,
+            groupCleared: false,
+            saved: true,
+          ),
+        );
       }
       final List<Device> devices = await _deviceStore.replaceAll(merged);
       final AccountSession session = account.copyWith(
@@ -1109,12 +1238,9 @@ class _HomePageState extends State<HomePage> {
       });
       unawaited(_refreshPresence());
       if (announce) {
-        _showSnack(_syncSummary(
-          plan,
-          failed,
-          pendingDeletions.length,
-          conflicts.length,
-        ));
+        _showSnack(
+          _syncSummary(plan, failed, pendingDeletions.length, conflicts.length),
+        );
       }
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
@@ -1187,17 +1313,18 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     try {
-      final AddressBookSnapshot snapshot =
-          await _fetchAddressBook(_server, account.token, 0);
+      final AddressBookSnapshot snapshot = await _fetchAddressBook(
+        _server,
+        account.token,
+        0,
+      );
       final Map<String, AddressBookPeer> byId = <String, AddressBookPeer>{
         for (final AddressBookPeer peer in snapshot.peers) peer.id: peer,
       };
       final List<Device> current = await _deviceStore.load();
       final List<Device> next = <Device>[];
       for (final Device item in current) {
-        if (item.id != peerId ||
-            !item.saved ||
-            item.server != _server.url) {
+        if (item.id != peerId || !item.saved || item.server != _server.url) {
           next.add(item);
           continue;
         }
@@ -1205,15 +1332,17 @@ class _HomePageState extends State<HomePage> {
         if (peer == null) {
           continue;
         }
-        next.add(item.copyWith(
-          name: peer.name,
-          tags: peer.tags,
-          groupId: peer.groupId,
-          revision: peer.revision,
-          tagsCleared: false,
-          groupCleared: false,
-          saved: true,
-        ));
+        next.add(
+          item.copyWith(
+            name: peer.name,
+            tags: peer.tags,
+            groupId: peer.groupId,
+            revision: peer.revision,
+            tagsCleared: false,
+            groupCleared: false,
+            saved: true,
+          ),
+        );
       }
       final List<Device> devices = await _deviceStore.replaceAll(next);
       final AccountSession session = account.copyWith(
@@ -1250,12 +1379,14 @@ class _HomePageState extends State<HomePage> {
     bool syncTags = false,
   }) async {
     final AccountSession? account = _account;
-    final String? name =
-        device.name.isNotEmpty || allowEmptyName ? device.name : null;
+    final String? name = device.name.isNotEmpty || allowEmptyName
+        ? device.name
+        : null;
     // A rename must not clear tags it never touched; an explicit tag edit
     // sends the list even when empty so clearing propagates.
-    final List<String>? tags =
-        device.tags.isNotEmpty || syncTags ? device.tags : null;
+    final List<String>? tags = device.tags.isNotEmpty || syncTags
+        ? device.tags
+        : null;
     if ((name == null && tags == null) ||
         !device.viaServer ||
         device.server != _server.url ||
@@ -1273,8 +1404,10 @@ class _HomePageState extends State<HomePage> {
         tags: tags,
         ifRevision: device.revision > 0 ? device.revision : null,
       );
-      List<Device> settled =
-          await _deviceStore.setPeerRevision(device.key, written.revision);
+      List<Device> settled = await _deviceStore.setPeerRevision(
+        device.key,
+        written.revision,
+      );
       if (tags != null) {
         settled = await _deviceStore.markPushSettled(device.key, tags: true);
       }
@@ -1369,7 +1502,9 @@ class _HomePageState extends State<HomePage> {
       builder: (BuildContext context) {
         return AlertDialog(
           backgroundColor: Theme.of(context).colorScheme.surface,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
           title: const Text('发现新版本'),
           content: SizedBox(
             width: 420,
@@ -1409,9 +1544,9 @@ class _HomePageState extends State<HomePage> {
     }
     await Clipboard.setData(ClipboardData(text: update.url));
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('下载地址已复制')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('下载地址已复制')));
     }
   }
 
@@ -1421,7 +1556,9 @@ class _HomePageState extends State<HomePage> {
       builder: (BuildContext context) {
         return AlertDialog(
           backgroundColor: Theme.of(context).colorScheme.surface,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
           title: const Text('关于 Chast'),
           content: Text(
             'Chast $chastVersion\n\n'
@@ -1441,7 +1578,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   List<Device> get _savedDevices {
-    final List<Device> devices = _devices.where((Device device) => device.saved).toList();
+    final List<Device> devices = _devices
+        .where((Device device) => device.saved)
+        .toList();
     devices.sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
     return devices;
   }
@@ -1464,10 +1603,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   List<String> _availableFilterTags(List<Device> saved) {
-    final List<String> tags = <String>{
-      for (final Device device in saved) ..._visibleTags(device),
-    }.toList()
-      ..sort((String a, String b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    final List<String> tags =
+        <String>{
+          for (final Device device in saved) ..._visibleTags(device),
+        }.toList()..sort(
+          (String a, String b) => a.toLowerCase().compareTo(b.toLowerCase()),
+        );
     return tags;
   }
 
@@ -1549,7 +1690,11 @@ class _HomePageState extends State<HomePage> {
             onConfigureServer: _showServerSettings,
             onAccount: _showAccount,
           ),
-          VerticalDivider(width: 1, thickness: 1, color: Theme.of(context).dividerColor),
+          VerticalDivider(
+            width: 1,
+            thickness: 1,
+            color: Theme.of(context).dividerColor,
+          ),
           Expanded(child: _buildMain(context)),
         ],
       ),
@@ -1560,7 +1705,9 @@ class _HomePageState extends State<HomePage> {
     final ThemeData theme = Theme.of(context);
     final bool dark = theme.brightness == Brightness.dark;
     final Color subtle = dark ? Colors.white12 : const Color(0xFFE4E6EB);
-    final Color fieldFill = dark ? const Color(0xFF1F2026) : const Color(0xFFF7F8FA);
+    final Color fieldFill = dark
+        ? const Color(0xFF1F2026)
+        : const Color(0xFFF7F8FA);
     final List<Device> saved = _savedDevices;
     final Set<String> activeTags = _activeTags(saved);
     final List<Device> filtered = _filteredSavedDevices(saved, activeTags);
@@ -1596,8 +1743,10 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ),
                           const SizedBox(height: 6),
-                          Text('输入设备 ID，或直接连接对端 chast QUIC 地址',
-                              style: mutedStyle(context)),
+                          Text(
+                            '输入设备 ID，或直接连接对端 chast QUIC 地址',
+                            style: mutedStyle(context),
+                          ),
                           const SizedBox(height: 18),
                           TextField(
                             controller: _address,
@@ -1614,23 +1763,33 @@ class _HomePageState extends State<HomePage> {
                               hintStyle: TextStyle(
                                 fontSize: 18,
                                 fontWeight: FontWeight.w300,
-                                color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
+                                color: dark
+                                    ? Colors.white38
+                                    : const Color(0xFF9AA0A6),
                               ),
                               prefixIcon: Icon(
                                 Icons.link_rounded,
                                 size: 20,
-                                color: dark ? Colors.white54 : const Color(0xFF7C8390),
+                                color: dark
+                                    ? Colors.white54
+                                    : const Color(0xFF7C8390),
                               ),
                               filled: true,
                               fillColor: fieldFill,
-                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 14,
+                              ),
                               enabledBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(8),
                                 borderSide: BorderSide(color: subtle),
                               ),
                               focusedBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(8),
-                                borderSide: const BorderSide(color: kAccent, width: 1.5),
+                                borderSide: const BorderSide(
+                                  color: kAccent,
+                                  width: 1.5,
+                                ),
                               ),
                             ),
                           ),
@@ -1647,23 +1806,33 @@ class _HomePageState extends State<HomePage> {
                               hintText: '访问令牌（主机启用时填写）',
                               hintStyle: TextStyle(
                                 fontSize: 13,
-                                color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
+                                color: dark
+                                    ? Colors.white38
+                                    : const Color(0xFF9AA0A6),
                               ),
                               prefixIcon: Icon(
                                 Icons.key_rounded,
                                 size: 18,
-                                color: dark ? Colors.white54 : const Color(0xFF7C8390),
+                                color: dark
+                                    ? Colors.white54
+                                    : const Color(0xFF7C8390),
                               ),
                               filled: true,
                               fillColor: fieldFill,
-                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 12,
+                              ),
                               enabledBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(8),
                                 borderSide: BorderSide(color: subtle),
                               ),
                               focusedBorder: OutlineInputBorder(
                                 borderRadius: BorderRadius.circular(8),
-                                borderSide: const BorderSide(color: kAccent, width: 1.5),
+                                borderSide: const BorderSide(
+                                  color: kAccent,
+                                  width: 1.5,
+                                ),
                               ),
                             ),
                           ),
@@ -1678,12 +1847,19 @@ class _HomePageState extends State<HomePage> {
                             const SizedBox(height: 10),
                             Row(
                               children: <Widget>[
-                                Icon(Icons.error_outline, size: 15, color: theme.colorScheme.error),
+                                Icon(
+                                  Icons.error_outline,
+                                  size: 15,
+                                  color: theme.colorScheme.error,
+                                ),
                                 const SizedBox(width: 6),
                                 Expanded(
                                   child: Text(
                                     _error!,
-                                    style: TextStyle(fontSize: 12, color: theme.colorScheme.error),
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: theme.colorScheme.error,
+                                    ),
                                   ),
                                 ),
                               ],
@@ -1696,16 +1872,22 @@ class _HomePageState extends State<HomePage> {
                                 child: SizedBox(
                                   height: 40,
                                   child: ElevatedButton(
-                                    onPressed: _opening ? null : () => _connect(_address.text),
+                                    onPressed: _opening
+                                        ? null
+                                        : () => _connect(_address.text),
                                     style: ElevatedButton.styleFrom(
                                       backgroundColor: kAccent,
                                       foregroundColor: Colors.white,
-                                      disabledBackgroundColor: kAccent.withValues(alpha: 0.5),
+                                      disabledBackgroundColor: kAccent
+                                          .withValues(alpha: 0.5),
                                       elevation: 0,
                                       shape: RoundedRectangleBorder(
                                         borderRadius: BorderRadius.circular(8),
                                       ),
-                                      textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+                                      textStyle: const TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w600,
+                                      ),
                                     ),
                                     child: _opening
                                         ? const SizedBox(
@@ -1713,7 +1895,10 @@ class _HomePageState extends State<HomePage> {
                                             height: 16,
                                             child: CircularProgressIndicator(
                                               strokeWidth: 2,
-                                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                              valueColor:
+                                                  AlwaysStoppedAnimation<Color>(
+                                                    Colors.white,
+                                                  ),
                                             ),
                                           )
                                         : const Text('连接'),
@@ -1733,7 +1918,9 @@ class _HomePageState extends State<HomePage> {
                                     child: Icon(
                                       Icons.more_horiz_rounded,
                                       size: 20,
-                                      color: dark ? Colors.white70 : const Color(0xFF5A6270),
+                                      color: dark
+                                          ? Colors.white70
+                                          : const Color(0xFF5A6270),
                                     ),
                                   ),
                                 ),
@@ -1787,8 +1974,10 @@ class _HomePageState extends State<HomePage> {
                           ),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        child: const Text('清除筛选',
-                            style: TextStyle(fontSize: 11)),
+                        child: const Text(
+                          '清除筛选',
+                          style: TextStyle(fontSize: 11),
+                        ),
                       ),
                     const Spacer(),
                     if (_account != null && _account!.server == _server.url)
@@ -1797,8 +1986,7 @@ class _HomePageState extends State<HomePage> {
                         onPressed: _manageGroups,
                         style: TextButton.styleFrom(foregroundColor: kAccent),
                         icon: const Icon(Icons.folder_outlined, size: 16),
-                        label: const Text('分组',
-                            style: TextStyle(fontSize: 12)),
+                        label: const Text('分组', style: TextStyle(fontSize: 12)),
                       ),
                     TextButton.icon(
                       key: const Key('lan-scan'),
@@ -1823,7 +2011,10 @@ class _HomePageState extends State<HomePage> {
                       child: SizedBox(
                         width: 18,
                         height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: kAccent,
+                        ),
                       ),
                     ),
                   )
@@ -1855,8 +2046,10 @@ class _HomePageState extends State<HomePage> {
                           ),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        child: const Text('清除筛选',
-                            style: TextStyle(fontSize: 12)),
+                        child: const Text(
+                          '清除筛选',
+                          style: TextStyle(fontSize: 12),
+                        ),
                       ),
                     )
                   else
@@ -1903,7 +2096,8 @@ class _HomePageState extends State<HomePage> {
                       for (final Device device in recent)
                         _RecentCard(
                           device: device,
-                          presence: _presence[device.key] ?? DevicePresence.unknown,
+                          presence:
+                              _presence[device.key] ?? DevicePresence.unknown,
                           onTap: () => _connectDevice(device),
                           onSave: () => _promote(device),
                         ),
@@ -1925,7 +2119,9 @@ class _HomePageState extends State<HomePage> {
     final ThemeData theme = Theme.of(context);
     final bool dark = theme.brightness == Brightness.dark;
     final Color subtle = dark ? Colors.white12 : const Color(0xFFE4E6EB);
-    final Color fieldFill = dark ? const Color(0xFF1F2026) : const Color(0xFFF7F8FA);
+    final Color fieldFill = dark
+        ? const Color(0xFF1F2026)
+        : const Color(0xFFF7F8FA);
     final List<String> tags = _availableFilterTags(saved);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1947,8 +2143,10 @@ class _HomePageState extends State<HomePage> {
               size: 16,
               color: dark ? Colors.white54 : const Color(0xFF7C8390),
             ),
-            prefixIconConstraints:
-                const BoxConstraints(minWidth: 34, minHeight: 34),
+            prefixIconConstraints: const BoxConstraints(
+              minWidth: 34,
+              minHeight: 34,
+            ),
             suffixIcon: _deviceQuery.isEmpty
                 ? null
                 : IconButton(
@@ -1965,12 +2163,16 @@ class _HomePageState extends State<HomePage> {
                       setState(() => _deviceQuery = '');
                     },
                   ),
-            suffixIconConstraints:
-                const BoxConstraints(minWidth: 34, minHeight: 34),
+            suffixIconConstraints: const BoxConstraints(
+              minWidth: 34,
+              minHeight: 34,
+            ),
             filled: true,
             fillColor: fieldFill,
-            contentPadding:
-                const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 10,
+              vertical: 10,
+            ),
             enabledBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(8),
               borderSide: BorderSide(color: subtle),
@@ -2030,8 +2232,8 @@ class _HomePageState extends State<HomePage> {
           color: selected
               ? kAccent.withValues(alpha: 0.55)
               : dark
-                  ? Colors.white12
-                  : const Color(0xFFE4E6EB),
+              ? Colors.white12
+              : const Color(0xFFE4E6EB),
         ),
       ),
       clipBehavior: Clip.antiAlias,
@@ -2066,7 +2268,8 @@ class _HomePageState extends State<HomePage> {
     };
     final List<Device> ungrouped = <Device>[];
     for (final Device device in saved) {
-      final bool inGroup = device.viaServer &&
+      final bool inGroup =
+          device.viaServer &&
           device.server == _server.url &&
           groupsById.containsKey(device.groupId);
       if (inGroup) {
@@ -2085,7 +2288,9 @@ class _HomePageState extends State<HomePage> {
       return Wrap(
         spacing: 12,
         runSpacing: 12,
-        children: <Widget>[for (final Device device in saved) _deviceCard(device)],
+        children: <Widget>[
+          for (final Device device in saved) _deviceCard(device),
+        ],
       );
     }
     return Column(
@@ -2149,7 +2354,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _deviceCard(Device device) {
-    final bool accountReady = _account != null &&
+    final bool accountReady =
+        _account != null &&
         _account!.server == _server.url &&
         device.viaServer &&
         device.server == _server.url;
@@ -2188,7 +2394,9 @@ class _HomePageState extends State<HomePage> {
             Icon(
               ungrouped ? Icons.inbox_outlined : Icons.folder_open_rounded,
               size: 16,
-              color: ungrouped ? theme.colorScheme.onSurface.withValues(alpha: 0.5) : kAccent,
+              color: ungrouped
+                  ? theme.colorScheme.onSurface.withValues(alpha: 0.5)
+                  : kAccent,
             ),
             const SizedBox(width: 7),
             Text(
@@ -2227,19 +2435,22 @@ class _HomePageState extends State<HomePage> {
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.55),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: dark ? Colors.white12 : const Color(0xFFE4E6EB)),
+        border: Border.all(
+          color: dark ? Colors.white12 : const Color(0xFFE4E6EB),
+        ),
       ),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            Icon(icon, size: 25, color: dark ? Colors.white30 : const Color(0xFFA8AEB8)),
+            Icon(
+              icon,
+              size: 25,
+              color: dark ? Colors.white30 : const Color(0xFFA8AEB8),
+            ),
             const SizedBox(height: 8),
             Text(text, style: mutedStyle(context)),
-            if (action != null) ...<Widget>[
-              const SizedBox(height: 4),
-              action,
-            ],
+            if (action != null) ...<Widget>[const SizedBox(height: 4), action],
           ],
         ),
       ),
@@ -2320,7 +2531,11 @@ class _Sidebar extends StatelessWidget {
                     ),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Icon(Icons.desktop_windows_rounded, color: Colors.white, size: 20),
+                  child: const Icon(
+                    Icons.desktop_windows_rounded,
+                    color: Colors.white,
+                    size: 20,
+                  ),
                 ),
                 const SizedBox(width: 10),
                 Column(
@@ -2378,7 +2593,10 @@ class _Sidebar extends StatelessWidget {
                               ),
                             ),
                             const SizedBox(height: 3),
-                            Text('查看器 · Windows', style: mutedStyle(context, size: 10)),
+                            Text(
+                              '查看器 · Windows',
+                              style: mutedStyle(context, size: 10),
+                            ),
                           ],
                         ),
                       ),
@@ -2413,9 +2631,13 @@ class _Sidebar extends StatelessWidget {
                   child: Row(
                     children: <Widget>[
                       Icon(
-                        server.configured ? Icons.cloud_done_outlined : Icons.cloud_off_outlined,
+                        server.configured
+                            ? Icons.cloud_done_outlined
+                            : Icons.cloud_off_outlined,
                         size: 17,
-                        color: server.configured ? kAccent : (dark ? Colors.white38 : const Color(0xFF8A919C)),
+                        color: server.configured
+                            ? kAccent
+                            : (dark ? Colors.white38 : const Color(0xFF8A919C)),
                       ),
                       const SizedBox(width: 8),
                       Expanded(
@@ -2436,7 +2658,7 @@ class _Sidebar extends StatelessWidget {
                             Text(
                               server.configured
                                   ? '${server.mode.shortLabel}'
-                                      '${onlineCount > 0 ? ' · $onlineCount 台在线' : ''}'
+                                        '${onlineCount > 0 ? ' · $onlineCount 台在线' : ''}'
                                   : '点击配置',
                               style: mutedStyle(context, size: 9.5),
                             ),
@@ -2460,12 +2682,16 @@ class _Sidebar extends StatelessWidget {
                 Icon(
                   Icons.shield_outlined,
                   size: 13,
-                  color: trustedCount > 0 ? kAccent : (dark ? Colors.white30 : const Color(0xFFA8AEB8)),
+                  color: trustedCount > 0
+                      ? kAccent
+                      : (dark ? Colors.white30 : const Color(0xFFA8AEB8)),
                 ),
                 const SizedBox(width: 5),
                 Expanded(
                   child: Text(
-                    trustedCount > 0 ? '已固定 $trustedCount 个主机身份' : '首次连接时记录主机证书指纹',
+                    trustedCount > 0
+                        ? '已固定 $trustedCount 个主机身份'
+                        : '首次连接时记录主机证书指纹',
                     style: mutedStyle(context, size: 10),
                   ),
                 ),
@@ -2526,8 +2752,8 @@ class _Sidebar extends StatelessWidget {
                               syncing
                                   ? '同步中…'
                                   : account == null
-                                      ? '登录以同步地址簿'
-                                      : '账号地址簿已连接',
+                                  ? '登录以同步地址簿'
+                                  : '账号地址簿已连接',
                               style: mutedStyle(context, size: 9.5),
                             ),
                           ],
@@ -2546,7 +2772,9 @@ class _Sidebar extends StatelessWidget {
                         Icon(
                           Icons.sync_rounded,
                           size: 14,
-                          color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
+                          color: dark
+                              ? Colors.white38
+                              : const Color(0xFF9AA0A6),
                         ),
                     ],
                   ),
@@ -2574,12 +2802,20 @@ class _Sidebar extends StatelessWidget {
                       color: Colors.white.withValues(alpha: 0.22),
                       shape: BoxShape.circle,
                     ),
-                    child: const Icon(Icons.bolt_rounded, color: Colors.white, size: 18),
+                    child: const Icon(
+                      Icons.bolt_rounded,
+                      color: Colors.white,
+                      size: 18,
+                    ),
                   ),
                   const SizedBox(height: 10),
                   const Text(
                     '直连优先',
-                    style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600),
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                   const SizedBox(height: 3),
                   Text(
@@ -2596,7 +2832,11 @@ class _Sidebar extends StatelessWidget {
             const SizedBox(height: 14),
             Row(
               children: <Widget>[
-                Icon(Icons.circle, size: 7, color: dark ? Colors.white24 : const Color(0xFFB6BCC6)),
+                Icon(
+                  Icons.circle,
+                  size: 7,
+                  color: dark ? Colors.white24 : const Color(0xFFB6BCC6),
+                ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
@@ -2659,11 +2899,7 @@ class _UpdateBanner extends StatelessWidget {
       ),
       child: Row(
         children: <Widget>[
-          const Icon(
-            Icons.system_update_alt_rounded,
-            size: 18,
-            color: kAccent,
-          ),
+          const Icon(Icons.system_update_alt_rounded, size: 18, color: kAccent),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -3005,7 +3241,9 @@ class _GroupPickerDialog extends StatelessWidget {
         leading: Icon(
           value.isEmpty ? Icons.inbox_outlined : Icons.folder_outlined,
           size: 18,
-          color: active ? kAccent : theme.colorScheme.onSurface.withValues(alpha: 0.6),
+          color: active
+              ? kAccent
+              : theme.colorScheme.onSurface.withValues(alpha: 0.6),
         ),
         title: Text(
           label,
@@ -3013,7 +3251,9 @@ class _GroupPickerDialog extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(fontSize: 13),
         ),
-        trailing: active ? Icon(Icons.check_rounded, size: 18, color: kAccent) : null,
+        trailing: active
+            ? Icon(Icons.check_rounded, size: 18, color: kAccent)
+            : null,
         onTap: () => Navigator.of(context).pop(value),
       );
     }
@@ -3064,8 +3304,9 @@ class _WakeDialog extends StatefulWidget {
 }
 
 class _WakeDialogState extends State<_WakeDialog> {
-  late final TextEditingController _mac =
-      TextEditingController(text: widget.device.mac);
+  late final TextEditingController _mac = TextEditingController(
+    text: widget.device.mac,
+  );
   String? _error;
 
   @override
@@ -3119,10 +3360,7 @@ class _WakeDialogState extends State<_WakeDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('取消'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('唤醒'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('唤醒')),
       ],
     );
   }
@@ -3162,12 +3400,11 @@ class _DeviceCard extends StatelessWidget {
     final String tags = _deviceTags(device, presence);
     final List<String> detail = <String>[
       if (title != device.id) device.id,
-      if (tags.isNotEmpty)
-        tags
-      else if (device.viaServer)
-        device.server,
+      if (tags.isNotEmpty) tags else if (device.viaServer) device.server,
     ];
-    final String detailText = detail.isEmpty ? device.detail : detail.join(' · ');
+    final String detailText = detail.isEmpty
+        ? device.detail
+        : detail.join(' · ');
     return SizedBox(
       width: 250,
       height: 92,
@@ -3221,7 +3458,11 @@ class _DeviceCard extends StatelessWidget {
                           ),
                           if (pinned) ...<Widget>[
                             const SizedBox(width: 5),
-                            Icon(Icons.verified_user_outlined, size: 12, color: kAccent),
+                            Icon(
+                              Icons.verified_user_outlined,
+                              size: 12,
+                              color: kAccent,
+                            ),
                           ],
                         ],
                       ),
@@ -3259,26 +3500,36 @@ class _DeviceCard extends StatelessWidget {
                       onDelete();
                     }
                   },
-                  itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-                    const PopupMenuItem<String>(value: 'rename', child: Text('重命名')),
-                    const PopupMenuItem<String>(value: 'wake', child: Text('唤醒')),
-                    if (onLabels != null)
-                      const PopupMenuItem<String>(
-                        value: 'labels',
-                        child: Text('服务端别名/标签'),
-                      ),
-                    if (onTags != null)
-                      const PopupMenuItem<String>(
-                        value: 'tags',
-                        child: Text('账号标签'),
-                      ),
-                    if (onGroup != null)
-                      const PopupMenuItem<String>(
-                        value: 'group',
-                        child: Text('移动到分组'),
-                      ),
-                    const PopupMenuItem<String>(value: 'delete', child: Text('删除')),
-                  ],
+                  itemBuilder: (BuildContext context) =>
+                      <PopupMenuEntry<String>>[
+                        const PopupMenuItem<String>(
+                          value: 'rename',
+                          child: Text('重命名'),
+                        ),
+                        const PopupMenuItem<String>(
+                          value: 'wake',
+                          child: Text('唤醒'),
+                        ),
+                        if (onLabels != null)
+                          const PopupMenuItem<String>(
+                            value: 'labels',
+                            child: Text('服务端别名/标签'),
+                          ),
+                        if (onTags != null)
+                          const PopupMenuItem<String>(
+                            value: 'tags',
+                            child: Text('账号标签'),
+                          ),
+                        if (onGroup != null)
+                          const PopupMenuItem<String>(
+                            value: 'group',
+                            child: Text('移动到分组'),
+                          ),
+                        const PopupMenuItem<String>(
+                          value: 'delete',
+                          child: Text('删除'),
+                        ),
+                      ],
                 ),
               ],
             ),
@@ -3288,7 +3539,11 @@ class _DeviceCard extends StatelessWidget {
     );
   }
 
-  Widget _presenceLine(BuildContext context, DevicePresence presence, Device device) {
+  Widget _presenceLine(
+    BuildContext context,
+    DevicePresence presence,
+    Device device,
+  ) {
     final bool dark = Theme.of(context).brightness == Brightness.dark;
     Color color;
     String text;
@@ -3401,7 +3656,9 @@ class _RecentCard extends StatelessWidget {
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: Icon(
-                    device.viaServer ? Icons.dns_outlined : Icons.desktop_windows_rounded,
+                    device.viaServer
+                        ? Icons.dns_outlined
+                        : Icons.desktop_windows_rounded,
                     color: kAccent,
                     size: 19,
                   ),
@@ -3550,10 +3807,10 @@ class _LanScanDialogState extends State<_LanScanDialog> {
           onPressed: !canAdd || _selected.isEmpty
               ? null
               : () => Navigator.of(context).pop(
-                    _peers
-                        .where((LanPeer peer) => _selected.contains(peer.id))
-                        .toList(),
-                  ),
+                  _peers
+                      .where((LanPeer peer) => _selected.contains(peer.id))
+                      .toList(),
+                ),
           child: Text(_selected.isEmpty ? '添加' : '添加 ${_selected.length} 台'),
         ),
       ],
@@ -3614,10 +3871,7 @@ class _LanScanDialogState extends State<_LanScanDialog> {
             style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
           ),
           subtitle: Text(
-            <String>[
-              peer.detail,
-              if (peer.mac.isNotEmpty) peer.mac,
-            ].join('\n'),
+            <String>[peer.detail, if (peer.mac.isNotEmpty) peer.mac].join('\n'),
             style: mutedStyle(context, size: 11),
           ),
           isThreeLine: peer.mac.isNotEmpty,
@@ -3686,8 +3940,9 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final String service =
-        widget.server.configured ? widget.server.url : '未配置连接服务';
+    final String service = widget.server.configured
+        ? widget.server.url
+        : '未配置连接服务';
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
@@ -3753,8 +4008,9 @@ class _RenameDialog extends StatefulWidget {
 }
 
 class _RenameDialogState extends State<_RenameDialog> {
-  late final TextEditingController _name =
-      TextEditingController(text: widget.device.name);
+  late final TextEditingController _name = TextEditingController(
+    text: widget.device.name,
+  );
 
   @override
   void dispose() {
@@ -3806,6 +4062,9 @@ class _AccountDialog extends StatefulWidget {
     required this.server,
     required this.account,
     required this.login,
+    required this.requestLoginSMS,
+    required this.requestLoginEmail,
+    required this.securityKeyLogin,
     required this.syncing,
     this.groups = const <AddressBookGroup>[],
   });
@@ -3813,6 +4072,9 @@ class _AccountDialog extends StatefulWidget {
   final ServerSettings server;
   final AccountSession? account;
   final AccountLogin login;
+  final LoginSMSRequester requestLoginSMS;
+  final LoginEmailRequester requestLoginEmail;
+  final AccountSecurityKeyLogin securityKeyLogin;
   final bool syncing;
   final List<AddressBookGroup> groups;
 
@@ -3825,10 +4087,17 @@ class _AccountDialogState extends State<_AccountDialog> {
   final TextEditingController _password = TextEditingController();
   final TextEditingController _totp = TextEditingController();
   final TextEditingController _recovery = TextEditingController();
+  final TextEditingController _sms = TextEditingController();
+  final TextEditingController _email = TextEditingController();
   bool _busy = false;
   bool _needsTotp = false;
   bool _useRecovery = false;
+  bool _useSms = false;
+  bool _useEmail = false;
+  bool _sendingSms = false;
+  bool _sendingEmail = false;
   String _error = '';
+  String _notice = '';
 
   @override
   void dispose() {
@@ -3836,6 +4105,8 @@ class _AccountDialogState extends State<_AccountDialog> {
     _password.dispose();
     _totp.dispose();
     _recovery.dispose();
+    _sms.dispose();
+    _email.dispose();
     super.dispose();
   }
 
@@ -3844,12 +4115,22 @@ class _AccountDialogState extends State<_AccountDialog> {
     final String password = _password.text;
     final String totp = _totp.text.trim();
     final String recovery = _recovery.text.trim();
+    final String sms = _sms.text.trim();
+    final String email = _email.text.trim();
     if (username.isEmpty || password.isEmpty) {
       setState(() => _error = '请输入用户名和密码');
       return;
     }
     if (_useRecovery && recovery.isEmpty) {
       setState(() => _error = '请输入恢复码');
+      return;
+    }
+    if (_useSms && sms.isEmpty) {
+      setState(() => _error = '请输入短信验证码');
+      return;
+    }
+    if (_useEmail && email.isEmpty) {
+      setState(() => _error = '请输入邮件验证码');
       return;
     }
     setState(() {
@@ -3861,25 +4142,12 @@ class _AccountDialogState extends State<_AccountDialog> {
         widget.server,
         username: username,
         password: password,
-        totpCode: _useRecovery ? '' : totp,
+        totpCode: _useRecovery || _useSms || _useEmail ? '' : totp,
         recoveryCode: _useRecovery ? recovery : '',
+        smsCode: _useSms ? sms : '',
+        emailCode: _useEmail ? email : '',
       );
-      if (!mounted) {
-        return;
-      }
-      final DateTime issued = DateTime.now().toUtc();
-      Navigator.of(context).pop(_AccountResult(
-        session: AccountSession(
-          server: widget.server.url,
-          username: result.username.isEmpty ? username : result.username,
-          token: result.token,
-          expiresAt: issued.add(Duration(milliseconds: result.expiresInMs)),
-          refreshToken: result.refreshToken,
-          refreshExpiresAt: result.refreshToken.isEmpty
-              ? null
-              : issued.add(Duration(milliseconds: result.refreshExpiresInMs)),
-        ),
-      ));
+      _finishLogin(username, result);
     } on ServerApiException catch (error) {
       if (mounted) {
         final bool twoFactor =
@@ -3900,11 +4168,197 @@ class _AccountDialogState extends State<_AccountDialog> {
     }
   }
 
+  void _finishLogin(String fallbackUsername, AccountLoginResult result) {
+    if (!mounted) {
+      return;
+    }
+    final DateTime issued = DateTime.now().toUtc();
+    Navigator.of(context).pop(
+      _AccountResult(
+        session: AccountSession(
+          server: widget.server.url,
+          username: result.username.isEmpty ? fallbackUsername : result.username,
+          token: result.token,
+          expiresAt: issued.add(Duration(milliseconds: result.expiresInMs)),
+          refreshToken: result.refreshToken,
+          refreshExpiresAt: result.refreshToken.isEmpty
+              ? null
+              : issued.add(Duration(milliseconds: result.refreshExpiresInMs)),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _submitSecurityKey() async {
+    final String username = _username.text.trim();
+    final String password = _password.text;
+    if (username.isEmpty || password.isEmpty) {
+      setState(() => _error = '请输入用户名和密码');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+      _notice = '';
+    });
+    try {
+      final AccountLoginResult result = await widget.securityKeyLogin(
+        widget.server,
+        username: username,
+        password: password,
+      );
+      _finishLogin(username, result);
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } on SecurityKeyException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '安全密钥登录失败：$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _sendLoginSMS() async {
+    final String username = _username.text.trim();
+    final String password = _password.text;
+    if (username.isEmpty || password.isEmpty) {
+      setState(() => _error = '请输入用户名和密码');
+      return;
+    }
+    setState(() {
+      _sendingSms = true;
+      _error = '';
+      _notice = '';
+    });
+    try {
+      await widget.requestLoginSMS(
+        widget.server,
+        username: username,
+        password: password,
+      );
+      if (mounted) {
+        setState(() {
+          _sendingSms = false;
+          _notice = '短信验证码已发送到绑定的手机号';
+        });
+      }
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _sendingSms = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _sendingSms = false;
+          _error = '发送短信验证码失败：$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _sendLoginEmail() async {
+    final String username = _username.text.trim();
+    final String password = _password.text;
+    if (username.isEmpty || password.isEmpty) {
+      setState(() => _error = '请输入用户名和密码');
+      return;
+    }
+    setState(() {
+      _sendingEmail = true;
+      _error = '';
+      _notice = '';
+    });
+    try {
+      await widget.requestLoginEmail(
+        widget.server,
+        username: username,
+        password: password,
+      );
+      if (mounted) {
+        setState(() {
+          _sendingEmail = false;
+          _notice = '邮件验证码已发送到绑定的邮箱';
+        });
+      }
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _sendingEmail = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _sendingEmail = false;
+          _error = '发送邮件验证码失败：$error';
+        });
+      }
+    }
+  }
+
+  void _useSmsFactor() {
+    setState(() {
+      _useSms = true;
+      _useRecovery = false;
+      _useEmail = false;
+      _error = '';
+      _notice = '';
+    });
+    _sendLoginSMS();
+  }
+
+  void _useEmailFactor() {
+    setState(() {
+      _useEmail = true;
+      _useSms = false;
+      _useRecovery = false;
+      _error = '';
+      _notice = '';
+    });
+    _sendLoginEmail();
+  }
+
+  void _useTotpFactor() {
+    setState(() {
+      _useSms = false;
+      _useEmail = false;
+      _useRecovery = false;
+      _error = '';
+    });
+  }
+
   Future<void> _openTwoFactor(AccountSession account) {
     return showDialog<void>(
       context: context,
       builder: (BuildContext context) {
         return TwoFactorDialog(server: widget.server, account: account);
+      },
+    );
+  }
+
+  Future<void> _openSecurityKeys(AccountSession account) {
+    return showDialog<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return SecurityKeyDialog(server: widget.server, account: account);
       },
     );
   }
@@ -3942,10 +4396,69 @@ class _AccountDialogState extends State<_AccountDialog> {
       },
     );
     if (changed == true && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('密码已修改，其他设备已退出')));
+    }
+  }
+
+  Future<void> _openRecoveryEmail(AccountSession account) async {
+    final String? email = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) {
+        return RecoveryEmailDialog(server: widget.server, account: account);
+      },
+    );
+    if (email != null && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('密码已修改，其他设备已退出')),
+        SnackBar(content: Text(email.isEmpty ? '找回邮箱已清除' : '找回邮箱已更新')),
       );
     }
+  }
+
+  Future<void> _openRecoveryPhone(AccountSession account) async {
+    final String? phone = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) {
+        return RecoveryPhoneDialog(server: widget.server, account: account);
+      },
+    );
+    if (phone != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(phone.isEmpty ? '找回手机已清除' : '找回手机已更新')),
+      );
+    }
+  }
+
+  Future<void> _openForgotPassword() async {
+    final String? username = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) {
+        return ForgotPasswordDialog(
+          server: widget.server,
+          initialUsername: _username.text.trim(),
+        );
+      },
+    );
+    if (username == null || !mounted) {
+      return;
+    }
+    setState(() {
+      _username.text = username;
+      _password.clear();
+      _totp.clear();
+      _recovery.clear();
+      _sms.clear();
+      _email.clear();
+      _needsTotp = false;
+      _useRecovery = false;
+      _useSms = false;
+      _useEmail = false;
+      _sendingSms = false;
+      _sendingEmail = false;
+      _error = '';
+      _notice = '密码已重置，请用新密码登录';
+    });
   }
 
   @override
@@ -3958,7 +4471,9 @@ class _AccountDialogState extends State<_AccountDialog> {
       title: Text(account == null ? '登录账号' : '账号'),
       content: SizedBox(
         width: 380,
-        child: account == null ? _loginForm(context) : _accountView(context, account),
+        child: account == null
+            ? _loginForm(context)
+            : _accountView(context, account),
       ),
       actions: account == null
           ? <Widget>[
@@ -3985,8 +4500,9 @@ class _AccountDialogState extends State<_AccountDialog> {
               ),
               TextButton(
                 key: const Key('account-logout'),
-                onPressed: () => Navigator.of(context)
-                    .pop(const _AccountResult(logout: true)),
+                onPressed: () => Navigator.of(
+                  context,
+                ).pop(const _AccountResult(logout: true)),
                 style: TextButton.styleFrom(
                   foregroundColor: theme.colorScheme.error,
                 ),
@@ -3996,8 +4512,9 @@ class _AccountDialogState extends State<_AccountDialog> {
                 key: const Key('account-sync'),
                 onPressed: widget.syncing
                     ? null
-                    : () => Navigator.of(context)
-                        .pop(const _AccountResult(sync: true)),
+                    : () => Navigator.of(
+                        context,
+                      ).pop(const _AccountResult(sync: true)),
                 child: Text(widget.syncing ? '同步中…' : '立即同步'),
               ),
             ],
@@ -4038,6 +4555,14 @@ class _AccountDialogState extends State<_AccountDialog> {
           ),
           onSubmitted: (_) => _submit(),
         ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            key: const Key('account-forgot-password'),
+            onPressed: _busy ? null : _openForgotPassword,
+            child: const Text('忘记密码？'),
+          ),
+        ),
         if (_needsTotp) ...<Widget>[
           const SizedBox(height: 12),
           if (_useRecovery)
@@ -4051,6 +4576,44 @@ class _AccountDialogState extends State<_AccountDialog> {
                 labelText: '恢复码',
                 hintText: 'ABCD-EFGH-IJKL-MNOP',
                 prefixIcon: Icon(Icons.key_outlined, size: 18),
+              ),
+              onSubmitted: (_) => _submit(),
+            )
+          else if (_useSms)
+            TextField(
+              key: const Key('account-sms'),
+              controller: _sms,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              inputFormatters: <TextInputFormatter>[
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(8),
+              ],
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: '短信验证码',
+                hintText: '8 位数字',
+                prefixIcon: Icon(Icons.sms_outlined, size: 18),
+              ),
+              onSubmitted: (_) => _submit(),
+            )
+          else if (_useEmail)
+            TextField(
+              key: const Key('account-email-code'),
+              controller: _email,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              inputFormatters: <TextInputFormatter>[
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(8),
+              ],
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: '邮件验证码',
+                hintText: '8 位数字',
+                prefixIcon: Icon(Icons.mail_outlined, size: 18),
               ),
               onSubmitted: (_) => _submit(),
             )
@@ -4070,18 +4633,58 @@ class _AccountDialogState extends State<_AccountDialog> {
               ),
               onSubmitted: (_) => _submit(),
             ),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton(
-              key: const Key('account-use-recovery'),
-              onPressed: _busy
-                  ? null
-                  : () => setState(() {
-                        _useRecovery = !_useRecovery;
-                        _error = '';
-                      }),
-              child: Text(_useRecovery ? '使用身份验证器验证码' : '验证器丢失？使用恢复码'),
-            ),
+          Wrap(
+            spacing: 8,
+            children: <Widget>[
+              if (_useRecovery || _useSms || _useEmail)
+                TextButton(
+                  key: const Key('account-use-totp'),
+                  onPressed: _busy ? null : _useTotpFactor,
+                  child: const Text('使用身份验证器验证码'),
+                )
+              else
+                TextButton(
+                  key: const Key('account-use-recovery'),
+                  onPressed: _busy
+                      ? null
+                      : () => setState(() {
+                          _useRecovery = true;
+                          _useSms = false;
+                          _useEmail = false;
+                          _error = '';
+                        }),
+                  child: const Text('验证器丢失？使用恢复码'),
+                ),
+              if (_useSms)
+                TextButton(
+                  key: const Key('account-send-sms'),
+                  onPressed: _busy || _sendingSms ? null : _sendLoginSMS,
+                  child: Text(_sendingSms ? '发送中…' : '重新发送短信验证码'),
+                )
+              else
+                TextButton(
+                  key: const Key('account-use-sms'),
+                  onPressed: _busy || _sendingSms ? null : _useSmsFactor,
+                  child: const Text('使用短信验证码'),
+                ),
+              if (_useEmail)
+                TextButton(
+                  key: const Key('account-send-email'),
+                  onPressed: _busy || _sendingEmail ? null : _sendLoginEmail,
+                  child: Text(_sendingEmail ? '发送中…' : '重新发送邮件验证码'),
+                )
+              else
+                TextButton(
+                  key: const Key('account-use-email'),
+                  onPressed: _busy || _sendingEmail ? null : _useEmailFactor,
+                  child: const Text('使用邮件验证码'),
+                ),
+              TextButton(
+                key: const Key('account-use-security-key'),
+                onPressed: _busy ? null : _submitSecurityKey,
+                child: const Text('使用安全密钥'),
+              ),
+            ],
           ),
         ],
         const SizedBox(height: 10),
@@ -4091,6 +4694,17 @@ class _AccountDialogState extends State<_AccountDialog> {
               : '请先在连接服务中填写服务地址',
           style: mutedStyle(context, size: 10.5),
         ),
+        if (_notice.isNotEmpty) ...<Widget>[
+          const SizedBox(height: 10),
+          Text(
+            _notice,
+            key: const Key('account-notice'),
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.primary,
+              fontSize: 12,
+            ),
+          ),
+        ],
         if (_error.isNotEmpty) ...<Widget>[
           const SizedBox(height: 10),
           Text(
@@ -4144,10 +4758,7 @@ class _AccountDialogState extends State<_AccountDialog> {
           ],
         ),
         const SizedBox(height: 16),
-        Text(
-          '账号地址簿会在此设备与其他已登录设备之间同步。',
-          style: mutedStyle(context, size: 12),
-        ),
+        Text('账号地址簿会在此设备与其他已登录设备之间同步。', style: mutedStyle(context, size: 12)),
         const SizedBox(height: 8),
         Text(
           '登录有效期至 ${_formatTime(account.expiresAt.toLocal())}',
@@ -4183,10 +4794,31 @@ class _AccountDialogState extends State<_AccountDialog> {
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
+          key: const Key('account-recovery-email'),
+          onPressed: _busy ? null : () => _openRecoveryEmail(account),
+          icon: const Icon(Icons.alternate_email_rounded, size: 17),
+          label: const Text('找回邮箱'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          key: const Key('account-recovery-phone'),
+          onPressed: _busy ? null : () => _openRecoveryPhone(account),
+          icon: const Icon(Icons.smartphone_rounded, size: 17),
+          label: const Text('找回手机'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
           key: const Key('account-two-factor'),
           onPressed: _busy ? null : () => _openTwoFactor(account),
           icon: const Icon(Icons.shield_outlined, size: 17),
           label: const Text('两步验证'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          key: const Key('account-security-keys'),
+          onPressed: _busy ? null : () => _openSecurityKeys(account),
+          icon: const Icon(Icons.fingerprint_rounded, size: 17),
+          label: const Text('安全密钥（Windows Hello）'),
         ),
       ],
     );
@@ -4233,8 +4865,9 @@ class _ServerDialogState extends State<_ServerDialog> {
 
   Future<void> _loadPin() async {
     final String url = normalizeServerUrl(_url.text);
-    final ServerIdentityPin? pin =
-        url.isEmpty ? null : await widget.identityStore.pinFor(url);
+    final ServerIdentityPin? pin = url.isEmpty
+        ? null
+        : await widget.identityStore.pinFor(url);
     if (mounted) {
       setState(() => _pin = pin);
     }
@@ -4260,11 +4893,9 @@ class _ServerDialogState extends State<_ServerDialog> {
       _statusOk = false;
     });
     try {
-      await ServerApi.check(ServerSettings(
-        url: url,
-        mode: _mode,
-        key: _key.text.trim(),
-      ));
+      await ServerApi.check(
+        ServerSettings(url: url, mode: _mode, key: _key.text.trim()),
+      );
       if (mounted) {
         setState(() {
           _status = '服务可用，密钥有效';
@@ -4295,11 +4926,9 @@ class _ServerDialogState extends State<_ServerDialog> {
       });
       return;
     }
-    Navigator.of(context).pop(ServerSettings(
-      url: url,
-      mode: _mode,
-      key: _key.text.trim(),
-    ));
+    Navigator.of(
+      context,
+    ).pop(ServerSettings(url: url, mode: _mode, key: _key.text.trim()));
   }
 
   @override
@@ -4376,7 +5005,9 @@ class _ServerDialogState extends State<_ServerDialog> {
                       fontSize: 11,
                       color: _status.isEmpty
                           ? Colors.grey
-                          : (_statusOk ? const Color(0xFF4CAF50) : Theme.of(context).colorScheme.error),
+                          : (_statusOk
+                                ? const Color(0xFF4CAF50)
+                                : Theme.of(context).colorScheme.error),
                     ),
                   ),
                 ),

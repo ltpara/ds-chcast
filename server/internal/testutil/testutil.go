@@ -17,6 +17,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/configpush"
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
@@ -27,6 +28,8 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
 	"github.com/ltpara/ds-chcast/server/internal/relaypool"
 	"github.com/ltpara/ds-chcast/server/internal/rendezvous"
+	"github.com/ltpara/ds-chcast/server/internal/software"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 const ServerKey = "test-server-key"
@@ -53,6 +56,12 @@ type Options struct {
 	// SoftwareVersion and SoftwareURL advertise an update like hbbs.
 	SoftwareVersion string
 	SoftwareURL     string
+	// SoftwareDir publishes artifacts under /software/. StartWith hashes the
+	// file named by SoftwareURL and signs the notice with its server identity,
+	// matching the chast-server wiring.
+	SoftwareDir string
+	// RendezvousConfig pushes alternative rendezvous servers to clients.
+	RendezvousConfig *configpush.Config
 	// NoAccounts leaves login and address-book routes unavailable, matching a
 	// server started with --state "".
 	NoAccounts bool
@@ -61,11 +70,28 @@ type Options struct {
 	// LoginPersistent enables the default 3-failures/1-minute lockout backed
 	// by the account database instead of process memory.
 	LoginPersistent bool
+	// Mailer delivers password-reset mail. Nil leaves recovery routes at 503.
+	Mailer api.Mailer
+	// SMS delivers password-reset codes. Nil leaves SMS recovery at 503.
+	SMS api.SMSer
+	// RecoveryURL and RecoveryTTL shape reset links and token lifetime.
+	RecoveryURL string
+	RecoveryTTL time.Duration
+	// SMSTTL bounds SMS reset codes.
+	SMSTTL time.Duration
+	// WebAuthnRPID and WebAuthnOrigins enable the security-key routes.
+	WebAuthnRPID    string
+	WebAuthnOrigins []string
 	// GeoIP labels login addresses in audit events and session lists.
 	GeoIP *geoip.Locator
 	// RelayExtra advertises additional relay hosts (for example the IPv6
 	// listener of the same relay) without making them the primary.
 	RelayExtra []string
+	// CarrierV6 adds an IPv6 shared-carrier listener on ::1 and advertises it,
+	// so tests can cover dual-stack carrier endpoints.
+	CarrierV6 bool
+	// Tracer exports request spans. Nil disables tracing.
+	Tracer *tracing.Tracer
 }
 
 type Server struct {
@@ -84,6 +110,7 @@ type Server struct {
 	IPChanges  *ipchange.Tracker
 	RelayAddrs *relayaddr.List
 	Pool       *relaypool.Pool
+	CarrierV6  string
 }
 
 func Start(t testing.TB) *Server {
@@ -107,9 +134,33 @@ func StartWith(t testing.TB, opts Options) *Server {
 	if err != nil {
 		t.Fatalf("server identity: %v", err)
 	}
-	rm, err := relay.NewManager("127.0.0.1", []int{0, 0}, reg, log,
-		relay.WithViewerTokenRequired(true),
-	)
+	var softwareSHA256, softwareSignature string
+	var softwareSize int64
+	if opts.SoftwareDir != "" {
+		name, err := software.HostedName(opts.SoftwareURL)
+		if err != nil {
+			t.Fatalf("software URL: %v", err)
+		}
+		if name == "" {
+			t.Fatalf("SoftwareDir needs SoftwareURL under %s", software.RoutePrefix)
+		}
+		artifact, err := software.Load(opts.SoftwareDir, name)
+		if err != nil {
+			t.Fatalf("software artifact: %v", err)
+		}
+		softwareSHA256, softwareSize = artifact.SHA256, artifact.Size
+		softwareSignature, err = serverIdentity.SignSoftware(
+			opts.SoftwareVersion, opts.SoftwareURL, softwareSHA256, softwareSize)
+		if err != nil {
+			t.Fatalf("software signature: %v", err)
+		}
+	}
+	var relayOpts []relay.Option
+	relayOpts = append(relayOpts, relay.WithViewerTokenRequired(true))
+	if opts.CarrierV6 {
+		relayOpts = append(relayOpts, relay.WithCarrierBind6("::1"))
+	}
+	rm, err := relay.NewManager("127.0.0.1", []int{0, 0}, reg, log, relayOpts...)
 	if err != nil {
 		t.Fatalf("relay: %v", err)
 	}
@@ -168,31 +219,49 @@ func StartWith(t testing.TB, opts Options) *Server {
 			Lockout:     time.Minute,
 		}, accounts, nil)
 	}
+	carrierV6Host := ""
+	if opts.CarrierV6 {
+		carrierV6Host = "::1"
+	}
 	handler := api.New(api.Config{
-		Registry:        reg,
-		Relay:           rm,
-		Identity:        serverIdentity,
-		PunchAddr:       meet.Addr(),
-		RelayHost:       "127.0.0.1",
-		ServerKey:       ServerKey,
-		TTL:             60 * time.Second,
-		Logger:          log,
-		Limiter:         ratelimit.New(opts.RateLimit, opts.RateBurst),
-		LoginLimiter:    loginLimiter,
-		ProxyHeader:     opts.ProxyHeader,
-		TLS:             opts.TLS,
-		GeoIP:           opts.GeoIP,
-		RelayOnly:       relayOnly,
-		Blocker:         opts.Registration,
-		PunchLog:        punchLog,
-		IPChanges:       ipChanges,
-		RelayAddrs:      relayAddrs,
-		RelayExtra:      opts.RelayExtra,
-		RelayPool:       pool,
-		PunchReadBuffer: meet.ReadBuffer(),
-		SoftwareVersion: opts.SoftwareVersion,
-		SoftwareURL:     opts.SoftwareURL,
-		Accounts:        accounts,
+		Registry:          reg,
+		Relay:             rm,
+		Identity:          serverIdentity,
+		PunchAddr:         meet.Addr(),
+		RelayHost:         "127.0.0.1",
+		ServerKey:         ServerKey,
+		TTL:               60 * time.Second,
+		Logger:            log,
+		Limiter:           ratelimit.New(opts.RateLimit, opts.RateBurst),
+		LoginLimiter:      loginLimiter,
+		ProxyHeader:       opts.ProxyHeader,
+		TLS:               opts.TLS,
+		GeoIP:             opts.GeoIP,
+		RelayOnly:         relayOnly,
+		Blocker:           opts.Registration,
+		PunchLog:          punchLog,
+		IPChanges:         ipChanges,
+		RelayAddrs:        relayAddrs,
+		RelayExtra:        opts.RelayExtra,
+		CarrierV6Host:     carrierV6Host,
+		RelayPool:         pool,
+		PunchReadBuffer:   meet.ReadBuffer(),
+		SoftwareVersion:   opts.SoftwareVersion,
+		SoftwareURL:       opts.SoftwareURL,
+		SoftwareDir:       opts.SoftwareDir,
+		SoftwareSHA256:    softwareSHA256,
+		SoftwareSize:      softwareSize,
+		SoftwareSignature: softwareSignature,
+		Rendezvous:        opts.RendezvousConfig,
+		Accounts:          accounts,
+		Mailer:            opts.Mailer,
+		SMS:               opts.SMS,
+		RecoveryURL:       opts.RecoveryURL,
+		RecoveryTTL:       opts.RecoveryTTL,
+		SMSTTL:            opts.SMSTTL,
+		WebAuthnRPID:      opts.WebAuthnRPID,
+		WebAuthnOrigins:   opts.WebAuthnOrigins,
+		Tracer:            opts.Tracer,
 	})
 	hs := httptest.NewServer(handler)
 	s := &Server{
@@ -211,6 +280,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		IPChanges:  ipChanges,
 		RelayAddrs: relayAddrs,
 		Pool:       pool,
+		CarrierV6:  rm.CarrierV6Addr(),
 	}
 	t.Cleanup(func() {
 		hs.Close()

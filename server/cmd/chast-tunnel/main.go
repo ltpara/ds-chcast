@@ -19,6 +19,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/agent"
 	"github.com/ltpara/ds-chcast/server/internal/lan"
+	"github.com/ltpara/ds-chcast/server/internal/netutil"
 )
 
 func main() {
@@ -49,6 +50,7 @@ func runHost(args []string) error {
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "server key required by the API")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
+	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id registered with the service")
 	oldID := fs.String("old-id", "", "previous host id to migrate on the server (used after changing --id)")
 	key := fs.String("key", "", "host key, at least 8 characters")
@@ -61,11 +63,18 @@ func runHost(args []string) error {
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	lanDiscovery := fs.Bool("lan-discovery", true, "answer LAN discovery pings; exposes id, hostname, username, platform and version on the local link")
 	lanPort := fs.Int("lan-port", lan.DefaultPort, "UDP port for LAN discovery")
+	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
+	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
+	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
 	if *lanPort < 1 || *lanPort > 65535 {
 		return fmt.Errorf("invalid --lan-port %d", *lanPort)
+	}
+	tlsConfig, err := netutil.ClientTLSConfig(*tlsCA, *tlsCert, *tlsKey)
+	if err != nil {
+		return err
 	}
 
 	log := newLogger(*verbose)
@@ -89,6 +98,7 @@ func runHost(args []string) error {
 
 	h, err := agent.StartHost(ctx, agent.HostConfig{
 		ServerURL:       *server,
+		Servers:         splitCSV(*rendezvousList),
 		ServerKey:       *serverKey,
 		ServerPublicKey: *serverPubKey,
 		ID:              *id,
@@ -101,6 +111,7 @@ func runHost(args []string) error {
 		ListenAddr:      *listen,
 		Keepalive:       *keepalive,
 		UPnP:            *upnpEnabled,
+		TLS:             tlsConfig,
 		Logger:          log,
 		OnInfo: func(info agent.HostInfo) {
 			emitMu.Lock()
@@ -167,13 +178,22 @@ func runViewer(args []string) error {
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "server key required by the API")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
+	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id to reach")
 	listen := fs.String("listen", "127.0.0.1:24434", "local UDP address for the QUIC client")
 	mode := fs.String("mode", agent.ModeAuto, "auto: direct, relay or carrier; direct; relay; carrier")
 	directTimeout := fs.Duration("direct-timeout", 2*time.Second, "how long auto waits for the direct path")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
+	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
+	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
+	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
+
+	tlsConfig, err := netutil.ClientTLSConfig(*tlsCA, *tlsCert, *tlsKey)
+	if err != nil {
+		return err
+	}
 
 	log := newLogger(*verbose)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -191,6 +211,7 @@ func runViewer(args []string) error {
 
 	v, err := agent.StartViewer(ctx, agent.ViewerConfig{
 		ServerURL:       *server,
+		Servers:         splitCSV(*rendezvousList),
 		ServerKey:       *serverKey,
 		ServerPublicKey: *serverPubKey,
 		HostID:          *id,
@@ -198,6 +219,7 @@ func runViewer(args []string) error {
 		Mode:            *mode,
 		DirectTimeout:   *directTimeout,
 		UPnP:            *upnpEnabled,
+		TLS:             tlsConfig,
 		Logger:          log,
 		OnPath: func(info agent.PathInfo) {
 			emit(agentEvent{
@@ -295,6 +317,16 @@ func display(value string) string {
 		return "-"
 	}
 	return value
+}
+
+func splitCSV(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 type agentEvent struct {

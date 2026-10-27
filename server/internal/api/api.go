@@ -27,6 +27,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/configpush"
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
@@ -36,6 +37,9 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/relay"
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
 	"github.com/ltpara/ds-chcast/server/internal/relaypool"
+	"github.com/ltpara/ds-chcast/server/internal/software"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
+	"github.com/ltpara/ds-chcast/server/internal/webadmin"
 )
 
 const (
@@ -78,6 +82,10 @@ type Config struct {
 	// rotated primary but never chosen as the primary themselves, so the
 	// carrier endpoint and lease stay on the configured rotation.
 	RelayExtra []string
+	// CarrierV6Host is the advertised IPv6 host of the local shared carrier.
+	// It is only used when the local relay also listens for IPv6 carrier
+	// connections, and is handed out as carrier_v6 alongside the IPv4 endpoint.
+	CarrierV6Host string
 	// RelayPool provisions leases on standalone relay nodes. Nil keeps every
 	// host on the local relay manager.
 	RelayPool *relaypool.Pool
@@ -103,21 +111,63 @@ type Config struct {
 	// way hbbs answers SoftwareUpdate. Both empty disables the notice.
 	SoftwareVersion string
 	SoftwareURL     string
+	// SoftwareDir publishes release files at GET /software/{name}. Empty
+	// disables the download route; it is independent of the advertised notice.
+	SoftwareDir string
+	// SoftwareSHA256, SoftwareSize and SoftwareSignature bind the advertised
+	// artifact. They are only set when the notice points at a hosted file, so
+	// clients can verify the download against the pinned server key.
+	SoftwareSHA256    string
+	SoftwareSize      int64
+	SoftwareSignature string
 	// Accounts backs user login and the per-user address book. Nil means the
 	// server runs without persistent state, so those routes report 503.
 	Accounts *account.Store
+	// WebAuthnRPID and WebAuthnOrigins enable security-key registration and
+	// login. Both must be set; origins are the exact scheme://host[:port]
+	// values a client may report in clientDataJSON.
+	WebAuthnRPID    string
+	WebAuthnOrigins []string
+	// Mailer delivers password-reset messages. Nil disables self-service
+	// recovery, while other account routes keep working.
+	Mailer Mailer
+	// SMS delivers password-reset codes through an HTTP gateway. Nil disables
+	// SMS recovery.
+	SMS SMSer
+	// RecoveryURL is the page a reset link points at. It is optional: the mail
+	// always contains the token itself. RecoveryTTL bounds how long a token
+	// stays usable and defaults to 30 minutes. SMSTTL bounds an SMS code and
+	// defaults to 10 minutes.
+	RecoveryURL string
+	RecoveryTTL time.Duration
+	SMSTTL      time.Duration
+	// Rendezvous pushes an alternate rendezvous server list to hosts and
+	// viewers, the equivalent of RustDesk's ConfigUpdate. Nil disables it.
+	Rendezvous *configpush.Config
+	// Tracer exports one span per HTTP request. Nil disables tracing.
+	Tracer *tracing.Tracer
 }
 
 type server struct {
 	cfg     Config
 	started time.Time
 
-	mu            sync.Mutex
-	requests      map[string]uint64
-	durationSum   map[string]float64
-	durationCount map[string]uint64
-	rateLimited   uint64
-	inFlight      atomic.Int64
+	mu              sync.Mutex
+	requests        map[string]uint64
+	durationSum     map[string]float64
+	durationCount   map[string]uint64
+	durationBuckets map[string][]uint64
+	rateLimited     uint64
+	inFlight        atomic.Int64
+
+	recoveryMu   sync.Mutex
+	recoveryLast map[string]time.Time
+}
+
+// httpDurationBuckets are the Prometheus histogram bounds in seconds. The
+// +Inf bucket is the request count, so it is not stored separately.
+var httpDurationBuckets = []float64{
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 }
 
 func New(cfg Config) http.Handler {
@@ -127,25 +177,48 @@ func New(cfg Config) http.Handler {
 	if cfg.TTL <= 0 {
 		cfg.TTL = 60 * time.Second
 	}
+	if cfg.RecoveryTTL <= 0 {
+		cfg.RecoveryTTL = 30 * time.Minute
+	}
+	if cfg.SMSTTL <= 0 {
+		cfg.SMSTTL = 10 * time.Minute
+	}
 	s := &server{
-		cfg:           cfg,
-		started:       time.Now(),
-		requests:      make(map[string]uint64),
-		durationSum:   make(map[string]float64),
-		durationCount: make(map[string]uint64),
+		cfg:             cfg,
+		started:         time.Now(),
+		requests:        make(map[string]uint64),
+		durationSum:     make(map[string]float64),
+		durationCount:   make(map[string]uint64),
+		durationBuckets: make(map[string][]uint64),
+		recoveryLast:    make(map[string]time.Time),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/hosts", s.register)
 	mux.HandleFunc("GET /v1/hosts", s.lookupBatch)
 	mux.HandleFunc("GET /v1/hosts/{id}", s.lookup)
+	mux.HandleFunc("GET /v1/identities", s.listIdentities)
 	mux.HandleFunc("DELETE /v1/hosts/{id}", s.unregister)
 	mux.HandleFunc("DELETE /v1/identities/{id}", s.resetIdentity)
 	mux.HandleFunc("PATCH /v1/identities/{id}", s.updateIdentity)
 	mux.HandleFunc("POST /v1/account/login", s.login)
+	mux.HandleFunc("POST /v1/account/login/sms", s.requestLoginSMSCode)
+	mux.HandleFunc("POST /v1/account/login/email", s.requestLoginEmailCode)
+	mux.HandleFunc("POST /v1/account/login/webauthn/begin", s.beginWebAuthnLogin)
+	mux.HandleFunc("POST /v1/account/login/webauthn/finish", s.finishWebAuthnLogin)
+	mux.HandleFunc("POST /v1/account/webauthn/register/begin", s.beginWebAuthnRegistration)
+	mux.HandleFunc("POST /v1/account/webauthn/register/finish", s.finishWebAuthnRegistration)
+	mux.HandleFunc("GET /v1/account/webauthn/credentials", s.listWebAuthnCredentials)
+	mux.HandleFunc("POST /v1/account/webauthn/credentials/remove", s.removeWebAuthnCredential)
 	mux.HandleFunc("POST /v1/account/refresh", s.refresh)
 	mux.HandleFunc("POST /v1/account/logout", s.logout)
 	mux.HandleFunc("GET /v1/account", s.accountInfo)
+	mux.HandleFunc("POST /v1/account/email", s.changeAccountEmail)
+	mux.HandleFunc("POST /v1/account/phone", s.changeAccountPhone)
 	mux.HandleFunc("POST /v1/account/password", s.changeAccountPassword)
+	mux.HandleFunc("POST /v1/account/recover", s.requestPasswordRecovery)
+	mux.HandleFunc("POST /v1/account/recover/complete", s.completePasswordRecovery)
+	mux.HandleFunc("POST /v1/account/recover/sms", s.requestSMSPasswordRecovery)
+	mux.HandleFunc("POST /v1/account/recover/sms/complete", s.completeSMSPasswordRecovery)
 	mux.HandleFunc("POST /v1/account/2fa/start", s.startAccountTwoFactor)
 	mux.HandleFunc("POST /v1/account/2fa/enable", s.enableAccountTwoFactor)
 	mux.HandleFunc("POST /v1/account/2fa/disable", s.disableAccountTwoFactor)
@@ -171,6 +244,13 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/addressbook/groups/{id}", s.deleteAddressBookGroup)
 	mux.HandleFunc("GET /v1/server", s.serverInfo)
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.Handle("GET "+webadmin.Prefix, webadmin.Handler())
+	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, webadmin.Prefix, http.StatusMovedPermanently)
+	})
+	if cfg.SoftwareDir != "" {
+		mux.Handle("GET "+software.RoutePrefix+"{name}", software.Handler(cfg.SoftwareDir))
+	}
 	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/audit", s.auditLog)
 	mux.HandleFunc("GET /v1/audit/connections", s.auditConnections)
@@ -180,6 +260,17 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/file-transfers", s.recordAccountFileTransfer)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
+	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)
+	mux.HandleFunc("POST /v1/accounts", s.adminCreateAccount)
+	mux.HandleFunc("PATCH /v1/accounts/{username}", s.adminUpdateAccount)
+	mux.HandleFunc("DELETE /v1/accounts/{username}", s.adminDeleteAccount)
+	mux.HandleFunc("POST /v1/accounts/{username}/ban", s.adminSetAccountBan)
+	mux.HandleFunc("DELETE /v1/accounts/{username}/ban", s.adminSetAccountBan)
+	mux.HandleFunc("POST /v1/accounts/{username}/password", s.adminResetAccountPassword)
+	mux.HandleFunc("POST /v1/accounts/{username}/email", s.adminSetAccountEmail)
+	mux.HandleFunc("POST /v1/accounts/{username}/phone", s.adminSetAccountPhone)
+	mux.HandleFunc("POST /v1/accounts/{username}/sms", s.adminSendAccountSMSCode)
+	mux.HandleFunc("POST /v1/accounts/{username}/2fa/reset", s.adminResetAccountTwoFactor)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return s.instrument(mux)
 }
@@ -211,12 +302,19 @@ type registerResponse struct {
 	ServerPublicKey string   `json:"server_public_key,omitempty"`
 	Binding         string   `json:"binding,omitempty"`
 	Carrier         string   `json:"carrier,omitempty"`
+	CarrierV6       string   `json:"carrier_v6,omitempty"`
 	CarrierToken    string   `json:"carrier_token,omitempty"`
 	// MigratedFrom echoes old_id after a successful registration so the host
 	// can clear its pending migration state. It is informational: an unknown
 	// old id also yields it, which makes a retry idempotent.
 	MigratedFrom string        `json:"migrated_from,omitempty"`
 	Software     *softwareInfo `json:"software,omitempty"`
+	// ConfigSerial and RendezvousServers carry the operator's alternative
+	// rendezvous endpoints. A client keeps the list at the highest serial it
+	// has seen and falls back to the next entry when its current server stops
+	// answering.
+	ConfigSerial      int64    `json:"config_serial,omitempty"`
+	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
 }
 
 // softwareInfo mirrors RustDesk's SoftwareUpdate reply: the newest version and
@@ -224,6 +322,13 @@ type registerResponse struct {
 type softwareInfo struct {
 	Version string `json:"version"`
 	URL     string `json:"url"`
+	// SHA256, Size and Signature are present when the server hosts the file
+	// itself. Signature is Ed25519 over version, url, sha256 and size with the
+	// server identity, so a client that pinned the server key can reject a
+	// swapped notice or binary.
+	SHA256    string `json:"sha256,omitempty"`
+	Size      int64  `json:"size,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
 type lookupResponse struct {
@@ -254,6 +359,7 @@ type lookupResponse struct {
 	LastSeenMS   int64    `json:"last_seen_ms,omitempty"`
 	ExpiresInMS  int64    `json:"expires_in_ms"`
 	Carrier      string   `json:"carrier,omitempty"`
+	CarrierV6    string   `json:"carrier_v6,omitempty"`
 	CarrierToken string   `json:"carrier_token,omitempty"`
 	RelayOnly    bool     `json:"relay_only,omitempty"`
 	// Transport is the path the server believes is usable: direct when a
@@ -262,12 +368,18 @@ type lookupResponse struct {
 	// every candidate.
 	Transport string        `json:"transport,omitempty"`
 	Software  *softwareInfo `json:"software,omitempty"`
+	// ConfigSerial and RendezvousServers mirror the registration reply so a
+	// viewer that only performs lookups still learns about failover servers.
+	ConfigSerial      int64    `json:"config_serial,omitempty"`
+	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
 }
 
 type batchLookupResponse struct {
-	Hosts    []lookupResponse `json:"hosts"`
-	Missing  []string         `json:"missing,omitempty"`
-	Software *softwareInfo    `json:"software,omitempty"`
+	Hosts             []lookupResponse `json:"hosts"`
+	Missing           []string         `json:"missing,omitempty"`
+	Software          *softwareInfo    `json:"software,omitempty"`
+	ConfigSerial      int64            `json:"config_serial,omitempty"`
+	RendezvousServers []string         `json:"rendezvous_servers,omitempty"`
 }
 
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +477,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.IPChanges != nil {
 		s.cfg.IPChanges.Observe(req.ID, clientAddr)
 	}
-	relayEndpoint, relays, carrier, err := s.assignRelay(req.ID, req.PublicKey, host)
+	relayEndpoint, relays, carrier, carrierV6, err := s.assignRelay(req.ID, req.PublicKey, host)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "no relay port is available")
 		return
@@ -380,10 +492,12 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		PublicKey:       host.PublicKey,
 		ServerPublicKey: s.cfg.Identity.PublicKeyText(),
 		Carrier:         carrier,
+		CarrierV6:       carrierV6,
 		CarrierToken:    host.CarrierToken,
 		MigratedFrom:    req.OldID,
 		Software:        s.software(),
 	}
+	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
 	} else {
@@ -440,6 +554,7 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Software = s.software()
 	resp.PunchV6 = s.punchV6(r)
+	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -462,6 +577,7 @@ func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
 		Hosts:    make([]lookupResponse, 0, len(ids)),
 		Software: s.software(),
 	}
+	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
 	for _, id := range ids {
 		host, ok := s.hostLookup(id, now, relayOnly)
 		if !ok {
@@ -575,6 +691,7 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 		}
 		resp.CarrierToken = host.CarrierToken
 		resp.Carrier = s.carrierEndpoint(host)
+		resp.CarrierV6 = s.carrierEndpointV6(host)
 		resp.Transport = s.transport(host, carrierLinked, len(resp.Candidates) > 0)
 	}
 	if host.RelayPort != 0 {
@@ -699,6 +816,7 @@ func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 		"punch":                 s.cfg.PunchAddr,
 		"punch_v6":              s.cfg.PunchAddrV6,
 		"carrier":               carrier,
+		"carrier_v6":            s.localCarrierV6(),
 		"tls":                   s.cfg.TLS,
 		"host_ttl_sec":          int64(s.cfg.TTL / time.Second),
 		"relay_configured":      s.cfg.RelayHost != "",
@@ -714,6 +832,10 @@ func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 	if software := s.software(); software != nil {
 		info["software"] = software
 	}
+	if serial, servers := s.rendezvousConfig(); len(servers) > 0 {
+		info["config_serial"] = serial
+		info["rendezvous_servers"] = servers
+	}
 	writeJSON(w, http.StatusOK, info)
 }
 
@@ -724,7 +846,22 @@ func (s *server) software() *softwareInfo {
 	if s.cfg.SoftwareVersion == "" || s.cfg.SoftwareURL == "" {
 		return nil
 	}
-	return &softwareInfo{Version: s.cfg.SoftwareVersion, URL: s.cfg.SoftwareURL}
+	return &softwareInfo{
+		Version:   s.cfg.SoftwareVersion,
+		URL:       s.cfg.SoftwareURL,
+		SHA256:    s.cfg.SoftwareSHA256,
+		Size:      s.cfg.SoftwareSize,
+		Signature: s.cfg.SoftwareSignature,
+	}
+}
+
+// rendezvousConfig returns the pushed failover list and its serial. Both are
+// zero when the operator did not configure one.
+func (s *server) rendezvousConfig() (int64, []string) {
+	if s.cfg.Rendezvous == nil {
+		return 0, nil
+	}
+	return s.cfg.Rendezvous.Snapshot()
 }
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
@@ -756,6 +893,10 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RelayPool != nil {
 		out["relay_nodes"] = s.cfg.RelayPool.Status()
 	}
+	if serial, servers := s.rendezvousConfig(); len(servers) > 0 {
+		out["config_serial"] = serial
+		out["rendezvous_servers"] = servers
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -764,6 +905,7 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 func (s *server) instrument(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		span := s.cfg.Tracer.Begin(w, r)
 		s.inFlight.Add(1)
 		defer s.inFlight.Add(-1)
 		if !s.cfg.Limiter.Allow(s.clientIP(r)) {
@@ -773,11 +915,13 @@ func (s *server) instrument(next http.Handler) http.Handler {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusTooManyRequests, "too many requests; retry later")
 			s.record(r, http.StatusTooManyRequests, time.Since(start))
+			s.cfg.Tracer.End(span, r, http.StatusTooManyRequests)
 			return
 		}
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		s.record(r, rec.status, time.Since(start))
+		s.cfg.Tracer.End(span, r, rec.status)
 	})
 }
 
@@ -809,10 +953,21 @@ func (s *server) record(r *http.Request, status int, took time.Duration) {
 		endpoint = "other"
 	}
 	key := endpoint + "\x00" + strconv.Itoa(status)
+	seconds := took.Seconds()
 	s.mu.Lock()
 	s.requests[key]++
-	s.durationSum[endpoint] += took.Seconds()
+	s.durationSum[endpoint] += seconds
 	s.durationCount[endpoint]++
+	buckets := s.durationBuckets[endpoint]
+	if buckets == nil {
+		buckets = make([]uint64, len(httpDurationBuckets))
+		s.durationBuckets[endpoint] = buckets
+	}
+	for i, bound := range httpDurationBuckets {
+		if seconds <= bound {
+			buckets[i]++
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -997,11 +1152,15 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	sums := make(map[string]float64, len(s.durationSum))
 	counts := make(map[string]uint64, len(s.durationCount))
+	buckets := make(map[string][]uint64, len(s.durationBuckets))
 	for key, value := range s.durationSum {
 		sums[key] = value
 	}
 	for key, value := range s.durationCount {
 		counts[key] = value
+	}
+	for key, value := range s.durationBuckets {
+		buckets[key] = append([]uint64(nil), value...)
 	}
 	s.mu.Unlock()
 
@@ -1025,8 +1184,19 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 		endpoints = append(endpoints, endpoint)
 	}
 	sort.Strings(endpoints)
-	fmt.Fprintf(&b, "# HELP chast_http_request_duration_seconds API request duration.\n# TYPE chast_http_request_duration_seconds summary\n")
+	fmt.Fprintf(&b, "# HELP chast_http_request_duration_seconds API request duration.\n# TYPE chast_http_request_duration_seconds histogram\n")
 	for _, endpoint := range endpoints {
+		observed := buckets[endpoint]
+		for i, bound := range httpDurationBuckets {
+			var count uint64
+			if i < len(observed) {
+				count = observed[i]
+			}
+			fmt.Fprintf(&b, "chast_http_request_duration_seconds_bucket{endpoint=%q,le=%q} %d\n",
+				endpoint, strconv.FormatFloat(bound, 'g', -1, 64), count)
+		}
+		fmt.Fprintf(&b, "chast_http_request_duration_seconds_bucket{endpoint=%q,le=\"+Inf\"} %d\n",
+			endpoint, counts[endpoint])
 		fmt.Fprintf(&b, "chast_http_request_duration_seconds_sum{endpoint=%q} %.6f\n", endpoint, sums[endpoint])
 		fmt.Fprintf(&b, "chast_http_request_duration_seconds_count{endpoint=%q} %d\n", endpoint, counts[endpoint])
 	}
@@ -1081,11 +1251,24 @@ func (s *server) carrierEndpoint(host registry.Host) string {
 	return net.JoinHostPort(s.relayHostFor(host), strconv.Itoa(port))
 }
 
+// carrierEndpointV6 names the IPv6 endpoint of the same shared carrier. A
+// remote lease carries its own; a local lease uses CarrierV6Host when the
+// local relay has an IPv6 carrier listener.
+func (s *server) carrierEndpointV6(host registry.Host) string {
+	if host.RelayNode != "" {
+		return host.CarrierV6
+	}
+	if s.cfg.Relay == nil || host.RelayPort == 0 {
+		return ""
+	}
+	return s.localCarrierV6()
+}
+
 // assignRelay gives a host a relay lease, preferring standalone relay nodes.
 // When every node is unavailable it falls back to the in-process relay so a
 // single-node outage does not stop new sessions, matching hbbs's relay list
 // with chast's local fallback.
-func (s *server) assignRelay(id, publicKey string, host registry.Host) (string, []string, string, error) {
+func (s *server) assignRelay(id, publicKey string, host registry.Host) (string, []string, string, string, error) {
 	if s.cfg.RelayPool != nil {
 		// The node lease outlives the host lease so a brief hbbs outage does
 		// not tear down a working relay path.
@@ -1094,8 +1277,8 @@ func (s *server) assignRelay(id, publicKey string, host registry.Host) (string, 
 			nodeHost, _, splitErr := splitRelayEndpoint(lease.Relay)
 			if splitErr == nil {
 				s.moveRelayLease(id, host, lease.Node)
-				s.cfg.Registry.SetRemoteRelay(id, lease.Node, lease.Port, nodeHost, lease.Carrier)
-				return lease.Relay, []string{lease.Relay}, lease.Carrier, nil
+				s.cfg.Registry.SetRemoteRelay(id, lease.Node, lease.Port, nodeHost, lease.Carrier, lease.CarrierV6)
+				return lease.Relay, []string{lease.Relay}, lease.Carrier, lease.CarrierV6, nil
 			}
 			err = splitErr
 			s.cfg.RelayPool.ReleaseAsync(lease.Node, id)
@@ -1108,10 +1291,10 @@ func (s *server) assignRelay(id, publicKey string, host registry.Host) (string, 
 	}
 	endpoint, relays, err := s.assignLocalRelay(id, host)
 	if err != nil {
-		return "", nil, "", err
+		return "", nil, "", "", err
 	}
 	relayHost, _, _ := splitRelayEndpoint(endpoint)
-	return endpoint, relays, s.localCarrier(relayHost), nil
+	return endpoint, relays, s.localCarrier(relayHost), s.localCarrierV6(), nil
 }
 
 // moveRelayLease frees whatever the previous registration owned. A lease on
@@ -1176,6 +1359,20 @@ func (s *server) localCarrier(relayHost string) string {
 		return ""
 	}
 	return net.JoinHostPort(relayHost, strconv.Itoa(port))
+}
+
+// localCarrierV6 advertises the local carrier's IPv6 listener. Without an
+// explicit CarrierV6Host there is no safe address to publish: the bound
+// address may be a wildcard or loopback.
+func (s *server) localCarrierV6() string {
+	if s.cfg.Relay == nil || s.cfg.CarrierV6Host == "" {
+		return ""
+	}
+	port := s.cfg.Relay.CarrierPort()
+	if port == 0 || s.cfg.Relay.CarrierV6Addr() == "" {
+		return ""
+	}
+	return net.JoinHostPort(strings.Trim(s.cfg.CarrierV6Host, "[]"), strconv.Itoa(port))
 }
 
 func splitRelayEndpoint(endpoint string) (string, int, error) {

@@ -10,6 +10,7 @@ add_library(chast_viewer_core STATIC
   "${VIEWER_DIR}/gpu_frame_sink.cc"
   "${VIEWER_DIR}/viewer_engine.cc"
   "${VIEWER_DIR}/remote_cursor.cc"
+  "${VIEWER_DIR}/security_key.cc"
 )
 target_include_directories(chast_viewer_core PUBLIC "${VIEWER_DIR}")
 # The viewer records with the same muxer the command-line tool uses, so the
@@ -25,6 +26,8 @@ target_link_libraries(chast_viewer_core PUBLIC chast.codec chast.net chast.audio
 target_link_libraries(chast_viewer_core PRIVATE
                       "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
 target_link_libraries(chast_viewer_core PRIVATE flutter)
+# Windows Hello (WebAuthN) ceremonies for the viewer's security-key login.
+target_link_libraries(chast_viewer_core PRIVATE webauthn)
 
 # Define the application target. To change its name, change BINARY_NAME in the
 # top-level CMakeLists.txt, not the value here, or `flutter run` will no longer

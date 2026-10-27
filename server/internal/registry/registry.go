@@ -71,6 +71,9 @@ type Host struct {
 	RelayNode string
 	// Carrier is the shared carrier endpoint advertised by RelayNode.
 	Carrier string
+	// CarrierV6 is the IPv6 endpoint of the same shared carrier when it has a
+	// second listener reachable over IPv6.
+	CarrierV6 string
 	// Candidate is the public UDP endpoint most recently observed by the
 	// rendezvous service. It is not trusted for routing on the server; it is
 	// only handed to peers that ask for this host. CandidateV6 holds the
@@ -330,12 +333,13 @@ func (r *Registry) SetRelay(id string, port int, host string) {
 		live.RelayHost = host
 		live.RelayNode = ""
 		live.Carrier = ""
+		live.CarrierV6 = ""
 	}
 }
 
 // SetRemoteRelay records a lease on a standalone relay node. The registry does
 // not verify the endpoint; the API only calls it after the node answered.
-func (r *Registry) SetRemoteRelay(id, node string, port int, host, carrier string) {
+func (r *Registry) SetRemoteRelay(id, node string, port int, host, carrier, carrierV6 string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if live, ok := r.hosts[id]; ok {
@@ -343,6 +347,7 @@ func (r *Registry) SetRemoteRelay(id, node string, port int, host, carrier strin
 		live.RelayHost = host
 		live.RelayNode = node
 		live.Carrier = carrier
+		live.CarrierV6 = carrierV6
 	}
 }
 

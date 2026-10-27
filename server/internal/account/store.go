@@ -25,6 +25,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/ltpara/ds-chcast/server/internal/registry"
+	"github.com/ltpara/ds-chcast/server/internal/schemamig"
 )
 
 const (
@@ -77,6 +78,18 @@ var (
 	ErrTwoFactorEnabled     = errors.New("two-factor is already enabled")
 	ErrTwoFactorNotStarted  = errors.New("two-factor enrollment has not started")
 	ErrTwoFactorNotEnabled  = errors.New("two-factor is not enabled")
+	ErrInvalidRole          = errors.New("role must be admin or user")
+	ErrLastAdmin            = errors.New("at least one admin account must remain")
+	ErrAccountBanned        = errors.New("account is banned")
+
+	ErrInvalidEmail      = errors.New("email address is not valid")
+	ErrEmailTaken        = errors.New("email address is already in use")
+	ErrNoRecoveryEmail   = errors.New("account has no recovery email")
+	ErrInvalidResetToken = errors.New("password reset token is invalid or expired")
+	ErrInvalidPhone      = errors.New("phone number must be 6..15 digits, optionally starting with +")
+	ErrPhoneTaken        = errors.New("phone number is already in use")
+	ErrNoRecoveryPhone   = errors.New("account has no recovery phone")
+	ErrInvalidResetCode  = errors.New("password reset code is invalid or expired")
 )
 
 // Shared address-book permissions, weakest first. Read may list the book,
@@ -92,8 +105,25 @@ var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$`)
 type User struct {
 	ID        string    `json:"id"`
 	Username  string    `json:"username"`
+	Role      string    `json:"role"`
 	CreatedAt time.Time `json:"created_at"`
+	// Email is the optional self-service recovery address. It is never used
+	// for login and is unique across accounts when set.
+	Email string `json:"email,omitempty"`
+	// Phone is the optional SMS recovery number, normalized to digits. It is
+	// never used for login and is unique across accounts when set.
+	Phone string `json:"phone,omitempty"`
+	// Banned blocks password login and refresh until an operator lifts it.
+	Banned bool `json:"banned,omitempty"`
 }
+
+// Account roles. Admin may manage accounts and read server-wide audit data;
+// user owns only its own address book and sessions. The first account created
+// on a fresh server is the admin, so a self-hosted deployment always has one.
+const (
+	RoleAdmin = "admin"
+	RoleUser  = "user"
+)
 
 // Session describes one live login. The ID is random and reveals nothing
 // about the bearer token, so a viewer can revoke another device without ever
@@ -215,197 +245,9 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("account store %s: PRAGMA journal_mode=WAL: %w", path, err)
 	}
-	for _, schema := range []string{
-		`CREATE TABLE IF NOT EXISTS users (
-			id            TEXT PRIMARY KEY,
-			username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-			password_hash  TEXT NOT NULL,
-			created_at     INTEGER NOT NULL,
-			book_revision  INTEGER NOT NULL DEFAULT 0,
-			totp_secret    TEXT NOT NULL DEFAULT '',
-			totp_enabled   INTEGER NOT NULL DEFAULT 0,
-			totp_last_step INTEGER NOT NULL DEFAULT 0
-		)`,
-		`CREATE TABLE IF NOT EXISTS user_tokens (
-			token_hash  TEXT PRIMARY KEY,
-			user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			created_at  INTEGER NOT NULL,
-			expires_at  INTEGER NOT NULL,
-			session_id  TEXT NOT NULL DEFAULT '',
-			device_id   TEXT NOT NULL DEFAULT '',
-			device_name TEXT NOT NULL DEFAULT '',
-			login_ip    TEXT NOT NULL DEFAULT '',
-			login_location TEXT NOT NULL DEFAULT ''
-		)`,
-		`CREATE INDEX IF NOT EXISTS user_tokens_expiry ON user_tokens(expires_at)`,
-		`CREATE TABLE IF NOT EXISTS refresh_tokens (
-			token_hash  TEXT PRIMARY KEY,
-			user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			session_id  TEXT NOT NULL,
-			created_at  INTEGER NOT NULL,
-			expires_at  INTEGER NOT NULL,
-			rotated_at  INTEGER NOT NULL DEFAULT 0,
-			replaced_by TEXT NOT NULL DEFAULT ''
-		)`,
-		`CREATE INDEX IF NOT EXISTS refresh_tokens_expiry ON refresh_tokens(expires_at)`,
-		`CREATE INDEX IF NOT EXISTS refresh_tokens_session ON refresh_tokens(session_id)`,
-		`CREATE TABLE IF NOT EXISTS recovery_codes (
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			code_hash  TEXT NOT NULL,
-			created_at INTEGER NOT NULL,
-			used_at    INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (user_id, code_hash)
-		)`,
-		`CREATE TABLE IF NOT EXISTS address_book (
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			peer_id    TEXT NOT NULL,
-			name       TEXT NOT NULL DEFAULT '',
-			tags       TEXT NOT NULL DEFAULT '',
-			updated_at INTEGER NOT NULL,
-			revision   INTEGER NOT NULL DEFAULT 0,
-			deleted    INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (user_id, peer_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS address_book_grants (
-			owner_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			grantee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			group_id        TEXT NOT NULL DEFAULT '',
-			permission      TEXT NOT NULL DEFAULT 'read',
-			created_at      INTEGER NOT NULL,
-			PRIMARY KEY (owner_user_id, grantee_user_id, group_id),
-			CHECK (owner_user_id <> grantee_user_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS address_book_grants_grantee
-			ON address_book_grants(grantee_user_id)`,
-		`CREATE TABLE IF NOT EXISTS address_book_groups (
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			group_id   TEXT NOT NULL,
-			name       TEXT NOT NULL DEFAULT '',
-			updated_at INTEGER NOT NULL,
-			revision   INTEGER NOT NULL DEFAULT 0,
-			deleted    INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (user_id, group_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS audit_events (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			created_at INTEGER NOT NULL,
-			username   TEXT NOT NULL,
-			action     TEXT NOT NULL,
-			detail     TEXT NOT NULL DEFAULT '',
-			client_ip  TEXT NOT NULL DEFAULT '',
-			location   TEXT NOT NULL DEFAULT '',
-			success    INTEGER NOT NULL DEFAULT 0
-		)`,
-		`CREATE INDEX IF NOT EXISTS audit_events_created ON audit_events(created_at)`,
-		`CREATE TABLE IF NOT EXISTS connection_events (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id    TEXT NOT NULL,
-			username   TEXT NOT NULL,
-			peer_id    TEXT NOT NULL,
-			direction  TEXT NOT NULL DEFAULT 'viewer',
-			client_ip  TEXT NOT NULL DEFAULT '',
-			started_at INTEGER NOT NULL,
-			ended_at   INTEGER NOT NULL,
-			success    INTEGER NOT NULL DEFAULT 1,
-			detail     TEXT NOT NULL DEFAULT '',
-			host_id    TEXT NOT NULL DEFAULT '',
-			audit_ref  TEXT NOT NULL DEFAULT '',
-			source     TEXT NOT NULL DEFAULT 'viewer'
-		)`,
-		`CREATE INDEX IF NOT EXISTS connection_events_started
-			ON connection_events(started_at)`,
-		`CREATE INDEX IF NOT EXISTS connection_events_audit
-			ON connection_events(audit_ref) WHERE audit_ref <> ''`,
-		`CREATE TABLE IF NOT EXISTS file_events (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			user_id     TEXT NOT NULL,
-			username    TEXT NOT NULL,
-			peer_id     TEXT NOT NULL,
-			direction   TEXT NOT NULL,
-			name        TEXT NOT NULL DEFAULT '',
-			size        INTEGER NOT NULL DEFAULT 0,
-			files       INTEGER NOT NULL DEFAULT 1,
-			client_ip   TEXT NOT NULL DEFAULT '',
-			occurred_at INTEGER NOT NULL,
-			success     INTEGER NOT NULL DEFAULT 1,
-			detail      TEXT NOT NULL DEFAULT '',
-			host_id     TEXT NOT NULL DEFAULT '',
-			audit_ref   TEXT NOT NULL DEFAULT '',
-			source      TEXT NOT NULL DEFAULT 'viewer'
-		)`,
-		`CREATE INDEX IF NOT EXISTS file_events_occurred
-			ON file_events(occurred_at)`,
-		`CREATE TABLE IF NOT EXISTS login_locks (
-			login_key    TEXT PRIMARY KEY,
-			failures     INTEGER NOT NULL,
-			window_start INTEGER NOT NULL,
-			locked_until INTEGER NOT NULL DEFAULT 0,
-			last_seen    INTEGER NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS login_locks_seen ON login_locks(last_seen)`,
-	} {
-		if _, err := db.Exec(schema); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("account store %s: create schema: %w", path, err)
-		}
-	}
-	if err := migrateGrantScopes(db); err != nil {
+	if _, err := schemamig.Run(db, "schema_migrations", accountMigrations); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("account store %s: migrate address book grants: %w", path, err)
-	}
-	for _, column := range []struct {
-		table string
-		name  string
-		ddl   string
-	}{
-		{"users", "book_revision", "book_revision INTEGER NOT NULL DEFAULT 0"},
-		{"users", "totp_secret", "totp_secret TEXT NOT NULL DEFAULT ''"},
-		{"users", "totp_enabled", "totp_enabled INTEGER NOT NULL DEFAULT 0"},
-		{"users", "totp_last_step", "totp_last_step INTEGER NOT NULL DEFAULT 0"},
-		{"address_book", "revision", "revision INTEGER NOT NULL DEFAULT 0"},
-		{"address_book", "deleted", "deleted INTEGER NOT NULL DEFAULT 0"},
-		{"address_book", "group_id", "group_id TEXT NOT NULL DEFAULT ''"},
-		{"address_book_grants", "permission", "permission TEXT NOT NULL DEFAULT 'read'"},
-		{"user_tokens", "session_id", "session_id TEXT NOT NULL DEFAULT ''"},
-		{"user_tokens", "device_id", "device_id TEXT NOT NULL DEFAULT ''"},
-		{"user_tokens", "device_name", "device_name TEXT NOT NULL DEFAULT ''"},
-		{"user_tokens", "login_ip", "login_ip TEXT NOT NULL DEFAULT ''"},
-		{"user_tokens", "login_location", "login_location TEXT NOT NULL DEFAULT ''"},
-		{"user_tokens", "access_expires_at", "access_expires_at INTEGER NOT NULL DEFAULT 0"},
-		{"audit_events", "location", "location TEXT NOT NULL DEFAULT ''"},
-		{"connection_events", "host_id", "host_id TEXT NOT NULL DEFAULT ''"},
-		{"connection_events", "audit_ref", "audit_ref TEXT NOT NULL DEFAULT ''"},
-		{"connection_events", "source", "source TEXT NOT NULL DEFAULT 'viewer'"},
-		{"file_events", "host_id", "host_id TEXT NOT NULL DEFAULT ''"},
-		{"file_events", "audit_ref", "audit_ref TEXT NOT NULL DEFAULT ''"},
-		{"file_events", "source", "source TEXT NOT NULL DEFAULT 'viewer'"},
-	} {
-		if err := ensureColumn(db, column.table, column.name, column.ddl); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("account store %s: migrate %s.%s: %w", path, column.table, column.name, err)
-		}
-	}
-	if err := backfillSessionIDs(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("account store %s: migrate session ids: %w", path, err)
-	}
-	if _, err := db.Exec(
-		`CREATE INDEX IF NOT EXISTS connection_events_audit
-		 ON connection_events(audit_ref) WHERE audit_ref <> ''`,
-	); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("account store %s: index audit refs: %w", path, err)
-	}
-	if _, err := db.Exec(
-		`CREATE UNIQUE INDEX IF NOT EXISTS user_tokens_session
-		 ON user_tokens(session_id) WHERE session_id <> ''`,
-	); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("account store %s: index session ids: %w", path, err)
-	}
-	if err := backfillRevisions(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("account store %s: migrate address book revisions: %w", path, err)
+		return nil, fmt.Errorf("account store %s: %w", path, err)
 	}
 	return &Store{
 		path:      path,
@@ -417,6 +259,24 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// backfillAdminRole promotes the earliest account when an upgrade from a
+// database without roles would otherwise leave the server with no admin.
+func backfillAdminRole(db *sql.DB) error {
+	var admins int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = ?`, RoleAdmin).Scan(&admins); err != nil {
+		return err
+	}
+	if admins > 0 {
+		return nil
+	}
+	_, err := db.Exec(
+		`UPDATE users SET role = ? WHERE id = (
+			SELECT id FROM users ORDER BY created_at, id LIMIT 1)`,
+		RoleAdmin,
+	)
+	return err
+}
 
 // enableWAL retries while another instance is switching a fresh database to
 // WAL; SQLite returns SQLITE_BUSY for the mode change without invoking the
@@ -628,11 +488,31 @@ func (s *Store) SetClock(now func() time.Time) {
 }
 
 func (s *Store) CreateUser(username, password string) (User, error) {
+	return s.CreateUserWithEmail(username, password, "")
+}
+
+// CreateUserWithEmail creates an account and its optional recovery address in
+// one insert, so a duplicate address cannot leave a half-created account.
+func (s *Store) CreateUserWithEmail(username, password, email string) (User, error) {
+	return s.CreateUserWithRecovery(username, password, email, "")
+}
+
+// CreateUserWithRecovery creates an account with both optional recovery
+// channels. A duplicate address or number rejects the whole insert.
+func (s *Store) CreateUserWithRecovery(username, password, email, phone string) (User, error) {
 	username = strings.TrimSpace(username)
 	if !usernamePattern.MatchString(username) {
 		return User{}, ErrInvalidUsername
 	}
 	if err := validatePassword(password); err != nil {
+		return User{}, err
+	}
+	email = strings.TrimSpace(email)
+	if err := validateEmail(email); err != nil {
+		return User{}, err
+	}
+	phone, err := normalizePhone(phone)
+	if err != nil {
 		return User{}, err
 	}
 	hash, err := hashPassword(password)
@@ -654,16 +534,30 @@ func (s *Store) CreateUser(username, password string) (User, error) {
 		return User{}, err
 	}
 	created := s.now().UTC()
+	role := RoleUser
+	var existing int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&existing); err != nil {
+		return User{}, fmt.Errorf("account store %s: count users: %w", s.path, err)
+	}
+	if existing == 0 {
+		role = RoleAdmin
+	}
 	if _, err := s.db.Exec(
-		`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
-		id, username, hash, unixMillis(created),
+		`INSERT INTO users (id, username, password_hash, created_at, role, email, phone) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, username, hash, unixMillis(created), role, email, phone,
 	); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
+			if strings.Contains(err.Error(), "phone") {
+				return User{}, ErrPhoneTaken
+			}
+			if strings.Contains(err.Error(), "email") {
+				return User{}, ErrEmailTaken
+			}
 			return User{}, ErrUserExists
 		}
 		return User{}, fmt.Errorf("account store %s: create user: %w", s.path, err)
 	}
-	return User{ID: id, Username: username, CreatedAt: created}, nil
+	return User{ID: id, Username: username, Role: role, CreatedAt: created, Email: email, Phone: phone}, nil
 }
 
 // SetPassword replaces the hash and revokes every existing token, so a
@@ -768,6 +662,12 @@ func (s *Store) ChangePassword(userID, currentToken, currentPassword, newPasswor
 	); err != nil {
 		return fmt.Errorf("account store %s: revoke other refresh tokens: %w", s.path, err)
 	}
+	if _, err := tx.Exec(`DELETE FROM login_sms_codes WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("account store %s: drop login SMS code: %w", s.path, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM login_email_codes WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("account store %s: drop login email code: %w", s.path, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit password change: %w", s.path, err)
 	}
@@ -777,6 +677,34 @@ func (s *Store) ChangePassword(userID, currentToken, currentPassword, newPasswor
 func (s *Store) DeleteUser(username string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var (
+		role   string
+		banned bool
+	)
+	err := s.db.QueryRow(`SELECT role, banned FROM users WHERE username = ?`,
+		strings.TrimSpace(username)).Scan(&role, &banned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUnknownUser
+	}
+	if err != nil {
+		return fmt.Errorf("account store %s: delete user: %w", s.path, err)
+	}
+	if role == RoleAdmin && !banned {
+		var admins, total int
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
+		).Scan(&admins); err != nil {
+			return fmt.Errorf("account store %s: count admins: %w", s.path, err)
+		}
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&total); err != nil {
+			return fmt.Errorf("account store %s: count users: %w", s.path, err)
+		}
+		// Removing every account is safe because the next CreateUser becomes
+		// admin again; leaving users behind without an admin is not.
+		if admins <= 1 && total > 1 {
+			return ErrLastAdmin
+		}
+	}
 	res, err := s.db.Exec(`DELETE FROM users WHERE username = ?`, strings.TrimSpace(username))
 	if err != nil {
 		return fmt.Errorf("account store %s: delete user: %w", s.path, err)
@@ -794,7 +722,7 @@ func (s *Store) DeleteUser(username string) error {
 func (s *Store) ListUsers() ([]User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT id, username, created_at FROM users ORDER BY username`)
+	rows, err := s.db.Query(`SELECT id, username, role, created_at, banned, email, phone FROM users ORDER BY username`)
 	if err != nil {
 		return nil, fmt.Errorf("account store %s: list users: %w", s.path, err)
 	}
@@ -804,11 +732,13 @@ func (s *Store) ListUsers() ([]User, error) {
 		var (
 			user    User
 			created int64
+			banned  bool
 		)
-		if err := rows.Scan(&user.ID, &user.Username, &created); err != nil {
+		if err := rows.Scan(&user.ID, &user.Username, &user.Role, &created, &banned, &user.Email, &user.Phone); err != nil {
 			return nil, err
 		}
 		user.CreatedAt = timeFromMillis(created)
+		user.Banned = banned
 		out = append(out, user)
 	}
 	return out, rows.Err()
@@ -817,20 +747,121 @@ func (s *Store) ListUsers() ([]User, error) {
 func (s *Store) FindUser(username string) (User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.findUserLocked(username)
+}
+
+// SetRole promotes or demotes an account. The last admin cannot be demoted,
+// otherwise the deployment would lose every way to manage accounts.
+func (s *Store) SetRole(username, role string) (User, error) {
+	role = strings.TrimSpace(role)
+	if role != RoleAdmin && role != RoleUser {
+		return User{}, ErrInvalidRole
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var (
 		user    User
 		created int64
+		banned  bool
 	)
 	err := s.db.QueryRow(
-		`SELECT id, username, created_at FROM users WHERE username = ?`,
+		`SELECT id, username, role, created_at, banned, email, phone FROM users WHERE username = ?`,
 		strings.TrimSpace(username),
-	).Scan(&user.ID, &user.Username, &created)
+	).Scan(&user.ID, &user.Username, &user.Role, &created, &banned, &user.Email, &user.Phone)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrUnknownUser
 	}
 	if err != nil {
 		return User{}, fmt.Errorf("account store %s: find user: %w", s.path, err)
 	}
+	if user.Role == role {
+		user.CreatedAt = timeFromMillis(created)
+		user.Banned = banned
+		return user, nil
+	}
+	if user.Role == RoleAdmin && !banned {
+		var admins int
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
+		).Scan(&admins); err != nil {
+			return User{}, fmt.Errorf("account store %s: count admins: %w", s.path, err)
+		}
+		if admins <= 1 {
+			return User{}, ErrLastAdmin
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, role, user.ID); err != nil {
+		return User{}, fmt.Errorf("account store %s: set role: %w", s.path, err)
+	}
+	user.Role = role
+	user.CreatedAt = timeFromMillis(created)
+	user.Banned = banned
+	return user, nil
+}
+
+// SetBanned blocks or restores an account. Banning revokes every live session
+// so the account loses access immediately, and the last usable admin cannot be
+// banned so the deployment keeps a way to manage accounts.
+func (s *Store) SetBanned(username string, banned bool) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		user      User
+		created   int64
+		wasBanned bool
+	)
+	err := s.db.QueryRow(
+		`SELECT id, username, role, created_at, banned, email, phone FROM users WHERE username = ?`,
+		strings.TrimSpace(username),
+	).Scan(&user.ID, &user.Username, &user.Role, &created, &wasBanned, &user.Email, &user.Phone)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, ErrUnknownUser
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("account store %s: find user: %w", s.path, err)
+	}
+	if banned && !wasBanned && user.Role == RoleAdmin {
+		var admins int
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
+		).Scan(&admins); err != nil {
+			return User{}, fmt.Errorf("account store %s: count admins: %w", s.path, err)
+		}
+		if admins <= 1 {
+			return User{}, ErrLastAdmin
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return User{}, fmt.Errorf("account store %s: begin ban: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE users SET banned = ? WHERE id = ?`, banned, user.ID); err != nil {
+		return User{}, fmt.Errorf("account store %s: set banned: %w", s.path, err)
+	}
+	if banned {
+		if _, err := tx.Exec(`DELETE FROM user_tokens WHERE user_id = ?`, user.ID); err != nil {
+			return User{}, fmt.Errorf("account store %s: revoke tokens: %w", s.path, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM refresh_tokens WHERE user_id = ?`, user.ID); err != nil {
+			return User{}, fmt.Errorf("account store %s: revoke refresh tokens: %w", s.path, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM login_sms_codes WHERE user_id = ?`, user.ID); err != nil {
+			return User{}, fmt.Errorf("account store %s: drop login SMS code: %w", s.path, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM login_email_codes WHERE user_id = ?`, user.ID); err != nil {
+			return User{}, fmt.Errorf("account store %s: drop login email code: %w", s.path, err)
+		}
+		// Security keys stay registered so lifting the ban restores the account
+		// as it was, but a pending assertion must not outlive the ban.
+		if _, err := tx.Exec(`DELETE FROM webauthn_challenges WHERE user_id = ?`, user.ID); err != nil {
+			return User{}, fmt.Errorf("account store %s: drop security key challenges: %w", s.path, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, fmt.Errorf("account store %s: commit ban: %w", s.path, err)
+	}
+	user.Banned = banned
 	user.CreatedAt = timeFromMillis(created)
 	return user, nil
 }
@@ -872,24 +903,42 @@ func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName
 // the same session. RefreshSession rotates the pair without a password; the
 // session lives until the refresh token expires or is revoked.
 func (s *Store) LoginWithRefresh(username, password, deviceID, deviceName, code, recoveryCode string) (User, string, time.Time, string, time.Time, error) {
+	return s.LoginWithRefreshSMS(username, password, deviceID, deviceName, code, recoveryCode, "")
+}
+
+// LoginWithRefreshSMS is LoginWithRefresh plus a single-use code delivered by
+// SMS. See LoginWithRefreshFactors for the precedence between backup codes.
+func (s *Store) LoginWithRefreshSMS(username, password, deviceID, deviceName, code, recoveryCode, smsCode string) (User, string, time.Time, string, time.Time, error) {
+	return s.LoginWithRefreshFactors(username, password, deviceID, deviceName, code, recoveryCode, smsCode, "")
+}
+
+// LoginWithRefreshFactors is LoginWithRefresh plus the single-use codes
+// delivered by SMS and by email. A TOTP code wins over a recovery code, then
+// the SMS code, then the email code. The chosen backup code is deleted in the
+// same transaction that issues the session, so a code can never sign in twice.
+func (s *Store) LoginWithRefreshFactors(username, password, deviceID, deviceName, code, recoveryCode, smsCode, emailCode string) (User, string, time.Time, string, time.Time, error) {
 	username = strings.TrimSpace(username)
 	code = strings.TrimSpace(code)
 	recoveryCode = normalizeRecoveryCode(recoveryCode)
+	smsCode = strings.TrimSpace(smsCode)
+	emailCode = strings.TrimSpace(emailCode)
 	s.mu.Lock()
 	var (
 		user         User
 		hash         string
 		created      int64
+		banned       bool
 		totpSecret   string
 		totpEnabled  bool
 		totpLastStep int64
 	)
 	err := s.db.QueryRow(
-		`SELECT id, username, password_hash, created_at,
+		`SELECT id, username, role, password_hash, created_at, banned, email, phone,
 		        totp_secret, totp_enabled, totp_last_step
 		 FROM users WHERE username = ?`,
 		username,
-	).Scan(&user.ID, &user.Username, &hash, &created, &totpSecret, &totpEnabled, &totpLastStep)
+	).Scan(&user.ID, &user.Username, &user.Role, &hash, &created, &banned, &user.Email, &user.Phone,
+		&totpSecret, &totpEnabled, &totpLastStep)
 	s.mu.Unlock()
 	if errors.Is(err, sql.ErrNoRows) {
 		verifyDummy(password)
@@ -902,22 +951,48 @@ func (s *Store) LoginWithRefresh(username, password, deviceID, deviceName, code,
 	if err != nil || !ok {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidCredentials
 	}
-	if totpEnabled && code == "" && recoveryCode == "" {
+	// The ban check follows the password check so a banned name cannot be
+	// probed without its password.
+	if banned {
+		return User{}, "", time.Time{}, "", time.Time{}, ErrAccountBanned
+	}
+	if totpEnabled && code == "" && recoveryCode == "" && smsCode == "" && emailCode == "" {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrTwoFactorRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now().UTC()
 	useRecovery := false
+	useSMS := false
+	useEmail := false
 	if totpEnabled {
-		if code != "" {
+		switch {
+		case code != "":
 			step, matched := totpMatch(totpSecret, code, now)
 			if !matched || step <= totpLastStep {
 				return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
 			}
 			totpLastStep = step
-		} else {
+		case recoveryCode != "":
 			useRecovery = true
+		case smsCode != "":
+			matched, err := s.matchLoginSMSCodeLocked(user.ID, smsCode, now)
+			if err != nil {
+				return User{}, "", time.Time{}, "", time.Time{}, err
+			}
+			if !matched {
+				return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
+			}
+			useSMS = true
+		default:
+			matched, err := s.matchLoginEmailCodeLocked(user.ID, emailCode, now)
+			if err != nil {
+				return User{}, "", time.Time{}, "", time.Time{}, err
+			}
+			if !matched {
+				return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
+			}
+			useEmail = true
 		}
 	}
 	token, err := newToken()
@@ -962,7 +1037,29 @@ func (s *Store) LoginWithRefresh(username, password, deviceID, deviceName, code,
 			return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
 		}
 	}
-	if totpEnabled && !useRecovery {
+	if useSMS {
+		res, err := tx.Exec(`DELETE FROM login_sms_codes WHERE user_id = ?`, user.ID)
+		if err != nil {
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: spend login SMS code: %w", s.path, err)
+		}
+		if rows, err := res.RowsAffected(); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: spend login SMS code: %w", s.path, err)
+		} else if rows == 0 {
+			return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
+		}
+	}
+	if useEmail {
+		res, err := tx.Exec(`DELETE FROM login_email_codes WHERE user_id = ?`, user.ID)
+		if err != nil {
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: spend login email code: %w", s.path, err)
+		}
+		if rows, err := res.RowsAffected(); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: spend login email code: %w", s.path, err)
+		} else if rows == 0 {
+			return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
+		}
+	}
+	if totpEnabled && !useRecovery && !useSMS && !useEmail {
 		res, err := tx.Exec(
 			`UPDATE users SET totp_last_step = ? WHERE id = ? AND totp_last_step < ?`,
 			totpLastStep, user.ID, totpLastStep,
@@ -1133,6 +1230,12 @@ func (s *Store) DisableTwoFactor(userID, password, code string) error {
 	if _, err := tx.Exec(`DELETE FROM recovery_codes WHERE user_id = ?`, userID); err != nil {
 		return fmt.Errorf("account store %s: clear recovery codes: %w", s.path, err)
 	}
+	if _, err := tx.Exec(`DELETE FROM login_sms_codes WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("account store %s: clear login SMS code: %w", s.path, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM login_email_codes WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("account store %s: clear login email code: %w", s.path, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit disable two-factor: %w", s.path, err)
 	}
@@ -1241,6 +1344,32 @@ func (s *Store) ResetTwoFactor(username string) error {
 	); err != nil {
 		return fmt.Errorf("account store %s: clear recovery codes: %w", s.path, err)
 	}
+	if _, err := s.db.Exec(
+		`DELETE FROM login_sms_codes WHERE user_id = (SELECT id FROM users WHERE username = ?)`,
+		strings.TrimSpace(username),
+	); err != nil {
+		return fmt.Errorf("account store %s: clear login SMS code: %w", s.path, err)
+	}
+	if _, err := s.db.Exec(
+		`DELETE FROM login_email_codes WHERE user_id = (SELECT id FROM users WHERE username = ?)`,
+		strings.TrimSpace(username),
+	); err != nil {
+		return fmt.Errorf("account store %s: clear login email code: %w", s.path, err)
+	}
+	// Security keys survive a TOTP reset on their own, so the operator reset is
+	// the only escape hatch for a lost key and must remove them with the rest.
+	if _, err := s.db.Exec(
+		`DELETE FROM webauthn_credentials WHERE user_id = (SELECT id FROM users WHERE username = ?)`,
+		strings.TrimSpace(username),
+	); err != nil {
+		return fmt.Errorf("account store %s: clear security keys: %w", s.path, err)
+	}
+	if _, err := s.db.Exec(
+		`DELETE FROM webauthn_challenges WHERE user_id = (SELECT id FROM users WHERE username = ?)`,
+		strings.TrimSpace(username),
+	); err != nil {
+		return fmt.Errorf("account store %s: clear security key challenges: %w", s.path, err)
+	}
 	return nil
 }
 
@@ -1254,23 +1383,29 @@ func (s *Store) Authenticate(token string) (User, error) {
 	var (
 		user    User
 		created int64
+		banned  bool
 		expires int64
 	)
 	// access_expires_at is zero on rows issued before refresh tokens existed;
 	// those legacy tokens keep their original long expiry until they age out.
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.created_at,
+		`SELECT u.id, u.username, u.role, u.created_at, u.banned, u.email, u.phone,
 		        CASE WHEN t.access_expires_at > 0 THEN t.access_expires_at
 		             ELSE t.expires_at END
 		 FROM user_tokens t JOIN users u ON u.id = t.user_id
 		 WHERE t.token_hash = ?`,
 		tokenHash(token),
-	).Scan(&user.ID, &user.Username, &created, &expires)
+	).Scan(&user.ID, &user.Username, &user.Role, &created, &banned, &user.Email, &user.Phone, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, ErrInvalidToken
 	}
 	if err != nil {
 		return User{}, fmt.Errorf("account store %s: authenticate: %w", s.path, err)
+	}
+	// Bans revoke tokens, so this only guards a token that slipped in during
+	// the ban transaction; it must never authenticate a banned account.
+	if banned {
+		return User{}, ErrInvalidToken
 	}
 	if s.now().UTC().UnixMilli() >= expires {
 		// An expired access token must not take the session row with it:
@@ -1338,15 +1473,26 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 	var (
 		user    User
 		created int64
+		banned  bool
 	)
-	err = tx.QueryRow(`SELECT username, created_at FROM users WHERE id = ?`, userID).
-		Scan(&user.Username, &created)
+	err = tx.QueryRow(`SELECT username, role, created_at, banned FROM users WHERE id = ?`, userID).
+		Scan(&user.Username, &user.Role, &created, &banned)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
 	}
 	if err != nil {
 		return User{}, "", time.Time{}, "", time.Time{},
 			fmt.Errorf("account store %s: refresh user lookup: %w", s.path, err)
+	}
+	if banned {
+		if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{},
+				fmt.Errorf("account store %s: commit banned refresh: %w", s.path, err)
+		}
+		return User{}, "", time.Time{}, "", time.Time{}, ErrAccountBanned
 	}
 	token, err := newToken()
 	if err != nil {

@@ -185,11 +185,20 @@ class AccountDeviceSession {
 class AccountInfo {
   const AccountInfo({
     required this.username,
+    this.email = '',
+    this.phone = '',
     this.twoFactor = false,
     this.recoveryCodes = 0,
   });
 
   final String username;
+
+  /// Optional recovery address; empty means password reset by mail is off.
+  final String email;
+
+  /// Optional recovery number, normalized to digits; empty means SMS reset is
+  /// off.
+  final String phone;
   final bool twoFactor;
 
   /// Unused one-time backup codes; zero means only the authenticator works.
@@ -207,6 +216,8 @@ class AccountInfo {
     final Object? rawRecovery = value['recovery_codes'];
     return AccountInfo(
       username: username,
+      email: user['email']?.toString().trim() ?? '',
+      phone: user['phone']?.toString().trim() ?? '',
       twoFactor: value['two_factor'] == true,
       recoveryCodes: rawRecovery is num ? rawRecovery.toInt() : 0,
     );
@@ -231,6 +242,128 @@ class TwoFactorEnrollment {
       return null;
     }
     return TwoFactorEnrollment(secret: secret, uri: uri);
+  }
+}
+
+/// One Windows Hello / FIDO2 credential registered on the account. [id] is
+/// the unpadded base64url credential id; the private key never leaves the
+/// platform authenticator.
+class WebAuthnCredential {
+  const WebAuthnCredential({
+    required this.id,
+    this.alg = 0,
+    this.name = '',
+    this.createdAtMs = 0,
+    this.lastUsedAtMs = 0,
+  });
+
+  final String id;
+  final int alg;
+  final String name;
+  final int createdAtMs;
+  final int lastUsedAtMs;
+
+  static List<WebAuthnCredential> listFromJson(Object? value) {
+    if (value is! List) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return <WebAuthnCredential>[
+      for (final Object? entry in value)
+        if (entry is Map)
+          WebAuthnCredential(
+            id: entry['id']?.toString().trim() ?? '',
+            alg: (entry['alg'] as num?)?.toInt() ?? 0,
+            name: entry['name']?.toString().trim() ?? '',
+            createdAtMs: (entry['created_at_ms'] as num?)?.toInt() ?? 0,
+            lastUsedAtMs: (entry['last_used_at_ms'] as num?)?.toInt() ?? 0,
+          ),
+    ];
+  }
+}
+
+/// A pending registration challenge. [userId] and [challenge] are the
+/// unpadded base64url values the native ceremony must sign verbatim.
+class WebAuthnRegisterOptions {
+  const WebAuthnRegisterOptions({
+    required this.challenge,
+    required this.rpId,
+    required this.userId,
+    required this.username,
+    this.displayName = '',
+    this.timeoutMs = 120000,
+    this.excludeCredentials = const <WebAuthnCredential>[],
+  });
+
+  final String challenge;
+  final String rpId;
+  final String userId;
+  final String username;
+  final String displayName;
+  final int timeoutMs;
+  final List<WebAuthnCredential> excludeCredentials;
+
+  static WebAuthnRegisterOptions? fromJson(Object? value) {
+    if (value is! Map) {
+      return null;
+    }
+    final String challenge = value['challenge']?.toString().trim() ?? '';
+    final String rpId = value['rp_id']?.toString().trim() ?? '';
+    final String userId = value['user_id']?.toString().trim() ?? '';
+    final String username = value['username']?.toString().trim() ?? '';
+    if (challenge.isEmpty || rpId.isEmpty || userId.isEmpty || username.isEmpty) {
+      return null;
+    }
+    final int timeout = (value['timeout_ms'] as num?)?.toInt() ?? 0;
+    return WebAuthnRegisterOptions(
+      challenge: challenge,
+      rpId: rpId,
+      userId: userId,
+      username: username,
+      displayName: value['display_name']?.toString().trim() ?? '',
+      timeoutMs: timeout > 0 ? timeout : 120000,
+      excludeCredentials: WebAuthnCredential.listFromJson(
+        value['exclude_credentials'] ?? const <Object?>[],
+      ),
+    );
+  }
+}
+
+/// A pending assertion challenge for a password-checked security-key login.
+class WebAuthnLoginOptions {
+  const WebAuthnLoginOptions({
+    required this.challenge,
+    required this.rpId,
+    required this.username,
+    this.timeoutMs = 120000,
+    this.credentials = const <WebAuthnCredential>[],
+  });
+
+  final String challenge;
+  final String rpId;
+  final String username;
+  final int timeoutMs;
+  final List<WebAuthnCredential> credentials;
+
+  static WebAuthnLoginOptions? fromJson(Object? value) {
+    if (value is! Map) {
+      return null;
+    }
+    final String challenge = value['challenge']?.toString().trim() ?? '';
+    final String rpId = value['rp_id']?.toString().trim() ?? '';
+    final String username = value['username']?.toString().trim() ?? '';
+    if (challenge.isEmpty || rpId.isEmpty || username.isEmpty) {
+      return null;
+    }
+    final int timeout = (value['timeout_ms'] as num?)?.toInt() ?? 0;
+    return WebAuthnLoginOptions(
+      challenge: challenge,
+      rpId: rpId,
+      username: username,
+      timeoutMs: timeout > 0 ? timeout : 120000,
+      credentials: WebAuthnCredential.listFromJson(
+        value['credentials'] ?? const <Object?>[],
+      ),
+    );
   }
 }
 
@@ -474,11 +607,11 @@ class SharedAddressBook {
       return permission;
     }
     int rank(String permission) => switch (permission) {
-          'control' => 3,
-          'write' => 2,
-          'read' => 1,
-          _ => 0,
-        };
+      'control' => 3,
+      'write' => 2,
+      'read' => 1,
+      _ => 0,
+    };
     String best = '';
     for (final AddressBookScope scope in scopes) {
       if (scope.groupId == groupId && rank(scope.permission) > rank(best)) {
@@ -736,6 +869,8 @@ class ServerApi {
     String deviceName = '',
     String totpCode = '',
     String recoveryCode = '',
+    String smsCode = '',
+    String emailCode = '',
     Duration timeout = const Duration(seconds: 6),
   }) async {
     if (!settings.configured) {
@@ -745,8 +880,22 @@ class ServerApi {
     final String device = deviceName.trim();
     final String otp = totpCode.trim();
     final String recovery = recoveryCode.trim();
+    final String sms = _numericCode(smsCode);
+    final String email = _numericCode(emailCode);
     if (name.isEmpty || password.isEmpty) {
       throw const ServerApiException('请输入用户名和密码');
+    }
+    // Precedence mirrors the server: authenticator code, then recovery code,
+    // then the SMS backup code, then the email backup code, so only one is
+    // sent.
+    final bool useSms = otp.isEmpty && recovery.isEmpty && sms.isNotEmpty;
+    final bool useEmail =
+        otp.isEmpty && recovery.isEmpty && sms.isEmpty && email.isNotEmpty;
+    if (useSms && sms.length != 8) {
+      throw const ServerApiException('短信验证码需为 8 位数字');
+    }
+    if (useEmail && email.length != 8) {
+      throw const ServerApiException('邮件验证码需为 8 位数字');
     }
     final Uri uri;
     try {
@@ -766,6 +915,8 @@ class ServerApi {
           if (device.isNotEmpty) 'device_name': device,
           if (otp.isNotEmpty) 'totp_code': otp,
           if (otp.isEmpty && recovery.isNotEmpty) 'recovery_code': recovery,
+          if (useSms) 'sms_code': sms,
+          if (useEmail) 'email_code': email,
         },
         unauthorized: '用户名或密码不正确',
       );
@@ -791,6 +942,78 @@ class ServerApi {
       throw const ServerApiException('连接服务返回了无效数据');
     }
     return result;
+  }
+
+  /// Asks the server to text a single-use login code to the account's
+  /// recovery number. The password is checked first, and accounts without
+  /// two-factor or a number still answer 202, so the route cannot be used to
+  /// discover either. Repeated sends are throttled to one per minute.
+  static Future<void> requestLoginSMS(
+    ServerSettings settings, {
+    required String username,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    if (name.isEmpty || password.isEmpty) {
+      throw const ServerApiException('请输入用户名和密码');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login/sms');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{'username': name, 'password': password},
+      success: const <int>{HttpStatus.accepted},
+      unauthorized: '用户名或密码不正确',
+      forbidden: '账号已被封禁',
+      badRequest: '用户名或密码无效',
+      unavailable: '连接服务未配置账号或短信登录',
+    );
+  }
+
+  /// Asks the server to email a single-use login code to the account's
+  /// recovery address. The password is checked first, and accounts without
+  /// two-factor or an address still answer 202, so the route cannot be used to
+  /// discover either. Repeated sends are throttled to one per minute.
+  static Future<void> requestLoginEmail(
+    ServerSettings settings, {
+    required String username,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    if (name.isEmpty || password.isEmpty) {
+      throw const ServerApiException('请输入用户名和密码');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login/email');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{'username': name, 'password': password},
+      success: const <int>{HttpStatus.accepted},
+      unauthorized: '用户名或密码不正确',
+      forbidden: '账号已被封禁',
+      badRequest: '用户名或密码无效',
+      unavailable: '连接服务未配置账号或邮件登录',
+    );
   }
 
   /// Trades a refresh token for a fresh access/refresh pair. The server
@@ -845,14 +1068,16 @@ class ServerApi {
     }
     final Object? rawToken = decoded['token'];
     final Object? rawExpires = decoded['expires_in_ms'];
-    final String username = (decoded['user'] as Map)['username']?.toString().trim() ?? '';
+    final String username =
+        (decoded['user'] as Map)['username']?.toString().trim() ?? '';
     if (rawToken is! String ||
         rawToken.trim().isEmpty ||
         rawExpires is! num ||
         username.isEmpty) {
       return null;
     }
-    final String refreshToken = decoded['refresh_token']?.toString().trim() ?? '';
+    final String refreshToken =
+        decoded['refresh_token']?.toString().trim() ?? '';
     final Object? rawRefreshExpires = decoded['refresh_expires_in_ms'];
     return AccountLoginResult(
       token: rawToken.trim(),
@@ -1064,6 +1289,254 @@ class ServerApi {
       codes.add(value);
     }
     return codes;
+  }
+
+  /// Starts registering a Windows Hello / FIDO2 credential. The password is
+  /// re-checked so a borrowed token cannot add a key.
+  static Future<WebAuthnRegisterOptions> webauthnRegisterBegin(
+    ServerSettings settings,
+    String token, {
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    if (password.isEmpty) {
+      throw const ServerApiException('请输入当前密码');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/webauthn/register/begin');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'password': password},
+      unauthorized: '账号登录已失效，请重新登录',
+      forbidden: '当前密码不正确',
+      unavailable: '连接服务未启用安全密钥',
+    );
+    final WebAuthnRegisterOptions? options = WebAuthnRegisterOptions.fromJson(
+      decoded,
+    );
+    if (options == null) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return options;
+  }
+
+  /// Sends the attestation produced by Windows Hello. [name] is the label the
+  /// account dialog shows, such as "此电脑".
+  static Future<WebAuthnCredential> webauthnRegisterFinish(
+    ServerSettings settings,
+    String token, {
+    required String name,
+    required String clientDataJSON,
+    required String attestationObject,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    if (clientDataJSON.isEmpty || attestationObject.isEmpty) {
+      throw const ServerApiException('安全密钥数据不完整');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/webauthn/register/finish');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{
+        'name': name.trim(),
+        'client_data_json': clientDataJSON,
+        'attestation_object': attestationObject,
+      },
+      unauthorized: '账号登录已失效，请重新登录',
+      forbidden: '注册校验未通过，请重新开始',
+      badRequest: '安全密钥数据无效',
+      conflict: '该安全密钥已经注册',
+      unavailable: '连接服务未启用安全密钥',
+    );
+    final List<WebAuthnCredential> stored = WebAuthnCredential.listFromJson(
+      decoded == null ? const <Object?>[] : <Object?>[decoded],
+    );
+    if (stored.isEmpty || stored.first.id.isEmpty) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return stored.first;
+  }
+
+  /// Lists the security keys registered on the signed-in account.
+  static Future<List<WebAuthnCredential>> webauthnCredentials(
+    ServerSettings settings,
+    String token, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/webauthn/credentials');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'GET',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      unauthorized: '账号登录已失效，请重新登录',
+      unavailable: '连接服务未启用安全密钥',
+    );
+    final Object? raw = decoded is Map ? decoded['credentials'] : null;
+    return WebAuthnCredential.listFromJson(raw ?? const <Object?>[]);
+  }
+
+  /// Removes a registered security key. The password is required again.
+  static Future<void> webauthnRemove(
+    ServerSettings settings,
+    String token, {
+    required String password,
+    required String credentialId,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    if (password.isEmpty) {
+      throw const ServerApiException('请输入当前密码');
+    }
+    if (credentialId.isEmpty) {
+      throw const ServerApiException('安全密钥标识为空');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/webauthn/credentials/remove');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{
+        'password': password,
+        'credential_id': credentialId,
+      },
+      success: const <int>{HttpStatus.ok, HttpStatus.noContent},
+      unauthorized: '账号登录已失效，请重新登录',
+      forbidden: '当前密码不正确',
+      notFound: '安全密钥不存在或已删除',
+      unavailable: '连接服务未启用安全密钥',
+    );
+  }
+
+  /// Starts a security-key login after the password has been checked. A null
+  /// result means the password matched but the account has no registered key;
+  /// the server answers 202 in that case so the route cannot map accounts.
+  ///
+  /// The account's two-factor state is not bypassed: this route is the
+  /// second factor itself.
+  static Future<WebAuthnLoginOptions?> loginWebAuthnBegin(
+    ServerSettings settings, {
+    required String username,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    if (name.isEmpty || password.isEmpty) {
+      throw const ServerApiException('请输入用户名和密码');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login/webauthn/begin');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{'username': name, 'password': password},
+      success: const <int>{HttpStatus.ok, HttpStatus.accepted},
+      unauthorized: '用户名或密码不正确',
+      forbidden: '账号已被封禁',
+      badRequest: '用户名或密码无效',
+      unavailable: '连接服务未启用安全密钥',
+    );
+    if (decoded is Map && decoded['status'] == 'accepted') {
+      return null;
+    }
+    final WebAuthnLoginOptions? options = WebAuthnLoginOptions.fromJson(
+      decoded,
+    );
+    if (options == null) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return options;
+  }
+
+  /// Exchanges a Windows Hello assertion for an account session.
+  static Future<AccountLoginResult> loginWebAuthnFinish(
+    ServerSettings settings, {
+    required String username,
+    required String credentialId,
+    required String clientDataJSON,
+    required String authenticatorData,
+    required String signature,
+    String deviceName = '',
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    final String device = deviceName.trim();
+    if (name.isEmpty) {
+      throw const ServerApiException('请输入用户名');
+    }
+    if (credentialId.isEmpty ||
+        clientDataJSON.isEmpty ||
+        authenticatorData.isEmpty ||
+        signature.isEmpty) {
+      throw const ServerApiException('安全密钥数据不完整');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/login/webauthn/finish');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{
+        'username': name,
+        'credential_id': credentialId,
+        'client_data_json': clientDataJSON,
+        'authenticator_data': authenticatorData,
+        'signature': signature,
+        if (device.isNotEmpty) 'device_name': device,
+      },
+      unauthorized: '安全密钥验证未通过',
+      forbidden: '账号已被封禁',
+      badRequest: '安全密钥数据无效',
+      unavailable: '连接服务未启用安全密钥',
+    );
+    final AccountLoginResult? result = _parseLoginReply(decoded);
+    if (result == null) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return result;
   }
 
   /// Reports one finished remote session to the account's server. The server
@@ -1357,6 +1830,251 @@ class ServerApi {
       forbidden: '当前密码不正确',
     );
   }
+
+  /// Attaches or clears the account recovery email. The server also requires
+  /// the current password so a borrowed token cannot redirect future resets.
+  /// An empty [email] clears the address; the stored value is returned.
+  static Future<String> changeRecoveryEmail(
+    ServerSettings settings,
+    String token, {
+    required String email,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    if (password.isEmpty) {
+      throw const ServerApiException('请输入当前密码');
+    }
+    final String value = email.trim();
+    if (value.isNotEmpty && !value.contains('@')) {
+      throw const ServerApiException('请输入有效的邮箱地址');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/email');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'email': value, 'password': password},
+      unauthorized: '账号登录已失效，请重新登录',
+      forbidden: '当前密码不正确',
+      badRequest: '邮箱格式无效',
+      conflict: '该邮箱已被其他账号使用',
+    );
+    final Object? stored = decoded is Map ? decoded['email'] : null;
+    if (decoded is! Map || (stored != null && stored is! String)) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return stored?.toString().trim() ?? '';
+  }
+
+  /// Asks the server to mail a reset token. Known and unknown names both
+  /// receive HTTP 202, so the result cannot reveal whether [username] exists
+  /// or has a recovery address.
+  static Future<void> requestPasswordRecovery(
+    ServerSettings settings, {
+    required String username,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    if (name.isEmpty) {
+      throw const ServerApiException('请输入用户名');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/recover');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{'username': name},
+      success: const <int>{HttpStatus.accepted},
+      badRequest: '用户名无效',
+      unavailable: '连接服务未配置账号或邮件找回',
+    );
+  }
+
+  /// Spends a reset token from the recovery mail and replaces the password.
+  /// The server revokes every existing session of the account.
+  static Future<String> completePasswordRecovery(
+    ServerSettings settings, {
+    required String token,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String value = token.trim();
+    if (value.isEmpty) {
+      throw const ServerApiException('请输入邮件中的重置令牌');
+    }
+    final int bytes = utf8.encode(password).length;
+    if (bytes < 8 || bytes > 128) {
+      throw const ServerApiException('新密码长度需为 8–128 个字节');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/recover/complete');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{'token': value, 'password': password},
+      badRequest: '重置令牌无效、已过期或密码不符合要求',
+    );
+    final Object? username = decoded is Map ? decoded['username'] : null;
+    if (username is! String || username.trim().isEmpty) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return username.trim();
+  }
+
+  /// Sets or clears the number that receives SMS reset codes. The current
+  /// password is required, matching the email change.
+  static Future<String> changeRecoveryPhone(
+    ServerSettings settings,
+    String token, {
+    required String phone,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    if (password.isEmpty) {
+      throw const ServerApiException('请输入当前密码');
+    }
+    final String value = phone.trim();
+    if (value.isNotEmpty && !_validPhone(value)) {
+      throw const ServerApiException('手机号需为 6–15 位数字');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/phone');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'phone': value, 'password': password},
+      unauthorized: '账号登录已失效，请重新登录',
+      forbidden: '当前密码不正确',
+      badRequest: '手机号格式无效',
+      conflict: '该手机号已被其他账号使用',
+    );
+    final Object? stored = decoded is Map ? decoded['phone'] : null;
+    if (decoded is! Map || (stored != null && stored is! String)) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return stored?.toString().trim() ?? '';
+  }
+
+  /// Asks the server to text a reset code. Known and unknown names both
+  /// receive HTTP 202, so the result cannot reveal whether [username] exists
+  /// or has a recovery number.
+  static Future<void> requestSMSRecovery(
+    ServerSettings settings, {
+    required String username,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    if (name.isEmpty) {
+      throw const ServerApiException('请输入用户名');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/recover/sms');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{'username': name},
+      success: const <int>{HttpStatus.accepted},
+      badRequest: '用户名无效',
+      unavailable: '连接服务未配置账号或短信找回',
+    );
+  }
+
+  /// Spends an SMS reset code and replaces the password. The server retires
+  /// the code after five wrong attempts and revokes every existing session.
+  static Future<String> completeSMSRecovery(
+    ServerSettings settings, {
+    required String username,
+    required String code,
+    required String password,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String name = username.trim();
+    if (name.isEmpty) {
+      throw const ServerApiException('请输入用户名');
+    }
+    final String value = _numericCode(code);
+    if (value.length != 8) {
+      throw const ServerApiException('短信验证码需为 8 位数字');
+    }
+    final int bytes = utf8.encode(password).length;
+    if (bytes < 8 || bytes > 128) {
+      throw const ServerApiException('新密码长度需为 8–128 个字节');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/recover/sms/complete');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{
+        'username': name,
+        'code': value,
+        'password': password,
+      },
+      badRequest: '短信验证码无效、已过期或密码不符合要求',
+    );
+    final Object? resolved = decoded is Map ? decoded['username'] : null;
+    if (resolved is! String || resolved.trim().isEmpty) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return resolved.trim();
+  }
+
+  static bool _validPhone(String value) {
+    if (!RegExp(r'^\+?[0-9 ()\-\.]+$').hasMatch(value)) {
+      return false;
+    }
+    final String digits = value.replaceAll(RegExp(r'[^0-9]'), '');
+    return digits.length >= 6 && digits.length <= 15;
+  }
+
+  static String _numericCode(String value) =>
+      value.replaceAll(RegExp(r'[\s-]'), '');
 
   /// Reads the account address book. [since] is the revision of the last
   /// successful sync; the server then also returns later deletion tombstones.
@@ -2116,7 +2834,9 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson('GET', uri, timeout);
     final Object? raw = decoded is Map ? decoded['public_key'] : null;
-    final ServerIdentity? identity = ServerIdentity.parse(raw?.toString() ?? '');
+    final ServerIdentity? identity = ServerIdentity.parse(
+      raw?.toString() ?? '',
+    );
     if (identity == null) {
       throw const ServerApiException('连接服务未提供有效的服务器身份');
     }
@@ -2177,6 +2897,9 @@ class ServerApi {
     String unauthorized = '连接服务密钥无效',
     String notFound = '设备未注册或已下线',
     String forbidden = '没有权限执行此操作',
+    String badRequest = '',
+    String conflict = '',
+    String unavailable = '连接服务未启用账号存储',
   }) async {
     final HttpClient client = HttpClient()..connectionTimeout = timeout;
     try {
@@ -2211,7 +2934,13 @@ class ServerApi {
               : response.statusCode == HttpStatus.tooManyRequests
               ? '请求过于频繁，请稍后再试'
               : response.statusCode == HttpStatus.serviceUnavailable
-              ? '连接服务未启用账号存储'
+              ? unavailable
+              : response.statusCode == HttpStatus.badRequest &&
+                    badRequest.isNotEmpty
+              ? badRequest
+              : response.statusCode == HttpStatus.conflict &&
+                    conflict.isNotEmpty
+              ? conflict
               : '连接服务返回 HTTP ${response.statusCode}',
           statusCode: response.statusCode,
           code: secondFactor == 'required'

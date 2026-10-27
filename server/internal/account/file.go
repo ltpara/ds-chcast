@@ -180,40 +180,62 @@ func (s *Store) insertFileEventLocked(event FileEvent, userID string) (FileEvent
 
 // FileTransfers lists one account's reports, newest first.
 func (s *Store) FileTransfers(userID string, limit int) ([]FileEvent, error) {
-	return s.fileEvents("WHERE user_id = ?", []any{strings.TrimSpace(userID)}, limit)
+	return s.FileTransfersBefore(userID, 0, limit)
+}
+
+// FileTransfersBefore pages one account's reports older than beforeID.
+func (s *Store) FileTransfersBefore(userID string, beforeID int64, limit int) ([]FileEvent, error) {
+	return s.fileEvents("user_id = ?", []any{strings.TrimSpace(userID)}, beforeID, limit)
 }
 
 // FileTransfersFor lists reports across accounts. An empty username returns
 // every account, which is what the operator console uses.
 func (s *Store) FileTransfersFor(username string, limit int) ([]FileEvent, error) {
+	return s.FileTransfersForBefore(username, 0, limit)
+}
+
+// FileTransfersForBefore pages cross-account reports older than beforeID.
+func (s *Store) FileTransfersForBefore(username string, beforeID int64, limit int) ([]FileEvent, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return s.fileEvents("", nil, limit)
+		return s.fileEvents("", nil, beforeID, limit)
 	}
-	return s.fileEvents("WHERE username = ? COLLATE NOCASE", []any{username}, limit)
+	return s.fileEvents("username = ? COLLATE NOCASE", []any{username}, beforeID, limit)
 }
 
 // FileTransfersForHost lists transfers involving one host, including inbound
 // host reports that have no account row.
 func (s *Store) FileTransfersForHost(hostID string, limit int) ([]FileEvent, error) {
-	hostID = strings.TrimSpace(hostID)
-	if hostID == "" {
-		return s.fileEvents("", nil, limit)
-	}
-	return s.fileEvents(
-		"WHERE host_id = ? OR peer_id = ? COLLATE NOCASE", []any{hostID, hostID}, limit)
+	return s.FileTransfersForHostBefore(hostID, 0, limit)
 }
 
-func (s *Store) fileEvents(where string, args []any, limit int) ([]FileEvent, error) {
+// FileTransfersForHostBefore pages host-involved reports older than beforeID.
+func (s *Store) FileTransfersForHostBefore(hostID string, beforeID int64, limit int) ([]FileEvent, error) {
+	hostID = strings.TrimSpace(hostID)
+	if hostID == "" {
+		return s.fileEvents("", nil, beforeID, limit)
+	}
+	return s.fileEvents(
+		"(host_id = ? OR peer_id = ? COLLATE NOCASE)", []any{hostID, hostID}, beforeID, limit)
+}
+
+func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) ([]FileEvent, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 200 {
 		limit = 200
 	}
+	if strings.TrimSpace(where) == "" {
+		where = "1 = 1"
+	}
+	if beforeID > 0 {
+		where = "(" + where + ") AND id < ?"
+		args = append(args, beforeID)
+	}
 	query := `SELECT id, username, peer_id, direction, name, size, files,
 			client_ip, occurred_at, success, detail, host_id, audit_ref, source
-		 FROM file_events ` + where + ` ORDER BY id DESC LIMIT ?`
+		 FROM file_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -378,6 +378,9 @@ func TestAddressBookIsPerUserAndPersists(t *testing.T) {
 	if peers, err := reopened.Peers(alice.ID); err != nil || len(peers) != 1 || peers[0].ID != "lab" {
 		t.Fatalf("persisted peers = %+v, %v", peers, err)
 	}
+	if _, err := reopened.SetRole("bob", RoleAdmin); err != nil {
+		t.Fatalf("promote bob: %v", err)
+	}
 	if err := reopened.DeleteUser("alice"); err != nil {
 		t.Fatalf("delete alice: %v", err)
 	}
@@ -924,6 +927,9 @@ func TestSharedAddressBookPermissions(t *testing.T) {
 	}
 	if _, err := store.ShareBook(alice.ID, "bob", PermissionRead); err != nil {
 		t.Fatalf("re-share: %v", err)
+	}
+	if _, err := store.SetRole("bob", RoleAdmin); err != nil {
+		t.Fatalf("promote bob: %v", err)
 	}
 	if err := store.DeleteUser("alice"); err != nil {
 		t.Fatalf("delete owner: %v", err)
@@ -1496,6 +1502,12 @@ func TestSessionMigrationBackfillsLegacyTokens(t *testing.T) {
 	if _, err := db.Exec(`UPDATE user_tokens SET session_id = '', device_id = '', device_name = ''`); err != nil {
 		db.Close()
 		t.Fatalf("clear session metadata: %v", err)
+	}
+	// Dropping the recorded version makes the next Open treat the file as a
+	// pre-migration database, which is the state this test simulates.
+	if _, err := db.Exec(`DELETE FROM schema_migrations`); err != nil {
+		db.Close()
+		t.Fatalf("clear schema version: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close raw db: %v", err)

@@ -325,40 +325,63 @@ func (s *Store) connectionByRefLocked(ref string) (ConnectionEvent, bool, error)
 
 // Connections lists one account's reports, newest first.
 func (s *Store) Connections(userID string, limit int) ([]ConnectionEvent, error) {
-	return s.connectionEvents("WHERE user_id = ?", []any{strings.TrimSpace(userID)}, limit)
+	return s.ConnectionsBefore(userID, 0, limit)
+}
+
+// ConnectionsBefore pages one account's reports older than beforeID; 0 starts
+// at the newest row.
+func (s *Store) ConnectionsBefore(userID string, beforeID int64, limit int) ([]ConnectionEvent, error) {
+	return s.connectionEvents("user_id = ?", []any{strings.TrimSpace(userID)}, beforeID, limit)
 }
 
 // ConnectionsFor lists reports across accounts. An empty username returns
 // every account, which is what the operator console uses.
 func (s *Store) ConnectionsFor(username string, limit int) ([]ConnectionEvent, error) {
+	return s.ConnectionsForBefore(username, 0, limit)
+}
+
+// ConnectionsForBefore pages cross-account reports older than beforeID.
+func (s *Store) ConnectionsForBefore(username string, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return s.connectionEvents("", nil, limit)
+		return s.connectionEvents("", nil, beforeID, limit)
 	}
-	return s.connectionEvents("WHERE username = ? COLLATE NOCASE", []any{username}, limit)
+	return s.connectionEvents("username = ? COLLATE NOCASE", []any{username}, beforeID, limit)
 }
 
 // ConnectionsForHost lists sessions that involve one host, including inbound
 // reports that never got an account-side row.
 func (s *Store) ConnectionsForHost(hostID string, limit int) ([]ConnectionEvent, error) {
-	hostID = strings.TrimSpace(hostID)
-	if hostID == "" {
-		return s.connectionEvents("", nil, limit)
-	}
-	return s.connectionEvents(
-		"WHERE host_id = ? OR peer_id = ? COLLATE NOCASE", []any{hostID, hostID}, limit)
+	return s.ConnectionsForHostBefore(hostID, 0, limit)
 }
 
-func (s *Store) connectionEvents(where string, args []any, limit int) ([]ConnectionEvent, error) {
+// ConnectionsForHostBefore pages host-involved reports older than beforeID.
+func (s *Store) ConnectionsForHostBefore(hostID string, beforeID int64, limit int) ([]ConnectionEvent, error) {
+	hostID = strings.TrimSpace(hostID)
+	if hostID == "" {
+		return s.connectionEvents("", nil, beforeID, limit)
+	}
+	return s.connectionEvents(
+		"(host_id = ? OR peer_id = ? COLLATE NOCASE)", []any{hostID, hostID}, beforeID, limit)
+}
+
+func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit int) ([]ConnectionEvent, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 200 {
 		limit = 200
 	}
+	if strings.TrimSpace(where) == "" {
+		where = "1 = 1"
+	}
+	if beforeID > 0 {
+		where = "(" + where + ") AND id < ?"
+		args = append(args, beforeID)
+	}
 	query := `SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
 			success, detail, host_id, audit_ref, source
-		 FROM connection_events ` + where + ` ORDER BY id DESC LIMIT ?`
+		 FROM connection_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
 	defer s.mu.Unlock()

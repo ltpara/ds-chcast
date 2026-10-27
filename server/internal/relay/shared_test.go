@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -463,4 +464,64 @@ func TestSharedCarrierPortIsReported(t *testing.T) {
 	if stats, ok := m.SharedCarrierStats(); !ok || stats.Addr != addr {
 		t.Fatalf("stats = %+v, %v", stats, ok)
 	}
+}
+
+func TestSharedCarrierIPv6Listener(t *testing.T) {
+	const secret = "host-secret-carrier-v6"
+	priv := identity.PrivateKeyFromSecret(secret)
+	reg := registry.New(time.Minute)
+	host, err := reg.Register(registry.RegisterRequest{
+		ID:        "devbox",
+		PublicKey: identity.PublicKeyText(priv.Public().(ed25519.PublicKey)),
+		TTL:       time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog, WithCarrierBind6("::1"))
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	t.Cleanup(m.Close)
+	if err := m.EnableSharedCarrier("127.0.0.1:0"); err != nil {
+		t.Fatalf("shared carrier: %v", err)
+	}
+	addrs := m.CarrierAddrs()
+	if len(addrs) != 2 {
+		t.Fatalf("carrier addrs = %v", addrs)
+	}
+	v6 := m.CarrierV6Addr()
+	if !strings.HasPrefix(v6, "[::1]:") {
+		t.Fatalf("carrier IPv6 addr = %q", v6)
+	}
+	_, v4Port, err := net.SplitHostPort(addrs[0])
+	if err != nil {
+		t.Fatalf("split v4: %v", err)
+	}
+	_, v6Port, err := net.SplitHostPort(v6)
+	if err != nil {
+		t.Fatalf("split v6: %v", err)
+	}
+	if v4Port != v6Port || m.CarrierPort() != mustPort(t, v4Port) {
+		t.Fatalf("carrier ports differ: %v %v", addrs, v6)
+	}
+	link := openSharedHost(t, v6, host.ID, secret)
+	_ = link
+	waitForSharedStats(t, m, func(stats SharedCarrierStats) bool { return stats.Hosts == 1 })
+	if !m.HostLinked(host.ID) {
+		t.Fatal("IPv6 carrier link did not authenticate")
+	}
+	stats, ok := m.SharedCarrierStats()
+	if !ok || len(stats.Addrs) != 2 || stats.Addr != addrs[0] {
+		t.Fatalf("stats = %+v, %v", stats, ok)
+	}
+}
+
+func mustPort(t *testing.T, text string) int {
+	t.Helper()
+	port, err := strconv.Atoi(text)
+	if err != nil {
+		t.Fatalf("port %q: %v", text, err)
+	}
+	return port
 }
