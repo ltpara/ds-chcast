@@ -60,7 +60,8 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
   String _revoking = '';
   String _renaming = '';
 
-  bool get _busy => _revoking.isNotEmpty || _revokingOthers || _renaming.isNotEmpty;
+  bool get _busy =>
+      _revoking.isNotEmpty || _revokingOthers || _renaming.isNotEmpty;
 
   bool get _hasOtherSessions =>
       _sessions.any((AccountDeviceSession session) => !session.current);
@@ -339,6 +340,11 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
     final String name = session.deviceName.isEmpty
         ? '未知设备'
         : session.deviceName;
+    final String origin = session.location.isEmpty
+        ? session.loginIp
+        : (session.loginIp.isEmpty
+              ? session.location
+              : '${session.location} · ${session.loginIp}');
     return Container(
       key: ValueKey<String>('account-session-${session.id}'),
       padding: const EdgeInsets.all(10),
@@ -399,6 +405,8 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
                   ' · 有效期至 ${_formatSessionTime(session.expiresAt.toLocal())}',
                   style: mutedStyle(context, size: 10.5),
                 ),
+                if (origin.isNotEmpty)
+                  Text('登录地点 $origin', style: mutedStyle(context, size: 10.5)),
               ],
             ),
           ),
@@ -422,9 +430,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
               ),
               if (!session.current)
                 TextButton(
-                  key: ValueKey<String>(
-                    'account-session-revoke-${session.id}',
-                  ),
+                  key: ValueKey<String>('account-session-revoke-${session.id}'),
                   onPressed: _busy ? null : () => _revoke(session),
                   style: TextButton.styleFrom(
                     foregroundColor: theme.colorScheme.error,

@@ -17,6 +17,7 @@ type connectionReportRequest struct {
 	EndedAtMS   int64  `json:"ended_at_ms"`
 	Success     *bool  `json:"success"`
 	Detail      string `json:"detail"`
+	AuditRef    string `json:"audit_ref,omitempty"`
 }
 
 type connectionView struct {
@@ -24,6 +25,9 @@ type connectionView struct {
 	Username    string `json:"username"`
 	PeerID      string `json:"peer_id"`
 	Direction   string `json:"direction"`
+	HostID      string `json:"host_id,omitempty"`
+	AuditRef    string `json:"audit_ref,omitempty"`
+	Source      string `json:"source,omitempty"`
 	ClientIP    string `json:"client_ip"`
 	StartedAtMS int64  `json:"started_at_ms"`
 	EndedAtMS   int64  `json:"ended_at_ms"`
@@ -42,6 +46,9 @@ func connectionToView(event account.ConnectionEvent) connectionView {
 		Username:    event.Username,
 		PeerID:      event.PeerID,
 		Direction:   event.Direction,
+		HostID:      event.HostID,
+		AuditRef:    event.AuditRef,
+		Source:      event.Source,
 		ClientIP:    event.ClientIP,
 		StartedAtMS: event.StartedAt.UnixMilli(),
 		EndedAtMS:   event.EndedAt.UnixMilli(),
@@ -90,7 +97,7 @@ func (s *server) recordAccountConnection(w http.ResponseWriter, r *http.Request)
 	}
 	event, err := s.cfg.Accounts.RecordConnection(
 		user.ID, user.Username, req.PeerID, req.Direction, s.clientIP(r),
-		startedAt, endedAt, success, req.Detail,
+		req.AuditRef, startedAt, endedAt, success, req.Detail,
 	)
 	if err != nil {
 		if errors.Is(err, account.ErrInvalidConnection) {
@@ -141,7 +148,15 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, err := s.cfg.Accounts.ConnectionsFor(r.URL.Query().Get("username"), limit)
+	var (
+		events []account.ConnectionEvent
+		err    error
+	)
+	if host := strings.TrimSpace(r.URL.Query().Get("host")); host != "" {
+		events, err = s.cfg.Accounts.ConnectionsForHost(host, limit)
+	} else {
+		events, err = s.cfg.Accounts.ConnectionsFor(r.URL.Query().Get("username"), limit)
+	}
 	if err != nil {
 		s.cfg.Logger.Error("account connection audit query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the connection log")

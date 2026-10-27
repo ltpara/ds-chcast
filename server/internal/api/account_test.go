@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,13 +14,16 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
 
 type loginReply struct {
-	Token       string `json:"token"`
-	ExpiresInMS int64  `json:"expires_in_ms"`
-	User        struct {
+	Token              string `json:"token"`
+	ExpiresInMS        int64  `json:"expires_in_ms"`
+	RefreshToken       string `json:"refresh_token"`
+	RefreshExpiresInMS int64  `json:"refresh_expires_in_ms"`
+	User               struct {
 		ID       string `json:"id"`
 		Username string `json:"username"`
 	} `json:"user"`
@@ -67,7 +72,81 @@ func login(t *testing.T, base, username, password string) loginReply {
 	if reply.Token == "" || reply.ExpiresInMS <= 0 || reply.User.Username != username {
 		t.Fatalf("unexpected login reply: %+v", reply)
 	}
+	if reply.RefreshToken == "" || reply.RefreshExpiresInMS <= 0 {
+		t.Fatalf("login reply has no refresh token: %+v", reply)
+	}
 	return reply
+}
+
+func TestAccountRefreshRotatesAndDetectsReplay(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	first := login(t, s.URL, "alice", "correct horse")
+	refreshBody := func(token string) string {
+		body, err := json.Marshal(map[string]string{"refresh_token": token})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+		refreshBody(first.RefreshToken), "")
+	if status != http.StatusOK {
+		t.Fatalf("refresh: %d %s", status, data)
+	}
+	var second loginReply
+	if err := json.Unmarshal(data, &second); err != nil {
+		t.Fatalf("refresh reply: %v", err)
+	}
+	if second.Token == "" || second.Token == first.Token ||
+		second.RefreshToken == "" || second.RefreshToken == first.RefreshToken {
+		t.Fatalf("refresh did not rotate the pair: %+v", second)
+	}
+	if second.RefreshExpiresInMS <= second.ExpiresInMS {
+		t.Fatalf("refresh lifetime should outlive the access token: %+v", second)
+	}
+	if status, data := request(t, http.MethodGet, s.URL+"/v1/account", "", first.Token); status != http.StatusUnauthorized {
+		t.Fatalf("old access token after refresh = %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodGet, s.URL+"/v1/account", "", second.Token); status != http.StatusOK {
+		t.Fatalf("new access token = %d %s", status, data)
+	}
+
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+		refreshBody(first.RefreshToken), "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("replayed refresh = %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodGet, s.URL+"/v1/account", "", second.Token); status != http.StatusUnauthorized {
+		t.Fatalf("replay kept the session alive: %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+		refreshBody(second.RefreshToken), ""); status != http.StatusUnauthorized {
+		t.Fatalf("rotated refresh after replay = %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh", `{}`, ""); status != http.StatusUnauthorized {
+		t.Fatalf("empty refresh = %d %s", status, data)
+	}
+
+	events, err := s.Accounts.AuditEventsFor(account.AuditRefresh, 10)
+	if err != nil {
+		t.Fatalf("refresh audit: %v", err)
+	}
+	var sawRotation, sawReplay bool
+	for _, event := range events {
+		if event.Success && event.Username == "alice" && event.Detail == "rotated" {
+			sawRotation = true
+		}
+		if !event.Success && event.Detail == "replay; session revoked" {
+			sawReplay = true
+		}
+	}
+	if !sawRotation || !sawReplay {
+		t.Fatalf("refresh audit missing: rotation=%v replay=%v events=%+v", sawRotation, sawReplay, events)
+	}
 }
 
 func TestAccountLoginAndAddressBook(t *testing.T) {
@@ -360,6 +439,67 @@ func TestAddressBookGroupAPI(t *testing.T) {
 	}
 }
 
+func TestAddressBookGroupOptimisticConcurrencyAPI(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	reply := login(t, s.URL, "alice", "correct horse")
+	status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/studio", `{"name":"Studio"}`, reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("create group: %d %s", status, body)
+	}
+	var group groupReply
+	if err := json.Unmarshal(body, &group); err != nil {
+		t.Fatalf("group reply: %v", err)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/studio", `{"name":"Lab","if_revision":0}`, reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("non-positive group if_revision: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/studio",
+		fmt.Sprintf(`{"name":"Lab","if_revision":%d}`, group.Revision), reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("matching group rename: %d %s", status, body)
+	}
+	var renamed groupReply
+	if err := json.Unmarshal(body, &renamed); err != nil {
+		t.Fatalf("renamed group reply: %v", err)
+	}
+	if renamed.Name != "Lab" || renamed.Revision != 2 {
+		t.Fatalf("renamed group = %+v", renamed)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/studio",
+		fmt.Sprintf(`{"name":"Stale","if_revision":%d}`, group.Revision), reply.Token); status != http.StatusConflict {
+		t.Fatalf("stale group rename: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/groups/studio?if_revision=0", "", reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("non-positive delete if_revision: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/groups/studio?if_revision=1", "", reply.Token); status != http.StatusConflict {
+		t.Fatalf("stale group delete: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete,
+		fmt.Sprintf("%s/v1/addressbook/groups/studio?if_revision=%d", s.URL, renamed.Revision),
+		"", reply.Token); status != http.StatusNoContent {
+		t.Fatalf("matching group delete: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/studio",
+		fmt.Sprintf(`{"name":"Revive","if_revision":%d}`, renamed.Revision), reply.Token); status != http.StatusConflict {
+		t.Fatalf("tombstoned group rename: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/studio", `{"name":"Revive"}`, reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("legacy group revive: %d %s", status, body)
+	}
+	var revived groupReply
+	if err := json.Unmarshal(body, &revived); err != nil {
+		t.Fatalf("revived group reply: %v", err)
+	}
+	if revived.Revision != 4 || revived.Deleted {
+		t.Fatalf("revived group = %+v", revived)
+	}
+}
+
 func TestAddressBookIsPerUser(t *testing.T) {
 	s := testutil.Start(t)
 	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
@@ -390,6 +530,7 @@ func TestAddressBookIsPerUser(t *testing.T) {
 type grantReply struct {
 	Username    string `json:"username"`
 	Permission  string `json:"permission"`
+	GroupID     string `json:"group_id"`
 	CreatedAtMS int64  `json:"created_at_ms"`
 }
 
@@ -398,15 +539,127 @@ type grantsReply struct {
 	Incoming []grantReply `json:"incoming"`
 }
 
+type sharedScopeReply struct {
+	GroupID    string `json:"group_id"`
+	Permission string `json:"permission"`
+}
+
 type sharedBookReply struct {
-	Owner      string      `json:"owner"`
-	Permission string      `json:"permission"`
-	Revision   int64       `json:"revision"`
-	Peers      []peerReply `json:"peers"`
+	Owner      string             `json:"owner"`
+	Permission string             `json:"permission"`
+	Revision   int64              `json:"revision"`
+	Peers      []peerReply        `json:"peers"`
+	Groups     []groupReply       `json:"groups"`
+	Scopes     []sharedScopeReply `json:"scopes"`
 }
 
 type sharedBooksReply struct {
 	Books []sharedBookReply `json:"books"`
+}
+
+func TestSharedAddressBookGroupScopeAPI(t *testing.T) {
+	s := testutil.Start(t)
+	for _, username := range []string{"alice", "bob", "carol"} {
+		if _, err := s.Accounts.CreateUser(username, "correct horse"); err != nil {
+			t.Fatalf("create %s: %v", username, err)
+		}
+	}
+	alice := login(t, s.URL, "alice", "correct horse")
+	bob := login(t, s.URL, "bob", "correct horse")
+	for _, group := range []string{"lab", "work"} {
+		if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/"+group,
+			`{"name":"`+group+`"}`, alice.Token); status != http.StatusOK {
+			t.Fatalf("create group %s: %d %s", group, status, body)
+		}
+	}
+	for _, peer := range []struct{ id, name, group string }{
+		{"devbox", "开发机", "lab"},
+		{"office", "办公机", "work"},
+		{"loose", "散装", ""},
+	} {
+		body := fmt.Sprintf(`{"name":%q,"group_id":%q}`, peer.name, peer.group)
+		if status, reply := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/"+peer.id, body, alice.Token); status != http.StatusOK {
+			t.Fatalf("seed %s: %d %s", peer.id, status, reply)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"invalid group id", `{"username":"bob","group_id":"bad id"}`, http.StatusBadRequest},
+		{"unknown group", `{"username":"bob","group_id":"ghost"}`, http.StatusNotFound},
+	} {
+		if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/grants", tc.body, alice.Token); status != tc.want {
+			t.Fatalf("%s: %d %s, want %d", tc.name, status, body, tc.want)
+		}
+	}
+	status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/grants",
+		`{"username":"bob","permission":"write","group_id":"lab"}`, alice.Token)
+	var grant grantReply
+	if err := json.Unmarshal(body, &grant); err != nil || status != http.StatusOK ||
+		grant.Username != "bob" || grant.GroupID != "lab" || grant.Permission != "write" {
+		t.Fatalf("scoped share: %d %s (%v)", status, body, err)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", bob.Token)
+	var shared sharedBooksReply
+	if err := json.Unmarshal(body, &shared); err != nil || status != http.StatusOK ||
+		len(shared.Books) != 1 || shared.Books[0].Permission != "write" ||
+		len(shared.Books[0].Peers) != 1 || shared.Books[0].Peers[0].ID != "devbox" ||
+		len(shared.Books[0].Groups) != 1 || shared.Books[0].Groups[0].ID != "lab" ||
+		len(shared.Books[0].Scopes) != 1 || shared.Books[0].Scopes[0].GroupID != "lab" {
+		t.Fatalf("bob scoped books: %d %s (%v)", status, body, err)
+	}
+
+	sharedPeerURL := s.URL + "/v1/addressbook/shared/alice/peers/"
+	for _, tc := range []struct {
+		name   string
+		method string
+		url    string
+		body   string
+		want   int
+	}{
+		{"write outside the group", http.MethodPatch, sharedPeerURL + "office", `{"name":"越权"}`, http.StatusForbidden},
+		{"add outside the group", http.MethodPost, s.URL + "/v1/addressbook/shared/alice/peers",
+			`{"id":"escaped","name":"越权","group_id":"work"}`, http.StatusForbidden},
+		{"add with invalid group", http.MethodPost, s.URL + "/v1/addressbook/shared/alice/peers",
+			`{"id":"escaped","name":"坏组","group_id":"bad id"}`, http.StatusBadRequest},
+		{"add with unknown group", http.MethodPost, s.URL + "/v1/addressbook/shared/alice/peers",
+			`{"id":"escaped","name":"坏组","group_id":"ghost"}`, http.StatusNotFound},
+		{"add into the granted group", http.MethodPost, s.URL + "/v1/addressbook/shared/alice/peers",
+			`{"id":"newbox","name":"新增","group_id":"lab"}`, http.StatusOK},
+		{"write inside the group", http.MethodPatch, sharedPeerURL + "devbox", `{"name":"共享改名"}`, http.StatusOK},
+	} {
+		if status, body := request(t, tc.method, tc.url, tc.body, bob.Token); status != tc.want {
+			t.Fatalf("%s: %d %s, want %d", tc.name, status, body, tc.want)
+		}
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook/grants", "", alice.Token)
+	var grants grantsReply
+	if err := json.Unmarshal(body, &grants); err != nil || status != http.StatusOK ||
+		len(grants.Outgoing) != 1 || grants.Outgoing[0].GroupID != "lab" {
+		t.Fatalf("alice scoped grants: %d %s (%v)", status, body, err)
+	}
+
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/addressbook/grants/bob?group_id=bad%20id", "", alice.Token); status != http.StatusBadRequest {
+		t.Fatalf("revoke with invalid group: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/addressbook/grants/bob?group_id=lab", "", alice.Token); status != http.StatusNoContent {
+		t.Fatalf("revoke scoped grant: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodDelete,
+		s.URL+"/v1/addressbook/grants/bob?group_id=lab", "", alice.Token); status != http.StatusNotFound {
+		t.Fatalf("repeated scoped revoke: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook/shared", "", bob.Token)
+	if status != http.StatusOK || !strings.Contains(string(body), `"books":[]`) {
+		t.Fatalf("books after scoped revoke: %d %s", status, body)
+	}
 }
 
 func TestSharedAddressBookAPI(t *testing.T) {
@@ -1744,6 +1997,9 @@ type connectionReply struct {
 	Username    string `json:"username"`
 	PeerID      string `json:"peer_id"`
 	Direction   string `json:"direction"`
+	HostID      string `json:"host_id"`
+	AuditRef    string `json:"audit_ref"`
+	Source      string `json:"source"`
 	ClientIP    string `json:"client_ip"`
 	StartedAtMS int64  `json:"started_at_ms"`
 	EndedAtMS   int64  `json:"ended_at_ms"`
@@ -1890,6 +2146,9 @@ type fileTransferReply struct {
 	Username     string `json:"username"`
 	PeerID       string `json:"peer_id"`
 	Direction    string `json:"direction"`
+	HostID       string `json:"host_id"`
+	AuditRef     string `json:"audit_ref"`
+	Source       string `json:"source"`
 	Name         string `json:"name"`
 	Size         int64  `json:"size"`
 	Files        int    `json:"files"`
@@ -2027,5 +2286,63 @@ func TestFileTransferAudit(t *testing.T) {
 	}
 	if status, body := request(t, http.MethodGet, noStore.URL+"/v1/audit/file-transfers", "", testutil.ServerKey); status != http.StatusServiceUnavailable {
 		t.Fatalf("operator transfers without accounts: %d %s", status, body)
+	}
+}
+
+func TestLoginRecordsGeoIPLocation(t *testing.T) {
+	table := filepath.Join(t.TempDir(), "geoip.txt")
+	if err := os.WriteFile(table, []byte("127.0.0.0/8\tLocal lab\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locator, err := geoip.Load(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testutil.StartWith(t, testutil.Options{GeoIP: locator})
+	user, err := s.Accounts.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, body := request(t, http.MethodPost, s.URL+"/v1/account/login",
+		`{"username":"alice","password":"correct horse"}`, "")
+	if status != http.StatusOK {
+		t.Fatalf("login: %d %s", status, body)
+	}
+	var reply loginReply
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := s.Accounts.Sessions(user.ID, reply.Token)
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, %v", sessions, err)
+	}
+	if sessions[0].LoginIP != "127.0.0.1" || sessions[0].Location != "Local lab" {
+		t.Fatalf("session origin = %+v", sessions[0])
+	}
+	events, err := s.Accounts.AuditEvents(10)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("audit events = %+v, %v", events, err)
+	}
+	if events[0].Action != account.AuditLogin || !events[0].Success ||
+		events[0].ClientIP != "127.0.0.1" || events[0].Location != "Local lab" {
+		t.Fatalf("login audit = %+v", events[0])
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/account/sessions", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("sessions api: %d %s", status, body)
+	}
+	var view struct {
+		Sessions []struct {
+			LoginIP  string `json:"login_ip"`
+			Location string `json:"location"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(body, &view); err != nil || len(view.Sessions) != 1 {
+		t.Fatalf("sessions view = %+v, %v", view, err)
+	}
+	if view.Sessions[0].LoginIP != "127.0.0.1" || view.Sessions[0].Location != "Local lab" {
+		t.Fatalf("sessions view origin = %+v", view.Sessions[0])
 	}
 }

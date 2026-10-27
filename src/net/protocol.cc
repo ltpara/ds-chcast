@@ -534,9 +534,12 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
                                       : hello.signature.size();
     const size_t totp_size = hello.totp.size() > kMaxTotpLength ? kMaxTotpLength
                                                                  : hello.totp.size();
+    const size_t audit_size = hello.audit_ref.size() > kMaxAuditRefLength
+                                  ? kMaxAuditRefLength
+                                  : hello.audit_ref.size();
     std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 2 + 2 + key_size +
                                  1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
-                                 signature_size + 2 + totp_size);
+                                 signature_size + 2 + totp_size + 2 + audit_size);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
     put_u16(cursor, hello.display);
@@ -570,6 +573,11 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     put_u16(cursor, static_cast<uint16_t>(totp_size));
     if (totp_size > 0) {
         std::memcpy(cursor, hello.totp.data(), totp_size);
+        cursor += totp_size;
+    }
+    put_u16(cursor, static_cast<uint16_t>(audit_size));
+    if (audit_size > 0) {
+        std::memcpy(cursor, hello.audit_ref.data(), audit_size);
     }
     return make_control(ControlType::Hello, payload);
 }
@@ -656,6 +664,16 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
     if (!reader.u16(totp_size) || totp_size > kMaxTotpLength ||
         !reader.string(hello.totp, totp_size)) {
         set_error(error, "Hello carries a malformed TOTP code");
+        return false;
+    }
+    uint16_t audit_size = 0;
+    if (!reader.u16(audit_size) || audit_size > kMaxAuditRefLength ||
+        !reader.string(hello.audit_ref, audit_size)) {
+        set_error(error, "Hello carries a malformed audit reference");
+        return false;
+    }
+    if (!valid_audit_ref(hello.audit_ref)) {
+        set_error(error, "Hello carries an audit reference that is not lowercase hex");
         return false;
     }
     if (!reader.at_end()) {
@@ -758,6 +776,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.file_transfer_enabled ? kServerInfoFileTransferEnabled : 0) |
                         (info.microphone_enabled ? kServerInfoMicrophoneEnabled : 0) |
                         (info.privacy_mode_enabled ? kServerInfoPrivacyModeEnabled : 0) |
+                        (info.port_forward_enabled ? kServerInfoPortForwardEnabled : 0) |
+                        (info.terminal_enabled ? kServerInfoTerminalEnabled : 0) |
                         (info.merged ? kServerInfoMergedLayout : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
@@ -806,6 +826,12 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     if (info.privacy_mode_enabled) {
         permissions |= kPermissionPrivacyMode;
+    }
+    if (info.port_forward_enabled) {
+        permissions |= kPermissionPortForward;
+    }
+    if (info.terminal_enabled) {
+        permissions |= kPermissionTerminal;
     }
     put_u16(cursor, permissions);
     return payload;
@@ -1026,6 +1052,8 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
     info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
+    info.port_forward_enabled = (permissions & kPermissionPortForward) != 0;
+    info.terminal_enabled = (permissions & kPermissionTerminal) != 0;
     return true;
 }
 
@@ -1227,6 +1255,391 @@ bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
     text.assign(payload.begin(), payload.end());
     if (!valid_utf8(text)) {
         set_error(error, "ChatMessage text is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool valid_port_forward_host(const std::string& host) {
+    return !host.empty() && host.size() <= kMaxPortForwardHostBytes &&
+           host.find('\0') == std::string::npos && valid_utf8(host);
+}
+
+bool valid_port_forward_code(PortForwardCode code) {
+    return code == PortForwardCode::Ok || code == PortForwardCode::Refused ||
+           code == PortForwardCode::InvalidTarget || code == PortForwardCode::Busy ||
+           code == PortForwardCode::Cancelled;
+}
+
+std::string truncate_port_forward_reason(const std::string& reason) {
+    if (reason.size() <= kMaxPortForwardReasonBytes) {
+        return valid_utf8(reason) ? reason : std::string();
+    }
+    size_t cut = kMaxPortForwardReasonBytes;
+    while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0u) == 0x80u) {
+        --cut;
+    }
+    std::string text = reason.substr(0, cut);
+    return valid_utf8(text) ? text : std::string();
+}
+
+std::vector<uint8_t> make_port_forward_reason_message(ControlType type, uint32_t forward_id,
+                                                      PortForwardCode code,
+                                                      const std::string& reason) {
+    if (!valid_port_forward_code(code)) {
+        return {};
+    }
+    const std::string text = truncate_port_forward_reason(reason);
+    std::vector<uint8_t> payload(4 + 1 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, forward_id);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(type, payload);
+}
+
+bool parse_port_forward_reason_message(const std::vector<uint8_t>& payload, uint32_t& forward_id,
+                                       PortForwardCode& code, std::string& reason,
+                                       std::string* error, const char* name) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(forward_id) || !reader.u8(raw_code) || !reader.u16(reason_size)) {
+        set_error(error, std::string("truncated ") + name);
+        return false;
+    }
+    code = static_cast<PortForwardCode>(raw_code);
+    if (!valid_port_forward_code(code)) {
+        set_error(error, std::string(name) + " carries an unknown code");
+        return false;
+    }
+    if (reason_size > kMaxPortForwardReasonBytes || !reader.string(reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, std::string(name) + " carries a malformed reason");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, std::string(name) + " reason is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_port_forward_request(const PortForwardRequest& request) {
+    if (request.forward_id == 0 || !valid_port_forward_host(request.host) ||
+        request.port == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 2 + 2 + request.host.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request.forward_id);
+    put_u16(cursor, request.port);
+    put_u16(cursor, static_cast<uint16_t>(request.host.size()));
+    std::memcpy(cursor, request.host.data(), request.host.size());
+    return make_control(ControlType::PortForwardRequest, payload);
+}
+
+bool parse_port_forward_request(const std::vector<uint8_t>& payload,
+                                PortForwardRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint16_t host_size = 0;
+    if (!reader.u32(request.forward_id) || !reader.u16(request.port) ||
+        !reader.u16(host_size)) {
+        set_error(error, "truncated PortForwardRequest");
+        return false;
+    }
+    if (request.forward_id == 0) {
+        set_error(error, "PortForwardRequest carries forward id 0");
+        return false;
+    }
+    if (request.port == 0) {
+        set_error(error, "PortForwardRequest carries port 0");
+        return false;
+    }
+    if (host_size == 0 || host_size > kMaxPortForwardHostBytes ||
+        !reader.string(request.host, host_size) || !reader.at_end()) {
+        set_error(error, "PortForwardRequest carries a malformed host");
+        return false;
+    }
+    if (!valid_port_forward_host(request.host)) {
+        set_error(error, "PortForwardRequest host is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_port_forward_result(const PortForwardResult& result) {
+    return make_port_forward_reason_message(ControlType::PortForwardResult, result.forward_id,
+                                            result.code, result.reason);
+}
+
+bool parse_port_forward_result(const std::vector<uint8_t>& payload,
+                               PortForwardResult& result, std::string* error) {
+    return parse_port_forward_reason_message(payload, result.forward_id, result.code,
+                                             result.reason, error, "PortForwardResult");
+}
+
+std::vector<uint8_t> make_port_forward_stop(const PortForwardStop& stop) {
+    return make_port_forward_reason_message(ControlType::PortForwardStop, stop.forward_id,
+                                            stop.code, stop.reason);
+}
+
+bool parse_port_forward_stop(const std::vector<uint8_t>& payload, PortForwardStop& stop,
+                             std::string* error) {
+    return parse_port_forward_reason_message(payload, stop.forward_id, stop.code,
+                                             stop.reason, error, "PortForwardStop");
+}
+
+std::vector<uint8_t> make_port_forward_stream_header(uint32_t forward_id,
+                                                      uint32_t connection_id) {
+    if (forward_id == 0 || connection_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> header(kPortForwardStreamHeaderSize, 0);
+    std::memcpy(header.data(), kPortForwardStreamMagic, 4);
+    header[4] = kPortForwardStreamVersion;
+    uint8_t* cursor = header.data() + 8;
+    put_u32(cursor, forward_id);
+    put_u32(cursor, connection_id);
+    return header;
+}
+
+bool decode_port_forward_stream_header(const uint8_t* data, size_t size,
+                                       PortForwardStreamHeader& header, std::string* error) {
+    if (!data || size < kPortForwardStreamHeaderSize) {
+        set_error(error, "truncated CPFW header");
+        return false;
+    }
+    if (std::memcmp(data, kPortForwardStreamMagic, 4) != 0) {
+        set_error(error, "CPFW header has the wrong magic");
+        return false;
+    }
+    if (data[4] != kPortForwardStreamVersion) {
+        set_error(error, "CPFW header has an unknown version");
+        return false;
+    }
+    if (data[5] != 0 || data[6] != 0 || data[7] != 0) {
+        set_error(error, "CPFW header has non-zero reserved bytes");
+        return false;
+    }
+    Reader reader(data + 8, kPortForwardStreamHeaderSize - 8);
+    if (!reader.u32(header.forward_id) || !reader.u32(header.connection_id)) {
+        set_error(error, "truncated CPFW header");
+        return false;
+    }
+    if (header.forward_id == 0 || header.connection_id == 0) {
+        set_error(error, "CPFW header carries a zero id");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool valid_terminal_code(TerminalCode code) {
+    return code == TerminalCode::Ok || code == TerminalCode::Refused ||
+           code == TerminalCode::Busy || code == TerminalCode::Failed ||
+           code == TerminalCode::Cancelled;
+}
+
+std::string truncate_terminal_reason(const std::string& reason) {
+    if (reason.size() <= kMaxTerminalReasonBytes) {
+        return valid_utf8(reason) ? reason : std::string();
+    }
+    size_t cut = kMaxTerminalReasonBytes;
+    while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0u) == 0x80u) {
+        --cut;
+    }
+    std::string text = reason.substr(0, cut);
+    return valid_utf8(text) ? text : std::string();
+}
+
+std::vector<uint8_t> make_terminal_reason_message(ControlType type, uint32_t terminal_id,
+                                                  TerminalCode code,
+                                                  const std::string& reason) {
+    if (!valid_terminal_code(code)) {
+        return {};
+    }
+    const std::string text = truncate_terminal_reason(reason);
+    std::vector<uint8_t> payload(4 + 1 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, terminal_id);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(type, payload);
+}
+
+bool parse_terminal_reason_message(const std::vector<uint8_t>& payload, uint32_t& terminal_id,
+                                   TerminalCode& code, std::string& reason, std::string* error,
+                                   const char* name) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(terminal_id) || !reader.u8(raw_code) || !reader.u16(reason_size)) {
+        set_error(error, std::string("truncated ") + name);
+        return false;
+    }
+    code = static_cast<TerminalCode>(raw_code);
+    if (!valid_terminal_code(code)) {
+        set_error(error, std::string(name) + " carries an unknown code");
+        return false;
+    }
+    if (reason_size > kMaxTerminalReasonBytes || !reader.string(reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, std::string(name) + " carries a malformed reason");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, std::string(name) + " reason is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool valid_terminal_size(uint16_t columns, uint16_t rows) {
+    return columns >= 1 && columns <= kMaxTerminalColumns && rows >= 1 &&
+           rows <= kMaxTerminalRows;
+}
+
+std::vector<uint8_t> make_terminal_request(const TerminalRequest& request) {
+    if (request.terminal_id == 0 || !valid_terminal_size(request.columns, request.rows)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 2 + 2);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request.terminal_id);
+    put_u16(cursor, request.columns);
+    put_u16(cursor, request.rows);
+    return make_control(ControlType::TerminalRequest, payload);
+}
+
+bool parse_terminal_request(const std::vector<uint8_t>& payload,
+                            TerminalRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(request.terminal_id) || !reader.u16(request.columns) ||
+        !reader.u16(request.rows) || !reader.at_end()) {
+        set_error(error, "malformed TerminalRequest");
+        return false;
+    }
+    if (request.terminal_id == 0) {
+        set_error(error, "TerminalRequest carries terminal id 0");
+        return false;
+    }
+    if (!valid_terminal_size(request.columns, request.rows)) {
+        set_error(error, "TerminalRequest carries a size out of range");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_terminal_result(const TerminalResult& result) {
+    return make_terminal_reason_message(ControlType::TerminalResult, result.terminal_id,
+                                        result.code, result.reason);
+}
+
+bool parse_terminal_result(const std::vector<uint8_t>& payload,
+                           TerminalResult& result, std::string* error) {
+    return parse_terminal_reason_message(payload, result.terminal_id, result.code,
+                                         result.reason, error, "TerminalResult");
+}
+
+std::vector<uint8_t> make_terminal_stop(const TerminalStop& stop) {
+    return make_terminal_reason_message(ControlType::TerminalStop, stop.terminal_id, stop.code,
+                                        stop.reason);
+}
+
+bool parse_terminal_stop(const std::vector<uint8_t>& payload, TerminalStop& stop,
+                         std::string* error) {
+    return parse_terminal_reason_message(payload, stop.terminal_id, stop.code, stop.reason,
+                                         error, "TerminalStop");
+}
+
+std::vector<uint8_t> make_terminal_resize(uint32_t terminal_id, uint16_t columns,
+                                          uint16_t rows) {
+    if (terminal_id == 0 || !valid_terminal_size(columns, rows)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 2 + 2);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, terminal_id);
+    put_u16(cursor, columns);
+    put_u16(cursor, rows);
+    return make_control(ControlType::TerminalResize, payload);
+}
+
+bool parse_terminal_resize(const std::vector<uint8_t>& payload, TerminalSize& size,
+                           std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(size.terminal_id) || !reader.u16(size.columns) ||
+        !reader.u16(size.rows) || !reader.at_end()) {
+        set_error(error, "malformed TerminalResize");
+        return false;
+    }
+    if (size.terminal_id == 0) {
+        set_error(error, "TerminalResize carries terminal id 0");
+        return false;
+    }
+    if (!valid_terminal_size(size.columns, size.rows)) {
+        set_error(error, "TerminalResize carries a size out of range");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_terminal_stream_header(uint32_t terminal_id) {
+    if (terminal_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> header(kTerminalStreamHeaderSize, 0);
+    std::memcpy(header.data(), kTerminalStreamMagic, 4);
+    header[4] = kTerminalStreamVersion;
+    uint8_t* cursor = header.data() + 8;
+    put_u32(cursor, terminal_id);
+    return header;
+}
+
+bool decode_terminal_stream_header(const uint8_t* data, size_t size,
+                                   TerminalStreamHeader& header, std::string* error) {
+    if (!data || size < kTerminalStreamHeaderSize) {
+        set_error(error, "truncated CTTY header");
+        return false;
+    }
+    if (std::memcmp(data, kTerminalStreamMagic, 4) != 0) {
+        set_error(error, "CTTY header has the wrong magic");
+        return false;
+    }
+    if (data[4] != kTerminalStreamVersion) {
+        set_error(error, "CTTY header has an unknown version");
+        return false;
+    }
+    if (data[5] != 0 || data[6] != 0 || data[7] != 0) {
+        set_error(error, "CTTY header has non-zero reserved bytes");
+        return false;
+    }
+    Reader reader(data + 8, kTerminalStreamHeaderSize - 8);
+    uint32_t reserved = 0;
+    if (!reader.u32(header.terminal_id) || !reader.u32(reserved)) {
+        set_error(error, "truncated CTTY header");
+        return false;
+    }
+    if (reserved != 0) {
+        set_error(error, "CTTY header has non-zero reserved bytes");
+        return false;
+    }
+    if (header.terminal_id == 0) {
+        set_error(error, "CTTY header carries terminal id 0");
         return false;
     }
     return true;

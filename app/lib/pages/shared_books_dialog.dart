@@ -14,14 +14,16 @@ typedef SharedGrantAction =
       ServerSettings settings,
       String token,
       String username,
-      String permission,
-    );
+      String permission, {
+      String? groupId,
+    });
 typedef SharedRevokeAction =
     Future<void> Function(
       ServerSettings settings,
       String token,
-      String username,
-    );
+      String username, {
+      String? groupId,
+    });
 typedef SharedBooksLoader =
     Future<List<SharedAddressBook>> Function(
       ServerSettings settings,
@@ -53,6 +55,7 @@ typedef SharedPeerAdder =
       String peerId, {
       String? name,
       List<String>? tags,
+      String? groupId,
     });
 typedef SharedBookGrantsLoader =
     Future<AddressBookGrants> Function(
@@ -66,15 +69,17 @@ typedef SharedBookGrantAction =
       String token,
       String owner,
       String username,
-      String permission,
-    );
+      String permission, {
+      String? groupId,
+    });
 typedef SharedBookRevokeAction =
     Future<void> Function(
       ServerSettings settings,
       String token,
       String owner,
-      String username,
-    );
+      String username, {
+      String? groupId,
+    });
 
 String sharedPermissionLabel(String permission) {
   switch (permission) {
@@ -94,6 +99,7 @@ class SharedBooksDialog extends StatefulWidget {
     super.key,
     required this.server,
     required this.account,
+    this.groups = const <AddressBookGroup>[],
     this.loadGrants,
     this.share,
     this.revoke,
@@ -108,6 +114,10 @@ class SharedBooksDialog extends StatefulWidget {
 
   final ServerSettings server;
   final AccountSession account;
+
+  /// Groups of this account's own address book, used by the share form and to
+  /// label outgoing group-scoped grants.
+  final List<AddressBookGroup> groups;
   final SharedGrantsLoader? loadGrants;
   final SharedGrantAction? share;
   final SharedRevokeAction? revoke;
@@ -128,9 +138,40 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   AddressBookGrants _grants = const AddressBookGrants();
   List<SharedAddressBook> _books = const <SharedAddressBook>[];
   String _permission = 'read';
+  String _scopeGroup = '';
   bool _loading = true;
   bool _busy = false;
   String _error = '';
+
+  String _groupName(String groupId) {
+    for (final AddressBookGroup group in widget.groups) {
+      if (group.id == groupId) {
+        return group.name;
+      }
+    }
+    return groupId;
+  }
+
+  String _grantScopeLabel(AddressBookGrant grant) {
+    if (grant.wholeBook) {
+      return '整本地址簿';
+    }
+    return '分组 ${_groupName(grant.groupId)}';
+  }
+
+  bool _canWritePeer(SharedAddressBook book, AddressBookPeer peer) {
+    return addressBookPermissionAllows(book.permissionFor(peer.groupId), 'write');
+  }
+
+  bool _canAddPeer(SharedAddressBook book) {
+    if (addressBookPermissionAllows(book.permissionFor(''), 'write')) {
+      return true;
+    }
+    return book.groups.any(
+      (AddressBookGroup group) =>
+          addressBookPermissionAllows(book.permissionFor(group.id), 'write'),
+    );
+  }
 
   @override
   void initState() {
@@ -239,6 +280,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         widget.account.token,
         username,
         _permission,
+        groupId: _scopeGroup,
       );
       _username.clear();
     }, '共享失败');
@@ -257,16 +299,18 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         widget.account.token,
         grant.username,
         permission,
+        groupId: grant.groupId,
       );
     }, '修改权限失败');
   }
 
-  Future<void> _revoke(String username) async {
+  Future<void> _revoke(AddressBookGrant grant) async {
     await _perform(() async {
       await (widget.revoke ?? ServerApi.unshareAddressBook)(
         widget.server,
         widget.account.token,
-        username,
+        grant.username,
+        groupId: grant.groupId,
       );
     }, '撤销共享失败');
   }
@@ -293,9 +337,20 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   }
 
   Future<void> _addPeer(SharedAddressBook book) async {
+    final List<AddressBookGroup> writableGroups = <AddressBookGroup>[
+      for (final AddressBookGroup group in book.groups)
+        if (addressBookPermissionAllows(book.permissionFor(group.id), 'write'))
+          group,
+    ];
     final _PeerDraft? draft = await showDialog<_PeerDraft>(
       context: context,
-      builder: (BuildContext context) => const _AddSharedPeerDialog(),
+      builder: (BuildContext context) => _AddSharedPeerDialog(
+        groups: writableGroups,
+        allowUngrouped: addressBookPermissionAllows(
+          book.permissionFor(''),
+          'write',
+        ),
+      ),
     );
     if (draft == null || !mounted) {
       return;
@@ -308,6 +363,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         draft.id,
         name: draft.name,
         tags: draft.tags,
+        groupId: draft.groupId,
       );
     }, '添加共享条目失败');
   }
@@ -354,6 +410,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         server: widget.server,
         account: widget.account,
         owner: book.owner,
+        groups: book.groups,
         loadGrants: widget.loadSharedGrants,
         share: widget.shareShared,
         revoke: widget.revokeShared,
@@ -451,10 +508,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                   '${book.peers.length} 台',
                                   style: mutedStyle(context, size: 10.5),
                                 ),
-                                if (addressBookPermissionAllows(
-                                  book.permission,
-                                  'write',
-                                ))
+                                if (_canAddPeer(book))
                                   IconButton(
                                     key: Key('shared-add-${book.owner}'),
                                     tooltip: '添加共享条目',
@@ -515,10 +569,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                 trailing: Row(
                                   mainAxisSize: MainAxisSize.min,
                                   children: <Widget>[
-                                    if (addressBookPermissionAllows(
-                                      book.permission,
-                                      'write',
-                                    ))
+                                    if (_canWritePeer(book, peer))
                                       PopupMenuButton<String>(
                                         key: Key(
                                           'shared-peer-menu-${book.owner}-${peer.id}',
@@ -576,7 +627,8 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               style: const TextStyle(fontSize: 12.5),
                             ),
                             subtitle: Text(
-                              sharedPermissionLabel(grant.permission),
+                              '${sharedPermissionLabel(grant.permission)} · '
+                              '${_grantScopeLabel(grant)}',
                               style: mutedStyle(context, size: 10.5),
                             ),
                             trailing: Row(
@@ -584,7 +636,8 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               children: <Widget>[
                                 DropdownButton<String>(
                                   key: Key(
-                                    'shared-permission-${grant.username}',
+                                    'shared-permission-${grant.username}'
+                                    '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
                                   ),
                                   value: grant.permission,
                                   underline: const SizedBox.shrink(),
@@ -611,11 +664,14 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                         },
                                 ),
                                 IconButton(
-                                  key: Key('shared-revoke-${grant.username}'),
+                                  key: Key(
+                                    'shared-revoke-${grant.username}'
+                                    '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
+                                  ),
                                   tooltip: '撤销共享',
                                   onPressed: _busy
                                       ? null
-                                      : () => _revoke(grant.username),
+                                      : () => _revoke(grant),
                                   icon: Icon(
                                     Icons.link_off_rounded,
                                     size: 18,
@@ -625,6 +681,41 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               ],
                             ),
                           ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: <Widget>[
+                          Text('共享范围', style: mutedStyle(context, size: 11.5)),
+                          const SizedBox(width: 8),
+                          DropdownButton<String>(
+                            key: const Key('shared-scope'),
+                            value: _scopeGroup,
+                            underline: const SizedBox.shrink(),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            items: <DropdownMenuItem<String>>[
+                              const DropdownMenuItem<String>(
+                                value: '',
+                                child: Text('整本地址簿'),
+                              ),
+                              for (final AddressBookGroup group
+                                  in widget.groups)
+                                DropdownMenuItem<String>(
+                                  value: group.id,
+                                  child: Text(group.name),
+                                ),
+                            ],
+                            onChanged: _busy
+                                ? null
+                                : (String? value) {
+                                    if (value != null) {
+                                      setState(() => _scopeGroup = value);
+                                    }
+                                  },
+                          ),
+                        ],
+                      ),
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
@@ -717,6 +808,7 @@ class SharedBookGrantsDialog extends StatefulWidget {
     required this.server,
     required this.account,
     required this.owner,
+    this.groups = const <AddressBookGroup>[],
     this.loadGrants,
     this.share,
     this.revoke,
@@ -725,6 +817,7 @@ class SharedBookGrantsDialog extends StatefulWidget {
   final ServerSettings server;
   final AccountSession account;
   final String owner;
+  final List<AddressBookGroup> groups;
   final SharedBookGrantsLoader? loadGrants;
   final SharedBookGrantAction? share;
   final SharedBookRevokeAction? revoke;
@@ -737,9 +830,26 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
   final TextEditingController _username = TextEditingController();
   AddressBookGrants _grants = const AddressBookGrants();
   String _permission = 'read';
+  String _scopeGroup = '';
   bool _loading = true;
   bool _busy = false;
   String _error = '';
+
+  String _groupName(String groupId) {
+    for (final AddressBookGroup group in widget.groups) {
+      if (group.id == groupId) {
+        return group.name;
+      }
+    }
+    return groupId;
+  }
+
+  String _scopeLabel(AddressBookGrant grant) {
+    if (grant.wholeBook) {
+      return '整本地址簿';
+    }
+    return '分组 ${_groupName(grant.groupId)}';
+  }
 
   @override
   void initState() {
@@ -806,6 +916,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
         widget.owner,
         username,
         _permission,
+        groupId: _scopeGroup,
       );
       _username.clear();
       await _load();
@@ -831,7 +942,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
     }
   }
 
-  Future<void> _revoke(String username) async {
+  Future<void> _revoke(AddressBookGrant grant) async {
     setState(() {
       _busy = true;
       _error = '';
@@ -841,7 +952,8 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
         widget.server,
         widget.account.token,
         widget.owner,
-        username,
+        grant.username,
+        groupId: grant.groupId,
       );
       await _load();
     } on ServerApiException catch (error) {
@@ -929,15 +1041,19 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                               style: const TextStyle(fontSize: 12.5),
                             ),
                             subtitle: Text(
-                              sharedPermissionLabel(grant.permission),
+                              '${sharedPermissionLabel(grant.permission)} · '
+                              '${_scopeLabel(grant)}',
                               style: mutedStyle(context, size: 10.5),
                             ),
                             trailing: IconButton(
-                              key: Key('shared-book-revoke-${grant.username}'),
+                              key: Key(
+                                'shared-book-revoke-${grant.username}'
+                                '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
+                              ),
                               tooltip: '撤销共享',
                               onPressed: _busy
                                   ? null
-                                  : () => _revoke(grant.username),
+                                  : () => _revoke(grant),
                               icon: Icon(
                                 Icons.link_off_rounded,
                                 size: 18,
@@ -945,6 +1061,41 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                               ),
                             ),
                           ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: <Widget>[
+                          Text('共享范围', style: mutedStyle(context, size: 11.5)),
+                          const SizedBox(width: 8),
+                          DropdownButton<String>(
+                            key: const Key('shared-book-scope'),
+                            value: _scopeGroup,
+                            underline: const SizedBox.shrink(),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            items: <DropdownMenuItem<String>>[
+                              const DropdownMenuItem<String>(
+                                value: '',
+                                child: Text('整本地址簿'),
+                              ),
+                              for (final AddressBookGroup group
+                                  in widget.groups)
+                                DropdownMenuItem<String>(
+                                  value: group.id,
+                                  child: Text(group.name),
+                                ),
+                            ],
+                            onChanged: _busy
+                                ? null
+                                : (String? value) {
+                                    if (value != null) {
+                                      setState(() => _scopeGroup = value);
+                                    }
+                                  },
+                          ),
+                        ],
+                      ),
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
@@ -1027,11 +1178,12 @@ class _PeerEdit {
 }
 
 class _PeerDraft {
-  const _PeerDraft(this.id, this.name, this.tags);
+  const _PeerDraft(this.id, this.name, this.tags, {this.groupId = ''});
 
   final String id;
   final String name;
   final List<String> tags;
+  final String groupId;
 }
 
 List<String> _splitTags(String text) {
@@ -1047,7 +1199,13 @@ List<String> _splitTags(String text) {
 }
 
 class _AddSharedPeerDialog extends StatefulWidget {
-  const _AddSharedPeerDialog();
+  const _AddSharedPeerDialog({
+    required this.groups,
+    required this.allowUngrouped,
+  });
+
+  final List<AddressBookGroup> groups;
+  final bool allowUngrouped;
 
   @override
   State<_AddSharedPeerDialog> createState() => _AddSharedPeerDialogState();
@@ -1057,6 +1215,9 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
   final TextEditingController _id = TextEditingController();
   final TextEditingController _name = TextEditingController();
   final TextEditingController _tags = TextEditingController();
+  late String _groupId = widget.allowUngrouped || widget.groups.isEmpty
+      ? ''
+      : widget.groups.first.id;
   String _error = '';
 
   @override
@@ -1073,9 +1234,9 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
       setState(() => _error = '请输入设备 ID');
       return;
     }
-    Navigator.of(
-      context,
-    ).pop(_PeerDraft(id, _name.text.trim(), _splitTags(_tags.text)));
+    Navigator.of(context).pop(
+      _PeerDraft(id, _name.text.trim(), _splitTags(_tags.text), groupId: _groupId),
+    );
   }
 
   @override
@@ -1109,6 +1270,29 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
               isDense: true,
               labelText: '标签（逗号分隔）',
             ),
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(
+            key: const Key('shared-add-group'),
+            initialValue: _groupId,
+            decoration: const InputDecoration(isDense: true, labelText: '分组'),
+            items: <DropdownMenuItem<String>>[
+              if (widget.allowUngrouped)
+                const DropdownMenuItem<String>(
+                  value: '',
+                  child: Text('未分组'),
+                ),
+              for (final AddressBookGroup group in widget.groups)
+                DropdownMenuItem<String>(
+                  value: group.id,
+                  child: Text(group.name),
+                ),
+            ],
+            onChanged: (String? value) {
+              if (value != null) {
+                setState(() => _groupId = value);
+              }
+            },
           ),
           if (_error.isNotEmpty) ...<Widget>[
             const SizedBox(height: 10),

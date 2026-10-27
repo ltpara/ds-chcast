@@ -199,8 +199,9 @@
 - 已完成：单机弱网验收（`docs/weak-network-acceptance.md`）。
   - 工具：新增 `chast-netem`（`tools/netem.cc`），在查看者与主机之间做 UDP 透明中继，按时间窗口注入单程时延、抖动、独立丢包和每方向带宽瓶颈；QUIC 拥塞控制、丢包检测与 ABR 接收的都是真实数据报信号。中继收发缓冲设为 16 MiB——默认 64 KiB 装不下切档后的双 IDR 突发，会在工具内静默丢包并伪造成链路拥塞。
   - 结果（单机，1920×1080，80 ms + 0–20 ms 抖动、3% 丢包、1000 kbps，劣化 20 s 后恢复）：档位 3000→500 kbps、30→10 fps、100%→50% 用时约 10.4 s，随后按 +100 kbps/3 s 单调回到 2700 kbps / 30 fps / 100%；1850/1850 帧解码，CRC/解码/协议/序号错误全为 0；干净对照 751/751 帧、`abr-changes=0`、最大帧龄 21.5 ms。
-  - 待解决：容量 3× 阶跃下降时帧龄峰值约 8 s（15% 的帧晚于 1 s），根因是 ABR 阶梯收敛慢于可靠有序流的排队速度；链路恢复后约 1 s 排空。后续可选“按实测交付速率一次性降档”（不动协议，优先）、“发送端时延预算 + 跳帧 + 强制 IDR”或“视频改走 QUIC DATAGRAM”。
-  - 已知限制：单机回环没有真实无线抖动、突发丢包、NAT/PMTU 与跨机时钟偏差；Flutter 查看器呈现路径与双机验收仍待做。
+  - 阶跃收敛（2026-10-27 已完成）：ABR 采样 1 s→500 ms；控制器按传输发送字节差、再按区间丢包折算交付速率。交付速率跌破目标 70% 且发送队列涨过拥塞窗口 65% 时，一次性落到交付速率的 65%（并绕过 1.5 s 下降冷却）；两个条件缺一不可——只有 RTT 升高而交付完好是纯时延事件，保持 15% 降幅，而线速率低但队列空闲是屏幕内容本身少，不是容量信号。其余仍走 -15%/-30% 与现有冷却/恢复阶梯。加门槛后四次复测：首次降档后 0.50–0.55 s 落到 500 kbps（原约 10.4 s），帧龄峰值 2.1–3.3 s（原 7954 ms），>1 s 的帧 75–137（原 278），>3 s 的帧 0–6（加门槛前 31–35），完整性零错误；峰值差异来自阶跃瞬间拥塞窗口（81–199 KB），不是控制器。`chast-bitrate-test` 127 项断言覆盖阶跃落位、落位门槛（交付与队列）、冷却穿越、丢包折算、地板与噪声阈值；`ctest -C Release` 25/25（387.6 s）。
+  - 仍保留：1–3.3 s 的帧龄峰值由 0.5 s 的发现窗口、阶跃瞬间的在途数据与可靠有序流的既有排队决定；再往下压需要“发送端时延预算 + 跳帧 + 强制 IDR”或“视频改走 QUIC DATAGRAM”。
+  - 已知限制：单机回环没有真实无线抖动、突发丢包、NAT/PMTU 与跨机时钟偏差；65% 余量与丢包折算在突发丢包下的表现待双机检验；Flutter 查看器呈现路径与双机验收仍待做。
 
 ## M7 — 安全模型
 
@@ -1184,11 +1185,155 @@
     密钥；密钥目前明文保存在 `server.json` 与进程参数中，依赖用户目录 ACL；
     打洞证明只覆盖会合请求，媒体仍由端到端 QUIC TLS 与令牌保护。
 
-## M6 后续（未开始）
+## M11 — RustDesk 服务端对齐（进行中）
 
-- 音频质量调优：唇音同步校准、设备热插拔自动切换（AEC/降噪/设备选择已在
-  M9.4 完成）。
+2026-10-26 以 `D:\rustdesk` @ `c7f212d`（只有客户端与 `libs/hbb_common`，
+无 hbbs/hbbr 源码）为参照，逐项核对了 `rendezvous.proto` 契约与客户端调用
+点，完整证据见 `docs/rustdesk-server-parity-2026-10-26.md`。
+
+- 结论：注册/保活、在线批量、打洞与 NAT 类型、中继与中继节点、限速/名单、
+  软件更新、别名/标签均已对齐；控制协议（JSON/`CHASTC1`）、传输（QUIC）、
+  服务器分配中继、端到端权限、无 licence/部署模型属于有意偏差，不修改。
+- 真实缺口按修正后的优先级：
+  1. **P0 双栈 / IPv6**：RustDesk 在打洞/中继/本地地址消息中并列携带
+     `socket_addr_v6`；我们的 `wire.Message` 只有单候选、默认监听 `0.0.0.0`，
+     IPv6-only 或 CGNAT+IPv6 环境只能走中继。要点：监听接受 IPv6（保留
+     IPv4 单栈默认）、注册/保活分族记录观测地址、wire 只增 v6 字段、代理
+     按族并行探测、中继按族分配与绑定。验收：`127.0.0.1` + `::1` 双栈回环
+     双族候选、v6 直连与 v6 中继；纯 IPv4 行为不变。
+     进展（2026-10-26，会合/打洞/中继阶段完成）：`wire` 增加 `candidate_v6` /
+     `local_addrs_v6`，注册与查询下发 `punch_v6`，registry 按族保存观测地址，
+     主机与查看器同时向两个会合地址保活并分族打洞；单机双栈回环通过——主机
+     `[::]` 注册后查询得到 `candidate_v6=[::1]:18434`，`[::1]` 查看器在 auto
+     模式经 v6 建立 direct 并完成回显往返。期间修复两个只在真实双栈路径暴露
+     的缺陷：keepalive 挑战改为按地址族键控（否则两条映射互相覆盖），主机
+     readLoop 接受来自 `punch6` 的控制报文（否则 v6 挑战被静默丢弃）。
+     中继新增 `--relay-listen-v6`：同一端口号上的按族 UDP/TCP 监听，共用主机
+     租约与统计、按族查看者槽位与限速会话；`relays` 下发 v4 主入口与 v6 端点，
+     主机全端点 `relay_hello`、查看者按 socket 族选择、主机按全部端点判定中继
+     路径。回环验收通过——`[::1]` 查看者经 `relay [::1]:41200` 完成 H.264
+     1920×1080 QUIC 会话（842 帧、0 CRC/解码错误、RTT 1.4 ms）。
+     剩余：纯 IPv6 主机经 IPv4 会合注册的降级路径（代理单 socket 不能跨族写
+     本地转发）、共享 TCP 载体的 v6 入口、双机跨网复核。
+  2. **P0 查看器固定服务器公钥**：RustDesk 内置 `RS_PUB_KEY` 并有
+     `KeyExchange`/`get_key_confirmed`；我们只有 CLI `--server-pubkey`，
+     Flutter 查看器只保存 `serverKey`。要点：首次连接展示指纹（TOFU）、
+     显式固定/更换确认、不匹配在 lookup 前失败。
+     进展（2026-10-26，完成）：`app/lib/server_identity.dart` 按服务器 URL
+     固定公钥并写本地审计；地址簿轮询比对查询响应，显式连接在对话框展示
+     完整指纹、变化需确认，确认值经 `--server-pubkey` 交代理再次校验。
+     回环验收通过匹配、错误固定、服务器轮换三条路径。
+  3. **P0 分组级 OCC 与分组共享/ACL**（2026-10-26 完成）：分组带
+     `revision`/`if_revision`；共享授权主键扩为 `(owner, grantee, group_id)`，
+     读取按范围过滤，读写限于授权分组，删除分组即撤权；API 与查看器同步。
+     验证：`go test ./internal/account/ ./internal/api/` 通过，
+     `flutter analyze` 无告警、`flutter test` 264 项全通过，单机回环
+     `account_sync_smoke.dart ... share` 44 项全过（10 项分组范围）。
+  4. **P1 主机 ID 迁移**（2026-10-26 完成）：注册新增 `old_id` +
+     `migrate_signature`，用旧 ID 已绑定的 Ed25519 密钥对 `(old_id, new_id,
+     timestamp)` 签名证明归属（不采用 uuid）；服务端原地移动持久记录、保留
+     alias/tags/created_at、释放旧租约，旧 ID 越权 403、新 ID 被占 409、旧
+     ID 不存在幂等成功。代理 `--old-id` 与 `migrated_from` 回显，主机
+     `tunnel_old_id` 持久化并在迁移确认后清空。单测与进程级回环均通过。
+  5. **P1 主机侧入站审计与关联 ID**（2026-10-26 完成）：关联 ID 由查看器
+     每会话生成（16 字节 CSPRNG，小写十六进制），作为 Hello 的 `audit_ref`
+     传给主机（协议 v25）。主机把会话结果与入站上传逐条写入
+     `audit_spool`（默认与 `host.ini` 同目录的 `<stem>.audit.jsonl`），
+     `chast-tunnel host --audit-spool` 用主机 Ed25519 密钥签名后
+     `POST /v1/hosts/{id}/audit`；服务端按引用合并查看器/主机两侧
+     （`source` = viewer/host/both），文件按主机视角逐文件保留，并支持
+     `?host=` 过滤。查看器报告同时携带引用，不依赖服务端下发。
+  6. **P1 令牌生命周期**（2026-10-26 完成）：30 min 访问令牌 + 720 h 刷新令牌；
+     登录与 `POST /v1/account/refresh` 返回同一结构，刷新轮换两枚令牌，重放
+     被轮换的刷新令牌即撤销整个会话；登出/撤权/改密/重置连带删除刷新令牌，
+     旧库长令牌保持可用。审计新增 `session_refresh`（rotated/replay/invalid）。
+     查看器持久化刷新令牌并在访问令牌到期前自动续期，401 登出、瞬时错误保留。
+     回环 39 项探针与管理台审计验证；`go test ./...`、Flutter 270 项通过。
+  7. **P1 UPnP**（2026-10-26 完成）：`upnp_port` 随 keepalive/查询/打洞双向
+     转发；`chast-tunnel host|viewer --upnp` 经 SSDP 发现 IGD，UDP 内外同端口
+     映射（租期 1800 s，每 15 min 续租，退出删除），718 冲突顺序换端口；
+     双方用“观察 IP + 映射端口”增加探针目标。IPv4-only、缺省关闭；本机无
+     IGD，真实路由器与对称 NAT 直连需部署复核。
+  8. **P1 GeoIP 登录地点**（2026-10-26 完成）：可选 `--geoip-file` 离线表
+     （每行 `CIDR 地点`，最长前缀匹配，IPv4/IPv6 与 IPv4-mapped 归一）；
+     地点写入账号安全审计 `location` 与登录会话 `login_ip`/`location`，
+     管理台审计与查看器设备会话对话框展示。未配置时只记录 IP，不做在线查询、
+     不带地点数据；单测覆盖最长前缀、坏行/缺文件、落库与 API，Flutter 270 项
+     测试含会话地点展示。
+  9. **P2-2 局域网发现**（2026-10-26 完成）：`chast-tunnel host` 默认在
+     UDP 21129 应答 `CHASTL1` + JSON 的 ping（`--lan-discovery=false` 关闭），
+     pong 只带 ID/主机名/用户名/平台/版本/MAC；查看器用
+     `chast-tunnel discover [--json]` 向受限广播、各网卡定向广播与回环探测，
+     同一主机多来源按 ID 合并并优先非回环地址；每来源令牌桶限速，发现不认证
+     也不授权连接。托盘防火墙增加 `chast-tunnel.exe` 的 21129/UDP 入站规则。
+     单机真实网卡广播与 Flutter 封装验收通过；跨子网/双机与 IPv6-only 待
+     实机；查看器首页“扫描”已接入（widget 测试覆盖，未人工点击）。
+ 10. **P2-3 端口转发**（2026-10-27 主机/查看器 GUI 全链路完成，协议 v26）：查看器
+     `PortForwardRequest`（33）/主机 `PortForwardResult`（34）/双向
+     `PortForwardStop`（35），权限位 `0x0080`、ServerInfo
+     `port_forward_enabled`，主机 `allow_port_forward` 默认关闭；每条被转发的
+     TCP 连接用两条单向 `CPFW` 流（上行 viewer→host、下行 host→viewer），
+     FIN 即半关闭，QUIC 流控即背压。主机 `PortForwardRelay` 在会话线程轮询
+     非阻塞拨号（5 s 超时、64 KiB 块），失败/完成即释放句柄；查看器侧对称的
+     `PortForwardClient` 绑定 127.0.0.1，主机批准后才 accept，`ViewerEngine`
+     命令与 `PortForwardStatus` 事件接入 Flutter 工具栏对话框（本地端口/
+     目标主机/目标端口）。验收：`chast-quic verify --port-forward` 走真实
+     127.0.0.1 TCP echo 往返 327803 字节逐字节一致；`verify --port-forward-denied`
+     证明闸门关闭时请求被拒且会话不受影响；`verify --port-forward-local` 由真实
+     本地 TCP 客户端穿透查看器监听器到达主机 echo；三项 ctest 全部通过。
+     查看器 GUI 实机（serve 令牌登录 → 工具栏对话框 51660 -> 127.0.0.1:45999）
+     1 MiB echo 往返逐字节一致。GUI 验收顺带修正：主机单向流权限闸门漏掉
+     端口转发位（只开端口转发的主机会 abort 上行流）；接收队列超过 512 KiB
+     即中止改为到高水位暂停（整包接受/拒绝 + 流控背压），慢速本地端不再
+     被判失败。主机 GUI 同步落地：安全设置“访问控制”页的“端口转发”复选框、
+     托盘勾选项与权限摘要，`current_gate_mask()` 补上 0x0080（否则会话中任意
+     实时权限切换会撤掉端口转发）；测试配置保存后 `port_forward=1`、
+     `permissions=143`，重开对话框保持勾选。剩余：双机与中继验收。
+ 11. **P2-4 远程终端**（2026-10-27 协议 v27 与主机/CLI 全链路完成）：查看器
+     `TerminalRequest`（36）/主机 `TerminalResult`（37）/双向 `TerminalStop`
+     （38）/查看器 `TerminalResize`（39），权限位 `0x0100`、ServerInfo
+     `terminal_enabled`，主机 `allow_terminal` 默认关闭；上行=键盘、下行=输出，
+     两条单向 `CTTY` 流（16 字节头），接收高水位 256 KiB 暂停流控。主机
+     `TerminalRelay` 动态加载 `CreatePseudoConsole`，`%COMSPEC%` 跑在伪控制台里，
+     读/写线程各有界队列，`ResizePseudoConsole` 跟随查看器尺寸；不做回放、
+     不常驻、不跨会话。验收：`chast-quic verify --terminal` 起内置主机，
+     真实 cmd.exe 回显 `CHAST_TTY_OK` 两次后 `exit`，主机以 Ok 收尾；
+     `verify --terminal-denied` 证明闸门关闭时请求被拒。两项 ctest 通过。
+     实现中确认两个必须项：子进程标准句柄要显式置空（否则继承本进程重定向的
+     stdin，cmd 打印完横幅即以 0 退出）；`TerminalStop` 不得重置已干净结束的
+     方向（QUIC 不跨流排序，查看器保留条目直到输出排空）。主机 GUI 已加
+     安全设置复选框、托盘开关与权限摘要。查看器 Flutter 面板（2026-10-27）
+     已接入工具栏：等宽 VT 渲染（光标/擦除/SGR/滚动区/备用屏/回滚 2000 行/
+     宽字符）、按面板尺寸申请与防抖 resize、30 ms 输出轮询、完整键序列与
+     bracketed paste；与聊天面板互斥，面板持有焦点时暂停远程键鼠转发，
+     Escape 发给主机，关闭按钮发送 TerminalStop。验证：`flutter analyze`
+     干净、`flutter test` 303 项通过（VT/键序列 24 项、面板 widget 3 项）、
+     Release 构建成功。未做：真实 GUI 点击复核、双机/中继验收。
+     详见 `docs/m11-p2-terminal-plan.md`。
+ 12. **P2 剩余**：基于会合的 HTTP API 代理（`HttpProxyRequest`，价值低）。
+- 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
+  `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
+  提升到 v25。
+
+## M6 后续（进行中）
+
+- 音频质量调优：唇音同步已按 RustDesk 对齐为“到达即播”（查看者系统
+  声音到达锚定、0 lead，2026-10-27，见 `docs/m6.3-lipsync-plan.md`）；
+  A/V skew 实测与长期漂移校正待双机/双端点。端点跟随已实现（默认设备
+  1 s 内切换、固定端点重试同 id），播放器已按 RustDesk 的 5 s 启动
+  确认对齐（已交出音频 5 s 内不被消费即重建）；真实热插拔验收待做
+  （AEC/降噪/设备选择已在 M9.4 完成）。
 - 更多采集/编码后端与其他平台。
+- 查看器侧录制：RustDesk 在查看器录制（`record_screen`）但重编码解码帧；
+  我方改为把主机已编码的 Annex B 访问单元无损封装 MP4（`tools/mp4_recorder.h`），
+  CLI `chast-quic connect --record out.mp4` 已做回环验收（541 帧原样落盘，
+  FFmpeg 重新打开读回校验通过）。画面尺寸中途变化时分段续录（`out-2.mp4`…），
+  与 RustDesk 重开录制的行为对齐；ctest `quic_recording` 在默认 75% 分辨率探针下
+  断言两段、样本/关键帧计数与重开校验（全套 26/26）。查看器工具栏的录制开关
+  已接通（复用同一 muxer，默认写入用户 Videos 目录，尺寸变化同样滚动分段），
+  状态经桥接发布为 `ViewerStatus.recording/recordPath/recordError`；`flutter
+  analyze` 无问题、`flutter test` 306 通过、`flutter build windows --release`
+  通过。录制权限本地设置项与可选上传待补；摄像头、远程打印仍缺。
 - M8 其余项（虚拟显示器、安装器与 i18n）见 `docs/m8-plan.md`。
 
 ## 推进原则

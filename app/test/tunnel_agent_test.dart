@@ -91,6 +91,30 @@ void main() {
         'dev-secret',
       ],
     );
+    expect(
+      TunnelAgent.arguments(
+        server: 'https://chast.example',
+        hostId: 'devbox',
+        mode: TunnelMode.relay,
+        key: 'dev-secret',
+        serverPublicKey: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+      ),
+      <String>[
+        'viewer',
+        '--server',
+        'https://chast.example',
+        '--id',
+        'devbox',
+        '--listen',
+        '127.0.0.1:0',
+        '--mode',
+        'relay',
+        '--server-key',
+        'dev-secret',
+        '--server-pubkey',
+        'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+      ],
+    );
   });
 
   test('a missing executable is reported as a tunnel failure', () async {

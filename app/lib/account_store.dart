@@ -14,6 +14,8 @@ class AccountSession {
     required this.username,
     required this.token,
     required this.expiresAt,
+    this.refreshToken = '',
+    this.refreshExpiresAt,
     this.syncedAt,
     this.bookRevision = 0,
   });
@@ -22,6 +24,11 @@ class AccountSession {
   final String username;
   final String token;
   final DateTime expiresAt;
+
+  /// Renews [token] without a password until [refreshExpiresAt]. Empty on
+  /// sessions created by servers that only issue long-lived access tokens.
+  final String refreshToken;
+  final DateTime? refreshExpiresAt;
   final DateTime? syncedAt;
 
   /// Newest server address-book revision applied on this device. The next
@@ -34,12 +41,30 @@ class AccountSession {
   bool isActiveAt(DateTime now) =>
       hasToken && expiresAt.isAfter(now.toUtc());
 
-  AccountSession copyWith({DateTime? syncedAt, int? bookRevision}) {
+  bool canRefreshAt(DateTime now) {
+    final DateTime? until = refreshExpiresAt;
+    return refreshToken.isNotEmpty && until != null && until.isAfter(now.toUtc());
+  }
+
+  /// The session is worth keeping while either the access token still works or
+  /// a refresh token can renew it; only then is a password login required.
+  bool isUsableAt(DateTime now) => isActiveAt(now) || canRefreshAt(now);
+
+  AccountSession copyWith({
+    String? token,
+    DateTime? expiresAt,
+    String? refreshToken,
+    DateTime? refreshExpiresAt,
+    DateTime? syncedAt,
+    int? bookRevision,
+  }) {
     return AccountSession(
       server: server,
       username: username,
-      token: token,
-      expiresAt: expiresAt,
+      token: token ?? this.token,
+      expiresAt: expiresAt ?? this.expiresAt,
+      refreshToken: refreshToken ?? this.refreshToken,
+      refreshExpiresAt: refreshExpiresAt ?? this.refreshExpiresAt,
       syncedAt: syncedAt ?? this.syncedAt,
       bookRevision: bookRevision ?? this.bookRevision,
     );
@@ -50,6 +75,9 @@ class AccountSession {
         'username': username,
         'token': token,
         'expiresAt': expiresAt.toUtc().millisecondsSinceEpoch,
+        if (refreshToken.isNotEmpty) 'refreshToken': refreshToken,
+        if (refreshExpiresAt != null)
+          'refreshExpiresAt': refreshExpiresAt!.toUtc().millisecondsSinceEpoch,
         'syncedAt': syncedAt?.toUtc().millisecondsSinceEpoch,
         'bookRevision': bookRevision,
       };
@@ -72,6 +100,9 @@ class AccountSession {
         rawExpires.toInt() <= 0) {
       return null;
     }
+    final String refreshToken =
+        value['refreshToken']?.toString().trim() ?? '';
+    final Object? rawRefreshExpires = value['refreshExpiresAt'];
     return AccountSession(
       server: server,
       username: username,
@@ -80,6 +111,15 @@ class AccountSession {
         rawExpires.toInt(),
         isUtc: true,
       ),
+      refreshToken: refreshToken,
+      refreshExpiresAt: refreshToken.isNotEmpty &&
+              rawRefreshExpires is num &&
+              rawRefreshExpires.toInt() > 0
+          ? DateTime.fromMillisecondsSinceEpoch(
+              rawRefreshExpires.toInt(),
+              isUtc: true,
+            )
+          : null,
       syncedAt: rawSynced is num && rawSynced.toInt() > 0
           ? DateTime.fromMillisecondsSinceEpoch(rawSynced.toInt(), isUtc: true)
           : null,

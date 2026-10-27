@@ -316,6 +316,17 @@ bool tunnel_listen_port(const std::string& listen, uint16_t& port) {
     return true;
 }
 
+std::string audit_spool_path_for(const std::string& settings_path) {
+    if (settings_path.empty()) {
+        return {};
+    }
+    std::filesystem::path path = native_path(settings_path);
+    std::filesystem::path name = path.stem();
+    name += L".audit.jsonl";
+    path.replace_filename(name);
+    return to_utf8(path.wstring());
+}
+
 std::string generate_tunnel_id() {
     wchar_t buffer[256]{};
     DWORD length = static_cast<DWORD>(std::size(buffer));
@@ -348,6 +359,9 @@ std::string generate_tunnel_id() {
 
 HostSettingsLoad load_host_settings(const std::string& path) {
     HostSettingsLoad result;
+    // The spool is per settings file, so a test config never mixes audit
+    // lines into the operator's real one.
+    result.settings.audit_spool = audit_spool_path_for(path);
     std::ifstream in(native_path(path), std::ios::binary);
     if (!in) {
         return result;
@@ -399,6 +413,14 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         } else if (key == "file_transfer") {
             if (!parse_bool(value, settings.allow_file_transfer)) {
                 warn(result.warning, "file_transfer '" + value + "' is not a boolean");
+            }
+        } else if (key == "port_forward") {
+            if (!parse_bool(value, settings.allow_port_forward)) {
+                warn(result.warning, "port_forward '" + value + "' is not a boolean");
+            }
+        } else if (key == "terminal") {
+            if (!parse_bool(value, settings.allow_terminal)) {
+                warn(result.warning, "terminal '" + value + "' is not a boolean");
             }
         } else if (key == "file_receive_dir") {
             settings.file_receive_directory = value;
@@ -456,7 +478,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             }
         } else if (key == "permissions") {
             uint32_t mask = 0;
-            if (!parse_u32(value, mask) || mask > kPermissionAll) {
+            // Bits outside the known set are refused, not silently dropped: a
+            // newer build may have added a permission this one cannot honour.
+            if (!parse_u32(value, mask) ||
+                (mask & ~static_cast<uint32_t>(kPermissionAll)) != 0) {
                 warn(result.warning, "permissions '" + value + "' is not a mask below " +
                                          std::to_string(kPermissionAll + 1));
             } else {
@@ -584,6 +609,18 @@ HostSettingsLoad load_host_settings(const std::string& path) {
                     settings.tunnel_id = normalized;
                 }
             }
+        } else if (key == "tunnel_old_id") {
+            if (value.empty()) {
+                settings.tunnel_old_id.clear();
+            } else {
+                std::string normalized;
+                if (!parse_tunnel_id(value, normalized)) {
+                    warn(result.warning,
+                         "tunnel_old_id '" + value + "' is not 1..64 letters, digits, '.', '_' or '-'");
+                } else {
+                    settings.tunnel_old_id = normalized;
+                }
+            }
         } else if (key == "tunnel_key") {
             if (value.empty()) {
                 settings.tunnel_key.clear();
@@ -599,6 +636,12 @@ HostSettingsLoad load_host_settings(const std::string& path) {
                 warn(result.warning, "tunnel_listen '" + value + "' is not host:port");
             } else {
                 settings.tunnel_listen = normalized;
+            }
+        } else if (key == "audit_spool") {
+            // Empty keeps the file next to host.ini; there is no separate
+            // switch, because a host that forwards nothing writes nothing.
+            if (!value.empty()) {
+                settings.audit_spool = value;
             }
         }
         // Unknown keys are kept quiet: a newer build may write settings this
@@ -624,6 +667,8 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_audio = (permissions_mask & kPermissionAudio) != 0;
         settings.allow_microphone = (permissions_mask & kPermissionMicrophone) != 0;
         settings.allow_file_transfer = (permissions_mask & kPermissionFileTransfer) != 0;
+        settings.allow_port_forward = (permissions_mask & kPermissionPortForward) != 0;
+        settings.allow_terminal = (permissions_mask & kPermissionTerminal) != 0;
         settings.allow_privacy_mode = (permissions_mask & kPermissionPrivacyMode) != 0;
     }
     return result;
@@ -646,6 +691,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_audio ? kPermissionAudio : 0) |
         (settings.allow_microphone ? kPermissionMicrophone : 0) |
         (settings.allow_file_transfer ? kPermissionFileTransfer : 0) |
+        (settings.allow_port_forward ? kPermissionPortForward : 0) |
+        (settings.allow_terminal ? kPermissionTerminal : 0) |
         (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
@@ -665,6 +712,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "input=" << (settings.allow_input ? 1 : 0) << "\n"
          << "clipboard=" << (settings.allow_clipboard ? 1 : 0) << "\n"
          << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
+         << "port_forward=" << (settings.allow_port_forward ? 1 : 0) << "\n"
+         << "terminal=" << (settings.allow_terminal ? 1 : 0) << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "audio_device=" << settings.audio_device << "\n"
@@ -688,8 +737,15 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "server_url=" << settings.server_url << "\n"
          << "server_key=" << settings.server_key << "\n"
          << "tunnel_id=" << settings.tunnel_id << "\n"
+         << "tunnel_old_id=" << settings.tunnel_old_id << "\n"
          << "tunnel_key=" << settings.tunnel_key << "\n"
          << "tunnel_listen=" << settings.tunnel_listen << "\n";
+    // Only a custom spool is written; the derived default would otherwise
+    // pin a machine-specific path into a file that may be copied elsewhere.
+    const std::string default_spool = audit_spool_path_for(path);
+    if (!settings.audit_spool.empty() && settings.audit_spool != default_spool) {
+        text << "audit_spool=" << settings.audit_spool << "\n";
+    }
 
     std::filesystem::path temporary = target;
     temporary += L".tmp";

@@ -54,6 +54,11 @@ Future<void> main(List<String> args) async {
     login.token.isNotEmpty && login.username == username,
     'login returns a token and the canonical username',
   );
+  check(
+    login.refreshToken.isNotEmpty &&
+        login.refreshExpiresInMs > login.expiresInMs,
+    'login returns a refresh token that outlives the access token',
+  );
   final String token = login.token;
 
   final Directory temp = await Directory.systemTemp.createTemp(
@@ -70,12 +75,19 @@ Future<void> main(List<String> args) async {
       expiresAt: DateTime.now().toUtc().add(
         Duration(milliseconds: login.expiresInMs),
       ),
+      refreshToken: login.refreshToken,
+      refreshExpiresAt: login.refreshToken.isEmpty
+          ? null
+          : DateTime.now().toUtc().add(
+              Duration(milliseconds: login.refreshExpiresInMs),
+            ),
     );
     await store.save(session);
     final AccountSession? loaded = await store.load();
     check(
       loaded != null &&
           loaded.token == token &&
+          loaded.refreshToken == login.refreshToken &&
           loaded.isActiveAt(DateTime.now()),
       'account session round-trips through account.json',
     );
@@ -603,6 +615,50 @@ Future<void> main(List<String> args) async {
       check(error.statusCode == 401, 'the token is rejected after logout');
     }
 
+    final AccountLoginResult lifecycle = await ServerApi.login(
+      settings,
+      username: username,
+      password: password,
+    );
+    try {
+      await ServerApi.refresh(settings, login.refreshToken);
+      check(false, 'a logged-out refresh token is rejected');
+    } on ServerApiException catch (error) {
+      check(error.statusCode == 401, 'a logged-out refresh token is rejected');
+    }
+    final AccountLoginResult renewed =
+        await ServerApi.refresh(settings, lifecycle.refreshToken);
+    check(
+      renewed.token.isNotEmpty &&
+          renewed.token != lifecycle.token &&
+          renewed.refreshToken.isNotEmpty &&
+          renewed.refreshToken != lifecycle.refreshToken,
+      'refresh rotates both tokens',
+    );
+    final AccountInfo info = await ServerApi.accountInfo(settings, renewed.token);
+    check(info.username == login.username, 'the renewed token reads the account');
+    try {
+      await ServerApi.addressBook(settings, lifecycle.token);
+      check(false, 'the old access token is rejected after rotation');
+    } on ServerApiException catch (error) {
+      check(
+        error.statusCode == 401,
+        'the old access token is rejected after rotation',
+      );
+    }
+    try {
+      await ServerApi.refresh(settings, lifecycle.refreshToken);
+      check(false, 'a replayed refresh token is rejected');
+    } on ServerApiException catch (error) {
+      check(error.statusCode == 401, 'a replayed refresh token is rejected');
+    }
+    try {
+      await ServerApi.accountInfo(settings, renewed.token);
+      check(false, 'a replay revokes the rotated session');
+    } on ServerApiException catch (error) {
+      check(error.statusCode == 401, 'a replay revokes the rotated session');
+    }
+
     await store.clear();
     check(
       await store.load() == null,
@@ -1113,6 +1169,190 @@ Future<void> _shareProbe({
   } on ServerApiException catch (error) {
     check(error.statusCode == 404, 'revoking the same grant twice is refused');
   }
+
+  // Group-scoped grants: only the granted group is visible and writable.
+  final String labGroup = 'lab-$stamp';
+  final String workGroup = 'work-$stamp';
+  final String labPeerId = 'smoke-lab-$stamp';
+  final String workPeerId = 'smoke-work-$stamp';
+  final String labAddedId = 'smoke-lab-add-$stamp';
+  await ServerApi.updateAddressBookGroup(
+    settings,
+    ownerLogin.token,
+    labGroup,
+    '实验室',
+  );
+  await ServerApi.updateAddressBookGroup(
+    settings,
+    ownerLogin.token,
+    workGroup,
+    '办公室',
+  );
+  await ServerApi.updateAddressBookPeer(
+    settings,
+    ownerLogin.token,
+    labPeerId,
+    name: '实验机',
+    groupId: labGroup,
+  );
+  await ServerApi.updateAddressBookPeer(
+    settings,
+    ownerLogin.token,
+    workPeerId,
+    name: '办公机',
+    groupId: workGroup,
+  );
+
+  final AddressBookGrant scoped = await ServerApi.shareAddressBook(
+    settings,
+    ownerLogin.token,
+    granteeLogin.username,
+    groupId: labGroup,
+  );
+  check(
+    scoped.groupId == labGroup && !scoped.wholeBook,
+    'the owner grants one group at read permission',
+  );
+  List<SharedAddressBook> scopedBooks = await ServerApi.sharedAddressBooks(
+    settings,
+    granteeLogin.token,
+  );
+  check(
+    scopedBooks.length == 1 &&
+        scopedBooks.single.scopes.length == 1 &&
+        scopedBooks.single.permissionFor(labGroup) == 'read' &&
+        scopedBooks.single.permissionFor(workGroup).isEmpty &&
+        scopedBooks.single.peers
+                .map((AddressBookPeer peer) => peer.id)
+                .join(',') ==
+            labPeerId &&
+        scopedBooks.single.groups
+                .map((AddressBookGroup group) => group.id)
+                .join(',') ==
+            labGroup,
+    'a group grant hides peers and groups outside its scope',
+  );
+  check(
+    await denied(
+          () => ServerApi.updateSharedAddressBookPeer(
+            settings,
+            granteeLogin.token,
+            ownerLogin.username,
+            labPeerId,
+            name: '篡改',
+          ),
+        ) ==
+        403,
+    'a scoped read grant cannot edit peers in its own group',
+  );
+  check(
+    await denied(
+          () => ServerApi.addSharedAddressBookPeer(
+            settings,
+            granteeLogin.token,
+            ownerLogin.username,
+            'smoke-scope-deny-$stamp',
+            name: '越权新增',
+            groupId: workGroup,
+          ),
+        ) ==
+        403,
+    'a scoped grant cannot add peers into another group',
+  );
+
+  final AddressBookGrant scopedWrite = await ServerApi.shareAddressBook(
+    settings,
+    ownerLogin.token,
+    granteeLogin.username,
+    permission: 'write',
+    groupId: labGroup,
+  );
+  check(
+    scopedWrite.groupId == labGroup && scopedWrite.permission == 'write',
+    'the owner upgrades the group grant to read-write',
+  );
+  final AddressBookPeer scopedEdit = await ServerApi.updateSharedAddressBookPeer(
+    settings,
+    granteeLogin.token,
+    ownerLogin.username,
+    labPeerId,
+    name: '实验机（改）',
+  );
+  check(
+    scopedEdit.name == '实验机（改）',
+    'a scoped read-write grant edits peers in its group',
+  );
+  check(
+    await denied(
+          () => ServerApi.updateSharedAddressBookPeer(
+            settings,
+            granteeLogin.token,
+            ownerLogin.username,
+            workPeerId,
+            name: '越权修改',
+          ),
+        ) ==
+        403,
+    'a scoped read-write grant cannot edit another group',
+  );
+  final AddressBookPeer scopedAdded = await ServerApi.addSharedAddressBookPeer(
+    settings,
+    granteeLogin.token,
+    ownerLogin.username,
+    labAddedId,
+    name: '组内新增',
+    groupId: labGroup,
+  );
+  check(
+    scopedAdded.groupId == labGroup,
+    'a scoped read-write grant adds peers into its group',
+  );
+
+  await ServerApi.shareAddressBook(
+    settings,
+    ownerLogin.token,
+    granteeLogin.username,
+    permission: 'control',
+    groupId: labGroup,
+  );
+  check(
+    await denied(
+          () => ServerApi.sharedAddressBookGrants(
+            settings,
+            granteeLogin.token,
+            ownerLogin.username,
+          ),
+        ) ==
+        403,
+    'a group-level control grant cannot manage the book grants',
+  );
+
+  await ServerApi.deleteAddressBookGroup(
+    settings,
+    ownerLogin.token,
+    labGroup,
+  );
+  scopedBooks = await ServerApi.sharedAddressBooks(
+    settings,
+    granteeLogin.token,
+  );
+  final AddressBookGrants scopedAfterDelete = await ServerApi.addressBookGrants(
+    settings,
+    granteeLogin.token,
+  );
+  check(
+    scopedBooks.isEmpty && scopedAfterDelete.incoming.isEmpty,
+    'deleting a group revokes its scoped grants',
+  );
+
+  await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, labPeerId);
+  await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, workPeerId);
+  await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, labAddedId);
+  await ServerApi.deleteAddressBookGroup(
+    settings,
+    ownerLogin.token,
+    workGroup,
+  );
 
   await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, peerId);
   await ServerApi.deleteAddressBookPeer(

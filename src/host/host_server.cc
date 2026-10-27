@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "chast/audio.h"
+#include "chast/audit_spool.h"
 #include "chast/bitrate_controller.h"
 #include "chast/capture.h"
 #include "chast/carrier.h"
@@ -22,6 +23,8 @@
 #include "chast/desktop.h"
 #include "chast/display_mode.h"
 #include "chast/file_transfer.h"
+#include "chast/port_forward_relay.h"
+#include "chast/terminal_relay.h"
 #include "chast/privacy.h"
 #include "chast/sas.h"
 
@@ -57,6 +60,14 @@ uint32_t bitrate_reserve(const AudioInfo& audio) {
 
 int64_t unix_now() {
     return static_cast<int64_t>(std::time(nullptr));
+}
+
+// Audit timestamps are wall-clock milliseconds: the server stores them next to
+// the viewer's own report, which uses the same epoch.
+int64_t unix_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 SecretScope secret_scope(IdentityScope scope) {
@@ -118,6 +129,12 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_file_transfer) {
         mask |= kPermissionFileTransfer;
+    }
+    if (settings.allow_port_forward) {
+        mask |= kPermissionPortForward;
+    }
+    if (settings.allow_terminal) {
+        mask |= kPermissionTerminal;
     }
     if (settings.allow_privacy_mode) {
         mask |= kPermissionPrivacyMode;
@@ -414,6 +431,8 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
     quic.allow_file_transfer = settings_.allow_file_transfer;
+    quic.allow_port_forward = settings_.allow_port_forward;
+    quic.allow_terminal = settings_.allow_terminal;
     quic.allow_audio = settings_.allow_audio;
     quic.allow_microphone = settings_.allow_microphone;
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
@@ -844,6 +863,10 @@ void HostServer::run() {
         ++stats.sessions;
         stats.client_connected = true;
         const std::string peer = session_->client_address();
+        // Captured now: wait_for_client() consumed the Hello, and the
+        // reference is cleared when this connection is torn down.
+        const std::string audit_ref = session_->audit_ref();
+        const int64_t audit_started_ms = unix_now_ms();
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.peer_address = peer;
@@ -890,6 +913,20 @@ void HostServer::run() {
         }
         if (!finished.ok() && !peer_left && error.empty() && !stopping_.load()) {
             error = "finish: " + finished.to_string();
+        }
+        // Only viewers that sent a reference can be merged with their own
+        // report; a tool or an older viewer leaves no host-side record.
+        if (!settings_.audit_spool.empty() && !audit_ref.empty()) {
+            AuditSessionRecord record;
+            record.audit_ref = audit_ref;
+            record.started_at_ms = audit_started_ms;
+            record.ended_at_ms = unix_now_ms();
+            record.success = ok && error.empty();
+            record.detail = error;
+            std::string audit_error;
+            if (!append_audit_session(settings_.audit_spool, record, &audit_error)) {
+                log("audit: " + audit_error);
+            }
         }
         if (!ok || !error.empty()) {
             log(error.empty() ? "the session ended" : error);
@@ -1544,6 +1581,29 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     };
     std::unique_ptr<ActiveUpload> upload;
 
+    // Inbound file audit. The viewer reports the same transfer from its side;
+    // both records carry the Hello reference, so the operator sees the host's
+    // per-file row next to the viewer's report.
+    const std::string audit_ref = session_->audit_ref();
+    auto audit_upload = [&](const std::string& name, uint64_t bytes, bool success,
+                            const std::string& detail) {
+        if (settings_.audit_spool.empty() || audit_ref.empty()) {
+            return;
+        }
+        AuditFileRecord record;
+        record.audit_ref = audit_ref;
+        record.direction = "upload";
+        record.name = name;
+        record.size = bytes;
+        record.occurred_at_ms = unix_now_ms();
+        record.success = success;
+        record.detail = detail;
+        std::string audit_error;
+        if (!append_audit_file(settings_.audit_spool, record, &audit_error)) {
+            log("audit: " + audit_error);
+        }
+    };
+
     // `report=false` is for a revocation the transport already announced to
     // the viewer; sending a second FileResult would only be noise.
     auto end_upload = [&](FileCode code, const std::string& reason, bool keep_partial,
@@ -1562,6 +1622,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (code != FileCode::Ok) {
             ++stats.file_failures;
             log("file: " + name + " failed: " + reason);
+            audit_upload(name, written, false, reason);
         }
         if (!report) {
             return;
@@ -1717,8 +1778,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return;
         }
         const uint64_t bytes = upload->written;
+        const std::string received_name =
+            upload->receiver ? upload->receiver->name() : upload->offer.name;
         upload->receiver.reset();
         upload.reset();
+        audit_upload(received_name, bytes, true, "");
         ++stats.files_received;
         stats.file_bytes_received += bytes;
         Error sent = session_->send_file_result(transfer_id, FileCode::Ok, bytes);
@@ -3275,9 +3339,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
-    // Once a second: link telemetry for the tray, and the bitrate decision
+    // Twice a second: link telemetry for the tray, and the bitrate decision
     // that follows from it. Runs on the host thread between frames so the
-    // encoder reset set_rate performs cannot overlap an encode call.
+    // encoder reset set_rate performs cannot overlap an encode call. The
+    // cadence is what bounds how long an unwanted capacity step goes
+    // unnoticed; the controller still gates cuts with its own cooldowns.
     auto last_link_sample = Clock::now();
     uint64_t last_sample_bytes = stats.bytes;
     uint64_t last_sent_packets = 0;
@@ -3521,6 +3587,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         return clean;
     }
     publish_cursor();
+    // Lives exactly as long as the session: its sockets close on every exit
+    // path, before the caller resets the transport for the next viewer.
+    PortForwardRelay port_forward(*session_);
+    // Same lifetime rule: its destructor terminates every shell still running.
+    TerminalRelay terminal(*session_);
 
     while (!stopping_.load()) {
         const auto now = Clock::now();
@@ -3614,6 +3685,32 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         drain_audio();
         drain_microphone();
+        PortForwardRequest forward_request;
+        while (session_->take_port_forward_request(forward_request)) {
+            // The transport already checked the session grant; reaching here
+            // means the operator enabled port forwarding for this host.
+            const Error answered = session_->send_port_forward_result(
+                forward_request.forward_id, PortForwardCode::Ok);
+            if (!answered.ok()) {
+                log("port forward: cannot approve target " + forward_request.host + ":" +
+                    std::to_string(forward_request.port) + ": " + answered.to_string());
+                break;
+            }
+            log("port forward: approved " + forward_request.host + ":" +
+                std::to_string(forward_request.port));
+        }
+        PortForwardStop forward_stop;
+        while (session_->take_port_forward_stop(forward_stop)) {
+            log("port forward: stopped with code " +
+                std::to_string(static_cast<int>(forward_stop.code)) +
+                (forward_stop.reason.empty() ? std::string() : ": " + forward_stop.reason));
+        }
+        for (const std::string& event : port_forward.pump()) {
+            log(event);
+        }
+        for (const std::string& event : terminal.pump()) {
+            log(event);
+        }
         drain_peer();
         poll_clipboard(now);
         if (upload && !file_transfer_allowed()) {
@@ -3627,7 +3724,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         drain_file_data();
         drain_file_cancel();
         drive_file_download();
-        if (now - last_link_sample >= std::chrono::seconds(1)) {
+        if (now - last_link_sample >= std::chrono::milliseconds(500)) {
             if (!sample_link(now)) {
                 const bool clean = error->empty();
                 drain_peer();

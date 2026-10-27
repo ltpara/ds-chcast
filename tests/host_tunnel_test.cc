@@ -72,7 +72,8 @@ void test_event_parse() {
           "an object without an event is ignored");
     check(chast::host::parse_tunnel_event(
               " {\"event\":\"ready\",\"listen\":\"0.0.0.0:14434\",\"host\":\"devbox\","
-              "\"punch\":\"1.2.3.4:9\",\"relay\":\"5.6.7.8:9\"}",
+              "\"punch\":\"1.2.3.4:9\",\"relay\":\"5.6.7.8:9\","
+              "\"migrated_from\":\"oldbox\"}",
               event),
           "a ready event parses with leading whitespace");
     check_text(event.event, "ready", "the event name is kept");
@@ -80,6 +81,7 @@ void test_event_parse() {
     check_text(event.host, "devbox", "the ready device id is kept");
     check_text(event.punch, "1.2.3.4:9", "the ready punch address is kept");
     check_text(event.relay, "5.6.7.8:9", "the ready relay address is kept");
+    check_text(event.migrated_from, "oldbox", "the migrated-from id is kept");
     check(chast::host::parse_tunnel_event(
               R"({"event":"viewer","path":"relay","remote":"5.6.7.8:9"})", event),
           "a viewer event parses");
@@ -123,11 +125,14 @@ chast::HostSettings valid_settings() {
 void test_command_line() {
     chast::HostSettings settings = valid_settings();
     settings.server_key = "server secret";
+    settings.tunnel_old_id = "devbox.home";
     const std::wstring command = chast::host::tunnel_command_line(
         L"C:\\Program Files\\chast\\chast-tunnel.exe", settings, 4433, "AA:BB:CC");
 
     check(contains(command, L"\"C:\\Program Files\\chast\\chast-tunnel.exe\" host"),
           "the executable is quoted and followed by host mode");
+    check(contains(command, L"--old-id devbox.home"),
+          "a pending old id is passed for migration");
     check(contains(command, L"--server https://rendezvous.example.com"),
           "the service URL is passed");
     check(contains(command, L"--id devbox.office"), "the device id is passed");
@@ -147,6 +152,14 @@ void test_command_line() {
           "an empty server key leaves out the flag");
     check(!contains(without_optional, L"--fingerprint"),
           "an empty fingerprint leaves out the flag");
+    check(!contains(without_optional, L"--audit-spool"),
+          "an empty audit spool leaves out the flag");
+
+    settings.audit_spool = "C:\\ProgramData\\chast\\host.audit.jsonl";
+    const std::wstring with_spool =
+        chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
+    check(contains(with_spool, L"--audit-spool C:\\ProgramData\\chast\\host.audit.jsonl"),
+          "the audit spool is passed for the agent to forward");
 
     const std::wstring quote_test = chast::host::tunnel_command_line(
         L"chast-tunnel.exe", settings, 4433, "a\"b");

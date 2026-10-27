@@ -12,13 +12,14 @@
 // is between video frames. On the viewer the same split exists: decode on the
 // packet thread, schedule and render on the audio thread.
 //
-// The system-sound player schedules against the host's steady clock. Each
-// packet carries the host capture time, and LatencyReply supplies the offset
-// between the two monotonic clocks; a block is handed to the endpoint
-// `lead_ms` after it was captured. That lead is the jitter buffer: large enough
-// to hide network jitter, small enough that lip sync stays within a few tens of
-// milliseconds. The microphone uplink has no shared clock, so its host-side
-// player anchors each burst at arrival instead.
+// The viewer's system-sound player plays decoded audio as it arrives: there is
+// no fixed lead and no A/V scheduling, so audio cannot trail the video by a
+// jitter buffer it does not need. Each burst anchors at its arrival, and the
+// capture stamps only space the blocks inside that burst; blocks that miss
+// their slot are dropped, and the queue cap bounds the delay after a stall.
+// The microphone uplink's host-side player anchors on arrival the same way,
+// with the default 80 ms lead as its jitter buffer. A caller that does know
+// the host clock can leave `arrival_anchored` off and rely on LatencyReply.
 //
 // Both directions use the device's own mix format and libswresample for the
 // format and channel conversion, so a 44.1 kHz endpoint, a mono headset or a
@@ -363,18 +364,20 @@ struct AudioPlayerConfig {
     // device; when it disappears the player keeps retrying the same id and
     // reports `recovering` instead of silently moving to another endpoint.
     std::string device_id;
-    // How far behind the sender timeline playback runs. This is the jitter
-    // buffer; 80 ms covers a wide range of network conditions without a
-    // noticeable lip-sync error.
+    // How far behind the sender timeline playback runs. For a caller that
+    // knows the host clock this is the jitter buffer; 80 ms covers typical
+    // network jitter. The viewer's system audio sets this to 0 and anchors on
+    // arrival instead, so it carries no fixed lead over the video.
     uint32_t lead_ms = 80;
     // Queued audio beyond this is dropped oldest-first, which keeps a network
     // burst from building an ever-growing delay.
     uint32_t queue_ms = 500;
-    // Microphone uplink: packets carry the viewer's clock, which the host
-    // cannot correlate with its own. The first block anchors the offset from
-    // its arrival time, and a burst after a stall re-anchors instead of
-    // replaying the stale timeline. System audio keeps this off and uses
-    // LatencyReply.
+    // Anchor each burst at its arrival instead of using a reported clock
+    // offset. The microphone uplink needs this (no shared clock) and the
+    // viewer's system audio uses it to play decoded blocks as they arrive.
+    // Capture stamps still space blocks inside a burst; a burst after a stall
+    // re-anchors instead of replaying the stale timeline. `set_clock_offset`
+    // is ignored in this mode.
     bool arrival_anchored = false;
 };
 
@@ -397,15 +400,17 @@ public:
     virtual void stop() = 0;
 
     // Queues one decoded block. The block's capture_ms places it on the host
-    // timeline; the clock offset turns that into a local render time. Blocks
-    // that are already older than one block are dropped rather than played
-    // late, which would drag the timeline behind for the rest of the session.
+    // timeline; the clock offset turns that into a local render time, or the
+    // arrival anchor does when `arrival_anchored` is set. Blocks that are
+    // already older than one block are dropped rather than played late,
+    // which would drag the timeline behind for the rest of the session.
     virtual Error push(const DecodedAudio& audio) = 0;
 
     // Host-minus-viewer steady-clock offset in milliseconds, from
     // LatencyReply. Updating it re-times everything still queued. Before the
     // first update the first pushed block anchors the offset, so playback
-    // starts one lead behind its arrival.
+    // starts one lead behind its arrival. Ignored when `arrival_anchored` is
+    // set: that mode anchors each burst on arrival instead.
     virtual void set_clock_offset(int64_t host_minus_local_ms) = 0;
     virtual void set_lead_ms(uint32_t lead_ms) = 0;
 

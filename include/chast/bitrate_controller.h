@@ -9,6 +9,18 @@
 // congestion window. Those lower the target; a sustained clean period raises
 // it again, never past the configured ceiling.
 //
+// A percent cut every cooldown is the right response to a slow drift, but not
+// to a capacity step: while the target walks down 15-30% at a time the
+// encoder keeps producing above the bottleneck, and a reliable ordered stream
+// can only queue the excess -- that is seconds of frame age. When delivery
+// collapses under 70% of the target while the send queue has filled most of the
+// congestion window, the delivered rate (the wire rate discounted by the
+// interval's loss share) is the budget the step left, so the controller lands
+// just under it in one decision. The delivered rate never sets a target the
+// percent cut would not also allow. A path that still carries most of the
+// target -- an RTT rise without a capacity change -- keeps the percent cut, and
+// so does a low wire rate with an idle queue, which is content, not capacity.
+//
 // The capture frame rate follows the target bitrate. Under CBR the rate is the
 // budget, so cutting frames saves no bandwidth; what it does buy is bits per
 // pixel, and at 500 kbps a 1080p frame needs 10 fps to look anything like the
@@ -37,7 +49,10 @@ struct BitrateSample {
     uint64_t queued_bytes = 0;
     uint64_t congestion_window = 0;
     // Cumulative transport counters. The controller keeps the previous sample
-    // and derives per-interval loss itself.
+    // and derives per-interval loss and wire rate itself. `sent_bytes` is the
+    // transport's total send volume (every stream, packet headers included),
+    // so its delta is what the path actually carried; 0 when the transport
+    // cannot report it.
     uint64_t sent_bytes = 0;
     uint64_t lost_packets = 0;
     uint64_t sent_packets = 0;
@@ -118,7 +133,10 @@ public:
                                    uint16_t current_percent);
 
 private:
-    BitrateDecision lower(uint32_t percent, const char* reason);
+    // `delivered_bps` is the interval's wire rate discounted by its loss
+    // share, 0 when there was no usable byte counter; a positive value can
+    // only pull the target further down, never up.
+    BitrateDecision lower(uint32_t percent, const char* reason, uint32_t delivered_bps);
     BitrateDecision settle();
 
     uint32_t ceiling_bps_;
@@ -132,7 +150,9 @@ private:
     uint32_t healthy_ms_ = 0;
     uint64_t previous_lost_packets_ = 0;
     uint64_t previous_sent_packets_ = 0;
+    uint64_t previous_sent_bytes_ = 0;
     bool have_previous_ = false;
+    bool have_previous_bytes_ = false;
 };
 
 }  // namespace chast

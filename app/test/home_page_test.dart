@@ -3,8 +3,10 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
 import 'package:chast_viewer/device_store.dart';
+import 'package:chast_viewer/lan_discovery.dart';
 import 'package:chast_viewer/pages/home_page.dart';
 import 'package:chast_viewer/server_api.dart';
+import 'package:chast_viewer/server_identity.dart';
 import 'package:chast_viewer/server_settings.dart';
 import 'package:chast_viewer/trust_store.dart';
 
@@ -42,6 +44,18 @@ class _MemoryDevices extends DeviceStore {
       ..clear()
       ..addAll(devices);
     return List<Device>.of(this.devices);
+  }
+
+  @override
+  Future<List<Device>> save(Device device) async {
+    final int index =
+        devices.indexWhere((Device item) => item.key == device.key);
+    if (index >= 0) {
+      devices[index] = device.copyWith(saved: true);
+    } else {
+      devices.add(device.copyWith(saved: true));
+    }
+    return List<Device>.of(devices);
   }
 
   @override
@@ -156,6 +170,53 @@ class _MemoryTrust extends TrustStore {
   Future<Map<String, String>> load() async => Map<String, String>.of(entries);
 }
 
+class _MemoryIdentity extends ServerIdentityStore {
+  _MemoryIdentity([Map<String, ServerIdentityPin>? pins])
+      : pins = pins ?? <String, ServerIdentityPin>{};
+
+  final Map<String, ServerIdentityPin> pins;
+
+  @override
+  Future<Map<String, ServerIdentityPin>> load() async =>
+      Map<String, ServerIdentityPin>.of(pins);
+
+  @override
+  Future<ServerIdentityPin?> pinFor(String serverUrl) async =>
+      pins[normalizeServerUrl(serverUrl)];
+
+  @override
+  Future<ServerIdentityPin> pin(
+    String serverUrl,
+    ServerIdentity identity, {
+    ServerIdentityPin? previous,
+  }) async {
+    final ServerIdentityPin record = ServerIdentityPin(
+      identity: identity,
+      pinnedAt: DateTime.now(),
+    );
+    pins[normalizeServerUrl(serverUrl)] = record;
+    return record;
+  }
+
+  @override
+  Future<void> forget(String serverUrl) async {
+    pins.remove(normalizeServerUrl(serverUrl));
+  }
+}
+
+class _FakeLanDiscovery extends LanDiscovery {
+  const _FakeLanDiscovery(this.peers);
+
+  final List<LanPeer> peers;
+
+  @override
+  Future<List<LanPeer>> scan({
+    String selfId = '',
+    Duration timeout = LanDiscovery.defaultTimeout,
+  }) async =>
+      peers;
+}
+
 String _savedCount(WidgetTester tester) =>
     tester.widget<Text>(find.byKey(const Key('saved-count'))).data ?? '';
 
@@ -190,6 +251,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{
           'server:http://127.0.0.1:8443/devbox': 'AB' * 32,
         }),
@@ -224,6 +286,62 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('LAN scan adds selected peers to the address book',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final List<Device> devices = <Device>[];
+    await tester.pumpWidget(MaterialApp(
+      home: HomePage(
+        deviceStore: _MemoryDevices(devices),
+        serverStore: _MemoryServers(
+          const ServerSettings(url: 'http://127.0.0.1:8443'),
+        ),
+        identityStore: _MemoryIdentity(),
+        trustStore: _MemoryTrust(<String, String>{}),
+        accountStore: _MemoryAccount(),
+        lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+            const BatchLookupResult(hosts: <String, HostInfo>{}),
+        lanDiscovery: const _FakeLanDiscovery(<LanPeer>[
+          LanPeer(
+            id: 'lanbox',
+            address: '192.168.8.20:21129',
+            addresses: <String>['192.168.8.20:21129', '127.0.0.1:21129'],
+            hostname: 'DESKTOP-LAN',
+            username: 'admin',
+            platform: 'windows/amd64',
+            version: 'dev',
+            mac: '18:31:BF:B2:CC:8A',
+          ),
+        ]),
+      ),
+    ));
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.tap(find.byKey(const Key('lan-scan')));
+    await tester.pumpAndSettle();
+    expect(find.text('DESKTOP-LAN'), findsOneWidget);
+    expect(find.textContaining('lanbox'), findsWidgets);
+    expect(find.textContaining('18:31:BF:B2:CC:8A'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('lan-add')));
+    await tester.pumpAndSettle();
+    expect(devices, hasLength(1));
+    expect(devices.single.id, 'lanbox');
+    expect(devices.single.name, 'DESKTOP-LAN');
+    expect(devices.single.server, 'http://127.0.0.1:8443');
+    expect(devices.single.mac, '18:31:BF:B2:CC:8A');
+    expect(devices.single.saved, isTrue);
+    expect(find.text('DESKTOP-LAN'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('address book batches per server and shows alias and tags',
       (WidgetTester tester) async {
     tester.view.physicalSize = const Size(1600, 1000);
@@ -253,6 +371,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -308,6 +427,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -368,6 +488,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443', key: 'dev-secret'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -460,6 +581,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -526,6 +648,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -616,6 +739,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -693,6 +817,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -794,6 +919,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -865,6 +991,125 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('an expired access token is renewed from the refresh token',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final DateTime now = DateTime.now().toUtc();
+    final _MemoryAccount accounts = _MemoryAccount(AccountSession(
+      server: 'http://127.0.0.1:8443',
+      username: 'alice',
+      token: 'old-access',
+      expiresAt: now.subtract(const Duration(minutes: 1)),
+      refreshToken: 'refresh-value',
+      refreshExpiresAt: now.add(const Duration(days: 30)),
+    ));
+    final List<String> refreshed = <String>[];
+    final List<String> fetchedTokens = <String>[];
+    await tester.pumpWidget(MaterialApp(
+      home: HomePage(
+        deviceStore: _MemoryDevices(<Device>[]),
+        serverStore: _MemoryServers(
+          const ServerSettings(url: 'http://127.0.0.1:8443'),
+        ),
+        identityStore: _MemoryIdentity(),
+        trustStore: _MemoryTrust(<String, String>{}),
+        accountStore: accounts,
+        lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+            const BatchLookupResult(hosts: <String, HostInfo>{}),
+        accountRefresh: (ServerSettings server, String refreshToken) async {
+          refreshed.add(refreshToken);
+          return const AccountLoginResult(
+            token: 'new-access',
+            username: 'alice',
+            expiresInMs: 1800000,
+            refreshToken: 'new-refresh',
+            refreshExpiresInMs: 2592000000,
+          );
+        },
+        addressBookFetcher:
+            (ServerSettings server, String token, int since) async {
+          fetchedTokens.add(token);
+          return const AddressBookSnapshot(
+            revision: 1,
+            peers: <AddressBookPeer>[],
+          );
+        },
+      ),
+    ));
+    for (int i = 0; i < 8; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(refreshed, <String>['refresh-value']);
+    expect(fetchedTokens, <String>['new-access']);
+    expect(accounts.session?.token, 'new-access');
+    expect(accounts.session?.refreshToken, 'new-refresh');
+    expect(
+      accounts.session!.refreshExpiresAt!.isAfter(now.add(const Duration(days: 29))),
+      isTrue,
+    );
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a rejected refresh token signs the viewer out',
+      (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final DateTime now = DateTime.now().toUtc();
+    final _MemoryAccount accounts = _MemoryAccount(AccountSession(
+      server: 'http://127.0.0.1:8443',
+      username: 'alice',
+      token: 'old-access',
+      expiresAt: now.subtract(const Duration(minutes: 1)),
+      refreshToken: 'retired-refresh',
+      refreshExpiresAt: now.add(const Duration(days: 30)),
+    ));
+    bool fetched = false;
+    await tester.pumpWidget(MaterialApp(
+      home: HomePage(
+        deviceStore: _MemoryDevices(<Device>[]),
+        serverStore: _MemoryServers(
+          const ServerSettings(url: 'http://127.0.0.1:8443'),
+        ),
+        identityStore: _MemoryIdentity(),
+        trustStore: _MemoryTrust(<String, String>{}),
+        accountStore: accounts,
+        lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+            const BatchLookupResult(hosts: <String, HostInfo>{}),
+        accountRefresh: (ServerSettings server, String refreshToken) async {
+          throw const ServerApiException(
+            '登录已过期，请重新登录',
+            statusCode: 401,
+          );
+        },
+        addressBookFetcher:
+            (ServerSettings server, String token, int since) async {
+          fetched = true;
+          return const AddressBookSnapshot(
+            revision: 1,
+            peers: <AddressBookPeer>[],
+          );
+        },
+      ),
+    ));
+    for (int i = 0; i < 8; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(accounts.session, isNull);
+    expect(fetched, isFalse);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('wake sends a magic packet and remembers the MAC',
       (WidgetTester tester) async {
     tester.view.physicalSize = const Size(1600, 1000);
@@ -889,6 +1134,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async =>
@@ -957,6 +1203,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1067,6 +1314,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1177,6 +1425,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1296,6 +1545,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1408,6 +1658,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1484,6 +1735,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1582,6 +1834,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1630,6 +1883,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1708,6 +1962,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1812,6 +2067,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1889,6 +2145,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -1969,6 +2226,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -2102,6 +2360,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: accounts,
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -2233,6 +2492,7 @@ void main() {
         serverStore: _MemoryServers(
           const ServerSettings(url: 'http://127.0.0.1:8443'),
         ),
+        identityStore: _MemoryIdentity(),
         trustStore: _MemoryTrust(<String, String>{}),
         accountStore: _MemoryAccount(),
         lookupBatch: (ServerSettings server, List<String> hostIds) async {
@@ -2272,6 +2532,65 @@ void main() {
     await tester.pump();
     expect(_savedCount(tester), '1/1');
     expect(find.text('会议室'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('a changed server key blocks presence lookups', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final ServerIdentity pinned = ServerIdentity.parse(
+      'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+    )!;
+    int lookups = 0;
+    await tester.pumpWidget(MaterialApp(
+      home: HomePage(
+        deviceStore: _MemoryDevices(<Device>[
+          Device(
+            id: 'devbox',
+            name: '办公室',
+            server: 'http://127.0.0.1:8443',
+            saved: true,
+            addedAt: DateTime.now(),
+          ),
+        ]),
+        serverStore: _MemoryServers(
+          const ServerSettings(url: 'http://127.0.0.1:8443'),
+        ),
+        trustStore: _MemoryTrust(<String, String>{}),
+        identityStore: _MemoryIdentity(<String, ServerIdentityPin>{
+          'http://127.0.0.1:8443': ServerIdentityPin(
+            identity: pinned,
+            pinnedAt: DateTime.now(),
+          ),
+        }),
+        accountStore: _MemoryAccount(),
+        lookupBatch: (ServerSettings server, List<String> hostIds) async {
+          lookups++;
+          return BatchLookupResult(hosts: <String, HostInfo>{
+            for (final String hostId in hostIds)
+              hostId: HostInfo(
+                id: hostId,
+                online: true,
+                serverPublicKey:
+                    'Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA',
+              ),
+          });
+        },
+      ),
+    ));
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(lookups, greaterThan(0));
+    expect(find.text('服务不可达'), findsWidgets);
+    expect(find.textContaining('在线'), findsNothing);
 
     await tester.pumpWidget(const SizedBox());
   });

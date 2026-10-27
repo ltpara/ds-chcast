@@ -268,3 +268,76 @@ func TestRelayRequiresHello(t *testing.T) {
 		}
 	}
 }
+
+func TestRelayServesBothFamiliesOnOnePort(t *testing.T) {
+	priv := identity.PrivateKeyFromSecret("host-secret")
+	reg := registry.New(time.Minute)
+	if _, err := reg.Register(registry.RegisterRequest{
+		ID:        "devbox",
+		PublicKey: identity.PublicKeyText(priv.Public().(ed25519.PublicKey)),
+		TTL:       time.Minute,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog, WithBind6("::1"))
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	t.Cleanup(m.Close)
+	port, err := m.Allocate("devbox")
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	reg.SetRelay("devbox", port, "")
+
+	host4 := listenUDP(t)
+	host6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::1")})
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	t.Cleanup(func() { host6.Close() })
+	viewer4 := listenUDP(t)
+	viewer6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::1")})
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	t.Cleanup(func() { viewer6.Close() })
+
+	relay4 := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
+	relay6 := &net.UDPAddr{IP: net.ParseIP("::1"), Port: port}
+	if ack := relayHandshake(t, host4, relay4, "devbox", priv); !ack.OK {
+		t.Fatalf("IPv4 relay handshake: %+v", ack)
+	}
+	if ack := relayHandshake(t, host6, relay6, "devbox", priv); !ack.OK {
+		t.Fatalf("IPv6 relay handshake: %+v", ack)
+	}
+
+	viewer4.WriteToUDP([]byte("from-v4-viewer"), relay4)
+	if got := string(recv(t, host4, 2*time.Second)); got != "from-v4-viewer" {
+		t.Fatalf("IPv4 host received %q", got)
+	}
+	host4.WriteToUDP([]byte("to-v4-viewer"), relay4)
+	if got := string(recv(t, viewer4, 2*time.Second)); got != "to-v4-viewer" {
+		t.Fatalf("IPv4 viewer received %q", got)
+	}
+
+	viewer6.WriteToUDP([]byte("from-v6-viewer"), relay6)
+	if got := string(recv(t, host6, 2*time.Second)); got != "from-v6-viewer" {
+		t.Fatalf("IPv6 host received %q", got)
+	}
+	host6.WriteToUDP([]byte("to-v6-viewer"), relay6)
+	if got := string(recv(t, viewer6, 2*time.Second)); got != "to-v6-viewer" {
+		t.Fatalf("IPv6 viewer received %q", got)
+	}
+
+	stats := m.Stats().Ports
+	if len(stats) != 1 {
+		t.Fatalf("stats ports = %+v", stats)
+	}
+	if !stats[0].HostOnline || stats[0].HostID != "devbox" {
+		t.Fatalf("stats: %+v", stats[0])
+	}
+	if stats[0].ToHost != 28 || stats[0].ToViewer != 24 {
+		t.Fatalf("stats counters did not aggregate both families: %+v", stats[0])
+	}
+}

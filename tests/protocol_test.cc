@@ -74,6 +74,7 @@ void test_hello() {
     sent.auth_flags = chast::kAuthFlagSigned;
     sent.signature.assign(64, 0x22);
     sent.totp = "123456";
+    sent.audit_ref = "00112233aabbccdd";
     check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
               got.access_token == sent.access_token &&
               got.password == sent.password &&
@@ -84,8 +85,9 @@ void test_hello() {
               got.nonce == sent.nonce &&
               got.unix_seconds == sent.unix_seconds &&
               got.auth_flags == sent.auth_flags &&
-              got.signature == sent.signature && got.totp == sent.totp,
-          "Hello round-trips the v13 authentication fields");
+              got.signature == sent.signature && got.totp == sent.totp &&
+              got.audit_ref == sent.audit_ref,
+          "Hello round-trips the v13 authentication fields and v25 audit reference");
 
     sent.access_token.clear();
     sent.password.clear();
@@ -95,6 +97,7 @@ void test_hello() {
     sent.totp.clear();
     sent.device_name.clear();
     sent.unix_seconds = 0;
+    sent.audit_ref.clear();
 
     rejects_hello(std::vector<uint8_t>(4), "short Hello is rejected");
     std::vector<uint8_t> bad_display = payload_of(chast::make_hello(sent));
@@ -124,8 +127,8 @@ void test_hello() {
     rejects_hello(long_password, "Hello with an oversized password is rejected");
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
-    unknown_permissions[8] = 0x40;  // version, display, token length, password length
-    unknown_permissions[9] = 0;
+    unknown_permissions[8] = 0x00;  // version, display, token length, password length
+    unknown_permissions[9] = 0x02;  // bit 9: outside every permission this build knows
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
     std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
@@ -145,6 +148,14 @@ void test_hello() {
     bad_totp.totp = "12ab56";
     rejects_hello(payload_of(chast::make_hello(bad_totp)),
                   "Hello with a non-numeric TOTP code is rejected");
+    chast::ClientHello short_ref = sent;
+    short_ref.audit_ref = "abcd";
+    rejects_hello(payload_of(chast::make_hello(short_ref)),
+                  "Hello with a short audit reference is rejected");
+    chast::ClientHello upper_ref = sent;
+    upper_ref.audit_ref = "00112233AABBCCDD";
+    rejects_hello(payload_of(chast::make_hello(upper_ref)),
+                  "Hello with a non-canonical audit reference is rejected");
 }
 
 void test_access_denied() {
@@ -198,6 +209,7 @@ void test_hello_ack() {
     sent.file_transfer_enabled = true;
     sent.microphone_enabled = true;
     sent.privacy_mode_enabled = true;
+    sent.port_forward_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -240,6 +252,7 @@ void test_hello_ack() {
     check(got.file_transfer_enabled, "HelloAck keeps the file transfer flag");
     check(got.microphone_enabled, "HelloAck keeps the microphone flag");
     check(got.privacy_mode_enabled, "HelloAck keeps the privacy mode flag");
+    check(got.port_forward_enabled, "HelloAck keeps the port forward flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
               got.file_transfer_enabled && got.microphone_enabled &&
               got.privacy_mode_enabled,
@@ -311,8 +324,8 @@ void test_hello_ack() {
     std::vector<uint8_t> unknown_flags = ack_payload();
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
-    unknown_flags[kFlagsAt] = 0x80;
-    unknown_flags[kFlagsAt + 1] = 0;
+    unknown_flags[kFlagsAt] = 0x00;
+    unknown_flags[kFlagsAt + 1] = 0x01;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
     std::vector<uint8_t> no_audio = ack_payload();
@@ -368,8 +381,8 @@ void test_hello_ack() {
     rejects_ack(std::move(mask_mismatch),
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
-    unknown_permissions[unknown_permissions.size() - 2] = 0x40;
-    unknown_permissions[unknown_permissions.size() - 1] = 0;
+    unknown_permissions[unknown_permissions.size() - 2] = 0x00;
+    unknown_permissions[unknown_permissions.size() - 1] = 0x02;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
 
@@ -476,7 +489,8 @@ void test_permission_update() {
           "PermissionUpdate round-trips every permission");
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
-    unknown[0] = 0x40;
+    unknown[0] = 0x00;
+    unknown[1] = 0x02;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -1425,6 +1439,223 @@ void test_chat() {
           "a ChatMessage with invalid UTF-8 is rejected");
 }
 
+void test_port_forward() {
+    std::string error;
+    chast::PortForwardRequest request;
+    request.forward_id = 7;
+    request.host = "127.0.0.1";
+    request.port = 3389;
+    const std::vector<uint8_t> encoded = chast::make_port_forward_request(request);
+    check(!encoded.empty() &&
+              encoded[6] == static_cast<uint8_t>(chast::ControlType::PortForwardRequest),
+          "PortForwardRequest names its control type");
+    chast::PortForwardRequest got;
+    check(chast::parse_port_forward_request(payload_of(encoded), got, &error) &&
+              got.forward_id == 7 && got.host == "127.0.0.1" && got.port == 3389,
+          "PortForwardRequest round-trips its target");
+    chast::PortForwardRequest utf8;
+    utf8.forward_id = 1;
+    utf8.host = "网关.local";
+    utf8.port = 22;
+    check(chast::parse_port_forward_request(
+              payload_of(chast::make_port_forward_request(utf8)), got, &error) &&
+              got.host == "网关.local",
+          "PortForwardRequest carries a UTF-8 host");
+
+    chast::PortForwardRequest bad = request;
+    bad.forward_id = 0;
+    check(chast::make_port_forward_request(bad).empty(),
+          "a port forward without an id is not encoded");
+    bad = request;
+    bad.port = 0;
+    check(chast::make_port_forward_request(bad).empty(),
+          "a port forward to port 0 is not encoded");
+    bad = request;
+    bad.host.clear();
+    check(chast::make_port_forward_request(bad).empty(),
+          "a port forward without a host is not encoded");
+    bad.host = std::string(400, 'a');
+    check(chast::make_port_forward_request(bad).empty(),
+          "an oversized port-forward host is not encoded");
+    std::vector<uint8_t> trailing = payload_of(encoded);
+    trailing.push_back(0);
+    check(!chast::parse_port_forward_request(trailing, got, &error),
+          "PortForwardRequest with trailing bytes is rejected");
+    std::vector<uint8_t> no_host = payload_of(encoded);
+    no_host[6] = 0;
+    no_host[7] = 0;
+    check(!chast::parse_port_forward_request(no_host, got, &error),
+          "PortForwardRequest with an empty host is rejected");
+
+    chast::PortForwardResult result;
+    result.forward_id = 7;
+    result.code = chast::PortForwardCode::Refused;
+    result.reason = "port forwarding is disabled";
+    chast::PortForwardResult result_out;
+    check(chast::parse_port_forward_result(
+              payload_of(chast::make_port_forward_result(result)), result_out, &error) &&
+              result_out.forward_id == 7 && result_out.code == chast::PortForwardCode::Refused &&
+              result_out.reason == result.reason,
+          "PortForwardResult round-trips a refusal with its reason");
+    std::vector<uint8_t> unknown = payload_of(chast::make_port_forward_result(result));
+    unknown[4] = 9;
+    check(!chast::parse_port_forward_result(unknown, result_out, &error),
+          "PortForwardResult with an unknown code is rejected");
+    result.reason = std::string(400, 'x');
+    check(chast::parse_port_forward_result(
+              payload_of(chast::make_port_forward_result(result)), result_out, &error) &&
+              result_out.reason.size() == chast::kMaxPortForwardReasonBytes,
+          "PortForwardResult truncates an oversized reason");
+
+    chast::PortForwardStop stop;
+    stop.forward_id = 7;
+    stop.code = chast::PortForwardCode::Cancelled;
+    chast::PortForwardStop stop_out;
+    check(chast::parse_port_forward_stop(
+              payload_of(chast::make_port_forward_stop(stop)), stop_out, &error) &&
+              stop_out.forward_id == 7 &&
+              stop_out.code == chast::PortForwardCode::Cancelled,
+          "PortForwardStop round-trips");
+
+    const std::vector<uint8_t> header = chast::make_port_forward_stream_header(7, 42);
+    check(header.size() == chast::kPortForwardStreamHeaderSize &&
+              std::memcmp(header.data(), chast::kPortForwardStreamMagic, 4) == 0 &&
+              header[4] == chast::kPortForwardStreamVersion,
+          "the CPFW header carries its magic and version");
+    chast::PortForwardStreamHeader decoded;
+    check(chast::decode_port_forward_stream_header(header.data(), header.size(), decoded,
+                                                   &error) &&
+              decoded.forward_id == 7 && decoded.connection_id == 42,
+          "the CPFW header round-trips its ids");
+    check(chast::make_port_forward_stream_header(0, 42).empty(),
+          "a CPFW header without a forward id is not encoded");
+    check(chast::make_port_forward_stream_header(7, 0).empty(),
+          "a CPFW header without a connection id is not encoded");
+    std::vector<uint8_t> bad_header = header;
+    bad_header[4] = 2;
+    check(!chast::decode_port_forward_stream_header(bad_header.data(), bad_header.size(),
+                                                    decoded, &error),
+          "a CPFW header with an unknown version is rejected");
+    bad_header = header;
+    bad_header[5] = 1;
+    check(!chast::decode_port_forward_stream_header(bad_header.data(), bad_header.size(),
+                                                    decoded, &error),
+          "a CPFW header with a reserved byte is rejected");
+    bad_header = header;
+    bad_header[8] = bad_header[9] = bad_header[10] = bad_header[11] = 0;
+    check(!chast::decode_port_forward_stream_header(bad_header.data(), bad_header.size(),
+                                                    decoded, &error),
+          "a CPFW header with a zero forward id is rejected");
+    check(!chast::decode_port_forward_stream_header(header.data(), 15, decoded, &error),
+          "a truncated CPFW header is rejected");
+}
+
+void test_terminal() {
+    std::string error;
+    chast::TerminalRequest request;
+    request.terminal_id = 3;
+    request.columns = 100;
+    request.rows = 30;
+    const std::vector<uint8_t> encoded = chast::make_terminal_request(request);
+    check(!encoded.empty() &&
+              encoded[6] == static_cast<uint8_t>(chast::ControlType::TerminalRequest),
+          "TerminalRequest names its control type");
+    chast::TerminalRequest got;
+    check(chast::parse_terminal_request(payload_of(encoded), got, &error) &&
+              got.terminal_id == 3 && got.columns == 100 && got.rows == 30,
+          "TerminalRequest round-trips its size");
+
+    chast::TerminalRequest bad = request;
+    bad.terminal_id = 0;
+    check(chast::make_terminal_request(bad).empty(),
+          "a terminal request without an id is not encoded");
+    bad = request;
+    bad.columns = 0;
+    check(chast::make_terminal_request(bad).empty(),
+          "a terminal request with zero columns is not encoded");
+    bad = request;
+    bad.rows = chast::kMaxTerminalRows + 1;
+    check(chast::make_terminal_request(bad).empty(),
+          "a terminal request above the row limit is not encoded");
+    check(!chast::valid_terminal_size(0, 24) && !chast::valid_terminal_size(80, 0) &&
+              !chast::valid_terminal_size(chast::kMaxTerminalColumns + 1, 24) &&
+              chast::valid_terminal_size(80, 24),
+          "valid_terminal_size enforces the console range");
+    std::vector<uint8_t> trailing = payload_of(encoded);
+    trailing.push_back(0);
+    check(!chast::parse_terminal_request(trailing, got, &error),
+          "TerminalRequest with trailing bytes is rejected");
+
+    chast::TerminalResult result;
+    result.terminal_id = 3;
+    result.code = chast::TerminalCode::Failed;
+    result.reason = "ConPTY is unavailable";
+    chast::TerminalResult result_out;
+    check(chast::parse_terminal_result(
+              payload_of(chast::make_terminal_result(result)), result_out, &error) &&
+              result_out.terminal_id == 3 && result_out.code == chast::TerminalCode::Failed &&
+              result_out.reason == result.reason,
+          "TerminalResult round-trips a failure with its reason");
+    std::vector<uint8_t> unknown = payload_of(chast::make_terminal_result(result));
+    unknown[4] = 9;
+    check(!chast::parse_terminal_result(unknown, result_out, &error),
+          "TerminalResult with an unknown code is rejected");
+    result.reason = std::string(400, 'x');
+    check(chast::parse_terminal_result(payload_of(chast::make_terminal_result(result)),
+                                       result_out, &error) &&
+              result_out.reason.size() == chast::kMaxTerminalReasonBytes,
+          "TerminalResult truncates an oversized reason");
+
+    chast::TerminalStop stop;
+    stop.terminal_id = 3;
+    stop.code = chast::TerminalCode::Cancelled;
+    chast::TerminalStop stop_out;
+    check(chast::parse_terminal_stop(payload_of(chast::make_terminal_stop(stop)), stop_out,
+                                     &error) &&
+              stop_out.terminal_id == 3 &&
+              stop_out.code == chast::TerminalCode::Cancelled,
+          "TerminalStop round-trips");
+
+    chast::TerminalSize size;
+    check(chast::parse_terminal_resize(
+              payload_of(chast::make_terminal_resize(3, 120, 40)), size, &error) &&
+              size.terminal_id == 3 && size.columns == 120 && size.rows == 40,
+          "TerminalResize round-trips its size");
+    check(chast::make_terminal_resize(0, 80, 24).empty(),
+          "a resize without an id is not encoded");
+    check(chast::make_terminal_resize(3, 0, 24).empty(),
+          "a resize with zero columns is not encoded");
+
+    const std::vector<uint8_t> header = chast::make_terminal_stream_header(3);
+    check(header.size() == chast::kTerminalStreamHeaderSize &&
+              std::memcmp(header.data(), chast::kTerminalStreamMagic, 4) == 0 &&
+              header[4] == chast::kTerminalStreamVersion,
+          "the CTTY header carries its magic and version");
+    chast::TerminalStreamHeader decoded;
+    check(chast::decode_terminal_stream_header(header.data(), header.size(), decoded, &error) &&
+              decoded.terminal_id == 3,
+          "the CTTY header round-trips its id");
+    check(chast::make_terminal_stream_header(0).empty(),
+          "a CTTY header without an id is not encoded");
+    std::vector<uint8_t> bad_header = header;
+    bad_header[4] = 2;
+    check(!chast::decode_terminal_stream_header(bad_header.data(), bad_header.size(), decoded,
+                                                &error),
+          "a CTTY header with an unknown version is rejected");
+    bad_header = header;
+    bad_header[12] = 1;
+    check(!chast::decode_terminal_stream_header(bad_header.data(), bad_header.size(), decoded,
+                                                &error),
+          "a CTTY header with a non-zero tail is rejected");
+    bad_header = header;
+    bad_header[8] = bad_header[9] = bad_header[10] = bad_header[11] = 0;
+    check(!chast::decode_terminal_stream_header(bad_header.data(), bad_header.size(), decoded,
+                                                &error),
+          "a CTTY header with a zero id is rejected");
+    check(!chast::decode_terminal_stream_header(header.data(), 15, decoded, &error),
+          "a truncated CTTY header is rejected");
+}
+
 void test_cursor_update() {
     std::string error;
     chast::CursorUpdate update;
@@ -2205,6 +2436,8 @@ int main(int argc, char** argv) {
     test_latency_probe();
     test_clipboard();
     test_chat();
+    test_port_forward();
+    test_terminal();
     test_cursor_update();
     test_stream_info();
     test_input_events();

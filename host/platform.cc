@@ -16,6 +16,10 @@ constexpr wchar_t kRunValue[] = L"chast-host";
 constexpr wchar_t kHostRuleName[] = L"chast host";
 constexpr wchar_t kHostTcpRuleName[] = L"chast host tcp";
 constexpr wchar_t kTunnelRuleName[] = L"chast tunnel";
+constexpr wchar_t kTunnelDiscoveryRuleName[] = L"chast tunnel discovery";
+// Keep in sync with lan.DefaultPort in server/internal/lan. The host agent
+// answers discovery on this fixed port, so the rule needs no settings field.
+constexpr uint16_t kTunnelDiscoveryPort = 21129;
 
 bool run_hidden(const std::wstring& command, DWORD* exit_code) {
     std::vector<wchar_t> buffer(command.begin(), command.end());
@@ -124,6 +128,9 @@ int apply_firewall_rule(uint16_t port, uint16_t tunnel_port) {
                    std::wstring(kTunnelRuleName) + L"\"",
                &ignored);
     run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kTunnelDiscoveryRuleName) + L"\"",
+               &ignored);
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
                    std::wstring(kHostTcpRuleName) + L"\"",
                &ignored);
     const int host_code = add_firewall_rule(kHostRuleName, executable_path(), port, L"UDP");
@@ -142,7 +149,13 @@ int apply_firewall_rule(uint16_t port, uint16_t tunnel_port) {
     if (tunnel_port == 0) {
         return 0;
     }
-    return add_firewall_rule(kTunnelRuleName, tunnel_executable(), tunnel_port, L"UDP");
+    const int tunnel_code =
+        add_firewall_rule(kTunnelRuleName, tunnel_executable(), tunnel_port, L"UDP");
+    if (tunnel_code != 0) {
+        return tunnel_code;
+    }
+    return add_firewall_rule(kTunnelDiscoveryRuleName, tunnel_executable(),
+                             kTunnelDiscoveryPort, L"UDP");
 }
 
 void remove_firewall_rules() {
@@ -155,6 +168,9 @@ void remove_firewall_rules() {
                &ignored);
     run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
                    std::wstring(kTunnelRuleName) + L"\"",
+               &ignored);
+    run_hidden(L"netsh.exe advfirewall firewall delete rule name=\"" +
+                   std::wstring(kTunnelDiscoveryRuleName) + L"\"",
                &ignored);
 }
 

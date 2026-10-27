@@ -6,8 +6,10 @@
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
+#include "chast/audit_spool.h"
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
 #include "chast/quic.h"
@@ -72,6 +74,8 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.allow_file_transfer == b.allow_file_transfer &&
+           a.allow_port_forward == b.allow_port_forward &&
+           a.allow_terminal == b.allow_terminal &&
            a.file_receive_directory == b.file_receive_directory &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
@@ -86,7 +90,9 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.quality == b.quality && a.autostart == b.autostart && a.display == b.display &&
            a.tunnel == b.tunnel && a.server_url == b.server_url &&
            a.server_key == b.server_key && a.tunnel_id == b.tunnel_id &&
-           a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen;
+           a.tunnel_old_id == b.tunnel_old_id &&
+           a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen &&
+           a.audit_spool == b.audit_spool;
 }
 
 void test_round_trip(const std::filesystem::path& dir) {
@@ -98,6 +104,8 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_input = false;
     settings.allow_clipboard = false;
     settings.allow_file_transfer = false;
+    settings.allow_port_forward = true;
+    settings.allow_terminal = true;
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
     settings.allow_microphone = true;
@@ -138,8 +146,10 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.server_url = "https://rendezvous.example.com/chast";
     settings.server_key = "server secret";
     settings.tunnel_id = "devbox.office";
+    settings.tunnel_old_id = "devbox.home";
     settings.tunnel_key = "host secret 123";
     settings.tunnel_listen = "127.0.0.1:46000";
+    settings.audit_spool = "D:\\审计\\host.audit.jsonl";
 
     std::string error;
     check(chast::save_host_settings(path, settings, &error), "settings save");
@@ -158,6 +168,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.warning.empty(), "a missing file is not a warning");
     check(loaded.settings.port == 4433 && loaded.settings.bind_address == "0.0.0.0",
           "missing file yields the documented defaults");
+    check(loaded.settings.audit_spool == (dir / L"absent.audit.jsonl").string(),
+          "a missing file still derives the spool next to itself");
     check(loaded.settings.carrier, "a fresh host accepts the TCP/WebSocket fallback");
     check(loaded.settings.allow_input && loaded.settings.require_approval,
           "a fresh host accepts input behind an approval");
@@ -488,6 +500,72 @@ void test_identity_defaults() {
           "the interactive host stops after five consecutive failures");
 }
 
+void test_audit_spool(const std::filesystem::path& dir) {
+    const std::filesystem::path folder = dir / L"audit";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    const std::string settings_path = (folder / L"host.ini").string();
+    const std::string derived = (folder / L"host.audit.jsonl").string();
+    check(chast::audit_spool_path_for(settings_path) == derived,
+          "the spool sits next to the settings file");
+    check(chast::audit_spool_path_for("").empty(), "an empty settings path has no spool");
+
+    const chast::HostSettingsLoad loaded = chast::load_host_settings(settings_path);
+    check(loaded.settings.audit_spool == derived, "loading derives the spool path");
+
+    chast::HostSettings settings = loaded.settings;
+    settings.audit_spool = (folder / L"custom-audit.jsonl").string();
+    std::string error;
+    check(chast::save_host_settings(settings_path, settings, &error),
+          "settings with a custom spool save");
+    check(chast::load_host_settings(settings_path).settings.audit_spool == settings.audit_spool,
+          "a custom spool path round-trips");
+    // The derived default must not be pinned into the file.
+    write_text(folder / L"plain.ini", "port=4433\n");
+    const chast::HostSettingsLoad plain = chast::load_host_settings((folder / L"plain.ini").string());
+    check(chast::save_host_settings((folder / L"plain.ini").string(), plain.settings, &error),
+          "a settings file with the derived spool saves");
+    std::ifstream saved(folder / L"plain.ini", std::ios::binary);
+    const std::string saved_text((std::istreambuf_iterator<char>(saved)),
+                                 std::istreambuf_iterator<char>());
+    check(saved_text.find("audit_spool=") == std::string::npos,
+          "the derived spool stays out of the settings file");
+
+    const std::string spool = (folder / L"events.jsonl").string();
+    chast::AuditSessionRecord session;
+    session.audit_ref = "00112233aabbccdd";
+    session.started_at_ms = 1700000000000;
+    session.ended_at_ms = 1700000005000;
+    session.success = false;
+    session.detail = "the \"viewer\" left";
+    check(chast::append_audit_session(spool, session, &error),
+          "a session record is appended to the spool");
+
+    chast::AuditFileRecord file;
+    file.audit_ref = "00112233aabbccdd";
+    file.direction = "upload";
+    file.name = "报告\nb.txt";
+    file.size = 42;
+    file.occurred_at_ms = 1700000004000;
+    check(chast::append_audit_file(spool, file, &error), "a file record is appended");
+
+    std::ifstream in(folder / L"events.jsonl", std::ios::binary);
+    std::string first;
+    std::string second;
+    check(static_cast<bool>(std::getline(in, first)) && static_cast<bool>(std::getline(in, second)),
+          "both spool lines are readable");
+    check(first ==
+              R"({"kind":"session","audit_ref":"00112233aabbccdd","started_at_ms":1700000000000,"ended_at_ms":1700000005000,"success":false,"detail":"the \"viewer\" left"})",
+          "the session line matches the agent's JSON shape");
+    check(second ==
+              R"({"kind":"file","audit_ref":"00112233aabbccdd","direction":"upload","name":"报告\nb.txt","size":42,"occurred_at_ms":1700000004000,"success":true,"detail":""})",
+          "the file line escapes the name and carries the size");
+
+    chast::AuditSessionRecord missing;
+    check(!chast::append_audit_session(spool, missing, &error),
+          "a record without a viewer reference is refused");
+}
+
 void test_unicode_path(const std::filesystem::path& dir) {
     // Windows profiles are often non-ASCII; the config path goes through
     // UTF-8, so a Chinese folder name has to survive both directions.
@@ -522,6 +600,7 @@ int main() {
     test_generated_tunnel_id();
     test_machine_paths();
     test_identity_defaults();
+    test_audit_spool(dir);
     test_unicode_path(dir);
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

@@ -2,12 +2,15 @@
 //
 // Decoded PCM arrives on the session's media thread; this object converts it
 // to the endpoint's mix format, positions each block on the host timeline and
-// writes it when the endpoint's queue has run out to that point. The playback
-// lead is the jitter buffer: blocks wait `lead_ms` after their host capture
-// time before they are handed to the endpoint, which absorbs network jitter
-// without letting latency grow. Blocks that miss their slot are dropped rather
-// than played late; a gap the network cannot fill becomes silence (counted as
-// an underrun) instead of a permanently delayed stream.
+// writes it when the endpoint's queue has run out to that point. In the
+// default mode the playback lead is the jitter buffer: blocks wait `lead_ms`
+// after their host capture time before they are handed to the endpoint, which
+// absorbs network jitter without letting latency grow. In arrival-anchored
+// mode each burst is anchored when it arrives and plays immediately; capture
+// stamps then only space the blocks inside the burst. Either way, blocks that
+// miss their slot are dropped rather than played late; a gap the network
+// cannot fill becomes silence (counted as an underrun) instead of a
+// permanently delayed stream.
 //
 // If the endpoint disappears or the default output changes, the renderer
 // rebuilds itself on the new default and keeps decoding: only this thread
@@ -51,6 +54,11 @@ extern "C" {
 namespace chast {
 
 namespace {
+
+// RustDesk rebuilds an output stream whose callback has not started within
+// this window. In shared-mode WASAPI the equivalent signal is the endpoint
+// consuming the audio handed to it, so this doubles as the stall window.
+constexpr int64_t kStartupConfirmationMs = 5000;
 
 Error av_error(int code, const char* what) {
     char text[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -475,6 +483,7 @@ void WasapiPlayer::close() {
 }
 
 void WasapiPlayer::render_loop() {
+    int64_t last_progress = wasapi::now_ms();
     bool endpoint_open = render_loop_start();
     if (!endpoint_open) {
         close_endpoint();
@@ -482,6 +491,7 @@ void WasapiPlayer::render_loop() {
     }
     int64_t next_retry = wasapi::now_ms() + 1000;
     int64_t next_check = wasapi::now_ms() + 1000;
+    uint64_t last_played = played_frames_.load();
 
     while (!stopping()) {
         if (!endpoint_open) {
@@ -492,6 +502,8 @@ void WasapiPlayer::render_loop() {
                     recovering_.store(false);
                     recoveries_.fetch_add(1);
                     next_check = wasapi::now_ms() + 1000;
+                    last_progress = wasapi::now_ms();
+                    last_played = played_frames_.load();
                 } else {
                     close_endpoint();
                     next_retry = wasapi::now_ms() + 1000;
@@ -521,7 +533,33 @@ void WasapiPlayer::render_loop() {
                 endpoint_open = false;
                 recovering_.store(true);
                 next_retry = wasapi::now_ms();
+            } else if (!render()) {
+                // The periodic render also refreshes the padding while idle,
+                // so a drained endpoint reads as empty to the stall check
+                // below; failing here means the engine is already gone.
+                close_endpoint();
+                endpoint_open = false;
+                recovering_.store(true);
+                next_retry = wasapi::now_ms() + 1000;
             }
+        }
+
+        const uint64_t played = played_frames_.load();
+        if (played != last_played) {
+            last_played = played;
+            last_progress = wasapi::now_ms();
+        } else if (buffer_ms_.load() > 0 &&
+                   wasapi::now_ms() - last_progress >= kStartupConfirmationMs) {
+            // RustDesk rebuilds an output stream whose callback has not run
+            // within this window. Start() can succeed on an engine that never
+            // consumes anything, so the callback here is the endpoint taking
+            // audio: queued or buffered audio that stays unwritten for the
+            // whole window means the stream is not running. An idle endpoint
+            // has no buffered audio and never trips this.
+            close_endpoint();
+            endpoint_open = false;
+            recovering_.store(true);
+            next_retry = wasapi::now_ms() + 1000;
         }
     }
 
@@ -783,17 +821,18 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
                          error_.empty() ? std::string("audio playback is stopping") : error_);
         }
         if (!have_offset_.load()) {
-            // No LatencyReply yet: treat this block as arriving one lead
-            // early, so playback starts after the jitter buffer instead of
-            // waiting for the first probe.
+            // No offset yet: anchor this block at its arrival, so playback
+            // starts after the jitter buffer (default mode) or immediately
+            // (arrival-anchored mode) instead of waiting for the first probe.
             offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
             have_offset_.store(true);
         } else if (config_.arrival_anchored && last_end_local_ms_ > 0 &&
                    wasapi::now_ms() > last_end_local_ms_ + 100) {
-            // Microphone bursts carry the sender's clock and have no
-            // LatencyReply. After a stall the old offset would place every
-            // queued block in the past; re-anchor the new burst at arrival and
-            // let the renderer drop what is left of the stale one.
+            // Arrival-anchored callers have no live clock offset (the mic
+            // uplink has no LatencyReply, system audio plays on arrival).
+            // After a stall the old offset would place every queued block in
+            // the past; re-anchor the new burst at arrival and let the
+            // renderer drop what is left of the stale one.
             offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
             queue_.clear();
             queued_frames_ = 0;

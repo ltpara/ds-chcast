@@ -64,6 +64,16 @@ constexpr size_t kMaxBufferedFileBytes = 64u * 1024u * 1024u;
 constexpr size_t kFileReceiveHighWaterBytes = 32u * 1024u * 1024u;
 constexpr size_t kFileReceiveLowWaterBytes = 8u * 1024u * 1024u;
 constexpr size_t kMaxQueuedOffers = 8;
+// One forwarded connection never buffers more than twice the protocol's high
+// water mark; above the high-water mark the receive stream is paused, so the
+// hard bound only catches a peer that ignores flow control.
+constexpr size_t kMaxBufferedPortForwardBytes = kPortForwardReceiveHighWaterBytes * 2;
+constexpr size_t kMaxQueuedPortForwardStops = 16;
+
+// Windows defines max() as a macro, so the qualifier is wrapped before the
+// call. This marks "wait as long as it takes" for the shared send queue.
+const std::chrono::steady_clock::time_point kNoSendDeadline =
+    (std::chrono::steady_clock::time_point::max)();
 
 // Device names come from the local computer and the protocol caps them at
 // kMaxDeviceNameLength bytes. Cut on a whole UTF-8 sequence so a long name
@@ -98,6 +108,12 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     }
     if (info.privacy_mode_enabled) {
         mask |= kPermissionPrivacyMode;
+    }
+    if (info.port_forward_enabled) {
+        mask |= kPermissionPortForward;
+    }
+    if (info.terminal_enabled) {
+        mask |= kPermissionTerminal;
     }
     return mask;
 }
@@ -512,6 +528,9 @@ struct QuicSession::Impl {
     // allowed.
     uint16_t requested_display = kDisplayAuto;
     std::string requested_peer;
+    // Audit reference of the accepted Hello. pending_hello is consumed by
+    // wait_for_client, so the accessor reads this copy instead.
+    std::string session_audit_ref;
     ClientHello pending_hello;
     // Server: the newest SwitchDisplay the viewer asked for. Intermediate
     // targets are not queued; a viewer clicking through the list wants the
@@ -637,6 +656,36 @@ struct QuicSession::Impl {
         HQUIC stream = nullptr;
         uint64_t next_offset = 0;
     };
+    // One forwarded TCP connection (protocol v26). The viewer owns the uplink
+    // and the host owns the downlink, so each side has exactly one send and
+    // one receive stream; the ids correlate them across the two roles.
+    struct PortForwardTarget {
+        std::string host;
+        uint16_t port = 0;
+    };
+    struct PortForwardEntry {
+        PortForwardHandle handle = 0;
+        uint32_t forward_id = 0;
+        uint32_t connection_id = 0;
+        bool server_side = false;
+        HQUIC uplink = nullptr;    // viewer -> host; open on both sides
+        HQUIC downlink = nullptr;  // host -> viewer; open after the dial
+        // Server: the host accepted the dial. Client: the downlink arrived,
+        // so the host's dial succeeded.
+        bool accepted = false;
+        bool send_finished = false;
+        bool receive_finished = false;
+        bool failed = false;
+        // The application closed the handle after both directions finished
+        // cleanly. The streams stay open until QUIC reports SHUTDOWN_COMPLETE,
+        // because aborting them here would discard bytes the peer has not
+        // acknowledged yet.
+        bool app_closed = false;
+        std::string error;
+        std::deque<std::vector<uint8_t>> received;
+        size_t buffered_bytes = 0;
+        bool receive_paused = false;
+    };
     std::vector<ClipboardStream> clipboard_streams;
     size_t pending_clipboard_bytes = 0;
     std::deque<ClipboardContent> clipboard_contents;
@@ -654,6 +703,51 @@ struct QuicSession::Impl {
     std::map<uint32_t, OutgoingUpload> outgoing_uploads;
     std::deque<FileAnswer> file_answers;
     std::deque<FileResult> file_results;
+    // Port forwarding. Targets are what the viewer registered and the host
+    // approved; entries are the live TCP connections. `pending_*` keeps the
+    // request between take_port_forward_request and the host's answer.
+    std::map<uint32_t, PortForwardTarget> active_forward_targets;
+    std::map<uint32_t, PortForwardTarget> client_forward_targets;
+    std::map<uint32_t, PortForwardTarget> client_pending_forwards;
+    std::map<uint32_t, PortForwardTarget> pending_forward_targets;
+    std::map<PortForwardHandle, PortForwardEntry> port_forward_connections;
+    std::deque<PortForwardRequest> port_forward_requests;
+    std::deque<PortForwardResult> port_forward_results;
+    std::deque<PortForwardOpen> port_forward_opens;
+    std::deque<PortForwardStop> port_forward_stops;
+    uint64_t next_port_forward_handle = 1;
+    // Remote terminals (protocol v27). Both roles create the entry when the
+    // host answers Ok, so the two CTTY streams can attach in either order:
+    // ConPTY may print its prompt before the viewer opens its input stream.
+    struct TerminalEntry {
+        uint32_t terminal_id = 0;
+        bool server_side = false;
+        uint16_t columns = 0;
+        uint16_t rows = 0;
+        HQUIC uplink = nullptr;    // viewer -> host input
+        HQUIC downlink = nullptr;  // host -> viewer output
+        bool send_finished = false;
+        bool receive_finished = false;
+        // The peer sent TerminalStop. The viewer keeps the entry so console
+        // output already on the wire can still be drained; the host closes its
+        // console and forgets the terminal at once.
+        bool stopped = false;
+        bool failed = false;
+        std::string error;
+        // Console output on the viewer, keyboard input on the host.
+        std::deque<std::vector<uint8_t>> received;
+        size_t buffered_bytes = 0;
+        bool receive_paused = false;
+    };
+    std::map<uint32_t, TerminalSize> pending_terminal_targets;
+    std::map<uint32_t, TerminalSize> active_terminal_targets;
+    std::map<uint32_t, TerminalSize> client_pending_terminals;
+    std::map<uint32_t, TerminalSize> client_terminal_targets;
+    std::map<uint32_t, TerminalEntry> terminal_entries;
+    std::deque<TerminalRequest> terminal_requests;
+    std::deque<TerminalResult> terminal_results;
+    std::deque<TerminalStop> terminal_stops;
+    std::deque<TerminalSize> terminal_resizes;
     // Unidirectional streams this side opened for clipboard changes; their
     // handles are closed when QUIC reports SHUTDOWN_COMPLETE.
     std::vector<HQUIC> one_shot_streams;
@@ -790,13 +884,14 @@ struct QuicSession::Impl {
                     HQUIC expected = nullptr;
                     accepted = control.compare_exchange_strong(expected, stream);
                 } else if (unidirectional) {
+                    constexpr uint32_t kViewerStreamPermissions =
+                        kPermissionClipboard | kPermissionFileTransfer |
+                        kPermissionMicrophone | kPermissionPortForward | kPermissionTerminal;
                     if (role == Role::Server &&
-                        (session_permissions.load() &
-                         (kPermissionClipboard | kPermissionFileTransfer |
-                          kPermissionMicrophone)) == 0) {
-                        // Neither clipboard, file nor microphone streams are
-                        // granted for this session; the HelloAck said so
-                        // already.
+                        (session_permissions.load() & kViewerStreamPermissions) == 0) {
+                        // None of the viewer-initiated stream types (clipboard,
+                        // file, microphone, port forward, terminal) is granted
+                        // for this session; the HelloAck said so already.
                         api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
                         break;
                     }
@@ -901,8 +996,21 @@ struct QuicSession::Impl {
     // viewer's microphone on the host. Anything else is a peer that is not
     // speaking this protocol version.
     void classify_media_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
-        enum class Kind { Wait, Video, Audio, Microphone, Clipboard, File, Reject, Bad };
+        enum class Kind {
+            Wait,
+            Video,
+            Audio,
+            Microphone,
+            Clipboard,
+            File,
+            PortForward,
+            Terminal,
+            Reject,
+            Bad
+        };
         Kind kind = Kind::Wait;
+        HQUIC port_forward_pause = nullptr;
+        HQUIC terminal_pause = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex);
             std::vector<uint8_t>* pending = nullptr;
@@ -1046,6 +1154,176 @@ struct QuicSession::Impl {
                         kind = Kind::File;
                     }
                 }
+            } else if (std::memcmp(pending->data(), kPortForwardStreamMagic, 4) == 0) {
+                // One unidirectional stream per direction per TCP connection.
+                // The host only accepts an uplink for a target it approved;
+                // the viewer only accepts a downlink for a connection it
+                // opened. Anything else is refused quietly, like a stale
+                // clipboard stream.
+                if ((session_permissions.load() & kPermissionPortForward) == 0) {
+                    kind = Kind::Reject;
+                } else if (pending->size() < kPortForwardStreamHeaderSize) {
+                    return;
+                } else {
+                    PortForwardStreamHeader header;
+                    std::string header_error;
+                    if (!decode_port_forward_stream_header(pending->data(),
+                                                           kPortForwardStreamHeaderSize, header,
+                                                           &header_error)) {
+                        kind = Kind::Bad;
+                    } else if (role == Role::Server) {
+                        const auto target = active_forward_targets.find(header.forward_id);
+                        // The uplink pauses after its first packet, so this is
+                        // the only chunk that can arrive before the host had a
+                        // chance to dial.
+                        const size_t excess =
+                            pending->size() - kPortForwardStreamHeaderSize;
+                        prune_retired_port_forwards_locked();
+                        const bool duplicate =
+                            has_port_forward_entry_locked(header.forward_id,
+                                                          header.connection_id);
+                        const size_t live = port_forward_live_count_locked();
+                        if (target == active_forward_targets.end() ||
+                            duplicate ||
+                            live >= kMaxPortForwardConnections ||
+                            excess > kMaxBufferedPortForwardBytes) {
+                            kind = Kind::Reject;
+                        } else {
+                            PortForwardEntry entry;
+                            entry.handle = next_port_forward_handle++;
+                            entry.forward_id = header.forward_id;
+                            entry.connection_id = header.connection_id;
+                            entry.server_side = true;
+                            entry.uplink = stream;
+                            // The host has to dial before any byte can be
+                            // relayed, so the uplink stays paused until
+                            // accept_port_forward_connection() succeeds.
+                            entry.receive_paused = true;
+                            auto inserted = port_forward_connections.emplace(
+                                entry.handle, std::move(entry));
+                            PortForwardEntry& created = inserted.first->second;
+                            PortForwardOpen open;
+                            open.handle = created.handle;
+                            open.forward_id = created.forward_id;
+                            open.connection_id = created.connection_id;
+                            open.host = target->second.host;
+                            open.port = target->second.port;
+                            port_forward_opens.push_back(std::move(open));
+                            if (excess > 0) {
+                                created.received.emplace_back(
+                                    pending->begin() + kPortForwardStreamHeaderSize,
+                                    pending->end());
+                                created.buffered_bytes = excess;
+                            }
+                            port_forward_pause = stream;
+                            kind = Kind::PortForward;
+                        }
+                    } else {
+                        PortForwardEntry* matched = nullptr;
+                        for (auto& item : port_forward_connections) {
+                            PortForwardEntry& candidate = item.second;
+                            if (!candidate.server_side && candidate.downlink == nullptr &&
+                                !candidate.failed && candidate.forward_id == header.forward_id &&
+                                candidate.connection_id == header.connection_id) {
+                                matched = &candidate;
+                                break;
+                            }
+                        }
+                        if (!matched) {
+                            kind = Kind::Reject;
+                        } else {
+                            matched->downlink = stream;
+                            matched->accepted = true;
+                            const size_t excess = pending->size() - kPortForwardStreamHeaderSize;
+                            if (matched->buffered_bytes + excess > kMaxBufferedPortForwardBytes) {
+                                std::vector<HQUIC> aborts;
+                                fail_port_forward_locked(
+                                    *matched, "the port forward receive queue overflowed",
+                                    aborts);
+                                for (HQUIC handle : aborts) {
+                                    api->StreamShutdown(
+                                        handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                                }
+                                kind = Kind::PortForward;
+                            } else {
+                                if (excess > 0) {
+                                    matched->received.emplace_back(
+                                        pending->begin() + kPortForwardStreamHeaderSize,
+                                        pending->end());
+                                    matched->buffered_bytes += excess;
+                                }
+                                kind = Kind::PortForward;
+                            }
+                        }
+                    }
+                }
+            } else if (std::memcmp(pending->data(), kTerminalStreamMagic, 4) == 0) {
+                // One CTTY stream per direction per terminal. Both entries
+                // exist once the host answered Ok, so either direction may
+                // arrive first: ConPTY can print its prompt before the viewer
+                // opens its input stream.
+                if ((session_permissions.load() & kPermissionTerminal) == 0) {
+                    kind = Kind::Reject;
+                } else if (pending->size() < kTerminalStreamHeaderSize) {
+                    return;
+                } else {
+                    TerminalStreamHeader header;
+                    std::string header_error;
+                    const size_t excess = pending->size() - kTerminalStreamHeaderSize;
+                    if (!decode_terminal_stream_header(pending->data(),
+                                                       kTerminalStreamHeaderSize, header,
+                                                       &header_error)) {
+                        kind = Kind::Bad;
+                    } else {
+                        const auto found = terminal_entries.find(header.terminal_id);
+                        TerminalEntry* entry =
+                            found == terminal_entries.end() ? nullptr : &found->second;
+                        if (!entry && role == Role::Client) {
+                            // The host's downlink can overtake TerminalResult:
+                            // control and CTTY travel on different streams and
+                            // QUIC does not order across streams. A downlink
+                            // for a terminal this side just asked for proves
+                            // the host created it, so accept it now; the
+                            // result still arrives and unlocks the input
+                            // direction.
+                            const auto requested =
+                                client_pending_terminals.find(header.terminal_id);
+                            if (requested != client_pending_terminals.end()) {
+                                TerminalEntry created;
+                                created.terminal_id = header.terminal_id;
+                                created.server_side = false;
+                                created.columns = requested->second.columns;
+                                created.rows = requested->second.rows;
+                                entry = &terminal_entries
+                                             .emplace(header.terminal_id, std::move(created))
+                                             .first->second;
+                            }
+                        }
+                        HQUIC* slot = nullptr;
+                        if (entry && !entry->failed &&
+                            entry->server_side == (role == Role::Server)) {
+                            slot = role == Role::Server ? &entry->uplink : &entry->downlink;
+                        }
+                        if (!slot || *slot || excess > kTerminalReceiveHighWaterBytes) {
+                            // A duplicate or unknown direction is a viewer
+                            // bug; refusing it quietly keeps the console.
+                            kind = Kind::Reject;
+                        } else {
+                            *slot = stream;
+                            if (excess > 0) {
+                                entry->received.emplace_back(
+                                    pending->begin() + kTerminalStreamHeaderSize,
+                                    pending->end());
+                                entry->buffered_bytes += excess;
+                            }
+                            if (entry->buffered_bytes >= kTerminalReceiveHighWaterBytes) {
+                                entry->receive_paused = true;
+                                terminal_pause = stream;
+                            }
+                            kind = Kind::Terminal;
+                        }
+                    }
+                }
             } else {
                 kind = Kind::Bad;
             }
@@ -1057,6 +1335,16 @@ struct QuicSession::Impl {
                                    }),
                     unclassified.end());
             }
+        }
+        if (port_forward_pause) {
+            // The host dials before any byte reaches the relay; re-enabled by
+            // accept_port_forward_connection().
+            api->StreamReceiveSetEnabled(port_forward_pause, FALSE);
+        }
+        if (terminal_pause) {
+            // A first packet that already filled the queue; the application
+            // re-enables the stream once it has drained below half.
+            api->StreamReceiveSetEnabled(terminal_pause, FALSE);
         }
         if (kind == Kind::Reject) {
             api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
@@ -1116,6 +1404,288 @@ struct QuicSession::Impl {
     bool is_microphone_handle_locked(HQUIC stream) const {
         return std::find(microphone_handles.begin(), microphone_handles.end(), stream) !=
                microphone_handles.end();
+    }
+
+    // Caller holds `mutex`. The receive stream of a forwarded connection: the
+    // viewer reads the downlink, the host reads the uplink.
+    static HQUIC port_forward_receive_stream(const PortForwardEntry& entry) {
+        return entry.server_side ? entry.uplink : entry.downlink;
+    }
+
+    static HQUIC port_forward_send_stream(const PortForwardEntry& entry) {
+        return entry.server_side ? entry.downlink : entry.uplink;
+    }
+
+    PortForwardEntry* port_forward_by_stream_locked(HQUIC stream) {
+        for (auto& item : port_forward_connections) {
+            if (item.second.uplink == stream || item.second.downlink == stream) {
+                return &item.second;
+            }
+        }
+        return nullptr;
+    }
+
+    PortForwardEntry* port_forward_by_handle_locked(PortForwardHandle handle) {
+        const auto it = port_forward_connections.find(handle);
+        return it == port_forward_connections.end() ? nullptr : &it->second;
+    }
+
+    // Caller holds `mutex`. Finished entries stay until the application closes
+    // the handle: the tail of the receive queue may still be unread, and
+    // receive() reports Unavailable after it instead of a vanished handle.
+    // They do not use the connection budget.
+    size_t port_forward_live_count_locked() const {
+        size_t live = 0;
+        for (const auto& item : port_forward_connections) {
+            if (item.second.app_closed) {
+                continue;
+            }
+            if (item.second.uplink != nullptr || item.second.downlink != nullptr) {
+                ++live;
+            }
+        }
+        return live;
+    }
+
+    // Caller holds `mutex`. Forgets every finished entry; called before a new
+    // connection tries to claim the last slot.
+    void prune_retired_port_forwards_locked() {
+        for (auto it = port_forward_connections.begin();
+             it != port_forward_connections.end();) {
+            if (it->second.uplink == nullptr && it->second.downlink == nullptr) {
+                it = port_forward_connections.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Caller holds `mutex`. Marks the connection broken and drops its queued
+    // bytes; the peer stream is aborted by the caller, which may hold a
+    // handle the callbacks no longer own.
+    void fail_port_forward_locked(PortForwardEntry& entry, const std::string& error,
+                                  std::vector<HQUIC>& aborts) {
+        entry.failed = true;
+        entry.error = error;
+        entry.receive_finished = true;
+        entry.send_finished = true;
+        entry.buffered_bytes = 0;
+        entry.received.clear();
+        if (entry.uplink) {
+            aborts.push_back(entry.uplink);
+        }
+        if (entry.downlink) {
+            aborts.push_back(entry.downlink);
+        }
+    }
+
+    // Caller holds `mutex`. Tears down every connection under one target and
+    // forgets the registrations; returns the stream handles to abort.
+    std::vector<HQUIC> stop_port_forward_target_locked(uint32_t forward_id) {
+        std::vector<HQUIC> aborts;
+        for (auto it = port_forward_connections.begin(); it != port_forward_connections.end();) {
+            if (it->second.forward_id != forward_id) {
+                ++it;
+                continue;
+            }
+            fail_port_forward_locked(it->second, "the forward target was stopped", aborts);
+            it = port_forward_connections.erase(it);
+        }
+        active_forward_targets.erase(forward_id);
+        client_forward_targets.erase(forward_id);
+        client_pending_forwards.erase(forward_id);
+        pending_forward_targets.erase(forward_id);
+        port_forward_requests.erase(
+            std::remove_if(port_forward_requests.begin(), port_forward_requests.end(),
+                           [forward_id](const PortForwardRequest& request) {
+                               return request.forward_id == forward_id;
+                           }),
+            port_forward_requests.end());
+        return aborts;
+    }
+
+    // Caller holds `mutex`. Revocation path: no target survives, and every
+    // live connection goes back to the caller to abort.
+    std::vector<HQUIC> clear_port_forward_locked(const std::string& reason) {
+        std::vector<HQUIC> aborts;
+        for (auto& item : port_forward_connections) {
+            fail_port_forward_locked(item.second, reason, aborts);
+        }
+        port_forward_connections.clear();
+        active_forward_targets.clear();
+        client_forward_targets.clear();
+        client_pending_forwards.clear();
+        pending_forward_targets.clear();
+        port_forward_requests.clear();
+        port_forward_results.clear();
+        port_forward_opens.clear();
+        return aborts;
+    }
+
+    // Caller holds `mutex`. Everything a session reset has to forget; the
+    // handles go back to the caller for closing.
+    std::vector<HQUIC> detach_port_forward_locked() {
+        std::vector<HQUIC> handles;
+        for (const auto& item : port_forward_connections) {
+            if (item.second.uplink) {
+                handles.push_back(item.second.uplink);
+            }
+            if (item.second.downlink) {
+                handles.push_back(item.second.downlink);
+            }
+        }
+        port_forward_connections.clear();
+        active_forward_targets.clear();
+        client_forward_targets.clear();
+        client_pending_forwards.clear();
+        pending_forward_targets.clear();
+        port_forward_requests.clear();
+        port_forward_results.clear();
+        port_forward_opens.clear();
+        port_forward_stops.clear();
+        next_port_forward_handle = 1;
+        return handles;
+    }
+
+    bool has_port_forward_entry_locked(uint32_t forward_id, uint32_t connection_id) const {
+        for (const auto& item : port_forward_connections) {
+            if (item.second.forward_id == forward_id &&
+                item.second.connection_id == connection_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Caller holds `mutex`. The viewer reads the downlink, the host reads the
+    // uplink; the same split as a forwarded TCP connection.
+    static HQUIC terminal_receive_stream(const TerminalEntry& entry) {
+        return entry.server_side ? entry.uplink : entry.downlink;
+    }
+
+    static HQUIC terminal_send_stream(const TerminalEntry& entry) {
+        return entry.server_side ? entry.downlink : entry.uplink;
+    }
+
+    TerminalEntry* terminal_by_stream_locked(HQUIC stream) {
+        for (auto& item : terminal_entries) {
+            if (item.second.uplink == stream || item.second.downlink == stream) {
+                return &item.second;
+            }
+        }
+        return nullptr;
+    }
+
+    // Caller holds `mutex`. Forgets one terminal and every trace of it in the
+    // request queues; the stream handles go back to the caller for closing.
+    // `keep_finished` leaves a direction that already ended cleanly alone, so
+    // a stop sent after the data stream's FIN cannot turn into a reset that
+    // makes the peer discard output still queued on its side.
+    std::vector<HQUIC> drop_terminal_locked(uint32_t terminal_id,
+                                           bool keep_finished = false) {
+        std::vector<HQUIC> aborts;
+        const auto it = terminal_entries.find(terminal_id);
+        if (it != terminal_entries.end()) {
+            if (it->second.uplink && !(keep_finished && it->second.receive_finished)) {
+                aborts.push_back(it->second.uplink);
+            }
+            if (it->second.downlink && !(keep_finished && it->second.send_finished)) {
+                aborts.push_back(it->second.downlink);
+            }
+            terminal_entries.erase(it);
+        }
+        pending_terminal_targets.erase(terminal_id);
+        active_terminal_targets.erase(terminal_id);
+        client_pending_terminals.erase(terminal_id);
+        client_terminal_targets.erase(terminal_id);
+        terminal_requests.erase(
+            std::remove_if(terminal_requests.begin(), terminal_requests.end(),
+                           [terminal_id](const TerminalRequest& request) {
+                               return request.terminal_id == terminal_id;
+                           }),
+            terminal_requests.end());
+        terminal_resizes.erase(
+            std::remove_if(terminal_resizes.begin(), terminal_resizes.end(),
+                           [terminal_id](const TerminalSize& size) {
+                               return size.terminal_id == terminal_id;
+                           }),
+            terminal_resizes.end());
+        return aborts;
+    }
+
+    // Caller holds `mutex`. One direction died, so the terminal as a whole is
+    // over: the other direction is aborted and the application learns from
+    // take_terminal_output()/take_terminal_input() that the console ended.
+    void fail_terminal_locked(TerminalEntry& entry, const std::string& error,
+                              std::vector<HQUIC>& aborts) {
+        entry.failed = true;
+        entry.error = error;
+        entry.receive_finished = true;
+        entry.send_finished = true;
+        entry.buffered_bytes = 0;
+        entry.received.clear();
+        if (entry.uplink) {
+            aborts.push_back(entry.uplink);
+        }
+        if (entry.downlink) {
+            aborts.push_back(entry.downlink);
+        }
+    }
+
+    // Caller holds `mutex`. Revocation path: every terminal ends, and the
+    // local application gets a stop per terminal so it closes the console and
+    // the child process it owns.
+    std::vector<HQUIC> clear_terminals_locked(const std::string& reason) {
+        std::vector<HQUIC> aborts;
+        for (const auto& item : terminal_entries) {
+            TerminalStop stop;
+            stop.terminal_id = item.first;
+            stop.code = TerminalCode::Cancelled;
+            stop.reason = reason;
+            while (terminal_stops.size() >= 8) {
+                terminal_stops.pop_front();
+            }
+            terminal_stops.push_back(std::move(stop));
+            if (item.second.uplink) {
+                aborts.push_back(item.second.uplink);
+            }
+            if (item.second.downlink) {
+                aborts.push_back(item.second.downlink);
+            }
+        }
+        terminal_entries.clear();
+        pending_terminal_targets.clear();
+        active_terminal_targets.clear();
+        client_pending_terminals.clear();
+        client_terminal_targets.clear();
+        terminal_requests.clear();
+        terminal_results.clear();
+        terminal_resizes.clear();
+        return aborts;
+    }
+
+    // Caller holds `mutex`. Everything a session reset has to forget; the
+    // handles go back to the caller for closing.
+    std::vector<HQUIC> detach_terminal_locked() {
+        std::vector<HQUIC> handles;
+        for (const auto& item : terminal_entries) {
+            if (item.second.uplink) {
+                handles.push_back(item.second.uplink);
+            }
+            if (item.second.downlink) {
+                handles.push_back(item.second.downlink);
+            }
+        }
+        terminal_entries.clear();
+        pending_terminal_targets.clear();
+        active_terminal_targets.clear();
+        client_pending_terminals.clear();
+        client_terminal_targets.clear();
+        terminal_requests.clear();
+        terminal_results.clear();
+        terminal_resizes.clear();
+        terminal_stops.clear();
+        return handles;
     }
 
     // Appends data of a stream that was already classified as CCLB or CFIL.
@@ -1180,6 +1750,64 @@ struct QuicSession::Impl {
                 }
                 return true;
             }
+            PortForwardEntry* forward = port_forward_by_stream_locked(stream);
+            if (forward) {
+                if (stream != port_forward_receive_stream(*forward) ||
+                    forward->receive_finished) {
+                    // A retired handle or the sending half; nothing to queue.
+                    return true;
+                }
+                // A receive event is accepted whole or not at all, so the
+                // queue stops at high water and the local socket's pace
+                // reaches the peer through QUIC flow control. Aborting here
+                // would break a healthy relay whose far end is simply busy.
+                if (forward->receive_paused ||
+                    forward->buffered_bytes >= kPortForwardReceiveHighWaterBytes) {
+                    forward->receive_paused = true;
+                    event.RECEIVE.TotalBufferLength = 0;
+                    *pause = stream;
+                    return true;
+                }
+                for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+                    const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+                    forward->received.emplace_back(buffer.Buffer, buffer.Buffer + buffer.Length);
+                    forward->buffered_bytes += buffer.Length;
+                }
+                if (forward->buffered_bytes >= kPortForwardReceiveHighWaterBytes) {
+                    forward->receive_paused = true;
+                    *pause = stream;
+                }
+                cv.notify_all();
+                return true;
+            }
+            TerminalEntry* terminal = terminal_by_stream_locked(stream);
+            if (terminal) {
+                if (stream != terminal_receive_stream(*terminal) ||
+                    terminal->receive_finished || terminal->failed) {
+                    return true;
+                }
+                // Same pause contract as a forwarded connection: a receive
+                // event is taken whole or not at all, so the console's reader
+                // thread sets the pace through QUIC flow control.
+                if (terminal->receive_paused ||
+                    terminal->buffered_bytes >= kTerminalReceiveHighWaterBytes) {
+                    terminal->receive_paused = true;
+                    event.RECEIVE.TotalBufferLength = 0;
+                    *pause = stream;
+                    return true;
+                }
+                for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+                    const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+                    terminal->received.emplace_back(buffer.Buffer, buffer.Buffer + buffer.Length);
+                    terminal->buffered_bytes += buffer.Length;
+                }
+                if (terminal->buffered_bytes >= kTerminalReceiveHighWaterBytes) {
+                    terminal->receive_paused = true;
+                    *pause = stream;
+                }
+                cv.notify_all();
+                return true;
+            }
         }
         return false;
     }
@@ -1219,6 +1847,10 @@ struct QuicSession::Impl {
         file_answers.clear();
         file_results.clear();
         one_shot_streams.clear();
+        std::vector<HQUIC> forwards = detach_port_forward_locked();
+        handles.insert(handles.end(), forwards.begin(), forwards.end());
+        std::vector<HQUIC> terminals = detach_terminal_locked();
+        handles.insert(handles.end(), terminals.begin(), terminals.end());
         return handles;
     }
 
@@ -1341,8 +1973,22 @@ struct QuicSession::Impl {
                             for (auto& entry : received_uploads) {
                                 if (entry.second.stream == stream) {
                                     entry.second.finished = true;
+                                    matched = true;
                                     break;
                                 }
+                            }
+                        }
+                        if (!matched) {
+                            PortForwardEntry* forward =
+                                port_forward_by_stream_locked(stream);
+                            if (forward && stream == port_forward_receive_stream(*forward)) {
+                                forward->receive_finished = true;
+                            }
+                        }
+                        if (!matched) {
+                            TerminalEntry* terminal = terminal_by_stream_locked(stream);
+                            if (terminal && stream == terminal_receive_stream(*terminal)) {
+                                terminal->receive_finished = true;
                             }
                         }
                     }
@@ -1352,6 +1998,7 @@ struct QuicSession::Impl {
             }
             case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
                 bool fatal = false;
+                std::vector<HQUIC> bulk_aborts;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     bool bulk = false;
@@ -1384,6 +2031,27 @@ struct QuicSession::Impl {
                             }
                         }
                     }
+                    if (!bulk) {
+                        PortForwardEntry* forward = port_forward_by_stream_locked(stream);
+                        if (forward && stream == port_forward_receive_stream(*forward)) {
+                            // One direction died; the TCP connection is gone.
+                            // Tell the peer by aborting the other direction
+                            // instead of leaving it half-open.
+                            fail_port_forward_locked(*forward,
+                                                     "the peer aborted the port forward connection",
+                                                     bulk_aborts);
+                            bulk = true;
+                        }
+                    }
+                    if (!bulk) {
+                        TerminalEntry* terminal = terminal_by_stream_locked(stream);
+                        if (terminal && stream == terminal_receive_stream(*terminal)) {
+                            fail_terminal_locked(*terminal,
+                                                 "the peer aborted the terminal stream",
+                                                 bulk_aborts);
+                            bulk = true;
+                        }
+                    }
                     if (stream == video.load()) {
                         video_finished = true;
                         fatal = !bulk;
@@ -1404,8 +2072,41 @@ struct QuicSession::Impl {
                         fatal = true;
                     }
                 }
+                for (HQUIC handle : bulk_aborts) {
+                    if (handle != stream) {
+                        api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                    }
+                }
                 if (fatal) {
                     note_transport_failure("QUIC peer aborted a stream");
+                }
+                cv.notify_all();
+                break;
+            }
+            case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED: {
+                // The peer sent STOP_SENDING for the direction this side
+                // writes. For a forwarded connection that is a broken TCP
+                // path; the other direction is aborted so both apps see it.
+                std::vector<HQUIC> aborts;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    PortForwardEntry* forward = port_forward_by_stream_locked(stream);
+                    if (forward && stream == port_forward_send_stream(*forward)) {
+                        fail_port_forward_locked(
+                            *forward, "the peer stopped reading the port forward stream",
+                            aborts);
+                    }
+                    TerminalEntry* terminal = terminal_by_stream_locked(stream);
+                    if (terminal && stream == terminal_send_stream(*terminal)) {
+                        fail_terminal_locked(*terminal,
+                                             "the peer stopped reading the terminal stream",
+                                             aborts);
+                    }
+                }
+                for (HQUIC handle : aborts) {
+                    if (handle != stream) {
+                        api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                    }
                 }
                 cv.notify_all();
                 break;
@@ -1471,6 +2172,48 @@ struct QuicSession::Impl {
                                     break;
                                 }
                             }
+                            PortForwardEntry* forward =
+                                port_forward_by_stream_locked(stream);
+                            if (forward) {
+                                const bool receive_side =
+                                    stream == port_forward_receive_stream(*forward);
+                                if (receive_side) {
+                                    forward->receive_finished = true;
+                                } else {
+                                    forward->send_finished = true;
+                                }
+                                if (forward->uplink == stream) {
+                                    forward->uplink = nullptr;
+                                }
+                                if (forward->downlink == stream) {
+                                    forward->downlink = nullptr;
+                                }
+                                forward->receive_paused = false;
+                                to_close.push_back(stream);
+                                // Both halves are gone: the entry is finished,
+                                // but it stays readable (and reports
+                                // Unavailable once drained) until the
+                                // application closes the handle.
+                            }
+                            TerminalEntry* terminal = terminal_by_stream_locked(stream);
+                            if (terminal) {
+                                if (stream == terminal_receive_stream(*terminal)) {
+                                    terminal->receive_finished = true;
+                                } else {
+                                    terminal->send_finished = true;
+                                }
+                                if (terminal->uplink == stream) {
+                                    terminal->uplink = nullptr;
+                                }
+                                if (terminal->downlink == stream) {
+                                    terminal->downlink = nullptr;
+                                }
+                                terminal->receive_paused = false;
+                                to_close.push_back(stream);
+                                // The entry outlives its streams so the
+                                // application can drain the queue; drop_terminal
+                                // or close_terminal forgets it.
+                            }
                             // A stream rejected during classification (bad
                             // magic, malformed microphone header) owns no
                             // state here but still holds its handle. The
@@ -1510,6 +2253,7 @@ struct QuicSession::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     requested_display = hello.display;
                     requested_peer = remote_address();
+                    session_audit_ref = hello.audit_ref;
                     pending_hello = std::move(hello);
                     hello_ready = true;
                 }
@@ -1718,6 +2462,7 @@ struct QuicSession::Impl {
                     note_transport_failure("PermissionUpdate: " + error);
                     break;
                 }
+                std::vector<HQUIC> aborts;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     session_permissions = permissions;
@@ -1737,6 +2482,17 @@ struct QuicSession::Impl {
                             }
                         }
                     }
+                    if ((permissions & kPermissionPortForward) == 0) {
+                        aborts = clear_port_forward_locked("port forwarding was revoked");
+                    }
+                    if ((permissions & kPermissionTerminal) == 0) {
+                        std::vector<HQUIC> terminals =
+                            clear_terminals_locked("terminal access was revoked");
+                        aborts.insert(aborts.end(), terminals.begin(), terminals.end());
+                    }
+                }
+                for (HQUIC handle : aborts) {
+                    api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
                 }
                 cv.notify_all();
                 break;
@@ -2177,6 +2933,252 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::PortForwardRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                PortForwardRequest request;
+                if (!parse_port_forward_request(payload, request, &error)) {
+                    note_transport_failure("PortForwardRequest: " + error);
+                    break;
+                }
+                PortForwardResult refusal;
+                refusal.forward_id = request.forward_id;
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if ((session_permissions.load() & kPermissionPortForward) == 0) {
+                        refusal.code = PortForwardCode::Refused;
+                        refusal.reason = "port forwarding is disabled on this host";
+                    } else if (pending_forward_targets.count(request.forward_id) != 0 ||
+                               active_forward_targets.count(request.forward_id) != 0) {
+                        refusal.code = PortForwardCode::Busy;
+                        refusal.reason = "that forward id is already in use";
+                    } else if (pending_forward_targets.size() +
+                                       active_forward_targets.size() >=
+                                   kMaxPortForwardTargets ||
+                               port_forward_requests.size() >= kMaxPortForwardTargets) {
+                        refusal.code = PortForwardCode::Busy;
+                        refusal.reason = "too many forwarded targets";
+                    } else {
+                        PortForwardTarget target;
+                        target.host = request.host;
+                        target.port = request.port;
+                        pending_forward_targets.emplace(request.forward_id, std::move(target));
+                        port_forward_requests.push_back(std::move(request));
+                        queued = true;
+                    }
+                }
+                if (!queued) {
+                    // The viewer is waiting for an answer before it dials
+                    // locally; a quiet drop would leave its UI spinning.
+                    try_send_bytes(control.load(), make_port_forward_result(refusal),
+                                   QUIC_SEND_FLAG_NONE);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::PortForwardResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                PortForwardResult result;
+                if (!parse_port_forward_result(payload, result, &error)) {
+                    note_transport_failure("PortForwardResult: " + error);
+                    break;
+                }
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto pending = client_pending_forwards.find(result.forward_id);
+                    if (pending != client_pending_forwards.end()) {
+                        if (result.code == PortForwardCode::Ok) {
+                            client_forward_targets[result.forward_id] = pending->second;
+                        }
+                        client_pending_forwards.erase(pending);
+                        port_forward_results.push_back(std::move(result));
+                        queued = true;
+                    }
+                }
+                if (queued) {
+                    cv.notify_all();
+                }
+                break;
+            }
+            case ControlType::PortForwardStop: {
+                PortForwardStop stop;
+                if (!parse_port_forward_stop(payload, stop, &error)) {
+                    note_transport_failure("PortForwardStop: " + error);
+                    break;
+                }
+                std::vector<HQUIC> aborts;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    aborts = stop_port_forward_target_locked(stop.forward_id);
+                    while (port_forward_stops.size() >= kMaxQueuedPortForwardStops) {
+                        port_forward_stops.pop_front();
+                    }
+                    port_forward_stops.push_back(std::move(stop));
+                }
+                for (HQUIC handle : aborts) {
+                    api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::TerminalRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                TerminalRequest request;
+                if (!parse_terminal_request(payload, request, &error)) {
+                    note_transport_failure("TerminalRequest: " + error);
+                    break;
+                }
+                TerminalResult refusal;
+                refusal.terminal_id = request.terminal_id;
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if ((session_permissions.load() & kPermissionTerminal) == 0) {
+                        refusal.code = TerminalCode::Refused;
+                        refusal.reason = "terminals are disabled on this host";
+                    } else if (pending_terminal_targets.count(request.terminal_id) != 0 ||
+                               active_terminal_targets.count(request.terminal_id) != 0) {
+                        refusal.code = TerminalCode::Busy;
+                        refusal.reason = "that terminal id is already in use";
+                    } else if (pending_terminal_targets.size() +
+                                       active_terminal_targets.size() >=
+                                   kMaxTerminals ||
+                               terminal_requests.size() >= kMaxTerminals) {
+                        refusal.code = TerminalCode::Busy;
+                        refusal.reason = "too many terminals";
+                    } else {
+                        TerminalSize size;
+                        size.terminal_id = request.terminal_id;
+                        size.columns = request.columns;
+                        size.rows = request.rows;
+                        pending_terminal_targets.emplace(request.terminal_id, size);
+                        terminal_requests.push_back(std::move(request));
+                        queued = true;
+                    }
+                }
+                if (!queued) {
+                    // The viewer waits for the answer before it spawns a UI;
+                    // a quiet drop would leave it spinning.
+                    try_send_bytes(control.load(), make_terminal_result(refusal),
+                                   QUIC_SEND_FLAG_NONE);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::TerminalResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                TerminalResult result;
+                if (!parse_terminal_result(payload, result, &error)) {
+                    note_transport_failure("TerminalResult: " + error);
+                    break;
+                }
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto pending =
+                        client_pending_terminals.find(result.terminal_id);
+                    if (pending != client_pending_terminals.end()) {
+                        const TerminalSize size = pending->second;
+                        client_pending_terminals.erase(pending);
+                        if (result.code == TerminalCode::Ok) {
+                            // The host may start printing before the viewer
+                            // opens its input stream, so the entry exists from
+                            // here on and both CTTY streams attach to it.
+                            TerminalEntry entry;
+                            entry.terminal_id = result.terminal_id;
+                            entry.server_side = false;
+                            entry.columns = size.columns;
+                            entry.rows = size.rows;
+                            client_terminal_targets[result.terminal_id] = size;
+                            terminal_entries.emplace(result.terminal_id, std::move(entry));
+                        }
+                        while (terminal_results.size() >= 8) {
+                            terminal_results.pop_front();
+                        }
+                        terminal_results.push_back(std::move(result));
+                        queued = true;
+                    }
+                }
+                if (queued) {
+                    cv.notify_all();
+                }
+                break;
+            }
+            case ControlType::TerminalStop: {
+                TerminalStop stop;
+                if (!parse_terminal_stop(payload, stop, &error)) {
+                    note_transport_failure("TerminalStop: " + error);
+                    break;
+                }
+                std::vector<HQUIC> aborts;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    const auto found = terminal_entries.find(stop.terminal_id);
+                    // The host's stop ends the viewer's input direction, but the
+                    // output stream may still hold bytes on the way. Keeping the
+                    // entry lets take_terminal_output() hand them over first.
+                    // On the host a viewer's stop means the console is closing,
+                    // so the terminal ends outright.
+                    if (found != terminal_entries.end() && !found->second.server_side) {
+                        TerminalEntry& entry = found->second;
+                        entry.stopped = true;
+                        if (entry.uplink && !entry.send_finished) {
+                            aborts.push_back(entry.uplink);
+                            entry.uplink = nullptr;
+                        }
+                        if (entry.receive_finished && entry.received.empty()) {
+                            std::vector<HQUIC> dropped =
+                                drop_terminal_locked(stop.terminal_id, true);
+                            aborts.insert(aborts.end(), dropped.begin(), dropped.end());
+                        }
+                    } else {
+                        std::vector<HQUIC> dropped =
+                            drop_terminal_locked(stop.terminal_id, true);
+                        aborts.insert(aborts.end(), dropped.begin(), dropped.end());
+                    }
+                    while (terminal_stops.size() >= 8) {
+                        terminal_stops.pop_front();
+                    }
+                    terminal_stops.push_back(std::move(stop));
+                }
+                for (HQUIC handle : aborts) {
+                    api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::TerminalResize: {
+                if (role != Role::Server) {
+                    break;
+                }
+                TerminalSize size;
+                if (!parse_terminal_resize(payload, size, &error)) {
+                    note_transport_failure("TerminalResize: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // A resize for a terminal that just ended is stale, not an
+                    // error: it can cross the stop on the wire.
+                    if (active_terminal_targets.count(size.terminal_id) != 0) {
+                        while (terminal_resizes.size() >= 8) {
+                            terminal_resizes.pop_front();
+                        }
+                        terminal_resizes.push_back(size);
+                    }
+                }
+                cv.notify_all();
+                break;
+            }
             default:
                 break;
         }
@@ -2197,7 +3199,8 @@ struct QuicSession::Impl {
     // callback (a latency reply). Blocking there could stall the transport's
     // own worker, so such a send is dropped when the queue is full instead.
     Error send_bytes_impl(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags,
-                          bool wait_for_capacity) {
+                          bool wait_for_capacity,
+                          std::chrono::steady_clock::time_point deadline = kNoSendDeadline) {
         if (!stream) {
             return Error(Status::Unavailable, "no stream is open");
         }
@@ -2206,14 +3209,18 @@ struct QuicSession::Impl {
         }
         {
             std::unique_lock<std::mutex> lock(send_mutex);
+            const auto has_capacity = [this] {
+                return (in_flight_sends < kMaxInFlightSends &&
+                        in_flight_bytes < kMaxInFlightBytes) ||
+                       transport_down.load();
+            };
             if (wait_for_capacity) {
-                send_cv.wait(lock, [this] {
-                    return (in_flight_sends < kMaxInFlightSends &&
-                            in_flight_bytes < kMaxInFlightBytes) ||
-                           transport_down.load();
-                });
-            } else if (in_flight_sends >= kMaxInFlightSends ||
-                       in_flight_bytes >= kMaxInFlightBytes) {
+                if (deadline == kNoSendDeadline) {
+                    send_cv.wait(lock, has_capacity);
+                } else if (!send_cv.wait_until(lock, deadline, has_capacity)) {
+                    return Error(Status::WaitTimeout, "send queue is full");
+                }
+            } else if (!has_capacity()) {
                 return Error(Status::WaitTimeout, "send queue is full");
             }
             if (transport_down.load()) {
@@ -2244,6 +3251,13 @@ struct QuicSession::Impl {
 
     Error send_bytes(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags) {
         return send_bytes_impl(stream, std::move(bytes), flags, true);
+    }
+
+    // A forwarded TCP pump may not block forever: a stalled queue returns
+    // WaitTimeout with nothing sent, and the caller retries with its buffer.
+    Error send_bytes_until(HQUIC stream, std::vector<uint8_t> bytes, QUIC_SEND_FLAGS flags,
+                           std::chrono::steady_clock::time_point deadline) {
+        return send_bytes_impl(stream, std::move(bytes), flags, true, deadline);
     }
 
     // A non-blocking capacity probe. The caller checks before touching any
@@ -2400,6 +3414,7 @@ struct QuicSession::Impl {
             pending_hello = ClientHello{};
             requested_display = kDisplayAuto;
             requested_peer.clear();
+            session_audit_ref.clear();
             display_switch_ready = false;
             display_switch_index = kDisplayAuto;
             display_switch_result_ready = false;
@@ -2510,6 +3525,12 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_privacy_mode) {
             mask |= kPermissionPrivacyMode;
+        }
+        if (server_config.allow_port_forward) {
+            mask |= kPermissionPortForward;
+        }
+        if (server_config.allow_terminal) {
+            mask |= kPermissionTerminal;
         }
         return mask;
     }
@@ -2666,7 +3687,7 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     settings.PeerBidiStreamCount = 1;
     settings.IsSet.PeerBidiStreamCount = TRUE;
     settings.PeerUnidiStreamCount = static_cast<uint16_t>(
-        kMaxClipboardStreams + kMaxIncomingUploads + 2);
+        kMaxClipboardStreams + kMaxIncomingUploads + kMaxPortForwardConnections + 2);
     settings.IsSet.PeerUnidiStreamCount = TRUE;
     settings.ServerResumptionLevel = QUIC_SERVER_RESUME_AND_ZERORTT;
     settings.IsSet.ServerResumptionLevel = TRUE;
@@ -2756,7 +3777,8 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
     // The server opens one unidirectional video stream and, when it shares
     // system audio, a second for audio. Its rich clipboard blobs use more, so
     // the cap is the receive-side stream budget rather than two.
-    settings.PeerUnidiStreamCount = static_cast<uint16_t>(kMaxClipboardStreams + 2);
+    settings.PeerUnidiStreamCount =
+        static_cast<uint16_t>(kMaxClipboardStreams + kMaxPortForwardConnections + 2);
     settings.IsSet.PeerUnidiStreamCount = TRUE;
 
     QUIC_BUFFER alpn{};
@@ -2936,6 +3958,11 @@ uint16_t QuicSession::requested_display() const {
     return impl_->requested_display;
 }
 
+std::string QuicSession::audit_ref() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session_audit_ref;
+}
+
 std::string QuicSession::server_fingerprint() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->identity_fingerprint;
@@ -3041,6 +4068,31 @@ Error QuicSession::set_permissions(uint16_t permissions) {
                                 QUIC_SEND_FLAG_NONE);
         }
     }
+    if ((next & kPermissionPortForward) == 0) {
+        // The targets and connections are host authority; drop them before
+        // the announcement so a message that races the update cannot reopen
+        // anything.
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            aborts = impl.clear_port_forward_locked("port forwarding was revoked");
+        }
+        for (HQUIC handle : aborts) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+    }
+    if ((next & kPermissionTerminal) == 0) {
+        // Same for terminals: the console belongs to the host application,
+        // which learns about the stop through take_terminal_stop().
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            aborts = impl.clear_terminals_locked("terminal access was revoked");
+        }
+        for (HQUIC handle : aborts) {
+            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+    }
     return impl.send_bytes(impl.control.load(), make_permission_update(next),
                            QUIC_SEND_FLAG_NONE);
 }
@@ -3094,6 +4146,8 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     ack.microphone_enabled = (granted & kPermissionMicrophone) != 0;
     ack.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
+    ack.port_forward_enabled = (granted & kPermissionPortForward) != 0;
+    ack.terminal_enabled = (granted & kPermissionTerminal) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -3179,6 +4233,8 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.file_transfer_enabled = (granted & kPermissionFileTransfer) != 0;
     update.microphone_enabled = (granted & kPermissionMicrophone) != 0;
     update.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
+    update.port_forward_enabled = (granted & kPermissionPortForward) != 0;
+    update.terminal_enabled = (granted & kPermissionTerminal) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -3780,6 +4836,7 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     hello.access_token = impl.client_config.access_token;
     hello.password = impl.client_config.password;
     hello.totp = impl.client_config.totp;
+    hello.audit_ref = impl.client_config.audit_ref;
     hello.requested_permissions = impl.client_config.requested_permissions & kPermissionAll;
     if (impl.client_config.device_identity) {
         const DeviceIdentity& identity = *impl.client_config.device_identity;
@@ -4711,6 +5768,1124 @@ bool QuicSession::take_file_result(FileResult& result) {
         impl.api->StreamClose(stream);
     }
     return true;
+}
+
+// ----- port forwarding -----
+
+bool QuicSession::take_port_forward_request(PortForwardRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->port_forward_requests.empty()) {
+        return false;
+    }
+    request = std::move(impl_->port_forward_requests.front());
+    impl_->port_forward_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_port_forward_result(uint32_t forward_id, PortForwardCode code,
+                                            const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall,
+                     "send_port_forward_result is a server operation");
+    }
+    if (forward_id == 0) {
+        return Error(Status::InvalidCall, "the forward id is zero");
+    }
+    PortForwardResult result;
+    result.forward_id = forward_id;
+    result.code = code;
+    result.reason = reason;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto pending = impl.pending_forward_targets.find(forward_id);
+        if (pending == impl.pending_forward_targets.end()) {
+            return Error(Status::InvalidCall, "no port forward request is waiting");
+        }
+        if (code == PortForwardCode::Ok) {
+            if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+                result.code = PortForwardCode::Refused;
+                result.reason = "port forwarding was revoked";
+            } else if (impl.active_forward_targets.size() >= kMaxPortForwardTargets) {
+                result.code = PortForwardCode::Busy;
+                result.reason = "too many forwarded targets";
+            } else {
+                impl.active_forward_targets[forward_id] = pending->second;
+            }
+        }
+        impl.pending_forward_targets.erase(pending);
+    }
+    return impl.send_bytes(impl.control.load(), make_port_forward_result(result),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_port_forward_open(PortForwardOpen& open) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->port_forward_opens.empty()) {
+        return false;
+    }
+    open = std::move(impl_->port_forward_opens.front());
+    impl_->port_forward_opens.pop_front();
+    return true;
+}
+
+Error QuicSession::accept_port_forward_connection(PortForwardHandle handle) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall,
+                     "accept_port_forward_connection is a server operation");
+    }
+    uint32_t forward_id = 0;
+    uint32_t connection_id = 0;
+    bool finish_after_header = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        Impl::PortForwardEntry* entry = impl.port_forward_by_handle_locked(handle);
+        if (!entry || !entry->server_side) {
+            return Error(Status::InvalidCall, "no such port forward connection");
+        }
+        if (entry->accepted) {
+            return Error(Status::InvalidCall, "the connection was already accepted");
+        }
+        if (entry->failed) {
+            return Error(Status::Unavailable, entry->error);
+        }
+        if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+            return Error(Status::PermissionDenied, "port forwarding was revoked");
+        }
+        forward_id = entry->forward_id;
+        connection_id = entry->connection_id;
+        finish_after_header = entry->send_finished;
+    }
+    HQUIC stream = nullptr;
+    QUIC_STATUS status = impl.api->StreamOpen(
+        impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+        &Impl::stream_callback, &impl, &stream);
+    if (QUIC_FAILED(status)) {
+        return quic_error(status, "QUIC StreamOpen(port forward)");
+    }
+    HQUIC uplink = nullptr;
+    bool gone = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        Impl::PortForwardEntry* entry = impl.port_forward_by_handle_locked(handle);
+        if (!entry || entry->failed) {
+            gone = true;
+        } else {
+            entry->downlink = stream;
+            entry->accepted = true;
+            // The viewer's bytes waited for the dial; let them through now.
+            entry->receive_paused = false;
+            uplink = entry->uplink;
+        }
+    }
+    if (gone) {
+        impl.api->StreamClose(stream);
+        return Error(Status::Unavailable, "the port forward connection ended while accepting");
+    }
+    QUIC_SEND_FLAGS flags = QUIC_SEND_FLAG_START;
+    if (finish_after_header) {
+        flags = static_cast<QUIC_SEND_FLAGS>(flags | QUIC_SEND_FLAG_FIN);
+    }
+    Error sent = impl.send_bytes(
+        stream, make_port_forward_stream_header(forward_id, connection_id), flags);
+    if (uplink) {
+        impl.api->StreamReceiveSetEnabled(uplink, TRUE);
+    }
+    if (!sent.ok()) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            Impl::PortForwardEntry* entry = impl.port_forward_by_handle_locked(handle);
+            if (entry) {
+                impl.fail_port_forward_locked(*entry, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+Error QuicSession::reject_port_forward_connection(PortForwardHandle handle) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall,
+                     "reject_port_forward_connection is a server operation");
+    }
+    HQUIC uplink = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it == impl.port_forward_connections.end() || !it->second.server_side) {
+            return Error(Status::InvalidCall, "no such port forward connection");
+        }
+        if (it->second.accepted) {
+            return Error(Status::InvalidCall, "the connection was already accepted");
+        }
+        uplink = it->second.uplink;
+        impl.port_forward_connections.erase(it);
+        impl.port_forward_opens.erase(
+            std::remove_if(impl.port_forward_opens.begin(), impl.port_forward_opens.end(),
+                           [handle](const PortForwardOpen& open) {
+                               return open.handle == handle;
+                           }),
+            impl.port_forward_opens.end());
+    }
+    if (uplink) {
+        impl.api->StreamShutdown(uplink, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    }
+    impl.cv.notify_all();
+    return Error::success();
+}
+
+Error QuicSession::request_port_forward(uint32_t forward_id, const std::string& host,
+                                        uint16_t port) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_port_forward is a client operation");
+    }
+    PortForwardRequest request;
+    request.forward_id = forward_id;
+    request.host = host;
+    request.port = port;
+    std::vector<uint8_t> message = make_port_forward_request(request);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the target is not a valid host:port pair");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant port forwarding");
+        }
+        if (impl.client_pending_forwards.count(forward_id) != 0 ||
+            impl.client_forward_targets.count(forward_id) != 0) {
+            return Error(Status::InvalidCall, "that forward id is already registered");
+        }
+        if (impl.client_pending_forwards.size() + impl.client_forward_targets.size() >=
+            kMaxPortForwardTargets) {
+            return Error(Status::InvalidCall, "too many forwarded targets");
+        }
+        Impl::PortForwardTarget target;
+        target.host = host;
+        target.port = port;
+        impl.client_pending_forwards.emplace(forward_id, std::move(target));
+    }
+    Error sent = impl.send_bytes(impl.control.load(), std::move(message),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.client_pending_forwards.erase(forward_id);
+    }
+    return sent;
+}
+
+bool QuicSession::take_port_forward_result(PortForwardResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->port_forward_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->port_forward_results.front());
+    impl_->port_forward_results.pop_front();
+    return true;
+}
+
+Error QuicSession::open_port_forward_connection(uint32_t forward_id,
+                                                uint32_t connection_id,
+                                                PortForwardHandle& handle) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall,
+                     "open_port_forward_connection is a client operation");
+    }
+    if (forward_id == 0 || connection_id == 0) {
+        return Error(Status::InvalidCall, "a port forward id is zero");
+    }
+    PortForwardHandle created = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionPortForward) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant port forwarding");
+        }
+        if (impl.client_forward_targets.count(forward_id) == 0) {
+            return Error(Status::InvalidCall, "the host did not approve that target");
+        }
+        if (impl.has_port_forward_entry_locked(forward_id, connection_id)) {
+            return Error(Status::InvalidCall, "that connection id is already in use");
+        }
+        if (impl.port_forward_live_count_locked() >= kMaxPortForwardConnections) {
+            impl.prune_retired_port_forwards_locked();
+        }
+        if (impl.port_forward_live_count_locked() >= kMaxPortForwardConnections) {
+            return Error(Status::InvalidCall, "too many forwarded connections");
+        }
+        Impl::PortForwardEntry entry;
+        entry.handle = impl.next_port_forward_handle++;
+        entry.forward_id = forward_id;
+        entry.connection_id = connection_id;
+        created = entry.handle;
+        impl.port_forward_connections.emplace(created, std::move(entry));
+    }
+    HQUIC stream = nullptr;
+    QUIC_STATUS status = impl.api->StreamOpen(
+        impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+        &Impl::stream_callback, &impl, &stream);
+    if (QUIC_FAILED(status)) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.port_forward_connections.erase(created);
+        return quic_error(status, "QUIC StreamOpen(port forward)");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(created);
+        if (it == impl.port_forward_connections.end()) {
+            impl.api->StreamClose(stream);
+            return Error(Status::Unavailable, "the port forward connection was closed");
+        }
+        it->second.uplink = stream;
+    }
+    Error sent = impl.send_bytes(
+        stream, make_port_forward_stream_header(forward_id, connection_id),
+        QUIC_SEND_FLAG_START);
+    if (!sent.ok()) {
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            impl.port_forward_connections.erase(created);
+        }
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+        return sent;
+    }
+    handle = created;
+    return Error::success();
+}
+
+Error QuicSession::wait_port_forward_connection(PortForwardHandle handle,
+                                                std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall,
+                     "wait_port_forward_connection is a client operation");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(impl.mutex);
+    for (;;) {
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it == impl.port_forward_connections.end()) {
+            return Error(Status::InvalidCall, "the port forward connection is not open");
+        }
+        const Impl::PortForwardEntry& entry = it->second;
+        if (entry.server_side) {
+            return Error(Status::InvalidCall, "not a viewer connection");
+        }
+        if (entry.accepted) {
+            return Error::success();
+        }
+        if (entry.failed) {
+            return Error(Status::Unavailable, entry.error);
+        }
+        if (entry.receive_finished) {
+            return Error(Status::Unavailable, "the host ended the port forward connection");
+        }
+        if (impl.transport_failed) {
+            return Error(impl.transport_status, impl.transport_message);
+        }
+        if (impl.shutdown_complete) {
+            return Error(Status::Unavailable, "the connection closed");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Error(Status::WaitTimeout, "the host has not answered the dial yet");
+        }
+        impl.cv.wait_until(lock, deadline);
+    }
+}
+
+Error QuicSession::send_port_forward_stop(uint32_t forward_id, PortForwardCode code,
+                                          const std::string& reason) {
+    Impl& impl = *impl_;
+    if (forward_id == 0) {
+        return Error(Status::InvalidCall, "the forward id is zero");
+    }
+    PortForwardStop stop;
+    stop.forward_id = forward_id;
+    stop.code = code;
+    stop.reason = reason;
+    std::vector<uint8_t> message = make_port_forward_stop(stop);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid port forward stop code");
+    }
+    std::vector<HQUIC> aborts;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        aborts = impl.stop_port_forward_target_locked(forward_id);
+    }
+    for (HQUIC handle : aborts) {
+        impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    }
+    impl.cv.notify_all();
+    return impl.send_bytes(impl.control.load(), std::move(message),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_port_forward_stop(PortForwardStop& stop) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->port_forward_stops.empty()) {
+        return false;
+    }
+    stop = std::move(impl_->port_forward_stops.front());
+    impl_->port_forward_stops.pop_front();
+    return true;
+}
+
+Error QuicSession::send_port_forward_data(PortForwardHandle handle, const uint8_t* data,
+                                          size_t size, std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (!data || size == 0 || size > kMaxPortForwardChunkBytes) {
+        return Error(Status::InvalidCall,
+                     "a port forward chunk is between 1 byte and 64 KiB");
+    }
+    HQUIC stream = nullptr;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it == impl.port_forward_connections.end()) {
+            return Error(Status::InvalidCall, "the port forward connection is not open");
+        }
+        Impl::PortForwardEntry& entry = it->second;
+        if (entry.failed) {
+            return Error(Status::Unavailable, entry.error);
+        }
+        if (entry.send_finished) {
+            return Error(Status::Unavailable, "the sending direction is closed");
+        }
+        stream = Impl::port_forward_send_stream(entry);
+        if (!stream) {
+            return Error(Status::Unavailable,
+                         "the host has not accepted the port forward connection");
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    Error sent = impl.send_bytes_until(stream, std::vector<uint8_t>(data, data + size),
+                                       QUIC_SEND_FLAG_NONE, deadline);
+    if (!sent.ok() && sent.status() != Status::WaitTimeout) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.port_forward_connections.find(handle);
+            if (it != impl.port_forward_connections.end()) {
+                impl.fail_port_forward_locked(it->second, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            if (abort != stream) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+Error QuicSession::receive_port_forward_data(PortForwardHandle handle,
+                                             std::vector<uint8_t>& data,
+                                             std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    HQUIC resume = nullptr;
+    Error result = Error::success();
+    {
+        std::unique_lock<std::mutex> lock(impl.mutex);
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            const auto it = impl.port_forward_connections.find(handle);
+            if (it == impl.port_forward_connections.end()) {
+                result = Error(Status::InvalidCall,
+                               "the port forward connection is not open");
+                break;
+            }
+            Impl::PortForwardEntry& entry = it->second;
+            if (!entry.received.empty()) {
+                data = std::move(entry.received.front());
+                entry.received.pop_front();
+                entry.buffered_bytes -=
+                    entry.buffered_bytes >= data.size() ? data.size() : entry.buffered_bytes;
+                if (entry.receive_paused &&
+                    entry.buffered_bytes <= kPortForwardReceiveHighWaterBytes / 2) {
+                    entry.receive_paused = false;
+                    resume = Impl::port_forward_receive_stream(entry);
+                }
+                break;
+            }
+            if (entry.failed) {
+                result = Error(Status::Unavailable, entry.error);
+                break;
+            }
+            if (entry.receive_finished) {
+                result = Error(Status::Unavailable,
+                               "the peer ended the port forward connection");
+                break;
+            }
+            if (impl.transport_failed) {
+                result = Error(impl.transport_status, impl.transport_message);
+                break;
+            }
+            if (impl.shutdown_complete) {
+                result = Error(Status::Unavailable, "the connection closed");
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                result = Error(Status::WaitTimeout, "no port forward data arrived in time");
+                break;
+            }
+            impl.cv.wait_until(lock, deadline);
+        }
+    }
+    if (resume) {
+        impl.api->StreamReceiveSetEnabled(resume, TRUE);
+    }
+    return result;
+}
+
+Error QuicSession::finish_port_forward(PortForwardHandle handle) {
+    Impl& impl = *impl_;
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it == impl.port_forward_connections.end()) {
+            return Error(Status::InvalidCall, "the port forward connection is not open");
+        }
+        Impl::PortForwardEntry& entry = it->second;
+        if (entry.send_finished) {
+            return Error::success();
+        }
+        stream = Impl::port_forward_send_stream(entry);
+        entry.send_finished = true;
+        // The host may half-close before it accepted; accept_port_forward_
+        // connection() then sends the header with FIN in one go.
+        if (!stream) {
+            return Error::success();
+        }
+    }
+    Error sent = impl.send_stream_fin(stream);
+    if (!sent.ok()) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.port_forward_connections.find(handle);
+            if (it != impl.port_forward_connections.end()) {
+                impl.fail_port_forward_locked(it->second, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            if (abort != stream) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+void QuicSession::close_port_forward(PortForwardHandle handle) {
+    Impl& impl = *impl_;
+    std::vector<HQUIC> streams;
+    bool graceful = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it == impl.port_forward_connections.end()) {
+            return;
+        }
+        Impl::PortForwardEntry& entry = it->second;
+        if (entry.app_closed) {
+            return;
+        }
+        // The relay only reaches this point after both directions finished
+        // cleanly, and the last FIN may still be sitting in the send queue.
+        // Aborting now would truncate it, so leave the streams to complete on
+        // their own; SHUTDOWN_COMPLETE closes the handles.
+        graceful = !entry.failed && entry.send_finished && entry.receive_finished;
+        if (graceful) {
+            entry.app_closed = true;
+        } else {
+            if (entry.uplink) {
+                streams.push_back(entry.uplink);
+            }
+            if (entry.downlink && entry.downlink != entry.uplink) {
+                streams.push_back(entry.downlink);
+            }
+            impl.port_forward_connections.erase(it);
+            impl.port_forward_opens.erase(
+                std::remove_if(impl.port_forward_opens.begin(),
+                               impl.port_forward_opens.end(),
+                               [handle](const PortForwardOpen& open) {
+                                   return open.handle == handle;
+                               }),
+                impl.port_forward_opens.end());
+        }
+    }
+    for (HQUIC stream : streams) {
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+    }
+    impl.cv.notify_all();
+}
+
+// ----- remote terminal -----
+
+bool QuicSession::take_terminal_request(TerminalRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->terminal_requests.empty()) {
+        return false;
+    }
+    request = std::move(impl_->terminal_requests.front());
+    impl_->terminal_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_terminal_result(const TerminalResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_terminal_result is a server operation");
+    }
+    if (result.terminal_id == 0 || make_terminal_result(result).empty()) {
+        return Error(Status::InvalidCall, "invalid terminal result");
+    }
+    TerminalResult answer = result;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto pending = impl.pending_terminal_targets.find(result.terminal_id);
+        if (pending == impl.pending_terminal_targets.end()) {
+            return Error(Status::InvalidCall, "no terminal request is waiting");
+        }
+        if (answer.code == TerminalCode::Ok) {
+            if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+                answer.code = TerminalCode::Refused;
+                answer.reason = "terminal access was revoked";
+            } else if (impl.active_terminal_targets.size() >= kMaxTerminals) {
+                answer.code = TerminalCode::Busy;
+                answer.reason = "too many terminals";
+            } else {
+                impl.active_terminal_targets[result.terminal_id] = pending->second;
+                Impl::TerminalEntry entry;
+                entry.terminal_id = result.terminal_id;
+                entry.server_side = true;
+                entry.columns = pending->second.columns;
+                entry.rows = pending->second.rows;
+                impl.terminal_entries.emplace(result.terminal_id, std::move(entry));
+            }
+        }
+        impl.pending_terminal_targets.erase(pending);
+    }
+    return impl.send_bytes(impl.control.load(), make_terminal_result(answer),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_terminal(uint32_t terminal_id, uint16_t columns, uint16_t rows) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_terminal is a client operation");
+    }
+    TerminalRequest request;
+    request.terminal_id = terminal_id;
+    request.columns = columns;
+    request.rows = rows;
+    std::vector<uint8_t> message = make_terminal_request(request);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the terminal id or size is out of range");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant terminals");
+        }
+        if (impl.client_pending_terminals.count(terminal_id) != 0 ||
+            impl.client_terminal_targets.count(terminal_id) != 0) {
+            return Error(Status::InvalidCall, "that terminal id is already in use");
+        }
+        if (impl.client_pending_terminals.size() + impl.client_terminal_targets.size() >=
+            kMaxTerminals) {
+            return Error(Status::InvalidCall, "too many terminals");
+        }
+        TerminalSize size;
+        size.terminal_id = terminal_id;
+        size.columns = columns;
+        size.rows = rows;
+        impl.client_pending_terminals.emplace(terminal_id, size);
+    }
+    Error sent = impl.send_bytes(impl.control.load(), std::move(message),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.client_pending_terminals.erase(terminal_id);
+    }
+    return sent;
+}
+
+bool QuicSession::take_terminal_result(TerminalResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->terminal_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->terminal_results.front());
+    impl_->terminal_results.pop_front();
+    return true;
+}
+
+Error QuicSession::open_terminal_input(uint32_t terminal_id) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "open_terminal_input is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end() || it->second.server_side) {
+            return Error(Status::InvalidCall, "no such terminal");
+        }
+        const Impl::TerminalEntry& entry = it->second;
+        if (entry.failed) {
+            return Error(Status::Unavailable, entry.error);
+        }
+        if (entry.send_finished) {
+            return Error(Status::Unavailable, "the input direction is closed");
+        }
+        if (entry.uplink) {
+            return Error(Status::InvalidCall, "the terminal input stream is already open");
+        }
+        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+            return Error(Status::PermissionDenied, "terminal access was revoked");
+        }
+    }
+    HQUIC stream = nullptr;
+    QUIC_STATUS status = impl.api->StreamOpen(
+        impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+        &Impl::stream_callback, &impl, &stream);
+    if (QUIC_FAILED(status)) {
+        return quic_error(status, "QUIC StreamOpen(terminal input)");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end() || it->second.failed ||
+            it->second.uplink) {
+            impl.api->StreamClose(stream);
+            return Error(Status::Unavailable, "the terminal ended while opening its input");
+        }
+        it->second.uplink = stream;
+    }
+    Error sent = impl.send_bytes(stream, make_terminal_stream_header(terminal_id),
+                                 QUIC_SEND_FLAG_START);
+    if (!sent.ok()) {
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end() && it->second.uplink == stream) {
+                it->second.uplink = nullptr;
+            }
+        }
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+        return sent;
+    }
+    impl.cv.notify_all();
+    return Error::success();
+}
+
+Error QuicSession::send_terminal_input(uint32_t terminal_id, const uint8_t* data,
+                                       size_t size, std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (!data || size == 0 || size > kMaxTerminalChunkBytes) {
+        return Error(Status::InvalidCall, "a terminal chunk is between 1 byte and 64 KiB");
+    }
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end() || it->second.server_side) {
+            return Error(Status::InvalidCall, "no such terminal");
+        }
+        Impl::TerminalEntry& entry = it->second;
+        if (entry.failed) {
+            return Error(Status::Unavailable, entry.error);
+        }
+        if (entry.send_finished) {
+            return Error(Status::Unavailable, "the input direction is closed");
+        }
+        stream = entry.uplink;
+        if (!stream) {
+            return Error(Status::Unavailable, "the input stream is not open");
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    Error sent = impl.send_bytes_until(stream, std::vector<uint8_t>(data, data + size),
+                                       QUIC_SEND_FLAG_NONE, deadline);
+    if (!sent.ok() && sent.status() != Status::WaitTimeout) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end()) {
+                impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            if (abort != stream) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+Error QuicSession::finish_terminal_input(uint32_t terminal_id) {
+    Impl& impl = *impl_;
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end() || it->second.server_side) {
+            return Error(Status::InvalidCall, "no such terminal");
+        }
+        Impl::TerminalEntry& entry = it->second;
+        if (entry.send_finished) {
+            return Error::success();
+        }
+        entry.send_finished = true;
+        stream = entry.uplink;
+        if (!stream) {
+            return Error::success();
+        }
+    }
+    Error sent = impl.send_stream_fin(stream);
+    if (!sent.ok()) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end()) {
+                impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            if (abort != stream) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+Error QuicSession::send_terminal_resize(uint32_t terminal_id, uint16_t columns,
+                                        uint16_t rows) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_terminal_resize is a client operation");
+    }
+    std::vector<uint8_t> message = make_terminal_resize(terminal_id, columns, rows);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the terminal id or size is out of range");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+            return Error(Status::PermissionDenied, "terminal access was revoked");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_terminal_output(uint32_t terminal_id, std::vector<uint8_t>& data,
+                                       bool& ended) {
+    Impl& impl = *impl_;
+    HQUIC resume = nullptr;
+    bool popped = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        ended = false;
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end()) {
+            ended = true;
+            return false;
+        }
+        Impl::TerminalEntry& entry = it->second;
+        if (!entry.received.empty()) {
+            data = std::move(entry.received.front());
+            entry.received.pop_front();
+            entry.buffered_bytes -=
+                entry.buffered_bytes >= data.size() ? data.size() : entry.buffered_bytes;
+            if (entry.receive_paused &&
+                entry.buffered_bytes <= kTerminalReceiveHighWaterBytes / 2) {
+                entry.receive_paused = false;
+                resume = Impl::terminal_receive_stream(entry);
+            }
+            popped = true;
+        }
+        if (!popped) {
+            // A stop alone is not the end: output already on the wire still
+            // has to arrive, so only the stream's own end (or a failure)
+            // reports ended.
+            ended = entry.receive_finished || entry.failed;
+        }
+        if (entry.stopped && entry.receive_finished && entry.received.empty()) {
+            // The host ended the terminal and everything it wrote has been
+            // handed over. The entry goes once QUIC released both handles.
+            ended = true;
+            if (!entry.uplink && !entry.downlink) {
+                impl.terminal_entries.erase(it);
+            }
+        }
+    }
+    if (resume) {
+        impl.api->StreamReceiveSetEnabled(resume, TRUE);
+    }
+    return popped;
+}
+
+bool QuicSession::take_terminal_resize(TerminalSize& size) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->terminal_resizes.empty()) {
+        return false;
+    }
+    size = impl_->terminal_resizes.front();
+    impl_->terminal_resizes.pop_front();
+    return true;
+}
+
+bool QuicSession::take_terminal_input(uint32_t terminal_id, std::vector<uint8_t>& data,
+                                      bool& ended) {
+    Impl& impl = *impl_;
+    HQUIC resume = nullptr;
+    bool popped = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        ended = false;
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end()) {
+            ended = true;
+            return false;
+        }
+        Impl::TerminalEntry& entry = it->second;
+        if (!entry.received.empty()) {
+            data = std::move(entry.received.front());
+            entry.received.pop_front();
+            entry.buffered_bytes -=
+                entry.buffered_bytes >= data.size() ? data.size() : entry.buffered_bytes;
+            if (entry.receive_paused &&
+                entry.buffered_bytes <= kTerminalReceiveHighWaterBytes / 2) {
+                entry.receive_paused = false;
+                resume = Impl::terminal_receive_stream(entry);
+            }
+            popped = true;
+        } else {
+            ended = entry.receive_finished || entry.failed;
+        }
+    }
+    if (resume) {
+        impl.api->StreamReceiveSetEnabled(resume, TRUE);
+    }
+    return popped;
+}
+
+Error QuicSession::send_terminal_output(uint32_t terminal_id, const uint8_t* data,
+                                        size_t size, std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (!data || size == 0 || size > kMaxTerminalChunkBytes) {
+        return Error(Status::InvalidCall, "a terminal chunk is between 1 byte and 64 KiB");
+    }
+    HQUIC stream = nullptr;
+    bool need_open = false;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end() || !it->second.server_side) {
+            return Error(Status::InvalidCall, "no such terminal");
+        }
+        Impl::TerminalEntry& entry = it->second;
+        if (entry.failed) {
+            return Error(Status::Unavailable, entry.error);
+        }
+        if (entry.send_finished) {
+            return Error(Status::Unavailable, "the output direction is closed");
+        }
+        if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
+            return Error(Status::PermissionDenied, "terminal access was revoked");
+        }
+        stream = entry.downlink;
+        need_open = stream == nullptr;
+    }
+    if (need_open) {
+        HQUIC opened = nullptr;
+        QUIC_STATUS status = impl.api->StreamOpen(
+            impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+            &Impl::stream_callback, &impl, &opened);
+        if (QUIC_FAILED(status)) {
+            return quic_error(status, "QUIC StreamOpen(terminal output)");
+        }
+        bool attached = false;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end() && !it->second.failed &&
+                it->second.downlink == nullptr) {
+                it->second.downlink = opened;
+                attached = true;
+            }
+        }
+        if (!attached) {
+            impl.api->StreamClose(opened);
+            return Error(Status::Unavailable, "the terminal ended while opening its output");
+        }
+        Error sent = impl.send_bytes(opened, make_terminal_stream_header(terminal_id),
+                                     QUIC_SEND_FLAG_START);
+        if (!sent.ok()) {
+            std::vector<HQUIC> aborts;
+            {
+                std::lock_guard<std::mutex> lock(impl.mutex);
+                const auto it = impl.terminal_entries.find(terminal_id);
+                if (it != impl.terminal_entries.end()) {
+                    impl.fail_terminal_locked(it->second, sent.message(), aborts);
+                }
+            }
+            for (HQUIC abort : aborts) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+            impl.cv.notify_all();
+            return sent;
+        }
+        stream = opened;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    Error sent = impl.send_bytes_until(stream, std::vector<uint8_t>(data, data + size),
+                                       QUIC_SEND_FLAG_NONE, deadline);
+    if (!sent.ok() && sent.status() != Status::WaitTimeout) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end()) {
+                impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            if (abort != stream) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+Error QuicSession::finish_terminal_output(uint32_t terminal_id) {
+    Impl& impl = *impl_;
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it == impl.terminal_entries.end() || !it->second.server_side) {
+            return Error(Status::InvalidCall, "no such terminal");
+        }
+        Impl::TerminalEntry& entry = it->second;
+        if (entry.send_finished) {
+            return Error::success();
+        }
+        entry.send_finished = true;
+        stream = entry.downlink;
+        if (!stream) {
+            // The console never printed; the stop message carries the outcome.
+            return Error::success();
+        }
+    }
+    Error sent = impl.send_stream_fin(stream);
+    if (!sent.ok()) {
+        std::vector<HQUIC> aborts;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end()) {
+                impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            }
+        }
+        for (HQUIC abort : aborts) {
+            if (abort != stream) {
+                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
+        }
+        impl.cv.notify_all();
+    }
+    return sent;
+}
+
+Error QuicSession::send_terminal_stop(uint32_t terminal_id, TerminalCode code,
+                                      const std::string& reason) {
+    Impl& impl = *impl_;
+    if (terminal_id == 0) {
+        return Error(Status::InvalidCall, "the terminal id is zero");
+    }
+    TerminalStop stop;
+    stop.terminal_id = terminal_id;
+    stop.code = code;
+    stop.reason = reason;
+    std::vector<uint8_t> message = make_terminal_stop(stop);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid terminal stop code");
+    }
+    std::vector<HQUIC> aborts;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        // A direction this side already finished cleanly keeps its FIN: a
+        // reset would tell the peer the transfer failed and make it drop bytes
+        // still queued on its side.
+        aborts = impl.drop_terminal_locked(terminal_id, true);
+    }
+    for (HQUIC handle : aborts) {
+        impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    }
+    impl.cv.notify_all();
+    return impl.send_bytes(impl.control.load(), std::move(message),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_terminal_stop(TerminalStop& stop) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->terminal_stops.empty()) {
+        return false;
+    }
+    stop = std::move(impl_->terminal_stops.front());
+    impl_->terminal_stops.pop_front();
+    return true;
+}
+
+void QuicSession::close_terminal(uint32_t terminal_id) {
+    Impl& impl = *impl_;
+    std::vector<HQUIC> streams;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        streams = impl.drop_terminal_locked(terminal_id);
+    }
+    for (HQUIC stream : streams) {
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        impl.api->StreamClose(stream);
+    }
+    impl.cv.notify_all();
 }
 
 Error QuicSession::send_cursor(const CursorUpdate& update) {

@@ -24,6 +24,10 @@ import (
 const (
 	// DomainRegister covers the HTTP registration proof.
 	DomainRegister = "chast-register-v1"
+	// DomainMigrate covers moving a durable peer identity from one id to
+	// another. The signature is made with the key already bound to the old id,
+	// which is what proves the caller owns it.
+	DomainMigrate = "chast-id-migrate-v1"
 	// DomainKeepalive covers the rendezvous keepalive challenge.
 	DomainKeepalive = "chast-keepalive-v1"
 	// DomainRelay covers the UDP relay host hello challenge.
@@ -34,6 +38,10 @@ const (
 	DomainHostBinding = "chast-host-binding-v1"
 	// DomainPunch covers the viewer's server-key proof in a punch request.
 	DomainPunch = "chast-punch-v1"
+	// DomainHostAudit covers a host reporting an inbound session or finished
+	// file. The host key that owns the id signs the canonical fields, so a
+	// leaked server key alone cannot fabricate host-side records.
+	DomainHostAudit = "chast-host-audit-v1"
 )
 
 var (
@@ -89,6 +97,37 @@ func fieldsMessage(domain string, fields ...string) []byte {
 
 func RegisterMessage(id, fingerprint string, unix int64) []byte {
 	return fieldsMessage(DomainRegister, id, fingerprint, strconv.FormatInt(unix, 10))
+}
+
+// MigrateMessage binds the old and new ids to the same timestamp as the
+// registration proof. RustDesk compares a device uuid for the same purpose;
+// an Ed25519 signature made by the key already bound to oldID is stronger,
+// because only the holder of the host key can produce it.
+func MigrateMessage(oldID, newID string, unix int64) []byte {
+	return fieldsMessage(DomainMigrate, oldID, newID, strconv.FormatInt(unix, 10))
+}
+
+func boolText(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+// HostAuditSessionMessage binds one inbound session report. kind separates it
+// from file reports so a signature cannot be replayed as the other kind.
+func HostAuditSessionMessage(hostID, auditRef string, startedAt, endedAt int64,
+	success bool, detail string) []byte {
+	return fieldsMessage(DomainHostAudit, "session", hostID, auditRef,
+		strconv.FormatInt(startedAt, 10), strconv.FormatInt(endedAt, 10),
+		boolText(success), detail)
+}
+
+func HostAuditFileMessage(hostID, auditRef, direction, name string, size, occurredAt int64,
+	success bool, detail string) []byte {
+	return fieldsMessage(DomainHostAudit, "file", hostID, auditRef, direction, name,
+		strconv.FormatInt(size, 10), strconv.FormatInt(occurredAt, 10),
+		boolText(success), detail)
 }
 
 func KeepaliveMessage(id, candidate, nonce string) []byte {

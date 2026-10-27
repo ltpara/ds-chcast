@@ -51,12 +51,14 @@ type registerResult struct {
 	Relay           string        `json:"relay"`
 	Relays          []string      `json:"relays"`
 	Punch           string        `json:"punch"`
+	PunchV6         string        `json:"punch_v6"`
 	Carrier         string        `json:"carrier"`
 	CarrierToken    string        `json:"carrier_token"`
 	ExpiresInSec    int64         `json:"expires_in_sec"`
 	PublicKey       string        `json:"public_key"`
 	ServerPublicKey string        `json:"server_public_key"`
 	Binding         string        `json:"binding"`
+	MigratedFrom    string        `json:"migrated_from"`
 	Software        *softwareInfo `json:"software"`
 }
 
@@ -64,9 +66,12 @@ type lookupResult struct {
 	ID              string        `json:"id"`
 	Online          bool          `json:"online"`
 	Candidate       string        `json:"candidate"`
+	CandidateV6     string        `json:"candidate_v6"`
 	Candidates      []string      `json:"candidates"`
 	Relay           string        `json:"relay"`
+	Relays          []string      `json:"relays"`
 	Punch           string        `json:"punch"`
+	PunchV6         string        `json:"punch_v6"`
 	Carrier         string        `json:"carrier"`
 	CarrierToken    string        `json:"carrier_token"`
 	Fingerprint     string        `json:"fingerprint"`
@@ -74,7 +79,9 @@ type lookupResult struct {
 	ServerPublicKey string        `json:"server_public_key"`
 	Binding         string        `json:"binding"`
 	LocalAddrs      []string      `json:"local_addrs"`
+	LocalAddrsV6    []string      `json:"local_addrs_v6"`
 	NATType         string        `json:"nat_type"`
+	UpnpPort        int           `json:"upnp_port"`
 	LastSeenMS      int64         `json:"last_seen_ms"`
 	ExpiresInMS     int64         `json:"expires_in_ms"`
 	RelayOnly       bool          `json:"relay_only"`
@@ -86,10 +93,10 @@ type apiError struct {
 	Error string `json:"error"`
 }
 
-func (c *apiClient) register(ctx context.Context, id string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
+func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
 	timestamp := time.Now().Unix()
 	hostname, _ := os.Hostname()
-	body, err := json.Marshal(map[string]any{
+	body := map[string]any{
 		"id":          id,
 		"public_key":  identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey)),
 		"fingerprint": fingerprint,
@@ -98,12 +105,17 @@ func (c *apiClient) register(ctx context.Context, id string, privateKey ed25519.
 		"version":     Version,
 		"timestamp":   timestamp,
 		"signature":   identity.Sign(privateKey, identity.RegisterMessage(id, fingerprint, timestamp)),
-	})
+	}
+	if oldID != "" {
+		body["old_id"] = oldID
+		body["migrate_signature"] = identity.Sign(privateKey, identity.MigrateMessage(oldID, id, timestamp))
+	}
+	data, err := json.Marshal(body)
 	if err != nil {
 		return registerResult{}, err
 	}
 	var out registerResult
-	if err := c.do(ctx, http.MethodPost, "/v1/hosts", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v1/hosts", data, &out); err != nil {
 		return registerResult{}, err
 	}
 	return out, nil

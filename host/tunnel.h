@@ -27,6 +27,8 @@ struct TunnelEvent {
     std::string remote;
     std::string punch;
     std::string relay;
+    // Set on ready when the service moved the durable identity from this id.
+    std::string migrated_from;
 };
 
 // Reads a top-level string field from one flat JSON object. Empty when the

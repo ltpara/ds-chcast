@@ -17,6 +17,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
@@ -60,6 +61,11 @@ type Options struct {
 	// LoginPersistent enables the default 3-failures/1-minute lockout backed
 	// by the account database instead of process memory.
 	LoginPersistent bool
+	// GeoIP labels login addresses in audit events and session lists.
+	GeoIP *geoip.Locator
+	// RelayExtra advertises additional relay hosts (for example the IPv6
+	// listener of the same relay) without making them the primary.
+	RelayExtra []string
 }
 
 type Server struct {
@@ -175,11 +181,13 @@ func StartWith(t testing.TB, opts Options) *Server {
 		LoginLimiter:    loginLimiter,
 		ProxyHeader:     opts.ProxyHeader,
 		TLS:             opts.TLS,
+		GeoIP:           opts.GeoIP,
 		RelayOnly:       relayOnly,
 		Blocker:         opts.Registration,
 		PunchLog:        punchLog,
 		IPChanges:       ipChanges,
 		RelayAddrs:      relayAddrs,
+		RelayExtra:      opts.RelayExtra,
 		RelayPool:       pool,
 		PunchReadBuffer: meet.ReadBuffer(),
 		SoftwareVersion: opts.SoftwareVersion,

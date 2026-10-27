@@ -128,6 +128,131 @@ func TestKeyMismatchAndIDValidation(t *testing.T) {
 	}
 }
 
+func TestRegisterMovesIdentityToNewID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(3000, 0)
+	reg.SetClock(func() time.Time { return now })
+	_, pub := hostKey("host-secret")
+	created, err := reg.Register(RegisterRequest{
+		ID: "devbox", PublicKey: pub, Fingerprint: "AB12", Hostname: "Old Box", TTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := "Workshop"
+	tags := []string{"lab", "desk"}
+	if _, _, err := reg.SetLabels("devbox", &alias, &tags); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := reg.Identity("devbox")
+	reg.SetRelay("devbox", 41000, "")
+
+	now = now.Add(5 * time.Second)
+	host, err := reg.Register(RegisterRequest{
+		ID: "newbox", OldID: "devbox", PublicKey: pub, Hostname: "New Box", TTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.ID != "newbox" || host.Fingerprint != "AB12" || !host.ExpiresAt.After(now) {
+		t.Fatalf("migrated lease = %+v", host)
+	}
+	if _, ok := reg.Identity("devbox"); ok {
+		t.Fatal("the old identity survived the move")
+	}
+	if _, ok := reg.Lookup("devbox"); ok {
+		t.Fatal("the old lease survived the move")
+	}
+	moved, ok := reg.Identity("newbox")
+	if !ok {
+		t.Fatal("the new identity was not created")
+	}
+	if !moved.CreatedAt.Equal(before.CreatedAt) {
+		t.Fatalf("created at = %v, want %v", moved.CreatedAt, before.CreatedAt)
+	}
+	if moved.Alias != alias || len(moved.Tags) != 2 || moved.Tags[0] != "lab" {
+		t.Fatalf("operator labels were lost: %+v", moved)
+	}
+	if moved.Hostname != "New Box" || moved.Fingerprint != "AB12" || moved.PublicKey != pub {
+		t.Fatalf("migrated metadata = %+v", moved)
+	}
+	if created.ID != "devbox" {
+		t.Fatalf("first registration id = %q", created.ID)
+	}
+
+	// A retry after the server already moved the record is a plain renewal.
+	if _, err := reg.Register(RegisterRequest{
+		ID: "newbox", OldID: "devbox", PublicKey: pub, TTL: time.Minute,
+	}); err != nil {
+		t.Fatalf("idempotent retry: %v", err)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloaded.Close()
+	if _, ok := reloaded.Identity("devbox"); ok {
+		t.Fatal("the old identity reappeared after a restart")
+	}
+	persisted, ok := reloaded.Identity("newbox")
+	if !ok || persisted.Alias != alias {
+		t.Fatalf("migrated identity after restart = %+v", persisted)
+	}
+}
+
+func TestRegisterMigrationRequiresOwnership(t *testing.T) {
+	reg := New(time.Minute)
+	_, pub := hostKey("host-secret")
+	_, other := hostKey("another-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Register(RegisterRequest{ID: "taken", PublicKey: other, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Register(RegisterRequest{
+		ID: "hijack", OldID: "devbox", PublicKey: other, TTL: time.Minute,
+	}); !errors.Is(err, ErrMigrationDenied) {
+		t.Fatalf("foreign key migration: %v", err)
+	}
+	if _, err := reg.Register(RegisterRequest{
+		ID: "taken", OldID: "devbox", PublicKey: pub, TTL: time.Minute,
+	}); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("migration onto a taken id: %v", err)
+	}
+	if _, err := reg.Register(RegisterRequest{
+		ID: "devbox", OldID: "devbox", PublicKey: pub, TTL: time.Minute,
+	}); err == nil {
+		t.Fatal("migration accepted an unchanged id")
+	}
+	if _, err := reg.Register(RegisterRequest{
+		ID: "newbox", OldID: "bad id", PublicKey: pub, TTL: time.Minute,
+	}); err == nil {
+		t.Fatal("migration accepted a malformed old id")
+	}
+	// An unknown old id is not proof of anything, but it is also not an error:
+	// the client may retry after the server already moved the record.
+	if _, err := reg.Register(RegisterRequest{
+		ID: "standalone", OldID: "ghost", PublicKey: other, TTL: time.Minute,
+	}); err != nil {
+		t.Fatalf("registration with an unknown old id: %v", err)
+	}
+	if _, ok := reg.Identity("devbox"); !ok {
+		t.Fatal("a denied migration changed the old identity")
+	}
+	if _, ok := reg.Identity("hijack"); ok {
+		t.Fatal("a denied migration created the new identity")
+	}
+}
+
 func TestExpiryKeepsIdentity(t *testing.T) {
 	reg := New(3 * time.Second)
 	now := time.Unix(2000, 0)
@@ -237,6 +362,38 @@ func TestChallengeIsOneTimeAndBound(t *testing.T) {
 	msg = identity.KeepaliveMessage("devbox", candidate, nonce)
 	if _, err := reg.VerifyChallenge("devbox", identity.DomainKeepalive, nonce, string(msg), identity.Sign(priv, msg)); !errors.Is(err, ErrChallenge) {
 		t.Fatalf("expired challenge: %v", err)
+	}
+}
+
+func TestKeepaliveChallengesPerFamily(t *testing.T) {
+	reg := New(time.Minute)
+	priv, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	v4 := "198.51.100.7:51234"
+	v6 := "[2001:db8::7]:51234"
+	nonce4, err := reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce6, err := reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct{ nonce, candidate string }{
+		{nonce6, v6},
+		{nonce4, v4},
+	} {
+		msg := identity.KeepaliveMessage("devbox", step.candidate, step.nonce)
+		if err := reg.TouchChallenge("devbox", step.nonce, step.candidate,
+			identity.Sign(priv, msg), string(msg), nil, "", 0); err != nil {
+			t.Fatalf("touch %s: %v", step.candidate, err)
+		}
+	}
+	host, ok := reg.Lookup("devbox")
+	if !ok || host.Candidate != v4 || host.CandidateV6 != v6 {
+		t.Fatalf("one family erased the other: %+v", host)
 	}
 }
 
@@ -611,5 +768,57 @@ func TestStoreUpgradesPreLabelSchema(t *testing.T) {
 	}
 	if ids[0].Alias != "Legacy" || len(ids[0].Tags) != 1 || ids[0].Tags[0] != "migrated" {
 		t.Fatalf("labels after upgrade: %+v", ids[0])
+	}
+}
+
+func TestTouchKeepsAddressFamiliesApart(t *testing.T) {
+	reg := New(time.Minute)
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "dual", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Touch("dual", "192.0.2.10:4000",
+		[]string{"10.0.0.10:4000", "[fd00::10]:4000"}, "cone"); err != nil {
+		t.Fatal(err)
+	}
+	host, _ := reg.Lookup("dual")
+	if host.Candidate != "192.0.2.10:4000" || host.CandidateV6 != "" {
+		t.Fatalf("candidates: %+v", host)
+	}
+	if len(host.LocalAddrs) != 1 || host.LocalAddrs[0] != "10.0.0.10:4000" {
+		t.Fatalf("ipv4 local addrs: %+v", host.LocalAddrs)
+	}
+	if len(host.LocalAddrsV6) != 1 || host.LocalAddrsV6[0] != "[fd00::10]:4000" {
+		t.Fatalf("ipv6 local addrs: %+v", host.LocalAddrsV6)
+	}
+
+	// A later IPv6 keepalive must not erase the IPv4 mapping.
+	if err := reg.Touch("dual", "[2001:db8::10]:4000", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	host, _ = reg.Lookup("dual")
+	if host.Candidate != "192.0.2.10:4000" || host.CandidateV6 != "[2001:db8::10]:4000" {
+		t.Fatalf("candidates after v6 keepalive: %+v", host)
+	}
+	if !reg.Online(host) {
+		t.Fatal("dual-stack host reported offline")
+	}
+}
+
+func TestIPv6OnlyHostIsOnline(t *testing.T) {
+	reg := New(time.Minute)
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "v6only", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Touch("v6only", "[2001:db8::11]:4000", []string{"[2001:db8::11]:4000"}, "cone"); err != nil {
+		t.Fatal(err)
+	}
+	host, _ := reg.Lookup("v6only")
+	if host.Candidate != "" || host.CandidateV6 != "[2001:db8::11]:4000" {
+		t.Fatalf("candidates: %+v", host)
+	}
+	if !reg.Online(host) {
+		t.Fatal("IPv6-only host reported offline")
 	}
 }

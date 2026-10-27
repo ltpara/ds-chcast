@@ -33,6 +33,7 @@ func run() error {
 	var (
 		httpListen  = flag.String("http-listen", "0.0.0.0:8447", "control API address used by hbbs")
 		relayListen = flag.String("relay-listen", "0.0.0.0", "IP address for relay UDP/TCP ports")
+		relayV6     = flag.String("relay-listen-v6", "", "optional IPv6 address for relay UDP/TCP ports, same port numbers as --relay-listen")
 		portRange   = flag.String("relay-ports", "41100-41199", "relay UDP/TCP ports, e.g. 41100-41199")
 		carrierAddr = flag.String("carrier-listen", "0.0.0.0:8448", "shared TCP/WebSocket carrier address; empty disables it")
 		advertise   = flag.String("advertise", "", "host name or IP published to hbbs and peers")
@@ -111,6 +112,7 @@ func run() error {
 	manager, err := relay.NewManager(*relayListen, ports, auth, log,
 		relay.WithReadBuffer(*rmem),
 		relay.WithViewerTokenRequired(true),
+		relay.WithBind6(*relayV6),
 	)
 	if err != nil {
 		return err

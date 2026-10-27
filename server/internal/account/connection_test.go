@@ -26,7 +26,7 @@ func TestConnectionEventsLifecycle(t *testing.T) {
 	started := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
 	ended := started.Add(42 * time.Minute)
 	first, err := store.RecordConnection(
-		alice.ID, alice.Username, " devbox\x00 ", "", "127.0.0.1",
+		alice.ID, alice.Username, " devbox\x00 ", "", "127.0.0.1", "",
 		started, ended, true, "session ended\x00",
 	)
 	if err != nil {
@@ -40,14 +40,14 @@ func TestConnectionEventsLifecycle(t *testing.T) {
 		t.Fatalf("duration = %v", first.Duration())
 	}
 	second, err := store.RecordConnection(
-		alice.ID, alice.Username, "laptop", "viewer", "10.0.0.5",
+		alice.ID, alice.Username, "laptop", "viewer", "10.0.0.5", "",
 		ended, ended.Add(time.Minute), false, "viewer closed",
 	)
 	if err != nil {
 		t.Fatalf("record second connection: %v", err)
 	}
 	if _, err := store.RecordConnection(
-		bob.ID, bob.Username, "server", "viewer", "192.0.2.7",
+		bob.ID, bob.Username, "server", "viewer", "192.0.2.7", "",
 		started, started.Add(5*time.Minute), true, "",
 	); err != nil {
 		t.Fatalf("record bob connection: %v", err)
@@ -91,14 +91,14 @@ func TestConnectionEventsLifecycle(t *testing.T) {
 		{"over 30 days", alice.ID, "devbox", "viewer", started, started.Add(31 * 24 * time.Hour)},
 	} {
 		if _, err := store.RecordConnection(
-			tc.userID, "alice", tc.peer, tc.direction, "", tc.started, tc.ended, true, "",
+			tc.userID, "alice", tc.peer, tc.direction, "", "", tc.started, tc.ended, true, "",
 		); !errors.Is(err, ErrInvalidConnection) {
 			t.Fatalf("%s: error = %v", tc.name, err)
 		}
 	}
 
 	// Missing timestamps fall back to the store clock instead of 1970.
-	now, err := store.RecordConnection(alice.ID, alice.Username, "instant", "viewer", "", time.Time{}, time.Time{}, true, "")
+	now, err := store.RecordConnection(alice.ID, alice.Username, "instant", "viewer", "", "", time.Time{}, time.Time{}, true, "")
 	if err != nil {
 		t.Fatalf("record without timestamps: %v", err)
 	}

@@ -41,6 +41,8 @@ void main() {
     required String id,
     String deviceName = '',
     bool current = false,
+    String loginIp = '',
+    String location = '',
   }) {
     return AccountDeviceSession(
       id: id,
@@ -48,6 +50,8 @@ void main() {
       createdAt: DateTime.utc(2026, 10, 20, 8, 30),
       expiresAt: DateTime.utc(2026, 11, 19, 8, 30),
       current: current,
+      loginIp: loginIp,
+      location: location,
     );
   }
 
@@ -64,7 +68,12 @@ void main() {
           expect(token, 'account-token');
           return <AccountDeviceSession>[
             session(id: 's1', deviceName: '书房-PC', current: true),
-            session(id: 's2', deviceName: '笔记本'),
+            session(
+              id: 's2',
+              deviceName: '笔记本',
+              loginIp: '203.0.113.7',
+              location: 'Tokyo',
+            ),
           ];
         },
         revokeSession:
@@ -77,6 +86,10 @@ void main() {
     expect(find.text('书房-PC'), findsOneWidget);
     expect(find.text('当前设备'), findsOneWidget);
     expect(find.text('笔记本'), findsOneWidget);
+    expect(
+      find.text('登录地点 Tokyo · 203.0.113.7'),
+      findsOneWidget,
+    );
     expect(find.byKey(const Key('account-session-revoke-s1')), findsNothing);
     expect(find.byKey(const Key('account-session-revoke-s2')), findsOneWidget);
 

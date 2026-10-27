@@ -21,6 +21,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/upnp"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -32,7 +33,11 @@ type HostConfig struct {
 	ServerPublicKey string
 	ID              string
 	Key             string
-	Fingerprint     string
+	// OldID is the previous rendezvous id when the operator changed it. The
+	// agent proves ownership with its host key and the server moves the
+	// durable identity instead of leaving the old peer orphaned.
+	OldID       string
+	Fingerprint string
 	// LocalAddr is chast-host's QUIC listener, usually 127.0.0.1:4433.
 	LocalAddr string
 	// ListenAddr is the public-facing UDP socket used for all traffic.
@@ -42,6 +47,15 @@ type HostConfig struct {
 	CarrierAddr string
 	Keepalive   time.Duration
 	Logger      *slog.Logger
+	// AuditSpool is a JSONL file chast-host appends inbound session and
+	// finished-file events to. The agent signs each line with the host key and
+	// posts it, so the spool works while the server is unreachable. Empty
+	// disables forwarding.
+	AuditSpool string
+	// UPnP maps the public UDP socket on the local Internet Gateway Device and
+	// reports that external port to the rendezvous service. It is opt-in
+	// because it changes router state.
+	UPnP bool
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
 	// goroutine, so it must not block.
@@ -62,24 +76,32 @@ type HostInfo struct {
 	// NAT is the classification derived from the mappings seen by the
 	// rendezvous and relay ports: asymmetric, symmetric or unknown.
 	NAT string `json:"nat,omitempty"`
+	// UPnPPort is the external port mapped on the local gateway, zero when no
+	// mapping is active.
+	UPnPPort int `json:"upnp_port,omitempty"`
+	// MigratedFrom is the old id the service moved to ID during this start.
+	// Empty on ordinary registrations and renewals.
+	MigratedFrom string `json:"migrated_from,omitempty"`
 }
 
 type HostAgent struct {
-	cfg        HostConfig
-	conn       *net.UDPConn
-	api        *apiClient
-	log        *slog.Logger
-	local      *net.UDPAddr
-	carrier    *net.TCPAddr
-	priv       ed25519.PrivateKey
-	publicKey  string
-	localAddrs []string
+	cfg          HostConfig
+	conn         *net.UDPConn
+	api          *apiClient
+	log          *slog.Logger
+	local        *net.UDPAddr
+	carrier      *net.TCPAddr
+	priv         ed25519.PrivateKey
+	publicKey    string
+	localAddrs   []string
+	localAddrsV6 []string
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu       sync.Mutex
 	punch    *net.UDPAddr
+	punch6   *net.UDPAddr
 	relay    *net.UDPAddr
 	relaySet []*net.UDPAddr
 	refresh  time.Duration
@@ -95,6 +117,9 @@ type HostAgent struct {
 	viewer     *net.UDPAddr
 	viewerPath string
 	lastInfo   string
+	// migratedFrom is set once at start, when the registration moved an old
+	// identity. It is never updated by renewals.
+	migratedFrom string
 	// softwareSeen remembers the last advertised update version so a renewal
 	// every few seconds does not repeat the same notice.
 	softwareSeen string
@@ -104,6 +129,7 @@ type HostAgent struct {
 	observedPunch *net.UDPAddr
 	observedRelay *net.UDPAddr
 	natType       string
+	upnpPort      int
 
 	// remote is only touched by the read loop: it is the source of the last
 	// datagram that came from a viewer path (direct or via the relay).
@@ -157,6 +183,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	}
 
 	ctx, cancel := context.WithCancel(parent)
+	localAddrs, localAddrsV6 := splitByFamily(localCandidates(conn.LocalAddr().(*net.UDPAddr)))
 	h := &HostAgent{
 		cfg:            cfg,
 		conn:           conn,
@@ -166,7 +193,8 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		carrier:        carrierAddr,
 		priv:           privateKey,
 		publicKey:      publicKey,
-		localAddrs:     localCandidates(conn.LocalAddr().(*net.UDPAddr)),
+		localAddrs:     localAddrs,
+		localAddrsV6:   localAddrsV6,
 		ctx:            ctx,
 		cancel:         cancel,
 		refresh:        20 * time.Second,
@@ -175,7 +203,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		carrierReady:   make(chan struct{}),
 	}
 	registerCtx, registerCancel := context.WithTimeout(ctx, 10*time.Second)
-	reg, err := h.api.register(registerCtx, cfg.ID, privateKey, cfg.Fingerprint)
+	reg, err := h.api.register(registerCtx, cfg.ID, cfg.OldID, privateKey, cfg.Fingerprint)
 	registerCancel()
 	if err != nil {
 		conn.Close()
@@ -188,6 +216,22 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		return nil, err
 	}
 	h.applyRegistration(reg)
+	h.migratedFrom = reg.MigratedFrom
+
+	if cfg.UPnP {
+		mapCtx, mapCancel := context.WithTimeout(ctx, 5*time.Second)
+		mapper, mapErr := upnp.Map(mapCtx, conn.LocalAddr().(*net.UDPAddr).Port, "chast host "+cfg.ID)
+		mapCancel()
+		if mapErr != nil {
+			h.log.Warn("UPnP mapping unavailable", "error", mapErr)
+		} else {
+			h.upnpPort = mapper.ExternalPort()
+			h.log.Info("UPnP port mapped", "external_port", h.upnpPort,
+				"internal_port", conn.LocalAddr().(*net.UDPAddr).Port,
+				"gateway", mapper.Gateway().ControlURL)
+			go renewUPnP(ctx, h.log, mapper)
+		}
+	}
 
 	go h.readLoop()
 	go h.keepaliveLoop()
@@ -195,6 +239,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	go h.refreshLoop()
 	if h.carrier != nil {
 		go h.carrierLinkLoop()
+	}
+	if cfg.AuditSpool != "" {
+		go h.auditSpoolLoop(cfg.AuditSpool)
 	}
 
 	h.log.Info("host agent listening", "on", conn.LocalAddr().String(), "forwarding_to", local.String(), "relay", reg.Relay)
@@ -214,20 +261,22 @@ func (h *HostAgent) Info() HostInfo {
 
 func (h *HostAgent) infoLocked() HostInfo {
 	return HostInfo{
-		ID:     h.cfg.ID,
-		Listen: h.conn.LocalAddr().String(),
-		Punch:  addrValue(h.punch),
-		Relay:  addrValue(h.relay),
-		Viewer: addrValue(h.viewer),
-		Path:   h.viewerPath,
-		NAT:    h.natType,
+		ID:           h.cfg.ID,
+		Listen:       h.conn.LocalAddr().String(),
+		Punch:        addrValue(h.punch),
+		Relay:        addrValue(h.relay),
+		Viewer:       addrValue(h.viewer),
+		Path:         h.viewerPath,
+		NAT:          h.natType,
+		UPnPPort:     h.upnpPort,
+		MigratedFrom: h.migratedFrom,
 	}
 }
 
 func (h *HostAgent) reportInfo() {
 	h.mu.Lock()
 	info := h.infoLocked()
-	key := info.Relay + "|" + info.Viewer + "|" + info.Path + "|" + info.NAT
+	key := info.Relay + "|" + info.Viewer + "|" + info.Path + "|" + info.NAT + "|" + info.MigratedFrom
 	changed := key != h.lastInfo
 	h.lastInfo = key
 	h.mu.Unlock()
@@ -297,6 +346,10 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	if err != nil {
 		h.log.Warn("registration returned an unusable punch address", "punch", reg.Punch, "error", err)
 	}
+	punch6, err := resolveUDP(reg.PunchV6)
+	if err != nil {
+		h.log.Warn("registration returned an unusable IPv6 punch address", "punch_v6", reg.PunchV6, "error", err)
+	}
 	relay, err := resolveUDP(reg.Relay)
 	if err != nil {
 		h.log.Warn("registration returned an unusable relay address", "relay", reg.Relay, "error", err)
@@ -309,6 +362,12 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	h.mu.Lock()
 	if punch != nil {
 		h.punch = punch
+	}
+	if punch6 != nil && familyAllowed(h.conn.LocalAddr().(*net.UDPAddr).IP, punch6.IP) {
+		if !sameAddr(h.punch6, punch6) {
+			h.log.Info("IPv6 rendezvous endpoint updated", "punch_v6", punch6.String())
+		}
+		h.punch6 = punch6
 	}
 	if relay != nil && !sameAddr(h.relay, relay) {
 		h.relay = relay
@@ -359,6 +418,12 @@ func (h *HostAgent) getPunch() *net.UDPAddr {
 	return cloneAddr(h.punch)
 }
 
+func (h *HostAgent) getPunch6() *net.UDPAddr {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return cloneAddr(h.punch6)
+}
+
 func (h *HostAgent) getRelay() *net.UDPAddr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -388,6 +453,13 @@ func (h *HostAgent) relayAllowed(src *net.UDPAddr) bool {
 		}
 	}
 	return false
+}
+
+// acceptsControl admits control datagrams from either rendezvous address or a
+// relay endpoint. A dual-stack host keeps an IPv4 and an IPv6 mapping alive, so
+// dropping the IPv6 source would leave that mapping unverified.
+func (h *HostAgent) acceptsControl(src, punch, punch6 *net.UDPAddr) bool {
+	return sameAddr(src, punch) || sameAddr(src, punch6) || h.relayAllowed(src)
 }
 
 func (h *HostAgent) getNATType() string {
@@ -442,12 +514,14 @@ func (h *HostAgent) readLoop() {
 		data := buf[:n]
 		h.mu.Lock()
 		punch := cloneAddr(h.punch)
+		punch6 := cloneAddr(h.punch6)
 		h.mu.Unlock()
 
 		if wire.IsControl(data) {
-			if sameAddr(src, punch) || h.relayAllowed(src) {
+			if h.acceptsControl(src, punch, punch6) {
 				h.handleControl(data, src)
 			}
+
 			// A punch from a viewer is only a NAT probe; there is nothing to
 			// forward. The host's own punch was sent when the server notified it.
 			continue
@@ -466,13 +540,15 @@ func (h *HostAgent) readLoop() {
 }
 
 // noteViewer records a new viewer path and reports a change. A relayed viewer
-// is seen by this agent as the relay endpoint, while a direct viewer keeps its
-// own public address.
+// is seen by this agent as one of the relay endpoints, while a direct viewer
+// keeps its own public address.
 func (h *HostAgent) noteViewer(src *net.UDPAddr) {
-	relay := h.getRelay()
 	path := "direct"
-	if relay != nil && sameAddr(src, relay) {
-		path = "relay"
+	for _, relay := range h.relayEndpoints() {
+		if sameAddr(src, relay) {
+			path = "relay"
+			break
+		}
 	}
 	h.mu.Lock()
 	first := h.viewer == nil
@@ -500,33 +576,55 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 	}
 	switch msg.Type {
 	case wire.TypeKeepaliveChallenge:
-		if !sameAddr(src, h.getPunch()) || msg.HostID != h.cfg.ID || msg.Candidate == "" || msg.Nonce == "" {
+		if (!sameAddr(src, h.getPunch()) && !sameAddr(src, h.getPunch6())) ||
+			msg.HostID != h.cfg.ID || (msg.Candidate == "" && msg.CandidateV6 == "") || msg.Nonce == "" {
+			h.log.Debug("ignoring keepalive challenge", "from", src.String(), "host", msg.HostID,
+				"candidate", msg.Candidate, "candidate_v6", msg.CandidateV6)
 			return
 		}
-		signature := identity.Sign(h.priv, identity.KeepaliveMessage(h.cfg.ID, msg.Candidate, msg.Nonce))
+		candidate := msg.Candidate
+		if candidate == "" {
+			candidate = msg.CandidateV6
+		}
+		signature := identity.Sign(h.priv, identity.KeepaliveMessage(h.cfg.ID, candidate, msg.Nonce))
 		h.conn.WriteToUDP(wire.Encode(wire.Message{
-			Type:       wire.TypeKeepaliveAuth,
-			HostID:     h.cfg.ID,
-			Nonce:      msg.Nonce,
-			Candidate:  msg.Candidate,
-			Signature:  signature,
-			LocalAddrs: h.localAddrs,
-			NATType:    h.getNATType(),
+			Type:         wire.TypeKeepaliveAuth,
+			HostID:       h.cfg.ID,
+			Nonce:        msg.Nonce,
+			Candidate:    msg.Candidate,
+			CandidateV6:  msg.CandidateV6,
+			Signature:    signature,
+			LocalAddrs:   h.localAddrs,
+			LocalAddrsV6: h.localAddrsV6,
+			NATType:      h.getNATType(),
+			UpnpPort:     h.upnpPort,
 		}), src)
 	case wire.TypeKeepaliveAck:
 		if !msg.OK {
 			h.log.Warn("keepalive refused", "error", msg.Error)
 			return
 		}
-		h.noteObserved(true, msg.Candidate)
+		if msg.Candidate != "" {
+			h.noteObserved(true, msg.Candidate)
+		}
 		h.keepaliveOnce.Do(func() { close(h.keepaliveReady) })
 	case wire.TypePunchPeer:
 		peer, err := resolveUDP(msg.Candidate)
 		if err != nil || peer == nil {
-			return
+			peer, err = resolveUDP(msg.CandidateV6)
+			if err != nil || peer == nil {
+				return
+			}
 		}
 		h.log.Info("punch request from viewer", "candidate", peer.String())
 		go h.sendPunches(peer, msg.Nonce)
+		// The viewer's gateway mapping stays reachable even when its observed
+		// source port differs per destination (symmetric NAT).
+		if mapped, err := resolveUDP(candidateWithUpnpPort(msg.Candidate, msg.UpnpPort)); err == nil &&
+			mapped != nil && !sameAddr(mapped, peer) {
+			h.log.Info("punching the viewer's UPnP mapping", "candidate", mapped.String())
+			go h.sendPunches(mapped, msg.Nonce)
+		}
 	case wire.TypeRelayChallenge:
 		if !h.relayAllowed(src) || msg.HostID != h.cfg.ID ||
 			msg.Candidate == "" || msg.Nonce == "" {
@@ -569,8 +667,17 @@ func (h *HostAgent) sendKeepalive() {
 	if punch == nil {
 		return
 	}
-	msg := wire.Message{Type: wire.TypeKeepalive, HostID: h.cfg.ID}
-	h.conn.WriteToUDP(wire.Encode(msg), punch)
+	msg := wire.Encode(wire.Message{Type: wire.TypeKeepalive, HostID: h.cfg.ID})
+	if _, err := h.conn.WriteToUDP(msg, punch); err != nil {
+		h.log.Debug("IPv4 keepalive write failed", "punch", punch.String(), "error", err)
+	}
+	// A second keepalive over IPv6 keeps that mapping alive independently;
+	// without it the server can only ever hand out the IPv4 mapping.
+	if punch6 := h.getPunch6(); punch6 != nil {
+		if _, err := h.conn.WriteToUDP(msg, punch6); err != nil {
+			h.log.Debug("IPv6 keepalive write failed", "punch6", punch6.String(), "error", err)
+		}
+	}
 }
 
 func (h *HostAgent) keepaliveLoop() {
@@ -591,12 +698,12 @@ func (h *HostAgent) relayHelloLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	send := func() {
-		relay := h.getRelay()
-		if relay == nil {
-			return
+		raw := wire.Encode(wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID})
+		// Every advertised endpoint is a way into the same lease. A dual-stack
+		// host authenticates on each family so a viewer can pick either one.
+		for _, relay := range h.relayEndpoints() {
+			h.conn.WriteToUDP(raw, relay)
 		}
-		msg := wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID}
-		h.conn.WriteToUDP(wire.Encode(msg), relay)
 	}
 	send()
 	for {
@@ -810,7 +917,7 @@ func (h *HostAgent) refreshLoop() {
 		case <-time.After(every):
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
-		reg, err := h.api.register(ctx, h.cfg.ID, h.priv, h.cfg.Fingerprint)
+		reg, err := h.api.register(ctx, h.cfg.ID, h.cfg.OldID, h.priv, h.cfg.Fingerprint)
 		cancel()
 		if err != nil {
 			h.log.Warn("registration refresh failed", "error", err)

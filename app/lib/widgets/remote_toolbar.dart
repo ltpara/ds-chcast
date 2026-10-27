@@ -50,6 +50,9 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSetAudioProcessing,
     required this.privacyAvailable,
     required this.privacyEnabled,
+    required this.portForwardAvailable,
+    required this.portForwardActive,
+    required this.onOpenPortForward,
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
@@ -70,9 +73,15 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSendFile,
     required this.chatOpen,
     required this.onToggleChat,
+    required this.terminalAvailable,
+    required this.terminalOpen,
+    required this.onToggleTerminal,
     required this.onToggleAudio,
     required this.onToggleMicrophone,
     required this.onTogglePrivacy,
+    this.recordingAvailable = false,
+    this.recording = false,
+    this.onToggleRecording,
     required this.onTogglePin,
     required this.onToggleStats,
     required this.onToggleFullscreen,
@@ -114,6 +123,13 @@ class RemoteToolbar extends StatelessWidget {
   final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
+
+  /// A viewer-side port-forward listener is running and the host accepted
+  /// the target; the button stays enabled either way so the dialog can stop
+  /// or replace it.
+  final bool portForwardAvailable;
+  final bool portForwardActive;
+  final VoidCallback onOpenPortForward;
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
@@ -136,9 +152,19 @@ class RemoteToolbar extends StatelessWidget {
   final VoidCallback onSendFile;
   final bool chatOpen;
   final VoidCallback onToggleChat;
+  final bool terminalAvailable;
+  final bool terminalOpen;
+  final VoidCallback onToggleTerminal;
   final VoidCallback onToggleAudio;
   final VoidCallback onToggleMicrophone;
   final VoidCallback onTogglePrivacy;
+
+  /// Viewer-side recording. Recording is local to this viewer: nothing is sent
+  /// to the host and nothing is uploaded. The switch is optional so tests and
+  /// hosts without a session can keep the toolbar unchanged.
+  final bool recordingAvailable;
+  final bool recording;
+  final VoidCallback? onToggleRecording;
   final VoidCallback onTogglePin;
   final VoidCallback onToggleStats;
   final VoidCallback onToggleFullscreen;
@@ -447,6 +473,17 @@ class RemoteToolbar extends StatelessWidget {
               onTap: onToggleChat,
             ),
             _BarButton(
+              icon: Icons.terminal_rounded,
+              tooltip: !terminalAvailable
+                  ? '服务端未开放远程终端'
+                  : terminalOpen
+                      ? '关闭远程终端'
+                      : '远程终端',
+              disabled: !terminalAvailable,
+              active: terminalOpen,
+              onTap: onToggleTerminal,
+            ),
+            _BarButton(
               icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
               tooltip: !audioAvailable
                   ? '服务端未启用声音'
@@ -484,6 +521,32 @@ class RemoteToolbar extends StatelessWidget {
               disabled: !privacyAvailable,
               active: privacyEnabled,
               onTap: onTogglePrivacy,
+            ),
+            _BarButton(
+              icon: recording
+                  ? Icons.stop_circle_rounded
+                  : Icons.fiber_manual_record_rounded,
+              tooltip: !recordingAvailable
+                  ? '会话建立后可录制到本地'
+                  : recording
+                      ? '停止录制（保存为本地 MP4）'
+                      : '录制到本地（保存为 MP4）',
+              disabled: !recordingAvailable,
+              active: recording,
+              onTap: () => onToggleRecording?.call(),
+            ),
+            _BarButton(
+              icon: portForwardActive
+                  ? Icons.alt_route_rounded
+                  : Icons.alt_route,
+              tooltip: !portForwardAvailable
+                  ? '服务端未开放端口转发'
+                  : portForwardActive
+                      ? '端口转发进行中（点击查看或停止）'
+                      : '端口转发',
+              disabled: !portForwardAvailable,
+              active: portForwardActive,
+              onTap: onOpenPortForward,
             ),
             _BarButton(
               icon: Icons.speed_rounded,

@@ -4,11 +4,15 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <utility>
 #include <vector>
+
+#include "mp4_recorder.h"
 
 #include "chast/audio.h"
 #include "chast/carrier.h"
@@ -16,6 +20,7 @@
 #include "chast/decoder.h"
 #include "chast/file_transfer.h"
 #include "chast/identity.h"
+#include "chast/port_forward_client.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
 #include "chast/security.h"
@@ -35,6 +40,35 @@ constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 constexpr auto kProbeInterval = std::chrono::seconds(1);
 constexpr auto kClipboardPollInterval = std::chrono::milliseconds(500);
+
+// A recording file name that is unlikely to collide: the local wall clock.
+// Mp4Recorder appends "-N" to the stem when a size change rolls over.
+std::string record_file_path(const std::string& directory) {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_s(&local, &now);
+    char stamp[32];
+    std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d",
+                  local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                  local.tm_hour, local.tm_min, local.tm_sec);
+    return (std::filesystem::path(directory) / ("chast-" + std::string(stamp) + ".mp4"))
+        .string();
+}
+
+// Where recordings land when the UI does not name a folder. RustDesk keeps
+// them in the user's Videos directory; this matches that default.
+std::string default_record_directory() {
+    char* profile = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&profile, &length, "USERPROFILE") == 0 && profile != nullptr) {
+        std::string value(profile);
+        std::free(profile);
+        if (!value.empty()) {
+            return (std::filesystem::path(value) / "Videos").string();
+        }
+    }
+    return std::filesystem::current_path().string();
+}
 // How long one receive-loop pass may spend writing an upload, so a large file
 // cannot starve video, audio and input.
 constexpr auto kFileSendBudget = std::chrono::milliseconds(8);
@@ -45,6 +79,9 @@ constexpr auto kFileSendBudget = std::chrono::milliseconds(8);
 constexpr double kFileUploadBytesPerSecond = 32.0 * 1024.0 * 1024.0;
 constexpr double kFileUploadBurst = 256.0 * 1024.0;
 constexpr size_t kMaxPendingInput = 256;
+// The viewer runs one console per session; the id only has to be stable
+// within that session.
+constexpr uint32_t kViewerTerminalId = 1;
 // Safety valve for a folder that expands into a huge tree; the UI would
 // otherwise build an unbounded queue on the session thread.
 constexpr size_t kMaxQueuedUploads = 10000;
@@ -243,6 +280,13 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     }
     file_worker_ = std::thread(&ViewerEngine::FileWorker, this);
     device_identity_ = std::move(device_identity);
+    // One reference per session ties the viewer's own audit report to the
+    // records the host writes for the same session and uploads.
+    uint8_t ref_bytes[16]{};
+    std::string audit_ref;
+    if (chast::secure_random(ref_bytes, sizeof(ref_bytes))) {
+        audit_ref = chast::hex_encode(ref_bytes, sizeof(ref_bytes));
+    }
     std::string selected_output;
     {
         std::lock_guard<std::mutex> lock(audio_output_mutex_);
@@ -261,6 +305,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         status_.audio_aec = microphone_aec_.load(std::memory_order_relaxed);
         status_.audio_noise_suppression =
             microphone_noise_.load(std::memory_order_relaxed);
+        status_.audit_ref = audit_ref;
         started_at_ = Clock::now();
     }
     {
@@ -293,11 +338,27 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     // A SAS request queued for a session that ended must not fire into the
     // next one.
     pending_sas_.store(false, std::memory_order_release);
+    // Port forwarding belongs to one session too; the listener lives on the
+    // session thread and goes away with it.
+    {
+        std::lock_guard<std::mutex> lock(port_forward_mutex_);
+        pending_port_forward_.reset();
+    }
     // Chat belongs to one viewer session in both directions.
     {
         std::lock_guard<std::mutex> lock(chat_mutex_);
         pending_chat_.clear();
         received_chat_.clear();
+    }
+    // A console belongs to one session too; neither its commands nor its
+    // unread output may leak into the next connection.
+    {
+        std::lock_guard<std::mutex> lock(terminal_mutex_);
+        pending_terminal_.clear();
+        pending_terminal_bytes_ = 0;
+        terminal_output_.clear();
+        terminal_output_bytes_ = 0;
+        terminal_output_ended_ = true;
     }
     // Microphone capture is a per-session privacy decision: every session
     // starts with the uplink off, while the chosen device is remembered.
@@ -309,7 +370,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                           std::move(access_token), std::move(password),
                           std::move(totp), trust_device, transport,
                           std::move(carrier_host), carrier_port,
-                          std::move(carrier_host_id), std::move(carrier_token));
+                          std::move(carrier_host_id), std::move(carrier_token),
+                          std::move(audit_ref));
     return true;
 }
 
@@ -716,6 +778,21 @@ bool ViewerEngine::SetAudioMuted(bool mute) {
     return true;
 }
 
+bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
+    if (enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming) {
+            return false;
+        }
+    }
+    if (!directory.empty()) {
+        std::lock_guard<std::mutex> lock(record_mutex_);
+        record_dir_ = std::move(directory);
+    }
+    record_wanted_.store(enabled, std::memory_order_relaxed);
+    return true;
+}
+
 bool ViewerEngine::SetMicrophone(bool enabled) {
     if (enabled) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -819,6 +896,177 @@ bool ViewerEngine::TakeChat(std::string& text) {
     return true;
 }
 
+bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows) {
+    if (!chast::valid_terminal_size(columns, rows)) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionTerminal) == 0) {
+            return false;
+        }
+        if (status_.terminal_phase == TerminalPhase::kRequesting ||
+            status_.terminal_phase == TerminalPhase::kOpen) {
+            return false;
+        }
+        status_.terminal_phase = TerminalPhase::kRequesting;
+        status_.terminal_code = 0;
+        status_.terminal_reason.clear();
+        status_.terminal_error.clear();
+        status_.terminal_columns = columns;
+        status_.terminal_rows = rows;
+        ++status_.terminal_updates;
+    }
+    std::lock_guard<std::mutex> lock(terminal_mutex_);
+    // The previous console's bytes must be on the panel before its phase can
+    // mean anything for a new one.
+    if (!terminal_output_ended_) {
+        return false;
+    }
+    // Leftovers from the previous console would be printed as if they
+    // belonged to this one.
+    terminal_output_.clear();
+    terminal_output_bytes_ = 0;
+    terminal_output_ended_ = false;
+    TerminalCommand command;
+    command.kind = TerminalCommand::Kind::kOpen;
+    command.columns = columns;
+    command.rows = rows;
+    pending_terminal_.push_back(std::move(command));
+    return true;
+}
+
+bool ViewerEngine::SendTerminalInput(const std::string& bytes) {
+    if (bytes.empty() || !running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.terminal_phase != TerminalPhase::kOpen) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(terminal_mutex_);
+    if (pending_terminal_bytes_ + bytes.size() >
+        chast::kTerminalInputHighWaterBytes) {
+        return false;
+    }
+    TerminalCommand command;
+    command.kind = TerminalCommand::Kind::kInput;
+    command.bytes = bytes;
+    pending_terminal_bytes_ += command.bytes.size();
+    pending_terminal_.push_back(std::move(command));
+    return true;
+}
+
+bool ViewerEngine::ResizeTerminal(uint16_t columns, uint16_t rows) {
+    if (!chast::valid_terminal_size(columns, rows) ||
+        !running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.terminal_phase != TerminalPhase::kOpen &&
+            status_.terminal_phase != TerminalPhase::kRequesting) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(terminal_mutex_);
+    // A resize that has not been sent yet is replaced: the console only needs
+    // where the panel is now.
+    for (TerminalCommand& command : pending_terminal_) {
+        if (command.kind == TerminalCommand::Kind::kResize) {
+            command.columns = columns;
+            command.rows = rows;
+            return true;
+        }
+    }
+    TerminalCommand command;
+    command.kind = TerminalCommand::Kind::kResize;
+    command.columns = columns;
+    command.rows = rows;
+    pending_terminal_.push_back(std::move(command));
+    return true;
+}
+
+void ViewerEngine::CloseTerminal() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.terminal_phase == TerminalPhase::kRequesting ||
+            status_.terminal_phase == TerminalPhase::kOpen) {
+            status_.terminal_phase = TerminalPhase::kClosed;
+            status_.terminal_code = 0;
+            status_.terminal_reason.clear();
+            status_.terminal_error.clear();
+            ++status_.terminal_updates;
+        }
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(terminal_mutex_);
+    // Input queued after this close is pointless; the close itself stays.
+    for (auto it = pending_terminal_.begin(); it != pending_terminal_.end();) {
+        if (it->kind == TerminalCommand::Kind::kInput) {
+            pending_terminal_bytes_ -= std::min(pending_terminal_bytes_, it->bytes.size());
+            it = pending_terminal_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    TerminalCommand command;
+    command.kind = TerminalCommand::Kind::kClose;
+    pending_terminal_.push_back(std::move(command));
+}
+
+bool ViewerEngine::TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended) {
+    std::lock_guard<std::mutex> lock(terminal_mutex_);
+    if (terminal_output_.empty()) {
+        ended = terminal_output_ended_;
+        return false;
+    }
+    data = std::move(terminal_output_.front());
+    terminal_output_.pop_front();
+    terminal_output_bytes_ -=
+        std::min(terminal_output_bytes_, data.size());
+    ended = terminal_output_ended_ && terminal_output_.empty();
+    return true;
+}
+
+bool ViewerEngine::StartPortForward(uint16_t local_port,
+                                    const std::string& remote_host,
+                                    uint16_t remote_port) {
+    if (!running_.load(std::memory_order_acquire) || remote_host.empty() ||
+        remote_port == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionPortForward) == 0) {
+            return false;
+        }
+    }
+    PortForwardCommand command;
+    command.local_port = local_port;
+    command.remote_host = remote_host;
+    command.remote_port = remote_port;
+    std::lock_guard<std::mutex> lock(port_forward_mutex_);
+    pending_port_forward_ = std::move(command);
+    return true;
+}
+
+void ViewerEngine::StopPortForward() {
+    PortForwardCommand command;
+    command.stop = true;
+    std::lock_guard<std::mutex> lock(port_forward_mutex_);
+    pending_port_forward_ = std::move(command);
+}
+
 ViewerStatus ViewerEngine::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     ViewerStatus status = status_;
@@ -842,7 +1090,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string access_token, std::string password,
                        std::string totp, bool trust_device, ViewerTransport transport,
                        std::string carrier_host, uint16_t carrier_port,
-                       std::string carrier_host_id, std::string carrier_token) {
+                       std::string carrier_host_id, std::string carrier_token,
+                       std::string audit_ref) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -984,6 +1233,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
 
     // Folds the worker's counters into the status the UI polls. Called from
     // this thread only; the window counters are reset once per second.
+    // Viewer-side recording. The muxer lives on this thread; the UI only
+    // crosses the wanted flag and the folder. The folder is read when a file
+    // starts, so a choice made mid-session applies to the next segment.
+    std::unique_ptr<chast_tools::Mp4Recorder> recorder;
+    std::string record_error;
+
     auto sync_status = [&](bool final) {
         const auto now = Clock::now();
         const double window_seconds =
@@ -1123,6 +1378,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.microphone_recoveries = microphone_recoveries;
             status_.microphone_recovering = microphone_recovering;
             status_.microphone_error = microphone_error;
+            status_.recording = recorder != nullptr;
+            if (recorder) {
+                status_.record_samples = recorder->samples();
+                status_.record_keyframes = recorder->keyframes();
+                status_.record_skipped = recorder->skipped();
+                status_.record_segments =
+                    static_cast<uint32_t>(recorder->segments().size());
+                status_.record_path =
+                    recorder->segments().empty() ? std::string() : recorder->segments().back();
+            }
+            status_.record_error = record_error;
             status_.privacy_supported = privacy_supported;
             status_.privacy_enabled = privacy_enabled;
             status_.privacy_code = privacy_code;
@@ -1171,6 +1437,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     // has been destroyed.
     std::unique_ptr<chast::CarrierBridge> carrier_bridge;
     std::unique_ptr<chast::QuicSession> session;
+    // Declared after the session so its destructor (which tells the host to
+    // drop the target) runs while the connection still exists.
+    std::unique_ptr<chast::PortForwardClient> port_forward;
 
     // Stops the uplink: the capture thread first (it owns the endpoint), then
     // the CMIC stream, so the host sees the switch go off. `switch_off`
@@ -1281,6 +1550,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         client_config.totp = totp;
         client_config.device_identity = device_identity_.get();
         client_config.trust_device = trust_device;
+        client_config.audit_ref = audit_ref;
         std::string create_error;
         session = chast::QuicSession::create_client(client_config, &create_error);
         if (!session) {
@@ -1407,6 +1677,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 std::string setup_error;
                 chast::AudioPlayerConfig player_config;
                 player_config.device_id = wanted;
+                // System audio plays as it arrives: no fixed lead and no
+                // host-timeline scheduling, so it cannot trail the video by a
+                // jitter buffer it does not need. Capture stamps still space
+                // blocks inside a burst; the stale drop and queue cap bound
+                // the delay after a stall.
+                player_config.arrival_anchored = true;
+                player_config.lead_ms = 0;
                 std::unique_ptr<chast::IAudioPlayer> player =
                     chast::create_audio_player(player_config, &setup_error);
                 std::string used = wanted;
@@ -1428,9 +1705,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 }
                 const bool muted = audio_muted_.load(std::memory_order_relaxed);
                 player->set_mute(muted);
-                if (clock_synced) {
-                    player->set_clock_offset(clock_offset_us / 1000);
-                }
                 chast::Error started = player->start();
                 if (!started.ok()) {
                     *note = started.to_string();
@@ -1505,6 +1779,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 const bool clipboard = (mask & chast::kPermissionClipboard) != 0;
                 const bool microphone = (mask & chast::kPermissionMicrophone) != 0;
                 const bool privacy = (mask & chast::kPermissionPrivacyMode) != 0;
+                const bool forward_allowed =
+                    (mask & chast::kPermissionPortForward) != 0;
+                const bool terminal_allowed =
+                    (mask & chast::kPermissionTerminal) != 0;
                 {
                     std::lock_guard<std::mutex> lock(input_mutex_);
                     input_enabled_ = input;
@@ -1523,6 +1801,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.clipboard_enabled = clipboard;
                     status_.microphone_authorized = microphone;
                     status_.privacy_supported = privacy;
+                    status_.port_forward_enabled = forward_allowed;
+                    status_.terminal_supported = terminal_allowed;
                 }
                 // The transport aborts the stream on revocation; stopping here
                 // releases the microphone at once and tells the UI why.
@@ -2771,6 +3051,413 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Remote terminal. The panel drives one console through the
+                // command queue; this thread owns the session, so request,
+                // input, resize and the stop all leave from here in order.
+                // `terminal_active` means the session holds an entry for
+                // kViewerTerminalId; `terminal_closing` means a stop went out
+                // or came in and the remaining output is still draining.
+                bool terminal_active = false;
+                bool terminal_closing = false;
+                uint64_t terminal_bytes = 0;
+
+                auto set_terminal_phase = [&](TerminalPhase phase, int code,
+                                              std::string reason, std::string error) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.terminal_phase = phase;
+                    status_.terminal_code = code;
+                    status_.terminal_reason = std::move(reason);
+                    status_.terminal_error = std::move(error);
+                    ++status_.terminal_updates;
+                };
+                auto terminal_phase_is = [&](TerminalPhase phase) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    return status_.terminal_phase == phase;
+                };
+
+                // Forgets the session-side entry once its output is done. The
+                // UI keeps whatever was already handed over, and the phase it
+                // sees next poll is the caller's.
+                auto finish_terminal = [&] {
+                    session->close_terminal(kViewerTerminalId);
+                    terminal_active = false;
+                    terminal_closing = false;
+                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                    terminal_output_ended_ = true;
+                };
+
+                auto drain_terminal = [&] {
+                    while (true) {
+                        TerminalCommand command;
+                        {
+                            std::lock_guard<std::mutex> lock(terminal_mutex_);
+                            if (pending_terminal_.empty()) {
+                                return;
+                            }
+                            command = std::move(pending_terminal_.front());
+                            pending_terminal_.pop_front();
+                            if (command.kind == TerminalCommand::Kind::kInput) {
+                                pending_terminal_bytes_ -= std::min(
+                                    pending_terminal_bytes_, command.bytes.size());
+                            }
+                        }
+                        switch (command.kind) {
+                            case TerminalCommand::Kind::kOpen: {
+                                if ((session->permissions() & chast::kPermissionTerminal) ==
+                                    0) {
+                                    set_terminal_phase(
+                                        TerminalPhase::kFailed, 0, {},
+                                        "the host did not grant remote terminals");
+                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                    terminal_output_ended_ = true;
+                                    continue;
+                                }
+                                if (terminal_active) {
+                                    // The previous console is still draining;
+                                    // opening now would mix its bytes into the
+                                    // new panel.
+                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                    pending_terminal_.push_front(std::move(command));
+                                    return;
+                                }
+                                chast::Error requested = session->request_terminal(
+                                    kViewerTerminalId, command.columns, command.rows);
+                                if (!requested.ok()) {
+                                    set_terminal_phase(TerminalPhase::kFailed, 0, {},
+                                                       "request: " +
+                                                           requested.to_string());
+                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                    terminal_output_ended_ = true;
+                                    continue;
+                                }
+                                terminal_active = true;
+                                terminal_closing = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    status_.terminal_columns = command.columns;
+                                    status_.terminal_rows = command.rows;
+                                }
+                                std::fprintf(stderr,
+                                             "viewer: terminal requested %ux%u\n",
+                                             command.columns, command.rows);
+                                continue;
+                            }
+                            case TerminalCommand::Kind::kInput: {
+                                if (!terminal_active || terminal_closing) {
+                                    continue;
+                                }
+                                bool retry = false;
+                                while (!command.bytes.empty()) {
+                                    const size_t chunk = std::min(
+                                        command.bytes.size(), chast::kMaxTerminalChunkBytes);
+                                    chast::Error sent = session->send_terminal_input(
+                                        kViewerTerminalId,
+                                        reinterpret_cast<const uint8_t*>(
+                                            command.bytes.data()),
+                                        chunk, std::chrono::milliseconds(0));
+                                    if (sent.status() == chast::Status::WaitTimeout) {
+                                        retry = true;
+                                        break;
+                                    }
+                                    if (!sent.ok()) {
+                                        set_terminal_phase(TerminalPhase::kFailed, 0, {},
+                                                           "send input: " +
+                                                               sent.to_string());
+                                        terminal_closing = true;
+                                        break;
+                                    }
+                                    command.bytes.erase(0, chunk);
+                                }
+                                if (retry && !command.bytes.empty()) {
+                                    std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                    pending_terminal_bytes_ += command.bytes.size();
+                                    pending_terminal_.push_front(std::move(command));
+                                    return;
+                                }
+                                continue;
+                            }
+                            case TerminalCommand::Kind::kResize: {
+                                if (!terminal_active || terminal_closing) {
+                                    continue;
+                                }
+                                chast::Error sent = session->send_terminal_resize(
+                                    kViewerTerminalId, command.columns, command.rows);
+                                if (!sent.ok()) {
+                                    std::fprintf(stderr,
+                                                 "viewer: terminal resize %ux%u: %s\n",
+                                                 command.columns, command.rows,
+                                                 sent.to_string().c_str());
+                                    continue;
+                                }
+                                std::lock_guard<std::mutex> lock(mutex_);
+                                status_.terminal_columns = command.columns;
+                                status_.terminal_rows = command.rows;
+                                continue;
+                            }
+                            case TerminalCommand::Kind::kClose: {
+                                if (terminal_active && !terminal_closing) {
+                                    chast::Error stopped = session->send_terminal_stop(
+                                        kViewerTerminalId,
+                                        chast::TerminalCode::Cancelled,
+                                        "closed by the viewer");
+                                    terminal_closing = true;
+                                    if (!stopped.ok()) {
+                                        std::lock_guard<std::mutex> lock(mutex_);
+                                        status_.terminal_error =
+                                            "close: " + stopped.to_string();
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                auto poll_terminal = [&] {
+                    chast::TerminalResult result;
+                    while (session->take_terminal_result(result)) {
+                        if (result.terminal_id != kViewerTerminalId) {
+                            continue;
+                        }
+                        if (terminal_phase_is(TerminalPhase::kClosed)) {
+                            // The panel closed while the answer was in
+                            // flight; the host's console must not outlive it.
+                            if (result.code == chast::TerminalCode::Ok) {
+                                session->close_terminal(kViewerTerminalId);
+                                terminal_active = false;
+                                terminal_closing = false;
+                                std::lock_guard<std::mutex> lock(terminal_mutex_);
+                                terminal_output_ended_ = true;
+                            }
+                            continue;
+                        }
+                        if (result.code != chast::TerminalCode::Ok) {
+                            terminal_active = false;
+                            terminal_closing = false;
+                            set_terminal_phase(TerminalPhase::kFailed,
+                                               static_cast<int>(result.code),
+                                               result.reason, {});
+                            std::fprintf(stderr, "viewer: terminal refused: %s\n",
+                                         result.reason.empty() ? "no reason given"
+                                                               : result.reason.c_str());
+                            std::lock_guard<std::mutex> lock(terminal_mutex_);
+                            terminal_output_ended_ = true;
+                            continue;
+                        }
+                        chast::Error opened = session->open_terminal_input(kViewerTerminalId);
+                        if (!opened.ok()) {
+                            session->close_terminal(kViewerTerminalId);
+                            terminal_active = false;
+                            terminal_closing = false;
+                            set_terminal_phase(
+                                TerminalPhase::kFailed,
+                                static_cast<int>(chast::TerminalCode::Failed), {},
+                                "input stream: " + opened.to_string());
+                            std::lock_guard<std::mutex> lock(terminal_mutex_);
+                            terminal_output_ended_ = true;
+                            continue;
+                        }
+                        set_terminal_phase(TerminalPhase::kOpen, 0, {}, {});
+                        std::fprintf(stderr, "viewer: terminal open\n");
+                    }
+
+                    chast::TerminalStop stop;
+                    while (session->take_terminal_stop(stop)) {
+                        if (stop.terminal_id != kViewerTerminalId || !terminal_active) {
+                            continue;
+                        }
+                        terminal_closing = true;
+                        // A local close already told the panel why it ended;
+                        // a host stop is the answer for everything else.
+                        if (!terminal_phase_is(TerminalPhase::kClosed) &&
+                            !terminal_phase_is(TerminalPhase::kFailed)) {
+                            set_terminal_phase(TerminalPhase::kEnded,
+                                               static_cast<int>(stop.code), stop.reason,
+                                               {});
+                        }
+                        std::fprintf(stderr, "viewer: terminal stopped: %s\n",
+                                     stop.reason.empty() ? "no reason given"
+                                                         : stop.reason.c_str());
+                    }
+
+                    if (!terminal_active) {
+                        return;
+                    }
+                    if ((session->permissions() & chast::kPermissionTerminal) == 0) {
+                        // The transport aborted the streams and the session
+                        // forgot the entry; anything received before that stays
+                        // queued for the panel.
+                        finish_terminal();
+                        set_terminal_phase(TerminalPhase::kFailed, 0, {},
+                                           "the host revoked terminal access");
+                        return;
+                    }
+                    for (;;) {
+                        {
+                            std::lock_guard<std::mutex> lock(terminal_mutex_);
+                            if (terminal_output_bytes_ >=
+                                chast::kTerminalReceiveHighWaterBytes) {
+                                // The panel has not caught up. Stop pulling so
+                                // the session's receive window pauses the host
+                                // instead of truncating the picture.
+                                break;
+                            }
+                        }
+                        std::vector<uint8_t> data;
+                        bool ended = false;
+                        if (!session->take_terminal_output(kViewerTerminalId, data,
+                                                           ended)) {
+                            if (ended) {
+                                // A host-initiated ending carries its own stop;
+                                // a lost one is still an ending.
+                                if (terminal_phase_is(TerminalPhase::kOpen) ||
+                                    terminal_phase_is(TerminalPhase::kRequesting)) {
+                                    set_terminal_phase(TerminalPhase::kEnded, 0, {},
+                                                       {});
+                                }
+                                finish_terminal();
+                            }
+                            break;
+                        }
+                        terminal_bytes += data.size();
+                        {
+                            std::lock_guard<std::mutex> lock(terminal_mutex_);
+                            terminal_output_bytes_ += data.size();
+                            terminal_output_.push_back(std::move(data));
+                        }
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.terminal_bytes = terminal_bytes;
+                    }
+                };
+
+                // Port forwarding. The operator's target crosses the mutex;
+                // the listener and every relay are driven here by pump(). The
+                // counters add up across targets, so the status stays
+                // session-wide even when a target is replaced.
+                uint64_t forward_connections_done = 0;
+                uint64_t forward_failures_done = 0;
+                uint64_t forward_bytes_up_done = 0;
+                uint64_t forward_bytes_down_done = 0;
+                std::string last_forward_error;
+
+                auto drop_port_forward = [&] {
+                    if (!port_forward) {
+                        return;
+                    }
+                    forward_connections_done += port_forward->connections();
+                    forward_failures_done += port_forward->failures();
+                    forward_bytes_up_done += port_forward->bytes_up();
+                    forward_bytes_down_done += port_forward->bytes_down();
+                    port_forward->stop();
+                    port_forward.reset();
+                };
+
+                auto drain_port_forward = [&] {
+                    std::optional<PortForwardCommand> command;
+                    {
+                        std::lock_guard<std::mutex> lock(port_forward_mutex_);
+                        command.swap(pending_port_forward_);
+                    }
+                    if (!command) {
+                        return;
+                    }
+                    drop_port_forward();
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.port_forward_active = false;
+                        status_.port_forward_local_port = 0;
+                        status_.port_forward_remote_host.clear();
+                        status_.port_forward_remote_port = 0;
+                        status_.port_forward_error.clear();
+                        status_.port_forward_connections = forward_connections_done;
+                        status_.port_forward_failures = forward_failures_done;
+                        status_.port_forward_bytes_up = forward_bytes_up_done;
+                        status_.port_forward_bytes_down = forward_bytes_down_done;
+                    }
+                    last_forward_error.clear();
+                    if (command->stop) {
+                        return;
+                    }
+                    if ((session->permissions() & chast::kPermissionPortForward) == 0) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.port_forward_error =
+                            "the host did not grant port forwarding";
+                        return;
+                    }
+                    auto client = std::make_unique<chast::PortForwardClient>(*session);
+                    uint16_t bound = 0;
+                    const chast::Error started = client->start(
+                        command->remote_host, command->remote_port, command->local_port,
+                        &bound);
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.port_forward_remote_host = command->remote_host;
+                        status_.port_forward_remote_port = command->remote_port;
+                        if (started.ok()) {
+                            status_.port_forward_local_port = bound;
+                        } else {
+                            status_.port_forward_local_port = 0;
+                            status_.port_forward_error =
+                                "listener: " + started.to_string();
+                        }
+                    }
+                    if (!started.ok()) {
+                        std::fprintf(stderr, "viewer: port forward: %s\n",
+                                     started.to_string().c_str());
+                        return;
+                    }
+                    std::fprintf(stderr,
+                                 "viewer: port forward listening on 127.0.0.1:%u -> %s:%u\n",
+                                 static_cast<unsigned>(bound), command->remote_host.c_str(),
+                                 static_cast<unsigned>(command->remote_port));
+                    port_forward = std::move(client);
+                };
+
+                auto poll_port_forward = [&] {
+                    if (!port_forward) {
+                        return;
+                    }
+                    if ((session->permissions() & chast::kPermissionPortForward) == 0) {
+                        // A revocation closes the local port immediately; the
+                        // transport aborts whatever was still in flight.
+                        drop_port_forward();
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.port_forward_active = false;
+                        status_.port_forward_error =
+                            "the host revoked port forwarding";
+                        status_.port_forward_connections = forward_connections_done;
+                        status_.port_forward_failures = forward_failures_done;
+                        status_.port_forward_bytes_up = forward_bytes_up_done;
+                        status_.port_forward_bytes_down = forward_bytes_down_done;
+                        return;
+                    }
+                    for (const std::string& event : port_forward->pump()) {
+                        std::fprintf(stderr, "viewer: %s\n", event.c_str());
+                    }
+                    const bool active = port_forward->running();
+                    const std::string error = port_forward->error();
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.port_forward_active = active;
+                        status_.port_forward_connections =
+                            forward_connections_done + port_forward->connections();
+                        status_.port_forward_failures =
+                            forward_failures_done + port_forward->failures();
+                        status_.port_forward_bytes_up =
+                            forward_bytes_up_done + port_forward->bytes_up();
+                        status_.port_forward_bytes_down =
+                            forward_bytes_down_done + port_forward->bytes_down();
+                        status_.port_forward_error = error;
+                    }
+                    if (error != last_forward_error) {
+                        if (!error.empty()) {
+                            std::fprintf(stderr, "viewer: port forward: %s\n",
+                                         error.c_str());
+                        }
+                        last_forward_error = error;
+                    }
+                };
+
                 // Adopts the desktop the host is capturing. Secure is the lock
                 // screen, UAC or a credential prompt; the host pauses video
                 // while it cannot follow and sends Default when it resumes.
@@ -3076,6 +3763,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     receive_chat();
                     drain_chat();
+                    poll_terminal();
+                    drain_terminal();
+                    drain_port_forward();
+                    poll_port_forward();
                     receive_desktop();
                     receive_display_switch();
                     receive_display_modes();
@@ -3094,9 +3785,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 rtt_ms = static_cast<double>(sample.rtt_us) / 1000.0;
                                 clock_offset_us = sample.offset_us;
                                 clock_synced = true;
-                                if (audio_player) {
-                                    audio_player->set_clock_offset(clock_offset_us / 1000);
-                                }
                             }
                         }
                     }
@@ -3124,7 +3812,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         (permissions & (chast::kPermissionInput |
                                         chast::kPermissionClipboard)) != 0 ||
                         file_active || audio_announced || microphone_enabled ||
-                        microphone_wanted_.load(std::memory_order_relaxed);
+                        microphone_wanted_.load(std::memory_order_relaxed) ||
+                        port_forward != nullptr || terminal_active;
                     chast::Error received_frame = session->receive_frame(
                         header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
                     // Audio and microphone packets arrive on their own streams
@@ -3139,6 +3828,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     receive_chat();
                     drain_chat();
+                    poll_terminal();
+                    drain_terminal();
+                    drain_port_forward();
+                    poll_port_forward();
                     receive_desktop();
                     receive_display_switch();
                     receive_display_modes();
@@ -3227,6 +3920,48 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         continue;
                     }
 
+                    // Viewer-side recording. The switch may arrive mid-session,
+                    // so it is applied here, on a picture the decoder also
+                    // accepts: the muxer waits for the next key frame before it
+                    // writes anything, and a size change rolls into a new file.
+                    const bool record_wanted =
+                        record_wanted_.load(std::memory_order_relaxed);
+                    if (record_wanted && !recorder) {
+                        std::string directory;
+                        {
+                            std::lock_guard<std::mutex> lock(record_mutex_);
+                            directory = record_dir_;
+                        }
+                        if (directory.empty()) {
+                            directory = default_record_directory();
+                        }
+                        std::error_code dir_ec;
+                        std::filesystem::create_directories(directory, dir_ec);
+                        std::string open_error;
+                        auto fresh = std::make_unique<chast_tools::Mp4Recorder>();
+                        if (!fresh->open(record_file_path(directory), info.codec, info.width,
+                                         info.height, &open_error)) {
+                            record_error = open_error;
+                            record_wanted_.store(false, std::memory_order_relaxed);
+                        } else {
+                            record_error.clear();
+                            std::fprintf(stderr, "viewer: recording started\n");
+                            recorder = std::move(fresh);
+                        }
+                    } else if (!record_wanted && recorder) {
+                        recorder->close();
+                        recorder.reset();
+                        std::fprintf(stderr, "viewer: recording stopped\n");
+                    }
+                    if (recorder) {
+                        recorder->write(header, payload.data(), payload.size());
+                        if (recorder->failed()) {
+                            record_error = recorder->error();
+                            recorder.reset();
+                            record_wanted_.store(false, std::memory_order_relaxed);
+                        }
+                    }
+
                     frames.clear();
                     chast::Error decode_error = decoder->decode(
                         payload.data(), payload.size(), header.pts_ms, header.keyframe, frames);
@@ -3265,6 +4000,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 }
             }
         }
+    }
+
+    // Finalise any recording before the session teardown; a file that fails
+    // here still reports why through ViewerStatus::record_error.
+    if (recorder) {
+        recorder->close();
+        if (recorder->failed()) {
+            record_error = recorder->error();
+        }
+        recorder.reset();
     }
 
     if (!stop_requested_.load(std::memory_order_acquire) && failure.empty() &&

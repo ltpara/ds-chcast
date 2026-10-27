@@ -117,6 +117,7 @@ class TunnelAgent {
     required String hostId,
     required TunnelMode mode,
     String key = '',
+    String serverPublicKey = '',
   }) {
     return <String>[
       'viewer',
@@ -129,6 +130,10 @@ class TunnelAgent {
       '--mode',
       mode.name,
       if (key.isNotEmpty) ...<String>['--server-key', key],
+      if (serverPublicKey.isNotEmpty) ...<String>[
+        '--server-pubkey',
+        serverPublicKey,
+      ],
     ];
   }
 
@@ -137,6 +142,7 @@ class TunnelAgent {
   static Future<TunnelAgent> start({
     required ServerSettings server,
     required String hostId,
+    String serverPublicKey = '',
     String? executable,
     List<String>? argumentOverride,
     Duration timeout = const Duration(seconds: 15),
@@ -151,6 +157,7 @@ class TunnelAgent {
           hostId: hostId,
           mode: server.mode,
           key: server.key,
+          serverPublicKey: serverPublicKey,
         );
     final Process process;
     try {

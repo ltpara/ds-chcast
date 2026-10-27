@@ -26,6 +26,14 @@ chast::BitrateSample healthy_sample(uint64_t packets) {
     return sample;
 }
 
+// A healthy sample that also carries the transport's wire byte counter, so
+// the controller can derive the measured delivery rate.
+chast::BitrateSample rate_sample(uint64_t packets, uint64_t bytes) {
+    chast::BitrateSample sample = healthy_sample(packets);
+    sample.sent_bytes = bytes;
+    return sample;
+}
+
 void test_severe_loss_and_cooldown() {
     chast::BitrateController controller(10000000, 1000000, 30);
     chast::BitrateDecision decision = controller.update(healthy_sample(1000), 1000);
@@ -81,6 +89,172 @@ void test_queue_pressure() {
     decision = severe.update(backed_up, 1000);
     check(decision.changed && decision.target_bps == 7000000,
           "a queue past the congestion window drops the target by 30%");
+}
+
+// A capacity step down must land in one decision, not walk down 15-30% every
+// 1.5 s while a reliable stream queues the excess. The wire byte delta is the
+// evidence the path gives; the target stops just under that rate.
+void test_capacity_step_convergence() {
+    chast::BitrateController controller(3000000, 500000, 30);
+    // Two clean samples at the full rate establish a baseline.
+    controller.update(rate_sample(1000, 5000000), 1000);
+    chast::BitrateDecision decision = controller.update(rate_sample(1100, 5375000), 1000);
+    check(!decision.changed && controller.target_bps() == 3000000,
+          "a clean rate sample leaves the target alone");
+
+    // The capacity drops 3x: the path now carries ~1 Mbps while the target
+    // still asks for 3. RTT inflates, the byte delta drops and the send queue
+    // backs up past the congestion window.
+    uint64_t bytes = 5375000;
+    chast::BitrateSample stepped = rate_sample(1200, bytes + 125000);
+    stepped.rtt_us = 50000;
+    stepped.queued_bytes = 1200000;
+    bytes += 125000;
+    decision = controller.update(stepped, 1000);
+    check(decision.changed && decision.target_bps == 650000 &&
+              std::string(decision.reason) == "rtt",
+          "a capacity step lands just under the measured delivery rate");
+
+    // The cut arms the usual down cooldown.
+    stepped.sent_packets = 1300;
+    stepped.sent_bytes = bytes + 125000;
+    bytes += 125000;
+    decision = controller.update(stepped, 1000);
+    check(!decision.changed && controller.target_bps() == 650000,
+          "the fast cut is followed by the normal down cooldown");
+
+    // Now the path delivers exactly what the 650 kbps target asks for and the
+    // queue has drained. The measured rate is not below the target, so only
+    // the percent cut applies (85% of 650 kbps, not 65% of the delivery rate
+    // again): the new signal cannot ratchet the target down on its own.
+    stepped.sent_packets = 1400;
+    stepped.sent_bytes = bytes + 200000;  // 800 kbps over 2 s
+    stepped.queued_bytes = 0;
+    bytes += 200000;
+    decision = controller.update(stepped, 2000);
+    check(decision.changed && decision.target_bps == 552500,
+          "below the delivered rate only the percent cut applies");
+
+    // Loss while the path still delivers most of the target is congestion,
+    // not a capacity step: 2.7 Mbps wire less 20% lost is 2.16 Mbps, 72% of
+    // the target, so the landing stays off and the percent cut governs.
+    chast::BitrateController slow(3000000, 500000, 30);
+    slow.update(rate_sample(1000, 2000000), 1000);
+    slow.update(rate_sample(1100, 2375000), 1000);
+    chast::BitrateSample lossy = rate_sample(1200, 2375000 + 337500);  // 2.7 Mbps
+    lossy.lost_packets = 20;
+    decision = slow.update(lossy, 1000);
+    check(decision.changed && decision.target_bps == 2100000 &&
+              std::string(decision.reason) == "loss",
+          "loss that leaves most of the target delivered keeps the percent cut");
+
+    // With a deeper loss share the discounted rate drops under the collapse
+    // threshold: the wire rate (2.7 Mbps, 90% of target) would hide the
+    // collapse, but the 2.025 Mbps actually delivered is what the target
+    // lands under.
+    chast::BitrateController discounted(3000000, 500000, 30);
+    discounted.update(rate_sample(1000, 2000000), 1000);
+    discounted.update(rate_sample(1100, 2375000), 1000);
+    chast::BitrateSample heavy = rate_sample(1200, 2375000 + 337500);  // 2.7 Mbps
+    heavy.lost_packets = 25;  // 25% lost -> 2.025 Mbps delivered
+    heavy.queued_bytes = 1200000;
+    decision = discounted.update(heavy, 1000);
+    check(decision.changed && decision.target_bps == 1316250 &&
+              std::string(decision.reason) == "loss",
+          "the loss share discounts the wire rate before the cut");
+
+    // An idle desktop sends far below the target on a healthy path. With no
+    // queue backlog the low wire rate is content, not capacity: the percent
+    // cut governs and the target does not fall to what the screen happens to
+    // be sending.
+    chast::BitrateController idle(3000000, 500000, 30);
+    idle.update(rate_sample(1000, 5000000), 500);
+    chast::BitrateSample quiet = rate_sample(1100, 5000000 + 20000);  // 320 kbps
+    quiet.lost_packets = 20;
+    decision = idle.update(quiet, 500);
+    check(decision.changed && decision.target_bps == 2100000 &&
+              std::string(decision.reason) == "loss",
+          "a low wire rate with an idle queue keeps the percent cut");
+
+    // A delivery rate below the floor still stops at the floor.
+    chast::BitrateController low(1000000, 500000, 30);
+    low.update(rate_sample(1000, 1000000), 1000);
+    low.update(rate_sample(1100, 1125000), 1000);
+    chast::BitrateSample starving = rate_sample(1200, 1125000 + 62500);  // 500 kbps
+    starving.rtt_us = 50000;
+    starving.queued_bytes = 1200000;
+    decision = low.update(starving, 1000);
+    check(decision.changed && decision.target_bps == 500000,
+          "a step below the floor stops at the floor");
+
+    // A tiny or missing counter is not a rate sample: without the byte
+    // counters the percent cut is exactly what it was before.
+    chast::BitrateController blind(3000000, 500000, 30);
+    blind.update(healthy_sample(1000), 1000);
+    chast::BitrateSample blind_loss = healthy_sample(1100);
+    blind_loss.lost_packets = 20;
+    decision = blind.update(blind_loss, 1000);
+    check(decision.changed && decision.target_bps == 2100000,
+          "without a wire rate the percent cut governs as before");
+
+    chast::BitrateController noisy(3000000, 500000, 30);
+    noisy.update(rate_sample(1000, 5000000), 1000);
+    chast::BitrateSample tiny = rate_sample(1100, 5000000 + 4096);  // 32 kbps
+    tiny.rtt_us = 50000;
+    decision = noisy.update(tiny, 1000);
+    check(decision.changed && decision.target_bps == 2550000,
+          "a byte delta too small to be a rate is ignored");
+
+    // A transport can report more suspected losses than packets sent in one
+    // interval. The share is clamped, so the rate cannot go negative and the
+    // percent cut still governs.
+    chast::BitrateController spurious(3000000, 500000, 30);
+    spurious.update(rate_sample(1000, 5000000), 1000);
+    spurious.update(rate_sample(1100, 5375000), 1000);
+    chast::BitrateSample odd = rate_sample(1200, 5375000 + 375000);
+    odd.lost_packets = 150;  // 100 sent for the interval
+    decision = spurious.update(odd, 1000);
+    check(decision.changed && decision.target_bps == 2100000,
+          "a loss share above one is clamped instead of inverting the rate");
+}
+
+void test_rate_collapse_bypasses_cooldown() {
+    chast::BitrateController controller(3000000, 500000, 30);
+    controller.update(rate_sample(1000, 5000000), 1000);
+    controller.update(rate_sample(1100, 5375000), 1000);
+
+    // The first pressure sample arrives before the byte counter reflects the
+    // step, so it can only cut by percent -- and that arms the cooldown.
+    chast::BitrateSample first = rate_sample(1200, 5375000 + 375000);
+    first.rtt_us = 50000;
+    chast::BitrateDecision decision = controller.update(first, 1000);
+    check(decision.changed && decision.target_bps == 2550000,
+          "the first pressure sample after a step cuts by percent");
+
+    // One second later the counter shows the new capacity and the queue is
+    // past the congestion window, while the cooldown is still open. Waiting it
+    // out would queue another second of video.
+    chast::BitrateSample collapse = rate_sample(1300, 5375000 + 375000 + 125000);
+    collapse.rtt_us = 50000;
+    collapse.queued_bytes = 1200000;
+    decision = controller.update(collapse, 1000);
+    check(decision.changed && decision.target_bps == 650000,
+          "a delivery collapse cuts through the down cooldown");
+
+    // A dip that stays near the target is still treated as noise and waits.
+    chast::BitrateController mild(3000000, 500000, 30);
+    mild.update(rate_sample(1000, 5000000), 1000);
+    mild.update(rate_sample(1100, 5375000), 1000);
+    chast::BitrateSample dip = rate_sample(1200, 5375000 + 375000);
+    dip.rtt_us = 50000;
+    decision = mild.update(dip, 1000);
+    check(decision.changed && decision.target_bps == 2550000,
+          "a mild path inflation still cuts by percent");
+    chast::BitrateSample shallow = rate_sample(1300, 5375000 + 375000 + 250000);
+    shallow.rtt_us = 50000;
+    decision = mild.update(shallow, 1000);
+    check(!decision.changed && mild.target_bps() == 2550000,
+          "a dip above the collapse threshold waits for the cooldown");
 }
 
 void test_recovery_and_ceiling() {
@@ -379,6 +553,8 @@ int main() {
     test_severe_loss_and_cooldown();
     test_rtt_inflation();
     test_queue_pressure();
+    test_capacity_step_convergence();
+    test_rate_collapse_bypasses_cooldown();
     test_recovery_and_ceiling();
     test_floor_and_bounds();
     test_no_congestion_window();

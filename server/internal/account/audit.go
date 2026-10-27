@@ -11,6 +11,7 @@ import (
 const (
 	AuditLogin             = "login"
 	AuditLogout            = "logout"
+	AuditRefresh           = "session_refresh"
 	AuditPasswordChange    = "password_change"
 	AuditTwoFactorEnable   = "2fa_enable"
 	AuditTwoFactorDisable  = "2fa_disable"
@@ -33,7 +34,10 @@ type AuditEvent struct {
 	Action    string
 	Detail    string
 	ClientIP  string
-	Success   bool
+	// Location is the operator-supplied label for ClientIP. It stays empty
+	// when no GeoIP table is configured or the address is not covered.
+	Location string
+	Success  bool
 }
 
 func (s *Store) AppendAudit(event AuditEvent) error {
@@ -52,10 +56,10 @@ func (s *Store) AppendAudit(event AuditEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, err := s.db.Exec(
-		`INSERT INTO audit_events (created_at, username, action, detail, client_ip, success)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO audit_events (created_at, username, action, detail, client_ip, location, success)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		unixMillis(at), username, action, strings.TrimSpace(event.Detail),
-		strings.TrimSpace(event.ClientIP), event.Success,
+		strings.TrimSpace(event.ClientIP), strings.TrimSpace(event.Location), event.Success,
 	); err != nil {
 		return fmt.Errorf("account store %s: append audit: %w", s.path, err)
 	}
@@ -83,11 +87,11 @@ func (s *Store) AuditEventsFor(action string, limit int) ([]AuditEvent, error) {
 		limit = 500
 	}
 	action = strings.TrimSpace(action)
-	query := `SELECT id, created_at, username, action, detail, client_ip, success
+	query := `SELECT id, created_at, username, action, detail, client_ip, location, success
 		 FROM audit_events ORDER BY id DESC LIMIT ?`
 	args := []any{limit}
 	if action != "" {
-		query = `SELECT id, created_at, username, action, detail, client_ip, success
+		query = `SELECT id, created_at, username, action, detail, client_ip, location, success
 		 FROM audit_events WHERE action = ? ORDER BY id DESC LIMIT ?`
 		args = []any{action, limit}
 	}
@@ -105,7 +109,7 @@ func (s *Store) AuditEventsFor(action string, limit int) ([]AuditEvent, error) {
 			created int64
 		)
 		if err := rows.Scan(&event.ID, &created, &event.Username, &event.Action,
-			&event.Detail, &event.ClientIP, &event.Success); err != nil {
+			&event.Detail, &event.ClientIP, &event.Location, &event.Success); err != nil {
 			return nil, fmt.Errorf("account store %s: scan audit: %w", s.path, err)
 		}
 		event.CreatedAt = timeFromMillis(created)

@@ -43,6 +43,24 @@ func TestMessageSignatureRejectsTamper(t *testing.T) {
 	}
 }
 
+func TestMigrateSignatureBindsBothIDs(t *testing.T) {
+	priv := PrivateKeyFromSecret("host-secret")
+	pub := priv.Public().(ed25519.PublicKey)
+	sig := Sign(priv, MigrateMessage("oldbox", "newbox", 1700000000))
+	if !Verify(pub, MigrateMessage("oldbox", "newbox", 1700000000), sig) {
+		t.Fatal("valid migration signature rejected")
+	}
+	if Verify(pub, MigrateMessage("otherbox", "newbox", 1700000000), sig) {
+		t.Fatal("migration signature accepted for a different old id")
+	}
+	if Verify(pub, MigrateMessage("oldbox", "otherbox", 1700000000), sig) {
+		t.Fatal("migration signature accepted for a different new id")
+	}
+	if Verify(pub, RegisterMessage("newbox", "", 1700000000), sig) {
+		t.Fatal("migration signature doubled as a registration proof")
+	}
+}
+
 func TestFieldBoundariesCannotBeShifted(t *testing.T) {
 	priv := PrivateKeyFromSecret("host-secret")
 	pub := priv.Public().(ed25519.PublicKey)

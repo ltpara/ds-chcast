@@ -145,6 +145,15 @@ struct QuicServerConfig {
     // announce() clears privacy_mode_enabled when false, and requests are
     // dropped by the transport.
     bool allow_privacy_mode = false;
+    // Accept PortForwardRequest and CPFW streams from the viewer. Off by
+    // default: forwarding reaches hosts the operator's own machine can dial,
+    // so it is a firewall decision, not a viewer convenience. announce()
+    // clears port_forward_enabled when false.
+    bool allow_port_forward = false;
+    // Accept TerminalRequest and CTTY streams from the viewer. Off by default:
+    // a terminal is a shell on the operator's own account, so the host opts in
+    // explicitly. announce() clears terminal_enabled when false.
+    bool allow_terminal = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -225,6 +234,22 @@ struct FileUploadState {
     std::string error;           // set when the stream broke
 };
 
+// One forwarded TCP connection, named on this side by an opaque handle. The
+// server only ever hands out a handle through take_port_forward_open(); the
+// client gets one from open_port_forward_connection().
+using PortForwardHandle = uint64_t;
+
+// A connection the viewer opened and the host has not answered yet.
+struct PortForwardOpen {
+    PortForwardHandle handle = 0;
+    uint32_t forward_id = 0;
+    uint32_t connection_id = 0;
+    // The registered target the viewer dialed. Only the host knows it,
+    // because it is the side that dials.
+    std::string host;
+    uint16_t port = 0;
+};
+
 struct QuicClientConfig {
     std::string host = "127.0.0.1";
     uint16_t port = 4433;
@@ -236,6 +261,10 @@ struct QuicClientConfig {
     // viewer collected after a TwoFactorRequired denial.
     std::string password;
     std::string totp;
+    // Lowercase hex reference for this session. The host copies it into the
+    // inbound audit records it forwards, so the server can merge the viewer's
+    // report with the host's. Empty is allowed for tools.
+    std::string audit_ref;
     // The permissions the viewer asks for; the host intersects them with its
     // defaults and the operator's approval.
     uint16_t requested_permissions = kPermissionAll;
@@ -288,6 +317,10 @@ public:
     // once wait_for_client() succeeded; the server creates its capturer after
     // that so the request can pick the output.
     uint16_t requested_display() const;
+    // The session's audit reference from Hello, empty when the viewer did not
+    // send one. Valid once wait_for_client() succeeded; the host copies it
+    // into its own audit records.
+    std::string audit_ref() const;
     // SHA-256 fingerprint of the certificate this server presents, uppercase
     // hex. Stable across restarts because the certificate is stored in the
     // user's certificate store; this is what a client pins.
@@ -625,6 +658,150 @@ public:
     bool take_chat(std::string& text);
     // Total ChatMessages received since the connection started.
     uint64_t chats_received() const;
+
+    // ----- port forwarding (protocol v26, both roles) -----
+    //
+    // The viewer registers a TCP target, then turns each accepted local
+    // connection into one CPFW uplink; the host dials the target and answers
+    // with a CPFW downlink. Both directions use the same data calls below;
+    // the server additionally approves targets and accepts each connection.
+    // Every call requires kPermissionPortForward, so a host whose config
+    // disables forwarding never sees a request or a stream.
+
+    // Server: approves or refuses a target the viewer registered. Ok records
+    // `request.host:request.port` for the rest of the session and is the only
+    // way a CPFW uplink naming that forward_id becomes acceptable; any other
+    // code forgets the request. The reason is UTF-8 and truncated on send.
+    bool take_port_forward_request(PortForwardRequest& request);
+    Error send_port_forward_result(uint32_t forward_id, PortForwardCode code,
+                                   const std::string& reason = {});
+    // Server: pops the oldest viewer connection that wants the host to dial.
+    // Nothing is relayed until accept_port_forward_connection() succeeds; the
+    // uplink's QUIC receive stays paused until then, so an ignored handle
+    // backpressures the viewer instead of buffering without bound.
+    bool take_port_forward_open(PortForwardOpen& open);
+    // Server: opens the downlink stream after the host dialed the target.
+    // Until this succeeds the viewer reads nothing and the relay is idle.
+    Error accept_port_forward_connection(PortForwardHandle handle);
+    // Server: refuses one connection (dial failed, or the host is full). The
+    // viewer sees its uplink reset and closes the local socket; close the
+    // handle afterwards.
+    Error reject_port_forward_connection(PortForwardHandle handle);
+
+    // Client: sends PortForwardRequest and waits for the answer through
+    // take_port_forward_result(). Requires the completed handshake and the
+    // permission; at most kMaxPortForwardTargets ids are tracked per session.
+    Error request_port_forward(uint32_t forward_id, const std::string& host, uint16_t port);
+    // Client: pops the oldest target answer. Ok makes forward_id usable in
+    // open_port_forward_connection(); every other code forgets the request.
+    bool take_port_forward_result(PortForwardResult& result);
+    // Client: starts relaying one accepted local TCP connection. Opens the
+    // uplink and writes the CPFW header; the local reader may start sending
+    // at once. The handle stays valid until close_port_forward().
+    Error open_port_forward_connection(uint32_t forward_id, uint32_t connection_id,
+                                       PortForwardHandle& handle);
+    // Client: waits until the host attached its downlink, which means the
+    // dial succeeded. Unavailable reports a failure (the viewer's uplink was
+    // reset); WaitTimeout means the host has not answered yet.
+    Error wait_port_forward_connection(PortForwardHandle handle,
+                                       std::chrono::milliseconds timeout);
+
+    // Both: tells the peer to stop forwarding a registered target. Every
+    // connection under it is torn down on both sides; the answer is silence,
+    // because the message is already the verdict. A reason is truncated on
+    // send, like every other port-forward reason.
+    Error send_port_forward_stop(uint32_t forward_id, PortForwardCode code,
+                                 const std::string& reason = {});
+    // Both: pops the oldest stop the peer sent. The transport has already
+    // torn down the matching connections, so this explains why they ended.
+    bool take_port_forward_stop(PortForwardStop& stop);
+    // Both: sends one piece of raw TCP data on the connection's sending
+    // stream (the uplink on the viewer, the downlink on the host). Waits for
+    // send-queue capacity at most `timeout`; WaitTimeout means nothing was
+    // sent and the caller keeps the bytes and retries. An aborted stream
+    // returns Unavailable.
+    Error send_port_forward_data(PortForwardHandle handle, const uint8_t* data, size_t size,
+                                 std::chrono::milliseconds timeout);
+    // Both: pops the next piece of received TCP data. WaitTimeout means no
+    // bytes arrived in time (normal for an idle connection); Unavailable
+    // means the peer ended or broke the stream and the queue is drained.
+    Error receive_port_forward_data(PortForwardHandle handle, std::vector<uint8_t>& data,
+                                    std::chrono::milliseconds timeout);
+    // Both: half-closes the sending direction (TCP FIN) without touching the
+    // other direction. Ending the whole connection is close_port_forward().
+    Error finish_port_forward(PortForwardHandle handle);
+    // Both: aborts both streams and forgets the handle. Idempotent. The peer
+    // sees a reset rather than a FIN, which is what a local socket failure
+    // means.
+    void close_port_forward(PortForwardHandle handle);
+
+    // ----- remote terminal (protocol v27, both roles) -----
+    //
+    // The viewer asks for a console; the host runs it under ConPTY and
+    // answers. The viewer then opens a CTTY uplink and sends keystrokes, and
+    // the host opens a CTTY downlink the first time the console prints. There
+    // is no replay buffer: output that was not read while the session was
+    // alive is gone. Every call requires kPermissionTerminal.
+
+    // Server: pops the oldest TerminalRequest accepted by the permission and
+    // settings filters. The console is created by the host, which then answers
+    // with send_terminal_result().
+    bool take_terminal_request(TerminalRequest& request);
+    // Server: answers one request. Ok registers the terminal id and makes
+    // CTTY streams naming it acceptable; every other code forgets the request.
+    // The reason is UTF-8 and truncated on send.
+    Error send_terminal_result(const TerminalResult& result);
+
+    // Client: asks the host for a console of the given size. The answer comes
+    // through take_terminal_result(); at most kMaxTerminals are tracked.
+    Error request_terminal(uint32_t terminal_id, uint16_t columns, uint16_t rows);
+    // Client: pops the oldest answer. Ok means open_terminal_input() may run.
+    bool take_terminal_result(TerminalResult& result);
+    // Client: opens the CTTY uplink for an approved terminal. Keystrokes are
+    // then sent with send_terminal_input(); the stream stays open until
+    // finish_terminal_input() or close_terminal().
+    Error open_terminal_input(uint32_t terminal_id);
+    // Client: sends raw console input. Non-blocking semantics match
+    // send_port_forward_data(): WaitTimeout means the bytes were kept by the
+    // caller and should be retried once the send queue has room.
+    Error send_terminal_input(uint32_t terminal_id, const uint8_t* data, size_t size,
+                              std::chrono::milliseconds timeout);
+    // Client: half-closes the input direction (the console sees EOF).
+    Error finish_terminal_input(uint32_t terminal_id);
+    // Client: asks the host to resize the console. Best effort; an unknown or
+    // already closed terminal is not an error at this layer.
+    Error send_terminal_resize(uint32_t terminal_id, uint16_t columns, uint16_t rows);
+    // Client: pops the next piece of console output. Unavailable once the host
+    // ended the output stream and the queue is drained.
+    bool take_terminal_output(uint32_t terminal_id, std::vector<uint8_t>& data, bool& ended);
+
+    // Server: pops the oldest resize request.
+    bool take_terminal_resize(TerminalSize& size);
+    // Server: pops the next piece of viewer input. `ended` reports the
+    // viewer's half-close; the queue may still hold bytes from before it.
+    bool take_terminal_input(uint32_t terminal_id, std::vector<uint8_t>& data, bool& ended);
+    // Server: sends console output. Opens the CTTY downlink on the first call.
+    // WaitTimeout means nothing was sent and the caller keeps the bytes.
+    Error send_terminal_output(uint32_t terminal_id, const uint8_t* data, size_t size,
+                               std::chrono::milliseconds timeout);
+    // Server: half-closes the output direction after the child process exited.
+    Error finish_terminal_output(uint32_t terminal_id);
+
+    // Both: tells the peer the terminal is over. The host must close the
+    // console and the child process; the viewer drops its streams. A
+    // direction that already finished cleanly keeps its FIN, so the stop never
+    // resets a stream whose bytes the peer has not acknowledged yet.
+    Error send_terminal_stop(uint32_t terminal_id, TerminalCode code,
+                             const std::string& reason = {});
+    // Both: pops the oldest stop the peer sent. On the host the matching
+    // streams are gone; on the viewer the entry survives the stop until
+    // take_terminal_output() reports ended, so output that was already in
+    // flight is still delivered. close_terminal() then forgets it.
+    bool take_terminal_stop(TerminalStop& stop);
+    // Both: aborts both streams and forgets the terminal. Idempotent. A clean
+    // ending uses finish_terminal_output()/finish_terminal_input() first; this
+    // is the failure or session-end path.
+    void close_terminal(uint32_t terminal_id);
 
     // ----- file transfer (both directions) -----
     //

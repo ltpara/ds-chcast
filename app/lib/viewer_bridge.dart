@@ -2,6 +2,39 @@ import 'package:flutter/services.dart';
 
 enum ViewerState { idle, connecting, handshaking, streaming, ended, failed }
 
+/// One remote console's life on the viewer (chast_viewer::TerminalPhase).
+/// Requesting covers the round trip to the host's answer; ended means the host
+/// stopped the console, and any bytes it printed arrive through
+/// [ViewerBridge.takeTerminalOutput] before the panel shows that ending.
+enum ViewerTerminalPhase {
+  closed(0),
+  requesting(1),
+  open(2),
+  ended(3),
+  failed(4);
+
+  const ViewerTerminalPhase(this.code);
+  final int code;
+
+  static ViewerTerminalPhase fromCode(int code) {
+    for (final ViewerTerminalPhase phase in values) {
+      if (phase.code == code) {
+        return phase;
+      }
+    }
+    return closed;
+  }
+}
+
+/// One piece of console output. [ended] marks the last piece the console ever
+/// produced; the panel keeps the bytes and then shows the ending.
+class ViewerTerminalOutput {
+  const ViewerTerminalOutput({required this.data, required this.ended});
+
+  final Uint8List data;
+  final bool ended;
+}
+
 /// One output the server announced in HelloAck. [index] is its position in
 /// the list, which is what a reconnect sends back to pick that output.
 class ViewerDisplay {
@@ -164,6 +197,7 @@ class ViewerStatus {
     this.decoder = '',
     this.serverEncoder = '',
     this.serverFingerprint = '',
+    this.auditRef = '',
     this.denial = 0,
     this.received = 0,
     this.decoded = 0,
@@ -217,6 +251,13 @@ class ViewerStatus {
     this.audioAnnounced = false,
     this.audioEnabled = false,
     this.audioMuted = false,
+    this.recording = false,
+    this.recordPath = '',
+    this.recordError = '',
+    this.recordSamples = 0,
+    this.recordKeyframes = 0,
+    this.recordSkipped = 0,
+    this.recordSegments = 0,
     this.audioSampleRate = 0,
     this.audioChannels = 0,
     this.audioBitrate = 0,
@@ -273,6 +314,25 @@ class ViewerStatus {
     this.streamOptionCode = 0,
     this.streamOptionError = '',
     this.streamOptionResults = 0,
+    this.portForwardEnabled = false,
+    this.portForwardActive = false,
+    this.portForwardLocalPort = 0,
+    this.portForwardRemoteHost = '',
+    this.portForwardRemotePort = 0,
+    this.portForwardConnections = 0,
+    this.portForwardFailures = 0,
+    this.portForwardBytesUp = 0,
+    this.portForwardBytesDown = 0,
+    this.portForwardError = '',
+    this.terminalSupported = false,
+    this.terminalPhase = ViewerTerminalPhase.closed,
+    this.terminalCode = 0,
+    this.terminalReason = '',
+    this.terminalError = '',
+    this.terminalColumns = 0,
+    this.terminalRows = 0,
+    this.terminalBytes = 0,
+    this.terminalUpdates = 0,
     this.displays = const <ViewerDisplay>[],
     this.mergedLayout = false,
   });
@@ -313,6 +373,11 @@ class ViewerStatus {
   /// Empty until one arrived; also filled when the identity did not match the
   /// pin, so the viewer can show the server's new fingerprint.
   final String serverFingerprint;
+
+  /// Lowercase hex reference generated for this session and sent in Hello.
+  /// The host copies it into its own audit records; reporting it here lets the
+  /// account server merge both sides into one row.
+  final String auditRef;
 
   /// The server's refusal code when it answered Hello with AccessDenied:
   /// [ViewerDenial] values, or 0 when it never refused. [error] carries the
@@ -418,6 +483,19 @@ class ViewerStatus {
   final bool audioAnnounced;
   final bool audioEnabled;
   final bool audioMuted;
+
+  /// Viewer-side recording: true while the engine is muxing the received
+  /// stream to a local MP4. Nothing crosses the wire and nothing is uploaded.
+  /// [recordPath] is the newest file, [recordError] explains a failure, and
+  /// the counters mirror the command-line tool (a picture-size change rolls
+  /// the recording into a new segment, counted by [recordSegments]).
+  final bool recording;
+  final String recordPath;
+  final String recordError;
+  final int recordSamples;
+  final int recordKeyframes;
+  final int recordSkipped;
+  final int recordSegments;
   final int audioSampleRate;
   final int audioChannels;
   final int audioBitrate;
@@ -550,6 +628,43 @@ class ViewerStatus {
   final String streamOptionError;
   final int streamOptionResults;
 
+  /// Viewer-side port forwarding. [portForwardEnabled] mirrors the host's
+  /// permission; [portForwardActive] means the local listener on
+  /// 127.0.0.1:[portForwardLocalPort] is up and the host accepted the target
+  /// [portForwardRemoteHost]:[portForwardRemotePort]. While a request is in
+  /// flight the port is already bound but the flag stays false;
+  /// [portForwardError] explains a refusal. The byte counters cover the whole
+  /// session, including targets that were replaced.
+  final bool portForwardEnabled;
+  final bool portForwardActive;
+  final int portForwardLocalPort;
+  final String portForwardRemoteHost;
+  final int portForwardRemotePort;
+  final int portForwardConnections;
+  final int portForwardFailures;
+  final int portForwardBytesUp;
+  final int portForwardBytesDown;
+  final String portForwardError;
+
+  /// Remote terminal. [terminalSupported] mirrors the host's permission;
+  /// [terminalPhase] is the console's state, [terminalCode] and
+  /// [terminalReason] carry the host's TerminalCode and wording for a refusal
+  /// or an ending, and [terminalError] explains a local failure such as a send
+  /// error or a revoked permission. [terminalColumns]/[terminalRows] are the
+  /// size the host last acknowledged. Output never travels in this struct:
+  /// [ViewerBridge.takeTerminalOutput] hands it over and [terminalBytes]
+  /// counts what arrived. [terminalUpdates] counts phase transitions so the
+  /// panel pairs each ending with the poll that saw it.
+  final bool terminalSupported;
+  final ViewerTerminalPhase terminalPhase;
+  final int terminalCode;
+  final String terminalReason;
+  final String terminalError;
+  final int terminalColumns;
+  final int terminalRows;
+  final int terminalBytes;
+  final int terminalUpdates;
+
   bool get hasFrame => published > 0 && width > 0 && height > 0;
   bool get isLive => state == ViewerState.streaming;
   bool get isOver =>
@@ -586,6 +701,11 @@ class ViewerStatus {
   // The privacy button needs a live session and the host's privacy bit.
   bool get acceptsPrivacy =>
       isLive && (permissions & ViewerPermission.privacyMode) != 0;
+  // The port-forward dialog needs a live session and the host's forward bit.
+  bool get acceptsPortForward =>
+      isLive && (permissions & ViewerPermission.portForward) != 0;
+  // The terminal panel needs a live session and the host's terminal bit.
+  bool get acceptsTerminal => isLive && terminalSupported;
   // True while the host captures a secure desktop (lock screen, UAC) or no
   // desktop at all; the picture is frozen and input is not delivered.
   bool get secureDesktop =>
@@ -696,6 +816,7 @@ class ViewerStatus {
       decoder: asString(map['decoder']),
       serverEncoder: asString(map['serverEncoder']),
       serverFingerprint: asString(map['serverFingerprint']),
+      auditRef: asString(map['auditRef']),
       denial: asInt(map['denial']),
       received: asInt(map['received']),
       decoded: asInt(map['decoded']),
@@ -749,6 +870,13 @@ class ViewerStatus {
       audioAnnounced: map['audioAnnounced'] == true,
       audioEnabled: map['audioEnabled'] == true,
       audioMuted: map['audioMuted'] == true,
+      recording: map['recording'] == true,
+      recordPath: asString(map['recordPath']),
+      recordError: asString(map['recordError']),
+      recordSamples: asInt(map['recordSamples']),
+      recordKeyframes: asInt(map['recordKeyframes']),
+      recordSkipped: asInt(map['recordSkipped']),
+      recordSegments: asInt(map['recordSegments']),
       audioSampleRate: asInt(map['audioSampleRate']),
       audioChannels: asInt(map['audioChannels']),
       audioBitrate: asInt(map['audioBitrate']),
@@ -805,6 +933,26 @@ class ViewerStatus {
       streamOptionCode: asInt(map['streamOptionCode']),
       streamOptionError: asString(map['streamOptionError']),
       streamOptionResults: asInt(map['streamOptionResults']),
+      portForwardEnabled: map['portForwardEnabled'] == true,
+      portForwardActive: map['portForwardActive'] == true,
+      portForwardLocalPort: asInt(map['portForwardLocalPort']),
+      portForwardRemoteHost: asString(map['portForwardRemoteHost']),
+      portForwardRemotePort: asInt(map['portForwardRemotePort']),
+      portForwardConnections: asInt(map['portForwardConnections']),
+      portForwardFailures: asInt(map['portForwardFailures']),
+      portForwardBytesUp: asInt(map['portForwardBytesUp']),
+      portForwardBytesDown: asInt(map['portForwardBytesDown']),
+      portForwardError: asString(map['portForwardError']),
+      terminalSupported: map['terminalSupported'] == true,
+      terminalPhase:
+          ViewerTerminalPhase.fromCode(asInt(map['terminalPhase'])),
+      terminalCode: asInt(map['terminalCode']),
+      terminalReason: asString(map['terminalReason']),
+      terminalError: asString(map['terminalError']),
+      terminalColumns: asInt(map['terminalColumns']),
+      terminalRows: asInt(map['terminalRows']),
+      terminalBytes: asInt(map['terminalBytes']),
+      terminalUpdates: asInt(map['terminalUpdates']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
       mergedLayout: map['mergedLayout'] == true,
     );
@@ -1068,6 +1216,101 @@ class ViewerBridge {
     return _channel.invokeMethod<String>('takeChat');
   }
 
+  /// Opens the session's one remote console at [columns] x [rows] characters
+  /// (1..500 by 1..200). False means it was not queued: no streaming session,
+  /// the host did not grant [ViewerPermission.terminal], a console is already
+  /// open, or the previous one's output has not been drained yet. The host's
+  /// answer arrives through [ViewerStatus.terminalPhase],
+  /// [ViewerStatus.terminalCode] and [ViewerStatus.terminalReason].
+  static Future<bool> openTerminal({
+    required int columns,
+    required int rows,
+  }) async {
+    final bool? opened = await _channel.invokeMethod<bool>(
+      'openTerminal',
+      <String, Object>{'columns': columns, 'rows': rows},
+    );
+    return opened ?? false;
+  }
+
+  /// Queues raw console input. Printable text is UTF-8; control keys travel as
+  /// single bytes (for example `\x03` for Ctrl+C). False means no console is
+  /// open or the engine's 256 KiB input queue is full.
+  static Future<bool> sendTerminalInput(String input) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('sendTerminalInput', input);
+    return queued ?? false;
+  }
+
+  /// Asks the host to resize the open console. False means no console is open
+  /// or the size is out of range. The host applies it best effort; the
+  /// acknowledged size arrives in [ViewerStatus.terminalColumns] and
+  /// [ViewerStatus.terminalRows].
+  static Future<bool> resizeTerminal({
+    required int columns,
+    required int rows,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'resizeTerminal',
+      <String, Object>{'columns': columns, 'rows': rows},
+    );
+    return queued ?? false;
+  }
+
+  /// Ends the console. The host closes the shell; output already in flight is
+  /// still returned by [takeTerminalOutput] until it reports `ended`.
+  static Future<void> closeTerminal() {
+    return _channel.invokeMethod<void>('closeTerminal');
+  }
+
+  /// Pops the oldest console output. Returns null when nothing is waiting and
+  /// the console has not ended; otherwise the bytes and whether that was the
+  /// last piece. A UTF-8 sequence may be split across pieces, so the panel
+  /// decodes only after it has reassembled them.
+  static Future<ViewerTerminalOutput?> takeTerminalOutput() async {
+    final Map<Object?, Object?>? reply =
+        await _channel.invokeMethod<Map<Object?, Object?>>('takeTerminalOutput');
+    if (reply == null) {
+      return null;
+    }
+    final Object? data = reply['data'];
+    final Uint8List bytes = data is Uint8List ? data : Uint8List(0);
+    final bool ended = reply['ended'] == true;
+    if (bytes.isEmpty && !ended) {
+      return null;
+    }
+    return ViewerTerminalOutput(data: bytes, ended: ended);
+  }
+
+  /// Binds a viewer-side port-forward listener on 127.0.0.1:[localPort]
+  /// (0 picks a free port) and asks the host to relay it to
+  /// [remoteHost]:[remotePort]. False means the request was not queued: no
+  /// streaming session, or the host did not grant
+  /// [ViewerPermission.portForward]. The bound port and the host's answer
+  /// arrive through [ViewerStatus.portForwardLocalPort] and
+  /// [ViewerStatus.portForwardError].
+  static Future<bool> startPortForward({
+    required int localPort,
+    required String remoteHost,
+    required int remotePort,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'startPortForward',
+      <String, Object>{
+        'localPort': localPort,
+        'remoteHost': remoteHost,
+        'remotePort': remotePort,
+      },
+    );
+    return queued ?? false;
+  }
+
+  /// Closes the listener and every relayed connection, and tells the host to
+  /// drop the target. Safe when nothing is running.
+  static Future<void> stopPortForward() {
+    return _channel.invokeMethod<void>('stopPortForward');
+  }
+
   /// While remote control is on, an active local IME must not turn physical
   /// keys into VK_PROCESSKEY (the engine drops those before Dart sees them).
   /// Turning this off restores the IME for local text fields.
@@ -1081,6 +1324,21 @@ class ViewerBridge {
   /// applied on top of this switch.
   static Future<void> setClipboardSync(bool enabled) {
     return _channel.invokeMethod<void>('setClipboardSync', enabled);
+  }
+
+  /// Starts or stops a local recording of the received stream. Nothing is sent
+  /// to the host and nothing is uploaded: the engine muxes the host's
+  /// already-encoded stream straight to an MP4. [directory] is used when the
+  /// recording starts (empty means the engine's default, the user's Videos
+  /// folder). The engine waits for the next key frame and rolls into a new
+  /// file when the picture size changes. Progress and failures arrive through
+  /// [ViewerStatus.recording], [ViewerStatus.recordPath] and
+  /// [ViewerStatus.recordError].
+  static Future<void> setRecording(bool enabled, {String directory = ''}) {
+    return _channel.invokeMethod<void>('setRecording', <String, Object?>{
+      'enabled': enabled,
+      'directory': directory,
+    });
   }
 
   /// Opens the system file picker and queues the chosen files for upload to
@@ -1339,6 +1597,8 @@ abstract final class ViewerPermission {
   static const int fileTransfer = 0x0008;
   static const int microphone = 0x0010;
   static const int privacyMode = 0x0020;
+  static const int portForward = 0x0080;
+  static const int terminal = 0x0100;
 }
 
 /// Why Ctrl+Alt+Del did not reach the host's secure desktop

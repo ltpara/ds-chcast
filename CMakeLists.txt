@@ -216,6 +216,7 @@ target_link_libraries(chast.transfer PUBLIC chast.base chast.security shell32)
 add_library(chast.net STATIC
     src/net/carrier.cc
     src/net/identity.cc
+    src/net/port_forward_client.cc
     src/net/protocol.cc
     src/net/quic.cc
     src/win/desktop.cc
@@ -233,10 +234,13 @@ target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard
 # top of both chast.codec and chast.net so neither of those has to know about
 # the other.
 add_library(chast.host STATIC
+    src/host/audit_spool.cc
     src/host/bitrate_controller.cc
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc
+    src/host/port_forward_relay.cc
+    src/host/terminal_relay.cc
     src/win/privacy.cc
     src/win/sas.cc)
 
@@ -328,7 +332,11 @@ if(CHAST_BUILD_TESTS)
     # separate processes; verify closes the loop in one process and checks the
     # decoded content against an offline replay of the sent stream.
     add_executable(chast-quic tools/quic.cc tools/crash_handler.cc)
-    target_link_libraries(chast-quic PRIVATE chast.codec chast.net chast.host dbghelp)
+    # avformat is only needed for --record: the tool muxes the received stream
+    # into an MP4 with the container writer, which the receive pipeline itself
+    # never touches. Its TLS object resolves against SChannel.
+    target_link_libraries(chast-quic PRIVATE chast.codec chast.net chast.host dbghelp
+        "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
     add_custom_command(TARGET chast-quic POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-quic>
@@ -427,6 +435,28 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(quic_loopback PROPERTIES TIMEOUT 120)
     # The preference probe switches codec families mid-session, so it runs on
     # its own port and the plain loopback above keeps the offline replay check.
+    # Port forwarding: the host dials a real loopback TCP echo endpoint and the
+    # viewer's bytes travel QUIC -> host -> TCP -> echo and back.
+    add_test(NAME quic_port_forward
+        COMMAND chast-quic verify --port 45503 --port-forward --quiet)
+    set_tests_properties(quic_port_forward PROPERTIES TIMEOUT 120)
+    add_test(NAME quic_port_forward_denied
+        COMMAND chast-quic verify --port 45504 --port-forward-denied --quiet)
+    set_tests_properties(quic_port_forward_denied PROPERTIES TIMEOUT 120)
+    # The viewer-side listener: a real local TCP client reaches the host's TCP
+    # endpoint through the viewer's 127.0.0.1 listener and the CPFW streams.
+    add_test(NAME quic_port_forward_local
+        COMMAND chast-quic verify --port 45505 --port-forward-local --quiet)
+    set_tests_properties(quic_port_forward_local PROPERTIES TIMEOUT 120)
+    # Remote terminal: the in-process host starts a real shell under ConPTY,
+    # the viewer types into it, and the console's own output must come back
+    # before the host reports a clean exit.
+    add_test(NAME quic_terminal
+        COMMAND chast-quic verify --port 45506 --terminal --quiet)
+    set_tests_properties(quic_terminal PROPERTIES TIMEOUT 120)
+    add_test(NAME quic_terminal_denied
+        COMMAND chast-quic verify --port 45507 --terminal-denied --quiet)
+    set_tests_properties(quic_terminal_denied PROPERTIES TIMEOUT 120)
     add_test(NAME quic_stream_options
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
@@ -453,4 +483,14 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_carrier_ws
         COMMAND chast-quic verify --port 45453 --transport ws --quiet)
     set_tests_properties(quic_carrier_ws PROPERTIES TIMEOUT 120)
+    # Viewer-side recording: the probe muxes the received access units into an
+    # MP4, reopens the files with the container demuxer and checks the sample
+    # counts against what the session carried. verify's default 75% resolution
+    # probe resizes the stream mid-session, so this run also exercises the
+    # rollover into a second segment. Both files are removed afterwards unless
+    # --save is also given.
+    add_test(NAME quic_recording
+        COMMAND chast-quic verify --port 45508 --seconds 4
+                --record .chast-quic-record-test.mp4 --quiet)
+    set_tests_properties(quic_recording PROPERTIES TIMEOUT 120)
 endif()

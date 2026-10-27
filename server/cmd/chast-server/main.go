@@ -23,6 +23,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/admin"
 	"github.com/ltpara/ds-chcast/server/internal/api"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
@@ -48,9 +49,11 @@ func run() error {
 		httpListen   = flag.String("http-listen", "0.0.0.0:8443", "HTTP registration and lookup address")
 		punchListen  = flag.String("punch-listen", "0.0.0.0:8444", "UDP rendezvous and punch address")
 		relayListen  = flag.String("relay-listen", "0.0.0.0", "IP address for relay UDP ports")
+		relayV6      = flag.String("relay-listen-v6", "", "optional IPv6 address for relay UDP ports, same port numbers as --relay-listen")
 		portRange    = flag.String("relay-ports", "41000-41099", "relay UDP ports, e.g. 41000-41099")
 		carrierAddr  = flag.String("carrier-listen", "0.0.0.0:8445", "shared TCP/WebSocket carrier address; empty disables it")
 		advertise    = flag.String("advertise", "", "public IP or DNS name returned to peers")
+		advertiseV6  = flag.String("advertise-v6", "", "public IPv6 address for the rendezvous port; empty derives it from the registration connection")
 		relayServers = flag.String("relay-servers", "", "comma-separated relay host names or IPs without ports; empty uses --advertise")
 		relayNodes   = flag.String("relay-nodes", "", "comma-separated standalone relay node URLs, e.g. http://relay1:8447")
 		relayNodeKey = flag.String("relay-node-key", "", "control key shared with every --relay-nodes entry")
@@ -70,6 +73,7 @@ func run() error {
 		loginWindow  = flag.Duration("login-window", 10*time.Minute, "window for counting failed account logins")
 		loginLockout = flag.Duration("login-lockout", time.Minute, "how long a locked username and client IP stay refused")
 		proxyHeader  = flag.String("proxy-header", "", "header carrying the client IP behind a trusted proxy, e.g. X-Forwarded-For")
+		geoIPFile    = flag.String("geoip-file", "", "CIDR-to-location table used to label login IPs; empty records IPs only")
 		relayOnly    = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
 		adminListen  = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
 
@@ -197,6 +201,18 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("--relay-servers: %w", err)
 	}
+	var relayExtra []string
+	if *relayServers == "" && *relayV6 != "" {
+		if *advertiseV6 == "" {
+			log.Warn("IPv6 relay is listening but not advertised; pass --advertise-v6 or --relay-servers")
+		} else {
+			extra, err := relayaddr.New([]string{*advertiseV6})
+			if err != nil {
+				return fmt.Errorf("--advertise-v6: %w", err)
+			}
+			relayExtra = extra.Addrs()
+		}
+	}
 	if *relayNodes != "" && *relayNodeKey == "" {
 		return errors.New("--relay-nodes requires --relay-node-key")
 	}
@@ -231,6 +247,14 @@ func run() error {
 	} else {
 		log.Warn("persistent state disabled; viewer accounts and address books are unavailable")
 	}
+	var geoLocator *geoip.Locator
+	if *geoIPFile != "" {
+		geoLocator, err = geoip.Load(*geoIPFile)
+		if err != nil {
+			return fmt.Errorf("--geoip-file: %w", err)
+		}
+		log.Info("geoip table loaded", "path", *geoIPFile, "prefixes", geoLocator.Len())
+	}
 	relayOnlyFlag := &atomic.Bool{}
 	relayOnlyFlag.Store(*relayOnly)
 	punchLog := punchlog.New(*punchLogMax, 60*time.Second)
@@ -250,6 +274,7 @@ func run() error {
 	relayManager, err := relay.NewManager(*relayListen, ports, reg, log,
 		relay.WithReadBuffer(*rmem),
 		relay.WithViewerTokenRequired(*serverKey != ""),
+		relay.WithBind6(*relayV6),
 	)
 	if err != nil {
 		return err
@@ -309,6 +334,10 @@ func run() error {
 		return err
 	}
 	punchAddr := net.JoinHostPort(advertised, punchPortText)
+	punchAddrV6 := ""
+	if *advertiseV6 != "" {
+		punchAddrV6 = net.JoinHostPort(strings.Trim(*advertiseV6, "[]"), punchPortText)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -352,22 +381,25 @@ func run() error {
 	}
 
 	handler := api.New(api.Config{
-		Registry:   reg,
-		Relay:      relayManager,
-		Identity:   serverIdentity,
-		PunchAddr:  punchAddr,
-		RelayHost:  advertised,
-		ServerKey:  *serverKey,
-		TTL:        *hostTTL,
-		RelayOnly:  relayOnlyFlag,
-		Blocker:    blocker,
-		Accounts:   accounts,
-		PunchLog:   punchLog,
-		IPChanges:  ipChanges,
-		RelayAddrs: relayAddrs,
-		RelayPool:  pool,
-		Logger:     log,
-		Limiter:    ratelimit.New(*apiRate, float64(*apiBurst)),
+		Registry:    reg,
+		Relay:       relayManager,
+		Identity:    serverIdentity,
+		PunchAddr:   punchAddr,
+		PunchAddrV6: punchAddrV6,
+		RelayHost:   advertised,
+		ServerKey:   *serverKey,
+		TTL:         *hostTTL,
+		RelayOnly:   relayOnlyFlag,
+		Blocker:     blocker,
+		Accounts:    accounts,
+		GeoIP:       geoLocator,
+		PunchLog:    punchLog,
+		IPChanges:   ipChanges,
+		RelayAddrs:  relayAddrs,
+		RelayExtra:  relayExtra,
+		RelayPool:   pool,
+		Logger:      log,
+		Limiter:     ratelimit.New(*apiRate, float64(*apiBurst)),
 		LoginLimiter: newLoginLimiter(accounts, authlimit.Config{
 			Window:      *loginWindow,
 			MaxFailures: *loginFails,
@@ -414,6 +446,7 @@ func run() error {
 
 	log.Info("chast-server ready",
 		"punch", punchAddr,
+		"punch_v6", punchAddrV6,
 		"relay_ports", *portRange,
 		"carrier", relayManager.CarrierAddr(),
 		"server_key", *serverKey != "",

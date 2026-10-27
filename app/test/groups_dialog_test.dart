@@ -12,8 +12,8 @@ class _Result {
 void main() {
   const ServerSettings settings = ServerSettings(url: 'http://127.0.0.1:18643');
   const List<AddressBookGroup> groups = <AddressBookGroup>[
-    AddressBookGroup(id: 'lab', name: 'Lab'),
-    AddressBookGroup(id: 'work', name: 'Work'),
+    AddressBookGroup(id: 'lab', name: 'Lab', revision: 5),
+    AddressBookGroup(id: 'work', name: 'Work', revision: 7),
   ];
 
   Future<_Result> open(WidgetTester tester, GroupsDialog dialog) async {
@@ -47,7 +47,8 @@ void main() {
       token: 'account-token',
       groups: const <AddressBookGroup>[],
       create:
-          (ServerSettings server, String token, String groupId, String name) async {
+          (ServerSettings server, String token, String groupId, String name,
+              {int? ifRevision}) async {
         created.add('$groupId/$name');
         return AddressBookGroup(id: groupId, name: name, revision: 1);
       },
@@ -84,9 +85,10 @@ void main() {
       groups: groups,
       peerCounts: const <String, int>{'lab': 3, 'work': 1},
       rename:
-          (ServerSettings server, String token, String groupId, String name) async {
-        renamed.add('$groupId/$name');
-        return AddressBookGroup(id: groupId, name: name, revision: 2);
+          (ServerSettings server, String token, String groupId, String name,
+              {int? ifRevision}) async {
+        renamed.add('$groupId/$name@$ifRevision');
+        return AddressBookGroup(id: groupId, name: name, revision: 8);
       },
     );
     final _Result result = await open(tester, dialog);
@@ -99,7 +101,7 @@ void main() {
     await tester.tap(find.byKey(const Key('group-name-save')));
     await tester.pumpAndSettle();
 
-    expect(renamed, <String>['work/工作室']);
+    expect(renamed, <String>['work/工作室@7']);
     expect(find.text('工作室'), findsOneWidget);
     expect(find.text('Work'), findsNothing);
     expect(find.text('1 台设备'), findsOneWidget);
@@ -115,8 +117,10 @@ void main() {
       server: settings,
       token: 'account-token',
       groups: groups,
-      remove: (ServerSettings server, String token, String groupId) async {
-        deleted.add(groupId);
+      remove:
+          (ServerSettings server, String token, String groupId,
+              {int? ifRevision}) async {
+        deleted.add('$groupId@$ifRevision');
       },
     );
     final _Result result = await open(tester, dialog);
@@ -127,7 +131,7 @@ void main() {
     await tester.tap(find.byKey(const Key('group-delete-confirm')));
     await tester.pumpAndSettle();
 
-    expect(deleted, <String>['lab']);
+    expect(deleted, <String>['lab@5']);
     expect(find.byKey(const Key('group-row-lab')), findsNothing);
     expect(find.byKey(const Key('group-row-work')), findsOneWidget);
 
@@ -145,7 +149,8 @@ void main() {
       token: 'account-token',
       groups: groups,
       rename:
-          (ServerSettings server, String token, String groupId, String name) async {
+          (ServerSettings server, String token, String groupId, String name,
+              {int? ifRevision}) async {
         attempts++;
         throw const ServerApiException('地址簿分组名称重复', statusCode: 400);
       },
@@ -172,5 +177,47 @@ void main() {
     await tester.tap(find.text('关闭'));
     await tester.pumpAndSettle();
     expect(result.changed, isFalse);
+  });
+
+  testWidgets('a stale group edit refreshes instead of retrying', (
+    tester,
+  ) async {
+    int reloads = 0;
+    final GroupsDialog dialog = GroupsDialog(
+      server: settings,
+      token: 'account-token',
+      groups: groups,
+      rename:
+          (ServerSettings server, String token, String groupId, String name,
+              {int? ifRevision}) async {
+        throw const ServerApiException(
+          'address book group changed elsewhere',
+          statusCode: 409,
+        );
+      },
+      reload: () async {
+        reloads++;
+        return const <AddressBookGroup>[
+          AddressBookGroup(id: 'lab', name: 'Lab', revision: 5),
+          AddressBookGroup(id: 'work', name: 'Work 2', revision: 9),
+        ];
+      },
+    );
+    final _Result result = await open(tester, dialog);
+
+    await tester.tap(find.byKey(const Key('group-rename-work')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('group-name')), '工作室');
+    await tester.tap(find.byKey(const Key('group-name-save')));
+    await tester.pumpAndSettle();
+
+    expect(reloads, 1);
+    expect(find.text('分组已在别处修改，已刷新列表，请重试'), findsOneWidget);
+    expect(find.text('Work 2'), findsOneWidget);
+    expect(find.text('工作室'), findsNothing);
+
+    await tester.tap(find.text('关闭'));
+    await tester.pumpAndSettle();
+    expect(result.changed, isTrue);
   });
 }

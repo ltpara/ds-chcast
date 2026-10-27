@@ -422,6 +422,7 @@ void ViewerBridge::HandleMethodCall(
         map[key("decoder")] = flutter::EncodableValue(status.decoder);
         map[key("serverEncoder")] = flutter::EncodableValue(status.server_encoder);
         map[key("serverFingerprint")] = flutter::EncodableValue(status.server_fingerprint);
+        map[key("auditRef")] = flutter::EncodableValue(status.audit_ref);
         map[key("denial")] = flutter::EncodableValue(static_cast<int32_t>(status.denial));
         map[key("received")] =
             flutter::EncodableValue(static_cast<int64_t>(status.received));
@@ -504,6 +505,17 @@ void ViewerBridge::HandleMethodCall(
         map[key("audioAnnounced")] = flutter::EncodableValue(status.audio_announced);
         map[key("audioEnabled")] = flutter::EncodableValue(status.audio_enabled);
         map[key("audioMuted")] = flutter::EncodableValue(status.audio_muted);
+        map[key("recording")] = flutter::EncodableValue(status.recording);
+        map[key("recordPath")] = flutter::EncodableValue(status.record_path);
+        map[key("recordError")] = flutter::EncodableValue(status.record_error);
+        map[key("recordSamples")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.record_samples));
+        map[key("recordKeyframes")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.record_keyframes));
+        map[key("recordSkipped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.record_skipped));
+        map[key("recordSegments")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.record_segments));
         map[key("audioSampleRate")] =
             flutter::EncodableValue(static_cast<int32_t>(status.audio_sample_rate));
         map[key("audioChannels")] =
@@ -572,6 +584,22 @@ void ViewerBridge::HandleMethodCall(
         map[key("chatFailures")] =
             flutter::EncodableValue(static_cast<int64_t>(status.chat_failures));
         map[key("chatError")] = flutter::EncodableValue(status.chat_error);
+        map[key("terminalSupported")] =
+            flutter::EncodableValue(status.terminal_supported);
+        map[key("terminalPhase")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.terminal_phase));
+        map[key("terminalCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.terminal_code));
+        map[key("terminalReason")] = flutter::EncodableValue(status.terminal_reason);
+        map[key("terminalError")] = flutter::EncodableValue(status.terminal_error);
+        map[key("terminalColumns")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.terminal_columns));
+        map[key("terminalRows")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.terminal_rows));
+        map[key("terminalBytes")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.terminal_bytes));
+        map[key("terminalUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.terminal_updates));
         map[key("displaySwitches")] =
             flutter::EncodableValue(static_cast<int64_t>(status.display_switches));
         map[key("displaySwitchFailures")] =
@@ -598,6 +626,26 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(status.stream_option_error);
         map[key("streamOptionResults")] =
             flutter::EncodableValue(static_cast<int64_t>(status.stream_option_results));
+        map[key("portForwardEnabled")] =
+            flutter::EncodableValue(status.port_forward_enabled);
+        map[key("portForwardActive")] =
+            flutter::EncodableValue(status.port_forward_active);
+        map[key("portForwardLocalPort")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.port_forward_local_port));
+        map[key("portForwardRemoteHost")] =
+            flutter::EncodableValue(status.port_forward_remote_host);
+        map[key("portForwardRemotePort")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.port_forward_remote_port));
+        map[key("portForwardConnections")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_connections));
+        map[key("portForwardFailures")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_failures));
+        map[key("portForwardBytesUp")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_bytes_up));
+        map[key("portForwardBytesDown")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_bytes_down));
+        map[key("portForwardError")] =
+            flutter::EncodableValue(status.port_forward_error);
         flutter::EncodableList modes;
         for (const chast::DisplayModeInfo& mode : status.display_modes) {
             flutter::EncodableMap entry;
@@ -762,6 +810,40 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setRecording") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "setRecording wants a map");
+            return;
+        }
+        bool enabled = false;
+        if (const auto it = args->find(flutter::EncodableValue("enabled"));
+            it != args->end()) {
+            if (const auto* value = std::get_if<bool>(&it->second)) {
+                enabled = *value;
+            }
+        }
+        std::string directory;
+        if (const auto it = args->find(flutter::EncodableValue("directory"));
+            it != args->end()) {
+            if (const auto* value = std::get_if<std::string>(&it->second)) {
+                directory = *value;
+            }
+        }
+        if (viewer_ == nullptr) {
+            result->Error("unavailable", "no viewer session is running");
+            return;
+        }
+        // Starting needs a streaming session; stopping must always be possible
+        // so a teardown can turn the recorder off.
+        if (!viewer_->SetRecording(enabled, directory) && enabled) {
+            result->Error("unavailable", "recording needs a streaming session");
+            return;
+        }
+        result->Success(flutter::EncodableValue(enabled));
+        return;
+    }
+
     if (method == "sendFile" || method == "sendFileAt") {
         if (viewer_ == nullptr) {
             result->Error("unavailable", "no viewer session is running");
@@ -911,6 +993,111 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         result->Success(flutter::EncodableValue(std::move(text)));
+        return;
+    }
+
+    if (method == "openTerminal") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t columns = 0;
+        int64_t rows = 0;
+        if (args == nullptr || !map_int(*args, "columns", &columns) ||
+            !map_int(*args, "rows", &rows) || columns <= 0 || columns > 500 ||
+            rows <= 0 || rows > 200) {
+            result->Error("bad_args", "openTerminal wants columns 1..500 and rows 1..200");
+            return;
+        }
+        const bool opened =
+            viewer_ != nullptr && viewer_->OpenTerminal(
+                                      static_cast<uint16_t>(columns),
+                                      static_cast<uint16_t>(rows));
+        result->Success(flutter::EncodableValue(opened));
+        return;
+    }
+
+    if (method == "sendTerminalInput") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        if (text == nullptr) {
+            result->Error("bad_args", "sendTerminalInput wants the input text");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->SendTerminalInput(*text);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "resizeTerminal") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t columns = 0;
+        int64_t rows = 0;
+        if (args == nullptr || !map_int(*args, "columns", &columns) ||
+            !map_int(*args, "rows", &rows) || columns <= 0 || columns > 500 ||
+            rows <= 0 || rows > 200) {
+            result->Error("bad_args", "resizeTerminal wants columns 1..500 and rows 1..200");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr && viewer_->ResizeTerminal(
+                                      static_cast<uint16_t>(columns),
+                                      static_cast<uint16_t>(rows));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "closeTerminal") {
+        if (viewer_ != nullptr) {
+            viewer_->CloseTerminal();
+        }
+        result->Success();
+        return;
+    }
+
+    if (method == "takeTerminalOutput") {
+        // Bytes, not text: a UTF-8 sequence may be split across chunks, so
+        // decoding belongs to the panel that reassembles the console picture.
+        std::vector<uint8_t> data;
+        bool ended = false;
+        if (viewer_ != nullptr) {
+            viewer_->TakeTerminalOutput(data, ended);
+        }
+        flutter::EncodableMap reply;
+        reply[flutter::EncodableValue("data")] =
+            flutter::EncodableValue(std::move(data));
+        reply[flutter::EncodableValue("ended")] = flutter::EncodableValue(ended);
+        result->Success(flutter::EncodableValue(std::move(reply)));
+        return;
+    }
+
+    if (method == "startPortForward") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "startPortForward wants an argument map");
+            return;
+        }
+        int64_t local_port = 0;
+        int64_t remote_port = 0;
+        std::string remote_host;
+        if (!map_int(*args, "localPort", &local_port) ||
+            !map_int(*args, "remotePort", &remote_port) ||
+            !map_string(*args, "remoteHost", &remote_host) || local_port < 0 ||
+            local_port > 65535 || remote_port <= 0 || remote_port > 65535) {
+            result->Error("bad_args",
+                          "startPortForward wants localPort 0..65535, "
+                          "remotePort 1..65535 and remoteHost");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->StartPortForward(static_cast<uint16_t>(local_port), remote_host,
+                                      static_cast<uint16_t>(remote_port));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "stopPortForward") {
+        if (viewer_ != nullptr) {
+            viewer_->StopPortForward();
+        }
+        result->Success();
         return;
     }
 

@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/upnp"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -35,6 +37,9 @@ type ViewerConfig struct {
 	Mode            string
 	DirectTimeout   time.Duration
 	Logger          *slog.Logger
+	// UPnP maps the viewer's UDP socket on the local gateway so the host can
+	// punch towards a stable external port. It is opt-in.
+	UPnP bool
 	// OnPath receives every direct/relay change, starting with the initial
 	// path once StartViewer has resolved the host. It is called from the read
 	// or timer goroutine, so it must not block.
@@ -68,6 +73,7 @@ type ViewerAgent struct {
 	cancel context.CancelFunc
 
 	punch  *net.UDPAddr
+	punch6 *net.UDPAddr
 	direct *net.UDPAddr
 	relay  *net.UDPAddr
 
@@ -100,6 +106,7 @@ type ViewerAgent struct {
 	lastPathKey string
 	candidates  []*net.UDPAddr
 	natType     string
+	upnpPort    int
 }
 
 func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error) {
@@ -160,6 +167,20 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel()
 		return nil, fmt.Errorf("host %s is registered but offline", cfg.HostID)
 	}
+	if cfg.UPnP {
+		mapCtx, mapCancel := context.WithTimeout(ctx, 5*time.Second)
+		mapper, mapErr := upnp.Map(mapCtx, conn.LocalAddr().(*net.UDPAddr).Port, "chast viewer")
+		mapCancel()
+		if mapErr != nil {
+			v.log.Warn("UPnP mapping unavailable", "error", mapErr)
+		} else {
+			v.upnpPort = mapper.ExternalPort()
+			v.log.Info("UPnP port mapped", "external_port", v.upnpPort,
+				"internal_port", conn.LocalAddr().(*net.UDPAddr).Port,
+				"gateway", mapper.Gateway().ControlURL)
+			go renewUPnP(ctx, v.log, mapper)
+		}
+	}
 	if host.Software.updateAvailable() {
 		v.log.Info("software update available",
 			"version", host.Software.Version, "current", Version, "url", host.Software.URL)
@@ -170,11 +191,24 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		cancel()
 		return nil, fmt.Errorf("punch address: %w", err)
 	}
+	// A viewer bound to an IPv6-only socket cannot reach the IPv4 rendezvous
+	// port, so it needs the IPv6 endpoint to ask for a punch at all.
+	if punch6, err := resolveUDP(host.PunchV6); err == nil && punch6 != nil &&
+		familyAllowed(conn.LocalAddr().(*net.UDPAddr).IP, punch6.IP) {
+		v.punch6 = punch6
+	}
 	candidateTexts := append([]string{}, host.Candidates...)
 	if host.Candidate != "" {
 		candidateTexts = append(candidateTexts, host.Candidate)
 	}
+	if host.CandidateV6 != "" {
+		candidateTexts = append(candidateTexts, host.CandidateV6)
+	}
 	candidateTexts = append(candidateTexts, host.LocalAddrs...)
+	candidateTexts = append(candidateTexts, host.LocalAddrsV6...)
+	if mapped := candidateWithUpnpPort(host.Candidate, host.UpnpPort); mapped != "" {
+		candidateTexts = append(candidateTexts, mapped)
+	}
 	v.candidates = mergeCandidates(conn.LocalAddr().(*net.UDPAddr), candidateTexts)
 	if len(v.candidates) > 0 {
 		v.direct = v.candidates[0]
@@ -184,11 +218,15 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	v.carrierToken = host.CarrierToken
 	v.relayOnly = host.RelayOnly
 	v.transport = host.Transport
-	v.relay, err = resolveUDP(host.Relay)
-	if err != nil {
+	relayTexts := host.Relays
+	if len(relayTexts) == 0 && host.Relay != "" {
+		relayTexts = []string{host.Relay}
+	}
+	v.relay = selectRelayAddr(conn.LocalAddr().(*net.UDPAddr), relayTexts)
+	if v.relay == nil && len(relayTexts) > 0 {
 		conn.Close()
 		cancel()
-		return nil, fmt.Errorf("relay address: %w", err)
+		return nil, fmt.Errorf("relay address %q is not reachable from %s", strings.Join(relayTexts, ", "), cfg.ListenAddr)
 	}
 	carrierReady := v.carrier != "" && v.carrierToken != ""
 	useCarrier := false
@@ -338,15 +376,21 @@ func (v *ViewerAgent) Close() {
 }
 
 func (v *ViewerAgent) sendPunchRequest() {
-	if v.punch == nil {
+	if v.punch == nil && v.punch6 == nil {
 		return
 	}
-	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce}
+	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce, UpnpPort: v.upnpPort}
 	if v.cfg.ServerKey != "" {
 		msg.Timestamp = time.Now().Unix()
 		msg.Auth = identity.PunchAuth(v.cfg.ServerKey, v.cfg.HostID, v.nonce, msg.Timestamp)
 	}
-	v.conn.WriteToUDP(wire.Encode(msg), v.punch)
+	encoded := wire.Encode(msg)
+	if v.punch != nil {
+		v.conn.WriteToUDP(encoded, v.punch)
+	}
+	if v.punch6 != nil {
+		v.conn.WriteToUDP(encoded, v.punch6)
+	}
 }
 
 const (
@@ -575,11 +619,11 @@ func (v *ViewerAgent) readLoop() {
 		}
 		data := buf[:n]
 		v.mu.Lock()
-		punch, direct, relay := cloneAddr(v.punch), cloneAddr(v.direct), cloneAddr(v.relay)
+		punch, punch6, direct, relay := cloneAddr(v.punch), cloneAddr(v.punch6), cloneAddr(v.direct), cloneAddr(v.relay)
 		v.mu.Unlock()
 
 		if wire.IsControl(data) {
-			if sameAddr(src, punch) || sameAddr(src, relay) {
+			if sameAddr(src, punch) || sameAddr(src, punch6) || sameAddr(src, relay) {
 				v.handleControl(data)
 				continue
 			}
@@ -588,7 +632,7 @@ func (v *ViewerAgent) readLoop() {
 			}
 			continue
 		}
-		if sameAddr(src, punch) {
+		if sameAddr(src, punch) || sameAddr(src, punch6) {
 			continue
 		}
 		if sameAddr(src, relay) {
@@ -703,12 +747,19 @@ func (v *ViewerAgent) handleControl(data []byte) {
 				v.mu.Unlock()
 			}
 		}
-		if msg.Candidate != "" || len(msg.LocalAddrs) > 0 {
-			texts := make([]string, 0, len(msg.LocalAddrs)+1)
+		if msg.Candidate != "" || msg.CandidateV6 != "" || len(msg.LocalAddrs) > 0 || len(msg.LocalAddrsV6) > 0 {
+			texts := make([]string, 0, len(msg.LocalAddrs)+len(msg.LocalAddrsV6)+2)
 			if msg.Candidate != "" {
 				texts = append(texts, msg.Candidate)
 			}
+			if msg.CandidateV6 != "" {
+				texts = append(texts, msg.CandidateV6)
+			}
 			texts = append(texts, msg.LocalAddrs...)
+			texts = append(texts, msg.LocalAddrsV6...)
+			if mapped := candidateWithUpnpPort(msg.Candidate, msg.UpnpPort); mapped != "" {
+				texts = append(texts, mapped)
+			}
 			v.mu.Lock()
 			merged := mergeCandidates(v.conn.LocalAddr().(*net.UDPAddr), addrList(v.candidates), texts)
 			if len(merged) > 0 {

@@ -8,7 +8,9 @@ import '../account_store.dart';
 import '../address_book_sync.dart';
 import '../app_info.dart';
 import '../device_store.dart';
+import '../lan_discovery.dart';
 import '../server_api.dart';
+import '../server_identity.dart';
 import '../server_settings.dart';
 import '../target.dart';
 import '../theme.dart';
@@ -36,6 +38,8 @@ typedef AccountLogin = Future<AccountLoginResult> Function(
   String totpCode,
   String recoveryCode,
 });
+typedef AccountRefresh = Future<AccountLoginResult> Function(
+    ServerSettings server, String refreshToken);
 typedef AccountLogout = Future<void> Function(
     ServerSettings server, String token);
 typedef AddressBookFetcher = Future<AddressBookSnapshot> Function(
@@ -59,15 +63,18 @@ class HomePage extends StatefulWidget {
     this.deviceStore,
     this.serverStore,
     this.trustStore,
+    this.identityStore,
     this.accountStore,
     this.lookupBatch,
     this.labelsUpdater,
     this.accountLogin,
+    this.accountRefresh,
     this.accountLogout,
     this.addressBookFetcher,
     this.addressBookPeerWriter,
     this.addressBookPeerDeleter,
     this.wakeSender,
+    this.lanDiscovery,
   });
 
   final String? initialTarget;
@@ -76,15 +83,18 @@ class HomePage extends StatefulWidget {
   final DeviceStore? deviceStore;
   final ServerSettingsStore? serverStore;
   final TrustStore? trustStore;
+  final ServerIdentityStore? identityStore;
   final AccountSessionStore? accountStore;
   final HostLookup? lookupBatch;
   final LabelsUpdater? labelsUpdater;
   final AccountLogin? accountLogin;
+  final AccountRefresh? accountRefresh;
   final AccountLogout? accountLogout;
   final AddressBookFetcher? addressBookFetcher;
   final AddressBookPeerWriter? addressBookPeerWriter;
   final AddressBookPeerDeleter? addressBookPeerDeleter;
   final WakeSender? wakeSender;
+  final LanDiscovery? lanDiscovery;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -101,15 +111,18 @@ class _HomePageState extends State<HomePage> {
   late final DeviceStore _deviceStore;
   late final ServerSettingsStore _serverStore;
   late final TrustStore _trustStore;
+  late final ServerIdentityStore _identityStore;
   late final AccountSessionStore _accountStore;
   late final HostLookup _lookupBatch;
   late final LabelsUpdater _updateLabels;
   late final AccountLogin _loginAccount;
+  late final AccountRefresh _refreshAccount;
   late final AccountLogout _logoutAccount;
   late final AddressBookFetcher _fetchAddressBook;
   late final AddressBookPeerWriter _writeAddressBookPeer;
   late final AddressBookPeerDeleter _deleteAddressBookPeer;
   late final WakeSender _wakeSender;
+  late final LanDiscovery _lanDiscovery;
 
   List<Device> _devices = <Device>[];
   List<AddressBookGroup> _groups = <AddressBookGroup>[];
@@ -117,12 +130,16 @@ class _HomePageState extends State<HomePage> {
   bool _groupsSynced = false;
   ServerSettings _server = const ServerSettings();
   Map<String, String> _trust = <String, String>{};
+  Map<String, ServerIdentityPin> _serverPins =
+      <String, ServerIdentityPin>{};
   AccountSession? _account;
   bool _syncing = false;
   final Map<String, DevicePresence> _presence = <String, DevicePresence>{};
   SoftwareInfo? _software;
   String? _softwareDismissed;
   Timer? _presenceTimer;
+  Timer? _accountTimer;
+  bool _renewing = false;
   bool _presenceRunning = false;
   int _presenceGeneration = 0;
   bool _loading = true;
@@ -137,9 +154,11 @@ class _HomePageState extends State<HomePage> {
     _deviceStore = widget.deviceStore ?? DeviceStore();
     _serverStore = widget.serverStore ?? ServerSettingsStore();
     _trustStore = widget.trustStore ?? TrustStore();
+    _identityStore = widget.identityStore ?? ServerIdentityStore();
     _accountStore = widget.accountStore ?? AccountSessionStore();
     _lookupBatch = widget.lookupBatch ?? ServerApi.lookupBatch;
     _wakeSender = widget.wakeSender ?? WakeOnLan.send;
+    _lanDiscovery = widget.lanDiscovery ?? const LanDiscovery();
     _updateLabels = widget.labelsUpdater ?? ServerApi.updateLabels;
     _loginAccount = widget.accountLogin ??
         (ServerSettings server,
@@ -157,6 +176,7 @@ class _HomePageState extends State<HomePage> {
             );
     _logoutAccount = widget.accountLogout ??
         (ServerSettings server, String token) => ServerApi.logout(server, token);
+    _refreshAccount = widget.accountRefresh ?? ServerApi.refresh;
     _fetchAddressBook = widget.addressBookFetcher ??
         (ServerSettings server, String token, int since) =>
             ServerApi.addressBook(server, token, since: since);
@@ -189,11 +209,16 @@ class _HomePageState extends State<HomePage> {
       _presenceInterval,
       (_) => unawaited(_refreshPresence()),
     );
+    _accountTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => unawaited(_renewAccountIfNeeded()),
+    );
   }
 
   @override
   void dispose() {
     _presenceTimer?.cancel();
+    _accountTimer?.cancel();
     _address.dispose();
     _token.dispose();
     _deviceSearch.dispose();
@@ -204,10 +229,11 @@ class _HomePageState extends State<HomePage> {
     final List<Device> devices = await _deviceStore.load();
     final ServerSettings server = await _serverStore.load();
     final Map<String, String> trust = await _trustStore.load();
+    final Map<String, ServerIdentityPin> pins = await _identityStore.load();
     final AccountSession? storedAccount = await _accountStore.load();
     AccountSession? account;
     if (storedAccount != null) {
-      if (!storedAccount.isActiveAt(DateTime.now()) ||
+      if (!storedAccount.isUsableAt(DateTime.now()) ||
           storedAccount.server != server.url) {
         unawaited(_accountStore.clear());
       } else {
@@ -221,11 +247,13 @@ class _HomePageState extends State<HomePage> {
       _devices = devices;
       _server = server;
       _trust = trust;
+      _serverPins = pins;
       _account = account;
       _loading = false;
     });
     unawaited(_refreshPresence());
-    if (account != null) {
+    await _renewAccountIfNeeded();
+    if (mounted && _account != null) {
       unawaited(_syncAddressBook(announce: false));
     }
     if (!_initialHandled && widget.initialTarget != null) {
@@ -236,6 +264,59 @@ class _HomePageState extends State<HomePage> {
           _connect(target);
         }
       });
+    }
+  }
+
+  /// Renews the access token before it lapses. A rejected refresh token means
+  /// the session is gone (logout, password change or replay detection), so the
+  /// stored session is dropped and the account UI falls back to signed out.
+  Future<void> _renewAccountIfNeeded() async {
+    final AccountSession? account = _account;
+    if (account == null || account.server != _server.url || _renewing) {
+      return;
+    }
+    final DateTime now = DateTime.now().toUtc();
+    if (account.isActiveAt(now.add(const Duration(minutes: 2)))) {
+      return;
+    }
+    if (!account.canRefreshAt(now)) {
+      return;
+    }
+    _renewing = true;
+    try {
+      final AccountLoginResult renewed =
+          await _refreshAccount(_server, account.refreshToken);
+      if (!mounted || !identical(_account, account)) {
+        return;
+      }
+      final DateTime issued = DateTime.now().toUtc();
+      final AccountSession session = account.copyWith(
+        token: renewed.token,
+        expiresAt: issued.add(Duration(milliseconds: renewed.expiresInMs)),
+        refreshToken:
+            renewed.refreshToken.isEmpty ? null : renewed.refreshToken,
+        refreshExpiresAt: renewed.refreshToken.isEmpty
+            ? null
+            : issued.add(Duration(milliseconds: renewed.refreshExpiresInMs)),
+      );
+      await _accountStore.save(session);
+      if (mounted) {
+        setState(() => _account = session);
+      }
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.unauthorized &&
+          mounted &&
+          identical(_account, account)) {
+        await _accountStore.clear();
+        if (mounted) {
+          setState(() => _account = null);
+        }
+      }
+    } catch (_) {
+      // A transient network failure leaves the stored refresh token intact;
+      // the next tick retries before the access token expires.
+    } finally {
+      _renewing = false;
     }
   }
 
@@ -296,6 +377,18 @@ class _HomePageState extends State<HomePage> {
               settings,
               <String>[for (final Device device in group.value) device.id],
             );
+            // A pinned server answers every lookup with its key. A different
+            // (or missing) key means this poll cannot be trusted, so the
+            // presence states stay unknown instead of showing host data.
+            final ServerIdentityPin? pin =
+                _serverPins[normalizeServerUrl(group.key)];
+            if (pin != null) {
+              for (final HostInfo info in batch.hosts.values) {
+                if (info.serverPublicKey != pin.identity.publicKey) {
+                  throw const ServerApiException('服务器身份已变化，已拒绝查询');
+                }
+              }
+            }
             if (group.key == _server.url && batch.software != null) {
               software = batch.software;
             }
@@ -417,7 +510,11 @@ class _HomePageState extends State<HomePage> {
     }
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(builder: (BuildContext context) {
-        return SessionPage(target: target, account: _account);
+        return SessionPage(
+          target: target,
+          account: _account,
+          identityStore: _identityStore,
+        );
       }),
     );
     if (!mounted) {
@@ -425,7 +522,15 @@ class _HomePageState extends State<HomePage> {
     }
     setState(() => _opening = false);
     await _reloadTrust();
+    await _reloadServerPins();
     unawaited(_refreshPresence());
+  }
+
+  Future<void> _reloadServerPins() async {
+    final Map<String, ServerIdentityPin> pins = await _identityStore.load();
+    if (mounted) {
+      setState(() => _serverPins = pins);
+    }
   }
 
   Device _deviceForTarget(ConnectTarget target) {
@@ -485,6 +590,44 @@ class _HomePageState extends State<HomePage> {
       builder: (BuildContext context) {
         return _AddDeviceDialog(server: _server);
       },
+    );
+  }
+
+  Future<void> _scanLan() async {
+    final List<LanPeer>? peers = await showDialog<List<LanPeer>>(
+      context: context,
+      builder: (BuildContext context) {
+        return _LanScanDialog(discovery: _lanDiscovery, server: _server);
+      },
+    );
+    if (peers == null || peers.isEmpty || !mounted) {
+      return;
+    }
+    List<Device> devices = _devices;
+    for (final LanPeer peer in peers) {
+      final Device device = Device(
+        id: peer.id,
+        name: peer.hostname,
+        server: _server.url,
+        mac: normalizeMac(peer.mac) ?? '',
+        addedAt: DateTime.now(),
+      );
+      devices = await _deviceStore.save(device);
+      unawaited(_pushAccountPeer(device, allowEmptyName: true));
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() => _devices = devices);
+    unawaited(_refreshPresence());
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          peers.length == 1
+              ? '已添加 ${peers.first.label}'
+              : '已添加 ${peers.length} 台局域网设备',
+        ),
+      ),
     );
   }
 
@@ -641,6 +784,10 @@ class _HomePageState extends State<HomePage> {
             token: account.token,
             groups: _groups,
             peerCounts: counts,
+            reload: () async {
+              await _syncAddressBook(announce: false);
+              return _groups;
+            },
           ),
         ) ??
         false;
@@ -737,6 +884,7 @@ class _HomePageState extends State<HomePage> {
           account: _account,
           login: _loginAccount,
           syncing: _syncing,
+          groups: _groups,
         );
       },
     );
@@ -1191,7 +1339,7 @@ class _HomePageState extends State<HomePage> {
     final ServerSettings? settings = await showDialog<ServerSettings>(
       context: context,
       builder: (BuildContext context) {
-        return _ServerDialog(initial: _server);
+        return _ServerDialog(initial: _server, identityStore: _identityStore);
       },
     );
     if (settings == null) {
@@ -1652,6 +1800,13 @@ class _HomePageState extends State<HomePage> {
                         label: const Text('分组',
                             style: TextStyle(fontSize: 12)),
                       ),
+                    TextButton.icon(
+                      key: const Key('lan-scan'),
+                      onPressed: _scanLan,
+                      style: TextButton.styleFrom(foregroundColor: kAccent),
+                      icon: const Icon(Icons.radar_rounded, size: 16),
+                      label: const Text('扫描', style: TextStyle(fontSize: 12)),
+                    ),
                     TextButton.icon(
                       onPressed: _showAddDevice,
                       style: TextButton.styleFrom(foregroundColor: kAccent),
@@ -3302,6 +3457,176 @@ class _RecentCard extends StatelessWidget {
   }
 }
 
+class _LanScanDialog extends StatefulWidget {
+  const _LanScanDialog({required this.discovery, required this.server});
+
+  final LanDiscovery discovery;
+  final ServerSettings server;
+
+  @override
+  State<_LanScanDialog> createState() => _LanScanDialogState();
+}
+
+class _LanScanDialogState extends State<_LanScanDialog> {
+  List<LanPeer> _peers = <LanPeer>[];
+  final Set<String> _selected = <String>{};
+  bool _scanning = true;
+  String _error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_scan());
+  }
+
+  Future<void> _scan() async {
+    setState(() {
+      _scanning = true;
+      _error = '';
+    });
+    try {
+      final List<LanPeer> peers = await widget.discovery.scan();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _peers = peers;
+        _selected
+          ..clear()
+          ..addAll(peers.map((LanPeer peer) => peer.id));
+        _scanning = false;
+      });
+    } on LanDiscoveryException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = error.message;
+        _scanning = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool canAdd = widget.server.configured;
+    return AlertDialog(
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      title: const Text('扫描局域网'),
+      content: SizedBox(
+        width: 460,
+        height: 320,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            if (!canAdd)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  '未配置连接服务，发现的 ID 不能保存为可连接设备。',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+            Expanded(child: _buildBody(context)),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          key: const Key('lan-scan-again'),
+          onPressed: _scanning ? null : _scan,
+          child: const Text('重新扫描'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          key: const Key('lan-add'),
+          onPressed: !canAdd || _selected.isEmpty
+              ? null
+              : () => Navigator.of(context).pop(
+                    _peers
+                        .where((LanPeer peer) => _selected.contains(peer.id))
+                        .toList(),
+                  ),
+          child: Text(_selected.isEmpty ? '添加' : '添加 ${_selected.length} 台'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    if (_scanning) {
+      return const Center(
+        child: SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2, color: kAccent),
+        ),
+      );
+    }
+    if (_error.isNotEmpty) {
+      return Center(
+        child: Text(
+          _error,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Theme.of(context).colorScheme.error,
+            fontSize: 12,
+          ),
+        ),
+      );
+    }
+    if (_peers.isEmpty) {
+      return Center(
+        child: Text(
+          '没有发现局域网主机\n确认主机正在运行、允许局域网发现，并放行 UDP 21129。',
+          textAlign: TextAlign.center,
+          style: mutedStyle(context, size: 12),
+        ),
+      );
+    }
+    return ListView.builder(
+      itemCount: _peers.length,
+      itemBuilder: (BuildContext context, int index) {
+        final LanPeer peer = _peers[index];
+        return CheckboxListTile(
+          key: Key('lan-peer-${peer.id}'),
+          value: _selected.contains(peer.id),
+          dense: true,
+          controlAffinity: ListTileControlAffinity.leading,
+          onChanged: (bool? value) {
+            setState(() {
+              if (value == true) {
+                _selected.add(peer.id);
+              } else {
+                _selected.remove(peer.id);
+              }
+            });
+          },
+          title: Text(
+            peer.label,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+          subtitle: Text(
+            <String>[
+              peer.detail,
+              if (peer.mac.isNotEmpty) peer.mac,
+            ].join('\n'),
+            style: mutedStyle(context, size: 11),
+          ),
+          isThreeLine: peer.mac.isNotEmpty,
+        );
+      },
+    );
+  }
+}
+
 class _AddDeviceDialog extends StatefulWidget {
   const _AddDeviceDialog({required this.server});
 
@@ -3482,12 +3807,14 @@ class _AccountDialog extends StatefulWidget {
     required this.account,
     required this.login,
     required this.syncing,
+    this.groups = const <AddressBookGroup>[],
   });
 
   final ServerSettings server;
   final AccountSession? account;
   final AccountLogin login;
   final bool syncing;
+  final List<AddressBookGroup> groups;
 
   @override
   State<_AccountDialog> createState() => _AccountDialogState();
@@ -3540,14 +3867,17 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (!mounted) {
         return;
       }
+      final DateTime issued = DateTime.now().toUtc();
       Navigator.of(context).pop(_AccountResult(
         session: AccountSession(
           server: widget.server.url,
           username: result.username.isEmpty ? username : result.username,
           token: result.token,
-          expiresAt: DateTime.now()
-              .toUtc()
-              .add(Duration(milliseconds: result.expiresInMs)),
+          expiresAt: issued.add(Duration(milliseconds: result.expiresInMs)),
+          refreshToken: result.refreshToken,
+          refreshExpiresAt: result.refreshToken.isEmpty
+              ? null
+              : issued.add(Duration(milliseconds: result.refreshExpiresInMs)),
         ),
       ));
     } on ServerApiException catch (error) {
@@ -3583,7 +3913,11 @@ class _AccountDialogState extends State<_AccountDialog> {
     final AddressBookPeer? peer = await showDialog<AddressBookPeer>(
       context: context,
       builder: (BuildContext context) {
-        return SharedBooksDialog(server: widget.server, account: account);
+        return SharedBooksDialog(
+          server: widget.server,
+          account: account,
+          groups: widget.groups,
+        );
       },
     );
     if (peer != null && mounted) {
@@ -3860,9 +4194,10 @@ class _AccountDialogState extends State<_AccountDialog> {
 }
 
 class _ServerDialog extends StatefulWidget {
-  const _ServerDialog({required this.initial});
+  const _ServerDialog({required this.initial, required this.identityStore});
 
   final ServerSettings initial;
+  final ServerIdentityStore identityStore;
 
   @override
   State<_ServerDialog> createState() => _ServerDialogState();
@@ -3876,6 +4211,7 @@ class _ServerDialogState extends State<_ServerDialog> {
   bool _showKey = false;
   String _status = '';
   bool _statusOk = false;
+  ServerIdentityPin? _pin;
 
   @override
   void initState() {
@@ -3883,13 +4219,30 @@ class _ServerDialogState extends State<_ServerDialog> {
     _url = TextEditingController(text: widget.initial.url);
     _key = TextEditingController(text: widget.initial.key);
     _mode = widget.initial.mode;
+    _url.addListener(_loadPin);
+    unawaited(_loadPin());
   }
 
   @override
   void dispose() {
+    _url.removeListener(_loadPin);
     _url.dispose();
     _key.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadPin() async {
+    final String url = normalizeServerUrl(_url.text);
+    final ServerIdentityPin? pin =
+        url.isEmpty ? null : await widget.identityStore.pinFor(url);
+    if (mounted) {
+      setState(() => _pin = pin);
+    }
+  }
+
+  Future<void> _forgetPin() async {
+    await widget.identityStore.forget(normalizeServerUrl(_url.text));
+    await _loadPin();
   }
 
   Future<void> _test() async {
@@ -4027,6 +4380,36 @@ class _ServerDialogState extends State<_ServerDialog> {
                     ),
                   ),
                 ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: <Widget>[
+                Icon(
+                  _pin == null
+                      ? Icons.verified_user_outlined
+                      : Icons.verified_user,
+                  size: 15,
+                  color: _pin == null
+                      ? mutedStyle(context).color
+                      : const Color(0xFF4CAF50),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    _pin == null
+                        ? '服务器身份尚未固定：首次连接时会展示指纹'
+                        : '服务器身份 ${shortenServerFingerprint(_pin!.identity.fingerprint)}（已固定）',
+                    overflow: TextOverflow.ellipsis,
+                    style: mutedStyle(context, size: 11),
+                  ),
+                ),
+                if (_pin != null)
+                  TextButton(
+                    key: const Key('server-identity-forget'),
+                    onPressed: _forgetPin,
+                    child: const Text('清除固定'),
+                  ),
               ],
             ),
             Text(

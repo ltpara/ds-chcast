@@ -171,30 +171,48 @@ func (s *Server) handle(msg wire.Message, src *net.UDPAddr) {
 // one-time nonce before the observed address is allowed to move, so a spoofed
 // source cannot redirect a host's mapping.
 func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
-	nonce, err := s.reg.IssueChallenge(msg.HostID, identity.DomainKeepalive)
+	candidate, candidateV6 := observedCandidate(src)
+	scope := "v4"
+	if candidateV6 != "" {
+		scope = "v6"
+	}
+	nonce, err := s.reg.IssueChallengeScoped(msg.HostID, identity.DomainKeepalive, scope)
 	if err != nil {
 		s.reply(src, wire.Message{Type: wire.TypeKeepaliveAck, Error: "host has no live registration"})
 		return
 	}
 	s.reply(src, wire.Message{
-		Type:      wire.TypeKeepaliveChallenge,
-		HostID:    msg.HostID,
-		Nonce:     nonce,
-		Candidate: src.String(),
+		Type:        wire.TypeKeepaliveChallenge,
+		HostID:      msg.HostID,
+		Nonce:       nonce,
+		Candidate:   candidate,
+		CandidateV6: candidateV6,
 	})
 }
 
 func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	ack := wire.Message{Type: wire.TypeKeepaliveAck}
-	candidate := src.String()
-	if msg.Candidate != "" && msg.Candidate != candidate {
+	candidate, candidateV6 := observedCandidate(src)
+	if (msg.Candidate != "" && msg.Candidate != candidate) ||
+		(msg.CandidateV6 != "" && msg.CandidateV6 != candidateV6) ||
+		(msg.Candidate == "" && msg.CandidateV6 == "") {
 		ack.Error = "keepalive arrived from a different address than the challenge"
 		s.reply(src, ack)
 		return
 	}
-	message := identity.KeepaliveMessage(msg.HostID, candidate, msg.Nonce)
-	if err := s.reg.TouchChallenge(msg.HostID, msg.Nonce, candidate, msg.Signature,
-		string(message), msg.LocalAddrs, msg.NATType); err != nil {
+	observed := candidate
+	if observed == "" {
+		observed = candidateV6
+	}
+	if !validUpnpPort(msg.UpnpPort) {
+		ack.Error = "upnp_port must be 0..65535"
+		s.reply(src, ack)
+		return
+	}
+	message := identity.KeepaliveMessage(msg.HostID, observed, msg.Nonce)
+	localAddrs := append(append([]string{}, msg.LocalAddrs...), msg.LocalAddrsV6...)
+	if err := s.reg.TouchChallenge(msg.HostID, msg.Nonce, observed, msg.Signature,
+		string(message), localAddrs, msg.NATType, msg.UpnpPort); err != nil {
 		ack.Error = err.Error()
 		s.reply(src, ack)
 		return
@@ -210,7 +228,9 @@ func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
 	}
 	ack.OK = true
 	ack.Candidate = candidate
+	ack.CandidateV6 = candidateV6
 	ack.LocalAddrs = host.LocalAddrs
+	ack.LocalAddrsV6 = host.LocalAddrsV6
 	ack.NATType = host.NATType
 	ack.Fingerprint = host.Fingerprint
 	if host.RelayPort != 0 {
@@ -241,6 +261,11 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
+	if !validUpnpPort(msg.UpnpPort) {
+		reply.Error = "upnp_port must be 0..65535"
+		s.reply(src, reply)
+		return
+	}
 	if !identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth,
 		msg.Timestamp, time.Now(), punchAuthWindow) {
 		reply.Error = "punch authentication failed"
@@ -258,28 +283,48 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		s.reply(src, reply)
 		return
 	}
-	hostAddr, err := net.ResolveUDPAddr("udp", host.Candidate)
-	if err != nil {
+	var hostAddrs []*net.UDPAddr
+	for _, text := range []string{host.Candidate, host.CandidateV6} {
+		if text == "" {
+			continue
+		}
+		addr, err := net.ResolveUDPAddr("udp", text)
+		if err == nil && addr != nil {
+			hostAddrs = append(hostAddrs, addr)
+		}
+	}
+	if len(hostAddrs) == 0 {
 		reply.Error = "host has no usable address"
 		s.reply(src, reply)
 		return
 	}
+	viewer4, viewer6 := observedCandidate(src)
 	// Record only requests that can actually be coordinated, matching hbbs's
-	// record point after the target's online check.
+	// record point after the target's online check. A dual-stack host gets one
+	// entry per family.
 	if s.punchLog != nil {
-		s.punchLog.Record(src.IP.String(), hostAddr.IP.String(), host.ID)
+		for _, addr := range hostAddrs {
+			s.punchLog.Record(src.IP.String(), addr.IP.String(), host.ID)
+		}
 	}
 	// Tell the host to punch towards the viewer. Best effort: the viewer is
 	// also told the host candidate and will probe first.
-	s.reply(hostAddr, wire.Message{
-		Type:      wire.TypePunchPeer,
-		Nonce:     msg.Nonce,
-		Candidate: src.String(),
-		ExpiresMS: punchTTL.Milliseconds(),
-	})
+	for _, hostAddr := range hostAddrs {
+		s.reply(hostAddr, wire.Message{
+			Type:        wire.TypePunchPeer,
+			Nonce:       msg.Nonce,
+			Candidate:   viewer4,
+			CandidateV6: viewer6,
+			UpnpPort:    msg.UpnpPort,
+			ExpiresMS:   punchTTL.Milliseconds(),
+		})
+	}
 	reply.OK = true
 	reply.Candidate = host.Candidate
+	reply.CandidateV6 = host.CandidateV6
+	reply.UpnpPort = host.UpnpPort
 	reply.LocalAddrs = host.LocalAddrs
+	reply.LocalAddrsV6 = host.LocalAddrsV6
 	reply.NATType = host.NATType
 	reply.PublicKey = host.PublicKey
 	reply.Fingerprint = host.Fingerprint
@@ -301,6 +346,12 @@ func (s *Server) reply(to *net.UDPAddr, m wire.Message) {
 	if _, err := s.conn.WriteToUDP(wire.Encode(m), to); err != nil {
 		s.log.Debug("rendezvous reply", "to", to, "error", err)
 	}
+}
+
+// validUpnpPort accepts 0 for "no mapping reported" and otherwise a port the
+// peer could plausibly be reached on.
+func validUpnpPort(port int) bool {
+	return port >= 0 && port <= 65535
 }
 
 type limitWindow struct {
@@ -351,4 +402,18 @@ func (l *limiter) allow(ip string) bool {
 // address and joins it with a port. IPv6 literals get brackets.
 func NormalizeRelay(host string, port int) string {
 	return net.JoinHostPort(strings.Trim(host, "[]"), fmt.Sprint(port))
+}
+
+// observedCandidate splits a source address into the IPv4 and IPv6 candidate
+// fields. UDPAddr.String already renders IPv4-mapped addresses (what a
+// dual-stack socket reports for an IPv4 peer) as dotted quads, so only the
+// family needs classifying here.
+func observedCandidate(src *net.UDPAddr) (v4, v6 string) {
+	if src == nil {
+		return "", ""
+	}
+	if src.IP.To4() != nil {
+		return src.String(), ""
+	}
+	return "", src.String()
 }

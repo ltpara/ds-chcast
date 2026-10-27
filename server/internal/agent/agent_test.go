@@ -84,7 +84,11 @@ func testRoundTrip(t *testing.T, ctx context.Context, s *testutil.Server, mode s
 		t.Fatalf("start viewer agent: %v", err)
 	}
 	t.Cleanup(viewer.Close)
+	assertRoundTrip(t, viewer, mode)
+}
 
+func assertRoundTrip(t *testing.T, viewer *ViewerAgent, mode string) {
+	t.Helper()
 	client, err := net.DialUDP("udp", nil, viewer.LocalAddr().(*net.UDPAddr))
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +112,61 @@ func testRoundTrip(t *testing.T, ctx context.Context, s *testutil.Server, mode s
 			t.Fatalf("%s path did not deliver a datagram: %v", mode, err)
 		}
 	}
+}
+
+func TestHostIDMigrationThroughAgent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := testutil.Start(t)
+	echo := startEcho(t)
+
+	first := startHostAgent(t, ctx, s.URL, echo.LocalAddr().String())
+	first.Close()
+
+	host, err := StartHost(ctx, HostConfig{
+		ServerURL:  s.URL,
+		ServerKey:  testutil.ServerKey,
+		ID:         "newbox",
+		OldID:      "devbox",
+		Key:        "host-secret",
+		LocalAddr:  echo.LocalAddr().String(),
+		ListenAddr: "127.0.0.1:0",
+		Keepalive:  300 * time.Millisecond,
+		Logger:     quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start migrated host: %v", err)
+	}
+	t.Cleanup(host.Close)
+	readyCtx, readyCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer readyCancel()
+	if err := host.WaitReady(readyCtx); err != nil {
+		t.Fatalf("host readiness: %v", err)
+	}
+	if info := host.Info(); info.ID != "newbox" || info.MigratedFrom != "devbox" {
+		t.Fatalf("host info after migration = %+v", info)
+	}
+	if _, ok := s.Registry.Identity("devbox"); ok {
+		t.Fatal("the server kept the old identity")
+	}
+	if _, ok := s.Registry.Identity("newbox"); !ok {
+		t.Fatal("the server did not create the new identity")
+	}
+
+	viewer, err := StartViewer(ctx, ViewerConfig{
+		ServerURL:     s.URL,
+		ServerKey:     testutil.ServerKey,
+		HostID:        "newbox",
+		ListenAddr:    "127.0.0.1:0",
+		Mode:          ModeDirect,
+		DirectTimeout: 1 * time.Second,
+		Logger:        quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start viewer: %v", err)
+	}
+	t.Cleanup(viewer.Close)
+	assertRoundTrip(t, viewer, ModeDirect)
 }
 
 func TestDirectPathThroughAgents(t *testing.T) {

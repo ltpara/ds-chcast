@@ -38,19 +38,29 @@ type Message struct {
 	HostID      string   `json:"host_id,omitempty"`
 	Nonce       string   `json:"nonce,omitempty"`
 	Candidate   string   `json:"candidate,omitempty"`
+	CandidateV6 string   `json:"candidate_v6,omitempty"`
 	LocalAddrs  []string `json:"local_addrs,omitempty"`
-	NATType     string   `json:"nat_type,omitempty"`
-	Fingerprint string   `json:"fingerprint,omitempty"`
-	PublicKey   string   `json:"public_key,omitempty"`
-	Binding     string   `json:"binding,omitempty"`
-	Signature   string   `json:"signature,omitempty"`
-	Auth        string   `json:"auth,omitempty"`
-	Token       string   `json:"token,omitempty"`
-	Timestamp   int64    `json:"timestamp,omitempty"`
-	Relay       string   `json:"relay,omitempty"`
-	OK          bool     `json:"ok"`
-	Error       string   `json:"error,omitempty"`
-	ExpiresMS   int64    `json:"expires_ms,omitempty"`
+	// LocalAddrsV6 mirrors LocalAddrs for IPv6. RustDesk carries the same split
+	// as socket_addr/socket_addr_v6; a dual-stack agent reports both.
+	LocalAddrsV6 []string `json:"local_addrs_v6,omitempty"`
+	NATType      string   `json:"nat_type,omitempty"`
+	// UpnpPort is the external UDP port an agent mapped on its gateway. It is
+	// only a hint: the peer still has to be reached through the NAT, but a
+	// stable mapping can rescue symmetric NATs where the observed source port
+	// differs per destination. RustDesk carries the same field in its punch,
+	// response and relay messages.
+	UpnpPort    int    `json:"upnp_port,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	PublicKey   string `json:"public_key,omitempty"`
+	Binding     string `json:"binding,omitempty"`
+	Signature   string `json:"signature,omitempty"`
+	Auth        string `json:"auth,omitempty"`
+	Token       string `json:"token,omitempty"`
+	Timestamp   int64  `json:"timestamp,omitempty"`
+	Relay       string `json:"relay,omitempty"`
+	OK          bool   `json:"ok"`
+	Error       string `json:"error,omitempty"`
+	ExpiresMS   int64  `json:"expires_ms,omitempty"`
 }
 
 var ErrNotControl = errors.New("not a control datagram")

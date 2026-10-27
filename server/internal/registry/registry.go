@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"slices"
 	"sort"
@@ -26,6 +27,10 @@ var (
 	ErrKeyMismatch = errors.New("host id is bound to another public key")
 	ErrUnknownHost = errors.New("unknown host")
 	ErrChallenge   = errors.New("challenge is missing, mismatched or expired")
+	// ErrMigrationDenied means old_id exists but belongs to another key. The
+	// caller has already proven the new id with the presented key, so this is
+	// an attempt to move an identity it does not own.
+	ErrMigrationDenied = errors.New("old id belongs to another public key")
 )
 
 const challengeTTL = 30 * time.Second
@@ -68,12 +73,20 @@ type Host struct {
 	Carrier string
 	// Candidate is the public UDP endpoint most recently observed by the
 	// rendezvous service. It is not trusted for routing on the server; it is
-	// only handed to peers that ask for this host.
-	Candidate string
-	// LocalAddrs and NATType are reported by the host agent to improve direct
-	// connections on LANs and to describe the path to the viewer.
-	LocalAddrs []string
-	NATType    string
+	// only handed to peers that ask for this host. CandidateV6 holds the
+	// IPv6 mapping when the host keeps a second, separate mapping.
+	Candidate   string
+	CandidateV6 string
+	// LocalAddrs/LocalAddrsV6 and NATType are reported by the host agent to
+	// improve direct connections on LANs and to describe the path to the
+	// viewer. The agent splits its candidates by address family.
+	LocalAddrs   []string
+	LocalAddrsV6 []string
+	NATType      string
+	// UpnpPort is the external UDP port the host asked its gateway to map to
+	// this agent's socket. It is renewed with each keepalive and cleared when
+	// the host re-registers without a mapping.
+	UpnpPort int
 	// CarrierToken authorizes the host's slot on the shared TCP/WebSocket
 	// carrier. It is regenerated per registration lease, so after a restart it
 	// no longer matches on old viewers, similar to RustDesk's relay uuid.
@@ -93,6 +106,12 @@ type RegisterRequest struct {
 	Platform string
 	Version  string
 	TTL      time.Duration
+	// OldID is the id this device used before. The caller must have proven
+	// ownership of it; Register moves its durable record to ID, preserving the
+	// creation time and operator labels, and releases its lease. An unknown
+	// old id is accepted so a retry after a successful migration is
+	// idempotent.
+	OldID string
 }
 
 type Registry struct {
@@ -180,24 +199,50 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if req.OldID != "" {
+		if !ValidID(req.OldID) {
+			return Host{}, fmt.Errorf("old id %q must be 1..64 characters of [A-Za-z0-9_.-]", req.OldID)
+		}
+		if req.OldID == req.ID {
+			return Host{}, errors.New("old id must differ from the new id")
+		}
+		old, oldExists := r.identities[req.OldID]
+		if oldExists {
+			if old.PublicKey != req.PublicKey {
+				return Host{}, ErrMigrationDenied
+			}
+			if existing, exists := r.identities[req.ID]; exists {
+				// A retry after the server already moved the record. The new
+				// record is authoritative; only the leftover old binding goes.
+				if existing.PublicKey != req.PublicKey {
+					return Host{}, ErrKeyMismatch
+				}
+			} else {
+				migrated := applyRegistrationMetadata(old, req)
+				migrated.ID = req.ID
+				migrated.LastSeen = now
+				if err := r.storeIdentityLocked(migrated); err != nil {
+					return Host{}, err
+				}
+				if r.store != nil {
+					if err := r.store.Delete(req.OldID); err != nil {
+						return Host{}, err
+					}
+				}
+			}
+			delete(r.identities, req.OldID)
+			// The old lease carries addresses and relay ownership. The API
+			// releases the relay itself; the lease must never answer lookups.
+			delete(r.hosts, req.OldID)
+		}
+	}
+
 	record, exists := r.identities[req.ID]
 	if exists {
 		if record.PublicKey != req.PublicKey {
 			return Host{}, ErrKeyMismatch
 		}
-		updated := record
-		if req.Fingerprint != "" {
-			updated.Fingerprint = req.Fingerprint
-		}
-		if req.Hostname != "" {
-			updated.Hostname = normalizeMetadata(req.Hostname, maxHostname)
-		}
-		if req.Platform != "" {
-			updated.Platform = normalizeMetadata(req.Platform, maxPlatform)
-		}
-		if req.Version != "" {
-			updated.Version = normalizeMetadata(req.Version, maxVersion)
-		}
+		updated := applyRegistrationMetadata(record, req)
 		updated.LastSeen = now
 		if identityChanged(record, updated) {
 			if err := r.storeIdentityLocked(updated); err != nil {
@@ -239,6 +284,24 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 	host.Fingerprint = record.Fingerprint
 	host.ExpiresAt = now.Add(req.TTL)
 	return *host, nil
+}
+
+// applyRegistrationMetadata overlays the fields a host may update. Alias,
+// tags and CreatedAt are operator history and stay untouched.
+func applyRegistrationMetadata(record Identity, req RegisterRequest) Identity {
+	if req.Fingerprint != "" {
+		record.Fingerprint = req.Fingerprint
+	}
+	if req.Hostname != "" {
+		record.Hostname = normalizeMetadata(req.Hostname, maxHostname)
+	}
+	if req.Platform != "" {
+		record.Platform = normalizeMetadata(req.Platform, maxPlatform)
+	}
+	if req.Version != "" {
+		record.Version = normalizeMetadata(req.Version, maxVersion)
+	}
+	return record
 }
 
 func newCarrierToken() (string, error) {
@@ -299,7 +362,7 @@ func (r *Registry) Lookup(id string) (Host, bool) {
 func (r *Registry) Online(host Host) bool {
 	now := r.now()
 	return now.Before(host.ExpiresAt) && !host.LastSeen.IsZero() &&
-		now.Sub(host.LastSeen) <= r.offlineAfter && host.Candidate != ""
+		now.Sub(host.LastSeen) <= r.offlineAfter && (host.Candidate != "" || host.CandidateV6 != "")
 }
 
 // Touch records an authenticated keepalive from the address the rendezvous
@@ -307,10 +370,10 @@ func (r *Registry) Online(host Host) bool {
 func (r *Registry) Touch(id, candidate string, localAddrs []string, natType string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.touchLocked(id, candidate, localAddrs, natType)
+	return r.touchLocked(id, candidate, localAddrs, natType, 0)
 }
 
-func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natType string) error {
+func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natType string, upnpPort int) error {
 	host, ok := r.hosts[id]
 	if !ok {
 		return ErrUnknownHost
@@ -324,13 +387,20 @@ func (r *Registry) touchLocked(id, candidate string, localAddrs []string, natTyp
 		r.identities[id] = record
 	}
 	if candidate != "" {
-		host.Candidate = candidate
+		if isIPv6Text(candidate) {
+			host.CandidateV6 = candidate
+		} else {
+			host.Candidate = candidate
+		}
 	}
 	if localAddrs != nil {
-		host.LocalAddrs = normalizeAddrs(localAddrs)
+		host.LocalAddrs, host.LocalAddrsV6 = splitAddrsByFamily(localAddrs)
 	}
 	if natType != "" {
 		host.NATType = natType
+	}
+	if upnpPort > 0 && upnpPort <= 65535 {
+		host.UpnpPort = upnpPort
 	}
 	return nil
 }
@@ -513,6 +583,17 @@ func (r *Registry) VerifyCarrier(id, token string) bool {
 // IssueChallenge creates a one-time nonce for a host and purpose. The caller
 // sends it to the host and includes it in the signed reply.
 func (r *Registry) IssueChallenge(id, purpose string) (string, error) {
+	return r.issueChallenge(id, purpose, "")
+}
+
+// IssueChallengeScoped is IssueChallenge with an extra key component. A
+// dual-stack host keeps its IPv4 and IPv6 mappings alive from two sources, and
+// a single pending nonce would be replaced by whichever exchange arrived last.
+func (r *Registry) IssueChallengeScoped(id, purpose, scope string) (string, error) {
+	return r.issueChallenge(id, purpose, scope)
+}
+
+func (r *Registry) issueChallenge(id, purpose, scope string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	host, ok := r.hosts[id]
@@ -524,7 +605,7 @@ func (r *Registry) IssueChallenge(id, purpose string) (string, error) {
 		return "", err
 	}
 	now := r.now()
-	key := challengeKey(id, purpose)
+	key := challengeKey(id, purpose, scope)
 	for k, c := range r.challenges {
 		if now.After(c.expires) {
 			delete(r.challenges, k)
@@ -537,9 +618,13 @@ func (r *Registry) IssueChallenge(id, purpose string) (string, error) {
 // VerifyChallenge consumes the nonce and verifies the host signature over the
 // caller-built canonical message. On success it returns the live host.
 func (r *Registry) VerifyChallenge(id, purpose, nonce, message, signature string) (Host, error) {
+	return r.verifyChallenge(id, purpose, "", nonce, message, signature)
+}
+
+func (r *Registry) verifyChallenge(id, purpose, scope, nonce, message, signature string) (Host, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := challengeKey(id, purpose)
+	key := challengeKey(id, purpose, scope)
 	pending, ok := r.challenges[key]
 	if !ok || pending.purpose != purpose || pending.nonce != nonce || r.now().After(pending.expires) {
 		return Host{}, ErrChallenge
@@ -570,17 +655,34 @@ func (r *Registry) CheckChallenge(id, purpose, nonce, message, signature string)
 // TouchChallenge verifies and records a keepalive in one step. The observed
 // candidate is part of the signed message, so a replay from another address
 // cannot move the host's mapping.
-func (r *Registry) TouchChallenge(id, nonce, candidate, signature, message string, localAddrs []string, natType string) error {
-	_, err := r.VerifyChallenge(id, identity.DomainKeepalive, nonce, message, signature)
+func (r *Registry) TouchChallenge(id, nonce, candidate, signature, message string, localAddrs []string, natType string, upnpPort int) error {
+	_, err := r.verifyChallenge(id, identity.DomainKeepalive, challengeScope(candidate),
+		nonce, message, signature)
 	if err != nil {
 		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.touchLocked(id, candidate, localAddrs, natType)
+	return r.touchLocked(id, candidate, localAddrs, natType, upnpPort)
 }
 
-func challengeKey(id, purpose string) string { return id + "\x00" + purpose }
+func challengeKey(id, purpose, scope string) string {
+	key := id + "\x00" + purpose
+	if scope != "" {
+		key += "\x00" + scope
+	}
+	return key
+}
+
+// challengeScope matches the family used by IssueChallengeScoped for a
+// keepalive: the observed candidate is the signed address, so its family is
+// the same one the challenge was issued for.
+func challengeScope(candidate string) string {
+	if isIPv6Text(candidate) {
+		return "v6"
+	}
+	return "v4"
+}
 
 func newNonce() (string, error) {
 	raw := make([]byte, 16)
@@ -620,6 +722,30 @@ func normalizeAddrs(addrs []string) []string {
 		}
 	}
 	return out
+}
+
+// isIPv6Text reports whether a host:port candidate is IPv6. Text that cannot
+// be parsed stays on the IPv4 side so older agents keep working unchanged.
+func isIPv6Text(text string) bool {
+	host, _, err := net.SplitHostPort(text)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.To4() == nil
+}
+
+// splitAddrsByFamily keeps IPv4 and IPv6 local candidates apart so a peer can
+// be told which family each address belongs to without probing both.
+func splitAddrsByFamily(addrs []string) (v4, v6 []string) {
+	for _, addr := range normalizeAddrs(addrs) {
+		if isIPv6Text(addr) {
+			v6 = append(v6, addr)
+		} else {
+			v4 = append(v4, addr)
+		}
+	}
+	return v4, v6
 }
 
 const (
@@ -682,4 +808,3 @@ func normalizeMetadata(value string, limit int) string {
 	}
 	return value
 }
-

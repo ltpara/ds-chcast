@@ -170,16 +170,22 @@ func probeOnce(conn *net.UDPConn, id string, priv ed25519.PrivateKey) (time.Dura
 	if challenge.Type != wire.TypeKeepaliveChallenge {
 		return 0, fmt.Errorf("expected keepalive_challenge, got %s: %s", challenge.Type, challenge.Error)
 	}
-	if challenge.Nonce == "" || challenge.Candidate == "" {
+	candidate := challenge.Candidate
+	candidateV6 := challenge.CandidateV6
+	if candidate == "" {
+		candidate = candidateV6
+	}
+	if challenge.Nonce == "" || candidate == "" {
 		return 0, errors.New("keepalive challenge carried no nonce or candidate")
 	}
-	signature := identity.Sign(priv, identity.KeepaliveMessage(id, challenge.Candidate, challenge.Nonce))
+	signature := identity.Sign(priv, identity.KeepaliveMessage(id, candidate, challenge.Nonce))
 	if _, err := conn.Write(wire.Encode(wire.Message{
-		Type:      wire.TypeKeepaliveAuth,
-		HostID:    id,
-		Nonce:     challenge.Nonce,
-		Candidate: challenge.Candidate,
-		Signature: signature,
+		Type:        wire.TypeKeepaliveAuth,
+		HostID:      id,
+		Nonce:       challenge.Nonce,
+		Candidate:   challenge.Candidate,
+		CandidateV6: challenge.CandidateV6,
+		Signature:   signature,
 	})); err != nil {
 		return 0, err
 	}

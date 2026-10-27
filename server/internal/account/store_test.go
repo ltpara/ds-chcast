@@ -147,17 +147,159 @@ func TestTokenExpiry(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	store.SetClock(func() time.Time { return now })
-	_, token, _, err := store.Login("alice", "correct horse")
+	_, token, accessExpires, refresh, refreshExpires, err :=
+		store.LoginWithRefresh("alice", "correct horse", "", "", "", "")
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
-	now = now.Add(29 * 24 * time.Hour)
-	if _, err := store.Authenticate(token); err != nil {
-		t.Fatalf("token should still be valid: %v", err)
+	if !accessExpires.Equal(now.Add(AccessTokenTTL)) {
+		t.Fatalf("access expiry = %v, want %v", accessExpires, now.Add(AccessTokenTTL))
 	}
-	now = now.Add(48 * time.Hour)
+	if !refreshExpires.Equal(now.Add(TokenTTL)) {
+		t.Fatalf("refresh expiry = %v, want %v", refreshExpires, now.Add(TokenTTL))
+	}
+	now = now.Add(29 * time.Minute)
+	if _, err := store.Authenticate(token); err != nil {
+		t.Fatalf("access token should still be valid: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
 	if _, err := store.Authenticate(token); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("expired token error = %v", err)
+		t.Fatalf("expired access token error = %v", err)
+	}
+	_, renewed, renewedExpiry, refresh, renewedRefreshExpiry, err := store.RefreshSession(refresh)
+	if err != nil {
+		t.Fatalf("refresh after access expiry: %v", err)
+	}
+	if !renewedExpiry.Equal(now.Add(AccessTokenTTL)) || !renewedRefreshExpiry.Equal(now.Add(TokenTTL)) {
+		t.Fatalf("rotated expiries = %v/%v", renewedExpiry, renewedRefreshExpiry)
+	}
+	if _, err := store.Authenticate(renewed); err != nil {
+		t.Fatalf("rotated access token: %v", err)
+	}
+	now = now.Add(TokenTTL)
+	if _, _, _, _, _, err := store.RefreshSession(refresh); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expired refresh token error = %v", err)
+	}
+	if _, err := store.Authenticate(renewed); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("access token outlived the session: %v", err)
+	}
+}
+
+func TestRefreshRotationDetectsReplay(t *testing.T) {
+	store := openTemp(t, "state.db")
+	if _, err := store.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+	_, first, _, refresh, _, err := store.LoginWithRefresh("alice", "correct horse", "", "", "", "")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	now = now.Add(time.Minute)
+	_, second, _, rotated, _, err := store.RefreshSession(refresh)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if second == first || rotated == refresh {
+		t.Fatalf("rotation reused a token")
+	}
+	if _, err := store.Authenticate(first); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("old access token survived rotation: %v", err)
+	}
+	if _, err := store.Authenticate(second); err != nil {
+		t.Fatalf("new access token: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(refresh); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("replayed refresh error = %v, want ErrRefreshReused", err)
+	}
+	if _, err := store.Authenticate(second); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("replay did not revoke the access token: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(rotated); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("replay did not revoke the rotated refresh token: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession("  "); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("empty refresh error = %v", err)
+	}
+}
+
+func TestRefreshTokensDieWithTheirSession(t *testing.T) {
+	store := openTemp(t, "state.db")
+	user, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+
+	_, accessA, _, refreshA, _, err :=
+		store.LoginWithRefresh("alice", "correct horse", "device-a", "Office PC", "", "")
+	if err != nil {
+		t.Fatalf("login a: %v", err)
+	}
+	if _, err := store.Authenticate(accessA); err != nil {
+		t.Fatalf("access a: %v", err)
+	}
+	_, accessB, _, refreshB, _, err :=
+		store.LoginWithRefresh("alice", "correct horse", "device-b", "Laptop", "", "")
+	if err != nil {
+		t.Fatalf("login b: %v", err)
+	}
+	sessions, err := store.Sessions(user.ID, accessB)
+	if err != nil || len(sessions) != 2 {
+		t.Fatalf("sessions = %+v, %v", sessions, err)
+	}
+	for _, session := range sessions {
+		if session.DeviceID == "device-a" {
+			if revoked, err := store.RevokeSession(user.ID, session.ID); err != nil || !revoked {
+				t.Fatalf("revoke a = %v, %v", revoked, err)
+			}
+		}
+	}
+	if _, _, _, _, _, err := store.RefreshSession(refreshA); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("revoked session refreshed: %v", err)
+	}
+	if _, nextAccess, _, next, _, err := store.RefreshSession(refreshB); err != nil {
+		t.Fatalf("other session refresh: %v", err)
+	} else {
+		accessB = nextAccess
+		refreshB = next
+	}
+	if err := store.Logout(accessB); err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(refreshB); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("logged-out session refreshed: %v", err)
+	}
+
+	_, accessC, _, refreshC, _, err :=
+		store.LoginWithRefresh("alice", "correct horse", "device-c", "Tablet", "", "")
+	if err != nil {
+		t.Fatalf("login c: %v", err)
+	}
+	_, accessD, _, refreshD, _, err :=
+		store.LoginWithRefresh("alice", "correct horse", "device-d", "Phone", "", "")
+	if err != nil {
+		t.Fatalf("login d: %v", err)
+	}
+	_ = accessC
+	if err := store.ChangePassword(user.ID, accessD, "correct horse", "new correct horse"); err != nil {
+		t.Fatalf("change password: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(refreshC); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("password change left another refresh token: %v", err)
+	}
+	if _, _, _, next, _, err := store.RefreshSession(refreshD); err != nil {
+		t.Fatalf("current session refresh: %v", err)
+	} else {
+		refreshD = next
+	}
+	if err := store.SetPassword("alice", "another password"); err != nil {
+		t.Fatalf("set password: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(refreshD); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("set password left a refresh token: %v", err)
 	}
 }
 
@@ -470,6 +612,41 @@ func TestAddressBookGroups(t *testing.T) {
 	snapshot, err = store.Snapshot(alice.ID, 9)
 	if err != nil || len(snapshot.GroupChanges) != 1 || snapshot.GroupChanges[0].Deleted {
 		t.Fatalf("revived group change = %+v, %v", snapshot, err)
+	}
+}
+
+func TestAddressBookGroupOptimisticConcurrency(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	group, err := store.UpsertGroup(alice.ID, "studio", "Studio")
+	if err != nil || group.Revision != 1 {
+		t.Fatalf("create group = %+v, %v", group, err)
+	}
+	renamed, err := store.UpsertGroupAt(alice.ID, "studio", "Lab", group.Revision)
+	if err != nil || renamed.Revision != 2 || renamed.Name != "Lab" {
+		t.Fatalf("matching group rename = %+v, %v", renamed, err)
+	}
+	if _, err := store.UpsertGroupAt(alice.ID, "studio", "Stale", group.Revision); !errors.Is(err, ErrGroupConflict) {
+		t.Fatalf("stale group rename error = %v", err)
+	}
+	if _, err := store.UpsertGroupAt(alice.ID, "missing", "New", group.Revision); !errors.Is(err, ErrGroupConflict) {
+		t.Fatalf("unknown group with token error = %v", err)
+	}
+	if _, err := store.DeleteGroupAt(alice.ID, "studio", 99); !errors.Is(err, ErrGroupConflict) {
+		t.Fatalf("stale group delete error = %v", err)
+	}
+	if removed, err := store.DeleteGroupAt(alice.ID, "studio", renamed.Revision); err != nil || !removed {
+		t.Fatalf("matching group delete = %v, %v", removed, err)
+	}
+	if _, err := store.UpsertGroupAt(alice.ID, "studio", "Revive", renamed.Revision); !errors.Is(err, ErrGroupConflict) {
+		t.Fatalf("tombstoned group with token error = %v", err)
+	}
+	revived, err := store.UpsertGroup(alice.ID, "studio", "Revive")
+	if err != nil || revived.Revision != 4 || revived.Deleted {
+		t.Fatalf("legacy group revive = %+v, %v", revived, err)
 	}
 }
 
@@ -797,6 +974,222 @@ func TestSharedGrantsSurviveReopen(t *testing.T) {
 	}
 	if books, err = reopened.SharedBooks(bob.ID); err != nil || len(books) != 0 {
 		t.Fatalf("books after reopen revoke = %+v, %v", books, err)
+	}
+}
+
+func TestSharedAddressBookGroupScopes(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := store.CreateUser("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	carol, err := store.CreateUser("carol", "correct horse")
+	if err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "lab", "Lab"); err != nil {
+		t.Fatalf("create lab group: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "work", "Work"); err != nil {
+		t.Fatalf("create work group: %v", err)
+	}
+	lab, work := "lab", "work"
+	name := "开发机"
+	if _, err := store.UpdatePeerWithGroup(alice.ID, "devbox", &name, nil, &lab); err != nil {
+		t.Fatalf("seed lab peer: %v", err)
+	}
+	workName := "办公机"
+	if _, err := store.UpdatePeerWithGroup(alice.ID, "office", &workName, nil, &work); err != nil {
+		t.Fatalf("seed work peer: %v", err)
+	}
+	loose := "散装"
+	if _, err := store.UpdatePeer(alice.ID, "loose", &loose, nil); err != nil {
+		t.Fatalf("seed loose peer: %v", err)
+	}
+
+	if _, err := store.ShareBookScoped(alice.ID, "bob", "", "bad id"); !errors.Is(err, ErrInvalidGroupID) {
+		t.Fatalf("invalid group id = %v", err)
+	}
+	if _, err := store.ShareBookScoped(alice.ID, "bob", "", "ghost"); !errors.Is(err, ErrUnknownGroup) {
+		t.Fatalf("unknown group = %v", err)
+	}
+	if _, err := store.ShareBookScoped(alice.ID, "ALICE", "", "lab"); !errors.Is(err, ErrSelfShare) {
+		t.Fatalf("self share = %v", err)
+	}
+	grant, err := store.ShareBookScoped(alice.ID, "bob", PermissionWrite, "lab")
+	if err != nil || grant.GroupID != "lab" || grant.Permission != PermissionWrite || grant.Username != "bob" {
+		t.Fatalf("scoped share = %+v, %v", grant, err)
+	}
+
+	books, err := store.SharedBooks(bob.ID)
+	if err != nil || len(books) != 1 || books[0].Owner != "alice" ||
+		books[0].Permission != PermissionWrite || len(books[0].Peers) != 1 ||
+		books[0].Peers[0].ID != "devbox" || len(books[0].Groups) != 1 ||
+		books[0].Groups[0].ID != "lab" || len(books[0].Scopes) != 1 ||
+		books[0].Scopes[0].GroupID != "lab" {
+		t.Fatalf("scoped shared book = %+v, %v", books, err)
+	}
+
+	if _, err := store.UpdateSharedPeer(bob.ID, "alice", "office", &name, nil); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("write outside the group = %v", err)
+	}
+	if _, err := store.DeleteSharedPeer(bob.ID, "alice", "office"); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("delete outside the group = %v", err)
+	}
+	if _, err := store.AddSharedPeer(bob.ID, "alice", "newbox", "越权新增", nil); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("ungrouped add through a group grant = %v", err)
+	}
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "work", "越权新增", nil); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("add into another group = %v", err)
+	}
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "ghost", "不存在的组", nil); !errors.Is(err, ErrUnknownGroup) {
+		t.Fatalf("add into an unknown group = %v", err)
+	}
+	added, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "lab", "新增设备", []string{"lab"})
+	if err != nil || added.GroupID != "lab" || added.ID != "newbox" {
+		t.Fatalf("add into the granted group = %+v, %v", added, err)
+	}
+	edited := "共享改名"
+	if peer, err := store.UpdateSharedPeer(bob.ID, "alice", "devbox", &edited, nil); err != nil || peer.Name != "共享改名" {
+		t.Fatalf("write inside the group = %+v, %v", peer, err)
+	}
+
+	// Whole-book read plus group write: everything becomes visible, but only
+	// the lab group stays writable.
+	if _, err := store.ShareBook(alice.ID, "bob", PermissionRead); err != nil {
+		t.Fatalf("whole-book share = %v", err)
+	}
+	books, err = store.SharedBooks(bob.ID)
+	if err != nil || len(books) != 1 || books[0].Permission != PermissionWrite ||
+		len(books[0].Peers) != 4 || len(books[0].Groups) != 2 || len(books[0].Scopes) != 2 {
+		t.Fatalf("combined scopes = %+v, %v", books, err)
+	}
+	if _, err := store.UpdateSharedPeer(bob.ID, "alice", "office", &name, nil); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("whole-book read write = %v", err)
+	}
+	if _, err := store.UpdateSharedPeer(bob.ID, "alice", "devbox", &edited, nil); err != nil {
+		t.Fatalf("group write under whole-book read = %v", err)
+	}
+
+	// Control of the whole book is still required to manage grants, no matter
+	// how many group scopes an actor holds.
+	if _, err := store.ShareBookScoped(alice.ID, "bob", PermissionControl, "lab"); err != nil {
+		t.Fatalf("lab control: %v", err)
+	}
+	if _, err := store.ShareBookScopedAs(bob.ID, "alice", "carol", "", "lab"); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("lab controller manages grants = %v", err)
+	}
+	if _, err := store.ShareBook(alice.ID, "bob", PermissionControl); err != nil {
+		t.Fatalf("whole-book control: %v", err)
+	}
+	granted, err := store.ShareBookScopedAs(bob.ID, "alice", "carol", PermissionRead, "work")
+	if err != nil || granted.GroupID != "work" || granted.Username != "carol" {
+		t.Fatalf("controller scoped grant = %+v, %v", granted, err)
+	}
+	if books, err = store.SharedBooks(carol.ID); err != nil || len(books) != 1 ||
+		len(books[0].Peers) != 1 || books[0].Peers[0].ID != "office" {
+		t.Fatalf("carol scoped book = %+v, %v", books, err)
+	}
+
+	if err := store.UnshareBookScope(alice.ID, "bob", "lab"); err != nil {
+		t.Fatalf("revoke lab scope: %v", err)
+	}
+	if err := store.UnshareBookScope(alice.ID, "bob", "lab"); !errors.Is(err, ErrUnknownShare) {
+		t.Fatalf("revoke lab scope twice = %v", err)
+	}
+	if err := store.UnshareBookScope(alice.ID, "bob", ""); err != nil {
+		t.Fatalf("revoke whole-book scope: %v", err)
+	}
+	if books, err = store.SharedBooks(bob.ID); err != nil || len(books) != 0 {
+		t.Fatalf("book after scoped revokes = %+v, %v", books, err)
+	}
+
+	// The legacy pair-wide revoke drops every remaining scope at once.
+	if _, err := store.ShareBook(alice.ID, "bob", PermissionRead); err != nil {
+		t.Fatalf("re-share whole book: %v", err)
+	}
+	if _, err := store.ShareBookScoped(alice.ID, "bob", PermissionWrite, "lab"); err != nil {
+		t.Fatalf("re-share lab: %v", err)
+	}
+	if err := store.UnshareBook(alice.ID, "bob"); err != nil {
+		t.Fatalf("revoke all scopes: %v", err)
+	}
+	if books, err = store.SharedBooks(bob.ID); err != nil || len(books) != 0 {
+		t.Fatalf("book after pair revoke = %+v, %v", books, err)
+	}
+	if outgoing, _, err := store.Grants(alice.ID); err != nil || len(outgoing) != 1 ||
+		outgoing[0].Username != "carol" || outgoing[0].GroupID != "work" {
+		t.Fatalf("grants after revokes = %+v, %v", outgoing, err)
+	}
+
+	// Deleting a group revokes its scoped grants instead of leaving dead
+	// scopes behind.
+	if _, err := store.ShareBookScoped(alice.ID, "carol", PermissionRead, "lab"); err != nil {
+		t.Fatalf("share lab with carol: %v", err)
+	}
+	if removed, err := store.DeleteGroup(alice.ID, "lab"); err != nil || !removed {
+		t.Fatalf("delete lab group = %v, %v", removed, err)
+	}
+	if outgoing, _, err := store.Grants(alice.ID); err != nil || len(outgoing) != 1 ||
+		outgoing[0].GroupID != "work" {
+		t.Fatalf("grants after group delete = %+v, %v", outgoing, err)
+	}
+}
+
+func TestGrantScopesMigrationSplitsLegacyPairKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	for _, schema := range []string{
+		`CREATE TABLE users (
+			id            TEXT PRIMARY KEY,
+			username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			password_hash TEXT NOT NULL,
+			created_at    INTEGER NOT NULL
+		)`,
+		`CREATE TABLE address_book_grants (
+			owner_user_id   TEXT NOT NULL,
+			grantee_user_id TEXT NOT NULL,
+			permission      TEXT NOT NULL DEFAULT 'read',
+			created_at      INTEGER NOT NULL,
+			PRIMARY KEY (owner_user_id, grantee_user_id)
+		)`,
+		`INSERT INTO users (id, username, password_hash, created_at) VALUES
+			('a', 'alice', 'x', 1), ('b', 'bob', 'x', 1)`,
+		`INSERT INTO address_book_grants (owner_user_id, grantee_user_id, permission, created_at)
+			VALUES ('a', 'b', 'read', 10)`,
+	} {
+		if _, err := db.Exec(schema); err != nil {
+			t.Fatalf("seed legacy schema: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate account store: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(
+		`INSERT INTO address_book_grants (owner_user_id, grantee_user_id, group_id, permission, created_at)
+		 VALUES ('a', 'b', 'lab', 'write', 20)`,
+	); err != nil {
+		t.Fatalf("insert scoped grant after migration: %v", err)
+	}
+	outgoing, _, err := store.Grants("a")
+	if err != nil || len(outgoing) != 2 ||
+		outgoing[0].Username != "bob" || outgoing[0].GroupID != "" ||
+		outgoing[1].Username != "bob" || outgoing[1].GroupID != "lab" ||
+		outgoing[1].Permission != PermissionWrite {
+		t.Fatalf("grants after migration = %+v, %v", outgoing, err)
 	}
 }
 
@@ -1481,6 +1874,110 @@ func TestAuditLoginEventsPersistNewestFirst(t *testing.T) {
 	}
 	if len(persisted) != 2 || persisted[0].Username != "bob" || !persisted[1].Success {
 		t.Fatalf("audit after reopen = %+v", persisted)
+	}
+}
+
+func TestConnectionReportsMergeByAuditRef(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	at := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return at })
+	const ref = "00112233aabbccdd"
+
+	host, err := store.RecordHostConnection("audithost", ref, at, at.Add(time.Minute), true, "")
+	if err != nil {
+		t.Fatalf("host report: %v", err)
+	}
+	if host.Source != connectionHost || host.Direction != connectionHost ||
+		host.HostID != "audithost" || host.Username != "-" || host.AuditRef != ref {
+		t.Fatalf("host row = %+v", host)
+	}
+
+	report := func() (ConnectionEvent, error) {
+		return store.RecordConnection(alice.ID, "alice", "viewerbox", connectionViewer,
+			"127.0.0.1", ref, at, at.Add(2*time.Minute), true, "")
+	}
+	merged, err := report()
+	if err != nil {
+		t.Fatalf("viewer report: %v", err)
+	}
+	if merged.ID != host.ID || merged.Source != connectionBoth ||
+		merged.Username != "alice" || merged.HostID != "audithost" ||
+		merged.PeerID != "viewerbox" || merged.Direction != connectionViewer {
+		t.Fatalf("merged row = %+v", merged)
+	}
+	if !merged.EndedAt.Equal(at.Add(2 * time.Minute)) {
+		t.Fatalf("merged window = %v", merged)
+	}
+
+	// A retry from either side must not pretend the other one reported twice.
+	if repeat, err := report(); err != nil || repeat.Source != connectionBoth {
+		t.Fatalf("repeated viewer report = %+v, %v", repeat, err)
+	}
+	if repeat, err := store.RecordHostConnection("audithost", ref,
+		at, at.Add(time.Minute), true, ""); err != nil || repeat.Source != connectionBoth {
+		t.Fatalf("repeated host report = %+v, %v", repeat, err)
+	}
+	if rows, err := store.Connections(alice.ID, 10); err != nil || len(rows) != 1 {
+		t.Fatalf("viewer rows = %+v, %v", rows, err)
+	}
+
+	// A host-only session keeps "host"; a second host report for the same ref
+	// must not upgrade it to "both".
+	const hostOnlyRef = "aabbccdd00112233"
+	first, err := store.RecordHostConnection("audithost", hostOnlyRef,
+		at, at.Add(time.Minute), true, "")
+	if err != nil {
+		t.Fatalf("second host session: %v", err)
+	}
+	again, err := store.RecordHostConnection("audithost", hostOnlyRef,
+		at, at.Add(2*time.Minute), true, "")
+	if err != nil {
+		t.Fatalf("repeated host session: %v", err)
+	}
+	if first.Source != connectionHost || again.Source != connectionHost || again.ID != first.ID {
+		t.Fatalf("host-only merge = %+v / %+v", first, again)
+	}
+	if rows, err := store.ConnectionsForHost("audithost", 10); err != nil || len(rows) != 2 {
+		t.Fatalf("host rows = %+v, %v", rows, err)
+	}
+}
+
+func TestAuditAndSessionRecordLocation(t *testing.T) {
+	store := openTemp(t, "state.db")
+	user, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	_, token, _, err := store.Login("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if err := store.SetSessionOrigin(token, "203.0.113.7", "Tokyo, JP"); err != nil {
+		t.Fatalf("session origin: %v", err)
+	}
+	if err := store.AppendAudit(AuditEvent{
+		Username: "alice", Action: AuditLogin, ClientIP: "203.0.113.7",
+		Location: "Tokyo, JP", Success: true,
+	}); err != nil {
+		t.Fatalf("append audit: %v", err)
+	}
+	sessions, err := store.Sessions(user.ID, token)
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, %v", sessions, err)
+	}
+	if sessions[0].LoginIP != "203.0.113.7" || sessions[0].Location != "Tokyo, JP" {
+		t.Fatalf("session origin = %+v", sessions[0])
+	}
+	events, err := store.AuditEvents(10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("audit events = %+v, %v", events, err)
+	}
+	if events[0].ClientIP != "203.0.113.7" || events[0].Location != "Tokyo, JP" {
+		t.Fatalf("audit location = %+v", events[0])
 	}
 }
 

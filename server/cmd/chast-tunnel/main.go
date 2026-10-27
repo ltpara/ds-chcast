@@ -9,13 +9,16 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/agent"
+	"github.com/ltpara/ds-chcast/server/internal/lan"
 )
 
 func main() {
@@ -27,15 +30,17 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: chast-tunnel host|viewer [flags]")
+		return fmt.Errorf("usage: chast-tunnel host|viewer|discover [flags]")
 	}
 	switch args[0] {
 	case "host":
 		return runHost(args[1:])
 	case "viewer":
 		return runViewer(args[1:])
+	case "discover":
+		return runDiscover(args[1:])
 	default:
-		return fmt.Errorf("unknown mode %q; use host or viewer", args[0])
+		return fmt.Errorf("unknown mode %q; use host, viewer or discover", args[0])
 	}
 }
 
@@ -45,14 +50,23 @@ func runHost(args []string) error {
 	serverKey := fs.String("server-key", "", "server key required by the API")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	id := fs.String("id", "", "host id registered with the service")
+	oldID := fs.String("old-id", "", "previous host id to migrate on the server (used after changing --id)")
 	key := fs.String("key", "", "host key, at least 8 characters")
 	fingerprint := fs.String("fingerprint", "", "certificate fingerprint shown in lookups")
 	local := fs.String("local", "127.0.0.1:4433", "chast-host QUIC listener")
 	carrierAddr := fs.String("carrier", "", "chast-host TCP carrier listener (127.0.0.1:P+1); empty disables the relay's TCP fallback")
+	auditSpool := fs.String("audit-spool", "", "chast-host JSONL audit spool; the agent signs and forwards it")
 	listen := fs.String("listen", "0.0.0.0:14434", "public-facing UDP address of this agent")
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
+	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
+	lanDiscovery := fs.Bool("lan-discovery", true, "answer LAN discovery pings; exposes id, hostname, username, platform and version on the local link")
+	lanPort := fs.Int("lan-port", lan.DefaultPort, "UDP port for LAN discovery")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
+
+	if *lanPort < 1 || *lanPort > 65535 {
+		return fmt.Errorf("invalid --lan-port %d", *lanPort)
+	}
 
 	log := newLogger(*verbose)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -78,25 +92,29 @@ func runHost(args []string) error {
 		ServerKey:       *serverKey,
 		ServerPublicKey: *serverPubKey,
 		ID:              *id,
+		OldID:           *oldID,
 		Key:             *key,
 		Fingerprint:     *fingerprint,
 		LocalAddr:       *local,
 		CarrierAddr:     *carrierAddr,
+		AuditSpool:      *auditSpool,
 		ListenAddr:      *listen,
 		Keepalive:       *keepalive,
+		UPnP:            *upnpEnabled,
 		Logger:          log,
 		OnInfo: func(info agent.HostInfo) {
 			emitMu.Lock()
 			defer emitMu.Unlock()
 			event := agentEvent{
-				Event:  "relay",
-				Listen: info.Listen,
-				Host:   info.ID,
-				Path:   info.Path,
-				Remote: info.Viewer,
-				Punch:  info.Punch,
-				Relay:  info.Relay,
-				NAT:    info.NAT,
+				Event:        "relay",
+				Listen:       info.Listen,
+				Host:         info.ID,
+				Path:         info.Path,
+				Remote:       info.Viewer,
+				Punch:        info.Punch,
+				Relay:        info.Relay,
+				NAT:          info.NAT,
+				MigratedFrom: info.MigratedFrom,
 			}
 			if info.Viewer != "" {
 				event.Event = "viewer"
@@ -118,17 +136,28 @@ func runHost(args []string) error {
 	emitMu.Lock()
 	ready = true
 	writeEvent(agentEvent{
-		Event:  "ready",
-		Listen: info.Listen,
-		Host:   info.ID,
-		Path:   info.Path,
-		Remote: info.Viewer,
-		Punch:  info.Punch,
-		Relay:  info.Relay,
-		NAT:    info.NAT,
+		Event:        "ready",
+		Listen:       info.Listen,
+		Host:         info.ID,
+		Path:         info.Path,
+		Remote:       info.Viewer,
+		Punch:        info.Punch,
+		Relay:        info.Relay,
+		NAT:          info.NAT,
+		MigratedFrom: info.MigratedFrom,
 	})
 	emitMu.Unlock()
 	log.Info("host agent online", "id", *id)
+	if *lanDiscovery {
+		profile := lan.LocalInfo(info.ID, agent.Version)
+		if _, err := lan.Start(ctx, fmt.Sprintf("0.0.0.0:%d", *lanPort), profile, log); err != nil {
+			// Discovery is a convenience; a busy port must not take the host
+			// offline.
+			log.Warn("LAN discovery unavailable", "port", *lanPort, "error", err)
+		} else {
+			log.Info("LAN discovery listening", "port", *lanPort, "id", info.ID)
+		}
+	}
 	<-ctx.Done()
 	return nil
 }
@@ -142,6 +171,7 @@ func runViewer(args []string) error {
 	listen := fs.String("listen", "127.0.0.1:24434", "local UDP address for the QUIC client")
 	mode := fs.String("mode", agent.ModeAuto, "auto: direct, relay or carrier; direct; relay; carrier")
 	directTimeout := fs.Duration("direct-timeout", 2*time.Second, "how long auto waits for the direct path")
+	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
@@ -167,6 +197,7 @@ func runViewer(args []string) error {
 		ListenAddr:      *listen,
 		Mode:            *mode,
 		DirectTimeout:   *directTimeout,
+		UPnP:            *upnpEnabled,
 		Logger:          log,
 		OnPath: func(info agent.PathInfo) {
 			emit(agentEvent{
@@ -205,6 +236,67 @@ func runViewer(args []string) error {
 	return nil
 }
 
+func runDiscover(args []string) error {
+	fs := flag.NewFlagSet("discover", flag.ExitOnError)
+	port := fs.Int("port", lan.DefaultPort, "discovery UDP port")
+	timeout := fs.Duration("timeout", lan.DefaultTimeout, "how long to wait for answers")
+	selfID := fs.String("id", "", "local host id to exclude from the results")
+	target := fs.String("target", "", "comma-separated host:port unicast probes in addition to broadcast")
+	asJSON := fs.Bool("json", false, "print a JSON array instead of a table")
+	fs.Parse(args)
+	if *port < 1 || *port > 65535 {
+		return fmt.Errorf("invalid --port %d", *port)
+	}
+	var targets []string
+	for _, part := range strings.Split(*target, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(part); err != nil {
+			return fmt.Errorf("invalid --target %q: %w", part, err)
+		}
+		targets = append(targets, part)
+	}
+
+	peers, err := lan.Discover(context.Background(), lan.DiscoverOptions{
+		Port:    *port,
+		Timeout: *timeout,
+		SelfID:  *selfID,
+		Targets: targets,
+	})
+	if err != nil {
+		return err
+	}
+	if peers == nil {
+		peers = []lan.Peer{}
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(peers)
+	}
+	if len(peers) == 0 {
+		fmt.Printf("no chast hosts answered on UDP %d\n", *port)
+		return nil
+	}
+	fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		"ID", "ADDRESS", "HOSTNAME", "USERNAME", "PLATFORM", "VERSION", "MAC")
+	for _, peer := range peers {
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			peer.ID, peer.Address, display(peer.Hostname), display(peer.Username),
+			display(peer.Platform), display(peer.Version), display(peer.MAC))
+	}
+	return nil
+}
+
+func display(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
 type agentEvent struct {
 	Event        string `json:"event"`
 	Listen       string `json:"listen,omitempty"`
@@ -218,6 +310,7 @@ type agentEvent struct {
 	Candidates   int    `json:"candidates,omitempty"`
 	Carrier      string `json:"carrier,omitempty"`
 	CarrierToken string `json:"carrier_token,omitempty"`
+	MigratedFrom string `json:"migrated_from,omitempty"`
 }
 
 func newLogger(verbose bool) *slog.Logger {

@@ -280,6 +280,9 @@ func (c *Console) hostsText(count int) string {
 		online := c.cfg.Registry.Online(host) || linked
 		candidate := host.Candidate
 		if candidate == "" {
+			candidate = host.CandidateV6
+		}
+		if candidate == "" {
 			candidate = "-"
 		}
 		relayHost := host.RelayHost

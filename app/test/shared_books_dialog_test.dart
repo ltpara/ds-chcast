@@ -118,9 +118,10 @@ void main() {
             ServerSettings server,
             String token,
             String username,
-            String permission,
-          ) async {
-            shared.add(username);
+            String permission, {
+            String? groupId,
+          }) async {
+            shared.add('$username@${groupId ?? ''}');
             permissions.add(permission);
             outgoing.removeWhere(
               (AddressBookGrant grant) => grant.username == username,
@@ -130,7 +131,8 @@ void main() {
             );
             return AddressBookGrant(username: username, permission: permission);
           },
-      revoke: (ServerSettings server, String token, String username) async {
+      revoke:
+          (ServerSettings server, String token, String username, {String? groupId}) async {
         revoked.add(username);
         outgoing.removeWhere(
           (AddressBookGrant grant) => grant.username == username,
@@ -147,7 +149,7 @@ void main() {
     await tester.enterText(find.byKey(const Key('shared-username')), ' dave ');
     await tester.tap(find.byKey(const Key('shared-grant')));
     await tester.pumpAndSettle();
-    expect(shared, <String>['dave']);
+    expect(shared, <String>['dave@']);
     expect(permissions, <String>['write']);
     expect(find.text('dave'), findsOneWidget);
     expect(find.text('读写'), findsWidgets);
@@ -176,9 +178,10 @@ void main() {
             ServerSettings server,
             String token,
             String username,
-            String permission,
-          ) async {
-            permissions.add('$username=$permission');
+            String permission, {
+            String? groupId,
+          }) async {
+            permissions.add('$username=$permission@${groupId ?? ''}');
             outgoing.removeWhere(
               (AddressBookGrant grant) => grant.username == username,
             );
@@ -195,7 +198,7 @@ void main() {
     await tester.tap(find.text('完全控制').last);
     await tester.pumpAndSettle();
 
-    expect(permissions, <String>['bob=control']);
+    expect(permissions, <String>['bob=control@']);
     expect(find.text('完全控制'), findsWidgets);
   });
 
@@ -301,8 +304,9 @@ void main() {
             String peerId, {
             String? name,
             List<String>? tags,
+            String? groupId,
           }) async {
-            added.add('$owner/$peerId/$name/${tags?.join('+')}');
+            added.add('$owner/$peerId/$name/${tags?.join('+')}@${groupId ?? ''}');
             return AddressBookPeer(
               id: peerId,
               name: name ?? '',
@@ -329,7 +333,7 @@ void main() {
     await tester.tap(find.byKey(const Key('shared-add-save')));
     await tester.pumpAndSettle();
 
-    expect(added, <String>['carol/dlbox/下载机/lab+vip']);
+    expect(added, <String>['carol/dlbox/下载机/lab+vip@']);
     expect(find.byKey(const Key('shared-add-id')), findsNothing);
     expect(find.byKey(const Key('shared-books-error')), findsNothing);
   });
@@ -366,24 +370,36 @@ void main() {
             String token,
             String owner,
             String username,
-            String permission,
-          ) async {
-            shared.add('$owner/$username/$permission');
+            String permission, {
+            String? groupId,
+          }) async {
+            shared.add('$owner/$username/$permission@${groupId ?? ''}');
             controlled.add(
-              AddressBookGrant(username: username, permission: permission),
+              AddressBookGrant(
+                username: username,
+                permission: permission,
+                groupId: groupId ?? '',
+              ),
             );
-            return AddressBookGrant(username: username, permission: permission);
+            return AddressBookGrant(
+              username: username,
+              permission: permission,
+              groupId: groupId ?? '',
+            );
           },
       revokeShared:
           (
             ServerSettings server,
             String token,
             String owner,
-            String username,
-          ) async {
-            revoked.add('$owner/$username');
+            String username, {
+            String? groupId,
+          }) async {
+            revoked.add('$owner/$username@${groupId ?? ''}');
             controlled.removeWhere(
-              (AddressBookGrant grant) => grant.username == username,
+              (AddressBookGrant grant) =>
+                  grant.username == username &&
+                  grant.groupId == (groupId ?? ''),
             );
           },
     );
@@ -405,12 +421,217 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('shared-book-grant')));
     await tester.pumpAndSettle();
-    expect(shared, <String>['carol/erin/write']);
+    expect(shared, <String>['carol/erin/write@']);
     expect(find.text('erin'), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('shared-book-revoke-dave')));
     await tester.pumpAndSettle();
-    expect(revoked, <String>['carol/dave']);
+    expect(revoked, <String>['carol/dave@']);
+    expect(find.text('dave'), findsNothing);
+  });
+
+  testWidgets('group scoped shares and writes follow the granted group', (
+    tester,
+  ) async {
+    final List<String> shared = <String>[];
+    final List<String> added = <String>[];
+    final List<AddressBookGrant> outgoing = <AddressBookGrant>[];
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      groups: const <AddressBookGroup>[
+        AddressBookGroup(id: 'lab', name: '实验室'),
+        AddressBookGroup(id: 'work', name: '办公室'),
+      ],
+      loadGrants: (ServerSettings server, String token) async =>
+          AddressBookGrants(outgoing: List<AddressBookGrant>.of(outgoing)),
+      loadBooks: (ServerSettings server, String token) async =>
+          const <SharedAddressBook>[
+            SharedAddressBook(
+              owner: 'carol',
+              permission: 'write',
+              groups: <AddressBookGroup>[
+                AddressBookGroup(id: 'lab', name: '实验室'),
+                AddressBookGroup(id: 'work', name: '办公室'),
+              ],
+              scopes: <AddressBookScope>[
+                AddressBookScope(permission: 'read'),
+                AddressBookScope(groupId: 'lab', permission: 'write'),
+              ],
+              peers: <AddressBookPeer>[
+                AddressBookPeer(id: 'devbox', groupId: 'lab'),
+                AddressBookPeer(id: 'office', groupId: 'work'),
+                AddressBookPeer(id: 'loose'),
+              ],
+            ),
+          ],
+      share:
+          (
+            ServerSettings server,
+            String token,
+            String username,
+            String permission, {
+            String? groupId,
+          }) async {
+            shared.add('$username/$permission@${groupId ?? ''}');
+            final AddressBookGrant grant = AddressBookGrant(
+              username: username,
+              permission: permission,
+              groupId: groupId ?? '',
+            );
+            outgoing
+              ..removeWhere(
+                (AddressBookGrant item) =>
+                    item.username == grant.username &&
+                    item.groupId == grant.groupId,
+              )
+              ..add(grant);
+            return grant;
+          },
+      addPeer:
+          (
+            ServerSettings server,
+            String token,
+            String owner,
+            String peerId, {
+            String? name,
+            List<String>? tags,
+            String? groupId,
+          }) async {
+            added.add('$owner/$peerId@${groupId ?? ''}');
+            return AddressBookPeer(id: peerId, groupId: groupId ?? '');
+          },
+    );
+    await open(tester, dialog);
+
+    expect(
+      find.byKey(const Key('shared-peer-menu-carol-devbox')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const Key('shared-peer-menu-carol-office')), findsNothing);
+    expect(find.byKey(const Key('shared-peer-menu-carol-loose')), findsNothing);
+    expect(find.byKey(const Key('shared-add-carol')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('shared-scope')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('实验室').last);
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('shared-username')), 'erin');
+    await tester.ensureVisible(find.byKey(const Key('shared-grant')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('shared-grant')));
+    await tester.pumpAndSettle();
+
+    expect(shared, <String>['erin/read@lab']);
+    expect(find.textContaining('分组 实验室'), findsOneWidget);
+    expect(
+      find.byKey(const Key('shared-revoke-erin-lab')),
+      findsOneWidget,
+    );
+
+    await tester.ensureVisible(find.byKey(const Key('shared-add-carol')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('shared-add-carol')));
+    await tester.pumpAndSettle();
+    expect(find.text('未分组'), findsNothing);
+    await tester.enterText(find.byKey(const Key('shared-add-id')), 'newbox');
+    await tester.tap(find.byKey(const Key('shared-add-save')));
+    await tester.pumpAndSettle();
+    expect(added, <String>['carol/newbox@lab']);
+  });
+
+  testWidgets('controlled shared books manage grants per group', (
+    tester,
+  ) async {
+    final List<AddressBookGrant> controlled = <AddressBookGrant>[
+      const AddressBookGrant(
+        username: 'dave',
+        permission: 'write',
+        groupId: 'lab',
+      ),
+    ];
+    final List<String> shared = <String>[];
+    final List<String> revoked = <String>[];
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      loadGrants: (ServerSettings server, String token) async =>
+          const AddressBookGrants(),
+      loadBooks: (ServerSettings server, String token) async =>
+          const <SharedAddressBook>[
+            SharedAddressBook(
+              owner: 'carol',
+              permission: 'control',
+              groups: <AddressBookGroup>[
+                AddressBookGroup(id: 'lab', name: '实验室'),
+              ],
+              peers: <AddressBookPeer>[AddressBookPeer(id: 'sharedbox')],
+            ),
+          ],
+      loadSharedGrants:
+          (ServerSettings server, String token, String owner) async =>
+              AddressBookGrants(
+                outgoing: List<AddressBookGrant>.of(controlled),
+              ),
+      shareShared:
+          (
+            ServerSettings server,
+            String token,
+            String owner,
+            String username,
+            String permission, {
+            String? groupId,
+          }) async {
+            shared.add('$owner/$username/$permission@${groupId ?? ''}');
+            final AddressBookGrant grant = AddressBookGrant(
+              username: username,
+              permission: permission,
+              groupId: groupId ?? '',
+            );
+            controlled.add(grant);
+            return grant;
+          },
+      revokeShared:
+          (
+            ServerSettings server,
+            String token,
+            String owner,
+            String username, {
+            String? groupId,
+          }) async {
+            revoked.add('$owner/$username@${groupId ?? ''}');
+            controlled.removeWhere(
+              (AddressBookGrant grant) =>
+                  grant.username == username &&
+                  grant.groupId == (groupId ?? ''),
+            );
+          },
+    );
+    await open(tester, dialog);
+
+    await tester.tap(find.byKey(const Key('shared-manage-carol')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('分组 实验室'), findsOneWidget);
+    expect(
+      find.byKey(const Key('shared-book-revoke-dave-lab')),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(const Key('shared-book-scope')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('实验室').last);
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('shared-book-username')),
+      'erin',
+    );
+    await tester.tap(find.byKey(const Key('shared-book-grant')));
+    await tester.pumpAndSettle();
+    expect(shared, <String>['carol/erin/read@lab']);
+
+    await tester.tap(find.byKey(const Key('shared-book-revoke-dave-lab')));
+    await tester.pumpAndSettle();
+    expect(revoked, <String>['carol/dave@lab']);
     expect(find.text('dave'), findsNothing);
   });
 

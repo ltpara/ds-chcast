@@ -1,10 +1,11 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio] [--encoder auto|vpl|ffmpeg]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--input] [--clipboard] [--audio] [--play]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio] [--play] [--audit-ref HEX]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
-//                      [--file-upload] [--file-download] [--microphone] [--privacy]
-//                      [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
+//                      [--file-upload] [--file-download] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
+//                      [--terminal] [--terminal-denied] [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
+//                      [--record out.mp4]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -64,6 +65,25 @@
 // deterministic file, the viewer accepts it, checks the bytes against the
 // offered digest and reports the result back to the host.
 //
+// --port-forward makes verify start a loopback TCP echo endpoint, register it
+// with the in-process host (serve --allow-port-forward enables the same path
+// for real sessions), push a payload spanning several chunks through one
+// forwarded connection and compare every echoed byte. The host dials the
+// endpoint itself, so the check covers the real TCP relay, not a simulation.
+// --port-forward-denied leaves the host gate closed: the viewer's request must
+// be refused and the session must keep streaming video afterwards.
+// --port-forward-local drives the viewer-side listener a GUI session uses
+// (PortForwardClient): an ordinary local TCP client connects to 127.0.0.1 and
+// gets the payload back through the host's relay.
+//
+// --terminal starts the in-process host with terminal access (serve
+// --allow-terminal does the same for real sessions), asks for a 100x30 console,
+// types `echo CHAST_TTY_OK` and exits the shell. The check requires the marker
+// in the console output and a clean TerminalStop from the host, which proves
+// the real ConPTY relay ran, not a simulation. --terminal-denied keeps the
+// host gate closed: every TerminalRequest must be refused and the session must
+// keep streaming video.
+//
 // With --audio the serve end captures the system sound through WASAPI and
 // connect decodes the second uni-stream, printing packet/sample/energy
 // counters. With --play connect also renders the decoded blocks through WASAPI
@@ -90,7 +110,12 @@
 // Unsupported. The flag is named after the channel because --quality already
 // sets the VPL encoder quality for serve/connect/verify.
 
+// Winsock 2 must precede windows.h, which the chast headers below pull in.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -124,10 +149,12 @@
 #include "chast/host_server.h"
 #include "chast/host_settings.h"
 #include "chast/identity.h"
+#include "chast/port_forward_client.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
 #include "chast/security.h"
 #include "crash_handler.h"
+#include "mp4_recorder.h"
 
 namespace {
 
@@ -255,6 +282,21 @@ std::vector<uint8_t> file_probe_content(size_t size) {
 inline constexpr size_t kFileProbeBytes = 300u * 1024u;
 inline constexpr size_t kFileResumePrefix = 100u * 1024u;
 inline constexpr size_t kFileDigestBytes = 64u * 1024u;
+
+// The port-forward probe's payload crosses several CPFW chunks in each
+// direction, and its last chunk is short.
+inline constexpr size_t kPortForwardProbeBytes =
+    5u * chast::kMaxPortForwardChunkBytes + 123u;
+inline constexpr uint32_t kPortForwardProbeId = 0x0F11E002u;
+inline constexpr uint32_t kPortForwardProbeConnection = 1;
+
+// The terminal probe's console and command. The marker is typed into a real
+// shell; it has to show up twice (the console echoes the typed line, then the
+// shell prints it), which fails if the command was never executed.
+inline constexpr uint32_t kTerminalProbeId = 0x0F11E003u;
+inline constexpr uint16_t kTerminalProbeColumns = 100;
+inline constexpr uint16_t kTerminalProbeRows = 30;
+inline constexpr char kTerminalProbeMarker[] = "CHAST_TTY_OK";
 
 bool same_clipboard_content(const chast::ClipboardContent& left,
                             const chast::ClipboardContent& right) {
@@ -584,6 +626,146 @@ private:
     bool muted_ = false;
 };
 
+// True when the last socket call failed only because a non-blocking socket
+// would have waited; every other error is a real failure.
+bool socket_would_block() {
+    const int error = WSAGetLastError();
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEALREADY;
+}
+
+// A loopback TCP echo endpoint for verify --port-forward. It listens on an
+// ephemeral port for the whole run, echoes every byte of each accepted
+// connection until the peer half-closes, and then shuts its own write side
+// down. The host's relay is the only client, so the bytes that come back are
+// the ones the viewer pushed through QUIC.
+class PortForwardEcho {
+public:
+    ~PortForwardEcho() { stop(); }
+
+    bool start(std::string* error) {
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            *error = "WSAStartup failed";
+            return false;
+        }
+        wsa_started_ = true;
+        listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listener_ == INVALID_SOCKET) {
+            *error = "echo socket: " + last_error();
+            stop();
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (bind(listener_, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) ==
+            SOCKET_ERROR) {
+            *error = "echo bind: " + last_error();
+            stop();
+            return false;
+        }
+        if (listen(listener_, 4) == SOCKET_ERROR) {
+            *error = "echo listen: " + last_error();
+            stop();
+            return false;
+        }
+        sockaddr_in bound{};
+        int bound_length = sizeof(bound);
+        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&bound), &bound_length) ==
+            SOCKET_ERROR) {
+            *error = "echo getsockname: " + last_error();
+            stop();
+            return false;
+        }
+        port_ = ntohs(bound.sin_port);
+        thread_ = std::thread([this] { serve(); });
+        return true;
+    }
+
+    void stop() {
+        stop_.store(true);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (listener_ != INVALID_SOCKET) {
+            closesocket(listener_);
+            listener_ = INVALID_SOCKET;
+        }
+        if (wsa_started_) {
+            WSACleanup();
+            wsa_started_ = false;
+        }
+    }
+
+    uint16_t port() const { return port_; }
+
+private:
+    static std::string last_error() {
+        return std::to_string(WSAGetLastError());
+    }
+
+    void serve() {
+        while (!stop_.load()) {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(listener_, &readable);
+            timeval wait{0, 100 * 1000};
+            if (select(0, &readable, nullptr, nullptr, &wait) <= 0) {
+                continue;
+            }
+            SOCKET client = accept(listener_, nullptr, nullptr);
+            if (client == INVALID_SOCKET) {
+                continue;
+            }
+            // The timeouts keep stop() from waiting on a connection whose peer
+            // stopped reading or never closes.
+            DWORD timeout = 200;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO,
+                       reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            std::array<char, 64 * 1024> buffer{};
+            while (!stop_.load()) {
+                const int got = recv(client, buffer.data(),
+                                     static_cast<int>(buffer.size()), 0);
+                if (got == 0) {
+                    break;
+                }
+                if (got == SOCKET_ERROR) {
+                    if (WSAGetLastError() == WSAETIMEDOUT) {
+                        continue;
+                    }
+                    break;
+                }
+                size_t sent = 0;
+                while (sent < static_cast<size_t>(got) && !stop_.load()) {
+                    const int written =
+                        send(client, buffer.data() + sent, got - static_cast<int>(sent), 0);
+                    if (written == SOCKET_ERROR) {
+                        if (WSAGetLastError() == WSAETIMEDOUT) {
+                            continue;
+                        }
+                        break;
+                    }
+                    sent += static_cast<size_t>(written);
+                }
+                if (sent < static_cast<size_t>(got)) {
+                    break;
+                }
+            }
+            shutdown(client, SD_SEND);
+            closesocket(client);
+        }
+    }
+
+    SOCKET listener_ = INVALID_SOCKET;
+    uint16_t port_ = 0;
+    bool wsa_started_ = false;
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
+
 struct Options {
     std::string mode;
     std::string bind = "127.0.0.1";
@@ -709,6 +891,28 @@ struct Options {
     // The file the host offers when --file-download is given; verify writes
     // it to a temporary folder before the session starts.
     std::string download_source;
+    // verify only: ask the host to relay a loopback TCP echo endpoint, push a
+    // deterministic payload through it and require the same bytes back.
+    bool port_forward = false;
+    // verify only: the host keeps forwarding off and the viewer's request must
+    // be refused without disturbing the session.
+    bool port_forward_denied = false;
+    // verify only: drive the viewer-side listener (PortForwardClient) against
+    // the echo endpoint through a real local TCP connection.
+    bool port_forward_local = false;
+    // serve only: let viewers dial TCP targets through this host.
+    bool allow_port_forward = false;
+    // verify only: open a real ConPTY console on the in-process host, run a
+    // command and require its output before the shell exits.
+    bool terminal = false;
+    // verify only: the host keeps terminals off and every request must be
+    // refused without disturbing the session.
+    bool terminal_denied = false;
+    // serve only: let viewers open terminals on this host.
+    bool allow_terminal = false;
+    // verify fills these with the echo endpoint it starts on 127.0.0.1.
+    std::string forward_host;
+    uint16_t forward_port = 0;
     // connect/verify: SHA-256 fingerprint to pin. verify fills it from the
     // server it starts when the option is absent.
     std::string fingerprint;
@@ -733,6 +937,11 @@ struct Options {
     // connect: compute the current six-digit code from it, or send `totp`.
     std::string totp_secret;
     std::string totp;
+    // connect: reference sent in Hello so the host's inbound audit records and
+    // the viewer's own report can be merged. serve: JSONL spool the host
+    // appends its inbound audit records to (the tunnel agent forwards them).
+    std::string audit_ref;
+    std::string audit_spool;
     // serve: access mode. Empty keeps the flag-derived default (click with
     // --approve, password with --password, token otherwise).
     chast::HostAuthMode auth_mode = chast::HostAuthMode::Both;
@@ -741,6 +950,9 @@ struct Options {
     bool seconds_set = false;
     double wait_seconds = 30.0;
     std::string save;
+    // connect only: mux the received stream into this MP4 instead of dumping
+    // the elementary stream. H.264 only, and no re-encode.
+    std::string record;
     chast::CaptureConfig config;
     bool quiet = false;
 };
@@ -849,6 +1061,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.wait_seconds = std::stod(argv[++i]);
             } else if (arg == "--save" && i + 1 < argc) {
                 options.save = argv[++i];
+            } else if (arg == "--record" && i + 1 < argc) {
+                options.record = argv[++i];
             } else if (arg == "--input") {
                 options.input = true;
             } else if (arg == "--clipboard") {
@@ -887,6 +1101,20 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.file_upload = true;
             } else if (arg == "--file-download") {
                 options.file_download = true;
+            } else if (arg == "--port-forward") {
+                options.port_forward = true;
+            } else if (arg == "--port-forward-denied") {
+                options.port_forward_denied = true;
+            } else if (arg == "--port-forward-local") {
+                options.port_forward_local = true;
+            } else if (arg == "--allow-port-forward") {
+                options.allow_port_forward = true;
+            } else if (arg == "--terminal") {
+                options.terminal = true;
+            } else if (arg == "--terminal-denied") {
+                options.terminal_denied = true;
+            } else if (arg == "--allow-terminal") {
+                options.allow_terminal = true;
             } else if (arg == "--fingerprint" && i + 1 < argc) {
                 options.fingerprint = argv[++i];
             } else if (arg == "--insecure") {
@@ -908,6 +1136,10 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.totp = argv[++i];
             } else if (arg == "--totp-secret" && i + 1 < argc) {
                 options.totp_secret = argv[++i];
+            } else if (arg == "--audit-ref" && i + 1 < argc) {
+                options.audit_ref = argv[++i];
+            } else if (arg == "--audit-spool" && i + 1 < argc) {
+                options.audit_spool = argv[++i];
             } else if (arg == "--auth-mode" && i + 1 < argc) {
                 const std::string value = argv[++i];
                 if (!chast::parse_auth_mode(value, options.auth_mode)) {
@@ -1005,12 +1237,58 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "--encoder only applies to serve and verify\n");
         return false;
     }
+    // Recording is a viewer-side concern: connect keeps the MP4, verify probes
+    // it. The sending side has nothing to mux.
+    if (!options.record.empty() && options.mode != "connect" && options.mode != "verify") {
+        std::fprintf(stderr, "--record only applies to connect and verify\n");
+        return false;
+    }
     if (options.file_upload && options.mode != "verify") {
         std::fprintf(stderr, "--file-upload only applies to verify\n");
         return false;
     }
     if (options.file_download && options.mode != "verify") {
         std::fprintf(stderr, "--file-download only applies to verify\n");
+        return false;
+    }
+    if (options.port_forward && options.mode != "verify") {
+        std::fprintf(stderr, "--port-forward only applies to verify\n");
+        return false;
+    }
+    if (options.port_forward_denied && options.mode != "verify") {
+        std::fprintf(stderr, "--port-forward-denied only applies to verify\n");
+        return false;
+    }
+    if (options.port_forward_local && options.mode != "verify") {
+        std::fprintf(stderr, "--port-forward-local only applies to verify\n");
+        return false;
+    }
+    if (options.port_forward && options.port_forward_denied) {
+        std::fprintf(stderr, "--port-forward and --port-forward-denied are exclusive\n");
+        return false;
+    }
+    if (options.port_forward_local && (options.port_forward || options.port_forward_denied)) {
+        std::fprintf(stderr, "--port-forward-local runs its own probe and cannot be combined\n");
+        return false;
+    }
+    if (options.allow_port_forward && options.mode != "serve") {
+        std::fprintf(stderr, "--allow-port-forward only applies to serve\n");
+        return false;
+    }
+    if (options.terminal && options.mode != "verify") {
+        std::fprintf(stderr, "--terminal only applies to verify\n");
+        return false;
+    }
+    if (options.terminal_denied && options.mode != "verify") {
+        std::fprintf(stderr, "--terminal-denied only applies to verify\n");
+        return false;
+    }
+    if (options.terminal && options.terminal_denied) {
+        std::fprintf(stderr, "--terminal and --terminal-denied are exclusive\n");
+        return false;
+    }
+    if (options.allow_terminal && options.mode != "serve") {
+        std::fprintf(stderr, "--allow-terminal only applies to serve\n");
         return false;
     }
     if (options.microphone && options.mode != "verify") {
@@ -1079,6 +1357,20 @@ bool parse_args(int argc, char** argv, Options& options) {
          !std::all_of(options.totp.begin(), options.totp.end(),
                       [](char c) { return c >= '0' && c <= '9'; }))) {
         std::fprintf(stderr, "--totp wants the six-digit code\n");
+        return false;
+    }
+    if (!options.audit_ref.empty()) {
+        if (options.mode != "connect") {
+            std::fprintf(stderr, "--audit-ref only applies to connect\n");
+            return false;
+        }
+        if (!chast::valid_audit_ref(options.audit_ref)) {
+            std::fprintf(stderr, "--audit-ref wants 8 to 64 lowercase hex digits\n");
+            return false;
+        }
+    }
+    if (!options.audit_spool.empty() && options.mode != "serve") {
+        std::fprintf(stderr, "--audit-spool only applies to serve\n");
         return false;
     }
     if (options.auth_mode_set && options.mode != "serve") {
@@ -1316,6 +1608,40 @@ struct ReceiverStats {
     bool download_finished = false;
     bool download_ok = false;
     std::string download_error;
+    // Port forward probe (verify --port-forward): the host's answer to the
+    // target, the bytes pushed and echoed back through the real TCP relay,
+    // and the first failure.
+    bool port_forward_probe = false;
+    // verify --port-forward-denied: the host kept forwarding off, so the
+    // viewer's request must be refused and the session must keep working.
+    bool port_forward_denied = false;
+    bool forward_denied_ok = false;
+    // verify --port-forward-local: the viewer-side listener forwarded a real
+    // local TCP connection through the host and got the payload back.
+    bool port_forward_local_probe = false;
+    bool forward_local_ok = false;
+    uint16_t forward_local_port = 0;
+    uint64_t forward_local_bytes = 0;
+    std::string forward_local_error;
+    // Terminal probe (verify --terminal): the host's answer, the console bytes
+    // the viewer received, whether the marker came back and how the shell
+    // ended.
+    bool terminal_probe = false;
+    bool terminal_denied = false;
+    bool terminal_denied_ok = false;
+    bool terminal_marker_ok = false;
+    chast::TerminalCode terminal_code = chast::TerminalCode::Ok;
+    chast::TerminalCode terminal_stop_code = chast::TerminalCode::Cancelled;
+    std::string terminal_reason;
+    std::string terminal_stop_reason;
+    uint64_t terminal_output_bytes = 0;
+    std::string terminal_error;
+    chast::PortForwardCode forward_code = chast::PortForwardCode::Ok;
+    std::string forward_reason;
+    uint64_t forward_bytes_sent = 0;
+    uint64_t forward_bytes_received = 0;
+    bool forward_echo_ok = false;
+    std::string forward_error;
     // Audio the viewer received and decoded: announced format, packet and
     // byte counts, sequence/CRC/decode errors, decoded sample count and the
     // RMS of the decoded PCM (the tone-energy check).
@@ -1492,6 +1818,18 @@ struct ReceiverStats {
     int32_t cursor_y = 0;
     // Fingerprint of the certificate the server presented.
     std::string peer_fingerprint;
+    // --record: the access units the MP4 muxer wrote, and the reopened-file
+    // check that proves players can parse what was recorded.
+    bool recording = false;
+    uint64_t record_samples = 0;
+    uint64_t record_keyframes = 0;
+    uint64_t record_skipped = 0;
+    // Files the recording produced (base plus any rollover segments).
+    std::vector<std::string> record_files;
+    bool record_ok = false;
+    uint64_t record_verified_samples = 0;
+    uint64_t record_verified_keyframes = 0;
+    std::string record_error;
 };
 
 // The input script connect and verify replay. It exercises every action the
@@ -1716,6 +2054,12 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     }
     config.settings.allow_file_transfer = options.file_upload || options.file_download;
     config.settings.file_receive_directory = options.file_receive_dir;
+    // verify passes --port-forward, which enlists the in-process host too.
+    config.settings.allow_port_forward =
+        options.allow_port_forward || options.port_forward || options.port_forward_local;
+    // verify passes --terminal, which enlists the in-process host too.
+    config.settings.allow_terminal = options.allow_terminal || options.terminal;
+    config.settings.audit_spool = options.audit_spool;
     config.file_received = [&stats](const std::string& path, uint64_t bytes) {
         ++stats.files_received;
         stats.file_bytes_received += bytes;
@@ -2026,6 +2370,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     client_config.access_token = options.token;
     client_config.password = options.password;
     client_config.totp = options.totp;
+    client_config.audit_ref = options.audit_ref;
     if (client_config.totp.empty() && !options.totp_secret.empty()) {
         // Computed right before the Hello so the 30 s window is fresh.
         std::vector<uint8_t> key;
@@ -2512,6 +2857,539 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         return ok;
     };
 
+    // ---- port forward probe (verify --port-forward) ----
+    // The viewer registers the loopback TCP echo endpoint this process started,
+    // opens one connection through the host's relay and pushes a payload that
+    // spans several chunks. The host dials real TCP behind the session; the
+    // echoed bytes that come back match the payload exactly.
+    stats.port_forward_probe = options.port_forward || options.port_forward_denied;
+    stats.port_forward_denied = options.port_forward_denied;
+    enum class ForwardStep { Request, WaitResult, Open, WaitOpen, Send, WaitEcho, Done };
+    ForwardStep forward_step = ForwardStep::Request;
+    chast::PortForwardHandle forward_handle = 0;
+    std::vector<uint8_t> forward_payload;
+    std::vector<uint8_t> forward_received;
+    size_t forward_sent = 0;
+    bool forward_eof = false;
+    if (stats.port_forward_denied) {
+        // The denial probe only makes sense against a host that kept the gate
+        // closed; an announcement here would mean the host ignored its setting.
+        if (info.port_forward_enabled) {
+            return fail("the server announced port forwarding although it is off");
+        }
+    } else if (stats.port_forward_probe) {
+        if (!info.port_forward_enabled) {
+            return fail("the server did not announce port forwarding "
+                        "(serve --allow-port-forward)");
+        }
+        if (options.forward_host.empty() || options.forward_port == 0) {
+            return fail("the port-forward probe has no target");
+        }
+        forward_payload = file_probe_content(kPortForwardProbeBytes);
+    }
+    auto drain_forward_echo = [&]() -> bool {
+        while (!forward_eof) {
+            std::vector<uint8_t> data;
+            const chast::Error received = session->receive_port_forward_data(
+                forward_handle, data, std::chrono::milliseconds(0));
+            if (received.status() == chast::Status::WaitTimeout) {
+                break;
+            }
+            if (received.status() == chast::Status::Unavailable) {
+                // Everything queued before the FIN has been handed over, so the
+                // WaitEcho step can compare the total.
+                forward_eof = true;
+                break;
+            }
+            if (!received.ok()) {
+                stats.forward_error =
+                    "receive_port_forward_data: " + received.to_string();
+                return false;
+            }
+            if (data.empty()) {
+                break;
+            }
+            forward_received.insert(forward_received.end(), data.begin(), data.end());
+            stats.forward_bytes_received = forward_received.size();
+        }
+        return true;
+    };
+    auto advance_port_forward = [&]() -> bool {
+        if (!stats.port_forward_probe || forward_step == ForwardStep::Done) {
+            return true;
+        }
+        if (stats.port_forward_denied) {
+            // With the gate closed the refusal happens before anything reaches
+            // the wire; the session must keep running afterwards.
+            const chast::Error requested = session->request_port_forward(
+                kPortForwardProbeId, "127.0.0.1", 9);
+            if (requested.status() != chast::Status::PermissionDenied) {
+                stats.forward_error =
+                    requested.ok()
+                        ? "the viewer registered a forward although the host never "
+                          "announced port forwarding"
+                        : "request_port_forward failed unexpectedly: " +
+                              requested.to_string();
+                return false;
+            }
+            if (!options.quiet) {
+                std::printf("quic: port-forward refusal as expected: %s\n",
+                            requested.message().c_str());
+            }
+            stats.forward_denied_ok = true;
+            forward_step = ForwardStep::Done;
+            return true;
+        }
+        if (forward_step == ForwardStep::Request) {
+            if (chast::Error requested = session->request_port_forward(
+                    kPortForwardProbeId, options.forward_host, options.forward_port);
+                !requested.ok()) {
+                stats.forward_error = "request_port_forward: " + requested.to_string();
+                return false;
+            }
+            forward_step = ForwardStep::WaitResult;
+            if (!options.quiet) {
+                std::printf("quic: registering forward target %s:%u\n",
+                            options.forward_host.c_str(),
+                            static_cast<unsigned>(options.forward_port));
+            }
+            return true;
+        }
+        if (forward_step == ForwardStep::WaitResult) {
+            chast::PortForwardResult result;
+            while (session->take_port_forward_result(result)) {
+                if (result.forward_id != kPortForwardProbeId) {
+                    continue;
+                }
+                stats.forward_code = result.code;
+                stats.forward_reason = result.reason;
+                if (result.code != chast::PortForwardCode::Ok) {
+                    stats.forward_error =
+                        "the host refused the forward target" +
+                        (result.reason.empty() ? std::string() : ": " + result.reason);
+                    return false;
+                }
+                forward_step = ForwardStep::Open;
+            }
+            return true;
+        }
+        if (forward_step == ForwardStep::Open) {
+            if (chast::Error opened = session->open_port_forward_connection(
+                    kPortForwardProbeId, kPortForwardProbeConnection, forward_handle);
+                !opened.ok()) {
+                stats.forward_error = "open_port_forward_connection: " + opened.to_string();
+                return false;
+            }
+            forward_step = ForwardStep::WaitOpen;
+            return true;
+        }
+        if (forward_step == ForwardStep::WaitOpen) {
+            const chast::Error attached = session->wait_port_forward_connection(
+                forward_handle, std::chrono::milliseconds(0));
+            if (attached.status() == chast::Status::WaitTimeout) {
+                return true;
+            }
+            if (!attached.ok()) {
+                stats.forward_error =
+                    "the host did not attach the forward: " + attached.to_string();
+                return false;
+            }
+            forward_step = ForwardStep::Send;
+            return true;
+        }
+        if (forward_step == ForwardStep::Send) {
+            while (forward_sent < forward_payload.size()) {
+                const size_t remaining = forward_payload.size() - forward_sent;
+                const size_t chunk = remaining > chast::kMaxPortForwardChunkBytes
+                                         ? chast::kMaxPortForwardChunkBytes
+                                         : remaining;
+                const chast::Error sent = session->send_port_forward_data(
+                    forward_handle, forward_payload.data() + forward_sent, chunk,
+                    std::chrono::milliseconds(0));
+                if (sent.status() == chast::Status::WaitTimeout) {
+                    break;
+                }
+                if (!sent.ok()) {
+                    stats.forward_error = "send_port_forward_data: " + sent.to_string();
+                    return false;
+                }
+                forward_sent += chunk;
+                stats.forward_bytes_sent = forward_sent;
+            }
+            if (!drain_forward_echo()) {
+                return false;
+            }
+            if (forward_sent == forward_payload.size()) {
+                if (chast::Error finished = session->finish_port_forward(forward_handle);
+                    !finished.ok()) {
+                    stats.forward_error = "finish_port_forward: " + finished.to_string();
+                    return false;
+                }
+                forward_step = ForwardStep::WaitEcho;
+            }
+            return true;
+        }
+        if (!drain_forward_echo()) {
+            return false;
+        }
+        if (forward_eof) {
+            if (forward_received != forward_payload) {
+                stats.forward_error =
+                    "the echoed bytes do not match the payload (" +
+                    std::to_string(forward_received.size()) + " of " +
+                    std::to_string(forward_payload.size()) + " bytes)";
+                return false;
+            }
+            stats.forward_echo_ok = true;
+            session->close_port_forward(forward_handle);
+            forward_handle = 0;
+            forward_step = ForwardStep::Done;
+            if (!options.quiet) {
+                std::printf("quic: port forward echoed %llu bytes over real TCP\n",
+                            static_cast<unsigned long long>(forward_received.size()));
+            }
+        }
+        return true;
+    };
+
+    // ---- terminal probe (verify --terminal) ----
+    // The viewer asks the in-process host for a console, types two lines and
+    // waits for the shell's own echo of the marker. The host side is the real
+    // ConPTY relay, so a passing run proves the whole path.
+    stats.terminal_probe = options.terminal || options.terminal_denied;
+    stats.terminal_denied = options.terminal_denied;
+    enum class TerminalStep { Request, WaitResult, Open, Typing, WaitEnd, Done };
+    TerminalStep terminal_step = TerminalStep::Request;
+    std::string terminal_output;
+    std::string terminal_input = "echo ";
+    terminal_input += kTerminalProbeMarker;
+    terminal_input += "\r\nexit\r\n";
+    bool terminal_ended = false;
+    bool terminal_stop_seen = false;
+    // The typed line already ends with `exit`, so the shell closes the console
+    // on its own. EOF is only the fallback for a shell that ignores it.
+    bool terminal_input_finished = false;
+    std::chrono::steady_clock::time_point terminal_typed_at;
+    if (stats.terminal_denied) {
+        if (info.terminal_enabled) {
+            return fail("the server announced remote terminals although they are off");
+        }
+    } else if (stats.terminal_probe && !info.terminal_enabled) {
+        return fail("the server did not announce remote terminals "
+                    "(serve --allow-terminal)");
+    }
+    auto drain_terminal = [&]() {
+        for (;;) {
+            std::vector<uint8_t> data;
+            bool ended = false;
+            const bool got = session->take_terminal_output(kTerminalProbeId, data, ended);
+            if (got) {
+                terminal_output.append(data.begin(), data.end());
+                stats.terminal_output_bytes = terminal_output.size();
+            }
+            if (ended) {
+                terminal_ended = true;
+            }
+            if (!got || ended) {
+                break;
+            }
+        }
+        chast::TerminalStop stop;
+        while (session->take_terminal_stop(stop)) {
+            if (stop.terminal_id != kTerminalProbeId) {
+                continue;
+            }
+            terminal_stop_seen = true;
+            stats.terminal_stop_code = stop.code;
+            stats.terminal_stop_reason = stop.reason;
+        }
+    };
+    auto advance_terminal = [&]() -> bool {
+        if (!stats.terminal_probe || terminal_step == TerminalStep::Done) {
+            return true;
+        }
+        if (stats.terminal_denied) {
+            // The gate is checked before anything reaches the wire; the
+            // session must keep streaming afterwards.
+            const chast::Error requested =
+                session->request_terminal(kTerminalProbeId, 80, 24);
+            if (requested.status() != chast::Status::PermissionDenied) {
+                stats.terminal_error =
+                    requested.ok()
+                        ? "the viewer opened a terminal although the host never "
+                          "announced one"
+                        : "request_terminal failed unexpectedly: " +
+                              requested.to_string();
+                return false;
+            }
+            if (!options.quiet) {
+                std::printf("quic: terminal refusal as expected: %s\n",
+                            requested.message().c_str());
+            }
+            stats.terminal_denied_ok = true;
+            terminal_step = TerminalStep::Done;
+            return true;
+        }
+        if (terminal_step == TerminalStep::Request) {
+            if (chast::Error requested = session->request_terminal(
+                    kTerminalProbeId, kTerminalProbeColumns, kTerminalProbeRows);
+                !requested.ok()) {
+                stats.terminal_error = "request_terminal: " + requested.to_string();
+                return false;
+            }
+            terminal_step = TerminalStep::WaitResult;
+            if (!options.quiet) {
+                std::printf("quic: asking for a %ux%u terminal\n",
+                            static_cast<unsigned>(kTerminalProbeColumns),
+                            static_cast<unsigned>(kTerminalProbeRows));
+            }
+            return true;
+        }
+        if (terminal_step == TerminalStep::WaitResult) {
+            chast::TerminalResult result;
+            while (session->take_terminal_result(result)) {
+                if (result.terminal_id != kTerminalProbeId) {
+                    continue;
+                }
+                stats.terminal_code = result.code;
+                stats.terminal_reason = result.reason;
+                if (result.code != chast::TerminalCode::Ok) {
+                    stats.terminal_error =
+                        "the host refused the terminal" +
+                        (result.reason.empty() ? std::string() : ": " + result.reason);
+                    return false;
+                }
+                terminal_step = TerminalStep::Open;
+            }
+            return true;
+        }
+        if (terminal_step == TerminalStep::Open) {
+            if (chast::Error opened = session->open_terminal_input(kTerminalProbeId);
+                !opened.ok()) {
+                stats.terminal_error = "open_terminal_input: " + opened.to_string();
+                return false;
+            }
+            terminal_step = TerminalStep::Typing;
+            return true;
+        }
+        if (terminal_step == TerminalStep::Typing) {
+            const chast::Error sent = session->send_terminal_input(
+                kTerminalProbeId, reinterpret_cast<const uint8_t*>(terminal_input.data()),
+                terminal_input.size(), std::chrono::milliseconds(0));
+            if (sent.status() == chast::Status::WaitTimeout) {
+                return true;
+            }
+            if (!sent.ok()) {
+                stats.terminal_error = "send_terminal_input: " + sent.to_string();
+                return false;
+            }
+            terminal_typed_at = std::chrono::steady_clock::now();
+            terminal_step = TerminalStep::WaitEnd;
+            return true;
+        }
+        if (!terminal_input_finished &&
+            std::chrono::steady_clock::now() - terminal_typed_at >
+                std::chrono::milliseconds(1500)) {
+            session->finish_terminal_input(kTerminalProbeId);
+            terminal_input_finished = true;
+        }
+        drain_terminal();
+        if (!terminal_ended || !terminal_stop_seen) {
+            return true;
+        }
+        size_t marker_count = 0;
+        for (size_t at = terminal_output.find(kTerminalProbeMarker); at != std::string::npos;
+             at = terminal_output.find(kTerminalProbeMarker, at + 1)) {
+            ++marker_count;
+        }
+        // One occurrence is only the console echoing the typed line; the
+        // command has run once the shell prints it as well.
+        stats.terminal_marker_ok = marker_count >= 2;
+        if (!stats.terminal_marker_ok) {
+            stats.terminal_error =
+                "the console output does not carry the marker twice (" +
+                std::to_string(marker_count) + " seen in " +
+                std::to_string(terminal_output.size()) + " bytes)";
+            return false;
+        }
+        if (stats.terminal_stop_code != chast::TerminalCode::Ok) {
+            stats.terminal_error =
+                "the host ended the terminal with code " +
+                std::to_string(static_cast<unsigned>(stats.terminal_stop_code)) +
+                (stats.terminal_stop_reason.empty() ? std::string()
+                                                    : ": " + stats.terminal_stop_reason);
+            return false;
+        }
+        session->close_terminal(kTerminalProbeId);
+        terminal_step = TerminalStep::Done;
+        if (!options.quiet) {
+            std::printf("quic: terminal printed %llu bytes and the shell exited cleanly\n",
+                        static_cast<unsigned long long>(stats.terminal_output_bytes));
+        }
+        return true;
+    };
+
+    // ---- viewer relay probe (verify --port-forward-local) ----
+    // The viewer starts the same 127.0.0.1 listener a GUI session uses, then
+    // connects to it like an ordinary local application. This covers the
+    // listener, one CPFW connection per accepted socket and the pump loop, not
+    // just the raw session calls the probe above exercises.
+    stats.port_forward_local_probe = options.port_forward_local;
+    std::unique_ptr<chast::PortForwardClient> local_forward;
+    enum class LocalForwardStep { Connect, Send, Drain, Done };
+    LocalForwardStep local_forward_step = LocalForwardStep::Connect;
+    std::vector<uint8_t> local_forward_payload;
+    std::vector<uint8_t> local_forward_received;
+    size_t local_forward_sent = 0;
+    SOCKET local_forward_socket = INVALID_SOCKET;
+    std::array<char, 64 * 1024> local_forward_buffer{};
+    if (stats.port_forward_local_probe) {
+        if (!info.port_forward_enabled) {
+            return fail("the server did not announce port forwarding "
+                        "(serve --allow-port-forward)");
+        }
+        if (options.forward_host.empty() || options.forward_port == 0) {
+            return fail("the local port-forward probe has no target");
+        }
+        local_forward = std::make_unique<chast::PortForwardClient>(*session);
+        uint16_t bound = 0;
+        const chast::Error started = local_forward->start(
+            options.forward_host, options.forward_port, 0, &bound);
+        if (!started.ok()) {
+            return fail("start_port_forward: " + started.to_string());
+        }
+        stats.forward_local_port = bound;
+        if (!options.quiet) {
+            std::printf("quic: port forward listening on 127.0.0.1:%u -> %s:%u\n",
+                        static_cast<unsigned>(bound), options.forward_host.c_str(),
+                        static_cast<unsigned>(options.forward_port));
+        }
+        local_forward_payload = file_probe_content(kPortForwardProbeBytes);
+        local_forward_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (local_forward_socket == INVALID_SOCKET) {
+            return fail("cannot create the local port-forward client");
+        }
+        u_long nonblocking = 1;
+        ioctlsocket(local_forward_socket, FIONBIO, &nonblocking);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(bound);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ::connect(local_forward_socket, reinterpret_cast<const sockaddr*>(&address),
+                  sizeof(address));
+    }
+    auto advance_port_forward_local = [&]() -> bool {
+        if (!stats.port_forward_local_probe ||
+            local_forward_step == LocalForwardStep::Done) {
+            return true;
+        }
+        if (local_forward) {
+            for (const std::string& event : local_forward->pump()) {
+                if (!options.quiet) {
+                    std::printf("quic: %s\n", event.c_str());
+                }
+            }
+            if (!local_forward->error().empty()) {
+                stats.forward_local_error = local_forward->error();
+                return false;
+            }
+        }
+        if (local_forward_step == LocalForwardStep::Connect) {
+            fd_set writable;
+            FD_ZERO(&writable);
+            FD_SET(local_forward_socket, &writable);
+            timeval immediate{0, 0};
+            const int ready = select(0, nullptr, &writable, nullptr, &immediate);
+            if (ready == SOCKET_ERROR) {
+                stats.forward_local_error = "the local forward client select failed";
+                return false;
+            }
+            if (ready == 0) {
+                return true;
+            }
+            int so_error = 0;
+            int length = sizeof(so_error);
+            if (getsockopt(local_forward_socket, SOL_SOCKET, SO_ERROR,
+                           reinterpret_cast<char*>(&so_error), &length) != 0 ||
+                so_error != 0) {
+                stats.forward_local_error =
+                    "cannot connect to the local forward listener";
+                return false;
+            }
+            local_forward_step = LocalForwardStep::Send;
+        }
+        if (local_forward_step == LocalForwardStep::Send) {
+            while (local_forward_sent < local_forward_payload.size()) {
+                const size_t remaining =
+                    local_forward_payload.size() - local_forward_sent;
+                const int chunk = static_cast<int>(
+                    remaining > chast::kMaxPortForwardChunkBytes
+                        ? chast::kMaxPortForwardChunkBytes
+                        : remaining);
+                const int sent = ::send(
+                    local_forward_socket,
+                    reinterpret_cast<const char*>(local_forward_payload.data() +
+                                                  local_forward_sent),
+                    chunk, 0);
+                if (sent > 0) {
+                    local_forward_sent += static_cast<size_t>(sent);
+                    continue;
+                }
+                if (sent == SOCKET_ERROR && socket_would_block()) {
+                    return true;
+                }
+                stats.forward_local_error =
+                    "the local forward client could not push the payload";
+                return false;
+            }
+            shutdown(local_forward_socket, SD_SEND);
+            local_forward_step = LocalForwardStep::Drain;
+        }
+        if (local_forward_step == LocalForwardStep::Drain) {
+            for (int i = 0; i < 16; ++i) {
+                const int got = ::recv(local_forward_socket,
+                                       local_forward_buffer.data(),
+                                       static_cast<int>(local_forward_buffer.size()), 0);
+                if (got > 0) {
+                    local_forward_received.insert(local_forward_received.end(),
+                                                  local_forward_buffer.data(),
+                                                  local_forward_buffer.data() + got);
+                    stats.forward_local_bytes = local_forward_received.size();
+                    continue;
+                }
+                if (got == 0) {
+                    if (local_forward_received != local_forward_payload) {
+                        stats.forward_local_error =
+                            "the relayed bytes do not match the payload (" +
+                            std::to_string(local_forward_received.size()) + " of " +
+                            std::to_string(local_forward_payload.size()) + " bytes)";
+                        return false;
+                    }
+                    stats.forward_local_ok = true;
+                    closesocket(local_forward_socket);
+                    local_forward_socket = INVALID_SOCKET;
+                    local_forward->stop();
+                    local_forward.reset();
+                    local_forward_step = LocalForwardStep::Done;
+                    if (!options.quiet) {
+                        std::printf("quic: the local listener relayed %llu bytes "
+                                    "through the host\n",
+                                    static_cast<unsigned long long>(
+                                        local_forward_received.size()));
+                    }
+                    return true;
+                }
+                if (socket_would_block()) {
+                    return true;
+                }
+                stats.forward_local_error =
+                    "the local forward client lost the connection";
+                return false;
+            }
+        }
+        return true;
+    };
+
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
     auto ensure_audio_decoder = [&](const chast::AudioInfo& audio) -> bool {
         if (!options.audio || !audio.enabled) {
@@ -2544,6 +3422,10 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     std::unique_ptr<chast::IAudioPlayer> audio_player;
     if (options.play) {
         chast::AudioPlayerConfig player_config;
+        // The viewer GUI plays system audio on arrival; mirror that here so
+        // the CLI measurement exercises the same path.
+        player_config.arrival_anchored = true;
+        player_config.lead_ms = 0;
         std::string player_error;
         audio_player = chast::create_audio_player(player_config, &player_error);
         if (!audio_player) {
@@ -2567,6 +3449,16 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     if (!options.save.empty() &&
         (fopen_s(&sink, options.save.c_str(), "wb") != 0 || !sink)) {
         return fail("could not open " + options.save);
+    }
+    // The handshake names the codec so the recorder can refuse an unsupported one
+// up front; the MP4 sample description itself follows each encoded picture, and
+// a mid-session size change rolls the recording into a new segment.
+    chast_tools::Mp4Recorder recorder;
+    if (!options.record.empty()) {
+        std::string record_error;
+        if (!recorder.open(options.record, info.codec, info.width, info.height, &record_error)) {
+            return fail("recording: " + record_error);
+        }
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -3695,6 +4587,16 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!advance_file_download()) {
             return fail(stats.download_error.empty() ? stats.error : stats.download_error);
         }
+        if (!advance_port_forward()) {
+            return fail(stats.forward_error.empty() ? stats.error : stats.forward_error);
+        }
+        if (!advance_port_forward_local()) {
+            return fail(stats.forward_local_error.empty() ? stats.error
+                                                          : stats.forward_local_error);
+        }
+        if (!advance_terminal()) {
+            return fail(stats.terminal_error.empty() ? stats.error : stats.terminal_error);
+        }
         drain_cursor();
         drain_desktop_state();
         drain_privacy_state();
@@ -3918,6 +4820,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (sink) {
             fwrite(payload.data(), 1, payload.size(), sink);
         }
+        if (!options.record.empty()) {
+            recorder.write(header, payload.data(), payload.size());
+        }
         stats.bytes += payload.size();
         if (header.keyframe) {
             ++stats.keyframes;
@@ -4009,6 +4914,82 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.error = "the host download did not finish";
         }
     }
+    if (stats.port_forward_probe && forward_step != ForwardStep::Done) {
+        // The relay moves bytes on the host thread; give both halves of the
+        // echo time to finish after the video stream ended.
+        const auto forward_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (forward_step != ForwardStep::Done &&
+               std::chrono::steady_clock::now() < forward_deadline) {
+            if (!advance_port_forward()) {
+                break;
+            }
+            if (forward_step != ForwardStep::Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (forward_step != ForwardStep::Done) {
+            if (stats.forward_error.empty()) {
+                stats.forward_error = "the port-forward probe did not finish";
+            }
+            if (stats.error.empty()) {
+                stats.error = stats.forward_error;
+            }
+        }
+    }
+    if (stats.port_forward_local_probe &&
+        local_forward_step != LocalForwardStep::Done) {
+        const auto local_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (local_forward_step != LocalForwardStep::Done &&
+               std::chrono::steady_clock::now() < local_deadline) {
+            if (!advance_port_forward_local()) {
+                break;
+            }
+            if (local_forward_step != LocalForwardStep::Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (local_forward_step != LocalForwardStep::Done) {
+            if (stats.forward_local_error.empty()) {
+                stats.forward_local_error = "the local port-forward probe did not finish";
+            }
+            if (stats.error.empty()) {
+                stats.error = stats.forward_local_error;
+            }
+        }
+        if (local_forward) {
+            local_forward->stop();
+            local_forward.reset();
+        }
+        if (local_forward_socket != INVALID_SOCKET) {
+            closesocket(local_forward_socket);
+            local_forward_socket = INVALID_SOCKET;
+        }
+    }
+    if (stats.terminal_probe && terminal_step != TerminalStep::Done) {
+        // The shell is a real process under ConPTY; give it time to print and
+        // exit after the video stream ended.
+        const auto terminal_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (terminal_step != TerminalStep::Done &&
+               std::chrono::steady_clock::now() < terminal_deadline) {
+            if (!advance_terminal()) {
+                break;
+            }
+            if (terminal_step != TerminalStep::Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (terminal_step != TerminalStep::Done) {
+            if (stats.terminal_error.empty()) {
+                stats.terminal_error = "the terminal probe did not finish";
+            }
+            if (stats.error.empty()) {
+                stats.error = stats.terminal_error;
+            }
+        }
+    }
     if (options.audio) {
         // The server FINs the audio stream right after the video's; wait
         // briefly for the tail and its closing packet before finishing.
@@ -4054,6 +5035,55 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     }
     if (sink) {
         fclose(sink);
+    }
+    if (!options.record.empty()) {
+        recorder.close();
+        stats.recording = true;
+        stats.record_samples = recorder.samples();
+        stats.record_keyframes = recorder.keyframes();
+        stats.record_skipped = recorder.skipped();
+        stats.record_files = recorder.segments();
+        stats.record_error = recorder.error();
+        stats.record_ok = !recorder.failed() && stats.record_error.empty();
+        // A resolution change rolls the recording into a new segment, so every
+        // file is reopened and the sample counts are summed across them.
+        if (stats.record_files.empty()) {
+            stats.record_ok = false;
+            if (stats.record_error.empty()) {
+                stats.record_error = "no key frame arrived to start the recording";
+            }
+        }
+        for (const std::string& segment : stats.record_files) {
+            uint64_t samples = 0;
+            uint64_t keyframes = 0;
+            std::string verify_error;
+            if (!chast_tools::Mp4Recorder::verify(segment, &samples, &keyframes, &verify_error)) {
+                stats.record_ok = false;
+                stats.record_error = verify_error;
+                break;
+            }
+            stats.record_verified_samples += samples;
+            stats.record_verified_keyframes += keyframes;
+        }
+        if (stats.record_ok && stats.record_verified_samples == 0) {
+            stats.record_ok = false;
+            stats.record_error = "reopened files have no samples";
+        }
+        if (!options.quiet) {
+            std::printf("receiver: recording file=%s segments=%llu samples=%llu "
+                        "keyframes=%llu skipped=%llu verified-samples=%llu "
+                        "verified-keyframes=%llu ok=%d%s%s\n",
+                        options.record.c_str(),
+                        static_cast<unsigned long long>(stats.record_files.size()),
+                        static_cast<unsigned long long>(stats.record_samples),
+                        static_cast<unsigned long long>(stats.record_keyframes),
+                        static_cast<unsigned long long>(stats.record_skipped),
+                        static_cast<unsigned long long>(stats.record_verified_samples),
+                        static_cast<unsigned long long>(stats.record_verified_keyframes),
+                        stats.record_ok ? 1 : 0,
+                        stats.record_error.empty() ? "" : " error=",
+                        stats.record_error.c_str());
+        }
     }
 
     const uint64_t elapsed_ms = static_cast<uint64_t>(
@@ -4128,6 +5158,47 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                             static_cast<unsigned long long>(stats.chat_sent),
                             static_cast<unsigned long long>(stats.chat_received),
                             static_cast<unsigned long long>(stats.chat_errors));
+            }
+            if (stats.port_forward_probe) {
+                if (stats.port_forward_denied) {
+                    std::printf("receiver: port-forward denied=%d%s%s\n",
+                                stats.forward_denied_ok ? 1 : 0,
+                                stats.forward_error.empty() ? "" : " error=",
+                                stats.forward_error.c_str());
+                } else {
+                    std::printf("receiver: port-forward code=%u sent=%llu received=%llu "
+                                "echo=%d%s%s\n",
+                                static_cast<unsigned>(stats.forward_code),
+                                static_cast<unsigned long long>(stats.forward_bytes_sent),
+                                static_cast<unsigned long long>(stats.forward_bytes_received),
+                                stats.forward_echo_ok ? 1 : 0,
+                                stats.forward_error.empty() ? "" : " error=",
+                                stats.forward_error.c_str());
+                }
+            }
+            if (stats.port_forward_local_probe) {
+                std::printf("receiver: port-forward local port=%u bytes=%llu ok=%d%s%s\n",
+                            static_cast<unsigned>(stats.forward_local_port),
+                            static_cast<unsigned long long>(stats.forward_local_bytes),
+                            stats.forward_local_ok ? 1 : 0,
+                            stats.forward_local_error.empty() ? "" : " error=",
+                            stats.forward_local_error.c_str());
+            }
+            if (stats.terminal_probe) {
+                if (stats.terminal_denied) {
+                    std::printf("receiver: terminal denied=%d%s%s\n",
+                                stats.terminal_denied_ok ? 1 : 0,
+                                stats.terminal_error.empty() ? "" : " error=",
+                                stats.terminal_error.c_str());
+                } else {
+                    std::printf("receiver: terminal code=%u bytes=%llu marker=%d stop=%u%s%s\n",
+                                static_cast<unsigned>(stats.terminal_code),
+                                static_cast<unsigned long long>(stats.terminal_output_bytes),
+                                stats.terminal_marker_ok ? 1 : 0,
+                                static_cast<unsigned>(stats.terminal_stop_code),
+                                stats.terminal_error.empty() ? "" : " error=",
+                                stats.terminal_error.c_str());
+                }
             }
             std::printf("receiver: cursor updates=%llu shapes=%llu visible=%d at=%d,%d\n",
                         static_cast<unsigned long long>(stats.cursor_updates),
@@ -6029,6 +7100,32 @@ int run_verify(const Options& options) {
         const std::u8string utf8 = source.u8string();
         local.download_source.assign(utf8.begin(), utf8.end());
     }
+    // The port-forward probe needs a real TCP endpoint: the host's relay dials
+    // it and every byte travels viewer -> QUIC -> host -> TCP -> echo -> host
+    // -> QUIC -> viewer. The endpoint stays up for the whole run.
+    PortForwardEcho echo;
+    if (local.port_forward || local.port_forward_local) {
+        std::string echo_error;
+        if (!echo.start(&echo_error)) {
+            std::fprintf(stderr, "could not start the port-forward echo endpoint: %s\n",
+                         echo_error.c_str());
+            return 1;
+        }
+        local.forward_host = "127.0.0.1";
+        local.forward_port = echo.port();
+        local.allow_port_forward = true;
+        if (local.seconds < 6.0) {
+            local.seconds = 6.0;
+        }
+    }
+    // The terminal probe opens a real shell on the in-process host; like the
+    // port-forward relay it runs inside the session loop.
+    if (local.terminal) {
+        local.allow_terminal = true;
+        if (local.seconds < 6.0) {
+            local.seconds = 6.0;
+        }
+    }
     const bool keep_file = !options.save.empty();
     const std::string path = keep_file ? options.save : ".chast-quic-verify.bin";
 
@@ -6185,6 +7282,26 @@ int run_verify(const Options& options) {
                     received.transport.c_str());
     }
     check(!local.token.empty(), "the loopback ran with an access token");
+    // The recording probe muxes the received access units into MP4 and reopens
+    // the files, so the counts must line up with what the session carried.
+    if (!options.record.empty()) {
+        check(received.record_ok, "the viewer recorded parseable MP4 segments");
+        if (!received.record_ok && !received.record_error.empty()) {
+            std::printf("     recording: %s\n", received.record_error.c_str());
+        }
+        check(received.record_samples + received.record_skipped == received.received,
+              "every received access unit was muxed or counted as pre-key-frame");
+        check(received.record_keyframes == received.keyframes,
+              "the recording kept every key frame the viewer saw");
+        check(received.record_verified_samples == received.record_samples,
+              "reopening the recordings read back every muxed sample");
+        if (local.resolution < 100) {
+            // The probe resized the stream once, so the recording must have
+            // rolled over into a second segment rather than stop.
+            check(received.record_files.size() == 2,
+                  "the resolution change rolled the recording into a second segment");
+        }
+    }
     // Probes run on neighbouring ports so they cannot disturb the session
     // above.
     const uint16_t probe_base =
@@ -6784,6 +7901,72 @@ int run_verify(const Options& options) {
         }
     }
 
+    if (local.port_forward_denied) {
+        check(received.port_forward_probe,
+              "the viewer ran the port-forward denial probe");
+        check(received.forward_denied_ok,
+              "the closed host gate refused the forward without hurting the session");
+        if (!received.forward_error.empty()) {
+            std::printf("     forward: %s\n", received.forward_error.c_str());
+        }
+    }
+
+    if (local.port_forward_local) {
+        check(received.port_forward_local_probe,
+              "the viewer started its own port-forward listener");
+        check(received.forward_local_ok &&
+                  received.forward_local_bytes == kPortForwardProbeBytes,
+              "a local TCP client got its payload back through the listener");
+        if (!received.forward_local_error.empty()) {
+            std::printf("     forward: %s\n", received.forward_local_error.c_str());
+        }
+    }
+
+    if (local.terminal_denied) {
+        check(received.terminal_probe, "the viewer ran the terminal denial probe");
+        check(received.terminal_denied_ok,
+              "the closed host gate refused the terminal without hurting the session");
+        if (!received.terminal_error.empty()) {
+            std::printf("     terminal: %s\n", received.terminal_error.c_str());
+        }
+    }
+
+    if (local.terminal) {
+        check(received.terminal_probe, "the viewer ran the terminal probe");
+        check(received.terminal_code == chast::TerminalCode::Ok,
+              "the host approved the terminal");
+        check(received.terminal_marker_ok,
+              "the console printed the command's own output before exiting");
+        check(received.terminal_stop_code == chast::TerminalCode::Ok,
+              "the console ended cleanly");
+        if (!received.terminal_error.empty()) {
+            std::printf("     terminal: %s\n", received.terminal_error.c_str());
+        }
+        if (!received.terminal_reason.empty()) {
+            std::printf("     terminal reason: %s\n", received.terminal_reason.c_str());
+        }
+        if (!received.terminal_stop_reason.empty()) {
+            std::printf("     terminal stop: %s\n", received.terminal_stop_reason.c_str());
+        }
+    }
+
+    if (local.port_forward) {
+        check(received.port_forward_probe, "the viewer ran the port-forward probe");
+        check(received.forward_code == chast::PortForwardCode::Ok,
+              "the host approved the forward target");
+        check(received.forward_bytes_sent == kPortForwardProbeBytes,
+              "the viewer pushed the whole payload through the forward");
+        check(received.forward_echo_ok &&
+                  received.forward_bytes_received == kPortForwardProbeBytes,
+              "the relay echoed every byte back through real TCP");
+        if (!received.forward_error.empty()) {
+            std::printf("     forward: %s\n", received.forward_error.c_str());
+        }
+        if (!received.forward_reason.empty()) {
+            std::printf("     forward reason: %s\n", received.forward_reason.c_str());
+        }
+    }
+
     if (local.audio) {
         check(sent.audio_announced, "the server announced the synthetic audio stream");
         check(received.audio_announced, "the client saw audio enabled in HelloAck");
@@ -6878,8 +8061,17 @@ int run_verify(const Options& options) {
 
     if (!keep_file) {
         std::remove(path.c_str());
+        // verify records into scratch files; keep them only when --save asked
+        // for this run's artifacts to be kept. A resolution change splits the
+        // recording, so every segment is removed.
+        for (const std::string& segment : received.record_files) {
+            std::remove(segment.c_str());
+        }
     } else {
         std::printf("saved the sent stream to %s\n", path.c_str());
+        for (const std::string& segment : received.record_files) {
+            std::printf("kept the recording at %s\n", segment.c_str());
+        }
     }
 
     if (failed) {

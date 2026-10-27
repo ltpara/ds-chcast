@@ -82,6 +82,8 @@ enum ControlId {
     kInputCheck,
     kClipboardCheck,
     kFileTransferCheck,
+    kPortForwardCheck,
+    kTerminalCheck,
     kSendFileButton,
     kAudioCheck,
     kMicrophoneCheck,
@@ -781,6 +783,12 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionFileTransfer) != 0) {
         add(L"文件传输");
     }
+    if ((mask & kPermissionPortForward) != 0) {
+        add(L"端口转发");
+    }
+    if ((mask & kPermissionTerminal) != 0) {
+        add(L"远程终端");
+    }
     if ((mask & kPermissionAudio) != 0) {
         add(L"声音");
     }
@@ -801,7 +809,11 @@ uint16_t current_gate_mask() {
                                  (g_app->settings.allow_privacy_mode ? kPermissionPrivacyMode
                                                                      : 0) |
                                  (g_app->settings.allow_file_transfer ? kPermissionFileTransfer
-                                                                      : 0));
+                                                                      : 0) |
+                                 (g_app->settings.allow_port_forward ? kPermissionPortForward
+                                                                     : 0) |
+                                 (g_app->settings.allow_terminal ? kPermissionTerminal
+                                                                 : 0));
 }
 
 std::wstring security_summary_text(const HostStatus& status) {
@@ -956,6 +968,14 @@ void apply_tunnel_event(const TunnelEvent& event) {
             line += L" · 中继 " + widen(event.relay);
         }
         append_log_line(line);
+        if (!event.migrated_from.empty()) {
+            append_log_line(L"设备 ID 已从 " + widen(event.migrated_from) + L" 迁移到 " +
+                            widen(device));
+            if (g_app->settings.tunnel_old_id == event.migrated_from) {
+                g_app->settings.tunnel_old_id.clear();
+                save_settings();
+            }
+        }
     } else if (event.event == "relay") {
         g_app->tunnel_relay = event.relay;
         append_log_line(L"连接服务中继地址：" + widen(event.relay));
@@ -998,6 +1018,10 @@ void load_settings() {
     }
     if (g_app->settings.tunnel_key.empty()) {
         g_app->settings.tunnel_key = generate_access_token(16);
+    }
+    if (!g_app->settings.tunnel_old_id.empty() &&
+        g_app->settings.tunnel_old_id == g_app->settings.tunnel_id) {
+        g_app->settings.tunnel_old_id.clear();
     }
     if (g_app->startup_created) {
         std::string error;
@@ -1369,6 +1393,16 @@ bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, s
         }
         updated.tunnel_id = normalized;
     }
+    if (updated.tunnel_id != g_app->settings.tunnel_id &&
+        !g_app->settings.tunnel_id.empty() && updated.tunnel_old_id.empty()) {
+        // Remember the id to release on the server. A pending older id wins so
+        // an edit made before the first migration was confirmed still resolves
+        // the original record instead of leaking it.
+        updated.tunnel_old_id = g_app->settings.tunnel_id;
+    }
+    if (updated.tunnel_old_id == updated.tunnel_id) {
+        updated.tunnel_old_id.clear();
+    }
 
     const std::string key = trim_ascii(narrow(control_text(dialog.key)));
     if (key.empty()) {
@@ -1591,6 +1625,8 @@ enum SecurityDialogId {
     kSecAllowAudio,
     kSecAllowMicrophone,
     kSecAllowPrivacy,
+    kSecAllowPortForward,
+    kSecAllowTerminal,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1625,6 +1661,8 @@ struct SecurityDialogState {
     HWND allow_input = nullptr;
     HWND allow_clipboard = nullptr;
     HWND allow_file = nullptr;
+    HWND allow_port_forward = nullptr;
+    HWND allow_terminal = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -1839,6 +1877,8 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_input = is_checked(dialog.allow_input);
     updated.allow_clipboard = is_checked(dialog.allow_clipboard);
     updated.allow_file_transfer = is_checked(dialog.allow_file);
+    updated.allow_port_forward = is_checked(dialog.allow_port_forward);
+    updated.allow_terminal = is_checked(dialog.allow_terminal);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2073,7 +2113,7 @@ bool edit_security_settings(HostSettings& result) {
     RECT owner_rect{};
     GetWindowRect(g_app->window, &owner_rect);
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT frame{0, 0, px(620), px(566)};
+    RECT frame{0, 0, px(620), px(600)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -2106,7 +2146,7 @@ bool edit_security_settings(HostSettings& result) {
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12), px(588),
-                                 px(488), window,
+                                 px(520), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
@@ -2234,9 +2274,19 @@ bool edit_security_settings(HostSettings& result) {
          (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
             .c_str(),
         SS_LEFT | SS_ENDELLIPSIS, 0, 290, 398, 290, 20, 0, nullptr, &dialog.access_page);
+    dialog.allow_port_forward =
+        add(L"BUTTON", L"端口转发", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 428, 120, 24,
+            kSecAllowPortForward, nullptr, &dialog.access_page);
+    add(L"STATIC", L"允许查看器经本机访问你可达的 TCP 地址。", SS_LEFT, 0, 150, 432, 430, 20, 0,
+        nullptr, &dialog.access_page);
     dialog.allow_change =
-        add(L"BUTTON", L"允许在会话中调整权限", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 426, 260,
+        add(L"BUTTON", L"允许在会话中调整权限", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 460, 260,
             24, kSecAllowChange, nullptr, &dialog.access_page);
+    dialog.allow_terminal =
+        add(L"BUTTON", L"远程终端", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 488, 120, 24,
+            kSecAllowTerminal, nullptr, &dialog.access_page);
+    add(L"STATIC", L"允许查看器在本机打开 shell（使用当前账户）。", SS_LEFT, 0, 160, 492,
+        420, 20, 0, nullptr, &dialog.access_page);
 
     // ----- advanced page -----
     add(L"STATIC", L"访问令牌（仅供 CLI 与自动化，默认关闭）", SS_LEFT, 0, 32, 56, 500, 20, 0,
@@ -2279,9 +2329,9 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", L"留空跟随系统默认；固定设备不可用时系统声音不会启动。", SS_LEFT, 0, 32,
         386, 540, 20, 0, nullptr, &dialog.advanced_page);
 
-    add(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 410, 514, 90, 32, kSecSave,
+    add(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 410, 548, 90, 32, kSecSave,
         nullptr, nullptr);
-    add(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 510, 514, 90, 32, kSecCancel,
+    add(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 510, 548, 90, 32, kSecCancel,
         nullptr, nullptr);
 
     // ----- initial state -----
@@ -2296,6 +2346,8 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_input, settings.allow_input);
     set_check(dialog.allow_clipboard, settings.allow_clipboard);
     set_check(dialog.allow_file, settings.allow_file_transfer);
+    set_check(dialog.allow_port_forward, settings.allow_port_forward);
+    set_check(dialog.allow_terminal, settings.allow_terminal);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2420,6 +2472,10 @@ void show_tray_menu() {
                 kClipboardCheck, L"同步剪贴板");
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_file_transfer ? MF_CHECKED : 0),
                 kFileTransferCheck, L"接受文件传输");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_port_forward ? MF_CHECKED : 0),
+                kPortForwardCheck, L"允许端口转发（查看器访问本机 TCP）");
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_terminal ? MF_CHECKED : 0),
+                kTerminalCheck, L"允许远程终端（查看器在本机开 shell）");
     const bool can_send = running && status.state == HostState::Streaming &&
                           (status.session_permissions & kPermissionFileTransfer) != 0;
     AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
@@ -2588,6 +2644,35 @@ void handle_command(int id) {
                 restart_server();
                 append_log_line(g_app->settings.allow_file_transfer ? L"文件传输已开启"
                                                                     : L"文件传输已关闭");
+            }
+            break;
+        case kPortForwardCheck:
+            g_app->settings.allow_port_forward = !g_app->settings.allow_port_forward;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                append_log_line(g_app->settings.allow_port_forward
+                                    ? L"端口转发已开启（本次会话实时生效）"
+                                    : L"端口转发已关闭（本次会话实时生效）");
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_port_forward
+                                    ? L"端口转发已开启"
+                                    : L"端口转发已关闭");
+            }
+            break;
+        case kTerminalCheck:
+            g_app->settings.allow_terminal = !g_app->settings.allow_terminal;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                append_log_line(g_app->settings.allow_terminal
+                                    ? L"远程终端已开启（本次会话实时生效）"
+                                    : L"远程终端已关闭（本次会话实时生效）");
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_terminal ? L"远程终端已开启"
+                                                               : L"远程终端已关闭");
             }
             break;
         case kAudioCheck:
@@ -2927,7 +3012,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                         L"--config <路径>     使用其他设置文件\n"
                         L"--tray              启动后隐藏窗口\n"
                         L"--autostart on|off  设置开机启动\n"
-                        L"--firewall <端口> [隧道端口]  添加防火墙规则（需要管理员）",
+                        L"--firewall <端口> [隧道端口]  添加防火墙规则（含局域网发现 21129/UDP，需要管理员）",
                         kWindowTitle, MB_OK | MB_ICONINFORMATION);
             LocalFree(argv);
             return 0;

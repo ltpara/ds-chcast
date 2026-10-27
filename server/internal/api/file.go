@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
@@ -17,6 +18,7 @@ type fileTransferReportRequest struct {
 	Success      *bool  `json:"success"`
 	Detail       string `json:"detail"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
+	AuditRef     string `json:"audit_ref,omitempty"`
 }
 
 type fileTransferView struct {
@@ -24,6 +26,9 @@ type fileTransferView struct {
 	Username     string `json:"username"`
 	PeerID       string `json:"peer_id"`
 	Direction    string `json:"direction"`
+	HostID       string `json:"host_id,omitempty"`
+	AuditRef     string `json:"audit_ref,omitempty"`
+	Source       string `json:"source,omitempty"`
 	Name         string `json:"name"`
 	Size         int64  `json:"size"`
 	Files        int    `json:"files"`
@@ -43,6 +48,9 @@ func fileTransferToView(event account.FileEvent) fileTransferView {
 		Username:     event.Username,
 		PeerID:       event.PeerID,
 		Direction:    event.Direction,
+		HostID:       event.HostID,
+		AuditRef:     event.AuditRef,
+		Source:       event.Source,
 		Name:         event.Name,
 		Size:         event.Size,
 		Files:        event.Files,
@@ -79,7 +87,7 @@ func (s *server) recordAccountFileTransfer(w http.ResponseWriter, r *http.Reques
 	}
 	event, err := s.cfg.Accounts.RecordFileTransfer(
 		user.ID, user.Username, req.PeerID, req.Direction, req.Name,
-		s.clientIP(r), req.Size, files, occurredAt, success, req.Detail,
+		s.clientIP(r), req.AuditRef, req.Size, files, occurredAt, success, req.Detail,
 	)
 	if err != nil {
 		if errors.Is(err, account.ErrInvalidTransfer) {
@@ -130,7 +138,15 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, err := s.cfg.Accounts.FileTransfersFor(r.URL.Query().Get("username"), limit)
+	var (
+		events []account.FileEvent
+		err    error
+	)
+	if host := strings.TrimSpace(r.URL.Query().Get("host")); host != "" {
+		events, err = s.cfg.Accounts.FileTransfersForHost(host, limit)
+	} else {
+		events, err = s.cfg.Accounts.FileTransfersFor(r.URL.Query().Get("username"), limit)
+	}
 	if err != nil {
 		s.cfg.Logger.Error("account file transfer audit query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the file transfer log")

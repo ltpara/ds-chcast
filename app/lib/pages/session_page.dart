@@ -7,6 +7,7 @@ import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
 
 import '../account_store.dart';
 import '../server_api.dart';
+import '../server_identity.dart';
 import '../server_settings.dart';
 import '../target.dart';
 import '../theme.dart';
@@ -19,15 +20,24 @@ import '../widgets/chat_panel.dart';
 import '../widgets/remote_toolbar.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
+import '../widgets/terminal_panel.dart';
 
 class SessionPage extends StatefulWidget {
-  const SessionPage({super.key, required this.target, this.account});
+  const SessionPage({
+    super.key,
+    required this.target,
+    this.account,
+    this.identityStore,
+  });
 
   final ConnectTarget target;
 
   /// The signed-in account, if any. It is only used to report a finished
   /// remote session for the server-side connection audit.
   final AccountSession? account;
+
+  /// Server identity pins; tests inject a file-backed store.
+  final ServerIdentityStore? identityStore;
 
   @override
   State<SessionPage> createState() => _SessionPageState();
@@ -40,6 +50,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   final FocusNode _focus = FocusNode(debugLabel: 'session');
   final FlutterGpuTextureRenderer _gpuTexture = FlutterGpuTextureRenderer();
   final TrustStore _trustStore = TrustStore();
+  late final ServerIdentityStore _identityStore =
+      widget.identityStore ?? ServerIdentityStore();
 
   Timer? _pollTimer;
   Timer? _hideTimer;
@@ -60,6 +72,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _chatOpen = false;
   bool _chatTyping = false;
   bool _chatDraining = false;
+  // Remote console. Like chat it is a modeless overlay; while its focus node
+  // owns the keyboard every key goes to the host's console instead of the
+  // remote desktop. The panel itself owns the screen model and the output
+  // poll; the page only decides when it is on screen.
+  final FocusNode _terminalFocus =
+      FocusNode(debugLabel: 'remote-terminal');
+  bool _terminalOpen = false;
+  bool _terminalTyping = false;
+  // The last port-forward failure already shown, so a stable error text does
+  // not pop a snack bar on every poll. Cleared when the engine clears it.
+  String _portForwardErrorSeen = '';
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -162,6 +185,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _chatInputFocus.addListener(_onChatFocusChanged);
+    _terminalFocus.addListener(_onTerminalFocusChanged);
     ViewerBridge.setDropHandler(_sendDroppedFiles);
     _startPolling();
     _starting = _start();
@@ -178,6 +202,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _autoTimer?.cancel();
     _chatInputFocus.removeListener(_onChatFocusChanged);
     _chatInputFocus.dispose();
+    _terminalFocus.removeListener(_onTerminalFocusChanged);
+    _terminalFocus.dispose();
     _focus.dispose();
     _setKeyCapture(false);
     _clearCursor();
@@ -217,6 +243,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         startedAt: startedAt,
         endedAt: DateTime.now(),
         detail: detail,
+        auditRef: _status.auditRef,
       );
     } catch (_) {
       // Audit delivery must not disturb the session or the returned page.
@@ -249,6 +276,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         files: files,
         success: success,
         detail: detail,
+        auditRef: _status.auditRef,
       );
     } catch (_) {
       // Audit delivery is best effort, exactly like the session report.
@@ -308,14 +336,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _tunnelStarting = null;
       unawaited(existing.stop());
     }
-    _tunnelStarting ??= TunnelAgent.start(
-      server: ServerSettings(
-        url: widget.target.server,
-        mode: widget.target.mode,
-        key: widget.target.serverKey,
-      ),
-      hostId: widget.target.hostId,
+    final ServerSettings settings = ServerSettings(
+      url: widget.target.server,
+      mode: widget.target.mode,
+      key: widget.target.serverKey,
     );
+    _tunnelStarting ??= () async {
+      final String serverKey = await _confirmedServerKey(settings);
+      return TunnelAgent.start(
+        server: settings,
+        hostId: widget.target.hostId,
+        serverPublicKey: serverKey,
+      );
+    }();
     try {
       final TunnelAgent agent = await _tunnelStarting!;
       _tunnel = agent;
@@ -325,6 +358,44 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _tunnelStarting = null;
       rethrow;
     }
+  }
+
+  /// Confirms the server key before the agent is allowed to look up the host
+  /// or ask for a punch. The first contact shows the fingerprint and pins it;
+  /// a later key change is refused until the user explicitly accepts it.
+  /// The returned key is also handed to `chast-tunnel viewer --server-pubkey`,
+  /// so a substituted lookup cannot be used even outside this page.
+  Future<String> _confirmedServerKey(ServerSettings settings) async {
+    final ServerIdentity live;
+    try {
+      live = await ServerApi.serverIdentity(settings);
+    } on ServerApiException catch (error) {
+      throw TunnelException('无法读取服务器身份：${error.message}');
+    }
+    final ServerIdentityPin? pinned =
+        await _identityStore.pinFor(settings.url);
+    if (pinned != null && pinned.identity.publicKey == live.publicKey) {
+      return live.publicKey;
+    }
+    if (!mounted) {
+      throw const TunnelException('服务器身份未确认');
+    }
+    final bool? accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return _ServerIdentityDialog(
+          server: settings.url,
+          identity: live,
+          previous: pinned?.identity,
+        );
+      },
+    );
+    if (accepted != true) {
+      throw const TunnelException('服务器身份未确认，已取消连接');
+    }
+    await _identityStore.pin(settings.url, live, previous: pinned);
+    return live.publicKey;
   }
 
   Future<void> _startOnce() async {
@@ -762,6 +833,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         duration: const Duration(seconds: 5),
       ));
     }
+    if (!nowOver) {
+      if (status.portForwardError.isEmpty) {
+        _portForwardErrorSeen = '';
+      } else if (status.portForwardError != _portForwardErrorSeen) {
+        _portForwardErrorSeen = status.portForwardError;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('端口转发：${status.portForwardError}'),
+          duration: const Duration(seconds: 5),
+        ));
+      }
+    }
     if (droppedControl) {
       _setKeyCapture(false);
     }
@@ -879,6 +961,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   Future<void> _applyClipboardSync(bool enabled) async {
     try {
       await ViewerBridge.setClipboardSync(enabled);
+    } on PlatformException {
+      // The session is going away; the next start reapplies the switch.
+    } on MissingPluginException {
+      // Same.
+    }
+  }
+
+  void _toggleRecording() {
+    unawaited(_applyRecording(!_status.recording));
+  }
+
+  Future<void> _applyRecording(bool enabled) async {
+    try {
+      await ViewerBridge.setRecording(enabled);
     } on PlatformException {
       // The session is going away; the next start reapplies the switch.
     } on MissingPluginException {
@@ -1056,6 +1152,173 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(error.message ?? '无法切换隐私模式')),
+      );
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  /// Opens the port-forward dialog. The listener binds 127.0.0.1 on the
+  /// viewer and the host relays each accepted TCP connection to the target;
+  /// the fields start from what the engine is running, so the dialog doubles
+  /// as the stop/replace sheet.
+  Future<void> _openPortForwardDialog() async {
+    if (!_status.acceptsPortForward) {
+      return;
+    }
+    final TextEditingController localController = TextEditingController(
+      text: '${_status.portForwardLocalPort}',
+    );
+    final TextEditingController hostController = TextEditingController(
+      text: _status.portForwardRemoteHost.isEmpty
+          ? '127.0.0.1'
+          : _status.portForwardRemoteHost,
+    );
+    final TextEditingController remoteController = TextEditingController(
+      text: _status.portForwardRemotePort == 0
+          ? ''
+          : '${_status.portForwardRemotePort}',
+    );
+    String? error;
+    final String? action = await showDialog<String>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setDialogState) {
+            void start() {
+              final int? local = int.tryParse(localController.text.trim());
+              final int? remote = int.tryParse(remoteController.text.trim());
+              final String host = hostController.text.trim();
+              if (local == null || local < 0 || local > 65535) {
+                setDialogState(() => error = '本地端口须为 0–65535（0 表示自动分配）');
+                return;
+              }
+              if (host.isEmpty || remote == null || remote < 1 || remote > 65535) {
+                setDialogState(() => error = '请填写目标主机和 1–65535 的目标端口');
+                return;
+              }
+              Navigator.of(dialogContext).pop('start');
+            }
+
+            return AlertDialog(
+              title: const Text('端口转发'),
+              content: SizedBox(
+                width: 380,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text(
+                      '本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。'
+                      '本地端口填 0 由系统分配。',
+                      style: TextStyle(fontSize: 12, height: 1.4),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: localController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: '本地端口（127.0.0.1）',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: hostController,
+                      decoration: const InputDecoration(
+                        labelText: '目标主机',
+                        isDense: true,
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: remoteController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: '目标端口',
+                        isDense: true,
+                      ),
+                    ),
+                    if (_status.portForwardActive) ...<Widget>[
+                      const SizedBox(height: 14),
+                      Text(
+                        '正在转发 127.0.0.1:${_status.portForwardLocalPort} → '
+                        '${_status.portForwardRemoteHost}:${_status.portForwardRemotePort}\n'
+                        '连接 ${_status.portForwardConnections} · '
+                        '失败 ${_status.portForwardFailures} · '
+                        '上行 ${_formatBytes(_status.portForwardBytesUp)} · '
+                        '下行 ${_formatBytes(_status.portForwardBytesDown)}',
+                        style: const TextStyle(fontSize: 11.5, height: 1.5),
+                      ),
+                    ],
+                    if (error != null) ...<Widget>[
+                      const SizedBox(height: 10),
+                      Text(
+                        error!,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: <Widget>[
+                if (_status.portForwardActive)
+                  TextButton(
+                    onPressed: () => Navigator.of(dialogContext).pop('stop'),
+                    child: const Text('停止转发'),
+                  ),
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: start,
+                  child: Text(_status.portForwardActive ? '更换目标' : '开始转发'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    final int? local = int.tryParse(localController.text.trim());
+    final int? remote = int.tryParse(remoteController.text.trim());
+    final String host = hostController.text.trim();
+    localController.dispose();
+    hostController.dispose();
+    remoteController.dispose();
+    if (!mounted) {
+      return;
+    }
+    try {
+      if (action == 'stop') {
+        await ViewerBridge.stopPortForward();
+        return;
+      }
+      if (action != 'start' || local == null || remote == null) {
+        return;
+      }
+      final bool queued = await ViewerBridge.startPortForward(
+        localPort: local,
+        remoteHost: host,
+        remotePort: remote,
+      );
+      if (!mounted || queued) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('无法开始端口转发：主机未开放该权限'),
+        duration: Duration(seconds: 4),
+      ));
+    } on PlatformException catch (failure) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(failure.message ?? '端口转发操作失败')),
       );
     } on MissingPluginException {
       // The native viewer is going away.
@@ -1584,9 +1847,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _chatEntries.clear();
       _chatOpen = false;
       _chatTyping = false;
+      _terminalOpen = false;
+      _terminalTyping = false;
     });
     if (_chatInputFocus.hasFocus) {
       _chatInputFocus.unfocus();
+    }
+    if (_terminalFocus.hasFocus) {
+      _terminalFocus.unfocus();
     }
     _setKeyCapture(false);
     _startPolling();
@@ -1678,6 +1946,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _closeChat();
       return KeyEventResult.handled;
     }
+    if (_terminalOpen && event.logicalKey == LogicalKeyboardKey.escape) {
+      _closeTerminalPanel();
+      return KeyEventResult.handled;
+    }
     if (event.logicalKey == LogicalKeyboardKey.escape) {
       if (_fullscreen) {
         unawaited(_setFullscreen(false));
@@ -1706,6 +1978,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       // button down on the far side.
       _releaseRemoteInput();
     }
+    final bool terminalHadKeyboard = _terminalTyping;
     setState(() {
       _controlEnabled = !_controlEnabled;
       _wheelX = 0;
@@ -1716,13 +1989,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       // leave every keystroke local; hand the keyboard back to the session.
       _chatInputFocus.unfocus();
     }
-    _setKeyCapture(_inputActive && !_chatTyping);
+    _setKeyCapture(_inputActive && !_chatTyping && !_terminalTyping);
     _syncCursor();
     if (_controlEnabled && !_chatTyping) {
       // The toolbar button may claim focus while it handles the tap; take it
       // back once the frame settles so keys go to the host immediately.
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _inputActive) {
+        if (!mounted || !_inputActive) {
+          return;
+        }
+        if (terminalHadKeyboard && _terminalOpen) {
+          _terminalFocus.requestFocus();
+        } else {
           _focus.requestFocus();
         }
       });
@@ -1762,7 +2040,65 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _releaseRemoteInput();
     }
     setState(() => _chatTyping = focused);
-    _setKeyCapture(_inputActive && !focused);
+    _setKeyCapture(_inputActive && !focused && !_terminalTyping);
+  }
+
+  /// Mirrors [_onChatFocusChanged] for the console. The panel handles its own
+  /// key events; this only arbitrates the native key-capture switch and the
+  /// release of keys the remote desktop may still hold.
+  void _onTerminalFocusChanged() {
+    final bool focused = _terminalFocus.hasFocus;
+    if (_terminalTyping == focused) {
+      return;
+    }
+    if (focused) {
+      _releaseRemoteInput();
+    }
+    setState(() => _terminalTyping = focused);
+    _setKeyCapture(_inputActive && !focused && !_chatTyping);
+  }
+
+  void _toggleTerminal() {
+    if (_terminalOpen) {
+      _closeTerminalPanel();
+    } else {
+      _openTerminalPanel();
+    }
+  }
+
+  void _openTerminalPanel() {
+    if (_terminalOpen || !_status.acceptsTerminal) {
+      return;
+    }
+    // Chat and the console both want the keyboard; keep one overlay at a
+    // time so Escape and typing have a single owner.
+    _closeChat();
+    setState(() => _terminalOpen = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _terminalOpen) {
+        _terminalFocus.requestFocus();
+      }
+    });
+  }
+
+  void _closeTerminalPanel() {
+    if (!_terminalOpen) {
+      return;
+    }
+    if (_terminalFocus.hasFocus) {
+      _terminalFocus.unfocus();
+    }
+    // The panel's dispose asks the engine to close the console, so the host
+    // shell ends with the overlay.
+    setState(() => _terminalOpen = false);
+    _setKeyCapture(_inputActive && !_chatTyping);
+    if (_inputActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _inputActive && !_terminalTyping) {
+          _focus.requestFocus();
+        }
+      });
+    }
   }
 
   void _toggleChat() {
@@ -1774,6 +2110,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _openChat() {
+    if (_terminalOpen) {
+      _closeTerminalPanel();
+    }
     if (!_chatOpen) {
       setState(() => _chatOpen = true);
     }
@@ -1791,7 +2130,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _chatInputFocus.unfocus();
     }
     setState(() => _chatOpen = false);
-    _setKeyCapture(_inputActive);
+    _setKeyCapture(_inputActive && !_terminalTyping);
     if (_inputActive) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && _inputActive && !_chatTyping) {
@@ -2191,6 +2530,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onSetAudioProcessing: _setAudioProcessing,
                         privacyAvailable: _status.acceptsPrivacy,
                         privacyEnabled: _status.privacyEnabled,
+                        portForwardAvailable: _status.acceptsPortForward,
+                        portForwardActive: _status.portForwardActive,
+                        onOpenPortForward: () =>
+                            unawaited(_openPortForwardDialog()),
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
                         onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
@@ -2221,9 +2564,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onSendFile: () => unawaited(_sendFile()),
                         chatOpen: _chatOpen,
                         onToggleChat: _toggleChat,
+                        terminalAvailable: _status.acceptsTerminal,
+                        terminalOpen: _terminalOpen,
+                        onToggleTerminal: _toggleTerminal,
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
                         onToggleMicrophone: () => unawaited(_toggleMicrophone()),
                         onTogglePrivacy: () => unawaited(_togglePrivacy()),
+                        recordingAvailable: _status.isLive,
+                        recording: _status.recording,
+                        onToggleRecording: _toggleRecording,
                         onTogglePin: _togglePin,
                         onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
                         onToggleFullscreen: _toggleFullscreen,
@@ -2319,6 +2668,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 if (hasFrame &&
                     !showOverlay &&
                     !_chatOpen &&
+                    !_terminalOpen &&
                     (_status.privacyEnabled ||
                         (_status.acceptsAudio && _status.audioMuted)))
                   Positioned(
@@ -2352,6 +2702,33 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onSend: _sendChat,
                       onClose: _closeChat,
                       inputFocusNode: _chatInputFocus,
+                    ),
+                  ),
+                if (hasFrame && !showOverlay && _terminalOpen)
+                  Positioned.fill(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 56, 16, 56),
+                      child: Align(
+                        alignment: Alignment.bottomRight,
+                        child: FractionallySizedBox(
+                          widthFactor: 0.7,
+                          heightFactor: 0.7,
+                          child: TerminalPanel(
+                            status: _status,
+                            focusNode: _terminalFocus,
+                            onOpen: (int columns, int rows) =>
+                                ViewerBridge.openTerminal(
+                                    columns: columns, rows: rows),
+                            onTakeOutput: ViewerBridge.takeTerminalOutput,
+                            onSendInput: ViewerBridge.sendTerminalInput,
+                            onResize: (int columns, int rows) =>
+                                ViewerBridge.resizeTerminal(
+                                    columns: columns, rows: rows),
+                            onClose: ViewerBridge.closeTerminal,
+                            onDismiss: _closeTerminalPanel,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
               ],
@@ -2997,4 +3374,87 @@ ViewerStreamQuality _streamQualityFor(int code) {
     }
   }
   return ViewerStreamQuality.high;
+}
+
+/// First-use and rotation confirmation for the rendezvous server key. The
+/// fingerprint is the only value a user can compare out of band, so both the
+/// old and the new one are shown in full when it changes.
+class _ServerIdentityDialog extends StatelessWidget {
+  const _ServerIdentityDialog({
+    required this.server,
+    required this.identity,
+    this.previous,
+  });
+
+  final String server;
+  final ServerIdentity identity;
+  final ServerIdentity? previous;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final bool changed = previous != null;
+    const TextStyle mono = TextStyle(
+      fontFamily: 'Consolas',
+      fontSize: 13,
+      letterSpacing: 0.8,
+      height: 1.5,
+    );
+    return AlertDialog(
+      title: Text(changed ? '服务器身份已变化' : '确认服务器身份'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(server, style: theme.textTheme.bodySmall),
+            const SizedBox(height: 12),
+            if (changed) ...<Widget>[
+              Text(
+                '此前固定的指纹',
+                style: theme.textTheme.labelMedium,
+              ),
+              const SizedBox(height: 4),
+              SelectableText(
+                formatServerFingerprint(previous!.fingerprint),
+                style: mono,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                '本次连接提供的指纹',
+                style: theme.textTheme.labelMedium,
+              ),
+            ] else
+              Text(
+                '首次连接将固定这台服务器的身份。请与管理员公布的值核对：',
+                style: theme.textTheme.bodyMedium,
+              ),
+            const SizedBox(height: 4),
+            SelectableText(
+              formatServerFingerprint(identity.fingerprint),
+              style: mono,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              changed
+                  ? '如果服务器没有更换密钥，这可能是中间人攻击。确认后旧指纹会被替换，并写入本地审计。'
+                  : '以后连接若遇到不同身份会被拒绝，并在确认后更换。',
+              style: theme.textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          key: const Key('server-identity-accept'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: Text(changed ? '信任新身份' : '信任并连接'),
+        ),
+      ],
+    );
+  }
 }

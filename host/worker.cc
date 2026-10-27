@@ -65,6 +65,21 @@ void save_trusted_devices(const std::vector<TrustedDevice>& devices) {
     }
 }
 
+void clear_migrated_identity(const std::string& old_id) {
+    std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
+    if (g_worker->settings.tunnel_old_id != old_id) {
+        return;
+    }
+    g_worker->settings.tunnel_old_id.clear();
+    if (g_worker->settings_path.empty()) {
+        return;
+    }
+    std::string error;
+    if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
+        worker_log("cannot clear the migrated device id: " + error);
+    }
+}
+
 void log_tunnel_event(const TunnelEvent& event) {
     if (event.event == "ready") {
         std::string line = "tunnel online";
@@ -76,6 +91,10 @@ void log_tunnel_event(const TunnelEvent& event) {
         }
         if (!event.relay.empty()) {
             line += " relay=" + event.relay;
+        }
+        if (!event.migrated_from.empty()) {
+            line += " migrated_from=" + event.migrated_from;
+            clear_migrated_identity(event.migrated_from);
         }
         worker_log(line);
     } else if (event.event == "viewer") {

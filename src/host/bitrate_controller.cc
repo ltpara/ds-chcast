@@ -24,6 +24,26 @@ constexpr double kQueueSevereRatio = 1.00;
 constexpr double kQueueModerateRatio = 0.65;
 constexpr double kQueueHealthyRatio = 0.50;
 
+// A capacity step down is handled in one decision: the target lands well under
+// the measured wire rate. The measured rate over the first interval after a
+// step still includes the old target's overshoot (retransmits and the queue
+// draining), so the margin has to be wide enough that even an inflated sample
+// leaves the target below the new capacity -- landing just above it keeps the
+// queue growing for another interval. It also drains the frames the old
+// target already queued.
+constexpr uint32_t kDeliveryHeadroomPercent = 65;
+// A rate needs a window and enough bytes to be meaningful; a short or tiny
+// interval is dominated by scheduling noise and must not move the target.
+constexpr uint32_t kMinRateWindowMs = 400;
+constexpr uint64_t kMinRateBytes = 16384;
+// A cooldown exists to keep one noisy sample from moving the target twice, but
+// delivery collapsing under this share of the target while the send queue is
+// filling the congestion window is not noise -- it is a capacity step. Such a
+// sample bypasses the cooldown and sets the landing point. A low wire rate
+// with an idle queue is content, not capacity (screen updates are bursty), so
+// it keeps the percent cut.
+constexpr uint32_t kDeliveryCollapsePercent = 70;
+
 // Frame-rate ladder, as a share of the ceiling. A 1080p screen at 500 kbps
 // needs about 10 fps to spend 0.02 bits per pixel; below that the desktop
 // turns into colour blocks, so the ladder bottoms out there.
@@ -176,9 +196,21 @@ BitrateDecision BitrateController::settle() {
     return decision;
 }
 
-BitrateDecision BitrateController::lower(uint32_t percent, const char* reason) {
-    const uint32_t next =
+BitrateDecision BitrateController::lower(uint32_t percent, const char* reason,
+                                         uint32_t delivered_bps) {
+    uint32_t next =
         std::max(floor_bps_, static_cast<uint32_t>(target_bps_ * percent / 100u));
+    // The percent cut is right for a slow drift, but on a capacity step it
+    // walks down for seconds while the encoder keeps overshooting the new
+    // bottleneck. The caller passes a rate only when delivery collapsed under
+    // an overloaded send queue, so the delivered rate says where the step
+    // landed: land just under it, with the floor still applying.
+    if (delivered_bps > 0) {
+        const uint32_t landing = static_cast<uint32_t>(
+            std::min<uint64_t>(static_cast<uint64_t>(delivered_bps) * kDeliveryHeadroomPercent / 100u,
+                               static_cast<uint64_t>(target_bps_)));
+        next = std::min(next, std::max(floor_bps_, landing));
+    }
     if (next >= target_bps_) {
         return settle();
     }
@@ -208,9 +240,37 @@ BitrateDecision BitrateController::update(const BitrateSample& sample, uint32_t 
     previous_sent_packets_ = sample.sent_packets;
     have_previous_ = true;
 
+    // The wire rate between two samples: transport send bytes over the
+    // interval. A reconnect can reset the counter, so a decrease is treated as
+    // no sample rather than a negative rate. The counter includes packets the
+    // path dropped and their retransmits, so it is discounted by the interval
+    // loss ratio below before it is used as the delivered rate.
+    uint32_t delivered_bps = 0;
+    if (have_previous_bytes_ && sample.sent_bytes >= previous_sent_bytes_) {
+        const uint64_t byte_delta = sample.sent_bytes - previous_sent_bytes_;
+        if (elapsed_ms >= kMinRateWindowMs && byte_delta >= kMinRateBytes) {
+            // bytes * 8 * 1000 / milliseconds is exactly bits per second.
+            delivered_bps = static_cast<uint32_t>(
+                std::min<uint64_t>(byte_delta * 8000u / elapsed_ms, 0xffffffffull));
+        }
+    }
+    previous_sent_bytes_ = sample.sent_bytes;
+    have_previous_bytes_ = true;
+
     const bool loss_valid = sent_delta >= kMinPacketsForLoss;
     const double loss_ratio =
         loss_valid ? static_cast<double>(lost_delta) / static_cast<double>(sent_delta) : 0.0;
+    // Under a capacity step every attempt over the bottleneck is dropped and
+    // retransmitted, so the send counter can sit far above what actually
+    // arrives -- the loss share is the part the path did not deliver. Without
+    // this the fast cut can land above the new capacity and the queue keeps
+    // growing for another interval. A spurious-loss counter can overreport
+    // for one interval, so the share is clamped before it scales the rate.
+    if (delivered_bps > 0 && loss_valid && loss_ratio > 0.0) {
+        const double keep = loss_ratio >= 1.0 ? 0.0 : 1.0 - loss_ratio;
+        delivered_bps =
+            static_cast<uint32_t>(static_cast<double>(delivered_bps) * keep);
+    }
 
     bool rtt_pressure = false;
     if (sample.rtt_us > 0 && sample.min_rtt_us > 0) {
@@ -239,14 +299,26 @@ BitrateDecision BitrateController::update(const BitrateSample& sample, uint32_t 
 
     if (severe || moderate) {
         healthy_ms_ = 0;
-        if (down_cooldown_ms_ == 0) {
+        // A wire rate below the target is only a capacity signal when the send
+        // queue is overloaded: an idle desktop on a healthy path also sends
+        // far below the target. With both the collapse and the queue, the rate
+        // is what the step left. The first sample after a step still shows the
+        // old rate and can only cut by percent, which arms the cooldown; the
+        // next one cuts through it, or the queue would hold another full
+        // interval of overshoot.
+        const bool delivery_step =
+            delivered_bps > 0 && queue_pressure && queue_ratio > kQueueModerateRatio &&
+            static_cast<uint64_t>(delivered_bps) * 100u <
+                static_cast<uint64_t>(target_bps_) * kDeliveryCollapsePercent;
+        if (down_cooldown_ms_ == 0 || delivery_step) {
+            const uint32_t landing = delivery_step ? delivered_bps : 0;
             if (loss_valid && loss_ratio > kModerateLossRatio) {
-                return lower(severe ? 70 : 85, "loss");
+                return lower(severe ? 70 : 85, "loss", landing);
             }
             if (rtt_pressure) {
-                return lower(severe ? 70 : 85, "rtt");
+                return lower(severe ? 70 : 85, "rtt", landing);
             }
-            return lower(severe ? 70 : 85, "queue");
+            return lower(severe ? 70 : 85, "queue", landing);
         }
         return decision;
     }

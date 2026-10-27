@@ -27,6 +27,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
+	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
@@ -51,6 +52,10 @@ type Config struct {
 	Identity *identity.Server
 	// Advertised public endpoint of the rendezvous UDP port, already joined.
 	PunchAddr string
+	// PunchAddrV6 is the explicit IPv6 rendezvous endpoint. When empty, the
+	// server derives one from the address a registration arrived on, which is
+	// correct for a directly reachable dual-stack server.
+	PunchAddrV6 string
 	// Hostname or IP advertised for relay ports.
 	RelayHost string
 	ServerKey string
@@ -68,6 +73,11 @@ type Config struct {
 	IPChanges *ipchange.Tracker
 	// RelayAddrs rotates the advertised relay hosts. Nil keeps RelayHost.
 	RelayAddrs *relayaddr.List
+	// RelayExtra lists additional relay hosts that reach the same relay
+	// instance, such as its IPv6 address. They are advertised alongside the
+	// rotated primary but never chosen as the primary themselves, so the
+	// carrier endpoint and lease stay on the configured rotation.
+	RelayExtra []string
 	// RelayPool provisions leases on standalone relay nodes. Nil keeps every
 	// host on the local relay manager.
 	RelayPool *relaypool.Pool
@@ -81,6 +91,9 @@ type Config struct {
 	// sits behind a trusted proxy (for example X-Forwarded-For). Empty means
 	// the TCP peer address is used.
 	ProxyHeader string
+	// GeoIP labels client addresses for login audit and session lists. Nil
+	// leaves locations empty, so only IPs are recorded.
+	GeoIP *geoip.Locator
 	// TLS reports whether clients reach this API over HTTPS.
 	TLS bool
 	// PunchReadBuffer is the kernel-reported SO_RCVBUF of the rendezvous
@@ -129,6 +142,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/identities/{id}", s.resetIdentity)
 	mux.HandleFunc("PATCH /v1/identities/{id}", s.updateIdentity)
 	mux.HandleFunc("POST /v1/account/login", s.login)
+	mux.HandleFunc("POST /v1/account/refresh", s.refresh)
 	mux.HandleFunc("POST /v1/account/logout", s.logout)
 	mux.HandleFunc("GET /v1/account", s.accountInfo)
 	mux.HandleFunc("POST /v1/account/password", s.changeAccountPassword)
@@ -165,6 +179,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/audit/file-transfers", s.auditFileTransfers)
 	mux.HandleFunc("POST /v1/account/file-transfers", s.recordAccountFileTransfer)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
+	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return s.instrument(mux)
 }
@@ -178,20 +193,30 @@ type registerRequest struct {
 	Version     string `json:"version"`
 	Timestamp   int64  `json:"timestamp"`
 	Signature   string `json:"signature"`
+	// OldID asks the server to move a durable identity to ID. It must be
+	// accompanied by MigrateSignature, made with the same host key over both
+	// ids, which proves the caller owns the old record.
+	OldID            string `json:"old_id,omitempty"`
+	MigrateSignature string `json:"migrate_signature,omitempty"`
 }
 
 type registerResponse struct {
-	ID              string        `json:"id"`
-	Relay           string        `json:"relay"`
-	Relays          []string      `json:"relays,omitempty"`
-	Punch           string        `json:"punch"`
-	ExpiresInSec    int64         `json:"expires_in_sec"`
-	PublicKey       string        `json:"public_key,omitempty"`
-	ServerPublicKey string        `json:"server_public_key,omitempty"`
-	Binding         string        `json:"binding,omitempty"`
-	Carrier         string        `json:"carrier,omitempty"`
-	CarrierToken    string        `json:"carrier_token,omitempty"`
-	Software        *softwareInfo `json:"software,omitempty"`
+	ID              string   `json:"id"`
+	Relay           string   `json:"relay"`
+	Relays          []string `json:"relays,omitempty"`
+	Punch           string   `json:"punch"`
+	PunchV6         string   `json:"punch_v6,omitempty"`
+	ExpiresInSec    int64    `json:"expires_in_sec"`
+	PublicKey       string   `json:"public_key,omitempty"`
+	ServerPublicKey string   `json:"server_public_key,omitempty"`
+	Binding         string   `json:"binding,omitempty"`
+	Carrier         string   `json:"carrier,omitempty"`
+	CarrierToken    string   `json:"carrier_token,omitempty"`
+	// MigratedFrom echoes old_id after a successful registration so the host
+	// can clear its pending migration state. It is informational: an unknown
+	// old id also yields it, which makes a retry idempotent.
+	MigratedFrom string        `json:"migrated_from,omitempty"`
+	Software     *softwareInfo `json:"software,omitempty"`
 }
 
 // softwareInfo mirrors RustDesk's SoftwareUpdate reply: the newest version and
@@ -205,25 +230,32 @@ type lookupResponse struct {
 	ID              string   `json:"id"`
 	Online          bool     `json:"online"`
 	Candidate       string   `json:"candidate,omitempty"`
+	CandidateV6     string   `json:"candidate_v6,omitempty"`
 	Candidates      []string `json:"candidates,omitempty"`
 	Relay           string   `json:"relay,omitempty"`
+	Relays          []string `json:"relays,omitempty"`
 	Punch           string   `json:"punch"`
+	PunchV6         string   `json:"punch_v6,omitempty"`
 	Fingerprint     string   `json:"fingerprint,omitempty"`
 	PublicKey       string   `json:"public_key,omitempty"`
 	ServerPublicKey string   `json:"server_public_key,omitempty"`
 	Binding         string   `json:"binding,omitempty"`
 	LocalAddrs      []string `json:"local_addrs,omitempty"`
+	LocalAddrsV6    []string `json:"local_addrs_v6,omitempty"`
 	NATType         string   `json:"nat_type,omitempty"`
-	Hostname        string   `json:"hostname,omitempty"`
-	Platform        string   `json:"platform,omitempty"`
-	Version         string   `json:"version,omitempty"`
-	Alias           string   `json:"alias,omitempty"`
-	Tags            []string `json:"tags,omitempty"`
-	LastSeenMS      int64    `json:"last_seen_ms,omitempty"`
-	ExpiresInMS     int64    `json:"expires_in_ms"`
-	Carrier         string   `json:"carrier,omitempty"`
-	CarrierToken    string   `json:"carrier_token,omitempty"`
-	RelayOnly       bool     `json:"relay_only,omitempty"`
+	// UpnpPort is the host's self-reported gateway mapping. Viewers combine it
+	// with the observed candidate IP to probe a stable external port.
+	UpnpPort     int      `json:"upnp_port,omitempty"`
+	Hostname     string   `json:"hostname,omitempty"`
+	Platform     string   `json:"platform,omitempty"`
+	Version      string   `json:"version,omitempty"`
+	Alias        string   `json:"alias,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	LastSeenMS   int64    `json:"last_seen_ms,omitempty"`
+	ExpiresInMS  int64    `json:"expires_in_ms"`
+	Carrier      string   `json:"carrier,omitempty"`
+	CarrierToken string   `json:"carrier_token,omitempty"`
+	RelayOnly    bool     `json:"relay_only,omitempty"`
 	// Transport is the path the server believes is usable: direct when a
 	// candidate was reported, carrier when only the shared carrier link proves
 	// the host alive, relay otherwise. It is a hint; viewers may still try
@@ -277,6 +309,30 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "registration signature was not accepted")
 		return
 	}
+	if req.OldID != "" {
+		if !registry.ValidID(req.OldID) {
+			writeError(w, http.StatusBadRequest, "old_id must be 1..64 characters of [A-Za-z0-9_.-]")
+			return
+		}
+		if req.OldID == req.ID {
+			writeError(w, http.StatusBadRequest, "old_id must differ from id")
+			return
+		}
+		if !identity.Verify(pub, identity.MigrateMessage(req.OldID, req.ID, req.Timestamp), req.MigrateSignature) {
+			writeError(w, http.StatusUnauthorized, "id migration signature was not accepted")
+			return
+		}
+	} else if req.MigrateSignature != "" {
+		writeError(w, http.StatusBadRequest, "migrate_signature requires old_id")
+		return
+	}
+
+	// Remember the old lease before Register drops it so its relay slot can be
+	// released exactly the way an explicit unregister would.
+	previous, hadPrevious := registry.Host{}, false
+	if req.OldID != "" {
+		previous, hadPrevious = s.cfg.Registry.Lookup(req.OldID)
+	}
 
 	host, err := s.cfg.Registry.Register(registry.RegisterRequest{
 		ID:          req.ID,
@@ -286,14 +342,25 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Platform:    req.Platform,
 		Version:     req.Version,
 		TTL:         s.cfg.TTL,
+		OldID:       req.OldID,
 	})
 	if err != nil {
 		if errors.Is(err, registry.ErrKeyMismatch) {
 			writeError(w, http.StatusForbidden, "host id is already registered with another public key")
 			return
 		}
+		if errors.Is(err, registry.ErrMigrationDenied) {
+			writeError(w, http.StatusForbidden, "old id belongs to another public key")
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if hadPrevious {
+		s.releaseLease(req.OldID, previous)
+	}
+	if req.OldID != "" {
+		s.cfg.Logger.Info("host id migrated", "from", req.OldID, "to", req.ID, "ip", clientAddr)
 	}
 	if s.cfg.IPChanges != nil {
 		s.cfg.IPChanges.Observe(req.ID, clientAddr)
@@ -308,11 +375,13 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Relay:           relayEndpoint,
 		Relays:          relays,
 		Punch:           s.cfg.PunchAddr,
+		PunchV6:         s.punchV6(r),
 		ExpiresInSec:    int64(s.cfg.TTL / time.Second),
 		PublicKey:       host.PublicKey,
 		ServerPublicKey: s.cfg.Identity.PublicKeyText(),
 		Carrier:         carrier,
 		CarrierToken:    host.CarrierToken,
+		MigratedFrom:    req.OldID,
 		Software:        s.software(),
 	}
 	if binding, err := s.binding(host, now); err == nil {
@@ -321,6 +390,37 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.Error("sign host binding", "id", host.ID, "error", err)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// punchV6 returns the IPv6 rendezvous endpoint a host should keep alive
+// towards. An explicit PunchAddrV6 wins; otherwise the address the client
+// dialed is used, which is right for a directly reachable server. A non-IPv6
+// local address (or a host-header port that cannot be split) yields no v6
+// endpoint, preserving IPv4-only behaviour.
+func (s *server) punchV6(r *http.Request) string {
+	if s.cfg.PunchAddrV6 != "" {
+		return s.cfg.PunchAddrV6
+	}
+	if s.cfg.PunchAddr == "" {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(s.cfg.PunchAddr)
+	if err != nil {
+		return ""
+	}
+	local, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(local.String())
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil || ip.To4() != nil || ip.IsUnspecified() {
+		return ""
+	}
+	return net.JoinHostPort(ip.String(), port)
 }
 
 func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +439,7 @@ func (s *server) lookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Software = s.software()
+	resp.PunchV6 = s.punchV6(r)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -367,6 +468,7 @@ func (s *server) lookupBatch(w http.ResponseWriter, r *http.Request) {
 			resp.Missing = append(resp.Missing, id)
 			continue
 		}
+		host.PunchV6 = s.punchV6(r)
 		resp.Hosts = append(resp.Hosts, host)
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -444,7 +546,9 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 	}
 	if !relayOnly {
 		resp.LocalAddrs = host.LocalAddrs
+		resp.LocalAddrsV6 = host.LocalAddrsV6
 		resp.NATType = host.NATType
+		resp.UpnpPort = host.UpnpPort
 	}
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
@@ -460,10 +564,13 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 			// is too old to punch at; hide it and let transport name the
 			// carrier. Local addresses go with the mapping.
 			resp.LocalAddrs = nil
+			resp.LocalAddrsV6 = nil
 		default:
 			resp.Candidate = host.Candidate
-			resp.Candidates = append(resp.Candidates, host.Candidate)
+			resp.CandidateV6 = host.CandidateV6
+			resp.Candidates = append(resp.Candidates, host.Candidate, host.CandidateV6)
 			resp.Candidates = append(resp.Candidates, host.LocalAddrs...)
+			resp.Candidates = append(resp.Candidates, host.LocalAddrsV6...)
 			resp.Candidates = dedupe(resp.Candidates)
 		}
 		resp.CarrierToken = host.CarrierToken
@@ -472,6 +579,7 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 	}
 	if host.RelayPort != 0 {
 		resp.Relay = net.JoinHostPort(s.relayHostFor(host), strconv.Itoa(host.RelayPort))
+		resp.Relays = s.relayEndpoints(host, host.RelayPort)
 	}
 	if !host.LastSeen.IsZero() {
 		resp.LastSeenMS = now.Sub(host.LastSeen).Milliseconds()
@@ -497,14 +605,20 @@ func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host is not registered")
 		return
 	}
+	s.releaseLease(id, host)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// releaseLease frees the relay slot a live lease owned. Shared with identity
+// migration, which removes the old lease without an explicit unregister.
+func (s *server) releaseLease(id string, host registry.Host) {
 	if host.RelayNode != "" {
 		if s.cfg.RelayPool != nil {
 			s.cfg.RelayPool.ReleaseAsync(host.RelayNode, id)
 		}
-	} else {
-		s.cfg.Relay.Release(id)
+		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	s.cfg.Relay.Release(id)
 }
 
 // resetIdentity is the administrative escape hatch for a lost host key. It
@@ -525,13 +639,7 @@ func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host identity is unknown")
 		return
 	}
-	if host.RelayNode != "" {
-		if s.cfg.RelayPool != nil {
-			s.cfg.RelayPool.ReleaseAsync(host.RelayNode, id)
-		}
-	} else {
-		s.cfg.Relay.Release(id)
-	}
+	s.releaseLease(id, host)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -589,6 +697,7 @@ func (s *server) serverInfo(w http.ResponseWriter, _ *http.Request) {
 		"version":               apiVer,
 		"public_key":            s.cfg.Identity.PublicKeyText(),
 		"punch":                 s.cfg.PunchAddr,
+		"punch_v6":              s.cfg.PunchAddrV6,
 		"carrier":               carrier,
 		"tls":                   s.cfg.TLS,
 		"host_ttl_sec":          int64(s.cfg.TTL / time.Second),
@@ -721,10 +830,34 @@ func (s *server) relayServers() []string {
 	} else if s.cfg.RelayHost != "" {
 		addrs = []string{s.cfg.RelayHost}
 	}
+	if len(s.cfg.RelayExtra) > 0 {
+		addrs = append(append([]string(nil), addrs...), s.cfg.RelayExtra...)
+		addrs = dedupe(addrs)
+	}
 	if addrs == nil {
 		addrs = []string{}
 	}
 	return addrs
+}
+
+// relayEndpoints lists every address that reaches the lease's relay port. A
+// standalone node advertises only its leased endpoint; the local manager can
+// be reached through each configured host name, including a second family.
+func (s *server) relayEndpoints(host registry.Host, port int) []string {
+	primary := s.relayHostFor(host)
+	hosts := []string{primary}
+	if host.RelayNode == "" {
+		for _, addr := range s.relayServers() {
+			if addr != primary {
+				hosts = append(hosts, addr)
+			}
+		}
+	}
+	out := make([]string, 0, len(hosts))
+	for _, addr := range hosts {
+		out = append(out, net.JoinHostPort(addr, strconv.Itoa(port)))
+	}
+	return out
 }
 
 func (s *server) clientIP(r *http.Request) string {
@@ -1023,6 +1156,10 @@ func (s *server) assignLocalRelay(id string, host registry.Host) (string, []stri
 	}
 	s.cfg.Registry.SetRelay(id, port, assigned)
 	portText := strconv.Itoa(port)
+	if len(s.cfg.RelayExtra) > 0 {
+		hosts = append(append([]string(nil), hosts...), s.cfg.RelayExtra...)
+		hosts = dedupe(hosts)
+	}
 	relays := make([]string, 0, len(hosts))
 	for _, relayHost := range hosts {
 		relays = append(relays, net.JoinHostPort(relayHost, portText))

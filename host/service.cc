@@ -108,6 +108,10 @@ void fill_machine_identity(HostSettings& settings, bool* changed) {
         settings.tunnel_key = generate_access_token(16);
         *changed = true;
     }
+    if (!settings.tunnel_old_id.empty() && settings.tunnel_old_id == settings.tunnel_id) {
+        settings.tunnel_old_id.clear();
+        *changed = true;
+    }
 }
 
 void report_status(DWORD state, DWORD exit_code = NO_ERROR, DWORD wait_hint = 0) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'server_identity.dart';
 import 'server_settings.dart';
 
 /// One host as reported by `GET /v1/hosts/{id}`.
@@ -13,6 +14,7 @@ class HostInfo {
     this.relay = '',
     this.punch = '',
     this.fingerprint = '',
+    this.serverPublicKey = '',
     this.alias = '',
     this.tags = const <String>[],
     this.lastSeenMs = 0,
@@ -25,6 +27,11 @@ class HostInfo {
   final String relay;
   final String punch;
   final String fingerprint;
+
+  /// The key of the server that answered this lookup. [ServerIdentityStore]
+  /// compares it with the pinned key; an empty value on a pinned server is a
+  /// mismatch, not a reason to skip the check.
+  final String serverPublicKey;
 
   /// Operator-maintained display name and tags. They live on the server, so a
   /// viewer sees the same labels on every machine and a local rename still
@@ -48,6 +55,7 @@ class HostInfo {
       relay: text(map['relay']),
       punch: text(map['punch']),
       fingerprint: text(map['fingerprint']),
+      serverPublicKey: text(map['server_public_key']),
       alias: text(map['alias']),
       tags: <String>[
         if (rawTags is List)
@@ -94,11 +102,18 @@ class AccountLoginResult {
     required this.token,
     required this.username,
     required this.expiresInMs,
+    this.refreshToken = '',
+    this.refreshExpiresInMs = 0,
   });
 
   final String token;
   final String username;
   final int expiresInMs;
+
+  /// Rotates [token] without a password. Empty when the server still issues
+  /// long-lived access tokens only; such a session simply ends at [expiresInMs].
+  final String refreshToken;
+  final int refreshExpiresInMs;
 }
 
 /// One server-side login session of the signed-in account. [id] is an opaque
@@ -111,6 +126,8 @@ class AccountDeviceSession {
     required this.createdAt,
     required this.expiresAt,
     this.current = false,
+    this.loginIp = '',
+    this.location = '',
   });
 
   final String id;
@@ -119,6 +136,8 @@ class AccountDeviceSession {
   final DateTime createdAt;
   final DateTime expiresAt;
   final bool current;
+  final String loginIp;
+  final String location;
 
   AccountDeviceSession copyWith({String? deviceName}) {
     return AccountDeviceSession(
@@ -128,6 +147,8 @@ class AccountDeviceSession {
       createdAt: createdAt,
       expiresAt: expiresAt,
       current: current,
+      loginIp: loginIp,
+      location: location,
     );
   }
 
@@ -154,6 +175,8 @@ class AccountDeviceSession {
         isUtc: true,
       ),
       current: value['current'] == true,
+      loginIp: value['login_ip']?.toString().trim() ?? '',
+      location: value['location']?.toString().trim() ?? '',
     );
   }
 }
@@ -352,17 +375,23 @@ bool addressBookPermissionAllows(String granted, String required) {
 }
 
 /// One user allowed to access an address book, or one book shared with the
-/// signed-in user. [permission] is read, write or control.
+/// signed-in user. [permission] is read, write or control; an empty
+/// [groupId] means the whole book and a non-empty one scopes the grant to a
+/// single group.
 class AddressBookGrant {
   const AddressBookGrant({
     required this.username,
     this.permission = 'read',
+    this.groupId = '',
     this.createdAtMs = 0,
   });
 
   final String username;
   final String permission;
+  final String groupId;
   final int createdAtMs;
+
+  bool get wholeBook => groupId.isEmpty;
 
   static AddressBookGrant? fromJson(Object? value) {
     if (value is! Map) {
@@ -377,6 +406,7 @@ class AddressBookGrant {
     return AddressBookGrant(
       username: username,
       permission: rawPermission.isEmpty ? 'read' : rawPermission,
+      groupId: value['group_id']?.toString().trim() ?? '',
       createdAtMs: rawCreated is num ? rawCreated.toInt() : 0,
     );
   }
@@ -395,19 +425,68 @@ class AddressBookGrants {
   final List<AddressBookGrant> incoming;
 }
 
-/// Another account's live address book, fetched whole by a grantee.
+/// One grant the signed-in user holds on another account's book. An empty
+/// [groupId] means the whole book.
+class AddressBookScope {
+  const AddressBookScope({this.groupId = '', this.permission = 'read'});
+
+  final String groupId;
+  final String permission;
+
+  bool get wholeBook => groupId.isEmpty;
+
+  static AddressBookScope? fromJson(Object? value) {
+    if (value is! Map) {
+      return null;
+    }
+    final String rawPermission = value['permission']?.toString().trim() ?? '';
+    return AddressBookScope(
+      groupId: value['group_id']?.toString().trim() ?? '',
+      permission: rawPermission.isEmpty ? 'read' : rawPermission,
+    );
+  }
+}
+
+/// Another account's live address book, fetched whole by a grantee. [peers]
+/// and [groups] only contain what the grants expose; [scopes] lists the
+/// whole-book and group-level permissions behind that view.
 class SharedAddressBook {
   const SharedAddressBook({
     required this.owner,
     this.permission = 'read',
     this.revision = 0,
     this.peers = const <AddressBookPeer>[],
+    this.groups = const <AddressBookGroup>[],
+    this.scopes = const <AddressBookScope>[],
   });
 
   final String owner;
   final String permission;
   final int revision;
   final List<AddressBookPeer> peers;
+  final List<AddressBookGroup> groups;
+  final List<AddressBookScope> scopes;
+
+  /// Permission covering one group, or '' when no grant reaches it. Servers
+  /// that predate scopes only report a book-wide permission.
+  String permissionFor(String groupId) {
+    if (scopes.isEmpty) {
+      return permission;
+    }
+    int rank(String permission) => switch (permission) {
+          'control' => 3,
+          'write' => 2,
+          'read' => 1,
+          _ => 0,
+        };
+    String best = '';
+    for (final AddressBookScope scope in scopes) {
+      if (scope.groupId == groupId && rank(scope.permission) > rank(best)) {
+        best = scope.permission;
+      }
+    }
+    return best;
+  }
 
   static SharedAddressBook? fromJson(Object? value) {
     if (value is! Map) {
@@ -426,6 +505,28 @@ class SharedAddressBook {
       }
       peers.add(peer);
     }
+    final List<AddressBookGroup> groups = <AddressBookGroup>[];
+    final Object? rawGroups = value['groups'];
+    if (rawGroups is List) {
+      for (final Object? item in rawGroups) {
+        final AddressBookGroup? group = AddressBookGroup.fromJson(item);
+        if (group == null) {
+          return null;
+        }
+        groups.add(group);
+      }
+    }
+    final List<AddressBookScope> scopes = <AddressBookScope>[];
+    final Object? rawScopes = value['scopes'];
+    if (rawScopes is List) {
+      for (final Object? item in rawScopes) {
+        final AddressBookScope? scope = AddressBookScope.fromJson(item);
+        if (scope == null) {
+          return null;
+        }
+        scopes.add(scope);
+      }
+    }
     final String rawPermission = value['permission']?.toString().trim() ?? '';
     final Object? rawRevision = value['revision'];
     return SharedAddressBook(
@@ -433,6 +534,8 @@ class SharedAddressBook {
       permission: rawPermission.isEmpty ? 'read' : rawPermission,
       revision: rawRevision is num ? rawRevision.toInt() : 0,
       peers: peers,
+      groups: groups,
+      scopes: scopes,
     );
   }
 }
@@ -683,22 +786,82 @@ class ServerApi {
       }
       rethrow;
     }
-    if (decoded is! Map ||
-        decoded['token'] is! String ||
-        (decoded['token'] as String).trim().isEmpty ||
-        decoded['user'] is! Map) {
+    final AccountLoginResult? result = _parseLoginReply(decoded);
+    if (result == null) {
       throw const ServerApiException('连接服务返回了无效数据');
     }
-    final Map<Object?, Object?> user = decoded['user'] as Map<Object?, Object?>;
-    final String returnedName = user['username']?.toString().trim() ?? '';
+    return result;
+  }
+
+  /// Trades a refresh token for a fresh access/refresh pair. The server
+  /// rotates the pair and revokes the session when a retired token is
+  /// presented again, so a failed renewal always means a new password login.
+  static Future<AccountLoginResult> refresh(
+    ServerSettings settings,
+    String refreshToken, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final String token = refreshToken.trim();
+    if (token.isEmpty) {
+      throw const ServerApiException('登录已过期，请重新登录');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/refresh');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded;
+    try {
+      decoded = await _requestJson(
+        'POST',
+        uri,
+        timeout,
+        body: <String, Object?>{'refresh_token': token},
+        unauthorized: '登录已过期，请重新登录',
+      );
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.unauthorized) {
+        throw const ServerApiException(
+          '登录已过期，请重新登录',
+          statusCode: HttpStatus.unauthorized,
+        );
+      }
+      rethrow;
+    }
+    final AccountLoginResult? result = _parseLoginReply(decoded);
+    if (result == null) {
+      throw const ServerApiException('连接服务返回了无效数据');
+    }
+    return result;
+  }
+
+  static AccountLoginResult? _parseLoginReply(Object? decoded) {
+    if (decoded is! Map || decoded['user'] is! Map) {
+      return null;
+    }
+    final Object? rawToken = decoded['token'];
     final Object? rawExpires = decoded['expires_in_ms'];
-    if (returnedName.isEmpty || rawExpires is! num) {
-      throw const ServerApiException('连接服务返回了无效数据');
+    final String username = (decoded['user'] as Map)['username']?.toString().trim() ?? '';
+    if (rawToken is! String ||
+        rawToken.trim().isEmpty ||
+        rawExpires is! num ||
+        username.isEmpty) {
+      return null;
     }
+    final String refreshToken = decoded['refresh_token']?.toString().trim() ?? '';
+    final Object? rawRefreshExpires = decoded['refresh_expires_in_ms'];
     return AccountLoginResult(
-      token: (decoded['token'] as String).trim(),
-      username: returnedName,
+      token: rawToken.trim(),
+      username: username,
       expiresInMs: rawExpires.toInt(),
+      refreshToken: refreshToken,
+      refreshExpiresInMs: refreshToken.isEmpty || rawRefreshExpires is! num
+          ? 0
+          : rawRefreshExpires.toInt(),
     );
   }
 
@@ -915,6 +1078,7 @@ class ServerApi {
     required DateTime endedAt,
     bool success = true,
     String detail = '',
+    String auditRef = '',
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -939,6 +1103,7 @@ class ServerApi {
         'ended_at_ms': endedAt.toUtc().millisecondsSinceEpoch,
         'success': success,
         if (detail.trim().isNotEmpty) 'detail': detail.trim(),
+        if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
       },
       success: const <int>{HttpStatus.created},
       unauthorized: '账号登录已失效，请重新登录',
@@ -957,6 +1122,7 @@ class ServerApi {
     int files = 1,
     bool success = true,
     String detail = '',
+    String auditRef = '',
     DateTime? occurredAt,
     Duration timeout = const Duration(seconds: 6),
   }) async {
@@ -984,6 +1150,7 @@ class ServerApi {
         if (size > 0) 'size': size,
         'success': success,
         if (detail.trim().isNotEmpty) 'detail': detail.trim(),
+        if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
         if (occurredAt != null)
           'occurred_at_ms': occurredAt.toUtc().millisecondsSinceEpoch,
       },
@@ -1274,12 +1441,14 @@ class ServerApi {
   }
 
   /// Creates or renames one address-book group. Reusing a deleted group id
-  /// revives it on the server.
+  /// revives it on the server. A positive [ifRevision] must match the live
+  /// group and makes a stale rename fail with a 409.
   static Future<AddressBookGroup> updateAddressBookGroup(
     ServerSettings settings,
     String token,
     String groupId,
     String name, {
+    int? ifRevision,
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -1299,12 +1468,16 @@ class ServerApi {
     } on FormatException {
       throw const ServerApiException('连接服务地址无效');
     }
+    final Map<String, Object?> body = <String, Object?>{'name': cleanName};
+    if (ifRevision != null && ifRevision > 0) {
+      body['if_revision'] = ifRevision;
+    }
     final Object? decoded = await _requestJson(
       'PATCH',
       uri,
       timeout,
       accountToken: accountToken,
-      body: <String, Object?>{'name': cleanName},
+      body: body,
       unauthorized: '账号登录已失效，请重新登录',
     );
     final AddressBookGroup? group = AddressBookGroup.fromJson(decoded);
@@ -1315,11 +1488,13 @@ class ServerApi {
   }
 
   /// Deletes an address-book group. The server moves its peers back to the
-  /// ungrouped list before tombstoning the group.
+  /// ungrouped list before tombstoning the group. A positive [ifRevision]
+  /// rejects a stale delete with a 409.
   static Future<void> deleteAddressBookGroup(
     ServerSettings settings,
     String token,
     String groupId, {
+    int? ifRevision,
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -1327,11 +1502,16 @@ class ServerApi {
     if (id.isEmpty) {
       throw const ServerApiException('分组 ID 为空');
     }
-    final Uri uri;
+    Uri uri;
     try {
       uri = Uri.parse(
         '${settings.url}/v1/addressbook/groups/${Uri.encodeComponent(id)}',
       );
+      if (ifRevision != null && ifRevision > 0) {
+        uri = uri.replace(
+          queryParameters: <String, String>{'if_revision': '$ifRevision'},
+        );
+      }
     } on FormatException {
       throw const ServerApiException('连接服务地址无效');
     }
@@ -1407,7 +1587,8 @@ class ServerApi {
   }
 
   /// Adds a peer to a shared book. The server requires write or control
-  /// permission and writes it into the owner's book.
+  /// permission and writes it into the owner's book; [groupId] places it in
+  /// one group and a group grant may only target its own group.
   static Future<AddressBookPeer> addSharedAddressBookPeer(
     ServerSettings settings,
     String token,
@@ -1415,6 +1596,7 @@ class ServerApi {
     String peerId, {
     String? name,
     List<String>? tags,
+    String groupId = '',
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -1451,6 +1633,7 @@ class ServerApi {
         'id': id,
         'name': name?.trim() ?? '',
         'tags': cleaned,
+        if (groupId.trim().isNotEmpty) 'group_id': groupId.trim(),
       },
       unauthorized: '账号登录已失效，请重新登录',
       notFound: '地址簿未共享给当前账号',
@@ -1694,11 +1877,13 @@ class ServerApi {
   }
 
   /// Shares this account's address book with [username] at [permission].
+  /// A non-empty [groupId] limits the grant to that group.
   static Future<AddressBookGrant> shareAddressBook(
     ServerSettings settings,
     String token,
     String username, {
     String permission = 'read',
+    String groupId = '',
     Duration timeout = const Duration(seconds: 6),
   }) {
     return _shareBook(
@@ -1707,6 +1892,7 @@ class ServerApi {
       '/v1/addressbook/grants',
       username,
       permission,
+      groupId,
       timeout,
     );
   }
@@ -1718,6 +1904,7 @@ class ServerApi {
     String owner,
     String username, {
     String permission = 'read',
+    String groupId = '',
     Duration timeout = const Duration(seconds: 6),
   }) {
     final String ownerName = owner.trim();
@@ -1730,6 +1917,7 @@ class ServerApi {
       '/v1/addressbook/shared/${Uri.encodeComponent(ownerName)}/grants',
       username,
       permission,
+      groupId,
       timeout,
     );
   }
@@ -1740,6 +1928,7 @@ class ServerApi {
     String grantsPath,
     String username,
     String permission,
+    String groupId,
     Duration timeout,
   ) async {
     final String accountToken = _accountToken(settings, token);
@@ -1751,20 +1940,28 @@ class ServerApi {
     if (!addressBookPermissions.contains(level)) {
       throw const ServerApiException('地址簿权限无效');
     }
+    final String scope = groupId.trim();
     final Uri uri;
     try {
       uri = Uri.parse('${settings.url}$grantsPath');
     } on FormatException {
       throw const ServerApiException('连接服务地址无效');
     }
+    final Map<String, Object?> body = <String, Object?>{
+      'username': target,
+      'permission': level,
+    };
+    if (scope.isNotEmpty) {
+      body['group_id'] = scope;
+    }
     final Object? decoded = await _requestJson(
       'POST',
       uri,
       timeout,
       accountToken: accountToken,
-      body: <String, Object?>{'username': target, 'permission': level},
+      body: body,
       unauthorized: '账号登录已失效，请重新登录',
-      notFound: '用户不存在',
+      notFound: '用户或分组不存在',
       forbidden: '共享地址簿权限不足',
     );
     final AddressBookGrant? grant = AddressBookGrant.fromJson(decoded);
@@ -1774,11 +1971,13 @@ class ServerApi {
     return grant;
   }
 
-  /// Revokes a share previously granted to [username].
+  /// Revokes a share previously granted to [username]. Without [groupId] every
+  /// scope is revoked; with one (an empty string included) only that scope is.
   static Future<void> unshareAddressBook(
     ServerSettings settings,
     String token,
     String username, {
+    String? groupId,
     Duration timeout = const Duration(seconds: 6),
   }) {
     return _unshareBook(
@@ -1786,6 +1985,7 @@ class ServerApi {
       token,
       '/v1/addressbook/grants',
       username,
+      groupId,
       timeout,
     );
   }
@@ -1796,6 +1996,7 @@ class ServerApi {
     String token,
     String owner,
     String username, {
+    String? groupId,
     Duration timeout = const Duration(seconds: 6),
   }) {
     final String ownerName = owner.trim();
@@ -1807,6 +2008,7 @@ class ServerApi {
       token,
       '/v1/addressbook/shared/${Uri.encodeComponent(ownerName)}/grants',
       username,
+      groupId,
       timeout,
     );
   }
@@ -1816,6 +2018,7 @@ class ServerApi {
     String token,
     String grantsPath,
     String username,
+    String? groupId,
     Duration timeout,
   ) async {
     final String accountToken = _accountToken(settings, token);
@@ -1825,9 +2028,14 @@ class ServerApi {
     }
     final Uri uri;
     try {
-      uri = Uri.parse(
+      final Uri base = Uri.parse(
         '${settings.url}$grantsPath/${Uri.encodeComponent(target)}',
       );
+      uri = groupId == null
+          ? base
+          : base.replace(
+              queryParameters: <String, String>{'group_id': groupId.trim()},
+            );
     } on FormatException {
       throw const ServerApiException('连接服务地址无效');
     }
@@ -1888,6 +2096,31 @@ class ServerApi {
       throw const ServerApiException('账号未登录');
     }
     return accountToken;
+  }
+
+  /// Reads the server's long-term Ed25519 key from `/v1/server`. The route is
+  /// deliberately unauthenticated: a viewer can refuse an unknown server
+  /// before it presents a key or lookup answer.
+  static Future<ServerIdentity> serverIdentity(
+    ServerSettings settings, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw const ServerApiException('未配置连接服务');
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/server');
+    } on FormatException {
+      throw const ServerApiException('连接服务地址无效');
+    }
+    final Object? decoded = await _requestJson('GET', uri, timeout);
+    final Object? raw = decoded is Map ? decoded['public_key'] : null;
+    final ServerIdentity? identity = ServerIdentity.parse(raw?.toString() ?? '');
+    if (identity == null) {
+      throw const ServerApiException('连接服务未提供有效的服务器身份');
+    }
+    return identity;
   }
 
   /// Looks up a reserved id to verify reachability and [ServerSettings.key] in

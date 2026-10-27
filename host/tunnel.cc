@@ -176,6 +176,7 @@ bool parse_tunnel_event(const std::string& line, TunnelEvent& event) {
     event.remote = json_string_field(line, "remote");
     event.punch = json_string_field(line, "punch");
     event.relay = json_string_field(line, "relay");
+    event.migrated_from = json_string_field(line, "migrated_from");
     return true;
 }
 
@@ -208,6 +209,9 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     };
     add(L"--server", widen(settings.server_url));
     add(L"--id", widen(settings.tunnel_id));
+    if (!settings.tunnel_old_id.empty()) {
+        add(L"--old-id", widen(settings.tunnel_old_id));
+    }
     add(L"--key", widen(settings.tunnel_key));
     add(L"--local", L"127.0.0.1:" + std::to_wstring(local_port));
     add(L"--listen", widen(settings.tunnel_listen));
@@ -224,6 +228,11 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     }
     if (!settings.server_key.empty()) {
         add(L"--server-key", widen(settings.server_key));
+    }
+    if (!settings.audit_spool.empty()) {
+        // The agent signs and forwards the host's inbound audit records from
+        // this spool; the path is shared with the host process, not a secret.
+        add(L"--audit-spool", widen(settings.audit_spool));
     }
     if (!fingerprint.empty()) {
         add(L"--fingerprint", widen(fingerprint));

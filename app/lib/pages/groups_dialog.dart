@@ -8,10 +8,16 @@ typedef GroupWriter = Future<AddressBookGroup> Function(
   ServerSettings settings,
   String token,
   String groupId,
-  String name,
-);
+  String name, {
+  int? ifRevision,
+});
 typedef GroupDeleter = Future<void> Function(
-    ServerSettings settings, String token, String groupId);
+  ServerSettings settings,
+  String token,
+  String groupId, {
+  int? ifRevision,
+});
+typedef GroupReloader = Future<List<AddressBookGroup>> Function();
 
 /// Creates, renames and deletes groups in the signed-in account's address
 /// book. The dialog returns true when any group was changed so the caller can
@@ -26,6 +32,7 @@ class GroupsDialog extends StatefulWidget {
     this.create,
     this.rename,
     this.remove,
+    this.reload,
   });
 
   final ServerSettings server;
@@ -35,6 +42,10 @@ class GroupsDialog extends StatefulWidget {
   final GroupWriter? create;
   final GroupWriter? rename;
   final GroupDeleter? remove;
+
+  /// Fetches the latest groups after a 409 so the dialog can show the state
+  /// that actually won instead of retrying against stale revisions.
+  final GroupReloader? reload;
 
   @override
   State<GroupsDialog> createState() => _GroupsDialogState();
@@ -85,14 +96,22 @@ class _GroupsDialogState extends State<GroupsDialog> {
       return;
     }
     await _run(() async {
-      final AddressBookGroup updated =
-          await (widget.rename ?? ServerApi.updateAddressBookGroup)(
-        widget.server,
-        widget.token,
-        group.id,
-        name,
-      );
-      _upsert(updated);
+      try {
+        final AddressBookGroup updated =
+            await (widget.rename ?? ServerApi.updateAddressBookGroup)(
+          widget.server,
+          widget.token,
+          group.id,
+          name,
+          ifRevision: group.revision > 0 ? group.revision : null,
+        );
+        _upsert(updated);
+      } on ServerApiException catch (error) {
+        if (error.statusCode != 409) {
+          rethrow;
+        }
+        await _conflict();
+      }
     });
   }
 
@@ -123,16 +142,47 @@ class _GroupsDialogState extends State<GroupsDialog> {
       return;
     }
     await _run(() async {
-      await (widget.remove ?? ServerApi.deleteAddressBookGroup)(
-        widget.server,
-        widget.token,
-        group.id,
-      );
+      try {
+        await (widget.remove ?? ServerApi.deleteAddressBookGroup)(
+          widget.server,
+          widget.token,
+          group.id,
+          ifRevision: group.revision > 0 ? group.revision : null,
+        );
+      } on ServerApiException catch (error) {
+        if (error.statusCode != 409) {
+          rethrow;
+        }
+        await _conflict();
+        return;
+      }
       _groups = <AddressBookGroup>[
         for (final AddressBookGroup item in _groups)
           if (item.id != group.id) item,
       ];
       _changed = true;
+    });
+  }
+
+  Future<void> _conflict() async {
+    _changed = true;
+    List<AddressBookGroup>? latest;
+    if (widget.reload != null) {
+      try {
+        latest = await widget.reload!();
+      } catch (_) {
+        // Keep the local list when the refresh fails; the error below still
+        // tells the user that their edit did not win.
+      }
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      if (latest != null) {
+        _groups = List<AddressBookGroup>.of(latest);
+      }
+      _error = '分组已在别处修改，已刷新列表，请重试';
     });
   }
 

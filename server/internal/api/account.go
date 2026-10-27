@@ -33,9 +33,15 @@ type accountView struct {
 }
 
 type loginResponse struct {
-	Token       string      `json:"token"`
-	ExpiresInMS int64       `json:"expires_in_ms"`
-	User        accountView `json:"user"`
+	Token              string      `json:"token"`
+	ExpiresInMS        int64       `json:"expires_in_ms"`
+	RefreshToken       string      `json:"refresh_token,omitempty"`
+	RefreshExpiresInMS int64       `json:"refresh_expires_in_ms,omitempty"`
+	User               accountView `json:"user"`
+}
+
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }
 
 type accountResponse struct {
@@ -74,6 +80,8 @@ type accountSessionView struct {
 	CreatedAtMS int64  `json:"created_at_ms"`
 	ExpiresAtMS int64  `json:"expires_at_ms"`
 	Current     bool   `json:"current"`
+	LoginIP     string `json:"login_ip,omitempty"`
+	Location    string `json:"location,omitempty"`
 }
 
 type accountSessionsResponse struct {
@@ -122,18 +130,21 @@ type addressBookPeerRequest struct {
 }
 
 type addressBookGroupRequest struct {
-	Name string `json:"name"`
+	Name       string `json:"name"`
+	IfRevision *int64 `json:"if_revision"`
 }
 
 type sharedAddressBookPeerRequest struct {
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Tags []string `json:"tags"`
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Tags    []string `json:"tags"`
+	GroupID string   `json:"group_id"`
 }
 
 type addressBookGrantView struct {
 	Username    string `json:"username"`
 	Permission  string `json:"permission"`
+	GroupID     string `json:"group_id,omitempty"`
 	CreatedAtMS int64  `json:"created_at_ms"`
 }
 
@@ -145,13 +156,21 @@ type addressBookGrantsResponse struct {
 type shareAddressBookRequest struct {
 	Username   string `json:"username"`
 	Permission string `json:"permission"`
+	GroupID    string `json:"group_id"`
+}
+
+type sharedAddressBookScope struct {
+	GroupID    string `json:"group_id,omitempty"`
+	Permission string `json:"permission"`
 }
 
 type sharedAddressBookView struct {
-	Owner      string            `json:"owner"`
-	Permission string            `json:"permission"`
-	Revision   int64             `json:"revision"`
-	Peers      []addressBookPeer `json:"peers"`
+	Owner      string                   `json:"owner"`
+	Permission string                   `json:"permission"`
+	Revision   int64                    `json:"revision"`
+	Peers      []addressBookPeer        `json:"peers"`
+	Groups     []addressBookGroup       `json:"groups"`
+	Scopes     []sharedAddressBookScope `json:"scopes"`
 }
 
 type sharedAddressBooksResponse struct {
@@ -170,6 +189,8 @@ func viewAccountSession(session account.Session) accountSessionView {
 		CreatedAtMS: session.CreatedAt.UnixMilli(),
 		ExpiresAtMS: session.ExpiresAt.UnixMilli(),
 		Current:     session.Current,
+		LoginIP:     session.LoginIP,
+		Location:    session.Location,
 	}
 }
 
@@ -199,6 +220,7 @@ func viewAddressBookGrant(grant account.Grant) addressBookGrantView {
 	return addressBookGrantView{
 		Username:    grant.Username,
 		Permission:  grant.Permission,
+		GroupID:     grant.GroupID,
 		CreatedAtMS: grant.CreatedAt.UnixMilli(),
 	}
 }
@@ -226,7 +248,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		writeLoginLocked(w, retry)
 		return
 	}
-	user, token, expires, err := s.cfg.Accounts.LoginWithDeviceRecovery(
+	user, token, _, refresh, _, err := s.cfg.Accounts.LoginWithRefresh(
 		req.Username, req.Password, req.DeviceID, req.DeviceName, req.TOTPCode, req.RecoveryCode,
 	)
 	if errors.Is(err, account.ErrTwoFactorRequired) {
@@ -263,6 +285,10 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.LoginLimiter.Success(key)
+	ip := s.clientIP(r)
+	if err := s.cfg.Accounts.SetSessionOrigin(token, ip, s.clientLocation(ip)); err != nil {
+		s.cfg.Logger.Error("account session origin", "error", err)
+	}
 	detail := "password"
 	if strings.TrimSpace(req.TOTPCode) != "" {
 		detail = "password+two-factor"
@@ -273,15 +299,58 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		detail += " device=" + device
 	}
 	s.auditLogin(r, user.Username, detail, true)
-	remaining := time.Until(expires)
-	if remaining < 0 {
-		remaining = 0
-	}
 	s.cfg.Logger.Info("account login", "user", user.Username)
 	writeJSON(w, http.StatusOK, loginResponse{
-		Token:       token,
-		ExpiresInMS: remaining.Milliseconds(),
-		User:        viewAccount(user),
+		Token:              token,
+		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
+		RefreshToken:       refresh,
+		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
+		User:               viewAccount(user),
+	})
+}
+
+// refresh rotates a refresh token into a new access/refresh pair. A replayed
+// token means the pair leaked or a previous rotation response was lost; the
+// store revokes the session in both cases, so the client must log in again.
+func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
+		return
+	}
+	var req refreshRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(req.RefreshToken) == "" {
+		s.recordAudit(r, "-", account.AuditRefresh, "missing token", false)
+		writeError(w, http.StatusUnauthorized, "refresh token was not accepted")
+		return
+	}
+	user, token, _, refresh, _, err := s.cfg.Accounts.RefreshSession(req.RefreshToken)
+	if errors.Is(err, account.ErrRefreshReused) {
+		s.recordAudit(r, "-", account.AuditRefresh, "replay; session revoked", false)
+		writeError(w, http.StatusUnauthorized, "refresh token was not accepted")
+		return
+	}
+	if errors.Is(err, account.ErrInvalidToken) {
+		s.recordAudit(r, "-", account.AuditRefresh, "invalid token", false)
+		writeError(w, http.StatusUnauthorized, "refresh token was not accepted")
+		return
+	}
+	if err != nil {
+		s.recordAudit(r, "-", account.AuditRefresh, "internal error", false)
+		s.cfg.Logger.Error("account refresh", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not renew the session")
+		return
+	}
+	s.recordAudit(r, user.Username, account.AuditRefresh, "rotated", true)
+	writeJSON(w, http.StatusOK, loginResponse{
+		Token:              token,
+		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),
+		RefreshToken:       refresh,
+		RefreshExpiresInMS: account.TokenTTL.Milliseconds(),
+		User:               viewAccount(user),
 	})
 }
 
@@ -292,15 +361,27 @@ func (s *server) recordAudit(r *http.Request, username, action, detail string, s
 	if s.cfg.Accounts == nil {
 		return
 	}
+	ip := s.clientIP(r)
 	if err := s.cfg.Accounts.AppendAudit(account.AuditEvent{
 		Username: username,
 		Action:   action,
 		Detail:   detail,
-		ClientIP: s.clientIP(r),
+		ClientIP: ip,
+		Location: s.clientLocation(ip),
 		Success:  success,
 	}); err != nil {
 		s.cfg.Logger.Error("account audit", "error", err)
 	}
+}
+
+// clientLocation resolves an address through the optional GeoIP table. An
+// absent table or uncovered address yields an empty label; the IP is stored
+// either way.
+func (s *server) clientLocation(ip string) string {
+	if s.cfg.GeoIP == nil {
+		return ""
+	}
+	return s.cfg.GeoIP.Lookup(ip)
 }
 
 func (s *server) auditLogin(r *http.Request, username, detail string, success bool) {
@@ -724,10 +805,16 @@ func (s *server) shareAddressBook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "username is required")
 		return
 	}
-	grant, err := s.cfg.Accounts.ShareBook(user.ID, req.Username, req.Permission)
+	grant, err := s.cfg.Accounts.ShareBookScoped(user.ID, req.Username, req.Permission, req.GroupID)
 	switch {
 	case errors.Is(err, account.ErrInvalidPermission):
 		writeError(w, http.StatusBadRequest, account.ErrInvalidPermission.Error())
+		return
+	case errors.Is(err, account.ErrInvalidGroupID):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupID.Error())
+		return
+	case errors.Is(err, account.ErrUnknownGroup):
+		writeError(w, http.StatusNotFound, "address book group is unknown")
 		return
 	case errors.Is(err, account.ErrUnknownUser):
 		writeError(w, http.StatusNotFound, "user is unknown")
@@ -748,12 +835,20 @@ func (s *server) unshareAddressBook(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	err := s.cfg.Accounts.UnshareBook(user.ID, r.PathValue("username"))
-	if errors.Is(err, account.ErrUnknownShare) {
+	var err error
+	if query := r.URL.Query(); query.Has("group_id") {
+		err = s.cfg.Accounts.UnshareBookScope(user.ID, r.PathValue("username"), query.Get("group_id"))
+	} else {
+		err = s.cfg.Accounts.UnshareBook(user.ID, r.PathValue("username"))
+	}
+	switch {
+	case errors.Is(err, account.ErrUnknownShare):
 		writeError(w, http.StatusNotFound, "address book is not shared with that user")
 		return
-	}
-	if err != nil {
+	case errors.Is(err, account.ErrInvalidGroupID):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupID.Error())
+		return
+	case err != nil:
 		s.cfg.Logger.Error("address book unshare", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not revoke the address book share")
 		return
@@ -781,9 +876,20 @@ func (s *server) sharedAddressBooks(w http.ResponseWriter, r *http.Request) {
 			Permission: book.Permission,
 			Revision:   book.Revision,
 			Peers:      make([]addressBookPeer, 0, len(book.Peers)),
+			Groups:     make([]addressBookGroup, 0, len(book.Groups)),
+			Scopes:     make([]sharedAddressBookScope, 0, len(book.Scopes)),
 		}
 		for _, peer := range book.Peers {
 			view.Peers = append(view.Peers, viewAddressBookPeer(peer))
+		}
+		for _, group := range book.Groups {
+			view.Groups = append(view.Groups, viewAddressBookGroup(group))
+		}
+		for _, scope := range book.Scopes {
+			view.Scopes = append(view.Scopes, sharedAddressBookScope{
+				GroupID:    scope.GroupID,
+				Permission: scope.Permission,
+			})
 		}
 		out.Books = append(out.Books, view)
 	}
@@ -800,6 +906,10 @@ func (s *server) sharedAddressBookError(w http.ResponseWriter, action string, er
 		writeError(w, http.StatusForbidden, "address book permission is insufficient")
 	case errors.Is(err, account.ErrInvalidPeerID):
 		writeError(w, http.StatusBadRequest, "peer id is invalid")
+	case errors.Is(err, account.ErrInvalidGroupID):
+		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupID.Error())
+	case errors.Is(err, account.ErrUnknownGroup):
+		writeError(w, http.StatusNotFound, "address book group is unknown")
 	case errors.Is(err, account.ErrInvalidPermission):
 		writeError(w, http.StatusBadRequest, account.ErrInvalidPermission.Error())
 	case errors.Is(err, account.ErrUnknownUser):
@@ -827,8 +937,8 @@ func (s *server) addSharedAddressBookPeer(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	peer, err := s.cfg.Accounts.AddSharedPeer(
-		user.ID, r.PathValue("owner"), req.ID, req.Name, req.Tags,
+	peer, err := s.cfg.Accounts.AddSharedPeerScoped(
+		user.ID, r.PathValue("owner"), req.ID, req.GroupID, req.Name, req.Tags,
 	)
 	if s.sharedAddressBookError(w, "shared address book add", err) {
 		return
@@ -927,8 +1037,8 @@ func (s *server) shareSharedAddressBook(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "username is required")
 		return
 	}
-	grant, err := s.cfg.Accounts.ShareBookAs(
-		user.ID, r.PathValue("owner"), req.Username, req.Permission,
+	grant, err := s.cfg.Accounts.ShareBookScopedAs(
+		user.ID, r.PathValue("owner"), req.Username, req.Permission, req.GroupID,
 	)
 	if s.sharedAddressBookError(w, "shared address book grant", err) {
 		return
@@ -941,9 +1051,16 @@ func (s *server) unshareSharedAddressBook(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	err := s.cfg.Accounts.UnshareBookAs(
-		user.ID, r.PathValue("owner"), r.PathValue("username"),
-	)
+	var err error
+	if query := r.URL.Query(); query.Has("group_id") {
+		err = s.cfg.Accounts.UnshareBookScopeAs(
+			user.ID, r.PathValue("owner"), r.PathValue("username"), query.Get("group_id"),
+		)
+	} else {
+		err = s.cfg.Accounts.UnshareBookAs(
+			user.ID, r.PathValue("owner"), r.PathValue("username"),
+		)
+	}
 	if s.sharedAddressBookError(w, "shared address book revoke", err) {
 		return
 	}
@@ -1022,13 +1139,24 @@ func (s *server) updateAddressBookGroup(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	group, err := s.cfg.Accounts.UpsertGroup(user.ID, r.PathValue("id"), req.Name)
+	if req.IfRevision != nil && *req.IfRevision <= 0 {
+		writeError(w, http.StatusBadRequest, "if_revision must be positive")
+		return
+	}
+	var ifRevision int64
+	if req.IfRevision != nil {
+		ifRevision = *req.IfRevision
+	}
+	group, err := s.cfg.Accounts.UpsertGroupAt(user.ID, r.PathValue("id"), req.Name, ifRevision)
 	switch {
 	case errors.Is(err, account.ErrInvalidGroupID):
 		writeError(w, http.StatusBadRequest, "group id is invalid")
 		return
 	case errors.Is(err, account.ErrInvalidGroupName):
 		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupName.Error())
+		return
+	case errors.Is(err, account.ErrGroupConflict):
+		writeError(w, http.StatusConflict, "address book group changed elsewhere")
 		return
 	case err != nil:
 		s.cfg.Logger.Error("address book group write", "error", err)
@@ -1043,9 +1171,22 @@ func (s *server) deleteAddressBookGroup(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	removed, err := s.cfg.Accounts.DeleteGroup(user.ID, r.PathValue("id"))
+	var ifRevision int64
+	if raw := r.URL.Query().Get("if_revision"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 {
+			writeError(w, http.StatusBadRequest, "if_revision must be positive")
+			return
+		}
+		ifRevision = parsed
+	}
+	removed, err := s.cfg.Accounts.DeleteGroupAt(user.ID, r.PathValue("id"), ifRevision)
 	if errors.Is(err, account.ErrInvalidGroupID) {
 		writeError(w, http.StatusBadRequest, "group id is invalid")
+		return
+	}
+	if errors.Is(err, account.ErrGroupConflict) {
+		writeError(w, http.StatusConflict, "address book group changed elsewhere")
 		return
 	}
 	if err != nil {

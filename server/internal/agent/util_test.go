@@ -83,3 +83,76 @@ func TestFamilyAllowed(t *testing.T) {
 		t.Fatal("an IPv4 socket was allowed to probe IPv6")
 	}
 }
+
+func TestSplitByFamily(t *testing.T) {
+	v4, v6 := splitByFamily([]string{
+		"10.0.0.9:4000", "[fd00::9]:4000", "192.0.2.9:4000", "[2001:db8::9]:4000",
+	})
+	if len(v4) != 2 || v4[0] != "10.0.0.9:4000" || v4[1] != "192.0.2.9:4000" {
+		t.Fatalf("ipv4 candidates: %+v", v4)
+	}
+	if len(v6) != 2 || v6[0] != "[fd00::9]:4000" || v6[1] != "[2001:db8::9]:4000" {
+		t.Fatalf("ipv6 candidates: %+v", v6)
+	}
+}
+
+func TestSelectRelayAddrMatchesSocketFamily(t *testing.T) {
+	endpoints := []string{"127.0.0.1:41000", "[::1]:41000"}
+	v4 := selectRelayAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, endpoints)
+	if v4 == nil || v4.IP.To4() == nil || v4.Port != 41000 {
+		t.Fatalf("IPv4 socket selected %v", v4)
+	}
+	v6 := selectRelayAddr(&net.UDPAddr{IP: net.IPv6loopback}, endpoints)
+	if v6 == nil || v6.IP.To4() != nil || v6.Port != 41000 {
+		t.Fatalf("IPv6 socket selected %v", v6)
+	}
+	if got := selectRelayAddr(&net.UDPAddr{IP: net.IPv6loopback}, endpoints[:1]); got != nil {
+		t.Fatalf("IPv6 socket fell back to an IPv4 relay: %v", got)
+	}
+	if got := selectRelayAddr(nil, []string{"", "garbage", "127.0.0.1:0", "[::1]:41000"}); got == nil || got.IP.To4() != nil {
+		t.Fatalf("malformed endpoints were not skipped: %v", got)
+	}
+	// A name may expand to both families; the chosen address must still match
+	// the socket. Skip only if this host does not resolve localhost to IPv6.
+	if got := selectRelayAddr(&net.UDPAddr{IP: net.IPv6loopback}, []string{"localhost:41000"}); got != nil && got.IP.To4() != nil {
+		t.Fatalf("name expansion ignored the socket family: %v", got)
+	}
+}
+
+func TestAcceptsControlFromBothRendezvousFamilies(t *testing.T) {
+	h := &HostAgent{}
+	punch := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 18444}
+	punch6 := &net.UDPAddr{IP: net.IPv6loopback, Port: 18444}
+	if !h.acceptsControl(punch, punch, punch6) {
+		t.Fatal("IPv4 rendezvous source was rejected")
+	}
+	if !h.acceptsControl(punch6, punch, punch6) {
+		t.Fatal("IPv6 rendezvous source was rejected")
+	}
+	if h.acceptsControl(&net.UDPAddr{IP: net.IPv6loopback, Port: 9999}, punch, punch6) {
+		t.Fatal("an unrelated source was accepted")
+	}
+}
+
+func TestCandidateWithUpnpPort(t *testing.T) {
+	cases := []struct {
+		name      string
+		candidate string
+		port      int
+		want      string
+	}{
+		{"ipv4 mapping", "198.51.100.7:51234", 40000, "198.51.100.7:40000"},
+		{"no mapping", "198.51.100.7:51234", 0, ""},
+		{"ipv6 gateway is not upnp", "[2001:db8::7]:51234", 40000, ""},
+		{"bad candidate", "198.51.100.7", 40000, ""},
+		{"out of range", "198.51.100.7:51234", 70000, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := candidateWithUpnpPort(tc.candidate, tc.port); got != tc.want {
+				t.Fatalf("candidateWithUpnpPort(%q, %d) = %q, want %q",
+					tc.candidate, tc.port, got, tc.want)
+			}
+		})
+	}
+}

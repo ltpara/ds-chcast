@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ type hostReply struct {
 	Candidate       string   `json:"candidate"`
 	Candidates      []string `json:"candidates"`
 	Relay           string   `json:"relay"`
+	Relays          []string `json:"relays"`
 	Punch           string   `json:"punch"`
 	Carrier         string   `json:"carrier"`
 	CarrierToken    string   `json:"carrier_token"`
@@ -37,6 +39,7 @@ type hostReply struct {
 	LastSeenMS      int64    `json:"last_seen_ms"`
 	ExpiresInMS     int64    `json:"expires_in_ms"`
 	NATType         string   `json:"nat_type"`
+	UpnpPort        int      `json:"upnp_port"`
 	RelayOnly       bool     `json:"relay_only"`
 	Transport       string   `json:"transport"`
 }
@@ -182,6 +185,24 @@ func TestRegisterLookupAndDelete(t *testing.T) {
 	}
 	if host.ExpiresInMS <= 0 || host.ExpiresInMS > int64(time.Minute/time.Millisecond) {
 		t.Fatalf("expiry = %d", host.ExpiresInMS)
+	}
+
+	// A gateway mapping reported through the authenticated keepalive is part
+	// of the lookup so viewers can probe the stable external port.
+	priv, _ := hostKey("correct horse")
+	nonce, err := s.Registry.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := identity.KeepaliveMessage("devbox", "198.51.100.9:5000", nonce)
+	if err := s.Registry.TouchChallenge("devbox", nonce, "198.51.100.9:5000",
+		identity.Sign(priv, message), string(message), nil, "", 50000); err != nil {
+		t.Fatal(err)
+	}
+	_, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
+	json.Unmarshal(body, &host)
+	if host.UpnpPort != 50000 {
+		t.Fatalf("upnp port = %d, want 50000", host.UpnpPort)
 	}
 
 	status, body = request(t, http.MethodDelete, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
@@ -336,6 +357,113 @@ func TestBatchLookup(t *testing.T) {
 	}
 }
 
+func migrationBody(t *testing.T, id, oldID, secret, hostname string, timestamp, signedAt int64) string {
+	t.Helper()
+	priv, pub := hostKey(secret)
+	body, err := json.Marshal(map[string]any{
+		"id":                id,
+		"public_key":        pub,
+		"hostname":          hostname,
+		"timestamp":         timestamp,
+		"signature":         identity.Sign(priv, identity.RegisterMessage(id, "", timestamp)),
+		"old_id":            oldID,
+		"migrate_signature": identity.Sign(priv, identity.MigrateMessage(oldID, id, signedAt)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestHostIDMigration(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "devbox", "devbox key", "AB12", "Dev Box", "windows/amd64", "1.0.0", now),
+		testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/identities/devbox",
+		`{"alias":"Workshop","tags":["lab"]}`, testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("labels: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "taken", "another horse", "", now), testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("register taken: %d %s", status, body)
+	}
+
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		migrationBody(t, "hijack", "devbox", "another horse", "", now, now),
+		testutil.ServerKey); status != http.StatusForbidden {
+		t.Fatalf("migration with a foreign key = %d %s, want 403", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		migrationBody(t, "newbox", "devbox", "devbox key", "", now, now-60),
+		testutil.ServerKey); status != http.StatusUnauthorized {
+		t.Fatalf("migration with a stale proof = %d %s, want 401", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		migrationBody(t, "taken", "devbox", "devbox key", "", now, now),
+		testutil.ServerKey); status != http.StatusForbidden {
+		t.Fatalf("migration onto a taken id = %d %s, want 403", status, body)
+	}
+
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		migrationBody(t, "newbox", "devbox", "devbox key", "New Box", now, now),
+		testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("migration: %d %s", status, body)
+	}
+	var reply struct {
+		ID           string `json:"id"`
+		MigratedFrom string `json:"migrated_from"`
+		Relay        string `json:"relay"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.ID != "newbox" || reply.MigratedFrom != "devbox" || reply.Relay == "" {
+		t.Fatalf("migration reply: %+v", reply)
+	}
+
+	if status, _ := request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey); status != http.StatusNotFound {
+		t.Fatalf("old id lookup = %d, want 404", status)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/newbox", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("new id lookup: %d %s", status, body)
+	}
+	var host hostReply
+	if err := json.Unmarshal(body, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.Hostname != "New Box" || host.Fingerprint != "AB12" || host.Alias != "Workshop" ||
+		len(host.Tags) != 1 || host.Tags[0] != "lab" {
+		t.Fatalf("migrated peer = %+v", host)
+	}
+
+	// The same request is idempotent after the server moved the record.
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		migrationBody(t, "newbox", "devbox", "devbox key", "", now, now),
+		testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("migration retry: %d %s", status, body)
+	}
+	priv, pub := hostKey("devbox key")
+	orphanProof, err := json.Marshal(map[string]any{
+		"id":                "no-old",
+		"public_key":        pub,
+		"timestamp":         now,
+		"signature":         identity.Sign(priv, identity.RegisterMessage("no-old", "", now)),
+		"migrate_signature": identity.Sign(priv, identity.MigrateMessage("devbox", "no-old", now)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/hosts", string(orphanProof), testutil.ServerKey); status != http.StatusBadRequest {
+		t.Fatalf("migrate signature without old_id = %d %s, want 400", status, body)
+	}
+}
+
 func TestIdentityLabels(t *testing.T) {
 	s := testutil.Start(t)
 	now := time.Now().Unix()
@@ -448,6 +576,45 @@ func TestLookupRelayOnly(t *testing.T) {
 	}
 	if host.Relay == "" || host.Transport != "relay" {
 		t.Fatalf("relay-only transport: %+v", host)
+	}
+}
+
+func TestRelayAdvertisementIncludesExtraEndpoints(t *testing.T) {
+	s := testutil.StartWith(t, testutil.Options{RelayExtra: []string{"::1"}})
+	now := time.Now().Unix()
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBody(t, "devbox", "correct horse", "AB12", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	var reg struct {
+		Relay  string   `json:"relay"`
+		Relays []string `json:"relays"`
+	}
+	if err := json.Unmarshal(body, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Relay == "" {
+		t.Fatalf("register reply has no primary relay: %s", body)
+	}
+	_, primaryPort, err := net.SplitHostPort(reg.Relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reg.Relays) != 2 || reg.Relays[0] != reg.Relay {
+		t.Fatalf("primary relay must stay first: %+v", reg)
+	}
+	if reg.Relays[1] != net.JoinHostPort("::1", primaryPort) {
+		t.Fatalf("register relays: %+v", reg.Relays)
+	}
+
+	_, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
+	var host hostReply
+	if err := json.Unmarshal(body, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.Relay != reg.Relay || len(host.Relays) != 2 || host.Relays[1] != reg.Relays[1] {
+		t.Fatalf("lookup relays: primary %q, relays %+v", host.Relay, host.Relays)
 	}
 }
 

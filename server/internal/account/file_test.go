@@ -25,7 +25,7 @@ func TestFileTransferEventsLifecycle(t *testing.T) {
 	occurred := time.Date(2026, 10, 25, 11, 0, 0, 0, time.UTC)
 	first, err := store.RecordFileTransfer(
 		alice.ID, alice.Username, " devbox\x00 ", "upload", "report\x00.pdf",
-		"127.0.0.1", 4096, 1, occurred, true, "",
+		"127.0.0.1", "", 4096, 1, occurred, true, "",
 	)
 	if err != nil {
 		t.Fatalf("record upload: %v", err)
@@ -36,14 +36,14 @@ func TestFileTransferEventsLifecycle(t *testing.T) {
 		t.Fatalf("unexpected upload event: %+v", first)
 	}
 	second, err := store.RecordFileTransfer(
-		alice.ID, alice.Username, "laptop", "download", "photos.zip", "10.0.0.5",
+		alice.ID, alice.Username, "laptop", "download", "photos.zip", "10.0.0.5", "",
 		900, 3, occurred.Add(time.Minute), false, "disk full",
 	)
 	if err != nil {
 		t.Fatalf("record download: %v", err)
 	}
 	if _, err := store.RecordFileTransfer(
-		bob.ID, bob.Username, "server", "upload", "", "192.0.2.7", 0, 2, occurred, true, "",
+		bob.ID, bob.Username, "server", "upload", "", "192.0.2.7", "", 0, 2, occurred, true, "",
 	); err != nil {
 		t.Fatalf("record bob transfer: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestFileTransferEventsLifecycle(t *testing.T) {
 		{"too many files", alice.ID, "devbox", "upload", 1, 2000},
 	} {
 		if _, err := store.RecordFileTransfer(
-			tc.userID, "alice", tc.peer, tc.direction, "x", "", tc.size, tc.files,
+			tc.userID, "alice", tc.peer, tc.direction, "x", "", "", tc.size, tc.files,
 			occurred, true, "",
 		); !errors.Is(err, ErrInvalidTransfer) {
 			t.Fatalf("%s: error = %v", tc.name, err)
@@ -95,7 +95,7 @@ func TestFileTransferEventsLifecycle(t *testing.T) {
 	}
 
 	// A missing timestamp uses the store clock instead of 1970.
-	now, err := store.RecordFileTransfer(alice.ID, alice.Username, "instant", "download", "a", "", 1, 1, time.Time{}, true, "")
+	now, err := store.RecordFileTransfer(alice.ID, alice.Username, "instant", "download", "a", "", "", 1, 1, time.Time{}, true, "")
 	if err != nil {
 		t.Fatalf("record without timestamp: %v", err)
 	}

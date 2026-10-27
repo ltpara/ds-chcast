@@ -50,6 +50,61 @@ void main() {
     expect(loaded.isActiveAt(DateTime.utc(2027, 1, 2, 3, 4, 5)), isFalse);
   });
 
+  test('refresh token round-trips and outlives the access token', () async {
+    final AccountSessionStore store = AccountSessionStore(file: file);
+    final DateTime access = DateTime.utc(2026, 12, 1, 0, 30);
+    final DateTime refresh = DateTime.utc(2027, 1, 2);
+    await store.save(AccountSession(
+      server: 'http://127.0.0.1:8443',
+      username: 'alice',
+      token: 'access-value',
+      expiresAt: access,
+      refreshToken: 'refresh-value',
+      refreshExpiresAt: refresh,
+    ));
+
+    final AccountSession? loaded = await store.load();
+    expect(loaded, isNotNull);
+    expect(loaded!.refreshToken, 'refresh-value');
+    expect(loaded.refreshExpiresAt, refresh);
+    expect(loaded.isActiveAt(access.add(const Duration(minutes: 1))), isFalse);
+    expect(
+      loaded.canRefreshAt(access.add(const Duration(minutes: 1))),
+      isTrue,
+    );
+    expect(
+      loaded.isUsableAt(access.add(const Duration(minutes: 1))),
+      isTrue,
+    );
+    expect(loaded.isUsableAt(refresh.add(const Duration(minutes: 1))), isFalse);
+
+    final AccountSession renewed = loaded.copyWith(
+      token: 'new-access',
+      expiresAt: refresh,
+      refreshToken: 'new-refresh',
+      refreshExpiresAt: refresh.add(const Duration(days: 30)),
+    );
+    expect(renewed.token, 'new-access');
+    expect(renewed.refreshToken, 'new-refresh');
+    expect(renewed.username, 'alice');
+  });
+
+  test('legacy sessions without a refresh token stay usable until expiry',
+      () async {
+    await file.writeAsString(jsonEncode(<String, Object?>{
+      'server': 'http://127.0.0.1:8443',
+      'username': 'alice',
+      'token': 'access-value',
+      'expiresAt': DateTime.utc(2027).millisecondsSinceEpoch,
+    }));
+    final AccountSessionStore store = AccountSessionStore(file: file);
+    final AccountSession? loaded = await store.load();
+    expect(loaded?.refreshToken, '');
+    expect(loaded?.refreshExpiresAt, isNull);
+    expect(loaded!.isActiveAt(DateTime.utc(2026, 12)), isTrue);
+    expect(loaded.canRefreshAt(DateTime.utc(2026, 12)), isFalse);
+  });
+
   test('server URL is normalized and malformed sessions are ignored', () async {
     await file.writeAsString(jsonEncode(<String, Object?>{
       'server': '127.0.0.1:8443/',

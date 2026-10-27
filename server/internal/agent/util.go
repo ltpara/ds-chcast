@@ -1,14 +1,18 @@
 package agent
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/upnp"
 )
 
 const (
@@ -63,6 +67,28 @@ func localCandidates(bound *net.UDPAddr) []string {
 		return out[i] < out[j]
 	})
 	return out
+}
+
+// isIPv6Text reports whether a host:port candidate is IPv6.
+func isIPv6Text(text string) bool {
+	host, _, err := net.SplitHostPort(text)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.To4() == nil
+}
+
+// splitByFamily keeps IPv4 and IPv6 candidates apart for reporting.
+func splitByFamily(addrs []string) (v4, v6 []string) {
+	for _, addr := range addrs {
+		if isIPv6Text(addr) {
+			v6 = append(v6, addr)
+		} else {
+			v4 = append(v4, addr)
+		}
+	}
+	return v4, v6
 }
 
 // rankAddr orders direct candidates for punching: LAN IPv4 first, then LAN
@@ -189,6 +215,49 @@ func sameAddr(a, b *net.UDPAddr) bool {
 	return a != nil && b != nil && a.Port == b.Port && a.IP.Equal(b.IP)
 }
 
+// candidateWithUpnpPort combines a peer's observed public IP with the external
+// port it mapped on its gateway. UPnP is IPv4-only, so IPv6 candidates and
+// malformed ports are ignored rather than guessed at.
+func candidateWithUpnpPort(candidate string, port int) string {
+	if candidate == "" || port <= 0 || port > 65535 {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(candidate)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// renewUPnP keeps the gateway lease alive and removes it when the agent
+// stops. Renewal failures are logged and retried: the mapping may still be
+// present, and the observed NAT address remains the primary direct path.
+func renewUPnP(ctx context.Context, log *slog.Logger, mapper *upnp.Mapper) {
+	ticker := time.NewTicker(upnp.DefaultLease / 2)
+	defer ticker.Stop()
+	defer mapper.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := mapper.Renew(renewCtx)
+			cancel()
+			if err != nil {
+				log.Warn("UPnP mapping renewal failed",
+					"port", mapper.ExternalPort(), "error", err)
+				continue
+			}
+			log.Debug("UPnP mapping renewed", "port", mapper.ExternalPort())
+		}
+	}
+}
+
 func cloneAddr(a *net.UDPAddr) *net.UDPAddr {
 	if a == nil {
 		return nil
@@ -207,6 +276,54 @@ func resolveUDP(text string) (*net.UDPAddr, error) {
 		return nil, fmt.Errorf("resolve %q: %w", text, err)
 	}
 	return addr, nil
+}
+
+// selectRelayAddr picks the first advertised relay endpoint this socket can
+// reach. Names are expanded to every address they publish, so one host name
+// can carry both the IPv4 and IPv6 listener of the same relay.
+func selectRelayAddr(local *net.UDPAddr, endpoints []string) *net.UDPAddr {
+	var localIP net.IP
+	if local != nil {
+		localIP = local.IP
+	}
+	for _, text := range endpoints {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		host, portText, err := net.SplitHostPort(text)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		host = strings.Trim(host, "[]")
+		var ips []net.IP
+		if ip := net.ParseIP(host); ip != nil {
+			ips = append(ips, ip)
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			cancel()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				ips = append(ips, addr.IP)
+			}
+		}
+		for _, ip := range ips {
+			if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
+				continue
+			}
+			if familyAllowed(localIP, ip) {
+				return &net.UDPAddr{IP: ip, Port: port}
+			}
+		}
+	}
+	return nil
 }
 
 // resolveUDPAll expands every endpoint to all addresses its host name

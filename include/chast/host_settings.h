@@ -69,6 +69,18 @@ struct HostSettings {
     // file_receive_directory. Off means the HelloAck reports file transfer
     // unavailable and every FileOffer is ignored.
     bool allow_file_transfer = true;
+    // Let the viewer dial TCP endpoints through this machine (port
+    // forwarding). Off by default: the viewer picks the targets, so this is a
+    // firewall decision rather than a convenience. Off means the HelloAck
+    // reports port forwarding unavailable and every PortForwardRequest is
+    // refused.
+    bool allow_port_forward = false;
+    // Let the viewer open a shell on this machine (remote terminal). Off by
+    // default: the viewer gets the operator's own account, so this is an
+    // explicit decision in the same spirit as port forwarding. Off means the
+    // HelloAck reports terminal unavailable and every TerminalRequest is
+    // refused.
+    bool allow_terminal = false;
     // UTF-8 directory for received files. Empty means Downloads\chast.
     std::string file_receive_directory;
     // Send the system sound to the viewer. Off means no audio stream is
@@ -131,10 +143,20 @@ struct HostSettings {
     // Device identity registered with the service. The key is never uploaded;
     // the server stores only its SHA-256 digest.
     std::string tunnel_id;
+    // Previous id waiting to be released on the server. Set when the operator
+    // changes tunnel_id; the agent proves ownership and the tray clears it
+    // after the registration reply confirms the move.
+    std::string tunnel_old_id;
     std::string tunnel_key;
     // Public-facing UDP socket of chast-tunnel host. It must differ from the
     // QUIC port above because both are UDP listeners.
     std::string tunnel_listen = "0.0.0.0:14434";
+    // JSONL spool the host appends finished inbound sessions and uploads to;
+    // chast-tunnel host signs each line and forwards it to the service. Empty
+    // means the file next to host.ini (<stem>.audit.jsonl), which load fills
+    // in automatically. The agent removes lines only after the service stored
+    // them, so a short outage loses nothing.
+    std::string audit_spool;
 };
 
 struct HostSettingsLoad {
@@ -193,6 +215,9 @@ bool parse_tunnel_id(const std::string& input, std::string& normalized);
 bool valid_tunnel_key(const std::string& key);
 bool parse_tunnel_listen(const std::string& input, std::string& normalized);
 bool tunnel_listen_port(const std::string& listen, uint16_t& port);
+// Spool next to a settings file: <dir>/<stem>.audit.jsonl. Empty for an empty
+// settings path.
+std::string audit_spool_path_for(const std::string& settings_path);
 // Machine name normalized to the device-id alphabet, for a fresh host.
 std::string generate_tunnel_id();
 

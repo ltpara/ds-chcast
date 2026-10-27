@@ -57,14 +57,20 @@ var ErrNoFreePort = errors.New("no free relay port")
 
 type Manager struct {
 	mu     sync.Mutex
-	ports  map[int]*port
+	ports  map[int]*portSet
 	order  []int
 	auth   Authenticator
 	log    *slog.Logger
 	shared *SharedCarrier
 	policy *Policy
 	bindIP net.IP
-	closed bool
+	// bind6IP is an optional second listener address. Relays bound this way
+	// serve IPv4 and IPv6 on the same port number, each with its own host and
+	// viewer association, because a dual-stack peer uses a different source
+	// mapping per family.
+	bind6IP  net.IP
+	bind6Err error
+	closed   bool
 
 	// requireViewerToken admits only viewers that first prove the lookup
 	// carrier token over the relay port. It is enabled with the server key so
@@ -91,16 +97,45 @@ func WithViewerTokenRequired(required bool) Option {
 	return func(m *Manager) { m.requireViewerToken = required }
 }
 
-type port struct {
+// WithBind6 listens on an additional IPv6 address with the same port numbers.
+// It is how a single relay serves dual-stack clients without relying on
+// v4-mapped sockets, which cannot keep separate host mappings per family.
+func WithBind6(bind string) Option {
+	return func(m *Manager) {
+		bind = strings.TrimSpace(bind)
+		if bind == "" {
+			return
+		}
+		ip := net.ParseIP(bind)
+		if ip == nil || ip.To4() != nil {
+			m.bind6Err = fmt.Errorf("relay IPv6 bind %q is not an IPv6 address", bind)
+			return
+		}
+		m.bind6IP = ip
+	}
+}
+
+// portSet groups the listeners and per-family state that share one host
+// reservation and port number.
+type portSet struct {
 	manager *Manager
 	number  int
+
+	mu        sync.Mutex
+	hostID    string
+	boundHost string
+	members   []*port
+}
+
+type port struct {
+	set    *portSet
+	number int
+	family string
 
 	mu         sync.Mutex
 	conn       *net.UDPConn
 	tcp        net.Listener
 	boundIP    net.IP
-	boundHost  string
-	hostID     string
 	hostAddr   *net.UDPAddr
 	hostSeen   time.Time
 	viewerAddr *net.UDPAddr
@@ -206,6 +241,10 @@ func peerIP(peer string) string {
 // bound the port keeps serving UDP without a carrier. A port of 0 asks the
 // kernel for an ephemeral port and is useful in tests; callers use Ports to
 // learn the actual numbers.
+//
+// WithBind6 adds a second, IPv6-only listener per port. The two listeners
+// share the host reservation but keep separate host and viewer associations,
+// since a dual-stack peer reaches them through different NAT mappings.
 func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, opts ...Option) (*Manager, error) {
 	if log == nil {
 		log = slog.Default()
@@ -221,7 +260,7 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 		return nil, err
 	}
 	m := &Manager{
-		ports:  make(map[int]*port),
+		ports:  make(map[int]*portSet),
 		auth:   auth,
 		log:    log,
 		policy: policy,
@@ -230,20 +269,20 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 	for _, opt := range opts {
 		opt(m)
 	}
+	if m.bind6Err != nil {
+		return nil, m.bind6Err
+	}
+	if m.bind6IP != nil && m.bindIP.To4() == nil {
+		return nil, errors.New("relay IPv6 bind is redundant when the primary bind is already IPv6")
+	}
 	for _, wanted := range ports {
-		conn, tcp, err := m.listenPort(ip, wanted)
+		set, err := m.newPortSet(wanted)
 		if err != nil {
 			m.Close()
 			return nil, err
 		}
-		actual := conn.LocalAddr().(*net.UDPAddr).Port
-		p := &port{manager: m, conn: conn, tcp: tcp, number: actual, boundIP: ip}
-		m.ports[actual] = p
-		m.order = append(m.order, actual)
-		go p.serve(conn)
-		if tcp != nil {
-			go p.serveTCP(tcp)
-		}
+		m.ports[set.number] = set
+		m.order = append(m.order, set.number)
 	}
 	if len(m.ports) == 0 {
 		return nil, errors.New("relay needs at least one port")
@@ -251,49 +290,93 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 	return m, nil
 }
 
-func (m *Manager) listenPort(ip net.IP, wanted int) (*net.UDPConn, net.Listener, error) {
+// newPortSet binds one port on every configured address family. Port 0 is
+// retried because the ephemeral UDP port chosen for one family must also be
+// free for the other family's TCP carrier twin.
+func (m *Manager) newPortSet(wanted int) (*portSet, error) {
 	attempts := 1
 	if wanted == 0 {
-		// An ephemeral UDP port may collide with an unrelated TCP listener;
-		// the carrier needs both, so try another candidate.
 		attempts = 10
 	}
+	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: ip, Port: wanted})
+		udp, tcp, number, err := m.listenPort(m.bindIP, wanted)
 		if err != nil {
-			return nil, nil, fmt.Errorf("relay port %d: %w", wanted, err)
+			return nil, err
 		}
-		actual := udp.LocalAddr().(*net.UDPAddr).Port
-		m.tuneReadBuffer(udp, actual)
-		tcp, err := net.ListenTCP("tcp", &net.TCPAddr{IP: ip, Port: actual})
-		if err == nil {
-			return udp, tcp, nil
+		set := &portSet{manager: m, number: number}
+		set.members = append(set.members, &port{
+			set: set, number: number, family: ipFamily(m.bindIP),
+			conn: udp, tcp: tcp, boundIP: m.bindIP,
+		})
+		if m.bind6IP != nil {
+			udp6, tcp6, _, err := m.listenPort(m.bind6IP, number)
+			if err != nil {
+				closePortMember(set.members[0])
+				lastErr = fmt.Errorf("relay IPv6 port %d: %w", number, err)
+				if wanted == 0 {
+					continue
+				}
+				return nil, lastErr
+			}
+			set.members = append(set.members, &port{
+				set: set, number: number, family: ipFamily(m.bind6IP),
+				conn: udp6, tcp: tcp6, boundIP: m.bind6IP,
+			})
 		}
-		udp.Close()
-		if wanted == 0 {
-			continue
+		for _, p := range set.members {
+			go p.serve(p.conn)
+			if p.tcp != nil {
+				go p.serveTCP(p.tcp)
+			}
 		}
-		m.log.Warn("relay carrier disabled: cannot bind the TCP twin",
-			"port", wanted, "error", err)
-		udp, err = net.ListenUDP("udp", &net.UDPAddr{IP: ip, Port: wanted})
-		if err != nil {
-			return nil, nil, fmt.Errorf("relay port %d: %w", wanted, err)
-		}
-		m.tuneReadBuffer(udp, wanted)
-		return udp, nil, nil
+		return set, nil
 	}
-	return nil, nil, errors.New("relay port 0: no UDP port with a free TCP twin")
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("relay port 0: no UDP port with a free TCP twin")
+}
+
+// listenPort binds one UDP port and, when possible, its TCP carrier twin.
+// Port 0 asks for an ephemeral port; a fixed port keeps serving UDP when only
+// the TCP twin is taken.
+func (m *Manager) listenPort(ip net.IP, wanted int) (*net.UDPConn, net.Listener, int, error) {
+	udpNet, tcpNet := familyNetworks(ip)
+	udp, err := net.ListenUDP(udpNet, &net.UDPAddr{IP: ip, Port: wanted})
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("relay port %d: %w", wanted, err)
+	}
+	actual := udp.LocalAddr().(*net.UDPAddr).Port
+	m.tuneReadBuffer(udp, actual)
+	tcp, err := net.ListenTCP(tcpNet, &net.TCPAddr{IP: ip, Port: actual})
+	if err == nil {
+		return udp, tcp, actual, nil
+	}
+	udp.Close()
+	if wanted == 0 {
+		return nil, nil, 0, fmt.Errorf("relay port 0: cannot bind the TCP twin: %w", err)
+	}
+	m.log.Warn("relay carrier disabled: cannot bind the TCP twin",
+		"port", wanted, "network", tcpNet, "error", err)
+	udp, err = net.ListenUDP(udpNet, &net.UDPAddr{IP: ip, Port: wanted})
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("relay port %d: %w", wanted, err)
+	}
+	m.tuneReadBuffer(udp, wanted)
+	return udp, nil, wanted, nil
 }
 
 // listenOn binds one UDP port and, when possible, its TCP carrier twin on the
 // same address. A missing TCP twin is reported to the caller as nil.
 func (m *Manager) listenOn(ip net.IP, number int) (*net.UDPConn, net.Listener, error) {
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: ip, Port: number})
+	udpNet, tcpNet := familyNetworks(ip)
+	udp, err := net.ListenUDP(udpNet, &net.UDPAddr{IP: ip, Port: number})
 	if err != nil {
 		return nil, nil, err
 	}
 	m.tuneReadBuffer(udp, number)
-	tcp, err := net.ListenTCP("tcp", &net.TCPAddr{IP: ip, Port: number})
+	tcp, err := net.ListenTCP(tcpNet, &net.TCPAddr{IP: ip, Port: number})
 	if err != nil {
 		m.log.Warn("relay carrier disabled: cannot bind the TCP twin",
 			"port", number, "address", ip.String(), "error", err)
@@ -302,46 +385,96 @@ func (m *Manager) listenOn(ip net.IP, number int) (*net.UDPConn, net.Listener, e
 	return udp, tcp, nil
 }
 
-// BindHost rebinds a port's listeners to the local address behind host, so a
+func familyNetworks(ip net.IP) (udpNet, tcpNet string) {
+	if ip != nil && ip.To4() == nil {
+		return "udp6", "tcp6"
+	}
+	return "udp4", "tcp4"
+}
+
+func ipFamily(ip net.IP) string {
+	if ip != nil && ip.To4() == nil {
+		return "v6"
+	}
+	return "v4"
+}
+
+func closePortMember(p *port) {
+	if p.conn != nil {
+		p.conn.Close()
+	}
+	if p.tcp != nil {
+		p.tcp.Close()
+	}
+}
+
+// BindHost rebinds each family listener to the local address behind host, so a
 // viewer that dialed that address sees relay replies from the same source
 // address. host may be a name; names that do not resolve, or addresses that
-// are not local, keep the port on the configured --relay-listen address.
+// are not local, keep the listener on its configured --relay-listen address.
 //
-// The host agent authenticates on whichever address its lease names, and the
-// per-port state is shared, so the switch does not need a new handshake.
+// The host agent authenticates on every advertised address, and the per-port
+// state is shared per family, so the switch does not need a new handshake.
 func (m *Manager) BindHost(number int, host string) error {
 	m.mu.Lock()
-	p := m.ports[number]
+	set := m.ports[number]
 	m.mu.Unlock()
-	if p == nil {
+	if set == nil {
 		return fmt.Errorf("relay port %d is not managed here", number)
 	}
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
 	if host == "" {
 		return nil
 	}
-	target := resolveRelayIP(host)
+	set.mu.Lock()
+	if set.boundHost == host {
+		ready := true
+		for _, p := range set.members {
+			p.mu.Lock()
+			if p.conn == nil {
+				ready = false
+			}
+			p.mu.Unlock()
+		}
+		if ready {
+			set.mu.Unlock()
+			return nil
+		}
+	}
+	// Keep the requested name so renewals of the same lease are a no-op even
+	// after falling back to the configured bind.
+	set.boundHost = host
+	members := append([]*port(nil), set.members...)
+	set.mu.Unlock()
+
+	var firstErr error
+	for _, p := range members {
+		if err := p.rebind(host); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// rebind switches one family listener to the address of that family behind
+// host. An address of the other family leaves the listener untouched.
+func (p *port) rebind(host string) error {
+	m := p.set.manager
+	fallback := m.bindFor(p.family)
+	target := resolveRelayIPFamily(host, p.family)
 	if target == nil {
-		m.log.Warn("relay address does not resolve; using the configured bind",
-			"port", number, "address", host)
-		target = m.bindIP
+		m.log.Warn("relay address does not resolve for this family; using the configured bind",
+			"port", p.number, "family", p.family, "address", host)
+		target = fallback
 	}
 
 	p.mu.Lock()
-	if p.boundHost == host && p.conn != nil {
-		p.mu.Unlock()
-		return nil
-	}
 	if p.boundIP != nil && p.boundIP.Equal(target) && p.conn != nil {
-		p.boundHost = host
 		p.mu.Unlock()
 		return nil
 	}
 	oldConn, oldTCP := p.conn, p.tcp
 	p.conn, p.tcp = nil, nil
-	// Keep the requested name so renewals of the same lease are a no-op even
-	// after falling back to the configured bind.
-	p.boundHost = host
 	p.mu.Unlock()
 
 	if oldConn != nil {
@@ -351,15 +484,15 @@ func (m *Manager) BindHost(number int, host string) error {
 		oldTCP.Close()
 	}
 
-	udp, tcp, err := m.listenOn(target, number)
-	if err != nil && !target.Equal(m.bindIP) {
+	udp, tcp, err := m.listenOn(target, p.number)
+	if err != nil && !target.Equal(fallback) {
 		m.log.Warn("relay address is not local; using the configured bind",
-			"port", number, "address", host, "error", err)
-		target = m.bindIP
-		udp, tcp, err = m.listenOn(target, number)
+			"port", p.number, "family", p.family, "address", host, "error", err)
+		target = fallback
+		udp, tcp, err = m.listenOn(target, p.number)
 	}
 	if err != nil {
-		m.log.Error("relay port lost its listener", "port", number, "error", err)
+		m.log.Error("relay port lost its listener", "port", p.number, "family", p.family, "error", err)
 		return err
 	}
 	if m.isClosed() {
@@ -387,6 +520,14 @@ func (m *Manager) BindHost(number int, host string) error {
 		go p.serveTCP(tcp)
 	}
 	return nil
+}
+
+// bindFor returns the configured listen address for one address family.
+func (m *Manager) bindFor(family string) net.IP {
+	if family == "v6" && m.bind6IP != nil {
+		return m.bind6IP
+	}
+	return m.bindIP
 }
 
 // tuneReadBuffer applies the configured receive buffer to one relay socket.
@@ -426,19 +567,29 @@ func (m *Manager) isClosed() bool {
 	return m.closed
 }
 
-// resolveRelayIP resolves a relay list entry for binding. Names can point at
-// several addresses; the first one is used, matching the viewer's resolution.
-func resolveRelayIP(host string) net.IP {
+// resolveRelayIPFamily resolves a relay list entry for binding, restricted to
+// one address family. Names can point at several addresses; the first address
+// of the requested family is used.
+func resolveRelayIPFamily(host, family string) net.IP {
+	wantV4 := family != "v6"
 	if ip := net.ParseIP(host); ip != nil {
-		return ip
+		if (ip.To4() != nil) == wantV4 {
+			return ip
+		}
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil || len(addrs) == 0 {
+	if err != nil {
 		return nil
 	}
-	return addrs[0].IP
+	for _, addr := range addrs {
+		if (addr.IP.To4() != nil) == wantV4 {
+			return addr.IP
+		}
+	}
+	return nil
 }
 
 func (m *Manager) Ports() []int {
@@ -455,20 +606,60 @@ func (m *Manager) Allocate(hostID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, number := range m.order {
-		p := m.ports[number]
-		p.mu.Lock()
-		held := p.hostID
-		p.mu.Unlock()
+		set := m.ports[number]
+		set.mu.Lock()
+		held := set.hostID
+		set.mu.Unlock()
 		if held == hostID {
 			return number, nil
 		}
 	}
 	for _, number := range m.order {
-		p := m.ports[number]
-		p.mu.Lock()
-		free := p.hostID == ""
+		set := m.ports[number]
+		set.mu.Lock()
+		free := set.hostID == ""
 		if free {
-			p.hostID = hostID
+			set.hostID = hostID
+			for _, p := range set.members {
+				p.mu.Lock()
+				p.hostAddr = nil
+				p.viewerAddr = nil
+				p.viewerAuthAddr = nil
+				p.hostSeen = time.Time{}
+				p.viewerSeen = time.Time{}
+				if p.udpSession != nil {
+					p.udpSession.Close()
+					p.udpSession = nil
+				}
+				p.mu.Unlock()
+			}
+		}
+		set.mu.Unlock()
+		if free {
+			return number, nil
+		}
+	}
+	return 0, ErrNoFreePort
+}
+
+// Release drops the host binding, any viewer association and the carrier link
+// on every family listener. The listeners stay up so the port can be handed to
+// the next host.
+func (m *Manager) Release(hostID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, number := range m.order {
+		set := m.ports[number]
+		set.mu.Lock()
+		if set.hostID != hostID {
+			set.mu.Unlock()
+			continue
+		}
+		set.hostID = ""
+		var links []*hostLink
+		var viewers []*carrierViewer
+		for _, p := range set.members {
+			p.mu.Lock()
 			p.hostAddr = nil
 			p.viewerAddr = nil
 			p.viewerAuthAddr = nil
@@ -478,44 +669,20 @@ func (m *Manager) Allocate(hostID string) (int, error) {
 				p.udpSession.Close()
 				p.udpSession = nil
 			}
-		}
-		p.mu.Unlock()
-		if free {
-			return number, nil
-		}
-	}
-	return 0, ErrNoFreePort
-}
-
-// Release drops the host binding, any viewer association and the carrier link.
-// The listener stays up so the port can be handed to the next host.
-func (m *Manager) Release(hostID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, number := range m.order {
-		p := m.ports[number]
-		p.mu.Lock()
-		if p.hostID != hostID {
+			if p.hostLink != nil {
+				links = append(links, p.hostLink)
+			}
+			if p.viewer != nil {
+				viewers = append(viewers, p.viewer)
+			}
+			p.hostLink, p.viewer = nil, nil
 			p.mu.Unlock()
-			continue
 		}
-		p.hostID = ""
-		p.hostAddr = nil
-		p.viewerAddr = nil
-		p.viewerAuthAddr = nil
-		p.hostSeen = time.Time{}
-		p.viewerSeen = time.Time{}
-		if p.udpSession != nil {
-			p.udpSession.Close()
-			p.udpSession = nil
-		}
-		link, viewer := p.hostLink, p.viewer
-		p.hostLink, p.viewer = nil, nil
-		p.mu.Unlock()
-		if link != nil {
+		set.mu.Unlock()
+		for _, link := range links {
 			link.conn.Close()
 		}
-		if viewer != nil {
+		for _, viewer := range viewers {
 			viewer.close()
 		}
 	}
@@ -524,28 +691,30 @@ func (m *Manager) Release(hostID string) {
 func (m *Manager) Close() {
 	m.mu.Lock()
 	m.closed = true
-	for _, p := range m.ports {
-		p.mu.Lock()
-		conn, tcp := p.conn, p.tcp
-		p.conn, p.tcp = nil, nil
-		if p.udpSession != nil {
-			p.udpSession.Close()
-			p.udpSession = nil
-		}
-		link, viewer := p.hostLink, p.viewer
-		p.hostLink, p.viewer = nil, nil
-		p.mu.Unlock()
-		if conn != nil {
-			conn.Close()
-		}
-		if tcp != nil {
-			tcp.Close()
-		}
-		if link != nil {
-			link.conn.Close()
-		}
-		if viewer != nil {
-			viewer.close()
+	for _, set := range m.ports {
+		for _, p := range set.members {
+			p.mu.Lock()
+			conn, tcp := p.conn, p.tcp
+			p.conn, p.tcp = nil, nil
+			if p.udpSession != nil {
+				p.udpSession.Close()
+				p.udpSession = nil
+			}
+			link, viewer := p.hostLink, p.viewer
+			p.hostLink, p.viewer = nil, nil
+			p.mu.Unlock()
+			if conn != nil {
+				conn.Close()
+			}
+			if tcp != nil {
+				tcp.Close()
+			}
+			if link != nil {
+				link.conn.Close()
+			}
+			if viewer != nil {
+				viewer.close()
+			}
 		}
 	}
 	shared := m.shared
@@ -654,30 +823,33 @@ func (m *Manager) Stats() Stats {
 	now := time.Now()
 	out := Stats{Ports: make([]PortStats, 0, len(m.order)), ReadBuffer: m.readBuffer}
 	for _, number := range m.order {
-		p := m.ports[number]
-		p.mu.Lock()
-		ps := PortStats{
-			Port:        p.number,
-			HostID:      p.hostID,
-			ToHost:      p.toHost,
-			ToViewer:    p.toViewer,
-			Busy:        p.busy,
-			Dropped:     p.dropped,
-			TCPToHost:   p.tcpToHost,
-			TCPToViewer: p.tcpToViewer,
-			TCPViewers:  p.tcpViewers,
-			TCPBusy:     p.tcpBusy,
-			Blocked:     p.blocked,
+		set := m.ports[number]
+		set.mu.Lock()
+		ps := PortStats{Port: number, HostID: set.hostID}
+		for _, p := range set.members {
+			p.mu.Lock()
+			ps.ToHost += p.toHost
+			ps.ToViewer += p.toViewer
+			ps.Busy += p.busy
+			ps.Dropped += p.dropped
+			ps.TCPToHost += p.tcpToHost
+			ps.TCPToViewer += p.tcpToViewer
+			ps.TCPViewers += p.tcpViewers
+			ps.TCPBusy += p.tcpBusy
+			ps.Blocked += p.blocked
+			if (p.hostAddr != nil && now.Sub(p.hostSeen) <= hostIdle) || p.hostLink != nil {
+				ps.HostOnline = true
+			}
+			if ps.Viewer == "" {
+				if p.viewer != nil {
+					ps.Viewer = p.viewer.peer
+				} else if p.viewerAddr != nil && now.Sub(p.viewerSeen) <= viewerIdle {
+					ps.Viewer = p.viewerAddr.String()
+				}
+			}
+			p.mu.Unlock()
 		}
-		if (p.hostAddr != nil && now.Sub(p.hostSeen) <= hostIdle) || p.hostLink != nil {
-			ps.HostOnline = true
-		}
-		if p.viewer != nil {
-			ps.Viewer = p.viewer.peer
-		} else if p.viewerAddr != nil && now.Sub(p.viewerSeen) <= viewerIdle {
-			ps.Viewer = p.viewerAddr.String()
-		}
-		p.mu.Unlock()
+		set.mu.Unlock()
 		out.Ports = append(out.Ports, ps)
 	}
 	if m.shared != nil {
@@ -697,7 +869,7 @@ func (p *port) serve(conn *net.UDPConn) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			p.manager.log.Warn("relay read", "port", p.number, "error", err)
+			p.set.manager.log.Warn("relay read", "port", p.number, "family", p.family, "error", err)
 			continue
 		}
 		if n == 0 {
@@ -705,6 +877,15 @@ func (p *port) serve(conn *net.UDPConn) {
 		}
 		p.handle(conn, buf[:n], src, time.Now())
 	}
+}
+
+// reservedHost reads the current lease without taking the per-listener lock.
+// Control handling calls it before locking, keeping the set -> port lock order
+// used by Allocate and Release.
+func (p *port) reservedHost() string {
+	p.set.mu.Lock()
+	defer p.set.mu.Unlock()
+	return p.set.hostID
 }
 
 // detachUDPViewerLocked releases the viewer slot after its session was
@@ -719,19 +900,33 @@ func (p *port) detachUDPViewerLocked() {
 }
 
 func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time.Time) {
+	var control *wire.Message
+	if msg, err := wire.Decode(data); err == nil {
+		switch msg.Type {
+		case wire.TypeRelayHello, wire.TypeRelayAuth, wire.TypeRelayViewer:
+			control = &msg
+		}
+	}
+	// Read the reservation before taking the listener lock so this path keeps
+	// the set -> port lock order used by allocation.
+	hostID := ""
+	if control != nil {
+		hostID = p.reservedHost()
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if msg, err := wire.Decode(data); err == nil {
-		switch msg.Type {
+	if control != nil {
+		switch control.Type {
 		case wire.TypeRelayHello:
-			p.handleHello(conn, msg, src, now)
+			p.handleHello(conn, *control, src, now, hostID)
 			return
 		case wire.TypeRelayAuth:
-			p.handleAuth(conn, msg, src, now)
+			p.handleAuth(conn, *control, src, now, hostID)
 			return
 		case wire.TypeRelayViewer:
-			p.handleViewerAuth(conn, msg, src)
+			p.handleViewerAuth(conn, *control, src, hostID)
 			return
 		}
 	}
@@ -762,13 +957,13 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 		p.dropped++
 		return
 	}
-	if p.manager.requireViewerToken &&
+	if p.set.manager.requireViewerToken &&
 		(p.viewerAuthAddr == nil || !sameAddr(p.viewerAuthAddr, src)) {
 		p.dropped++
 		return
 	}
 	if p.viewerAddr == nil || now.Sub(p.viewerSeen) > viewerIdle {
-		session, err := p.manager.policy.Open(fmt.Sprintf("udp:%d", p.number), src.IP.String())
+		session, err := p.set.manager.policy.Open(fmt.Sprintf("udp:%d/%s", p.number, p.family), src.IP.String())
 		if err != nil {
 			if p.udpSession != nil {
 				p.udpSession.Close()
@@ -812,16 +1007,16 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 	p.toHost += uint64(len(data))
 }
 
-func (p *port) handleHello(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, now time.Time) {
-	if p.hostID == "" || msg.HostID != p.hostID {
+func (p *port) handleHello(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, now time.Time, hostID string) {
+	if hostID == "" || msg.HostID != hostID {
 		p.reply(conn, src, wire.Message{Type: wire.TypeRelayAck, Error: "no relay reservation for this host"})
 		return
 	}
-	if p.manager.auth == nil || !p.manager.auth.VerifyHost(msg.HostID, p.number) {
+	if p.set.manager.auth == nil || !p.set.manager.auth.VerifyHost(msg.HostID, p.number) {
 		p.reply(conn, src, wire.Message{Type: wire.TypeRelayAck, Error: "host has no live relay reservation"})
 		return
 	}
-	nonce, err := p.manager.auth.IssueChallenge(msg.HostID, identity.DomainRelay)
+	nonce, err := p.set.manager.auth.IssueChallenge(msg.HostID, identity.DomainRelay)
 	if err != nil {
 		p.reply(conn, src, wire.Message{Type: wire.TypeRelayAck, Error: "host has no live registration"})
 		return
@@ -834,9 +1029,9 @@ func (p *port) handleHello(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr
 	})
 }
 
-func (p *port) handleAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, now time.Time) {
+func (p *port) handleAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, now time.Time, hostID string) {
 	ack := wire.Message{Type: wire.TypeRelayAck}
-	if p.hostID == "" || msg.HostID != p.hostID {
+	if hostID == "" || msg.HostID != hostID {
 		ack.Error = "no relay reservation for this host"
 		p.reply(conn, src, ack)
 		return
@@ -848,9 +1043,9 @@ func (p *port) handleAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr,
 		return
 	}
 	message := identity.RelayMessage(msg.HostID, p.number, candidate, msg.Nonce)
-	if p.manager.auth == nil ||
-		!p.manager.auth.CheckChallenge(msg.HostID, identity.DomainRelay, msg.Nonce, string(message), msg.Signature) ||
-		!p.manager.auth.VerifyHost(msg.HostID, p.number) {
+	if p.set.manager.auth == nil ||
+		!p.set.manager.auth.CheckChallenge(msg.HostID, identity.DomainRelay, msg.Nonce, string(message), msg.Signature) ||
+		!p.set.manager.auth.VerifyHost(msg.HostID, p.number) {
 		ack.Error = "relay proof was not accepted"
 		p.reply(conn, src, ack)
 		return
@@ -878,12 +1073,12 @@ func (p *port) reply(conn *net.UDPConn, to *net.UDPAddr, m wire.Message) {
 // handleViewerAuth is the UDP counterpart of the carrier viewer hello. A valid
 // token reserves the source address, and a new valid source supersedes a stale
 // viewer association so a reconnect does not have to wait for viewerIdle.
-func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr) {
+func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, hostID string) {
 	ack := wire.Message{Type: wire.TypeRelayViewerAck}
 	switch {
-	case p.hostID == "" || msg.HostID != p.hostID:
+	case hostID == "" || msg.HostID != hostID:
 		ack.Error = "no relay reservation for this host"
-	case p.manager.auth == nil || !p.manager.auth.VerifyCarrier(msg.HostID, msg.Token):
+	case p.set.manager.auth == nil || !p.set.manager.auth.VerifyCarrier(msg.HostID, msg.Token):
 		ack.Error = "viewer token was not accepted"
 	default:
 		if p.viewerAuthAddr == nil || !sameAddr(p.viewerAuthAddr, src) {
@@ -892,7 +1087,7 @@ func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UD
 			}
 			p.viewerAuthAddr = cloneAddr(src)
 		}
-		p.manager.log.Info("relay viewer authenticated", "port", p.number, "remote", src.String())
+		p.set.manager.log.Info("relay viewer authenticated", "port", p.number, "remote", src.String())
 		ack.OK = true
 	}
 	p.reply(conn, src, ack)
@@ -904,7 +1099,7 @@ func (p *port) serveTCP(tcp net.Listener) {
 		conn, err := tcp.Accept()
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				p.manager.log.Warn("relay carrier accept", "port", p.number, "error", err)
+				p.set.manager.log.Warn("relay carrier accept", "port", p.number, "error", err)
 			}
 			return
 		}
@@ -924,12 +1119,12 @@ func (p *port) handleTCP(conn net.Conn) {
 	case string(prefix) == "GET ":
 		ws, err := carrier.UpgradeServer(conn, br)
 		if err != nil {
-			p.manager.log.Debug("relay carrier upgrade refused",
+			p.set.manager.log.Debug("relay carrier upgrade refused",
 				"port", p.number, "remote", conn.RemoteAddr().String(), "error", err)
 			conn.Close()
 			return
 		}
-		if p.manager.requireViewerToken {
+		if p.set.manager.requireViewerToken {
 			body, err := ws.ReadMessage()
 			if err != nil || !p.viewerHelloOK(body) {
 				conn.Close()
@@ -950,7 +1145,7 @@ func (p *port) handleTCP(conn net.Conn) {
 		}
 		switch line + "\n" {
 		case carrier.MagicRaw:
-			if p.manager.requireViewerToken {
+			if p.set.manager.requireViewerToken {
 				hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
 				if err != nil || !p.viewerHelloTextOK(hello) {
 					p.refuseConn(conn, "viewer token was not accepted")
@@ -998,15 +1193,13 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 		p.refuseConn(conn, "malformed host hello")
 		return
 	}
-	p.mu.Lock()
-	reserved := p.hostID
-	p.mu.Unlock()
-	if reserved == "" || hello.HostID != reserved || p.manager.auth == nil ||
-		!p.manager.auth.VerifyHost(hello.HostID, p.number) {
+	reserved := p.reservedHost()
+	if reserved == "" || hello.HostID != reserved || p.set.manager.auth == nil ||
+		!p.set.manager.auth.VerifyHost(hello.HostID, p.number) {
 		p.refuseConn(conn, "host was not accepted")
 		return
 	}
-	nonce, err := p.manager.auth.IssueChallenge(hello.HostID, identity.DomainCarrierHost)
+	nonce, err := p.set.manager.auth.IssueChallenge(hello.HostID, identity.DomainCarrierHost)
 	if err != nil {
 		p.refuseConn(conn, "host has no live registration")
 		return
@@ -1037,7 +1230,7 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	}
 	message := identity.CarrierHostMessage(hello.HostID, "", auth.Nonce)
 	if auth.HostID != hello.HostID || auth.Nonce != nonce ||
-		!p.manager.auth.CheckChallenge(hello.HostID, identity.DomainCarrierHost, auth.Nonce, string(message), auth.Signature) {
+		!p.set.manager.auth.CheckChallenge(hello.HostID, identity.DomainCarrierHost, auth.Nonce, string(message), auth.Signature) {
 		p.refuseConn(conn, "host proof was not accepted")
 		return
 	}
@@ -1048,12 +1241,14 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	_ = conn.SetDeadline(time.Time{})
 
 	link := &hostLink{conn: conn, send: carrier.NewFrameWriter(conn)}
-	p.mu.Lock()
-	if p.hostID != reserved {
-		p.mu.Unlock()
+	p.set.mu.Lock()
+	if p.set.hostID != reserved {
+		p.set.mu.Unlock()
 		conn.Close()
 		return
 	}
+	p.mu.Lock()
+	p.set.mu.Unlock()
 	oldLink, oldViewer := p.hostLink, p.viewer
 	p.hostLink = link
 	p.viewer = nil
@@ -1065,7 +1260,7 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	if oldViewer != nil {
 		oldViewer.close()
 	}
-	p.manager.log.Info("relay carrier host link", "port", p.number, "host", hello.HostID)
+	p.set.manager.log.Info("relay carrier host link", "port", p.number, "host", hello.HostID)
 
 	frames := carrier.NewFrameReader(br)
 	for {
@@ -1129,7 +1324,7 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 		viewer.close()
 	}
 	conn.Close()
-	p.manager.log.Info("relay carrier host link closed", "port", p.number)
+	p.set.manager.log.Info("relay carrier host link closed", "port", p.number)
 }
 
 func (p *port) refuseConn(conn net.Conn, reason string) {
@@ -1155,8 +1350,9 @@ func (p *port) viewerHelloOK(body []byte) bool {
 }
 
 func (p *port) viewerTokenOK(id, token string) bool {
-	return p.hostID != "" && id == p.hostID && p.manager.auth != nil &&
-		p.manager.auth.VerifyCarrier(id, token)
+	reserved := p.reservedHost()
+	return reserved != "" && id == reserved && p.set.manager.auth != nil &&
+		p.set.manager.auth.VerifyCarrier(id, token)
 }
 
 func (p *port) serveViewer(v *carrierViewer) {
@@ -1172,7 +1368,7 @@ func (p *port) serveViewer(v *carrierViewer) {
 		v.close()
 		return
 	}
-	session, err := p.manager.policy.Open(fmt.Sprintf("carrier:%d", p.number), peerIP(v.peer))
+	session, err := p.set.manager.policy.Open(fmt.Sprintf("carrier:%d/%s", p.number, p.family), peerIP(v.peer))
 	if err != nil {
 		p.blocked++
 		p.mu.Unlock()
@@ -1186,7 +1382,7 @@ func (p *port) serveViewer(v *carrierViewer) {
 	p.tcpViewers++
 	host := p.hostLink
 	p.mu.Unlock()
-	p.manager.log.Info("relay carrier viewer attached", "port", p.number, "remote", v.peer)
+	p.set.manager.log.Info("relay carrier viewer attached", "port", p.number, "remote", v.peer)
 
 	for {
 		_ = v.conn.SetReadDeadline(time.Now().Add(carrierViewerIdle))
@@ -1222,7 +1418,7 @@ func (p *port) serveViewer(v *carrierViewer) {
 	p.mu.Unlock()
 	v.close()
 	if stillPaired {
-		p.manager.log.Info("relay carrier viewer left", "port", p.number, "remote", v.peer)
+		p.set.manager.log.Info("relay carrier viewer left", "port", p.number, "remote", v.peer)
 	}
 }
 

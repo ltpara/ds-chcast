@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 22.
+// The chast wire protocol, version 27.
 //
 // One QUIC connection carries:
 //
@@ -18,13 +18,17 @@
 //     side that copied, and
 //   * one unidirectional stream per file transfer (`CFIL`), opened by the
 //     side that offered the file: the viewer uploads to the host and the host
-//     downloads to the viewer.
+//     downloads to the viewer,
+//   * one unidirectional `CPFW` stream per direction of a forwarded TCP
+//     connection, and
+//   * one `CTTY` uplink (input) plus one `CTTY` downlink (output) per remote
+//     terminal.
 //
 // The streams are told apart by their packet magic, not by the order the
 // streams were opened: QUIC does not promise that the first bytes of a later
 // stream arrive after an earlier one. Video is `CFRM`, system audio is
-// `CAUD`, the microphone is `CMIC`, clipboard content is `CCLB` and file data
-// is `CFIL`.
+// `CAUD`, the microphone is `CMIC`, clipboard content is `CCLB`, file data
+// is `CFIL`, forwarded TCP bytes are `CPFW` and terminal bytes are `CTTY`.
 //
 // QUIC streams give the media reliable, ordered delivery; the sequence number
 // is still carried so the receiver can report gaps and so a future version can
@@ -48,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 24;
+inline constexpr uint16_t kProtocolVersion = 27;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -202,6 +206,38 @@ enum class ControlType : uint16_t {
     // the authorization, and either side can ignore or close the chat UI.
     // Protocol v24.
     ChatMessage = 32,
+    // Viewer -> host: register a port-forward target. Payload: forward id
+    // (u32), target port (u16), host length (u16), UTF-8 host. The host
+    // checks the permission and its settings and answers PortForwardResult.
+    // Data for an accepted target travels on CPFW streams, never here.
+    // Protocol v26.
+    PortForwardRequest = 33,
+    // Host -> viewer: the outcome of PortForwardRequest. Payload: forward id
+    // (u32), code (u8), reason length (u16), UTF-8 reason. Ok means CPFW
+    // streams naming that id are accepted. See PortForwardCode.
+    PortForwardResult = 34,
+    // Either role: stop one registered forward. Payload: forward id (u32),
+    // code (u8), reason length (u16), UTF-8 reason. The sender closes every
+    // connection it owns for the id; the receiver does the same on its side.
+    PortForwardStop = 35,
+    // Viewer -> host: open a remote terminal. Payload: terminal id (u32),
+    // columns (u16), rows (u16). The host checks the permission and its
+    // settings, spawns a console under ConPTY and answers TerminalResult.
+    // Terminal bytes never travel here.
+    // Protocol v27.
+    TerminalRequest = 36,
+    // Host -> viewer: the outcome of TerminalRequest. Payload: terminal id
+    // (u32), code (u8), reason length (u16), UTF-8 reason. Ok means CTTY
+    // streams naming that id are accepted. See TerminalCode.
+    TerminalResult = 37,
+    // Either role: stop one terminal. Payload: terminal id (u32), code (u8),
+    // reason length (u16), UTF-8 reason. The host closes the console and the
+    // child process; the viewer drops its streams.
+    TerminalStop = 38,
+    // Viewer -> host: change the console size of a running terminal. Payload:
+    // terminal id (u32), columns (u16), rows (u16). The host applies it with
+    // ResizePseudoConsole; too late or unknown ids are ignored.
+    TerminalResize = 39,
 };
 
 // ----- input -----
@@ -535,9 +571,10 @@ bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo
 // it that both sides may exchange clipboard content; bit 2 tells it the host
 // opened an audio stream and described the format in the audio block; bit 3
 // tells it that file offers are accepted; bit 4 that the viewer may open a
-// microphone stream; bit 5 that SetPrivacyMode is accepted. Bit 6 is not a
-// permission: it says the picture is a merged layout of every attached output,
-// with origin/source covering their union.
+// microphone stream; bit 5 that SetPrivacyMode is accepted; bit 7 that the
+// viewer may ask for TCP port forwarding. Bit 6 is not a permission: it says
+// the picture is a merged layout of every attached output, with origin/source
+// covering their union.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
@@ -545,6 +582,8 @@ inline constexpr uint16_t kServerInfoFileTransferEnabled = 0x0008;
 inline constexpr uint16_t kServerInfoMicrophoneEnabled = 0x0010;
 inline constexpr uint16_t kServerInfoPrivacyModeEnabled = 0x0020;
 inline constexpr uint16_t kServerInfoMergedLayout = 0x0040;
+inline constexpr uint16_t kServerInfoPortForwardEnabled = 0x0080;
+inline constexpr uint16_t kServerInfoTerminalEnabled = 0x0100;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
 // this mask rather than with every known flag.
@@ -553,7 +592,9 @@ inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
                                                        kServerInfoAudioEnabled |
                                                        kServerInfoFileTransferEnabled |
                                                        kServerInfoMicrophoneEnabled |
-                                                       kServerInfoPrivacyModeEnabled;
+                                                       kServerInfoPrivacyModeEnabled |
+                                                       kServerInfoPortForwardEnabled |
+                                                       kServerInfoTerminalEnabled;
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoMergedLayout;
 
@@ -563,7 +604,8 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // keyboard injection; clipboard governs clipboard streams in both directions;
 // audio is present only while an audio stream is open; microphone allows the
 // viewer to open a `CMIC` uplink; file transfer gates FileOffer; privacy mode
-// gates SetPrivacyMode.
+// gates SetPrivacyMode; port forward gates PortForwardRequest and CPFW streams;
+// terminal gates TerminalRequest and CTTY streams.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -571,10 +613,17 @@ enum PermissionBit : uint16_t {
     kPermissionFileTransfer = 0x0008,
     kPermissionMicrophone = 0x0010,
     kPermissionPrivacyMode = 0x0020,
+    // Bit 0x0040 stays unused: on the HelloAck flag word that bit is the
+    // merged-layout marker, which is not a permission. Aligning the next
+    // permission with 0x0080 keeps the mask and the flag word comparable
+    // field by field, as every earlier permission bit already is.
+    kPermissionPortForward = 0x0080,
+    kPermissionTerminal = 0x0100,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
-                                           kPermissionMicrophone | kPermissionPrivacyMode;
+                                           kPermissionMicrophone | kPermissionPrivacyMode |
+                                           kPermissionPortForward | kPermissionTerminal;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -696,6 +745,12 @@ struct ServerInfo {
     // the other booleans; the overlay's current state travels separately in
     // PrivacyModeState because a reconnect always starts with it off.
     bool privacy_mode_enabled = false;
+    // The viewer may register TCP port-forward targets. Decoded from the
+    // permission mask; each target is still checked when it is requested.
+    bool port_forward_enabled = false;
+    // The viewer may ask for remote terminals. Decoded from the permission
+    // mask; every request is still checked against the host's settings.
+    bool terminal_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;
@@ -750,7 +805,10 @@ inline constexpr size_t kMaxAccessDenialReason = 512;
 inline constexpr size_t kMaxPasswordLength = 128;
 inline constexpr size_t kMaxDeviceKeyLength = 128;
 inline constexpr size_t kMaxDeviceNameLength = 64;
+// Because Hello rejects trailing bytes, the audit reference is part of the
+// versioned layout: v25 appends it after totp.
 inline constexpr size_t kMaxTotpLength = 16;
+inline constexpr size_t kMaxAuditRefLength = 64;
 inline constexpr size_t kMaxSignatureLength = 128;
 inline constexpr size_t kHelloNonceBytes = 16;
 
@@ -779,7 +837,29 @@ struct ClientHello {
     std::vector<uint8_t> signature;
     // Six ASCII digits, empty when the client has nothing to prove.
     std::string totp;
+    // Canonical lowercase hex reference for one session. The host includes it
+    // in the inbound audit records it forwards, which is how the server joins
+    // the viewer's account report and the host's view of the same session.
+    // Empty for CLI tools that do not report audit.
+    std::string audit_ref;
 };
+
+// The server accepts an empty reference or 8..64 lowercase hex digits. The
+// length keeps the join key out of sequential-id territory.
+inline bool valid_audit_ref(const std::string& audit_ref) {
+    if (audit_ref.empty()) {
+        return true;
+    }
+    if (audit_ref.size() < 8 || audit_ref.size() > kMaxAuditRefLength) {
+        return false;
+    }
+    for (char c : audit_ref) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // The bytes a trusted device signs: the host's canonical (64 uppercase hex
 // digit) certificate fingerprint, the nonce, and unix_seconds as a
@@ -850,6 +930,164 @@ bool valid_chat_text(const std::string& text);
 std::vector<uint8_t> make_chat_message(const std::string& text);
 bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
                         std::string* error);
+
+// ----- port forwarding -----
+//
+// The viewer registers a target with PortForwardRequest; once the host answers
+// Ok, every accepted local TCP connection becomes one client-initiated `CPFW`
+// uplink stream. The host dials the target and, on success, opens a
+// host-initiated `CPFW` downlink stream with the same pair of ids. Both
+// streams carry raw TCP bytes after their 16-byte header; QUIC's per-stream
+// flow control is the only backpressure needed. A stream FIN means the TCP
+// side saw EOF in that direction; an aborted stream tears the connection down.
+inline constexpr char kPortForwardStreamMagic[4] = {'C', 'P', 'F', 'W'};
+inline constexpr uint8_t kPortForwardStreamVersion = 1;
+inline constexpr size_t kPortForwardStreamHeaderSize = 16;
+inline constexpr size_t kMaxPortForwardHostBytes = 255;
+inline constexpr size_t kMaxPortForwardReasonBytes = 256;
+// Targets a viewer may register in one session, and TCP connections the host
+// carries at once across all of them.
+inline constexpr size_t kMaxPortForwardTargets = 8;
+inline constexpr uint32_t kMaxPortForwardConnections = 32;
+inline constexpr size_t kMaxPortForwardChunkBytes = 64u * 1024u;
+// The receive queue for one forwarded connection. Above the high-water mark
+// the stream's QUIC receive is paused instead of dropping bytes, so a slow
+// local reader slows the sender down rather than corrupting the connection.
+inline constexpr size_t kPortForwardReceiveHighWaterBytes = 256u * 1024u;
+
+enum class PortForwardCode : uint8_t {
+    Ok = 0,
+    Refused = 1,        // the host does not allow forwarding for this session
+    InvalidTarget = 2,  // empty/oversized host, port 0, or an unusable id
+    Busy = 3,           // the forward table or connection budget is full
+    Cancelled = 4,      // either side stopped it (or the session is ending)
+};
+
+struct PortForwardRequest {
+    uint32_t forward_id = 0;
+    std::string host;
+    uint16_t port = 0;
+};
+
+struct PortForwardResult {
+    uint32_t forward_id = 0;
+    PortForwardCode code = PortForwardCode::Ok;
+    std::string reason;
+};
+
+struct PortForwardStop {
+    uint32_t forward_id = 0;
+    PortForwardCode code = PortForwardCode::Cancelled;
+    std::string reason;
+};
+
+struct PortForwardStreamHeader {
+    uint32_t forward_id = 0;
+    uint32_t connection_id = 0;
+};
+
+// The makers truncate `reason` on a UTF-8 boundary; the parsers reject unknown
+// codes, over-long or empty hosts, ports outside 1..65535, malformed UTF-8 and
+// trailing bytes rather than repairing a broken message.
+std::vector<uint8_t> make_port_forward_request(const PortForwardRequest& request);
+bool parse_port_forward_request(const std::vector<uint8_t>& payload,
+                                PortForwardRequest& request, std::string* error);
+std::vector<uint8_t> make_port_forward_result(const PortForwardResult& result);
+bool parse_port_forward_result(const std::vector<uint8_t>& payload,
+                               PortForwardResult& result, std::string* error);
+std::vector<uint8_t> make_port_forward_stop(const PortForwardStop& stop);
+bool parse_port_forward_stop(const std::vector<uint8_t>& payload, PortForwardStop& stop,
+                             std::string* error);
+// Exactly kPortForwardStreamHeaderSize bytes. Zero ids are rejected because
+// they would make an uninitialised structure look valid.
+std::vector<uint8_t> make_port_forward_stream_header(uint32_t forward_id,
+                                                      uint32_t connection_id);
+bool decode_port_forward_stream_header(const uint8_t* data, size_t size,
+                                       PortForwardStreamHeader& header, std::string* error);
+
+// ----- remote terminal -----
+//
+// The viewer asks for a console with TerminalRequest; once the host answers
+// Ok, the viewer opens a `CTTY` uplink stream for keyboard input and the host
+// opens a `CTTY` downlink stream the first time the console produces output.
+// Both carry raw console bytes after their 16-byte header, including the VT
+// sequences ConPTY emits. A stream FIN ends that direction; aborting tears the
+// terminal down. There is no replay buffer: a terminal lives and dies with the
+// session, exactly like the forwarded TCP connections.
+inline constexpr char kTerminalStreamMagic[4] = {'C', 'T', 'T', 'Y'};
+inline constexpr uint8_t kTerminalStreamVersion = 1;
+inline constexpr size_t kTerminalStreamHeaderSize = 16;
+inline constexpr size_t kMaxTerminalReasonBytes = 256;
+// Consoles one session may open at once, and the accepted size range. Sizes
+// outside it are refused instead of clamped: a viewer that asks for 0 columns
+// has a bug, and silently "fixing" it would hide it.
+inline constexpr size_t kMaxTerminals = 2;
+inline constexpr uint16_t kMaxTerminalColumns = 500;
+inline constexpr uint16_t kMaxTerminalRows = 200;
+inline constexpr size_t kMaxTerminalChunkBytes = 64u * 1024u;
+// Console output buffered for one terminal before the host stops reading the
+// ConPTY pipe, and viewer input buffered by the host before it pauses the
+// uplink stream.
+inline constexpr size_t kTerminalReceiveHighWaterBytes = 256u * 1024u;
+inline constexpr size_t kTerminalInputHighWaterBytes = 256u * 1024u;
+
+enum class TerminalCode : uint8_t {
+    Ok = 0,
+    Refused = 1,  // the host does not allow terminals for this session
+    Busy = 2,     // the per-session terminal budget is full
+    Failed = 3,   // ConPTY or the child process could not be created
+    Cancelled = 4,
+};
+
+struct TerminalRequest {
+    uint32_t terminal_id = 0;
+    uint16_t columns = 0;
+    uint16_t rows = 0;
+};
+
+struct TerminalResult {
+    uint32_t terminal_id = 0;
+    TerminalCode code = TerminalCode::Ok;
+    std::string reason;
+};
+
+struct TerminalStop {
+    uint32_t terminal_id = 0;
+    TerminalCode code = TerminalCode::Cancelled;
+    std::string reason;
+};
+
+struct TerminalSize {
+    uint32_t terminal_id = 0;
+    uint16_t columns = 0;
+    uint16_t rows = 0;
+};
+
+struct TerminalStreamHeader {
+    uint32_t terminal_id = 0;
+};
+
+bool valid_terminal_size(uint16_t columns, uint16_t rows);
+// The makers reject a zero id or an out-of-range size and return an empty
+// vector; the parsers reject unknown codes, malformed UTF-8 and trailing
+// bytes rather than repairing a broken message.
+std::vector<uint8_t> make_terminal_request(const TerminalRequest& request);
+bool parse_terminal_request(const std::vector<uint8_t>& payload,
+                            TerminalRequest& request, std::string* error);
+std::vector<uint8_t> make_terminal_result(const TerminalResult& result);
+bool parse_terminal_result(const std::vector<uint8_t>& payload,
+                           TerminalResult& result, std::string* error);
+std::vector<uint8_t> make_terminal_stop(const TerminalStop& stop);
+bool parse_terminal_stop(const std::vector<uint8_t>& payload, TerminalStop& stop,
+                         std::string* error);
+std::vector<uint8_t> make_terminal_resize(uint32_t terminal_id, uint16_t columns,
+                                          uint16_t rows);
+bool parse_terminal_resize(const std::vector<uint8_t>& payload, TerminalSize& size,
+                           std::string* error);
+std::vector<uint8_t> make_terminal_stream_header(uint32_t terminal_id);
+bool decode_terminal_stream_header(const uint8_t* data, size_t size,
+                                   TerminalStreamHeader& header, std::string* error);
+
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that
 // keep the sprite can send the same update again with an empty one.

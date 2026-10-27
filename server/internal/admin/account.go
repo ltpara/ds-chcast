@@ -197,9 +197,13 @@ func (c *Console) auditText(args []string) string {
 		if detail == "" {
 			detail = "-"
 		}
-		fmt.Fprintf(&b, "%s user=%s action=%s %s ip=%s detail=%s\n",
+		location := event.Location
+		if location == "" {
+			location = "-"
+		}
+		fmt.Fprintf(&b, "%s user=%s action=%s %s ip=%s location=%s detail=%s\n",
 			event.CreatedAt.Format(time.RFC3339), event.Username, event.Action,
-			status, event.ClientIP, detail)
+			status, event.ClientIP, location, detail)
 	}
 	return b.String()
 }

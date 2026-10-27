@@ -4,7 +4,10 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/server_api.dart';
+import 'package:chast_viewer/server_identity.dart';
 import 'package:chast_viewer/server_settings.dart';
+
+const String _serverKey = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
 
 void main() {
   late HttpServer server;
@@ -32,6 +35,7 @@ void main() {
           'candidate': '203.0.113.7:13434',
           'relay': '198.51.100.2:5000',
           'fingerprint': 'AB' * 32,
+          'server_public_key': _serverKey,
           'last_seen_ms': 1234,
           'expires_in_ms': 9000,
         }),
@@ -47,9 +51,42 @@ void main() {
     expect(host.hasRelay, isTrue);
     expect(host.candidate, '203.0.113.7:13434');
     expect(host.fingerprint, 'AB' * 32);
+    expect(host.serverPublicKey, _serverKey);
     expect(host.lastSeenMs, 1234);
     expect(host.expiresInMs, 9000);
     expect(authorization, isNull);
+  });
+
+  test('serverIdentity reads and fingerprints /v1/server', () async {
+    Uri? requested;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{'public_key': _serverKey}),
+      );
+      await request.response.close();
+    });
+
+    final ServerIdentity identity = await ServerApi.serverIdentity(settings);
+    expect(requested?.path, '/v1/server');
+    expect(identity.publicKey, _serverKey);
+    expect(
+      identity.fingerprint,
+      '630DCD2966C4336691125448BBB25B4FF412A49C732DB2C8ABC1B8581BD710DD',
+    );
+  });
+
+  test('serverIdentity refuses a server without a usable key', () async {
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode(<String, Object?>{'version': '1'}));
+      await request.response.close();
+    });
+    await expectLater(
+      ServerApi.serverIdentity(settings),
+      throwsA(isA<ServerApiException>()),
+    );
   });
 
   test(
@@ -392,7 +429,9 @@ void main() {
       request.response.write(
         jsonEncode(<String, Object?>{
           'token': 'account-token',
-          'expires_in_ms': 2592000000,
+          'expires_in_ms': 1800000,
+          'refresh_token': 'refresh-token',
+          'refresh_expires_in_ms': 2592000000,
           'user': <String, Object?>{'id': 'user-1', 'username': 'alice'},
         }),
       );
@@ -413,7 +452,61 @@ void main() {
     });
     expect(result.token, 'account-token');
     expect(result.username, 'alice');
-    expect(result.expiresInMs, 2592000000);
+    expect(result.expiresInMs, 1800000);
+    expect(result.refreshToken, 'refresh-token');
+    expect(result.refreshExpiresInMs, 2592000000);
+  });
+
+  test('refresh rotates the token pair without credentials', () async {
+    Uri? requested;
+    String? authorization;
+    Object? body;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      body = jsonDecode(await utf8.decoder.bind(request).join());
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'token': 'new-access',
+          'expires_in_ms': 1800000,
+          'refresh_token': 'new-refresh',
+          'refresh_expires_in_ms': 2592000000,
+          'user': <String, Object?>{'id': 'user-1', 'username': 'alice'},
+        }),
+      );
+      await request.response.close();
+    });
+
+    final AccountLoginResult result =
+        await ServerApi.refresh(settings, ' old-refresh ');
+    expect(requested?.path, '/v1/account/refresh');
+    expect(authorization, isNull);
+    expect(body, <String, Object?>{'refresh_token': 'old-refresh'});
+    expect(result.token, 'new-access');
+    expect(result.refreshToken, 'new-refresh');
+    expect(result.username, 'alice');
+  });
+
+  test('refresh maps a rejected token to a signed-out error', () async {
+    server.listen((HttpRequest request) async {
+      request.response.statusCode = HttpStatus.unauthorized;
+      request.response.write('{"error":"refresh token was not accepted"}');
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.refresh(settings, 'retired-refresh'),
+      throwsA(
+        isA<ServerApiException>()
+            .having((ServerApiException e) => e.statusCode, 'statusCode', 401)
+            .having(
+              (ServerApiException e) => e.message,
+              'message',
+              contains('重新登录'),
+            ),
+      ),
+    );
   });
 
   test('login reports bad credentials as an account error', () async {
@@ -1518,7 +1611,7 @@ void main() {
             .having(
               (ServerApiException e) => e.message,
               'message',
-              contains('用户不存在'),
+              contains('用户或分组不存在'),
             ),
       ),
     );
@@ -1678,6 +1771,127 @@ void main() {
         ),
       ),
     );
+  });
+
+  test('group scoped shares carry the scope on the wire', () async {
+    final List<String> requests = <String>[];
+    server.listen((HttpRequest request) async {
+      final String body = await utf8.decoder.bind(request).join();
+      requests.add(
+        '${request.method} ${request.uri.path}'
+        '${request.uri.hasQuery ? '?${request.uri.query}' : ''} $body',
+      );
+      request.response.headers.contentType = ContentType.json;
+      switch (request.method) {
+        case 'POST':
+          if (request.uri.path.endsWith('/peers')) {
+            request.response.write(
+              jsonEncode(<String, Object?>{
+                'id': 'dlbox',
+                'name': '',
+                'tags': <String>[],
+                'group_id': 'lab',
+                'revision': 51,
+              }),
+            );
+          } else {
+            request.response.write(
+              jsonEncode(<String, Object?>{
+                'username': 'bob',
+                'permission': 'write',
+                'group_id': 'lab',
+                'created_at_ms': 40,
+              }),
+            );
+          }
+        case 'DELETE':
+          request.response.statusCode = HttpStatus.noContent;
+        case 'GET':
+          request.response.write(
+            jsonEncode(<String, Object?>{
+              'books': <Object?>[
+                <String, Object?>{
+                  'owner': 'carol',
+                  'permission': 'write',
+                  'revision': 5,
+                  'groups': <Object?>[
+                    <String, Object?>{'id': 'lab', 'name': '实验室'},
+                  ],
+                  'scopes': <Object?>[
+                    <String, Object?>{'permission': 'read'},
+                    <String, Object?>{
+                      'group_id': 'lab',
+                      'permission': 'write',
+                    },
+                  ],
+                  'peers': <Object?>[
+                    <String, Object?>{'id': 'devbox', 'group_id': 'lab'},
+                  ],
+                },
+              ],
+            }),
+          );
+      }
+      await request.response.close();
+    });
+
+    final AddressBookGrant grant = await ServerApi.shareAddressBook(
+      settings,
+      'account-token',
+      'bob',
+      permission: 'write',
+      groupId: 'lab',
+    );
+    expect(grant.groupId, 'lab');
+    expect(grant.wholeBook, isFalse);
+    await ServerApi.unshareAddressBook(
+      settings,
+      'account-token',
+      'bob',
+      groupId: 'lab',
+    );
+    await ServerApi.shareSharedAddressBook(
+      settings,
+      'account-token',
+      'carol',
+      'erin',
+      groupId: 'lab',
+    );
+    await ServerApi.unshareSharedAddressBook(
+      settings,
+      'account-token',
+      'carol',
+      'erin',
+      groupId: '',
+    );
+    final AddressBookPeer added = await ServerApi.addSharedAddressBookPeer(
+      settings,
+      'account-token',
+      'carol',
+      'dlbox',
+      groupId: 'lab',
+    );
+    expect(added.groupId, 'lab');
+    final List<SharedAddressBook> books = await ServerApi.sharedAddressBooks(
+      settings,
+      'account-token',
+    );
+    final SharedAddressBook book = books.single;
+    expect(book.permissionFor('lab'), 'write');
+    expect(book.permissionFor(''), 'read');
+    expect(book.permissionFor('work'), '');
+
+    expect(requests, <String>[
+      'POST /v1/addressbook/grants '
+          '{"username":"bob","permission":"write","group_id":"lab"}',
+      'DELETE /v1/addressbook/grants/bob?group_id=lab ',
+      'POST /v1/addressbook/shared/carol/grants '
+          '{"username":"erin","permission":"read","group_id":"lab"}',
+      'DELETE /v1/addressbook/shared/carol/grants/erin?group_id ',
+      'POST /v1/addressbook/shared/carol/peers '
+          '{"id":"dlbox","name":"","tags":[],"group_id":"lab"}',
+      'GET /v1/addressbook/shared ',
+    ]);
   });
 
   test('shared writes surface a permission failure', () async {

@@ -2,7 +2,7 @@
 
 Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打洞协调和不可达时
 的中继/载体回退。服务端只转发加密的 QUIC 数据报，不解析、不终止 chast 协议，
-因此协议 v24 的令牌、审批、证书指纹和输入通道都保持端到端语义。
+因此协议 v25 的令牌、审批、证书指纹和输入通道都保持端到端语义。
 
 参考实现是 RustDesk 的 `hbbs`（会合/信令）与 `hbbr`（中继）：
 
@@ -12,16 +12,21 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | `Peer` 记录持久化 | SQLite `chast-server-state.db`（`peers` 表）+ 服务器签名 `binding` | 离线仍可查询身份、主机名/平台/版本与最近在线时间；旧 JSON 状态自动一次性导入 |
 | 地址簿批量在线查询 | `GET /v1/hosts?ids=<id,...>` | 一次最多 200 个 ID、自动去重；未知 ID 列入 `missing`，整批查询不因个别失效条目失败 |
 | 对等记录别名与标签 | `PATCH /v1/identities/{id}` + 管理台 `alias`/`tags` | 运营者维护的展示名称与标签持久化到 SQLite，主机续约不会覆盖；单机与批量查询随记录返回，查看器地址簿在配置 server-key 后可从设备菜单直接编辑 |
-| 用户账号与账号地址簿 | `POST /v1/account/login` 等 + 管理台 `user`/`ab`/`audit` | PBKDF2-SHA256 密码换取 720 h Bearer 令牌（库中只存令牌哈希），可选 TOTP 两步验证与一次性恢复码、设备会话改名/撤销与持久化账号安全审计；每个用户拥有独立的名称/标签地址簿，账号令牌与运营者 server-key 互不通用；查看器侧栏可登录并同步该地址簿，设备菜单可编辑账号标签 |
+| 用户账号与账号地址簿 | `POST /v1/account/login` 等 + 管理台 `user`/`ab`/`audit` | PBKDF2-SHA256 密码换取 30 min 访问令牌与 720 h 刷新令牌（库中只存令牌哈希），刷新即轮换、重放即撤销整个会话；可选 TOTP 两步验证与一次性恢复码、设备会话改名/撤销与持久化账号安全审计；每个用户拥有独立的名称/标签地址簿，账号令牌与运营者 server-key 互不通用；查看器侧栏可登录并自动续期同步该地址簿，设备菜单可编辑账号标签 |
+| 登录地点（GeoIP） | `--geoip-file` + 审计 `location` / 会话 `location` | 可选离线表，每行 `CIDR 地点`，按最长前缀把登录 IP 映射为地点（IPv4、IPv6 与 IPv4-mapped 归一）；写入账号安全审计与设备会话列表，管理台与查看器会话对话框显示；缺省不解析，只记录 IP |
 | 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤 |
 | 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤，同样保留最新 10000 条 |
+| 主机入站审计 | `POST /v1/hosts/{id}/audit` + `GET /v1/audit/connections?host=` + `GET /v1/audit/file-transfers?host=` | 查看器每会话生成 `audit_ref` 随 Hello 传给主机（协议 v25）；主机把会话与入站上传写 JSONL spool，`chast-tunnel host --audit-spool` 用主机 Ed25519 密钥逐条签名上报。服务端按引用合并两侧，会话一条主记录（`source`=viewer/host/both），文件保留主机逐文件行；运营者可按主机过滤 |
 | 地址簿分组 | `/v1/addressbook/groups/{id}` + peer `group_id` | 每个账号可创建、改名、删除分组；条目通过 `group_id` 归组，删除分组只解除归组且每个被移动条目各自推进修订号；查看器“我的设备”按分组分区并可移动条目 |
 | 地址簿搜索与筛选 | 查看器本地 | 名称/ID/标签的大小写不敏感子串搜索；标签芯片多选按并集匹配，筛选同时收窄分组标题与成员计数，可一键清除 |
+| 按分组共享与分组 ACL | `/v1/addressbook/grants`、`/v1/addressbook/shared/{owner}/...` | 授权可选 `group_id`（空为整本）；读取按授权范围过滤条目与分组，读写权限只作用于被授权分组，整本 `control` 才能管理授权；删除分组时同一事务撤销其授权 |
 | 离线清空标签/分组 | 查看器本地意图 + 同步 `PATCH` | 清空全部标签或移出分组会持久化显式意图；离线期间不被服务端旧值回填，恢复后上传空值，成功或服务端已匹配才撤销意图 |
 | Wake-on-LAN | 查看器本地广播 | 设备菜单可为已保存或最近设备填写 MAC，向 `255.255.255.255:9` 发送 102 字节魔法包；MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
+| `PeerDiscovery` 局域网发现 | `chast-tunnel host --lan-discovery` + `chast-tunnel discover` | 主机在 UDP 21129 应答 `CHASTL1` ping，返回 ID/主机名/用户名/平台/版本/MAC；`discover` 向受限广播、各网卡定向广播与回环探测，并按 ID 合并同一主机的多个来源地址。无认证、只暴露展示元数据、不授权连接；主机侧默认开启，可 `--lan-discovery=false` 关闭 |
 | `SoftwareUpdate` | `--software-version`/`--software-url` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；主机代理记录提示，查看器首页显示可忽略的更新横幅，均不自动下载 |
 | `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 交换观察到的公网地址并让双方互发探针 |
 | `FetchLocalAddr` | `local_addrs` + `nat_type` | 主机上报局域网候选与 NAT 分类 |
+| UPnP 端口映射 | `--upnp` + `upnp_port`（keepalive、punch、查询） | 代理向本地 IGD 申请 UDP 端口映射并每 15 min 续租，服务端把映射外部端口随双方候选转发；缺省关闭，只有 IPv4 |
 | `RequestRelay`（uuid 配对） | 按主机分配 UDP 中继端口 | 查看者直接连该端口，主机侧代理回连中继 |
 | 共享中继端口按 UUID 复用 | `--carrier-listen` TCP/WebSocket 共享载体 | 一个端口承载所有主机链路，查看者凭随机令牌选择主机 |
 | 中继按 uuid 配对 TCP 流 | 透明转发 UDP 数据报或载体帧 | 不需要拆 QUIC 流，握手与加密都在端点上 |
@@ -95,7 +100,11 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   私钥由 `--key` 派生，从不上传。首次登记后公钥永久绑定；
 - 用数据套接字向 UDP 会合端口发送 keepalive；服务器回
   `keepalive_challenge`，代理签名后发 `keepalive_auth`，服务器记录其
-  **观察到的公网地址**、`local_addrs` 与 `nat_type`；
+  **观察到的公网地址**、`local_addrs`、`nat_type` 与可选 `upnp_port`；
+- 加 `--upnp` 时，代理在绑定数据套接字后通过 SSDP 找到本地 IGD，向
+  WANIPConnection/WANPPPConnection 申请同一个内部 UDP 端口的映射（租期
+  1800 s，每 15 min 续租），并把映射外部端口随 keepalive/punch 上报；映射
+  失败只记警告，不影响直连/中继回退；
 - 用同一套接字向分配到的中继端口发送 `relay_hello`，经 `relay_challenge` /
   `relay_auth` 认证后，服务器记录主机侧中继地址；注册响应的 `relays` 在本机
   模式下列出全部本地地址、节点模式下只含该节点租约端点，代理接受其中任意
@@ -103,17 +112,18 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
   把主机钉在单一入口；
 - 注册响应包含 `carrier` 时，优先向共享载体建立 `CHASTT-HOST2` 链路；没有
   共享载体则回退到中继端口的 TCP 载体；
-- 收到 `punch_peer` 后向查看者候选地址发探针，打开本侧 NAT；
+- 收到 `punch_peer` 后向查看者候选地址发探针（含查看者上报的 `upnp_port`
+  拼出的外部端点），打开本侧 NAT；
 - 收到的查看者数据报（直连来源、中继来源或载体帧）转发给 `--local` 指定的
   `chast-host`；`chast-host` 的回包发回最后一个远端来源。由于两侧代理都只有
   一个数据套接字，直连切中继时 QUIC 看到的五元组不变。
 
 查看者代理：
 
-- 用 `GET /v1/hosts/{id}` 查询在线状态、主机候选/局域网地址、NAT 类型、中继
-  地址、会合地址、身份绑定、主机名/平台/版本与 `transport`
-  （`direct`/`relay`/`carrier`）；离线主机仍返回持久记录与 `last_seen_ms`，
-  但不返回候选或令牌；
+- 用 `GET /v1/hosts/{id}` 查询在线状态、主机候选/局域网地址、NAT 类型、
+  中继地址、会合地址、身份绑定、主机名/平台/版本、`upnp_port` 与
+  `transport`（`direct`/`relay`/`carrier`）；离线主机仍返回持久记录与
+  `last_seen_ms`，但不返回候选或令牌；
   查询返回的 `relay` 是该租约的主中继地址，续约不变，查看者无需在多个
   地址间自行选择；主机在线时还会得到共享载体地址与 `carrier_token`；
 - `relay_only` 为真时服务器不返回任何直连候选，`nat_type` 固定为
@@ -139,10 +149,10 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | --- | --- | --- | --- |
 | `keepalive` | 主机 → 会合 | `host_id` | 请求保活挑战 |
 | `keepalive_challenge` | 会合 → 主机 | `nonce`, `candidate` | 一次性 nonce 与服务器观察地址 |
-| `keepalive_auth` | 主机 → 会合 | `host_id`, `nonce`, `candidate`, `local_addrs`, `nat_type`, `signature` | 签名应答并上报候选 |
+| `keepalive_auth` | 主机 → 会合 | `host_id`, `nonce`, `candidate`, `local_addrs`, `nat_type`, `upnp_port`, `signature` | 签名应答并上报候选 |
 | `keepalive_ack` | 会合 → 主机 | `ok`, `candidate`, `relay`, `local_addrs`, `nat_type`, `error` | 认证结果与中继地址 |
-| `punch_request` | 查看者 → 会合 | `host_id`, `nonce` | 请求与主机交换候选地址 |
-| `punch_peer` | 会合 → 双方 | `nonce`, `candidate`, `relay`, `public_key`, `binding` | 对方地址与身份绑定 |
+| `punch_request` | 查看者 → 会合 | `host_id`, `nonce`, `upnp_port`（可选） | 请求与主机交换候选地址 |
+| `punch_peer` | 会合 → 双方 | `nonce`, `candidate`, `relay`, `public_key`, `binding`, `upnp_port`（可选） | 对方地址、身份绑定与 UPnP 映射端口 |
 | `punch` | 代理 ↔ 代理 | `nonce` | 打开 NAT 映射的探针，收到即说明路径可用 |
 | `relay_hello` | 主机 → 中继 | `host_id` | 请求中继挑战 |
 | `relay_challenge` | 中继 → 主机 | `nonce` | 一次性 nonce |
@@ -188,38 +198,50 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、`carrier_token` 与可选的 `software` |
+| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、`carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
 | `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、`transport`、`relay_only` 与可选的 `software`；共享载体与令牌只在该主机在线时返回 |
 | `GET` | `/v1/hosts?ids=<id,...>` | 配置了 server-key 时需要 Bearer server-key | 批量查询，逗号分隔、最多 200 个 ID；返回 `hosts` 数组（字段同单机查询）、`missing` 未知 ID 列表与顶层 `software` |
 | `PATCH` | `/v1/identities/{id}` | Bearer server-key | 设置或清除运营者别名/标签；省略字段保持不变，`""`/`[]` 表示清除 |
-| `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code` 或 `recovery_code`） | 返回 `token`、`expires_in_ms` 与 `user`；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码或恢复码返回 401 与 `X-Chast-2FA: invalid`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
-| `POST` | `/v1/account/logout` | Bearer account token | 删除当前令牌，返回 204 |
+| `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code` 或 `recovery_code`） | 返回 `token`、`expires_in_ms`（30 min）、`refresh_token`、`refresh_expires_in_ms`（720 h）与 `user`；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码或恢复码返回 401 与 `X-Chast-2FA: invalid`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
+| `POST` | `/v1/account/refresh` | `refresh_token` | 轮换同一会话的访问/刷新令牌，返回与登录相同的字段；旧访问令牌立即失效；已轮换的刷新令牌再次提交视为泄漏/重放，返回 401 并撤销整个会话；过期或未知令牌返回 401；结果写入 `session_refresh` 审计 |
+| `POST` | `/v1/account/logout` | Bearer account token | 撤销当前会话（访问令牌与刷新令牌），返回 204 |
 | `GET` | `/v1/account` | Bearer account token | 当前用户、两步验证状态与剩余恢复码数 `{"user":{"id","username"},"two_factor":false,"recovery_codes":0}` |
 | `POST` | `/v1/account/password` | Bearer account token | 提交 `current_password` 与 `new_password`；原密码错误为 403、新密码不合规为 400，成功返回 204 并撤销该账号其他设备令牌，当前令牌保留 |
 | `POST` | `/v1/account/2fa/start` | Bearer account token | 生成待确认的 TOTP 密钥，返回 `secret`（base32、无填充）与 `otpauth_uri`；已启用时返回 409 |
 | `POST` | `/v1/account/2fa/enable` | Bearer account token | 提交身份验证器的 6 位 `code` 激活待确认密钥，返回 204；未生成密钥为 400、验证码不匹配为 403 |
 | `POST` | `/v1/account/2fa/disable` | Bearer account token | 提交 `password` 与 `code` 关闭两步验证，返回 204；凭据或验证码错误均为 403，未启用为 400；关闭会同时清除全部恢复码 |
 | `POST` | `/v1/account/2fa/recovery` | Bearer account token | 提交 `password` 与当前 `code`，重新生成 10 个一次性恢复码并返回 `{"codes":[...]}`（仅此一次）；凭据或验证码错误为 403，未启用为 400；旧恢复码全部失效 |
-| `GET` | `/v1/account/sessions` | Bearer account token | 当前账号未过期的登录会话：公开 `id`、`device_id`、`device_name`、创建/到期毫秒时间与 `current` |
+| `GET` | `/v1/account/sessions` | Bearer account token | 当前账号未过期的登录会话：公开 `id`、`device_id`、`device_name`、创建/到期毫秒时间、`current`，以及登录来源 `login_ip`/`location`（未配置 GeoIP 时地点为空） |
 | `POST` | `/v1/account/sessions/revoke-others` | Bearer account token | 保留当前会话令牌并撤销该账号全部其他会话，返回 `{"revoked":N}`；无其他会话时为 0 |
 | `PATCH` | `/v1/account/sessions/{id}` | Bearer account token | 提交 `device_name` 改名本账号的一个会话（去空白/控制字符、最长 128 字符），返回 204；空名为 400，不存在、已过期或属于他人为 404 |
 | `DELETE` | `/v1/account/sessions/{id}` | Bearer account token | 撤销本账号的一个会话，返回 204；不存在或属于他人返回 404；撤销当前会话会使本设备令牌失效 |
 | `GET` | `/v1/addressbook?since=N` | Bearer account token | 返回当前 `revision`、存活条目 `peers`、存活分组 `groups`，以及 `since` 之后的条目变更/墓碑 `changes` 与分组变更 `group_changes`；省略 `since` 时从 0 开始，越界值回落到全量历史 |
 | `PATCH` | `/v1/addressbook/peers/{id}` | Bearer account token | 添加或部分更新名称/标签/`group_id`；省略字段保持不变，`""`/`[]` 清除，标签去重；只带 `group_id` 时要求条目与目标分组都存在；可选正整数 `if_revision` 作为条目级并发令牌，过期/缺失/已删除返回 409，省略时仍为最后写入者优先 |
 | `DELETE` | `/v1/addressbook/peers/{id}` | Bearer account token | 删除条目；不存在返回 404 |
-| `PATCH` | `/v1/addressbook/groups/{id}` | Bearer account token | 创建或改名分组；名称去除首尾空白且最长 64 字符，重复使用同一 ID 会复活已删除分组 |
-| `DELETE` | `/v1/addressbook/groups/{id}` | Bearer account token | 删除分组并写分组墓碑，组内存活条目逐个解除归组；不存在返回 404 |
+| `PATCH` | `/v1/addressbook/groups/{id}` | Bearer account token | 创建或改名分组；名称去除首尾空白且最长 64 字符，重复使用同一 ID 会复活已删除分组；可选正整数 `if_revision` 作为分组级并发令牌，过期/缺失返回 409 |
+| `DELETE` | `/v1/addressbook/groups/{id}` | Bearer account token | 删除分组并写分组墓碑，组内存活条目逐个解除归组，同一事务撤销该分组的共享授权；可选 `?if_revision` 校验，不存在返回 404 |
+| `GET` | `/v1/addressbook/grants` | Bearer account token | 返回授出 `outgoing` 与收到 `incoming` 两组授权；每项含 `username`、`permission` 与可选的 `group_id`（空表示整本） |
+| `POST` | `/v1/addressbook/grants` | Bearer account token | 提交 `username`、`permission` 与可选 `group_id` 授权整本或某个分组；同一范围重复提交幂等并可改权限；未知用户/分组 404、非法分组 ID 400、自共享 400 |
+| `DELETE` | `/v1/addressbook/grants/{username}` | Bearer account token | 不带查询参数撤销该用户全部授权；带 `?group_id=<id>`（可为空串）只撤销该范围；不存在 404 |
+| `GET` | `/v1/addressbook/shared` | Bearer account token | 授权给我的地址簿：`books[].peers`/`groups` 只含授权范围，`scopes` 列出整本与分组权限，`permission` 为最高权限 |
+| `POST` | `/v1/addressbook/shared/{owner}/peers` | Bearer account token | 在属主地址簿新增条目，可选 `group_id`；需要整本或目标分组的读写权限 |
+| `PATCH` | `/v1/addressbook/shared/{owner}/peers/{id}` | Bearer account token | 修改属主条目；需要整本或该条目所属分组的读写权限，可选 `if_revision`，409 时需重新读取 |
+| `DELETE` | `/v1/addressbook/shared/{owner}/peers/{id}` | Bearer account token | 删除属主条目；需要整本或该条目所属分组的读写权限，可带 `?if_revision` |
+| `GET` | `/v1/addressbook/shared/{owner}/grants` | Bearer account token | 查看属主地址簿的授出授权（含 `group_id`）；要求整本 `control` |
+| `POST` | `/v1/addressbook/shared/{owner}/grants` | Bearer account token | 提交 `username`、`permission` 与可选 `group_id`；要求整本 `control`，分组级 `control` 不能管理授权 |
+| `DELETE` | `/v1/addressbook/shared/{owner}/grants/{username}` | Bearer account token | 撤销属主地址簿的授权；不带参数撤销全部范围，带 `?group_id=<id>` 只撤销该范围；要求整本 `control` |
 | `DELETE` | `/v1/hosts/{id}` | Bearer server-key | 主机主动下线并释放中继端口，保留永久身份 |
 | `DELETE` | `/v1/identities/{id}` | Bearer server-key | 管理员重置丢失密钥的主机身份 |
+| `POST` | `/v1/hosts/{id}/audit` | 主机 Ed25519 签名（按 `audit_ref`） | 主机上报一条入站审计：`kind`（`session`/`file`）、`audit_ref`、时间/方向/文件名/大小/结果/说明，以及 `signature`。签名覆盖域分隔的规范消息 `chast-host-audit-v1`；未知主机 404、签名无效 401、时间偏差超过 2 分钟或字段非法 400。会话与查看器记录按引用合并，文件保存为主机逐文件行；返回 201 与规范化后的记录 |
 | `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
-| `GET` | `/v1/audit?limit=N&action=<action>` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤；返回 `events`，每项含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip` 与 `success`；未启用账号存储返回 503 |
+| `GET` | `/v1/audit?limit=N&action=<action>` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤；返回 `events`，每项含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`；未启用账号存储返回 503 |
 | `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail` 与 `direction`；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大或方向非法返回 400 |
 | `GET` | `/v1/account/connections?limit=N` | Bearer account token | 当前账号自己的连接记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50） |
-| `GET` | `/v1/audit/connections?limit=N&username=<name>` | Bearer server-key | 运营者连接审计，可按用户名过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50）；未启用账号存储返回 503 |
+| `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50）；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；未启用账号存储返回 503 |
 | `POST` | `/v1/account/file-transfers` | Bearer account token | 查看器上报一个轮询窗口内结束的文件传输：`peer_id`、`direction`（`upload`/`download`）、可选 `name`/`size`、`files`（默认 1）、`success`、可选 `detail` 与 `occurred_at_ms`；返回 201；空对端、未知方向、负大小或文件数越界返回 400 |
 | `GET` | `/v1/account/file-transfers?limit=N` | Bearer account token | 当前账号自己的文件传输记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50） |
-| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>` | Bearer server-key | 运营者文件传输审计，可按用户名过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50）；未启用账号存储返回 503 |
+| `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50）；主机逐文件行与查看器汇总行并存；未启用账号存储返回 503 |
 | `GET` | `/metrics` | 配置了 server-key 时需要 | Prometheus 文本格式指标 |
 | `GET` | `/healthz` | 无 | 存活检查 |
 
@@ -227,6 +249,14 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 Ed25519 种子），服务端只保存公钥与可选指纹。首次注册把 ID 永久绑定到该公钥；
 续约必须由同一私钥签名，指纹也只在首次登记时可采用，防止他人用同一 ID
 换绑或劫持中继端口。`DELETE /v1/identities/{id}` 是丢失密钥时的人工出口。
+
+主机改 ID 时在注册体里同时提交 `old_id` 与 `migrate_signature`：签名用旧 ID
+上已绑定的私钥对 `old_id`、新 `id` 与同一 `timestamp` 做域分离签名
+（`identity.MigrateMessage`，域 `chast-id-migrate-v1`）。服务端验签后把持久
+记录原地移到新 ID，保留 `created_at`、别名、标签与指纹，删除旧记录并释放旧
+租约与中继槽位；成功响应带 `migrated_from`。旧 ID 属于其他公钥返回 403，
+新 ID 已被其他公钥占用按密钥不匹配拒绝，旧 ID 不存在视为幂等成功（迁移重试
+或已迁移后重启）。没有 `old_id` 的普通注册行为不变。
 
 示例：
 
@@ -247,6 +277,7 @@ GET /v1/hosts/devbox
 → 200 {"id":"devbox","online":true,"candidate":"198.51.100.7:51234",
        "candidates":["198.51.100.7:51234","192.168.1.7:51234"],
        "local_addrs":["192.168.1.7:51234"],"nat_type":"asymmetric",
+       "upnp_port":50000,
        "hostname":"Studio PC","platform":"windows/amd64","version":"1.2.3",
        "alias":"Studio PC","tags":["office","prod"],
        "relay":"203.0.113.5:41007","punch":"203.0.113.5:8444",
@@ -268,7 +299,16 @@ PATCH /v1/identities/devbox
 POST /v1/account/login
 {"username":"alice","password":"<password>","device_id":"office-pc",
  "device_name":"Office PC"}
-→ 200 {"token":"<32 random bytes base64url>","expires_in_ms":2592000000,
+→ 200 {"token":"<32 random bytes base64url>","expires_in_ms":1800000,
+       "refresh_token":"<32 random bytes base64url>",
+       "refresh_expires_in_ms":2592000000,
+       "user":{"id":"<user id>","username":"alice"}}
+
+POST /v1/account/refresh
+{"refresh_token":"<refresh token>"}
+→ 200 {"token":"<new access token>","expires_in_ms":1800000,
+       "refresh_token":"<new refresh token>",
+       "refresh_expires_in_ms":2592000000,
        "user":{"id":"<user id>","username":"alice"}}
 
 GET /v1/account
@@ -325,7 +365,8 @@ Authorization: Bearer <account token>
 条目在此之后被改名、改标签、移动分组或删除（也包括从未以该修订号存在），服务端
 返回 409 `{"error":"address book peer changed elsewhere"}` 且不写入任何字段；
 `if_revision` 必须为正整数，`0` 或负数返回 400。省略该字段（旧客户端、查看器
-同步上传）保持最后写入者优先；分组改名/删除也不使用该令牌。共享地址簿的
+同步上传）保持最后写入者优先。分组改名同样接受 `if_revision`（冲突 409），
+删除分组用 `?if_revision=N` 查询参数；共享地址簿的
 `PATCH`/`DELETE /v1/addressbook/shared/{owner}/peers/{id}` 接受同一令牌
 （删除用 `?if_revision=N` 查询参数），冲突同样返回 409。
 
@@ -384,6 +425,17 @@ MAC），目标端口 9。MAC 接受 `AA:BB:CC:DD:EE:FF`、`AA-BB-...` 与无分
 成功后当前会话保留、该账号其他令牌全部撤销，其他设备必须用新密码重新登录。
 管理台重置密码（`user passwd`）仍是忘记密码时的人工出口。
 
+令牌分为短期访问令牌（30 min）与会话刷新令牌（720 h）。刷新令牌保存在独立
+的 `refresh_tokens` 表，携带公开 `session_id`；每次
+`POST /v1/account/refresh` 轮换两者，旧访问令牌立刻失效，旧刷新令牌标记
+`rotated_at` 与 `replaced_by`。已轮换的刷新令牌再次出现时按泄漏处理：撤销整个
+会话（访问与刷新行），返回 401 并写 `session_refresh` 审计，
+`detail=replay; session revoked`。登出、撤销单个会话、撤销其他会话、自助改密
+与管理台重置密码都会同时删除刷新行；只有会话级动作（如改密保留当前会话）
+保留当前会话的刷新令牌。旧库升级时 `access_expires_at=0`，这些存量长令牌按
+原 `expires_at` 继续有效直到自然过期，新登录立即改用短访问令牌。查看器在访问
+令牌到期前自动刷新并持久化新令牌，刷新被拒时回到未登录状态。
+
 每次登录尝试（成功、凭据错误、两步验证缺失或错误、锁定拒绝、内部错误）都会
 写入 SQLite 的 `audit_events`，记录时间、尝试的用户名、客户端 IP（遵循
 `--proxy-header`）、结果与说明；成功登录额外记录设备名和是否使用了两步验证。
@@ -401,8 +453,12 @@ server-key）或管理台 `audit [count]` 按时间倒序读取；HTTP 版本支
 的 `connection_events`。上报是尽力而为的，网络或服务端错误不会影响会话本身；
 同一账号可读取自己的记录，运营者用 `GET /v1/audit/connections`（Bearer
 server-key）或管理台 `connections [count]` 查看全部账号并可按用户名过滤。
-表内同样保留最新 10000 条，超出后按 ID 删除最旧记录。当前只覆盖查看器发起的
-远程会话，主机侧入站会话尚未记录。
+表内同样保留最新 10000 条，超出后按 ID 删除最旧记录。除查看器上报外，主机
+也会上报自己看到的入站会话：`chast-host` 把事件写进本地 spool，隧道代理用
+主机密钥签名后 `POST /v1/hosts/{id}/audit`（`kind=session`，`internal/api/host_audit.go`），
+服务端校验签名与时间窗后用查看器在 Hello 里带来的 `audit_ref` 合并到同一行。
+同一机制也承载主机侧的文件完成事件（`kind=file`），因此一次传输在两侧都有
+记录。
 
 文件传输审计使用独立的 `file_events` 表：查看器在两个轮询之间发现上传或下载
 完成/失败计数推进时，向 `POST /v1/account/file-transfers` 上报方向、最后文件名
@@ -410,8 +466,8 @@ server-key）或管理台 `connections [count]` 查看全部账号并可按用�
 一次上报可覆盖同一窗口内的多个文件，此时 `name`/`size` 只描述最后一个，`files`
 给出数量。账号可用 `GET /v1/account/file-transfers` 读取自己的记录，运营者用
 `GET /v1/audit/file-transfers` 或管理台 `transfers [count]` 查看全部并可按用户名
-过滤；保留最新 10000 条。只看查看器一侧的完成事件，主机端不单独上报，也不含
-传输中的实时进度。
+过滤；保留最新 10000 条。查看器一侧按轮询窗口聚合，主机一侧由签名审计上报逐
+文件记录，两侧按 `audit_ref` 合并；不含传输中的实时进度。
 
 账号可启用 TOTP 两步验证：`POST /v1/account/2fa/start` 生成 20 字节随机密钥
 （base32、无填充），返回一次性的 `secret` 与
@@ -449,7 +505,9 @@ URI 供手动录入身份验证器（不内置二维码扫描），并可在同�
 “已刷新为服务器版本”；同步摘要单独显示冲突数。设备菜单里的标签编辑与
 “移动到分组”同样携带当前修订号并走同一刷新路径。共享地址簿对话框的编辑与
 删除也携带条目修订号；409 后自动重新读取共享地址簿、用服务器条目覆盖显示并
-提示“已刷新为服务器版本”。清空全部标签或把设备移出分组会在 `Device` 上记录
+提示“已刷新为服务器版本”。共享对话框按授权范围控制操作：整本或条目所属
+分组可写时才显示编辑/删除菜单，新增条目只能选择可写分组；授出/改权限/撤销
+也可选择整本或具体分组，列表显示每条授权的范围。清空全部标签或把设备移出分组会在 `Device` 上记录
 `tagsCleared`/`groupCleared` 并随 `devices.json` 持久化：离线合并不会用服务端
 旧值回填，下一次同步把空列表或空分组作为显式更新上传，只有上传成功或服务端
 本已为空时才撤销标记。本地新增、改名、保存最近连接、移动分组和删除都会尽力
@@ -486,6 +544,12 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   （全锥/受限/端口受限）有效。对称 NAT 下不同目的地的映射端口不同，直连会
   失败，查看者代理在 `--direct-timeout` 后自动切中继；这是有意保留的回退，
   不伪装成"总能直连"。
+- `--upnp` 是这种回退之外的可选补救：代理向本地 IGD 申请固定外部端口后，
+  对方可以用“观察到的公网 IP + 映射外部端口”直接发探针，不必依赖对称 NAT
+  的逐目的地映射。该端口由代理自报、经签名 keepalive 传给服务器，属于
+  **提示而非可信地址**；服务器仍以 UDP 观察值为准，映射失败或路由器不响应
+  SSDP 时行为与未启用时一致。目前只处理 IPv4 与 WANIPConnection/
+  WANPPPConnection，不覆盖 IPv6 防火墙规则。
 - 中继端口按主机分配，服务器重启后重新分配；主机代理会在续约时更新地址。
   `--state` 是 SQLite 对等数据库（默认 `chast-server-state.db`），重启后恢复
   ID 绑定与最近一次元数据（租约与中继端口不持久化，主机重新注册时再分配）。
@@ -514,8 +578,10 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   TCP/WS 载体各自验证一次性挑战签名，nonce 30 s 过期且单次有效。服务端只
   保存公钥，`--key` 派生出的私钥不离开主机。
 - **身份绑定**：服务器用持久 Ed25519 身份签署 `binding`；部署时应把
-  `/v1/server` 的 `public_key` 交给查看者固定（代理的 `--server-pubkey`），
-  这样中间人无法伪造“某 ID 属于某公钥”。
+  `/v1/server` 的 `public_key` 交给查看者固定。Flutter 查看器现在会按服务器
+  URL 自动固定（TOFU，首次连接展示指纹，变化需显式确认并写入本地审计），再把
+  固定值经 `--server-pubkey` 传给代理复核；这样中间人无法伪造“某 ID 属于某
+  公钥”。
 - **服务端密钥**：`--server-key` 保护注册、查询、统计、指标和下线。查询不再是
   公开接口：没有密钥就无法枚举主机，也拿不到候选、共享载体与令牌。公钥换绑与
   指纹变更会被拒绝，管理员只能用 `DELETE /v1/identities/{id}` 显式重置。公网
@@ -576,6 +642,25 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   全部端点。多网卡或 NAT 多映射时，每个地址都必须路由到同一实例，且中继
   端口能按该地址绑定（也可用解析到本机的 DNS 名）；`rs`/`tg` 用于运行时
   查看、替换与预览，`aur` 仍控制是否强制中继。
+- `--punch-listen [::]:8444` 用一个双栈 socket 同时服务 IPv4 与 IPv6；
+  `--advertise-v6` 指定下发的 IPv6 会合地址，留空时按注册连接的本地地址
+  推导（只有连接本身走 IPv6 才会下发）。注册、单机/批量查询与 `/v1/server`
+  增加 `punch_v6`，查询还增加 `candidate_v6` 与 `local_addrs_v6`；主机代理
+  同时向两个会合地址发送 keepalive，各自维护映射，`keepalive` 挑战按地址族
+  分开编号，避免两条映射互相覆盖。
+- `--relay-listen-v6`（服务端与 `chast-relay` 同名）为每个中继端口在同一
+  端口号上再开一组 IPv6 UDP/TCP 监听，例如 `--relay-listen 0.0.0.0
+  --relay-listen-v6 ::` 得到双栈中继；只给 `--relay-listen ::` 是 IPv6-only，
+  不会接受 IPv4。同一端口的两个族共用一份主机租约与统计，但查看者槽位、
+  限速会话和 TCP 载体连接按族独立，因此 v4/v6 查看者可同时使用同一端口。
+  主机代理向 `relays` 里的每个端点发 `relay_hello`，两族监听都能接受该主机
+  的 `relay_challenge/auth`；查看者按自己 socket 的地址族选择端点。
+  `relays` 由 `--advertise`/`--relay-servers` 加 `--advertise-v6` 组成，主
+  入口仍是轮换选中的 IPv4 地址，因此共享 TCP 载体仍只在主入口上提供服务。
+  纯 IPv6 主机需要 `--listen` 与转发目标 `--local` 同族（或用双栈 socket）：
+  代理的单个 UDP socket 同时承担中继与本地转发，绑定 `[::1]` 时无法写往
+  `127.0.0.1`，日志会记录 `IPv4 keepalive write failed` 并在 v6 路径正常
+  工作。
 - `--software-version` 与 `--software-url` 必须同时设置，对应 hbbs 的
   `SoftwareUpdate`：服务端在注册、单机/批量查询与 `/v1/server` 中附带
   `software{version,url}`；主机与查看者代理发现自身版本不同时记录
@@ -592,6 +677,14 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `--login-max-failures 0` 关闭；启用时窗口与锁定时长至少 1s。计数持久化在
   `state.db` 的 `login_locks` 表，重启后仍生效，同库实例共享；无持久状态时
   退回进程内存。来源地址与 HTTP 限流一致，可受 `--proxy-header` 影响。
+- `--geoip-file`（默认空）读取离线 GeoIP 表，把登录来源映射为“登录地点”。
+  文件为 UTF-8 文本，每行 `CIDR 地点`（如 `203.0.113.0/24 Tokyo, JP`），
+  `#` 开头为注释；支持 IPv4 与 IPv6，按最长前缀匹配，`::ffff:` 映射地址归一
+  为 IPv4。命中结果写入账号安全审计（`location`）与登录会话
+  （`login_ip`/`location`），管理台审计与查看器设备会话对话框都会显示。
+  留空、文件未命中或未配置时地点为空，行为与之前相同。服务端不做在线查询，
+  也不内置地点数据：识别效果取决于运维提供的表；来源地址同样受
+  `--proxy-header` 影响，启用前应确认代理会覆盖该头。
 - `GET /metrics` 输出 Prometheus 文本格式，配置 `--server-key` 后需要 Bearer
   认证。采集器示例：
 
@@ -847,14 +940,15 @@ chast-quic connect --host 127.0.0.1 --port 24434 --token <token>
 ```
 
 `--mode relay` 强制中继，`--mode direct` 只走打洞直连，`--mode carrier` 强制
-共享载体，用于分别验证各条路径。服务器加 `--relay-only` 后不再下发直连候选，
+共享载体，用于分别验证各条路径。`--upnp` 让主机或查看者尝试在本地网关上
+映射自己的 UDP 端口并随查询/打洞交换（缺省关闭；没有 IGD 时只记警告）。服务器加 `--relay-only` 后不再下发直连候选，
 效果类似 RustDesk 的 `ALWAYS_USE_RELAY`；`--state ""` 与 `--identity ""` 用于
 一次性测试；`--host-ttl` 和 `--offline-after` 控制租约与在线判定；
 `--carrier-listen ""` 关闭共享载体。`--relay-servers` 在本机回环可省略
 （默认取 `--advertise`）；验证地址轮换时加 `--relay-servers
 127.0.0.1,127.0.0.2`，再用管理通道 `rs`/`tg` 查看分配。IP 变更审计默认
 启用（180 s 窗口、360 s 保留，上限 65536 个 ID）。
-`chast-tunnel host --help` / `viewer --help` 列出全部参数。
+`chast-tunnel host --help` / `viewer --help` / `discover --help` 列出全部参数。
 
 ## 查看者集成（Flutter）
 
@@ -876,6 +970,60 @@ stdout 是面向嵌入方的 JSON Lines 事件流（诊断仍在 stderr）：
 交给载体桥，否则回退到中继端口的 TCP 载体或直连的 `host:(P+1)`。
 证书指纹 pin 使用逻辑身份 `server:<url>/<id>`，不是代理的 loopback 端口。
 
+## 局域网发现（M11 P2-2）
+
+RustDesk 在受控端启动监听、由查看器广播 `PeerDiscovery` 得到同网段主机列表
+（`src/lan.rs`）。我们采用同样的“主机应答、查看器广播”模型，但格式独立：
+
+- 端口 UDP `21129`（`lan.DefaultPort`）；RustDesk 用 `21119`
+  （`RENDEZVOUS_PORT + 3`），两边报文格式不兼容，因此不复用其端口。
+- 报文是 ASCII magic `CHASTL1\n` 加一行 JSON，`type` 为 `ping` 或 `pong`；
+  单包上限 2048 字节，超长或字段非法直接丢弃。ping 只带 `type`，pong 额外
+  带 `id`/`hostname`/`username`/`platform`/`version`/`mac`。
+- 主机侧随 `chast-tunnel host` 启动，默认开启；`--lan-discovery=false` 关闭，
+  `--lan-port` 改端口。应答端只回答合法 ID 的 ping，忽略自己的 ID；对每个
+  来源做 5 个突发、每秒补 1 个的令牌桶限速，避免被放大利用。
+- 查看器侧用独立子命令探测，不需要已配置连接服务：
+
+```sh
+chast-tunnel discover                       # 默认 1.5 s，表格输出
+chast-tunnel discover --json --timeout 3s   # JSON 数组，便于 GUI 集成
+chast-tunnel discover --port 21130 --target 192.168.8.20:21129
+chast-tunnel discover --id devbox           # 过滤自己
+```
+
+查看器首页“我的设备”右侧的“扫描”按钮就是这条命令的 GUI 入口
+（`app/lib/lan_discovery.dart`）：列出应答主机，勾选后把 ID/主机名/MAC
+写入地址簿。保存要求已配置连接服务——pong 里的地址是发现端口，不是主机
+的 QUIC 端口，不能当作直连地址保存。
+
+探测目标包括 `255.255.255.255`、每张在线非回环 IPv4 网卡的定向广播和
+`127.0.0.1`，发送两次（间隔 400 ms）。同一主机的多份 pong（例如真实网卡与
+回环同时收到）按 ID 合并为一条，`addresses` 保留全部来源，`address` 优先选
+非回环地址。JSON 形如：
+
+```json
+[{"id":"devbox","address":"192.168.8.20:21129","addresses":["192.168.8.20:21129","127.0.0.1:21129"],"hostname":"DESKTOP-XXXX","username":"user","platform":"windows/amd64","version":"dev","mac":"18:31:bf:b2:cc:8a"}]
+```
+
+安全边界：发现是**未认证**的，和 RustDesk 一样只用于“找到同网段主机”，
+返回内容只有展示元数据，不含密钥、密码、令牌或中继分配；发现结果不会授权
+连接，连接仍要经过扫描/密码/审批与证书指纹。UDP 21129 只在需要局域网发现时
+需要放行：托盘“允许防火墙”为 `chast-tunnel.exe` 增加该端口的按程序 UDP
+入站规则，禁用隧道服务或卸载时删除。主机托盘会自动启用发现（与 RustDesk
+受控端默认监听一致），不需要额外配置。
+
+验证（2026-10-26，单机真实进程）：`chast-server` + `chast-tunnel host`
+（`id=lanhost`）+ `chast-tunnel discover` 在真实网卡 `192.168.8.20` 的广播上
+得到一条合并结果，主机名/用户名/平台/版本/MAC 与主机一致；`--lan-discovery=false`
+时 `[]`；`--id lanhost` 自过滤为 `[]`；21129 被占用时主机日志
+`LAN discovery unavailable` 但仍正常上线。Flutter 侧 `LanDiscovery.scan()`
+用同一 `chast-tunnel.exe discover --json` 跑真实进程，解析出同一条记录并
+验证了自过滤；`internal/lan` 单测覆盖应答、坏包、限速与合并；`flutter analyze`
+与 276 项 Flutter 测试通过。边界：单机广播会被本机网卡和回环各收一份（已按
+ID 合并），跨子网、双机与混合 IPv6-only 局域网仍需实机复核；GUI 的扫描
+对话框由 widget 测试覆盖，尚未做人工点击验收。
+
 ## 主机集成（托盘）
 
 M4.2 起 `chast-host.exe`（Win32 托盘）自己托管主机代理：HostServer 成功监听后
@@ -891,6 +1039,7 @@ server_url=https://rendezvous.example.com
 server_key=...
 tunnel_id=devbox
 tunnel_key=...
+tunnel_old_id=
 tunnel_listen=0.0.0.0:14434
 carrier=1
 ```
@@ -899,10 +1048,14 @@ carrier=1
 - `tunnel_id`/`tunnel_key` 首次启动按机器名自动生成（密钥 16 字符，可修改）；
   `tunnel_key` 派生 Ed25519 私钥用于注册与挑战签名，从不上传，服务端只保存
   公钥和 SHA-256 派生后的身份绑定。
+- `tunnel_old_id` 只用于改 ID 后的服务端迁移：托盘/服务在 `tunnel_id` 变化时
+  自动填入旧值，代理以 `--old-id` 提交并回显 `migrated_from`，确认后自动清空；
+  正常情况下为空。
 - `tunnel_listen` 必须与主机 QUIC 的 `port` 不同（两者都是 UDP 监听），默认
   `0.0.0.0:14434`。`carrier=1`（默认）让 HostServer 在 `port+1` 上监听 TCP/WS
   载体；托盘“允许防火墙”为主机端口与隧道端口各建一条按程序限定的 UDP 入站
-  规则，并加一条载体 TCP 规则；禁用隧道服务时会删除这些规则。
+  规则，并加一条载体 TCP 规则和一条 `chast-tunnel.exe` 的 21129/UDP 局域网
+  发现规则；禁用隧道服务时会删除这些规则。
 
 主机代理的 stdout 同样只输出 JSON Lines 机器事件（字段随事件可选）：
 
@@ -911,6 +1064,9 @@ carrier=1
 {"event":"relay","listen":"127.0.0.1:14434","host":"devbox","punch":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
 {"event":"viewer","listen":"127.0.0.1:14434","host":"devbox","path":"direct","remote":"198.51.100.7:51234","relay":"203.0.113.5:41007"}
 ```
+
+迁移成功后 `ready`（以及同一进程内的后续事件）带 `"migrated_from":"<旧 id>"`
+字段，托盘与服务据此清空 `tunnel_old_id`。
 
 `ready` 在注册与中继绑定完成后输出；`relay` 在重新注册后中继端点变化时输出；
 `viewer` 在查看者首次出现或路径变化时输出。HostServer 看到的对端永远是代理的
@@ -1280,7 +1436,8 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   `livetest created id=805d290cfabf6a79e671bada87f5629d`；`user list`
   只列出用户名、ID 与创建时间，不回显密码；省略密码的 `user add` 生成一次
   性随机密码，输出中的密码可直接登录。
-- `POST /v1/account/login` 错误密码返回 401，正确密码返回 720 h 令牌；
+- `POST /v1/account/login` 错误密码返回 401；当时正确密码返回 720 h 令牌，
+  2026-10-26 起改为 30 min 访问令牌加 720 h 刷新令牌（见下文）。
   用运营者 `server-key` 访问 `GET /v1/account` 得到 401，证明两类凭据不通用。
   用户名 `LiveTest` 与 `livetest` 登录到同一账号。
 - 地址簿：新账号 `{"peers":[]}`；`PATCH /v1/addressbook/peers/devbox`
@@ -1349,6 +1506,22 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   设备菜单“移动到分组”、分组分区与折叠、未分组分区；分组名只在内存中缓存，
   因此每次启动后的首次同步读取全量地址簿。`flutter analyze`、全量 186 项
   Flutter 测试与 Windows Release 构建通过。
+- 分组共享与 ACL（2026-10-26，服务端/API 单测与查看器组件测试）：授权主键扩为
+  `(owner, grantee, group_id)`，旧库在 `Open` 时整表重建迁移，老行归为整本授权；
+  `GET /v1/addressbook/shared` 按范围过滤 `peers`/`groups` 并返回 `scopes`，
+  同一分组取整本与分组授权中的最高权限。共享改/删/新增按条目所属分组校验，
+  分组级授权不能管理授权，删除分组在同一事务撤销该分组授权。`DELETE
+  /v1/addressbook/grants/{user}` 不带查询参数仍撤销整对共享，带 `?group_id=`
+  （可为空串）只撤销单一范围。查看器共享对话框与“管理授权”子对话框可选择
+  范围并显示授权范围；只有可写分组的条目显示编辑/删除菜单，新增条目只能落到
+  可写分组。验证：`go test ./internal/account/ ./internal/api/` 通过；
+  `flutter analyze --no-pub` 无告警，`flutter test` 264 项全通过。单机回环用
+  `dart run tool/account_sync_smoke.dart <url> smoke-owner <pass> share
+  smoke-grantee <pass> smoke-control <pass>` 跑真实 HTTP 服务，44 项检查全部
+  通过，其中 11 项覆盖分组范围：只授权一组时其他分组与条目不可见、组内只读
+  不能改、带写只能改本组、跨组新增 403、组级 `control` 不能管理授权、
+  `DELETE ?group_id=` 只撤销单一范围、删组即撤权。服务端单测另覆盖旧库迁移、
+  整本+分组叠加、重复撤销与越权错误码。
 - 地址簿搜索与标签筛选（2026-10-25，本机组件测试）：首页“我的设备”新增
   搜索框与标签芯片，大小写不敏感匹配名称、设备 ID、账号标签、主机别名与
   主机自报标签；芯片取卡片实际展示的标签，多选按并集匹配并与搜索同时生效。
@@ -1365,21 +1538,22 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   新增 2 项、`home_page_test` 新增 2 项，覆盖离线清空、重试不上传、恢复后
   上传空值与标记撤销。`flutter analyze`、全量 186 项 Flutter 测试与 Windows
   Release 构建通过。
-- 已知限制：共享地址簿没有按地址簿分组或按分组的授权；共享条目没有保存密码
+- 已知限制：共享条目没有保存密码
   或导入导出；共享只共享条目，连接目标仍需目标主机自己的密码与审批。地址簿
-  分组不支持嵌套或拖拽排序，也不参与共享（被授权者看到的是属主的平铺条目）；
+  已支持按分组共享，但分组不支持嵌套或拖拽排序；
   分组名称只在查看器内存中缓存，重启后的首次同步必须全量读取，离线时只能
   保留旧分组 ID 且无法新建/改名/删除分组；账号标签仍只是逐设备标签，没有按
   组授权；搜索与标签筛选只作用于“我的设备”，不覆盖最近连接、共享地址簿或
   分组标题，只做大小写不敏感子串匹配，没有拼音/模糊、按分组/在线状态筛选，
-  筛选状态不跨重启保存。地址簿条目级乐观并发控制只覆盖查看器对自有地址簿的
-  `PATCH`：省略 `if_revision` 的旧客户端、共享新增以及分组改名/删除
-  仍是最后写入者优先；冲突后查看器放弃本地未上传的旧值并采用服务器版本，
+  筛选状态不跨重启保存。地址簿条目级乐观并发控制覆盖查看器对自有地址簿的
+  `PATCH` 与共享编辑/删除，分组级覆盖改名/删除；省略 `if_revision` 的旧客户端、
+  共享新增仍是最后写入者优先；冲突后查看器放弃本地未上传的旧值并采用服务器版本，
   不提供逐字段合并或自动重试；墓碑长期保留，尚未按时间或已同步水位清理；查看器只在已保存
   条目上应用删除，最近连接不受墓碑影响；删除已有按账号隔离的本地待办并在每次
   同步前重试（成功/404 清理，401 保留）；清空标签/分组的意图会持久化并在恢复
-  后上传，但跨设备同时编辑的意图在 409 后会被服务器版本替换；令牌明文保存在 `account.json` 且是长期
-  Bearer，没有刷新/轮换机制；密码可在查看器自助修改，但忘记密码仍只能由回环
+  后上传，但跨设备同时编辑的意图在 409 后会被服务器版本替换；访问令牌与刷新令牌
+  都以明文保存在 `account.json`，刷新令牌轮换但文件本身未加密；登录地点默认只记录
+  IP，配置 `--geoip-file` 时按离线表补充，地点质量与更新由运维负责；密码可在查看器自助修改，但忘记密码仍只能由回环
   管理台重置，没有邮件找回；账号级 TOTP 两步验证与一次性恢复码已支持，但没有
   短信/邮件备用通道或 WebAuthn，查看器只显示密钥文本、不提供二维码扫描；登录失败
   锁定已持久化到 `state.db`（重启保留、同库实例共享，空闲 30 分钟清理），
@@ -1387,17 +1561,134 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   `user unlock <name>`
   手动清除某个用户名的全部锁定；账号安全审计持久化登录、登出、
   改密、两步验证、会话撤销与改名；查看器上报的连接与文件传输审计已持久化
-  （仅查看器发起的事件、按轮询窗口聚合文件、保留最新 10000 条、按数量而非
-  时间清理、不能导出），但没有主机侧入站会话记录，也没有传输中的实时进度；
+  （查看器按轮询窗口聚合文件、保留最新 10000 条、按数量而非
+  时间清理、不能导出；主机侧入站会话与逐文件完成事件已由签名审计上报补齐），
+  但没有传输中的实时进度；
   地址簿只保存
   peer ID、名称、标签与分组 ID，不保存连接参数；按组授权、分组导入/导出与批量
   移动尚未实现。
 
-环境边界：单机回环只有一张网卡，`symmetric` NAT 分类、局域网候选与真实 IPv6
-跨网行为需要双机复核；共享载体尚未经过真实 HTTP 代理/CDN；证书轮换、ACME
+2026-10-26，查看器固定服务器公钥在单机回环上验证（`--server-key testkey`）：
+
+- Flutter 查看器新增独立于主机证书 `TrustStore` 的服务器身份记录
+  （`%APPDATA%\chast\server_identities.json`）与追加式审计
+  （`server_identity_audit.jsonl`）。地址簿在线轮询比对查询响应的
+  `server_public_key`；显式连接先读 `/v1/server`，首次展示完整指纹做 TOFU，
+  公钥变化必须在对话框中确认才轮换，取消即不启动代理。
+- 匹配固定：主机 `--server-pubkey <A>` 注册成功，查看器代理带同一固定值解析
+  到候选并完成打洞，事件流为 `{"event":"path","path":"direct",
+  "remote":"127.0.0.1:18454"}`。
+- 错误固定：查看器在查询阶段退出，`lookup came from an unexpected server
+  identity`，没有进入打洞。
+- 服务器身份轮换：服务端改用另一份 `-identity` 后 `/v1/server` 返回不同
+  `public_key`；固定旧身份的查看器查询被同一错误拒绝，固定旧身份的主机刷新
+  注册被拒（`registration refresh was not trusted ... server identity does
+  not match the pinned --server-pubkey`）。
+- 自动化：`flutter analyze` 无问题，`flutter test` 260 项通过；新增指纹解析/
+  格式化、TOFU→轮换→清除审计、查询门禁、会话页确认对话框与不改写查询结果的
+  用例。
+
+2026-10-26，令牌生命周期（P1）在单机回环上验证：
+
+- 登录与刷新返回同一结构：30 min 访问令牌（`expires_in_ms=1800000`）+
+  720 h 刷新令牌（`refresh_expires_in_ms=2592000000`）。`user_tokens` 保留
+  会话行与长会话过期时间，新增 `access_expires_at` 区分访问有效期；
+  `refresh_tokens` 按令牌哈希保存 `session_id`/`rotated_at`/`replaced_by`，
+  服务端可区分“访问过期但会话有效”和“会话结束”。
+- `POST /v1/account/refresh` 用刷新令牌换一对新令牌，同时轮换访问令牌与刷新
+  令牌；被轮换掉的刷新令牌再次使用视为泄漏（`ErrRefreshReused`），整个会话
+  立即撤销，新访问令牌也失效。登出、撤销会话、改密、管理员重置密码都会同步
+  删除刷新令牌；旧库 `access_expires_at=0` 的行仍按原长有效期工作。
+- 查看器：`AccountSession` 保存刷新令牌与刷新过期时间，访问令牌剩余不足 2 分钟
+  时自动刷新（每分钟检查一次），刷新失败且 401 才清空会话，网络错误保留会话
+  稍后重试；旧 `account.json` 没有刷新字段仍可加载。
+- 验收（`build/token-accept` 隔离 `state.db`，服务端 127.0.0.1:18643，
+  `app/tool/account_sync_smoke.dart`）：39 项检查全过，末尾为
+  `ok refresh rotates both tokens`、`ok the renewed token reads the account`、
+  `ok the old access token is rejected after rotation`、
+  `ok a replayed refresh token is rejected`、
+  `ok a replay revokes the rotated session`，随后
+  `account sync smoke checks passed`；管理台 `audit` 可见
+  `session_refresh ok detail=rotated`、
+  `session_refresh failed detail=replay; session revoked` 与
+  `session_refresh failed detail=invalid token`。
+- 自动化：`go vet ./...`、`go test ./... -count=1`、三程序构建通过；
+  `flutter analyze --no-pub` 无告警，`flutter test` 270 项全通过。
+
+2026-10-26，UPnP 端口补充（P1）实现并验证：
+
+- 字段：`keepalive_auth`、`punch_request`、`punch_peer` 与 `GET /v1/hosts/{id}`
+  增加可选 `upnp_port`（缺省或 0 表示未映射）。服务端只校验 0..65535，不把它
+  当作可信地址：查询的 `candidate` 仍来自 UDP 观察，映射端口单独返回，供对方
+  拼出“观察 IP + 映射外部端口”的额外探针目标；离线主机与 `relay_only` 下
+  不返回该字段。
+- 客户端：`chast-tunnel host|viewer --upnp` 通过 SSDP（239.255.255.250:1900）
+  发现本地 IGD，读取设备描述后优先选择 WANIPConnection:1，其次 :2、
+  WANPPPConnection:1/:2；SOAP `AddPortMapping` 使用 UDP、内外同端口、租期
+  1800 s，每 15 min `Renew` 续租，代理退出时 `DeletePortMapping`（714
+  “无此条目”视为成功）。外部端口冲突（718）时顺序尝试内部端口后的 19 个
+  端口，全部失败才放弃并回退到原有直连/中继路径。
+- 打洞：主机的 `punch_peer` 会向查看者上报的映射端口发探针，查看者也会把
+  主机的映射端口加入候选，因此对称 NAT 一侧在网关允许入站时仍可能直连；
+  该端口只经签名 keepalive 传回服务器，网络上的其他来源无法伪造后让主机
+  向任意地址打洞。
+- 单测：`internal/upnp` 用 httptest 假 IGD 覆盖描述遍历与 WAN 服务优先级、
+  相对控制 URL、LOCALIP 推导、LOCATION 解析、添加/续租/删除/查询外部 IP、
+  718 换端口、非法端口与 714 删除容错；`internal/agent` 覆盖候选拼装（仅
+  IPv4，端口越界或格式错误返回空）；`internal/rendezvous` 覆盖映射端口从
+  注册到 punch 的双向转发与 `-1`/`70000` 拒绝；`internal/api` 覆盖查询返回
+  `upnp_port`。
+- 边界：本机没有 UPnP 网关，真实发现返回 `no UPnP Internet Gateway Device
+  answered`，因此真实路由器上的映射、续租与对称 NAT 直连尚未实测，现有证据
+  是假 IGD 的协议级单测与回环上的字段转发；只处理 IPv4；映射在路由器管理页
+  可见内部地址与端口。
+
+2026-10-26，登录地点（GeoIP）实现并验证：
+
+- 设计：不引入第三方库或在线服务，新增 `--geoip-file` 指向离线表。每行
+  `CIDR 地点`，`#` 注释、UTF-8（容忍 BOM），按前缀长度倒序做最长前缀匹配；
+  IPv4、IPv6 与 `::ffff:` 映射地址共用同一套规则。未配置或文件为空时
+  `Locator` 为 nil，所有地点为空，服务端行为与之前完全一致。
+- 落库：`user_tokens` 增加 `login_ip`/`login_location`，`audit_events` 增加
+  `location`；迁移只加列（旧行缺省 `''`）。登录成功时 `SetSessionOrigin`
+  写入来源地址与地点，`recordAudit` 同时写 `location`。`GET
+  /v1/account/sessions` 返回 `login_ip`/`location`，`/v1/audit` 的每条事件
+  也带 `location`；管理台文本为 `ip=… location=…`，空地点显示 `-`。
+- 查看器：`AccountDeviceSession` 解析 `login_ip`/`location`，设备会话对话框
+  显示 `登录地点 <地点> · <IP>`；只有其中一项时只显示该项，两项都为空时
+  不显示该行（兼容未配置 GeoIP 的旧服务端）。
+- 单测：`internal/geoip` 覆盖最长前缀（`/0`、`/24`、`/32`、IPv6）、BOM、
+  IPv4-mapped、坏行与缺文件；`internal/account` 覆盖来源地址/地点落库与
+  审计；`internal/api` 用临时表（`127.0.0.0/8 → Local lab`）验证登录后
+  会话列表与审计同时带地点。`go vet ./...` 与受影响包测试通过；Flutter
+  `analyze` 无告警、270 项测试通过，设备会话对话框新增地点展示断言。
+- 真实进程验收（`build/geoip-accept` 隔离 `state.db`，表含
+  `127.0.0.0/8 Local lab`）：管理台 `user add` 建号，登录返回 30 min 访问
+  令牌；`GET /v1/account/sessions` 给出 `login_ip=127.0.0.1`、
+  `location=Local lab`，管理台 `audit` 同一条登录记录带
+  `location=Local lab`。
+- 边界：地点质量取决于运维提供的表（可从 GeoLite2/IP2Region 等导出，本项目
+  不分发数据、不做在线查询）；地点只用于展示与审计，不参与拦截或计费；
+  来源地址仍受 `--proxy-header` 影响。
+
+环境边界：单机回环只有一张网卡，`symmetric` NAT 分类、局域网候选与跨网行为需要
+双机复核。IPv6 会合、打洞与中继已在单机双栈回环验证（服务端
+`--punch-listen [::1] --relay-listen 127.0.0.1 --relay-listen-v6 ::1`、
+主机与查看者均绑定 `[::1]`；查看者选中 `relay [::1]:41200`，经 IPv6 中继完成
+H.264 1920×1080 的 QUIC 会话，842 帧、0 CRC/解码错误）。实际部署形态也验证过：
+主机绑定双栈 `[::]:15434`、经 IPv4 注册与保活、`--local 127.0.0.1:14433`，
+`[::1]` 查看者仍选中 v6 中继并完成同样 842 帧、RTT 1.9 ms 的会话。真实跨网
+IPv6、双机中继与 IPv6 中继的 NAT 映射仍需双机部署复核；共享 TCP 载体仍只在
+主入口（IPv4）提供。共享载体尚未
+经过真实 HTTP 代理/CDN；证书轮换、ACME
 与 mTLS 不在本阶段范围。`--relay-servers` 的多地址轮换只在回环别名上验证，
 多网卡与 DNS 轮换仍需真实部署复核。M10.6 的独立节点、故障回退与恢复已在单机
 回环验证，但真实跨机时延、节点带外故障与多节点负载分配仍需真实部署复核。
 M10.7 的令牌桶、名单与降级只在回环的低速率下验证，真实链路上的整形效果、
 名单一致性与多节点独立策略仍需部署复核。中继/载体统计中的字节数包含两侧
 QUIC 握手与重传，与编码器输出的裸帧大小不可直接比较。
+
+构建环境：Go 1.26.0/1.26.1 在 Windows 上有 Green Tea GC 栈破坏导致的随机
+`fatal error: fault`（golang/go#77975，已确认与本项目代码无关），本阶段的
+验收二进制用 `GOEXPERIMENT=nogreenteagc go build` 构建；升级到修复版本后可
+去掉该变量。

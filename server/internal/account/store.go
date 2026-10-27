@@ -28,9 +28,13 @@ import (
 )
 
 const (
-	// TokenTTL matches a long-lived viewer session; revocation is explicit
-	// through logout or a password change.
+	// TokenTTL is the lifetime of a viewer session: the refresh token may be
+	// rotated for this long after the last use, and revocation is explicit
+	// through logout, a password change or a used refresh token replay.
 	TokenTTL = 720 * time.Hour
+	// AccessTokenTTL keeps the bearer token short so a copied token ages out
+	// quickly; viewers renew it with the refresh token without a password.
+	AccessTokenTTL = 30 * time.Minute
 
 	maxName           = 128
 	maxTag            = 32
@@ -50,6 +54,7 @@ const (
 var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrInvalidToken       = errors.New("invalid account token")
+	ErrRefreshReused      = errors.New("refresh token was already used")
 	ErrInvalidDeviceName  = errors.New("device name is required")
 	ErrUserExists         = errors.New("user already exists")
 	ErrUnknownUser        = errors.New("unknown user")
@@ -61,6 +66,7 @@ var (
 	ErrUnknownGroup       = errors.New("unknown address book group")
 	ErrUnknownPeer        = errors.New("unknown address book peer")
 	ErrPeerConflict       = errors.New("address book peer changed elsewhere")
+	ErrGroupConflict      = errors.New("address book group changed elsewhere")
 	ErrSelfShare          = errors.New("cannot share an address book with yourself")
 	ErrUnknownShare       = errors.New("address book is not shared")
 	ErrInvalidPermission  = errors.New("permission must be read, write or control")
@@ -99,6 +105,10 @@ type Session struct {
 	CreatedAt  time.Time `json:"created_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Current    bool      `json:"current"`
+	// LoginIP and Location describe where the session signed in. Location is
+	// empty without a GeoIP table or outside its coverage.
+	LoginIP  string `json:"login_ip,omitempty"`
+	Location string `json:"location,omitempty"`
 }
 
 type Peer struct {
@@ -138,31 +148,44 @@ type Snapshot struct {
 }
 
 // Grant names a user who may access the owner's address book at Permission.
+// GroupID scopes the grant to one group; an empty value means the whole book.
 type Grant struct {
 	Username   string    `json:"username"`
 	Permission string    `json:"permission"`
+	GroupID    string    `json:"group_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// SharedScope is one grant the signed-in grantee holds on another account's
+// book. A whole-book grant appears with an empty GroupID.
+type SharedScope struct {
+	GroupID    string `json:"group_id,omitempty"`
+	Permission string `json:"permission"`
 }
 
 // SharedBook is another user's address book as seen by a grantee. Revision
 // lets the viewer show how fresh the snapshot is, but shared books are fetched
-// whole rather than through the owner's incremental cursor.
+// whole rather than through the owner's incremental cursor. Peers and Groups
+// only contain what the grants expose.
 type SharedBook struct {
-	Owner      string `json:"owner"`
-	Permission string `json:"permission"`
-	Revision   int64  `json:"revision"`
-	Peers      []Peer `json:"peers"`
+	Owner      string        `json:"owner"`
+	Permission string        `json:"permission"`
+	Revision   int64         `json:"revision"`
+	Peers      []Peer        `json:"peers"`
+	Groups     []Group       `json:"groups,omitempty"`
+	Scopes     []SharedScope `json:"scopes,omitempty"`
 }
 
 // Store keeps accounts in the same SQLite file as the peer registry. A single
 // connection serialises writes and the WAL journal lets registry traffic keep
 // reading while a login or address-book write is in flight.
 type Store struct {
-	path     string
-	db       *sql.DB
-	mu       sync.Mutex
-	now      func() time.Time
-	tokenTTL time.Duration
+	path      string
+	db        *sql.DB
+	mu        sync.Mutex
+	now       func() time.Time
+	tokenTTL  time.Duration
+	accessTTL time.Duration
 }
 
 func Open(path string) (*Store, error) {
@@ -210,9 +233,22 @@ func Open(path string) (*Store, error) {
 			expires_at  INTEGER NOT NULL,
 			session_id  TEXT NOT NULL DEFAULT '',
 			device_id   TEXT NOT NULL DEFAULT '',
-			device_name TEXT NOT NULL DEFAULT ''
+			device_name TEXT NOT NULL DEFAULT '',
+			login_ip    TEXT NOT NULL DEFAULT '',
+			login_location TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS user_tokens_expiry ON user_tokens(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS refresh_tokens (
+			token_hash  TEXT PRIMARY KEY,
+			user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			session_id  TEXT NOT NULL,
+			created_at  INTEGER NOT NULL,
+			expires_at  INTEGER NOT NULL,
+			rotated_at  INTEGER NOT NULL DEFAULT 0,
+			replaced_by TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS refresh_tokens_expiry ON refresh_tokens(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS refresh_tokens_session ON refresh_tokens(session_id)`,
 		`CREATE TABLE IF NOT EXISTS recovery_codes (
 			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			code_hash  TEXT NOT NULL,
@@ -233,9 +269,10 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS address_book_grants (
 			owner_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			grantee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			group_id        TEXT NOT NULL DEFAULT '',
 			permission      TEXT NOT NULL DEFAULT 'read',
 			created_at      INTEGER NOT NULL,
-			PRIMARY KEY (owner_user_id, grantee_user_id),
+			PRIMARY KEY (owner_user_id, grantee_user_id, group_id),
 			CHECK (owner_user_id <> grantee_user_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS address_book_grants_grantee
@@ -256,6 +293,7 @@ func Open(path string) (*Store, error) {
 			action     TEXT NOT NULL,
 			detail     TEXT NOT NULL DEFAULT '',
 			client_ip  TEXT NOT NULL DEFAULT '',
+			location   TEXT NOT NULL DEFAULT '',
 			success    INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS audit_events_created ON audit_events(created_at)`,
@@ -269,10 +307,15 @@ func Open(path string) (*Store, error) {
 			started_at INTEGER NOT NULL,
 			ended_at   INTEGER NOT NULL,
 			success    INTEGER NOT NULL DEFAULT 1,
-			detail     TEXT NOT NULL DEFAULT ''
+			detail     TEXT NOT NULL DEFAULT '',
+			host_id    TEXT NOT NULL DEFAULT '',
+			audit_ref  TEXT NOT NULL DEFAULT '',
+			source     TEXT NOT NULL DEFAULT 'viewer'
 		)`,
 		`CREATE INDEX IF NOT EXISTS connection_events_started
 			ON connection_events(started_at)`,
+		`CREATE INDEX IF NOT EXISTS connection_events_audit
+			ON connection_events(audit_ref) WHERE audit_ref <> ''`,
 		`CREATE TABLE IF NOT EXISTS file_events (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id     TEXT NOT NULL,
@@ -285,7 +328,10 @@ func Open(path string) (*Store, error) {
 			client_ip   TEXT NOT NULL DEFAULT '',
 			occurred_at INTEGER NOT NULL,
 			success     INTEGER NOT NULL DEFAULT 1,
-			detail      TEXT NOT NULL DEFAULT ''
+			detail      TEXT NOT NULL DEFAULT '',
+			host_id     TEXT NOT NULL DEFAULT '',
+			audit_ref   TEXT NOT NULL DEFAULT '',
+			source      TEXT NOT NULL DEFAULT 'viewer'
 		)`,
 		`CREATE INDEX IF NOT EXISTS file_events_occurred
 			ON file_events(occurred_at)`,
@@ -303,6 +349,10 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("account store %s: create schema: %w", path, err)
 		}
 	}
+	if err := migrateGrantScopes(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("account store %s: migrate address book grants: %w", path, err)
+	}
 	for _, column := range []struct {
 		table string
 		name  string
@@ -319,6 +369,16 @@ func Open(path string) (*Store, error) {
 		{"user_tokens", "session_id", "session_id TEXT NOT NULL DEFAULT ''"},
 		{"user_tokens", "device_id", "device_id TEXT NOT NULL DEFAULT ''"},
 		{"user_tokens", "device_name", "device_name TEXT NOT NULL DEFAULT ''"},
+		{"user_tokens", "login_ip", "login_ip TEXT NOT NULL DEFAULT ''"},
+		{"user_tokens", "login_location", "login_location TEXT NOT NULL DEFAULT ''"},
+		{"user_tokens", "access_expires_at", "access_expires_at INTEGER NOT NULL DEFAULT 0"},
+		{"audit_events", "location", "location TEXT NOT NULL DEFAULT ''"},
+		{"connection_events", "host_id", "host_id TEXT NOT NULL DEFAULT ''"},
+		{"connection_events", "audit_ref", "audit_ref TEXT NOT NULL DEFAULT ''"},
+		{"connection_events", "source", "source TEXT NOT NULL DEFAULT 'viewer'"},
+		{"file_events", "host_id", "host_id TEXT NOT NULL DEFAULT ''"},
+		{"file_events", "audit_ref", "audit_ref TEXT NOT NULL DEFAULT ''"},
+		{"file_events", "source", "source TEXT NOT NULL DEFAULT 'viewer'"},
 	} {
 		if err := ensureColumn(db, column.table, column.name, column.ddl); err != nil {
 			db.Close()
@@ -328,6 +388,13 @@ func Open(path string) (*Store, error) {
 	if err := backfillSessionIDs(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("account store %s: migrate session ids: %w", path, err)
+	}
+	if _, err := db.Exec(
+		`CREATE INDEX IF NOT EXISTS connection_events_audit
+		 ON connection_events(audit_ref) WHERE audit_ref <> ''`,
+	); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("account store %s: index audit refs: %w", path, err)
 	}
 	if _, err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS user_tokens_session
@@ -341,10 +408,11 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("account store %s: migrate address book revisions: %w", path, err)
 	}
 	return &Store{
-		path:     path,
-		db:       db,
-		now:      time.Now,
-		tokenTTL: TokenTTL,
+		path:      path,
+		db:        db,
+		now:       time.Now,
+		tokenTTL:  TokenTTL,
+		accessTTL: AccessTokenTTL,
 	}, nil
 }
 
@@ -410,6 +478,76 @@ func columnExists(db *sql.DB, table, column string) (bool, error) {
 		}
 	}
 	return false, rows.Err()
+}
+
+// migrateGrantScopes rebuilds address_book_grants so one owner/grantee pair
+// can hold separate grants per group. The original primary key allowed only
+// one row per pair, so adding a column is not enough. An empty group id keeps
+// the old whole-book meaning.
+func migrateGrantScopes(db *sql.DB) error {
+	found, err := columnExists(db, "address_book_grants", "group_id")
+	if err != nil || found {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// A concurrent instance may have completed the rebuild between the check
+	// above and this transaction; in that case there is nothing left to do.
+	rows, err := tx.Query(`PRAGMA table_info(address_book_grants)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			kind    string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "group_id" {
+			rows.Close()
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, statement := range []string{
+		`DROP INDEX IF EXISTS address_book_grants_grantee`,
+		`CREATE TABLE address_book_grants_scoped (
+			owner_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			grantee_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			group_id        TEXT NOT NULL DEFAULT '',
+			permission      TEXT NOT NULL DEFAULT 'read',
+			created_at      INTEGER NOT NULL,
+			PRIMARY KEY (owner_user_id, grantee_user_id, group_id),
+			CHECK (owner_user_id <> grantee_user_id)
+		)`,
+		`INSERT INTO address_book_grants_scoped
+			(owner_user_id, grantee_user_id, group_id, permission, created_at)
+		 SELECT owner_user_id, grantee_user_id, '', permission, created_at
+		 FROM address_book_grants`,
+		`DROP TABLE address_book_grants`,
+		`ALTER TABLE address_book_grants_scoped RENAME TO address_book_grants`,
+		`CREATE INDEX IF NOT EXISTS address_book_grants_grantee
+			ON address_book_grants(grantee_user_id)`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // backfillRevisions assigns every pre-migration row a revision. Without it a
@@ -563,6 +701,12 @@ func (s *Store) SetPassword(username, password string) error {
 	); err != nil {
 		return fmt.Errorf("account store %s: revoke tokens: %w", s.path, err)
 	}
+	if _, err := tx.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = (SELECT id FROM users WHERE username = ?)`,
+		username,
+	); err != nil {
+		return fmt.Errorf("account store %s: revoke refresh tokens: %w", s.path, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit password update: %w", s.path, err)
 	}
@@ -616,6 +760,13 @@ func (s *Store) ChangePassword(userID, currentToken, currentPassword, newPasswor
 	}
 	if err != nil {
 		return fmt.Errorf("account store %s: revoke other sessions: %w", s.path, err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = ?
+		 AND session_id NOT IN (SELECT session_id FROM user_tokens WHERE user_id = ?)`,
+		userID, userID,
+	); err != nil {
+		return fmt.Errorf("account store %s: revoke other refresh tokens: %w", s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("account store %s: commit password change: %w", s.path, err)
@@ -712,6 +863,15 @@ func (s *Store) LoginWithDeviceCode(username, password, deviceID, deviceName, co
 // logins cannot spend the same backup code. Wrong codes report
 // ErrInvalidTwoFactorCode and are counted like a wrong TOTP code.
 func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName, code, recoveryCode string) (User, string, time.Time, error) {
+	user, token, expires, _, _, err := s.LoginWithRefresh(
+		username, password, deviceID, deviceName, code, recoveryCode)
+	return user, token, expires, err
+}
+
+// LoginWithRefresh issues a short-lived access token plus a refresh token for
+// the same session. RefreshSession rotates the pair without a password; the
+// session lives until the refresh token expires or is revoked.
+func (s *Store) LoginWithRefresh(username, password, deviceID, deviceName, code, recoveryCode string) (User, string, time.Time, string, time.Time, error) {
 	username = strings.TrimSpace(username)
 	code = strings.TrimSpace(code)
 	recoveryCode = normalizeRecoveryCode(recoveryCode)
@@ -733,17 +893,17 @@ func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName
 	s.mu.Unlock()
 	if errors.Is(err, sql.ErrNoRows) {
 		verifyDummy(password)
-		return User{}, "", time.Time{}, ErrInvalidCredentials
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidCredentials
 	}
 	if err != nil {
-		return User{}, "", time.Time{}, fmt.Errorf("account store %s: login lookup: %w", s.path, err)
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: login lookup: %w", s.path, err)
 	}
 	ok, err := verifyPassword(hash, password)
 	if err != nil || !ok {
-		return User{}, "", time.Time{}, ErrInvalidCredentials
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidCredentials
 	}
 	if totpEnabled && code == "" && recoveryCode == "" {
-		return User{}, "", time.Time{}, ErrTwoFactorRequired
+		return User{}, "", time.Time{}, "", time.Time{}, ErrTwoFactorRequired
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -753,7 +913,7 @@ func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName
 		if code != "" {
 			step, matched := totpMatch(totpSecret, code, now)
 			if !matched || step <= totpLastStep {
-				return User{}, "", time.Time{}, ErrInvalidTwoFactorCode
+				return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
 			}
 			totpLastStep = step
 		} else {
@@ -762,21 +922,29 @@ func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName
 	}
 	token, err := newToken()
 	if err != nil {
-		return User{}, "", time.Time{}, err
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	}
+	refresh, err := newToken()
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
 	}
 	sessionID, err := newRandomHex(sessionIDBytes)
 	if err != nil {
-		return User{}, "", time.Time{}, err
+		return User{}, "", time.Time{}, "", time.Time{}, err
 	}
 	deviceID = normalizeText(deviceID, maxDeviceID)
 	deviceName = normalizeText(deviceName, maxDeviceName)
-	expires := now.Add(s.tokenTTL)
+	accessExpires := now.Add(s.accessTTL)
+	sessionExpires := now.Add(s.tokenTTL)
 	if _, err := s.db.Exec(`DELETE FROM user_tokens WHERE expires_at <= ?`, unixMillis(now)); err != nil {
-		return User{}, "", time.Time{}, fmt.Errorf("account store %s: prune tokens: %w", s.path, err)
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: prune tokens: %w", s.path, err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM refresh_tokens WHERE expires_at <= ?`, unixMillis(now)); err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: prune refresh tokens: %w", s.path, err)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return User{}, "", time.Time{}, fmt.Errorf("account store %s: begin login: %w", s.path, err)
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: begin login: %w", s.path, err)
 	}
 	defer tx.Rollback()
 	if useRecovery {
@@ -786,12 +954,12 @@ func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName
 			unixMillis(now), user.ID, recoveryCodeHash(recoveryCode),
 		)
 		if err != nil {
-			return User{}, "", time.Time{}, fmt.Errorf("account store %s: consume recovery code: %w", s.path, err)
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: consume recovery code: %w", s.path, err)
 		}
 		if rows, err := res.RowsAffected(); err != nil {
-			return User{}, "", time.Time{}, fmt.Errorf("account store %s: consume recovery code: %w", s.path, err)
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: consume recovery code: %w", s.path, err)
 		} else if rows == 0 {
-			return User{}, "", time.Time{}, ErrInvalidTwoFactorCode
+			return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
 		}
 	}
 	if totpEnabled && !useRecovery {
@@ -800,28 +968,37 @@ func (s *Store) LoginWithDeviceRecovery(username, password, deviceID, deviceName
 			totpLastStep, user.ID, totpLastStep,
 		)
 		if err != nil {
-			return User{}, "", time.Time{}, fmt.Errorf("account store %s: record two-factor step: %w", s.path, err)
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: record two-factor step: %w", s.path, err)
 		}
 		if rows, err := res.RowsAffected(); err != nil {
-			return User{}, "", time.Time{}, fmt.Errorf("account store %s: record two-factor step: %w", s.path, err)
+			return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: record two-factor step: %w", s.path, err)
 		} else if rows == 0 {
-			return User{}, "", time.Time{}, ErrInvalidTwoFactorCode
+			return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidTwoFactorCode
 		}
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO user_tokens
-			(token_hash, user_id, created_at, expires_at, session_id, device_id, device_name)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		tokenHash(token), user.ID, unixMillis(now), unixMillis(expires),
-		sessionID, deviceID, deviceName,
+			(token_hash, user_id, created_at, expires_at, access_expires_at,
+			 session_id, device_id, device_name)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		tokenHash(token), user.ID, unixMillis(now), unixMillis(sessionExpires),
+		unixMillis(accessExpires), sessionID, deviceID, deviceName,
 	); err != nil {
-		return User{}, "", time.Time{}, fmt.Errorf("account store %s: save token: %w", s.path, err)
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: save token: %w", s.path, err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO refresh_tokens
+			(token_hash, user_id, session_id, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		tokenHash(refresh), user.ID, sessionID, unixMillis(now), unixMillis(sessionExpires),
+	); err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: save refresh token: %w", s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return User{}, "", time.Time{}, fmt.Errorf("account store %s: commit login: %w", s.path, err)
+		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: commit login: %w", s.path, err)
 	}
 	user.CreatedAt = timeFromMillis(created)
-	return user, token, expires, nil
+	return user, token, accessExpires, refresh, sessionExpires, nil
 }
 
 // TwoFactorEnabled reports whether logins for userID require a TOTP code.
@@ -1079,8 +1256,12 @@ func (s *Store) Authenticate(token string) (User, error) {
 		created int64
 		expires int64
 	)
+	// access_expires_at is zero on rows issued before refresh tokens existed;
+	// those legacy tokens keep their original long expiry until they age out.
 	err := s.db.QueryRow(
-		`SELECT u.id, u.username, u.created_at, t.expires_at
+		`SELECT u.id, u.username, u.created_at,
+		        CASE WHEN t.access_expires_at > 0 THEN t.access_expires_at
+		             ELSE t.expires_at END
 		 FROM user_tokens t JOIN users u ON u.id = t.user_id
 		 WHERE t.token_hash = ?`,
 		tokenHash(token),
@@ -1092,13 +1273,151 @@ func (s *Store) Authenticate(token string) (User, error) {
 		return User{}, fmt.Errorf("account store %s: authenticate: %w", s.path, err)
 	}
 	if s.now().UTC().UnixMilli() >= expires {
-		_, _ = s.db.Exec(`DELETE FROM user_tokens WHERE token_hash = ?`, tokenHash(token))
+		// An expired access token must not take the session row with it:
+		// RefreshSession rotates that row, so only drop it once the session
+		// itself has ended.
+		_, _ = s.db.Exec(
+			`DELETE FROM user_tokens WHERE token_hash = ? AND expires_at <= ?`,
+			tokenHash(token), unixMillis(s.now().UTC()),
+		)
 		return User{}, ErrInvalidToken
 	}
 	user.CreatedAt = timeFromMillis(created)
 	return user, nil
 }
 
+// RefreshSession rotates a refresh token and returns a fresh access/refresh
+// pair for the same session. Presenting a token that was already rotated
+// revokes the whole session: either the viewer lost the rotation response or
+// somebody else replayed a copied token, and neither should keep access.
+func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, string, time.Time, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now().UTC()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: begin refresh: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	var (
+		userID    string
+		sessionID string
+		expires   int64
+		rotated   int64
+	)
+	err = tx.QueryRow(
+		`SELECT user_id, session_id, expires_at, rotated_at
+		 FROM refresh_tokens WHERE token_hash = ?`,
+		tokenHash(refreshToken),
+	).Scan(&userID, &sessionID, &expires, &rotated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
+	}
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: refresh lookup: %w", s.path, err)
+	}
+	if rotated != 0 {
+		if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{},
+				fmt.Errorf("account store %s: commit refresh replay: %w", s.path, err)
+		}
+		return User{}, "", time.Time{}, "", time.Time{}, ErrRefreshReused
+	}
+	if expires <= unixMillis(now) {
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
+	}
+	var (
+		user    User
+		created int64
+	)
+	err = tx.QueryRow(`SELECT username, created_at FROM users WHERE id = ?`, userID).
+		Scan(&user.Username, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
+	}
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: refresh user lookup: %w", s.path, err)
+	}
+	token, err := newToken()
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	}
+	refresh, err := newToken()
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	}
+	accessExpires := now.Add(s.accessTTL)
+	sessionExpires := now.Add(s.tokenTTL)
+	res, err := tx.Exec(
+		`UPDATE user_tokens
+		 SET token_hash = ?, created_at = ?, expires_at = ?, access_expires_at = ?
+		 WHERE user_id = ? AND session_id = ?`,
+		tokenHash(token), unixMillis(now), unixMillis(sessionExpires),
+		unixMillis(accessExpires), userID, sessionID,
+	)
+	if err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: rotate access token: %w", s.path, err)
+	}
+	if rows, err := res.RowsAffected(); err != nil {
+		return User{}, "", time.Time{}, "", time.Time{}, err
+	} else if rows == 0 {
+		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
+	}
+	if _, err := tx.Exec(
+		`UPDATE refresh_tokens SET rotated_at = ?, replaced_by = ? WHERE token_hash = ?`,
+		unixMillis(now), tokenHash(refresh), tokenHash(refreshToken),
+	); err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: retire refresh token: %w", s.path, err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO refresh_tokens
+			(token_hash, user_id, session_id, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		tokenHash(refresh), userID, sessionID, unixMillis(now), unixMillis(sessionExpires),
+	); err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: save refresh token: %w", s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, "", time.Time{}, "", time.Time{},
+			fmt.Errorf("account store %s: commit refresh: %w", s.path, err)
+	}
+	user.ID = userID
+	user.CreatedAt = timeFromMillis(created)
+	return user, token, accessExpires, refresh, sessionExpires, nil
+}
+
+// revokeSessionLocked removes both the access and refresh rows of one login.
+func revokeSessionLocked(tx *sql.Tx, userID, sessionID string) error {
+	if _, err := tx.Exec(
+		`DELETE FROM user_tokens WHERE user_id = ? AND session_id = ?`,
+		userID, sessionID,
+	); err != nil {
+		return fmt.Errorf("account store: revoke session tokens: %w", err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = ? AND session_id = ?`,
+		userID, sessionID,
+	); err != nil {
+		return fmt.Errorf("account store: revoke session refresh tokens: %w", err)
+	}
+	return nil
+}
+
+// Logout drops the session that owns this access token, including its refresh
+// token, so a copied refresh token cannot outlive an explicit sign-out.
 func (s *Store) Logout(token string) error {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -1106,8 +1425,27 @@ func (s *Store) Logout(token string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`DELETE FROM user_tokens WHERE token_hash = ?`, tokenHash(token)); err != nil {
-		return fmt.Errorf("account store %s: logout: %w", s.path, err)
+	var userID, sessionID string
+	err := s.db.QueryRow(
+		`SELECT user_id, session_id FROM user_tokens WHERE token_hash = ?`,
+		tokenHash(token),
+	).Scan(&userID, &sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("account store %s: logout lookup: %w", s.path, err)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("account store %s: begin logout: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("account store %s: commit logout: %w", s.path, err)
 	}
 	return nil
 }
@@ -1122,8 +1460,12 @@ func (s *Store) Sessions(userID, currentToken string) ([]Session, error) {
 	if _, err := s.db.Exec(`DELETE FROM user_tokens WHERE expires_at <= ?`, unixMillis(now)); err != nil {
 		return nil, fmt.Errorf("account store %s: prune sessions: %w", s.path, err)
 	}
+	if _, err := s.db.Exec(`DELETE FROM refresh_tokens WHERE expires_at <= ?`, unixMillis(now)); err != nil {
+		return nil, fmt.Errorf("account store %s: prune refresh tokens: %w", s.path, err)
+	}
 	rows, err := s.db.Query(
-		`SELECT session_id, device_id, device_name, created_at, expires_at, token_hash
+		`SELECT session_id, device_id, device_name, created_at, expires_at, token_hash,
+		        login_ip, login_location
 		 FROM user_tokens WHERE user_id = ?
 		 ORDER BY created_at DESC, session_id`,
 		userID,
@@ -1145,7 +1487,7 @@ func (s *Store) Sessions(userID, currentToken string) ([]Session, error) {
 			tokenHash string
 		)
 		if err := rows.Scan(&session.ID, &session.DeviceID, &session.DeviceName,
-			&created, &expires, &tokenHash); err != nil {
+			&created, &expires, &tokenHash, &session.LoginIP, &session.Location); err != nil {
 			return nil, err
 		}
 		session.CreatedAt = timeFromMillis(created)
@@ -1154,6 +1496,25 @@ func (s *Store) Sessions(userID, currentToken string) ([]Session, error) {
 		out = append(out, session)
 	}
 	return out, rows.Err()
+}
+
+// SetSessionOrigin records where a login token was issued. It runs after the
+// token row exists so refresh rotation keeps the original location instead of
+// rewriting it from the refreshing device.
+func (s *Store) SetSessionOrigin(token, clientIP, location string) error {
+	hash := tokenHash(strings.TrimSpace(token))
+	if hash == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		`UPDATE user_tokens SET login_ip = ?, login_location = ? WHERE token_hash = ?`,
+		strings.TrimSpace(clientIP), strings.TrimSpace(location), hash,
+	); err != nil {
+		return fmt.Errorf("account store %s: record session origin: %w", s.path, err)
+	}
+	return nil
 }
 
 // RevokeOtherSessions deletes every login of the user except the caller's
@@ -1166,7 +1527,19 @@ func (s *Store) RevokeOtherSessions(userID, currentToken string) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("account store %s: begin revoke other sessions: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = ?
+		 AND session_id IN (SELECT session_id FROM user_tokens WHERE user_id = ? AND token_hash <> ?)`,
+		userID, userID, tokenHash(currentToken),
+	); err != nil {
+		return 0, fmt.Errorf("account store %s: revoke other refresh tokens: %w", s.path, err)
+	}
+	res, err := tx.Exec(
 		`DELETE FROM user_tokens WHERE user_id = ? AND token_hash <> ?`,
 		userID, tokenHash(currentToken),
 	)
@@ -1176,6 +1549,9 @@ func (s *Store) RevokeOtherSessions(userID, currentToken string) (int, error) {
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("account store %s: revoke other sessions: %w", s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("account store %s: commit revoke other sessions: %w", s.path, err)
 	}
 	return int(affected), nil
 }
@@ -1218,7 +1594,12 @@ func (s *Store) RevokeSession(userID, sessionID string) (bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("account store %s: begin revoke session: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(
 		`DELETE FROM user_tokens WHERE user_id = ? AND session_id = ?`,
 		userID, sessionID,
 	)
@@ -1228,6 +1609,15 @@ func (s *Store) RevokeSession(userID, sessionID string) (bool, error) {
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = ? AND session_id = ?`,
+		userID, sessionID,
+	); err != nil {
+		return false, fmt.Errorf("account store %s: revoke session refresh token: %w", s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("account store %s: commit revoke session: %w", s.path, err)
 	}
 	return affected > 0, nil
 }
@@ -1595,6 +1985,14 @@ func (s *Store) SetPeerGroupAt(userID, peerID, groupID string, ifRevision int64)
 // UpsertGroup creates or renames one of the user's groups. Reusing a
 // tombstoned id revives it with a new revision.
 func (s *Store) UpsertGroup(userID, groupID, name string) (Group, error) {
+	return s.UpsertGroupAt(userID, groupID, name, 0)
+}
+
+// UpsertGroupAt is UpsertGroup with an optional group revision token. A
+// positive ifRevision must match the live group; a missing or tombstoned
+// group, or one written since the client read it, reports ErrGroupConflict.
+// Zero keeps last-writer-wins for older clients.
+func (s *Store) UpsertGroupAt(userID, groupID, name string, ifRevision int64) (Group, error) {
 	if !registry.ValidID(groupID) {
 		return Group{}, ErrInvalidGroupID
 	}
@@ -1609,6 +2007,24 @@ func (s *Store) UpsertGroup(userID, groupID, name string) (Group, error) {
 		return Group{}, fmt.Errorf("account store %s: begin address book group write: %w", s.path, err)
 	}
 	defer tx.Rollback()
+	if ifRevision > 0 {
+		var (
+			live    int64
+			deleted int
+		)
+		err := tx.QueryRow(
+			`SELECT revision, deleted FROM address_book_groups
+			 WHERE user_id = ? AND group_id = ?`,
+			userID, groupID,
+		).Scan(&live, &deleted)
+		if errors.Is(err, sql.ErrNoRows) ||
+			(err == nil && (deleted != 0 || live != ifRevision)) {
+			return Group{}, ErrGroupConflict
+		}
+		if err != nil {
+			return Group{}, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
+		}
+	}
 	revision, err := nextRevision(tx, userID)
 	if err != nil {
 		return Group{}, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
@@ -1634,6 +2050,13 @@ func (s *Store) UpsertGroup(userID, groupID, name string) (Group, error) {
 // moved peer gets its own revision so incremental clients see the new group.
 // false means the group was already absent.
 func (s *Store) DeleteGroup(userID, groupID string) (bool, error) {
+	return s.DeleteGroupAt(userID, groupID, 0)
+}
+
+// DeleteGroupAt is DeleteGroup with an optional group revision token. A
+// positive ifRevision that no longer matches the live group reports
+// ErrGroupConflict before anything is written.
+func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, error) {
 	if !registry.ValidID(groupID) {
 		return false, ErrInvalidGroupID
 	}
@@ -1644,16 +2067,22 @@ func (s *Store) DeleteGroup(userID, groupID string) (bool, error) {
 		return false, fmt.Errorf("account store %s: begin address book group delete: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	var deleted int
+	var (
+		deleted int
+		live    int64
+	)
 	err = tx.QueryRow(
-		`SELECT deleted FROM address_book_groups WHERE user_id = ? AND group_id = ?`,
+		`SELECT deleted, revision FROM address_book_groups WHERE user_id = ? AND group_id = ?`,
 		userID, groupID,
-	).Scan(&deleted)
+	).Scan(&deleted, &live)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted != 0) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
+	}
+	if ifRevision > 0 && live != ifRevision {
+		return false, ErrGroupConflict
 	}
 	revision, err := nextRevision(tx, userID)
 	if err != nil {
@@ -1701,6 +2130,14 @@ func (s *Store) DeleteGroup(userID, groupID string) (bool, error) {
 		); err != nil {
 			return false, fmt.Errorf("account store %s: ungroup address book entry: %w", s.path, err)
 		}
+	}
+	// A scoped grant for a tombstoned group would otherwise linger and cover
+	// nothing; revoke it with the group it was created for.
+	if _, err := tx.Exec(
+		`DELETE FROM address_book_grants WHERE owner_user_id = ? AND group_id = ?`,
+		userID, groupID,
+	); err != nil {
+		return false, fmt.Errorf("account store %s: revoke group grants: %w", s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("account store %s: commit address book group delete: %w", s.path, err)
@@ -1787,16 +2224,27 @@ func (s *Store) deletePeerLocked(userID, peerID string, ifRevision int64) (bool,
 // requested permission. An empty permission means read. Sharing the same user
 // again updates the permission and keeps the original creation time.
 func (s *Store) ShareBook(ownerID, granteeUsername, permission string) (Grant, error) {
+	return s.ShareBookScoped(ownerID, granteeUsername, permission, "")
+}
+
+// ShareBookScoped shares the whole book when groupID is empty, otherwise only
+// that group. Grants accumulate, so a user can hold whole-book read plus write
+// on a single group.
+func (s *Store) ShareBookScoped(ownerID, granteeUsername, permission, groupID string) (Grant, error) {
 	permission, err := normalizePermission(permission)
 	if err != nil {
 		return Grant{}, err
 	}
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return Grant{}, ErrInvalidGroupID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.shareBookLocked(ownerID, granteeUsername, permission)
+	return s.shareBookLocked(ownerID, granteeUsername, permission, groupID)
 }
 
-func (s *Store) shareBookLocked(ownerID, granteeUsername, permission string) (Grant, error) {
+func (s *Store) shareBookLocked(ownerID, granteeUsername, permission, groupID string) (Grant, error) {
 	granteeUsername = strings.TrimSpace(granteeUsername)
 	var (
 		granteeID string
@@ -1814,32 +2262,95 @@ func (s *Store) shareBookLocked(ownerID, granteeUsername, permission string) (Gr
 	if granteeID == ownerID {
 		return Grant{}, ErrSelfShare
 	}
+	if groupID != "" {
+		live, err := s.groupLiveLocked(ownerID, groupID)
+		if err != nil {
+			return Grant{}, err
+		}
+		if !live {
+			return Grant{}, ErrUnknownGroup
+		}
+	}
 	if _, err := s.db.Exec(
-		`INSERT INTO address_book_grants (owner_user_id, grantee_user_id, permission, created_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(owner_user_id, grantee_user_id) DO UPDATE SET permission = excluded.permission`,
-		ownerID, granteeID, permission, unixMillis(s.now().UTC()),
+		`INSERT INTO address_book_grants (owner_user_id, grantee_user_id, group_id, permission, created_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(owner_user_id, grantee_user_id, group_id) DO UPDATE SET permission = excluded.permission`,
+		ownerID, granteeID, groupID, permission, unixMillis(s.now().UTC()),
 	); err != nil {
 		return Grant{}, fmt.Errorf("account store %s: share address book: %w", s.path, err)
 	}
 	var created int64
 	if err := s.db.QueryRow(
 		`SELECT created_at FROM address_book_grants
-		 WHERE owner_user_id = ? AND grantee_user_id = ?`,
-		ownerID, granteeID,
+		 WHERE owner_user_id = ? AND grantee_user_id = ? AND group_id = ?`,
+		ownerID, granteeID, groupID,
 	).Scan(&created); err != nil {
 		return Grant{}, fmt.Errorf("account store %s: read shared grant: %w", s.path, err)
 	}
-	return Grant{Username: grantee, Permission: permission, CreatedAt: timeFromMillis(created)}, nil
+	return Grant{
+		Username:   grantee,
+		Permission: permission,
+		GroupID:    groupID,
+		CreatedAt:  timeFromMillis(created),
+	}, nil
 }
 
-// UnshareBook revokes a grant. Unsharing a user who was never granted the book
+func (s *Store) groupLiveLocked(userID, groupID string) (bool, error) {
+	var deleted int
+	err := s.db.QueryRow(
+		`SELECT deleted FROM address_book_groups WHERE user_id = ? AND group_id = ?`,
+		userID, groupID,
+	).Scan(&deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
+	}
+	return deleted == 0, nil
+}
+
+// UnshareBook revokes every grant between the pair, matching the original
+// whole-book semantics. Unsharing a user who was never granted the book
 // reports ErrUnknownShare so the API can answer 404.
 func (s *Store) UnshareBook(ownerID, granteeUsername string) error {
 	granteeUsername = strings.TrimSpace(granteeUsername)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.unshareBookLocked(ownerID, granteeUsername)
+}
+
+// UnshareBookScope revokes one grant row: the whole-book grant when groupID is
+// empty, otherwise that group's grant. Other scopes stay in place.
+func (s *Store) UnshareBookScope(ownerID, granteeUsername, groupID string) error {
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return ErrInvalidGroupID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unshareBookScopeLocked(ownerID, granteeUsername, groupID)
+}
+
+func (s *Store) unshareBookScopeLocked(ownerID, granteeUsername, groupID string) error {
+	res, err := s.db.Exec(
+		`DELETE FROM address_book_grants
+		 WHERE owner_user_id = ?
+		   AND grantee_user_id = (SELECT id FROM users WHERE username = ?)
+		   AND group_id = ?`,
+		ownerID, granteeUsername, groupID,
+	)
+	if err != nil {
+		return fmt.Errorf("account store %s: unshare address book scope: %w", s.path, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrUnknownShare
+	}
+	return nil
 }
 
 func (s *Store) unshareBookLocked(ownerID, granteeUsername string) error {
@@ -1868,17 +2379,17 @@ func (s *Store) Grants(userID string) (outgoing, incoming []Grant, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if outgoing, err = s.grantsLocked(
-		`SELECT u.username, g.permission, g.created_at FROM address_book_grants g
+		`SELECT u.username, g.permission, g.group_id, g.created_at FROM address_book_grants g
 		 JOIN users u ON u.id = g.grantee_user_id
-		 WHERE g.owner_user_id = ? ORDER BY u.username COLLATE NOCASE`,
+		 WHERE g.owner_user_id = ? ORDER BY u.username COLLATE NOCASE, g.group_id`,
 		userID,
 	); err != nil {
 		return nil, nil, err
 	}
 	if incoming, err = s.grantsLocked(
-		`SELECT u.username, g.permission, g.created_at FROM address_book_grants g
+		`SELECT u.username, g.permission, g.group_id, g.created_at FROM address_book_grants g
 		 JOIN users u ON u.id = g.owner_user_id
-		 WHERE g.grantee_user_id = ? ORDER BY u.username COLLATE NOCASE`,
+		 WHERE g.grantee_user_id = ? ORDER BY u.username COLLATE NOCASE, g.group_id`,
 		userID,
 	); err != nil {
 		return nil, nil, err
@@ -1898,7 +2409,7 @@ func (s *Store) grantsLocked(query, userID string) ([]Grant, error) {
 			grant   Grant
 			created int64
 		)
-		if err := rows.Scan(&grant.Username, &grant.Permission, &created); err != nil {
+		if err := rows.Scan(&grant.Username, &grant.Permission, &grant.GroupID, &created); err != nil {
 			return nil, err
 		}
 		grant.CreatedAt = timeFromMillis(created)
@@ -1907,36 +2418,52 @@ func (s *Store) grantsLocked(query, userID string) ([]Grant, error) {
 	return out, rows.Err()
 }
 
-// SharedBooks returns every address book shared with userID, including the
-// full live peer list. Owners are resolved first so the single database
-// connection is free before each peer query runs.
+// SharedBooks returns every address book shared with userID. Each book lists
+// only the peers and groups its grants expose; Scopes carries the individual
+// whole-book and group-level permissions. Owners are resolved first so the
+// single database connection is free before each peer query runs.
 func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		`SELECT u.id, u.username, g.permission, u.book_revision
+		`SELECT u.id, u.username, g.group_id, g.permission, u.book_revision
 		 FROM address_book_grants g
 		 JOIN users u ON u.id = g.owner_user_id
-		 WHERE g.grantee_user_id = ? ORDER BY u.username COLLATE NOCASE`,
+		 WHERE g.grantee_user_id = ? ORDER BY u.username COLLATE NOCASE, g.group_id`,
 		userID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("account store %s: list shared books: %w", s.path, err)
 	}
-	type owner struct {
-		id         string
-		username   string
-		permission string
-		revision   int64
+	type ownerBook struct {
+		id       string
+		username string
+		revision int64
+		scopes   []SharedScope
 	}
-	var owners []owner
+	var (
+		owners []*ownerBook
+		index  = make(map[string]*ownerBook)
+	)
 	for rows.Next() {
-		var item owner
-		if err := rows.Scan(&item.id, &item.username, &item.permission, &item.revision); err != nil {
+		var (
+			id         string
+			username   string
+			groupID    string
+			permission string
+			revision   int64
+		)
+		if err := rows.Scan(&id, &username, &groupID, &permission, &revision); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		owners = append(owners, item)
+		book, ok := index[id]
+		if !ok {
+			book = &ownerBook{id: id, username: username, revision: revision}
+			index[id] = book
+			owners = append(owners, book)
+		}
+		book.scopes = append(book.scopes, SharedScope{GroupID: groupID, Permission: permission})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -1952,40 +2479,143 @@ func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 		if peers == nil {
 			peers = []Peer{}
 		}
+		groups, err := s.groupsLocked(item.id)
+		if err != nil {
+			return nil, err
+		}
+		whole := ""
+		permission := ""
+		for _, scope := range item.scopes {
+			if permissionRank(scope.Permission) > permissionRank(permission) {
+				permission = scope.Permission
+			}
+			if scope.GroupID != "" {
+				continue
+			}
+			whole = scope.Permission
+		}
+		visiblePeers := make([]Peer, 0, len(peers))
+		for _, peer := range peers {
+			if whole != "" || scopePermission(item.scopes, peer.GroupID) != "" {
+				visiblePeers = append(visiblePeers, peer)
+			}
+		}
+		visibleGroups := make([]Group, 0, len(groups))
+		for _, group := range groups {
+			if whole != "" || scopePermission(item.scopes, group.ID) != "" {
+				visibleGroups = append(visibleGroups, group)
+			}
+		}
 		out = append(out, SharedBook{
 			Owner:      item.username,
-			Permission: item.permission,
+			Permission: permission,
 			Revision:   item.revision,
-			Peers:      peers,
+			Peers:      visiblePeers,
+			Groups:     visibleGroups,
+			Scopes:     item.scopes,
 		})
 	}
 	return out, nil
 }
 
-// sharedAccessLocked resolves the owner of a shared book and checks that the
-// grantee holds at least required permission. Unknown owners and missing
-// grants both report ErrUnknownShare so the API does not leak usernames.
-func (s *Store) sharedAccessLocked(granteeID, ownerUsername, required string) (string, error) {
-	var (
-		ownerID    string
-		permission string
-	)
+func scopePermission(scopes []SharedScope, groupID string) string {
+	best := ""
+	for _, scope := range scopes {
+		if scope.GroupID == groupID && permissionRank(scope.Permission) > permissionRank(best) {
+			best = scope.Permission
+		}
+	}
+	return best
+}
+
+// sharedGrants collects every grant a grantee holds on one owner. Unknown
+// owners and missing grants both report ErrUnknownShare so the API does not
+// leak usernames.
+type sharedGrants struct {
+	ownerID string
+	whole   string
+	groups  map[string]string
+}
+
+func (s *Store) sharedGrantsLocked(granteeID, ownerUsername string) (sharedGrants, error) {
+	var ownerID string
 	err := s.db.QueryRow(
-		`SELECT u.id, g.permission FROM address_book_grants g
-		 JOIN users u ON u.id = g.owner_user_id
-		 WHERE g.grantee_user_id = ? AND u.username = ?`,
-		granteeID, strings.TrimSpace(ownerUsername),
-	).Scan(&ownerID, &permission)
+		`SELECT id FROM users WHERE username = ?`, strings.TrimSpace(ownerUsername),
+	).Scan(&ownerID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrUnknownShare
+		return sharedGrants{}, ErrUnknownShare
 	}
 	if err != nil {
-		return "", fmt.Errorf("account store %s: read shared grant: %w", s.path, err)
+		return sharedGrants{}, fmt.Errorf("account store %s: look up shared owner: %w", s.path, err)
 	}
-	if !permissionAllows(permission, required) {
-		return "", ErrPermissionDenied
+	rows, err := s.db.Query(
+		`SELECT group_id, permission FROM address_book_grants
+		 WHERE owner_user_id = ? AND grantee_user_id = ?`,
+		ownerID, granteeID,
+	)
+	if err != nil {
+		return sharedGrants{}, fmt.Errorf("account store %s: read shared grants: %w", s.path, err)
 	}
-	return ownerID, nil
+	defer rows.Close()
+	out := sharedGrants{ownerID: ownerID, groups: make(map[string]string)}
+	found := false
+	for rows.Next() {
+		var (
+			groupID    string
+			permission string
+		)
+		if err := rows.Scan(&groupID, &permission); err != nil {
+			return sharedGrants{}, err
+		}
+		found = true
+		if groupID == "" {
+			out.whole = permission
+		} else {
+			out.groups[groupID] = permission
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return sharedGrants{}, err
+	}
+	if !found {
+		return sharedGrants{}, ErrUnknownShare
+	}
+	return out, nil
+}
+
+// effective is the strongest permission covering groupID. The whole-book
+// grant covers every group; a group grant only covers its own group.
+func (g sharedGrants) effective(groupID string) string {
+	best := g.whole
+	if permission := g.groups[groupID]; permissionRank(permission) > permissionRank(best) {
+		best = permission
+	}
+	return best
+}
+
+func (g sharedGrants) require(required, groupID string) error {
+	if !permissionAllows(g.effective(groupID), required) {
+		return ErrPermissionDenied
+	}
+	return nil
+}
+
+// peerGroupLocked reports the group a peer currently belongs to, including
+// tombstones, so a scoped grantee can revive an entry without escaping its
+// group. Unknown peers map to the ungrouped scope.
+func (s *Store) peerGroupLocked(userID, peerID string) (string, error) {
+	var groupID string
+	err := s.db.QueryRow(
+		`SELECT group_id FROM address_book WHERE user_id = ? AND peer_id = ?`,
+		userID, peerID,
+	).Scan(&groupID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("account store %s: read shared peer group: %w", s.path, err)
+	}
+	return groupID, nil
 }
 
 func permissionAllows(granted, required string) bool {
@@ -2023,18 +2653,26 @@ func (s *Store) UpdateSharedPeer(granteeID, ownerUsername, peerID string, name *
 
 // UpdateSharedPeerAt is UpdateSharedPeer with an optional revision token.
 // A positive ifRevision must match the owner's live row; zero keeps
-// last-writer-wins for grantee writes.
+// last-writer-wins for grantee writes. A group-scoped grant may only touch
+// peers that currently live in that group.
 func (s *Store) UpdateSharedPeerAt(granteeID, ownerUsername, peerID string, name *string, tags *[]string, ifRevision int64) (Peer, error) {
 	if !registry.ValidID(peerID) {
 		return Peer{}, ErrInvalidPeerID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ownerID, err := s.sharedAccessLocked(granteeID, ownerUsername, PermissionWrite)
+	grants, err := s.sharedGrantsLocked(granteeID, ownerUsername)
 	if err != nil {
 		return Peer{}, err
 	}
-	return s.updatePeerLocked(ownerID, peerID, name, tags, nil, ifRevision)
+	groupID, err := s.peerGroupLocked(grants.ownerID, peerID)
+	if err != nil {
+		return Peer{}, err
+	}
+	if err := grants.require(PermissionWrite, groupID); err != nil {
+		return Peer{}, err
+	}
+	return s.updatePeerLocked(grants.ownerID, peerID, name, tags, nil, ifRevision)
 }
 
 func (s *Store) DeleteSharedPeer(granteeID, ownerUsername, peerID string) (bool, error) {
@@ -2050,68 +2688,136 @@ func (s *Store) DeleteSharedPeerAt(granteeID, ownerUsername, peerID string, ifRe
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ownerID, err := s.sharedAccessLocked(granteeID, ownerUsername, PermissionWrite)
+	grants, err := s.sharedGrantsLocked(granteeID, ownerUsername)
 	if err != nil {
 		return false, err
 	}
-	return s.deletePeerLocked(ownerID, peerID, ifRevision)
+	groupID, err := s.peerGroupLocked(grants.ownerID, peerID)
+	if err != nil {
+		return false, err
+	}
+	if err := grants.require(PermissionWrite, groupID); err != nil {
+		return false, err
+	}
+	return s.deletePeerLocked(grants.ownerID, peerID, ifRevision)
 }
 
 // AddSharedPeer inserts a new peer into another user's book through a write or
 // control grant. An existing live or tombstoned entry with the same id is
 // overwritten and revived, matching the owner's own PATCH upsert behaviour.
 func (s *Store) AddSharedPeer(granteeID, ownerUsername, peerID, name string, tags []string) (Peer, error) {
+	return s.AddSharedPeerScoped(granteeID, ownerUsername, peerID, "", name, tags)
+}
+
+// AddSharedPeerScoped adds a peer to the owner's ungrouped list (empty
+// groupID) or to one group. Group grants may only write into their own group.
+func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, name string, tags []string) (Peer, error) {
 	if !registry.ValidID(peerID) {
 		return Peer{}, ErrInvalidPeerID
 	}
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return Peer{}, ErrInvalidGroupID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ownerID, err := s.sharedAccessLocked(granteeID, ownerUsername, PermissionWrite)
+	grants, err := s.sharedGrantsLocked(granteeID, ownerUsername)
 	if err != nil {
 		return Peer{}, err
 	}
-	return s.updatePeerLocked(ownerID, peerID, &name, &tags, nil, 0)
+	var groupArg *string
+	if groupID != "" {
+		live, err := s.groupLiveLocked(grants.ownerID, groupID)
+		if err != nil {
+			return Peer{}, err
+		}
+		if !live {
+			return Peer{}, ErrUnknownGroup
+		}
+		groupArg = &groupID
+	}
+	if err := grants.require(PermissionWrite, groupID); err != nil {
+		return Peer{}, err
+	}
+	return s.updatePeerLocked(grants.ownerID, peerID, &name, &tags, groupArg, 0)
 }
 
-// ShareBookAs lets a grantee with control permission manage another user's
-// grants without being the owner.
+// ShareBookAs lets a grantee with whole-book control permission manage
+// another user's grants without being the owner.
 func (s *Store) ShareBookAs(actorID, ownerUsername, granteeUsername, permission string) (Grant, error) {
+	return s.ShareBookScopedAs(actorID, ownerUsername, granteeUsername, permission, "")
+}
+
+// ShareBookScopedAs is ShareBookAs for one group scope. Management still
+// requires whole-book control, so a group controller cannot widen its reach.
+func (s *Store) ShareBookScopedAs(actorID, ownerUsername, granteeUsername, permission, groupID string) (Grant, error) {
 	permission, err := normalizePermission(permission)
 	if err != nil {
 		return Grant{}, err
 	}
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return Grant{}, ErrInvalidGroupID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ownerID, err := s.sharedAccessLocked(actorID, ownerUsername, PermissionControl)
+	grants, err := s.sharedGrantsLocked(actorID, ownerUsername)
 	if err != nil {
 		return Grant{}, err
 	}
-	return s.shareBookLocked(ownerID, granteeUsername, permission)
+	if !permissionAllows(grants.whole, PermissionControl) {
+		return Grant{}, ErrPermissionDenied
+	}
+	return s.shareBookLocked(grants.ownerID, granteeUsername, permission, groupID)
 }
 
 func (s *Store) UnshareBookAs(actorID, ownerUsername, granteeUsername string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ownerID, err := s.sharedAccessLocked(actorID, ownerUsername, PermissionControl)
+	grants, err := s.sharedGrantsLocked(actorID, ownerUsername)
 	if err != nil {
 		return err
 	}
-	return s.unshareBookLocked(ownerID, strings.TrimSpace(granteeUsername))
+	if !permissionAllows(grants.whole, PermissionControl) {
+		return ErrPermissionDenied
+	}
+	return s.unshareBookLocked(grants.ownerID, strings.TrimSpace(granteeUsername))
+}
+
+// UnshareBookScopeAs revokes one scope of a shared book for a controller.
+func (s *Store) UnshareBookScopeAs(actorID, ownerUsername, granteeUsername, groupID string) error {
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && !registry.ValidID(groupID) {
+		return ErrInvalidGroupID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	grants, err := s.sharedGrantsLocked(actorID, ownerUsername)
+	if err != nil {
+		return err
+	}
+	if !permissionAllows(grants.whole, PermissionControl) {
+		return ErrPermissionDenied
+	}
+	return s.unshareBookScopeLocked(grants.ownerID, strings.TrimSpace(granteeUsername), groupID)
 }
 
 // SharedBookGrants lists the grants on a shared book for a controller.
 func (s *Store) SharedBookGrants(actorID, ownerUsername string) ([]Grant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ownerID, err := s.sharedAccessLocked(actorID, ownerUsername, PermissionControl)
+	grants, err := s.sharedGrantsLocked(actorID, ownerUsername)
 	if err != nil {
 		return nil, err
 	}
+	if !permissionAllows(grants.whole, PermissionControl) {
+		return nil, ErrPermissionDenied
+	}
 	return s.grantsLocked(
-		`SELECT u.username, g.permission, g.created_at FROM address_book_grants g
+		`SELECT u.username, g.permission, g.group_id, g.created_at FROM address_book_grants g
 		 JOIN users u ON u.id = g.grantee_user_id
-		 WHERE g.owner_user_id = ? ORDER BY u.username COLLATE NOCASE`,
-		ownerID,
+		 WHERE g.owner_user_id = ? ORDER BY u.username COLLATE NOCASE, g.group_id`,
+		grants.ownerID,
 	)
 }
 

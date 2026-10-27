@@ -6,3 +6,9 @@ Testing/
 *.h264
 *.h265
 *.bmp
+
+# Runtime secrets and machine-local state: a server identity seed is generated
+# on first run, and the viewer writes its settings next to the executable.
+chast-server-identity.key
+chast-server-state.db
+ds-chcastbuildpf-gui.ini

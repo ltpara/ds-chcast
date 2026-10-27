@@ -32,6 +32,7 @@ struct ID3D11Texture2D;
 namespace chast {
 class DeviceIdentity;
 class FileReceiver;
+class PortForwardClient;
 }
 
 namespace chast_viewer {
@@ -84,6 +85,18 @@ enum class FilePhase {
     kFailed = 5,
 };
 
+// One remote console's life on the viewer. Requesting covers the round trip
+// from OpenTerminal() to the host's answer; Ended means the host stopped the
+// console (its code and reason are in the status) and every byte it printed
+// was already queued for TakeTerminalOutput().
+enum class TerminalPhase {
+    kClosed = 0,
+    kRequesting = 1,
+    kOpen = 2,
+    kEnded = 3,
+    kFailed = 4,
+};
+
 struct ViewerStatus {
     ViewerState state = ViewerState::kIdle;
     std::string error;
@@ -113,6 +126,11 @@ struct ViewerStatus {
     // connection was rejected for not matching the pinned one, so the UI can
     // offer the new identity.
     std::string server_fingerprint;
+    // Lowercase hex reference generated for this session and carried in Hello.
+    // The host copies it into its inbound audit record; the UI reports it with
+    // the session and file events, so the service merges both sides into one
+    // row. Empty only when the CSPRNG failed.
+    std::string audit_ref;
     // The server's AccessDenied code when it refused the Hello: one of
     // chast::AccessDenial, or 0 when it never did. The UI turns this into its
     // own wording; `error` carries the server's reason.
@@ -322,6 +340,57 @@ struct ViewerStatus {
     int stream_option_code = 0;
     std::string stream_option_error;
     uint64_t stream_option_results = 0;
+    // Viewer-side port forwarding. `port_forward_enabled` mirrors the host's
+    // announced permission; `port_forward_active` means the local listener is
+    // up and the host accepted the target. While a request is in flight the
+    // listener is already bound (so the UI can show the port) but the flag
+    // stays false; a refusal closes the listener and explains itself in
+    // `port_forward_error`. The byte counters cover the whole session and all
+    // relayed connections.
+    bool port_forward_enabled = false;
+    bool port_forward_active = false;
+    uint16_t port_forward_local_port = 0;
+    std::string port_forward_remote_host;
+    uint16_t port_forward_remote_port = 0;
+    uint64_t port_forward_connections = 0;
+    uint64_t port_forward_failures = 0;
+    uint64_t port_forward_bytes_up = 0;
+    uint64_t port_forward_bytes_down = 0;
+    std::string port_forward_error;
+    // Remote terminal (protocol v27). The viewer drives at most one console.
+    // `terminal_supported` mirrors the host's announced permission;
+    // `terminal_phase` is a TerminalPhase value; `terminal_code` and
+    // `terminal_reason` are the host's TerminalCode and wording for a refusal
+    // or an ending, while `terminal_error` explains a local failure such as a
+    // send error or a revocation. Output bytes never travel in this struct:
+    // TakeTerminalOutput() hands them over, and `terminal_bytes` counts what
+    // was received. `terminal_columns`/`terminal_rows` are the size the
+    // console was opened with and that the host acknowledged through the most
+    // recent resize. `terminal_updates` counts phase transitions so the panel
+    // can pair an ending with the poll that saw it.
+    bool terminal_supported = false;
+    TerminalPhase terminal_phase = TerminalPhase::kClosed;
+    int terminal_code = 0;
+    std::string terminal_reason;
+    std::string terminal_error;
+    uint16_t terminal_columns = 0;
+    uint16_t terminal_rows = 0;
+    uint64_t terminal_bytes = 0;
+    uint64_t terminal_updates = 0;
+
+    // Viewer-side recording. Nothing here crosses the wire: the viewer muxes
+    // the host's already-encoded stream to a local MP4. `recording` is true
+    // while a muxer is writing; the counters mirror the command-line tool,
+    // `record_segments` counts every file opened (a picture-size change rolls
+    // into a new one), `record_path` is the newest file and `record_error`
+    // explains why recording stopped or never started.
+    bool recording = false;
+    uint64_t record_samples = 0;
+    uint64_t record_keyframes = 0;
+    uint64_t record_skipped = 0;
+    uint32_t record_segments = 0;
+    std::string record_path;
+    std::string record_error;
 };
 
 class ViewerEngine {
@@ -411,6 +480,20 @@ public:
     // ViewerStatus::file_phase and the queue counters.
     bool SendFiles(const std::vector<std::string>& paths);
 
+    // Binds a viewer-side port-forward listener on 127.0.0.1:local_port (0
+    // picks a free port) and asks the host to relay it to
+    // remote_host:remote_port. Returns false when no session is streaming, the
+    // host did not grant kPermissionPortForward, or the arguments are invalid
+    // (an empty host or a zero remote port). The listener is applied by the
+    // session thread within one poll; the bound port, the host's answer and the
+    // counters arrive through ViewerStatus::port_forward_*. One target per
+    // viewer: starting again replaces the running listener.
+    bool StartPortForward(uint16_t local_port, const std::string& remote_host,
+                          uint16_t remote_port);
+    // Stops the listener and every relayed connection, and tells the host to
+    // drop the target. Safe to call when nothing is running.
+    void StopPortForward();
+
     // Copies the newest pointer state the host sent, once per received update.
     // The sprite is only attached to the update that introduced a shape, so a
     // caller caches it by `shape_id`. Returns false when nothing new arrived.
@@ -420,6 +503,16 @@ public:
     // thread applies it to the render session. Returns false when no audio
     // pipeline is running, so the caller knows the tap had no effect.
     bool SetAudioMuted(bool mute);
+
+    // Starts or stops a local, lossless recording of the received stream. The
+    // host is never told and nothing is uploaded. `directory` is used when the
+    // recording starts (empty means the user's Videos folder); the file name is
+    // chosen by the viewer and rolls to a new segment when the picture size
+    // changes. Recording begins on the next key frame, so a switch that finds
+    // no key frame yet keeps waiting. Returns false when no session is
+    // streaming. Progress and failures arrive through ViewerStatus::recording
+    // / record_path / record_error.
+    bool SetRecording(bool enabled, std::string directory = {});
 
     // Turns the microphone uplink on or off. Opening the capture device and
     // the CMIC stream happens on the session thread; switching off stops them
@@ -463,6 +556,29 @@ public:
     // Pops the oldest line the host sent. Returns false when none is waiting.
     bool TakeChat(std::string& text);
 
+    // Opens the session's remote console at the given character size. Returns
+    // false when no session is streaming, the host did not grant
+    // kPermissionTerminal, the size is outside 1..500 x 1..200, or a console
+    // is already open (or being requested). The round trip and the host's
+    // answer arrive through terminal_phase/terminal_code/terminal_reason.
+    bool OpenTerminal(uint16_t columns, uint16_t rows);
+    // Queues raw console input: printable text as UTF-8 and control sequences
+    // as bytes (for example "\x03" for Ctrl+C). Returns false when no console
+    // is open or the queue's 256 KiB bound is reached.
+    bool SendTerminalInput(const std::string& bytes);
+    // Queues a console resize. Returns false when no console is open or the
+    // size is out of range. The host applies it best effort; the acknowledged
+    // size shows up in terminal_columns/terminal_rows.
+    bool ResizeTerminal(uint16_t columns, uint16_t rows);
+    // Ends the console. The host closes the shell; output that was already in
+    // flight is still queued for TakeTerminalOutput() until it reports ended.
+    void CloseTerminal();
+    // Pops the oldest console output. `ended` reports that the console is over
+    // and this was its last buffered piece; the phase in the status stays
+    // terminal until the panel takes the bytes. Returns false when nothing is
+    // waiting, with `ended` still telling whether the console finished.
+    bool TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended);
+
     ViewerStatus Snapshot() const;
 
 private:
@@ -471,7 +587,8 @@ private:
              std::string access_token, std::string password, std::string totp,
              bool trust_device, ViewerTransport transport,
              std::string carrier_host, uint16_t carrier_port,
-             std::string carrier_host_id, std::string carrier_token);
+             std::string carrier_host_id, std::string carrier_token,
+             std::string audit_ref);
     void SetState(ViewerState state, std::string error = {});
     // Expands dropped folders and hashes queued uploads on its own thread, so
     // a multi-gigabyte read never stalls the session's receive loop.
@@ -505,6 +622,13 @@ private:
     std::atomic<bool> microphone_aec_{true};
     std::atomic<bool> microphone_noise_{true};
 
+    // Viewer-side recording. The switch crosses to the session thread, which
+    // owns the muxer; `record_dir_` is read when a recording starts, so a new
+    // folder applies to the next file instead of interrupting one in flight.
+    std::atomic<bool> record_wanted_{false};
+    mutable std::mutex record_mutex_;
+    std::string record_dir_;
+
     // Newest privacy request, for the same reason as the display switch: the
     // operator wants the state they picked last, not a replay of every toggle.
     mutable std::mutex privacy_mutex_;
@@ -513,12 +637,51 @@ private:
     // second tap replaces an unsent one instead of queueing a burst.
     std::atomic<bool> pending_sas_{false};
 
+    // The port-forward target crosses to the session thread here. One slot is
+    // enough: the operator picks a target, and a newer pick replaces an
+    // unsent one. `stop` is a command of its own so it cannot be dropped by a
+    // later start.
+    struct PortForwardCommand {
+        bool stop = false;
+        uint16_t local_port = 0;
+        std::string remote_host;
+        uint16_t remote_port = 0;
+    };
+    mutable std::mutex port_forward_mutex_;
+    std::optional<PortForwardCommand> pending_port_forward_;
+
     // Chat crosses in both directions. The outgoing queue is bounded and
     // cleared when a session starts; the session thread appends host lines for
     // the UI to pop, dropping the newest when the UI falls too far behind.
     mutable std::mutex chat_mutex_;
     std::deque<std::string> pending_chat_;
     std::deque<std::string> received_chat_;
+
+    // One remote console crosses in both directions. Commands keep their
+    // order: typing, resizes and the close must reach the host in the order
+    // they happened. Input is bounded by the same high water the host applies
+    // to the uplink; output is handed to the UI in pieces, and the session
+    // thread stops pulling when the UI falls behind so the transport's flow
+    // control pauses the host instead of dropping bytes that are part of the
+    // console picture.
+    struct TerminalCommand {
+        enum class Kind {
+            kOpen,
+            kInput,
+            kResize,
+            kClose,
+        };
+        Kind kind = Kind::kOpen;
+        std::string bytes;
+        uint16_t columns = 0;
+        uint16_t rows = 0;
+    };
+    mutable std::mutex terminal_mutex_;
+    std::deque<TerminalCommand> pending_terminal_;
+    size_t pending_terminal_bytes_ = 0;
+    std::deque<std::vector<uint8_t>> terminal_output_;
+    size_t terminal_output_bytes_ = 0;
+    bool terminal_output_ended_ = true;
 
     // Input crosses from the UI thread to the session thread here. The queue
     // is bounded: a stalled transport drops the newest events instead of

@@ -138,6 +138,67 @@ func TestKeepaliveAndPunchExchange(t *testing.T) {
 	}
 }
 
+func TestUpnpPortIsRelayedToBothPeers(t *testing.T) {
+	_, reg, meetAddr, priv := startMeet(t)
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+
+	host.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeKeepalive, HostID: "devbox"}), meetAddr)
+	challenge := recv(t, host)
+	message := identity.KeepaliveMessage("devbox", challenge.Candidate, challenge.Nonce)
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type:      wire.TypeKeepaliveAuth,
+		HostID:    "devbox",
+		Nonce:     challenge.Nonce,
+		Candidate: challenge.Candidate,
+		Signature: identity.Sign(priv, message),
+		UpnpPort:  50000,
+	}), meetAddr)
+	if ack := recv(t, host); !ack.OK {
+		t.Fatalf("keepalive: %+v", ack)
+	}
+	if hostNow, _ := reg.Lookup("devbox"); hostNow.UpnpPort != 50000 {
+		t.Fatalf("registered upnp port = %d, want 50000", hostNow.UpnpPort)
+	}
+
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce, UpnpPort: 60000,
+	}), meetAddr)
+	reply := recv(t, viewer)
+	if !reply.OK || reply.UpnpPort != 50000 {
+		t.Fatalf("punch reply upnp port: %+v", reply)
+	}
+	notify := recv(t, host)
+	if notify.Type != wire.TypePunchPeer || notify.UpnpPort != 60000 {
+		t.Fatalf("host notification upnp port: %+v", notify)
+	}
+
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce, UpnpPort: -1,
+	}), meetAddr)
+	if refused := recv(t, viewer); refused.OK || refused.Error != "upnp_port must be 0..65535" {
+		t.Fatalf("invalid upnp port: %+v", refused)
+	}
+}
+
+func TestKeepaliveRejectsInvalidUpnpPort(t *testing.T) {
+	_, _, meetAddr, _ := startMeet(t)
+	host := listenUDP(t)
+	host.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeKeepalive, HostID: "devbox"}), meetAddr)
+	challenge := recv(t, host)
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type:      wire.TypeKeepaliveAuth,
+		HostID:    "devbox",
+		Nonce:     challenge.Nonce,
+		Candidate: challenge.Candidate,
+		UpnpPort:  70000,
+	}), meetAddr)
+	if ack := recv(t, host); ack.OK || ack.Error != "upnp_port must be 0..65535" {
+		t.Fatalf("invalid upnp port: %+v", ack)
+	}
+}
+
 func TestKeepaliveRejectsWrongKeyAndUnknownPunch(t *testing.T) {
 	_, _, meetAddr, priv := startMeet(t)
 	stranger := listenUDP(t)
@@ -322,5 +383,86 @@ func TestRateLimiter(t *testing.T) {
 		if !disabled.allow("198.51.100.3") {
 			t.Fatal("zero limit still refused a request")
 		}
+	}
+}
+
+func TestKeepaliveOverIPv6(t *testing.T) {
+	priv := identity.PrivateKeyFromSecret("host-secret")
+	pub := identity.PublicKeyText(priv.Public().(ed25519.PublicKey))
+	reg := registry.New(5 * time.Second)
+	if _, err := reg.Register(registry.RegisterRequest{
+		ID: "devbox", PublicKey: pub, TTL: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	meet, err := New("[::1]:0", reg, func(port int) string { return "192.0.2.1:41000" },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	serverIdentity, err := identity.GenerateServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meet.SetIdentity(serverIdentity)
+	go meet.Serve()
+	t.Cleanup(meet.Close)
+	meetAddr, err := net.ResolveUDPAddr("udp", meet.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skipf("IPv6 loopback socket unavailable: %v", err)
+	}
+	t.Cleanup(func() { host.Close() })
+
+	host.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeKeepalive, HostID: "devbox"}), meetAddr)
+	challenge := recv(t, host)
+	if challenge.Type != wire.TypeKeepaliveChallenge || challenge.Nonce == "" {
+		t.Fatalf("challenge: %+v", challenge)
+	}
+	if challenge.Candidate != "" || challenge.CandidateV6 != host.LocalAddr().String() {
+		t.Fatalf("challenge candidates: %+v", challenge)
+	}
+	message := identity.KeepaliveMessage("devbox", challenge.CandidateV6, challenge.Nonce)
+	host.WriteToUDP(wire.Encode(wire.Message{
+		Type:         wire.TypeKeepaliveAuth,
+		HostID:       "devbox",
+		Nonce:        challenge.Nonce,
+		CandidateV6:  challenge.CandidateV6,
+		Signature:    identity.Sign(priv, message),
+		LocalAddrsV6: []string{"[fd00::9]:14434"},
+		NATType:      "cone",
+	}), meetAddr)
+	ack := recv(t, host)
+	if !ack.OK || ack.Candidate != "" || ack.CandidateV6 != host.LocalAddr().String() {
+		t.Fatalf("ack: %+v", ack)
+	}
+	if len(ack.LocalAddrsV6) != 1 || ack.LocalAddrsV6[0] != "[fd00::9]:14434" {
+		t.Fatalf("ack local addrs: %+v", ack.LocalAddrsV6)
+	}
+	stored, _ := reg.Lookup("devbox")
+	if stored.Candidate != "" || stored.CandidateV6 == "" {
+		t.Fatalf("stored candidates: %+v", stored)
+	}
+
+	viewer, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { viewer.Close() })
+	const nonce = "0123456789abcdef"
+	viewer.WriteToUDP(wire.Encode(wire.Message{
+		Type: wire.TypePunchRequest, HostID: "devbox", Nonce: nonce,
+	}), meetAddr)
+	reply := recv(t, viewer)
+	if !reply.OK || reply.Candidate != "" || reply.CandidateV6 != host.LocalAddr().String() {
+		t.Fatalf("punch reply: %+v", reply)
+	}
+	notify := recv(t, host)
+	if notify.Type != wire.TypePunchPeer || notify.Candidate != "" ||
+		notify.CandidateV6 != viewer.LocalAddr().String() {
+		t.Fatalf("host notification: %+v", notify)
 	}
 }
