@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 
+#include "chast/protocol.h"
+
 namespace chast {
 
 // The sanitized name is limited to this many UTF-16 units (Windows counts
@@ -94,5 +96,40 @@ private:
 // for not offering a file that changes while it is read.
 bool sha256_file(const std::string& utf8_path, uint64_t& size,
                  std::array<uint8_t, 32>& digest, std::string* error);
+
+// ----- shared-folder browsing -----
+//
+// The viewer browses and downloads from the same receive root that receives
+// uploads. Paths are '/'-separated relative paths; every component is resolved
+// with GetFileAttributesW and a reparse point anywhere on the way refuses the
+// request, so a junction cannot widen the sandbox.
+
+// Resolves `relative` below `root`. Ok fills `full_path` (absolute) and
+// `is_directory`; NotFound means a component does not exist, Refused an
+// invalid or escaping path, IoError a file-system failure. `error` carries a
+// UTF-8 explanation for every code other than Ok.
+FileCode resolve_receive_path(const std::string& root, const std::string& relative,
+                              std::string& full_path, bool& is_directory,
+                              std::string& error);
+
+// Fills `result.entries`, `result.truncated`, `result.code` and
+// `result.reason` for one browse request; the caller sets `request_id`.
+// Directories come first, then files, each sorted by name. Reparse points and
+// names too long or not representable as UTF-8 are skipped, and at most
+// kMaxFileListEntries entries are returned with `truncated` set when more
+// exist.
+void list_receive_directory(const std::string& root, const std::string& relative,
+                            FileListResult& result);
+
+// Applies one viewer file operation below `root`: create a folder, rename an
+// entry inside its current folder, or remove a file / empty directory.
+// `path` follows the browse rules and may not be empty; `new_name` is one
+// component for Rename and empty otherwise. Ok means the change happened;
+// Refused covers policy, escaping paths, reparse points, occupied names,
+// non-empty folders and unusable names; NotFound and IoError carry the usual
+// meanings. `error` explains every code other than Ok.
+FileCode apply_file_operation(const std::string& root, FileOperation op,
+                              const std::string& path, const std::string& new_name,
+                              std::string& error);
 
 }  // namespace chast

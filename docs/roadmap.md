@@ -153,7 +153,7 @@
   - 查看器：`ViewerEngine` 暴露队列与计数，bridge 新增 `sendClipboard`/`takeClipboard`；Flutter 会话页 500 ms 轮询本机与远端并抑制回声，浮层显示开关与收发计数；`host.ini` 新增 `clipboard=0/1`（默认开），托盘复选与菜单项随设置持久化并重启共享。
   - 验证（2026-10-22，单机回环）：`chast-quic verify` 57 项断言全过（含 8 项剪贴板断言与关闭闸门探针：主机/查看者各收 1 条、各发 1 条、内容逐字相等、计数为 1 证明无回声），145 个访问单元；真实 Win32 剪贴板双向实测（主机→查看者、`connect --send-clipboard`→主机各一次）；`ctest -C Release` 6/6、`flutter analyze`、53 项 `flutter test`、`flutter build windows --release`、`go vet`/`go test` 全部通过。
   - 设计取舍：复用可靠有序的控制流而不新开流；两端都以“变化”为准并轮询而非剪贴板监听链，换取两端一致与简单，代价最多 500 ms 延迟；畸形消息计入传输错误但不关闭会话，避免剪贴板拖垮视频。
-  - 已知限制：只同步纯文本，图片/文件/HTML 与历史记录不在范围；超过 256 KiB 的文本静默不同步（待分片）；快速连续复制只保留最后一次稳定文本；Windows 以外的剪贴板后端未实现；未做真实鼠标操作的复制粘贴人工验收，Win32 路径由真实回环与 PowerShell 读写覆盖。
+  - 已知限制：只同步纯文本，图片/文件/HTML 与历史记录不在范围；旧 `ClipboardUpdate` 控制消息仍限 256 KiB，超长文本自 2026-10-30 起改由 CCLB 流承载（4 MiB，见 P2-43）；快速连续复制只保留最后一次稳定文本；Windows 以外的剪贴板后端未实现；未做真实鼠标操作的复制粘贴人工验收，Win32 路径由真实回环与 PowerShell 读写覆盖。
 - 已完成：系统声音单向传输 M5.2（`docs/m5.2-plan.md`）。
   - 协议 v10：新增 48 字节 `AudioHeader`（`CAUD` magic、独立序号、`pts_ms`/`capture_ms`、载荷 CRC32、采样率/帧长/声道/codec）与 `AudioParser`；`ServerInfo` 在显示器列表后追加音频参数块，flags bit2 公告可用，extradata 上限 64 字节；HelloAck 与 StreamInfo 逐字节相同。
   - 传输：主机在 `announce()` 时按闸门打开第二条单向流，查看者按首 4 字节 magic 分类，不依赖开流顺序；音频发送使用非阻塞路径，队列满只丢音频包并计数，不阻塞视频；闸门关闭时 `send_audio` 返回 `InvalidCall`。
@@ -471,7 +471,8 @@
     请求被 400 拒绝；`/metrics` 未认证 401、带 key 后内容与 `/v1/stats`
     一致。
   - 已知限制：证书文件替换热加载已于 2026-10-27 补齐（P2-14），ACME 自动
-    申请已于 2026-10-28 补齐（P2-20，mTLS 与私有 CA 见 P2-11）；限流基于
+    申请已于 2026-10-28 补齐（P2-20，mTLS 与私有 CA 见 P2-11），客户端 CA
+    热加载见 P2-26（文件证书与 ACME 两种模式）；限流基于
     内存桶，重启后清零，
     多实例部署需要前置网关统一限流；真实反向代理头与多客户端压力需部署
     环境复核。
@@ -755,6 +756,20 @@
     创建、改名、删除分组，名称去空白且最长 64 字符。删组先写分组墓碑，再按
     peer ID 顺序把组内存活条目解绑并各自推进修订号；条目 `PATCH` 接受
     `group_id`（空串清除），只移动分组时要求条目与目标分组都存活。
+  - 地址簿分组嵌套与排序（2026-10-28，账号库迁移 v3）：
+    `address_book_groups` 增加 `parent_id`/`position`，`address_book` 增加
+    `position`，迁移器按幂等方式补列，旧库升级后保持原有名称/ID 顺序。
+    分组上级必须是同一账号的存活分组，空串表示根；把分组挂到自己或后代
+    之下返回 400，深度上限 8，负排序值返回 400。`PATCH` 分组接受
+    `parent_id`/`position`，`PATCH` 条目接受 `position`，重排按
+    `position, name, group_id`（分组）与 `position, peer_id`（条目）稳定
+    排序。删除分组时，子分组上移到被删组的上级并各自推进修订号，组内条目
+    解绑，随后写分组墓碑并撤销该分组范围的授权。分组级共享授权覆盖整棵
+    子树：被授权者能看到子分组及其条目，祖先分组仅作为容器出现且不暴露
+    其他条目。查看器首页按分组树缩进显示（折叠作用于整棵子树），管理
+    对话框可设置上级并用上下按钮重排同级分组（同级重排为 1..N，只提交
+    变化的条目并携带 OCC 令牌，409 后整体刷新），设备菜单新增组内上移/
+    下移；损坏的父子链（未知上级、环）按根/剩余节点降级显示而不崩溃。
     `GET /v1/addressbook` 增加存活 `groups` 与增量 `group_changes`。查看器
     `AddressBookGroup`/`AddressBookPeer.groupId` 解析快照，`Device` 持久化
     `groupId` 并参与合并与上传；启动后的首次同步固定 `since=0` 以取得仅存在
@@ -1015,8 +1030,8 @@
       `login_locks` 并跨重启、同库实例共享，失败计数通过 `BEGIN IMMEDIATE`
       事务原子累计，但没有持久封禁名单（管理台 `user unlock` 可手动解锁）；两步验证已支持 TOTP、
       一次性恢复码、短信登录码与邮件登录码（后两者需先分别绑定找回手机/邮箱），
-      WebAuthn 安全密钥已于 2026-10-28 补齐（P2-19，密码 + Windows Hello/
-      FIDO2），查看器不提供 TOTP 二维码扫描；会话管理没有刷新令牌；账号安全审计
+      WebAuthn 安全密钥已于 2026-10-28 补齐（P2-19/P2-30，密码 + 断言或
+      免密码断言，Windows Hello/FIDO2），查看器不提供 TOTP 二维码扫描；会话管理没有刷新令牌；账号安全审计
       记录 IP 但不做地理位置解析；连接与文件传输审计只覆盖查看器发起的事件
       （文件按轮询窗口聚合），不含主机侧入站会话、逐文件明细或传输中进度，
       保留期按条数而非时间且不能导出；查看器不允许在
@@ -1117,6 +1132,19 @@
     重启、删组墓碑可见；共享地址簿 34 项回归通过。`go vet ./...`、
     `go test ./... -count=1`、`flutter analyze`、全量 `flutter test`（186 项）
     与 Windows Release 构建通过。
+  - 验证（地址簿分组嵌套与排序，2026-10-28，单机回环）：账号库迁移用例
+    构造 v2 旧库，验证自动补 `parent_id`/`position` 且旧分组保持根/0；
+    `internal/account` 覆盖父子上级、子树授权、成环/未知上级/深度超限/
+    负排序拒绝、按 `position,name,group_id` 与 `position,peer_id` 排序、
+    删组提升子分组并解绑条目；`internal/api` 覆盖分组 `PATCH` 的
+    `parent_id`/`position`/`if_revision`、条目 `position`、400/404/409 与
+    `GET` 排序。Flutter 覆盖分组树排序（缺失上级与环降级）、合并排序、
+    条目位置持久化与同步、分组对话框的上级选择/后代禁选/同级上下重排、
+    首页缩进树与组内上移/下移；`flutter analyze` 与全量 `flutter test`
+    通过。真实服务端探针新增子分组父级/排序、成环 400、删父提升子组，
+    并在共享探针断言分组授权覆盖整棵子树、可写入子组；账号/地址簿 42 项、
+    共享地址簿 44 项（含分组范围 11 项）全部通过。`go vet ./...`、
+    `go test ./... -count=1`、`go build ./...` 通过。
   - 验证（地址簿搜索与标签筛选，2026-10-25，本机组件测试）：`home_page_test`
     新增 3 项，覆盖按名称/ID/大小写不敏感标签搜索、搜索清除按钮、标签芯片
     单选与多选并集、“全部”复位、无匹配空状态与“清除筛选”、搜索与标签同时
@@ -1143,12 +1171,12 @@
     令牌 400，`shared_books_dialog_test` 覆盖共享编辑携带修订号及 409 后刷新
     服务器行。`go vet ./...`、`go test ./... -count=1`、`go build ./...`、
     `flutter analyze`、全量 251 项 Flutter 测试与 Windows Release 构建通过。
-  - 已知限制：共享地址簿虽有只读/读写/完全控制三级权限，但没有按地址簿分组
-    或按分组的授权；共享条目没有保存密码或导入导出；共享只共享条目，被授权者
-    连接目标仍需目标主机自己的密码与审批。地址簿分组不支持嵌套或拖拽排序，
-    也不参与共享（被授权者看到的是属主的平铺条目）；分组名称只在查看器内存中
+  - 已知限制：共享地址簿有只读/读写/完全控制三级权限，也支持按分组授权
+    （分组授权覆盖整棵子树）；共享条目没有保存密码或导入导出；共享只共享
+    条目，被授权者连接目标仍需目标主机自己的密码与审批。地址簿分组支持
+    嵌套与按钮式上下排序，但不支持鼠标拖拽；分组名称只在查看器内存中
     缓存，重启后的首次同步必须全量读取，离线只能保留旧分组 ID 且无法新建/
-    改名/删除分组；账号标签只是逐设备标签，没有按组授权。搜索与标签筛选只
+    改名/删除分组；账号标签只是逐设备标签，不参与授权。搜索与标签筛选只
     作用于“我的设备”，不覆盖最近连接、共享地址簿对话框或分组标题，只做
     大小写不敏感的子串匹配，没有拼音/模糊匹配、按分组/在线状态筛选，筛选
     状态不跨重启保存。地址簿逐条乐观并发控制只覆盖查看器对自有地址簿的
@@ -1162,7 +1190,7 @@
     可以列出、改名并撤销其他设备，也可以一键退出全部其他设备，但没有登录
     地点审计；密码可在查看器自助修改；忘记密码可用邮件令牌或短信验证码在
     查看器登录页或管理台重置，账号对话框可设置/清除找回邮箱与手机；WebAuthn
-    安全密钥已于 2026-10-28 补齐（P2-19）；登录有按“用户名+IP”的失败
+    安全密钥已于 2026-10-28 补齐（P2-19/P2-30，含免密码登录）；登录有按“用户名+IP”的失败
     锁定，配置 `--state` 后写入 SQLite `login_locks` 并跨重启共享，失败计数
     通过 `BEGIN IMMEDIATE` 事务原子累计；没有持久封禁（管理台 `user unlock` 可手动解锁）；账号级 TOTP 两步验证、一次性
     恢复码、短信登录码与邮件登录码已支持（需先绑定找回手机/邮箱）；连接与文件传输审计只覆盖
@@ -1172,9 +1200,10 @@
     的 MAC 只写入本地设备条目，不随账号同步。主机
     自报元数据未签名；别名/标签可从查看器设备菜单或回环管理台编辑，但前者
     要求配置 server-key；软件更新可由服务端托管并签名（`--software-dir`），
-    主机端只写代理日志，查看器显示一次性横幅与可复制的下载地址，不自动下载
-    或安装；租约、中继分配与打洞地址仍只在内存中（重连后重建，与 hbbs
-    一致）。
+    主机端可固定服务器公钥后自动校验、暂存并启动安装器（`--auto-update`，
+    2026-10-28），未开启时只写代理日志；查看器显示一次性横幅与可复制的
+    下载地址，不自动下载或安装；租约、中继分配与打洞地址仍只在内存中
+    （重连后重建，与 hbbs 一致）。
 
 ## P0 — 查看者鉴权（已完成）
 
@@ -1418,7 +1447,8 @@
      `netutil.LoadReloadingTLSConfig` 用 `GetCertificate` 回调按 5 秒间隔惰性
      重读 `--tls-cert`/`--tls-key`，对 PEM 求 SHA-256 仅在内容变化时原子替换；
      坏文件保留旧证书并按错误去重告警，`chast-server` 与 `chast-relay` 均已
-     接入，certbot 式续期无需重启。`--tls-client-ca` 仍只在启动时读取。验证：
+     接入，certbot 式续期无需重启。`--tls-client-ca` 当时仍只在启动时读取
+     （2026-10-28 由 P2-26 补齐热加载）。验证：
      `internal/netutil` 单测覆盖真实握手下的证书轮换、坏文件保留与恢复、mTLS
      字段与参数回退；真实进程回环从 `CN=first-cert` 在 6 秒内切到
      `CN=second-cert`，写入垃圾后仍出示 `second-cert` 并记录
@@ -1481,8 +1511,8 @@
      组件测试）；`flutter analyze`、全量 335 项 Flutter 测试与 Windows
      Release 构建通过。
  26. **P2-19 WebAuthn 安全密钥**（2026-10-28 完成）：账号可用 Windows Hello /
-     FIDO2 平台认证器作为登录第二因素（密码仍必填），并在账号对话框注册、
-     命名、删除安全密钥；只改 HTTP 账号 API，会话协议保持 v27，查看器原生桥
+     FIDO2 平台认证器作为登录第二因素（密码 + 断言；免密码登录见第 38 项），
+     并在账号对话框注册、命名、删除安全密钥；只改 HTTP 账号 API，会话协议保持 v27，查看器原生桥
      直接调用 `webauthn.dll`。`internal/webauthn` 极简 CBOR 解码，支持
      ES256/RS256/EdDSA，校验 clientDataJSON 的 type/challenge/origin/
      crossOrigin、rpIdHash、UP 与签名，attestation 接受 `none`/`packed`
@@ -1502,7 +1532,8 @@
      （HTTP-01），支持多域名、联系邮箱、EAB 与自定义 ACME 目录；
      `--acme-cache` 默认在 `--state` 同目录，缓存命中即用、未命中才签发；
      `--acme-http-listen` 独立监听挑战应答与 HTTPS 跳转；与
-     `--tls-cert`/`--tls-key` 互斥，可与 `--tls-client-ca`（mTLS）组合。
+     `--tls-cert`/`--tls-key` 互斥，可与 `--tls-client-ca`（mTLS，CA 热加载
+     见第 34 项）组合。
      校验裸 DNS 名（拒绝通配符/IP/端口/无点）、EAB 成对与挑战端口不冲突。
      验证：`internal/acmecert` 单测覆盖域名解析、EAB 四种编码、无效配置、
      缓存命中与白名单外主机、mTLS 组合、302/404/403；真实进程回环用预置
@@ -1528,6 +1559,400 @@
      延迟直方图已于 2026-10-27 补齐，14 个 `le` 分桶 + `+Inf`；审计/连接/
      文件传输 `format=csv` 整表导出也于同日补齐；邮件找回已于 2026-10-28
      补齐，短信找回、短信登录码与邮件登录码也于同日补齐。）
+ 30. **P2-22 主机代理自动更新**（2026-10-28 完成）：新增 `internal/updater`
+     与 `chast-tunnel host --auto-update --auto-update-dir`，在固定
+     `--server-pubkey` 的前提下校验服务器签名（`chast-software-v1` 域，覆盖
+     版本/URL/摘要/大小）、流式下载并核对 SHA-256 与长度、改名为最终文件后
+     以分离进程启动安装器；每个版本最多尝试一次，失败只记日志，不执行任何
+     下载文件。验证：`internal/updater` 与 `internal/agent` 单测覆盖签名/
+     篡改/超限/URL 形态/摘要与长度不符/上下文取消/缺 pin；真实进程回环
+     （`build/autoupdate-smoke/run.sh`）完成“通告 → 校验 → 暂存 → 启动”全
+     链路，替换托管文件后以大小不符拒绝且不执行。边界：仅 Windows 自动
+     启动，宿主不等待安装器结束；查看器侧见 P2-27。协议无变化（v27）。
+ 31. **P2-23 管理台多运营者与只读角色**（2026-10-28 完成）：账号角色扩展为
+     `admin`/`operator`/`readonly`/`user`，控制台按 `consoleRead` <
+     `consoleWrite` < `consoleAdmin` 三级重新鉴权：只读可看总览/设备/审计/
+     服务器并导出 CSV，operator 额外可改别名/标签、重置身份、移除租约
+     （分别写 `device_labels`/`device_reset`/`device_lease_remove` 审计），
+     admin 才能读写 `/v1/accounts`；`user` 不能进入管理台。内嵌管理台登录
+     方式增加“账号”：复用 `/v1/account/login`（含 TOTP 与恢复码），访问
+     令牌 401 时自动 `/v1/account/refresh` 轮换，退出调
+     `/v1/account/logout`；服务器密钥仍是隐式超管。首个账号仍强制 admin，
+     创建账号可在一条插入里指定角色（不再先建后改，避免“账号已创建但返回
+     409”）。验证：`TestConsoleRoleMatrix` 覆盖 4 角色 × 读/写/管理端点，
+     `TestOperatorAndReadonlyRoles` 与 `TestCreateUserWithRole` 覆盖角色存储
+     与首账号引导；真实进程回环用 alice/bob/carol/dave 四个账号在浏览器验证
+     登录、页签与设备按钮差异、readonly CSV 导出、401→refresh 保活、user
+     账号被拒并立即吊销会话。全量 `go test ./...` 通过，协议无变化。
+ 32. **P2-24 审计外部归档与流式导出**（2026-10-28 完成）：账号库迁移升到
+     v2，新增 `archive_checkpoints(stream, last_id, updated_at)`；
+     `internal/account` 增加按 ID 升序的审计/连接/文件传输分页读取与单调推进
+     的检查点；新增 `internal/auditarchive`，每 `--audit-archive-interval`
+     （默认 1h，启动同步一次）把检查点之后的行追加到
+     `<stream>-<UTC 日>.jsonl`，先写并 `fsync` 再推进检查点（至少一次；重启
+     不重写已有行，崩溃最多产生可按 `stream`+`id` 去重的重复行）；
+     `chast-server --audit-archive-dir` 接线，管理台 `audit archive [run]`
+     查看进度或立即执行。三类 CSV 导出改为分批流式写出（chunked，表头在首页
+     查询成功后发送）：账号审计每批 500 行、连接与文件传输每批 200 行，修复
+     超过存储单页上限后导出提前结束的问题；`api` 与 `tracing` 的响应包装器
+     补 `Flush` 透传，否则 instrumentation 会缓冲整个响应。验证：
+     `internal/account` 覆盖检查点持久化/单调/拒绝空流与升序分页；
+     `internal/auditarchive` 覆盖 JSONL 内容、空闲不写、增量追加与跨日文件；
+     `internal/api` 覆盖 510/450/250 行跨页导出与 chunked 无
+     `Content-Length`；真实进程回环确认重启从检查点续写、单条新事件只追加
+     一行、CSV 响应为 `Transfer-Encoding: chunked`。`go vet ./...` 与
+     `go test ./... -count=1` 通过，协议无变化（v27）。
+ 33. **P2-25 查看器录制的主机授权**（2026-10-28 完成，协议 v28）：对齐
+     RustDesk `enable-record-session` 的语义——主机同意查看器把收到的流录制到
+     本地，权限位 `0x0200`，ServerInfo `record_enabled` 随 HelloAck 与
+     PermissionUpdate 下发；流已在查看器侧，主机无法强制执行，因此这是建议性
+     同意而不是技术闸门。主机 `allow_record` 默认开启，`.ini` 用独立
+     `record=` 行（旧掩码没有该位，不能撤销默认同意），审批窗、安全设置
+     “访问控制”页与托盘均可切换；会话中撤销立即生效，开启受握手时的权限
+     上限约束，若当前会话未获授权则提示“下次连接生效”。查看器 `ViewerEngine`
+     在未获同意时拒绝新录制，工具栏录制按钮置灰并显示“主机未开放录制”；
+     已开始的录制在权限被撤销后继续（RustDesk 行为），权限变化提示中包含
+     “录制”。CLI `connect --record` 同样遵守同意位。验证：协议/设置单测、
+     Flutter 状态与工具栏测试、全套 `ctest` 26/26；真实主机回环
+     `record=1` 录制 752 个样本（5.1 MB，重开校验 752 样本/1 关键帧通过），
+     `record=0` 时 `connect --record` 以“the host did not grant recording
+     consent”拒绝且不建文件，普通连接仍解码 692 帧。回环发现并修复了
+     `record=1` 被旧 `permissions=` 掩码覆盖的迁移缺陷，新增回归测试；
+     `flutter analyze` 无问题、全量 355 项 Flutter 测试通过。
+ 34. **P2-26 TLS 客户端 CA 热加载**（2026-10-28 完成，协议无变化）：启用
+     `--tls-client-ca` 时，`netutil.LoadReloadingTLSConfig` 安装
+     `GetConfigForClient`，每次握手按 5 秒间隔惰性重读 CA PEM；摘要变化才用
+     `tls.Config.Clone` 生成带新 `ClientCAs` 的每握手配置并原子替换，不修改
+     共享配置；坏文件保留当前 CA 池并按错误去重记录
+     `TLS client CA reload skipped`，恢复有效文件后继续轮换（日志
+     `TLS client CA reloaded`）。未配置客户端 CA 或轮转间隔为 0 时行为不变。
+     验证：`internal/netutil` 新增真实 mTLS 握手测试，覆盖旧 CA 通过/新 CA
+     拒绝、替换后信任切换、坏文件保留与恢复；真实 `chast-server` 进程回环
+     用两套 openssl CA 与客户端证书完成四步——初始 client1 200 /
+     client2 `unknown ca`，换 CA 后 client2 200 / client1 `unknown ca`，CA
+     写成垃圾后 client2 仍 200 且日志 skipped，恢复第一套 CA 后 client1
+     再次 200，全程不重启；`go vet ./...` 与全量 `go test ./... -count=1`
+     通过。同日补强（2026-10-28）：重载逻辑提取为
+     `netutil.ClientCAReloader`，`acmecert.Manager.TLSConfig` 也接收轮换
+     间隔并以每握手 `Clone` 的 `GetConfigForClient` 换入当前 CA 池，因此
+     `--acme-domain` 模式同样无需重启；`internal/acmecert` 新增轮换、坏文件
+     保留与间隔 0 静态三组测试，真实 ACME 回环用 CA A/B 客户端完成
+     200/拒绝/轮换/坏文件四步，日志含 `TLS client CA reloaded` 与
+     `… reload skipped`。
+ 35. **P2-27 查看器自动更新**（2026-10-28 完成，协议无变化）：`SoftwareInfo`
+     增加 `sha256`/`size`/`signature` 与 `installable`；服务端托管并签名
+     （`--software-dir`）且查看器已固定服务器公钥时，更新对话框提供
+     “下载并安装”。`TunnelAgent.applyUpdate` 以分离进程启动随包分发的
+     `chast-tunnel apply-update` 后退出；helper 用 pin 校验通告签名、流式
+     下载并核对 SHA-256/长度、`WaitForPID` 等查看器退出、`updater.Install`
+     把旧映像改名备份后换入新文件并启动，成功后 `Retire` 删除备份；启动失败
+     则 `Restore` 还原并重新启动旧映像，避免用户停在无进程状态。helper 拒绝
+     替换正在运行的自身；缺 pin、签名不匹配与被篡改的大小都在下载前拒绝。
+     Windows 允许改名正在运行的 exe，因此无需停止进程即可备份；备份名带
+     纳秒时间戳，残留备份由下一次更新覆盖。验证：`internal/updater` 新增
+     `Install`/`Restore`/`Retire`/`WaitForPID` 单测（含 Windows 自进程超时与
+     跨卷复制回退）；Flutter `server_api_test` 覆盖签名块解析与半签名不可
+     安装，`home_page_test` 覆盖固定身份时以 pin 调用安装并退出、无 pin 时
+     不显示安装按钮、非签名通告保持复制对话框；真实回环用 `--software-dir`
+     托管签名发布，helper 等待 1.5 s 子进程后下载并换入新映像（哈希与通告
+     一致、标记文件为 new、备份已清理）；错误公钥、篡改大小、缺 pin 与被
+     替换自身均被拒绝且目标未变；`--launch` 指向坏文件时退出码 1，旧映像
+     还原并重启（标记 old）。`go vet ./...`、全量 `go test ./... -count=1`、
+     `flutter analyze` 与全量 365 项 Flutter 测试通过。
+ 36. **P2-28 Windows 安装器与发布打包**（2026-10-28 完成，协议无变化）：
+     自研单文件安装器 `chast-setup.exe`（`internal/setup` + `cmd/chast-setup`，
+     不引入 WiX/Inno/NSIS 或新的 Go 依赖），默认按用户装到
+     `%LOCALAPPDATA%\Programs\chast`（查看器可就地自更新），`--machine`
+     装到 `%ProgramFiles%\chast` 并写 HKLM（需提升）。发布树压成 zip 后由
+     `cmd/chast-package` 追加到安装器尾部（`CHASTPK1` + uint64 长度，
+     `--payload` 也可直接读取独立 zip）；解压经 `.new` 暂存再换入，拒绝
+     `..` 路径与符号链接。可选写 Programs and Features 卸载项（reg.exe）、
+     开始菜单快捷方式（PowerShell WScript.Shell，脚本以 UTF-16LE
+     `-EncodedCommand` 传入）与 `--service`（调 `chast-service.exe --install`，
+     要求 `--machine`）。机器级升级若检测到已注册的 chast-host 服务，先用
+     Get-Service 停服、安装后重启，避免替换被占用的 exe；卸载先删服务与
+     注册再删目录，安装器自身在目录内运行时由隐藏的 PowerShell 延迟自删
+     （CREATE_NO_WINDOW；实测 DETACHED_PROCESS 会让 PowerShell 不执行脚本）。
+     `tools/package-windows.ps1` 从 Flutter Release 树与 host 产物组装
+     `dist/chast-<ver>-setup.exe`（排除 `.lib`/`.pdb`/`.exp`）并打印
+     SHA-256/大小，可直接配合 `--software-dir` 托管。验证：单测覆盖 zip
+     遍历/符号链接拒绝、追加负载 roundtrip、损坏尾部、覆盖解压、安全根目录、
+     HKCU 注册与快捷方式往返；真实 48 MB 发布包 `--list` 17 项、静默安装/
+     覆盖安装/卸载通过，卸载后 HKCU 与快捷方式立即消失、目录约 3 秒内自删；
+     提升回环验证 `--machine --service` 写 HKLM、ProgramData 快捷方式并调用
+     `chast-service.exe --install`，卸载全部清除；相对 `--root` 会先转绝对
+     路径，否则卸载器认不出正在运行的自身。`go vet ./...` 与全量
+     `go test ./... -count=1` 通过。限制：机器级安装的查看器自更新仍需
+     提升；服务注册复用既有 C++ 安装逻辑，未在真实 SCM 上重复验收。
+ 37. **P2-29 查看器录制归档（可选上传）**（2026-10-28 完成，协议无变化）：
+     查看器结束本地录制后，按账号设置把每个分段 MP4 以原始字节流上传到服务端
+     （元数据在查询串：名称、对端、开始时间、时长），服务端按账号隔离存储在
+     `--recordings-dir/<userID>/<id>.mp4`，边写边算 SHA-256；单文件上限
+     `--recordings-max-mb`、账号配额 `--recordings-quota-mb` 与保留期
+     `--recordings-retention-days` 在拷贝时与每 6 小时清理中强制（schema v4
+     `recordings` 表）。HTTP API：`POST/GET /v1/account/recordings`、
+     `GET/DELETE /v1/account/recordings/{id}`，上传/删除写 `recording_upload`/
+     `recording_delete` 审计（跨账号删除尝试记失败）。管理台新增 `GET
+     /v1/recordings` 与 `GET/DELETE /v1/recordings/{id}`：`readonly` 及以上可
+     跨账号列出（按属主过滤、`before_id` 游标）与下载，`operator` 及以上可
+     删除，成功删除的审计记在属主名下并注明 `by=<操作者>`；控制台“录制”
+     页签提供过滤、翻页、用量/上限、下载与二次确认删除。查看器 `ServerApi` 增加
+     列表、流式上传（10 分钟超时、进度回调）、流式下载（同名自动加 ` (n)`）
+     与删除；会话页只在录制结束且账号启用“自动上传录制”时逐段上传，账号
+     对话框新增“云端录制”管理页（用量/配额、单次上限、下载到 Videos、
+     二次确认删除）。验证：`go vet ./...`、`go build ./...` 与全量
+     `go test ./...` 通过；Flutter `analyze` 无问题、全量 382 项测试与
+     Windows Release 构建通过；真实 `chast-server` 回环（账号 alice/bob）：
+     空体 400、5.1 MB 上传 201 且返回的 SHA-256 与本地一致、中文名以
+     RFC 5987 回传、列表与用量正确、下载字节与 SHA-256 完全一致、删除 204
+     后下载 404 且磁盘文件删除、审计含上传/删除两条；bob 读取/删除 alice 的
+     录制均 404 且删除记失败审计；Dart `ServerApi` 对同一进程完成上传→列表→
+     下载（逐字节比对）→删除的跨栈回环。运营者管理单测覆盖角色阶梯、属主
+     过滤、游标、跨账号下载、删除审计与归档关闭 503；真实服务端回环验证
+     server-key 列表/用量、readonly 下载 SHA-256 一致、readonly 删除 403、
+     operator 删除 204，浏览器完成过滤、下载与二次确认删除，审计含属主与
+     `by=` 操作者。限制：配额/单文件上限与保留期清理由服务端单测覆盖，回环
+     未制造超大文件；“自动上传”需要真实会话产生录制，本轮未做 GUI 端到端；
+     运营者管理未做跨网大文件与并发验收。
+ 38. **P2-30 WebAuthn 免密码登录**（2026-10-28 完成，协议无变化）：
+     在 P2-19 基础上新增 `login-passwordless` 挑战 purpose，与密码版 `login`
+     各自单活、互不替换也互不重放，共用既有凭据表、断言校验、令牌签发、
+     限流与封禁。`POST /v1/account/login/webauthn/passwordless/begin` 只收
+     `username`，账号存在且有凭据时返回断言选项；未知账号与无凭据统一 202
+     且不计限流失败，避免枚举与误锁；封禁账号照常拿到挑战，只有有效断言
+     提交后才由 finish 返回 403。`.../passwordless/finish` 与密码版使用相同
+     断言字段，成功签发访问/刷新令牌并写 `passwordless-security-key
+     device=...` 审计；删除单枚凭据同时清掉两种登录挑战。验证：
+     `internal/account`/`internal/api` 覆盖双 purpose 并存、跨 purpose 拒绝、
+     202、限流 429、封禁 403、重放与审计；扩展
+     `server/cmd/chast-webauthn-smoke` 完成 25 项真实进程回环检查全部通过
+     （含免密码 begin/finish、令牌可用、重放 401、未知账号 202、删除后 202）；
+     查看器主登录表单新增“使用安全密钥登录”，`webauthn_api_test`/
+     `security_key_test`/`home_page_test` 覆盖接口、错误映射与完整登录；
+     `flutter analyze` 无问题，全量 388 项 Flutter 测试与 Windows Release
+     构建通过。边界：必须输入用户名（用户名作用域），不做无用户名的可发现
+     凭据（passkey）与跨设备同步。
+ 39. **P2-31 主机共享目录浏览与按需下载**（2026-10-28 完成，协议 v30）：
+     新增控制消息 45–48（FileListRequest/FileListResult/FileDownloadRequest/
+     FileDownloadResult），沿用 `FileCode`。主机把接收目录当唯一根，逐段
+     解析并拒绝 `..`、空段、绝对路径、NUL 与 reparse point，列出一层、
+     最多 512 项并标记截断；下载先确认普通文件与 16 GiB 上限，忙则 `Busy`，
+     Ok 立即回传预分配 transfer id 并复用既有 FileOffer/CFIL 管道。查看器
+     引擎按请求 id 把列表配回目录、会话线程发送与接收，桥接发布增量状态，
+     下载自动接受到 `下载\chast`；Flutter 新增模型式文件浏览器（面包屑、
+     子目录、逐文件下载、进度与保存路径）与工具栏入口，中英文词典同步。
+     验证：`chast-quic verify --file-browse` 在真实回环中列出种子目录与
+     子目录、断言 `../` 与绝对路径被拒、下载 300 KiB 并比对摘要，ctest
+     `quic_file_browse` 登记；`file_browser_panel_test` 覆盖面板请求、导航、
+     拒绝提示与下载页脚；`flutter analyze` 无问题、395 项 Flutter 测试
+     与 Windows Release 构建通过。主机“安全设置 → 访问控制”新增共享/接收
+     目录显示与“更改…”文件夹选择器（保存 `file_receive_dir`，随设置重启
+     共享生效），真实主机进程冒烟在中文/英文界面各 21 项检查通过（按钮与
+     标签可见、不重叠、选择器打开可取消，重开后选定目录并保存后
+     `file_receive_dir` 与标签一致、进程存活）。边界：浏览根跟随
+     主机接收目录（可在设置或 INI 更改），浏览与下载本身只读（上传见
+     第 40 项，新建/重命名/删除见第 41 项），单层最多 512 项。
+ 40. **P2-32 文件浏览器上传到当前共享目录**（2026-10-30 完成，协议 v30
+     复用）：不新增协议字段，复用既有 FileOffer/CFIL 上传管道。查看器
+     `SendFiles` 增加 `relative_prefix`，文件夹展开时把浏览目录作为前缀拼到
+     每个文件的 `relative_path`（根目录为空）；桥接新增 `sendFileTo`，从
+     面板标题栏的“上传文件到此处”选择文件/文件夹；主机沿用既有多段校验、
+     沙箱与 `unique_name` 重名去重，落盘到当前浏览的子目录。面板在队列排空
+     或最后结果变化后自动刷新列表，显示上传中队列、完成与失败原因，中英文
+     词典同步。验证：`chast-quic verify --file-browse` 在真实回环中把
+     34 字节经 FileOffer 上传到 `nested`，主机回报 Ok 且字节一致，重新列目录
+     看到该文件（ctest `quic_file_browse` 通过）；`file_browser_panel_test`
+     新增目标目录、快速完成检测、失败原因与取消选择四项用例，
+     `viewer_bridge_upload_test` 覆盖 `sendFileTo` 的目录参数与取消返回，
+     全量 401 项 Flutter 测试、`flutter analyze` 与 Windows Release 构建
+     通过。边界：
+     上传受主机文件传输权限约束；只落盘到当前浏览目录之下，不新建/改名/
+     删除远端文件（见第 41 项）；文件夹上传保留顶层文件夹名。
+ 41. **P2-33 文件浏览器新建文件夹/重命名/删除**（2026-10-30 完成，协议 v31）：
+     新增控制消息 49 FileOpRequest / 50 FileOpResult，提升到 v31，引入
+     `FileOperation`{MakeDirectory, Rename, Remove}；请求携带请求 id、操作、
+     '/'-相对路径与仅重命名使用的新名字（一个路径段），结果复用 `FileCode`
+     与截断原因。主机仍以接收目录为唯一根：路径按浏览同规则逐段校验并拒绝
+     reparse point，新名字在协议层与沙箱层各校验一次；mkdir 只建末级且父目录
+     必须存在，rename 用 MoveFileExW 同父移动且不覆盖，remove 只删普通文件或
+     空目录，只读/非空/重解析点一律 Refused。QuicSession 增加服务端请求队列
+     与客户端结果队列（各上限 8，权限回收时降级为 Refused），主机
+     `drain_file_browse` 按到达顺序处理。查看器引擎按序发送、按请求 id 回配
+     路径，状态发布 fileOpAnswers/fileOpCode/fileOpPath/fileOpError；桥接新增
+     `fileOperation`。Flutter 面板标题栏“新建文件夹”、每行“重命名/删除”菜单、
+     删除确认对话框（文件夹提示需为空）、本地名称校验与操作后自动刷新，
+     中英文词典同步。验证：`chast-quic verify --file-browse` 在真实回环中
+     新建 `nested/probe-folder`、重命名为 `probe-renamed`、重新列目录断言
+     出现/消失，再删除并再次断言消失（ctest `quic_file_browse` 通过）；
+     protocol/file_transfer 单测覆盖编解码拒绝与三种操作的成功/拒绝分支；
+     `file_browser_panel_test` 新增新建、重命名、删除确认与拒绝提示三项用例；
+     全量 404 项 Flutter 测试、`flutter analyze` 与 Windows Release 构建通过。
+     边界：仅限接收目录内，不做递归删除、覆盖式重命名或跨目录移动；删除
+     不可撤销。
+ 42. **P2-34 查看器递归下载文件夹**（2026-10-30 完成，协议 v31 复用）：
+     不新增协议字段，主机不变；遍历器完全在查看器引擎。先以普通列表请求
+     广度遍历目标目录的全部子目录（任一列表被截断即失败），再串行请求
+     每个文件；FileDownloadResult 的 transfer id 映射到本地相对目录，文件
+     落到 `下载\chast\<文件夹>\<子目录>`，列目录答案到达时即创建对应目录，
+     空文件夹也会落盘。列表/下载答案各 10 s 超时；主机 Busy 或查看器正忙
+     时该文件退避 500 ms 重新排队；接收中把“等 FileOffer”放宽到 60 s。
+     取消会中止接收中的流、对已分配但尚未打开的 transfer 预发 Busy，并
+     记住该 id 吞掉可能仍在途的 offer，避免落进接收根目录；会话断开清空
+     全部遍历状态。桥接发布九项 `folderDownload*` 状态，Flutter 面板在
+     目录行新增下载按钮、页脚显示进度/当前文件并提供取消，结束时显示完成
+     路径、取消或失败原因，中英文词典同步。验证：新增 `file_browser_panel_test`
+     四项用例（目录行入队、进度页脚与取消、完成/取消/失败答案、无法入队），
+     全量 407 项 Flutter 测试、`flutter analyze` 与 Windows Release 构建
+     通过；ctest `protocol`、`file_transfer`、`quic_file_browse` 复跑通过。
+     边界：同名本地目录会合并写入且不提示覆盖；远端层级超过 32 段整次失败。
+     引擎层验收（2026-10-30）：新增无头探针 `chast-viewer-probe`
+     （ctest `viewer_folder_download`），同一进程内起真实 `HostServer`
+     （密码认证、真实共享目录）并用真实 `ViewerEngine` 经 QUIC 回环连接：
+     流为 1920x1080 H.264、权限 0x020F；遍历 `tree/` 后 3 个文件按相对路径
+     落盘并逐字节比对（a.txt 5 B、another/c.txt 7 B、deep/b.bin 13 B），
+     `empty/` 与 `deep/nested-empty/` 两个空目录被镜像，共享根下的
+     `outside.txt` 未被带出；对 16 MiB 的 `big/Big.bin` 在传输中调用
+     `CancelDirectoryDownload()`，答案 code 2 且目标目录无残留文件；同次运行
+     解码 54 帧。GUI 人工点击仍未做，遍历器本体已由真实会话覆盖。
+ 43. **P2-35 拖拽上传跟随浏览目录**（2026-10-30 完成，协议无变化）：
+     查看器窗口的拖拽上传原本一律落到共享根；现在 `sendFileAt` 接受
+     `{paths, directory}`，文件浏览器把每个被接受的目录回调给会话页，拖拽时
+     上传到当前目录（浏览器未打开时仍为共享根）。文件夹拖入仍在引擎侧展开
+     并保留自身名字，主机按 offer 的相对路径逐级创建目录。验证：
+     `file_browser_panel_test` 新增目录回调用例（根→photos→根），
+     `viewer_bridge_upload_test` 新增 `sendFilesTo` 参数用例，全量 409 项
+     Flutter 测试、`flutter analyze` 与 Windows Release 构建通过；
+     `chast-viewer-probe`（ctest
+     `viewer_folder_download`）在同一次真实会话中把 1 个文件与 1 个含嵌套
+     子目录的文件夹上传到 `incoming`，断言 3 个文件逐字节一致且主机新建了
+     `incoming/drop/nested`（本次运行共上传 3 个文件、解码 66 帧）。边界：
+     拖拽只接受文件与文件夹，符号链接被跳过；浏览器关闭时投递到共享根。
+ 44. **P2-36 查看器引擎真实终端会话验收与开流竞态修复**（2026-10-30 完成，
+     协议无变化）：`chast-viewer-probe` 的同一真实会话新增终端段——主机
+     开启 `allow_terminal`，引擎 `OpenTerminal(80, 24)` 等到 `kOpen`，键入
+     `echo chast-probe-terminal` 并在回显/输出里匹配标记，
+     `ResizeTerminal(100, 30)` 等到状态同步，`CloseTerminal()` 后抽干输出
+     直到结束并断言 phase=closed、code=0。实跑证据：主机日志确认 ConPTY
+     建台 80x24、`resized to 100x30`、`closed by the viewer`，共 327 B
+     控制台输出，同次运行解码 71 帧；ctest `viewer_folder_download`
+     4.57 s 通过。探针同时暴露并修复引擎竞态：`request_terminal` 在途时
+     会话尚无 entry，旧的输出抽干把“尚未建立”误判为“已结束”，在主机答复
+     前就置为 ended；现在 `kRequesting` 阶段不再抽干输出。Flutter Runner
+     与探针均重新构建通过。边界：只验证引擎 API 与协议路径，GUI 终端面板
+     未人工点击；Ctrl+C 等控制字节未在探针中覆盖。
+ 45. **P2-37 账号令牌 DPAPI 落盘**（2026-10-30 完成，协议无变化）：
+     `%APPDATA%\chast\account.json` 从明文 JSON 改为
+     `{"version":1,"protected":"<DPAPI blob>"}` 信封；桥接新增
+     `protectSecret`/`unprotectSecret`（CurrentUser、entropy
+     `chast.account.v1`、明文上限 64 KiB），查看器账号存储默认注入。无桥接
+     的 `dart run` 工具保持旧明文格式，带保护器加载旧文件时自动重写为信封。
+     实跑证据：用 `tool/dpapi_envelope_probe.dart` 作为入口构建 Windows
+     Release runner 并运行，10 项检查全过（真实 DPAPI 往返、信封字段、文件
+     不含明文令牌、重载复原、旧明文迁移、损坏/异账户 blob 判空、超长拒绝），
+     exit 0，随后用默认入口重建生产 runner；`flutter test` 417 项与
+     `flutter analyze` 通过。边界：GUI 登录未人工点击。
+ 46. **P2-38 审计归档压缩与保留清理**（2026-10-30 完成，协议无变化）：
+     `auditarchive` 每次归档开始时先处理已关闭的 UTC 日文件：默认 gzip 为
+     `<stream>-<YYYYMMDD>.jsonl.gz`（临时文件 + `fsync` + 重命名，成功后删除
+     原文件），`--audit-archive-retention-days`（默认 0，永久保留）按 UTC
+     日期删除窗口外的 `.jsonl`/`.jsonl.gz`；只匹配 `audit`/`connections`/
+     `file-transfers` 的命名，目录内其他文件不动，压缩或清理失败只记日志，
+     不挡新行。管理台 `audit archive run` 追加 `compressed=`/`pruned=`，
+     `--audit-archive-compress=false` 关闭压缩。验证：新增
+     `TestRunCompressesClosedDays` 与 `TestRunPrunesExpiredArchives`（旧文件
+     gzip 后逐字节可读、今日与外来文件不动、半截 `.gz.tmp` 被重建、第二次
+     运行不重复压缩；7 天窗口删除 10-01/10-20、保留边界 10-22、关闭压缩时
+     只清理）；`go vet ./...` 与 `go test ./...` 通过；真实进程以
+     `--audit-archive-dir … --audit-archive-retention-days 7` 启动，日志
+     `audit archive compacted compressed=1 pruned=2`，30 天与 9 天旧文件被删、
+     2 天前文件转为 gzip 且解压内容一致、今日文件与 `notes.txt` 未动。边界：
+     没有远端投递（S3/HTTP），迟到合并的主机审计不回写旧日文件。
+ 47. **P2-39 文件浏览器多选批量下载/删除**（2026-10-30 完成，协议 v31 复用）：
+     面板标题栏新增“多选”，行复选框与整行点击切换选择（多选时文件夹行
+     不再导航），选择条提供全选/清空、已选计数、批量下载与删除。下载走
+     引擎新增的 `RequestBatchDownload(vector<DownloadRoot>)`：一次最多
+     512 项并逐项校验 '/'-相对路径，遍历器按顺序处理多个根——文件夹各自
+     递归并镜像到 `下载\chast\<名字>\…`，散文件落到接收根；进度复用
+     `folder_download_*` 并新增 `folderDownloadRoots` 与
+     `folderDownloadBatch`（单个文件的批量也按批量措辞），结束时目标为
+     接收根。删除在 Flutter 侧串行发送（同一时刻只有一个在途请求，轮询不会
+     合并两个答案）、聚合失败原因、结束后只刷新一次列表。验证：
+     `file_browser_panel_test` 新增多选下载与串行批量删除两项用例及批量
+     完成文案，`flutter analyze` 无问题、420 项 Flutter 测试与 Windows
+     Release 构建通过；`chast-viewer-probe`（ctest `viewer_folder_download`）
+     新增混合批量真实回环——1 个含文件的文件夹、1 个只有空目录的文件夹、
+     1 个根散文件，断言 total/done=2/2、`folderDownloadRoots`=3、目标为
+     接收根，文件逐字节一致、两个空目录被镜像、散文件未嵌进选中文件夹，
+     并断言空选择与 `../` 越界路径被拒；ctest 32 项全过。边界：批量删除
+     不递归、不做跨目录移动；批量下载沿用合并写入与 32 层限制。
+ 48. **P2-40 仅文件传输会话**（2026-10-30 完成，协议 v32）：Hello 增加会话
+     模式字节（Desktop/FileTransfer），HelloAck 增加
+     `kServerInfoFileTransferOnly` 与 `files_only`。仅文件答案把宽高、源
+     尺寸、显示器与音频清零，权限只保留文件传输；主机在
+     `HostServer::file_session()` 中复用文件收发机制（20 ms 轮询、
+     MsQuic keepalive 保活、RAII 清理），文件传输关闭时以
+     `AccessDenial::Declined` 拒绝而不是回退桌面。查看器
+     `Start(..., file_transfer_only)` 跳过 sink/解码器，主循环用短睡眠轮询
+     对端存活，不报画面停滞；桥接与 Dart 新增 `fileTransferOnly`/
+     `filesOnly`，连接页新增“仅文件传输”入口，会话页改为占满窗口的共享
+     文件夹浏览器。验证：`chast-viewer-probe --files-only` 真实回环断言
+     0 帧、0 显示器、权限 0x0008，并完成 3 文件下载与 3 文件上传；
+     `--files-only-denied` 断言拒绝码与“从未进入 streaming”；ctest
+     34 项、`flutter analyze`、421 项 Flutter 测试（新增连接页入口用例）
+     与 Windows Release 构建通过。边界：GUI 未人工点击；仅 Windows；无
+     剪贴板/摄像头/终端/输入，也不支持会话中切回桌面。
+ 49. **P2-41 剪贴板文件列表（主机→查看器）**（2026-10-30 完成，协议
+     v33）：CCLB 新增 `ClipboardFormat::FileList = 4`，格式体为条目列表
+     （UTF-8 基本名、u64 大小、可选相对路径；身份哈希覆盖有序名字、相对
+     路径与大小；上限 256 项 / 64 KiB），文件字节仍走既有下载通道。主机在
+     剪贴板权限内每 500 ms 读取 CF_HDROP，变化时广播列表并以虚拟路径
+     `.chast-clipboard/<index>` 提供下载（闸门是剪贴板权限而非文件传输）；
+     查看器收到后逐个取回到 `%TEMP%\chast-clipboard-*` 暂存目录，全部到齐
+     才一次性写 CF_HDROP，主机忙时 500 ms 重试、10 s 超时清理，并用独立的
+     主机 FileList 哈希判定过期列表（本机对外发送不会误伤）。复制文件夹
+     不需要线上变更：主机把顶层文件夹递归展开为逐文件条目
+     （`rel_path = <顶层文件夹>/<子…>/<文件名>`，跳过重解析点、深度上限 16、
+     超限或不可读时整份不公告、空文件夹不复制），查看器按 `rel_path` 父目录
+     重建树，CF_HDROP 只列扁平文件与每个复制树的顶层文件夹。验证：新增
+     `chast-viewer-probe --clipboard-files`（ctest `viewer_clipboard_files`）
+     真实回环，`clip-one.txt`、`名字 二.bin`（256 KiB）与
+     `clip-folder/{inner.txt,sub/deep.bin}` 落到同一暂存目录，sink 收到 3 个
+     顶层项、树与字节逐字节一致、无 `.part` 残留，`clipboard_received=1`、
+     formats=0x10、failed=0，退出码 0 后目录删除；全套 ctest 35/35 通过。
+     边界：真实 CF_HDROP 写入由现有 Win32 后端承担，探针以 sink 代替并清理
+     暂存目录；反向方向由 P2-42 补齐。
+ 50. **P2-42 剪贴板文件反向（查看器→主机）**（2026-10-30 完成，协议
+     v34）：`FileOffer` 增加 flags 字节（bit0 resume、bit1 clipboard），
+     带 clipboard 位的上传只受剪贴板权限约束，与文件传输开关和接收目录
+     无关。查看器在剪贴板权限内每 500 ms 读 CF_HDROP，基线只记录不发送，
+     列表哈希变化时先广播 FileList 再按顺序发 clipboard 上传；本地复制
+     优先于主机列表（打断下载、回 `IoError` 并清理暂存），主机列表写入
+     CF_HDROP 后记为本机基线避免回送，文件占用剪贴板期间富剪贴板轮询
+     暂停。主机把列表暂存到 `%TEMP%\chast-clipboard-*-in`：扁平文件各占
+     `.item-<序号>`，复制树按 rel_path 顶层分量归到 `.root-<序号>` 下重建
+     文件夹，同名项不覆盖；逐个校验名字/大小，不一致整份拒绝、槽位忙回
+     `Busy`，全部到齐后把 CF_HDROP 顶层项交给 `clipboard_write_files`
+     （默认真实写入），下一次列表/会话结束/失败时删除暂存。与普通上传
+     共用一条队列和活动槽，权限撤销、列表替换会丢弃排队中的 clipboard
+     上传并取消活动传输。验证：`chast-viewer-probe --clipboard-files-up`
+     （ctest `viewer_clipboard_files_up`）真实回环，3 个顶层项（文件+目录
+     两层）逐字节落到同一暂存根，无回送（received=0、failed=0），会话结束
+     后目录删除，退出码 0；正向 `--clipboard-files` 仍通过；全套 ctest
+     36/36 通过。边界：真实
+     CF_HDROP 写入由 Win32 后端承担、探针以捕获代替；上限同 v33；仅
+     Windows；GUI 未人工粘贴验证。
+ 51. **P2-43 剪贴板文本上限提升（2026-10-30 完成）**：CCLB 流的
+     `Text` 上限从继承旧控制消息的 256 KiB 提升为独立的
+     `kMaxClipboardTextBytes = 4 MiB`，与 Html/Rtf 同额；`format_limit`
+     统一约束长度，Text 分支只校验非空、无 NUL、合法 UTF-8。旧
+     `ClipboardUpdate` 控制消息与 `kMaxClipboardBytes` 原样保留，旧客户端
+     路径不受影响。Win32 `read_text` 在 UTF-16 单元数超限时跳过转换，其余
+     交由 `accepts()` 按流上限复验。验证：协议测试覆盖 4 MiB 恰等通过、
+     往返一致与 4 MiB+1 被拒；`chast-quic verify` 回环用 300 KiB（含非
+     ASCII）文本断言查看器收到的内容超过旧 256 KiB 上限；同日单独复跑
+     `quic_loopback` 129 项通过。全量串行 ctest 复跑见文首状态快照。
+     边界：仅提升单条 Text 格式体上限，流总量 40 MiB 与
+     format 数 5 不变；主机读侧仍受 Win32 剪贴板本身与轮询周期约束。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
@@ -1542,16 +1967,32 @@
   （AEC/降噪/设备选择已在 M9.4 完成）。
 - 更多采集/编码后端与其他平台。
 - 查看器侧录制：RustDesk 在查看器录制（`record_screen`）但重编码解码帧；
-  我方改为把主机已编码的 Annex B 访问单元无损封装 MP4（`tools/mp4_recorder.h`），
+  我方改为把主机已编码的 Annex B 访问单元无损封装 MP4（`tools/mp4_recorder.h`，
+  2026-10-28 起支持 H.264 与 HEVC，HEVC 用 hvcC + `hvc1`），
   CLI `chast-quic connect --record out.mp4` 已做回环验收（541 帧原样落盘，
   FFmpeg 重新打开读回校验通过）。画面尺寸中途变化时分段续录（`out-2.mp4`…），
   与 RustDesk 重开录制的行为对齐；ctest `quic_recording` 在默认 75% 分辨率探针下
-  断言两段、样本/关键帧计数与重开校验（全套 26/26）。查看器工具栏的录制开关
-  已接通（复用同一 muxer，默认写入用户 Videos 目录，尺寸变化同样滚动分段），
+  断言两段、样本/关键帧计数与重开校验。HEVC 路径用 FATE 真实码流独立验证
+  （15 样本/1 关键帧全部封装并读回、hvcC 137 字节、FFmpeg HEVC 解码通过；
+  本机 HD 630 无 HEVC 编码器，实机 HEVC 会话待验），另加 ctest
+  `quic_recording_hevc`（请求 HEVC，无编码器时按实际回退的 H.264 校验）。
+  查看器工具栏的录制开关已接通（复用同一 muxer，默认写入用户 Videos 目录，尺寸变化同样滚动分段），
   状态经桥接发布为 `ViewerStatus.recording/recordPath/recordError`；`flutter
   analyze` 无问题、`flutter test` 306 通过、`flutter build windows --release`
-  通过。录制权限本地设置项与可选上传待补；摄像头、远程打印仍缺。
-- M8 其余项（虚拟显示器、安装器与 i18n）见 `docs/m8-plan.md`。
+  通过。主机授予的录制权限已完成（协议 v28，默认允许，主机审批/设置/托盘可
+  切换，查看器未获同意时禁用录制，见 P2-25）；可选上传已完成（P2-29：设置
+  开启后逐段上传到账号，账号对话框可下载/删除，真实服务端与 Dart 客户端
+  跨栈回环通过）；远程摄像头已按
+  v29 完成（同一会话内 `CCAM` 流，不走独立连接）：主机 Media Foundation 采集
+  NV12、在采集卡上硬件编码，查看器 GPU 解码到独立纹理并新增摄像头面板；
+  回环探针覆盖枚举/列表与停止，媒体路径待有摄像头的机器验收（见
+  `docs/status-2026-10-25.md` P2-7）。
+- 远程打印经 2026-10-28 复核定为暂缓：RustDesk 依赖已签名的虚拟 v4 打印机
+  驱动（INF + `printer_driver_adapter.dll`，经
+  UploadPrinterDriverPackage/InstallPrinterDriverFromPackage 安装），没有
+  免驱路径，与虚拟显示器同属驱动签名前置问题。
+- M8.7 的 Windows 安装器（P2-28）与界面多语言（i18n，2026-10-28）均已
+  完成，见 `docs/m8-plan.md`；虚拟显示器因驱动前置问题暂不做。
 
 ## 推进原则
 

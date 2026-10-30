@@ -115,6 +115,12 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.terminal_enabled) {
         mask |= kPermissionTerminal;
     }
+    if (info.camera_enabled) {
+        mask |= kPermissionCamera;
+    }
+    if (info.record_enabled) {
+        mask |= kPermissionRecord;
+    }
     return mask;
 }
 
@@ -527,6 +533,7 @@ struct QuicSession::Impl {
     // MsQuic worker, and closing the connection from its own callback is not
     // allowed.
     uint16_t requested_display = kDisplayAuto;
+    SessionMode requested_mode = SessionMode::Desktop;
     std::string requested_peer;
     // Audit reference of the accepted Hello. pending_hello is consumed by
     // wait_for_client, so the accessor reads this copy instead.
@@ -703,6 +710,22 @@ struct QuicSession::Impl {
     std::map<uint32_t, OutgoingUpload> outgoing_uploads;
     std::deque<FileAnswer> file_answers;
     std::deque<FileResult> file_results;
+    // Shared-folder browsing (protocol v30). Requests keep the viewer's id so
+    // every one is answered; results keep the host's id for the same reason.
+    std::deque<std::pair<uint32_t, std::string>> file_list_requests;
+    std::deque<FileListResult> file_list_results;
+    std::deque<std::pair<uint32_t, std::string>> file_download_requests;
+    std::deque<FileDownloadResult> file_download_results;
+    // File management (protocol v31). The request keeps the viewer's id and
+    // every answer keeps it too, so each is matched like a browse request.
+    struct FileOpRequestData {
+        uint32_t request_id = 0;
+        FileOperation op = FileOperation::MakeDirectory;
+        std::string path;
+        std::string new_name;
+    };
+    std::deque<FileOpRequestData> file_op_requests;
+    std::deque<FileOpResult> file_op_results;
     // Port forwarding. Targets are what the viewer registered and the host
     // approved; entries are the live TCP connections. `pending_*` keeps the
     // request between take_port_forward_request and the host's answer.
@@ -748,6 +771,28 @@ struct QuicSession::Impl {
     std::deque<TerminalResult> terminal_results;
     std::deque<TerminalStop> terminal_stops;
     std::deque<TerminalSize> terminal_resizes;
+    // Camera (protocol v29). One CCAM stream at a time, opened by the host
+    // after a successful StartCamera. The viewer keeps the parsed frames in
+    // `camera_received`/`camera_parser`; the host only sends. The pending and
+    // running ids both name a stream the viewer will accept, because the CCAM
+    // stream and the CameraResult travel on different streams and may cross.
+    std::atomic<HQUIC> camera{nullptr};
+    std::atomic<uint64_t> next_camera_seq{0};
+    bool camera_finished = false;
+    uint16_t server_camera_id = 0;
+    // Host: the start the host application has not answered yet. It keeps the
+    // one-at-a-time rule intact while the device is still opening.
+    uint16_t server_pending_camera = 0;
+    uint16_t client_pending_camera = 0;
+    uint16_t client_camera_id = 0;
+    bool camera_list_request_ready = false;
+    std::deque<CameraList> camera_lists_queue;
+    uint64_t camera_lists_seen = 0;
+    std::deque<uint16_t> camera_starts;
+    std::deque<CameraResult> camera_results;
+    std::deque<uint16_t> camera_stops;
+    std::deque<std::vector<uint8_t>> camera_received;
+    FrameParser camera_parser;
     // Unidirectional streams this side opened for clipboard changes; their
     // handles are closed when QUIC reports SHUTDOWN_COMPLETE.
     std::vector<HQUIC> one_shot_streams;
@@ -1005,6 +1050,7 @@ struct QuicSession::Impl {
             File,
             PortForward,
             Terminal,
+            Camera,
             Reject,
             Bad
         };
@@ -1322,6 +1368,45 @@ struct QuicSession::Impl {
                             }
                             kind = Kind::Terminal;
                         }
+                    }
+                }
+            } else if (std::memcmp(pending->data(), kCameraStreamMagic, 4) == 0) {
+                // Host to viewer only. The stream can overtake the CameraResult
+                // that granted it, so both the pending and the running id name
+                // an acceptable stream; anything else is refused quietly.
+                const bool expecting =
+                    client_pending_camera != 0 || client_camera_id != 0;
+                if (role != Role::Client ||
+                    (session_permissions.load() & kPermissionCamera) == 0) {
+                    kind = Kind::Reject;
+                } else if (pending->size() < kCameraStreamHeaderSize) {
+                    return;
+                } else {
+                    CameraStreamHeader header;
+                    std::string header_error;
+                    if (!decode_camera_stream_header(pending->data(),
+                                                     kCameraStreamHeaderSize, header,
+                                                     &header_error)) {
+                        kind = Kind::Bad;
+                    } else if (!expecting ||
+                               (header.camera_id != client_pending_camera &&
+                                header.camera_id != client_camera_id)) {
+                        kind = Kind::Reject;
+                    } else if (camera.load() != nullptr && !camera_finished) {
+                        // One camera per session; a second stream is a host bug.
+                        kind = Kind::Reject;
+                    } else {
+                        camera = stream;
+                        camera_finished = false;
+                        client_camera_id = header.camera_id;
+                        client_pending_camera = 0;
+                        camera_parser.reset();
+                        camera_received.clear();
+                        if (pending->size() > kCameraStreamHeaderSize) {
+                            camera_received.emplace_back(
+                                pending->begin() + kCameraStreamHeaderSize, pending->end());
+                        }
+                        kind = Kind::Camera;
                     }
                 }
             } else {
@@ -1846,6 +1931,12 @@ struct QuicSession::Impl {
         outgoing_uploads.clear();
         file_answers.clear();
         file_results.clear();
+        file_list_requests.clear();
+        file_list_results.clear();
+        file_download_requests.clear();
+        file_download_results.clear();
+        file_op_requests.clear();
+        file_op_results.clear();
         one_shot_streams.clear();
         std::vector<HQUIC> forwards = detach_port_forward_locked();
         handles.insert(handles.end(), forwards.begin(), forwards.end());
@@ -1891,6 +1982,14 @@ struct QuicSession::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     copy_chunks(microphone_received, event);
                     cv.notify_all();
+                } else if (stream == camera.load()) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // After a local stop the rest of the host's in-flight
+                    // frames are dropped instead of buffered for nobody.
+                    if (!camera_finished) {
+                        copy_chunks(camera_received, event);
+                    }
+                    cv.notify_all();
                 } else if (stream == control.load()) {
                     std::vector<std::pair<ControlType, std::vector<uint8_t>>> messages;
                     std::string error;
@@ -1934,6 +2033,8 @@ struct QuicSession::Impl {
                         audio_finished = true;
                     } else if (stream == microphone.load()) {
                         microphone_finished = true;
+                    } else if (stream == camera.load()) {
+                        camera_finished = true;
                     } else if (stream == control.load()) {
                         control_finished = true;
                     } else {
@@ -2066,6 +2167,10 @@ struct QuicSession::Impl {
                         if (stream == microphone.load()) {
                             microphone_finished = true;
                         }
+                    } else if (stream == camera.load()) {
+                        // The camera is optional: a broken stream ends the
+                        // camera, not the desktop session.
+                        camera_finished = true;
                     } else if (stream == control.load()) {
                         fatal = true;
                     } else if (!bulk) {
@@ -2102,6 +2207,11 @@ struct QuicSession::Impl {
                                              "the peer stopped reading the terminal stream",
                                              aborts);
                     }
+                    if (stream == camera.load()) {
+                        // The viewer no longer reads the camera; the host's
+                        // capture loop sees the same end through camera_open().
+                        camera_finished = true;
+                    }
                 }
                 for (HQUIC handle : aborts) {
                     if (handle != stream) {
@@ -2121,6 +2231,10 @@ struct QuicSession::Impl {
                         audio_shutdown_complete = true;
                     } else if (stream == control.load()) {
                         control_shutdown_complete = true;
+                    } else if (stream == camera.load()) {
+                        camera = nullptr;
+                        camera_finished = true;
+                        to_close.push_back(stream);
                     } else {
                         bool microphone_stream = false;
                         for (auto it = microphone_handles.begin();
@@ -2252,6 +2366,7 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     requested_display = hello.display;
+                    requested_mode = hello.mode;
                     requested_peer = remote_address();
                     session_audit_ref = hello.audit_ref;
                     pending_hello = std::move(hello);
@@ -2933,6 +3048,123 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::FileListRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint32_t request_id = 0;
+                std::string directory;
+                if (!parse_file_list_request(payload, request_id, directory, &error)) {
+                    note_transport_failure("FileListRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_list_requests.size() >= 8) {
+                        file_list_requests.pop_front();
+                    }
+                    file_list_requests.emplace_back(request_id, std::move(directory));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileListResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                FileListResult result;
+                if (!parse_file_list_result(payload, result, &error)) {
+                    note_transport_failure("FileListResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_list_results.size() >= 8) {
+                        file_list_results.pop_front();
+                    }
+                    file_list_results.push_back(std::move(result));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileDownloadRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint32_t request_id = 0;
+                std::string path;
+                if (!parse_file_download_request(payload, request_id, path, &error)) {
+                    note_transport_failure("FileDownloadRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_download_requests.size() >= 8) {
+                        file_download_requests.pop_front();
+                    }
+                    file_download_requests.emplace_back(request_id, std::move(path));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileDownloadResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                FileDownloadResult result;
+                if (!parse_file_download_result(payload, result, &error)) {
+                    note_transport_failure("FileDownloadResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_download_results.size() >= 8) {
+                        file_download_results.pop_front();
+                    }
+                    file_download_results.push_back(std::move(result));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileOpRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                FileOpRequestData request;
+                if (!parse_file_op_request(payload, request.request_id, request.op,
+                                           request.path, request.new_name, &error)) {
+                    note_transport_failure("FileOpRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_op_requests.size() >= 8) {
+                        file_op_requests.pop_front();
+                    }
+                    file_op_requests.push_back(std::move(request));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::FileOpResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                FileOpResult result;
+                if (!parse_file_op_result(payload, result, &error)) {
+                    note_transport_failure("FileOpResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (file_op_results.size() >= 8) {
+                        file_op_results.pop_front();
+                    }
+                    file_op_results.push_back(std::move(result));
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::PortForwardRequest: {
                 if (role != Role::Server) {
                     break;
@@ -3179,6 +3411,160 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::ListCameras: {
+                if (role != Role::Server) {
+                    break;
+                }
+                if (!parse_camera_list_request(payload, &error)) {
+                    note_transport_failure("ListCameras: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if ((session_permissions.load() & kPermissionCamera) != 0) {
+                        camera_list_request_ready = true;
+                    }
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::CameraList: {
+                if (role != Role::Client) {
+                    break;
+                }
+                CameraList list;
+                if (!parse_camera_list(payload, list, &error)) {
+                    note_transport_failure("CameraList: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // The answer is a snapshot: a slow host loop wants the
+                    // newest list, not a replay.
+                    while (camera_lists_queue.size() >= 4) {
+                        camera_lists_queue.pop_front();
+                    }
+                    camera_lists_queue.push_back(std::move(list));
+                    ++camera_lists_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::StartCamera: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint16_t camera_id = 0;
+                if (!parse_camera_start(payload, camera_id, &error)) {
+                    note_transport_failure("StartCamera: " + error);
+                    break;
+                }
+                CameraResult refusal;
+                refusal.camera_id = camera_id;
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if ((session_permissions.load() & kPermissionCamera) == 0) {
+                        refusal.code = CameraCode::Refused;
+                        refusal.reason = "cameras are disabled on this host";
+                    } else if ((camera.load() != nullptr && !camera_finished) ||
+                               server_pending_camera != 0) {
+                        refusal.code = CameraCode::Busy;
+                        refusal.reason = "another camera is already streaming";
+                    } else if (camera_starts.size() >= 4) {
+                        refusal.code = CameraCode::Busy;
+                        refusal.reason = "too many camera requests";
+                    } else if (std::find(camera_starts.begin(), camera_starts.end(),
+                                         camera_id) != camera_starts.end()) {
+                        refusal.code = CameraCode::Busy;
+                        refusal.reason = "that camera is already requested";
+                    } else {
+                        camera_starts.push_back(camera_id);
+                        server_pending_camera = camera_id;
+                        queued = true;
+                    }
+                }
+                if (!queued) {
+                    // The viewer waits for the answer before it shows a
+                    // picture; a quiet drop would leave its panel spinning.
+                    try_send_bytes(control.load(), make_camera_result(refusal),
+                                   QUIC_SEND_FLAG_NONE);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::CameraResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                CameraResult result;
+                if (!parse_camera_result(payload, result, &error)) {
+                    note_transport_failure("CameraResult: " + error);
+                    break;
+                }
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // The CCAM stream may already have arrived and cleared the
+                    // pending id; the running id accepts that late answer.
+                    if (result.camera_id == client_pending_camera ||
+                        result.camera_id == client_camera_id) {
+                        client_pending_camera = 0;
+                        if (result.code == CameraCode::Ok) {
+                            client_camera_id = result.camera_id;
+                        } else if (result.camera_id == client_camera_id) {
+                            client_camera_id = 0;
+                            camera_finished = true;
+                        }
+                        while (camera_results.size() >= 8) {
+                            camera_results.pop_front();
+                        }
+                        camera_results.push_back(std::move(result));
+                        queued = true;
+                    }
+                }
+                if (queued) {
+                    cv.notify_all();
+                }
+                break;
+            }
+            case ControlType::StopCamera: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint16_t camera_id = 0;
+                if (!parse_camera_stop(payload, camera_id, &error)) {
+                    note_transport_failure("StopCamera: " + error);
+                    break;
+                }
+                HQUIC stream = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    while (camera_stops.size() >= 4) {
+                        camera_stops.pop_front();
+                    }
+                    camera_stops.push_back(camera_id);
+                    if (camera_id == server_pending_camera) {
+                        // The viewer gave up while the host was still opening
+                        // the device; a later send_camera_result is refused.
+                        server_pending_camera = 0;
+                    }
+                    // A stale stop for an earlier camera must not end the one
+                    // that replaced it; the id check is the guard.
+                    if (camera_id == server_camera_id && !camera_finished) {
+                        stream = camera.load();
+                        camera_finished = true;
+                        server_camera_id = 0;
+                    }
+                }
+                if (stream) {
+                    // The host application still pops the id and stops its
+                    // capture; the FIN tells the viewer no more frames follow.
+                    api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+                }
+                cv.notify_all();
+                break;
+            }
             default:
                 break;
         }
@@ -3377,6 +3763,9 @@ struct QuicSession::Impl {
         if (HQUIC handle = control.exchange(nullptr)) {
             api->StreamClose(handle);
         }
+        if (HQUIC handle = camera.exchange(nullptr)) {
+            api->StreamClose(handle);
+        }
         std::vector<HQUIC> bulk;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -3413,6 +3802,7 @@ struct QuicSession::Impl {
             hello_ack_ready = false;
             pending_hello = ClientHello{};
             requested_display = kDisplayAuto;
+            requested_mode = SessionMode::Desktop;
             requested_peer.clear();
             session_audit_ref.clear();
             display_switch_ready = false;
@@ -3490,6 +3880,19 @@ struct QuicSession::Impl {
             frame_parser.reset();
             audio_parser.reset();
             microphone_streams_seen = 0;
+            camera_finished = false;
+            server_camera_id = 0;
+            server_pending_camera = 0;
+            client_pending_camera = 0;
+            client_camera_id = 0;
+            camera_list_request_ready = false;
+            camera_lists_queue.clear();
+            camera_lists_seen = 0;
+            camera_starts.clear();
+            camera_results.clear();
+            camera_stops.clear();
+            camera_received.clear();
+            camera_parser.reset();
             unclassified.clear();
             transport_failed = false;
             transport_status = Status::Ok;
@@ -3498,6 +3901,7 @@ struct QuicSession::Impl {
         transport_down = false;
         next_audio_seq = 0;
         next_microphone_seq = 0;
+        next_camera_seq = 0;
         // Only now can the listener claim the slot for the next client.
         connection = nullptr;
         cv.notify_all();
@@ -3531,6 +3935,12 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_terminal) {
             mask |= kPermissionTerminal;
+        }
+        if (server_config.allow_camera) {
+            mask |= kPermissionCamera;
+        }
+        if (server_config.allow_record) {
+            mask |= kPermissionRecord;
         }
         return mask;
     }
@@ -3617,6 +4027,9 @@ struct QuicSession::Impl {
             api->StreamClose(handle);
         }
         if (HQUIC handle = control.exchange(nullptr)) {
+            api->StreamClose(handle);
+        }
+        if (HQUIC handle = camera.exchange(nullptr)) {
             api->StreamClose(handle);
         }
         if (listener) {
@@ -3958,6 +4371,25 @@ uint16_t QuicSession::requested_display() const {
     return impl_->requested_display;
 }
 
+SessionMode QuicSession::requested_mode() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->requested_mode;
+}
+
+bool QuicSession::peer_alive() const {
+    return impl_->peer_alive();
+}
+
+bool QuicSession::viewer_finished() const {
+    Impl& impl = *impl_;
+    if (impl.transport_down.load()) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    return impl.stats_ready || impl.bye_ready || impl.peer_closed || impl.transport_failed ||
+           impl.shutdown_complete;
+}
+
 std::string QuicSession::audit_ref() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->session_audit_ref;
@@ -4093,6 +4525,27 @@ Error QuicSession::set_permissions(uint16_t permissions) {
             impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         }
     }
+    if ((next & kPermissionCamera) == 0) {
+        // The host owns the camera; queueing the stop wakes its capture loop
+        // and the aborted stream ends the viewer's picture at once.
+        HQUIC stream = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            stream = impl.camera.load();
+            if (impl.server_camera_id != 0) {
+                while (impl.camera_stops.size() >= 4) {
+                    impl.camera_stops.pop_front();
+                }
+                impl.camera_stops.push_back(impl.server_camera_id);
+            }
+            impl.camera_finished = true;
+            impl.server_camera_id = 0;
+            impl.server_pending_camera = 0;
+        }
+        if (stream) {
+            impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
+    }
     return impl.send_bytes(impl.control.load(), make_permission_update(next),
                            QUIC_SEND_FLAG_NONE);
 }
@@ -4148,48 +4601,65 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
     ack.port_forward_enabled = (granted & kPermissionPortForward) != 0;
     ack.terminal_enabled = (granted & kPermissionTerminal) != 0;
+    ack.camera_enabled = (granted & kPermissionCamera) != 0;
+    ack.record_enabled = (granted & kPermissionRecord) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
+    }
+    if (ack.files_only) {
+        // There is no picture and no media stream in a files-only session.
+        // Normalize the message here so a caller that reused a desktop
+        // description cannot announce a stream the viewer would wait for.
+        ack.audio.enabled = false;
+        ack.audio.extradata.clear();
+        ack.width = 0;
+        ack.height = 0;
+        ack.source_width = 0;
+        ack.source_height = 0;
+        ack.displays.clear();
+        ack.merged = false;
     }
 
     // Open both media streams before the HelloAck so the announcement never
     // describes a stream that failed to open. The client classifies them by
     // packet magic, so their order here does not matter.
-    HQUIC video = nullptr;
-    QUIC_STATUS status = impl.api->StreamOpen(
-        impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
-        &Impl::stream_callback, &impl, &video);
-    if (QUIC_FAILED(status)) {
-        return quic_error(status, "QUIC StreamOpen(video)");
-    }
-    status = impl.api->StreamStart(video, QUIC_STREAM_START_FLAG_NONE);
-    if (QUIC_FAILED(status)) {
-        impl.api->StreamClose(video);
-        return quic_error(status, "QUIC StreamStart(video)");
-    }
-    impl.video = video;
-
-    if (ack.audio.enabled) {
-        HQUIC audio = nullptr;
-        QUIC_STATUS audio_status = impl.api->StreamOpen(
+    if (!ack.files_only) {
+        HQUIC video = nullptr;
+        QUIC_STATUS status = impl.api->StreamOpen(
             impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
-            &Impl::stream_callback, &impl, &audio);
-        if (QUIC_SUCCEEDED(audio_status)) {
-            audio_status =
-                impl.api->StreamStart(audio, QUIC_STREAM_START_FLAG_NONE);
+            &Impl::stream_callback, &impl, &video);
+        if (QUIC_FAILED(status)) {
+            return quic_error(status, "QUIC StreamOpen(video)");
         }
-        if (QUIC_FAILED(audio_status)) {
-            if (audio) {
-                impl.api->StreamClose(audio);
+        status = impl.api->StreamStart(video, QUIC_STREAM_START_FLAG_NONE);
+        if (QUIC_FAILED(status)) {
+            impl.api->StreamClose(video);
+            return quic_error(status, "QUIC StreamStart(video)");
+        }
+        impl.video = video;
+
+        if (ack.audio.enabled) {
+            HQUIC audio = nullptr;
+            QUIC_STATUS audio_status = impl.api->StreamOpen(
+                impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+                &Impl::stream_callback, &impl, &audio);
+            if (QUIC_SUCCEEDED(audio_status)) {
+                audio_status =
+                    impl.api->StreamStart(audio, QUIC_STREAM_START_FLAG_NONE);
             }
-            // Audio is optional: announce video only instead of failing a
-            // session that could still stream the desktop.
-            ack.audio.enabled = false;
-            ack.audio.extradata.clear();
-        } else {
-            impl.audio = audio;
-            impl.next_audio_seq = 0;
+            if (QUIC_FAILED(audio_status)) {
+                if (audio) {
+                    impl.api->StreamClose(audio);
+                }
+                // Audio is optional: announce video only instead of failing a
+                // session that could still stream the desktop.
+                ack.audio.enabled = false;
+                ack.audio.extradata.clear();
+            } else {
+                impl.audio = audio;
+                impl.next_audio_seq = 0;
+            }
         }
     }
 
@@ -4235,6 +4705,8 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
     update.port_forward_enabled = (granted & kPermissionPortForward) != 0;
     update.terminal_enabled = (granted & kPermissionTerminal) != 0;
+    update.camera_enabled = (granted & kPermissionCamera) != 0;
+    update.record_enabled = (granted & kPermissionRecord) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -4838,6 +5310,7 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     hello.totp = impl.client_config.totp;
     hello.audit_ref = impl.client_config.audit_ref;
     hello.requested_permissions = impl.client_config.requested_permissions & kPermissionAll;
+    hello.mode = impl.client_config.session_mode;
     if (impl.client_config.device_identity) {
         const DeviceIdentity& identity = *impl.client_config.device_identity;
         hello.device_key = identity.public_key();
@@ -5767,6 +6240,217 @@ bool QuicSession::take_file_result(FileResult& result) {
         impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         impl.api->StreamClose(stream);
     }
+    return true;
+}
+
+// ----- shared-folder browsing -----
+
+bool QuicSession::take_file_list_request(uint32_t& request_id, std::string& directory) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_list_requests.empty()) {
+        return false;
+    }
+    request_id = impl_->file_list_requests.front().first;
+    directory = std::move(impl_->file_list_requests.front().second);
+    impl_->file_list_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_file_list_result(const FileListResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_file_list_result is a server operation");
+    }
+    FileListResult answer = result;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            answer.entries.clear();
+            answer.truncated = false;
+            answer.code = FileCode::Refused;
+            answer.reason = "file transfer was revoked";
+        }
+    }
+    std::vector<uint8_t> message = make_file_list_result(answer);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid file list result");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_download_request(uint32_t& request_id, std::string& path) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_download_requests.empty()) {
+        return false;
+    }
+    request_id = impl_->file_download_requests.front().first;
+    path = std::move(impl_->file_download_requests.front().second);
+    impl_->file_download_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_file_download_result(const FileDownloadResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_file_download_result is a server operation");
+    }
+    FileDownloadResult answer = result;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            answer.transfer_id = 0;
+            answer.code = FileCode::Refused;
+            answer.reason = "file transfer was revoked";
+        }
+    }
+    std::vector<uint8_t> message = make_file_download_result(answer);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid file download result");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_file_list(uint32_t request_id, const std::string& directory) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_file_list is a client operation");
+    }
+    std::vector<uint8_t> message = make_file_list_request(request_id, directory);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid file list request");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            return Error(Status::PermissionDenied,
+                         "the host did not grant file transfer");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_list_result(FileListResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_list_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->file_list_results.front());
+    impl_->file_list_results.pop_front();
+    return true;
+}
+
+Error QuicSession::request_file_download(uint32_t request_id, const std::string& path) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_file_download is a client operation");
+    }
+    std::vector<uint8_t> message = make_file_download_request(request_id, path);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid file download request");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            return Error(Status::PermissionDenied,
+                         "the host did not grant file transfer");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_download_result(FileDownloadResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_download_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->file_download_results.front());
+    impl_->file_download_results.pop_front();
+    return true;
+}
+
+// ----- file management -----
+
+bool QuicSession::take_file_op_request(uint32_t& request_id, FileOperation& op,
+                                       std::string& path, std::string& new_name) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_op_requests.empty()) {
+        return false;
+    }
+    Impl::FileOpRequestData& request = impl_->file_op_requests.front();
+    request_id = request.request_id;
+    op = request.op;
+    path = std::move(request.path);
+    new_name = std::move(request.new_name);
+    impl_->file_op_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_file_op_result(const FileOpResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_file_op_result is a server operation");
+    }
+    FileOpResult answer = result;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            answer.code = FileCode::Refused;
+            answer.reason = "file transfer was revoked";
+        }
+    }
+    std::vector<uint8_t> message = make_file_op_result(answer);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid file operation result");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_file_op(uint32_t request_id, FileOperation op,
+                                   const std::string& path,
+                                   const std::string& new_name) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_file_op is a client operation");
+    }
+    std::vector<uint8_t> message = make_file_op_request(request_id, op, path, new_name);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid file operation request");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+            return Error(Status::PermissionDenied,
+                         "the host did not grant file transfer");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_file_op_result(FileOpResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->file_op_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->file_op_results.front());
+    impl_->file_op_results.pop_front();
     return true;
 }
 
@@ -6886,6 +7570,355 @@ void QuicSession::close_terminal(uint32_t terminal_id) {
         impl.api->StreamClose(stream);
     }
     impl.cv.notify_all();
+}
+
+// ----- camera -----
+
+bool QuicSession::take_camera_list_request() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const bool ready = impl_->camera_list_request_ready;
+    impl_->camera_list_request_ready = false;
+    return ready;
+}
+
+Error QuicSession::send_camera_list(const CameraList& list) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_camera_list is a server operation");
+    }
+    std::vector<uint8_t> message = make_camera_list(list);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid camera list");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_camera_start(uint16_t& camera_id) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->camera_starts.empty()) {
+        return false;
+    }
+    camera_id = impl_->camera_starts.front();
+    impl_->camera_starts.pop_front();
+    return true;
+}
+
+Error QuicSession::send_camera_result(const CameraResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_camera_result is a server operation");
+    }
+    if (result.camera_id == 0 || make_camera_result(result).empty()) {
+        return Error(Status::InvalidCall, "invalid camera result");
+    }
+    CameraResult answer = result;
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if (result.camera_id != impl.server_pending_camera) {
+            return Error(Status::InvalidCall, "no camera request is waiting");
+        }
+        impl.server_pending_camera = 0;
+        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+            answer.code = CameraCode::Refused;
+            answer.reason = "camera access was revoked";
+        } else if (answer.code == CameraCode::Ok && impl.camera.load() != nullptr &&
+                   !impl.camera_finished) {
+            answer.code = CameraCode::Busy;
+            answer.reason = "another camera is already streaming";
+        }
+    }
+    if (answer.code == CameraCode::Ok) {
+        // The header names the id and goes first on the new stream, so the
+        // viewer can classify it before the CameraResult reaches it.
+        QUIC_STATUS status = impl.api->StreamOpen(
+            impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+            &Impl::stream_callback, &impl, &stream);
+        if (QUIC_FAILED(status)) {
+            return quic_error(status, "QUIC StreamOpen(camera)");
+        }
+        Error sent = impl.send_bytes(stream, make_camera_stream_header(result.camera_id),
+                                     QUIC_SEND_FLAG_START);
+        if (!sent.ok()) {
+            impl.api->StreamClose(stream);
+            return sent;
+        }
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            impl.camera = stream;
+            impl.camera_finished = false;
+            impl.server_camera_id = result.camera_id;
+            impl.next_camera_seq = 0;
+        }
+    }
+    Error sent = impl.send_bytes(impl.control.load(), make_camera_result(answer),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok() && stream) {
+        {
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            if (impl.camera.load() == stream) {
+                impl.camera = nullptr;
+                impl.camera_finished = true;
+                impl.server_camera_id = 0;
+            }
+        }
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    }
+    impl.cv.notify_all();
+    return sent;
+}
+
+Error QuicSession::send_camera_frame(FrameHeader header, const uint8_t* payload,
+                                     size_t size) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_camera_frame is a server operation");
+    }
+    if (!payload || size == 0 || size > kMaxFramePayload) {
+        return Error(Status::InvalidCall, "invalid frame payload size");
+    }
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the camera stream is not open");
+        }
+        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+            return Error(Status::PermissionDenied, "camera access was revoked");
+        }
+        if (impl.camera_finished) {
+            return Error(Status::Unavailable, "the camera stream is finished");
+        }
+        stream = impl.camera.load();
+    }
+    if (!stream) {
+        return Error(Status::Unavailable, "the camera stream is not open");
+    }
+    header.seq = impl.next_camera_seq.fetch_add(1);
+    header.payload_size = static_cast<uint32_t>(size);
+    header.payload_crc32 = crc32(payload, size);
+    std::vector<uint8_t> bytes(kFrameHeaderSize + size);
+    encode_frame_header(header, bytes.data());
+    std::memcpy(bytes.data() + kFrameHeaderSize, payload, size);
+    // Never waits: a stalled queue drops the frame instead of stalling the
+    // camera capture loop, and the caller can send a keyframe next time.
+    return impl.send_bytes_impl(stream, std::move(bytes), QUIC_SEND_FLAG_NONE, false);
+}
+
+Error QuicSession::finish_camera() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "finish_camera is a server operation");
+    }
+    HQUIC stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.camera_finished) {
+            return Error::success();
+        }
+        stream = impl.camera.load();
+        if (!stream) {
+            return Error::success();
+        }
+        impl.camera_finished = true;
+        impl.server_camera_id = 0;
+    }
+    impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+    impl.cv.notify_all();
+    return Error::success();
+}
+
+bool QuicSession::camera_open() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->camera.load() != nullptr && !impl_->camera_finished;
+}
+
+bool QuicSession::take_camera_stop(uint16_t& camera_id) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->camera_stops.empty()) {
+        return false;
+    }
+    camera_id = impl_->camera_stops.front();
+    impl_->camera_stops.pop_front();
+    return true;
+}
+
+Error QuicSession::request_camera_list() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_camera_list is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant cameras");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_camera_list_request(),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_camera_list(CameraList& list) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->camera_lists_queue.empty()) {
+        return false;
+    }
+    // The newest answer supersedes whatever arrived before it.
+    list = std::move(impl_->camera_lists_queue.back());
+    impl_->camera_lists_queue.clear();
+    return true;
+}
+
+uint64_t QuicSession::camera_lists() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->camera_lists_seen;
+}
+
+Error QuicSession::request_camera_start(uint16_t camera_id) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_camera_start is a client operation");
+    }
+    std::vector<uint8_t> message = make_camera_start(camera_id);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "the camera id is zero");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionCamera) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant cameras");
+        }
+        if (impl.camera_finished) {
+            // The previous camera ended; its ids and buffered frames belong to
+            // it and must not block or leak into the new one.
+            impl.client_camera_id = 0;
+            impl.client_pending_camera = 0;
+            impl.camera_received.clear();
+            impl.camera_parser.reset();
+        }
+        if (impl.client_pending_camera != 0 || impl.client_camera_id != 0 ||
+            (impl.camera.load() != nullptr && !impl.camera_finished)) {
+            return Error(Status::InvalidCall, "a camera is already running");
+        }
+        impl.client_pending_camera = camera_id;
+    }
+    Error sent = impl.send_bytes(impl.control.load(), std::move(message),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.client_pending_camera == camera_id) {
+            impl.client_pending_camera = 0;
+        }
+    }
+    return sent;
+}
+
+bool QuicSession::take_camera_result(CameraResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->camera_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->camera_results.front());
+    impl_->camera_results.pop_front();
+    return true;
+}
+
+Error QuicSession::receive_camera_frame(FrameHeader& header, std::vector<uint8_t>& payload,
+                                        std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "receive_camera_frame is a client operation");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(impl.mutex);
+    for (;;) {
+        while (!impl.camera_received.empty()) {
+            std::vector<uint8_t> chunk = std::move(impl.camera_received.front());
+            impl.camera_received.pop_front();
+            lock.unlock();
+            std::string error;
+            const bool ok = impl.camera_parser.push(chunk.data(), chunk.size(), &error);
+            lock.lock();
+            if (!ok) {
+                return Error(Status::CaptureFailed, "camera stream: " + error);
+            }
+        }
+
+        const uint8_t* frame_payload = nullptr;
+        std::string parse_error;
+        switch (impl.camera_parser.next(header, &frame_payload, &parse_error)) {
+            case FrameParser::Status::Frame: {
+                payload.assign(frame_payload, frame_payload + header.payload_size);
+                impl.camera_parser.consume();
+                return Error::success();
+            }
+            case FrameParser::Status::Error:
+                return Error(Status::CaptureFailed, "camera stream: " + parse_error);
+            case FrameParser::Status::Incomplete:
+                break;
+        }
+
+        if (impl.camera_finished) {
+            if (impl.camera_parser.buffered() > 0) {
+                return Error(Status::CaptureFailed, "camera stream ended mid-frame");
+            }
+            return Error(Status::Unavailable, "the host finished the camera stream");
+        }
+        if (impl.transport_failed) {
+            return Error(impl.transport_status, impl.transport_message);
+        }
+        if (impl.shutdown_complete) {
+            return Error(Status::Unavailable, "the connection closed");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Error(Status::WaitTimeout, "no camera frame arrived in time");
+        }
+        impl.cv.wait_until(lock, deadline);
+    }
+}
+
+Error QuicSession::request_camera_stop() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_camera_stop is a client operation");
+    }
+    uint16_t camera_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        camera_id = impl.client_camera_id != 0 ? impl.client_camera_id
+                                               : impl.client_pending_camera;
+        if (camera_id == 0) {
+            return Error::success();
+        }
+        impl.client_pending_camera = 0;
+        impl.client_camera_id = 0;
+        // The viewer asked to stop: whichever frames were buffered are over
+        // and the next start belongs to a fresh timeline.
+        impl.camera_finished = true;
+        impl.camera_received.clear();
+        impl.camera_parser.reset();
+    }
+    impl.cv.notify_all();
+    return impl.send_bytes(impl.control.load(), make_camera_stop(camera_id),
+                           QUIC_SEND_FLAG_NONE);
 }
 
 Error QuicSession::send_cursor(const CursorUpdate& update) {

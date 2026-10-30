@@ -113,6 +113,9 @@ void main() {
             'software': <String, Object?>{
               'version': '2.1.0',
               'url': 'https://downloads.example.com/chast-2.1.0.exe',
+              'sha256': '0f343b0931126a20f133d67c2b018a3c',
+              'size': 73400320,
+              'signature': 'MEUCIQ-test-signature',
             },
           }),
         );
@@ -136,6 +139,9 @@ void main() {
         batch.software?.url,
         'https://downloads.example.com/chast-2.1.0.exe',
       );
+      expect(batch.software?.sha256, '0f343b0931126a20f133d67c2b018a3c');
+      expect(batch.software?.size, 73400320);
+      expect(batch.software?.installable, isTrue);
     },
   );
 
@@ -172,6 +178,25 @@ void main() {
       <String>['devbox'],
     );
     expect(batch.software, isNull);
+  });
+
+  test('lookupBatch keeps an unsigned offer without marking it installable', () async {
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        '{"hosts":[],"software":{"version":"2.1.0",'
+        '"url":"https://downloads.example.com/chast-2.1.0.exe",'
+        '"sha256":"","size":0,"signature":""}}',
+      );
+      await request.response.close();
+    });
+
+    final BatchLookupResult batch = await ServerApi.lookupBatch(
+      settings,
+      <String>['devbox'],
+    );
+    expect(batch.software?.version, '2.1.0');
+    expect(batch.software?.installable, isFalse);
   });
 
   test('lookupBatch rejects a response without a host list', () async {
@@ -2032,9 +2057,8 @@ void main() {
 
   test('address book groups are created, deleted and validated', () async {
     final List<String> requests = <String>[];
-    int calls = 0;
+    int deletes = 0;
     server.listen((HttpRequest request) async {
-      calls++;
       final String body = await utf8.decoder.bind(request).join();
       requests.add('${request.method} ${request.uri.path} $body');
       request.response.headers.contentType = ContentType.json;
@@ -2043,11 +2067,13 @@ void main() {
           jsonEncode(<String, Object?>{
             'id': 'work',
             'name': 'Work',
+            'parent_id': 'team',
+            'position': 2,
             'updated_at_ms': 1761300000000,
             'revision': 6,
           }),
         );
-      } else if (calls == 2) {
+      } else if (deletes++ == 0) {
         request.response.statusCode = HttpStatus.noContent;
       } else {
         request.response.statusCode = HttpStatus.notFound;
@@ -2068,7 +2094,50 @@ void main() {
     );
     expect(group.id, 'work');
     expect(group.name, 'Work');
+    expect(group.parentId, 'team');
+    expect(group.position, 2);
     expect(group.revision, 6);
+
+    final AddressBookGroup placed = await ServerApi.updateAddressBookGroup(
+      settings,
+      'account-token',
+      'work',
+      null,
+      parentId: ' team ',
+      position: 3,
+    );
+    expect(
+      requests.last,
+      'PATCH /v1/addressbook/groups/work {"parent_id":"team","position":3}',
+    );
+    expect(placed.parentId, 'team');
+
+    await expectLater(
+      ServerApi.updateAddressBookGroup(
+        settings,
+        'account-token',
+        'work',
+        null,
+        position: -1,
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('排序位置'),
+        ),
+      ),
+    );
+    await expectLater(
+      ServerApi.updateAddressBookGroup(settings, 'account-token', 'work', null),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('至少需要一项'),
+        ),
+      ),
+    );
 
     await ServerApi.deleteAddressBookGroup(settings, 'account-token', 'work');
     expect(requests.last, 'DELETE /v1/addressbook/groups/work ');
@@ -2117,7 +2186,11 @@ void main() {
       body = jsonDecode(await utf8.decoder.bind(request).join());
       request.response.headers.contentType = ContentType.json;
       request.response.write(
-        jsonEncode(<String, Object?>{'id': 'devbox', 'group_id': 'work'}),
+        jsonEncode(<String, Object?>{
+          'id': 'devbox',
+          'group_id': 'work',
+          'position': 3,
+        }),
       );
       await request.response.close();
     });
@@ -2139,6 +2212,31 @@ void main() {
       groupId: '',
     );
     expect(body, <String, Object?>{'group_id': ''});
+
+    body = null;
+    final AddressBookPeer placed = await ServerApi.updateAddressBookPeer(
+      settings,
+      'account-token',
+      'devbox',
+      position: 3,
+    );
+    expect(body, <String, Object?>{'position': 3});
+    expect(placed.position, 3);
+    await expectLater(
+      ServerApi.updateAddressBookPeer(
+        settings,
+        'account-token',
+        'devbox',
+        position: -1,
+      ),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException e) => e.message,
+          'message',
+          contains('排序位置'),
+        ),
+      ),
+    );
   });
 
   test('shared address books parse grants and peers', () async {
@@ -2782,5 +2880,229 @@ void main() {
       direction: 'viewer',
     );
     expect(calls, 0);
+  });
+
+  test('listRecordings parses the archive and its limits', () async {
+    String? authorization;
+    Uri? requested;
+    server.listen((HttpRequest request) async {
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      requested = request.uri;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'recordings': <Object?>[
+            <String, Object?>{
+              'id': 'a' * 32,
+              'name': '会话录制.mp4',
+              'peer_id': 'devbox',
+              'size': 2048,
+              'sha256': 'AB' * 32,
+              'duration_ms': 60000,
+              'started_at_ms': 1761400000000,
+              'created_at_ms': 1761400060000,
+            },
+          ],
+          'usage_bytes': 2048,
+          'quota_bytes': 8192,
+          'max_upload_bytes': 4096,
+        }),
+      );
+      await request.response.close();
+    });
+
+    final RecordingArchive archive = await ServerApi.listRecordings(
+      settings,
+      'account-token',
+    );
+    expect(requested?.path, '/v1/account/recordings');
+    expect(authorization, 'Bearer account-token');
+    expect(archive.recordings, hasLength(1));
+    expect(archive.recordings.single.name, '会话录制.mp4');
+    expect(archive.recordings.single.peerId, 'devbox');
+    expect(archive.recordings.single.durationMs, 60000);
+    expect(archive.recordings.single.createdAt?.toUtc().millisecondsSinceEpoch,
+        1761400060000);
+    expect(archive.usageBytes, 2048);
+    expect(archive.quotaBytes, 8192);
+    expect(archive.maxUploadBytes, 4096);
+  });
+
+  test('uploadRecording streams the file with encoded metadata', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-upload-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
+    final List<int> bytes = List<int>.generate(1024, (int index) => index % 251);
+    await file.writeAsBytes(bytes);
+
+    Uri? requested;
+    String? authorization;
+    ContentType? contentType;
+    int? contentLength;
+    List<int>? body;
+    server.listen((HttpRequest request) async {
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      contentType = request.headers.contentType;
+      contentLength = request.headers.contentLength;
+      body = await request.fold<List<int>>(
+        <int>[],
+        (List<int> all, List<int> chunk) => all..addAll(chunk),
+      );
+      request.response.statusCode = HttpStatus.created;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'recording': <String, Object?>{
+            'id': 'b' * 32,
+            'name': '会话录制.mp4',
+            'peer_id': 'devbox',
+            'size': 1024,
+            'sha256': 'CD' * 32,
+            'duration_ms': 5000,
+            'started_at_ms': 1761400000000,
+            'created_at_ms': 1761400005000,
+          },
+          'usage_bytes': 1024,
+          'quota_bytes': 8192,
+        }),
+      );
+      await request.response.close();
+    });
+
+    int lastSent = 0;
+    int lastTotal = 0;
+    final RemoteRecording recorded = await ServerApi.uploadRecording(
+      settings,
+      'account-token',
+      file: file,
+      name: '会话录制.mp4',
+      peerId: 'devbox',
+      startedAtMs: 1761400000000,
+      durationMs: 5000,
+      onProgress: (int sent, int total) {
+        lastSent = sent;
+        lastTotal = total;
+      },
+    );
+
+    expect(requested?.path, '/v1/account/recordings');
+    expect(requested?.queryParameters['name'], '会话录制.mp4');
+    expect(requested?.queryParameters['peer_id'], 'devbox');
+    expect(requested?.queryParameters['started_ms'], '1761400000000');
+    expect(requested?.queryParameters['duration_ms'], '5000');
+    expect(authorization, 'Bearer account-token');
+    expect(contentType?.mimeType, 'video/mp4');
+    expect(contentLength, 1024);
+    expect(body, bytes);
+    expect(lastSent, 1024);
+    expect(lastTotal, 1024);
+    expect(recorded.id, 'b' * 32);
+    expect(recorded.name, '会话录制.mp4');
+  });
+
+  test('uploadRecording maps a quota refusal to a readable reason', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-upload-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}rec.mp4');
+    await file.writeAsBytes(<int>[1, 2, 3, 4]);
+    server.listen((HttpRequest request) async {
+      await request.drain<void>();
+      request.response.statusCode = HttpStatus.requestEntityTooLarge;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{
+          'error': 'account recording quota is exhausted',
+        }),
+      );
+      await request.response.close();
+    });
+
+    await expectLater(
+      ServerApi.uploadRecording(
+        settings,
+        'account-token',
+        file: file,
+      ),
+      throwsA(
+        isA<ServerApiException>()
+            .having((ServerApiException e) => e.statusCode, 'status', 413)
+            .having((ServerApiException e) => e.message, 'message', '录制存储配额已用尽'),
+      ),
+    );
+  });
+
+  test('downloadRecording saves without overwriting and sends the token', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-download-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    String? authorization;
+    server.listen((HttpRequest request) async {
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      request.response.headers.contentType = ContentType('video', 'mp4');
+      request.response.add(<int>[0, 1, 2, 3, 4]);
+      await request.response.close();
+    });
+    final RemoteRecording recording = RemoteRecording(
+      id: 'c' * 32,
+      name: r'..\会话/录制 2026.mp4',
+      size: 5,
+    );
+
+    final File first = await ServerApi.downloadRecording(
+      settings,
+      'account-token',
+      recording,
+      directory: dir,
+    );
+    final File second = await ServerApi.downloadRecording(
+      settings,
+      'account-token',
+      recording,
+      directory: dir,
+    );
+
+    expect(authorization, 'Bearer account-token');
+    expect(first.path, endsWith('会话_录制 2026.mp4'));
+    expect(second.path, endsWith('会话_录制 2026 (1).mp4'));
+    expect(await first.readAsBytes(), <int>[0, 1, 2, 3, 4]);
+    expect(await second.readAsBytes(), <int>[0, 1, 2, 3, 4]);
+  });
+
+  test('deleteRecording accepts 204 and reports a missing recording', () async {
+    final List<String> methods = <String>[];
+    final List<String> paths = <String>[];
+    bool missing = false;
+    server.listen((HttpRequest request) async {
+      methods.add(request.method);
+      paths.add(request.uri.path);
+      if (missing) {
+        request.response.statusCode = HttpStatus.notFound;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode(<String, Object?>{'error': 'x'}));
+      } else {
+        request.response.statusCode = HttpStatus.noContent;
+      }
+      await request.response.close();
+    });
+
+    await ServerApi.deleteRecording(settings, 'account-token', 'd' * 32);
+    expect(methods, <String>['DELETE']);
+    expect(paths, <String>['/v1/account/recordings/${'d' * 32}']);
+
+    missing = true;
+    await expectLater(
+      ServerApi.deleteRecording(settings, 'account-token', 'd' * 32),
+      throwsA(
+        isA<ServerApiException>()
+            .having((ServerApiException e) => e.statusCode, 'status', 404)
+            .having((ServerApiException e) => e.message, 'message', '录制不存在或已被删除'),
+      ),
+    );
   });
 }

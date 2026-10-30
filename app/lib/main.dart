@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 
+import 'l10n.dart';
 import 'pages/home_page.dart';
 import 'theme.dart';
 
 void main(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
+  AppLanguage.load();
   runApp(ChastApp(connectTarget: _connectTarget(args)));
 }
 
@@ -28,13 +31,26 @@ class ChastApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Chast',
-      debugShowCheckedModeBanner: false,
-      theme: buildChastTheme(Brightness.light),
-      darkTheme: buildChastTheme(Brightness.dark),
-      themeMode: ThemeMode.system,
-      home: HomePage(initialTarget: connectTarget),
+    return ValueListenableBuilder<String>(
+      valueListenable: AppLanguage.current,
+      builder: (BuildContext context, String language, Widget? child) {
+        return MaterialApp(
+          title: 'Chast',
+          debugShowCheckedModeBanner: false,
+          locale: Locale(language),
+          supportedLocales: const <Locale>[Locale('zh', 'CN'), Locale('en')],
+          localizationsDelegates:
+              const <LocalizationsDelegate<Object>>[
+                GlobalMaterialLocalizations.delegate,
+                GlobalWidgetsLocalizations.delegate,
+                GlobalCupertinoLocalizations.delegate,
+              ],
+          theme: buildChastTheme(Brightness.light),
+          darkTheme: buildChastTheme(Brightness.dark),
+          themeMode: ThemeMode.system,
+          home: HomePage(initialTarget: connectTarget),
+        );
+      },
     );
   }
 }

@@ -8,6 +8,7 @@ import '../terminal/terminal_keys.dart';
 import '../terminal/terminal_model.dart';
 import '../theme.dart';
 import '../viewer_bridge.dart';
+import 'package:chast_viewer/l10n.dart';
 
 const double _kFontSize = 13;
 const double _kLineHeight = 16;
@@ -413,7 +414,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
   }
 
   Widget _buildHeader(bool busy) {
-    final String title = _grid.title.isEmpty ? '远程终端' : _grid.title;
+    final String title = _grid.title.isEmpty ? tr('远程终端') : _grid.title;
     return Container(
       height: 36,
       color: const Color(0xFF1B1C20),
@@ -464,18 +465,18 @@ class _TerminalPanelState extends State<TerminalPanel> {
           if (_ended || _openFailed)
             _headerButton(
               icon: Icons.refresh_rounded,
-              tooltip: '重新申请终端',
+              tooltip: tr('重新申请终端'),
               onTap: _reopen,
             ),
           _headerButton(
             icon: Icons.content_paste_rounded,
-            tooltip: '粘贴（Ctrl+V）',
+            tooltip: tr('粘贴（Ctrl+V）'),
             disabled: !_canType,
             onTap: () => unawaited(_paste()),
           ),
           _headerButton(
             icon: Icons.close_rounded,
-            tooltip: '关闭终端（同时结束主机上的控制台）',
+            tooltip: tr('关闭终端（同时结束主机上的控制台）'),
             onTap: widget.onDismiss,
           ),
         ],
@@ -511,15 +512,15 @@ class _TerminalPanelState extends State<TerminalPanel> {
   String _phaseLabel() {
     switch (widget.status.terminalPhase) {
       case ViewerTerminalPhase.requesting:
-        return '申请中…';
+        return tr('申请中…');
       case ViewerTerminalPhase.open:
-        return _ended ? '已结束' : '已连接';
+        return _ended ? tr('已结束') : tr('已连接');
       case ViewerTerminalPhase.ended:
-        return '已结束';
+        return tr('已结束');
       case ViewerTerminalPhase.failed:
-        return '失败';
+        return tr('失败');
       case ViewerTerminalPhase.closed:
-        return _openFailed ? '未连接' : '准备中';
+        return _openFailed ? tr('未连接') : tr('准备中');
     }
   }
 
@@ -579,23 +580,23 @@ class _TerminalPanelState extends State<TerminalPanel> {
 
   String _notice() {
     if (_openFailed) {
-      return '无法打开终端：主机未授权、已有控制台，或上一个控制台尚未收尾';
+      return tr('无法打开终端：主机未授权、已有控制台，或上一个控制台尚未收尾');
     }
     if (_ended) {
       final String reason = widget.status.terminalReason;
-      return reason.isEmpty ? '主机已结束该控制台' : '主机已结束该控制台：$reason';
+      return reason.isEmpty ? tr('主机已结束该控制台') : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
     }
     switch (widget.status.terminalPhase) {
       case ViewerTerminalPhase.requesting:
         return '';
       case ViewerTerminalPhase.ended:
         final String reason = widget.status.terminalReason;
-        return reason.isEmpty ? '主机已结束该控制台' : '主机已结束该控制台：$reason';
+        return reason.isEmpty ? tr('主机已结束该控制台') : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
       case ViewerTerminalPhase.failed:
         final String detail = widget.status.terminalError.isNotEmpty
             ? widget.status.terminalError
             : widget.status.terminalReason;
-        return detail.isEmpty ? '终端不可用（主机拒绝或权限已撤销）' : detail;
+        return detail.isEmpty ? tr('终端不可用（主机拒绝或权限已撤销）') : detail;
       default:
         return '';
     }
@@ -629,16 +630,16 @@ class _TerminalPanelState extends State<TerminalPanel> {
       padding: const EdgeInsets.symmetric(horizontal: 10),
       child: Row(
         children: <Widget>[
-          const Expanded(
+          Expanded(
             child: Text(
-              '点击面板后直接输入 · Ctrl+V 粘贴 · Esc 交给主机',
+              tr('点击面板后直接输入 · Ctrl+V 粘贴 · Esc 交给主机'),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(fontSize: 10, color: Colors.white38),
             ),
           ),
           Text(
-            '${widget.status.terminalBytes} 字节',
+            tr('{p3} 字节', <String, Object?>{'p3': widget.status.terminalBytes}),
             style: const TextStyle(fontSize: 10, color: Colors.white24),
           ),
         ],

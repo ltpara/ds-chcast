@@ -5,9 +5,10 @@ import 'server_settings.dart';
 
 /// A logged-in viewer account tied to one connection service.
 ///
-/// The token is stored in plaintext under the user profile, like the server
-/// key in `server.json`; the app relies on the profile directory ACL rather
-/// than a platform keystore.
+/// The Windows viewer persists tokens inside a DPAPI envelope (see
+/// [AccountSessionStore]); standalone Dart tooling without the native bridge
+/// falls back to the legacy plaintext file, protected only by the profile
+/// directory ACL.
 class AccountSession {
   const AccountSession({
     required this.server,
@@ -129,15 +130,36 @@ class AccountSession {
   }
 }
 
+/// Encrypts a session payload before it is written to disk.
+typedef SecretProtector = Future<String> Function(String plaintext);
+
+/// Decrypts a payload produced by [SecretProtector].
+typedef SecretUnprotector = Future<String> Function(String protectedBase64);
+
 /// Persists one account session in `%APPDATA%\chast\account.json`.
+///
+/// With a [SecretProtector] the file holds
+/// `{"version":1,"protected":"<DPAPI blob>"}`; the Windows viewer passes
+/// `ViewerBridge.protectSecret` so the bearer and refresh tokens never touch
+/// the disk in the clear. Without one (standalone `dart run` tools) the file
+/// keeps the legacy plaintext shape, and a plaintext file is re-encrypted the
+/// first time it is loaded with a protector.
 ///
 /// A session is only used when its [AccountSession.server] matches the
 /// configured connection service; switching services does not silently reuse
 /// a token against a different server.
 class AccountSessionStore {
-  AccountSessionStore({File? file}) : _injected = file;
+  AccountSessionStore({
+    File? file,
+    SecretProtector? protectSecret,
+    SecretUnprotector? unprotectSecret,
+  })  : _injected = file,
+        _protector = protectSecret,
+        _unprotector = unprotectSecret;
 
   final File? _injected;
+  final SecretProtector? _protector;
+  final SecretUnprotector? _unprotector;
 
   File? _file() {
     if (_injected != null) {
@@ -156,7 +178,22 @@ class AccountSessionStore {
       return null;
     }
     try {
-      return AccountSession.fromJson(jsonDecode(await file.readAsString()));
+      final Object? decoded = jsonDecode(await file.readAsString());
+      if (decoded is Map && decoded['protected'] is String) {
+        final SecretUnprotector? unprotect = _unprotector;
+        if (unprotect == null) {
+          return null;
+        }
+        final String plaintext =
+            await unprotect(decoded['protected'] as String);
+        return AccountSession.fromJson(jsonDecode(plaintext));
+      }
+      final AccountSession? session = AccountSession.fromJson(decoded);
+      if (session != null && _protector != null) {
+        // Replace a legacy plaintext token with its protected envelope.
+        await save(session);
+      }
+      return session;
     } catch (_) {
       return null;
     }
@@ -167,9 +204,22 @@ class AccountSessionStore {
     if (file == null) {
       return;
     }
+    final String payload = jsonEncode(session.toJson());
+    String text = payload;
+    final SecretProtector? protect = _protector;
+    if (protect != null) {
+      try {
+        final String blob = await protect(payload);
+        text =
+            jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
+      } catch (_) {
+        // Losing the session costs a login; refusing to persist it costs the
+        // same. Keep the legacy shape rather than failing the sign-in.
+      }
+    }
     try {
       await file.parent.create(recursive: true);
-      await file.writeAsString(jsonEncode(session.toJson()));
+      await file.writeAsString(text);
     } catch (_) {
       // A lost session only costs one login; never block the app on it.
     }

@@ -4,6 +4,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 typedef AccountSessionsLoader =
     Future<List<AccountDeviceSession>> Function(
@@ -101,7 +102,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _error = '读取设备会话失败：$error';
+          _error = tr('读取设备会话失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -132,7 +133,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
       });
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('已退出该设备')));
+      ).showSnackBar(SnackBar(content: Text(tr('已退出该设备'))));
     } on ServerApiException catch (error) {
       if (mounted) {
         setState(() {
@@ -144,7 +145,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
       if (mounted) {
         setState(() {
           _revoking = '';
-          _error = '退出设备失败：$error';
+          _error = tr('退出设备失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -188,7 +189,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
       });
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('已更新设备名称')));
+      ).showSnackBar(SnackBar(content: Text(tr('已更新设备名称'))));
     } on ServerApiException catch (error) {
       if (mounted) {
         setState(() {
@@ -200,7 +201,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
       if (mounted) {
         setState(() {
           _renaming = '';
-          _error = '重命名设备失败：$error';
+          _error = tr('重命名设备失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -231,7 +232,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
         _revokingOthers = false;
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(count > 0 ? '已退出 $count 台其他设备' : '没有其他已登录设备')),
+        SnackBar(content: Text(count > 0 ? tr('已退出 {count} 台其他设备', <String, Object?>{'count': count}) : tr('没有其他已登录设备'))),
       );
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -244,7 +245,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
       if (mounted) {
         setState(() {
           _revokingOthers = false;
-          _error = '退出其他设备失败：$error';
+          _error = tr('退出其他设备失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -256,7 +257,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('设备会话'),
+      title: Text(tr('设备会话')),
       content: SizedBox(
         width: 420,
         child: Column(
@@ -264,7 +265,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             Text(
-              '这些设备正使用当前账号登录。退出后该设备需要重新登录，地址簿同步也会停止。',
+              tr('这些设备正使用当前账号登录。退出后该设备需要重新登录，地址簿同步也会停止。'),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 14),
@@ -277,7 +278,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 18),
                 child: Text(
-                  '没有其他已登录设备。',
+                  tr('没有其他已登录设备。'),
                   key: const Key('account-sessions-empty'),
                   style: mutedStyle(context, size: 12),
                 ),
@@ -320,16 +321,16 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
                   height: 14,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : const Text('退出其他设备'),
+              : Text(tr('退出其他设备')),
         ),
         TextButton(
           key: const Key('account-sessions-refresh'),
           onPressed: _loading || _busy ? null : _load,
-          child: const Text('刷新'),
+          child: Text(tr('刷新')),
         ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('关闭'),
+          child: Text(tr('关闭')),
         ),
       ],
     );
@@ -338,7 +339,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
   Widget _sessionTile(BuildContext context, AccountDeviceSession session) {
     final ThemeData theme = Theme.of(context);
     final String name = session.deviceName.isEmpty
-        ? '未知设备'
+        ? tr('未知设备')
         : session.deviceName;
     final String origin = session.location.isEmpty
         ? session.loginIp
@@ -385,7 +386,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
                     if (session.current) ...<Widget>[
                       const SizedBox(width: 6),
                       Text(
-                        '当前设备',
+                        tr('当前设备'),
                         style: TextStyle(
                           fontSize: 10.5,
                           color: kAccent,
@@ -397,16 +398,15 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
                 ),
                 if (session.deviceId.isNotEmpty)
                   Text(
-                    '设备 ID ${session.deviceId}',
+                    tr('设备 ID {p4}', <String, Object?>{'p4': session.deviceId}),
                     style: mutedStyle(context, size: 10.5),
                   ),
                 Text(
-                  '登录于 ${_formatSessionTime(session.createdAt.toLocal())}'
-                  ' · 有效期至 ${_formatSessionTime(session.expiresAt.toLocal())}',
+                  tr('登录于 {p5} · 有效期至 {p6}', <String, Object?>{'p5': _formatSessionTime(session.createdAt.toLocal()), 'p6': _formatSessionTime(session.expiresAt.toLocal())}),
                   style: mutedStyle(context, size: 10.5),
                 ),
                 if (origin.isNotEmpty)
-                  Text('登录地点 $origin', style: mutedStyle(context, size: 10.5)),
+                  Text(tr('登录地点 {origin}', <String, Object?>{'origin': origin}), style: mutedStyle(context, size: 10.5)),
               ],
             ),
           ),
@@ -416,7 +416,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
               IconButton(
                 key: ValueKey<String>('account-session-rename-${session.id}'),
                 onPressed: _busy ? null : () => _rename(session),
-                tooltip: '重命名',
+                tooltip: tr('重命名'),
                 visualDensity: VisualDensity.compact,
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
@@ -443,7 +443,7 @@ class _AccountSessionsDialogState extends State<AccountSessionsDialog> {
                           height: 13,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
-                      : const Text('退出', style: TextStyle(fontSize: 12)),
+                      : Text(tr('退出'), style: TextStyle(fontSize: 12)),
                 ),
             ],
           ),
@@ -483,7 +483,7 @@ class _RenameSessionDialogState extends State<_RenameSessionDialog> {
   void _save() {
     final String name = _name.text.trim();
     if (name.isEmpty) {
-      setState(() => _error = '请输入设备名称');
+      setState(() => _error = tr('请输入设备名称'));
       return;
     }
     Navigator.of(context).pop(name);
@@ -493,7 +493,7 @@ class _RenameSessionDialogState extends State<_RenameSessionDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
-      title: const Text('重命名设备'),
+      title: Text(tr('重命名设备')),
       content: SizedBox(
         width: 320,
         child: TextField(
@@ -502,8 +502,8 @@ class _RenameSessionDialogState extends State<_RenameSessionDialog> {
           autofocus: true,
           maxLength: 128,
           decoration: InputDecoration(
-            labelText: '设备名称',
-            hintText: '例如：书房 PC',
+            labelText: tr('设备名称'),
+            hintText: tr('例如：书房 PC'),
             errorText: _error.isEmpty ? null : _error,
           ),
           onSubmitted: (_) => _save(),
@@ -512,12 +512,12 @@ class _RenameSessionDialogState extends State<_RenameSessionDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('account-session-rename-save'),
           onPressed: _save,
-          child: const Text('保存'),
+          child: Text(tr('保存')),
         ),
       ],
     );

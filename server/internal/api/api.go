@@ -33,6 +33,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
+	"github.com/ltpara/ds-chcast/server/internal/recordings"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/relay"
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
@@ -123,6 +124,10 @@ type Config struct {
 	// Accounts backs user login and the per-user address book. Nil means the
 	// server runs without persistent state, so those routes report 503.
 	Accounts *account.Store
+	// Recordings archives viewer recordings uploaded to accounts. Nil leaves
+	// the archive routes at 503; the archive shares the account database for
+	// metadata and owns the files on disk.
+	Recordings *recordings.Archive
 	// WebAuthnRPID and WebAuthnOrigins enable security-key registration and
 	// login. Both must be set; origins are the exact scheme://host[:port]
 	// values a client may report in clientDataJSON.
@@ -205,6 +210,8 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/login/email", s.requestLoginEmailCode)
 	mux.HandleFunc("POST /v1/account/login/webauthn/begin", s.beginWebAuthnLogin)
 	mux.HandleFunc("POST /v1/account/login/webauthn/finish", s.finishWebAuthnLogin)
+	mux.HandleFunc("POST /v1/account/login/webauthn/passwordless/begin", s.beginWebAuthnPasswordlessLogin)
+	mux.HandleFunc("POST /v1/account/login/webauthn/passwordless/finish", s.finishWebAuthnPasswordlessLogin)
 	mux.HandleFunc("POST /v1/account/webauthn/register/begin", s.beginWebAuthnRegistration)
 	mux.HandleFunc("POST /v1/account/webauthn/register/finish", s.finishWebAuthnRegistration)
 	mux.HandleFunc("GET /v1/account/webauthn/credentials", s.listWebAuthnCredentials)
@@ -256,6 +263,13 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/audit/connections", s.auditConnections)
 	mux.HandleFunc("POST /v1/account/connections", s.recordAccountConnection)
 	mux.HandleFunc("GET /v1/account/connections", s.accountConnections)
+	mux.HandleFunc("POST /v1/account/recordings", s.uploadRecording)
+	mux.HandleFunc("GET /v1/account/recordings", s.accountRecordings)
+	mux.HandleFunc("GET /v1/account/recordings/{id}", s.downloadRecording)
+	mux.HandleFunc("DELETE /v1/account/recordings/{id}", s.deleteRecording)
+	mux.HandleFunc("GET /v1/recordings", s.consoleRecordings)
+	mux.HandleFunc("GET /v1/recordings/{id}", s.consoleDownloadRecording)
+	mux.HandleFunc("DELETE /v1/recordings/{id}", s.consoleDeleteRecording)
 	mux.HandleFunc("GET /v1/audit/file-transfers", s.auditFileTransfers)
 	mux.HandleFunc("POST /v1/account/file-transfers", s.recordAccountFileTransfer)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
@@ -712,8 +726,8 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 }
 
 func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	_, actor, ok := s.consoleActor(w, r, consoleWrite)
+	if !ok {
 		return
 	}
 	id := r.PathValue("id")
@@ -723,6 +737,7 @@ func (s *server) unregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.releaseLease(id, host)
+	s.recordAudit(r, actor, account.AuditDeviceLeaseRemove, "removed lease for "+id, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -741,8 +756,8 @@ func (s *server) releaseLease(id string, host registry.Host) {
 // resetIdentity is the administrative escape hatch for a lost host key. It
 // removes the permanent binding as well as any live lease.
 func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	_, actor, ok := s.consoleActor(w, r, consoleWrite)
+	if !ok {
 		return
 	}
 	id := r.PathValue("id")
@@ -757,6 +772,7 @@ func (s *server) resetIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.releaseLease(id, host)
+	s.recordAudit(r, actor, account.AuditDeviceReset, "reset identity "+id, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -775,8 +791,8 @@ type identityLabelsResponse struct {
 // metadata, these survive host renewals and are never accepted from the host
 // registration body.
 func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	_, actor, ok := s.consoleActor(w, r, consoleWrite)
+	if !ok {
 		return
 	}
 	id := r.PathValue("id")
@@ -802,6 +818,8 @@ func (s *server) updateIdentity(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host identity is unknown")
 		return
 	}
+	s.recordAudit(r, actor, account.AuditDeviceLabels,
+		"labels for "+id+" alias="+record.Alias, true)
 	writeJSON(w, http.StatusOK, identityLabelsResponse{ID: record.ID, Alias: record.Alias, Tags: record.Tags})
 }
 
@@ -870,8 +888,7 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) stats(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
 		return
 	}
 	out := map[string]any{
@@ -945,6 +962,14 @@ func (r *statusRecorder) Write(p []byte) (int, error) {
 		r.wroteHeader = true
 	}
 	return r.ResponseWriter.Write(p)
+}
+
+// Flush keeps streaming handlers streaming: without it the wrapper hides the
+// server's http.Flusher and CSV exports buffer until the handler returns.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (s *server) record(r *http.Request, status int, took time.Duration) {

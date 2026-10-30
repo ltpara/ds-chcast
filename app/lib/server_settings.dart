@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:chast_viewer/l10n.dart';
 
 /// How a server-assisted viewer reaches the host. Direct and relay are meant
 /// for troubleshooting and for validating one path at a time; auto is the
@@ -21,22 +22,22 @@ extension TunnelModeName on TunnelMode {
   String get label {
     switch (this) {
       case TunnelMode.auto:
-        return '自动直连 · 失败回退中继';
+        return tr('自动直连 · 失败回退中继');
       case TunnelMode.direct:
-        return '仅直连';
+        return tr('仅直连');
       case TunnelMode.relay:
-        return '仅中继';
+        return tr('仅中继');
     }
   }
 
   String get shortLabel {
     switch (this) {
       case TunnelMode.auto:
-        return '自动';
+        return tr('自动');
       case TunnelMode.direct:
-        return '直连';
+        return tr('直连');
       case TunnelMode.relay:
-        return '中继';
+        return tr('中继');
     }
   }
 
@@ -89,6 +90,7 @@ class ServerSettings {
     this.url = '',
     this.mode = TunnelMode.auto,
     this.key = '',
+    this.uploadRecordings = false,
   });
 
   final String url;
@@ -99,13 +101,23 @@ class ServerSettings {
   /// prove its punch requests, so it belongs with the service, not a device.
   final String key;
 
+  /// Uploads a finished viewer recording to the signed-in account's archive.
+  /// The server decides whether an archive exists; this only records intent.
+  final bool uploadRecordings;
+
   bool get configured => url.isNotEmpty;
 
-  ServerSettings copyWith({String? url, TunnelMode? mode, String? key}) {
+  ServerSettings copyWith({
+    String? url,
+    TunnelMode? mode,
+    String? key,
+    bool? uploadRecordings,
+  }) {
     return ServerSettings(
       url: url ?? this.url,
       mode: mode ?? this.mode,
       key: key ?? this.key,
+      uploadRecordings: uploadRecordings ?? this.uploadRecordings,
     );
   }
 
@@ -113,6 +125,7 @@ class ServerSettings {
         'url': url,
         'mode': mode.name,
         'key': key,
+        'upload_recordings': uploadRecordings,
       };
 
   static ServerSettings fromJson(Object? value) {
@@ -124,6 +137,7 @@ class ServerSettings {
       url: url,
       mode: TunnelModeName.parse(value['mode']),
       key: value['key']?.toString().trim() ?? '',
+      uploadRecordings: value['upload_recordings'] == true,
     );
   }
 }

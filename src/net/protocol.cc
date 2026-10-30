@@ -539,7 +539,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
                                   : hello.audit_ref.size();
     std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 2 + 2 + key_size +
                                  1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
-                                 signature_size + 2 + totp_size + 2 + audit_size);
+                                 signature_size + 2 + totp_size + 2 + audit_size + 1);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
     put_u16(cursor, hello.display);
@@ -578,7 +578,9 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     put_u16(cursor, static_cast<uint16_t>(audit_size));
     if (audit_size > 0) {
         std::memcpy(cursor, hello.audit_ref.data(), audit_size);
+        cursor += audit_size;
     }
+    put_u8(cursor, static_cast<uint8_t>(hello.mode));
     return make_control(ControlType::Hello, payload);
 }
 
@@ -676,6 +678,17 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "Hello carries an audit reference that is not lowercase hex");
         return false;
     }
+    uint8_t mode = 0;
+    if (!reader.u8(mode)) {
+        set_error(error, "Hello carries no session mode");
+        return false;
+    }
+    if (mode != static_cast<uint8_t>(SessionMode::Desktop) &&
+        mode != static_cast<uint8_t>(SessionMode::FileTransfer)) {
+        set_error(error, "Hello asks for session mode " + std::to_string(mode));
+        return false;
+    }
+    hello.mode = static_cast<SessionMode>(mode);
     if (!reader.at_end()) {
         set_error(error, "Hello carries trailing bytes");
         return false;
@@ -778,7 +791,10 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.privacy_mode_enabled ? kServerInfoPrivacyModeEnabled : 0) |
                         (info.port_forward_enabled ? kServerInfoPortForwardEnabled : 0) |
                         (info.terminal_enabled ? kServerInfoTerminalEnabled : 0) |
-                        (info.merged ? kServerInfoMergedLayout : 0)));
+                        (info.record_enabled ? kServerInfoRecordEnabled : 0) |
+                        (info.camera_enabled ? kServerInfoCameraEnabled : 0) |
+                        (info.merged ? kServerInfoMergedLayout : 0) |
+                        (info.files_only ? kServerInfoFileTransferOnly : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -833,6 +849,12 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.terminal_enabled) {
         permissions |= kPermissionTerminal;
     }
+    if (info.record_enabled) {
+        permissions |= kPermissionRecord;
+    }
+    if (info.camera_enabled) {
+        permissions |= kPermissionCamera;
+    }
     put_u16(cursor, permissions);
     return payload;
 }
@@ -871,12 +893,25 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.input_enabled = (flags & kServerInfoInputEnabled) != 0;
     info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
     info.merged = (flags & kServerInfoMergedLayout) != 0;
+    info.files_only = (flags & kServerInfoFileTransferOnly) != 0;
     const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
     }
-    if (info.width == 0 || info.height == 0) {
+    if (info.files_only && info.merged) {
+        set_error(error, "HelloAck is files-only and merged at once");
+        return false;
+    }
+    if (info.files_only && audio_flag) {
+        set_error(error, "HelloAck announces audio in a files-only session");
+        return false;
+    }
+    if (info.files_only && (info.width != 0 || info.height != 0)) {
+        set_error(error, "HelloAck has a picture in a files-only session");
+        return false;
+    }
+    if (!info.files_only && (info.width == 0 || info.height == 0)) {
         set_error(error, "HelloAck has an empty picture");
         return false;
     }
@@ -1005,7 +1040,12 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         return false;
     }
     if (info.source_width == 0 || info.source_height == 0) {
-        set_error(error, "HelloAck has an empty source picture");
+        if (!info.files_only) {
+            set_error(error, "HelloAck has an empty source picture");
+            return false;
+        }
+    } else if (info.files_only) {
+        set_error(error, "HelloAck has a source picture in a files-only session");
         return false;
     }
     uint16_t permissions = 0;
@@ -1019,6 +1059,10 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     if (permissions != (flags & kServerInfoPermissionFlags)) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
+        return false;
+    }
+    if (info.files_only && (permissions & ~kPermissionFileTransfer) != 0) {
+        set_error(error, "HelloAck grants more than file transfer in a files-only session");
         return false;
     }
     if (info.merged) {
@@ -1054,6 +1098,8 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
     info.port_forward_enabled = (permissions & kPermissionPortForward) != 0;
     info.terminal_enabled = (permissions & kPermissionTerminal) != 0;
+    info.record_enabled = (permissions & kPermissionRecord) != 0;
+    info.camera_enabled = (permissions & kPermissionCamera) != 0;
     return true;
 }
 
@@ -1640,6 +1686,306 @@ bool decode_terminal_stream_header(const uint8_t* data, size_t size,
     }
     if (header.terminal_id == 0) {
         set_error(error, "CTTY header carries terminal id 0");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool valid_camera_code(CameraCode code) {
+    return code == CameraCode::Ok || code == CameraCode::Refused ||
+           code == CameraCode::NotFound || code == CameraCode::Busy ||
+           code == CameraCode::Failed;
+}
+
+std::string truncate_camera_reason(const std::string& reason) {
+    if (reason.size() <= kMaxCameraReasonBytes) {
+        return valid_utf8(reason) ? reason : std::string();
+    }
+    size_t cut = kMaxCameraReasonBytes;
+    while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0u) == 0x80u) {
+        --cut;
+    }
+    std::string text = reason.substr(0, cut);
+    return valid_utf8(text) ? text : std::string();
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_camera_list_request() {
+    return make_control(ControlType::ListCameras, {});
+}
+
+bool parse_camera_list_request(const std::vector<uint8_t>& payload, std::string* error) {
+    if (!payload.empty()) {
+        set_error(error, "ListCameras carries a payload");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_camera_list(const CameraList& list) {
+    if (!valid_camera_code(list.code)) {
+        return {};
+    }
+    const std::string reason = truncate_camera_reason(list.reason);
+    std::vector<const CameraDescription*> cameras;
+    if (list.code == CameraCode::Ok) {
+        if (list.cameras.size() > kMaxCameras) {
+            return {};
+        }
+        for (const CameraDescription& camera : list.cameras) {
+            if (camera.id == 0 || camera.name.size() > kMaxCameraNameBytes ||
+                !valid_utf8(camera.name)) {
+                return {};
+            }
+            for (const CameraDescription* seen : cameras) {
+                if (seen->id == camera.id) {
+                    return {};
+                }
+            }
+            cameras.push_back(&camera);
+        }
+    }
+    size_t size = 1 + 2 + reason.size() + 2;
+    for (const CameraDescription* camera : cameras) {
+        size += 2 + 1 + 2 + camera->name.size();
+    }
+    std::vector<uint8_t> payload(size);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(list.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+        cursor += reason.size();
+    }
+    put_u16(cursor, static_cast<uint16_t>(cameras.size()));
+    for (const CameraDescription* camera : cameras) {
+        put_u16(cursor, camera->id);
+        put_u8(cursor, camera->is_default ? 0x1 : 0);
+        put_u16(cursor, static_cast<uint16_t>(camera->name.size()));
+        if (!camera->name.empty()) {
+            std::memcpy(cursor, camera->name.data(), camera->name.size());
+            cursor += camera->name.size();
+        }
+    }
+    return make_control(ControlType::CameraList, payload);
+}
+
+bool parse_camera_list(const std::vector<uint8_t>& payload, CameraList& list,
+                       std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u16(reason_size)) {
+        set_error(error, "truncated CameraList");
+        return false;
+    }
+    list.code = static_cast<CameraCode>(raw_code);
+    if (!valid_camera_code(list.code)) {
+        set_error(error, "CameraList carries an unknown code");
+        return false;
+    }
+    if (reason_size > kMaxCameraReasonBytes || !reader.string(list.reason, reason_size)) {
+        set_error(error, "CameraList carries a malformed reason");
+        return false;
+    }
+    if (!list.reason.empty() && !valid_utf8(list.reason)) {
+        set_error(error, "CameraList reason is not valid UTF-8");
+        return false;
+    }
+    uint16_t count = 0;
+    if (!reader.u16(count)) {
+        set_error(error, "CameraList carries no camera count");
+        return false;
+    }
+    if (count > kMaxCameras) {
+        set_error(error, "CameraList lists " + std::to_string(count) + " cameras");
+        return false;
+    }
+    if (list.code != CameraCode::Ok && count != 0) {
+        set_error(error, "a non-Ok CameraList carries cameras");
+        return false;
+    }
+    list.cameras.clear();
+    list.cameras.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        CameraDescription camera;
+        uint8_t flags = 0;
+        uint16_t name_size = 0;
+        if (!reader.u16(camera.id) || !reader.u8(flags) || !reader.u16(name_size)) {
+            set_error(error, "truncated CameraList entry " + std::to_string(i));
+            return false;
+        }
+        if (camera.id == 0) {
+            set_error(error, "CameraList entry carries id 0");
+            return false;
+        }
+        if ((flags & ~0x1u) != 0) {
+            set_error(error, "CameraList entry " + std::to_string(i) + " has unknown flags");
+            return false;
+        }
+        camera.is_default = (flags & 0x1u) != 0;
+        if (name_size > kMaxCameraNameBytes || !reader.string(camera.name, name_size)) {
+            set_error(error, "CameraList entry " + std::to_string(i) + " has a malformed name");
+            return false;
+        }
+        if (!camera.name.empty() && !valid_utf8(camera.name)) {
+            set_error(error, "CameraList entry " + std::to_string(i) +
+                                 " name is not valid UTF-8");
+            return false;
+        }
+        for (const CameraDescription& seen : list.cameras) {
+            if (seen.id == camera.id) {
+                set_error(error, "CameraList repeats camera id " + std::to_string(camera.id));
+                return false;
+            }
+        }
+        list.cameras.push_back(std::move(camera));
+    }
+    if (!reader.at_end()) {
+        set_error(error, "CameraList carries trailing bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_camera_start(uint16_t camera_id) {
+    if (camera_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(2);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, camera_id);
+    return make_control(ControlType::StartCamera, payload);
+}
+
+bool parse_camera_start(const std::vector<uint8_t>& payload, uint16_t& camera_id,
+                        std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u16(camera_id) || !reader.at_end()) {
+        set_error(error, "malformed StartCamera");
+        return false;
+    }
+    if (camera_id == 0) {
+        set_error(error, "StartCamera carries camera id 0");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_camera_result(const CameraResult& result) {
+    if (!valid_camera_code(result.code)) {
+        return {};
+    }
+    const std::string reason = truncate_camera_reason(result.reason);
+    std::vector<uint8_t> payload(2 + 1 + 2 + reason.size());
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, result.camera_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+    }
+    return make_control(ControlType::CameraResult, payload);
+}
+
+bool parse_camera_result(const std::vector<uint8_t>& payload, CameraResult& result,
+                         std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u16(result.camera_id) || !reader.u8(raw_code) ||
+        !reader.u16(reason_size)) {
+        set_error(error, "truncated CameraResult");
+        return false;
+    }
+    result.code = static_cast<CameraCode>(raw_code);
+    if (!valid_camera_code(result.code)) {
+        set_error(error, "CameraResult carries an unknown code");
+        return false;
+    }
+    if (reason_size > kMaxCameraReasonBytes || !reader.string(result.reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, "CameraResult carries a malformed reason");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "CameraResult reason is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_camera_stop(uint16_t camera_id) {
+    if (camera_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(2);
+    uint8_t* cursor = payload.data();
+    put_u16(cursor, camera_id);
+    return make_control(ControlType::StopCamera, payload);
+}
+
+bool parse_camera_stop(const std::vector<uint8_t>& payload, uint16_t& camera_id,
+                       std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u16(camera_id) || !reader.at_end()) {
+        set_error(error, "malformed StopCamera");
+        return false;
+    }
+    if (camera_id == 0) {
+        set_error(error, "StopCamera carries camera id 0");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_camera_stream_header(uint16_t camera_id) {
+    if (camera_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> header(kCameraStreamHeaderSize, 0);
+    std::memcpy(header.data(), kCameraStreamMagic, 4);
+    header[4] = kCameraStreamVersion;
+    uint8_t* cursor = header.data() + 8;
+    put_u16(cursor, camera_id);
+    return header;
+}
+
+bool decode_camera_stream_header(const uint8_t* data, size_t size,
+                                 CameraStreamHeader& header, std::string* error) {
+    if (!data || size < kCameraStreamHeaderSize) {
+        set_error(error, "truncated CCAM header");
+        return false;
+    }
+    if (std::memcmp(data, kCameraStreamMagic, 4) != 0) {
+        set_error(error, "CCAM header has the wrong magic");
+        return false;
+    }
+    if (data[4] != kCameraStreamVersion) {
+        set_error(error, "CCAM header has an unknown version");
+        return false;
+    }
+    if (data[5] != 0 || data[6] != 0 || data[7] != 0) {
+        set_error(error, "CCAM header has non-zero reserved bytes");
+        return false;
+    }
+    Reader reader(data + 8, kCameraStreamHeaderSize - 8);
+    uint16_t reserved1 = 0;
+    uint32_t reserved2 = 0;
+    if (!reader.u16(header.camera_id) || !reader.u16(reserved1) ||
+        !reader.u32(reserved2)) {
+        set_error(error, "truncated CCAM header");
+        return false;
+    }
+    if (reserved1 != 0 || reserved2 != 0) {
+        set_error(error, "CCAM header has non-zero reserved bytes");
+        return false;
+    }
+    if (header.camera_id == 0) {
+        set_error(error, "CCAM header carries camera id 0");
         return false;
     }
     return true;
@@ -2381,7 +2727,8 @@ std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
     uint8_t* cursor = payload.data();
     put_u32(cursor, offer.transfer_id);
     put_u64(cursor, offer.size);
-    put_u8(cursor, offer.resume ? kFileOfferFlagResume : 0);
+    put_u8(cursor, static_cast<uint8_t>((offer.resume ? kFileOfferFlagResume : 0) |
+                                        (offer.clipboard ? kFileOfferFlagClipboard : 0)));
     std::memcpy(cursor, offer.sha256.data(), offer.sha256.size());
     cursor += offer.sha256.size();
     put_u16(cursor, static_cast<uint16_t>(name.size()));
@@ -2410,6 +2757,7 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
         return false;
     }
     offer.resume = (flags & kFileOfferFlagResume) != 0;
+    offer.clipboard = (flags & kFileOfferFlagClipboard) != 0;
     if (offer.size > kMaxFileTransferBytes) {
         set_error(error, "FileOffer names a file past the protocol limit");
         return false;
@@ -2596,6 +2944,395 @@ bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeade
     }
     if (header.offset > kMaxFileTransferBytes) {
         set_error(error, "CFIL offset is past the protocol limit");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool known_file_code(uint8_t code) {
+    return code <= static_cast<uint8_t>(FileCode::Cancelled);
+}
+
+bool valid_list_entry_name(const std::string& name) {
+    return !name.empty() && name.size() <= kMaxFileNameBytes && valid_utf8(name) &&
+           name.find('\0') == std::string::npos && name.find('/') == std::string::npos &&
+           name.find('\\') == std::string::npos;
+}
+
+}  // namespace
+
+bool valid_file_browser_path(const std::string& path) {
+    if (path.empty()) {
+        return true;
+    }
+    if (path.size() > kMaxFileBrowserPathBytes || !valid_utf8(path) ||
+        path.find('\0') != std::string::npos) {
+        return false;
+    }
+    if (path.front() == '/' || path.back() == '/' ||
+        path.find('\\') != std::string::npos || path.find(':') != std::string::npos) {
+        return false;
+    }
+    size_t components = 0;
+    size_t start = 0;
+    for (;;) {
+        const size_t slash = path.find('/', start);
+        const size_t length = slash == std::string::npos ? path.size() - start : slash - start;
+        if (length == 0 || length > kMaxFileNameBytes ||
+            (length == 1 && path[start] == '.') ||
+            (length == 2 && path[start] == '.' && path[start + 1] == '.')) {
+            return false;
+        }
+        if (++components > kMaxFileRelativeComponents) {
+            return false;
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
+
+bool valid_file_browser_name(const std::string& name) {
+    return !name.empty() && name.size() <= kMaxFileNameBytes && valid_utf8(name) &&
+           name.find('\0') == std::string::npos && name.find('/') == std::string::npos &&
+           name.find('\\') == std::string::npos && name.find(':') == std::string::npos &&
+           name != "." && name != "..";
+}
+
+std::vector<uint8_t> make_file_list_request(uint32_t request_id,
+                                            const std::string& directory) {
+    if (request_id == 0 || !valid_file_browser_path(directory)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 2 + directory.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request_id);
+    put_u16(cursor, static_cast<uint16_t>(directory.size()));
+    if (!directory.empty()) {
+        std::memcpy(cursor, directory.data(), directory.size());
+    }
+    return make_control(ControlType::FileListRequest, payload);
+}
+
+bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
+                             std::string& directory, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint16_t size = 0;
+    if (!reader.u32(request_id) || !reader.u16(size) ||
+        !reader.string(directory, size) || !reader.at_end()) {
+        set_error(error, "malformed FileListRequest");
+        return false;
+    }
+    if (request_id == 0) {
+        set_error(error, "FileListRequest has a zero request id");
+        return false;
+    }
+    if (!valid_file_browser_path(directory)) {
+        set_error(error, "FileListRequest path is not a plain relative directory");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_list_result(const FileListResult& result) {
+    if (result.request_id == 0 ||
+        !known_file_code(static_cast<uint8_t>(result.code)) ||
+        result.entries.size() > kMaxFileListEntries) {
+        return {};
+    }
+    if (result.code != FileCode::Ok && (!result.entries.empty() || result.truncated)) {
+        return {};
+    }
+    size_t entries_size = 0;
+    for (const FileListEntry& entry : result.entries) {
+        if (!valid_list_entry_name(entry.name)) {
+            return {};
+        }
+        entries_size += 2 + entry.name.size() + 8 + 8 + 1;
+    }
+    const std::string reason = truncate_utf8_reason(result.reason, kMaxFileBrowserReasonBytes);
+    std::vector<uint8_t> payload(4 + 1 + 1 + 2 + reason.size() + 2 + entries_size);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, result.request_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u8(cursor, result.truncated ? kFileListFlagTruncated : 0);
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+        cursor += reason.size();
+    }
+    put_u16(cursor, static_cast<uint16_t>(result.entries.size()));
+    for (const FileListEntry& entry : result.entries) {
+        put_u16(cursor, static_cast<uint16_t>(entry.name.size()));
+        std::memcpy(cursor, entry.name.data(), entry.name.size());
+        cursor += entry.name.size();
+        put_u64(cursor, entry.size);
+        put_u64(cursor, entry.modified_ms);
+        put_u8(cursor, entry.directory ? kFileEntryFlagDirectory : 0);
+    }
+    return make_control(ControlType::FileListResult, payload);
+}
+
+bool parse_file_list_result(const std::vector<uint8_t>& payload, FileListResult& result,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t code = 0;
+    uint8_t flags = 0;
+    uint16_t reason_size = 0;
+    uint16_t count = 0;
+    if (!reader.u32(result.request_id) || !reader.u8(code) || !reader.u8(flags) ||
+        !reader.u16(reason_size) || !reader.string(result.reason, reason_size) ||
+        !reader.u16(count)) {
+        set_error(error, "truncated FileListResult");
+        return false;
+    }
+    if (result.request_id == 0) {
+        set_error(error, "FileListResult has a zero request id");
+        return false;
+    }
+    if (!known_file_code(code) || (flags & ~kFileListFlagTruncated) != 0) {
+        set_error(error, "FileListResult carries an unknown code or flags");
+        return false;
+    }
+    result.code = static_cast<FileCode>(code);
+    result.truncated = (flags & kFileListFlagTruncated) != 0;
+    if (reason_size > kMaxFileBrowserReasonBytes) {
+        set_error(error, "FileListResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "FileListResult reason is not UTF-8");
+        return false;
+    }
+    if (count > kMaxFileListEntries) {
+        set_error(error, "FileListResult carries too many entries");
+        return false;
+    }
+    if (result.code != FileCode::Ok && (count != 0 || result.truncated)) {
+        set_error(error, "a refused FileListResult carries entries");
+        return false;
+    }
+    result.entries.clear();
+    result.entries.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t name_size = 0;
+        FileListEntry entry;
+        uint8_t entry_flags = 0;
+        if (!reader.u16(name_size) || !reader.string(entry.name, name_size) ||
+            !reader.u64(entry.size) || !reader.u64(entry.modified_ms) ||
+            !reader.u8(entry_flags)) {
+            set_error(error, "FileListResult entry overruns the message");
+            return false;
+        }
+        if (!valid_list_entry_name(entry.name) || (entry_flags & ~kFileEntryFlagDirectory) != 0) {
+            set_error(error, "FileListResult carries an unusable entry");
+            return false;
+        }
+        entry.directory = (entry_flags & kFileEntryFlagDirectory) != 0;
+        result.entries.push_back(std::move(entry));
+    }
+    if (!reader.at_end()) {
+        set_error(error, "FileListResult carries trailing bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_download_request(uint32_t request_id,
+                                                const std::string& path) {
+    if (request_id == 0 || path.empty() || !valid_file_browser_path(path)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 2 + path.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request_id);
+    put_u16(cursor, static_cast<uint16_t>(path.size()));
+    std::memcpy(cursor, path.data(), path.size());
+    return make_control(ControlType::FileDownloadRequest, payload);
+}
+
+bool parse_file_download_request(const std::vector<uint8_t>& payload,
+                                 uint32_t& request_id, std::string& path,
+                                 std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint16_t size = 0;
+    if (!reader.u32(request_id) || !reader.u16(size) || !reader.string(path, size) ||
+        !reader.at_end()) {
+        set_error(error, "malformed FileDownloadRequest");
+        return false;
+    }
+    if (request_id == 0) {
+        set_error(error, "FileDownloadRequest has a zero request id");
+        return false;
+    }
+    if (path.empty() || !valid_file_browser_path(path)) {
+        set_error(error, "FileDownloadRequest path is not a plain relative file");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_download_result(const FileDownloadResult& result) {
+    if (result.request_id == 0 ||
+        !known_file_code(static_cast<uint8_t>(result.code)) ||
+        (result.code == FileCode::Ok) != (result.transfer_id != 0)) {
+        return {};
+    }
+    const std::string reason = truncate_utf8_reason(result.reason, kMaxFileBrowserReasonBytes);
+    std::vector<uint8_t> payload(4 + 4 + 1 + 2 + reason.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, result.request_id);
+    put_u32(cursor, result.transfer_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+    }
+    return make_control(ControlType::FileDownloadResult, payload);
+}
+
+bool parse_file_download_result(const std::vector<uint8_t>& payload,
+                                FileDownloadResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(result.request_id) || !reader.u32(result.transfer_id) ||
+        !reader.u8(code) || !reader.u16(reason_size) ||
+        !reader.string(result.reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed FileDownloadResult");
+        return false;
+    }
+    if (result.request_id == 0) {
+        set_error(error, "FileDownloadResult has a zero request id");
+        return false;
+    }
+    if (!known_file_code(code)) {
+        set_error(error, "FileDownloadResult carries an unknown code");
+        return false;
+    }
+    result.code = static_cast<FileCode>(code);
+    if ((result.code == FileCode::Ok) != (result.transfer_id != 0)) {
+        set_error(error, "FileDownloadResult code and transfer id disagree");
+        return false;
+    }
+    if (reason_size > kMaxFileBrowserReasonBytes) {
+        set_error(error, "FileDownloadResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "FileDownloadResult reason is not UTF-8");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_op_request(uint32_t request_id, FileOperation op,
+                                          const std::string& path,
+                                          const std::string& new_name) {
+    const uint8_t raw_op = static_cast<uint8_t>(op);
+    if (request_id == 0 || raw_op > static_cast<uint8_t>(FileOperation::Remove) ||
+        path.empty() || !valid_file_browser_path(path)) {
+        return {};
+    }
+    if (op == FileOperation::Rename ? !valid_file_browser_name(new_name)
+                                    : !new_name.empty()) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 1 + 2 + path.size() + 2 + new_name.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request_id);
+    put_u8(cursor, raw_op);
+    put_u16(cursor, static_cast<uint16_t>(path.size()));
+    std::memcpy(cursor, path.data(), path.size());
+    cursor += path.size();
+    put_u16(cursor, static_cast<uint16_t>(new_name.size()));
+    if (!new_name.empty()) {
+        std::memcpy(cursor, new_name.data(), new_name.size());
+    }
+    return make_control(ControlType::FileOpRequest, payload);
+}
+
+bool parse_file_op_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
+                           FileOperation& op, std::string& path, std::string& new_name,
+                           std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_op = 0;
+    uint16_t path_size = 0;
+    uint16_t name_size = 0;
+    if (!reader.u32(request_id) || !reader.u8(raw_op) || !reader.u16(path_size) ||
+        !reader.string(path, path_size) || !reader.u16(name_size) ||
+        !reader.string(new_name, name_size) || !reader.at_end()) {
+        set_error(error, "malformed FileOpRequest");
+        return false;
+    }
+    if (request_id == 0) {
+        set_error(error, "FileOpRequest has a zero request id");
+        return false;
+    }
+    if (raw_op > static_cast<uint8_t>(FileOperation::Remove)) {
+        set_error(error, "FileOpRequest carries an unknown operation");
+        return false;
+    }
+    op = static_cast<FileOperation>(raw_op);
+    if (path.empty() || !valid_file_browser_path(path)) {
+        set_error(error, "FileOpRequest path is not a plain relative path");
+        return false;
+    }
+    if (op == FileOperation::Rename ? !valid_file_browser_name(new_name)
+                                    : !new_name.empty()) {
+        set_error(error, "FileOpRequest new name does not match its operation");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_file_op_result(const FileOpResult& result) {
+    if (result.request_id == 0 ||
+        !known_file_code(static_cast<uint8_t>(result.code))) {
+        return {};
+    }
+    const std::string reason = truncate_utf8_reason(result.reason, kMaxFileBrowserReasonBytes);
+    std::vector<uint8_t> payload(4 + 1 + 2 + reason.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, result.request_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+    }
+    return make_control(ControlType::FileOpResult, payload);
+}
+
+bool parse_file_op_result(const std::vector<uint8_t>& payload, FileOpResult& result,
+                          std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(result.request_id) || !reader.u8(code) ||
+        !reader.u16(reason_size) || !reader.string(result.reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, "malformed FileOpResult");
+        return false;
+    }
+    if (result.request_id == 0) {
+        set_error(error, "FileOpResult has a zero request id");
+        return false;
+    }
+    if (!known_file_code(code)) {
+        set_error(error, "FileOpResult carries an unknown code");
+        return false;
+    }
+    result.code = static_cast<FileCode>(code);
+    if (reason_size > kMaxFileBrowserReasonBytes) {
+        set_error(error, "FileOpResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "FileOpResult reason is not UTF-8");
         return false;
     }
     return true;

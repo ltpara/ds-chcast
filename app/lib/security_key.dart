@@ -2,6 +2,7 @@ import 'package:flutter/services.dart';
 
 import 'server_api.dart';
 import 'server_settings.dart';
+import 'package:chast_viewer/l10n.dart';
 
 /// A failed Windows Hello ceremony or a platform that cannot run one.
 class SecurityKeyException implements Exception {
@@ -58,8 +59,8 @@ class SecurityKey {
     try {
       return await channel.invokeMethod<bool>('securityKeyAvailable') ?? false;
     } on MissingPluginException {
-      throw const SecurityKeyException(
-        '当前平台不支持 Windows Hello',
+      throw SecurityKeyException(
+        tr('当前平台不支持 Windows Hello'),
         code: 'not_supported',
       );
     } on PlatformException catch (error) {
@@ -98,7 +99,7 @@ class SecurityKey {
     if (result.credentialId.isEmpty ||
         result.clientDataJSON.isEmpty ||
         result.attestationObject.isEmpty) {
-      throw const SecurityKeyException('Windows Hello 未返回完整的凭据', code: 'failed');
+      throw SecurityKeyException(tr('Windows Hello 未返回完整的凭据'), code: 'failed');
     }
     return result;
   }
@@ -128,7 +129,7 @@ class SecurityKey {
         result.clientDataJSON.isEmpty ||
         result.authenticatorData.isEmpty ||
         result.signature.isEmpty) {
-      throw const SecurityKeyException('Windows Hello 未返回完整的断言', code: 'failed');
+      throw SecurityKeyException(tr('Windows Hello 未返回完整的断言'), code: 'failed');
     }
     return result;
   }
@@ -142,10 +143,10 @@ class SecurityKey {
       if (reply is Map) {
         return reply.cast<Object?, Object?>();
       }
-      throw const SecurityKeyException('Windows Hello 返回了无效数据', code: 'failed');
+      throw SecurityKeyException(tr('Windows Hello 返回了无效数据'), code: 'failed');
     } on MissingPluginException {
-      throw const SecurityKeyException(
-        '当前平台不支持 Windows Hello',
+      throw SecurityKeyException(
+        tr('当前平台不支持 Windows Hello'),
         code: 'not_supported',
       );
     } on PlatformException catch (error) {
@@ -170,10 +171,10 @@ Future<AccountLoginResult> loginWithSecurityKey(
     password: password,
   );
   if (options == null) {
-    throw const ServerApiException('该账号未注册安全密钥');
+    throw ServerApiException(tr('该账号未注册安全密钥'));
   }
   if (!await key.available()) {
-    throw const SecurityKeyException('此设备未配置 Windows Hello', code: 'not_supported');
+    throw SecurityKeyException(tr('此设备未配置 Windows Hello'), code: 'not_supported');
   }
   final SecurityKeyAssertion assertion = await key.getAssertion(
     rpId: options.rpId,
@@ -194,23 +195,60 @@ Future<AccountLoginResult> loginWithSecurityKey(
   );
 }
 
+/// Completes a passwordless security-key login: the username selects the
+/// registered keys, Windows Hello signs the server challenge, and the
+/// assertion alone opens the session.
+Future<AccountLoginResult> loginWithSecurityKeyOnly(
+  ServerSettings server, {
+  required String username,
+  SecurityKey? securityKey,
+  String deviceName = '',
+}) async {
+  final SecurityKey key = securityKey ?? SecurityKey();
+  final WebAuthnLoginOptions? options =
+      await ServerApi.loginWebAuthnPasswordlessBegin(server, username: username);
+  if (options == null) {
+    throw ServerApiException(tr('该账号未注册安全密钥'));
+  }
+  if (!await key.available()) {
+    throw SecurityKeyException(tr('此设备未配置 Windows Hello'), code: 'not_supported');
+  }
+  final SecurityKeyAssertion assertion = await key.getAssertion(
+    rpId: options.rpId,
+    challenge: options.challenge,
+    allowCredentials: <String>[
+      for (final WebAuthnCredential credential in options.credentials) credential.id,
+    ],
+    timeoutMs: options.timeoutMs,
+  );
+  return ServerApi.loginWebAuthnPasswordlessFinish(
+    server,
+    username: username,
+    credentialId: assertion.credentialId,
+    clientDataJSON: assertion.clientDataJSON,
+    authenticatorData: assertion.authenticatorData,
+    signature: assertion.signature,
+    deviceName: deviceName,
+  );
+}
+
 String _message(String code, String? detail) {
   switch (code) {
     case 'not_supported':
-      return '当前设备未配置 Windows Hello';
+      return tr('当前设备未配置 Windows Hello');
     case 'user_cancelled':
-      return '已取消 Windows Hello 验证';
+      return tr('已取消 Windows Hello 验证');
     case 'timeout':
-      return 'Windows Hello 验证超时';
+      return tr('Windows Hello 验证超时');
     case 'credential_exists':
-      return '该安全密钥已经注册';
+      return tr('该安全密钥已经注册');
     case 'not_found':
-      return '未找到匹配的安全密钥';
+      return tr('未找到匹配的安全密钥');
     case 'busy':
-      return '另一个安全密钥操作正在进行';
+      return tr('另一个安全密钥操作正在进行');
     case 'bad_args':
-      return '安全密钥参数无效';
+      return tr('安全密钥参数无效');
   }
   final String text = detail?.trim() ?? '';
-  return text.isEmpty ? 'Windows Hello 操作失败' : 'Windows Hello 操作失败：$text';
+  return text.isEmpty ? tr('Windows Hello 操作失败') : tr('Windows Hello 操作失败：{text}', <String, Object?>{'text': text});
 }

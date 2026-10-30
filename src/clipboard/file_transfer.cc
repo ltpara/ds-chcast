@@ -516,6 +516,331 @@ struct FileReceiver::Impl {
     Sha256 hash;
 };
 
+namespace {
+
+// 100 ns ticks between the FILETIME epoch (1601-01-01) and Unix time.
+constexpr uint64_t kFileTimeUnixEpoch = 116444736000000000ull;
+
+}  // namespace
+
+FileCode resolve_receive_path(const std::string& root, const std::string& relative,
+                              std::string& full_path, bool& is_directory,
+                              std::string& error) {
+    full_path.clear();
+    is_directory = false;
+    // The protocol layer already validated the wire path; this second pass is
+    // the sandbox boundary, so it does not trust it.
+    if (relative.size() > kMaxFileBrowserPathBytes ||
+        relative.find('\\') != std::string::npos ||
+        relative.find(':') != std::string::npos ||
+        relative.find('\0') != std::string::npos) {
+        error = "the path is not a plain relative path";
+        return FileCode::Refused;
+    }
+    const std::wstring wide_root = utf8_to_wide(root);
+    if (wide_root.empty()) {
+        error = "the receive directory is not usable";
+        return FileCode::Refused;
+    }
+    std::wstring current = wide_root;
+    if (relative.empty()) {
+        const DWORD attributes = GetFileAttributesW(long_path(wide_root).c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+                error = "the receive directory does not exist";
+                return FileCode::NotFound;
+            }
+            error = "cannot read the receive directory (error " + std::to_string(code) + ")";
+            return FileCode::IoError;
+        }
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            error = "the receive directory is not a plain directory";
+            return FileCode::Refused;
+        }
+        is_directory = true;
+    } else {
+        size_t start = 0;
+        size_t components = 0;
+        for (;;) {
+            const size_t slash = relative.find('/', start);
+            const size_t length =
+                slash == std::string::npos ? relative.size() - start : slash - start;
+            if (++components > kMaxFileRelativeComponents) {
+                error = "the path is too deep";
+                return FileCode::Refused;
+            }
+            if (length == 0 || length > kMaxFileNameBytes ||
+                (length == 1 && relative[start] == '.') ||
+                (length == 2 && relative[start] == '.' && relative[start + 1] == '.')) {
+                error = "a path component is not usable";
+                return FileCode::Refused;
+            }
+            const std::wstring wide_part = utf8_to_wide(relative.substr(start, length));
+            if (wide_part.empty()) {
+                error = "a path component is not usable";
+                return FileCode::Refused;
+            }
+            current = join(current, wide_part);
+            const DWORD attributes = GetFileAttributesW(long_path(current).c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                const DWORD code = GetLastError();
+                if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+                    error = "no such file or directory";
+                    return FileCode::NotFound;
+                }
+                error = "cannot read the path (error " + std::to_string(code) + ")";
+                return FileCode::IoError;
+            }
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                error = "the path crosses a reparse point";
+                return FileCode::Refused;
+            }
+            const bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (!directory && slash != std::string::npos) {
+                error = "a path component is not a directory";
+                return FileCode::NotFound;
+            }
+            is_directory = directory;
+            if (slash == std::string::npos) {
+                break;
+            }
+            start = slash + 1;
+        }
+    }
+    const std::wstring absolute = absolute_path(current);
+    full_path = wide_to_utf8(absolute.empty() ? current : absolute);
+    if (full_path.empty()) {
+        error = "the path cannot be represented";
+        return FileCode::Refused;
+    }
+    return FileCode::Ok;
+}
+
+void list_receive_directory(const std::string& root, const std::string& relative,
+                            FileListResult& result) {
+    result.entries.clear();
+    result.truncated = false;
+    result.code = FileCode::Ok;
+    result.reason.clear();
+
+    std::string directory;
+    bool is_directory = false;
+    std::string error;
+    result.code = resolve_receive_path(root, relative, directory, is_directory, error);
+    if (result.code != FileCode::Ok) {
+        result.reason = error;
+        return;
+    }
+    if (!is_directory) {
+        result.code = FileCode::NotFound;
+        result.reason = "the path is not a directory";
+        return;
+    }
+
+    // FindFirstFile rather than std::filesystem so a reparse point can be
+    // spotted from the enumeration data without resolving it.
+    const std::wstring pattern = join(utf8_to_wide(directory), L"*");
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(long_path(pattern).c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND) {
+            return;  // an empty directory
+        }
+        result.code = FileCode::IoError;
+        result.reason = "cannot list the directory (error " + std::to_string(code) + ")";
+        return;
+    }
+
+    std::vector<FileListEntry> directories;
+    std::vector<FileListEntry> files;
+    do {
+        const std::wstring name = data.cFileName;
+        if (name == L"." || name == L".." ||
+            (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            continue;
+        }
+        const std::string utf8_name = wide_to_utf8(name);
+        // An entry the wire cannot carry would fail the whole answer, so it is
+        // skipped like a reparse point.
+        if (utf8_name.empty() || utf8_name.size() > kMaxFileNameBytes) {
+            continue;
+        }
+        FileListEntry entry;
+        entry.name = utf8_name;
+        entry.directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!entry.directory) {
+            ULARGE_INTEGER size{};
+            size.LowPart = data.nFileSizeLow;
+            size.HighPart = data.nFileSizeHigh;
+            entry.size = size.QuadPart;
+        }
+        ULARGE_INTEGER stamp{};
+        stamp.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        stamp.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        if (stamp.QuadPart >= kFileTimeUnixEpoch) {
+            entry.modified_ms = (stamp.QuadPart - kFileTimeUnixEpoch) / 10000;
+        }
+        (entry.directory ? directories : files).push_back(std::move(entry));
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+
+    auto by_name = [](const FileListEntry& left, const FileListEntry& right) {
+        return left.name < right.name;
+    };
+    std::sort(directories.begin(), directories.end(), by_name);
+    std::sort(files.begin(), files.end(), by_name);
+
+    const size_t total = directories.size() + files.size();
+    result.entries.reserve(std::min(total, kMaxFileListEntries));
+    for (FileListEntry& entry : directories) {
+        if (result.entries.size() == kMaxFileListEntries) {
+            break;
+        }
+        result.entries.push_back(std::move(entry));
+    }
+    for (FileListEntry& entry : files) {
+        if (result.entries.size() == kMaxFileListEntries) {
+            break;
+        }
+        result.entries.push_back(std::move(entry));
+    }
+    result.truncated = total > kMaxFileListEntries;
+}
+
+namespace {
+
+bool valid_operation_name(const std::string& name) {
+    return !name.empty() && name.size() <= kMaxFileNameBytes &&
+           name.find('\0') == std::string::npos &&
+           name.find('/') == std::string::npos &&
+           name.find('\\') == std::string::npos &&
+           name.find(':') == std::string::npos && name != "." && name != ".." &&
+           !utf8_to_wide(name).empty();
+}
+
+FileCode map_operation_error(DWORD code, std::string& error) {
+    switch (code) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+            error = "no such file or directory";
+            return FileCode::NotFound;
+        case ERROR_ALREADY_EXISTS:
+        case ERROR_FILE_EXISTS:
+            error = "an entry with that name already exists";
+            return FileCode::Refused;
+        case ERROR_DIR_NOT_EMPTY:
+            error = "the folder is not empty";
+            return FileCode::Refused;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+            error = "the host refused the change (error " + std::to_string(code) + ")";
+            return FileCode::Refused;
+        default:
+            error = "the host's file system failed (error " + std::to_string(code) + ")";
+            return FileCode::IoError;
+    }
+}
+
+}  // namespace
+
+FileCode apply_file_operation(const std::string& root, FileOperation op,
+                              const std::string& path, const std::string& new_name,
+                              std::string& error) {
+    error.clear();
+    if (path.empty() || path.size() > kMaxFileBrowserPathBytes) {
+        error = "the path is not a plain relative path";
+        return FileCode::Refused;
+    }
+    const size_t slash = path.rfind('/');
+    const std::string parent =
+        slash == std::string::npos ? std::string() : path.substr(0, slash);
+    const std::string leaf = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (!valid_operation_name(leaf)) {
+        error = "the entry name is not usable";
+        return FileCode::Refused;
+    }
+
+    std::string parent_path;
+    bool parent_is_directory = false;
+    FileCode code =
+        resolve_receive_path(root, parent, parent_path, parent_is_directory, error);
+    if (code != FileCode::Ok) {
+        return code;
+    }
+    if (!parent_is_directory) {
+        error = "the parent path is not a directory";
+        return FileCode::Refused;
+    }
+    const std::wstring wide_parent = utf8_to_wide(parent_path);
+    const std::wstring wide_leaf = utf8_to_wide(leaf);
+    if (wide_parent.empty() || wide_leaf.empty()) {
+        error = "the entry name is not usable";
+        return FileCode::Refused;
+    }
+    const std::wstring target = join(wide_parent, wide_leaf);
+
+    switch (op) {
+        case FileOperation::MakeDirectory:
+            if (!CreateDirectoryW(long_path(target).c_str(), nullptr)) {
+                return map_operation_error(GetLastError(), error);
+            }
+            return FileCode::Ok;
+        case FileOperation::Rename: {
+            if (!valid_operation_name(new_name)) {
+                error = "the new name is not usable";
+                return FileCode::Refused;
+            }
+            const std::wstring wide_new = utf8_to_wide(new_name);
+            if (wide_new.empty()) {
+                error = "the new name is not usable";
+                return FileCode::Refused;
+            }
+            const DWORD attributes = GetFileAttributesW(long_path(target).c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                return map_operation_error(GetLastError(), error);
+            }
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                error = "the path is a reparse point";
+                return FileCode::Refused;
+            }
+            const std::wstring destination = join(wide_parent, wide_new);
+            if (!MoveFileExW(long_path(target).c_str(), long_path(destination).c_str(),
+                             MOVEFILE_WRITE_THROUGH)) {
+                return map_operation_error(GetLastError(), error);
+            }
+            return FileCode::Ok;
+        }
+        case FileOperation::Remove: {
+            const DWORD attributes = GetFileAttributesW(long_path(target).c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES) {
+                return map_operation_error(GetLastError(), error);
+            }
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                error = "the path is a reparse point";
+                return FileCode::Refused;
+            }
+            if ((attributes & FILE_ATTRIBUTE_READONLY) != 0) {
+                error = "the entry is read-only";
+                return FileCode::Refused;
+            }
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                if (!RemoveDirectoryW(long_path(target).c_str())) {
+                    return map_operation_error(GetLastError(), error);
+                }
+            } else if (!DeleteFileW(long_path(target).c_str())) {
+                return map_operation_error(GetLastError(), error);
+            }
+            return FileCode::Ok;
+        }
+    }
+    error = "the operation is not supported";
+    return FileCode::Refused;
+}
+
 FileReceiver::FileReceiver() : impl_(std::make_unique<Impl>()) {}
 FileReceiver::~FileReceiver() {
     if (impl_ && impl_->file != INVALID_HANDLE_VALUE) {

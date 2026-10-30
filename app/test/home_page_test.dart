@@ -1,8 +1,12 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
 import 'package:chast_viewer/device_store.dart';
+import 'package:chast_viewer/l10n.dart';
 import 'package:chast_viewer/lan_discovery.dart';
 import 'package:chast_viewer/pages/home_page.dart';
 import 'package:chast_viewer/server_api.dart';
@@ -120,7 +124,11 @@ class _MemoryDevices extends DeviceStore {
   }
 
   @override
-  Future<List<Device>> setPeerRevision(String key, int revision) async {
+  Future<List<Device>> setPeerRevision(
+    String key,
+    int revision, {
+    int? position,
+  }) async {
     if (revision > 0) {
       final int index = devices.indexWhere(
         (Device device) => device.key == key,
@@ -161,6 +169,17 @@ class _MemoryServers extends ServerSettingsStore {
 
   @override
   Future<ServerSettings> load() async => settings;
+}
+
+class _SavingServers extends _MemoryServers {
+  _SavingServers(super.settings);
+
+  ServerSettings? saved;
+
+  @override
+  Future<void> save(ServerSettings settings) async {
+    saved = settings;
+  }
 }
 
 class _MemoryTrust extends TrustStore {
@@ -285,9 +304,123 @@ void main() {
       expect(find.textContaining('在线'), findsWidgets);
       expect(lookups, greaterThan(0));
 
+      await tester.tap(find.byIcon(Icons.more_vert_rounded).first);
+      await tester.pumpAndSettle();
+      expect(find.text('仅文件传输'), findsOneWidget);
+      await tester.tapAt(const Offset(8, 8));
+      await tester.pumpAndSettle();
+
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  testWidgets('the files-only entry asks for an address before connecting', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: _MemoryServers(const ServerSettings()),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(find.byTooltip('仅文件传输'), findsOneWidget);
+    await tester.tap(find.byTooltip('仅文件传输'));
+    await tester.pump();
+    expect(find.text('请输入设备 ID 或主机地址'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('the language menu switches the UI to English and back', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final Directory dir = Directory.systemTemp.createTempSync('chast_l10n_ui_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    AppLanguage.configPathOverride =
+        '${dir.path}${Platform.pathSeparator}ui.json';
+    addTearDown(() {
+      AppLanguage.configPathOverride = null;
+      AppLanguage.current.value = kLanguageChinese;
+    });
+
+    await tester.pumpWidget(
+      ValueListenableBuilder<String>(
+        valueListenable: AppLanguage.current,
+        builder: (BuildContext context, String language, Widget? child) {
+          return MaterialApp(
+            locale: Locale(language),
+            supportedLocales: const <Locale>[Locale('zh', 'CN'), Locale('en')],
+            localizationsDelegates: const <LocalizationsDelegate<Object>>[
+              GlobalMaterialLocalizations.delegate,
+              GlobalWidgetsLocalizations.delegate,
+              GlobalCupertinoLocalizations.delegate,
+            ],
+            home: HomePage(
+              deviceStore: _MemoryDevices(<Device>[]),
+              serverStore: _MemoryServers(
+                const ServerSettings(url: 'http://127.0.0.1:8443'),
+              ),
+              identityStore: _MemoryIdentity(),
+              trustStore: _MemoryTrust(<String, String>{}),
+              accountStore: _MemoryAccount(),
+              lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+                  const BatchLookupResult(hosts: <String, HostInfo>{}),
+            ),
+          );
+        },
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(find.text('我的设备'), findsOneWidget);
+    expect(find.text('界面语言'), findsOneWidget);
+
+    await tester.ensureVisible(find.byKey(const Key('language-menu')));
+    await tester.tap(find.byKey(const Key('language-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.widgetWithText(CheckedPopupMenuItem<String>, 'English'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(AppLanguage.code, kLanguageEnglish);
+    expect(find.text('My Devices'), findsOneWidget);
+    expect(find.text('Language'), findsOneWidget);
+    expect(find.text('我的设备'), findsNothing);
+
+    await tester.ensureVisible(find.byKey(const Key('language-menu')));
+    await tester.tap(find.byKey(const Key('language-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.widgetWithText(CheckedPopupMenuItem<String>, '简体中文'),
+    );
+    await tester.pumpAndSettle();
+
+    expect(AppLanguage.code, kLanguageChinese);
+    expect(find.text('我的设备'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
 
   testWidgets('LAN scan adds selected peers to the address book', (
     WidgetTester tester,
@@ -470,6 +603,152 @@ void main() {
     await tester.tap(find.byTooltip('忽略此版本'));
     await tester.pump();
     expect(find.textContaining('可更新到 2.1.0'), findsNothing);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('home installs a signed update with the pinned server key', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final ServerIdentity pinned = ServerIdentity.parse(
+      'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+    )!;
+    SoftwareInfo? installed;
+    String? installKey;
+    int? exitCode;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[
+            Device(
+              id: 'devbox',
+              server: 'http://127.0.0.1:8443',
+              saved: true,
+              addedAt: DateTime.now(),
+            ),
+          ]),
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(<String, ServerIdentityPin>{
+            'http://127.0.0.1:8443': ServerIdentityPin(
+              identity: pinned,
+              pinnedAt: DateTime.now(),
+            ),
+          }),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return BatchLookupResult(
+              hosts: <String, HostInfo>{
+                for (final String hostId in hostIds)
+                  hostId: HostInfo(
+                    id: hostId,
+                    online: true,
+                    serverPublicKey: pinned.publicKey,
+                  ),
+              },
+              software: const SoftwareInfo(
+                version: '2.1.0',
+                url: 'https://downloads.example.com/chast-2.1.0.exe',
+                sha256: '0f343b0931126a20f133d67c2b018a3c',
+                size: 73400320,
+                signature: 'MEUCIQ-test-signature',
+              ),
+            );
+          },
+          appExit: (int code) => exitCode = code,
+          softwareUpdater: (SoftwareInfo update, String serverPublicKey) async {
+            installed = update;
+            installKey = serverPublicKey;
+          },
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(find.textContaining('可更新到 2.1.0'), findsOneWidget);
+    await tester.tap(find.text('下载地址'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('由 chast-tunnel 替换'), findsOneWidget);
+    await tester.tap(find.text('下载并安装'));
+    await tester.pumpAndSettle();
+
+    expect(installed?.version, '2.1.0');
+    expect(installed?.sha256, '0f343b0931126a20f133d67c2b018a3c');
+    expect(installed?.size, 73400320);
+    expect(installKey, pinned.publicKey);
+    expect(exitCode, 0);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('home does not install an update without a pinned identity', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    bool installed = false;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[
+            Device(
+              id: 'devbox',
+              server: 'http://127.0.0.1:8443',
+              saved: true,
+              addedAt: DateTime.now(),
+            ),
+          ]),
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+          softwareUpdater: (SoftwareInfo update, String serverPublicKey) async {
+            installed = true;
+          },
+          appExit: (int code) {},
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return BatchLookupResult(
+              hosts: <String, HostInfo>{
+                for (final String hostId in hostIds)
+                  hostId: HostInfo(id: hostId, online: true),
+              },
+              software: const SoftwareInfo(
+                version: '2.1.0',
+                url: 'https://downloads.example.com/chast-2.1.0.exe',
+                sha256: '0f343b0931126a20f133d67c2b018a3c',
+                size: 73400320,
+                signature: 'MEUCIQ-test-signature',
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.tap(find.text('下载地址'));
+    await tester.pumpAndSettle();
+    expect(find.text('下载并安装'), findsNothing);
+    expect(find.textContaining('尚未固定此服务器的身份'), findsOneWidget);
+    expect(installed, isFalse);
+    await tester.tap(find.text('关闭'));
+    await tester.pumpAndSettle();
 
     await tester.pumpWidget(const SizedBox());
   });
@@ -926,6 +1205,69 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(keys, <String>['alice|secret']);
+    expect(accounts.session?.username, 'alice');
+    expect(accounts.session?.token, 'keytok');
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('account login can use a passwordless security key', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final List<String> users = <String>[];
+    final _MemoryAccount accounts = _MemoryAccount();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: accounts,
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return const BatchLookupResult(hosts: <String, HostInfo>{});
+          },
+          accountPasswordlessSecurityKeyLogin:
+              (ServerSettings server, {required String username}) async {
+                users.add(username);
+                return const AccountLoginResult(
+                  token: 'keytok',
+                  username: 'alice',
+                  expiresInMs: 3600000,
+                );
+              },
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async {
+                return const AddressBookSnapshot(
+                  revision: 0,
+                  peers: <AddressBookPeer>[],
+                );
+              },
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.tap(find.byKey(const Key('account-tile')));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const Key('account-security-key-login')),
+      findsOneWidget,
+    );
+    await tester.enterText(find.byKey(const Key('account-username')), 'alice');
+    await tester.tap(find.byKey(const Key('account-security-key-login')));
+    await tester.pumpAndSettle();
+
+    expect(users, <String>['alice']);
     expect(accounts.session?.username, 'alice');
     expect(accounts.session?.token, 'keytok');
 
@@ -2331,6 +2673,66 @@ void main() {
     expect(revoked, 'tok');
     expect(accounts.session, isNull);
     expect(find.text('登录账号'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('the account dialog toggles automatic recording upload', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final _SavingServers servers = _SavingServers(
+      const ServerSettings(url: 'http://127.0.0.1:8443'),
+    );
+    final _MemoryAccount accounts = _MemoryAccount(
+      AccountSession(
+        server: 'http://127.0.0.1:8443',
+        username: 'alice',
+        token: 'tok',
+        expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: servers,
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: accounts,
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return const BatchLookupResult(hosts: <String, HostInfo>{});
+          },
+          addressBookFetcher:
+              (ServerSettings server, String token, int since) async {
+                return const AddressBookSnapshot(
+                  revision: 0,
+                  peers: <AddressBookPeer>[],
+                );
+              },
+        ),
+      ),
+    );
+    for (int i = 0; i < 6; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.tap(find.byKey(const Key('account-tile')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('account-recordings')), findsOneWidget);
+    final Finder toggle = find.byKey(const Key('account-upload-recordings'));
+    expect(toggle, findsOneWidget);
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+    expect(servers.saved?.uploadRecordings, isTrue);
+    expect(servers.saved?.url, 'http://127.0.0.1:8443');
 
     await tester.pumpWidget(const SizedBox());
   });

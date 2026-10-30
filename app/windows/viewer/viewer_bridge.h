@@ -92,6 +92,9 @@ private:
     double cursor_scale_ = 1.0;
     std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
     std::unique_ptr<GpuFrameSink> texture_sink_;
+    // The shared camera gets its own Flutter texture and sink, so both
+    // pictures can render at once.
+    std::unique_ptr<GpuFrameSink> camera_sink_;
     std::unique_ptr<ViewerEngine> viewer_;
     std::shared_ptr<chast::DeviceIdentity> identity_;
     bool identity_loaded_ = false;

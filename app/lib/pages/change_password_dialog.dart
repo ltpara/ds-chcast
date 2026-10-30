@@ -6,6 +6,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 typedef PasswordChanger = Future<void> Function(
   ServerSettings settings,
@@ -56,15 +57,15 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
     final String next = _next.text;
     final int bytes = utf8.encode(next).length;
     if (current.isEmpty) {
-      setState(() => _error = '请输入当前密码');
+      setState(() => _error = tr('请输入当前密码'));
       return;
     }
     if (bytes < 8 || bytes > 128) {
-      setState(() => _error = '新密码长度需为 8–128 个字节');
+      setState(() => _error = tr('新密码长度需为 8–128 个字节'));
       return;
     }
     if (next != _confirm.text) {
-      setState(() => _error = '两次输入的新密码不一致');
+      setState(() => _error = tr('两次输入的新密码不一致'));
       return;
     }
     setState(() {
@@ -93,7 +94,7 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '修改密码失败：$error';
+          _error = tr('修改密码失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -105,7 +106,7 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('修改密码'),
+      title: Text(tr('修改密码')),
       content: SizedBox(
         width: 360,
         child: Column(
@@ -113,7 +114,7 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             Text(
-              '修改后其他设备需要使用新密码重新登录，本机保持登录。',
+              tr('修改后其他设备需要使用新密码重新登录，本机保持登录。'),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 14),
@@ -124,8 +125,8 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
               obscureText: true,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '当前密码',
+              decoration: InputDecoration(
+                labelText: tr('当前密码'),
                 prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
               ),
             ),
@@ -136,8 +137,8 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
               obscureText: true,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '新密码（8–128 字节）',
+              decoration: InputDecoration(
+                labelText: tr('新密码（8–128 字节）'),
                 prefixIcon: Icon(Icons.password_rounded, size: 18),
               ),
             ),
@@ -148,8 +149,8 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
               obscureText: true,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '确认新密码',
+              decoration: InputDecoration(
+                labelText: tr('确认新密码'),
                 prefixIcon: Icon(Icons.check_circle_outline_rounded, size: 18),
               ),
               onSubmitted: (_) => _submit(),
@@ -171,7 +172,7 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('change-password-submit'),
@@ -182,7 +183,7 @@ class _ChangePasswordDialogState extends State<ChangePasswordDialog> {
                   height: 15,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : const Text('修改密码'),
+              : Text(tr('修改密码')),
         ),
       ],
     );

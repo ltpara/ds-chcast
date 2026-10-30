@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/updater"
 	"github.com/ltpara/ds-chcast/server/internal/upnp"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
@@ -64,6 +66,13 @@ type HostConfig struct {
 	// reports that external port to the rendezvous service. It is opt-in
 	// because it changes router state.
 	UPnP bool
+	// AutoUpdate stages and launches the installer advertised by the server.
+	// It requires ServerPublicKey: without a pin the notice cannot be
+	// verified, so the agent refuses to run a downloaded binary.
+	AutoUpdate bool
+	// UpdateDir is where the installer is staged. Empty uses the system temp
+	// directory.
+	UpdateDir string
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
 	// goroutine, so it must not block.
@@ -134,6 +143,9 @@ type HostAgent struct {
 	// softwareSeen remembers the last advertised update version so a renewal
 	// every few seconds does not repeat the same notice.
 	softwareSeen string
+	// updatesTried keeps the versions this process already staged or
+	// rejected, so a flapping server cannot loop the download.
+	updatesTried map[string]bool
 	// observedPunch and observedRelay are this host's public mappings as seen
 	// by the rendezvous port and by its relay port. Comparing them classifies
 	// the NAT without a second server.
@@ -168,6 +180,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		if _, err := identity.ParsePublicKey(cfg.ServerPublicKey); err != nil {
 			return nil, fmt.Errorf("--server-pubkey: %w", err)
 		}
+	}
+	if cfg.AutoUpdate && cfg.ServerPublicKey == "" {
+		return nil, fmt.Errorf("--auto-update needs --server-pubkey so the update notice can be verified")
 	}
 	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
 	if err != nil {
@@ -460,8 +475,62 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 	if notice != nil {
 		h.log.Info("software update available",
 			"version", notice.Version, "current", Version, "url", notice.URL)
+		h.startUpdate(*notice)
 	}
 	h.reportInfo()
+}
+
+// startUpdate stages the advertised release at most once per version. The
+// download runs off the read loop: a slow or capped link must never stall
+// keepalives. Verification happens before anything is written, and the
+// installer only runs after the digest matches.
+func (h *HostAgent) startUpdate(n softwareInfo) {
+	if !h.cfg.AutoUpdate {
+		return
+	}
+	h.mu.Lock()
+	if h.updatesTried[n.Version] {
+		h.mu.Unlock()
+		return
+	}
+	if h.updatesTried == nil {
+		h.updatesTried = make(map[string]bool)
+	}
+	h.updatesTried[n.Version] = true
+	h.mu.Unlock()
+
+	notice := updater.Notice{
+		Version:   n.Version,
+		URL:       n.URL,
+		SHA256:    n.SHA256,
+		Size:      n.Size,
+		Signature: n.Signature,
+	}
+	go func() {
+		if err := updater.Verify(notice, h.cfg.ServerPublicKey); err != nil {
+			h.log.Error("software update rejected", "version", notice.Version, "error", err)
+			return
+		}
+		client := &http.Client{Timeout: 15 * time.Minute}
+		if h.cfg.TLS != nil {
+			client.Transport = &http.Transport{TLSClientConfig: h.cfg.TLS.Clone()}
+		}
+		ctx, cancel := context.WithTimeout(h.ctx, 15*time.Minute)
+		defer cancel()
+		path, err := updater.Fetch(ctx, client, notice, h.cfg.UpdateDir)
+		if err != nil {
+			h.log.Error("software update download failed", "version", notice.Version, "error", err)
+			return
+		}
+		h.log.Info("software update staged", "version", notice.Version,
+			"path", path, "size", notice.Size, "sha256", notice.SHA256)
+		if err := updater.Launch(path); err != nil {
+			h.log.Error("software update launch failed", "version", notice.Version,
+				"path", path, "error", err)
+			return
+		}
+		h.log.Info("software update installer started", "version", notice.Version, "path", path)
+	}()
 }
 
 func (h *HostAgent) getPunch() *net.UDPAddr {

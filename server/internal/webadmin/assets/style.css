@@ -81,7 +81,11 @@ a { color: var(--accent); }
 }
 
 .auth { display: flex; align-items: center; gap: 10px; }
-.login { display: flex; align-items: center; gap: 8px; }
+.login { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.login-fields { display: inline-flex; align-items: center; gap: 8px; }
+.login input { width: 150px; }
+.login #account-username, .login #account-password { width: 132px; }
+.login #account-totp { width: 96px; }
 .session { display: flex; align-items: center; gap: 10px; }
 
 .login-note { margin: 6px 22px 0; min-height: 1.2em; font-size: 12.5px; }

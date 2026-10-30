@@ -23,6 +23,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
+	"github.com/ltpara/ds-chcast/server/internal/recordings"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/relay"
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
@@ -65,6 +66,12 @@ type Options struct {
 	// NoAccounts leaves login and address-book routes unavailable, matching a
 	// server started with --state "".
 	NoAccounts bool
+	// RecordingsDir enables the account recording archive at this directory.
+	// RecordingsQuota and RecordingsMax default to 8 GiB and 2 GiB when zero,
+	// so a test only names the directory.
+	RecordingsDir   string
+	RecordingsQuota int64
+	RecordingsMax   int64
 	// LoginLimiter locks repeated wrong passwords out. Nil disables it.
 	LoginLimiter *authlimit.Limiter
 	// LoginPersistent enables the default 3-failures/1-minute lockout backed
@@ -223,6 +230,31 @@ func StartWith(t testing.TB, opts Options) *Server {
 	if opts.CarrierV6 {
 		carrierV6Host = "::1"
 	}
+	var recordingArchive *recordings.Archive
+	if opts.RecordingsDir != "" {
+		if accounts == nil {
+			t.Fatal("RecordingsDir needs accounts")
+		}
+		quota := opts.RecordingsQuota
+		if quota == 0 {
+			quota = 8 << 30
+		}
+		maxUpload := opts.RecordingsMax
+		if maxUpload == 0 {
+			maxUpload = 2 << 30
+		}
+		var err error
+		recordingArchive, err = recordings.New(recordings.Config{
+			Dir:       opts.RecordingsDir,
+			Quota:     quota,
+			MaxUpload: maxUpload,
+			Accounts:  accounts,
+			Logger:    log,
+		})
+		if err != nil {
+			t.Fatalf("recordings: %v", err)
+		}
+	}
 	handler := api.New(api.Config{
 		Registry:          reg,
 		Relay:             rm,
@@ -254,6 +286,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		SoftwareSignature: softwareSignature,
 		Rendezvous:        opts.RendezvousConfig,
 		Accounts:          accounts,
+		Recordings:        recordingArchive,
 		Mailer:            opts.Mailer,
 		SMS:               opts.SMS,
 		RecoveryURL:       opts.RecoveryURL,

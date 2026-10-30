@@ -17,6 +17,7 @@ class Device {
     this.server = '',
     this.tags = const <String>[],
     this.groupId = '',
+    this.position = 0,
     this.tagsCleared = false,
     this.groupCleared = false,
     this.saved = false,
@@ -40,6 +41,10 @@ class Device {
   /// Account address-book group. Empty means ungrouped. The group name lives
   /// on the server; only the id is cached locally for sync.
   final String groupId;
+
+  /// Server sort position inside [groupId]; lower values come first and ties
+  /// fall back to the host id.
+  final int position;
 
   /// The user emptied the tags while offline; an empty list is an explicit
   /// intent to clear the server copy, not "no local preference". Cleared once
@@ -81,6 +86,7 @@ class Device {
     String? server,
     List<String>? tags,
     String? groupId,
+    int? position,
     bool? tagsCleared,
     bool? groupCleared,
     bool? saved,
@@ -95,6 +101,7 @@ class Device {
       server: server ?? this.server,
       tags: tags ?? this.tags,
       groupId: groupId ?? this.groupId,
+      position: position ?? this.position,
       tagsCleared: tagsCleared ?? this.tagsCleared,
       groupCleared: groupCleared ?? this.groupCleared,
       saved: saved ?? this.saved,
@@ -111,6 +118,7 @@ class Device {
         'server': server,
         'tags': tags,
         'groupId': groupId,
+        'position': position,
         'tagsCleared': tagsCleared,
         'groupCleared': groupCleared,
         'saved': saved,
@@ -157,6 +165,7 @@ class Device {
     final Object? rawName = value['name'];
     final Object? rawTags = value['tags'];
     final Object? rawRevision = value['revision'];
+    final Object? rawPosition = value['position'];
     final Object? rawLastUsed = value['lastUsed'];
     final Object? rawAddedAt = value['addedAt'];
     return Device(
@@ -169,6 +178,9 @@ class Device {
             if (tag is String) tag,
       ]),
       groupId: value['groupId']?.toString().trim() ?? '',
+      position: rawPosition is num && rawPosition >= 0
+          ? rawPosition.toInt()
+          : 0,
       tagsCleared: value['tagsCleared'] == true,
       groupCleared: value['groupCleared'] == true,
       saved: value['saved'] == true,
@@ -459,16 +471,24 @@ class DeviceStore {
     return _save(devices);
   }
 
-  /// Records the revision returned by a successful address-book upload so a
-  /// follow-up edit carries the new concurrency token instead of the old one.
-  Future<List<Device>> setPeerRevision(String key, int revision) async {
+  /// Records the revision (and optional sort position) returned by a
+  /// successful address-book upload so a follow-up edit carries the new
+  /// concurrency token instead of the old one.
+  Future<List<Device>> setPeerRevision(
+    String key,
+    int revision, {
+    int? position,
+  }) async {
     if (revision <= 0) {
       return load();
     }
     final List<Device> devices = await load();
     final int index = devices.indexWhere((Device item) => item.key == key);
     if (index >= 0) {
-      devices[index] = devices[index].copyWith(revision: revision);
+      devices[index] = devices[index].copyWith(
+        revision: revision,
+        position: position,
+      );
     }
     return _save(devices);
   }

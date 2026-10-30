@@ -200,7 +200,7 @@ add_library(chast.clipboard STATIC
     src/clipboard/clipboard.cc
     src/clipboard/clipboard_win.cc)
 target_include_directories(chast.clipboard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32)
+target_link_libraries(chast.clipboard PUBLIC chast.base chast.security user32 shell32)
 
 # Receive-side file handling: name sanitizing, resumable .part files, digest
 # verification. The receiver side only; the viewer hashes what it sends through
@@ -234,8 +234,10 @@ target_link_libraries(chast.net PUBLIC chast.base chast.security chast.clipboard
 # top of both chast.codec and chast.net so neither of those has to know about
 # the other.
 add_library(chast.host STATIC
+    src/capture/camera.cc
     src/host/audit_spool.cc
     src/host/bitrate_controller.cc
+    src/host/camera_relay.cc
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc
@@ -246,13 +248,17 @@ add_library(chast.host STATIC
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32)
+# Media Foundation supplies camera enumeration and capture; mf holds the
+# device-source helpers and mfuuid the format GUIDs.
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32 mf mfplat mfreadwrite mfuuid)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from
 # chast.host so the command-line tools do not pull in Win32 process management
 # just for the settings.
 add_library(chast.host.tray STATIC
+    host/i18n.cc
+    host/i18n_en.cc
     host/platform.cc
     host/tunnel.cc
     host/service.cc
@@ -342,6 +348,23 @@ if(CHAST_BUILD_TESTS)
                 $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-quic>
         VERBATIM)
 
+    # Headless viewer-engine acceptance: the Flutter shell only polls
+    # ViewerStatus, so the real engine and a real HostServer run in one
+    # process here to exercise the shared-folder walk over loopback QUIC.
+    add_executable(chast-viewer-probe tools/viewer_probe.cc
+        app/windows/viewer/viewer_engine.cc)
+    target_include_directories(chast-viewer-probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/windows/viewer
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+    target_compile_definitions(chast-viewer-probe PRIVATE NOMINMAX)
+    # avformat only backs the engine's local recording, as in the runner.
+    target_link_libraries(chast-viewer-probe PRIVATE chast.host d3d11 dxgi
+        "${FFMPEG_ROOT}/lib/avformat.lib" secur32)
+    add_custom_command(TARGET chast-viewer-probe POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-viewer-probe>
+        VERBATIM)
+
     # Raw duplicate/acquire loop: isolates a driver or platform fault from the
     # capturer's own code when debugging.
     add_executable(chast-dup-loop tools/dup_loop.cc tools/crash_handler.cc)
@@ -407,6 +430,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-tunnel-test tests/host_tunnel_test.cc)
     target_link_libraries(chast-host-tunnel-test PRIVATE chast.host.tray)
 
+    # Tray language selection: the environment override, the viewer's shared
+    # ui.json and the English table. No window is created.
+    add_executable(chast-host-i18n-test tests/host_i18n_test.cc)
+    target_link_libraries(chast-host-i18n-test PRIVATE chast.host.tray)
+
     # Raw TCP and WebSocket carrier framing against a loopback UDP echo,
     # including the RFC 6455 handshake, bad frames and the connection limit.
     add_executable(chast-carrier-test tests/carrier_test.cc)
@@ -421,6 +449,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
+    add_test(NAME host_i18n COMMAND chast-host-i18n-test)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
     add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
@@ -457,9 +486,59 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_terminal_denied
         COMMAND chast-quic verify --port 45507 --terminal-denied --quiet)
     set_tests_properties(quic_terminal_denied PROPERTIES TIMEOUT 120)
+    # Remote camera: the host enumerates its cameras, answers the list, and
+    # when one exists opens it and must stream hardware-encoded access units
+    # over CCAM before the viewer stops it. A host without a camera still
+    # proves the list round-trip.
+    add_test(NAME quic_camera
+        COMMAND chast-quic verify --port 45508 --camera --quiet)
+    set_tests_properties(quic_camera PROPERTIES TIMEOUT 180)
+    add_test(NAME quic_camera_denied
+        COMMAND chast-quic verify --port 45509 --camera-denied --quiet)
+    set_tests_properties(quic_camera_denied PROPERTIES TIMEOUT 120)
     add_test(NAME quic_stream_options
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)
+    # Shared-folder browsing: the viewer lists the host's receive directory and
+    # one subfolder, the sandbox refuses escapes, and a viewer-requested
+    # download crosses CFIL and is compared with the seeded payload.
+    add_test(NAME quic_file_browse
+        COMMAND chast-quic verify --port 45510 --file-browse --quiet)
+    set_tests_properties(quic_file_browse PROPERTIES TIMEOUT 120)
+    # Recursive folder download and upload through the real ViewerEngine: the
+    # walk must mirror the seeded tree including empty folders, a cancel must
+    # end with code 2 and leave no partial file, and a dropped file plus a
+    # dropped folder must land byte-for-byte under the browsed folder with the
+    # host creating the nested directories. The remote console must open at
+    # 80x24, echo a typed marker, accept a resize to 100x30 and close cleanly.
+    # Downloads land in the user's Downloads\chast under unique names and are
+    # removed again.
+    add_test(NAME viewer_folder_download COMMAND chast-viewer-probe)
+    set_tests_properties(viewer_folder_download PROPERTIES TIMEOUT 180)
+    # Protocol v32: a files-only request must reach streaming with no picture
+    # size, no displays and zero frames, and the same shared folder must still
+    # list, download and accept an upload. The refuser host (file transfer off)
+    # must refuse the Hello with AccessDenial::Declined instead of streaming.
+    add_test(NAME viewer_files_only COMMAND chast-viewer-probe --files-only)
+    set_tests_properties(viewer_files_only PROPERTIES TIMEOUT 180)
+    add_test(NAME viewer_files_only_denied COMMAND chast-viewer-probe --files-only-denied)
+    set_tests_properties(viewer_files_only_denied PROPERTIES TIMEOUT 120)
+    # Protocol v33 clipboard files: a host copy of a text file, a binary with
+    # a non-ASCII name and a folder with a nested tree must reach the viewer
+    # as one FileList, download through the ordinary transfer channel, and land
+    # byte-for-byte in a staging folder the clipboard sink captures, with the
+    # folder tree rebuilt from rel_path. The host clipboard is faked, the sink
+    # stands in for CF_HDROP, and the staged copies are removed.
+    add_test(NAME viewer_clipboard_files COMMAND chast-viewer-probe --clipboard-files)
+    set_tests_properties(viewer_clipboard_files PROPERTIES TIMEOUT 120)
+    # Protocol v34 reverse clipboard files: a viewer copy of the same shape is
+    # announced as a FileList, uploaded through clipboard-marked offers and
+    # staged by the host below one session temp folder with per-entry item
+    # directories; the captured CF_HDROP must name the three top items with the
+    # tree intact, nothing may echo back to the viewer, and the staging folder
+    # must be gone once the session ends.
+    add_test(NAME viewer_clipboard_files_up COMMAND chast-viewer-probe --clipboard-files-up)
+    set_tests_properties(viewer_clipboard_files_up PROPERTIES TIMEOUT 120)
     # The FFmpeg backend serves the adapters oneVPL does not cover and is the
     # second attempt on Intel. Pin it to exercise its D3D11VA frame pool, rate
     # programming and replay path instead of Auto's oneVPL choice.
@@ -493,4 +572,13 @@ if(CHAST_BUILD_TESTS)
         COMMAND chast-quic verify --port 45508 --seconds 4
                 --record .chast-quic-record-test.mp4 --quiet)
     set_tests_properties(quic_recording PROPERTIES TIMEOUT 120)
+    # The same recording probe with HEVC requested. Where the host cannot
+    # encode HEVC (an Intel HD 630 falls back to H.264) the run still records
+    # and verifies whatever codec the stream carried: the muxer describes each
+    # segment from its own key frame and verify checks that description. On a
+    # host with an HEVC encoder the same run exercises the hvcC path.
+    add_test(NAME quic_recording_hevc
+        COMMAND chast-quic verify --port 45511 --seconds 4
+                --record .chast-quic-record-hevc-test.mp4 --codec hevc --quiet)
+    set_tests_properties(quic_recording_hevc PROPERTIES TIMEOUT 120)
 endif()

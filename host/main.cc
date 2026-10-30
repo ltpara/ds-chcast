@@ -17,6 +17,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +40,7 @@
 #include "chast/host_settings.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
+#include "i18n.h"
 #include "platform.h"
 #include "service.h"
 #include "tunnel.h"
@@ -47,13 +49,18 @@ namespace {
 
 using namespace chast;
 using chast::host::narrow;
+using chast::host::load_ui_language;
+using chast::host::tr;
 using chast::host::TunnelEvent;
 using chast::host::TunnelProcess;
 using chast::host::validate_tunnel_settings;
 using chast::host::widen;
 
 constexpr wchar_t kWindowClass[] = L"ChastHostTrayWindow";
-constexpr wchar_t kWindowTitle[] = L"chast 主机";
+
+const wchar_t* window_title() {
+    return tr(L"chast 主机");
+}
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kLogMessage = WM_APP + 2;
@@ -84,6 +91,8 @@ enum ControlId {
     kFileTransferCheck,
     kPortForwardCheck,
     kTerminalCheck,
+    kRecordCheck,
+    kCameraCheck,
     kSendFileButton,
     kAudioCheck,
     kMicrophoneCheck,
@@ -176,6 +185,31 @@ void append_chat_line(const std::wstring& text);
 
 int px(int value) {
     return MulDiv(value, g_app->dpi, 96);
+}
+
+// English labels are wider than the four-character Chinese ones the layout was
+// drawn for. Measure with the real UI font so a control grows with its text
+// instead of clipping it.
+int text_px(const wchar_t* text, HFONT font = nullptr) {
+    HFONT use = font != nullptr ? font : g_app->font;
+    if (text == nullptr || *text == L'\0' || use == nullptr) {
+        return 0;
+    }
+    HDC dc = GetDC(g_app->window);
+    HGDIOBJ previous = SelectObject(dc, use);
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, text, static_cast<int>(wcslen(text)), &extent);
+    SelectObject(dc, previous);
+    ReleaseDC(g_app->window, dc);
+    return MulDiv(extent.cx, 96, g_app->dpi) + 2;
+}
+
+int button_px(const wchar_t* text) {
+    return text_px(text) + 22;
+}
+
+int check_px(const wchar_t* text) {
+    return text_px(text) + 26;
 }
 
 void set_text(HWND control, const std::wstring& text) {
@@ -283,6 +317,7 @@ enum ApprovalDialogId {
     kApprovalAudio,
     kApprovalMicrophone,
     kApprovalPrivacy,
+    kApprovalRecord,
     kApprovalAllow,
     kApprovalDeny,
 };
@@ -295,6 +330,7 @@ struct ApprovalDialogState {
     HWND audio = nullptr;
     HWND microphone = nullptr;
     HWND privacy = nullptr;
+    HWND record = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
@@ -333,6 +369,9 @@ void finish_approval(ApprovalDialogState& dialog, bool allowed) {
         }
         if (SendMessageW(dialog.privacy, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionPrivacyMode;
+        }
+        if (SendMessageW(dialog.record, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            mask |= kPermissionRecord;
         }
         dialog.result = mask;
     }
@@ -404,19 +443,19 @@ LRESULT CALLBACK approval_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
 }
 
 std::wstring platform_label(uint8_t platform) {
-    return platform == 1 ? L"Windows" : L"未知系统";
+    return platform == 1 ? L"Windows" : tr(L"未知系统");
 }
 
 std::wstring approval_method_label(ClientApprovalMethod method) {
     switch (method) {
         case ClientApprovalMethod::Click:
-            return L"点击批准模式：每次连接都需要确认";
+            return tr(L"点击批准模式：每次连接都需要确认");
         case ClientApprovalMethod::NoPassword:
-            return L"查看器没有提供密码，请求当面批准";
+            return tr(L"查看器没有提供密码，请求当面批准");
         case ClientApprovalMethod::Unknown:
             break;
     }
-    return L"查看器请求连接";
+    return tr(L"查看器请求连接");
 }
 
 ClientApproval server_approve(const ClientRequest& request) {
@@ -432,7 +471,7 @@ ClientApproval server_approve(const ClientRequest& request) {
         window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
         window_class.lpszClassName = kApprovalDialogClass;
         if (RegisterClassExW(&window_class) == 0) {
-            post_log(L"无法创建连接审批窗口，已拒绝这次连接");
+            post_log(tr(L"无法创建连接审批窗口，已拒绝这次连接"));
             return ClientApproval{};
         }
         class_ready = true;
@@ -440,8 +479,24 @@ ClientApproval server_approve(const ClientRequest& request) {
 
     ApprovalDialogState dialog;
     dialog.request = &request;
+    const wchar_t* input_text = tr(L"键盘与鼠标");
+    const wchar_t* clipboard_text = tr(L"剪贴板");
+    const wchar_t* audio_text = tr(L"系统声音");
+    const wchar_t* file_text = tr(L"文件传输");
+    const wchar_t* microphone_text = tr(L"麦克风（上行）");
+    const wchar_t* privacy_text = tr(L"隐私模式（黑屏）");
+    const wchar_t* record_text = tr(L"查看者录制会话");
+    const int column1 = std::max(130, std::max(check_px(input_text), check_px(file_text)));
+    const int column2 = std::max(130, std::max(check_px(clipboard_text), check_px(microphone_text)));
+    const int column3 =
+        std::max(130, std::max(check_px(audio_text),
+                               std::max(check_px(privacy_text), check_px(record_text))));
+    const int second = 20 + column1 + 20;
+    const int third = second + column2 + 20;
+    const int dialog_width = third + column3 + 20;
+    const int full_width = dialog_width - 40;
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT frame{0, 0, px(470), px(348)};
+    RECT frame{0, 0, px(dialog_width), px(348)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_TOPMOST);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -450,10 +505,10 @@ ClientApproval server_approve(const ClientRequest& request) {
     const int x = work.left + ((work.right - work.left) - width) / 2;
     const int y = work.top + ((work.bottom - work.top) - height) / 2;
     HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, kApprovalDialogClass,
-                                  L"chast 连接请求", style, x, y, width, height, nullptr,
+                                  tr(L"chast 连接请求"), style, x, y, width, height, nullptr,
                                   nullptr, g_app->instance, &dialog);
     if (window == nullptr) {
-        post_log(L"无法创建连接审批窗口，已拒绝这次连接");
+        post_log(tr(L"无法创建连接审批窗口，已拒绝这次连接"));
         return ClientApproval{};
     }
 
@@ -470,26 +525,27 @@ ClientApproval server_approve(const ClientRequest& request) {
         return control;
     };
 
-    add(L"STATIC", L"有查看器请求连接这台电脑", SS_LEFT, 20, 16, 420, 24, 0,
+    add(L"STATIC", tr(L"有查看器请求连接这台电脑"), SS_LEFT, 20, 16, full_width, 24, 0,
         g_app->title_font);
     const std::wstring peer =
-        request.peer_address.empty() ? std::wstring(L"未知地址") : widen(request.peer_address);
-    add(L"STATIC", (L"来源：" + peer).c_str(), SS_LEFT, 20, 52, 430, 20, 0, nullptr);
-    std::wstring device = L"设备：";
-    device += request.hello.device_name.empty() ? L"未命名" : widen(request.hello.device_name);
-    device += L"（" + platform_label(request.hello.device_platform) + L"）";
-    add(L"STATIC", device.c_str(), SS_LEFT, 20, 76, 430, 20, 0, nullptr);
-    const std::wstring method = L"方式：" + approval_method_label(request.method);
-    add(L"STATIC", method.c_str(), SS_LEFT, 20, 100, 430, 40, 0, nullptr);
+        request.peer_address.empty() ? std::wstring(tr(L"未知地址")) : widen(request.peer_address);
+    add(L"STATIC", (tr(L"来源：") + peer).c_str(), SS_LEFT, 20, 52, full_width, 20, 0, nullptr);
+    std::wstring device = tr(L"设备：");
+    device += request.hello.device_name.empty() ? tr(L"未命名") : widen(request.hello.device_name);
+    device += tr(L"（") + platform_label(request.hello.device_platform) + tr(L"）");
+    add(L"STATIC", device.c_str(), SS_LEFT, 20, 76, full_width, 20, 0, nullptr);
+    const std::wstring method = tr(L"方式：") + approval_method_label(request.method);
+    add(L"STATIC", method.c_str(), SS_LEFT, 20, 100, full_width, 40, 0, nullptr);
     if (request.device_proof) {
-        add(L"STATIC", L"设备签名验证通过，允许后将记入可信设备。", SS_LEFT, 20, 140, 430, 20,
-            0, nullptr);
+        add(L"STATIC", tr(L"设备签名验证通过，允许后将记入可信设备。"), SS_LEFT, 20, 140,
+            full_width, 20, 0, nullptr);
     }
-    add(L"STATIC", L"允许的权限（可以取消勾选）：", SS_LEFT, 20, 164, 430, 20, 0, nullptr);
+    add(L"STATIC", tr(L"允许的权限（可以取消勾选）："), SS_LEFT, 20, 164, full_width, 20, 0,
+        nullptr);
 
-    const auto permission_check = [&](const wchar_t* text, uint16_t bit, int left, int top,
-                                      int id) {
-        HWND control = add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, left, top, 130, 24,
+    const auto permission_check = [&](const wchar_t* text, uint16_t bit, int left, int width,
+                                      int top, int id) {
+        HWND control = add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, left, top, width, 24,
                            id, nullptr);
         if ((request.permissions & bit) == 0) {
             SendMessageW(control, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -499,30 +555,34 @@ ClientApproval server_approve(const ClientRequest& request) {
         }
         return control;
     };
-    dialog.input =
-        permission_check(L"键盘与鼠标", kPermissionInput, 20, 188, kApprovalInput);
-    dialog.clipboard =
-        permission_check(L"剪贴板", kPermissionClipboard, 170, 188, kApprovalClipboard);
-    dialog.audio = permission_check(L"系统声音", kPermissionAudio, 320, 188, kApprovalAudio);
-    dialog.file = permission_check(L"文件传输", kPermissionFileTransfer, 20, 216, kApprovalFile);
+    dialog.input = permission_check(input_text, kPermissionInput, 20, column1, 188,
+                                    kApprovalInput);
+    dialog.clipboard = permission_check(clipboard_text, kPermissionClipboard, second, column2,
+                                        188, kApprovalClipboard);
+    dialog.audio = permission_check(audio_text, kPermissionAudio, third, column3, 188,
+                                    kApprovalAudio);
+    dialog.file = permission_check(file_text, kPermissionFileTransfer, 20, column1, 216,
+                                   kApprovalFile);
     const std::string receive_directory = g_app->settings.file_receive_directory.empty()
                                               ? chast::default_receive_directory()
                                               : g_app->settings.file_receive_directory;
     add(L"STATIC",
-        (L"接收目录：" +
-         (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
+        (tr(L"接收目录：") +
+         (receive_directory.empty() ? std::wstring(tr(L"（不可用）")) : widen(receive_directory)))
             .c_str(),
-        SS_LEFT | SS_ENDELLIPSIS, 170, 220, 280, 18, 0, nullptr);
-    dialog.microphone =
-        permission_check(L"麦克风（上行）", kPermissionMicrophone, 20, 244,
-                         kApprovalMicrophone);
-    dialog.privacy =
-        permission_check(L"隐私模式（黑屏）", kPermissionPrivacyMode, 170, 244,
-                         kApprovalPrivacy);
+        SS_LEFT | SS_ENDELLIPSIS, second, 220, third - second - 10, 18, 0, nullptr);
+    dialog.microphone = permission_check(microphone_text, kPermissionMicrophone, 20, column1,
+                                         244, kApprovalMicrophone);
+    dialog.privacy = permission_check(privacy_text, kPermissionPrivacyMode, second, column2, 244,
+                                      kApprovalPrivacy);
+    dialog.record = permission_check(record_text, kPermissionRecord, third, column3, 244,
+                                     kApprovalRecord);
 
-    add(L"BUTTON", L"允许", BS_DEFPUSHBUTTON | WS_TABSTOP, 250, 278, 90, 32, kApprovalAllow,
-        nullptr);
-    add(L"BUTTON", L"拒绝", BS_PUSHBUTTON | WS_TABSTOP, 350, 278, 90, 32, kApprovalDeny,
+    const int deny_left = dialog_width - 20 - 90;
+    const int allow_left = deny_left - 10 - 90;
+    add(L"BUTTON", tr(L"允许"), BS_DEFPUSHBUTTON | WS_TABSTOP, allow_left, 278, 90, 32,
+        kApprovalAllow, nullptr);
+    add(L"BUTTON", tr(L"拒绝"), BS_PUSHBUTTON | WS_TABSTOP, deny_left, 278, 90, 32, kApprovalDeny,
         nullptr);
 
     SetTimer(window, 1, 200, nullptr);
@@ -548,10 +608,10 @@ ClientApproval server_approve(const ClientRequest& request) {
         DestroyWindow(window);
     }
     if (peer_gone) {
-        post_log(L"查看者在审批期间离开，已取消来自 " + peer + L" 的请求");
+        post_log(tr(L"查看者在审批期间离开，已取消来自 ") + peer + tr(L" 的请求"));
     } else {
-        post_log(allowed ? L"已允许来自 " + peer + L" 的连接"
-                         : L"已拒绝来自 " + peer + L" 的连接");
+        post_log(allowed ? tr(L"已允许来自 ") + peer + tr(L" 的连接")
+                         : tr(L"已拒绝来自 ") + peer + tr(L" 的连接"));
     }
     if (!allowed) {
         return ClientApproval{};
@@ -562,7 +622,7 @@ ClientApproval server_approve(const ClientRequest& request) {
 bool save_settings() {
     std::string error;
     if (!save_host_settings(g_app->config_path, g_app->settings, &error)) {
-        post_log(L"保存设置失败：" + widen(error));
+        post_log(tr(L"保存设置失败：") + widen(error));
         return false;
     }
     return true;
@@ -585,13 +645,13 @@ void start_tunnel() {
     }
     if (g_app->settings.server_url.empty()) {
         g_app->tunnel_error = "尚未配置服务器地址";
-        append_log_line(L"连接服务：尚未配置服务器地址");
+        append_log_line(tr(L"连接服务：尚未配置服务器地址"));
         return;
     }
     std::string error;
     if (!validate_tunnel_settings(g_app->settings, &error)) {
         g_app->tunnel_error = error;
-        append_log_line(L"连接服务：" + widen(error));
+        append_log_line(tr(L"连接服务：") + widen(error));
         return;
     }
     std::string fingerprint;
@@ -605,10 +665,10 @@ void start_tunnel() {
     if (!g_app->tunnel.start(g_app->settings, g_app->settings.port, fingerprint, tunnel_event,
                              tunnel_log, tunnel_exited, &error)) {
         g_app->tunnel_error = error;
-        append_log_line(L"连接服务启动失败：" + widen(error));
+        append_log_line(tr(L"连接服务启动失败：") + widen(error));
         return;
     }
-    append_log_line(L"正在注册设备 " + widen(g_app->settings.tunnel_id) + L"…");
+    append_log_line(tr(L"正在注册设备 ") + widen(g_app->settings.tunnel_id) + L"…");
 }
 
 void stop_server() {
@@ -620,7 +680,7 @@ void stop_server() {
     g_app->server->stop();
     g_app->server_stopping.store(false);
     g_app->server.reset();
-    append_log_line(L"共享已停止");
+    append_log_line(tr(L"共享已停止"));
 }
 
 void start_server() {
@@ -628,7 +688,7 @@ void start_server() {
         return;
     }
     if (g_app->config_path == host_settings_path() && chast::host::service_running()) {
-        append_log_line(L"chast 主机服务正在运行，托盘不能同时共享");
+        append_log_line(tr(L"chast 主机服务正在运行，托盘不能同时共享"));
         return;
     }
     HostServerConfig config;
@@ -645,15 +705,15 @@ void start_server() {
     std::string error;
     g_app->server = HostServer::create(std::move(config), &error);
     if (!g_app->server) {
-        append_log_line(L"启动失败：" + widen(error));
-        const std::wstring message = L"无法启动共享：\n" + widen(error);
-        MessageBoxW(g_app->window, message.c_str(), kWindowTitle, MB_ICONERROR | MB_OK);
+        append_log_line(tr(L"启动失败：") + widen(error));
+        const std::wstring message = tr(L"无法启动共享：\n") + widen(error);
+        MessageBoxW(g_app->window, message.c_str(), window_title(), MB_ICONERROR | MB_OK);
         return;
     }
     g_app->listener_microphone = g_app->settings.allow_microphone;
     g_app->listener_privacy = g_app->settings.allow_privacy_mode;
     g_app->server->start();
-    append_log_line(L"正在等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）");
+    append_log_line(tr(L"正在等待查看器（端口 ") + std::to_wstring(g_app->settings.port) + tr(L"）"));
     start_tunnel();
 }
 
@@ -698,21 +758,21 @@ std::wstring codec_label(VideoCodec codec) {
 std::wstring state_text(HostState state, const HostStatus& status) {
     switch (state) {
         case HostState::Stopped:
-            return L"已停止";
+            return tr(L"已停止");
         case HostState::Listening: {
             std::wstring text =
-                L"等待查看器（端口 " + std::to_wstring(g_app->settings.port) + L"）";
+                tr(L"等待查看器（端口 ") + std::to_wstring(g_app->settings.port) + tr(L"）");
             if (status.carrier_listening) {
-                text += L" · 弱网回退端口 " + std::to_wstring(status.carrier_port);
+                text += tr(L" · 弱网回退端口 ") + std::to_wstring(status.carrier_port);
             } else if (!status.carrier_error.empty()) {
-                text += L" · 弱网回退不可用";
+                text += tr(L" · 弱网回退不可用");
             }
             return text;
         }
         case HostState::Streaming:
-            return L"正在共享";
+            return tr(L"正在共享");
         case HostState::Failed:
-            return status.error.empty() ? L"出错" : L"出错：" + widen(status.error);
+            return status.error.empty() ? tr(L"出错") : tr(L"出错：") + widen(status.error);
     }
     return L"—";
 }
@@ -720,34 +780,34 @@ std::wstring state_text(HostState state, const HostStatus& status) {
 std::wstring tunnel_text() {
     const HostSettings& settings = g_app->settings;
     if (!settings.tunnel) {
-        return L"连接服务：已关闭";
+        return tr(L"连接服务：已关闭");
     }
     if (settings.server_url.empty()) {
-        return L"连接服务：未配置服务器（打开“连接服务设置…”）";
+        return tr(L"连接服务：未配置服务器（打开“连接服务设置…”）");
     }
-    std::wstring text = L"连接服务：";
+    std::wstring text = tr(L"连接服务：");
     if (g_app->tunnel.running()) {
-        text += g_app->tunnel_relay.empty() ? L"注册中…"
-                                            : L"已在线 · 中继 " + widen(g_app->tunnel_relay);
+        text += g_app->tunnel_relay.empty() ? tr(L"注册中…")
+                                            : tr(L"已在线 · 中继 ") + widen(g_app->tunnel_relay);
     } else if (!g_app->server) {
-        text += L"已停止";
+        text += tr(L"已停止");
     } else if (!g_app->tunnel_error.empty()) {
-        text += L"离线 · " + widen(g_app->tunnel_error);
+        text += tr(L"离线 · ") + widen(g_app->tunnel_error);
     } else {
-        text += L"未连接";
+        text += tr(L"未连接");
     }
     if (!settings.tunnel_id.empty()) {
-        text += L" · 设备 ID " + widen(settings.tunnel_id);
+        text += tr(L" · 设备 ID ") + widen(settings.tunnel_id);
     }
     return text;
 }
 
 std::wstring path_text(const HostStatus& status) {
     if (status.state != HostState::Streaming || g_app->tunnel_viewer_path.empty()) {
-        return L"最近路径：—";
+        return tr(L"最近路径：—");
     }
     const bool relay = g_app->tunnel_viewer_path == "relay";
-    std::wstring text = relay ? L"最近路径：经中继" : L"最近路径：直连";
+    std::wstring text = relay ? tr(L"最近路径：经中继") : tr(L"最近路径：直连");
     if (!g_app->tunnel_viewer_remote.empty()) {
         text += L" · " + widen(g_app->tunnel_viewer_remote);
     }
@@ -757,11 +817,11 @@ std::wstring path_text(const HostStatus& status) {
 std::wstring auth_mode_label(HostAuthMode mode) {
     switch (mode) {
         case HostAuthMode::Password:
-            return L"密码";
+            return tr(L"密码");
         case HostAuthMode::Click:
-            return L"点击批准";
+            return tr(L"点击批准");
         case HostAuthMode::Both:
-            return L"密码或批准";
+            return tr(L"密码或批准");
     }
     return L"—";
 }
@@ -770,35 +830,41 @@ std::wstring permission_label(uint16_t mask) {
     std::wstring text;
     auto add = [&text](const wchar_t* name) {
         if (!text.empty()) {
-            text += L"、";
+            text += tr(L"、");
         }
         text += name;
     };
     if ((mask & kPermissionInput) != 0) {
-        add(L"键盘");
+        add(tr(L"键盘"));
     }
     if ((mask & kPermissionClipboard) != 0) {
-        add(L"剪贴板");
+        add(tr(L"剪贴板"));
     }
     if ((mask & kPermissionFileTransfer) != 0) {
-        add(L"文件传输");
+        add(tr(L"文件传输"));
     }
     if ((mask & kPermissionPortForward) != 0) {
-        add(L"端口转发");
+        add(tr(L"端口转发"));
     }
     if ((mask & kPermissionTerminal) != 0) {
-        add(L"远程终端");
+        add(tr(L"远程终端"));
     }
     if ((mask & kPermissionAudio) != 0) {
-        add(L"声音");
+        add(tr(L"声音"));
     }
     if ((mask & kPermissionMicrophone) != 0) {
-        add(L"麦克风");
+        add(tr(L"麦克风"));
     }
     if ((mask & kPermissionPrivacyMode) != 0) {
-        add(L"隐私模式");
+        add(tr(L"隐私模式"));
     }
-    return text.empty() ? L"只看" : text;
+    if ((mask & kPermissionRecord) != 0) {
+        add(tr(L"录制"));
+    }
+    if ((mask & kPermissionCamera) != 0) {
+        add(tr(L"摄像头"));
+    }
+    return text.empty() ? tr(L"只看") : text;
 }
 
 uint16_t current_gate_mask() {
@@ -812,8 +878,9 @@ uint16_t current_gate_mask() {
                                                                       : 0) |
                                  (g_app->settings.allow_port_forward ? kPermissionPortForward
                                                                      : 0) |
-                                 (g_app->settings.allow_terminal ? kPermissionTerminal
-                                                                 : 0));
+                                 (g_app->settings.allow_terminal ? kPermissionTerminal : 0) |
+                                 (g_app->settings.allow_record ? kPermissionRecord : 0) |
+                                 (g_app->settings.allow_camera ? kPermissionCamera : 0));
 }
 
 std::wstring security_summary_text(const HostStatus& status) {
@@ -822,20 +889,20 @@ std::wstring security_summary_text(const HostStatus& status) {
     const bool password =
         live ? status.password_configured : !g_app->settings.password_hash.empty();
     const bool two_factor = live ? status.two_factor_enabled : !g_app->settings.totp_secret.empty();
-    std::wstring text = L"接入：" + auth_mode_label(mode);
-    text += password ? L" · 永久密码已设置" : L" · 永久密码未设置";
-    text += two_factor ? L" · 2FA 已启用" : L" · 2FA 已关闭";
-    text += L" · 默认权限：" + permission_label(current_gate_mask());
+    std::wstring text = tr(L"接入：") + auth_mode_label(mode);
+    text += password ? tr(L" · 永久密码已设置") : tr(L" · 永久密码未设置");
+    text += two_factor ? tr(L" · 2FA 已启用") : tr(L" · 2FA 已关闭");
+    text += tr(L" · 默认权限：") + permission_label(current_gate_mask());
     return text;
 }
 
 std::wstring session_permission_text(const HostStatus& status) {
     if (status.state != HostState::Streaming) {
-        return L"本次会话权限：—";
+        return tr(L"本次会话权限：—");
     }
-    std::wstring text = L"本次会话权限：" + permission_label(status.session_permissions);
+    std::wstring text = tr(L"本次会话权限：") + permission_label(status.session_permissions);
     if (status.stats.privacy_mode_active) {
-        text += L" · 本地屏幕已遮挡（隐私模式）";
+        text += tr(L" · 本地屏幕已遮挡（隐私模式）");
     }
     return text;
 }
@@ -857,24 +924,24 @@ void refresh_ui() {
         g_app->chat_live = streaming;
         if (streaming) {
             g_app->chat_lines.clear();
-            append_chat_line(L"—— 查看者已连接，可以开始聊天 ——");
+            append_chat_line(tr(L"—— 查看者已连接，可以开始聊天 ——"));
         } else {
-            append_chat_line(L"—— 查看者已断开 ——");
+            append_chat_line(tr(L"—— 查看者已断开 ——"));
         }
     }
 
-    set_text(g_app->state_label, L"状态：" + (g_app->server ? state_text(status.state, status)
-                                                           : std::wstring(L"已停止")));
+    set_text(g_app->state_label, tr(L"状态：") + (g_app->server ? state_text(status.state, status)
+                                                           : std::wstring(tr(L"已停止"))));
     set_text(g_app->peer_label,
-             L"查看器：" + (status.peer_address.empty() ? std::wstring(L"—")
+             tr(L"查看器：") + (status.peer_address.empty() ? std::wstring(L"—")
                                                        : widen(status.peer_address)));
     if (status.stream.width > 0) {
-        std::wstring stream = L"画面：" + widen(status.display_name) + L" · " +
+        std::wstring stream = tr(L"画面：") + widen(status.display_name) + L" · " +
                               std::to_wstring(status.stream.width) + L"×" +
                               std::to_wstring(status.stream.height) + L" · " +
                               codec_label(status.stream.codec) + L" · " +
                               std::to_wstring(status.stream.framerate) + L" fps · " +
-                              std::to_wstring(status.stats.encoded) + L" 帧";
+                              std::to_wstring(status.stats.encoded) + tr(L" 帧");
         if (status.stats.target_bitrate > 0) {
             stream += L" · " +
                       std::to_wstring((status.stats.target_bitrate + 500) / 1000) + L" kbps";
@@ -884,29 +951,29 @@ void refresh_ui() {
                       std::to_wstring(static_cast<int>(status.stats.rtt_ms + 0.5)) + L" ms";
         }
         if (status.stats.input_events > 0) {
-            stream += L" · 输入 " + std::to_wstring(status.stats.input_events);
+            stream += tr(L" · 输入 ") + std::to_wstring(status.stats.input_events);
         }
         if (status.stats.audio_active) {
-            stream += L" · 音频";
+            stream += tr(L" · 音频");
             if (status.stats.audio_dsp_frames > 0) {
                 stream += L" · AEC " + std::to_wstring(status.stats.audio_dsp_frames) +
-                          L" 帧";
+                          tr(L" 帧");
                 if (status.stats.audio_dsp_resets > 0) {
-                    stream += L"（重置 " +
-                              std::to_wstring(status.stats.audio_dsp_resets) + L"）";
+                    stream += tr(L"（重置 ") +
+                              std::to_wstring(status.stats.audio_dsp_resets) + tr(L"）");
                 }
             }
         }
         if (status.download_active) {
-            stream += L" · 发送 " + widen(status.download_name) + L" " +
+            stream += tr(L" · 发送 ") + widen(status.download_name) + L" " +
                       std::to_wstring(status.download_sent) + L"/" +
                       std::to_wstring(status.download_size);
         } else if (!status.download_error.empty()) {
-            stream += L" · 发送失败";
+            stream += tr(L" · 发送失败");
         }
         set_text(g_app->stream_label, stream);
     } else {
-        set_text(g_app->stream_label, L"画面：—");
+        set_text(g_app->stream_label, tr(L"画面：—"));
     }
     set_text(g_app->tunnel_label, tunnel_text());
     set_text(g_app->path_label, path_text(status));
@@ -928,7 +995,7 @@ void refresh_ui() {
     const bool temp_available = !status.temporary_password.empty();
     std::wstring temporary = temp_available ? widen(status.temporary_password) : L"—";
     if (!temp_available && g_app->server && status.auth_mode == HostAuthMode::Click) {
-        temporary = L"点击批准模式";
+        temporary = tr(L"点击批准模式");
     }
     set_text(g_app->temp_password_edit, temporary);
     if (g_app->refresh_password_button != nullptr) {
@@ -944,12 +1011,12 @@ void refresh_ui() {
     set_check(g_app->privacy_check, g_app->settings.allow_privacy_mode);
     set_check(g_app->carrier_check, g_app->settings.carrier);
     set_check(g_app->autostart_check, g_app->settings.autostart);
-    set_text(g_app->toggle_button, running ? L"停止共享" : L"开始共享");
+    set_text(g_app->toggle_button, running ? tr(L"停止共享") : tr(L"开始共享"));
 
-    std::wstring tip = std::wstring(L"chast 主机 · ") +
-                       (g_app->server ? state_text(status.state, status) : std::wstring(L"已停止"));
+    std::wstring tip = std::wstring(tr(L"chast 主机 · ")) +
+                       (g_app->server ? state_text(status.state, status) : std::wstring(tr(L"已停止")));
     if (g_app->settings.tunnel && g_app->tunnel.running()) {
-        tip += g_app->tunnel_relay.empty() ? L" · 连接服务注册中" : L" · 连接服务在线";
+        tip += g_app->tunnel_relay.empty() ? tr(L" · 连接服务注册中") : tr(L" · 连接服务在线");
     }
     update_tray_tip(tip);
 }
@@ -960,16 +1027,16 @@ void apply_tunnel_event(const TunnelEvent& event) {
         g_app->tunnel_error.clear();
         const std::string device =
             event.host.empty() ? g_app->settings.tunnel_id : event.host;
-        std::wstring line = L"连接服务已上线 · 设备 ID " + widen(device);
+        std::wstring line = tr(L"连接服务已上线 · 设备 ID ") + widen(device);
         if (!event.listen.empty()) {
-            line += L" · 隧道 " + widen(event.listen);
+            line += tr(L" · 隧道 ") + widen(event.listen);
         }
         if (!event.relay.empty()) {
-            line += L" · 中继 " + widen(event.relay);
+            line += tr(L" · 中继 ") + widen(event.relay);
         }
         append_log_line(line);
         if (!event.migrated_from.empty()) {
-            append_log_line(L"设备 ID 已从 " + widen(event.migrated_from) + L" 迁移到 " +
+            append_log_line(tr(L"设备 ID 已从 ") + widen(event.migrated_from) + tr(L" 迁移到 ") +
                             widen(device));
             if (g_app->settings.tunnel_old_id == event.migrated_from) {
                 g_app->settings.tunnel_old_id.clear();
@@ -978,14 +1045,14 @@ void apply_tunnel_event(const TunnelEvent& event) {
         }
     } else if (event.event == "relay") {
         g_app->tunnel_relay = event.relay;
-        append_log_line(L"连接服务中继地址：" + widen(event.relay));
+        append_log_line(tr(L"连接服务中继地址：") + widen(event.relay));
     } else if (event.event == "viewer") {
         g_app->tunnel_viewer_path = event.path;
         g_app->tunnel_viewer_remote = event.remote;
         std::wstring line =
-            event.path == "relay" ? L"查看者经中继连接" : L"查看者经直连";
+            event.path == "relay" ? tr(L"查看者经中继连接") : tr(L"查看者经直连");
         if (!event.remote.empty()) {
-            line += L"：" + widen(event.remote);
+            line += tr(L"：") + widen(event.remote);
         }
         append_log_line(line);
     }
@@ -1058,86 +1125,113 @@ void create_fonts() {
                     DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 }
 
+int main_window_width() {
+    return chast::host::english_ui() ? 700 : 620;
+}
+
+int main_window_summary_shift() {
+    // English lists every permission by its full label, which needs two lines.
+    return chast::host::english_ui() ? 24 : 0;
+}
+
+int main_window_height() {
+    return 724 + main_window_summary_shift();
+}
+
 void create_controls() {
-    add_control(L"STATIC", L"chast 主机", SS_LEFT, 0, 24, 18, 300, 30, 0,
+    const int content = main_window_width() - 48;
+    const int shift = main_window_summary_shift();
+
+    add_control(L"STATIC", tr(L"chast 主机"), SS_LEFT, 0, 24, 18, 300, 30, 0,
                 g_app->title_font);
-    add_control(L"STATIC", L"远程桌面主机 · 设备 ID、临时密码与安全设置", SS_LEFT, 0, 24, 52,
+    add_control(L"STATIC", tr(L"远程桌面主机 · 设备 ID、临时密码与安全设置"), SS_LEFT, 0, 24, 52,
                 500, 20, 0, nullptr);
 
-    g_app->state_label = add_control(L"STATIC", L"状态：启动中…", SS_LEFT, 0, 24, 84, 572, 22,
-                                     kStateLabel, nullptr);
-    g_app->peer_label = add_control(L"STATIC", L"查看器：—", SS_LEFT, 0, 24, 108, 572, 22,
+    g_app->state_label = add_control(L"STATIC", tr(L"状态：启动中…"), SS_LEFT, 0, 24, 84,
+                                     content, 22, kStateLabel, nullptr);
+    g_app->peer_label = add_control(L"STATIC", tr(L"查看器：—"), SS_LEFT, 0, 24, 108, content, 22,
                                     kPeerLabel, nullptr);
-    g_app->stream_label = add_control(L"STATIC", L"画面：—", SS_LEFT, 0, 24, 132, 572, 22,
+    g_app->stream_label = add_control(L"STATIC", tr(L"画面：—"), SS_LEFT, 0, 24, 132, content, 22,
                                       kStreamLabel, nullptr);
-    g_app->tunnel_label = add_control(L"STATIC", L"连接服务：—", SS_LEFT, 0, 24, 156, 572, 22,
-                                      kTunnelLabel, nullptr);
-    g_app->path_label = add_control(L"STATIC", L"最近路径：—", SS_LEFT, 0, 24, 180, 572, 22,
-                                    kPathLabel, nullptr);
+    g_app->tunnel_label = add_control(L"STATIC", tr(L"连接服务：—"), SS_LEFT, 0, 24, 156, content,
+                                      22, kTunnelLabel, nullptr);
+    g_app->path_label = add_control(L"STATIC", tr(L"最近路径：—"), SS_LEFT, 0, 24, 180, content,
+                                    22, kPathLabel, nullptr);
 
-    add_control(L"STATIC", L"设备 ID（用于连接服务）", SS_LEFT, 0, 24, 214, 300, 20, 0,
+    add_control(L"STATIC", tr(L"设备 ID（用于连接服务）"), SS_LEFT, 0, 24, 214, 300, 20, 0,
                 nullptr);
     g_app->device_id_edit =
         add_control(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 24, 236, 340,
                     26, kDeviceIdEdit, nullptr);
-    add_control(L"BUTTON", L"复制 ID", BS_PUSHBUTTON, 0, 376, 235, 88, 28, kCopyIdButton,
-                nullptr);
+    const wchar_t* copy_id_text = tr(L"复制 ID");
+    add_control(L"BUTTON", copy_id_text, BS_PUSHBUTTON, 0, 376, 235,
+                std::max(88, button_px(copy_id_text)), 28, kCopyIdButton, nullptr);
 
-    add_control(L"STATIC", L"临时密码（使用一次或连续失败后自动更换）", SS_LEFT, 0, 24, 272,
+    add_control(L"STATIC", tr(L"临时密码（使用一次或连续失败后自动更换）"), SS_LEFT, 0, 24, 272,
                 400, 20, 0, nullptr);
     g_app->temp_password_edit =
         add_control(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 24, 294, 340,
                     26, kTempPasswordEdit, nullptr);
-    add_control(L"BUTTON", L"复制密码", BS_PUSHBUTTON, 0, 376, 293, 88, 28, kCopyPasswordButton,
-                nullptr);
-    g_app->refresh_password_button = add_control(L"BUTTON", L"刷新密码", BS_PUSHBUTTON, 0, 476,
-                                                 293, 120, 28, kRefreshPasswordButton, nullptr);
+    const wchar_t* copy_password_text = tr(L"复制密码");
+    const int copy_password_width = std::max(88, button_px(copy_password_text));
+    add_control(L"BUTTON", copy_password_text, BS_PUSHBUTTON, 0, 376, 293, copy_password_width, 28,
+                kCopyPasswordButton, nullptr);
+    const wchar_t* refresh_password_text = tr(L"刷新密码");
+    g_app->refresh_password_button =
+        add_control(L"BUTTON", refresh_password_text, BS_PUSHBUTTON, 0,
+                    376 + copy_password_width + 10, 293,
+                    std::max(120, button_px(refresh_password_text)), 28, kRefreshPasswordButton,
+                    nullptr);
 
-    g_app->security_summary = add_control(L"STATIC", L"接入：—", SS_LEFT, 0, 24, 330, 572, 20,
-                                          kSecuritySummary, nullptr);
-    g_app->session_label = add_control(L"STATIC", L"本次会话权限：—", SS_LEFT, 0, 24, 352, 440,
-                                       20, kSessionLabel, nullptr);
-    add_control(L"BUTTON", L"会话聊天…", BS_PUSHBUTTON, 0, 476, 348, 120, 28, kChatButton,
-                nullptr);
+    g_app->security_summary = add_control(L"STATIC", tr(L"接入：—"), SS_LEFT, 0, 24, 330, content,
+                                          20 + shift, kSecuritySummary, nullptr);
+    g_app->session_label = add_control(L"STATIC", tr(L"本次会话权限：—"), SS_LEFT, 0, 24,
+                                       352 + shift, 440, 20, kSessionLabel, nullptr);
+    add_control(L"BUTTON", tr(L"会话聊天…"), BS_PUSHBUTTON, 0, 476, 348 + shift, 120, 28,
+                kChatButton, nullptr);
 
-    g_app->input_check = add_control(L"BUTTON", L"接受远程输入", BS_AUTOCHECKBOX, 0, 24, 380,
-                                     140, 24, kInputCheck, nullptr);
-    g_app->clipboard_check = add_control(L"BUTTON", L"同步剪贴板", BS_AUTOCHECKBOX, 0, 180, 380,
-                                         130, 24, kClipboardCheck, nullptr);
-    g_app->audio_check = add_control(L"BUTTON", L"共享系统声音", BS_AUTOCHECKBOX, 0, 326, 380,
-                                     130, 24, kAudioCheck, nullptr);
-    g_app->autostart_check = add_control(L"BUTTON", L"开机自动启动", BS_AUTOCHECKBOX, 0, 472, 380,
-                                         120, 24, kAutostartCheck, nullptr);
-    g_app->microphone_check = add_control(L"BUTTON", L"接收查看者麦克风", BS_AUTOCHECKBOX, 0, 24,
-                                          408, 200, 24, kMicrophoneCheck, nullptr);
-    g_app->privacy_check = add_control(L"BUTTON", L"允许隐私模式", BS_AUTOCHECKBOX, 0, 240, 408,
-                                       200, 24, kPrivacyModeCheck, nullptr);
-    g_app->carrier_check = add_control(L"BUTTON", L"弱网回退（TCP）", BS_AUTOCHECKBOX, 0, 446, 408,
-                                       126, 24, kCarrierCheck, nullptr);
+    int left = 24;
+    const auto check_row = [&left](const wchar_t* text, int top, int id) {
+        const int width = check_px(text);
+        HWND control =
+            add_control(L"BUTTON", text, BS_AUTOCHECKBOX, 0, left, top, width, 24, id, nullptr);
+        left += width + 12;
+        return control;
+    };
+    g_app->input_check = check_row(tr(L"接受远程输入"), 380 + shift, kInputCheck);
+    g_app->clipboard_check = check_row(tr(L"同步剪贴板"), 380 + shift, kClipboardCheck);
+    g_app->audio_check = check_row(tr(L"共享系统声音"), 380 + shift, kAudioCheck);
+    g_app->autostart_check = check_row(tr(L"开机自动启动"), 380 + shift, kAutostartCheck);
+    left = 24;
+    g_app->microphone_check = check_row(tr(L"接收查看者麦克风"), 408 + shift, kMicrophoneCheck);
+    g_app->privacy_check = check_row(tr(L"允许隐私模式"), 408 + shift, kPrivacyModeCheck);
+    g_app->carrier_check = check_row(tr(L"弱网回退（TCP）"), 408 + shift, kCarrierCheck);
 
-    add_control(L"BUTTON", L"安全设置…", BS_PUSHBUTTON, 0, 24, 444, 116, 30, kSecurityButton,
-                nullptr);
-    add_control(L"BUTTON", L"连接服务设置…", BS_PUSHBUTTON, 0, 146, 444, 150, 30,
-                kTunnelSettingsButton, nullptr);
-    add_control(L"BUTTON", L"打开设置文件", BS_PUSHBUTTON, 0, 302, 444, 104, 30,
-                kOpenConfigButton, nullptr);
-    add_control(L"BUTTON", L"允许防火墙访问…", BS_PUSHBUTTON, 0, 412, 444, 160, 30,
-                kFirewallButton, nullptr);
+    left = 24;
+    const auto row_button = [&left](const wchar_t* text, int top, int height, int id,
+                                    int min_width) {
+        const int width = std::max(min_width, button_px(text));
+        HWND control =
+            add_control(L"BUTTON", text, BS_PUSHBUTTON, 0, left, top, width, height, id, nullptr);
+        left += width + 10;
+        return control;
+    };
+    row_button(tr(L"安全设置…"), 444 + shift, 30, kSecurityButton, 116);
+    row_button(tr(L"连接服务设置…"), 444 + shift, 30, kTunnelSettingsButton, 150);
+    row_button(tr(L"打开设置文件"), 444 + shift, 30, kOpenConfigButton, 104);
+    row_button(tr(L"允许防火墙访问…"), 444 + shift, 30, kFirewallButton, 160);
 
-    g_app->toggle_button = add_control(L"BUTTON", L"开始共享", BS_PUSHBUTTON, 0, 24, 482, 110,
-                                       32, kToggleButton, nullptr);
-    add_control(L"BUTTON", L"重新注册", BS_PUSHBUTTON, 0, 142, 482, 104, 32,
-                kTunnelRegisterButton, nullptr);
-    add_control(L"BUTTON", L"重新加载设置", BS_PUSHBUTTON, 0, 254, 482, 120, 32, kReloadButton,
-                nullptr);
-    add_control(L"BUTTON", L"隐藏到托盘", BS_PUSHBUTTON, 0, 382, 482, 110, 32, kHideButton,
-                nullptr);
-    add_control(L"BUTTON", L"退出", BS_PUSHBUTTON, 0, 500, 482, 80, 32, kQuitButton, nullptr);
+    left = 24;
+    g_app->toggle_button = row_button(tr(L"开始共享"), 482 + shift, 32, kToggleButton, 110);
+    row_button(tr(L"重新注册"), 482 + shift, 32, kTunnelRegisterButton, 104);
+    row_button(tr(L"重新加载设置"), 482 + shift, 32, kReloadButton, 120);
+    row_button(tr(L"隐藏到托盘"), 482 + shift, 32, kHideButton, 110);
+    row_button(tr(L"退出"), 482 + shift, 32, kQuitButton, 80);
 
-    add_control(L"STATIC", L"日志", SS_LEFT, 0, 24, 524, 200, 20, 0, nullptr);
+    add_control(L"STATIC", tr(L"日志"), SS_LEFT, 0, 24, 524 + shift, 200, 20, 0, nullptr);
     g_app->log_edit =
         add_control(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-                    WS_EX_CLIENTEDGE, 24, 544, 572, 150, kLogEdit, nullptr);
+                    WS_EX_CLIENTEDGE, 24, 544 + shift, content, 150, kLogEdit, nullptr);
 
     set_check(g_app->input_check, g_app->settings.allow_input);
     set_check(g_app->clipboard_check, g_app->settings.allow_clipboard);
@@ -1231,19 +1325,19 @@ LRESULT CALLBACK chat_input_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
 
 void send_chat_from_input() {
     if (g_app->server == nullptr) {
-        append_chat_line(L"系统：共享没有运行，消息未发送");
+        append_chat_line(tr(L"系统：共享没有运行，消息未发送"));
         return;
     }
     const std::string text = trim_ascii(narrow(control_text(g_app->chat_input)));
     if (!valid_chat_text(text)) {
-        append_chat_line(L"系统：消息不能为空，最长 4096 字节");
+        append_chat_line(tr(L"系统：消息不能为空，最长 4096 字节"));
         return;
     }
     if (!g_app->server->send_chat(text)) {
-        append_chat_line(L"系统：没有正在连接的查看者，或待发队列已满");
+        append_chat_line(tr(L"系统：没有正在连接的查看者，或待发队列已满"));
         return;
     }
-    append_chat_line(L"[主机] " + widen(text));
+    append_chat_line(tr(L"[主机] ") + widen(text));
     SetWindowTextW(g_app->chat_input, L"");
     SetFocus(g_app->chat_input);
 }
@@ -1284,7 +1378,7 @@ void show_chat_window(bool focus) {
             window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
             window_class.lpszClassName = kChatWindowClass;
             if (RegisterClassExW(&window_class) == 0) {
-                append_log_line(L"无法创建聊天窗口");
+                append_log_line(tr(L"无法创建聊天窗口"));
                 return;
             }
             class_ready = true;
@@ -1297,11 +1391,11 @@ void show_chat_window(bool focus) {
         RECT work{};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
         // Ownerless so it still opens while the main window sits in the tray.
-        const HWND window = CreateWindowExW(0, kChatWindowClass, L"chast 会话聊天", style, 0, 0,
+        const HWND window = CreateWindowExW(0, kChatWindowClass, tr(L"chast 会话聊天"), style, 0, 0,
                                             width, height, nullptr, nullptr, g_app->instance,
                                             nullptr);
         if (window == nullptr) {
-            append_log_line(L"无法创建聊天窗口");
+            append_log_line(tr(L"无法创建聊天窗口"));
             return;
         }
         g_app->chat_window = window;
@@ -1336,7 +1430,7 @@ void show_chat_window(bool focus) {
             }
             return control;
         };
-        add(L"STATIC", L"会话聊天 · 消息只在本会话中传输", SS_LEFT, 0, 16, 12, 480, 20, 0);
+        add(L"STATIC", tr(L"会话聊天 · 消息只在本会话中传输"), SS_LEFT, 0, 16, 12, 480, 20, 0);
         g_app->chat_history =
             add(L"EDIT", L"",
                 ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP,
@@ -1344,8 +1438,8 @@ void show_chat_window(bool focus) {
         g_app->chat_input =
             add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 16, 360, 372, 28,
                 kChatInput);
-        add(L"BUTTON", L"发送", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 398, 358, 90, 32, kChatSend);
-        add(L"STATIC", L"按 Enter 发送 · 最多 4096 字节", SS_LEFT, 0, 16, 396, 360, 18, 0);
+        add(L"BUTTON", tr(L"发送"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 398, 358, 90, 32, kChatSend);
+        add(L"STATIC", tr(L"按 Enter 发送 · 最多 4096 字节"), SS_LEFT, 0, 16, 396, 360, 18, 0);
         SetWindowSubclass(g_app->chat_input, chat_input_proc, 1, 0);
         chat_refresh_history();
     }
@@ -1433,7 +1527,7 @@ void accept_tunnel_dialog(TunnelDialogState& dialog) {
     updated.tunnel = SendMessageW(dialog.enabled, BM_GETCHECK, 0, 0) == BST_CHECKED;
     std::string error;
     if (!collect_tunnel_settings(dialog, updated, error)) {
-        MessageBoxW(dialog.window, widen(error).c_str(), L"连接服务设置",
+        MessageBoxW(dialog.window, widen(error).c_str(), tr(L"连接服务设置"),
                     MB_OK | MB_ICONWARNING);
         return;
     }
@@ -1500,13 +1594,15 @@ bool edit_tunnel_settings(HostSettings& result) {
     RECT owner_rect{};
     GetWindowRect(g_app->window, &owner_rect);
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT frame{0, 0, px(540), px(470)};
+    const int dialog_width = chast::host::english_ui() ? 660 : 540;
+    const int tunnel_content = dialog_width - 40;
+    RECT frame{0, 0, px(dialog_width), px(470)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
     const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
     const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kTunnelDialogClass, L"连接服务设置",
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kTunnelDialogClass, tr(L"连接服务设置"),
                                   style, x, y, width, height, g_app->window, nullptr,
                                   g_app->instance, &dialog);
     if (window == nullptr) {
@@ -1528,37 +1624,39 @@ bool edit_tunnel_settings(HostSettings& result) {
     };
 
     add(L"STATIC",
-        L"服务器地址留空表示不注册，只在本机或局域网共享。设备密钥不会上传，"
-        L"服务端只保存它的摘要。",
-        SS_LEFT, 0, 20, 14, 500, 40, 0, nullptr);
-    add(L"STATIC", L"服务器地址（http:// 或 https://）", SS_LEFT, 0, 20, 64, 400, 20, 0,
+        tr(L"服务器地址留空表示不注册，只在本机或局域网共享。设备密钥不会上传，"
+        L"服务端只保存它的摘要。"),
+        SS_LEFT, 0, 20, 14, tunnel_content, 40, 0, nullptr);
+    add(L"STATIC", tr(L"服务器地址（http:// 或 https://）"), SS_LEFT, 0, 20, 64, 400, 20, 0,
         nullptr);
-    dialog.url = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 86, 500,
-                     26, kDialogUrl, nullptr);
-    add(L"STATIC", L"服务器密钥（可选）", SS_LEFT, 0, 20, 122, 400, 20, 0, nullptr);
+    dialog.url = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 86,
+                     tunnel_content, 26, kDialogUrl, nullptr);
+    add(L"STATIC", tr(L"服务器密钥（可选）"), SS_LEFT, 0, 20, 122, 400, 20, 0, nullptr);
     dialog.server_key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20,
-                            144, 500, 26, kDialogServerKey, nullptr);
-    add(L"STATIC", L"设备 ID（会合服务中的名称）", SS_LEFT, 0, 20, 180, 400, 20, 0, nullptr);
-    dialog.id = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 202, 500,
-                    26, kDialogId, nullptr);
-    add(L"STATIC", L"设备密钥（8 个字符以上，不会被上传）", SS_LEFT, 0, 20, 238, 400, 20, 0,
+                            144, tunnel_content, 26, kDialogServerKey, nullptr);
+    add(L"STATIC", tr(L"设备 ID（会合服务中的名称）"), SS_LEFT, 0, 20, 180, 400, 20, 0, nullptr);
+    dialog.id = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 202,
+                    tunnel_content, 26, kDialogId, nullptr);
+    add(L"STATIC", tr(L"设备密钥（8 个字符以上，不会被上传）"), SS_LEFT, 0, 20, 238, 400, 20, 0,
         nullptr);
-    dialog.key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 260, 500,
-                     26, kDialogKey, nullptr);
-    add(L"STATIC", L"隧道监听地址（UDP）", SS_LEFT, 0, 20, 296, 240, 20, 0, nullptr);
+    dialog.key = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 260,
+                     tunnel_content, 26, kDialogKey, nullptr);
+    add(L"STATIC", tr(L"隧道监听地址（UDP）"), SS_LEFT, 0, 20, 296, 240, 20, 0, nullptr);
     dialog.listen = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 318,
                         240, 26, kDialogListen, nullptr);
     const std::wstring port_hint =
-        L"主机 QUIC 端口：" + std::to_wstring(g_app->settings.port) +
-        L"\n隧道端口必须不同，例如 0.0.0.0:14434";
-    add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 316, 250, 40, 0, nullptr);
-    dialog.enabled =
-        add(L"BUTTON", L"启用连接服务（注册到会合服务器）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20,
-            366, 400, 24, kDialogEnabled, nullptr);
-    add(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 300, 408, 100, 32, IDOK,
+        tr(L"主机 QUIC 端口：") + std::to_wstring(g_app->settings.port) +
+        tr(L"\n隧道端口必须不同，例如 0.0.0.0:14434");
+    add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 316, dialog_width - 20 - 276, 40, 0,
         nullptr);
-    add(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 410, 408, 100, 32, IDCANCEL,
-        nullptr);
+    const wchar_t* enable_text = tr(L"启用连接服务（注册到会合服务器）");
+    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 366,
+                         std::max(400, check_px(enable_text)), 24, kDialogEnabled, nullptr);
+    const int tunnel_cancel_left = dialog_width - 20 - 100;
+    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left - 10 - 100,
+        408, 100, 32, IDOK, nullptr);
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 408, 100, 32,
+        IDCANCEL, nullptr);
 
     set_text(dialog.url, widen(g_app->settings.server_url));
     set_text(dialog.server_key, widen(g_app->settings.server_key));
@@ -1622,11 +1720,14 @@ enum SecurityDialogId {
     kSecAllowInput,
     kSecAllowClipboard,
     kSecAllowFile,
+    kSecReceivePick,
     kSecAllowAudio,
     kSecAllowMicrophone,
     kSecAllowPrivacy,
     kSecAllowPortForward,
     kSecAllowTerminal,
+    kSecAllowRecord,
+    kSecAllowCamera,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1661,8 +1762,14 @@ struct SecurityDialogState {
     HWND allow_input = nullptr;
     HWND allow_clipboard = nullptr;
     HWND allow_file = nullptr;
+    HWND receive_dir = nullptr;
+    // Chosen receive/shared folder in UTF-8; empty keeps the default. It only
+    // reaches the settings when the dialog is saved.
+    std::string receive_directory;
     HWND allow_port_forward = nullptr;
     HWND allow_terminal = nullptr;
+    HWND allow_record = nullptr;
+    HWND allow_camera = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -1697,7 +1804,7 @@ bool is_checked(HWND control) {
 
 std::wstring unix_date(int64_t seconds) {
     if (seconds <= 0) {
-        return L"从未";
+        return tr(L"从未");
     }
     const time_t stamp = static_cast<time_t>(seconds);
     tm local{};
@@ -1722,16 +1829,23 @@ std::string format_ipv4_range(const Ipv4Range& range) {
 void refresh_trusted_list(SecurityDialogState& dialog) {
     SendMessageW(dialog.trusted_list, LB_RESETCONTENT, 0, 0);
     for (const TrustedDevice& device : dialog.devices) {
-        std::wstring line = device.name.empty() ? std::wstring(L"未命名设备")
+        std::wstring line = device.name.empty() ? std::wstring(tr(L"未命名设备"))
                                                 : widen(device.name);
         line += L" · " + platform_label(device.platform);
         const int64_t seen =
             device.last_seen_unix_seconds != 0 ? device.last_seen_unix_seconds
                                                : device.added_unix_seconds;
-        line += L" · 最近使用 " + unix_date(seen);
+        line += tr(L" · 最近使用 ") + unix_date(seen);
         SendMessageW(dialog.trusted_list, LB_ADDSTRING, 0,
                      reinterpret_cast<LPARAM>(line.c_str()));
     }
+}
+
+std::wstring receive_directory_text(const std::string& directory) {
+    const std::string effective =
+        directory.empty() ? chast::default_receive_directory() : directory;
+    return tr(L"接收目录：") +
+           (effective.empty() ? std::wstring(tr(L"（不可用）")) : widen(effective));
 }
 
 void show_security_page(SecurityDialogState& dialog, int page) {
@@ -1762,7 +1876,7 @@ void refresh_audio_devices(SecurityDialogState& dialog) {
     SendMessageW(dialog.audio_device, CB_RESETCONTENT, 0, 0);
     dialog.audio_device_ids.clear();
     SendMessageW(dialog.audio_device, CB_ADDSTRING, 0,
-                 reinterpret_cast<LPARAM>(L"系统默认（跟随 Windows）"));
+                 reinterpret_cast<LPARAM>(tr(L"系统默认（跟随 Windows）")));
     dialog.audio_device_ids.emplace_back();
     int chosen = 0;
 
@@ -1773,7 +1887,7 @@ void refresh_audio_devices(SecurityDialogState& dialog) {
         }
         std::wstring label = widen(output.name.empty() ? output.id : output.name);
         if (output.is_default) {
-            label += L"（默认）";
+            label += tr(L"（默认）");
         }
         const int index = static_cast<int>(dialog.audio_device_ids.size());
         SendMessageW(dialog.audio_device, CB_ADDSTRING, 0,
@@ -1788,7 +1902,7 @@ void refresh_audio_devices(SecurityDialogState& dialog) {
     if (!selected.empty() &&
         dialog.audio_device_ids[static_cast<size_t>(chosen)] != selected) {
         SendMessageW(dialog.audio_device, CB_ADDSTRING, 0,
-                     reinterpret_cast<LPARAM>(L"已选设备（当前不可用）"));
+                     reinterpret_cast<LPARAM>(tr(L"已选设备（当前不可用）")));
         chosen = static_cast<int>(dialog.audio_device_ids.size());
         dialog.audio_device_ids.push_back(selected);
     }
@@ -1806,7 +1920,7 @@ void security_enable_two_factor(SecurityDialogState& dialog) {
     set_text(dialog.totp_secret, widen(dialog.pending_totp));
     set_text(dialog.totp_uri,
              widen(totp_uri(dialog.pending_totp, "chast", "chast@host")));
-    set_text(dialog.two_factor_state, L"待验证：把密钥加入认证器，再输入 6 位验证码");
+    set_text(dialog.two_factor_state, tr(L"待验证：把密钥加入认证器，再输入 6 位验证码"));
     set_text(dialog.totp_code, L"");
     EnableWindow(dialog.totp_code, TRUE);
     EnableWindow(dialog.totp_confirm, TRUE);
@@ -1820,7 +1934,7 @@ void security_disable_two_factor(SecurityDialogState& dialog) {
         const std::wstring current = control_text(dialog.password_current);
         if (current.empty() ||
             !verify_password(narrow(current), g_app->settings.password_hash)) {
-            MessageBoxW(dialog.window, L"关闭两步验证需要先输入当前密码。", L"安全设置",
+            MessageBoxW(dialog.window, tr(L"关闭两步验证需要先输入当前密码。"), tr(L"安全设置"),
                         MB_OK | MB_ICONWARNING);
             SetFocus(dialog.password_current);
             return;
@@ -1829,7 +1943,7 @@ void security_disable_two_factor(SecurityDialogState& dialog) {
     dialog.two_factor_disable_pending = true;
     dialog.pending_totp.clear();
     dialog.pending_totp_confirmed = false;
-    set_text(dialog.two_factor_state, L"已标记关闭，点击“保存”生效");
+    set_text(dialog.two_factor_state, tr(L"已标记关闭，点击“保存”生效"));
     set_text(dialog.totp_secret, L"");
     set_text(dialog.totp_uri, L"");
     set_text(dialog.totp_code, L"");
@@ -1847,21 +1961,21 @@ void security_confirm_totp(SecurityDialogState& dialog) {
     if (code.empty() || !verify_totp(dialog.pending_totp, narrow(code),
                                      static_cast<uint64_t>(std::time(nullptr)), 1)) {
         MessageBoxW(dialog.window,
-                    L"验证码不正确，请按认证器当前显示的 6 位数字重新输入。", L"安全设置",
+                    tr(L"验证码不正确，请按认证器当前显示的 6 位数字重新输入。"), tr(L"安全设置"),
                     MB_OK | MB_ICONWARNING);
         SendMessageW(dialog.totp_code, EM_SETSEL, 0, -1);
         SetFocus(dialog.totp_code);
         return;
     }
     dialog.pending_totp_confirmed = true;
-    set_text(dialog.two_factor_state, L"验证码正确，点击“保存”启用");
+    set_text(dialog.two_factor_state, tr(L"验证码正确，点击“保存”启用"));
     EnableWindow(dialog.totp_code, FALSE);
     EnableWindow(dialog.totp_confirm, FALSE);
 }
 
 bool accept_security_dialog(SecurityDialogState& dialog) {
     const auto complain = [&dialog](const std::wstring& text) {
-        MessageBoxW(dialog.window, text.c_str(), L"安全设置", MB_OK | MB_ICONWARNING);
+        MessageBoxW(dialog.window, text.c_str(), tr(L"安全设置"), MB_OK | MB_ICONWARNING);
         return false;
     };
 
@@ -1879,10 +1993,13 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_file_transfer = is_checked(dialog.allow_file);
     updated.allow_port_forward = is_checked(dialog.allow_port_forward);
     updated.allow_terminal = is_checked(dialog.allow_terminal);
+    updated.allow_record = is_checked(dialog.allow_record);
+    updated.allow_camera = is_checked(dialog.allow_camera);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
     updated.allow_permission_change = is_checked(dialog.allow_change);
+    updated.file_receive_directory = dialog.receive_directory;
 
     std::string whitelist = narrow(control_text(dialog.whitelist));
     std::replace(whitelist.begin(), whitelist.end(), '\r', ',');
@@ -1890,7 +2007,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     std::vector<Ipv4Range> ranges;
     std::string whitelist_error;
     if (!parse_ip_whitelist(whitelist, ranges, &whitelist_error)) {
-        return complain(L"IP 白名单无效：" + widen(whitelist_error));
+        return complain(tr(L"IP 白名单无效：") + widen(whitelist_error));
     }
     std::string normalized;
     for (const Ipv4Range& range : ranges) {
@@ -1906,18 +2023,18 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     const std::wstring confirm = control_text(dialog.password_confirm);
     if (!next.empty() || !confirm.empty()) {
         if (next.size() < kMinPermanentPasswordLength) {
-            return complain(L"新密码至少需要 8 个字符。");
+            return complain(tr(L"新密码至少需要 8 个字符。"));
         }
         if (next != confirm) {
-            return complain(L"两次输入的新密码不一致。");
+            return complain(tr(L"两次输入的新密码不一致。"));
         }
         const std::string encoded = narrow(next);
         if (encoded.size() > 128) {
-            return complain(L"新密码太长（最多 128 字节）。");
+            return complain(tr(L"新密码太长（最多 128 字节）。"));
         }
         if (!updated.password_hash.empty() &&
             (current.empty() || !verify_password(narrow(current), updated.password_hash))) {
-            return complain(L"当前密码不正确。");
+            return complain(tr(L"当前密码不正确。"));
         }
         updated.password_hash = hash_password(encoded);
         // A device trusted under the old secret must prove itself again.
@@ -1928,13 +2045,13 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
         updated.totp_secret.clear();
     } else if (!dialog.pending_totp.empty()) {
         if (!dialog.pending_totp_confirmed) {
-            return complain(L"请先用认证器输入 6 位验证码并点击“确认验证码”。");
+            return complain(tr(L"请先用认证器输入 6 位验证码并点击“确认验证码”。"));
         }
         std::string protected_secret;
         std::string error;
         if (!protect_totp_secret(dialog.pending_totp, SecretScope::CurrentUser,
                                  protected_secret, &error)) {
-            return complain(L"无法保护两步验证密钥：" + widen(error));
+            return complain(tr(L"无法保护两步验证密钥：") + widen(error));
         }
         updated.totp_secret = std::move(protected_secret);
     }
@@ -1966,7 +2083,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     if (dialog.token_edited) {
         const std::string token = trim_ascii(narrow(control_text(dialog.token_edit)));
         if (token.empty() || token.size() > 128) {
-            return complain(L"访问令牌不能为空，且不能超过 128 个字符。");
+            return complain(tr(L"访问令牌不能为空，且不能超过 128 个字符。"));
         }
         updated.access_token = token;
     }
@@ -2026,6 +2143,47 @@ LRESULT CALLBACK security_dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LP
                             dialog->audio_device_ids[static_cast<size_t>(selected)];
                     }
                     refresh_audio_devices(*dialog);
+                    return 0;
+                }
+                case kSecReceivePick: {
+                    // BIF_NEWDIALOGSTYLE needs an initialized apartment; the
+                    // classic dialog still works if COM is unavailable.
+                    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                    PIDLIST_ABSOLUTE start = nullptr;
+                    const std::string current = dialog->receive_directory.empty()
+                                                    ? chast::default_receive_directory()
+                                                    : dialog->receive_directory;
+                    if (!current.empty() && SUCCEEDED(com)) {
+                        SHParseDisplayName(widen(current).c_str(), nullptr, &start, 0, nullptr);
+                    }
+                    BROWSEINFOW browse{};
+                    browse.hwndOwner = dialog->window;
+                    browse.pidlRoot = start;
+                    browse.lpszTitle =
+                        tr(L"选择接收目录（查看器可浏览并下载其中的文件）");
+                    browse.ulFlags = BIF_RETURNONLYFSDIRS;
+                    if (SUCCEEDED(com)) {
+                        browse.ulFlags |= BIF_NEWDIALOGSTYLE;
+                    }
+                    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+                    wchar_t path[MAX_PATH]{};
+                    const bool picked =
+                        item != nullptr && SHGetPathFromIDListW(item, path) != FALSE;
+                    if (item != nullptr) {
+                        CoTaskMemFree(item);
+                    }
+                    if (start != nullptr) {
+                        CoTaskMemFree(start);
+                    }
+                    if (SUCCEEDED(com)) {
+                        CoUninitialize();
+                    }
+                    if (!picked) {
+                        return 0;
+                    }
+                    dialog->receive_directory = narrow(path);
+                    set_text(dialog->receive_dir,
+                             receive_directory_text(dialog->receive_directory));
                     return 0;
                 }
                 case kSecRevoke: {
@@ -2113,13 +2271,15 @@ bool edit_security_settings(HostSettings& result) {
     RECT owner_rect{};
     GetWindowRect(g_app->window, &owner_rect);
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT frame{0, 0, px(620), px(600)};
+    const int dialog_width = chast::host::english_ui() ? 700 : 620;
+    const int page_text_width = dialog_width - 80;
+    RECT frame{0, 0, px(dialog_width), px(626)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
     const int x = owner_rect.left + ((owner_rect.right - owner_rect.left) - width) / 2;
     const int y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - height) / 2;
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kSecurityDialogClass, L"安全设置",
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, kSecurityDialogClass, tr(L"安全设置"),
                                   style, x, y, width, height, g_app->window, nullptr,
                                   g_app->instance, &dialog);
     if (window == nullptr) {
@@ -2145,45 +2305,53 @@ bool edit_security_settings(HostSettings& result) {
     };
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
-                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12), px(588),
-                                 px(520), window,
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12),
+                                 px(dialog_width - 32), px(546), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
         SendMessageW(dialog.tab, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->font), TRUE);
         TCITEMW item{};
         item.mask = TCIF_TEXT;
-        item.pszText = const_cast<wchar_t*>(L"认证");
+        item.pszText = const_cast<wchar_t*>(tr(L"认证"));
         TabCtrl_InsertItem(dialog.tab, 0, &item);
-        item.pszText = const_cast<wchar_t*>(L"访问控制");
+        item.pszText = const_cast<wchar_t*>(tr(L"访问控制"));
         TabCtrl_InsertItem(dialog.tab, 1, &item);
-        item.pszText = const_cast<wchar_t*>(L"高级");
+        item.pszText = const_cast<wchar_t*>(tr(L"高级"));
         TabCtrl_InsertItem(dialog.tab, 2, &item);
     }
 
     // ----- authentication page -----
-    add(L"STATIC", L"接入方式", SS_LEFT, 0, 32, 56, 200, 20, 0, nullptr,
+    add(L"STATIC", tr(L"接入方式"), SS_LEFT, 0, 32, 56, 200, 20, 0, nullptr,
         &dialog.auth_page);
+    const wchar_t* mode_password_text = tr(L"密码");
+    const wchar_t* mode_click_text = tr(L"点击批准");
+    const wchar_t* mode_both_text = tr(L"两者");
+    const int mode_password_width = std::max(110, button_px(mode_password_text));
+    const int mode_click_width = std::max(130, button_px(mode_click_text));
     dialog.mode_password =
-        add(L"BUTTON", L"密码", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 0, 32, 78, 110, 24,
-            kSecModePassword, nullptr, &dialog.auth_page);
+        add(L"BUTTON", mode_password_text, BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 0, 32, 78,
+            mode_password_width, 24, kSecModePassword, nullptr, &dialog.auth_page);
     dialog.mode_click =
-        add(L"BUTTON", L"点击批准", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 150, 78, 130, 24,
-            kSecModeClick, nullptr, &dialog.auth_page);
+        add(L"BUTTON", mode_click_text, BS_AUTORADIOBUTTON | WS_TABSTOP, 0,
+            32 + mode_password_width + 20, 78, mode_click_width, 24, kSecModeClick, nullptr,
+            &dialog.auth_page);
     dialog.mode_both =
-        add(L"BUTTON", L"两者", BS_AUTORADIOBUTTON | WS_TABSTOP, 0, 290, 78, 130, 24,
-            kSecModeBoth, nullptr, &dialog.auth_page);
+        add(L"BUTTON", mode_both_text, BS_AUTORADIOBUTTON | WS_TABSTOP, 0,
+            32 + mode_password_width + 20 + mode_click_width + 20, 78,
+            std::max(130, button_px(mode_both_text)), 24, kSecModeBoth, nullptr,
+            &dialog.auth_page);
     add(L"STATIC",
-        L"密码：必须输入密码；点击批准：每次连接都弹窗；两者：有密码就验证，"
-        L"空密码请求批准。",
-        SS_LEFT, 0, 32, 104, 540, 36, 0, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"修改永久密码（留空表示不修改）", SS_LEFT, 0, 32, 144, 300, 20, 0,
+        tr(L"密码：必须输入密码；点击批准：每次连接都弹窗；两者：有密码就验证，"
+        L"空密码请求批准。"),
+        SS_LEFT, 0, 32, 104, page_text_width, 36, 0, nullptr, &dialog.auth_page);
+    add(L"STATIC", tr(L"修改永久密码（留空表示不修改）"), SS_LEFT, 0, 32, 144, 300, 20, 0,
         nullptr, &dialog.auth_page);
-    add(L"STATIC", L"当前密码（修改时需要）", SS_LEFT, 0, 32, 168, 170, 20, 0, nullptr,
+    add(L"STATIC", tr(L"当前密码（修改时需要）"), SS_LEFT, 0, 32, 168, 170, 20, 0, nullptr,
         &dialog.auth_page);
-    add(L"STATIC", L"新密码（至少 8 个字符）", SS_LEFT, 0, 214, 168, 170, 20, 0, nullptr,
+    add(L"STATIC", tr(L"新密码（至少 8 个字符）"), SS_LEFT, 0, 214, 168, 170, 20, 0, nullptr,
         &dialog.auth_page);
-    add(L"STATIC", L"确认新密码", SS_LEFT, 0, 396, 168, 170, 20, 0, nullptr,
+    add(L"STATIC", tr(L"确认新密码"), SS_LEFT, 0, 396, 168, 170, 20, 0, nullptr,
         &dialog.auth_page);
     dialog.password_current =
         add(L"EDIT", L"", ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 188,
@@ -2194,145 +2362,184 @@ bool edit_security_settings(HostSettings& result) {
     dialog.password_confirm =
         add(L"EDIT", L"", ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 396,
             188, 170, 26, kSecPasswordConfirm, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"修改永久密码会清空可信设备；两步验证密钥保留。", SS_LEFT, 0, 32, 220,
-        540, 20, 0, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"两步验证（TOTP）", SS_LEFT, 0, 32, 248, 200, 20, 0, nullptr,
+    add(L"STATIC", tr(L"修改永久密码会清空可信设备；两步验证密钥保留。"), SS_LEFT, 0, 32, 220,
+        page_text_width, 20, 0, nullptr, &dialog.auth_page);
+    add(L"STATIC", tr(L"两步验证（TOTP）"), SS_LEFT, 0, 32, 248, 200, 20, 0, nullptr,
         &dialog.auth_page);
     dialog.two_factor_state =
         add(L"STATIC", L"", SS_LEFT, 0, 300, 248, 270, 20, kSecTwoFactorState, nullptr,
             &dialog.auth_page);
+    const wchar_t* two_factor_enable_text = tr(L"启用两步验证");
+    const wchar_t* two_factor_disable_text = tr(L"关闭两步验证");
+    const int two_factor_enable_width = std::max(120, button_px(two_factor_enable_text));
     dialog.two_factor_enable =
-        add(L"BUTTON", L"启用两步验证", BS_PUSHBUTTON | WS_TABSTOP, 0, 32, 272, 120, 28,
-            kSecTwoFactorEnable, nullptr, &dialog.auth_page);
+        add(L"BUTTON", two_factor_enable_text, BS_PUSHBUTTON | WS_TABSTOP, 0, 32, 272,
+            two_factor_enable_width, 28, kSecTwoFactorEnable, nullptr, &dialog.auth_page);
     dialog.two_factor_disable =
-        add(L"BUTTON", L"关闭两步验证", BS_PUSHBUTTON | WS_TABSTOP, 0, 162, 272, 120, 28,
-            kSecTwoFactorDisable, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"密钥（Base32，手动添加到认证器）", SS_LEFT, 0, 32, 308, 400, 20, 0,
+        add(L"BUTTON", two_factor_disable_text, BS_PUSHBUTTON | WS_TABSTOP, 0,
+            32 + two_factor_enable_width + 10, 272,
+            std::max(120, button_px(two_factor_disable_text)), 28, kSecTwoFactorDisable, nullptr,
+            &dialog.auth_page);
+    add(L"STATIC", tr(L"密钥（Base32，手动添加到认证器）"), SS_LEFT, 0, 32, 308, 400, 20, 0,
         nullptr, &dialog.auth_page);
     dialog.totp_secret =
         add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 32, 326, 540, 26,
             kSecTotpSecret, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"otpauth 链接", SS_LEFT, 0, 32, 358, 400, 20, 0, nullptr,
+    add(L"STATIC", tr(L"otpauth 链接"), SS_LEFT, 0, 32, 358, 400, 20, 0, nullptr,
         &dialog.auth_page);
     dialog.totp_uri =
         add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 32, 376, 540, 26,
             kSecTotpUri, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"6 位验证码", SS_LEFT, 0, 32, 408, 100, 20, 0, nullptr,
+    add(L"STATIC", tr(L"6 位验证码"), SS_LEFT, 0, 32, 408, 100, 20, 0, nullptr,
         &dialog.auth_page);
     dialog.totp_code =
         add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 426, 120, 26,
             kSecTotpCode, nullptr, &dialog.auth_page);
     dialog.totp_confirm =
-        add(L"BUTTON", L"确认验证码", BS_PUSHBUTTON | WS_TABSTOP, 0, 164, 426, 110, 26,
+        add(L"BUTTON", tr(L"确认验证码"), BS_PUSHBUTTON | WS_TABSTOP, 0, 164, 426, 110, 26,
             kSecTotpConfirm, nullptr, &dialog.auth_page);
-    add(L"STATIC", L"输入认证器当前显示的 6 位数字", SS_LEFT, 0, 286, 430, 280, 20, 0,
+    add(L"STATIC", tr(L"输入认证器当前显示的 6 位数字"), SS_LEFT, 0, 286, 430, 280, 20, 0,
         nullptr, &dialog.auth_page);
 
     // ----- access-control page -----
-    add(L"STATIC", L"可信设备（通过两步验证后可以记住这台查看器）", SS_LEFT, 0, 32, 56, 500,
+    add(L"STATIC", tr(L"可信设备（通过两步验证后可以记住这台查看器）"), SS_LEFT, 0, 32, 56, 500,
         20, 0, nullptr, &dialog.access_page);
     dialog.trusted_list =
         add(L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER, 0, 32, 78,
             440, 110, kSecTrustedList, nullptr, &dialog.access_page);
-    add(L"BUTTON", L"撤销信任", BS_PUSHBUTTON | WS_TABSTOP, 0, 484, 78, 92, 30, kSecRevoke,
+    add(L"BUTTON", tr(L"撤销信任"), BS_PUSHBUTTON | WS_TABSTOP, 0, 484, 78, 92, 30, kSecRevoke,
         nullptr, &dialog.access_page);
-    add(L"STATIC", L"设备 90 天未使用自动失效；修改永久密码会清空列表。", SS_LEFT, 0, 32,
-        196, 540, 20, 0, nullptr, &dialog.access_page);
-    add(L"STATIC", L"IP 白名单（IPv4 或 CIDR，逗号或换行分隔，留空不限制）", SS_LEFT, 0,
-        32, 224, 540, 20, 0, nullptr, &dialog.access_page);
+    add(L"STATIC", tr(L"设备 90 天未使用自动失效；修改永久密码会清空列表。"), SS_LEFT, 0, 32,
+        196, page_text_width, 20, 0, nullptr, &dialog.access_page);
+    add(L"STATIC", tr(L"IP 白名单（IPv4 或 CIDR，逗号或换行分隔，留空不限制）"), SS_LEFT, 0,
+        32, 224, page_text_width, 20, 0, nullptr, &dialog.access_page);
     dialog.whitelist =
         add(L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP,
-            WS_EX_CLIENTEDGE, 32, 246, 544, 64, kSecWhitelist, nullptr,
+            WS_EX_CLIENTEDGE, 32, 246, dialog_width - 76, 64, kSecWhitelist, nullptr,
             &dialog.access_page);
-    add(L"STATIC", L"经中继连接时，主机看到的是中继地址。", SS_LEFT, 0, 32, 316, 540, 20,
-        0, nullptr, &dialog.access_page);
-    add(L"STATIC", L"新连接的默认权限", SS_LEFT, 0, 32, 344, 300, 20, 0, nullptr,
+    add(L"STATIC", tr(L"经中继连接时，主机看到的是中继地址。"), SS_LEFT, 0, 32, 316,
+        page_text_width, 20, 0, nullptr, &dialog.access_page);
+    add(L"STATIC", tr(L"新连接的默认权限"), SS_LEFT, 0, 32, 344, 300, 20, 0, nullptr,
         &dialog.access_page);
-    dialog.allow_input =
-        add(L"BUTTON", L"键盘与鼠标", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 366, 120, 24,
-            kSecAllowInput, nullptr, &dialog.access_page);
+    const int page_right = dialog_width - 36;
+    const auto page_check = [&](const wchar_t* text, int left, int top, int id) {
+        return add(L"BUTTON", text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, left, top, check_px(text), 24,
+                   id, nullptr, &dialog.access_page);
+    };
+    const wchar_t* allow_input_text = tr(L"键盘与鼠标");
+    const wchar_t* allow_clipboard_text = tr(L"剪贴板");
+    const wchar_t* allow_audio_text = tr(L"系统声音");
+    const wchar_t* allow_privacy_text = tr(L"隐私模式（本机黑屏）");
+    const int allow_input_width = std::max(120, check_px(allow_input_text));
+    const int allow_clipboard_width = std::max(110, check_px(allow_clipboard_text));
+    const int allow_audio_width = std::max(110, check_px(allow_audio_text));
+    dialog.allow_input = page_check(allow_input_text, 32, 366, kSecAllowInput);
     dialog.allow_clipboard =
-        add(L"BUTTON", L"剪贴板", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 160, 366, 110, 24,
-            kSecAllowClipboard, nullptr, &dialog.access_page);
-    dialog.allow_audio =
-        add(L"BUTTON", L"系统声音", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 276, 366, 110, 24,
-            kSecAllowAudio, nullptr, &dialog.access_page);
-    dialog.allow_file =
-        add(L"BUTTON", L"文件传输", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 394, 110, 24,
-            kSecAllowFile, nullptr, &dialog.access_page);
+        page_check(allow_clipboard_text, 32 + allow_input_width + 12, 366, kSecAllowClipboard);
+    dialog.allow_audio = page_check(
+        allow_audio_text, 32 + allow_input_width + allow_clipboard_width + 24, 366,
+        kSecAllowAudio);
+    dialog.allow_privacy = page_check(
+        allow_privacy_text,
+        32 + allow_input_width + allow_clipboard_width + allow_audio_width + 36, 366,
+        kSecAllowPrivacy);
+
+    const wchar_t* allow_file_text = tr(L"文件传输");
+    const wchar_t* allow_microphone_text = tr(L"麦克风（上行）");
+    const int allow_file_width = std::max(110, check_px(allow_file_text));
+    const int allow_microphone_width = std::max(130, check_px(allow_microphone_text));
+    dialog.allow_file = page_check(allow_file_text, 32, 394, kSecAllowFile);
     dialog.allow_microphone =
-        add(L"BUTTON", L"麦克风（上行）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 150, 394, 130, 24,
-            kSecAllowMicrophone, nullptr, &dialog.access_page);
-    dialog.allow_privacy =
-        add(L"BUTTON", L"隐私模式（本机黑屏）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 400, 366,
-            160, 24, kSecAllowPrivacy, nullptr, &dialog.access_page);
-    const std::string receive_directory = g_app->settings.file_receive_directory.empty()
-                                              ? chast::default_receive_directory()
-                                              : g_app->settings.file_receive_directory;
-    add(L"STATIC",
-        (L"接收目录：" +
-         (receive_directory.empty() ? std::wstring(L"（不可用）") : widen(receive_directory)))
-            .c_str(),
-        SS_LEFT | SS_ENDELLIPSIS, 0, 290, 398, 290, 20, 0, nullptr, &dialog.access_page);
-    dialog.allow_port_forward =
-        add(L"BUTTON", L"端口转发", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 428, 120, 24,
-            kSecAllowPortForward, nullptr, &dialog.access_page);
-    add(L"STATIC", L"允许查看器经本机访问你可达的 TCP 地址。", SS_LEFT, 0, 150, 432, 430, 20, 0,
-        nullptr, &dialog.access_page);
-    dialog.allow_change =
-        add(L"BUTTON", L"允许在会话中调整权限", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 460, 260,
-            24, kSecAllowChange, nullptr, &dialog.access_page);
-    dialog.allow_terminal =
-        add(L"BUTTON", L"远程终端", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 488, 120, 24,
-            kSecAllowTerminal, nullptr, &dialog.access_page);
-    add(L"STATIC", L"允许查看器在本机打开 shell（使用当前账户）。", SS_LEFT, 0, 160, 492,
-        420, 20, 0, nullptr, &dialog.access_page);
+        page_check(allow_microphone_text, 32 + allow_file_width + 8, 394, kSecAllowMicrophone);
+    const int receive_left = 32 + allow_file_width + 8 + allow_microphone_width + 10;
+    const wchar_t* receive_pick_text = tr(L"更改…");
+    const int receive_pick_width = std::max(72, button_px(receive_pick_text));
+    dialog.receive_directory = g_app->settings.file_receive_directory;
+    const std::wstring receive_text = receive_directory_text(dialog.receive_directory);
+    dialog.receive_dir =
+        add(L"STATIC", receive_text.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, receive_left, 398,
+            page_right - receive_left - receive_pick_width - 8, 20, 0, nullptr,
+            &dialog.access_page);
+    add(L"BUTTON", receive_pick_text, BS_PUSHBUTTON | WS_TABSTOP, 0,
+        page_right - receive_pick_width, 396, receive_pick_width, 26, kSecReceivePick, nullptr,
+        &dialog.access_page);
+
+    const wchar_t* allow_port_forward_text = tr(L"端口转发");
+    dialog.allow_port_forward = page_check(allow_port_forward_text, 32, 428, kSecAllowPortForward);
+    const int port_forward_left = 32 + std::max(120, check_px(allow_port_forward_text)) + 10;
+    add(L"STATIC", tr(L"允许查看器经本机访问你可达的 TCP 地址。"), SS_LEFT, 0, port_forward_left,
+        432, page_right - port_forward_left, 20, 0, nullptr, &dialog.access_page);
+
+    const wchar_t* allow_change_text = tr(L"允许在会话中调整权限");
+    const wchar_t* allow_record_text = tr(L"允许查看者录制会话");
+    const int allow_change_width = std::max(260, check_px(allow_change_text));
+    dialog.allow_change = page_check(allow_change_text, 32, 460, kSecAllowChange);
+    dialog.allow_record =
+        page_check(allow_record_text, 32 + allow_change_width + 16, 460, kSecAllowRecord);
+
+    const wchar_t* allow_terminal_text = tr(L"远程终端");
+    dialog.allow_terminal = page_check(allow_terminal_text, 32, 488, kSecAllowTerminal);
+    const int terminal_left = 32 + std::max(120, check_px(allow_terminal_text)) + 10;
+    add(L"STATIC", tr(L"允许查看器在本机打开 shell（使用当前账户）。"), SS_LEFT, 0, terminal_left,
+        492, page_right - terminal_left, 20, 0, nullptr, &dialog.access_page);
+
+    const wchar_t* allow_camera_text = tr(L"摄像头");
+    dialog.allow_camera = page_check(allow_camera_text, 32, 516, kSecAllowCamera);
+    const int camera_left = 32 + std::max(120, check_px(allow_camera_text)) + 10;
+    add(L"STATIC", tr(L"允许查看器串流本机的一台摄像头（与桌面画面同时）。"), SS_LEFT, 0,
+        camera_left, 520, page_right - camera_left, 20, 0, nullptr, &dialog.access_page);
 
     // ----- advanced page -----
-    add(L"STATIC", L"访问令牌（仅供 CLI 与自动化，默认关闭）", SS_LEFT, 0, 32, 56, 500, 20, 0,
+    add(L"STATIC", tr(L"访问令牌（仅供 CLI 与自动化，默认关闭）"), SS_LEFT, 0, 32, 56, 500, 20, 0,
         nullptr, &dialog.advanced_page);
     dialog.token_auth =
-        add(L"BUTTON", L"允许令牌认证", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 80, 200, 24,
+        add(L"BUTTON", tr(L"允许令牌认证"), BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 80, 200, 24,
             kSecTokenAuth, nullptr, &dialog.advanced_page);
     dialog.one_time =
-        add(L"BUTTON", L"一次性令牌（使用后自动更换）", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32,
+        add(L"BUTTON", tr(L"一次性令牌（使用后自动更换）"), BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32,
             106, 260, 24, kSecOneTime, nullptr, &dialog.advanced_page);
     dialog.token_edit =
         add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 32, 134, 408, 26,
             kSecTokenEdit, nullptr, &dialog.advanced_page);
-    add(L"BUTTON", L"复制", BS_PUSHBUTTON | WS_TABSTOP, 0, 448, 134, 60, 26, kSecTokenCopy,
-        nullptr, &dialog.advanced_page);
-    add(L"BUTTON", L"生成", BS_PUSHBUTTON | WS_TABSTOP, 0, 514, 134, 62, 26, kSecTokenRotate,
-        nullptr, &dialog.advanced_page);
-    add(L"STATIC", L"查看器不再使用访问令牌；只有勾选“允许令牌认证”后令牌才有效。",
+    const wchar_t* token_copy_text = tr(L"复制");
+    const wchar_t* token_rotate_text = tr(L"生成");
+    const int token_copy_width = std::max(60, button_px(token_copy_text));
+    add(L"BUTTON", token_copy_text, BS_PUSHBUTTON | WS_TABSTOP, 0, 448, 134, token_copy_width, 26,
+        kSecTokenCopy, nullptr, &dialog.advanced_page);
+    add(L"BUTTON", token_rotate_text, BS_PUSHBUTTON | WS_TABSTOP, 0,
+        448 + token_copy_width + 8, 134, std::max(62, button_px(token_rotate_text)), 26,
+        kSecTokenRotate, nullptr, &dialog.advanced_page);
+    add(L"STATIC", tr(L"查看器不再使用访问令牌；只有勾选“允许令牌认证”后令牌才有效。"),
         SS_LEFT, 0, 32, 166, 540, 36, 0, nullptr, &dialog.advanced_page);
-    add(L"STATIC", L"身份指纹（SHA-256）", SS_LEFT, 0, 32, 212, 300, 20, 0, nullptr,
+    add(L"STATIC", tr(L"身份指纹（SHA-256）"), SS_LEFT, 0, 32, 212, 300, 20, 0, nullptr,
         &dialog.advanced_page);
     HWND fingerprint =
-        add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 32, 234, 544, 26,
-            0, nullptr, &dialog.advanced_page);
-    add(L"STATIC", L"查看器首次连接时固定此指纹；变更后会提示身份不匹配。", SS_LEFT, 0, 32,
-        266, 540, 20, 0, nullptr, &dialog.advanced_page);
+        add(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, 32, 234,
+            dialog_width - 76, 26, 0, nullptr, &dialog.advanced_page);
+    add(L"STATIC", tr(L"查看器首次连接时固定此指纹；变更后会提示身份不匹配。"), SS_LEFT, 0, 32,
+        266, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
-    add(L"STATIC", L"系统声音输出（捕获与查看者麦克风共用）", SS_LEFT, 0, 32, 300, 500, 20,
+    add(L"STATIC", tr(L"系统声音输出（捕获与查看者麦克风共用）"), SS_LEFT, 0, 32, 300, 500, 20,
         0, nullptr, &dialog.advanced_page);
     dialog.audio_device = add(L"COMBOBOX", L"",
                               CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
                               WS_EX_CLIENTEDGE, 32, 322, 460, 200, kSecAudioDevice, nullptr,
                               &dialog.advanced_page);
-    add(L"BUTTON", L"刷新", BS_PUSHBUTTON | WS_TABSTOP, 0, 500, 321, 76, 28,
+    add(L"BUTTON", tr(L"刷新"), BS_PUSHBUTTON | WS_TABSTOP, 0, 500, 321, 76, 28,
         kSecAudioRefresh, nullptr, &dialog.advanced_page);
+    const wchar_t* audio_aec_text = tr(L"回声消除（以查看者麦克风播放为参考）");
     dialog.audio_aec =
-        add(L"BUTTON", L"回声消除（以查看者麦克风播放为参考）",
-            BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 358, 400, 24, kSecAudioAec, nullptr,
+        add(L"BUTTON", audio_aec_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 358,
+            std::max(400, check_px(audio_aec_text)), 24, kSecAudioAec, nullptr,
             &dialog.advanced_page);
-    add(L"STATIC", L"留空跟随系统默认；固定设备不可用时系统声音不会启动。", SS_LEFT, 0, 32,
-        386, 540, 20, 0, nullptr, &dialog.advanced_page);
+    add(L"STATIC", tr(L"留空跟随系统默认；固定设备不可用时系统声音不会启动。"), SS_LEFT, 0, 32,
+        386, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
-    add(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 410, 548, 90, 32, kSecSave,
-        nullptr, nullptr);
-    add(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 510, 548, 90, 32, kSecCancel,
-        nullptr, nullptr);
+    const int sec_cancel_left = dialog_width - 20 - 90;
+    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 574,
+        90, 32, kSecSave, nullptr, nullptr);
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 574, 90, 32,
+        kSecCancel, nullptr, nullptr);
 
     // ----- initial state -----
     const HostSettings& settings = g_app->settings;
@@ -2348,6 +2555,8 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_file, settings.allow_file_transfer);
     set_check(dialog.allow_port_forward, settings.allow_port_forward);
     set_check(dialog.allow_terminal, settings.allow_terminal);
+    set_check(dialog.allow_record, settings.allow_record);
+    set_check(dialog.allow_camera, settings.allow_camera);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2357,18 +2566,18 @@ bool edit_security_settings(HostSettings& result) {
     set_text(dialog.token_edit, widen(settings.access_token));
     set_text(fingerprint,
              g_app->server ? widen(format_fingerprint(g_app->server->status().fingerprint))
-                           : std::wstring(L"共享未启动"));
+                           : std::wstring(tr(L"共享未启动")));
     dialog.selected_audio_device = settings.audio_device;
     set_check(dialog.audio_aec, settings.audio_aec);
     refresh_audio_devices(dialog);
 
     if (!settings.totp_secret.empty()) {
-        set_text(dialog.two_factor_state, L"已启用");
-        set_text(dialog.totp_secret, L"（已启用；密钥只在设置时显示）");
+        set_text(dialog.two_factor_state, tr(L"已启用"));
+        set_text(dialog.totp_secret, tr(L"（已启用；密钥只在设置时显示）"));
         EnableWindow(dialog.two_factor_enable, FALSE);
         EnableWindow(dialog.two_factor_disable, TRUE);
     } else {
-        set_text(dialog.two_factor_state, L"已关闭");
+        set_text(dialog.two_factor_state, tr(L"已关闭"));
         set_text(dialog.totp_secret, L"");
         EnableWindow(dialog.two_factor_enable, TRUE);
         EnableWindow(dialog.two_factor_disable, FALSE);
@@ -2422,10 +2631,10 @@ void add_tray_icon() {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = kTrayMessage;
     data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcsncpy_s(data.szTip, L"chast 主机 · 已停止", _TRUNCATE);
+    wcsncpy_s(data.szTip, tr(L"chast 主机 · 已停止"), _TRUNCATE);
     if (Shell_NotifyIconW(NIM_ADD, &data)) {
         g_app->tray_added = true;
-        g_app->tray_tip = L"chast 主机 · 已停止";
+        g_app->tray_tip = tr(L"chast 主机 · 已停止");
     }
 }
 
@@ -2455,55 +2664,59 @@ void show_tray_menu() {
         status = g_app->server->status();
     }
     const std::wstring line =
-        L"状态：" + (g_app->server ? state_text(status.state, status) : std::wstring(L"已停止"));
+        tr(L"状态：") + (g_app->server ? state_text(status.state, status) : std::wstring(tr(L"已停止")));
 
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
         return;
     }
-    AppendMenuW(menu, MF_STRING, kMenuShow, L"显示 chast 主机");
+    AppendMenuW(menu, MF_STRING, kMenuShow, tr(L"显示 chast 主机"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kCopyIdButton, L"复制设备 ID");
+    AppendMenuW(menu, MF_STRING, kCopyIdButton, tr(L"复制设备 ID"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_input ? MF_CHECKED : 0), kInputCheck,
-                L"接受远程输入");
+                tr(L"接受远程输入"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_clipboard ? MF_CHECKED : 0),
-                kClipboardCheck, L"同步剪贴板");
+                kClipboardCheck, tr(L"同步剪贴板"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_file_transfer ? MF_CHECKED : 0),
-                kFileTransferCheck, L"接受文件传输");
+                kFileTransferCheck, tr(L"接受文件传输"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_port_forward ? MF_CHECKED : 0),
-                kPortForwardCheck, L"允许端口转发（查看器访问本机 TCP）");
+                kPortForwardCheck, tr(L"允许端口转发（查看器访问本机 TCP）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_terminal ? MF_CHECKED : 0),
-                kTerminalCheck, L"允许远程终端（查看器在本机开 shell）");
+                kTerminalCheck, tr(L"允许远程终端（查看器在本机开 shell）"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_record ? MF_CHECKED : 0),
+                kRecordCheck, tr(L"允许查看者录制会话"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_camera ? MF_CHECKED : 0),
+                kCameraCheck, tr(L"允许查看器串流本机摄像头"));
     const bool can_send = running && status.state == HostState::Streaming &&
                           (status.session_permissions & kPermissionFileTransfer) != 0;
     AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
-                L"发送文件到查看器…");
+                tr(L"发送文件到查看器…"));
     const bool can_chat = running && status.state == HostState::Streaming;
     AppendMenuW(menu, MF_STRING | (can_chat ? 0 : MF_GRAYED), kChatButton,
-                L"与查看者聊天…");
+                tr(L"与查看者聊天…"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
-                L"共享系统声音");
+                tr(L"共享系统声音"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_microphone ? MF_CHECKED : 0),
-                kMicrophoneCheck, L"接收查看者麦克风");
+                kMicrophoneCheck, tr(L"接收查看者麦克风"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_privacy_mode ? MF_CHECKED : 0),
-                kPrivacyModeCheck, L"允许查看者开启隐私模式");
+                kPrivacyModeCheck, tr(L"允许查看者开启隐私模式"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
-                L"弱网回退（TCP/WebSocket）");
+                tr(L"弱网回退（TCP/WebSocket）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
-                L"开机自动启动");
+                tr(L"开机自动启动"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kSecurityButton, L"安全设置…");
+    AppendMenuW(menu, MF_STRING, kSecurityButton, tr(L"安全设置…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, tunnel_text().c_str());
-    AppendMenuW(menu, MF_STRING, kTunnelSettingsButton, L"连接服务设置…");
-    AppendMenuW(menu, MF_STRING, kTunnelRegisterButton, L"重新注册连接服务");
+    AppendMenuW(menu, MF_STRING, kTunnelSettingsButton, tr(L"连接服务设置…"));
+    AppendMenuW(menu, MF_STRING, kTunnelRegisterButton, tr(L"重新注册连接服务"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kToggleButton, running ? L"停止共享" : L"开始共享");
-    AppendMenuW(menu, MF_STRING, kOpenConfigButton, L"打开设置文件");
+    AppendMenuW(menu, MF_STRING, kToggleButton, running ? tr(L"停止共享") : tr(L"开始共享"));
+    AppendMenuW(menu, MF_STRING, kOpenConfigButton, tr(L"打开设置文件"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kQuitButton, L"退出");
+    AppendMenuW(menu, MF_STRING, kQuitButton, tr(L"退出"));
 
     SetForegroundWindow(g_app->window);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, point.x, point.y, 0,
@@ -2516,15 +2729,15 @@ void reload_settings() {
     stop_server();
     load_settings();
     if (g_app->startup_created) {
-        append_log_line(L"已重新创建设置文件：" + widen(g_app->config_path));
+        append_log_line(tr(L"已重新创建设置文件：") + widen(g_app->config_path));
     } else {
-        append_log_line(L"设置已重新加载");
+        append_log_line(tr(L"设置已重新加载"));
     }
     if (!g_app->startup_warning.empty()) {
-        append_log_line(L"设置文件有警告：" + widen(g_app->startup_warning));
+        append_log_line(tr(L"设置文件有警告：") + widen(g_app->startup_warning));
     }
     if (!g_app->startup_save_error.empty()) {
-        append_log_line(L"保存设置失败：" + widen(g_app->startup_save_error));
+        append_log_line(tr(L"保存设置失败：") + widen(g_app->startup_save_error));
     }
     start_server();
     refresh_ui();
@@ -2542,7 +2755,7 @@ void handle_command(int id) {
             return;
         case kCopyIdButton:
             chast::host::copy_text(g_app->window, widen(g_app->settings.tunnel_id));
-            append_log_line(L"设备 ID 已复制到剪贴板");
+            append_log_line(tr(L"设备 ID 已复制到剪贴板"));
             break;
         case kCopyPasswordButton: {
             std::string password;
@@ -2550,21 +2763,21 @@ void handle_command(int id) {
                 password = g_app->server->status().temporary_password;
             }
             if (password.empty()) {
-                append_log_line(L"当前没有临时密码（点击批准模式）");
+                append_log_line(tr(L"当前没有临时密码（点击批准模式）"));
             } else {
                 chast::host::copy_text(g_app->window, widen(password));
-                append_log_line(L"临时密码已复制到剪贴板");
+                append_log_line(tr(L"临时密码已复制到剪贴板"));
             }
             break;
         }
         case kRefreshPasswordButton: {
             if (!g_app->server) {
-                append_log_line(L"共享未启动，无法生成临时密码");
+                append_log_line(tr(L"共享未启动，无法生成临时密码"));
                 break;
             }
             const std::string password = g_app->server->refresh_temporary_password();
-            append_log_line(password.empty() ? std::wstring(L"无法生成临时密码")
-                                             : L"已生成新的临时密码 " + widen(password));
+            append_log_line(password.empty() ? std::wstring(tr(L"无法生成临时密码"))
+                                             : tr(L"已生成新的临时密码 ") + widen(password));
             break;
         }
         case kSecurityButton: {
@@ -2573,7 +2786,7 @@ void handle_command(int id) {
                 g_app->settings = updated;
                 save_settings();
                 restart_server();
-                append_log_line(L"安全设置已保存，共享已重新启动");
+                append_log_line(tr(L"安全设置已保存，共享已重新启动"));
             }
             break;
         }
@@ -2583,12 +2796,12 @@ void handle_command(int id) {
             if (session_is_live()) {
                 g_app->server->set_permissions(current_gate_mask());
                 append_log_line(g_app->settings.allow_input
-                                    ? L"远程输入已开启（本次会话实时生效）"
-                                    : L"远程输入已关闭（本次会话实时生效）");
+                                    ? tr(L"远程输入已开启（本次会话实时生效）")
+                                    : tr(L"远程输入已关闭（本次会话实时生效）"));
             } else {
                 restart_server();
-                append_log_line(g_app->settings.allow_input ? L"远程输入已开启"
-                                                            : L"远程输入已关闭");
+                append_log_line(g_app->settings.allow_input ? tr(L"远程输入已开启")
+                                                            : tr(L"远程输入已关闭"));
             }
             break;
         case kClipboardCheck:
@@ -2597,24 +2810,26 @@ void handle_command(int id) {
             if (session_is_live()) {
                 g_app->server->set_permissions(current_gate_mask());
                 append_log_line(g_app->settings.allow_clipboard
-                                    ? L"剪贴板同步已开启（本次会话实时生效）"
-                                    : L"剪贴板同步已关闭（本次会话实时生效）");
+                                    ? tr(L"剪贴板同步已开启（本次会话实时生效）")
+                                    : tr(L"剪贴板同步已关闭（本次会话实时生效）"));
             } else {
                 restart_server();
-                append_log_line(g_app->settings.allow_clipboard ? L"剪贴板同步已开启"
-                                                                : L"剪贴板同步已关闭");
+                append_log_line(g_app->settings.allow_clipboard ? tr(L"剪贴板同步已开启")
+                                                                : tr(L"剪贴板同步已关闭"));
             }
             break;
         case kSendFileButton: {
             if (!session_is_live()) {
-                append_log_line(L"没有正在连接的查看者，无法发送文件");
+                append_log_line(tr(L"没有正在连接的查看者，无法发送文件"));
                 break;
             }
             wchar_t path[32768]{};
             OPENFILENAMEW dialog{};
             dialog.lStructSize = sizeof(dialog);
             dialog.hwndOwner = g_app->window;
-            dialog.lpstrFilter = L"所有文件\0*.*\0";
+            const std::wstring filter =
+                std::wstring(tr(L"所有文件")) + L'\0' + L"*.*" + L'\0';
+            dialog.lpstrFilter = filter.c_str();
             dialog.lpstrFile = path;
             dialog.nMaxFile = static_cast<DWORD>(std::size(path));
             dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
@@ -2623,9 +2838,9 @@ void handle_command(int id) {
             }
             std::string error;
             if (!g_app->server->start_file_download(narrow(path), &error)) {
-                append_log_line(L"无法发送文件：" + widen(error));
+                append_log_line(tr(L"无法发送文件：") + widen(error));
             } else {
-                append_log_line(L"已排队发送：" + std::wstring(path));
+                append_log_line(tr(L"已排队发送：") + std::wstring(path));
             }
             break;
         }
@@ -2638,12 +2853,12 @@ void handle_command(int id) {
             if (session_is_live()) {
                 g_app->server->set_permissions(current_gate_mask());
                 append_log_line(g_app->settings.allow_file_transfer
-                                    ? L"文件传输已开启（本次会话实时生效）"
-                                    : L"文件传输已关闭（本次会话实时生效）");
+                                    ? tr(L"文件传输已开启（本次会话实时生效）")
+                                    : tr(L"文件传输已关闭（本次会话实时生效）"));
             } else {
                 restart_server();
-                append_log_line(g_app->settings.allow_file_transfer ? L"文件传输已开启"
-                                                                    : L"文件传输已关闭");
+                append_log_line(g_app->settings.allow_file_transfer ? tr(L"文件传输已开启")
+                                                                    : tr(L"文件传输已关闭"));
             }
             break;
         case kPortForwardCheck:
@@ -2652,13 +2867,13 @@ void handle_command(int id) {
             if (session_is_live()) {
                 g_app->server->set_permissions(current_gate_mask());
                 append_log_line(g_app->settings.allow_port_forward
-                                    ? L"端口转发已开启（本次会话实时生效）"
-                                    : L"端口转发已关闭（本次会话实时生效）");
+                                    ? tr(L"端口转发已开启（本次会话实时生效）")
+                                    : tr(L"端口转发已关闭（本次会话实时生效）"));
             } else {
                 restart_server();
                 append_log_line(g_app->settings.allow_port_forward
-                                    ? L"端口转发已开启"
-                                    : L"端口转发已关闭");
+                                    ? tr(L"端口转发已开启")
+                                    : tr(L"端口转发已关闭"));
             }
             break;
         case kTerminalCheck:
@@ -2667,12 +2882,51 @@ void handle_command(int id) {
             if (session_is_live()) {
                 g_app->server->set_permissions(current_gate_mask());
                 append_log_line(g_app->settings.allow_terminal
-                                    ? L"远程终端已开启（本次会话实时生效）"
-                                    : L"远程终端已关闭（本次会话实时生效）");
+                                    ? tr(L"远程终端已开启（本次会话实时生效）")
+                                    : tr(L"远程终端已关闭（本次会话实时生效）"));
             } else {
                 restart_server();
-                append_log_line(g_app->settings.allow_terminal ? L"远程终端已开启"
-                                                               : L"远程终端已关闭");
+                append_log_line(g_app->settings.allow_terminal ? tr(L"远程终端已开启")
+                                                               : tr(L"远程终端已关闭"));
+            }
+            break;
+        case kRecordCheck:
+            g_app->settings.allow_record = !g_app->settings.allow_record;
+            save_settings();
+            if (session_is_live()) {
+                const HostStatus status = g_app->server->status();
+                g_app->server->set_permissions(current_gate_mask());
+                if (g_app->settings.allow_record &&
+                    (status.session_permissions & kPermissionRecord) == 0) {
+                    // The permission ceiling was fixed at handshake, so a
+                    // session that started without consent cannot gain it.
+                    append_log_line(
+                        tr(L"已允许查看者录制会话；当前会话未获授权，将在下次连接时生效"));
+                } else if (g_app->settings.allow_record) {
+                    append_log_line(tr(L"已允许查看者录制会话（本次会话实时生效）"));
+                } else {
+                    append_log_line(
+                        tr(L"已撤回录制权限（本次会话实时生效，查看者将停止新的录制）"));
+                }
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_record
+                                    ? tr(L"已允许查看者录制会话")
+                                    : tr(L"已撤回查看者的录制权限"));
+            }
+            break;
+        case kCameraCheck:
+            g_app->settings.allow_camera = !g_app->settings.allow_camera;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                append_log_line(g_app->settings.allow_camera
+                                    ? tr(L"摄像头已开启（本次会话实时生效）")
+                                    : tr(L"摄像头已关闭（本次会话实时生效）"));
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_camera ? tr(L"摄像头已开启")
+                                                             : tr(L"摄像头已关闭"));
             }
             break;
         case kAudioCheck:
@@ -2681,12 +2935,12 @@ void handle_command(int id) {
             if (session_is_live()) {
                 g_app->server->set_permissions(current_gate_mask());
                 append_log_line(g_app->settings.allow_audio
-                                    ? L"系统声音共享已开启（本次会话实时生效）"
-                                    : L"系统声音共享已关闭（本次会话实时生效）");
+                                    ? tr(L"系统声音共享已开启（本次会话实时生效）")
+                                    : tr(L"系统声音共享已关闭（本次会话实时生效）"));
             } else {
                 restart_server();
-                append_log_line(g_app->settings.allow_audio ? L"系统声音共享已开启"
-                                                            : L"系统声音共享已关闭");
+                append_log_line(g_app->settings.allow_audio ? tr(L"系统声音共享已开启")
+                                                            : tr(L"系统声音共享已关闭"));
             }
             break;
         case kMicrophoneCheck:
@@ -2699,17 +2953,17 @@ void handle_command(int id) {
                     // without the microphone gate; restarting would drop the
                     // viewer, so the change waits for the next connection.
                     append_log_line(
-                        L"已开启接收查看者麦克风；当前监听器未启用，将在下次连接时生效");
+                        tr(L"已开启接收查看者麦克风；当前监听器未启用，将在下次连接时生效"));
                 } else {
                     append_log_line(g_app->settings.allow_microphone
-                                        ? L"接收查看者麦克风已开启（本次会话实时生效）"
-                                        : L"接收查看者麦克风已关闭（本次会话实时生效）");
+                                        ? tr(L"接收查看者麦克风已开启（本次会话实时生效）")
+                                        : tr(L"接收查看者麦克风已关闭（本次会话实时生效）"));
                 }
             } else {
                 restart_server();
                 append_log_line(g_app->settings.allow_microphone
-                                    ? L"接收查看者麦克风已开启"
-                                    : L"接收查看者麦克风已关闭");
+                                    ? tr(L"接收查看者麦克风已开启")
+                                    : tr(L"接收查看者麦克风已关闭"));
             }
             break;
         case kPrivacyModeCheck:
@@ -2721,16 +2975,16 @@ void handle_command(int id) {
                     // The listener gate is fixed at creation, so the permission
                     // cannot be raised until the next connection.
                     append_log_line(
-                        L"已允许隐私模式；当前监听器未启用，将在下次连接时生效");
+                        tr(L"已允许隐私模式；当前监听器未启用，将在下次连接时生效"));
                 } else if (g_app->settings.allow_privacy_mode) {
-                    append_log_line(L"已允许隐私模式（本次会话实时生效）");
+                    append_log_line(tr(L"已允许隐私模式（本次会话实时生效）"));
                 } else {
-                    append_log_line(L"隐私模式已关闭（本次会话实时生效，遮罩会立即撤下）");
+                    append_log_line(tr(L"隐私模式已关闭（本次会话实时生效，遮罩会立即撤下）"));
                 }
             } else {
                 restart_server();
-                append_log_line(g_app->settings.allow_privacy_mode ? L"已允许隐私模式"
-                                                                   : L"隐私模式已关闭");
+                append_log_line(g_app->settings.allow_privacy_mode ? tr(L"已允许隐私模式")
+                                                                   : tr(L"隐私模式已关闭"));
             }
             break;
         case kCarrierCheck:
@@ -2740,20 +2994,20 @@ void handle_command(int id) {
                 // The fallback listener is bound at start-up; changing it now
                 // would drop the viewer, so the switch waits for the next run.
                 append_log_line(g_app->settings.carrier
-                                    ? L"已开启弱网回退；将在下次开始共享时生效"
-                                    : L"已关闭弱网回退；将在下次开始共享时生效");
+                                    ? tr(L"已开启弱网回退；将在下次开始共享时生效")
+                                    : tr(L"已关闭弱网回退；将在下次开始共享时生效"));
             } else {
                 restart_server();
                 if (!g_app->settings.carrier) {
-                    append_log_line(L"弱网回退已关闭");
+                    append_log_line(tr(L"弱网回退已关闭"));
                 } else if (!g_app->server) {
-                    append_log_line(L"弱网回退已开启");
+                    append_log_line(tr(L"弱网回退已开启"));
                 } else {
                     const HostStatus status = g_app->server->status();
                     append_log_line(status.carrier_listening
-                                        ? L"弱网回退已开启（端口 " +
-                                              std::to_wstring(status.carrier_port) + L"）"
-                                        : L"弱网回退已开启，但监听失败：" +
+                                        ? tr(L"弱网回退已开启（端口 ") +
+                                              std::to_wstring(status.carrier_port) + tr(L"）")
+                                        : tr(L"弱网回退已开启，但监听失败：") +
                                               widen(status.carrier_error));
                 }
             }
@@ -2762,19 +3016,19 @@ void handle_command(int id) {
             const bool enabled = !g_app->settings.autostart;
             std::string error;
             if (!chast::host::set_autostart(enabled, &error)) {
-                append_log_line(L"开机启动：" + widen(error));
-                const std::wstring message = L"无法修改开机启动项：\n" + widen(error);
-                MessageBoxW(g_app->window, message.c_str(), kWindowTitle,
+                append_log_line(tr(L"开机启动：") + widen(error));
+                const std::wstring message = tr(L"无法修改开机启动项：\n") + widen(error);
+                MessageBoxW(g_app->window, message.c_str(), window_title(),
                             MB_ICONERROR | MB_OK);
                 break;
             }
             g_app->settings.autostart = enabled;
             save_settings();
-            append_log_line(enabled ? L"已加入开机启动" : L"已从开机启动移除");
+            append_log_line(enabled ? tr(L"已加入开机启动") : tr(L"已从开机启动移除"));
             break;
         }
         case kFirewallButton: {
-            append_log_line(L"正在请求管理员权限以添加防火墙规则…");
+            append_log_line(tr(L"正在请求管理员权限以添加防火墙规则…"));
             SetCursor(LoadCursorW(nullptr, IDC_WAIT));
             uint16_t tunnel_port = 0;
             if (g_app->settings.tunnel) {
@@ -2784,11 +3038,11 @@ void handle_command(int id) {
             if (chast::host::request_firewall_rule(g_app->settings.port, tunnel_port, &error)) {
                 std::wstring ports = std::to_wstring(g_app->settings.port);
                 if (tunnel_port != 0) {
-                    ports += L" 和 " + std::to_wstring(tunnel_port);
+                    ports += tr(L" 和 ") + std::to_wstring(tunnel_port);
                 }
-                append_log_line(L"已允许 chast 在 UDP 端口 " + ports + L" 上通过防火墙");
+                append_log_line(tr(L"已允许 chast 在 UDP 端口 ") + ports + tr(L" 上通过防火墙"));
             } else {
-                append_log_line(L"防火墙：" + widen(error));
+                append_log_line(tr(L"防火墙：") + widen(error));
             }
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             break;
@@ -2799,15 +3053,15 @@ void handle_command(int id) {
                 g_app->settings = updated;
                 save_settings();
                 restart_server();
-                append_log_line(L"连接服务设置已保存");
+                append_log_line(tr(L"连接服务设置已保存"));
             }
             break;
         }
         case kTunnelRegisterButton:
             if (!g_app->settings.tunnel) {
-                append_log_line(L"连接服务已关闭，请先在“连接服务设置…”中启用");
+                append_log_line(tr(L"连接服务已关闭，请先在“连接服务设置…”中启用"));
             } else {
-                append_log_line(L"正在重新注册连接服务…");
+                append_log_line(tr(L"正在重新注册连接服务…"));
                 restart_tunnel();
             }
             break;
@@ -2888,7 +3142,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         }
         case kChatMessage: {
             auto* text = reinterpret_cast<std::string*>(lparam);
-            append_chat_line(L"[查看器] " + widen(*text));
+            append_chat_line(tr(L"[查看器] ") + widen(*text));
             delete text;
             // Show it without taking focus away from whatever the operator is
             // doing; the taskbar flash announces the message.
@@ -2905,7 +3159,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             g_app->tunnel_relay.clear();
             g_app->tunnel_viewer_path.clear();
             g_app->tunnel_viewer_remote.clear();
-            append_log_line(L"连接服务已断开：" + widen(g_app->tunnel_error));
+            append_log_line(tr(L"连接服务已断开：") + widen(g_app->tunnel_error));
             refresh_ui();
             return 0;
         }
@@ -2972,6 +3226,7 @@ std::wstring absolute_path(const std::wstring& path) {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetProcessDPIAware();
+    load_ui_language();
     static HostApp app;
     g_app = &app;
     app.instance = instance;
@@ -3008,26 +3263,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             return ok ? 0 : 1;
         } else if (arg == L"--help" || arg == L"-h") {
             MessageBoxW(nullptr,
-                        L"chast 主机\n\n"
+                        tr(L"chast 主机\n\n"
                         L"--config <路径>     使用其他设置文件\n"
                         L"--tray              启动后隐藏窗口\n"
                         L"--autostart on|off  设置开机启动\n"
-                        L"--firewall <端口> [隧道端口]  添加防火墙规则（含局域网发现 21129/UDP，需要管理员）",
-                        kWindowTitle, MB_OK | MB_ICONINFORMATION);
+                        L"--firewall <端口> [隧道端口]  添加防火墙规则（含局域网发现 21129/UDP，需要管理员）"),
+                        window_title(), MB_OK | MB_ICONINFORMATION);
             LocalFree(argv);
             return 0;
         }
     }
     LocalFree(argv);
     if (config_path.empty()) {
-        MessageBoxW(nullptr, L"无法确定设置文件的位置。", kWindowTitle, MB_ICONERROR | MB_OK);
+        MessageBoxW(nullptr, tr(L"无法确定设置文件的位置。"), window_title(), MB_ICONERROR | MB_OK);
         return 1;
     }
     if (config_path == host_settings_path() && chast::host::service_running()) {
         MessageBoxW(nullptr,
-                    L"chast 主机服务正在运行，托盘主机已让位。\n"
-                    L"请使用 chast-service.exe --token 查看访问令牌。",
-                    kWindowTitle, MB_ICONINFORMATION | MB_OK);
+                    tr(L"chast 主机服务正在运行，托盘主机已让位。\n"
+                    L"请使用 chast-service.exe --token 查看访问令牌。"),
+                    window_title(), MB_ICONINFORMATION | MB_OK);
         return 0;
     }
     app.config_path = config_path;
@@ -3040,7 +3295,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 ShowWindow(existing, SW_SHOWNORMAL);
                 SetForegroundWindow(existing);
             } else {
-                MessageBoxW(nullptr, L"chast 主机已经在运行。请查看通知区域。", kWindowTitle,
+                MessageBoxW(nullptr, tr(L"chast 主机已经在运行。请查看通知区域。"), window_title(),
                             MB_ICONINFORMATION | MB_OK);
             }
             if (instance_mutex != nullptr) {
@@ -3073,32 +3328,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rect{0, 0, px(620), px(724)};
+    RECT rect{0, 0, px(main_window_width()), px(main_window_height())};
     AdjustWindowRectEx(&rect, style, FALSE, 0);
     const int width = rect.right - rect.left;
     const int height = rect.bottom - rect.top;
     const int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
     const int y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
-    const HWND window = CreateWindowExW(0, kWindowClass, kWindowTitle, style, x, y, width,
+    const HWND window = CreateWindowExW(0, kWindowClass, window_title(), style, x, y, width,
                                         height, nullptr, nullptr, instance, nullptr);
     if (window == nullptr) {
-        MessageBoxW(nullptr, L"无法创建主机窗口。", kWindowTitle, MB_ICONERROR | MB_OK);
+        MessageBoxW(nullptr, tr(L"无法创建主机窗口。"), window_title(), MB_ICONERROR | MB_OK);
         return 1;
     }
     g_app->window = window;
     add_tray_icon();
 
     if (!g_app->startup_save_error.empty()) {
-        append_log_line(L"保存默认设置失败：" + widen(g_app->startup_save_error));
+        append_log_line(tr(L"保存默认设置失败：") + widen(g_app->startup_save_error));
     }
-    append_log_line(L"设置文件：" + widen(g_app->config_path));
+    append_log_line(tr(L"设置文件：") + widen(g_app->config_path));
     if (!g_app->startup_warning.empty()) {
-        append_log_line(L"设置文件有警告：" + widen(g_app->startup_warning));
+        append_log_line(tr(L"设置文件有警告：") + widen(g_app->startup_warning));
     }
     if (g_app->settings.autostart) {
         std::string error;
         if (!chast::host::set_autostart(true, &error)) {
-            append_log_line(L"开机启动：" + widen(error));
+            append_log_line(tr(L"开机启动：") + widen(error));
         }
     }
 
@@ -3106,7 +3361,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (g_app->server) {
         const HostStatus status = g_app->server->status();
         if (!status.fingerprint.empty()) {
-            append_log_line(L"身份 SHA256 " + widen(format_fingerprint(status.fingerprint)));
+            append_log_line(tr(L"身份 SHA256 ") + widen(format_fingerprint(status.fingerprint)));
         }
     }
 

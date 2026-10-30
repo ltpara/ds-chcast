@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'server_settings.dart';
+import 'package:chast_viewer/l10n.dart';
 
 /// One JSON line printed by `chast-tunnel viewer`. Stdout carries only these
 /// events so the client never has to parse human log text; diagnostics are on
@@ -97,6 +98,49 @@ class TunnelAgent {
   bool _running = true;
   bool _stopping = false;
 
+  /// Hands a verified viewer release to the bundled helper. The helper waits
+  /// for this process to exit, swaps the executable and starts the new one;
+  /// the caller must exit right after this returns.
+  static Future<void> applyUpdate({
+    required String version,
+    required String url,
+    required String sha256,
+    required int size,
+    required String signature,
+    required String serverPublicKey,
+    String? executable,
+  }) async {
+    if (!Platform.isWindows) {
+      throw UnsupportedError('automatic update is only supported on Windows');
+    }
+    final String helper = executable ?? defaultExecutable();
+    await Process.start(
+      helper,
+      <String>[
+        'apply-update',
+        '--version',
+        version,
+        '--url',
+        url,
+        '--sha256',
+        sha256,
+        '--size',
+        '$size',
+        '--signature',
+        signature,
+        '--server-pubkey',
+        serverPublicKey,
+        '--target',
+        Platform.resolvedExecutable,
+        '--wait-pid',
+        '$pid',
+        '--log',
+        '${Directory.systemTemp.path}\\chast-viewer-update.log',
+      ],
+      mode: ProcessStartMode.detached,
+    );
+  }
+
   static String defaultExecutable() {
     final String? override = Platform.environment['CHAST_TUNNEL'];
     if (override != null && override.trim().isNotEmpty) {
@@ -148,7 +192,7 @@ class TunnelAgent {
     Duration timeout = const Duration(seconds: 15),
   }) async {
     if (!server.configured) {
-      throw const TunnelException('未配置连接服务');
+      throw TunnelException(tr('未配置连接服务'));
     }
     final String exe = executable ?? defaultExecutable();
     final List<String> args = argumentOverride ??
@@ -164,8 +208,7 @@ class TunnelAgent {
       process = await Process.start(exe, args, runInShell: false);
     } on ProcessException catch (error) {
       throw TunnelException(
-        '无法启动隧道代理（$exe）：${error.message}\n'
-        '请确认 chast-tunnel.exe 与会话程序位于同一目录。',
+        tr('无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。', <String, Object?>{'exe': exe, 'p2': error.message}),
       );
     }
     final TunnelAgent agent = TunnelAgent._(process, exe);
@@ -184,8 +227,7 @@ class TunnelAgent {
     } on TimeoutException {
       await agent.stop();
       throw TunnelException(
-        '隧道代理在 ${timeout.inSeconds} 秒内没有就绪'
-        '${agent._logSuffix()}',
+        tr('隧道代理在 {p3} 秒内没有就绪{p4}', <String, Object?>{'p3': timeout.inSeconds, 'p4': agent._logSuffix()}),
       );
     } catch (_) {
       await agent.stop();
@@ -247,11 +289,11 @@ class TunnelAgent {
   String get pathLabel {
     switch (_path) {
       case 'direct':
-        return '直连';
+        return tr('直连');
       case 'relay':
-        return '中继';
+        return tr('中继');
       default:
-        return '连接中';
+        return tr('连接中');
     }
   }
 
@@ -281,7 +323,7 @@ class TunnelAgent {
     if (event.event == 'ready') {
       final int? port = parseListenPort(event.listen);
       if (port == null || port <= 0 || port > 65535) {
-        _fail(TunnelException('隧道代理返回了无效监听地址：${event.listen}'));
+        _fail(TunnelException(tr('隧道代理返回了无效监听地址：{p5}', <String, Object?>{'p5': event.listen})));
         return;
       }
       _port = port;
@@ -315,7 +357,7 @@ class TunnelAgent {
     _running = false;
     if (!_stopping && !(_ready?.isCompleted ?? true)) {
       _fail(TunnelException(
-        '隧道代理启动失败（退出码 $code）${_logSuffix()}',
+        tr('隧道代理启动失败（退出码 {code}）{p7}', <String, Object?>{'code': code, 'p7': _logSuffix()}),
       ));
     }
   }

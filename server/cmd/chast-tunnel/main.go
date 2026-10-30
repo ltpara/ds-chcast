@@ -31,7 +31,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: chast-tunnel host|viewer|discover [flags]")
+		return fmt.Errorf("usage: chast-tunnel host|viewer|discover|apply-update [flags]")
 	}
 	switch args[0] {
 	case "host":
@@ -40,8 +40,10 @@ func run(args []string) error {
 		return runViewer(args[1:])
 	case "discover":
 		return runDiscover(args[1:])
+	case "apply-update":
+		return runApplyUpdate(args[1:])
 	default:
-		return fmt.Errorf("unknown mode %q; use host, viewer or discover", args[0])
+		return fmt.Errorf("unknown mode %q; use host, viewer, discover or apply-update", args[0])
 	}
 }
 
@@ -61,6 +63,8 @@ func runHost(args []string) error {
 	listen := fs.String("listen", "0.0.0.0:14434", "public-facing UDP address of this agent")
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
+	autoUpdate := fs.Bool("auto-update", false, "stage and launch the installer advertised by the server; needs --server-pubkey")
+	autoUpdateDir := fs.String("auto-update-dir", "", "directory for the downloaded installer (default: system temp)")
 	lanDiscovery := fs.Bool("lan-discovery", true, "answer LAN discovery pings; exposes id, hostname, username, platform and version on the local link")
 	lanPort := fs.Int("lan-port", lan.DefaultPort, "UDP port for LAN discovery")
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
@@ -111,6 +115,8 @@ func runHost(args []string) error {
 		ListenAddr:      *listen,
 		Keepalive:       *keepalive,
 		UPnP:            *upnpEnabled,
+		AutoUpdate:      *autoUpdate,
+		UpdateDir:       *autoUpdateDir,
 		TLS:             tlsConfig,
 		Logger:          log,
 		OnInfo: func(info agent.HostInfo) {

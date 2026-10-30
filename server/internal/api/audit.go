@@ -21,11 +21,10 @@ type auditResponse struct {
 	NextBeforeID int64            `json:"next_before_id,omitempty"`
 }
 
-// auditLog exposes the persisted account-security trail to operators holding
-// the server key. Viewer account tokens are deliberately not accepted here.
+// auditLog exposes the persisted account-security trail to console readers.
+// Any console role may read it; ordinary viewer accounts may not.
 func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
 		return
 	}
 	if s.cfg.Accounts == nil {

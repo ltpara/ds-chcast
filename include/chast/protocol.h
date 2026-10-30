@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 27.
+// The chast wire protocol, version 32.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 27;
+inline constexpr uint16_t kProtocolVersion = 34;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -238,6 +238,64 @@ enum class ControlType : uint16_t {
     // terminal id (u32), columns (u16), rows (u16). The host applies it with
     // ResizePseudoConsole; too late or unknown ids are ignored.
     TerminalResize = 39,
+    // Viewer -> host: ask which cameras the host can share. No payload. The
+    // host checks kPermissionCamera and its settings and answers CameraList.
+    // Protocol v29.
+    ListCameras = 40,
+    // Host -> viewer: the answer to ListCameras. Payload: code (u8), reason
+    // length (u16), UTF-8 reason, count (u16), then per camera id (u16),
+    // flags (u8, bit 0 = default device) and UTF-8 name (u16 length). Ids are
+    // valid until the next list; they name an entry of the current
+    // enumeration, not a persistent device handle. See CameraCode.
+    CameraList = 41,
+    // Viewer -> host: open one camera. Payload: camera id (u16). The host
+    // checks the permission and its settings and answers CameraResult. On Ok
+    // a server-initiated CCAM stream naming that id follows.
+    StartCamera = 42,
+    // Host -> viewer: the outcome of StartCamera. Payload: camera id (u16),
+    // code (u8), reason length (u16), UTF-8 reason. Ok means the CCAM stream
+    // is opening; every other code means no stream will follow.
+    CameraResult = 43,
+    // Viewer -> host: stop the running camera. Payload: camera id (u16). The
+    // host finishes the CCAM stream; there is no answer, because the stream's
+    // FIN is the verdict. An id that is not streaming is ignored.
+    StopCamera = 44,
+    // Viewer -> host: list the folder the host shares for browsing. Payload:
+    // request id (u32), directory length (u16), UTF-8 directory relative to
+    // the shared root with '/' separators (empty means the root). Requires
+    // the file-transfer permission and the host's gate; the host answers
+    // FileListResult. Protocol v30.
+    FileListRequest = 45,
+    // Host -> viewer: the answer to FileListRequest. Payload: request id
+    // (u32), code (u8, see FileCode), flags (u8, bit 0 = cut at the entry
+    // limit), reason length (u16), UTF-8 reason, count (u16), then per entry
+    // UTF-8 name (u16 length), size (u64), modification time (u64, Unix
+    // milliseconds, 0 when unknown) and flags (u8, bit 0 = directory).
+    // Entries are directories first, then by name; a non-Ok answer carries
+    // no entries.
+    FileListResult = 46,
+    // Viewer -> host: ask for one file from the shared folder. Payload:
+    // request id (u32), path length (u16), UTF-8 path relative to the shared
+    // root with '/' separators. The host resolves it inside the root,
+    // refuses reparse points and directories, and answers FileDownloadResult;
+    // on Ok a FileOffer naming the transfer id follows.
+    FileDownloadRequest = 47,
+    // Host -> viewer: the outcome of FileDownloadRequest. Payload: request id
+    // (u32), transfer id (u32), code (u8, see FileCode), reason length (u16),
+    // UTF-8 reason. Ok means the FileOffer for that transfer follows, and the
+    // viewer answers it like any host download.
+    FileDownloadResult = 48,
+    // Viewer -> host: create, rename or remove one entry below the shared
+    // root. Payload: request id (u32), operation (u8, see FileOperation),
+    // path length (u16), UTF-8 path relative to the root with '/' separators,
+    // new name length (u16), UTF-8 new name. The new name is one component
+    // and only a rename carries one. The host resolves the path inside the
+    // root, refuses reparse points and answers FileOpResult. Protocol v31.
+    FileOpRequest = 49,
+    // Host -> viewer: the outcome of FileOpRequest. Payload: request id (u32),
+    // code (u8, see FileCode), reason length (u16), UTF-8 reason. A refusal
+    // leaves the file system untouched.
+    FileOpResult = 50,
 };
 
 // ----- input -----
@@ -381,7 +439,12 @@ inline constexpr size_t kMaxFileRelativePathBytes = 1024;
 inline constexpr size_t kMaxFileRelativeComponents = 32;
 inline constexpr size_t kMaxFileReasonBytes = 256;
 inline constexpr uint8_t kFileOfferFlagResume = 0x01;
-inline constexpr uint8_t kFileOfferFlagsKnown = kFileOfferFlagResume;
+// The upload belongs to the sender's clipboard (protocol v34): the receiver
+// stages it for CF_HDROP instead of filing it into the receive directory, and
+// the clipboard permission, not file transfer, gates it.
+inline constexpr uint8_t kFileOfferFlagClipboard = 0x02;
+inline constexpr uint8_t kFileOfferFlagsKnown =
+    kFileOfferFlagResume | kFileOfferFlagClipboard;
 
 enum class FileCode : uint8_t {
     Ok = 0,
@@ -397,6 +460,7 @@ struct FileOffer {
     uint32_t transfer_id = 0;
     uint64_t size = 0;
     bool resume = false;
+    bool clipboard = false;  // a clipboard copy staged for CF_HDROP
     std::array<uint8_t, 32> sha256{};
     std::string name;
     // Directory below the receiver's root, '/'-separated and without the
@@ -435,6 +499,101 @@ void encode_file_stream_header(const FileStreamHeader& header,
                                uint8_t out[kFileStreamHeaderSize]);
 bool decode_file_stream_header(const uint8_t* data, size_t size, FileStreamHeader& header,
                                std::string* error);
+
+// ----- shared-folder browsing -----
+//
+// The viewer may list the folder the host shares (its receive directory) and
+// pull single files out of it. Paths are relative to that root and use '/'
+// separators; absolute paths, drive letters, backslashes and empty, "." or
+// ".." components are rejected on both sides, and the host additionally
+// refuses reparse points, so a request can never leave the root. Browsing and
+// downloading are gated by the same file-transfer permission and setting as
+// uploads.
+inline constexpr size_t kMaxFileListEntries = 1024;
+inline constexpr size_t kMaxFileBrowserPathBytes = kMaxFileRelativePathBytes;
+inline constexpr size_t kMaxFileBrowserReasonBytes = kMaxFileReasonBytes;
+inline constexpr uint8_t kFileListFlagTruncated = 0x01;
+inline constexpr uint8_t kFileEntryFlagDirectory = 0x01;
+
+// True when `path` is empty or a '/'-separated relative path of at most
+// kMaxFileBrowserPathBytes bytes and kMaxFileRelativeComponents components,
+// with no empty, "." or ".." component, no backslash, no drive colon, no NUL
+// and well-formed UTF-8. Each component may be at most kMaxFileNameBytes.
+bool valid_file_browser_path(const std::string& path);
+
+struct FileListEntry {
+    std::string name;  // one component, UTF-8
+    uint64_t size = 0;
+    // Unix milliseconds; 0 when the file system does not report it.
+    uint64_t modified_ms = 0;
+    bool directory = false;
+};
+
+struct FileListResult {
+    uint32_t request_id = 0;
+    FileCode code = FileCode::Ok;
+    bool truncated = false;
+    std::string reason;
+    std::vector<FileListEntry> entries;
+};
+
+struct FileDownloadResult {
+    uint32_t request_id = 0;
+    uint32_t transfer_id = 0;
+    FileCode code = FileCode::Ok;
+    std::string reason;
+};
+
+enum class FileOperation : uint8_t {
+    MakeDirectory = 0,  // path names the new folder itself
+    Rename = 1,         // path names the entry, new_name replaces its name
+    Remove = 2,         // path names a file or an empty directory
+};
+
+struct FileOpResult {
+    uint32_t request_id = 0;
+    FileCode code = FileCode::Ok;
+    std::string reason;
+};
+
+// True when `name` is one usable path component: non-empty, at most
+// kMaxFileNameBytes, well-formed UTF-8, no NUL, '/', '\\' or ':', and not
+// "." or "..".
+bool valid_file_browser_name(const std::string& name);
+
+// The makers reject a zero request id, an invalid path, a non-Ok code with
+// entries (or a non-Ok download with a transfer id), over-long names or
+// reasons and return an empty vector; the parsers reject the same cases plus
+// trailing bytes.
+std::vector<uint8_t> make_file_list_request(uint32_t request_id,
+                                            const std::string& directory);
+bool parse_file_list_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
+                             std::string& directory, std::string* error);
+std::vector<uint8_t> make_file_list_result(const FileListResult& result);
+bool parse_file_list_result(const std::vector<uint8_t>& payload, FileListResult& result,
+                            std::string* error);
+std::vector<uint8_t> make_file_download_request(uint32_t request_id,
+                                                const std::string& path);
+bool parse_file_download_request(const std::vector<uint8_t>& payload,
+                                 uint32_t& request_id, std::string& path,
+                                 std::string* error);
+std::vector<uint8_t> make_file_download_result(const FileDownloadResult& result);
+bool parse_file_download_result(const std::vector<uint8_t>& payload,
+                                FileDownloadResult& result, std::string* error);
+
+// The makers reject a zero request id, a non-empty path is required, a
+// rename needs one valid new name while the other operations must leave it
+// empty, and reasons are truncated like the other file messages. The
+// parsers reject the same cases plus trailing bytes.
+std::vector<uint8_t> make_file_op_request(uint32_t request_id, FileOperation op,
+                                          const std::string& path,
+                                          const std::string& new_name);
+bool parse_file_op_request(const std::vector<uint8_t>& payload, uint32_t& request_id,
+                           FileOperation& op, std::string& path, std::string& new_name,
+                           std::string* error);
+std::vector<uint8_t> make_file_op_result(const FileOpResult& result);
+bool parse_file_op_result(const std::vector<uint8_t>& payload, FileOpResult& result,
+                          std::string* error);
 
 // ----- pointer -----
 //
@@ -572,9 +731,11 @@ bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo
 // opened an audio stream and described the format in the audio block; bit 3
 // tells it that file offers are accepted; bit 4 that the viewer may open a
 // microphone stream; bit 5 that SetPrivacyMode is accepted; bit 7 that the
-// viewer may ask for TCP port forwarding. Bit 6 is not a permission: it says
-// the picture is a merged layout of every attached output, with origin/source
-// covering their union.
+// viewer may ask for TCP port forwarding; bit 8 that remote terminals are
+// accepted; bit 9 that the host consents to viewer-side recording; bit 10 that
+// cameras may be listed and started. Bit 6 is
+// not a permission: it says the picture is a merged layout of every attached
+// output, with origin/source covering their union.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
@@ -584,6 +745,12 @@ inline constexpr uint16_t kServerInfoPrivacyModeEnabled = 0x0020;
 inline constexpr uint16_t kServerInfoMergedLayout = 0x0040;
 inline constexpr uint16_t kServerInfoPortForwardEnabled = 0x0080;
 inline constexpr uint16_t kServerInfoTerminalEnabled = 0x0100;
+inline constexpr uint16_t kServerInfoRecordEnabled = 0x0200;
+inline constexpr uint16_t kServerInfoCameraEnabled = 0x0400;
+// This session carries files only: no video or audio stream follows, and the
+// picture and source sizes in the message are zero. The viewer never creates
+// a decoder for such a session.
+inline constexpr uint16_t kServerInfoFileTransferOnly = 0x0800;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
 // this mask rather than with every known flag.
@@ -594,9 +761,12 @@ inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
                                                        kServerInfoMicrophoneEnabled |
                                                        kServerInfoPrivacyModeEnabled |
                                                        kServerInfoPortForwardEnabled |
-                                                       kServerInfoTerminalEnabled;
+                                                       kServerInfoTerminalEnabled |
+                                                       kServerInfoRecordEnabled |
+                                                       kServerInfoCameraEnabled;
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
-                                                  kServerInfoMergedLayout;
+                                                  kServerInfoMergedLayout |
+                                                  kServerInfoFileTransferOnly;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
@@ -605,7 +775,11 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // audio is present only while an audio stream is open; microphone allows the
 // viewer to open a `CMIC` uplink; file transfer gates FileOffer; privacy mode
 // gates SetPrivacyMode; port forward gates PortForwardRequest and CPFW streams;
-// terminal gates TerminalRequest and CTTY streams.
+// terminal gates TerminalRequest and CTTY streams; record is the host's consent
+// for the viewer to keep a local recording of the received stream (the host
+// cannot enforce it, so it is an advisory permission like RustDesk's
+// "enable-record-session"); camera gates ListCameras, StartCamera and CCAM
+// streams.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -619,11 +793,14 @@ enum PermissionBit : uint16_t {
     // field by field, as every earlier permission bit already is.
     kPermissionPortForward = 0x0080,
     kPermissionTerminal = 0x0100,
+    kPermissionRecord = 0x0200,
+    kPermissionCamera = 0x0400,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
                                            kPermissionMicrophone | kPermissionPrivacyMode |
-                                           kPermissionPortForward | kPermissionTerminal;
+                                           kPermissionPortForward | kPermissionTerminal |
+                                           kPermissionRecord | kPermissionCamera;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -738,6 +915,11 @@ struct ServerInfo {
     // single captured output. `origin_x/y` and `source_width/height` describe
     // that union; `displays` lists the members.
     bool merged = false;
+    // The session was opened for file transfer only: no video or audio stream
+    // exists, `width`/`height` and `source_width`/`source_height` are zero and
+    // the viewer must not expect frames. Only `file_transfer_enabled` can be
+    // set alongside it.
+    bool files_only = false;
     // The viewer may open a microphone stream. This is the permission bit's
     // decoded form; it is not a separate wire field.
     bool microphone_enabled = false;
@@ -751,6 +933,14 @@ struct ServerInfo {
     // The viewer may ask for remote terminals. Decoded from the permission
     // mask; every request is still checked against the host's settings.
     bool terminal_enabled = false;
+    // The host consents to the viewer keeping a local recording of the
+    // received stream. Advisory: the stream is already on the viewer's side,
+    // so the host cannot enforce it; the viewer hides its record button when
+    // this is false.
+    bool record_enabled = false;
+    // The viewer may list and start cameras. Decoded from the permission
+    // mask; the device is still checked when it is requested.
+    bool camera_enabled = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;
@@ -806,11 +996,21 @@ inline constexpr size_t kMaxPasswordLength = 128;
 inline constexpr size_t kMaxDeviceKeyLength = 128;
 inline constexpr size_t kMaxDeviceNameLength = 64;
 // Because Hello rejects trailing bytes, the audit reference is part of the
-// versioned layout: v25 appends it after totp.
+// versioned layout: v25 appends it after totp, and v32 appends the session
+// mode after the audit reference.
 inline constexpr size_t kMaxTotpLength = 16;
 inline constexpr size_t kMaxAuditRefLength = 64;
 inline constexpr size_t kMaxSignatureLength = 128;
 inline constexpr size_t kHelloNonceBytes = 16;
+
+// What the viewer wants to do on this connection. Desktop is the full remote
+// desktop; FileTransfer asks for a control-only session that browses the
+// shared directories and moves files without capturing or encoding anything.
+// The host may refuse the mode; its answer in HelloAck is authoritative.
+enum class SessionMode : uint8_t {
+    Desktop = 0,
+    FileTransfer = 1,
+};
 
 // auth_flags bits.
 inline constexpr uint8_t kAuthFlagTrustDevice = 0x01;  // add this key to the trust list
@@ -842,6 +1042,9 @@ struct ClientHello {
     // the viewer's account report and the host's view of the same session.
     // Empty for CLI tools that do not report audit.
     std::string audit_ref;
+    // v32: desktop by default; FileTransfer asks the host for a control-only
+    // file session. The host answers with ServerInfo::files_only.
+    SessionMode mode = SessionMode::Desktop;
 };
 
 // The server accepts an empty reference or 8..64 lowercase hex digits. The
@@ -1087,6 +1290,73 @@ bool parse_terminal_resize(const std::vector<uint8_t>& payload, TerminalSize& si
 std::vector<uint8_t> make_terminal_stream_header(uint32_t terminal_id);
 bool decode_terminal_stream_header(const uint8_t* data, size_t size,
                                    TerminalStreamHeader& header, std::string* error);
+
+// ----- camera -----
+//
+// The viewer lists the host's cameras with ListCameras and asks for one with
+// StartCamera; the host opens a server-initiated `CCAM` stream carrying the
+// same encoded access units as the desktop picture (FrameHeader packets, its
+// own encoder and timeline). The camera runs beside the desktop stream: it
+// has its own resolution, sequence numbers and keyframe requests, and the
+// stream's FIN is the camera switch. One camera per session.
+inline constexpr char kCameraStreamMagic[4] = {'C', 'C', 'A', 'M'};
+inline constexpr uint8_t kCameraStreamVersion = 1;
+inline constexpr size_t kCameraStreamHeaderSize = 16;
+inline constexpr size_t kMaxCameraReasonBytes = 256;
+inline constexpr size_t kMaxCameraNameBytes = 128;
+// Upper bound on one CameraList answer. A host with more cameras stops here.
+inline constexpr uint16_t kMaxCameras = 8;
+
+enum class CameraCode : uint8_t {
+    Ok = 0,
+    Refused = 1,   // the host does not allow cameras for this session
+    NotFound = 2,  // the id is not in the latest list, or the device is gone
+    Busy = 3,      // another camera is already streaming
+    Failed = 4,    // the device or the encoder could not start
+};
+
+struct CameraDescription {
+    uint16_t id = 0;
+    std::string name;  // UTF-8 device name
+    bool is_default = false;
+};
+
+struct CameraList {
+    CameraCode code = CameraCode::Ok;
+    std::string reason;
+    std::vector<CameraDescription> cameras;
+};
+
+struct CameraResult {
+    uint16_t camera_id = 0;
+    CameraCode code = CameraCode::Ok;
+    std::string reason;
+};
+
+struct CameraStreamHeader {
+    uint16_t camera_id = 0;
+};
+
+// The makers reject a zero id, an unknown code, duplicate ids, an over-long
+// or invalid UTF-8 name and return an empty vector; the parsers reject the
+// same cases plus trailing bytes. A non-Ok list carries no cameras.
+std::vector<uint8_t> make_camera_list_request();
+bool parse_camera_list_request(const std::vector<uint8_t>& payload, std::string* error);
+std::vector<uint8_t> make_camera_list(const CameraList& list);
+bool parse_camera_list(const std::vector<uint8_t>& payload, CameraList& list,
+                       std::string* error);
+std::vector<uint8_t> make_camera_start(uint16_t camera_id);
+bool parse_camera_start(const std::vector<uint8_t>& payload, uint16_t& camera_id,
+                        std::string* error);
+std::vector<uint8_t> make_camera_result(const CameraResult& result);
+bool parse_camera_result(const std::vector<uint8_t>& payload, CameraResult& result,
+                         std::string* error);
+std::vector<uint8_t> make_camera_stop(uint16_t camera_id);
+bool parse_camera_stop(const std::vector<uint8_t>& payload, uint16_t& camera_id,
+                       std::string* error);
+std::vector<uint8_t> make_camera_stream_header(uint16_t camera_id);
+bool decode_camera_stream_header(const uint8_t* data, size_t size,
+                                 CameraStreamHeader& header, std::string* error);
 
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that

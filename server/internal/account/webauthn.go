@@ -12,6 +12,10 @@ import (
 const (
 	WebAuthnRegister = "register"
 	WebAuthnLogin    = "login"
+	// WebAuthnLoginPasswordless is a login challenge issued without a password
+	// check. It is a separate purpose so the two login ceremonies can be
+	// pending at the same time without replacing each other.
+	WebAuthnLoginPasswordless = "login-passwordless"
 )
 
 const maxWebAuthnName = 64
@@ -37,7 +41,11 @@ type WebAuthnCredential struct {
 }
 
 func validWebAuthnPurpose(purpose string) bool {
-	return purpose == WebAuthnRegister || purpose == WebAuthnLogin
+	return purpose == WebAuthnRegister || validLoginPurpose(purpose)
+}
+
+func validLoginPurpose(purpose string) bool {
+	return purpose == WebAuthnLogin || purpose == WebAuthnLoginPasswordless
 }
 
 // IssueWebAuthnChallenge stores the single active challenge for a user and
@@ -206,6 +214,56 @@ func (s *Store) BeginWebAuthnLogin(username, password string, challenge []byte, 
 	return user, creds, nil
 }
 
+// BeginWebAuthnPasswordlessLogin stores an assertion challenge for an account
+// with at least one registered key. There is no password to check first, so
+// unknown accounts and accounts without keys return distinct errors only for
+// the caller to answer them identically. A banned account still receives a
+// challenge: only the holder of its key can finish, and CompleteWebAuthnLogin
+// then rejects the session, so ban state is not exposed to unauthenticated
+// probes.
+func (s *Store) BeginWebAuthnPasswordlessLogin(username string, challenge []byte, ttl time.Duration) (User, []WebAuthnCredential, error) {
+	if len(challenge) == 0 {
+		return User{}, nil, errors.New("security key challenge is empty")
+	}
+	if ttl <= 0 {
+		return User{}, nil, errors.New("security key challenge lifetime must be positive")
+	}
+	username = strings.TrimSpace(username)
+	s.mu.Lock()
+	var (
+		user    User
+		created int64
+		banned  bool
+	)
+	err := s.db.QueryRow(
+		`SELECT id, username, role, created_at, banned, email, phone
+		 FROM users WHERE username = ?`,
+		username,
+	).Scan(&user.ID, &user.Username, &user.Role, &created, &banned, &user.Email, &user.Phone)
+	s.mu.Unlock()
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, nil, ErrInvalidCredentials
+	}
+	if err != nil {
+		return User{}, nil, fmt.Errorf("account store %s: passwordless security key lookup: %w", s.path, err)
+	}
+	user.CreatedAt = timeFromMillis(created)
+	user.Banned = banned
+	s.mu.Lock()
+	creds, err := s.webauthnCredentialsLocked(user.ID)
+	s.mu.Unlock()
+	if err != nil {
+		return User{}, nil, err
+	}
+	if len(creds) == 0 {
+		return User{}, nil, ErrWebAuthnNotEnabled
+	}
+	if _, err := s.IssueWebAuthnChallenge(user.ID, WebAuthnLoginPasswordless, challenge, ttl); err != nil {
+		return User{}, nil, err
+	}
+	return user, creds, nil
+}
+
 // WebAuthnCredentialForUser scopes a credential lookup to one account, so an
 // assertion cannot name a key registered by somebody else.
 func (s *Store) WebAuthnCredentialForUser(userID string, credentialID []byte) (WebAuthnCredential, error) {
@@ -332,7 +390,8 @@ func (s *Store) RemoveWebAuthnCredential(userID string, credentialID []byte, pas
 		return ErrWebAuthnCredential
 	}
 	if _, err := tx.Exec(
-		`DELETE FROM webauthn_challenges WHERE user_id = ? AND purpose = ?`, userID, WebAuthnLogin,
+		`DELETE FROM webauthn_challenges WHERE user_id = ? AND purpose IN (?, ?)`,
+		userID, WebAuthnLogin, WebAuthnLoginPasswordless,
 	); err != nil {
 		return fmt.Errorf("account store %s: drop security key challenge: %w", s.path, err)
 	}
@@ -346,7 +405,11 @@ func (s *Store) RemoveWebAuthnCredential(userID string, credentialID []byte, pas
 // signature counter and issues the same access and refresh token pair as a
 // password login, all in one transaction. The caller verifies the assertion
 // first; a second concurrent finish finds the challenge gone and fails.
-func (s *Store) CompleteWebAuthnLogin(username string, credentialID, expectedChallenge []byte, signCount uint32, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
+// purpose selects which login ceremony the challenge belongs to.
+func (s *Store) CompleteWebAuthnLogin(username, purpose string, credentialID, expectedChallenge []byte, signCount uint32, deviceID, deviceName string) (User, string, time.Time, string, time.Time, error) {
+	if !validLoginPurpose(purpose) {
+		return User{}, "", time.Time{}, "", time.Time{}, errors.New("invalid security key login purpose")
+	}
 	username = strings.TrimSpace(username)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -394,7 +457,7 @@ func (s *Store) CompleteWebAuthnLogin(username string, credentialID, expectedCha
 	res, err := tx.Exec(
 		`DELETE FROM webauthn_challenges
 		 WHERE user_id = ? AND purpose = ? AND challenge = ? AND expires_at > ?`,
-		user.ID, WebAuthnLogin, expectedChallenge, unixMillis(now),
+		user.ID, purpose, expectedChallenge, unixMillis(now),
 	)
 	if err != nil {
 		return User{}, "", time.Time{}, "", time.Time{}, fmt.Errorf("account store %s: spend security key challenge: %w", s.path, err)

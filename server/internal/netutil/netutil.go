@@ -110,12 +110,83 @@ func LoadTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) 
 // certificate files for a new pair.
 const CertificateReloadInterval = 5 * time.Second
 
-// LoadReloadingTLSConfig is LoadTLSConfig plus automatic certificate rotation:
-// the certificate and key are re-read lazily on the first handshake after
-// interval, so replacing the pair (for example from certbot) does not require
-// a restart. A broken replacement is logged and the previous certificate stays
-// in use. The client CA bundle is read once at startup; rotating it still
-// requires a restart.
+// ClientCAReloader verifies client certificates against a PEM bundle that is
+// re-read when it changes. A broken replacement is logged once and the
+// previous pool stays in use. It is safe for concurrent use.
+type ClientCAReloader struct {
+	path     string
+	interval time.Duration
+	logger   *slog.Logger
+
+	mu        sync.Mutex
+	lastCheck time.Time
+	digest    [sha256.Size]byte
+	lastError string
+	pool      atomic.Pointer[x509.CertPool]
+}
+
+// NewClientCAReloader loads the bundle once, so a bad file fails at startup,
+// then refreshes it lazily on the first check after interval.
+func NewClientCAReloader(path string, logger *slog.Logger, interval time.Duration) (*ClientCAReloader, error) {
+	if path == "" {
+		return nil, errors.New("client CA path is empty")
+	}
+	pool, digest, err := readCertPool(path)
+	if err != nil {
+		return nil, err
+	}
+	r := &ClientCAReloader{
+		path:      path,
+		interval:  interval,
+		logger:    logger,
+		lastCheck: time.Now(),
+		digest:    digest,
+	}
+	r.pool.Store(pool)
+	return r, nil
+}
+
+// Current returns the pool in use, re-reading the file when the interval has
+// elapsed. With a non-positive interval it never re-reads.
+func (r *ClientCAReloader) Current() *x509.CertPool {
+	r.refresh()
+	return r.pool.Load()
+}
+
+func (r *ClientCAReloader) refresh() {
+	if r.interval <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if time.Since(r.lastCheck) < r.interval {
+		return
+	}
+	r.lastCheck = time.Now()
+	pool, digest, err := readCertPool(r.path)
+	if err != nil {
+		if r.logger != nil && err.Error() != r.lastError {
+			r.lastError = err.Error()
+			r.logger.Warn("TLS client CA reload skipped", "ca", r.path, "error", err)
+		}
+		return
+	}
+	r.lastError = ""
+	if digest == r.digest {
+		return
+	}
+	r.pool.Store(pool)
+	r.digest = digest
+	if r.logger != nil {
+		r.logger.Info("TLS client CA reloaded", "ca", r.path)
+	}
+}
+
+// LoadReloadingTLSConfig is LoadTLSConfig plus automatic rotation: the
+// certificate and key, and the client CA bundle when mTLS is enabled, are
+// re-read lazily on the first handshake after interval, so replacing them
+// (for example from certbot) does not require a restart. A broken replacement
+// is logged and the previous material stays in use.
 func LoadReloadingTLSConfig(certFile, keyFile, clientCAFile string, logger *slog.Logger, interval time.Duration) (*tls.Config, error) {
 	if interval <= 0 {
 		return LoadTLSConfig(certFile, keyFile, clientCAFile)
@@ -144,13 +215,18 @@ func LoadReloadingTLSConfig(certFile, keyFile, clientCAFile string, logger *slog
 		GetCertificate: source.getCertificate,
 	}
 	if clientCAFile != "" {
-		pool, err := loadCertPool(clientCAFile)
+		loader, err := NewClientCAReloader(clientCAFile, logger, interval)
 		if err != nil {
 			return nil, err
 		}
-		cfg.ClientCAs = pool
+		source.clientCAs = loader
+		cfg.ClientCAs = loader.Current()
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		// The per-handshake config swaps in a rotated client CA pool without
+		// mutating the shared config, which crypto/tls reads concurrently.
+		cfg.GetConfigForClient = source.getConfigForClient
 	}
+	source.base = cfg
 	if logger != nil {
 		logger.Info("TLS certificate reload enabled", "cert", certFile, "interval", interval)
 	}
@@ -167,12 +243,16 @@ type reloadingCert struct {
 	keyFile  string
 	interval time.Duration
 	logger   *slog.Logger
+	// base is the config handed to the listener. getConfigForClient clones it
+	// per handshake so a rotated client CA never mutates a live config.
+	base *tls.Config
 
 	mu        sync.Mutex
 	lastCheck time.Time
 	digest    [sha256.Size]byte
 	lastError string
 	current   atomic.Pointer[certMaterial]
+	clientCAs *ClientCAReloader
 }
 
 func (r *reloadingCert) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -184,6 +264,16 @@ func (r *reloadingCert) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, 
 	return &material.cert, nil
 }
 
+func (r *reloadingCert) getConfigForClient(*tls.ClientHelloInfo) (*tls.Config, error) {
+	r.refresh()
+	clone := r.base.Clone()
+	clone.GetConfigForClient = nil
+	if r.clientCAs != nil {
+		clone.ClientCAs = r.clientCAs.Current()
+	}
+	return clone, nil
+}
+
 func (r *reloadingCert) refresh() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -191,6 +281,10 @@ func (r *reloadingCert) refresh() {
 		return
 	}
 	r.lastCheck = time.Now()
+	r.refreshCertificate()
+}
+
+func (r *reloadingCert) refreshCertificate() {
 	material, err := readCertMaterial(r.certFile, r.keyFile)
 	if err != nil {
 		if r.logger != nil && err.Error() != r.lastError {
@@ -273,13 +367,18 @@ func LoadClientCAPool(path string) (*x509.CertPool, error) {
 }
 
 func loadCertPool(path string) (*x509.CertPool, error) {
+	pool, _, err := readCertPool(path)
+	return pool, err
+}
+
+func readCertPool(path string) (*x509.CertPool, [sha256.Size]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read client CA: %w", err)
+		return nil, [sha256.Size]byte{}, fmt.Errorf("read client CA: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(data) {
-		return nil, fmt.Errorf("client CA %q contains no certificates", path)
+		return nil, [sha256.Size]byte{}, fmt.Errorf("client CA %q contains no certificates", path)
 	}
-	return pool, nil
+	return pool, sha256.Sum256(data), nil
 }

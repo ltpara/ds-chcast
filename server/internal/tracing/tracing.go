@@ -200,6 +200,13 @@ func (r *recorder) Write(p []byte) (int, error) {
 	return r.ResponseWriter.Write(p)
 }
 
+// Flush keeps wrapped streaming handlers streaming.
+func (r *recorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Close stops accepting spans, flushes what is queued and waits for the
 // exporter until ctx expires.
 func (t *Tracer) Close(ctx context.Context) error {

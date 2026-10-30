@@ -32,8 +32,7 @@ type identityListResponse struct {
 // identity, including offline peers, with a substring search and an optional
 // online filter. RustDesk's hbbs console lists the same peer-table view.
 func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
 		return
 	}
 	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))

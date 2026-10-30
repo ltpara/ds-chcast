@@ -324,7 +324,44 @@ Future<void> main(List<String> args) async {
       groupDelta.groupChanges.isEmpty && groupDelta.revision == grouped.revision,
       'a caught-up cursor returns no further group changes',
     );
+    final String childGroupId = '$groupId-child';
+    final AddressBookGroup childGroup = await ServerApi.updateAddressBookGroup(
+      settings,
+      token,
+      childGroupId,
+      '子分组',
+      parentId: groupId,
+      position: 1,
+    );
+    check(
+      childGroup.parentId == groupId && childGroup.position == 1,
+      'a child group keeps its parent and position',
+    );
+    try {
+      await ServerApi.updateAddressBookGroup(
+        settings,
+        token,
+        groupId,
+        null,
+        parentId: childGroupId,
+      );
+      check(false, 'a group cycle is rejected');
+    } on ServerApiException catch (error) {
+      check(error.statusCode == 400, 'a group cycle is rejected');
+    }
     await ServerApi.deleteAddressBookGroup(settings, token, groupId);
+    final AddressBookSnapshot promotedSnapshot = await ServerApi.addressBook(
+      settings,
+      token,
+    );
+    check(
+      promotedSnapshot.groups.any(
+        (AddressBookGroup group) =>
+            group.id == childGroupId && group.parentId.isEmpty,
+      ),
+      'deleting a parent promotes its child groups',
+    );
+    await ServerApi.deleteAddressBookGroup(settings, token, childGroupId);
     final AddressBookSnapshot ungroupedDelta = await ServerApi.addressBook(
       settings,
       token,
@@ -1172,15 +1209,26 @@ Future<void> _shareProbe({
 
   // Group-scoped grants: only the granted group is visible and writable.
   final String labGroup = 'lab-$stamp';
+  final String labChildGroup = 'lab-child-$stamp';
   final String workGroup = 'work-$stamp';
   final String labPeerId = 'smoke-lab-$stamp';
+  final String labChildPeerId = 'smoke-lab-child-$stamp';
   final String workPeerId = 'smoke-work-$stamp';
   final String labAddedId = 'smoke-lab-add-$stamp';
+  final String labChildAddedId = 'smoke-lab-child-add-$stamp';
   await ServerApi.updateAddressBookGroup(
     settings,
     ownerLogin.token,
     labGroup,
     '实验室',
+  );
+  await ServerApi.updateAddressBookGroup(
+    settings,
+    ownerLogin.token,
+    labChildGroup,
+    '机架',
+    parentId: labGroup,
+    position: 1,
   );
   await ServerApi.updateAddressBookGroup(
     settings,
@@ -1194,6 +1242,13 @@ Future<void> _shareProbe({
     labPeerId,
     name: '实验机',
     groupId: labGroup,
+  );
+  await ServerApi.updateAddressBookPeer(
+    settings,
+    ownerLogin.token,
+    labChildPeerId,
+    name: '机架机',
+    groupId: labChildGroup,
   );
   await ServerApi.updateAddressBookPeer(
     settings,
@@ -1217,20 +1272,30 @@ Future<void> _shareProbe({
     settings,
     granteeLogin.token,
   );
+  final Set<String> scopedPeers = scopedBooks.isEmpty
+      ? <String>{}
+      : scopedBooks.single.peers
+          .map((AddressBookPeer peer) => peer.id)
+          .toSet();
+  final Set<String> scopedGroups = scopedBooks.isEmpty
+      ? <String>{}
+      : scopedBooks.single.groups
+          .map((AddressBookGroup group) => group.id)
+          .toSet();
   check(
     scopedBooks.length == 1 &&
         scopedBooks.single.scopes.length == 1 &&
         scopedBooks.single.permissionFor(labGroup) == 'read' &&
         scopedBooks.single.permissionFor(workGroup).isEmpty &&
-        scopedBooks.single.peers
-                .map((AddressBookPeer peer) => peer.id)
-                .join(',') ==
-            labPeerId &&
+        scopedPeers.length == 2 &&
+        scopedPeers.containsAll(<String>[labPeerId, labChildPeerId]) &&
+        scopedGroups.length == 2 &&
+        scopedGroups.containsAll(<String>[labGroup, labChildGroup]) &&
         scopedBooks.single.groups
-                .map((AddressBookGroup group) => group.id)
-                .join(',') ==
+                .firstWhere((AddressBookGroup group) => group.id == labChildGroup)
+                .parentId ==
             labGroup,
-    'a group grant hides peers and groups outside its scope',
+    'a group grant covers its subtree and hides peers and groups outside it',
   );
   check(
     await denied(
@@ -1307,6 +1372,19 @@ Future<void> _shareProbe({
     scopedAdded.groupId == labGroup,
     'a scoped read-write grant adds peers into its group',
   );
+  final AddressBookPeer scopedChildAdded =
+      await ServerApi.addSharedAddressBookPeer(
+    settings,
+    granteeLogin.token,
+    ownerLogin.username,
+    labChildAddedId,
+    name: '子组新增',
+    groupId: labChildGroup,
+  );
+  check(
+    scopedChildAdded.groupId == labChildGroup,
+    'a scoped read-write grant adds peers into a child group',
+  );
 
   await ServerApi.shareAddressBook(
     settings,
@@ -1346,8 +1424,23 @@ Future<void> _shareProbe({
   );
 
   await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, labPeerId);
+  await ServerApi.deleteAddressBookPeer(
+    settings,
+    ownerLogin.token,
+    labChildPeerId,
+  );
   await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, workPeerId);
   await ServerApi.deleteAddressBookPeer(settings, ownerLogin.token, labAddedId);
+  await ServerApi.deleteAddressBookPeer(
+    settings,
+    ownerLogin.token,
+    labChildAddedId,
+  );
+  await ServerApi.deleteAddressBookGroup(
+    settings,
+    ownerLogin.token,
+    labChildGroup,
+  );
   await ServerApi.deleteAddressBookGroup(
     settings,
     ownerLogin.token,

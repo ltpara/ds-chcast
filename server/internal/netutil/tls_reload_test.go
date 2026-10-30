@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -160,6 +161,86 @@ func TestReloadingTLSConfigKeepsPreviousCertificateOnBadReplacement(t *testing.T
 	tlsReloadCopy(t, rotatedCert, certFile)
 	tlsReloadCopy(t, rotatedKey, keyFile)
 	tlsReloadWaitSerial(t, addr, recovered)
+}
+
+func tlsReloadMTLSClient(t *testing.T, rootCA, certFile, keyFile string) *http.Client {
+	t.Helper()
+	cfg, err := ClientTLSConfig(rootCA, certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true, TLSClientConfig: cfg},
+	}
+}
+
+func tlsReloadMTLSOK(client *http.Client, addr string) bool {
+	resp, err := client.Get("https://" + addr + "/")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+func TestReloadingTLSConfigRotatesClientCA(t *testing.T) {
+	ca1 := newTestCA(t)
+	ca2 := newTestCA(t)
+	serverCert, serverKey := ca1.issue(t, true)
+	client1Cert, client1Key := ca1.issue(t, false)
+	client2Cert, client2Key := ca2.issue(t, false)
+	caFile := filepath.Join(t.TempDir(), "client-ca.pem")
+	tlsReloadCopy(t, ca1.file, caFile)
+
+	cfg, err := LoadReloadingTLSConfig(serverCert, serverKey, caFile, tlsReloadLogger(), 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := tlsReloadServe(t, cfg)
+	client1 := tlsReloadMTLSClient(t, ca1.file, client1Cert, client1Key)
+	client2 := tlsReloadMTLSClient(t, ca1.file, client2Cert, client2Key)
+	if !tlsReloadMTLSOK(client1, addr) {
+		t.Fatal("the trusted client certificate was rejected")
+	}
+	if tlsReloadMTLSOK(client2, addr) {
+		t.Fatal("a client signed by an untrusted CA was accepted")
+	}
+
+	tlsReloadCopy(t, ca2.file, caFile)
+	deadline := time.Now().Add(3 * time.Second)
+	for !tlsReloadMTLSOK(client2, addr) {
+		if time.Now().After(deadline) {
+			t.Fatal("the rotated client CA was not picked up")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tlsReloadMTLSOK(client1, addr) {
+		t.Fatal("the retired client CA still authenticates")
+	}
+
+	// A broken replacement must keep the active pool rather than dropping
+	// mTLS or locking every client out.
+	if err := os.WriteFile(caFile, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settle := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(settle) {
+		if !tlsReloadMTLSOK(client2, addr) {
+			t.Fatal("a broken client CA file dropped the active pool")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	tlsReloadCopy(t, ca1.file, caFile)
+	deadline = time.Now().Add(3 * time.Second)
+	for !tlsReloadMTLSOK(client1, addr) {
+		if time.Now().After(deadline) {
+			t.Fatal("the client CA did not recover after a bad replacement")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestReloadingTLSConfigFlagsAndMTLS(t *testing.T) {

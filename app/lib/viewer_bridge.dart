@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'package:chast_viewer/l10n.dart';
 
 enum ViewerState { idle, connecting, handshaking, streaming, ended, failed }
 
@@ -33,6 +34,136 @@ class ViewerTerminalOutput {
 
   final Uint8List data;
   final bool ended;
+}
+
+/// One shared camera's life on the viewer (chast_viewer::CameraPhase).
+/// [listing] covers the round trip of a list request, [starting] covers
+/// StartCamera until the host's answer, and [streaming] means pictures are
+/// arriving. [stopped] is terminal: the viewer asked to stop or the host
+/// ended the stream. [failed] carries the host's CameraCode and reason, or a
+/// local error.
+enum ViewerCameraPhase {
+  idle(0),
+  listing(1),
+  listed(2),
+  starting(3),
+  streaming(4),
+  stopped(5),
+  failed(6);
+
+  const ViewerCameraPhase(this.code);
+  final int code;
+
+  static ViewerCameraPhase fromCode(int code) {
+    for (final ViewerCameraPhase phase in values) {
+      if (phase.code == code) {
+        return phase;
+      }
+    }
+    return idle;
+  }
+}
+
+/// One camera the host announced. [id] is only valid for the newest list; a
+/// later list may reuse or drop it.
+class ViewerCamera {
+  const ViewerCamera({
+    required this.id,
+    required this.name,
+    this.isDefault = false,
+  });
+
+  final int id;
+  final String name;
+  final bool isDefault;
+
+  String get label => name.isEmpty ? tr('摄像头') : name;
+
+  static ViewerCamera? fromMap(Map<Object?, Object?> map) {
+    final int id = (map['id'] as num?)?.toInt() ?? 0;
+    if (id <= 0) {
+      return null;
+    }
+    return ViewerCamera(
+      id: id,
+      name: map['name']?.toString() ?? '',
+      isDefault: map['default'] == true,
+    );
+  }
+}
+
+/// One entry of the host's shared folder. [name] is a single component;
+/// [modifiedMs] is Unix milliseconds and 0 when the file system did not
+/// report it. Directories carry [size] 0.
+class ViewerFileEntry {
+  const ViewerFileEntry({
+    required this.name,
+    required this.size,
+    required this.modifiedMs,
+    required this.directory,
+  });
+
+  final String name;
+  final int size;
+  final int modifiedMs;
+  final bool directory;
+
+  static ViewerFileEntry? fromMap(Map<Object?, Object?> map) {
+    final String name = map['name']?.toString() ?? '';
+    if (name.isEmpty) {
+      return null;
+    }
+    return ViewerFileEntry(
+      name: name,
+      size: (map['size'] as num?)?.toInt() ?? 0,
+      modifiedMs: (map['modifiedMs'] as num?)?.toInt() ?? 0,
+      directory: map['directory'] == true,
+    );
+  }
+}
+
+/// The file operations the host applies below its shared root
+/// (`chast::FileOperation`). Only [rename] carries a second name; the others
+/// act on [path] alone.
+enum ViewerFileOperation {
+  makeDirectory(0),
+  rename(1),
+  remove(2);
+
+  const ViewerFileOperation(this.wireValue);
+
+  final int wireValue;
+}
+
+/// One directory listing the host answered (`chast::FileListResult`).
+/// [code] is a `chast::FileCode` value: 0 Ok, 1 Refused, 2 Busy, 3 NotFound,
+/// 4 DigestMismatch, 5 IoError, 6 Cancelled. [directory] is the relative
+/// request path the answer belongs to (empty is the shared root).
+class ViewerFileListing {
+  const ViewerFileListing({
+    required this.directory,
+    required this.code,
+    required this.reason,
+    required this.truncated,
+    required this.entries,
+  });
+
+  final String directory;
+  final int code;
+  final String reason;
+  final bool truncated;
+  final List<ViewerFileEntry> entries;
+
+  bool get ok => code == 0;
+}
+
+/// One entry of a batch download: [path] is the '/'-separated relative path
+/// below the shared root and [directory] selects the recursive walk.
+class ViewerFileSelection {
+  const ViewerFileSelection({required this.path, required this.directory});
+
+  final String path;
+  final bool directory;
 }
 
 /// One output the server announced in HelloAck. [index] is its position in
@@ -135,7 +266,7 @@ class ViewerMicrophoneDevice {
   final String name;
   final bool isDefault;
 
-  String get label => name.isEmpty ? '麦克风' : name;
+  String get label => name.isEmpty ? tr('麦克风') : name;
 
   static ViewerMicrophoneDevice? fromMap(Map<Object?, Object?> map) {
     final String id = map['id']?.toString() ?? '';
@@ -164,7 +295,7 @@ class ViewerAudioOutput {
   final String name;
   final bool isDefault;
 
-  String get label => name.isEmpty ? '音频输出' : name;
+  String get label => name.isEmpty ? tr('音频输出') : name;
 
   static ViewerAudioOutput? fromMap(Map<Object?, Object?> map) {
     final String id = map['id']?.toString() ?? '';
@@ -214,6 +345,7 @@ class ViewerStatus {
     this.latencyMs = 0,
     this.elapsedMs = 0,
     this.videoFinished = false,
+    this.filesOnly = false,
     this.fullscreen = false,
     this.inputEnabled = false,
     this.permissions = 0,
@@ -241,11 +373,37 @@ class ViewerStatus {
     this.fileFailures = 0,
     this.downloadPhase = ViewerFilePhase.idle,
     this.downloadName = '',
+    this.downloadPath = '',
     this.downloadSize = 0,
     this.downloadReceived = 0,
     this.downloadError = '',
     this.filesReceived = 0,
     this.fileReceiveFailures = 0,
+    this.fileListAnswers = 0,
+    this.fileListDirectory = '',
+    this.fileListEntries = 0,
+    this.fileListTruncated = false,
+    this.fileListError = '',
+    this.fileDownloadAnswers = 0,
+    this.fileDownloadCode = 0,
+    this.fileDownloadTransferId = 0,
+    this.fileDownloadPath = '',
+    this.fileDownloadError = '',
+    this.fileOpAnswers = 0,
+    this.fileOpCode = 0,
+    this.fileOpPath = '',
+    this.fileOpError = '',
+    this.folderDownloadActive = false,
+    this.folderDownloadName = '',
+    this.folderDownloadDestination = '',
+    this.folderDownloadFilesTotal = 0,
+    this.folderDownloadFilesDone = 0,
+    this.folderDownloadCurrent = '',
+    this.folderDownloadRoots = 0,
+    this.folderDownloadBatch = false,
+    this.folderDownloadAnswers = 0,
+    this.folderDownloadCode = 0,
+    this.folderDownloadError = '',
     this.cursorUpdates = 0,
     this.cursorPending = false,
     this.audioAnnounced = false,
@@ -333,6 +491,19 @@ class ViewerStatus {
     this.terminalRows = 0,
     this.terminalBytes = 0,
     this.terminalUpdates = 0,
+    this.cameraSupported = false,
+    this.cameraPhase = ViewerCameraPhase.idle,
+    this.cameraCode = 0,
+    this.cameraReason = '',
+    this.cameraError = '',
+    this.cameraId = 0,
+    this.cameras = const <ViewerCamera>[],
+    this.cameraListUpdates = 0,
+    this.cameraWidth = 0,
+    this.cameraHeight = 0,
+    this.cameraFrames = 0,
+    this.cameraDecoder = '',
+    this.cameraUpdates = 0,
     this.displays = const <ViewerDisplay>[],
     this.mergedLayout = false,
   });
@@ -404,6 +575,12 @@ class ViewerStatus {
   final double latencyMs;
   final int elapsedMs;
   final bool videoFinished;
+
+  /// True when the host answered a file-transfer-only request: this session
+  /// has no picture, sound, input or pointer stream, and the page shows the
+  /// file browser instead of the remote screen. The state still reaches
+  /// [ViewerState.streaming] once the host accepted the Hello.
+  final bool filesOnly;
   final bool fullscreen;
   final bool inputEnabled;
 
@@ -462,11 +639,65 @@ class ViewerStatus {
   /// [fileReceiveFailures] cover the session.
   final int downloadPhase;
   final String downloadName;
+
+  /// Where the finished download was renamed to on this viewer; empty until
+  /// [downloadPhase] is done.
+  final String downloadPath;
   final int downloadSize;
   final int downloadReceived;
   final String downloadError;
   final int filesReceived;
   final int fileReceiveFailures;
+
+  /// Shared-folder browsing. [fileListAnswers] changes with every listing the
+  /// host sent (the entries themselves come from [ViewerBridge.takeFileList]);
+  /// [fileListDirectory] echoes the request, [fileListTruncated] says the host
+  /// stopped at its entry cap, and [fileListError] explains a refusal.
+  final int fileListAnswers;
+  final String fileListDirectory;
+  final int fileListEntries;
+  final bool fileListTruncated;
+  final String fileListError;
+
+  /// The newest viewer-initiated download request. A zero [fileDownloadCode]
+  /// (Ok) means the host queued it and its progress shows up in the download
+  /// fields above; [fileDownloadError] carries the host's refusal otherwise.
+  final int fileDownloadAnswers;
+  final int fileDownloadCode;
+  final int fileDownloadTransferId;
+  final String fileDownloadPath;
+  final String fileDownloadError;
+
+  /// The newest file-operation answer (new folder, rename or remove).
+  /// [fileOpAnswers] changes with every answer, [fileOpCode] is a
+  /// `chast::FileCode` value (0 Ok), [fileOpPath] echoes the entry and
+  /// [fileOpError] explains a refusal.
+  final int fileOpAnswers;
+  final int fileOpCode;
+  final String fileOpPath;
+  final String fileOpError;
+
+  /// A folder download walks the browsed tree and mirrors it below
+  /// [folderDownloadDestination]. [folderDownloadFilesTotal] grows while
+  /// folders are listed; [folderDownloadCurrent] names the file in flight.
+  /// [folderDownloadAnswers] moves once when the walk ends and
+  /// [folderDownloadCode] then says how: 0 done, 1 failed, 2 cancelled, with
+  /// [folderDownloadError] explaining the other two.
+  final bool folderDownloadActive;
+  final String folderDownloadName;
+  final String folderDownloadDestination;
+  final int folderDownloadFilesTotal;
+  final int folderDownloadFilesDone;
+  final String folderDownloadCurrent;
+  /// The selected entries the running walk was asked for: 1 is the folder
+  /// row's recursive download, higher counts are a batch.
+  final int folderDownloadRoots;
+  /// Whether the walk came from the multi-select bar. A batch can hold one
+  /// file, which [folderDownloadRoots] alone cannot tell from a folder row.
+  final bool folderDownloadBatch;
+  final int folderDownloadAnswers;
+  final int folderDownloadCode;
+  final String folderDownloadError;
 
   /// Pointer updates the host sent. The sprite itself never reaches Dart: the
   /// native side installs it as the Windows cursor, which is where it has to
@@ -665,7 +896,34 @@ class ViewerStatus {
   final int terminalBytes;
   final int terminalUpdates;
 
+  /// Camera sharing (protocol v29). [cameraSupported] mirrors the host's
+  /// permission; the viewer watches at most one camera. [cameraPhase] is its
+  /// life, [cameraCode]/[cameraReason] carry the host's CameraCode and wording
+  /// for a refusal or an ending, and [cameraError] explains a local failure.
+  /// [cameraId] names the camera the phase describes; [cameras] is the newest
+  /// list and [cameraListUpdates] counts answers so the panel can pair one
+  /// list with a poll. The picture arrives on its own Flutter texture; its
+  /// encoded size is [cameraWidth] x [cameraHeight] and [cameraFrames] counts
+  /// decoded pictures.
+  final bool cameraSupported;
+  final ViewerCameraPhase cameraPhase;
+  final int cameraCode;
+  final String cameraReason;
+  final String cameraError;
+  final int cameraId;
+  final List<ViewerCamera> cameras;
+  final int cameraListUpdates;
+  final int cameraWidth;
+  final int cameraHeight;
+  final int cameraFrames;
+  final String cameraDecoder;
+  final int cameraUpdates;
+
   bool get hasFrame => published > 0 && width > 0 && height > 0;
+  bool get hasCameraFrame =>
+      cameraFrames > 0 && cameraWidth > 0 && cameraHeight > 0;
+  // The camera panel needs a live session and the host's camera bit.
+  bool get acceptsCamera => isLive && cameraSupported;
   bool get isLive => state == ViewerState.streaming;
   bool get isOver =>
       state == ViewerState.ended || state == ViewerState.failed || error.isNotEmpty;
@@ -706,6 +964,10 @@ class ViewerStatus {
       isLive && (permissions & ViewerPermission.portForward) != 0;
   // The terminal panel needs a live session and the host's terminal bit.
   bool get acceptsTerminal => isLive && terminalSupported;
+  // Recording needs a live session and the host's consent bit. A recording
+  // already in progress keeps running if the permission is revoked.
+  bool get acceptsRecording =>
+      isLive && (permissions & ViewerPermission.record) != 0;
   // True while the host captures a secure desktop (lock screen, UAC) or no
   // desktop at all; the picture is frozen and input is not delivered.
   bool get secureDesktop =>
@@ -714,20 +976,20 @@ class ViewerStatus {
   // Where the uplink captures from, for the tooltip and the overlay.
   String get microphoneLabel => microphoneName.isNotEmpty
       ? microphoneName
-      : (microphoneDevice.isEmpty ? '系统默认麦克风' : '麦克风');
+      : (microphoneDevice.isEmpty ? tr('系统默认麦克风') : tr('麦克风'));
   // Where system audio goes, for the volume menu's menu entry.
   String get audioOutputLabel => audioDeviceName.isNotEmpty
       ? audioDeviceName
-      : (audioDevice.isEmpty ? '系统默认输出' : '输出设备');
+      : (audioDevice.isEmpty ? tr('系统默认输出') : tr('输出设备'));
   String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
 
   /// "UDP", "TCP 回退" or "WebSocket 回退" for the stats overlay.
   String get transportLabel {
     switch (transport) {
       case 'tcp':
-        return 'TCP 回退';
+        return tr('TCP 回退');
       case 'ws':
-        return 'WebSocket 回退';
+        return tr('WebSocket 回退');
       default:
         return 'UDP';
     }
@@ -742,7 +1004,7 @@ class ViewerStatus {
     return '${khz == khz.roundToDouble() ? khz.toStringAsFixed(0) : khz.toStringAsFixed(1)} kHz';
   }
 
-  String get audioChannelLabel => audioChannels >= 2 ? '立体声' : '单声道';
+  String get audioChannelLabel => audioChannels >= 2 ? tr('立体声') : tr('单声道');
 
   /// The announced display whose rect is the stream's origin and source size,
   /// or null while no list has arrived or when the picture is a merged union.
@@ -781,6 +1043,18 @@ class ViewerStatus {
           final ViewerDisplay? display = ViewerDisplay.fromMap(entry, i);
           if (display != null) {
             displays.add(display);
+          }
+        }
+      }
+    }
+    final List<ViewerCamera> cameras = <ViewerCamera>[];
+    final Object? rawCameras = map['cameras'];
+    if (rawCameras is List) {
+      for (final Object? entry in rawCameras) {
+        if (entry is Map) {
+          final ViewerCamera? camera = ViewerCamera.fromMap(entry);
+          if (camera != null) {
+            cameras.add(camera);
           }
         }
       }
@@ -833,6 +1107,7 @@ class ViewerStatus {
       latencyMs: asDouble(map['latencyMs']),
       elapsedMs: asInt(map['elapsedMs']),
       videoFinished: map['videoFinished'] == true,
+      filesOnly: map['filesOnly'] == true,
       fullscreen: map['fullscreen'] == true,
       inputEnabled: map['inputEnabled'] == true,
       permissions: asInt(map['permissions']),
@@ -860,11 +1135,37 @@ class ViewerStatus {
       fileFailures: asInt(map['fileFailures']),
       downloadPhase: asInt(map['downloadPhase']),
       downloadName: asString(map['downloadName']),
+      downloadPath: asString(map['downloadPath']),
       downloadSize: asInt(map['downloadSize']),
       downloadReceived: asInt(map['downloadReceived']),
       downloadError: asString(map['downloadError']),
       filesReceived: asInt(map['filesReceived']),
       fileReceiveFailures: asInt(map['fileReceiveFailures']),
+      fileListAnswers: asInt(map['fileListAnswers']),
+      fileListDirectory: asString(map['fileListDirectory']),
+      fileListEntries: asInt(map['fileListEntries']),
+      fileListTruncated: map['fileListTruncated'] == true,
+      fileListError: asString(map['fileListError']),
+      fileDownloadAnswers: asInt(map['fileDownloadAnswers']),
+      fileDownloadCode: asInt(map['fileDownloadCode']),
+      fileDownloadTransferId: asInt(map['fileDownloadTransferId']),
+      fileDownloadPath: asString(map['fileDownloadPath']),
+      fileDownloadError: asString(map['fileDownloadError']),
+      fileOpAnswers: asInt(map['fileOpAnswers']),
+      fileOpCode: asInt(map['fileOpCode']),
+      fileOpPath: asString(map['fileOpPath']),
+      fileOpError: asString(map['fileOpError']),
+      folderDownloadActive: map['folderDownloadActive'] == true,
+      folderDownloadName: asString(map['folderDownloadName']),
+      folderDownloadDestination: asString(map['folderDownloadDestination']),
+      folderDownloadFilesTotal: asInt(map['folderDownloadFilesTotal']),
+      folderDownloadFilesDone: asInt(map['folderDownloadFilesDone']),
+      folderDownloadCurrent: asString(map['folderDownloadCurrent']),
+      folderDownloadRoots: asInt(map['folderDownloadRoots']),
+      folderDownloadBatch: map['folderDownloadBatch'] == true,
+      folderDownloadAnswers: asInt(map['folderDownloadAnswers']),
+      folderDownloadCode: asInt(map['folderDownloadCode']),
+      folderDownloadError: asString(map['folderDownloadError']),
       cursorUpdates: asInt(map['cursorUpdates']),
       cursorPending: map['cursorPending'] == true,
       audioAnnounced: map['audioAnnounced'] == true,
@@ -953,6 +1254,19 @@ class ViewerStatus {
       terminalRows: asInt(map['terminalRows']),
       terminalBytes: asInt(map['terminalBytes']),
       terminalUpdates: asInt(map['terminalUpdates']),
+      cameraSupported: map['cameraSupported'] == true,
+      cameraPhase: ViewerCameraPhase.fromCode(asInt(map['cameraPhase'])),
+      cameraCode: asInt(map['cameraCode']),
+      cameraReason: asString(map['cameraReason']),
+      cameraError: asString(map['cameraError']),
+      cameraId: asInt(map['cameraId']),
+      cameras: List<ViewerCamera>.unmodifiable(cameras),
+      cameraListUpdates: asInt(map['cameraListUpdates']),
+      cameraWidth: asInt(map['cameraWidth']),
+      cameraHeight: asInt(map['cameraHeight']),
+      cameraFrames: asInt(map['cameraFrames']),
+      cameraDecoder: asString(map['cameraDecoder']),
+      cameraUpdates: asInt(map['cameraUpdates']),
       displays: List<ViewerDisplay>.unmodifiable(displays),
       mergedLayout: map['mergedLayout'] == true,
     );
@@ -1002,6 +1316,10 @@ class ViewerBridge {
   /// relay or shared carrier the tunnel agent reported. Empty host means
   /// [host] and port 0 means [port] + 1. [carrierHostId]/[carrierToken] select
   /// this host on a shared carrier; leave them empty for a per-host port.
+  ///
+  /// [fileTransferOnly] asks the host for a session without a screen stream
+  /// (protocol v32); [gpuOutput] is then unused and may be 0. A host that does
+  /// not allow file transfer refuses the Hello.
   static Future<void> start({
     required String host,
     required int port,
@@ -1018,6 +1336,7 @@ class ViewerBridge {
     int carrierPort = 0,
     String carrierHostId = '',
     String carrierToken = '',
+    bool fileTransferOnly = false,
   }) async {
     await _channel.invokeMethod<void>(
       'start',
@@ -1037,6 +1356,7 @@ class ViewerBridge {
         'carrierPort': carrierPort,
         'carrierHostId': carrierHostId,
         'carrierToken': carrierToken,
+        'fileTransferOnly': fileTransferOnly,
       },
     );
   }
@@ -1054,6 +1374,34 @@ class ViewerBridge {
       'key': trustKey,
       'password': password,
     });
+  }
+
+  /// Encrypts [plaintext] with DPAPI under the current Windows user and
+  /// returns the base64 blob. Throws [PlatformException] when DPAPI fails.
+  static Future<String> protectSecret(String plaintext) async {
+    final String? blob =
+        await _channel.invokeMethod<String>('protectSecret', plaintext);
+    if (blob == null || blob.isEmpty) {
+      throw PlatformException(
+        code: 'dpapi',
+        message: 'the secret was not protected',
+      );
+    }
+    return blob;
+  }
+
+  /// Decrypts a [protectSecret] blob. Throws [PlatformException] when the
+  /// blob does not belong to this Windows account or was corrupted.
+  static Future<String> unprotectSecret(String blob) async {
+    final String? plaintext =
+        await _channel.invokeMethod<String>('unprotectSecret', blob);
+    if (plaintext == null) {
+      throw PlatformException(
+        code: 'dpapi',
+        message: 'the secret could not be read',
+      );
+    }
+    return plaintext;
   }
 
   static Future<void> stop() => _channel.invokeMethod<void>('stop');
@@ -1282,6 +1630,46 @@ class ViewerBridge {
     return ViewerTerminalOutput(data: bytes, ended: ended);
   }
 
+  /// Points the camera decoder at a Flutter texture output, the same opaque
+  /// pointer [FlutterGpuTextureRenderer.output] returns for the texture the
+  /// camera panel registered. 0 detaches, so decoded pictures are dropped
+  /// until a new output is attached.
+  static Future<bool> setCameraOutput(int output) async {
+    final bool? attached =
+        await _channel.invokeMethod<bool>('setCameraOutput', output);
+    return attached ?? false;
+  }
+
+  /// Asks the host to enumerate its cameras. False means the request was not
+  /// queued: no streaming session, the host did not grant
+  /// [ViewerPermission.camera], or a camera is starting or running. The answer
+  /// arrives through [ViewerStatus.cameraPhase], [ViewerStatus.cameraCode],
+  /// [ViewerStatus.cameraReason] and [ViewerStatus.cameras].
+  static Future<bool> requestCameraList() async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('requestCameraList');
+    return queued ?? false;
+  }
+
+  /// Asks the host to open [cameraId] from the newest [ViewerStatus.cameras].
+  /// False means the request was not queued: no streaming session, no camera
+  /// permission, the id is not in the list, or another camera is still
+  /// starting or running. Pictures arrive on the texture registered through
+  /// [setCameraOutput].
+  static Future<bool> startCamera(int cameraId) async {
+    final bool? started = await _channel.invokeMethod<bool>(
+      'startCamera',
+      <String, Object>{'cameraId': cameraId},
+    );
+    return started ?? false;
+  }
+
+  /// Stops the running camera, or cancels one that is still starting. Safe
+  /// when nothing is running.
+  static Future<void> stopCamera() {
+    return _channel.invokeMethod<void>('stopCamera');
+  }
+
   /// Binds a viewer-side port-forward listener on 127.0.0.1:[localPort]
   /// (0 picks a free port) and asks the host to relay it to
   /// [remoteHost]:[remotePort]. False means the request was not queued: no
@@ -1355,6 +1743,138 @@ class ViewerBridge {
   /// their files on the native side. Returns how many roots were queued.
   static Future<int?> sendFileAt(List<String> paths) {
     return _channel.invokeMethod<int>('sendFileAt', paths);
+  }
+
+  /// Opens the system file picker and queues the chosen files for upload into
+  /// the shared [directory] being browsed ('' is the shared root). Returns how
+  /// many roots were queued, or null when the dialog was cancelled.
+  static Future<int?> sendFileTo(String directory) {
+    return _channel.invokeMethod<int>(
+        'sendFileTo', <String, Object?>{'directory': directory});
+  }
+
+  /// Queues already-known [paths] for upload into the shared [directory] being
+  /// browsed ('' is the shared root). Dropped files use this so they land
+  /// beside the picker's uploads instead of always in the receive root.
+  static Future<int?> sendFilesTo(List<String> paths, String directory) {
+    return _channel.invokeMethod<int>('sendFileAt', <String, Object?>{
+      'paths': paths,
+      'directory': directory,
+    });
+  }
+
+  /// Asks the host to list one directory below its shared receive root.
+  /// [directory] is '/'-separated and relative ('' is the root). False means
+  /// the request was not queued: no streaming session, the host did not grant
+  /// [ViewerPermission.fileTransfer], or too many requests are in flight. The
+  /// answer arrives through [ViewerStatus.fileListAnswers] and
+  /// [takeFileList].
+  static Future<bool> requestFileList(String directory) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('requestFileList', directory);
+    return queued ?? false;
+  }
+
+  /// Asks the host to send one regular file from its shared root. [path] is
+  /// '/'-separated and relative. False means the request was not queued (see
+  /// [requestFileList]). On acceptance the host answers through
+  /// [ViewerStatus.fileDownloadCode] and then sends the file like any other
+  /// download: [ViewerStatus.downloadPhase] and [ViewerStatus.downloadName]
+  /// follow it into the viewer's Downloads\chast folder.
+  static Future<bool> requestFileDownload(String path) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('requestFileDownload', path);
+    return queued ?? false;
+  }
+
+  /// Asks the host to create a folder, rename one entry or remove one below
+  /// its shared root. [path] is '/'-separated and relative; [newName] is one
+  /// component and is only used by [ViewerFileOperation.rename]. False means
+  /// the request was not queued (see [requestFileList]). The answer arrives
+  /// through [ViewerStatus.fileOpAnswers] and [ViewerStatus.fileOpCode];
+  /// reload the listing afterwards.
+  static Future<bool> fileOperation(
+    ViewerFileOperation operation,
+    String path, {
+    String newName = '',
+  }) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('fileOperation', <String, Object?>{
+      'operation': operation.wireValue,
+      'path': path,
+      'newName': newName,
+    });
+    return queued ?? false;
+  }
+
+  /// Asks the viewer to download [path] and everything below it into the local
+  /// receive directory, mirroring the remote tree under the folder's name.
+  /// [path] is '/'-separated, relative and non-empty. False means the walk was
+  /// not started (see [requestFileList], or one is already running). Progress
+  /// and the outcome arrive through the `folderDownload*` status fields.
+  static Future<bool> downloadFolder(String path) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('downloadFolder', path);
+    return queued ?? false;
+  }
+
+  /// Asks the viewer to download several selected entries in one walk: every
+  /// folder mirrors below its own name and every file lands at the top of the
+  /// receive directory. [entries] must be non-empty; each [ViewerFileSelection]
+  /// path is relative and '/'-separated. False means the walk was not started
+  /// (see [requestFileList], or one is already running). Progress and the
+  /// outcome arrive through the `folderDownload*` status fields, with
+  /// [ViewerStatus.folderDownloadRoots] naming the selection size.
+  static Future<bool> downloadEntries(List<ViewerFileSelection> entries) async {
+    if (entries.isEmpty) {
+      return false;
+    }
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'downloadEntries',
+      entries
+          .map((ViewerFileSelection entry) => <String, Object?>{
+                'path': entry.path,
+                'directory': entry.directory,
+              })
+          .toList(),
+    );
+    return queued ?? false;
+  }
+
+  /// Stops the running folder download; the file in flight is aborted and the
+  /// outcome is published as cancelled.
+  static Future<void> cancelFolderDownload() async {
+    await _channel.invokeMethod<void>('cancelFolderDownload');
+  }
+
+  /// Pops the newest directory listing the host sent. Returns null when none
+  /// is waiting; a listing for an older request is superseded by a newer one.
+  static Future<ViewerFileListing?> takeFileList() async {
+    final Map<Object?, Object?>? map =
+        await _channel.invokeMethod<Map<Object?, Object?>>('takeFileList');
+    if (map == null) {
+      return null;
+    }
+    final List<ViewerFileEntry> entries = <ViewerFileEntry>[];
+    final Object? raw = map['entries'];
+    if (raw is List) {
+      for (final Object? item in raw) {
+        if (item is Map) {
+          final ViewerFileEntry? entry =
+              ViewerFileEntry.fromMap(Map<Object?, Object?>.from(item));
+          if (entry != null) {
+            entries.add(entry);
+          }
+        }
+      }
+    }
+    return ViewerFileListing(
+      directory: map['directory']?.toString() ?? '',
+      code: (map['code'] as num?)?.toInt() ?? 0,
+      reason: map['reason']?.toString() ?? '',
+      truncated: map['truncated'] == true,
+      entries: entries,
+    );
   }
 
   /// Installs the handler for files dropped on the viewer window. Only one
@@ -1599,6 +2119,9 @@ abstract final class ViewerPermission {
   static const int privacyMode = 0x0020;
   static const int portForward = 0x0080;
   static const int terminal = 0x0100;
+  // The host's consent to a local recording of the received stream; advisory,
+  // because the host cannot see or stop the recording itself.
+  static const int record = 0x0200;
 }
 
 /// Why Ctrl+Alt+Del did not reach the host's secure desktop
@@ -1617,26 +2140,46 @@ enum ViewerSasCode {
 /// chast/protocol.h). Auto keeps the host's tier ladder, which prefers HEVC
 /// when the GPU supports it.
 enum ViewerStreamCodec {
-  auto(0, '自动'),
-  h264(1, 'H.264'),
-  hevc(2, 'HEVC');
+  auto(0),
+  h264(1),
+  hevc(2);
 
-  const ViewerStreamCodec(this.code, this.label);
+  const ViewerStreamCodec(this.code);
   final int code;
-  final String label;
+
+  String get label {
+    switch (this) {
+      case ViewerStreamCodec.auto:
+        return tr('自动');
+      case ViewerStreamCodec.h264:
+        return 'H.264';
+      case ViewerStreamCodec.hevc:
+        return 'HEVC';
+    }
+  }
 }
 
 /// Quality preset (chast::StreamQuality). It scales the host's video bitrate
 /// budget; adaptive bitrate can still go below the preset when the link
 /// degrades.
 enum ViewerStreamQuality {
-  high(0, '高清'),
-  balanced(1, '均衡'),
-  smooth(2, '流畅');
+  high(0),
+  balanced(1),
+  smooth(2);
 
-  const ViewerStreamQuality(this.code, this.label);
+  const ViewerStreamQuality(this.code);
   final int code;
-  final String label;
+
+  String get label {
+    switch (this) {
+      case ViewerStreamQuality.high:
+        return tr('高清');
+      case ViewerStreamQuality.balanced:
+        return tr('均衡');
+      case ViewerStreamQuality.smooth:
+        return tr('流畅');
+    }
+  }
 }
 
 /// Why the host refused new stream preferences (chast::StreamOptionsCode).
@@ -1694,10 +2237,10 @@ abstract final class ViewerClipboardFormat {
   /// "文本 + 图片" style summary; empty when [mask] is 0.
   static String describe(int mask) {
     final List<String> names = <String>[
-      if ((mask & text) != 0) '文本',
+      if ((mask & text) != 0) tr('文本'),
       if ((mask & html) != 0) 'HTML',
       if ((mask & rtf) != 0) 'RTF',
-      if ((mask & dib) != 0) '图片',
+      if ((mask & dib) != 0) tr('图片'),
     ];
     return names.join(' + ');
   }
@@ -1725,25 +2268,25 @@ abstract final class ViewerDenial {
 String accessDenialText(int denial) {
   switch (denial) {
     case ViewerDenial.invalidToken:
-      return '访问令牌不正确。请向主机确认当前令牌后重试。';
+      return tr('访问令牌不正确。请向主机确认当前令牌后重试。');
     case ViewerDenial.tokenUsed:
-      return '该一次性令牌已被使用，请让主机重新生成一个。';
+      return tr('该一次性令牌已被使用，请让主机重新生成一个。');
     case ViewerDenial.declined:
-      return '主机拒绝了本次连接请求，请让主机确认后重试。';
+      return tr('主机拒绝了本次连接请求，请让主机确认后重试。');
     case ViewerDenial.wrongPassword:
-      return '密码不正确，请重试。';
+      return tr('密码不正确，请重试。');
     case ViewerDenial.passwordRequired:
-      return '主机要求输入连接密码。';
+      return tr('主机要求输入连接密码。');
     case ViewerDenial.twoFactorRequired:
-      return '主机要求两步验证码。';
+      return tr('主机要求两步验证码。');
     case ViewerDenial.wrongTwoFactor:
-      return '两步验证码不正确或已过期，请重新输入。';
+      return tr('两步验证码不正确或已过期，请重新输入。');
     case ViewerDenial.lockedOut:
-      return '尝试次数过多，主机已暂时拒绝此地址。请稍后再试。';
+      return tr('尝试次数过多，主机已暂时拒绝此地址。请稍后再试。');
     case ViewerDenial.notWhitelisted:
-      return '本机地址不在主机的允许列表中。';
+      return tr('本机地址不在主机的允许列表中。');
     case ViewerDenial.authTimeout:
-      return '主机未在限定时间内完成验证，请重试。';
+      return tr('主机未在限定时间内完成验证，请重试。');
     default:
       return '';
   }

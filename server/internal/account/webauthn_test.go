@@ -66,7 +66,7 @@ func TestWebAuthnRegistrationAndLogin(t *testing.T) {
 		t.Fatalf("begin login user=%v creds=%v", user.ID, creds)
 	}
 	user, token, accessExpires, refresh, sessionExpires, err := store.CompleteWebAuthnLogin(
-		"alice", []byte{1, 2, 3, 4}, loginChallenge, 7, "dev-1", "Desk")
+		"alice", WebAuthnLogin, []byte{1, 2, 3, 4}, loginChallenge, 7, "dev-1", "Desk")
 	if err != nil {
 		t.Fatalf("complete login: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestWebAuthnRegistrationAndLogin(t *testing.T) {
 	}
 	// Replaying the spent challenge must fail even with the same credential.
 	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
-		"alice", []byte{1, 2, 3, 4}, loginChallenge, 8, "dev-1", "Desk"); !errors.Is(err, ErrWebAuthnChallenge) {
+		"alice", WebAuthnLogin, []byte{1, 2, 3, 4}, loginChallenge, 8, "dev-1", "Desk"); !errors.Is(err, ErrWebAuthnChallenge) {
 		t.Fatalf("replayed login challenge = %v", err)
 	}
 
@@ -148,7 +148,7 @@ func TestWebAuthnLoginRequirements(t *testing.T) {
 		t.Fatalf("banned login begin = %v", err)
 	}
 	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
-		"bob", []byte{5, 6}, []byte("pre-ban"), 1, "", ""); !errors.Is(err, ErrAccountBanned) {
+		"bob", WebAuthnLogin, []byte{5, 6}, []byte("pre-ban"), 1, "", ""); !errors.Is(err, ErrAccountBanned) {
 		t.Fatalf("banned login complete = %v", err)
 	}
 	if creds, err := store.WebAuthnCredentials(bob.ID); err != nil || len(creds) != 1 {
@@ -205,6 +205,100 @@ func TestWebAuthnResetTwoFactorClearsKeys(t *testing.T) {
 	}
 }
 
+func TestWebAuthnPasswordlessLogin(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	registerTestKey(t, store, alice.ID, []byte{1, 2, 3, 4}, "key")
+	if _, err := store.CreateUser("bob", "correct horse"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	// Keep an admin while alice is banned below.
+	if _, err := store.SetRole("bob", RoleAdmin); err != nil {
+		t.Fatalf("promote bob: %v", err)
+	}
+
+	if _, _, err := store.BeginWebAuthnPasswordlessLogin("nobody", []byte("c"), time.Minute); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("unknown user = %v", err)
+	}
+	if _, _, err := store.BeginWebAuthnPasswordlessLogin("bob", []byte("c"), time.Minute); !errors.Is(err, ErrWebAuthnNotEnabled) {
+		t.Fatalf("account without keys = %v", err)
+	}
+
+	challenge := []byte("passwordless-challenge")
+	user, creds, err := store.BeginWebAuthnPasswordlessLogin("alice", challenge, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("begin passwordless login: %v", err)
+	}
+	if user.ID != alice.ID || user.Banned || len(creds) != 1 || !bytes.Equal(creds[0].ID, []byte{1, 2, 3, 4}) {
+		t.Fatalf("begin passwordless user=%+v creds=%v", user, creds)
+	}
+	// The password-gated ceremony keeps its own pending challenge.
+	if _, err := store.WebAuthnChallenge(alice.ID, WebAuthnLogin); !errors.Is(err, ErrWebAuthnChallenge) {
+		t.Fatalf("password ceremony unexpectedly has a challenge: %v", err)
+	}
+	// A passwordless challenge cannot be spent by the password-gated purpose.
+	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
+		"alice", WebAuthnLogin, []byte{1, 2, 3, 4}, challenge, 7, "", ""); !errors.Is(err, ErrWebAuthnChallenge) {
+		t.Fatalf("cross-purpose completion = %v", err)
+	}
+
+	user, token, accessExpires, refresh, sessionExpires, err := store.CompleteWebAuthnLogin(
+		"alice", WebAuthnLoginPasswordless, []byte{1, 2, 3, 4}, challenge, 7, "dev-1", "Desk")
+	if err != nil {
+		t.Fatalf("complete passwordless login: %v", err)
+	}
+	if user.ID != alice.ID || token == "" || refresh == "" || !accessExpires.Before(sessionExpires) {
+		t.Fatalf("complete passwordless user=%v token=%q refresh=%q", user.ID, token, refresh)
+	}
+	if _, err := store.Authenticate(token); err != nil {
+		t.Fatalf("authenticate passwordless token: %v", err)
+	}
+	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
+		"alice", WebAuthnLoginPasswordless, []byte{1, 2, 3, 4}, challenge, 8, "", ""); !errors.Is(err, ErrWebAuthnChallenge) {
+		t.Fatalf("replayed passwordless challenge = %v", err)
+	}
+
+	// A banned account still receives a challenge, so only someone holding its
+	// key can learn the account state; completion is refused.
+	if _, err := store.SetBanned("alice", true); err != nil {
+		t.Fatalf("ban alice: %v", err)
+	}
+	bannedChallenge := []byte("banned-challenge")
+	if _, _, err := store.BeginWebAuthnPasswordlessLogin("alice", bannedChallenge, time.Minute); err != nil {
+		t.Fatalf("banned begin: %v", err)
+	}
+	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
+		"alice", WebAuthnLoginPasswordless, []byte{1, 2, 3, 4}, bannedChallenge, 9, "", ""); !errors.Is(err, ErrAccountBanned) {
+		t.Fatalf("banned completion = %v", err)
+	}
+	if _, err := store.SetBanned("alice", false); err != nil {
+		t.Fatalf("unban alice: %v", err)
+	}
+
+	// Removing the last key drops both login ceremonies.
+	if _, err := store.IssueWebAuthnChallenge(alice.ID, WebAuthnLogin, []byte("pw"), time.Minute); err != nil {
+		t.Fatalf("issue password challenge: %v", err)
+	}
+	if _, err := store.IssueWebAuthnChallenge(alice.ID, WebAuthnLoginPasswordless, []byte("pl"), time.Minute); err != nil {
+		t.Fatalf("issue passwordless challenge: %v", err)
+	}
+	if err := store.RemoveWebAuthnCredential(alice.ID, []byte{1, 2, 3, 4}, "correct horse"); err != nil {
+		t.Fatalf("remove key: %v", err)
+	}
+	for _, purpose := range []string{WebAuthnLogin, WebAuthnLoginPasswordless} {
+		if _, err := store.WebAuthnChallenge(alice.ID, purpose); !errors.Is(err, ErrWebAuthnChallenge) {
+			t.Fatalf("challenge %q after remove = %v", purpose, err)
+		}
+	}
+	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
+		"alice", WebAuthnRegister, nil, nil, 0, "", ""); err == nil {
+		t.Fatal("registration purpose accepted for completion")
+	}
+}
+
 func TestWebAuthnCredentialScoping(t *testing.T) {
 	store := openTemp(t, "state.db")
 	alice, err := store.CreateUser("alice", "correct horse")
@@ -220,7 +314,7 @@ func TestWebAuthnCredentialScoping(t *testing.T) {
 		t.Fatalf("cross-account credential lookup = %v", err)
 	}
 	if _, _, _, _, _, err := store.CompleteWebAuthnLogin(
-		"bob", []byte{7, 8, 9}, []byte("c"), 1, "", ""); !errors.Is(err, ErrWebAuthnChallenge) {
+		"bob", WebAuthnLogin, []byte{7, 8, 9}, []byte("c"), 1, "", ""); !errors.Is(err, ErrWebAuthnChallenge) {
 		t.Fatalf("bob finishing alice's assertion = %v", err)
 	}
 }

@@ -1,10 +1,10 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal] [--allow-camera]
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio] [--play] [--audit-ref HEX]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
-//                      [--file-upload] [--file-download] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
-//                      [--terminal] [--terminal-denied] [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
+//                      [--file-upload] [--file-download] [--file-browse] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
+//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
 //                      [--record out.mp4]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
@@ -83,6 +83,13 @@
 // the real ConPTY relay ran, not a simulation. --terminal-denied keeps the
 // host gate closed: every TerminalRequest must be refused and the session must
 // keep streaming video.
+//
+// --camera lists the in-process host's cameras (serve --allow-camera does the
+// same for real sessions) and, when the host has one, opens it and requires a
+// few CRC-correct access units on CCAM before stopping it and waiting for the
+// host's FIN. A host without a camera still proves the list round-trip.
+// --camera-denied keeps the host gate closed: the list request must be refused
+// without disturbing the session.
 //
 // With --audio the serve end captures the system sound through WASAPI and
 // connect decodes the second uni-stream, printing packet/sample/energy
@@ -241,7 +248,10 @@ struct FakeClipboard {
     std::mutex mutex;
     std::condition_variable cv;
     std::string baseline_text = "chast clipboard: host baseline";
-    std::string updated_text = "chast clipboard: host update \xE2\x9C\x93";
+    // Past the legacy 256 KiB ClipboardUpdate limit on purpose: the rich item
+    // must prove the CCLB stream carries larger text than the control message.
+    std::string updated_text = std::string(300u * 1024u, 'u') +
+                               "chast clipboard: host update \xE2\x9C\x93";
     chast::ClipboardContent baseline = rich_clipboard_probe(baseline_text);
     chast::ClipboardContent updated = rich_clipboard_probe(updated_text);
     chast::ClipboardContent current = baseline;
@@ -282,6 +292,14 @@ std::vector<uint8_t> file_probe_content(size_t size) {
 inline constexpr size_t kFileProbeBytes = 300u * 1024u;
 inline constexpr size_t kFileResumePrefix = 100u * 1024u;
 inline constexpr size_t kFileDigestBytes = 64u * 1024u;
+// The browse probe seeds this text in a subfolder of the host's shared
+// directory; its size and name let the listing check tell folder and file
+// entries apart.
+inline constexpr char kBrowseNestedText[] = "chast browse nested file\n";
+// The browse probe uploads this text into the subfolder it just listed, the
+// way the file browser's "upload here" button does.
+inline constexpr char kBrowseUploadName[] = "chast-verify-browse-upload.txt";
+inline constexpr char kBrowseUploadText[] = "uploaded into the browsed folder\n";
 
 // The port-forward probe's payload crosses several CPFW chunks in each
 // direction, and its last chunk is short.
@@ -297,6 +315,10 @@ inline constexpr uint32_t kTerminalProbeId = 0x0F11E003u;
 inline constexpr uint16_t kTerminalProbeColumns = 100;
 inline constexpr uint16_t kTerminalProbeRows = 30;
 inline constexpr char kTerminalProbeMarker[] = "CHAST_TTY_OK";
+
+// The camera probe stops after this many encoded access units: enough to show
+// the stream runs, few enough to keep the test short on any camera.
+inline constexpr uint64_t kCameraProbeFrames = 3;
 
 bool same_clipboard_content(const chast::ClipboardContent& left,
                             const chast::ClipboardContent& right) {
@@ -891,6 +913,10 @@ struct Options {
     // The file the host offers when --file-download is given; verify writes
     // it to a temporary folder before the session starts.
     std::string download_source;
+    // verify only: list the host's receive directory through the browse
+    // channel, walk into a subfolder, check that escapes are refused, then
+    // download a seeded file and compare it byte for byte.
+    bool file_browse = false;
     // verify only: ask the host to relay a loopback TCP echo endpoint, push a
     // deterministic payload through it and require the same bytes back.
     bool port_forward = false;
@@ -910,6 +936,14 @@ struct Options {
     bool terminal_denied = false;
     // serve only: let viewers open terminals on this host.
     bool allow_terminal = false;
+    // verify only: list the host's cameras and, when the host has one, open it
+    // and require hardware-encoded frames over CCAM before stopping it.
+    bool camera = false;
+    // verify only: the host keeps cameras off and every request must be
+    // refused without disturbing the session.
+    bool camera_denied = false;
+    // serve only: let viewers list and open cameras on this host.
+    bool allow_camera = false;
     // verify fills these with the echo endpoint it starts on 127.0.0.1.
     std::string forward_host;
     uint16_t forward_port = 0;
@@ -1101,6 +1135,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.file_upload = true;
             } else if (arg == "--file-download") {
                 options.file_download = true;
+            } else if (arg == "--file-browse") {
+                options.file_browse = true;
             } else if (arg == "--port-forward") {
                 options.port_forward = true;
             } else if (arg == "--port-forward-denied") {
@@ -1115,6 +1151,12 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.terminal_denied = true;
             } else if (arg == "--allow-terminal") {
                 options.allow_terminal = true;
+            } else if (arg == "--camera") {
+                options.camera = true;
+            } else if (arg == "--camera-denied") {
+                options.camera_denied = true;
+            } else if (arg == "--allow-camera") {
+                options.allow_camera = true;
             } else if (arg == "--fingerprint" && i + 1 < argc) {
                 options.fingerprint = argv[++i];
             } else if (arg == "--insecure") {
@@ -1251,6 +1293,19 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "--file-download only applies to verify\n");
         return false;
     }
+    if (options.file_browse && options.mode != "verify") {
+        std::fprintf(stderr, "--file-browse only applies to verify\n");
+        return false;
+    }
+    if (options.file_browse && (options.file_upload || options.file_download)) {
+        // The browse probe owns the receive directory and the transfer queue;
+        // combining it with the other file probes would make the listings and
+        // the offer they expect ambiguous.
+        std::fprintf(stderr,
+                     "--file-browse runs its own listing and download; do not combine "
+                     "it with --file-upload or --file-download\n");
+        return false;
+    }
     if (options.port_forward && options.mode != "verify") {
         std::fprintf(stderr, "--port-forward only applies to verify\n");
         return false;
@@ -1289,6 +1344,22 @@ bool parse_args(int argc, char** argv, Options& options) {
     }
     if (options.allow_terminal && options.mode != "serve") {
         std::fprintf(stderr, "--allow-terminal only applies to serve\n");
+        return false;
+    }
+    if (options.camera && options.mode != "verify") {
+        std::fprintf(stderr, "--camera only applies to verify\n");
+        return false;
+    }
+    if (options.camera_denied && options.mode != "verify") {
+        std::fprintf(stderr, "--camera-denied only applies to verify\n");
+        return false;
+    }
+    if (options.camera && options.camera_denied) {
+        std::fprintf(stderr, "--camera and --camera-denied are exclusive\n");
+        return false;
+    }
+    if (options.allow_camera && options.mode != "serve") {
+        std::fprintf(stderr, "--allow-camera only applies to serve\n");
         return false;
     }
     if (options.microphone && options.mode != "verify") {
@@ -1608,6 +1679,21 @@ struct ReceiverStats {
     bool download_finished = false;
     bool download_ok = false;
     std::string download_error;
+    // Browse probe (verify --file-browse): the listings the viewer read, the
+    // negative answers for paths outside the shared folder, and the download
+    // it compared with the seeded payload.
+    bool browse_probe = false;
+    uint64_t browse_root_entries = 0;
+    uint64_t browse_nested_entries = 0;
+    bool browse_list_ok = false;
+    bool browse_negative_ok = false;
+    bool browse_download_ok = false;
+    bool browse_upload_ok = false;
+    bool browse_folder_ok = false;
+    bool browse_rename_ok = false;
+    bool browse_remove_ok = false;
+    uint64_t browse_bytes = 0;
+    std::string browse_error;
     // Port forward probe (verify --port-forward): the host's answer to the
     // target, the bytes pushed and echoed back through the real TCP relay,
     // and the first failure.
@@ -1636,6 +1722,20 @@ struct ReceiverStats {
     std::string terminal_stop_reason;
     uint64_t terminal_output_bytes = 0;
     std::string terminal_error;
+    // Camera probe (verify --camera): the list answer, the camera that was
+    // opened, frames received over CCAM, and how the stop ended.
+    bool camera_probe = false;
+    bool camera_denied = false;
+    bool camera_denied_ok = false;
+    bool camera_list_ok = false;
+    bool camera_stop_ok = false;
+    uint64_t camera_count = 0;
+    uint16_t camera_id = 0;
+    uint64_t camera_frames = 0;
+    uint64_t camera_bytes = 0;
+    uint32_t camera_width = 0;
+    uint32_t camera_height = 0;
+    std::string camera_error;
     chast::PortForwardCode forward_code = chast::PortForwardCode::Ok;
     std::string forward_reason;
     uint64_t forward_bytes_sent = 0;
@@ -1824,8 +1924,10 @@ struct ReceiverStats {
     uint64_t record_samples = 0;
     uint64_t record_keyframes = 0;
     uint64_t record_skipped = 0;
-    // Files the recording produced (base plus any rollover segments).
+    // Files the recording produced (base plus any rollover segments), and the
+    // codec each was described with (a stream-options change can differ).
     std::vector<std::string> record_files;
+    std::vector<chast::VideoCodec> record_codecs;
     bool record_ok = false;
     uint64_t record_verified_samples = 0;
     uint64_t record_verified_keyframes = 0;
@@ -2052,13 +2154,16 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
             return clipboard->write(content);
         };
     }
-    config.settings.allow_file_transfer = options.file_upload || options.file_download;
+    config.settings.allow_file_transfer =
+        options.file_upload || options.file_download || options.file_browse;
     config.settings.file_receive_directory = options.file_receive_dir;
     // verify passes --port-forward, which enlists the in-process host too.
     config.settings.allow_port_forward =
         options.allow_port_forward || options.port_forward || options.port_forward_local;
     // verify passes --terminal, which enlists the in-process host too.
     config.settings.allow_terminal = options.allow_terminal || options.terminal;
+    // verify passes --camera, which enlists the in-process host too.
+    config.settings.allow_camera = options.allow_camera || options.camera;
     config.settings.audit_spool = options.audit_spool;
     config.file_received = [&stats](const std::string& path, uint64_t bytes) {
         ++stats.files_received;
@@ -2857,6 +2962,547 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         return ok;
     };
 
+    // ---- shared-folder browse probe (verify --file-browse) ----
+    // The viewer drives the browse channel against the in-process host: it
+    // lists the seeded receive directory, walks into its subfolder, checks
+    // that paths outside the shared folder are refused, then asks for one
+    // seeded file and compares the bytes with the payload written before the
+    // session started.
+    stats.browse_probe = options.file_browse;
+    enum class BrowseStep {
+        ListRoot,
+        ListNested,
+        Escapes,
+        Missing,
+        Request,
+        Receive,
+        Upload,
+        UploadAnswer,
+        UploadResult,
+        ReList,
+        MakeFolder,
+        MakeFolderAnswer,
+        FolderList,
+        Rename,
+        RenameAnswer,
+        RenameList,
+        Remove,
+        RemoveAnswer,
+        RemoveList,
+        Done,
+    };
+    BrowseStep browse_step = BrowseStep::ListRoot;
+    uint32_t browse_request_id = 0;
+    uint32_t browse_wait_id = 0;
+    uint32_t browse_transfer_id = 0;
+    bool browse_offer_taken = false;
+    uint64_t browse_size = 0;
+    std::array<uint8_t, 32> browse_digest{};
+    std::vector<uint8_t> browse_content;
+    // The viewer-to-host upload into the subfolder it just browsed.
+    constexpr uint32_t kBrowseUploadId = 0x0B05E001u;
+    constexpr size_t kBrowseUploadBytes = sizeof(kBrowseUploadText) - 1;
+    bool browse_upload_answer = false;
+    auto take_browse_list = [&](uint32_t expected, chast::FileListResult& out) {
+        chast::FileListResult result;
+        while (session->take_file_list_result(result)) {
+            if (result.request_id == expected) {
+                out = std::move(result);
+                return true;
+            }
+        }
+        return false;
+    };
+    auto take_browse_download = [&](uint32_t expected, chast::FileDownloadResult& out) {
+        chast::FileDownloadResult answer;
+        while (session->take_file_download_result(answer)) {
+            if (answer.request_id == expected) {
+                out = answer;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto take_browse_op = [&](uint32_t expected, chast::FileOpResult& out) {
+        chast::FileOpResult answer;
+        while (session->take_file_op_result(answer)) {
+            if (answer.request_id == expected) {
+                out = std::move(answer);
+                return true;
+            }
+        }
+        return false;
+    };
+    auto browse_list_has = [](const chast::FileListResult& result, const std::string& name,
+                              bool directory) {
+        for (const chast::FileListEntry& entry : result.entries) {
+            if (entry.name == name && entry.directory == directory) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto advance_file_browse = [&]() -> bool {
+        if (!stats.browse_probe || browse_step == BrowseStep::Done) {
+            return true;
+        }
+        if (browse_step == BrowseStep::ListRoot || browse_step == BrowseStep::ListNested) {
+            const bool root = browse_step == BrowseStep::ListRoot;
+            if (browse_wait_id == 0) {
+                browse_wait_id = ++browse_request_id;
+                const chast::Error asked =
+                    session->request_file_list(browse_wait_id, root ? "" : "nested");
+                if (!asked.ok()) {
+                    stats.browse_error = "request_file_list: " + asked.to_string();
+                    return false;
+                }
+                return true;
+            }
+            chast::FileListResult result;
+            if (!take_browse_list(browse_wait_id, result)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (result.code != chast::FileCode::Ok) {
+                stats.browse_error =
+                    std::string("the host refused to list ") +
+                    (root ? "." : "nested") + ": " + result.reason;
+                return false;
+            }
+            bool seeded_file = false;
+            bool seeded_dir = false;
+            for (const chast::FileListEntry& entry : result.entries) {
+                if (entry.name.empty() ||
+                    entry.name.find_first_of("/\\") != std::string::npos) {
+                    stats.browse_error = "a listed name was empty or carried a separator";
+                    return false;
+                }
+                if (root && entry.name == "chast-verify-browse.bin" && !entry.directory &&
+                    entry.size == kFileProbeBytes) {
+                    seeded_file = true;
+                }
+                if (root && entry.name == "nested" && entry.directory) {
+                    seeded_dir = true;
+                }
+                if (!root && entry.name == "inner.txt" && !entry.directory &&
+                    entry.size == sizeof(kBrowseNestedText) - 1) {
+                    seeded_file = true;
+                }
+            }
+            if (result.truncated) {
+                stats.browse_error = "the host truncated a listing of the seeded tree";
+                return false;
+            }
+            if (root) {
+                stats.browse_root_entries = result.entries.size();
+                if (!seeded_file || !seeded_dir) {
+                    stats.browse_error =
+                        "the root listing did not carry the seeded file and folder";
+                    return false;
+                }
+                browse_step = BrowseStep::ListNested;
+            } else {
+                stats.browse_nested_entries = result.entries.size();
+                if (!seeded_file) {
+                    stats.browse_error = "the subfolder listing did not carry the seeded file";
+                    return false;
+                }
+                stats.browse_list_ok = true;
+                browse_step = BrowseStep::Escapes;
+            }
+            return true;
+        }
+        if (browse_step == BrowseStep::Escapes) {
+            // The protocol makers reject `..` components and absolute paths
+            // before they reach the wire; the host resolves every accepted
+            // path inside its receive directory again. Both layers must
+            // refuse, and the session must stay usable afterwards.
+            const chast::Error list_dotdot =
+                session->request_file_list(++browse_request_id, "../escape");
+            const chast::Error list_absolute =
+                session->request_file_list(++browse_request_id, "C:/Windows");
+            const chast::Error load_dotdot =
+                session->request_file_download(++browse_request_id, "../escape.bin");
+            const chast::Error load_absolute =
+                session->request_file_download(++browse_request_id, "C:/Windows/win.ini");
+            if (list_dotdot.status() != chast::Status::InvalidCall ||
+                list_absolute.status() != chast::Status::InvalidCall ||
+                load_dotdot.status() != chast::Status::InvalidCall ||
+                load_absolute.status() != chast::Status::InvalidCall) {
+                stats.browse_error = "the viewer accepted a path outside the shared folder";
+                return false;
+            }
+            stats.browse_negative_ok = true;
+            browse_step = BrowseStep::Missing;
+            return true;
+        }
+        if (browse_step == BrowseStep::Missing || browse_step == BrowseStep::Request) {
+            const bool missing = browse_step == BrowseStep::Missing;
+            if (browse_wait_id == 0) {
+                browse_wait_id = ++browse_request_id;
+                const chast::Error asked = session->request_file_download(
+                    browse_wait_id, missing ? "missing.bin" : "chast-verify-browse.bin");
+                if (!asked.ok()) {
+                    stats.browse_error = "request_file_download: " + asked.to_string();
+                    return false;
+                }
+                return true;
+            }
+            chast::FileDownloadResult answer;
+            if (!take_browse_download(browse_wait_id, answer)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (missing) {
+                if (answer.code != chast::FileCode::NotFound || answer.transfer_id != 0) {
+                    stats.browse_error = "a missing file was not answered with NotFound";
+                    return false;
+                }
+                browse_step = BrowseStep::Request;
+                return true;
+            }
+            if (answer.code != chast::FileCode::Ok || answer.transfer_id == 0) {
+                stats.browse_error =
+                    "the host refused the seeded download: " + answer.reason;
+                return false;
+            }
+            // The answer names the transfer the following FileOffer must use;
+            // that is what ties the listing request to the streamed file.
+            browse_transfer_id = answer.transfer_id;
+            browse_step = BrowseStep::Receive;
+            return true;
+        }
+        if (browse_step == BrowseStep::Receive) {
+            if (!browse_offer_taken) {
+                chast::FileOffer offer;
+                if (!session->take_file_offer(offer)) {
+                    return true;
+                }
+                if (offer.transfer_id != browse_transfer_id) {
+                    stats.browse_error =
+                        "the host offered a different transfer than it answered";
+                    return false;
+                }
+                browse_offer_taken = true;
+                browse_size = offer.size;
+                browse_digest = offer.sha256;
+                browse_content.clear();
+                const chast::Error answered =
+                    session->send_file_answer(browse_transfer_id, chast::FileCode::Ok);
+                if (!answered.ok()) {
+                    stats.browse_error = "send_file_answer: " + answered.to_string();
+                    return false;
+                }
+            }
+            while (true) {
+                chast::FileChunk chunk;
+                const chast::Error received =
+                    session->receive_file_chunk(chunk, std::chrono::milliseconds(0));
+                if (received.status() == chast::Status::WaitTimeout ||
+                    received.status() == chast::Status::Unavailable) {
+                    break;
+                }
+                if (!received.ok()) {
+                    stats.browse_error = "receive_file_chunk: " + received.to_string();
+                    return false;
+                }
+                if (chunk.transfer_id != browse_transfer_id) {
+                    continue;
+                }
+                if (chunk.offset != browse_content.size()) {
+                    stats.browse_error = "the downloaded bytes arrived out of order";
+                    return false;
+                }
+                browse_content.insert(browse_content.end(), chunk.data.begin(),
+                                      chunk.data.end());
+                stats.browse_bytes += chunk.data.size();
+            }
+            chast::FileUploadState state;
+            if (!session->file_upload_state(browse_transfer_id, state)) {
+                return true;
+            }
+            if (!state.finished) {
+                if (!state.error.empty()) {
+                    stats.browse_error = "the download stream broke: " + state.error;
+                    return false;
+                }
+                return true;
+            }
+            std::array<uint8_t, 32> digest{};
+            if (browse_size != kFileProbeBytes ||
+                browse_content.size() != browse_size ||
+                !chast::sha256(browse_content.data(), browse_content.size(), digest) ||
+                digest != browse_digest) {
+                stats.browse_error = "the downloaded bytes did not match the seeded file";
+                return false;
+            }
+            const chast::Error reported = session->send_file_result(
+                browse_transfer_id, chast::FileCode::Ok, browse_content.size(), "");
+            if (!reported.ok()) {
+                stats.browse_error = "send_file_result: " + reported.to_string();
+                return false;
+            }
+            stats.browse_download_ok = true;
+            browse_step = BrowseStep::Upload;
+            if (!options.quiet) {
+                std::printf(
+                    "quic: browsed %llu + %llu entries and downloaded %llu bytes\n",
+                    static_cast<unsigned long long>(stats.browse_root_entries),
+                    static_cast<unsigned long long>(stats.browse_nested_entries),
+                    static_cast<unsigned long long>(browse_content.size()));
+            }
+            return true;
+        }
+        if (browse_step == BrowseStep::Upload) {
+            // Upload into the subfolder just listed, the way the browser's
+            // "upload here" button does: the same FileOffer, with the browsed
+            // folder as the relative path below the host's receive root.
+            if (!info.file_transfer_enabled) {
+                stats.browse_error = "the host did not announce file transfer";
+                return false;
+            }
+            chast::FileOffer offer;
+            offer.transfer_id = kBrowseUploadId;
+            offer.name = kBrowseUploadName;
+            offer.size = kBrowseUploadBytes;
+            offer.relative_path = "nested";
+            if (!chast::sha256(reinterpret_cast<const uint8_t*>(kBrowseUploadText),
+                               kBrowseUploadBytes, offer.sha256)) {
+                stats.browse_error = "could not hash the browse upload";
+                return false;
+            }
+            if (chast::Error offered = session->offer_file(offer); !offered.ok()) {
+                stats.browse_error = "offer_file: " + offered.to_string();
+                return false;
+            }
+            browse_step = BrowseStep::UploadAnswer;
+            return true;
+        }
+        if (browse_step == BrowseStep::UploadAnswer) {
+            chast::FileAnswer answer;
+            while (session->take_file_answer(answer)) {
+                if (answer.transfer_id != kBrowseUploadId) {
+                    continue;
+                }
+                if (answer.code != chast::FileCode::Ok) {
+                    stats.browse_error =
+                        "the host refused the upload into the browsed folder: " + answer.reason;
+                    return false;
+                }
+                browse_upload_answer = true;
+            }
+            if (!browse_upload_answer) {
+                return true;
+            }
+            const chast::Error sent = session->send_file_data(
+                kBrowseUploadId, reinterpret_cast<const uint8_t*>(kBrowseUploadText),
+                kBrowseUploadBytes);
+            if (!sent.ok()) {
+                stats.browse_error = "send_file_data: " + sent.to_string();
+                return false;
+            }
+            if (chast::Error finished = session->finish_file_upload(kBrowseUploadId);
+                !finished.ok()) {
+                stats.browse_error = "finish_file_upload: " + finished.to_string();
+                return false;
+            }
+            browse_step = BrowseStep::UploadResult;
+            return true;
+        }
+        if (browse_step == BrowseStep::UploadResult) {
+            chast::FileResult result;
+            while (session->take_file_result(result)) {
+                if (result.transfer_id != kBrowseUploadId) {
+                    continue;
+                }
+                if (result.code != chast::FileCode::Ok ||
+                    result.received != kBrowseUploadBytes) {
+                    stats.browse_error =
+                        "the host refused the upload into the browsed folder: " + result.reason;
+                    return false;
+                }
+                browse_step = BrowseStep::ReList;
+                return true;
+            }
+            return true;
+        }
+        if (browse_step == BrowseStep::ReList) {
+            // The uploaded file must show up in a fresh listing of the folder,
+            // which is what the panel refresh does after the queue drains.
+            if (browse_wait_id == 0) {
+                browse_wait_id = ++browse_request_id;
+                const chast::Error asked =
+                    session->request_file_list(browse_wait_id, "nested");
+                if (!asked.ok()) {
+                    stats.browse_error = "request_file_list: " + asked.to_string();
+                    return false;
+                }
+                return true;
+            }
+            chast::FileListResult result;
+            if (!take_browse_list(browse_wait_id, result)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (result.code != chast::FileCode::Ok) {
+                stats.browse_error =
+                    "the host refused to list nested after the upload: " + result.reason;
+                return false;
+            }
+            bool found = false;
+            for (const chast::FileListEntry& entry : result.entries) {
+                if (!entry.directory && entry.name == kBrowseUploadName &&
+                    entry.size == kBrowseUploadBytes) {
+                    found = true;
+                }
+            }
+            if (!found) {
+                stats.browse_error =
+                    "the upload did not appear in the browsed folder";
+                return false;
+            }
+            stats.browse_upload_ok = true;
+            browse_step = BrowseStep::MakeFolder;
+            if (!options.quiet) {
+                std::printf("quic: uploaded %llu bytes into the browsed folder\n",
+                            static_cast<unsigned long long>(kBrowseUploadBytes));
+            }
+            return true;
+        }
+        // File management below the browsed subfolder: create one folder,
+        // rename it, then remove it, checking a fresh listing after each
+        // answer. The names are unique to this run and cleaned up even on a
+        // failure because the last step removes whatever survived.
+        if (browse_step == BrowseStep::MakeFolder) {
+            browse_wait_id = ++browse_request_id;
+            const chast::Error asked =
+                session->request_file_op(browse_wait_id, chast::FileOperation::MakeDirectory,
+                                         "nested/probe-folder", "");
+            if (!asked.ok()) {
+                stats.browse_error = "request_file_op: " + asked.to_string();
+                return false;
+            }
+            browse_step = BrowseStep::MakeFolderAnswer;
+            return true;
+        }
+        if (browse_step == BrowseStep::MakeFolderAnswer) {
+            chast::FileOpResult answer;
+            if (!take_browse_op(browse_wait_id, answer)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (answer.code != chast::FileCode::Ok) {
+                stats.browse_error = "the host refused to create a folder: " + answer.reason;
+                return false;
+            }
+            stats.browse_folder_ok = true;
+            browse_step = BrowseStep::FolderList;
+            return true;
+        }
+        if (browse_step == BrowseStep::FolderList ||
+            browse_step == BrowseStep::RenameList ||
+            browse_step == BrowseStep::RemoveList) {
+            if (browse_wait_id == 0) {
+                browse_wait_id = ++browse_request_id;
+                const chast::Error asked =
+                    session->request_file_list(browse_wait_id, "nested");
+                if (!asked.ok()) {
+                    stats.browse_error = "request_file_list: " + asked.to_string();
+                    return false;
+                }
+                return true;
+            }
+            chast::FileListResult result;
+            if (!take_browse_list(browse_wait_id, result)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (result.code != chast::FileCode::Ok) {
+                stats.browse_error = "the host refused to list nested: " + result.reason;
+                return false;
+            }
+            if (browse_step == BrowseStep::FolderList) {
+                if (!browse_list_has(result, "probe-folder", true)) {
+                    stats.browse_error = "the new folder did not appear in the listing";
+                    return false;
+                }
+                browse_step = BrowseStep::Rename;
+                return true;
+            }
+            if (browse_step == BrowseStep::RenameList) {
+                if (!browse_list_has(result, "probe-renamed", true) ||
+                    browse_list_has(result, "probe-folder", true)) {
+                    stats.browse_error = "the rename did not reach the listing";
+                    return false;
+                }
+                browse_step = BrowseStep::Remove;
+                return true;
+            }
+            if (browse_list_has(result, "probe-renamed", true)) {
+                stats.browse_error = "the removed folder is still listed";
+                return false;
+            }
+            browse_step = BrowseStep::Done;
+            if (!options.quiet) {
+                std::printf("quic: created, renamed and removed a folder below the browsed one\n");
+            }
+            return true;
+        }
+        if (browse_step == BrowseStep::Rename) {
+            browse_wait_id = ++browse_request_id;
+            const chast::Error asked =
+                session->request_file_op(browse_wait_id, chast::FileOperation::Rename,
+                                         "nested/probe-folder", "probe-renamed");
+            if (!asked.ok()) {
+                stats.browse_error = "request_file_op: " + asked.to_string();
+                return false;
+            }
+            browse_step = BrowseStep::RenameAnswer;
+            return true;
+        }
+        if (browse_step == BrowseStep::RenameAnswer) {
+            chast::FileOpResult answer;
+            if (!take_browse_op(browse_wait_id, answer)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (answer.code != chast::FileCode::Ok) {
+                stats.browse_error = "the host refused to rename the folder: " + answer.reason;
+                return false;
+            }
+            stats.browse_rename_ok = true;
+            browse_step = BrowseStep::RenameList;
+            return true;
+        }
+        if (browse_step == BrowseStep::Remove) {
+            browse_wait_id = ++browse_request_id;
+            const chast::Error asked =
+                session->request_file_op(browse_wait_id, chast::FileOperation::Remove,
+                                         "nested/probe-renamed", "");
+            if (!asked.ok()) {
+                stats.browse_error = "request_file_op: " + asked.to_string();
+                return false;
+            }
+            browse_step = BrowseStep::RemoveAnswer;
+            return true;
+        }
+        if (browse_step == BrowseStep::RemoveAnswer) {
+            chast::FileOpResult answer;
+            if (!take_browse_op(browse_wait_id, answer)) {
+                return true;
+            }
+            browse_wait_id = 0;
+            if (answer.code != chast::FileCode::Ok) {
+                stats.browse_error = "the host refused to remove the folder: " + answer.reason;
+                return false;
+            }
+            stats.browse_remove_ok = true;
+            browse_step = BrowseStep::RemoveList;
+            return true;
+        }
+        return true;
+    };
+
     // ---- port forward probe (verify --port-forward) ----
     // The viewer registers the loopback TCP echo endpoint this process started,
     // opens one connection through the host's relay and pushes a payload that
@@ -3229,6 +3875,198 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         return true;
     };
 
+    // ---- camera probe (verify --camera / --camera-denied) ----
+    // The viewer lists the in-process host's cameras and, when one exists,
+    // opens it and requires a few hardware-encoded access units on CCAM before
+    // stopping it. A machine without a camera still proves the list round-trip;
+    // the stream half is skipped because the enumeration is empty.
+    stats.camera_probe = options.camera || options.camera_denied;
+    stats.camera_denied = options.camera_denied;
+    enum class CameraStep { List, WaitList, Start, WaitResult, Frames, Stop, Done };
+    CameraStep camera_step = CameraStep::List;
+    chast::CameraList camera_list;
+    std::chrono::steady_clock::time_point camera_step_started =
+        std::chrono::steady_clock::now();
+    if (stats.camera_denied) {
+        if (info.camera_enabled) {
+            return fail("the server announced cameras although they are off");
+        }
+    } else if (stats.camera_probe && !info.camera_enabled) {
+        return fail("the server did not announce cameras (serve --allow-camera)");
+    }
+    auto drain_camera = [&]() -> bool {
+        chast::CameraList list;
+        while (session->take_camera_list(list)) {
+            stats.camera_count = list.cameras.size();
+            if (list.code != chast::CameraCode::Ok) {
+                stats.camera_error =
+                    "the host refused the camera list" +
+                    (list.reason.empty() ? std::string() : ": " + list.reason);
+                return false;
+            }
+            stats.camera_list_ok = true;
+            camera_list = list;
+            if (list.cameras.empty()) {
+                camera_step = CameraStep::Done;
+            } else {
+                stats.camera_id = list.cameras.front().id;
+                camera_step = CameraStep::Start;
+            }
+        }
+        chast::CameraResult result;
+        while (session->take_camera_result(result)) {
+            if (result.camera_id != stats.camera_id) {
+                continue;
+            }
+            if (result.code != chast::CameraCode::Ok) {
+                stats.camera_error =
+                    "the host refused camera " +
+                    std::to_string(static_cast<unsigned>(result.camera_id)) +
+                    (result.reason.empty() ? std::string() : ": " + result.reason);
+                return false;
+            }
+            camera_step = CameraStep::Frames;
+            camera_step_started = std::chrono::steady_clock::now();
+        }
+        return true;
+    };
+    auto receive_camera = [&]() -> bool {
+        chast::FrameHeader header;
+        std::vector<uint8_t> payload;
+        const chast::Error received = session->receive_camera_frame(
+            header, payload, std::chrono::milliseconds(0));
+        if (received.status() == chast::Status::WaitTimeout) {
+            return true;
+        }
+        if (!received.ok()) {
+            if (camera_step == CameraStep::Stop &&
+                received.status() == chast::Status::Unavailable) {
+                stats.camera_stop_ok = true;
+                camera_step = CameraStep::Done;
+                return true;
+            }
+            stats.camera_error = "receive_camera_frame: " + received.to_string();
+            return false;
+        }
+        if (payload.size() != header.payload_size) {
+            stats.camera_error = "a camera frame carries " +
+                                 std::to_string(payload.size()) + " bytes but its header says " +
+                                 std::to_string(header.payload_size);
+            return false;
+        }
+        if (chast::crc32(payload.data(), payload.size()) != header.payload_crc32) {
+            stats.camera_error = "a camera frame fails its CRC";
+            return false;
+        }
+        ++stats.camera_frames;
+        stats.camera_bytes += payload.size();
+        stats.camera_width = header.width;
+        stats.camera_height = header.height;
+        if (stats.camera_frames >= kCameraProbeFrames && camera_step == CameraStep::Frames) {
+            if (chast::Error stopped = session->request_camera_stop(); !stopped.ok()) {
+                stats.camera_error = "request_camera_stop: " + stopped.to_string();
+                return false;
+            }
+            camera_step = CameraStep::Stop;
+            camera_step_started = std::chrono::steady_clock::now();
+        }
+        return true;
+    };
+    auto advance_camera = [&]() -> bool {
+        if (!stats.camera_probe || camera_step == CameraStep::Done) {
+            return true;
+        }
+        if (stats.camera_denied) {
+            const chast::Error requested = session->request_camera_list();
+            if (requested.status() != chast::Status::PermissionDenied) {
+                stats.camera_error =
+                    requested.ok()
+                        ? "the viewer listed cameras although the host never "
+                          "announced them"
+                        : "request_camera_list failed unexpectedly: " +
+                              requested.to_string();
+                return false;
+            }
+            if (!options.quiet) {
+                std::printf("quic: camera refusal as expected: %s\n",
+                            requested.message().c_str());
+            }
+            stats.camera_denied_ok = true;
+            camera_step = CameraStep::Done;
+            return true;
+        }
+        if (camera_step == CameraStep::List) {
+            if (chast::Error requested = session->request_camera_list(); !requested.ok()) {
+                stats.camera_error = "request_camera_list: " + requested.to_string();
+                return false;
+            }
+            camera_step = CameraStep::WaitList;
+            camera_step_started = std::chrono::steady_clock::now();
+            if (!options.quiet) {
+                std::printf("quic: asking the host for its cameras\n");
+            }
+            return true;
+        }
+        if (camera_step == CameraStep::WaitList) {
+            if (!drain_camera()) {
+                return false;
+            }
+            if (camera_step == CameraStep::WaitList &&
+                std::chrono::steady_clock::now() - camera_step_started >
+                    std::chrono::milliseconds(5000)) {
+                stats.camera_error = "the host did not answer the camera list";
+                return false;
+            }
+            return true;
+        }
+        if (camera_step == CameraStep::Start) {
+            if (chast::Error started = session->request_camera_start(stats.camera_id);
+                !started.ok()) {
+                stats.camera_error = "request_camera_start: " + started.to_string();
+                return false;
+            }
+            camera_step = CameraStep::WaitResult;
+            camera_step_started = std::chrono::steady_clock::now();
+            if (!options.quiet) {
+                std::printf("quic: opening camera %u (%s)\n",
+                            static_cast<unsigned>(stats.camera_id),
+                            camera_list.cameras.front().name.c_str());
+            }
+            return true;
+        }
+        if (camera_step == CameraStep::WaitResult) {
+            if (!drain_camera()) {
+                return false;
+            }
+            if (camera_step == CameraStep::WaitResult &&
+                std::chrono::steady_clock::now() - camera_step_started >
+                    std::chrono::milliseconds(8000)) {
+                stats.camera_error = "the host did not answer the camera start";
+                return false;
+            }
+            return true;
+        }
+        if (camera_step == CameraStep::Frames || camera_step == CameraStep::Stop) {
+            // The transport already ended the stream after a stop request, so
+            // nothing else is expected here.
+            if (!receive_camera()) {
+                return false;
+            }
+            if (camera_step != CameraStep::Done &&
+                std::chrono::steady_clock::now() - camera_step_started >
+                    std::chrono::milliseconds(5000)) {
+                stats.camera_error =
+                    camera_step == CameraStep::Stop
+                        ? "the host did not finish the camera stream after the stop"
+                        : "the camera produced " + std::to_string(stats.camera_frames) +
+                              " frames in 5 s";
+                return false;
+            }
+            return true;
+        }
+        return true;
+    };
+
     // ---- viewer relay probe (verify --port-forward-local) ----
     // The viewer starts the same 127.0.0.1 listener a GUI session uses, then
     // connects to it like an ordinary local application. This covers the
@@ -3455,6 +4293,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
 // a mid-session size change rolls the recording into a new segment.
     chast_tools::Mp4Recorder recorder;
     if (!options.record.empty()) {
+        // The host's consent is advisory on the wire, so every viewer honours
+        // it locally; this CLI is a viewer too.
+        if (!info.record_enabled) {
+            return fail("recording: the host did not grant recording consent");
+        }
         std::string record_error;
         if (!recorder.open(options.record, info.codec, info.width, info.height, &record_error)) {
             return fail("recording: " + record_error);
@@ -4587,6 +5430,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!advance_file_download()) {
             return fail(stats.download_error.empty() ? stats.error : stats.download_error);
         }
+        if (!advance_file_browse()) {
+            return fail(stats.browse_error.empty() ? stats.error : stats.browse_error);
+        }
         if (!advance_port_forward()) {
             return fail(stats.forward_error.empty() ? stats.error : stats.forward_error);
         }
@@ -4596,6 +5442,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
         if (!advance_terminal()) {
             return fail(stats.terminal_error.empty() ? stats.error : stats.terminal_error);
+        }
+        if (!advance_camera()) {
+            return fail(stats.camera_error.empty() ? stats.error : stats.camera_error);
         }
         drain_cursor();
         drain_desktop_state();
@@ -4914,6 +5763,25 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.error = "the host download did not finish";
         }
     }
+    if (stats.browse_probe && browse_step != BrowseStep::Done) {
+        // Every browse step waits for the host's previous answer, and the
+        // final transfer runs in the host's frame loop; give the probe the
+        // same grace after video ends that the other file probes get.
+        const auto browse_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (browse_step != BrowseStep::Done &&
+               std::chrono::steady_clock::now() < browse_deadline) {
+            if (!advance_file_browse()) {
+                break;
+            }
+            if (browse_step != BrowseStep::Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (browse_step != BrowseStep::Done && stats.browse_error.empty()) {
+            stats.browse_error = "the shared-folder browse did not finish";
+        }
+    }
     if (stats.port_forward_probe && forward_step != ForwardStep::Done) {
         // The relay moves bytes on the host thread; give both halves of the
         // echo time to finish after the video stream ended.
@@ -4990,6 +5858,29 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
         }
     }
+    if (stats.camera_probe && camera_step != CameraStep::Done) {
+        // A camera and its hardware encoder need a moment to open and to
+        // deliver the first access units after the video stream ended.
+        const auto camera_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(12);
+        while (camera_step != CameraStep::Done &&
+               std::chrono::steady_clock::now() < camera_deadline) {
+            if (!advance_camera()) {
+                break;
+            }
+            if (camera_step != CameraStep::Done) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (camera_step != CameraStep::Done) {
+            if (stats.camera_error.empty()) {
+                stats.camera_error = "the camera probe did not finish";
+            }
+            if (stats.error.empty()) {
+                stats.error = stats.camera_error;
+            }
+        }
+    }
     if (options.audio) {
         // The server FINs the audio stream right after the video's; wait
         // briefly for the tail and its closing packet before finishing.
@@ -5043,6 +5934,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         stats.record_keyframes = recorder.keyframes();
         stats.record_skipped = recorder.skipped();
         stats.record_files = recorder.segments();
+        stats.record_codecs = recorder.segment_codecs();
         stats.record_error = recorder.error();
         stats.record_ok = !recorder.failed() && stats.record_error.empty();
         // A resolution change rolls the recording into a new segment, so every
@@ -5053,11 +5945,14 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 stats.record_error = "no key frame arrived to start the recording";
             }
         }
-        for (const std::string& segment : stats.record_files) {
+        for (size_t i = 0; i < stats.record_files.size(); ++i) {
             uint64_t samples = 0;
             uint64_t keyframes = 0;
             std::string verify_error;
-            if (!chast_tools::Mp4Recorder::verify(segment, &samples, &keyframes, &verify_error)) {
+            const chast::VideoCodec expected =
+                i < stats.record_codecs.size() ? stats.record_codecs[i] : stats.codec;
+            if (!chast_tools::Mp4Recorder::verify(stats.record_files[i], expected, &samples,
+                                                  &keyframes, &verify_error)) {
                 stats.record_ok = false;
                 stats.record_error = verify_error;
                 break;
@@ -5198,6 +6093,26 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                                 static_cast<unsigned>(stats.terminal_stop_code),
                                 stats.terminal_error.empty() ? "" : " error=",
                                 stats.terminal_error.c_str());
+                }
+            }
+            if (stats.camera_probe) {
+                if (stats.camera_denied) {
+                    std::printf("receiver: camera denied=%d%s%s\n",
+                                stats.camera_denied_ok ? 1 : 0,
+                                stats.camera_error.empty() ? "" : " error=",
+                                stats.camera_error.c_str());
+                } else {
+                    std::printf("receiver: camera listed=%d count=%llu id=%u frames=%llu "
+                                "bytes=%llu size=%ux%u stopped=%d%s%s\n",
+                                stats.camera_list_ok ? 1 : 0,
+                                static_cast<unsigned long long>(stats.camera_count),
+                                static_cast<unsigned>(stats.camera_id),
+                                static_cast<unsigned long long>(stats.camera_frames),
+                                static_cast<unsigned long long>(stats.camera_bytes),
+                                stats.camera_width, stats.camera_height,
+                                stats.camera_stop_ok ? 1 : 0,
+                                stats.camera_error.empty() ? "" : " error=",
+                                stats.camera_error.c_str());
                 }
             }
             std::printf("receiver: cursor updates=%llu shapes=%llu visible=%d at=%d,%d\n",
@@ -7100,6 +8015,59 @@ int run_verify(const Options& options) {
         const std::u8string utf8 = source.u8string();
         local.download_source.assign(utf8.begin(), utf8.end());
     }
+    if (local.file_browse) {
+        // The browse probe needs a deterministic tree below the host's
+        // receive directory: one 300 KiB file at the root and a subfolder
+        // with a small text file. It is rebuilt from scratch every run.
+        if (local.seconds < 6.0) {
+            local.seconds = 6.0;
+        }
+        std::error_code ec;
+        const std::filesystem::path dir =
+            std::filesystem::temp_directory_path(ec) / "chast-quic-browse";
+        if (!ec) {
+            std::filesystem::remove_all(dir, ec);
+        }
+        if (!ec) {
+            std::filesystem::create_directories(dir / "nested", ec);
+        }
+        if (!ec) {
+            const std::vector<uint8_t> payload = file_probe_content(kFileProbeBytes);
+            std::ofstream out(dir / "chast-verify-browse.bin",
+                              std::ios::binary | std::ios::trunc);
+            if (!out) {
+                ec = std::make_error_code(std::errc::io_error);
+            } else {
+                out.write(reinterpret_cast<const char*>(payload.data()),
+                          static_cast<std::streamsize>(payload.size()));
+                out.close();
+                if (!out) {
+                    ec = std::make_error_code(std::errc::io_error);
+                }
+            }
+        }
+        if (!ec) {
+            std::ofstream inner(dir / "nested" / "inner.txt",
+                                std::ios::binary | std::ios::trunc);
+            if (!inner) {
+                ec = std::make_error_code(std::errc::io_error);
+            } else {
+                inner.write(kBrowseNestedText,
+                            static_cast<std::streamsize>(sizeof(kBrowseNestedText) - 1));
+                inner.close();
+                if (!inner) {
+                    ec = std::make_error_code(std::errc::io_error);
+                }
+            }
+        }
+        if (ec) {
+            std::fprintf(stderr, "could not prepare the browse directory: %s\n",
+                         ec.message().c_str());
+            return 1;
+        }
+        const std::u8string utf8 = dir.u8string();
+        local.file_receive_dir.assign(utf8.begin(), utf8.end());
+    }
     // The port-forward probe needs a real TCP endpoint: the host's relay dials
     // it and every byte travels viewer -> QUIC -> host -> TCP -> echo -> host
     // -> QUIC -> viewer. The endpoint stays up for the whole run.
@@ -7124,6 +8092,15 @@ int run_verify(const Options& options) {
         local.allow_terminal = true;
         if (local.seconds < 6.0) {
             local.seconds = 6.0;
+        }
+    }
+    // The camera probe lists and opens a real device on the in-process host.
+    // Media Foundation may take a moment to start the stream; the list round
+    // trip alone (a host without a camera) finishes immediately.
+    if (local.camera) {
+        local.allow_camera = true;
+        if (local.seconds < 10.0) {
+            local.seconds = 10.0;
         }
     }
     const bool keep_file = !options.save.empty();
@@ -7807,6 +8784,10 @@ int run_verify(const Options& options) {
                   same_clipboard_content(received.clipboard_contents.front(),
                                          local.fake_clipboard->updated),
               "the received item carried the host's text, HTML, RTF and DIB");
+        check(!received.clipboard_contents.empty() &&
+                  received.clipboard_contents.front().text().size() >
+                      chast::kMaxClipboardBytes,
+              "the received text exceeded the legacy 256 KiB control limit");
     }
 
     if (local.chat_probe) {
@@ -7901,6 +8882,38 @@ int run_verify(const Options& options) {
         }
     }
 
+    if (local.file_browse) {
+        check(received.browse_probe, "the viewer ran the shared-folder browse probe");
+        check(received.browse_list_ok,
+              "the viewer listed the shared folder and its subfolder");
+        check(received.browse_root_entries == 2 && received.browse_nested_entries == 1,
+              "both listings carried exactly the seeded entries");
+        check(received.browse_negative_ok,
+              "paths outside the shared folder were refused");
+        check(received.browse_download_ok && received.browse_bytes == kFileProbeBytes,
+              "the viewer downloaded the seeded file and its digest matched");
+        check(sent.files_sent == 1 && sent.file_bytes_sent == kFileProbeBytes,
+              "the host completed the viewer-requested 300 KiB download");
+        check(received.browse_upload_ok,
+              "the viewer uploaded a file into the browsed subfolder");
+        check(sent.files_received == 1 &&
+                  sent.file_bytes_received == sizeof(kBrowseUploadText) - 1,
+              "the host stored the upload below that subfolder");
+        check(received.browse_folder_ok,
+              "the viewer created a folder below the browsed subfolder");
+        check(received.browse_rename_ok,
+              "the viewer renamed that folder and the listing followed");
+        check(received.browse_remove_ok,
+              "the viewer removed it and the listing followed");
+        if (!received.browse_download_ok || !received.browse_upload_ok ||
+            !received.browse_folder_ok || !received.browse_rename_ok ||
+            !received.browse_remove_ok || !received.browse_error.empty()) {
+            std::printf("     browse: %s\n",
+                        received.browse_error.empty() ? "the probe did not finish"
+                                                      : received.browse_error.c_str());
+        }
+    }
+
     if (local.port_forward_denied) {
         check(received.port_forward_probe,
               "the viewer ran the port-forward denial probe");
@@ -7947,6 +8960,35 @@ int run_verify(const Options& options) {
         }
         if (!received.terminal_stop_reason.empty()) {
             std::printf("     terminal stop: %s\n", received.terminal_stop_reason.c_str());
+        }
+    }
+
+    if (local.camera_denied) {
+        check(received.camera_probe, "the viewer ran the camera denial probe");
+        check(received.camera_denied_ok,
+              "the closed host gate refused the camera list without hurting the session");
+        if (!received.camera_error.empty()) {
+            std::printf("     camera: %s\n", received.camera_error.c_str());
+        }
+    }
+
+    if (local.camera) {
+        check(received.camera_probe, "the viewer ran the camera probe");
+        check(received.camera_list_ok, "the host answered the camera list");
+        if (received.camera_count == 0) {
+            // No webcam on this machine: the list round-trip is the whole
+            // probe and the stream half is reported as skipped.
+            std::printf("     camera: the host has no camera; stream checks skipped\n");
+        } else {
+            check(received.camera_frames > 0,
+                  "the host opened the camera and sent encoded access units");
+            check(received.camera_width > 0 && received.camera_height > 0,
+                  "every camera frame named its size");
+            check(received.camera_stop_ok,
+                  "the host finished the camera stream after the stop request");
+        }
+        if (!received.camera_error.empty()) {
+            std::printf("     camera: %s\n", received.camera_error.c_str());
         }
     }
 

@@ -34,6 +34,34 @@ void main() {
     expect(status.recordSegments, 0);
   });
 
+  test('recording needs a live session and the host consent bit', () {
+    ViewerStatus status(Map<String, Object?> fields) =>
+        ViewerStatus.fromMap(<Object?, Object?>{
+          'state': 'streaming',
+          ...fields,
+        });
+    expect(
+        status(<String, Object?>{'permissions': ViewerPermission.record})
+            .acceptsRecording,
+        isTrue);
+    expect(
+        status(<String, Object?>{'permissions': 0}).acceptsRecording, isFalse);
+    expect(
+        ViewerStatus.fromMap(<Object?, Object?>{
+          'state': 'ended',
+          'permissions': ViewerPermission.record,
+        }).acceptsRecording,
+        isFalse);
+    // Revoking consent does not stop a running recording, but no new one can
+    // start.
+    final ViewerStatus revoked = status(<String, Object?>{
+      'permissions': 0,
+      'recording': true,
+    });
+    expect(revoked.recording, isTrue);
+    expect(revoked.acceptsRecording, isFalse);
+  });
+
   test('a failed recording keeps its reason for the toolbar', () {
     final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
       'state': 'streaming',

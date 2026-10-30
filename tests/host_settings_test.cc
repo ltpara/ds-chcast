@@ -75,7 +75,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.allow_file_transfer == b.allow_file_transfer &&
            a.allow_port_forward == b.allow_port_forward &&
-           a.allow_terminal == b.allow_terminal &&
+           a.allow_terminal == b.allow_terminal && a.allow_record == b.allow_record &&
            a.file_receive_directory == b.file_receive_directory &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
@@ -106,6 +106,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_file_transfer = false;
     settings.allow_port_forward = true;
     settings.allow_terminal = true;
+    settings.allow_record = false;
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
     settings.allow_microphone = true;
@@ -183,6 +184,7 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.audio_device.empty(), "a fresh host follows the default output");
     check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
     check(!loaded.settings.allow_privacy_mode, "a fresh host does not blank the local screen");
+    check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
     check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
@@ -215,6 +217,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "audio_aec=perhaps\n"
                "microphone=perhaps\n"
                "privacy_mode=perhaps\n"
+               "record=perhaps\n"
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
@@ -246,6 +249,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
           "an unparsable microphone toggle keeps the private default");
     check(!settings.allow_privacy_mode,
           "an unparsable privacy toggle keeps the private default");
+    check(settings.allow_record, "an unparsable record toggle keeps the consent default");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -263,7 +267,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
                             "audio_device", "audio_aec", "microphone", "privacy_mode",
-                            "token_mode", "token", "codec",
+                            "record", "token_mode", "token", "codec",
                             "bitrate_kbps",
                             "framerate",
                             "quality", "display", "tunnel", "server_url", "server_key",
@@ -353,6 +357,19 @@ void test_security_migration(const std::filesystem::path& dir) {
           "the permissions mask wins over the legacy switches");
     check(loaded.settings.allow_privacy_mode,
           "the permissions mask carries the privacy-mode grant");
+    check(loaded.settings.allow_record,
+          "a mask written before the record bit keeps the consent default");
+
+    const std::filesystem::path no_record = dir / "no-record.ini";
+    write_text(no_record, "permissions=37\nrecord=0\n");
+    loaded = chast::load_host_settings(no_record.string());
+    check(!loaded.settings.allow_record, "an explicit record=0 revokes the consent");
+
+    const std::filesystem::path with_record = dir / "with-record.ini";
+    write_text(with_record, "permissions=37\nrecord=1\n");
+    loaded = chast::load_host_settings(with_record.string());
+    check(loaded.settings.allow_record,
+          "an explicit record=1 survives a mask that predates the bit");
 
     const std::filesystem::path broken = dir / "broken-security.ini";
     write_text(broken,

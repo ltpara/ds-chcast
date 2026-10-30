@@ -86,8 +86,16 @@ void test_hello() {
               got.unix_seconds == sent.unix_seconds &&
               got.auth_flags == sent.auth_flags &&
               got.signature == sent.signature && got.totp == sent.totp &&
-              got.audit_ref == sent.audit_ref,
-          "Hello round-trips the v13 authentication fields and v25 audit reference");
+              got.audit_ref == sent.audit_ref &&
+              got.mode == chast::SessionMode::Desktop,
+          "Hello round-trips the v13 authentication fields, v25 audit reference and "
+          "v32 desktop mode");
+
+    sent.mode = chast::SessionMode::FileTransfer;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+              got.mode == chast::SessionMode::FileTransfer,
+          "Hello round-trips the v32 file-transfer session mode");
+    sent.mode = chast::SessionMode::Desktop;
 
     sent.access_token.clear();
     sent.password.clear();
@@ -128,7 +136,7 @@ void test_hello() {
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
     unknown_permissions[8] = 0x00;  // version, display, token length, password length
-    unknown_permissions[9] = 0x02;  // bit 9: outside every permission this build knows
+    unknown_permissions[9] = 0x08;  // bit 11: outside every permission this build knows
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
     std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
@@ -156,6 +164,9 @@ void test_hello() {
     upper_ref.audit_ref = "00112233AABBCCDD";
     rejects_hello(payload_of(chast::make_hello(upper_ref)),
                   "Hello with a non-canonical audit reference is rejected");
+    std::vector<uint8_t> unknown_mode = payload_of(chast::make_hello(sent));
+    unknown_mode.back() = 7;
+    rejects_hello(unknown_mode, "Hello with an unknown session mode is rejected");
 }
 
 void test_access_denied() {
@@ -210,6 +221,9 @@ void test_hello_ack() {
     sent.microphone_enabled = true;
     sent.privacy_mode_enabled = true;
     sent.port_forward_enabled = true;
+    sent.terminal_enabled = true;
+    sent.record_enabled = true;
+    sent.camera_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -253,9 +267,13 @@ void test_hello_ack() {
     check(got.microphone_enabled, "HelloAck keeps the microphone flag");
     check(got.privacy_mode_enabled, "HelloAck keeps the privacy mode flag");
     check(got.port_forward_enabled, "HelloAck keeps the port forward flag");
+    check(got.terminal_enabled, "HelloAck keeps the terminal flag");
+    check(got.record_enabled, "HelloAck keeps the record flag");
+    check(got.camera_enabled, "HelloAck keeps the camera flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
               got.file_transfer_enabled && got.microphone_enabled &&
-              got.privacy_mode_enabled,
+              got.privacy_mode_enabled && got.port_forward_enabled &&
+              got.terminal_enabled && got.record_enabled && got.camera_enabled,
           "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
@@ -325,7 +343,7 @@ void test_hello_ack() {
     // codec, reserved, size, rate, bitrate, origin, then the flags word.
     constexpr size_t kFlagsAt = 20;
     unknown_flags[kFlagsAt] = 0x00;
-    unknown_flags[kFlagsAt + 1] = 0x01;
+    unknown_flags[kFlagsAt + 1] = 0x04;
     rejects_ack(std::move(unknown_flags), "a HelloAck with unknown flags is rejected");
 
     std::vector<uint8_t> no_audio = ack_payload();
@@ -382,7 +400,7 @@ void test_hello_ack() {
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
     unknown_permissions[unknown_permissions.size() - 2] = 0x00;
-    unknown_permissions[unknown_permissions.size() - 1] = 0x02;
+    unknown_permissions[unknown_permissions.size() - 1] = 0x08;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
 
@@ -391,14 +409,65 @@ void test_hello_ack() {
     sent.file_transfer_enabled = false;
     sent.microphone_enabled = false;
     sent.privacy_mode_enabled = false;
+    sent.port_forward_enabled = false;
+    sent.terminal_enabled = false;
+    sent.record_enabled = false;
     sent.audio.enabled = false;
     sent.audio.extradata.clear();
     chast::ServerInfo disabled;
     check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), disabled, &error) &&
               !disabled.input_enabled && !disabled.clipboard_enabled &&
               !disabled.file_transfer_enabled && !disabled.audio.enabled &&
-              !disabled.microphone_enabled && !disabled.privacy_mode_enabled,
+              !disabled.microphone_enabled && !disabled.privacy_mode_enabled &&
+              !disabled.port_forward_enabled && !disabled.terminal_enabled &&
+              !disabled.record_enabled,
           "HelloAck reports every permission disabled");
+}
+
+void test_files_only_hello_ack() {
+    chast::ServerInfo sent;
+    sent.files_only = true;
+    sent.file_transfer_enabled = true;
+    sent.encoder = "none";
+    chast::ServerInfo got;
+    std::string error;
+    const bool parsed =
+        chast::parse_hello_ack(payload_of(chast::make_hello_ack(sent)), got, &error);
+    check(parsed, "a files-only HelloAck round-trips");
+    if (!parsed) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+    check(got.files_only, "HelloAck keeps the files-only flag");
+    check(got.file_transfer_enabled, "a files-only HelloAck grants file transfer");
+    check(got.width == 0 && got.height == 0 && got.source_width == 0 &&
+              got.source_height == 0,
+          "a files-only HelloAck carries no picture size");
+    check(!got.audio.enabled && !got.merged && got.displays.empty(),
+          "a files-only HelloAck carries no media");
+
+    auto rejects_ack = [&](const chast::ServerInfo& info, const char* what) {
+        chast::ServerInfo dropped;
+        check(!chast::parse_hello_ack(payload_of(chast::make_hello_ack(info)), dropped,
+                                      &error),
+              what);
+    };
+    chast::ServerInfo picture = sent;
+    picture.width = 1280;
+    picture.height = 720;
+    rejects_ack(picture, "a files-only HelloAck with a picture is rejected");
+    chast::ServerInfo source = sent;
+    source.source_width = 1280;
+    source.source_height = 720;
+    rejects_ack(source, "a files-only HelloAck with a source picture is rejected");
+    chast::ServerInfo extra = sent;
+    extra.input_enabled = true;
+    rejects_ack(extra, "a files-only HelloAck that grants input is rejected");
+    chast::ServerInfo audio = sent;
+    audio.audio.enabled = true;
+    audio.audio.extradata = {0x11, 0x90};
+    rejects_ack(audio, "a files-only HelloAck that announces audio is rejected");
+    rejects_ack(chast::ServerInfo{}, "a HelloAck without a picture and without the flag is rejected");
 }
 
 void test_merged_hello_ack() {
@@ -490,7 +559,7 @@ void test_permission_update() {
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
     unknown[0] = 0x00;
-    unknown[1] = 0x02;
+    unknown[1] = 0x08;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -1404,6 +1473,101 @@ void test_clipboard() {
           "a truncated ClipboardUpdate is rejected");
 }
 
+void test_clipboard_files() {
+    std::string error;
+    std::vector<chast::ClipboardFileEntry> files;
+    files.push_back({"报告 2026.pdf", 123456789ull, ""});
+    files.push_back({"photo.jpg", 42, "stage-1/photo.jpg"});
+    const std::vector<uint8_t> payload = chast::encode_clipboard_file_list(files);
+    check(!payload.empty(), "a file list encodes");
+    std::vector<chast::ClipboardFileEntry> got;
+    check(chast::decode_clipboard_file_list(payload, got, &error) && got.size() == 2 &&
+              got[0].name == "报告 2026.pdf" && got[0].size == 123456789ull &&
+              got[1].rel_path == "stage-1/photo.jpg",
+          "a file list round-trips names, sizes and staging paths");
+
+    std::vector<chast::ClipboardFileEntry> tree;
+    tree.push_back({"deep.bin", 7, "clip-folder/sub/deep.bin"});
+    const std::vector<uint8_t> tree_payload = chast::encode_clipboard_file_list(tree);
+    check(!tree_payload.empty() && chast::decode_clipboard_file_list(tree_payload, got, &error) &&
+              got.size() == 1 && got[0].name == "deep.bin" &&
+              got[0].rel_path == "clip-folder/sub/deep.bin",
+          "a nested folder path round-trips");
+
+    const uint64_t identity = chast::clipboard_file_identity_hash(files);
+    check(identity != 0 && identity == chast::clipboard_file_identity_hash(files),
+          "the file identity is stable for the same list");
+    std::vector<chast::ClipboardFileEntry> moved = files;
+    moved[1].rel_path = "stage-2/photo.jpg";
+    check(identity != chast::clipboard_file_identity_hash(moved),
+          "the file identity covers the folder layout");
+    moved = files;
+    moved[1].size = 43;
+    check(identity != chast::clipboard_file_identity_hash(moved),
+          "the file identity covers sizes");
+    moved = files;
+    std::swap(moved[0], moved[1]);
+    check(identity != chast::clipboard_file_identity_hash(moved),
+          "the file identity is order sensitive");
+
+    chast::ClipboardContent content;
+    chast::ClipboardFormatData entry;
+    entry.format = chast::ClipboardFormat::FileList;
+    entry.data = payload;
+    content.formats.push_back(entry);
+    check(chast::valid_clipboard_content(content, &error),
+          "a FileList clipboard item validates");
+    check(!chast::encode_clipboard_stream(content).empty(),
+          "a FileList clipboard stream encodes");
+    content.formats.front().data = {0, 0};
+    check(!chast::valid_clipboard_content(content, &error),
+          "an empty FileList item is rejected");
+
+    check(chast::encode_clipboard_file_list({}).empty(),
+          "an empty file list is not encoded");
+    std::vector<chast::ClipboardFileEntry> bad;
+    bad.push_back({"../escape", 1, ""});
+    check(chast::encode_clipboard_file_list(bad).empty(),
+          "a file name with a traversal is not encoded");
+    bad[0] = {"sub/dir", 1, ""};
+    check(chast::encode_clipboard_file_list(bad).empty(),
+          "a file name with a separator is not encoded");
+    bad[0] = {"C:file", 1, ""};
+    check(chast::encode_clipboard_file_list(bad).empty(),
+          "a file name with a drive is not encoded");
+    bad[0] = {"file", 1, "../up"};
+    check(chast::encode_clipboard_file_list(bad).empty(),
+          "a staging path with a traversal is not encoded");
+    bad[0] = {"file", 1, "/abs"};
+    check(chast::encode_clipboard_file_list(bad).empty(),
+          "an absolute staging path is not encoded");
+    bad[0] = {"file", 1, "ok/./x"};
+    check(chast::encode_clipboard_file_list(bad).empty(),
+          "a staging path with a dot segment is not encoded");
+
+    std::vector<chast::ClipboardFileEntry> many(
+        chast::kMaxClipboardFileEntries + 1, {"file", 0, ""});
+    check(chast::encode_clipboard_file_list(many).empty(),
+          "too many files are not encoded");
+    check(chast::decode_clipboard_file_list(payload, got, &error),
+          "a valid file list decodes");
+
+    std::vector<uint8_t> extra = payload;
+    extra.push_back(0);
+    check(!chast::decode_clipboard_file_list(extra, got, &error),
+          "trailing bytes after a file list are rejected");
+    check(!chast::decode_clipboard_file_list(std::vector<uint8_t>(1, 0), got, &error),
+          "a truncated file list is rejected");
+    std::vector<uint8_t> zero_count{0, 0};
+    check(!chast::decode_clipboard_file_list(zero_count, got, &error),
+          "a zero-entry file list is rejected");
+    std::vector<uint8_t> bad_flags = payload;
+    // Entry 0 header at offset 2: name length at +0, flags at +2.
+    bad_flags[4] = 0x02;
+    check(!chast::decode_clipboard_file_list(bad_flags, got, &error),
+          "an unknown file-list flag is rejected");
+}
+
 void test_chat() {
     std::string error;
     const std::string text = "请在主机上确认订单 😀\n第二行";
@@ -1654,6 +1818,103 @@ void test_terminal() {
           "a CTTY header with a zero id is rejected");
     check(!chast::decode_terminal_stream_header(header.data(), 15, decoded, &error),
           "a truncated CTTY header is rejected");
+}
+
+void test_camera() {
+    std::string error;
+    const std::vector<uint8_t> request = chast::make_camera_list_request();
+    check(request.size() == chast::kControlHeaderSize &&
+              request[6] == static_cast<uint8_t>(chast::ControlType::ListCameras),
+          "ListCameras names its control type and carries no payload");
+    check(chast::parse_camera_list_request(payload_of(request), &error),
+          "ListCameras round-trips empty");
+    check(!chast::parse_camera_list_request({0}, &error),
+          "ListCameras with a payload is rejected");
+
+    chast::CameraList list;
+    chast::CameraDescription front;
+    front.id = 1;
+    front.name = "Integrated Camera";
+    front.is_default = true;
+    chast::CameraDescription rear;
+    rear.id = 2;
+    rear.name = "USB Webcam";
+    list.cameras = {front, rear};
+    chast::CameraList got;
+    const auto encoded = chast::make_camera_list(list);
+    check(!encoded.empty() && chast::parse_camera_list(payload_of(encoded), got, &error) &&
+              got.code == chast::CameraCode::Ok && got.cameras.size() == 2 &&
+              got.cameras[0].id == 1 && got.cameras[0].name == front.name &&
+              got.cameras[0].is_default && got.cameras[1].id == 2 &&
+              !got.cameras[1].is_default,
+          "CameraList round-trips ids, names and the default flag");
+
+    chast::CameraList bad = list;
+    bad.cameras[1].id = 1;
+    check(chast::make_camera_list(bad).empty(), "duplicate camera ids are not encoded");
+    bad = list;
+    bad.cameras[0].id = 0;
+    check(chast::make_camera_list(bad).empty(), "a camera id of 0 is not encoded");
+    bad = list;
+    bad.cameras[0].name.assign(chast::kMaxCameraNameBytes + 1, 'x');
+    check(chast::make_camera_list(bad).empty(), "an over-long camera name is not encoded");
+    bad = list;
+    bad.code = chast::CameraCode::Refused;
+    bad.reason = "cameras are off";
+    chast::CameraList refused;
+    check(chast::parse_camera_list(payload_of(chast::make_camera_list(bad)), refused, &error) &&
+              refused.code == chast::CameraCode::Refused && refused.cameras.empty() &&
+              refused.reason == bad.reason,
+          "a refused CameraList drops the cameras and keeps the reason");
+    std::vector<uint8_t> unknown = payload_of(encoded);
+    unknown[4] = 9;
+    check(!chast::parse_camera_list(unknown, got, &error),
+          "CameraList with an unknown code is rejected");
+
+    uint16_t camera_id = 0;
+    check(chast::parse_camera_start(payload_of(chast::make_camera_start(2)), camera_id, &error) &&
+              camera_id == 2,
+          "StartCamera round-trips its id");
+    check(chast::make_camera_start(0).empty(), "StartCamera with id 0 is not encoded");
+    check(chast::make_camera_stop(0).empty(), "StopCamera with id 0 is not encoded");
+    check(chast::parse_camera_stop(payload_of(chast::make_camera_stop(2)), camera_id, &error) &&
+              camera_id == 2,
+          "StopCamera round-trips its id");
+
+    chast::CameraResult result;
+    result.camera_id = 2;
+    result.code = chast::CameraCode::Busy;
+    result.reason = "the other camera is still open";
+    chast::CameraResult result_out;
+    check(chast::parse_camera_result(payload_of(chast::make_camera_result(result)), result_out,
+                                     &error) &&
+              result_out.camera_id == 2 && result_out.code == chast::CameraCode::Busy &&
+              result_out.reason == result.reason,
+          "CameraResult round-trips a refusal with its reason");
+
+    const std::vector<uint8_t> header = chast::make_camera_stream_header(2);
+    check(header.size() == chast::kCameraStreamHeaderSize &&
+              std::memcmp(header.data(), chast::kCameraStreamMagic, 4) == 0 &&
+              header[4] == chast::kCameraStreamVersion,
+          "the CCAM header carries its magic and version");
+    chast::CameraStreamHeader decoded;
+    check(chast::decode_camera_stream_header(header.data(), header.size(), decoded, &error) &&
+              decoded.camera_id == 2,
+          "the CCAM header round-trips its id");
+    check(chast::make_camera_stream_header(0).empty(),
+          "a CCAM header without an id is not encoded");
+    std::vector<uint8_t> bad_header = header;
+    bad_header[5] = 1;
+    check(!chast::decode_camera_stream_header(bad_header.data(), bad_header.size(), decoded,
+                                              &error),
+          "a CCAM header with non-zero reserved bytes is rejected");
+    bad_header = header;
+    bad_header[8] = bad_header[9] = 0;
+    check(!chast::decode_camera_stream_header(bad_header.data(), bad_header.size(), decoded,
+                                              &error),
+          "a CCAM header with a zero id is rejected");
+    check(!chast::decode_camera_stream_header(header.data(), 15, decoded, &error),
+          "a truncated CCAM header is rejected");
 }
 
 void test_cursor_update() {
@@ -2143,9 +2404,20 @@ void test_file_transfer() {
     check(chast::parse_file_offer(payload_of(chast::make_file_offer(offer)), got_offer,
                                   &error) &&
               got_offer.transfer_id == 7 && got_offer.size == 12 && got_offer.resume &&
-              got_offer.name == offer.name && got_offer.sha256 == offer.sha256 &&
+              !got_offer.clipboard && got_offer.name == offer.name &&
+              got_offer.sha256 == offer.sha256 &&
               got_offer.relative_path == offer.relative_path,
           "FileOffer round-trips id, size, resume flag, digest, UTF-8 name and directory");
+
+    chast::FileOffer clipboard_offer = offer;
+    clipboard_offer.clipboard = true;
+    chast::FileOffer got_clipboard;
+    check(chast::parse_file_offer(payload_of(chast::make_file_offer(clipboard_offer)),
+                                  got_clipboard, &error) &&
+              got_clipboard.resume && got_clipboard.clipboard &&
+              got_clipboard.name == offer.name &&
+              got_clipboard.relative_path == offer.relative_path,
+          "the v34 clipboard flag rides beside the resume flag");
 
     chast::FileOffer legacy_offer = offer;
     legacy_offer.relative_path.clear();
@@ -2197,7 +2469,7 @@ void test_file_transfer() {
     }
     rejects_relative(std::move(deep), "a too-deep FileOffer directory is rejected");
     std::vector<uint8_t> unknown_flags = payload_of(chast::make_file_offer(offer));
-    unknown_flags[12] = 0x02;  // id(4) + size(8), then flags
+    unknown_flags[12] = 0x04;  // id(4) + size(8), then flags
     rejects_offer(std::move(unknown_flags), "FileOffer with unknown flags is rejected");
 
     std::vector<uint8_t> empty_name = payload_of(chast::make_file_offer(offer));
@@ -2313,6 +2585,312 @@ void test_file_transfer() {
           "a truncated CFIL header is rejected");
 }
 
+void test_file_browser() {
+    std::string error;
+
+    const std::vector<uint8_t> list_message =
+        chast::make_file_list_request(9, "docs/2026");
+    check(list_message.size() >= chast::kControlHeaderSize &&
+              list_message[4] == static_cast<uint8_t>(chast::kProtocolVersion & 0xFF) &&
+              list_message[5] == static_cast<uint8_t>(chast::kProtocolVersion >> 8) &&
+              list_message[6] == static_cast<uint8_t>(chast::ControlType::FileListRequest) &&
+              list_message[7] == 0,
+          "FileListRequest is a v30 control message of type 45");
+
+    uint32_t request_id = 0;
+    std::string directory;
+    check(chast::parse_file_list_request(payload_of(list_message), request_id, directory,
+                                         &error) &&
+              request_id == 9 && directory == "docs/2026",
+          "FileListRequest round-trips id and a relative directory");
+    check(chast::parse_file_list_request(
+              payload_of(chast::make_file_list_request(9, "")), request_id, directory,
+              &error) &&
+              request_id == 9 && directory.empty(),
+          "FileListRequest round-trips the receive root");
+
+    check(chast::make_file_list_request(0, "docs").empty() &&
+              chast::make_file_list_request(9, "../secret").empty() &&
+              chast::make_file_list_request(9, "/etc").empty() &&
+              chast::make_file_list_request(9, "docs\\2026").empty() &&
+              chast::make_file_list_request(9, "C:/Windows").empty() &&
+              chast::make_file_list_request(9, "docs/./2026").empty() &&
+              chast::make_file_list_request(9, "docs//2026").empty(),
+          "the FileListRequest maker refuses zero ids and unpinned paths");
+
+    check(chast::valid_file_browser_path("") &&
+              chast::valid_file_browser_path("photos/2026") &&
+              !chast::valid_file_browser_path(".") &&
+              !chast::valid_file_browser_path("a/..") &&
+              !chast::valid_file_browser_path(std::string("a\xFF", 2)) &&
+              !chast::valid_file_browser_path(std::string("a\0b", 3)) &&
+              !chast::valid_file_browser_path("a:b"),
+          "the browser path check accepts plain relative directories only");
+
+    auto rejects_list_request = [&](std::vector<uint8_t> payload, const char* what) {
+        uint32_t id = 0;
+        std::string dir;
+        check(!chast::parse_file_list_request(payload, id, dir, &error), what);
+    };
+    std::vector<uint8_t> zero_list_id = payload_of(list_message);
+    zero_list_id[0] = zero_list_id[1] = zero_list_id[2] = zero_list_id[3] = 0;
+    rejects_list_request(std::move(zero_list_id),
+                         "FileListRequest with a zero id is rejected");
+    // The maker refuses a traversal path, so build the wire form by hand.
+    std::vector<uint8_t> traversal_request{9, 0, 0, 0, 9, 0};
+    const char traversal[] = "../secret";
+    traversal_request.insert(traversal_request.end(), traversal, traversal + 9);
+    rejects_list_request(std::move(traversal_request),
+                         "FileListRequest with .. is rejected");
+    std::vector<uint8_t> trailing_request = payload_of(list_message);
+    trailing_request.push_back(0x55);
+    rejects_list_request(std::move(trailing_request),
+                         "FileListRequest with trailing bytes is rejected");
+
+    chast::FileListResult result;
+    result.request_id = 9;
+    result.truncated = true;
+    chast::FileListEntry folder;
+    folder.name = "photos";
+    folder.modified_ms = 1730000000000;
+    folder.directory = true;
+    chast::FileListEntry file;
+    file.name = "notes-\xE6\x8A\xA5\xE5\x91\x8A.txt";
+    file.size = 42;
+    file.modified_ms = 1730000001000;
+    result.entries = {folder, file};
+    chast::FileListResult got_list;
+    check(chast::parse_file_list_result(payload_of(chast::make_file_list_result(result)),
+                                        got_list, &error) &&
+              got_list.request_id == 9 && got_list.code == chast::FileCode::Ok &&
+              got_list.truncated && got_list.entries.size() == 2 &&
+              got_list.entries[0].name == "photos" && got_list.entries[0].directory &&
+              got_list.entries[0].modified_ms == 1730000000000 &&
+              got_list.entries[1].name == file.name && !got_list.entries[1].directory &&
+              got_list.entries[1].size == 42 &&
+              got_list.entries[1].modified_ms == 1730000001000,
+          "FileListResult round-trips entries, sizes, mtimes and the truncation flag");
+
+    chast::FileListResult refused;
+    refused.request_id = 9;
+    refused.code = chast::FileCode::Refused;
+    refused.reason = "file transfer is disabled";
+    check(chast::parse_file_list_result(payload_of(chast::make_file_list_result(refused)),
+                                        got_list, &error) &&
+              got_list.code == chast::FileCode::Refused && got_list.entries.empty() &&
+              !got_list.truncated && got_list.reason == refused.reason,
+          "a refused FileListResult carries its reason and no entries");
+
+    chast::FileListResult stray_entries = result;
+    stray_entries.code = chast::FileCode::NotFound;
+    check(chast::make_file_list_result(stray_entries).empty(),
+          "the FileListResult maker refuses a refusal with entries");
+    chast::FileListResult too_many;
+    too_many.request_id = 9;
+    too_many.entries.resize(chast::kMaxFileListEntries + 1);
+    for (chast::FileListEntry& entry : too_many.entries) {
+        entry.name = "a";
+    }
+    check(chast::make_file_list_result(too_many).empty(),
+          "the FileListResult maker refuses more than the protocol entry limit");
+    chast::FileListResult bad_name = result;
+    bad_name.entries.resize(1);
+    bad_name.entries[0].name = "photos/2026";
+    check(chast::make_file_list_result(bad_name).empty(),
+          "the FileListResult maker refuses an entry name with a separator");
+
+    auto rejects_list_result = [&](std::vector<uint8_t> payload, const char* what) {
+        chast::FileListResult dropped;
+        check(!chast::parse_file_list_result(std::move(payload), dropped, &error), what);
+    };
+    std::vector<uint8_t> ok_list = payload_of(chast::make_file_list_result(result));
+    std::vector<uint8_t> busy_with_entries = ok_list;
+    busy_with_entries[4] = static_cast<uint8_t>(chast::FileCode::Refused);
+    rejects_list_result(std::move(busy_with_entries),
+                        "a refused FileListResult with entries is rejected");
+    std::vector<uint8_t> unknown_list_code = ok_list;
+    unknown_list_code[4] = 0xFF;
+    rejects_list_result(std::move(unknown_list_code),
+                        "FileListResult with an unknown code is rejected");
+    std::vector<uint8_t> unknown_list_flags = ok_list;
+    unknown_list_flags[5] = 0x02;
+    rejects_list_result(std::move(unknown_list_flags),
+                        "FileListResult with unknown flags is rejected");
+    // id(4) code(1) flags(1) reason length(2), then the entry count.
+    std::vector<uint8_t> counted_list{9, 0, 0, 0, 0, 0, 0, 0, 1, 4};  // 1025 entries
+    rejects_list_result(std::move(counted_list),
+                        "FileListResult past the entry limit is rejected");
+    std::vector<uint8_t> slash_name = ok_list;
+    slash_name[12] = '/';  // the first entry name follows its u16 length
+    rejects_list_result(std::move(slash_name),
+                        "FileListResult with a separator in an entry name is rejected");
+    std::vector<uint8_t> entry_flags = ok_list;
+    entry_flags.back() = 0x02;
+    rejects_list_result(std::move(entry_flags),
+                        "FileListResult with unknown entry flags is rejected");
+    std::vector<uint8_t> trailing_list = ok_list;
+    trailing_list.push_back(0x55);
+    rejects_list_result(std::move(trailing_list),
+                        "FileListResult with trailing bytes is rejected");
+    std::vector<uint8_t> cut_list = ok_list;
+    cut_list.pop_back();
+    rejects_list_result(std::move(cut_list), "a truncated FileListResult is rejected");
+
+    uint32_t download_id = 0;
+    std::string path;
+    check(chast::parse_file_download_request(
+              payload_of(chast::make_file_download_request(11, "docs/report.pdf")),
+              download_id, path, &error) &&
+              download_id == 11 && path == "docs/report.pdf",
+          "FileDownloadRequest round-trips id and a relative file path");
+    check(chast::make_file_download_request(0, "a.txt").empty() &&
+              chast::make_file_download_request(11, "").empty() &&
+              chast::make_file_download_request(11, "../a.txt").empty() &&
+              chast::make_file_download_request(11, "C:/a.txt").empty() &&
+              chast::make_file_download_request(11, "docs\\a.txt").empty(),
+          "the FileDownloadRequest maker refuses zero ids, empty and unpinned paths");
+
+    auto rejects_download_request = [&](std::vector<uint8_t> payload, const char* what) {
+        uint32_t id = 0;
+        std::string file_path;
+        check(!chast::parse_file_download_request(std::move(payload), id, file_path, &error),
+              what);
+    };
+    std::vector<uint8_t> traversal_download{11, 0, 0, 0, 8, 0};
+    const char traversal_file[] = "../a.txt";
+    traversal_download.insert(traversal_download.end(), traversal_file,
+                              traversal_file + 8);
+    rejects_download_request(std::move(traversal_download),
+                             "FileDownloadRequest with .. is rejected");
+    std::vector<uint8_t> empty_download_path{11, 0, 0, 0, 0, 0};
+    rejects_download_request(std::move(empty_download_path),
+                             "FileDownloadRequest without a path is rejected");
+
+    chast::FileDownloadResult download;
+    download.request_id = 11;
+    download.transfer_id = 70;
+    chast::FileDownloadResult got_download;
+    check(chast::parse_file_download_result(
+              payload_of(chast::make_file_download_result(download)), got_download, &error) &&
+              got_download.request_id == 11 && got_download.transfer_id == 70 &&
+              got_download.code == chast::FileCode::Ok,
+          "FileDownloadResult round-trips the transfer id");
+    download.transfer_id = 0;
+    download.code = chast::FileCode::NotFound;
+    download.reason = "no such file";
+    check(chast::parse_file_download_result(
+              payload_of(chast::make_file_download_result(download)), got_download, &error) &&
+              got_download.code == chast::FileCode::NotFound &&
+              got_download.transfer_id == 0 && got_download.reason == download.reason,
+          "a refused FileDownloadResult carries its reason and no transfer id");
+    chast::FileDownloadResult ok_without_id;
+    ok_without_id.request_id = 11;
+    check(chast::make_file_download_result(ok_without_id).empty(),
+          "the FileDownloadResult maker refuses Ok without a transfer id");
+    chast::FileDownloadResult refusal_with_id = download;
+    refusal_with_id.transfer_id = 70;
+    check(chast::make_file_download_result(refusal_with_id).empty(),
+          "the FileDownloadResult maker refuses a refusal with a transfer id");
+
+    auto rejects_download_result = [&](std::vector<uint8_t> payload, const char* what) {
+        chast::FileDownloadResult dropped;
+        check(!chast::parse_file_download_result(std::move(payload), dropped, &error), what);
+    };
+    std::vector<uint8_t> ok_download = payload_of(chast::make_file_download_result(
+        chast::FileDownloadResult{11, 70, chast::FileCode::Ok, {}}));
+    std::vector<uint8_t> mismatched_download = ok_download;
+    mismatched_download[8] = static_cast<uint8_t>(chast::FileCode::NotFound);
+    rejects_download_result(std::move(mismatched_download),
+                            "a FileDownloadResult whose code and id disagree is rejected");
+    std::vector<uint8_t> unknown_download_code = ok_download;
+    unknown_download_code[8] = 0xFF;
+    rejects_download_result(std::move(unknown_download_code),
+                            "FileDownloadResult with an unknown code is rejected");
+    std::vector<uint8_t> trailing_download = ok_download;
+    trailing_download.push_back(0x55);
+    rejects_download_result(std::move(trailing_download),
+                            "FileDownloadResult with trailing bytes is rejected");
+
+    uint32_t op_id = 0;
+    chast::FileOperation op = chast::FileOperation::Remove;
+    std::string op_path;
+    std::string op_name;
+    check(chast::parse_file_op_request(
+              payload_of(chast::make_file_op_request(13, chast::FileOperation::Rename,
+                                                     "docs/a.txt", "b.txt")),
+              op_id, op, op_path, op_name, &error) &&
+              op_id == 13 && op == chast::FileOperation::Rename &&
+              op_path == "docs/a.txt" && op_name == "b.txt",
+          "FileOpRequest round-trips a rename");
+    check(chast::parse_file_op_request(
+              payload_of(chast::make_file_op_request(
+                  13, chast::FileOperation::MakeDirectory, "docs/new", "")),
+              op_id, op, op_path, op_name, &error) &&
+              op_id == 13 && op == chast::FileOperation::MakeDirectory &&
+              op_path == "docs/new" && op_name.empty(),
+          "FileOpRequest round-trips a folder creation");
+    check(chast::make_file_op_request(0, chast::FileOperation::Remove, "a", "").empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Remove, "", "").empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Remove, "../a", "")
+                  .empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Remove, "a", "b")
+                  .empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Rename, "a", "").empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Rename, "a", "../b")
+                  .empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Rename, "a", "b/c")
+                  .empty() &&
+              chast::make_file_op_request(13, chast::FileOperation::Rename, "a", ".").empty() &&
+              chast::make_file_op_request(13, static_cast<chast::FileOperation>(7), "a", "")
+                  .empty(),
+          "the FileOpRequest maker refuses zero ids, unpinned paths and mismatched names");
+
+    auto rejects_op_request = [&](std::vector<uint8_t> payload, const char* what) {
+        uint32_t id = 0;
+        chast::FileOperation dropped_op = chast::FileOperation::Remove;
+        std::string dropped_path;
+        std::string dropped_name;
+        check(!chast::parse_file_op_request(std::move(payload), id, dropped_op,
+                                            dropped_path, dropped_name, &error),
+              what);
+    };
+    std::vector<uint8_t> unknown_op = payload_of(chast::make_file_op_request(
+        13, chast::FileOperation::Remove, "a", ""));
+    unknown_op[4] = 0xFF;
+    rejects_op_request(std::move(unknown_op),
+                       "FileOpRequest with an unknown operation is rejected");
+    std::vector<uint8_t> trailing_op = payload_of(chast::make_file_op_request(
+        13, chast::FileOperation::Remove, "a", ""));
+    trailing_op.push_back(0x55);
+    rejects_op_request(std::move(trailing_op),
+                       "FileOpRequest with trailing bytes is rejected");
+    std::vector<uint8_t> slash_new_name = payload_of(chast::make_file_op_request(
+        13, chast::FileOperation::Rename, "a", "b"));
+    slash_new_name.back() = '/';
+    rejects_op_request(std::move(slash_new_name),
+                       "FileOpRequest with a separator in the new name is rejected");
+
+    chast::FileOpResult op_result;
+    op_result.request_id = 13;
+    op_result.code = chast::FileCode::Refused;
+    op_result.reason = "the folder is not empty";
+    chast::FileOpResult got_op;
+    check(chast::parse_file_op_result(
+              payload_of(chast::make_file_op_result(op_result)), got_op, &error) &&
+              got_op.request_id == 13 && got_op.code == chast::FileCode::Refused &&
+              got_op.reason == op_result.reason,
+          "FileOpResult round-trips a refusal and its reason");
+    op_result.request_id = 0;
+    check(chast::make_file_op_result(op_result).empty(),
+          "the FileOpResult maker refuses a zero request id");
+    std::vector<uint8_t> ok_op = payload_of(chast::make_file_op_result(
+        chast::FileOpResult{13, chast::FileCode::Ok, {}}));
+    ok_op[4] = 0xFF;
+    chast::FileOpResult dropped_op;
+    check(!chast::parse_file_op_result(std::move(ok_op), dropped_op, &error),
+          "FileOpResult with an unknown code is rejected");
+}
+
 void test_clipboard_container() {
     std::string error;
     chast::ClipboardContent content;
@@ -2412,6 +2990,29 @@ void test_clipboard_container() {
     bad_dib.formats.push_back(short_dib);
     check(chast::encode_clipboard_stream(bad_dib).empty(),
           "the encoder refuses a DIB with no picture size");
+
+    // A rich item's text rides the CCLB stream, not the legacy control
+    // message, so it must not inherit that message's 256 KiB limit.
+    check(chast::kMaxClipboardTextBytes > chast::kMaxClipboardBytes,
+          "the stream text limit exceeds the legacy control message limit");
+    const std::string large_text(chast::kMaxClipboardTextBytes, 'L');
+    chast::ClipboardContent large;
+    chast::ClipboardFormatData large_entry;
+    large_entry.format = chast::ClipboardFormat::Text;
+    large_entry.data.assign(large_text.begin(), large_text.end());
+    large.formats.push_back(std::move(large_entry));
+    check(chast::valid_clipboard_content(large, &error),
+          "clipboard text at the stream limit validates");
+    const std::vector<uint8_t> large_stream = chast::encode_clipboard_stream(large);
+    chast::ClipboardContent large_decoded;
+    check(!large_stream.empty() &&
+              chast::decode_clipboard_stream(large_stream.data(), large_stream.size(),
+                                             large_decoded, &error) &&
+              large_decoded.formats.size() == 1 && large_decoded.text() == large_text,
+          "clipboard text at the stream limit round-trips");
+    large.formats.front().data.push_back('L');
+    check(!chast::valid_clipboard_content(large, &error),
+          "clipboard text past the stream limit is rejected");
 }
 
 }  // namespace
@@ -2420,6 +3021,7 @@ int main(int argc, char** argv) {
     test_hello();
     test_access_denied();
     test_hello_ack();
+    test_files_only_hello_ack();
     test_merged_hello_ack();
     test_permission_update();
     test_sas();
@@ -2428,6 +3030,7 @@ int main(int argc, char** argv) {
     test_display_switch();
     test_display_modes();
     test_file_transfer();
+    test_file_browser();
     test_clipboard_container();
     test_frame_header();
     test_audio_header();
@@ -2435,9 +3038,11 @@ int main(int argc, char** argv) {
     test_audio_parser();
     test_latency_probe();
     test_clipboard();
+    test_clipboard_files();
     test_chat();
     test_port_forward();
     test_terminal();
+    test_camera();
     test_cursor_update();
     test_stream_info();
     test_input_events();

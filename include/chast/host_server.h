@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,7 @@
 #include "chast/carrier.h"
 #include "chast/clipboard.h"
 #include "chast/encoder.h"
+#include "chast/file_transfer.h"
 #include "chast/host_security.h"
 #include "chast/host_settings.h"
 #include "chast/input.h"
@@ -274,6 +276,14 @@ struct HostServerConfig {
     // never touches the operator's clipboard.
     std::function<bool(ClipboardContent&)> clipboard_read;
     std::function<bool(const ClipboardContent&)> clipboard_write;
+    // CF_HDROP access. Empty reads the real clipboard; the loopback check
+    // substitutes a list so it never touches the operator's clipboard.
+    std::function<bool(std::vector<std::string>&)> clipboard_read_files;
+    // CF_HDROP write used when a viewer's clipboard file copy has been staged
+    // (protocol v34). Empty writes the real clipboard; the loopback check
+    // captures the list so an automated run never touches the operator's
+    // clipboard. The staged files stay valid for the rest of the session.
+    std::function<bool(const std::vector<std::string>&)> clipboard_write_files;
     // Called on the host thread for every ChatMessage the viewer sent. The
     // operator UI appends it to the chat window; the message is not echoed.
     std::function<void(const std::string&)> chat_message;
@@ -360,6 +370,10 @@ private:
     // error stops it. Returns false only for a failure, not for a normal
     // disconnect. `peer_left` distinguishes a vanished viewer.
     bool stream_session(HostServerStats& stats, std::string* error, bool* peer_left);
+    // Serves a viewer that asked for a file-transfer-only session: no capture,
+    // encoder, display or audio exists. The same file machinery as a desktop
+    // session runs in a short polling loop until the viewer leaves.
+    bool file_session(HostServerStats& stats, std::string* error, bool* peer_left);
     bool sleep_unless_stopping(std::chrono::milliseconds duration);
     void log(const std::string& message);
     void publish_state(HostState state, const std::string& error = {});
@@ -438,6 +452,94 @@ private:
     std::thread send_hasher_;
     uint32_t next_send_id_ = 1;
     std::string pending_download_path_;
+    // Preassigned for a viewer-requested download so the answer can name the
+    // transfer id before hashing starts; 0 for an operator download.
+    uint32_t pending_download_transfer_id_ = 0;
+
+    // The files named by the last FileList clipboard item the host announced
+    // or received. The order is the viewer's ".chast-clipboard/<index>"
+    // download key; the identity (ordered names, folder layout and sizes)
+    // stops a staged CF_HDROP write from being announced straight back.
+    mutable std::mutex clipboard_files_mutex_;
+    std::vector<std::string> clipboard_file_paths_;
+    std::vector<ClipboardFileEntry> clipboard_file_entries_;
+    uint64_t last_file_identity_ = 0;
+    std::vector<ClipboardFileEntry> last_file_entries_;
+    std::vector<std::string> last_file_paths_;
+
+    // The viewer's clipboard file list being staged (protocol v34). One list at
+    // a time; the staging directory outlives the completed list because the
+    // host's CF_HDROP points into it, and is removed when the next list starts
+    // or the session ends.
+    struct ClipboardIncoming {
+        bool active = false;
+        std::string directory;  // staging root (UTF-8)
+        std::vector<ClipboardFileEntry> entries;
+        std::vector<std::string> landed;  // final path per entry
+        // Per entry: the staging directory below the root and the CF_HDROP
+        // top-level item, both relative to the root.
+        std::vector<std::string> relative;
+        std::vector<std::string> top_relative;
+        size_t next = 0;
+        uint64_t identity = 0;
+    };
+    ClipboardIncoming clipboard_incoming_;
+    uint64_t clipboard_stage_seq_ = 0;
+
+    // ----- file transfer shared by both session kinds -----
+    //
+    // stream_session calls poll_files() once per frame; file_session calls it
+    // from its own loop. Everything here runs on the host thread.
+
+    // Picks up the receive directory and audit reference and resets the
+    // per-session download throttle. Called once when a session starts.
+    void begin_file_session();
+    // Aborts an incomplete upload (keeping its .part file), joins the hashing
+    // thread and leaves a truthful terminal state for the tray. Idempotent.
+    void end_file_session();
+    void poll_files(HostServerStats& stats);
+    bool file_transfer_allowed() const;
+    bool clipboard_transfer_allowed() const;
+    // Records the viewer's announced clipboard list and creates its staging
+    // directory; a previous list (and its in-flight upload) is dropped first.
+    bool begin_clipboard_incoming(const std::vector<ClipboardFileEntry>& entries,
+                                  HostServerStats& stats, std::string* error);
+    void reset_clipboard_incoming(bool remove_directory);
+    // All announced files landed: puts the top-level items on the host
+    // clipboard and suppresses the echo the next local poll would see.
+    void finish_clipboard_incoming(HostServerStats& stats);
+    void drain_file_offers(HostServerStats& stats);
+    void drain_file_data(HostServerStats& stats);
+    void drain_file_cancel(HostServerStats& stats);
+    void drain_file_browse(HostServerStats& stats);
+    void drive_file_download(HostServerStats& stats);
+    void end_upload(FileCode code, const std::string& reason, bool keep_partial,
+                    bool report, HostServerStats& stats);
+    void send_file_failure(const std::string& message, bool report,
+                           HostServerStats& stats);
+    void audit_upload(const std::string& name, uint64_t bytes, bool success,
+                      const std::string& detail);
+
+    // The viewer's incoming upload. One transfer at a time: the receiver owns
+    // the .part file and the answer goes out only after the name, free space
+    // and resume state checked out.
+    struct ActiveUpload {
+        FileOffer offer;
+        std::unique_ptr<FileReceiver> receiver;
+        std::chrono::steady_clock::time_point answer_time;
+        uint64_t written = 0;
+        // A clipboard-marked offer stages into the announced list's directory
+        // and never touches the receive directory (protocol v34).
+        bool clipboard = false;
+        size_t clipboard_entry = 0;
+    };
+
+    std::unique_ptr<ActiveUpload> upload_;
+    std::string file_receive_directory_;
+    std::string file_audit_ref_;
+    std::ifstream download_stream_;
+    double download_tokens_ = 0.0;
+    std::chrono::steady_clock::time_point download_token_time_;
 
     // Chat queued by the operator UI. Cleared when a session starts so a line
     // typed while nobody was connected never reaches the next viewer.

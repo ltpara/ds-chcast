@@ -3,6 +3,7 @@ package api_test
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -76,6 +77,90 @@ func exportCSV(t *testing.T, url string) [][]string {
 		prefix = "chast-file-transfers"
 	}
 	return decodeExport(t, header, body, prefix)
+}
+
+func TestCSVExportPagesPastStorePageCaps(t *testing.T) {
+	s := testutil.Start(t)
+	user, err := s.Accounts.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	start := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+
+	const auditRows = 510
+	for i := 0; i < auditRows; i++ {
+		if err := s.Accounts.AppendAudit(account.AuditEvent{
+			Username: "alice", Action: "export_bulk", Detail: fmt.Sprintf("a%d", i),
+			CreatedAt: start.Add(time.Duration(i) * time.Second), Success: true,
+		}); err != nil {
+			t.Fatalf("append audit %d: %v", i, err)
+		}
+	}
+	rows := exportCSV(t, s.URL+"/v1/audit?format=csv&action=export_bulk")
+	if len(rows) != auditRows+1 {
+		t.Fatalf("audit export rows = %d, want %d", len(rows)-1, auditRows)
+	}
+	if rows[1][4] != "a509" || rows[len(rows)-1][4] != "a0" {
+		t.Fatalf("audit export order = %q .. %q", rows[1][4], rows[len(rows)-1][4])
+	}
+
+	// The connection and file listings cap a page at 200 rows, so these
+	// downloads must not stop after the first page.
+	const connectionRows = 450
+	for i := 0; i < connectionRows; i++ {
+		at := start.Add(time.Duration(i) * time.Minute)
+		if _, err := s.Accounts.RecordConnection(user.ID, "alice", "peer1", "viewer", "",
+			"", at, at.Add(time.Second), true, fmt.Sprintf("c%d", i)); err != nil {
+			t.Fatalf("record connection %d: %v", i, err)
+		}
+	}
+	rows = exportCSV(t, s.URL+"/v1/audit/connections?format=csv")
+	if len(rows) != connectionRows+1 {
+		t.Fatalf("connection export rows = %d, want %d", len(rows)-1, connectionRows)
+	}
+	if rows[1][12] != "c449" || rows[len(rows)-1][12] != "c0" {
+		t.Fatalf("connection export order = %q .. %q", rows[1][12], rows[len(rows)-1][12])
+	}
+
+	const transferRows = 250
+	for i := 0; i < transferRows; i++ {
+		if _, err := s.Accounts.RecordFileTransfer(user.ID, "alice", "peer1", "upload",
+			"dump.bin", "", "", 1, 1, start, true, fmt.Sprintf("f%d", i)); err != nil {
+			t.Fatalf("record transfer %d: %v", i, err)
+		}
+	}
+	rows = exportCSV(t, s.URL+"/v1/audit/file-transfers?format=csv")
+	if len(rows) != transferRows+1 {
+		t.Fatalf("file export rows = %d, want %d", len(rows)-1, transferRows)
+	}
+	if rows[1][13] != "f249" || rows[len(rows)-1][13] != "f0" {
+		t.Fatalf("file export order = %q .. %q", rows[1][13], rows[len(rows)-1][13])
+	}
+}
+
+func TestCSVExportFlushesThroughInstrumentation(t *testing.T) {
+	s := testutil.Start(t)
+	req, err := http.NewRequest(http.MethodGet, s.URL+"/v1/audit?format=csv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testutil.ServerKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d", resp.StatusCode)
+	}
+	// A flush before the handler returns makes the server stream the body
+	// instead of buffering it to compute Content-Length.
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Fatalf("streaming export kept content length %q", got)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("read export body: %v", err)
+	}
 }
 
 func TestOperatorHistoryCSVExport(t *testing.T) {
@@ -237,19 +322,35 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	}
 
 	token := login(t, s.URL, "alice", "correct horse").Token
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	viewerToken := login(t, s.URL, "bob", "battery staple").Token
 	for _, path := range []string{
 		"/v1/audit?format=csv",
 		"/v1/audit/connections?format=csv",
 		"/v1/audit/file-transfers?format=csv",
 	} {
-		for _, key := range []string{"", token} {
-			status, header, body := exportGet(t, s.URL+path, key)
-			if status != http.StatusUnauthorized {
-				t.Fatalf("%s key=%q: %d %s", path, key, status, body)
-			}
-			if strings.HasPrefix(header.Get("Content-Type"), "text/csv") {
-				t.Fatalf("%s key=%q leaked a csv body", path, key)
-			}
+		status, header, body := exportGet(t, s.URL+path, "")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("%s anonymous: %d %s", path, status, body)
+		}
+		if strings.HasPrefix(header.Get("Content-Type"), "text/csv") {
+			t.Fatalf("%s anonymous leaked a csv body", path)
+		}
+		status, header, body = exportGet(t, s.URL+path, viewerToken)
+		if status != http.StatusForbidden {
+			t.Fatalf("%s viewer: %d %s", path, status, body)
+		}
+		if strings.HasPrefix(header.Get("Content-Type"), "text/csv") {
+			t.Fatalf("%s viewer leaked a csv body", path)
+		}
+		status, header, body = exportGet(t, s.URL+path, token)
+		if status != http.StatusOK {
+			t.Fatalf("%s admin: %d %s", path, status, body)
+		}
+		if !strings.HasPrefix(header.Get("Content-Type"), "text/csv") {
+			t.Fatalf("%s admin content type = %q", path, header.Get("Content-Type"))
 		}
 	}
 }

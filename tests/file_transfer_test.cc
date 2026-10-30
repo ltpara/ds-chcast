@@ -261,6 +261,130 @@ void test_nested_receiver(const std::filesystem::path& directory) {
     check(receiver == nullptr, "a directory component that is a file is refused");
 }
 
+void test_browser(const std::filesystem::path& directory) {
+    const std::filesystem::path root = directory / "browse";
+    std::error_code ignored;
+    std::filesystem::create_directories(root / "sub", ignored);
+    {
+        std::ofstream(root / "beta.bin", std::ios::binary) << "beta";
+    }
+    {
+        std::ofstream(root / "alpha.txt", std::ios::binary) << "abc";
+    }
+    {
+        std::ofstream(root / "sub" / "inner.txt", std::ios::binary) << "inner";
+    }
+
+    std::string full;
+    bool is_directory = false;
+    std::string error;
+    check(chast::resolve_receive_path(root.string(), "", full, is_directory, error) ==
+                  chast::FileCode::Ok &&
+              is_directory && std::filesystem::equivalent(full, root),
+          "the receive root resolves to itself and is a directory");
+    check(chast::resolve_receive_path(root.string(), "sub", full, is_directory, error) ==
+                  chast::FileCode::Ok &&
+              is_directory && std::filesystem::equivalent(full, root / "sub"),
+          "a subdirectory resolves and is reported as a directory");
+    check(chast::resolve_receive_path(root.string(), "sub/inner.txt", full, is_directory,
+                                      error) == chast::FileCode::Ok &&
+              !is_directory &&
+              std::filesystem::equivalent(full, root / "sub" / "inner.txt"),
+          "a nested file resolves and is reported as a file");
+    check(chast::resolve_receive_path(root.string(), "../outside", full, is_directory,
+                                      error) == chast::FileCode::Refused,
+          "a traversal is refused before touching the file system");
+    check(chast::resolve_receive_path(root.string(), "/etc/passwd", full, is_directory,
+                                      error) == chast::FileCode::Refused,
+          "an absolute path is refused");
+    check(chast::resolve_receive_path(root.string(), "missing.txt", full, is_directory,
+                                      error) == chast::FileCode::NotFound,
+          "a missing file reports NotFound");
+    check(chast::resolve_receive_path(root.string(), "alpha.txt/inner", full, is_directory,
+                                      error) == chast::FileCode::NotFound,
+          "a file used as a directory reports NotFound");
+
+    chast::FileListResult list;
+    list.request_id = 3;
+    chast::list_receive_directory(root.string(), "", list);
+    check(list.code == chast::FileCode::Ok && !list.truncated && list.entries.size() == 3,
+          "the root lists every entry without truncation");
+    check(list.entries.size() == 3 && list.entries[0].name == "sub" &&
+              list.entries[0].directory && list.entries[1].name == "alpha.txt" &&
+              !list.entries[1].directory && list.entries[1].size == 3 &&
+              list.entries[1].modified_ms != 0 && list.entries[2].name == "beta.bin" &&
+              list.entries[2].size == 4,
+          "directories come first, then files sorted by name with sizes and mtimes");
+
+    chast::list_receive_directory(root.string(), "sub", list);
+    check(list.code == chast::FileCode::Ok && list.entries.size() == 1 &&
+              list.entries[0].name == "inner.txt" && list.entries[0].size == 5,
+          "a subdirectory lists its own files only");
+
+    chast::list_receive_directory(root.string(), "missing", list);
+    check(list.code == chast::FileCode::NotFound && !list.reason.empty(),
+          "listing a missing directory reports NotFound with a reason");
+
+    chast::list_receive_directory(root.string(), "alpha.txt", list);
+    check(list.code == chast::FileCode::NotFound,
+          "listing a file reports NotFound instead of entries");
+
+    const std::filesystem::path link = root / "escape";
+    constexpr DWORD kAllowUnprivilegedCreate = 0x2;
+    if (CreateSymbolicLinkW(link.c_str(), directory.c_str(),
+                            SYMBOLIC_LINK_FLAG_DIRECTORY | kAllowUnprivilegedCreate)) {
+        chast::list_receive_directory(root.string(), "", list);
+        bool listed = false;
+        for (const chast::FileListEntry& entry : list.entries) {
+            listed = listed || entry.name == "escape";
+        }
+        check(!listed, "a reparse point is not listed");
+        check(chast::resolve_receive_path(root.string(), "escape", full, is_directory,
+                                          error) == chast::FileCode::Refused,
+              "a reparse point is refused while resolving");
+        std::filesystem::remove(link, ignored);
+    } else {
+        std::printf("skip reparse-point checks: cannot create a link here\n");
+    }
+
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::MakeDirectory,
+                                      "fresh", "", error) == chast::FileCode::Ok &&
+              std::filesystem::is_directory(root / "fresh"),
+          "creating a folder lands below the root");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::MakeDirectory,
+                                      "fresh", "", error) == chast::FileCode::Refused,
+          "creating an existing folder is refused");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Rename, "fresh",
+                                      "renamed", error) == chast::FileCode::Ok &&
+              std::filesystem::is_directory(root / "renamed") &&
+              !std::filesystem::exists(root / "fresh"),
+          "a rename moves the entry inside its own folder");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Rename, "renamed",
+                                      "alpha.txt", error) == chast::FileCode::Refused,
+          "a rename onto an occupied name is refused");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Rename,
+                                      "sub/inner.txt", "sub/inner2.txt", error) ==
+              chast::FileCode::Refused,
+          "a rename new name cannot carry a separator");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Remove,
+                                      "renamed", "", error) == chast::FileCode::Ok &&
+              !std::filesystem::exists(root / "renamed"),
+          "an empty folder is removed");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Remove, "sub", "",
+                                      error) == chast::FileCode::Refused,
+          "a non-empty folder is refused");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Remove,
+                                      "alpha.txt", "", error) == chast::FileCode::Ok &&
+              !std::filesystem::exists(root / "alpha.txt"),
+          "a file is removed");
+    check(chast::apply_file_operation(root.string(), chast::FileOperation::Remove,
+                                      "../outside", "", error) == chast::FileCode::Refused &&
+              chast::apply_file_operation(root.string(), chast::FileOperation::Remove,
+                                          "missing.txt", "", error) ==
+                  chast::FileCode::NotFound,
+          "operations cannot leave the root and report missing paths");
+}
+
 }  // namespace
 
 int main() {
@@ -281,6 +405,7 @@ int main() {
         test_sha256_file(directory);
         test_receiver(directory);
         test_nested_receiver(directory);
+        test_browser(directory);
     } else {
         std::printf("FAIL could not create a temp directory\n");
         ++failures;

@@ -74,24 +74,7 @@ func (s *server) adminActor(w http.ResponseWriter, r *http.Request) (account.Use
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return account.User{}, "", false
 	}
-	if s.authorized(r) {
-		return account.User{}, "server-key", true
-	}
-	token, ok := bearerToken(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "server key or admin account token required")
-		return account.User{}, "", false
-	}
-	user, err := s.cfg.Accounts.Authenticate(token)
-	if err != nil {
-		writeError(w, http.StatusUnauthorized, "server key or admin account token required")
-		return account.User{}, "", false
-	}
-	if user.Role != account.RoleAdmin {
-		writeError(w, http.StatusForbidden, "admin role required")
-		return account.User{}, "", false
-	}
-	return user, user.Username, true
+	return s.consoleActor(w, r, consoleAdmin)
 }
 
 func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -125,10 +108,6 @@ func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 	if role == "" {
 		role = account.RoleUser
 	}
-	if role != account.RoleAdmin && role != account.RoleUser {
-		writeError(w, http.StatusBadRequest, account.ErrInvalidRole.Error())
-		return
-	}
 	password := req.Password
 	generated := false
 	if password == "" {
@@ -139,17 +118,10 @@ func (s *server) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 		}
 		generated = true
 	}
-	user, err := s.cfg.Accounts.CreateUserWithRecovery(req.Username, password, req.Email, req.Phone)
+	user, err := s.cfg.Accounts.CreateUserWithRole(req.Username, password, req.Email, req.Phone, role)
 	if err != nil {
 		writeAccountError(w, err)
 		return
-	}
-	if user.Role != role {
-		user, err = s.cfg.Accounts.SetRole(user.Username, role)
-		if err != nil {
-			writeAccountError(w, err)
-			return
-		}
 	}
 	s.recordAudit(r, actor, account.AuditAccountCreate,
 		"created "+user.Username+" role="+user.Role, true)

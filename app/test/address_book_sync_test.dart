@@ -200,6 +200,91 @@ void main() {
     expect(merged.any((AddressBookGroup group) => group.id == 'old'), isFalse);
   });
 
+  test('group merge orders siblings by position, then name, then id', () {
+    const AddressBookSnapshot snapshot = AddressBookSnapshot(
+      revision: 4,
+      peers: <AddressBookPeer>[],
+      groupChanges: <AddressBookGroup>[
+        AddressBookGroup(id: 'b', name: 'Beta', position: 2),
+      ],
+    );
+    final List<AddressBookGroup> merged = mergeAddressBookGroups(
+      current: const <AddressBookGroup>[
+        AddressBookGroup(id: 'c', name: 'Omega', position: 2),
+        AddressBookGroup(id: 'a', name: 'Zulu', position: 1),
+        AddressBookGroup(id: 'b', name: 'Beta', position: 2),
+      ],
+      snapshot: snapshot,
+      since: 3,
+    );
+    expect(
+      merged.map((AddressBookGroup group) => group.id),
+      <String>['a', 'b', 'c'],
+    );
+  });
+
+  test('group tree order nests children and tolerates damaged links', () {
+    const List<AddressBookGroup> groups = <AddressBookGroup>[
+      AddressBookGroup(id: 'team', name: 'Team'),
+      AddressBookGroup(id: 'dev', name: 'Dev', parentId: 'team'),
+      AddressBookGroup(id: 'ops', name: 'Ops', parentId: 'team', position: 1),
+      AddressBookGroup(id: 'hq', name: 'HQ', position: 1),
+      AddressBookGroup(id: 'lost', name: 'Lost', parentId: 'deleted'),
+      AddressBookGroup(id: 'loop-a', name: 'A', parentId: 'loop-b'),
+      AddressBookGroup(id: 'loop-b', name: 'B', parentId: 'loop-a'),
+      AddressBookGroup(id: 'gone', deleted: true),
+    ];
+    final List<AddressBookGroupNode> nodes = addressBookGroupTreeOrder(groups);
+    expect(
+      nodes.map((AddressBookGroupNode node) => '${node.depth}/${node.group.id}'),
+      <String>[
+        '0/lost',
+        '0/team',
+        '1/dev',
+        '1/ops',
+        '0/hq',
+        '0/loop-a',
+        '1/loop-b',
+      ],
+    );
+  });
+
+  test('server peer positions sync into the local device order', () {
+    final List<Device> devices = <Device>[
+      Device(
+        id: 'second',
+        server: server,
+        saved: true,
+        groupId: 'work',
+        addedAt: now,
+      ),
+      Device(
+        id: 'first',
+        server: server,
+        saved: true,
+        groupId: 'work',
+        addedAt: now,
+      ),
+    ];
+    final AddressBookPlan plan = planAddressBookSync(
+      devices: devices,
+      peers: const <AddressBookPeer>[
+        AddressBookPeer(id: 'first', groupId: 'work', position: 1, revision: 3),
+        AddressBookPeer(id: 'second', groupId: 'work', position: 2, revision: 3),
+      ],
+      groups: const <AddressBookGroup>[
+        AddressBookGroup(id: 'work', name: 'Work'),
+      ],
+      serverUrl: server,
+      now: now,
+    );
+    final Map<String, int> positions = <String, int>{
+      for (final Device device in plan.devices) device.id: device.position,
+    };
+    expect(positions, <String, int>{'first': 1, 'second': 2});
+    expect(plan.pushes, isEmpty);
+  });
+
   test('tags adopt from the server, and local tags win and are uploaded', () {
     final List<Device> devices = <Device>[
       Device(

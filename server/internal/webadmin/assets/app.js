@@ -1,13 +1,17 @@
 'use strict';
 
 (() => {
-  const STORAGE_KEY = 'chast.admin.key';
+  const STORAGE_KEY = 'chast.admin.session';
+  const LEGACY_KEY = 'chast.admin.key';
   const REFRESH_MS = 15000;
+  const ROLE_RANK = { readonly: 1, operator: 2, admin: 3 };
 
   const $ = (id) => document.getElementById(id);
 
   const state = {
-    key: null,
+    // {mode:'key', key} for the server key, or
+    // {mode:'account', token, refresh, username, role} for an operator login.
+    auth: null,
     tab: 'overview',
     publicKey: '',
     editing: null,
@@ -17,6 +21,9 @@
     auditBefore: 0,
     auditRows: [],
     auditGen: 0,
+    recordingBefore: 0,
+    recordingRows: [],
+    recordingGen: 0,
   };
 
   class ApiError extends Error {
@@ -150,34 +157,100 @@
 
   // ---------- session and API ----------
 
-  function readKey() {
+  function readSession() {
     try {
-      return sessionStorage.getItem(STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  }
-
-  function writeKey(key) {
-    try {
-      sessionStorage.setItem(STORAGE_KEY, key);
+      const raw = sessionStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && (parsed.mode === 'key' || parsed.mode === 'account')) return parsed;
+      }
+      // Sessions saved before account logins existed stored the raw server key.
+      const legacy = sessionStorage.getItem(LEGACY_KEY);
+      if (legacy !== null) return { mode: 'key', key: legacy };
     } catch {
       /* storage can be unavailable in locked-down browsers */
     }
+    return null;
   }
 
-  function clearKey() {
+  function writeSession(auth) {
     try {
-      sessionStorage.removeItem(STORAGE_KEY);
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(auth));
+      sessionStorage.removeItem(LEGACY_KEY);
     } catch {
       /* ignore */
     }
   }
 
-  async function api(path, options) {
+  function clearSession() {
+    try {
+      sessionStorage.removeItem(STORAGE_KEY);
+      sessionStorage.removeItem(LEGACY_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function can(level) {
+    const auth = state.auth;
+    if (!auth) return false;
+    if (auth.mode === 'key') return true;
+    return (ROLE_RANK[auth.role] || 0) >= ROLE_RANK[level];
+  }
+
+  function authToken() {
+    const auth = state.auth;
+    if (!auth) return '';
+    return auth.mode === 'key' ? auth.key : auth.token;
+  }
+
+  function authHeaders() {
+    const token = authToken();
+    return token ? { Authorization: 'Bearer ' + token } : {};
+  }
+
+  function readJSON(text) {
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
+  // refreshSession rotates the account pair. It runs on every expired access
+  // token, so a console stays usable for the refresh token's lifetime.
+  async function refreshSession() {
+    const auth = state.auth;
+    if (!auth || auth.mode !== 'account' || !auth.refresh) return false;
+    try {
+      const resp = await fetch('/v1/account/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: auth.refresh }),
+        cache: 'no-store',
+      });
+      if (!resp.ok) return false;
+      const data = readJSON(await resp.text());
+      if (!data || !data.token || !data.refresh_token) return false;
+      auth.token = data.token;
+      auth.refresh = data.refresh_token;
+      if (data.user) {
+        auth.username = data.user.username || auth.username;
+        auth.role = data.user.role || auth.role;
+      }
+      writeSession(auth);
+      renderSession();
+      applyPermissions();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function api(path, options, retried) {
     const opts = options || {};
-    const headers = {};
-    if (state.key) headers.Authorization = 'Bearer ' + state.key;
+    const headers = authHeaders();
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
     const resp = await fetch(path, {
       method: opts.method || 'GET',
@@ -186,16 +259,12 @@
       cache: 'no-store',
     });
     const text = await resp.text();
-    let data = null;
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = null;
-      }
-    }
+    const data = readJSON(text);
     if (resp.status === 401) {
-      lock('服务器密钥无效或已更改，请重新连接。');
+      if (!retried && await refreshSession()) {
+        return api(path, options, true);
+      }
+      lock('登录已失效或凭据被拒绝，请重新登录。');
       throw new ApiError('unauthorized', 401);
     }
     if (!resp.ok) {
@@ -205,34 +274,117 @@
     return data;
   }
 
-  async function unlock(key) {
-    state.key = key;
+  async function unlockKey(key) {
+    state.auth = { mode: 'key', key };
     await api('/v1/stats');
-    writeKey(key);
+    writeSession(state.auth);
+    enterConsole();
+  }
+
+  async function unlockAccount(username, password, code) {
+    const body = { username, password };
+    if (code) {
+      // Six digits is a TOTP code; anything else is treated as a printed
+      // recovery code so a lost authenticator does not lock operators out.
+      if (/^\d{6}$/.test(code)) body.totp_code = code;
+      else body.recovery_code = code;
+    }
+    const resp = await fetch('/v1/account/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
+    const data = readJSON(await resp.text());
+    if (resp.status === 401) {
+      const factor = resp.headers.get('X-Chast-2FA');
+      const message = factor === 'required' ? '该账号启用了两步验证，请输入验证码。'
+        : factor === 'invalid' ? '两步验证码不正确。'
+          : (data && data.error) || '用户名或密码不正确。';
+      throw new ApiError(message, 401);
+    }
+    if (!resp.ok) {
+      throw new ApiError((data && data.error) || resp.status + ' ' + resp.statusText, resp.status);
+    }
+    const user = data && data.user ? data.user : {};
+    if (!ROLE_RANK[user.role]) {
+      // The viewer session is valid but useless here; revoke it right away.
+      fetch('/v1/account/logout', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + data.token },
+        cache: 'no-store',
+      }).catch(() => {});
+      throw new ApiError('该账号没有管理台权限（需要 readonly、operator 或 admin 角色）。', 403);
+    }
+    state.auth = {
+      mode: 'account',
+      token: data.token,
+      refresh: data.refresh_token,
+      username: user.username || username,
+      role: user.role,
+    };
+    writeSession(state.auth);
+    enterConsole();
+  }
+
+  function enterConsole() {
     $('login-form').classList.add('hidden');
     $('session-bar').classList.remove('hidden');
-    $('session-label').textContent = key ? '已连接' : '已连接（未设密钥）';
     $('login-note').textContent = '';
     $('workspace').classList.remove('hidden');
+    renderSession();
+    applyPermissions();
     startTimer();
     switchTab('overview');
   }
 
+  function renderSession() {
+    const auth = state.auth;
+    if (!auth) return;
+    const role = auth.mode === 'key' ? 'server-key' : auth.role;
+    const pill = $('session-role');
+    pill.textContent = role;
+    pill.className = 'pill ' + (role === 'admin' || role === 'server-key' ? 'ok'
+      : role === 'operator' ? 'warn' : '');
+    $('session-label').textContent = auth.mode === 'key' ? '服务器密钥' : auth.username;
+  }
+
+  function applyPermissions() {
+    const admin = can('admin');
+    const write = can('operator');
+    document.querySelector('.tab[data-tab="accounts"]').classList.toggle('hidden', !admin);
+    $('device-readonly').classList.toggle('hidden', write);
+    $('recording-readonly').classList.toggle('hidden', write);
+    if (!admin && state.tab === 'accounts') switchTab('overview');
+  }
+
   function lock(message) {
     stopTimer();
-    state.key = null;
+    const auth = state.auth;
+    if (auth && auth.mode === 'account' && auth.token) {
+      fetch('/v1/account/logout', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + auth.token },
+        cache: 'no-store',
+      }).catch(() => {});
+    }
+    state.auth = null;
     state.publicKey = '';
     state.auditRows = [];
     state.auditGen++;
+    state.recordingRows = [];
+    state.recordingGen++;
     const dialog = $('device-dialog');
     if (dialog.open) dialog.close();
-    clearKey();
+    clearSession();
     $('workspace').classList.add('hidden');
     $('session-bar').classList.add('hidden');
     $('login-form').classList.remove('hidden');
     $('server-key').value = '';
+    $('account-password').value = '';
+    $('account-totp').value = '';
     $('login-note').textContent = message || '已断开连接。';
-    $('server-key').focus();
+    syncLoginMode();
   }
 
   function startTimer() {
@@ -267,6 +419,7 @@
     if (tab === 'overview') refreshOverview().catch(reportError);
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
+    else if (tab === 'recordings') loadRecordings(true).catch(reportError);
     else if (tab === 'audit') loadAudit(true).catch(reportError);
     else if (tab === 'server') loadServerPanel().catch(reportError);
   }
@@ -531,6 +684,10 @@
     tr.appendChild(cell(fmtAge(peer.last_seen_ms)));
 
     const actions = el('div', 'actions-wrap');
+    if (!can('operator')) {
+      tr.appendChild(cell(el('span', 'muted', '只读')));
+      return tr;
+    }
     const edit = button('编辑', 'small');
     edit.addEventListener('click', () => openDeviceDialog(peer));
     actions.appendChild(edit);
@@ -606,7 +763,7 @@
     tr.appendChild(name);
 
     const select = document.createElement('select');
-    ['user', 'admin'].forEach((role) => {
+    ['user', 'readonly', 'operator', 'admin'].forEach((role) => {
       const option = document.createElement('option');
       option.value = role;
       option.textContent = role;
@@ -700,6 +857,120 @@
       }
       await loadAccounts();
     });
+  }
+
+  // ---------- recordings ----------
+
+  async function loadRecordings(reset) {
+    const generation = ++state.recordingGen;
+    if (reset) {
+      state.recordingBefore = 0;
+      state.recordingRows = [];
+    }
+    const username = $('recording-user').value.trim();
+    const params = new URLSearchParams();
+    if (username) params.set('username', username);
+    params.set('limit', '50');
+    const cursor = state.recordingBefore;
+    if (cursor) params.set('before_id', String(cursor));
+    let data;
+    try {
+      data = await api('/v1/recordings?' + params.toString()) || {};
+    } catch (err) {
+      if (err && err.status === 503) {
+        state.recordingRows = [];
+        state.recordingBefore = 0;
+        renderRecordings();
+        $('recording-summary').textContent = '服务端未启用录制归档（缺少 --recordings-dir）。';
+        return;
+      }
+      throw err;
+    }
+    if (generation !== state.recordingGen) return;
+    const list = Array.isArray(data.recordings) ? data.recordings : [];
+    state.recordingRows = state.recordingRows.concat(list);
+    state.recordingBefore = data.next_before_id || 0;
+    renderRecordings();
+    const total = data.total === undefined ? list.length : data.total;
+    const bits = ['共 ' + total + ' 个', '合计 ' + fmtBytes(data.usage_bytes || 0)];
+    if (data.max_upload_bytes) bits.push('单文件上限 ' + fmtBytes(data.max_upload_bytes));
+    if (username) bits.push('用户 ' + username);
+    if (state.recordingRows.length < total) bits.push('已显示 ' + state.recordingRows.length + ' 个');
+    $('recording-summary').textContent = bits.join(' · ');
+  }
+
+  function renderRecordings() {
+    const body = $('recording-rows');
+    clear(body);
+    state.recordingRows.forEach((rec) => body.appendChild(recordingRow(rec)));
+    $('recording-empty').classList.toggle('hidden', state.recordingRows.length > 0);
+    $('recording-more').classList.toggle('hidden', !state.recordingBefore);
+  }
+
+  function recordingRow(rec) {
+    const tr = document.createElement('tr');
+    tr.appendChild(cell(fmtTime(rec.created_at_ms)));
+
+    const owner = cell(rec.username || '—');
+    owner.className = 'mono';
+    tr.appendChild(owner);
+
+    const name = cell(rec.name || '—');
+    if (rec.sha256) name.title = 'SHA-256 ' + rec.sha256;
+    tr.appendChild(name);
+    tr.appendChild(cell(rec.peer_id || '—'));
+    tr.appendChild(cell(fmtBytes(rec.size)));
+    tr.appendChild(cell(fmtDurationMS(rec.duration_ms)));
+    tr.appendChild(cell(fmtTime(rec.started_at_ms)));
+
+    const actions = el('div', 'actions-wrap');
+    const download = button('下载', 'small');
+    download.addEventListener('click', () => withButton(download, () => downloadRecording(rec)));
+    actions.appendChild(download);
+
+    if (can('operator')) {
+      const remove = button('删除', 'small danger');
+      remove.addEventListener('click', () => withButton(remove, async () => {
+        if (!window.confirm('删除 ' + (rec.username || '') + ' 的录制「' + (rec.name || rec.id) +
+          '」？\n文件与元数据会一并移除，此操作不可撤销。')) return;
+        await api('/v1/recordings/' + encodeURIComponent(rec.id), { method: 'DELETE' });
+        toast('已删除录制');
+        await loadRecordings(true);
+      }));
+      actions.appendChild(remove);
+    }
+
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  async function downloadRecording(rec) {
+    const target = '/v1/recordings/' + encodeURIComponent(rec.id);
+    let resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
+    if (resp.status === 401 && await refreshSession()) {
+      resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
+    }
+    if (!resp.ok) {
+      let message = resp.status + ' ' + resp.statusText;
+      try {
+        const data = await resp.json();
+        if (data && data.error) message = data.error;
+      } catch {
+        /* not JSON */
+      }
+      if (resp.status === 401) lock('登录已失效或凭据被拒绝，请重新登录。');
+      throw new ApiError(message, resp.status);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = rec.name || rec.id + '.mp4';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('已开始下载 ' + (rec.name || rec.id));
   }
 
   // ---------- audit ----------
@@ -835,9 +1106,11 @@
     const spec = AUDIT[state.auditTab];
     const params = auditParams(spec);
     params.set('format', 'csv');
-    const headers = {};
-    if (state.key) headers.Authorization = 'Bearer ' + state.key;
-    const resp = await fetch(spec.path + '?' + params.toString(), { headers, cache: 'no-store' });
+    const target = spec.path + '?' + params.toString();
+    let resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
+    if (resp.status === 401 && await refreshSession()) {
+      resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
+    }
     if (!resp.ok) {
       let message = resp.status + ' ' + resp.statusText;
       try {
@@ -866,18 +1139,45 @@
 
   let deviceInputTimer = 0;
 
+  function syncLoginMode() {
+    const account = $('login-mode').value === 'account';
+    $('server-key').classList.toggle('hidden', account);
+    $('login-account').classList.toggle('hidden', !account);
+    if (account) $('account-username').focus();
+    else $('server-key').focus();
+  }
+
   function bindEvents() {
+    $('login-mode').addEventListener('change', syncLoginMode);
     $('login-form').addEventListener('submit', async (event) => {
       event.preventDefault();
-      const key = $('server-key').value.trim();
+      const mode = $('login-mode').value;
       try {
-        await unlock(key);
+        if (mode === 'account') {
+          const username = $('account-username').value.trim();
+          const password = $('account-password').value;
+          if (!username || !password) {
+            $('login-note').textContent = '请输入用户名与密码。';
+            return;
+          }
+          await unlockAccount(username, password, $('account-totp').value.trim());
+          $('account-password').value = '';
+          $('account-totp').value = '';
+        } else {
+          await unlockKey($('server-key').value.trim());
+        }
         toast('已连接');
       } catch (err) {
-        if (err.status !== 401) {
-          lock('无法连接：' + (err.message || err));
-          toast(err.message || '无法连接', true);
+        // A rejected server key has already been explained by lock().
+        if (err.status === 401 && mode === 'key') return;
+        const message = err.message || String(err);
+        if (err.status === 401 || err.status === 403) {
+          $('login-note').textContent = message;
+          toast(message, true);
+          return;
         }
+        lock('无法连接：' + message);
+        toast(message, true);
       }
     });
 
@@ -920,6 +1220,16 @@
       await loadAccounts();
       toast('已刷新');
     }));
+
+    $('recording-reload').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadRecordings(true);
+    }));
+    $('recording-more').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadRecordings(false);
+    }));
+    $('recording-user').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') loadRecordings(true).catch(reportError);
+    });
 
     document.querySelectorAll('.subtab').forEach((node) => {
       node.addEventListener('click', () => selectAuditTab(node.dataset.audit));
@@ -977,10 +1287,14 @@
 
   function boot() {
     bindEvents();
-    $('login-note').textContent = '输入 --server-key 对应的密钥；服务器未设置密钥时可直接连接。';
-    const saved = readKey();
-    if (saved === null) return;
-    unlock(saved).catch((err) => {
+    syncLoginMode();
+    $('login-note').textContent = '使用服务器密钥，或以 readonly / operator / admin 角色的账号登录。';
+    const saved = readSession();
+    if (!saved) return;
+    state.auth = saved;
+    api('/v1/stats').then(() => {
+      enterConsole();
+    }).catch((err) => {
       if (err && err.status === 401) return;
       lock('自动连接失败：' + (err && err.message ? err.message : err));
     });

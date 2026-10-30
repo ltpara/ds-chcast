@@ -26,6 +26,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/acmecert"
 	"github.com/ltpara/ds-chcast/server/internal/admin"
 	"github.com/ltpara/ds-chcast/server/internal/api"
+	"github.com/ltpara/ds-chcast/server/internal/auditarchive"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/configpush"
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
@@ -36,6 +37,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
+	"github.com/ltpara/ds-chcast/server/internal/recordings"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/relay"
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
@@ -57,66 +59,74 @@ func main() {
 
 func run() error {
 	var (
-		httpListen     = flag.String("http-listen", "0.0.0.0:8443", "HTTP registration and lookup address")
-		punchListen    = flag.String("punch-listen", "0.0.0.0:8444", "UDP rendezvous and punch address")
-		relayListen    = flag.String("relay-listen", "0.0.0.0", "IP address for relay UDP ports")
-		relayV6        = flag.String("relay-listen-v6", "", "optional IPv6 address for relay UDP ports, same port numbers as --relay-listen")
-		portRange      = flag.String("relay-ports", "41000-41099", "relay UDP ports, e.g. 41000-41099")
-		carrierAddr    = flag.String("carrier-listen", "0.0.0.0:8445", "shared TCP/WebSocket carrier address; empty disables it")
-		carrierV6      = flag.String("carrier-listen-v6", "", "optional IPv6 address for the shared carrier, same port as --carrier-listen")
-		advertise      = flag.String("advertise", "", "public IP or DNS name returned to peers")
-		advertiseV6    = flag.String("advertise-v6", "", "public IPv6 address for the rendezvous port; empty derives it from the registration connection")
-		relayServers   = flag.String("relay-servers", "", "comma-separated relay host names or IPs without ports; empty uses --advertise")
-		relayNodes     = flag.String("relay-nodes", "", "comma-separated standalone relay node URLs, e.g. http://relay1:8447")
-		relayNodeKey   = flag.String("relay-node-key", "", "control key shared with every --relay-nodes entry")
-		relayNodeCA    = flag.String("relay-node-ca", "", "PEM CA bundle for HTTPS relay nodes; empty uses the system roots")
-		relayNodeCert  = flag.String("relay-node-client-cert", "", "client certificate presented to relay nodes requiring mTLS")
-		relayNodeKeyID = flag.String("relay-node-client-key", "", "private key for --relay-node-client-cert")
-		relayHealth    = flag.Duration("relay-node-health", 10*time.Second, "how often standalone relay nodes are probed")
-		serverKey      = flag.String("server-key", "", "required for registration unless empty")
-		softwareVer    = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
-		softwareURL    = flag.String("software-url", "", "download URL advertised with --software-version")
-		softwareDir    = flag.String("software-dir", "", "release directory published read-only at /software/{name}; the file named by --software-url is hashed and signed in the notice")
-		smtpAddr       = flag.String("smtp-addr", "", "SMTP host:port used to send password-reset mail; empty disables email recovery")
-		smtpFrom       = flag.String("smtp-from", "", "From address for password-reset mail; required with --smtp-addr")
-		smtpUser       = flag.String("smtp-user", "", "SMTP username for PLAIN authentication; empty sends without auth")
-		smtpPass       = flag.String("smtp-pass", "", "SMTP password for PLAIN authentication; prefer an env file over the command line")
-		smtpTLS        = flag.String("smtp-tls", mail.TLSStart, "SMTP security: starttls, implicit or none")
-		recoveryURL    = flag.String("recovery-url", "", "page password-reset links point at; the token is always included in the mail")
-		recoveryTTL    = flag.Duration("recovery-ttl", 30*time.Minute, "password-reset token lifetime")
-		smsURL         = flag.String("sms-url", "", "HTTP SMS gateway endpoint for password-reset codes; empty disables SMS recovery")
-		smsToken       = flag.String("sms-token", "", "bearer token sent to --sms-url; prefer an env file over the command line")
-		smsFrom        = flag.String("sms-from", "", "optional sender ID passed to the SMS gateway")
-		smsTTL         = flag.Duration("sms-ttl", 10*time.Minute, "SMS password-reset code lifetime, at most 1h")
-		webauthnRPID   = flag.String("webauthn-rp-id", "", "relying party id (bare host name) that enables security-key registration and login")
-		webauthnOrigin = flag.String("webauthn-origin", "", "comma-separated origins (scheme://host[:port]) accepted in security-key ceremonies")
-		auditRetention = flag.Int("audit-retention-days", 0, "delete audit, connection and file-transfer history older than this many days; 0 keeps the row caps only")
-		tombstoneDays  = flag.Int("addressbook-tombstone-days", 0, "delete address-book tombstones older than this many days; 0 keeps them")
-		rendezvousList = flag.String("rendezvous-servers", "", "comma-separated HTTP API base URLs pushed to clients for failover; empty disables the push")
-		configSerial   = flag.Int64("config-serial", 0, "serial of the pushed rendezvous list; 0 becomes 1 when a list is set")
-		hostTTL        = flag.Duration("host-ttl", 60*time.Second, "how long a registration survives without renewal")
-		offline        = flag.Duration("offline-after", 30*time.Second, "keepalive silence that makes a host offline")
-		stateFile      = flag.String("state", "chast-server-state.db", "persistent SQLite peer database; a legacy .json next to it is imported once; empty disables persistence")
-		identityFile   = flag.String("identity", "chast-server-identity.key", "Ed25519 server identity seed; created on first run, empty for ephemeral")
-		tlsCert        = flag.String("tls-cert", "", "PEM certificate for the HTTP API; requires --tls-key")
-		tlsKey         = flag.String("tls-key", "", "PEM private key for the HTTP API; requires --tls-cert")
-		tlsClientCA    = flag.String("tls-client-ca", "", "PEM CA bundle; when set, HTTPS clients must present a certificate signed by it (mTLS)")
-		acmeDomain     = flag.String("acme-domain", "", "comma-separated DNS names obtained automatically over ACME HTTP-01; replaces --tls-cert/--tls-key")
-		acmeEmail      = flag.String("acme-email", "", "contact address registered with the ACME CA")
-		acmeCache      = flag.String("acme-cache", "", "directory for ACME account keys and certificates; empty uses an acme-cache directory next to --state")
-		acmeHTTPListen = flag.String("acme-http-listen", ":80", "HTTP-01 challenge and HTTPS redirect listener; must be reachable from the CA")
-		acmeDirectory  = flag.String("acme-directory-url", "", "ACME directory URL; empty uses Let's Encrypt production")
-		acmeEABKID     = flag.String("acme-eab-kid", "", "external account binding key id for CAs that require EAB")
-		acmeEABKey     = flag.String("acme-eab-key", "", "external account binding HMAC key in base64; paired with --acme-eab-kid")
-		apiRate        = flag.Float64("api-rate", 50, "sustained HTTP requests per second per client IP; 0 disables the limiter")
-		apiBurst       = flag.Int("api-burst", 100, "HTTP burst allowance per client IP")
-		loginFails     = flag.Int("login-max-failures", 5, "failed account logins per username and client IP before a lockout; 0 disables it")
-		loginWindow    = flag.Duration("login-window", 10*time.Minute, "window for counting failed account logins")
-		loginLockout   = flag.Duration("login-lockout", time.Minute, "how long a locked username and client IP stay refused")
-		proxyHeader    = flag.String("proxy-header", "", "header carrying the client IP behind a trusted proxy, e.g. X-Forwarded-For")
-		geoIPFile      = flag.String("geoip-file", "", "CIDR-to-location table used to label login IPs; empty records IPs only")
-		relayOnly      = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
-		adminListen    = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
+		httpListen      = flag.String("http-listen", "0.0.0.0:8443", "HTTP registration and lookup address")
+		punchListen     = flag.String("punch-listen", "0.0.0.0:8444", "UDP rendezvous and punch address")
+		relayListen     = flag.String("relay-listen", "0.0.0.0", "IP address for relay UDP ports")
+		relayV6         = flag.String("relay-listen-v6", "", "optional IPv6 address for relay UDP ports, same port numbers as --relay-listen")
+		portRange       = flag.String("relay-ports", "41000-41099", "relay UDP ports, e.g. 41000-41099")
+		carrierAddr     = flag.String("carrier-listen", "0.0.0.0:8445", "shared TCP/WebSocket carrier address; empty disables it")
+		carrierV6       = flag.String("carrier-listen-v6", "", "optional IPv6 address for the shared carrier, same port as --carrier-listen")
+		advertise       = flag.String("advertise", "", "public IP or DNS name returned to peers")
+		advertiseV6     = flag.String("advertise-v6", "", "public IPv6 address for the rendezvous port; empty derives it from the registration connection")
+		relayServers    = flag.String("relay-servers", "", "comma-separated relay host names or IPs without ports; empty uses --advertise")
+		relayNodes      = flag.String("relay-nodes", "", "comma-separated standalone relay node URLs, e.g. http://relay1:8447")
+		relayNodeKey    = flag.String("relay-node-key", "", "control key shared with every --relay-nodes entry")
+		relayNodeCA     = flag.String("relay-node-ca", "", "PEM CA bundle for HTTPS relay nodes; empty uses the system roots")
+		relayNodeCert   = flag.String("relay-node-client-cert", "", "client certificate presented to relay nodes requiring mTLS")
+		relayNodeKeyID  = flag.String("relay-node-client-key", "", "private key for --relay-node-client-cert")
+		relayHealth     = flag.Duration("relay-node-health", 10*time.Second, "how often standalone relay nodes are probed")
+		serverKey       = flag.String("server-key", "", "required for registration unless empty")
+		softwareVer     = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
+		softwareURL     = flag.String("software-url", "", "download URL advertised with --software-version")
+		softwareDir     = flag.String("software-dir", "", "release directory published read-only at /software/{name}; the file named by --software-url is hashed and signed in the notice")
+		smtpAddr        = flag.String("smtp-addr", "", "SMTP host:port used to send password-reset mail; empty disables email recovery")
+		smtpFrom        = flag.String("smtp-from", "", "From address for password-reset mail; required with --smtp-addr")
+		smtpUser        = flag.String("smtp-user", "", "SMTP username for PLAIN authentication; empty sends without auth")
+		smtpPass        = flag.String("smtp-pass", "", "SMTP password for PLAIN authentication; prefer an env file over the command line")
+		smtpTLS         = flag.String("smtp-tls", mail.TLSStart, "SMTP security: starttls, implicit or none")
+		recoveryURL     = flag.String("recovery-url", "", "page password-reset links point at; the token is always included in the mail")
+		recoveryTTL     = flag.Duration("recovery-ttl", 30*time.Minute, "password-reset token lifetime")
+		smsURL          = flag.String("sms-url", "", "HTTP SMS gateway endpoint for password-reset codes; empty disables SMS recovery")
+		smsToken        = flag.String("sms-token", "", "bearer token sent to --sms-url; prefer an env file over the command line")
+		smsFrom         = flag.String("sms-from", "", "optional sender ID passed to the SMS gateway")
+		smsTTL          = flag.Duration("sms-ttl", 10*time.Minute, "SMS password-reset code lifetime, at most 1h")
+		webauthnRPID    = flag.String("webauthn-rp-id", "", "relying party id (bare host name) that enables security-key registration and login")
+		webauthnOrigin  = flag.String("webauthn-origin", "", "comma-separated origins (scheme://host[:port]) accepted in security-key ceremonies")
+		auditRetention  = flag.Int("audit-retention-days", 0, "delete audit, connection and file-transfer history older than this many days; 0 keeps the row caps only")
+		auditArchive    = flag.String("audit-archive-dir", "", "append audit, connection and file-transfer history to JSONL files in this directory; empty disables the archive")
+		archiveEvery    = flag.Duration("audit-archive-interval", time.Hour, "how often new history rows are appended to the archive")
+		archiveGzip     = flag.Bool("audit-archive-compress", true, "gzip archive files once their UTC day is closed")
+		archiveKeep     = flag.Int("audit-archive-retention-days", 0, "delete archive files whose UTC day is older than this many days; 0 keeps them")
+		tombstoneDays   = flag.Int("addressbook-tombstone-days", 0, "delete address-book tombstones older than this many days; 0 keeps them")
+		recordingsDir   = flag.String("recordings-dir", "", "directory for viewer recordings uploaded to accounts; empty disables the archive")
+		recordingsQuota = flag.Int("recordings-quota-mb", 8192, "per-account recording storage limit in MiB; 0 disables the quota")
+		recordingsMax   = flag.Int("recordings-max-mb", 2048, "largest single recording upload in MiB; 0 disables the limit")
+		recordingsDays  = flag.Int("recordings-retention-days", 30, "delete uploaded recordings older than this many days; 0 keeps them forever")
+		rendezvousList  = flag.String("rendezvous-servers", "", "comma-separated HTTP API base URLs pushed to clients for failover; empty disables the push")
+		configSerial    = flag.Int64("config-serial", 0, "serial of the pushed rendezvous list; 0 becomes 1 when a list is set")
+		hostTTL         = flag.Duration("host-ttl", 60*time.Second, "how long a registration survives without renewal")
+		offline         = flag.Duration("offline-after", 30*time.Second, "keepalive silence that makes a host offline")
+		stateFile       = flag.String("state", "chast-server-state.db", "persistent SQLite peer database; a legacy .json next to it is imported once; empty disables persistence")
+		identityFile    = flag.String("identity", "chast-server-identity.key", "Ed25519 server identity seed; created on first run, empty for ephemeral")
+		tlsCert         = flag.String("tls-cert", "", "PEM certificate for the HTTP API; requires --tls-key")
+		tlsKey          = flag.String("tls-key", "", "PEM private key for the HTTP API; requires --tls-cert")
+		tlsClientCA     = flag.String("tls-client-ca", "", "PEM CA bundle; when set, HTTPS clients must present a certificate signed by it (mTLS)")
+		acmeDomain      = flag.String("acme-domain", "", "comma-separated DNS names obtained automatically over ACME HTTP-01; replaces --tls-cert/--tls-key")
+		acmeEmail       = flag.String("acme-email", "", "contact address registered with the ACME CA")
+		acmeCache       = flag.String("acme-cache", "", "directory for ACME account keys and certificates; empty uses an acme-cache directory next to --state")
+		acmeHTTPListen  = flag.String("acme-http-listen", ":80", "HTTP-01 challenge and HTTPS redirect listener; must be reachable from the CA")
+		acmeDirectory   = flag.String("acme-directory-url", "", "ACME directory URL; empty uses Let's Encrypt production")
+		acmeEABKID      = flag.String("acme-eab-kid", "", "external account binding key id for CAs that require EAB")
+		acmeEABKey      = flag.String("acme-eab-key", "", "external account binding HMAC key in base64; paired with --acme-eab-kid")
+		apiRate         = flag.Float64("api-rate", 50, "sustained HTTP requests per second per client IP; 0 disables the limiter")
+		apiBurst        = flag.Int("api-burst", 100, "HTTP burst allowance per client IP")
+		loginFails      = flag.Int("login-max-failures", 5, "failed account logins per username and client IP before a lockout; 0 disables it")
+		loginWindow     = flag.Duration("login-window", 10*time.Minute, "window for counting failed account logins")
+		loginLockout    = flag.Duration("login-lockout", time.Minute, "how long a locked username and client IP stay refused")
+		proxyHeader     = flag.String("proxy-header", "", "header carrying the client IP behind a trusted proxy, e.g. X-Forwarded-For")
+		geoIPFile       = flag.String("geoip-file", "", "CIDR-to-location table used to label login IPs; empty records IPs only")
+		relayOnly       = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
+		adminListen     = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
 
 		relaySingle    = flag.Float64("relay-single-bandwidth", 128, "per-session relay bandwidth in Mbit/s; 0 disables the limit")
 		relayTotal     = flag.Float64("relay-total-bandwidth", 1024, "total relay bandwidth in Mbit/s; 0 disables the limit")
@@ -364,6 +374,9 @@ func run() error {
 	if *regMaxIDs > 0 && *regIDWindow < time.Minute {
 		return errors.New("--register-id-window must be at least 1m")
 	}
+	if *recordingsQuota < 0 || *recordingsMax < 0 || *recordingsDays < 0 {
+		return errors.New("--recordings-quota-mb, --recordings-max-mb and --recordings-retention-days must not be negative")
+	}
 	var acmeManager *acmecert.Manager
 	acmeDomainsRaw := strings.TrimSpace(*acmeDomain)
 	if acmeDomainsRaw == "" {
@@ -420,7 +433,7 @@ func run() error {
 	}
 	var tlsConfig *tls.Config
 	if acmeManager != nil {
-		tlsConfig, err = acmeManager.TLSConfig(*tlsClientCA)
+		tlsConfig, err = acmeManager.TLSConfig(*tlsClientCA, netutil.CertificateReloadInterval)
 	} else {
 		tlsConfig, err = netutil.LoadReloadingTLSConfig(*tlsCert, *tlsKey, *tlsClientCA, log,
 			netutil.CertificateReloadInterval)
@@ -628,6 +641,56 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var recordingArchive *recordings.Archive
+	if *recordingsDir != "" {
+		if accounts == nil {
+			return errors.New("--recordings-dir requires --state")
+		}
+		archive, err := recordings.New(recordings.Config{
+			Dir:       *recordingsDir,
+			Quota:     int64(*recordingsQuota) << 20,
+			MaxUpload: int64(*recordingsMax) << 20,
+			Accounts:  accounts,
+			Logger:    log,
+		})
+		if err != nil {
+			return fmt.Errorf("--recordings-dir: %w", err)
+		}
+		recordingArchive = archive
+		log.Info("recording archive enabled", "dir", archive.Dir(),
+			"quota_mb", *recordingsQuota, "max_mb", *recordingsMax,
+			"retention_days", *recordingsDays)
+		purge := func() {
+			if *recordingsDays > 0 {
+				age := time.Duration(*recordingsDays) * 24 * time.Hour
+				purged, err := archive.PurgeExpired(time.Now().Add(-age))
+				if err != nil {
+					log.Error("recording retention", "error", err)
+				} else if purged > 0 {
+					log.Info("recording retention removed files", "count", purged)
+				}
+			}
+			orphans, err := archive.PurgeOrphans(time.Now())
+			if err != nil {
+				log.Error("recording orphan sweep", "error", err)
+			} else if orphans > 0 {
+				log.Info("recording orphan sweep removed files", "count", orphans)
+			}
+		}
+		purge()
+		go func() {
+			ticker := time.NewTicker(6 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					purge()
+				}
+			}
+		}()
+	}
 	if (*auditRetention > 0 || *tombstoneDays > 0) && accounts != nil {
 		auditAge := time.Duration(*auditRetention) * 24 * time.Hour
 		tombstoneAge := time.Duration(*tombstoneDays) * 24 * time.Hour
@@ -660,6 +723,57 @@ func run() error {
 					return
 				case <-ticker.C:
 					prune()
+				}
+			}
+		}()
+	}
+	var archiveConsole *auditarchive.Archiver
+	if *auditArchive != "" {
+		if accounts == nil {
+			return fmt.Errorf("--audit-archive-dir requires --state")
+		}
+		if *archiveEvery <= 0 {
+			return fmt.Errorf("--audit-archive-interval must be positive")
+		}
+		if *archiveKeep < 0 {
+			return fmt.Errorf("--audit-archive-retention-days must not be negative")
+		}
+		archiver, err := auditarchive.New(*auditArchive, accounts, log, auditarchive.Options{
+			Compress:      *archiveGzip,
+			RetentionDays: *archiveKeep,
+		})
+		if err != nil {
+			return fmt.Errorf("--audit-archive-dir: %w", err)
+		}
+		archiveConsole = archiver
+		archive := func() {
+			result, err := archiver.Run()
+			if err != nil {
+				log.Error("audit archive", "error", err)
+				return
+			}
+			if result.Audit+result.Connections+result.FileTransfers > 0 {
+				log.Info("audit archive wrote rows", "audit", result.Audit,
+					"connections", result.Connections, "transfers", result.FileTransfers,
+					"files", result.Files)
+			}
+			if len(result.Compressed)+len(result.Pruned) > 0 {
+				log.Info("audit archive compacted", "compressed", len(result.Compressed),
+					"pruned", len(result.Pruned))
+			}
+		}
+		log.Info("audit archive enabled", "dir", archiver.Dir(), "interval", *archiveEvery,
+			"compress", *archiveGzip, "retention_days", *archiveKeep)
+		archive()
+		go func() {
+			ticker := time.NewTicker(*archiveEvery)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					archive()
 				}
 			}
 		}()
@@ -699,6 +813,7 @@ func run() error {
 			RecoveryTTL: *recoveryTTL,
 			SMS:         consoleSMS,
 			SMSTTL:      *smsTTL,
+			Archive:     archiveConsole,
 			Logger:      log,
 		})
 		if err != nil {
@@ -730,6 +845,7 @@ func run() error {
 		RelayOnly:     relayOnlyFlag,
 		Blocker:       blocker,
 		Accounts:      accounts,
+		Recordings:    recordingArchive,
 		GeoIP:         geoLocator,
 		PunchLog:      punchLog,
 		IPChanges:     ipChanges,

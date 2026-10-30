@@ -18,6 +18,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/auditarchive"
 	"github.com/ltpara/ds-chcast/server/internal/configpush"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
@@ -46,12 +47,12 @@ rendezvous-servers(rv) [url1,url2 | serial <n> <url1,url2|-> | clear]
 test-geo(tg) <ip1> [ip2]
 relay-only(aur) [Y|N]
 user list | user add <name> [password] | user passwd <name> [password] | user del <name>
-user role <name> admin|user | user ban <name> | user unban <name>
+user role <name> admin|operator|readonly|user | user ban <name> | user unban <name>
 user email <name> <email|-> | user recover <name>
 user phone <name> <phone|-> | user sms <name>
 user 2fa <name> off | user unlock <name>
 ab <username> [count] | ab prune <days>
-audit [count] | audit prune <days>
+audit [count] | audit prune <days> | audit archive [run]
 connections [count]
 transfers [count]
 relay bandwidth: sb|tb|ls [Mbit/s], dt [0..1], t [seconds]
@@ -91,6 +92,8 @@ type Config struct {
 	// SMS and SMSTTL drive the user phone and user sms commands.
 	SMS    SMS
 	SMSTTL time.Duration
+	// Archive exposes the JSONL audit archive; nil disables audit archive.
+	Archive *auditarchive.Archiver
 	// PolicyOnly trims the help text to the relay console used by chast-relay.
 	PolicyOnly bool
 	Logger     *slog.Logger

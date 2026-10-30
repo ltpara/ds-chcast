@@ -117,6 +117,80 @@ void main() {
     await answered;
   });
 
+  test('loginWebAuthnPasswordlessBegin posts only the username', () async {
+    final Future<void> answered = serve(200, <String, Object?>{
+      'challenge': 'Y2hhbGxlbmdl',
+      'rp_id': 'chast.example.com',
+      'username': 'alice',
+      'timeout_ms': 60000,
+      'credentials': <Object?>[
+        <String, Object?>{'id': 'Y3JlZA', 'name': '此电脑'},
+      ],
+    });
+    final WebAuthnLoginOptions? options =
+        await ServerApi.loginWebAuthnPasswordlessBegin(
+      settings,
+      username: ' alice ',
+    );
+    await answered;
+    expect(
+      requests.single['path'],
+      '/v1/account/login/webauthn/passwordless/begin',
+    );
+    expect(requests.single['authorization'], isNull);
+    expect(requests.single['body'], <String, Object?>{'username': 'alice'});
+    expect(options, isNotNull);
+    expect(options!.challenge, 'Y2hhbGxlbmdl');
+    expect(options.credentials.single.id, 'Y3JlZA');
+  });
+
+  test('loginWebAuthnPasswordlessBegin returns null without a key', () async {
+    final Future<void> answered = serve(202, <String, Object?>{
+      'status': 'accepted',
+    });
+    final WebAuthnLoginOptions? options =
+        await ServerApi.loginWebAuthnPasswordlessBegin(
+      settings,
+      username: 'alice',
+    );
+    await answered;
+    expect(options, isNull);
+  });
+
+  test('loginWebAuthnPasswordlessFinish uses the passwordless route',
+      () async {
+    final Future<void> answered = serve(200, <String, Object?>{
+      'token': 'acct-token',
+      'expires_in_ms': 900000,
+      'user': <String, Object?>{'username': 'alice'},
+    });
+    final AccountLoginResult result =
+        await ServerApi.loginWebAuthnPasswordlessFinish(
+      settings,
+      username: 'alice',
+      credentialId: 'Y3JlZA',
+      clientDataJSON: 'Y2xpZW50',
+      authenticatorData: 'YXV0aA',
+      signature: 'c2ln',
+      deviceName: '开发机',
+    );
+    await answered;
+    expect(
+      requests.single['path'],
+      '/v1/account/login/webauthn/passwordless/finish',
+    );
+    expect(requests.single['body'], <String, Object?>{
+      'username': 'alice',
+      'credential_id': 'Y3JlZA',
+      'client_data_json': 'Y2xpZW50',
+      'authenticator_data': 'YXV0aA',
+      'signature': 'c2ln',
+      'device_name': '开发机',
+    });
+    expect(result.token, 'acct-token');
+    expect(result.username, 'alice');
+  });
+
   test('loginWebAuthnFinish posts the assertion and parses the session',
       () async {
     final Future<void> answered = serve(200, <String, Object?>{

@@ -31,6 +31,11 @@ const (
 	AuditAccountRecover    = "account_recover"
 	AuditWebAuthnRegister  = "webauthn_register"
 	AuditWebAuthnRemove    = "webauthn_remove"
+	AuditDeviceLabels      = "device_labels"
+	AuditDeviceReset       = "device_reset"
+	AuditDeviceLeaseRemove = "device_lease_remove"
+	AuditRecordingUpload   = "recording_upload"
+	AuditRecordingDelete   = "recording_delete"
 )
 
 // auditRetention keeps the table bounded without an external maintenance job.

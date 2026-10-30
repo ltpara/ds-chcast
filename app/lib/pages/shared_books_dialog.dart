@@ -6,6 +6,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 typedef SharedGrantsLoader =
     Future<AddressBookGrants> Function(ServerSettings settings, String token);
@@ -84,11 +85,11 @@ typedef SharedBookRevokeAction =
 String sharedPermissionLabel(String permission) {
   switch (permission) {
     case 'write':
-      return '读写';
+      return tr('读写');
     case 'control':
-      return '完全控制';
+      return tr('完全控制');
   }
-  return '只读';
+  return tr('只读');
 }
 
 /// Address books shared by other accounts, plus management of the shares this
@@ -154,9 +155,9 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
 
   String _grantScopeLabel(AddressBookGrant grant) {
     if (grant.wholeBook) {
-      return '整本地址簿';
+      return tr('整本地址簿');
     }
-    return '分组 ${_groupName(grant.groupId)}';
+    return tr('分组 {p1}', <String, Object?>{'p1': _groupName(grant.groupId)});
   }
 
   bool _canWritePeer(SharedAddressBook book, AddressBookPeer peer) {
@@ -220,7 +221,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _error = '读取共享地址簿失败：$error';
+          _error = tr('读取共享地址簿失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -241,7 +242,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
           setState(() {
             _busy = false;
             if (_error.isEmpty) {
-              _error = '该条目已在其他设备修改，已刷新为服务器版本';
+              _error = tr('该条目已在其他设备修改，已刷新为服务器版本');
             }
           });
         }
@@ -271,7 +272,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   Future<void> _share() async {
     final String username = _username.text.trim();
     if (username.isEmpty) {
-      setState(() => _error = '请输入要共享的用户名');
+      setState(() => _error = tr('请输入要共享的用户名'));
       return;
     }
     await _perform(() async {
@@ -283,7 +284,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         groupId: _scopeGroup,
       );
       _username.clear();
-    }, '共享失败');
+    }, tr('共享失败'));
   }
 
   Future<void> _changePermission(
@@ -301,7 +302,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         permission,
         groupId: grant.groupId,
       );
-    }, '修改权限失败');
+    }, tr('修改权限失败'));
   }
 
   Future<void> _revoke(AddressBookGrant grant) async {
@@ -312,7 +313,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         grant.username,
         groupId: grant.groupId,
       );
-    }, '撤销共享失败');
+    }, tr('撤销共享失败'));
   }
 
   Future<void> _editPeer(SharedAddressBook book, AddressBookPeer peer) async {
@@ -333,7 +334,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         tags: edit.tags,
         ifRevision: peer.revision > 0 ? peer.revision : null,
       );
-    }, '更新共享条目失败');
+    }, tr('更新共享条目失败'));
   }
 
   Future<void> _addPeer(SharedAddressBook book) async {
@@ -365,26 +366,26 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         tags: draft.tags,
         groupId: draft.groupId,
       );
-    }, '添加共享条目失败');
+    }, tr('添加共享条目失败'));
   }
 
   Future<void> _deletePeer(SharedAddressBook book, AddressBookPeer peer) async {
     final bool? confirmed = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
-        title: const Text('删除共享条目'),
+        title: Text(tr('删除共享条目')),
         content: Text(
-          '从 ${book.owner} 的地址簿删除 ${peer.name.isEmpty ? peer.id : peer.name}？',
+          tr('从 {p2} 的地址簿删除 {p3}？', <String, Object?>{'p2': book.owner, 'p3': peer.name.isEmpty ? peer.id : peer.name}),
         ),
         actions: <Widget>[
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
+            child: Text(tr('取消')),
           ),
           FilledButton(
             key: const Key('shared-peer-delete-confirm'),
             onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('删除'),
+            child: Text(tr('删除')),
           ),
         ],
       ),
@@ -400,7 +401,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         peer.id,
         ifRevision: peer.revision > 0 ? peer.revision : null,
       );
-    }, '删除共享条目失败');
+    }, tr('删除共享条目失败'));
   }
 
   Future<void> _manageGrants(SharedAddressBook book) async {
@@ -427,7 +428,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('共享地址簿'),
+      title: Text(tr('共享地址簿')),
       content: SizedBox(
         width: 480,
         child: ConstrainedBox(
@@ -444,8 +445,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Text(
-                        '共享条目不会复制到对方自己的地址簿；'
-                        '读写与完全控制允许对方直接修改本账号的条目。',
+                        tr('共享条目不会复制到对方自己的地址簿；读写与完全控制允许对方直接修改本账号的条目。'),
                         style: mutedStyle(context, size: 11.5),
                       ),
                       if (_error.isNotEmpty) ...<Widget>[
@@ -465,15 +465,15 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                             TextButton(
                               key: const Key('shared-books-retry'),
                               onPressed: _busy ? null : _load,
-                              child: const Text('重试'),
+                              child: Text(tr('重试')),
                             ),
                           ],
                         ),
                       ],
                       const SizedBox(height: 14),
-                      _sectionTitle(context, '共享给我的地址簿'),
+                      _sectionTitle(context, tr('共享给我的地址簿')),
                       if (_books.isEmpty)
-                        Text('暂无共享', style: mutedStyle(context, size: 12))
+                        Text(tr('暂无共享'), style: mutedStyle(context, size: 12))
                       else
                         for (final SharedAddressBook book
                             in _books) ...<Widget>[
@@ -505,13 +505,13 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                 ),
                                 const SizedBox(width: 6),
                                 Text(
-                                  '${book.peers.length} 台',
+                                  tr('{p5} 台', <String, Object?>{'p5': book.peers.length}),
                                   style: mutedStyle(context, size: 10.5),
                                 ),
                                 if (_canAddPeer(book))
                                   IconButton(
                                     key: Key('shared-add-${book.owner}'),
-                                    tooltip: '添加共享条目',
+                                    tooltip: tr('添加共享条目'),
                                     visualDensity: VisualDensity.compact,
                                     onPressed: _busy
                                         ? null
@@ -528,7 +528,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                     onPressed: _busy
                                         ? null
                                         : () => _manageGrants(book),
-                                    child: const Text('管理授权'),
+                                    child: Text(tr('管理授权')),
                                   ),
                               ],
                             ),
@@ -540,7 +540,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                 bottom: 4,
                               ),
                               child: Text(
-                                '该地址簿为空',
+                                tr('该地址簿为空'),
                                 style: mutedStyle(context, size: 11),
                               ),
                             )
@@ -575,7 +575,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                           'shared-peer-menu-${book.owner}-${peer.id}',
                                         ),
                                         enabled: !_busy,
-                                        tooltip: '共享条目操作',
+                                        tooltip: tr('共享条目操作'),
                                         onSelected: (String action) {
                                           if (action == 'edit') {
                                             _editPeer(book, peer);
@@ -584,14 +584,14 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                           }
                                         },
                                         itemBuilder: (_) =>
-                                            const <PopupMenuEntry<String>>[
+                                            <PopupMenuEntry<String>>[
                                               PopupMenuItem<String>(
                                                 value: 'edit',
-                                                child: Text('编辑名称/标签'),
+                                                child: Text(tr('编辑名称/标签')),
                                               ),
                                               PopupMenuItem<String>(
                                                 value: 'delete',
-                                                child: Text('删除'),
+                                                child: Text(tr('删除')),
                                               ),
                                             ],
                                       ),
@@ -603,16 +603,16 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                           ? null
                                           : () =>
                                                 Navigator.of(context).pop(peer),
-                                      child: const Text('连接'),
+                                      child: Text(tr('连接')),
                                     ),
                                   ],
                                 ),
                               ),
                         ],
                       const SizedBox(height: 14),
-                      _sectionTitle(context, '我共享的地址簿'),
+                      _sectionTitle(context, tr('我共享的地址簿')),
                       if (_grants.outgoing.isEmpty)
-                        Text('尚未共享给其他用户', style: mutedStyle(context, size: 12))
+                        Text(tr('尚未共享给其他用户'), style: mutedStyle(context, size: 12))
                       else
                         for (final AddressBookGrant grant in _grants.outgoing)
                           ListTile(
@@ -668,7 +668,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                     'shared-revoke-${grant.username}'
                                     '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
                                   ),
-                                  tooltip: '撤销共享',
+                                  tooltip: tr('撤销共享'),
                                   onPressed: _busy
                                       ? null
                                       : () => _revoke(grant),
@@ -684,7 +684,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
-                          Text('共享范围', style: mutedStyle(context, size: 11.5)),
+                          Text(tr('共享范围'), style: mutedStyle(context, size: 11.5)),
                           const SizedBox(width: 8),
                           DropdownButton<String>(
                             key: const Key('shared-scope'),
@@ -695,9 +695,9 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               color: theme.colorScheme.onSurface,
                             ),
                             items: <DropdownMenuItem<String>>[
-                              const DropdownMenuItem<String>(
+                              DropdownMenuItem<String>(
                                 value: '',
-                                child: Text('整本地址簿'),
+                                child: Text(tr('整本地址簿')),
                               ),
                               for (final AddressBookGroup group
                                   in widget.groups)
@@ -725,9 +725,9 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               controller: _username,
                               autocorrect: false,
                               enableSuggestions: false,
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 isDense: true,
-                                labelText: '共享给用户名',
+                                labelText: tr('共享给用户名'),
                                 prefixIcon: Icon(
                                   Icons.person_add_alt_1,
                                   size: 17,
@@ -771,7 +771,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                           FilledButton(
                             key: const Key('shared-grant'),
                             onPressed: _busy ? null : _share,
-                            child: const Text('共享'),
+                            child: Text(tr('共享')),
                           ),
                         ],
                       ),
@@ -783,7 +783,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('关闭'),
+          child: Text(tr('关闭')),
         ),
       ],
     );
@@ -846,9 +846,9 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
 
   String _scopeLabel(AddressBookGrant grant) {
     if (grant.wholeBook) {
-      return '整本地址簿';
+      return tr('整本地址簿');
     }
-    return '分组 ${_groupName(grant.groupId)}';
+    return tr('分组 {p18}', <String, Object?>{'p18': _groupName(grant.groupId)});
   }
 
   @override
@@ -893,7 +893,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _error = '读取授权失败：$error';
+          _error = tr('读取授权失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -902,7 +902,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
   Future<void> _share() async {
     final String username = _username.text.trim();
     if (username.isEmpty) {
-      setState(() => _error = '请输入要共享的用户名');
+      setState(() => _error = tr('请输入要共享的用户名'));
       return;
     }
     setState(() {
@@ -932,7 +932,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '共享失败：$error';
+          _error = tr('共享失败：{error}', <String, Object?>{'error': error});
         });
       }
       return;
@@ -968,7 +968,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '撤销共享失败：$error';
+          _error = tr('撤销共享失败：{error}', <String, Object?>{'error': error});
         });
       }
       return;
@@ -984,7 +984,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: Text('管理「${widget.owner}」的共享'),
+      title: Text(tr('管理「{p19}」的共享', <String, Object?>{'p19': widget.owner})),
       content: SizedBox(
         width: 400,
         child: ConstrainedBox(
@@ -1016,7 +1016,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                             TextButton(
                               key: const Key('shared-book-grants-retry'),
                               onPressed: _busy ? null : _load,
-                              child: const Text('重试'),
+                              child: Text(tr('重试')),
                             ),
                           ],
                         ),
@@ -1024,7 +1024,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                       ],
                       if (_grants.outgoing.isEmpty)
                         Text(
-                          '该地址簿尚未共享给其他用户',
+                          tr('该地址簿尚未共享给其他用户'),
                           style: mutedStyle(context, size: 12),
                         )
                       else
@@ -1050,7 +1050,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                                 'shared-book-revoke-${grant.username}'
                                 '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
                               ),
-                              tooltip: '撤销共享',
+                              tooltip: tr('撤销共享'),
                               onPressed: _busy
                                   ? null
                                   : () => _revoke(grant),
@@ -1064,7 +1064,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
-                          Text('共享范围', style: mutedStyle(context, size: 11.5)),
+                          Text(tr('共享范围'), style: mutedStyle(context, size: 11.5)),
                           const SizedBox(width: 8),
                           DropdownButton<String>(
                             key: const Key('shared-book-scope'),
@@ -1075,9 +1075,9 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                               color: theme.colorScheme.onSurface,
                             ),
                             items: <DropdownMenuItem<String>>[
-                              const DropdownMenuItem<String>(
+                              DropdownMenuItem<String>(
                                 value: '',
-                                child: Text('整本地址簿'),
+                                child: Text(tr('整本地址簿')),
                               ),
                               for (final AddressBookGroup group
                                   in widget.groups)
@@ -1105,9 +1105,9 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                               controller: _username,
                               autocorrect: false,
                               enableSuggestions: false,
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 isDense: true,
-                                labelText: '共享给用户名',
+                                labelText: tr('共享给用户名'),
                                 prefixIcon: Icon(
                                   Icons.person_add_alt_1,
                                   size: 17,
@@ -1151,7 +1151,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                           FilledButton(
                             key: const Key('shared-book-grant'),
                             onPressed: _busy ? null : _share,
-                            child: const Text('共享'),
+                            child: Text(tr('共享')),
                           ),
                         ],
                       ),
@@ -1163,7 +1163,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('关闭'),
+          child: Text(tr('关闭')),
         ),
       ],
     );
@@ -1231,7 +1231,7 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
   void _save() {
     final String id = _id.text.trim();
     if (id.isEmpty) {
-      setState(() => _error = '请输入设备 ID');
+      setState(() => _error = tr('请输入设备 ID'));
       return;
     }
     Navigator.of(context).pop(
@@ -1242,7 +1242,7 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('添加共享条目'),
+      title: Text(tr('添加共享条目')),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
@@ -1251,36 +1251,36 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
             controller: _id,
             autocorrect: false,
             enableSuggestions: false,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               isDense: true,
-              labelText: '设备 ID',
+              labelText: tr('设备 ID'),
             ),
           ),
           const SizedBox(height: 12),
           TextField(
             key: const Key('shared-add-name'),
             controller: _name,
-            decoration: const InputDecoration(isDense: true, labelText: '名称'),
+            decoration: InputDecoration(isDense: true, labelText: tr('名称')),
           ),
           const SizedBox(height: 12),
           TextField(
             key: const Key('shared-add-tags'),
             controller: _tags,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               isDense: true,
-              labelText: '标签（逗号分隔）',
+              labelText: tr('标签（逗号分隔）'),
             ),
           ),
           const SizedBox(height: 12),
           DropdownButtonFormField<String>(
             key: const Key('shared-add-group'),
             initialValue: _groupId,
-            decoration: const InputDecoration(isDense: true, labelText: '分组'),
+            decoration: InputDecoration(isDense: true, labelText: tr('分组')),
             items: <DropdownMenuItem<String>>[
               if (widget.allowUngrouped)
-                const DropdownMenuItem<String>(
+                DropdownMenuItem<String>(
                   value: '',
-                  child: Text('未分组'),
+                  child: Text(tr('未分组')),
                 ),
               for (final AddressBookGroup group in widget.groups)
                 DropdownMenuItem<String>(
@@ -1313,12 +1313,12 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('shared-add-save'),
           onPressed: _save,
-          child: const Text('添加'),
+          child: Text(tr('添加')),
         ),
       ],
     );
@@ -1358,22 +1358,22 @@ class _EditSharedPeerDialogState extends State<_EditSharedPeerDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('编辑共享条目'),
+      title: Text(tr('编辑共享条目')),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
           TextField(
             key: const Key('shared-peer-name'),
             controller: _name,
-            decoration: const InputDecoration(isDense: true, labelText: '名称'),
+            decoration: InputDecoration(isDense: true, labelText: tr('名称')),
           ),
           const SizedBox(height: 12),
           TextField(
             key: const Key('shared-peer-tags'),
             controller: _tags,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               isDense: true,
-              labelText: '标签（逗号分隔）',
+              labelText: tr('标签（逗号分隔）'),
             ),
           ),
         ],
@@ -1381,12 +1381,12 @@ class _EditSharedPeerDialogState extends State<_EditSharedPeerDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('shared-peer-save'),
           onPressed: _save,
-          child: const Text('保存'),
+          child: Text(tr('保存')),
         ),
       ],
     );

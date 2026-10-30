@@ -6,6 +6,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 typedef RecoveryEmailChanger = Future<String> Function(
   ServerSettings settings,
@@ -107,14 +108,14 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _loadError = '无法读取当前邮箱：${error.message}';
+          _loadError = tr('无法读取当前邮箱：{p1}', <String, Object?>{'p1': error.message});
         });
       }
     } catch (error) {
       if (mounted) {
         setState(() {
           _loading = false;
-          _loadError = '无法读取当前邮箱：$error';
+          _loadError = tr('无法读取当前邮箱：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -126,11 +127,11 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
     }
     final String email = _email.text.trim();
     if (email.isNotEmpty && !email.contains('@')) {
-      setState(() => _error = '请输入有效的邮箱地址');
+      setState(() => _error = tr('请输入有效的邮箱地址'));
       return;
     }
     if (_password.text.isEmpty) {
-      setState(() => _error = '请输入当前密码');
+      setState(() => _error = tr('请输入当前密码'));
       return;
     }
     setState(() {
@@ -160,7 +161,7 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '保存失败：$error';
+          _error = tr('保存失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -172,7 +173,7 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('找回邮箱'),
+      title: Text(tr('找回邮箱')),
       content: SizedBox(
         width: 380,
         child: Column(
@@ -180,12 +181,12 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             Text(
-              '忘记密码时，服务端会把一次性重置令牌发送到该邮箱。留空并保存表示关闭邮件找回。',
+              tr('忘记密码时，服务端会把一次性重置令牌发送到该邮箱。留空并保存表示关闭邮件找回。'),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 12),
             if (_loading)
-              Text('正在读取当前邮箱…', style: mutedStyle(context, size: 11))
+              Text(tr('正在读取当前邮箱…'), style: mutedStyle(context, size: 11))
             else if (_loadError.isNotEmpty)
               Text(
                 _loadError,
@@ -194,7 +195,7 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
               )
             else
               Text(
-                _email.text.isEmpty ? '当前邮箱：未设置' : '当前邮箱：${_email.text}',
+                _email.text.isEmpty ? tr('当前邮箱：未设置') : tr('当前邮箱：{p2}', <String, Object?>{'p2': _email.text}),
                 key: const Key('recovery-email-current'),
                 style: mutedStyle(context, size: 11),
               ),
@@ -205,8 +206,8 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
               keyboardType: TextInputType.emailAddress,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '找回邮箱',
+              decoration: InputDecoration(
+                labelText: tr('找回邮箱'),
                 hintText: 'name@example.com',
                 prefixIcon: Icon(Icons.alternate_email_rounded, size: 18),
               ),
@@ -218,8 +219,8 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
               obscureText: true,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '当前密码',
+              decoration: InputDecoration(
+                labelText: tr('当前密码'),
                 prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
               ),
               onSubmitted: (_) => _submit(),
@@ -238,7 +239,7 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('recovery-email-save'),
@@ -249,7 +250,7 @@ class _RecoveryEmailDialogState extends State<RecoveryEmailDialog> {
                   height: 15,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : const Text('保存'),
+              : Text(tr('保存')),
         ),
       ],
     );
@@ -314,14 +315,14 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _loadError = '无法读取当前手机号：${error.message}';
+          _loadError = tr('无法读取当前手机号：{p3}', <String, Object?>{'p3': error.message});
         });
       }
     } catch (error) {
       if (mounted) {
         setState(() {
           _loading = false;
-          _loadError = '无法读取当前手机号：$error';
+          _loadError = tr('无法读取当前手机号：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -333,11 +334,11 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
     }
     final String phone = _phone.text.trim();
     if (!_validPhoneInput(phone)) {
-      setState(() => _error = '手机号需为 6–15 位数字');
+      setState(() => _error = tr('手机号需为 6–15 位数字'));
       return;
     }
     if (_password.text.isEmpty) {
-      setState(() => _error = '请输入当前密码');
+      setState(() => _error = tr('请输入当前密码'));
       return;
     }
     setState(() {
@@ -367,7 +368,7 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '保存失败：$error';
+          _error = tr('保存失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -379,7 +380,7 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('找回手机'),
+      title: Text(tr('找回手机')),
       content: SizedBox(
         width: 380,
         child: Column(
@@ -387,12 +388,12 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             Text(
-              '忘记密码时，服务端会把一次性验证码发送到该手机号。留空并保存表示关闭短信找回。',
+              tr('忘记密码时，服务端会把一次性验证码发送到该手机号。留空并保存表示关闭短信找回。'),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 12),
             if (_loading)
-              Text('正在读取当前手机号…', style: mutedStyle(context, size: 11))
+              Text(tr('正在读取当前手机号…'), style: mutedStyle(context, size: 11))
             else if (_loadError.isNotEmpty)
               Text(
                 _loadError,
@@ -401,7 +402,7 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
               )
             else
               Text(
-                _phone.text.isEmpty ? '当前手机号：未设置' : '当前手机号：${_phone.text}',
+                _phone.text.isEmpty ? tr('当前手机号：未设置') : tr('当前手机号：{p4}', <String, Object?>{'p4': _phone.text}),
                 key: const Key('recovery-phone-current'),
                 style: mutedStyle(context, size: 11),
               ),
@@ -412,8 +413,8 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
               keyboardType: TextInputType.phone,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '找回手机',
+              decoration: InputDecoration(
+                labelText: tr('找回手机'),
                 hintText: '+1 555 010 0001',
                 prefixIcon: Icon(Icons.smartphone_rounded, size: 18),
               ),
@@ -425,8 +426,8 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
               obscureText: true,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '当前密码',
+              decoration: InputDecoration(
+                labelText: tr('当前密码'),
                 prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
               ),
               onSubmitted: (_) => _submit(),
@@ -445,7 +446,7 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('recovery-phone-save'),
@@ -456,7 +457,7 @@ class _RecoveryPhoneDialogState extends State<RecoveryPhoneDialog> {
                   height: 15,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : const Text('保存'),
+              : Text(tr('保存')),
         ),
       ],
     );
@@ -516,7 +517,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
     }
     final String username = _username.text.trim();
     if (username.isEmpty) {
-      setState(() => _error = '请输入用户名');
+      setState(() => _error = tr('请输入用户名'));
       return;
     }
     setState(() {
@@ -535,8 +536,8 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
         _busy = false;
         _sent = true;
         _notice = _useSMS
-            ? '如果该账号存在且已设置找回手机，6–15 位号码会收到 8 位验证码。请查看短信。'
-            : '如果该账号存在且已设置找回邮箱，重置令牌已发送。请检查邮件（含垃圾箱）。';
+            ? tr('如果该账号存在且已设置找回手机，6–15 位号码会收到 8 位验证码。请查看短信。')
+            : tr('如果该账号存在且已设置找回邮箱，重置令牌已发送。请检查邮件（含垃圾箱）。');
       });
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -549,7 +550,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '发送失败：$error';
+          _error = tr('发送失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -562,19 +563,19 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
     final String token = _token.text.trim();
     final int bytes = utf8.encode(_password.text).length;
     if (token.isEmpty) {
-      setState(() => _error = _useSMS ? '请输入短信中的验证码' : '请输入邮件中的重置令牌');
+      setState(() => _error = _useSMS ? tr('请输入短信中的验证码') : tr('请输入邮件中的重置令牌'));
       return;
     }
     if (_useSMS && _smsDigits(token).length != 8) {
-      setState(() => _error = '短信验证码需为 8 位数字');
+      setState(() => _error = tr('短信验证码需为 8 位数字'));
       return;
     }
     if (bytes < 8 || bytes > 128) {
-      setState(() => _error = '新密码长度需为 8–128 个字节');
+      setState(() => _error = tr('新密码长度需为 8–128 个字节'));
       return;
     }
     if (_password.text != _confirm.text) {
-      setState(() => _error = '两次输入的新密码不一致');
+      setState(() => _error = tr('两次输入的新密码不一致'));
       return;
     }
     setState(() {
@@ -610,7 +611,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '重置失败：$error';
+          _error = tr('重置失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -622,7 +623,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('找回密码'),
+      title: Text(tr('找回密码')),
       content: SizedBox(
         width: 380,
         child: Column(
@@ -632,11 +633,11 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
             Text(
               _sent
                   ? (_useSMS
-                      ? '把手机短信里的 8 位验证码粘贴到下方，并设置新密码。重置成功后，该账号在所有设备上的登录都会失效。'
-                      : '把邮件里的令牌粘贴到下方，并设置新密码。重置成功后，该账号在所有设备上的登录都会失效。')
+                      ? tr('把手机短信里的 8 位验证码粘贴到下方，并设置新密码。重置成功后，该账号在所有设备上的登录都会失效。')
+                      : tr('把邮件里的令牌粘贴到下方，并设置新密码。重置成功后，该账号在所有设备上的登录都会失效。'))
                   : (_useSMS
-                      ? '输入账号用户名，服务端会向该账号的找回手机发送 8 位验证码。没有设置手机号的账号不会收到短信。'
-                      : '输入账号用户名，服务端会向该账号的找回邮箱发送一次性令牌。没有设置邮箱的账号不会收到邮件。'),
+                      ? tr('输入账号用户名，服务端会向该账号的找回手机发送 8 位验证码。没有设置手机号的账号不会收到短信。')
+                      : tr('输入账号用户名，服务端会向该账号的找回邮箱发送一次性令牌。没有设置邮箱的账号不会收到邮件。')),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 12),
@@ -646,7 +647,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                 children: <Widget>[
                   ChoiceChip(
                     key: const Key('forgot-channel-email'),
-                    label: const Text('邮箱'),
+                    label: Text(tr('邮箱')),
                     avatar: const Icon(Icons.alternate_email_rounded, size: 16),
                     selected: !_useSMS,
                     onSelected: _busy
@@ -658,7 +659,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                   ),
                   ChoiceChip(
                     key: const Key('forgot-channel-sms'),
-                    label: const Text('短信'),
+                    label: Text(tr('短信')),
                     avatar: const Icon(Icons.sms_outlined, size: 16),
                     selected: _useSMS,
                     onSelected: _busy
@@ -677,8 +678,8 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                 autofocus: true,
                 autocorrect: false,
                 enableSuggestions: false,
-                decoration: const InputDecoration(
-                  labelText: '用户名',
+                decoration: InputDecoration(
+                  labelText: tr('用户名'),
                   prefixIcon: Icon(Icons.person_outline_rounded, size: 18),
                 ),
                 onSubmitted: (_) => _send(),
@@ -700,8 +701,8 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                 autocorrect: false,
                 enableSuggestions: false,
                 decoration: InputDecoration(
-                  labelText: _useSMS ? '短信验证码' : '重置令牌',
-                  hintText: _useSMS ? '8 位数字' : null,
+                  labelText: _useSMS ? tr('短信验证码') : tr('重置令牌'),
+                  hintText: _useSMS ? tr('8 位数字') : null,
                   prefixIcon: Icon(
                     _useSMS ? Icons.sms_outlined : Icons.key_outlined,
                     size: 18,
@@ -715,8 +716,8 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                 obscureText: true,
                 autocorrect: false,
                 enableSuggestions: false,
-                decoration: const InputDecoration(
-                  labelText: '新密码（8–128 字节）',
+                decoration: InputDecoration(
+                  labelText: tr('新密码（8–128 字节）'),
                   prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
                 ),
               ),
@@ -727,8 +728,8 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                 obscureText: true,
                 autocorrect: false,
                 enableSuggestions: false,
-                decoration: const InputDecoration(
-                  labelText: '确认新密码',
+                decoration: InputDecoration(
+                  labelText: tr('确认新密码'),
                   prefixIcon: Icon(Icons.check_circle_outline_rounded, size: 18),
                 ),
                 onSubmitted: (_) => _complete(),
@@ -748,7 +749,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         if (_sent)
           TextButton(
@@ -760,7 +761,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                       _notice = '';
                       _error = '';
                     }),
-            child: const Text('换个账号'),
+            child: Text(tr('换个账号')),
           ),
         FilledButton(
           key: Key(_sent ? 'forgot-complete' : 'forgot-send'),
@@ -771,7 +772,7 @@ class _ForgotPasswordDialogState extends State<ForgotPasswordDialog> {
                   height: 15,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : Text(_sent ? '重置密码' : (_useSMS ? '发送验证码' : '发送重置令牌')),
+              : Text(_sent ? tr('重置密码') : (_useSMS ? tr('发送验证码') : tr('发送重置令牌'))),
         ),
       ],
     );

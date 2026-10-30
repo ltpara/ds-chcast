@@ -132,11 +132,10 @@ func (s *server) accountFileTransfers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// auditFileTransfers is the operator view across accounts. Account tokens are
-// rejected here.
+// auditFileTransfers is the operator view across accounts. Console readers may
+// view it; viewer accounts may not.
 func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
 		return
 	}
 	if s.cfg.Accounts == nil {

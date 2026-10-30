@@ -163,17 +163,28 @@ func New(cfg Config) (*Manager, error) {
 }
 
 // TLSConfig returns a server TLS config backed by ACME certificates. When
-// clientCAFile is set the listener also demands a client certificate.
-func (m *Manager) TLSConfig(clientCAFile string) (*tls.Config, error) {
+// clientCAFile is set the listener also demands a client certificate signed by
+// that bundle; the bundle is re-read when interval elapses, so rotating it does
+// not require a restart.
+func (m *Manager) TLSConfig(clientCAFile string, interval time.Duration) (*tls.Config, error) {
 	cfg := m.manager.TLSConfig()
 	cfg.MinVersion = tls.VersionTLS12
-	if clientCAFile != "" {
-		pool, err := netutil.LoadClientCAPool(clientCAFile)
-		if err != nil {
-			return nil, err
-		}
-		cfg.ClientCAs = pool
-		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	if clientCAFile == "" {
+		return cfg, nil
+	}
+	loader, err := netutil.NewClientCAReloader(clientCAFile, m.logger, interval)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ClientCAs = loader.Current()
+	cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	// A per-handshake clone carries the current pool, so a rotated client CA
+	// never mutates the shared config that crypto/tls reads concurrently.
+	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		clone := cfg.Clone()
+		clone.GetConfigForClient = nil
+		clone.ClientCAs = loader.Current()
+		return clone, nil
 	}
 	return cfg, nil
 }

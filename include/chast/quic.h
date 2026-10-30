@@ -154,6 +154,15 @@ struct QuicServerConfig {
     // a terminal is a shell on the operator's own account, so the host opts in
     // explicitly. announce() clears terminal_enabled when false.
     bool allow_terminal = false;
+    // Accept ListCameras/StartCamera and open CCAM streams. Off by default: a
+    // camera shows the operator's room, so the host opts in explicitly.
+    // announce() clears camera_enabled when false.
+    bool allow_camera = false;
+    // Consent to the viewer recording the received stream locally. Advisory:
+    // the host cannot observe or stop a recording on the viewer's machine, so
+    // announce() only reports record_enabled and the viewer hides its record
+    // button. On by default, matching RustDesk's "enable-record-session".
+    bool allow_record = true;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -268,6 +277,10 @@ struct QuicClientConfig {
     // The permissions the viewer asks for; the host intersects them with its
     // defaults and the operator's approval.
     uint16_t requested_permissions = kPermissionAll;
+    // What this connection is for. Desktop captures the remote desktop;
+    // FileTransfer asks for a control-only session that browses the shared
+    // directories and moves files. The host may refuse the mode.
+    SessionMode session_mode = SessionMode::Desktop;
     // Non-owning, must outlive the session. When set, Hello carries the public
     // key and name and is signed with the host fingerprint, which lets the
     // host recognize this device and skip 2FA. The nonce and timestamp are
@@ -317,6 +330,18 @@ public:
     // once wait_for_client() succeeded; the server creates its capturer after
     // that so the request can pick the output.
     uint16_t requested_display() const;
+    // The session mode the client asked for in Hello. Valid once
+    // wait_for_client() succeeded; the host decides whether to serve it.
+    SessionMode requested_mode() const;
+    // True while the transport still believes the connection is up. A session
+    // without a media stream (files only) uses it to notice a viewer that
+    // closed without sending a Bye; a video session learns the same from
+    // receive_frame().
+    bool peer_alive() const;
+    // Server: true once the viewer sent its closing Stats or Bye, or the
+    // connection dropped. A control-only session polls this to end its loop;
+    // finish_server() still performs the shutdown and collects the stats.
+    bool viewer_finished() const;
     // The session's audit reference from Hello, empty when the viewer did not
     // send one. Valid once wait_for_client() succeeded; the host copies it
     // into its own audit records.
@@ -349,7 +374,9 @@ public:
     // streams. Must be called once, after wait_for_client() succeeded. The
     // audio stream is opened too when `info.audio.enabled` is set and the
     // server allows audio; if the stream cannot be opened the announcement
-    // falls back to video only instead of failing the session.
+    // falls back to video only instead of failing the session. When
+    // `info.files_only` is set no media streams are opened and the picture
+    // and source sizes are zeroed in the message.
     Error announce(const ServerInfo& info);
     // Replaces the stream description mid-session: the captured output's size,
     // origin, rotation or codec changed after a capture rebuild. Sent on the
@@ -803,6 +830,60 @@ public:
     // is the failure or session-end path.
     void close_terminal(uint32_t terminal_id);
 
+    // ----- camera (protocol v29, both roles) -----
+    //
+    // The viewer lists the host's cameras and asks for one; the host opens a
+    // server-initiated CCAM stream carrying encoded access units. The stream
+    // runs beside the desktop picture and ends with a FIN when the viewer
+    // stops it or the host's device fails. Every call requires
+    // kPermissionCamera, so a host whose config disables cameras never sees a
+    // request or a stream.
+
+    // Server: pops one ListCameras request. The host answers with
+    // send_camera_list(); a request is a flag rather than a queue because the
+    // answer is a snapshot and a second list supersedes the first.
+    bool take_camera_list_request();
+    Error send_camera_list(const CameraList& list);
+    // Server: pops the oldest camera the viewer asked for. The device is
+    // opened by the host, which then answers with send_camera_result().
+    bool take_camera_start(uint16_t& camera_id);
+    // Server: answers one start. Ok opens the CCAM stream (the header names
+    // the id) and makes send_camera_frame() valid; every other code means no
+    // stream will follow. The reason is UTF-8 and truncated on send.
+    Error send_camera_result(const CameraResult& result);
+    // Server: sends one encoded access unit on the CCAM stream. Like
+    // send_frame it never waits: a full queue drops the frame and returns
+    // WaitTimeout, so camera traffic can never stall the desktop stream.
+    Error send_camera_frame(FrameHeader header, const uint8_t* payload, size_t size);
+    // Server: ends the CCAM stream with a FIN. Idempotent.
+    Error finish_camera();
+    // Server: true while a CCAM stream is open.
+    bool camera_open() const;
+    // Server: pops the camera id the viewer stopped. The transport already
+    // finished the stream; this is the "stop capturing" edge.
+    bool take_camera_stop(uint16_t& camera_id);
+
+    // Client: asks for the camera list. Requires the handshake and
+    // kPermissionCamera; the answer arrives through take_camera_list().
+    Error request_camera_list();
+    // Client: pops the newest list. A later answer supersedes an older one.
+    bool take_camera_list(CameraList& list);
+    // Total CameraList answers received. Observation hook for tools.
+    uint64_t camera_lists() const;
+    // Client: asks the host to open one camera. The answer arrives through
+    // take_camera_result(); Ok makes receive_camera_frame() valid. One camera
+    // at a time: a pending or open camera refuses a second start.
+    Error request_camera_start(uint16_t camera_id);
+    // Client: pops the oldest start answer.
+    bool take_camera_result(CameraResult& result);
+    // Client: waits for one camera access unit. Unavailable once the host
+    // finished the stream (or the viewer called request_camera_stop()).
+    Error receive_camera_frame(FrameHeader& header, std::vector<uint8_t>& payload,
+                               std::chrono::milliseconds timeout);
+    // Client: stops the running camera. The host finishes the stream; a later
+    // start opens a fresh one. An already stopped camera is a no-op.
+    Error request_camera_stop();
+
     // ----- file transfer (both directions) -----
     //
     // The side that offers a file is the sender; the side that answers is the
@@ -864,6 +945,49 @@ public:
     // Sender: tells the receiver to drop the transfer and its partial file.
     // The local stream is aborted through cancel_file_upload().
     Error send_file_cancel(uint32_t transfer_id, FileCode code, const std::string& reason);
+
+    // ----- shared-folder browsing -----
+    //
+    // The viewer lists and downloads files below the host's receive directory.
+    // Every call requires the handshake and kPermissionFileTransfer, like
+    // FileOffer.
+
+    // Server: pops the oldest browse request (the viewer's request id and a
+    // relative directory). The host answers with send_file_list_result().
+    bool take_file_list_request(uint32_t& request_id, std::string& directory);
+    // Server: answers one browse request on the control stream.
+    Error send_file_list_result(const FileListResult& result);
+    // Server: pops the oldest download request (the viewer's request id and a
+    // relative file path). The host answers with send_file_download_result();
+    // on Ok the file is offered through the regular transfer machinery.
+    bool take_file_download_request(uint32_t& request_id, std::string& path);
+    // Server: answers one download request. Ok must name the transfer id the
+    // host is about to offer; every other code must pass 0.
+    Error send_file_download_result(const FileDownloadResult& result);
+    // Client: asks for one directory listing. The answer arrives through
+    // take_file_list_result().
+    Error request_file_list(uint32_t request_id, const std::string& directory);
+    // Client: pops the oldest listing.
+    bool take_file_list_result(FileListResult& result);
+    // Client: asks the host to offer one file. The answer arrives through
+    // take_file_download_result(); Ok means a FileOffer with the same transfer
+    // id follows.
+    Error request_file_download(uint32_t request_id, const std::string& path);
+    // Client: pops the oldest download answer.
+    bool take_file_download_result(FileDownloadResult& result);
+    // Server: pops the oldest file operation (create, rename or remove one
+    // entry below the receive root). The host answers with
+    // send_file_op_result().
+    bool take_file_op_request(uint32_t& request_id, FileOperation& op,
+                              std::string& path, std::string& new_name);
+    // Server: answers one file operation on the control stream.
+    Error send_file_op_result(const FileOpResult& result);
+    // Client: asks the host to apply one file operation. The answer arrives
+    // through take_file_op_result().
+    Error request_file_op(uint32_t request_id, FileOperation op,
+                          const std::string& path, const std::string& new_name);
+    // Client: pops the oldest file operation answer.
+    bool take_file_op_result(FileOpResult& result);
 
     // ----- pointer (server to client) -----
 

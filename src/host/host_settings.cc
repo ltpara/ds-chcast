@@ -422,6 +422,14 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_terminal)) {
                 warn(result.warning, "terminal '" + value + "' is not a boolean");
             }
+        } else if (key == "camera") {
+            if (!parse_bool(value, settings.allow_camera)) {
+                warn(result.warning, "camera '" + value + "' is not a boolean");
+            }
+        } else if (key == "record") {
+            if (!parse_bool(value, settings.allow_record)) {
+                warn(result.warning, "record '" + value + "' is not a boolean");
+            }
         } else if (key == "file_receive_dir") {
             settings.file_receive_directory = value;
         } else if (key == "audio") {
@@ -670,6 +678,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_port_forward = (permissions_mask & kPermissionPortForward) != 0;
         settings.allow_terminal = (permissions_mask & kPermissionTerminal) != 0;
         settings.allow_privacy_mode = (permissions_mask & kPermissionPrivacyMode) != 0;
+        // The mask is authoritative for every gate it predates, but not for
+        // record or camera: older builds never wrote those bits, and the
+        // explicit record=/camera= lines (which save always emits alongside
+        // the mask) decide them.
     }
     return result;
 }
@@ -693,7 +705,9 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_file_transfer ? kPermissionFileTransfer : 0) |
         (settings.allow_port_forward ? kPermissionPortForward : 0) |
         (settings.allow_terminal ? kPermissionTerminal : 0) |
-        (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0);
+        (settings.allow_camera ? kPermissionCamera : 0) |
+        (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0) |
+        (settings.allow_record ? kPermissionRecord : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
@@ -714,6 +728,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
          << "port_forward=" << (settings.allow_port_forward ? 1 : 0) << "\n"
          << "terminal=" << (settings.allow_terminal ? 1 : 0) << "\n"
+         << "camera=" << (settings.allow_camera ? 1 : 0) << "\n"
+         << "record=" << (settings.allow_record ? 1 : 0) << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "audio_device=" << settings.audio_device << "\n"

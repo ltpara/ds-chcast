@@ -14,7 +14,7 @@ import (
 
 const accountUsage = `user list | user add <username> [password]
 user passwd <username> [password] | user del <username>
-user role <username> admin|user
+user role <username> admin|operator|readonly|user
 user ban <username> | user unban <username>
 user email <username> <email|-> | user recover <username>
 user phone <username> <phone|-> | user sms <username>
@@ -403,6 +403,9 @@ func (c *Console) auditText(args []string) string {
 		return fmt.Sprintf("pruned older than %d days: audit=%d connections=%d transfers=%d\n",
 			days, report.AuditEvents, report.Connections, report.FileTransfers)
 	}
+	if len(args) > 0 && args[0] == "archive" {
+		return c.archiveText(args[1:])
+	}
 	count := 20
 	if len(args) > 0 {
 		count = parseCount(args, count)
@@ -431,6 +434,38 @@ func (c *Console) auditText(args []string) string {
 		fmt.Fprintf(&b, "%s user=%s action=%s %s ip=%s location=%s detail=%s\n",
 			event.CreatedAt.Format(time.RFC3339), event.Username, event.Action,
 			status, event.ClientIP, location, detail)
+	}
+	return b.String()
+}
+
+// archiveText reports how far the JSONL archive has copied each history table,
+// or forces a pass with "run" instead of waiting for the periodic copy.
+func (c *Console) archiveText(args []string) string {
+	if c.cfg.Archive == nil {
+		return "audit archive is disabled; start chast-server with --audit-archive-dir\n"
+	}
+	if len(args) > 0 && args[0] != "run" {
+		return "usage: audit archive [run]\n"
+	}
+	if len(args) > 0 {
+		result, err := c.cfg.Archive.Run()
+		if err != nil {
+			return fmt.Sprintf("audit archive failed: %v\n", err)
+		}
+		return fmt.Sprintf("archived: audit=%d connections=%d transfers=%d files=%d compressed=%d pruned=%d\n",
+			result.Audit, result.Connections, result.FileTransfers, len(result.Files),
+			len(result.Compressed), len(result.Pruned))
+	}
+	checkpoints, err := c.cfg.Archive.Checkpoints()
+	if err != nil {
+		return fmt.Sprintf("could not read archive checkpoints: %v\n", err)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "archive dir: %s\n", c.cfg.Archive.Dir())
+	for _, stream := range []string{
+		account.HistoryAudit, account.HistoryConnections, account.HistoryFileTransfers,
+	} {
+		fmt.Fprintf(&b, "  %-15s last id %d\n", stream, checkpoints[stream])
 	}
 	return b.String()
 }

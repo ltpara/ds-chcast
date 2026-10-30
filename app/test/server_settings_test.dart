@@ -39,11 +39,13 @@ void main() {
       url: 'https://chast.example/',
       mode: TunnelMode.relay,
       key: 'dev-secret',
+      uploadRecordings: true,
     ));
     final ServerSettings loaded = await store.load();
     expect(loaded.url, 'https://chast.example');
     expect(loaded.mode, TunnelMode.relay);
     expect(loaded.key, 'dev-secret');
+    expect(loaded.uploadRecordings, isTrue);
     expect(loaded.configured, isTrue);
   });
 

@@ -15,12 +15,21 @@
     </div>
     <div class="auth">
       <form id="login-form" class="login" autocomplete="off">
-        <label class="sr-only" for="server-key">服务器密钥</label>
+        <select id="login-mode" aria-label="登录方式">
+          <option value="key">服务器密钥</option>
+          <option value="account">账号</option>
+        </select>
         <input id="server-key" type="password" placeholder="服务器密钥（未设置可留空）" spellcheck="false" autocomplete="off">
+        <span id="login-account" class="login-fields hidden">
+          <input id="account-username" placeholder="用户名" spellcheck="false" autocomplete="username">
+          <input id="account-password" type="password" placeholder="密码" autocomplete="current-password">
+          <input id="account-totp" placeholder="2FA / 恢复码（可选）" maxlength="24" autocomplete="one-time-code">
+        </span>
         <button type="submit" class="primary">连接</button>
       </form>
       <div id="session-bar" class="session hidden">
-        <span class="pill ok" id="session-label">已连接</span>
+        <span id="session-role" class="pill ok">已连接</span>
+        <span id="session-label" class="muted"></span>
         <button type="button" id="logout" class="ghost">断开</button>
       </div>
     </div>
@@ -33,6 +42,7 @@
       <button type="button" class="tab active" data-tab="overview" role="tab">概览</button>
       <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
       <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
+      <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
       <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
       <button type="button" class="tab" data-tab="server" role="tab">服务</button>
     </nav>
@@ -83,6 +93,7 @@
           </table>
         </div>
         <p id="device-empty" class="muted hidden">没有匹配的设备</p>
+        <p id="device-readonly" class="muted hidden">当前角色为只读，设备编辑与重置不可用。</p>
       </div>
     </section>
 
@@ -94,13 +105,15 @@
           <label>密码（留空自动生成）<input id="account-password" type="password" maxlength="128" autocomplete="new-password"></label>
           <label>角色
             <select id="account-role">
-              <option value="user">user</option>
-              <option value="admin">admin</option>
+              <option value="user">user（仅查看器，无管理台）</option>
+              <option value="readonly">readonly（只读管理台）</option>
+              <option value="operator">operator（设备管理）</option>
+              <option value="admin">admin（账号管理）</option>
             </select>
           </label>
           <button type="submit" class="primary">创建</button>
         </form>
-        <p class="muted">账号接口也接受管理员账号令牌；此处使用服务器密钥。封禁、重置密码与重置 2FA 立即生效并写入审计。</p>
+        <p class="muted">管理台可用服务器密钥或账号登录：admin 可管理账号，operator 可改设备标签与重置身份，readonly 只读；user 无管理台权限。封禁、重置密码与重置 2FA 立即生效并写入审计。</p>
       </div>
       <div class="panel">
         <div class="panel-head"><h2>账号列表</h2><button type="button" id="account-refresh">刷新</button></div>
@@ -111,6 +124,33 @@
           </table>
         </div>
         <p id="account-empty" class="muted hidden">还没有账号</p>
+      </div>
+    </section>
+
+    <section id="panel-recordings" class="panel-page">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>云端录制</h2>
+          <div class="toolbar">
+            <input id="recording-user" type="search" placeholder="用户名（可选）" spellcheck="false">
+            <button type="button" id="recording-reload">查询</button>
+          </div>
+        </div>
+        <p id="recording-summary" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>创建时间</th><th>用户</th><th>名称</th><th>对端</th><th>大小</th><th>时长</th><th>开始</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="recording-rows"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span id="recording-pager" class="muted"></span>
+          <button type="button" id="recording-more" class="hidden">加载更多</button>
+        </div>
+        <p id="recording-empty" class="muted hidden">没有录制</p>
+        <p id="recording-readonly" class="muted hidden">当前角色为只读，录制下载可用，删除不可用。</p>
       </div>
     </section>
 

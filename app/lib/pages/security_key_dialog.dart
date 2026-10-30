@@ -5,6 +5,7 @@ import '../security_key.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 typedef SecurityKeyAvailabilityProbe = Future<bool> Function();
 typedef SecurityKeyCredentialsLoader =
@@ -138,7 +139,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
         setState(() {
           _loading = false;
           _loadFailed = true;
-          _error = '读取安全密钥失败：$error';
+          _error = tr('读取安全密钥失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -150,7 +151,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
     }
     final String password = _password.text;
     if (password.isEmpty) {
-      setState(() => _error = '请输入当前密码');
+      setState(() => _error = tr('请输入当前密码'));
       return;
     }
     setState(() {
@@ -183,7 +184,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           await (widget.finishRegistration ?? ServerApi.webauthnRegisterFinish)(
         widget.server,
         widget.account.token,
-        name: name.isEmpty ? '此电脑' : name,
+        name: name.isEmpty ? tr('此电脑') : name,
         clientDataJSON: made.clientDataJSON,
         attestationObject: made.attestationObject,
       );
@@ -196,7 +197,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
         _available = true;
         _password.clear();
         _name.clear();
-        _message = '安全密钥已添加';
+        _message = tr('安全密钥已添加');
       });
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -216,7 +217,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '注册安全密钥失败：$error';
+          _error = tr('注册安全密钥失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -248,7 +249,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
     }
     final String password = _password.text;
     if (password.isEmpty) {
-      setState(() => _error = '删除安全密钥需要当前密码');
+      setState(() => _error = tr('删除安全密钥需要当前密码'));
       return;
     }
     setState(() {
@@ -273,7 +274,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
             if (entry.id != credential.id) entry,
         ];
         _password.clear();
-        _message = '安全密钥已删除';
+        _message = tr('安全密钥已删除');
       });
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -286,7 +287,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '删除安全密钥失败：$error';
+          _error = tr('删除安全密钥失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -313,7 +314,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
 
   Widget _credentialRow(BuildContext context, int index, WebAuthnCredential credential) {
     final ThemeData theme = Theme.of(context);
-    final String name = credential.name.isEmpty ? '安全密钥' : credential.name;
+    final String name = credential.name.isEmpty ? tr('安全密钥') : credential.name;
     final String created = credential.createdAtMs > 0
         ? _formatDate(DateTime.fromMillisecondsSinceEpoch(
             credential.createdAtMs,
@@ -321,11 +322,11 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           ).toLocal())
         : '';
     final String used = credential.lastUsedAtMs > 0
-        ? '上次使用 ${_formatDate(DateTime.fromMillisecondsSinceEpoch(
+        ? tr('上次使用 {p1}', <String, Object?>{'p1': _formatDate(DateTime.fromMillisecondsSinceEpoch(
             credential.lastUsedAtMs,
             isUtc: true,
-          ).toLocal())}'
-        : '尚未使用';
+          ).toLocal())})
+        : tr('尚未使用');
     return Container(
       key: Key('security-key-row-$index'),
       margin: const EdgeInsets.only(bottom: 8),
@@ -352,7 +353,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  created.isEmpty ? used : '添加于 $created · $used',
+                  created.isEmpty ? used : tr('添加于 {created} · {used}', <String, Object?>{'created': created, 'used': used}),
                   style: mutedStyle(context, size: 10.5),
                 ),
               ],
@@ -360,7 +361,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           ),
           IconButton(
             key: Key('security-key-remove-$index'),
-            tooltip: '删除',
+            tooltip: tr('删除'),
             onPressed: _busy ? null : () => _remove(credential),
             icon: Icon(
               Icons.delete_outline_rounded,
@@ -397,7 +398,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           OutlinedButton(
             key: const Key('security-key-retry'),
             onPressed: _load,
-            child: const Text('重试'),
+            child: Text(tr('重试')),
           ),
         ],
       );
@@ -409,19 +410,19 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
         _statusHeader(
           context,
           _available ? Icons.verified_user_outlined : Icons.gpp_maybe_outlined,
-          _available ? '此设备支持 Windows Hello' : '此设备未配置 Windows Hello',
+          _available ? tr('此设备支持 Windows Hello') : tr('此设备未配置 Windows Hello'),
         ),
         const SizedBox(height: 8),
         Text(
           _available
-              ? '登录时先校验密码，再用 Windows Hello 确认身份。'
-              : '添加安全密钥需要在此设备配置 PIN 或生物识别。已注册的密钥仍可在其他设备使用。',
+              ? tr('登录时先校验密码，再用 Windows Hello 确认身份。')
+              : tr('添加安全密钥需要在此设备配置 PIN 或生物识别。已注册的密钥仍可在其他设备使用。'),
           style: mutedStyle(context, size: 12),
         ),
         const SizedBox(height: 14),
         if (_credentials.isEmpty)
           Text(
-            '尚未注册安全密钥',
+            tr('尚未注册安全密钥'),
             key: const Key('security-key-empty'),
             style: mutedStyle(context, size: 12),
           )
@@ -429,7 +430,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           for (int index = 0; index < _credentials.length; ++index)
             _credentialRow(context, index, _credentials[index]),
         const SizedBox(height: 10),
-        Text('添加安全密钥', style: mutedStyle(context, size: 11)),
+        Text(tr('添加安全密钥'), style: mutedStyle(context, size: 11)),
         const SizedBox(height: 6),
         TextField(
           key: const Key('security-key-password'),
@@ -437,8 +438,8 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           obscureText: true,
           autocorrect: false,
           enableSuggestions: false,
-          decoration: const InputDecoration(
-            labelText: '当前密码',
+          decoration: InputDecoration(
+            labelText: tr('当前密码'),
             prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
           ),
         ),
@@ -448,9 +449,9 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           controller: _name,
           autocorrect: false,
           enableSuggestions: false,
-          decoration: const InputDecoration(
-            labelText: '名称（可选）',
-            hintText: '例如：此电脑',
+          decoration: InputDecoration(
+            labelText: tr('名称（可选）'),
+            hintText: tr('例如：此电脑'),
             prefixIcon: Icon(Icons.label_outline_rounded, size: 18),
           ),
         ),
@@ -459,11 +460,11 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
           key: const Key('security-key-register'),
           onPressed: _busy ? null : _register,
           icon: const Icon(Icons.fingerprint_rounded, size: 17),
-          label: Text(_busy ? '正在等待 Windows Hello…' : '使用 Windows Hello 注册'),
+          label: Text(_busy ? tr('正在等待 Windows Hello…') : tr('使用 Windows Hello 注册')),
         ),
         const SizedBox(height: 6),
         Text(
-          '删除安全密钥同样需要当前密码。注册和删除都会记录到账号审计。',
+          tr('删除安全密钥同样需要当前密码。注册和删除都会记录到账号审计。'),
           style: mutedStyle(context, size: 10.5),
         ),
       ],
@@ -477,7 +478,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
       key: const Key('security-key-dialog'),
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('安全密钥'),
+      title: Text(tr('安全密钥')),
       content: SizedBox(
         width: 400,
         child: SingleChildScrollView(
@@ -513,7 +514,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
         TextButton(
           key: const Key('security-key-close'),
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('关闭'),
+          child: Text(tr('关闭')),
         ),
       ],
     );

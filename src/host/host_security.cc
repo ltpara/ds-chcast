@@ -231,8 +231,14 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     result.device_name = hello.device_name;
     result.device_platform = hello.device_platform;
     result.device_key = hello.device_key;
-    result.permissions =
-        config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+    // A file-transfer-only session may request nothing but file transfer: the
+    // host will announce no picture, input or other control for it. Clamping
+    // the request here keeps every later decision and the approval window on
+    // the same mask.
+    const uint16_t requested =
+        hello.requested_permissions &
+        (hello.mode == SessionMode::FileTransfer ? kPermissionFileTransfer : kPermissionAll);
+    result.permissions = config_.default_permissions & requested;
 
     if (whitelist_configured_) {
         uint32_t address = 0;
@@ -269,6 +275,17 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         }
     }
 
+    // A files-only session has nothing to serve when the host does not allow
+    // file transfer; refusing here is clearer than an empty session that
+    // refuses every request.
+    if (hello.mode == SessionMode::FileTransfer &&
+        (config_.default_permissions & kPermissionFileTransfer) == 0) {
+        result = deny(AccessDenial::Declined, "file transfer is disabled on this host");
+        result.peer_address = peer_address;
+        result.peer_ip = address_key(peer_address, result.peer_ip);
+        return result;
+    }
+
     // The access token is an alternative credential for CLI/automation. A
     // client that does not carry one continues with the password flow.
     if (config_.token_auth && !hello.access_token.empty()) {
@@ -287,7 +304,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         result.peer_address = peer_address;
         result.peer_ip = address_key(peer_address, result.peer_ip);
         result.permissions =
-            config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+            config_.default_permissions & requested;
         return result;
     }
 
@@ -347,7 +364,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         result.peer_address = peer_address;
         result.peer_ip = address_key(peer_address, result.peer_ip);
         result.permissions =
-            config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+            config_.default_permissions & requested;
         result.device_key = hello.device_key;
         return result;
     }
@@ -356,7 +373,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     if (config_.mode == HostAuthMode::Click) {
         result.decision = Decision::RequireApproval;
         result.permissions =
-            config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+            config_.default_permissions & requested;
         return result;
     }
 
@@ -366,12 +383,12 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result.peer_address = peer_address;
             result.peer_ip = address_key(peer_address, result.peer_ip);
             result.permissions =
-                config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+                config_.default_permissions & requested;
             return result;
         }
         result.decision = Decision::RequireApproval;
         result.permissions =
-            config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+            config_.default_permissions & requested;
         return result;
     }
 
@@ -392,14 +409,14 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         result.peer_address = peer_address;
         result.peer_ip = address_key(peer_address, result.peer_ip);
         result.permissions =
-            config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+            config_.default_permissions & requested;
         if (hash_present && !hash_usable) {
             result = deny(AccessDenial::Declined,
                           "the host's password configuration is invalid");
             result.peer_address = peer_address;
             result.peer_ip = address_key(peer_address, result.peer_ip);
             result.permissions =
-                config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+                config_.default_permissions & requested;
             return result;
         }
         fail_locked(key, now_unix);
@@ -421,7 +438,7 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result.peer_address = peer_address;
             result.peer_ip = address_key(peer_address, result.peer_ip);
             result.permissions =
-                config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+                config_.default_permissions & requested;
             return result;
         }
         const bool skip = trusted_active && signature_valid;
@@ -432,14 +449,14 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result.peer_address = peer_address;
             result.peer_ip = address_key(peer_address, result.peer_ip);
             result.permissions =
-                config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+                config_.default_permissions & requested;
             return result;
         } else if (!verify_totp(config_.totp_secret, hello.totp, now_unix, 1)) {
             result = deny(AccessDenial::WrongTwoFactor);
             result.peer_address = peer_address;
             result.peer_ip = address_key(peer_address, result.peer_ip);
             result.permissions =
-                config_.default_permissions & (hello.requested_permissions & kPermissionAll);
+                config_.default_permissions & requested;
             fail_locked(key, now_unix);
             if (!config_.service_mode && !temporary_password_.empty()) {
                 ++temporary_failures_;

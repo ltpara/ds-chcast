@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/account"
+	"github.com/ltpara/ds-chcast/server/internal/auditarchive"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
 )
@@ -60,7 +61,7 @@ func TestAccountConsoleCommands(t *testing.T) {
 	c := startConsole(t, Config{Registry: s.Registry, Relay: s.Relay, Accounts: s.Accounts})
 
 	help := send(t, c.Addr(), "h")
-	for _, want := range []string{"user list", "user add", "user passwd", "user del", "user role", "user ban", "user unban", "user email", "user recover", "user phone", "user sms", "user 2fa", "user unlock", "ab <username>", "ab prune <days>", "audit prune", "connections", "transfers"} {
+	for _, want := range []string{"user list", "user add", "user passwd", "user del", "user role", "user ban", "user unban", "user email", "user recover", "user phone", "user sms", "user 2fa", "user unlock", "ab <username>", "ab prune <days>", "audit prune", "audit archive", "connections", "transfers"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help missing %q:\n%s", want, help)
 		}
@@ -569,4 +570,40 @@ func generatedPassword(t *testing.T, out string) string {
 	}
 	t.Fatalf("no generated password in %q", out)
 	return ""
+}
+
+func TestConsoleAuditArchive(t *testing.T) {
+	s := testutil.Start(t)
+	dir := t.TempDir()
+	archiver, err := auditarchive.New(dir, s.Accounts, nil, auditarchive.Options{})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	c := startConsole(t, Config{
+		Registry: s.Registry, Relay: s.Relay, Accounts: s.Accounts, Archive: archiver,
+	})
+	if out := send(t, c.Addr(), "audit archive"); !strings.Contains(out, "archive dir: "+dir) ||
+		!strings.Contains(out, "audit") || !strings.Contains(out, "connections") ||
+		!strings.Contains(out, "file-transfers") {
+		t.Fatalf("archive status: %q", out)
+	}
+	if err := s.Accounts.AppendAudit(account.AuditEvent{
+		Username: "alice", Action: account.AuditLogin, Success: true,
+	}); err != nil {
+		t.Fatalf("append audit: %v", err)
+	}
+	if out := send(t, c.Addr(), "audit archive run"); !strings.Contains(out, "audit=1 connections=0 transfers=0 files=1") {
+		t.Fatalf("archive run: %q", out)
+	}
+	if out := send(t, c.Addr(), "audit archive run"); !strings.Contains(out, "audit=0 connections=0 transfers=0 files=0") {
+		t.Fatalf("idle archive run: %q", out)
+	}
+	if out := send(t, c.Addr(), "audit archive nope"); !strings.Contains(out, "usage: audit archive") {
+		t.Fatalf("archive usage: %q", out)
+	}
+
+	plain := startConsole(t, Config{Registry: s.Registry, Relay: s.Relay, Accounts: s.Accounts})
+	if out := send(t, plain.Addr(), "audit archive"); !strings.Contains(out, "--audit-archive-dir") {
+		t.Fatalf("disabled archive: %q", out)
+	}
 }

@@ -9,6 +9,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,12 @@ constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 constexpr auto kProbeInterval = std::chrono::seconds(1);
 constexpr auto kClipboardPollInterval = std::chrono::milliseconds(500);
+// Virtual browse path that the host serves announced clipboard files from;
+// the digits after the prefix index the FileList the host sent.
+constexpr char kClipboardFilePathPrefix[] = ".chast-clipboard/";
+// How long the host may take to answer a clipboard download request. The
+// offer itself is not bounded: the host hashes the file first.
+constexpr auto kClipboardAnswerTimeout = std::chrono::seconds(10);
 
 // A recording file name that is unlikely to collide: the local wall clock.
 // Mp4Recorder appends "-N" to the stem when a size change rolls over.
@@ -238,7 +245,8 @@ std::string utf8_from_path(const std::filesystem::path& path) {
 
 }  // namespace
 
-ViewerEngine::ViewerEngine(FrameSink* sink) : sink_(sink) {}
+ViewerEngine::ViewerEngine(FrameSink* sink, FrameSink* camera_sink)
+    : sink_(sink), camera_sink_(camera_sink) {}
 
 ViewerEngine::~ViewerEngine() {
     Stop();
@@ -251,7 +259,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                          std::shared_ptr<chast::DeviceIdentity> device_identity,
                          bool trust_device, ViewerTransport transport,
                          std::string carrier_host, uint16_t carrier_port,
-                         std::string carrier_host_id, std::string carrier_token) {
+                         std::string carrier_host_id, std::string carrier_token,
+                         bool file_transfer_only) {
     if (running_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -331,6 +340,15 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(stream_option_mutex_);
         pending_stream_options_.reset();
     }
+    // Browse answers belong to the session that was asked; a listing from the
+    // previous host must not appear in the next one's browser.
+    {
+        std::lock_guard<std::mutex> lock(browse_mutex_);
+        pending_browse_.clear();
+        browse_paths_.clear();
+        newest_file_list_.reset();
+        next_browse_id_ = 1;
+    }
     {
         std::lock_guard<std::mutex> lock(privacy_mutex_);
         pending_privacy_.reset();
@@ -360,6 +378,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         terminal_output_bytes_ = 0;
         terminal_output_ended_ = true;
     }
+    // A camera request belongs to one session; the host's ids are only valid
+    // for its own list.
+    {
+        std::lock_guard<std::mutex> lock(camera_mutex_);
+        pending_camera_.clear();
+    }
     // Microphone capture is a per-session privacy decision: every session
     // starts with the uplink off, while the chosen device is remembered.
     microphone_wanted_.store(false, std::memory_order_relaxed);
@@ -371,7 +395,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                           std::move(totp), trust_device, transport,
                           std::move(carrier_host), carrier_port,
                           std::move(carrier_host_id), std::move(carrier_token),
-                          std::move(audit_ref));
+                          std::move(audit_ref), file_transfer_only);
     return true;
 }
 
@@ -521,7 +545,20 @@ void ViewerEngine::SetClipboardSync(bool enabled) {
     clipboard_sync_.store(enabled, std::memory_order_release);
 }
 
-bool ViewerEngine::SendFiles(const std::vector<std::string>& paths) {
+void ViewerEngine::SetClipboardFileSink(
+    std::function<bool(const std::vector<std::string>&)> sink) {
+    std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
+    clipboard_file_sink_ = std::move(sink);
+}
+
+void ViewerEngine::SetClipboardFileSource(
+    std::function<bool(std::vector<std::string>&)> source) {
+    std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
+    clipboard_file_source_ = std::move(source);
+}
+
+bool ViewerEngine::SendFiles(const std::vector<std::string>& paths,
+                             std::string relative_prefix) {
     if (!running_.load(std::memory_order_acquire) || paths.empty()) {
         return false;
     }
@@ -542,7 +579,7 @@ bool ViewerEngine::SendFiles(const std::vector<std::string>& paths) {
             if (pending_upload_roots_.size() + uploads_.size() >= kMaxQueuedUploads) {
                 break;
             }
-            pending_upload_roots_.push_back(path);
+            pending_upload_roots_.push_back(PendingUploadRoot{path, relative_prefix});
             ++added;
         }
     }
@@ -550,6 +587,158 @@ bool ViewerEngine::SendFiles(const std::vector<std::string>& paths) {
         return false;
     }
     file_work_cv_.notify_all();
+    return true;
+}
+
+namespace {
+
+constexpr size_t kMaxPendingBrowse = 8;
+// A batch download walks its entries in one session-thread state machine; the
+// cap keeps a select-all over a huge share from turning into a multi-minute
+// queue the operator cannot see the end of.
+constexpr size_t kMaxBatchDownloadRoots = 512;
+
+}  // namespace
+
+bool ViewerEngine::RequestFileList(std::string directory) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionFileTransfer) == 0) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(browse_mutex_);
+    if (pending_browse_.size() >= kMaxPendingBrowse) {
+        return false;
+    }
+    BrowseCommand command;
+    command.request_id = next_browse_id_++;
+    command.path = std::move(directory);
+    browse_paths_[command.request_id] = command.path;
+    pending_browse_.push_back(std::move(command));
+    return true;
+}
+
+bool ViewerEngine::RequestFileDownload(std::string path) {
+    if (!running_.load(std::memory_order_acquire) || path.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionFileTransfer) == 0) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(browse_mutex_);
+    if (pending_browse_.size() >= kMaxPendingBrowse) {
+        return false;
+    }
+    BrowseCommand command;
+    command.kind = BrowseCommand::Kind::kDownload;
+    command.request_id = next_browse_id_++;
+    command.path = std::move(path);
+    browse_paths_[command.request_id] = command.path;
+    pending_browse_.push_back(std::move(command));
+    return true;
+}
+
+bool ViewerEngine::RequestFileOperation(chast::FileOperation op, std::string path,
+                                        std::string new_name) {
+    if (!running_.load(std::memory_order_acquire) ||
+        !chast::valid_file_browser_path(path)) {
+        return false;
+    }
+    if (op == chast::FileOperation::Rename) {
+        if (!chast::valid_file_browser_name(new_name)) {
+            return false;
+        }
+    } else if (op != chast::FileOperation::MakeDirectory &&
+               op != chast::FileOperation::Remove) {
+        return false;
+    } else if (!new_name.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionFileTransfer) == 0) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(browse_mutex_);
+    if (pending_browse_.size() >= kMaxPendingBrowse) {
+        return false;
+    }
+    BrowseCommand command;
+    command.kind = BrowseCommand::Kind::kOperation;
+    command.request_id = next_browse_id_++;
+    command.operation = op;
+    command.path = std::move(path);
+    command.new_name = std::move(new_name);
+    browse_paths_[command.request_id] = command.path;
+    pending_browse_.push_back(std::move(command));
+    return true;
+}
+
+bool ViewerEngine::RequestBatchDownload(std::vector<DownloadRoot> roots) {
+    return QueueDownload(std::move(roots), true);
+}
+
+bool ViewerEngine::RequestDirectoryDownload(std::string path) {
+    std::vector<DownloadRoot> roots;
+    DownloadRoot root;
+    root.path = std::move(path);
+    root.directory = true;
+    roots.push_back(std::move(root));
+    return QueueDownload(std::move(roots), false);
+}
+
+bool ViewerEngine::QueueDownload(std::vector<DownloadRoot> roots, bool batch) {
+    if (!running_.load(std::memory_order_acquire) || roots.empty() ||
+        roots.size() > kMaxBatchDownloadRoots) {
+        return false;
+    }
+    for (const DownloadRoot& root : roots) {
+        if (root.path.empty() || !chast::valid_file_browser_path(root.path)) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionFileTransfer) == 0) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(browse_mutex_);
+    if (folder_request_ || folder_.stage == FolderDownload::Stage::kListing ||
+        folder_.stage == FolderDownload::Stage::kDownloading) {
+        return false;
+    }
+    folder_request_ = FolderRequest{std::move(roots), batch};
+    return true;
+}
+
+void ViewerEngine::CancelDirectoryDownload() {
+    std::lock_guard<std::mutex> lock(browse_mutex_);
+    if (folder_.stage == FolderDownload::Stage::kListing ||
+        folder_.stage == FolderDownload::Stage::kDownloading) {
+        folder_.cancel = true;
+    }
+}
+
+bool ViewerEngine::TakeFileList(FileListAnswer& answer) {
+    std::lock_guard<std::mutex> lock(browse_mutex_);
+    if (!newest_file_list_) {
+        return false;
+    }
+    answer = std::move(*newest_file_list_);
+    newest_file_list_.reset();
     return true;
 }
 
@@ -573,7 +762,7 @@ void ViewerEngine::FileWorker() {
             return;
         }
         const uint64_t epoch = upload_epoch_;
-        std::string root;
+        PendingUploadRoot root;
         FileUpload job;
         bool hash_job = false;
         if (!pending_upload_roots_.empty()) {
@@ -590,7 +779,7 @@ void ViewerEngine::FileWorker() {
             }
         }
         lock.unlock();
-        if (!root.empty()) {
+        if (!root.path.empty()) {
             ExpandUploadRoot(root, epoch);
             lock.lock();
             continue;
@@ -606,6 +795,18 @@ void ViewerEngine::FileWorker() {
             }
             lock.lock();
             if (upload_epoch_ != epoch) {
+                // A purge cleared the ordinary entries this result belonged to,
+                // but concurrent clipboard uploads survive one (the two are
+                // gated by different permissions): put a surviving hash job
+                // back in the queue instead of leaving it stuck in kHashing.
+                for (FileUpload& upload : uploads_) {
+                    if (upload.transfer_id == job.transfer_id &&
+                        upload.stage == FileUpload::Stage::kHashing &&
+                        upload.clipboard) {
+                        upload.stage = FileUpload::Stage::kQueued;
+                        break;
+                    }
+                }
                 continue;
             }
             for (FileUpload& upload : uploads_) {
@@ -636,32 +837,36 @@ void ViewerEngine::FileWorker() {
     }
 }
 
-void ViewerEngine::ExpandUploadRoot(const std::string& root, uint64_t epoch) {
-    const std::filesystem::path source = path_from_utf8(root);
+void ViewerEngine::ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoch) {
+    const std::filesystem::path source = path_from_utf8(root.path);
     std::error_code ec;
     const std::filesystem::file_status status =
         std::filesystem::symlink_status(source, ec);
     const std::string display_name =
-        source.filename().empty() ? root : utf8_from_path(source.filename());
+        source.filename().empty() ? root.path : utf8_from_path(source.filename());
     if (ec) {
-        EnqueueUploadFailure(display_name, {},
+        EnqueueUploadFailure(display_name, root.prefix,
                              "the path cannot be read: " + ec.message(), epoch);
         return;
     }
     if (!std::filesystem::exists(status)) {
-        EnqueueUploadFailure(display_name, {}, "the path no longer exists", epoch);
+        EnqueueUploadFailure(display_name, root.prefix, "the path no longer exists", epoch);
         return;
     }
     if (std::filesystem::is_regular_file(status)) {
-        EnqueueUpload(root, {}, epoch);
+        EnqueueUpload(root.path, root.prefix, epoch);
         return;
     }
     if (!std::filesystem::is_directory(status)) {
-        EnqueueUploadFailure(display_name, {},
+        EnqueueUploadFailure(display_name, root.prefix,
                              "only regular files and folders can be sent", epoch);
         return;
     }
     const std::string top = chast::sanitize_received_name(display_name);
+    // A folder dropped into a browsed subdirectory keeps its own name below
+    // that directory, so the host creates prefix/top/... instead of prefix/...
+    const std::string base =
+        root.prefix.empty() ? top : root.prefix + "/" + top;
     bool added = false;
     size_t seen = 0;
     std::filesystem::recursive_directory_iterator iterator(
@@ -688,7 +893,7 @@ void ViewerEngine::ExpandUploadRoot(const std::string& root, uint64_t epoch) {
                 entry.path().parent_path().lexically_relative(source);
             // lexically_relative uses native separators; the wire wants '/'.
             const std::string relative = chast::make_offer_relative_path(
-                top, utf8_from_path(relative_dir));
+                base, utf8_from_path(relative_dir));
             if (relative.size() <= chast::kMaxFileRelativePathBytes) {
                 if (!EnqueueUpload(utf8_from_path(entry.path()), std::move(relative),
                                    epoch)) {
@@ -699,13 +904,13 @@ void ViewerEngine::ExpandUploadRoot(const std::string& root, uint64_t epoch) {
         }
         iterator.increment(ec);
         if (ec) {
-            std::fprintf(stderr, "viewer: folder %s: %s\n", root.c_str(),
+            std::fprintf(stderr, "viewer: folder %s: %s\n", root.path.c_str(),
                          ec.message().c_str());
             ec.clear();
         }
     }
     if (!added) {
-        EnqueueUploadFailure(top, {},
+        EnqueueUploadFailure(top, base,
                              ec ? "the folder cannot be read"
                                 : "the folder contains no sendable files",
                              epoch);
@@ -713,7 +918,7 @@ void ViewerEngine::ExpandUploadRoot(const std::string& root, uint64_t epoch) {
 }
 
 bool ViewerEngine::EnqueueUpload(const std::string& path, std::string relative_path,
-                                 uint64_t epoch) {
+                                 uint64_t epoch, bool clipboard) {
     const std::filesystem::path source = path_from_utf8(path);
     const std::string name = utf8_from_path(source.filename());
     if (name.empty() || name.size() > chast::kMaxFileNameBytes) {
@@ -736,6 +941,7 @@ bool ViewerEngine::EnqueueUpload(const std::string& path, std::string relative_p
     upload.name = name;
     upload.relative_path = std::move(relative_path);
     upload.transfer_id = next_file_id_++;
+    upload.clipboard = clipboard;
     uploads_.push_back(std::move(upload));
     return true;
 }
@@ -781,7 +987,12 @@ bool ViewerEngine::SetAudioMuted(bool mute) {
 bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
     if (enabled) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.state != ViewerState::kStreaming) {
+        // The host grants recording explicitly; the stream itself is always
+        // recordable locally, so this check is the consent gate, not a
+        // technical one. A recording already in progress keeps running if the
+        // host later revokes the permission, as in RustDesk.
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionRecord) == 0) {
             return false;
         }
     }
@@ -1037,6 +1248,104 @@ bool ViewerEngine::TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended) {
     return true;
 }
 
+bool ViewerEngine::RequestCameraList() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionCamera) == 0) {
+            return false;
+        }
+        if (status_.camera_phase == CameraPhase::kStarting ||
+            status_.camera_phase == CameraPhase::kStreaming) {
+            return false;
+        }
+        status_.camera_phase = CameraPhase::kListing;
+        status_.camera_code = 0;
+        status_.camera_reason.clear();
+        status_.camera_error.clear();
+        ++status_.camera_updates;
+    }
+    CameraCommand command;
+    command.kind = CameraCommand::Kind::kList;
+    std::lock_guard<std::mutex> lock(camera_mutex_);
+    pending_camera_.push_back(std::move(command));
+    return true;
+}
+
+bool ViewerEngine::StartCamera(uint16_t camera_id) {
+    if (camera_id == 0 || !running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionCamera) == 0) {
+            return false;
+        }
+        if (status_.camera_phase == CameraPhase::kListing ||
+            status_.camera_phase == CameraPhase::kStarting ||
+            status_.camera_phase == CameraPhase::kStreaming) {
+            return false;
+        }
+        // The ids in the newest list are the only ones the host accepts; a
+        // start for anything else was chosen from a list that is gone.
+        bool listed = false;
+        for (const chast::CameraDescription& camera : status_.cameras) {
+            if (camera.id == camera_id) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) {
+            return false;
+        }
+        status_.camera_phase = CameraPhase::kStarting;
+        status_.camera_id = camera_id;
+        status_.camera_code = 0;
+        status_.camera_reason.clear();
+        status_.camera_error.clear();
+        ++status_.camera_updates;
+    }
+    CameraCommand command;
+    command.kind = CameraCommand::Kind::kStart;
+    command.camera_id = camera_id;
+    std::lock_guard<std::mutex> lock(camera_mutex_);
+    pending_camera_.push_back(std::move(command));
+    return true;
+}
+
+void ViewerEngine::StopCamera() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.camera_phase == CameraPhase::kStreaming ||
+            status_.camera_phase == CameraPhase::kStarting) {
+            status_.camera_phase = CameraPhase::kStopped;
+            status_.camera_code = 0;
+            status_.camera_reason.clear();
+            status_.camera_error.clear();
+            ++status_.camera_updates;
+        }
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(camera_mutex_);
+    // Requests that were never sent would reopen the camera the panel just
+    // closed; only the stop itself matters now.
+    for (auto it = pending_camera_.begin(); it != pending_camera_.end();) {
+        if (it->kind == CameraCommand::Kind::kStop) {
+            return;
+        }
+        it = pending_camera_.erase(it);
+    }
+    CameraCommand command;
+    command.kind = CameraCommand::Kind::kStop;
+    pending_camera_.push_back(std::move(command));
+}
+
 bool ViewerEngine::StartPortForward(uint16_t local_port,
                                     const std::string& remote_host,
                                     uint16_t remote_port) {
@@ -1091,7 +1400,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string totp, bool trust_device, ViewerTransport transport,
                        std::string carrier_host, uint16_t carrier_port,
                        std::string carrier_host_id, std::string carrier_token,
-                       std::string audit_ref) {
+                       std::string audit_ref, bool file_transfer_only) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -1192,6 +1501,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint32_t display_source_height = 0;
     bool video_finished = false;
     bool handshaken = false;
+    // Set from HelloAck: the host serves file transfer only, so the session
+    // runs without decoder, sink or media waits.
+    bool files_only = false;
     bool logged_frame = false;
     bool logged_drop = false;
     uint64_t init_errors = 0;
@@ -1290,6 +1602,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             {
                 std::lock_guard<std::mutex> file_lock(file_mutex_);
                 status_.download_name = download_.name;
+                status_.download_path = download_.path;
                 status_.download_size = download_.size;
                 status_.download_received = download_.received;
                 status_.download_error = download_.error;
@@ -1551,6 +1864,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         client_config.device_identity = device_identity_.get();
         client_config.trust_device = trust_device;
         client_config.audit_ref = audit_ref;
+        client_config.session_mode = file_transfer_only
+                                         ? chast::SessionMode::FileTransfer
+                                         : chast::SessionMode::Desktop;
         std::string create_error;
         session = chast::QuicSession::create_client(client_config, &create_error);
         if (!session) {
@@ -1611,12 +1927,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             fail("handshake: " + handshake.to_string());
         } else {
             handshaken = true;
+            // The host decides: it answers a files-only request with an empty
+            // screen description and the flag, and the UI leaves the picture
+            // view for the file browser.
+            files_only = info.files_only;
             display_width = info.width;
             display_height = info.height;
             display_source_width = info.source_width;
             display_source_height = info.source_height;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                status_.files_only = files_only;
                 status_.codec = info.codec;
                 status_.width = info.width;
                 status_.height = info.height;
@@ -1783,6 +2104,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     (mask & chast::kPermissionPortForward) != 0;
                 const bool terminal_allowed =
                     (mask & chast::kPermissionTerminal) != 0;
+                const bool camera_allowed = (mask & chast::kPermissionCamera) != 0;
                 {
                     std::lock_guard<std::mutex> lock(input_mutex_);
                     input_enabled_ = input;
@@ -1803,6 +2125,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.privacy_supported = privacy;
                     status_.port_forward_enabled = forward_allowed;
                     status_.terminal_supported = terminal_allowed;
+                    status_.camera_supported = camera_allowed;
                 }
                 // The transport aborts the stream on revocation; stopping here
                 // releases the microphone at once and tells the UI why.
@@ -1818,64 +2141,77 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                        : std::to_string(display).c_str(),
                          info.displays.size(), info.origin_x, info.origin_y);
 
+            // Kept outside the decoder gate below: apply_stream_updates
+            // rebuilds the decoder from this config when the host changes
+            // its picture size or codec.
             chast::DecoderConfig decoder_config;
-            decoder_config.codec = info.codec;
-            if (sink_ == nullptr || sink_->device() == nullptr) {
-                fail("display: " +
-                     (sink_ != nullptr ? sink_->error()
-                                       : std::string("the frame sink is not available")));
-            }
-            // Decode straight into a D3D11 texture and hand each picture to
-            // the sink while the decoder still owns the surface: the image
-            // never reaches system memory.
-            decoder_config.d3d11_device = sink_ != nullptr ? sink_->device() : nullptr;
-            decoder_config.gpu_handler =
-                [&](const chast::GpuFrame& frame) -> chast::Error {
-                ++decoded;
-                display_width = frame.width;
-                display_height = frame.height;
-                if (sink_ != nullptr &&
-                    sink_->OnGpuFrame(frame.texture, frame.subresource, frame.width,
-                                      frame.height, frame.crop_x, frame.crop_y,
-                                      frame.pts_ms)) {
-                    ++published;
-                    ++window_frames;
-                    if (!logged_frame) {
-                        logged_frame = true;
-                        std::fprintf(stderr, "viewer: first GPU frame %ux%u\n", frame.width,
-                                     frame.height);
+            std::unique_ptr<chast::IVideoDecoder> decoder;
+            if (!files_only) {
+                decoder_config.codec = info.codec;
+                if (sink_ == nullptr || sink_->device() == nullptr) {
+                    fail("display: " +
+                         (sink_ != nullptr ? sink_->error()
+                                           : std::string("the frame sink is not available")));
+                }
+                // Decode straight into a D3D11 texture and hand each picture
+                // to the sink while the decoder still owns the surface: the
+                // image never reaches system memory.
+                decoder_config.d3d11_device =
+                    sink_ != nullptr ? sink_->device() : nullptr;
+                decoder_config.gpu_handler =
+                    [&](const chast::GpuFrame& frame) -> chast::Error {
+                    ++decoded;
+                    display_width = frame.width;
+                    display_height = frame.height;
+                    if (sink_ != nullptr &&
+                        sink_->OnGpuFrame(frame.texture, frame.subresource, frame.width,
+                                          frame.height, frame.crop_x, frame.crop_y,
+                                          frame.pts_ms)) {
+                        ++published;
+                        ++window_frames;
+                        if (!logged_frame) {
+                            logged_frame = true;
+                            std::fprintf(stderr, "viewer: first GPU frame %ux%u\n",
+                                         frame.width, frame.height);
+                        }
+                        return chast::Error::success();
                     }
+                    if (sink_ == nullptr) {
+                        return chast::Error(chast::Status::Unsupported,
+                                            "display: the frame sink is not available");
+                    }
+                    if (!sink_->error().empty()) {
+                        return chast::Error(chast::Status::CaptureFailed,
+                                            "display: " + sink_->error());
+                    }
+                    if (!logged_drop) {
+                        logged_drop = true;
+                        std::fprintf(stderr,
+                                     "viewer: the display has no GPU output; dropping frames\n");
+                    }
+                    // The plugin texture is gone (for example while the UI is
+                    // tearing the page down); dropping keeps the decoder running.
                     return chast::Error::success();
+                };
+                decoder = decoder_config.d3d11_device != nullptr
+                              ? chast::create_decoder(decoder_config, &error)
+                              : nullptr;
+                if (!decoder && failure.empty()) {
+                    fail("decoder (" + codec_name(info.codec) + "): " + error);
                 }
-                if (sink_ == nullptr) {
-                    return chast::Error(chast::Status::Unsupported,
-                                        "display: the frame sink is not available");
-                }
-                if (!sink_->error().empty()) {
-                    return chast::Error(chast::Status::CaptureFailed,
-                                        "display: " + sink_->error());
-                }
-                if (!logged_drop) {
-                    logged_drop = true;
+            }
+            if (files_only || decoder) {
+                if (decoder) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.decoder = decoder->implementation();
+                    }
+                    std::fprintf(stderr, "viewer: decoder %s\n",
+                                 decoder->implementation().c_str());
+                } else {
                     std::fprintf(stderr,
-                                 "viewer: the display has no GPU output; dropping frames\n");
+                                 "viewer: file transfer only; no screen stream follows\n");
                 }
-                // The plugin texture is gone (for example while the UI is
-                // tearing the page down); dropping keeps the decoder running.
-                return chast::Error::success();
-            };
-            std::unique_ptr<chast::IVideoDecoder> decoder =
-                decoder_config.d3d11_device != nullptr
-                    ? chast::create_decoder(decoder_config, &error)
-                    : nullptr;
-            if (!decoder && failure.empty()) {
-                fail("decoder (" + codec_name(info.codec) + "): " + error);
-            } else if (decoder) {
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    status_.decoder = decoder->implementation();
-                }
-                std::fprintf(stderr, "viewer: decoder %s\n", decoder->implementation().c_str());
                 SetState(ViewerState::kStreaming);
 
                 auto request_keyframe = [&] {
@@ -1928,6 +2264,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // and remembered so the next poll cannot echo it back.
                 bool clipboard_was_allowed = false;
                 uint64_t clipboard_hash = 0;
+                // Hash of the host's latest FileList; unlike clipboard_hash it
+                // is not touched by outbound polls, so a local copy on the
+                // viewer cannot make a downloading list look stale.
+                uint64_t clipboard_peer_file_list = 0;
+                // Viewer -> host clipboard files (protocol v34): identity of the
+                // list last announced or baselined, whether the local clipboard
+                // currently owns files (the rich poll then stays out of the
+                // way), and one log line per distinct collection refusal.
+                uint64_t clipboard_out_identity = 0;
+                bool clipboard_has_files = false;
+                bool clipboard_out_was_allowed = false;
+                auto next_clipboard_file_poll = Clock::now();
+                std::string last_clipboard_file_error;
                 auto clipboard_allowed = [&] {
                     return clipboard_enabled &&
                            (permissions & chast::kPermissionClipboard) != 0 &&
@@ -1941,6 +2290,187 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
                 auto next_clipboard_poll = Clock::now();
+
+                // Clipboard file copy (protocol v33). The host announces the
+                // files on its clipboard as a FileList; the viewer pulls each
+                // entry through the ordinary download channel into a staging
+                // directory and puts the finished top-level items on the local
+                // clipboard as CF_HDROP. Copied folders arrive as entries
+                // sharing a first rel_path component. v1 runs host -> viewer
+                // only.
+                struct ClipboardFiles {
+                    enum class Stage {
+                        kIdle,
+                        kRequesting,
+                        kOffering,
+                        kReceiving,
+                    };
+                    Stage stage = Stage::kIdle;
+                    std::vector<chast::ClipboardFileEntry> entries;
+                    // Top-level paths for CF_HDROP: flat files, and one
+                    // staging folder per copied tree.
+                    std::vector<std::string> paths;
+                    size_t next = 0;
+                    uint32_t request_id = 0;
+                    uint32_t transfer_id = 0;
+                    std::string directory;
+                    uint64_t hash = 0;
+                    std::chrono::steady_clock::time_point deadline;
+                    std::chrono::steady_clock::time_point retry_after;
+                } clipboard_files;
+                uint32_t next_clipboard_request = 0x40000000u;
+                uint32_t clipboard_staging_seq = 0;
+
+                auto discard_clipboard_files = [&] {
+                    std::error_code ec;
+                    if (!clipboard_files.directory.empty()) {
+                        std::filesystem::remove_all(path_from_utf8(clipboard_files.directory),
+                                                    ec);
+                    }
+                    clipboard_files = ClipboardFiles{};
+                };
+                auto clip_files_fail = [&](const std::string& message) {
+                    if (clipboard_files.stage == ClipboardFiles::Stage::kIdle) {
+                        return;
+                    }
+                    ++clipboard_failed;
+                    std::fprintf(stderr, "viewer: clipboard files failed: %s\n",
+                                 message.c_str());
+                    discard_clipboard_files();
+                };
+                auto start_clipboard_files =
+                    [&](std::vector<chast::ClipboardFileEntry> entries, uint64_t hash) {
+                        if (entries.empty() || !clipboard_allowed()) {
+                            return;
+                        }
+                        if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {
+                            std::fprintf(stderr,
+                                         "viewer: clipboard files: a transfer is running; "
+                                         "the new list was ignored\n");
+                            return;
+                        }
+                        std::error_code ec;
+                        const std::filesystem::path base =
+                            std::filesystem::temp_directory_path(ec);
+                        if (ec || base.empty()) {
+                            ++clipboard_failed;
+                            std::fprintf(stderr,
+                                         "viewer: clipboard files: no temporary directory\n");
+                            return;
+                        }
+                        const std::filesystem::path directory =
+                            base / ("chast-clipboard-" +
+                                    std::to_string(
+                                        static_cast<unsigned long long>(std::time(nullptr))) +
+                                    "-" + std::to_string(++clipboard_staging_seq));
+                        std::filesystem::create_directories(directory, ec);
+                        if (ec) {
+                            ++clipboard_failed;
+                            std::fprintf(stderr,
+                                         "viewer: clipboard files: cannot create the "
+                                         "staging folder: %s\n",
+                                         ec.message().c_str());
+                            return;
+                        }
+                        clipboard_files.entries = std::move(entries);
+                        clipboard_files.hash = hash;
+                        clipboard_files.directory = utf8_from_path(directory);
+                        clipboard_files.stage = ClipboardFiles::Stage::kRequesting;
+                        std::fprintf(stderr, "viewer: clipboard carries %zu file(s)\n",
+                                     clipboard_files.entries.size());
+                    };
+                auto step_clipboard_files = [&] {
+                    if (clipboard_files.stage == ClipboardFiles::Stage::kIdle) {
+                        return;
+                    }
+                    if (!clipboard_allowed()) {
+                        clip_files_fail("clipboard sync is disabled");
+                        return;
+                    }
+                    const auto now = Clock::now();
+                    if (clipboard_files.stage == ClipboardFiles::Stage::kRequesting &&
+                        clipboard_files.request_id != 0) {
+                        if (now > clipboard_files.deadline) {
+                            clip_files_fail(
+                                "the host did not answer the download of '" +
+                                clipboard_files.entries[clipboard_files.next].name + "'");
+                        }
+                        return;
+                    }
+                    if (clipboard_files.stage == ClipboardFiles::Stage::kOffering ||
+                        clipboard_files.stage == ClipboardFiles::Stage::kReceiving) {
+                        return;
+                    }
+                    if (now < clipboard_files.retry_after) {
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (download_.stage == FileDownload::Stage::kReceiving) {
+                            clipboard_files.retry_after =
+                                now + std::chrono::milliseconds(500);
+                            return;
+                        }
+                    }
+                    if (clipboard_files.next >= clipboard_files.entries.size()) {
+                        if (clipboard_peer_file_list != clipboard_files.hash) {
+                            // A newer clipboard item replaced this list while
+                            // it downloaded; stale files must not take over.
+                            std::fprintf(stderr,
+                                         "viewer: clipboard files: a newer item replaced "
+                                         "the list\n");
+                            discard_clipboard_files();
+                            return;
+                        }
+                        std::function<bool(const std::vector<std::string>&)> sink;
+                        {
+                            std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
+                            sink = clipboard_file_sink_;
+                        }
+                        std::string write_error;
+                        const bool written =
+                            sink ? sink(clipboard_files.paths)
+                                 : chast::write_clipboard_files(clipboard_files.paths,
+                                                                &write_error);
+                        if (!written) {
+                            if (write_error.empty()) {
+                                write_error = "the clipboard sink rejected the list";
+                            }
+                            ++clipboard_failed;
+                            std::fprintf(stderr,
+                                         "viewer: clipboard files: cannot write the "
+                                         "clipboard: %s\n",
+                                         write_error.c_str());
+                            discard_clipboard_files();
+                            return;
+                        }
+                        ++clipboard_received;
+                        clipboard_received_formats =
+                            1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
+                        // These files are on the local clipboard now: the
+                        // reverse poll must see its own write as the baseline
+                        // instead of copying the list back to the host.
+                        clipboard_out_identity = chast::clipboard_file_identity_hash(
+                            clipboard_files.entries);
+                        std::fprintf(stderr,
+                                     "viewer: clipboard files written (%zu top-level "
+                                     "item(s), formats 0x%x)\n",
+                                     clipboard_files.paths.size(),
+                                     clipboard_received_formats);
+                        clipboard_files = ClipboardFiles{};
+                        return;
+                    }
+                    const size_t index = clipboard_files.next;
+                    const std::string path = kClipboardFilePathPrefix + std::to_string(index);
+                    const uint32_t request_id = next_clipboard_request++;
+                    chast::Error sent = session->request_file_download(request_id, path);
+                    if (!sent.ok()) {
+                        clip_files_fail("request '" + path + "': " + sent.to_string());
+                        return;
+                    }
+                    clipboard_files.request_id = request_id;
+                    clipboard_files.deadline = now + kClipboardAnswerTimeout;
+                };
 
                 auto poll_clipboard = [&] {
                     const auto now = Clock::now();
@@ -1960,6 +2490,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         return;
                     }
                     next_clipboard_poll = now + kClipboardPollInterval;
+                    // A file copy owns the clipboard; a stale text hash would
+                    // otherwise announce a rich item beside it. The next rich
+                    // read after the files are gone is a fresh change again.
+                    if (clipboard_has_files) {
+                        clipboard_hash = 0;
+                        return;
+                    }
                     chast::ClipboardContent current;
                     std::string read_error;
                     if (!chast::read_clipboard(current, &read_error)) {
@@ -2011,6 +2548,32 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                      content_error.c_str());
                         return;
                     }
+                    const chast::ClipboardFormatData* file_list = nullptr;
+                    for (const chast::ClipboardFormatData& format : content.formats) {
+                        if (format.format == chast::ClipboardFormat::FileList) {
+                            file_list = &format;
+                            break;
+                        }
+                    }
+                    if (file_list != nullptr) {
+                        // The files themselves arrive through the download
+                        // channel; only the list crosses the clipboard stream.
+                        std::vector<chast::ClipboardFileEntry> entries;
+                        std::string file_error;
+                        if (!chast::decode_clipboard_file_list(file_list->data, entries,
+                                                               &file_error)) {
+                            ++clipboard_failed;
+                            std::fprintf(stderr,
+                                         "viewer: clipboard: the host sent an unusable "
+                                         "file list: %s\n",
+                                         file_error.c_str());
+                            return;
+                        }
+                        clipboard_hash = hash;
+                        clipboard_peer_file_list = hash;
+                        start_clipboard_files(std::move(entries), hash);
+                        return;
+                    }
                     std::string write_error;
                     if (!chast::write_clipboard(content, &write_error)) {
                         ++clipboard_failed;
@@ -2021,6 +2584,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         return;
                     }
                     clipboard_hash = hash;
+                    clipboard_peer_file_list = 0;
                     clipboard_received_formats = formats_mask(content);
                     ++clipboard_received;
                     std::fprintf(stderr, "viewer: clipboard written (formats 0x%x)\n",
@@ -2054,12 +2618,52 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 double file_tokens = kFileUploadBurst;
                 Clock::time_point file_token_time = Clock::now();
 
+                // Drops queued clipboard uploads without touching ordinary
+                // ones: the two kinds are gated by different permissions, and
+                // a clipboard change must not cancel a file the operator sent
+                // from the browser. `keep_front` leaves a head that is already
+                // marked failed for the accounting loop.
+                auto drop_clipboard_uploads = [&](const std::string& message,
+                                                  bool keep_front = false) {
+                    uint32_t active_id = 0;
+                    size_t dropped = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        bool first = true;
+                        for (auto it = uploads_.begin(); it != uploads_.end();) {
+                            const bool skip = keep_front && first;
+                            first = false;
+                            if (skip || !it->clipboard) {
+                                ++it;
+                                continue;
+                            }
+                            if (it->stage == FileUpload::Stage::kOffered ||
+                                it->stage == FileUpload::Stage::kSending ||
+                                it->stage == FileUpload::Stage::kFinishing) {
+                                active_id = it->transfer_id;
+                            }
+                            it = uploads_.erase(it);
+                            ++dropped;
+                        }
+                    }
+                    if (active_id != 0) {
+                        file_stream.close();
+                        session->cancel_file_upload(active_id);
+                    }
+                    if (dropped > 0) {
+                        std::fprintf(stderr,
+                                     "viewer: clipboard files: %zu upload(s) dropped (%s)\n",
+                                     dropped, message.c_str());
+                    }
+                };
+
                 // Marks the head failed. The failure counter advances when a
                 // failed entry leaves the queue, so every failure is counted
                 // exactly once no matter which path reported it.
                 auto file_fail = [&](const std::string& message) {
                     uint32_t transfer_id = 0;
                     std::string name;
+                    bool clipboard = false;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
                         if (uploads_.empty()) {
@@ -2072,6 +2676,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         transfer_id = head.transfer_id;
                         name = head.name;
+                        clipboard = head.clipboard;
                         head.stage = FileUpload::Stage::kFailed;
                         head.error = message;
                     }
@@ -2081,11 +2686,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     session->cancel_file_upload(transfer_id);
                     std::fprintf(stderr, "viewer: file %s failed: %s\n", name.c_str(),
                                  message.c_str());
+                    if (clipboard) {
+                        // The host aborted the list after this entry; offering
+                        // the rest would only draw one refusal per file.
+                        drop_clipboard_uploads(message, true);
+                    }
                 };
 
-                // A revoked grant drops the whole queue; the user should not
-                // receive one rejection per entry for a permission that is
-                // already gone.
+                // A revoked grant drops the ordinary queue; the user should
+                // not receive one rejection per entry for a permission that is
+                // already gone. Clipboard uploads belong to the clipboard
+                // permission and stay queued.
                 auto purge_uploads = [&](const std::string& message) {
                     uint32_t active_id = 0;
                     std::string name;
@@ -2095,25 +2706,33 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         // A folder walk or hash still in flight must not
                         // repopulate the queue after the purge.
                         ++upload_epoch_;
-                        if (!uploads_.empty()) {
-                            name = uploads_.front().name;
-                            FileUpload finished = std::move(uploads_.front());
-                            if (finished.stage == FileUpload::Stage::kOffered ||
-                                finished.stage == FileUpload::Stage::kSending ||
-                                finished.stage == FileUpload::Stage::kFinishing) {
-                                active_id = finished.transfer_id;
+                        bool reported = false;
+                        for (auto it = uploads_.begin(); it != uploads_.end();) {
+                            if (it->clipboard) {
+                                ++it;
+                                continue;
                             }
-                            finished.stage = FileUpload::Stage::kFailed;
-                            finished.error = message;
-                            last_upload_ = std::move(finished);
-                            ++file_failures;
+                            if (it->stage == FileUpload::Stage::kOffered ||
+                                it->stage == FileUpload::Stage::kSending ||
+                                it->stage == FileUpload::Stage::kFinishing) {
+                                active_id = it->transfer_id;
+                            }
+                            if (!reported) {
+                                reported = true;
+                                name = it->name;
+                                FileUpload finished = std::move(*it);
+                                finished.stage = FileUpload::Stage::kFailed;
+                                finished.error = message;
+                                last_upload_ = std::move(finished);
+                                ++file_failures;
+                            }
+                            it = uploads_.erase(it);
+                            ++dropped;
                         }
-                        dropped = uploads_.size();
-                        uploads_.clear();
                         pending_upload_roots_.clear();
                     }
-                    file_stream.close();
                     if (active_id != 0) {
+                        file_stream.close();
                         session->cancel_file_upload(active_id);
                     }
                     if (!name.empty()) {
@@ -2122,6 +2741,195 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                      "dropped)\n",
                                      name.c_str(), message.c_str(), dropped);
                     }
+                };
+
+                // Viewer -> host clipboard files (protocol v34). The local
+                // CF_HDROP list is announced as a FileList and every entry then
+                // rides the ordinary upload channel marked clipboard, so the
+                // host stages it for its own clipboard instead of its receive
+                // directory. A baseline is taken when sync opens: whatever was
+                // on the clipboard before the session is never flushed.
+                auto read_local_clipboard_files =
+                    [&](std::vector<chast::ClipboardFileEntry>& entries,
+                        std::vector<std::string>& paths) {
+                        entries.clear();
+                        paths.clear();
+                        std::vector<std::string> found;
+                        std::function<bool(std::vector<std::string>&)> source;
+                        {
+                            std::lock_guard<std::mutex> lock(clipboard_sink_mutex_);
+                            source = clipboard_file_source_;
+                        }
+                        if (source) {
+                            if (!source(found)) {
+                                return false;
+                            }
+                        } else {
+                            std::string read_error;
+                            if (!chast::read_clipboard_files(found, &read_error)) {
+                                return false;
+                            }
+                        }
+                        std::string collect_error;
+                        if (!chast::collect_clipboard_files(found, entries, paths,
+                                                            &collect_error)) {
+                            // One line per distinct refusal: the operator can
+                            // copy again, but an unchanged unsendable list must
+                            // not repaint the log twice a second.
+                            if (collect_error != last_clipboard_file_error) {
+                                last_clipboard_file_error = collect_error;
+                                std::fprintf(stderr, "viewer: clipboard files: %s\n",
+                                             collect_error.c_str());
+                            }
+                            return false;
+                        }
+                        last_clipboard_file_error.clear();
+                        return true;
+                    };
+                auto poll_local_clipboard_files = [&] {
+                    const auto now = Clock::now();
+                    if (!clipboard_allowed()) {
+                        clipboard_out_was_allowed = false;
+                        clipboard_out_identity = 0;
+                        clipboard_has_files = false;
+                        return;
+                    }
+                    std::vector<chast::ClipboardFileEntry> entries;
+                    std::vector<std::string> paths;
+                    if (!clipboard_out_was_allowed) {
+                        clipboard_out_was_allowed = true;
+                        clipboard_has_files = read_local_clipboard_files(entries, paths);
+                        clipboard_out_identity =
+                            clipboard_has_files
+                                ? chast::clipboard_file_identity_hash(entries)
+                                : 0;
+                        next_clipboard_file_poll = now + kClipboardPollInterval;
+                        return;
+                    }
+                    if (now < next_clipboard_file_poll) {
+                        return;
+                    }
+                    next_clipboard_file_poll = now + kClipboardPollInterval;
+                    clipboard_has_files = read_local_clipboard_files(entries, paths);
+                    if (!clipboard_has_files) {
+                        clipboard_out_identity = 0;
+                        return;
+                    }
+                    const uint64_t identity = chast::clipboard_file_identity_hash(entries);
+                    if (identity == 0 || identity == clipboard_out_identity) {
+                        return;
+                    }
+                    chast::ClipboardFormatData format;
+                    format.format = chast::ClipboardFormat::FileList;
+                    format.data = chast::encode_clipboard_file_list(entries);
+                    if (format.data.empty()) {
+                        clipboard_out_identity = identity;
+                        std::fprintf(stderr,
+                                     "viewer: clipboard files: the local list is not "
+                                     "sendable\n");
+                        return;
+                    }
+                    // The local copy wins over a host list still arriving: the
+                    // staging download is aborted and its slot released.
+                    if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {
+                        uint32_t replaced = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(file_mutex_);
+                            if (download_.stage == FileDownload::Stage::kReceiving) {
+                                replaced = download_.transfer_id;
+                                if (download_.receiver) {
+                                    download_.receiver->abort(true);
+                                    download_.receiver.reset();
+                                }
+                                download_.stage = FileDownload::Stage::kFailed;
+                                download_.error =
+                                    "the local clipboard replaced the host's list";
+                            }
+                        }
+                        if (replaced != 0) {
+                            (void)session->send_file_result(
+                                replaced, chast::FileCode::IoError, 0,
+                                "the local clipboard replaced the host's list");
+                        }
+                        std::fprintf(stderr,
+                                     "viewer: clipboard files: the local copy replaced "
+                                     "the host's list\n");
+                        discard_clipboard_files();
+                    }
+                    // The host expects the offers in list order and refuses the
+                    // whole list on the first mismatch, so all entries must fit
+                    // in the queue before the list is announced.
+                    size_t room = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        size_t ordinary = 0;
+                        for (const FileUpload& upload : uploads_) {
+                            if (!upload.clipboard) {
+                                ++ordinary;
+                            }
+                        }
+                        room = kMaxQueuedUploads > ordinary ? kMaxQueuedUploads - ordinary : 0;
+                    }
+                    if (entries.size() > room) {
+                        clipboard_out_identity = identity;
+                        std::fprintf(stderr,
+                                     "viewer: clipboard files: the upload queue is full; "
+                                     "the list was not announced\n");
+                        return;
+                    }
+                    drop_clipboard_uploads("the local clipboard changed");
+                    bool queued = false;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (uploads_.size() + entries.size() <= kMaxQueuedUploads) {
+                            for (size_t i = 0; i < entries.size(); ++i) {
+                                const std::string& rel = entries[i].rel_path;
+                                const size_t slash = rel.rfind('/');
+                                FileUpload upload;
+                                upload.path = paths[i];
+                                upload.name = entries[i].name;
+                                if (slash != std::string::npos) {
+                                    upload.relative_path = rel.substr(0, slash);
+                                }
+                                upload.transfer_id = next_file_id_++;
+                                upload.clipboard = true;
+                                uploads_.push_back(std::move(upload));
+                            }
+                            queued = true;
+                        }
+                    }
+                    if (!queued) {
+                        // A folder walk filled the queue between the check and
+                        // the enqueue; the current host-side list stays valid.
+                        clipboard_out_identity = identity;
+                        std::fprintf(stderr,
+                                     "viewer: clipboard files: the upload queue is full; "
+                                     "the list was not announced\n");
+                        return;
+                    }
+                    file_work_cv_.notify_all();
+                    const uint64_t sent_identity = identity;
+                    chast::ClipboardContent content;
+                    content.seq = clipboard_seq;
+                    content.formats.push_back(std::move(format));
+                    chast::Error sent = session->send_clipboard_content(std::move(content));
+                    if (!sent.ok()) {
+                        ++clipboard_failed;
+                        std::fprintf(stderr, "viewer: clipboard files send failed: %s\n",
+                                     sent.to_string().c_str());
+                        drop_clipboard_uploads("the file list could not be sent");
+                        return;
+                    }
+                    clipboard_out_identity = sent_identity;
+                    // Files own the clipboard now; the next rich item counts as
+                    // a fresh change even if it matches the old text.
+                    clipboard_hash = 0;
+                    clipboard_sent_formats =
+                        1u << static_cast<uint32_t>(chast::ClipboardFormat::FileList);
+                    ++clipboard_seq;
+                    ++clipboard_sent;
+                    std::fprintf(stderr, "viewer: clipboard files announced (%zu file(s))\n",
+                                 entries.size());
                 };
 
                 auto drive_file_upload = [&] {
@@ -2143,6 +2951,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             last_upload_ = std::move(uploads_.front());
                             uploads_.pop_front();
                         }
+                    }
+                    // The clipboard half of the queue has its own gate, and an
+                    // incoming host list supersedes whatever the local poll
+                    // queued: the host's clipboard is the current one.
+                    if (!clipboard_allowed()) {
+                        drop_clipboard_uploads("clipboard sync was disabled");
+                    } else if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {
+                        drop_clipboard_uploads("the host replaced the clipboard");
                     }
                     FileUpload snapshot;
                     {
@@ -2194,10 +3010,20 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             }
                             std::fprintf(stderr, "viewer: file %s failed: %s\n",
                                          snapshot.name.c_str(), reason.c_str());
+                            if (snapshot.clipboard) {
+                                // A refused entry means the host already
+                                // abandoned the list; the rest would only draw
+                                // one refusal per file.
+                                drop_clipboard_uploads(reason, true);
+                            }
                         }
                         return;
                     }
-                    if ((permissions & chast::kPermissionFileTransfer) == 0) {
+                    // Clipboard uploads are gated by the clipboard permission,
+                    // already applied above; only ordinary entries answer to a
+                    // revoked file transfer.
+                    if (!snapshot.clipboard &&
+                        (permissions & chast::kPermissionFileTransfer) == 0) {
                         purge_uploads("the host revoked file transfer");
                         return;
                     }
@@ -2213,6 +3039,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         offer.sha256 = snapshot.digest;
                         offer.name = snapshot.name;
                         offer.relative_path = snapshot.relative_path;
+                        offer.clipboard = snapshot.clipboard;
                         chast::Error sent = session->offer_file(offer);
                         if (!sent.ok()) {
                             file_fail("offer: " + sent.to_string());
@@ -2356,6 +3183,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto download_fail = [&](const std::string& message, bool report) {
                     uint32_t transfer_id = 0;
                     std::string name;
+                    bool clipboard_transfer = false;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
                         if (download_.stage != FileDownload::Stage::kReceiving) {
@@ -2369,6 +3197,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         download_.stage = FileDownload::Stage::kFailed;
                         download_.error = message;
+                        clipboard_transfer =
+                            clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
+                            clipboard_files.transfer_id == transfer_id;
                     }
                     if (report) {
                         (void)session->send_file_result(transfer_id, chast::FileCode::IoError, 0,
@@ -2377,22 +3208,153 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     ++file_receive_failures;
                     std::fprintf(stderr, "viewer: download %s failed: %s\n", name.c_str(),
                                  message.c_str());
+                    if (clipboard_transfer) {
+                        clip_files_fail("the download of '" + name + "' failed: " + message);
+                    }
+                };
+
+                // The folder walk's shared state lives under browse_mutex_; the
+                // page polls these copies through ViewerStatus.
+                auto publish_folder_progress = [&] {
+                    bool active = false;
+                    std::string name;
+                    std::string destination;
+                    std::string current;
+                    uint64_t total = 0;
+                    uint64_t done = 0;
+                    uint32_t roots = 0;
+                    bool batch = false;
+                    {
+                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                        active = folder_.stage == FolderDownload::Stage::kListing ||
+                                 folder_.stage == FolderDownload::Stage::kDownloading;
+                        name = folder_.name;
+                        destination = folder_.destination;
+                        current = folder_.current;
+                        total = folder_.files_total;
+                        done = folder_.files_done;
+                        roots = folder_.batch_total;
+                        batch = folder_.batch;
+                    }
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.folder_download_active = active;
+                    status_.folder_download_name = name;
+                    status_.folder_download_destination = destination;
+                    status_.folder_download_current = current;
+                    status_.folder_download_files_total = total;
+                    status_.folder_download_files_done = done;
+                    status_.folder_download_roots = roots;
+                    status_.folder_download_batch = batch;
+                };
+
+                // Ends the walk and publishes the outcome once. `code` is 0 for
+                // a completed download, 1 for a failure and 2 for a cancel.
+                auto finish_folder_download = [&](int code, const std::string& reason) {
+                    bool first = false;
+                    std::string name;
+                    std::string destination;
+                    uint64_t total = 0;
+                    uint64_t done = 0;
+                    uint32_t roots = 0;
+                    bool batch = false;
+                    std::string error;
+                    {
+                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                        if (folder_.stage != FolderDownload::Stage::kListing &&
+                            folder_.stage != FolderDownload::Stage::kDownloading) {
+                            return;
+                        }
+                        first = true;
+                        folder_.stage = code == 0   ? FolderDownload::Stage::kDone
+                                        : code == 2 ? FolderDownload::Stage::kCancelled
+                                                    : FolderDownload::Stage::kFailed;
+                        folder_.finished = true;
+                        folder_.error = code == 0 ? std::string() : reason;
+                        folder_.current.clear();
+                        folder_.roots.clear();
+                        folder_.directories.clear();
+                        folder_.files.clear();
+                        folder_.listing_id = 0;
+                        folder_.download_id = 0;
+                        folder_.transfer_id = 0;
+                        folder_transfers_.clear();
+                        name = folder_.name;
+                        destination = folder_.destination;
+                        total = folder_.files_total;
+                        done = folder_.files_done;
+                        roots = folder_.batch_total;
+                        batch = folder_.batch;
+                        error = folder_.error;
+                    }
+                    if (!first) {
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.folder_download_active = false;
+                        status_.folder_download_name = name;
+                        status_.folder_download_destination = destination;
+                        status_.folder_download_current.clear();
+                        status_.folder_download_files_total = total;
+                        status_.folder_download_files_done = done;
+                        status_.folder_download_roots = roots;
+                        status_.folder_download_batch = batch;
+                        ++status_.folder_download_answers;
+                        status_.folder_download_code = code;
+                        status_.folder_download_error = error;
+                    }
+                    std::fprintf(stderr, "viewer: folder download '%s' %s%s\n", name.c_str(),
+                                 code == 0 ? "done" : code == 2 ? "cancelled" : "failed: ",
+                                 code == 1 ? error.c_str() : "");
                 };
 
                 auto drain_downloads = [&] {
-                    if ((permissions & chast::kPermissionFileTransfer) == 0) {
-                        bool active = false;
-                        {
-                            std::lock_guard<std::mutex> lock(file_mutex_);
-                            active = download_.stage == FileDownload::Stage::kReceiving;
-                        }
-                        if (active) {
-                            download_fail("the host revoked file transfer", false);
-                        }
+                    bool transfer_receiving = false;
+                    bool clipboard_receiving = false;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        transfer_receiving =
+                            download_.stage == FileDownload::Stage::kReceiving;
+                        clipboard_receiving =
+                            transfer_receiving &&
+                            clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
+                            clipboard_files.transfer_id == download_.transfer_id;
+                    }
+                    if (transfer_receiving && !clipboard_receiving &&
+                        (permissions & chast::kPermissionFileTransfer) == 0) {
+                        download_fail("the host revoked file transfer", false);
+                    }
+                    if (transfer_receiving && clipboard_receiving && !clipboard_allowed()) {
+                        download_fail("clipboard sync is disabled", false);
                     }
                     chast::FileOffer offer;
                     while (session->take_file_offer(offer)) {
-                        if ((permissions & chast::kPermissionFileTransfer) == 0) {
+                        const bool clipboard_transfer =
+                            clipboard_files.stage == ClipboardFiles::Stage::kOffering &&
+                            clipboard_files.transfer_id == offer.transfer_id;
+                        if ((permissions & chast::kPermissionFileTransfer) == 0 &&
+                            !clipboard_transfer) {
+                            continue;
+                        }
+                        if (clipboard_transfer && !clipboard_allowed()) {
+                            (void)session->send_file_answer(
+                                offer.transfer_id, chast::FileCode::Busy, 0,
+                                "clipboard sync is disabled");
+                            clip_files_fail("clipboard sync was disabled before the transfer "
+                                            "started");
+                            continue;
+                        }
+                        bool ignored = false;
+                        {
+                            // A walk that was cancelled just as the host sent
+                            // this offer already turned the transfer away.
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            ignored = ignored_transfers_.erase(offer.transfer_id) > 0;
+                        }
+                        if (ignored) {
+                            (void)session->send_file_answer(
+                                offer.transfer_id, chast::FileCode::Busy, 0,
+                                "the folder download was cancelled");
                             continue;
                         }
                         bool busy = false;
@@ -2400,18 +3362,87 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             std::lock_guard<std::mutex> lock(file_mutex_);
                             busy = download_.stage == FileDownload::Stage::kReceiving;
                         }
-                        if (busy || download_directory.empty()) {
-                            ++file_receive_failures;
-                            (void)session->send_file_answer(
-                                offer.transfer_id, chast::FileCode::Busy, 0,
+                        const bool no_directory = clipboard_transfer
+                                                      ? clipboard_files.directory.empty()
+                                                      : download_directory.empty();
+                        if (busy || no_directory) {
+                            const char* reason =
                                 busy ? "another download is running"
-                                     : "the viewer has no download directory");
+                                     : "the viewer has no download directory";
+                            (void)session->send_file_answer(offer.transfer_id,
+                                                            chast::FileCode::Busy, 0, reason);
+                            if (clipboard_transfer) {
+                                if (no_directory) {
+                                    clip_files_fail("the viewer has no staging directory");
+                                } else {
+                                    // Let the running download finish, then ask
+                                    // the host for this entry again.
+                                    clipboard_files.stage =
+                                        ClipboardFiles::Stage::kRequesting;
+                                    clipboard_files.request_id = 0;
+                                    clipboard_files.transfer_id = 0;
+                                    clipboard_files.retry_after =
+                                        Clock::now() + std::chrono::milliseconds(500);
+                                }
+                                continue;
+                            }
+                            ++file_receive_failures;
+                            // The walk's file was turned away; queue it again
+                            // instead of ending the whole walk.
+                            bool walk_transfer = false;
+                            bool retry = false;
+                            {
+                                std::lock_guard<std::mutex> lock(browse_mutex_);
+                                walk_transfer = folder_transfers_.erase(offer.transfer_id) > 0;
+                                if (walk_transfer &&
+                                    folder_.stage == FolderDownload::Stage::kDownloading) {
+                                    folder_.transfer_id = 0;
+                                    folder_.current.clear();
+                                    if (busy) {
+                                        folder_.files.push_front(std::make_pair(
+                                            folder_.download_path, folder_.download_directory));
+                                        folder_.retry_after =
+                                            Clock::now() + std::chrono::milliseconds(500);
+                                        folder_.download_path.clear();
+                                        folder_.download_directory.clear();
+                                        retry = true;
+                                    }
+                                }
+                            }
+                            if (retry) {
+                                publish_folder_progress();
+                            } else if (walk_transfer) {
+                                finish_folder_download(1, reason);
+                            }
                             continue;
                         }
                         chast::FileReceiveOptions options;
-                        options.directory = download_directory;
+                        options.directory = clipboard_transfer ? clipboard_files.directory
+                                                               : download_directory;
                         options.name = offer.name;
-                        options.relative_path = offer.relative_path;
+                        options.relative_path =
+                            clipboard_transfer ? std::string() : offer.relative_path;
+                        if (clipboard_transfer) {
+                            // The entry's rel_path holds the copied folder
+                            // layout, so the file lands under the same
+                            // subdirectories in the staging root.
+                            if (clipboard_files.next < clipboard_files.entries.size()) {
+                                const std::string& rel =
+                                    clipboard_files.entries[clipboard_files.next].rel_path;
+                                const size_t slash = rel.rfind('/');
+                                if (slash != std::string::npos) {
+                                    options.relative_path = rel.substr(0, slash);
+                                }
+                            }
+                        } else {
+                            // A walk's file lands in the mirrored tree, not
+                            // in the receive root.
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            auto it = folder_transfers_.find(offer.transfer_id);
+                            if (it != folder_transfers_.end()) {
+                                options.relative_path = it->second;
+                            }
+                        }
                         options.size = offer.size;
                         options.sha256 = offer.sha256;
                         options.allow_resume = offer.resume;
@@ -2425,6 +3456,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                             0, receive_error);
                             std::fprintf(stderr, "viewer: download %s refused: %s\n",
                                          offer.name.c_str(), receive_error.c_str());
+                            if (clipboard_transfer) {
+                                clip_files_fail("cannot receive '" + offer.name +
+                                                "': " + receive_error);
+                                continue;
+                            }
+                            bool walk_transfer = false;
+                            {
+                                std::lock_guard<std::mutex> lock(browse_mutex_);
+                                walk_transfer = folder_transfers_.erase(offer.transfer_id) > 0;
+                            }
+                            if (walk_transfer) {
+                                finish_folder_download(1, receive_error);
+                            }
                             continue;
                         }
                         const std::string name = receiver->name();
@@ -2440,6 +3484,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             download_.received = resume_offset;
                             download_.answer_time = Clock::now();
                             download_.receiver = std::move(receiver);
+                        }
+                        if (clipboard_transfer) {
+                            clipboard_files.stage = ClipboardFiles::Stage::kReceiving;
                         }
                         chast::Error answered = session->send_file_answer(
                             transfer_id, chast::FileCode::Ok, resume_offset);
@@ -2575,6 +3622,32 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         download_.path = final_path;
                         download_.error.clear();
                     }
+                    if (clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
+                        clipboard_files.transfer_id == transfer_id &&
+                        clipboard_files.next < clipboard_files.entries.size()) {
+                        // CF_HDROP lists what the operator sees: a flat file
+                        // by itself, a copied folder once for all of its files.
+                        const std::string& rel =
+                            clipboard_files.entries[clipboard_files.next].rel_path;
+                        const size_t slash = rel.find('/');
+                        if (slash == std::string::npos) {
+                            clipboard_files.paths.push_back(final_path);
+                        } else {
+                            const std::string top_path = utf8_from_path(
+                                path_from_utf8(clipboard_files.directory) /
+                                path_from_utf8(rel.substr(0, slash)));
+                            if (std::find(clipboard_files.paths.begin(),
+                                          clipboard_files.paths.end(),
+                                          top_path) == clipboard_files.paths.end()) {
+                                clipboard_files.paths.push_back(top_path);
+                            }
+                        }
+                        ++clipboard_files.next;
+                        clipboard_files.stage = ClipboardFiles::Stage::kRequesting;
+                        clipboard_files.request_id = 0;
+                        clipboard_files.transfer_id = 0;
+                        clipboard_files.retry_after = Clock::now();
+                    }
                     ++files_received;
                     chast::Error sent =
                         session->send_file_result(transfer_id, chast::FileCode::Ok, bytes);
@@ -2601,6 +3674,659 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                           false);
                         }
                     }
+                };
+
+                // Sends queued browse requests in the order the operator made
+                // them. A revoked permission drops them: the host would refuse
+                // and the page is about to hide the browser anyway.
+                auto drain_file_browse = [&] {
+                    for (;;) {
+                        if ((permissions & chast::kPermissionFileTransfer) == 0) {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            pending_browse_.clear();
+                            browse_paths_.clear();
+                            return;
+                        }
+                        BrowseCommand command;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            if (pending_browse_.empty()) {
+                                return;
+                            }
+                            command = std::move(pending_browse_.front());
+                            pending_browse_.pop_front();
+                        }
+                        chast::Error sent =
+                            command.kind == BrowseCommand::Kind::kDownload
+                                ? session->request_file_download(command.request_id, command.path)
+                            : command.kind == BrowseCommand::Kind::kOperation
+                                ? session->request_file_op(command.request_id, command.operation,
+                                                           command.path, command.new_name)
+                                : session->request_file_list(command.request_id, command.path);
+                        if (sent.ok()) {
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            browse_paths_.erase(command.request_id);
+                        }
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (command.kind == BrowseCommand::Kind::kDownload) {
+                            ++status_.file_download_answers;
+                            status_.file_download_code = static_cast<int>(chast::FileCode::IoError);
+                            status_.file_download_path = command.path;
+                            status_.file_download_error = "request: " + sent.to_string();
+                        } else if (command.kind == BrowseCommand::Kind::kOperation) {
+                            ++status_.file_op_answers;
+                            status_.file_op_code = static_cast<int>(chast::FileCode::IoError);
+                            status_.file_op_path = command.path;
+                            status_.file_op_error = "request: " + sent.to_string();
+                        } else {
+                            ++status_.file_list_answers;
+                            status_.file_list_directory = command.path;
+                            status_.file_list_entries = 0;
+                            status_.file_list_truncated = false;
+                            status_.file_list_error = "request: " + sent.to_string();
+                        }
+                        std::fprintf(stderr, "viewer: file browse request: %s\n",
+                                     sent.to_string().c_str());
+                    }
+                };
+
+                // Adopts every browse answer. The newest listing is kept for
+                // TakeFileList(); a refusal replaces it too, because the page
+                // asked about this directory and must not see an older one.
+                auto receive_file_browse = [&] {
+                    chast::FileListResult list;
+                    while (session->take_file_list_result(list)) {
+                        bool walk = false;
+                        std::string walk_error;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            if (list.request_id != 0 && list.request_id == folder_.listing_id &&
+                                folder_.stage == FolderDownload::Stage::kListing) {
+                                walk = true;
+                                const std::string listed = folder_.listing_path;
+                                folder_.listing_id = 0;
+                                folder_.listing_path.clear();
+                                if (list.code != chast::FileCode::Ok) {
+                                    walk_error = list.reason.empty() ? file_code_name(list.code)
+                                                                     : list.reason;
+                                } else if (list.truncated) {
+                                    walk_error = "the folder has too many entries to download";
+                                } else {
+                                    std::string local_sub;
+                                    if (listed.size() > folder_.root.size() + 1) {
+                                        local_sub = listed.substr(folder_.root.size() + 1);
+                                    }
+                                    // Mirror the folder itself, so folders
+                                    // that hold no files still appear.
+                                    std::string local_dir = folder_.name;
+                                    if (!local_sub.empty()) {
+                                        local_dir += "/" + local_sub;
+                                    }
+                                    std::string sanitized;
+                                    if (!chast::sanitize_received_directory(local_dir,
+                                                                             sanitized)) {
+                                        walk_error =
+                                            "the folder path is too deep to save locally";
+                                    } else {
+                                        std::error_code ec;
+                                        std::filesystem::create_directories(
+                                            path_from_utf8(download_directory) /
+                                                path_from_utf8(sanitized),
+                                            ec);
+                                        if (ec) {
+                                            walk_error = "cannot create '" + sanitized +
+                                                         "': " + ec.message();
+                                        }
+                                    }
+                                    if (walk_error.empty()) {
+                                        for (const chast::FileListEntry& entry : list.entries) {
+                                            const std::string child =
+                                                listed + "/" + entry.name;
+                                            if (entry.directory) {
+                                                folder_.directories.push_back(child);
+                                            } else {
+                                                std::string local = folder_.name;
+                                                if (!local_sub.empty()) {
+                                                    local += "/" + local_sub;
+                                                }
+                                                folder_.files.emplace_back(child, local);
+                                                ++folder_.files_total;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (walk) {
+                            if (!walk_error.empty()) {
+                                finish_folder_download(1, walk_error);
+                            } else {
+                                publish_folder_progress();
+                            }
+                            list = chast::FileListResult{};
+                            continue;
+                        }
+                        const std::string error =
+                            list.code == chast::FileCode::Ok
+                                ? std::string()
+                                : (list.reason.empty() ? file_code_name(list.code) : list.reason);
+                        const uint32_t entries = static_cast<uint32_t>(list.entries.size());
+                        const bool truncated = list.truncated;
+                        std::string directory;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            auto it = browse_paths_.find(list.request_id);
+                            if (it != browse_paths_.end()) {
+                                directory = it->second;
+                                browse_paths_.erase(it);
+                            }
+                            newest_file_list_ = FileListAnswer{};
+                            newest_file_list_->directory = directory;
+                            newest_file_list_->result = std::move(list);
+                            list = chast::FileListResult{};
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            ++status_.file_list_answers;
+                            status_.file_list_directory = directory;
+                            status_.file_list_entries = entries;
+                            status_.file_list_truncated = truncated;
+                            status_.file_list_error = error;
+                        }
+                        std::fprintf(stderr, "viewer: listing '%s' has %u entries%s%s\n",
+                                     directory.c_str(), entries,
+                                     truncated ? " (truncated)" : "",
+                                     error.empty() ? "" : error.c_str());
+                    }
+                    chast::FileDownloadResult answer;
+                    while (session->take_file_download_result(answer)) {
+                        if (answer.request_id != 0 &&
+                            clipboard_files.stage == ClipboardFiles::Stage::kRequesting &&
+                            answer.request_id == clipboard_files.request_id) {
+                            clipboard_files.request_id = 0;
+                            if (answer.code == chast::FileCode::Ok &&
+                                answer.transfer_id != 0) {
+                                clipboard_files.transfer_id = answer.transfer_id;
+                                clipboard_files.stage = ClipboardFiles::Stage::kOffering;
+                            } else if (answer.code == chast::FileCode::Busy) {
+                                // The host is sending something else; ask again
+                                // shortly through step_clipboard_files.
+                                clipboard_files.retry_after =
+                                    Clock::now() + std::chrono::milliseconds(500);
+                            } else {
+                                const std::string reason =
+                                    answer.reason.empty() ? file_code_name(answer.code)
+                                                          : answer.reason;
+                                clip_files_fail(
+                                    "the host refused the download of '" +
+                                    clipboard_files.entries[clipboard_files.next].name +
+                                    "': " + reason);
+                            }
+                            continue;
+                        }
+                        bool walk = false;
+                        bool walk_cancelled = false;
+                        std::string walk_error;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            if (answer.request_id != 0 &&
+                                answer.request_id == folder_.download_id &&
+                                folder_.stage == FolderDownload::Stage::kDownloading) {
+                                walk = true;
+                                walk_cancelled = folder_.cancel;
+                                folder_.download_id = 0;
+                                if (answer.code == chast::FileCode::Ok) {
+                                    folder_.transfer_id = answer.transfer_id;
+                                    folder_transfers_[answer.transfer_id] =
+                                        folder_.download_directory;
+                                    folder_.transfer_deadline =
+                                        Clock::now() + std::chrono::seconds(10);
+                                } else if (answer.code == chast::FileCode::Busy) {
+                                    folder_.files.push_front(std::make_pair(
+                                        folder_.download_path, folder_.download_directory));
+                                    folder_.download_path.clear();
+                                    folder_.download_directory.clear();
+                                    folder_.current.clear();
+                                    folder_.retry_after =
+                                        Clock::now() + std::chrono::milliseconds(500);
+                                } else {
+                                    walk_error = answer.reason.empty()
+                                                     ? file_code_name(answer.code)
+                                                     : answer.reason;
+                                }
+                            }
+                        }
+                        if (walk) {
+                            if (!walk_error.empty()) {
+                                finish_folder_download(walk_cancelled ? 2 : 1, walk_error);
+                            } else {
+                                publish_folder_progress();
+                            }
+                            continue;
+                        }
+                        std::string path;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            auto it = browse_paths_.find(answer.request_id);
+                            if (it != browse_paths_.end()) {
+                                path = it->second;
+                                browse_paths_.erase(it);
+                            }
+                        }
+                        const std::string error =
+                            answer.code == chast::FileCode::Ok
+                                ? std::string()
+                                : (answer.reason.empty() ? file_code_name(answer.code)
+                                                         : answer.reason);
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            ++status_.file_download_answers;
+                            status_.file_download_code = static_cast<int>(answer.code);
+                            status_.file_download_transfer_id = answer.transfer_id;
+                            status_.file_download_path = path;
+                            status_.file_download_error = error;
+                        }
+                        std::fprintf(stderr, "viewer: download '%s' %s%s\n", path.c_str(),
+                                     error.empty() ? "accepted" : "refused: ", error.c_str());
+                    }
+                    chast::FileOpResult op_answer;
+                    while (session->take_file_op_result(op_answer)) {
+                        std::string path;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            auto it = browse_paths_.find(op_answer.request_id);
+                            if (it != browse_paths_.end()) {
+                                path = it->second;
+                                browse_paths_.erase(it);
+                            }
+                        }
+                        const std::string error =
+                            op_answer.code == chast::FileCode::Ok
+                                ? std::string()
+                                : (op_answer.reason.empty() ? file_code_name(op_answer.code)
+                                                           : op_answer.reason);
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            ++status_.file_op_answers;
+                            status_.file_op_code = static_cast<int>(op_answer.code);
+                            status_.file_op_path = path;
+                            status_.file_op_error = error;
+                        }
+                        std::fprintf(stderr, "viewer: file operation '%s' %s%s\n", path.c_str(),
+                                     error.empty() ? "applied" : "refused: ", error.c_str());
+                    }
+                };
+
+                // Starts the next selected entry under browse_mutex_. A folder
+                // begins by listing itself; a file is queued for its download
+                // with an empty local folder, so it lands at the top of the
+                // receive directory. Returns false when no roots are left.
+                auto begin_next_root = [](FolderDownload& walk, Clock::time_point now) {
+                    if (walk.roots.empty()) {
+                        return false;
+                    }
+                    DownloadRoot root = std::move(walk.roots.front());
+                    walk.roots.pop_front();
+                    walk.root = std::move(root.path);
+                    const size_t slash = walk.root.find_last_of('/');
+                    walk.name =
+                        slash == std::string::npos ? walk.root : walk.root.substr(slash + 1);
+                    walk.listing_id = 0;
+                    walk.listing_path.clear();
+                    walk.download_id = 0;
+                    walk.download_path.clear();
+                    walk.download_directory.clear();
+                    walk.transfer_id = 0;
+                    walk.current.clear();
+                    walk.retry_after = now;
+                    walk.transfer_deadline = now;
+                    if (root.directory) {
+                        walk.stage = FolderDownload::Stage::kListing;
+                        walk.directories.push_back(walk.root);
+                    } else {
+                        walk.stage = FolderDownload::Stage::kDownloading;
+                        walk.files.emplace_back(walk.root, std::string());
+                        ++walk.files_total;
+                    }
+                    return true;
+                };
+
+                // Advances the folder walk once per poll: starts a queued
+                // download, lists the next folder, sends the next file and
+                // observes the transfer in flight. Everything the walk sends
+                // uses its own request ids, so the page's listing is untouched.
+                auto step_folder_download = [&] {
+                    const auto now = Clock::now();
+                    {
+                        bool active = false;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            active = folder_.stage == FolderDownload::Stage::kListing ||
+                                     folder_.stage == FolderDownload::Stage::kDownloading;
+                        }
+                        if (active && (permissions & chast::kPermissionFileTransfer) == 0) {
+                            finish_folder_download(1, "the host revoked file transfer");
+                            return;
+                        }
+                    }
+
+                    {
+                        std::vector<DownloadRoot> roots;
+                        bool batch = false;
+                        bool start = false;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            if (folder_request_ &&
+                                folder_.stage != FolderDownload::Stage::kListing &&
+                                folder_.stage != FolderDownload::Stage::kDownloading) {
+                                roots = std::move(folder_request_->roots);
+                                batch = folder_request_->batch;
+                                folder_request_.reset();
+                                start = true;
+                            }
+                        }
+                        if (start) {
+                            bool no_directory = false;
+                            bool begun = false;
+                            std::string destination;
+                            std::string started;
+                            uint32_t selected = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(browse_mutex_);
+                                folder_ = FolderDownload{};
+                                folder_.batch_total = static_cast<uint32_t>(roots.size());
+                                folder_.batch = batch;
+                                folder_.roots.assign(std::make_move_iterator(roots.begin()),
+                                                     std::make_move_iterator(roots.end()));
+                                folder_.retry_after = now;
+                                folder_.transfer_deadline = now;
+                                no_directory = download_directory.empty();
+                                begun = begin_next_root(folder_, now);
+                                selected = folder_.batch_total;
+                                started = folder_.root;
+                                if (!no_directory && begun) {
+                                    // One folder keeps the "below the folder's
+                                    // name" destination; a batch and a lone
+                                    // file land in the receive root.
+                                    folder_.destination = download_directory;
+                                    if (folder_.batch_total == 1 &&
+                                        folder_.stage == FolderDownload::Stage::kListing) {
+                                        folder_.destination += "\\" + folder_.name;
+                                    }
+                                    destination = folder_.destination;
+                                }
+                            }
+                            if (no_directory) {
+                                finish_folder_download(1, "the viewer has no download directory");
+                            } else if (!begun) {
+                                {
+                                    std::lock_guard<std::mutex> lock(browse_mutex_);
+                                    folder_.stage = FolderDownload::Stage::kDownloading;
+                                }
+                                finish_folder_download(1, "the download has no entries");
+                            } else {
+                                publish_folder_progress();
+                                if (batch) {
+                                    std::fprintf(
+                                        stderr,
+                                        "viewer: downloading %u selected %s to '%s'\n", selected,
+                                        selected == 1 ? "entry" : "entries", destination.c_str());
+                                } else {
+                                    std::fprintf(stderr,
+                                                 "viewer: downloading folder '%s' to '%s'\n",
+                                                 started.c_str(), destination.c_str());
+                                }
+                            }
+                        }
+                    }
+
+                    // The file the walk sent is complete once the transfer
+                    // it allocated reports done.
+                    {
+                        uint32_t transfer = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            transfer = folder_.transfer_id;
+                        }
+                        if (transfer != 0) {
+                            uint32_t active = 0;
+                            FileDownload::Stage stage = FileDownload::Stage::kNone;
+                            std::string error;
+                            {
+                                std::lock_guard<std::mutex> lock(file_mutex_);
+                                active = download_.transfer_id;
+                                stage = download_.stage;
+                                error = download_.error;
+                            }
+                            if (active == transfer && stage == FileDownload::Stage::kDone) {
+                                {
+                                    std::lock_guard<std::mutex> lock(browse_mutex_);
+                                    if (folder_.transfer_id == transfer) {
+                                        folder_.transfer_id = 0;
+                                        folder_.current.clear();
+                                        folder_transfers_.erase(transfer);
+                                        ++folder_.files_done;
+                                    }
+                                }
+                                publish_folder_progress();
+                            } else if (active == transfer &&
+                                       stage == FileDownload::Stage::kFailed) {
+                                finish_folder_download(
+                                    1, error.empty() ? "the download failed" : error);
+                                return;
+                            } else {
+                                bool expired = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(browse_mutex_);
+                                    if (folder_.transfer_id == transfer) {
+                                        if (active == transfer &&
+                                            stage == FileDownload::Stage::kReceiving) {
+                                            folder_.transfer_deadline =
+                                                now + std::chrono::seconds(60);
+                                        } else if (now > folder_.transfer_deadline) {
+                                            expired = true;
+                                        }
+                                    }
+                                }
+                                if (expired) {
+                                    finish_folder_download(
+                                        1, "the host never opened the file stream");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // A cancel aborts the file in flight and ends the walk;
+                    // answers for requests still in the queues are ignored
+                    // because the stage is terminal. A download request the
+                    // host has not answered yet is awaited first, so the
+                    // transfer it names can be turned away before the offer
+                    // opens a stream.
+                    {
+                        bool cancel = false;
+                        uint32_t transfer = 0;
+                        uint32_t outstanding = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            cancel = folder_.cancel &&
+                                     (folder_.stage == FolderDownload::Stage::kListing ||
+                                      folder_.stage == FolderDownload::Stage::kDownloading);
+                            transfer = folder_.transfer_id;
+                            outstanding = folder_.download_id;
+                        }
+                        if (cancel && outstanding != 0) {
+                            return;
+                        }
+                        if (cancel) {
+                            if (transfer != 0) {
+                                bool active = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(file_mutex_);
+                                    active = download_.stage == FileDownload::Stage::kReceiving &&
+                                             download_.transfer_id == transfer;
+                                    if (active) {
+                                        if (download_.receiver) {
+                                            download_.receiver->abort(false);
+                                            download_.receiver.reset();
+                                        }
+                                        download_.stage = FileDownload::Stage::kFailed;
+                                        download_.error = "cancelled by the operator";
+                                    }
+                                }
+                                if (active) {
+                                    (void)session->send_file_result(
+                                        transfer, chast::FileCode::IoError, 0,
+                                        "cancelled by the operator");
+                                } else {
+                                    // The answer named the transfer but the
+                                    // offer has not opened it yet; refuse it
+                                    // now, and refuse the offer as well should
+                                    // it already be in flight.
+                                    {
+                                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                                        ignored_transfers_.insert(transfer);
+                                    }
+                                    (void)session->send_file_answer(
+                                        transfer, chast::FileCode::Busy, 0,
+                                        "the folder download was cancelled");
+                                }
+                            }
+                            finish_folder_download(2, "cancelled by the operator");
+                            return;
+                        }
+                    }
+
+                    FolderDownload::Stage stage = FolderDownload::Stage::kIdle;
+                    {
+                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                        stage = folder_.stage;
+                    }
+                    if (stage == FolderDownload::Stage::kListing) {
+                        uint32_t request_id = 0;
+                        std::string path;
+                        bool listed_all = false;
+                        bool advanced = false;
+                        std::string timed_out;
+                        {
+                            std::lock_guard<std::mutex> lock(browse_mutex_);
+                            if (folder_.listing_id != 0) {
+                                if (now > folder_.transfer_deadline) {
+                                    timed_out = folder_.listing_path;
+                                } else {
+                                    return;
+                                }
+                            } else if (folder_.directories.empty()) {
+                                if (folder_.files.empty() && begin_next_root(folder_, now)) {
+                                    advanced = true;
+                                } else {
+                                    folder_.stage = FolderDownload::Stage::kDownloading;
+                                    listed_all = true;
+                                }
+                            } else {
+                                path = folder_.directories.front();
+                                folder_.directories.pop_front();
+                                request_id = next_browse_id_++;
+                                folder_.listing_id = request_id;
+                                folder_.listing_path = path;
+                                folder_.transfer_deadline = now + std::chrono::seconds(10);
+                            }
+                        }
+                        if (!timed_out.empty()) {
+                            finish_folder_download(1, "listing '" + timed_out + "' timed out");
+                            return;
+                        }
+                        if (advanced) {
+                            publish_folder_progress();
+                            return;
+                        }
+                        if (listed_all) {
+                            publish_folder_progress();
+                            return;
+                        }
+                        chast::Error sent = session->request_file_list(request_id, path);
+                        if (!sent.ok()) {
+                            finish_folder_download(1, "listing '" + path + "': " + sent.to_string());
+                        }
+                        return;
+                    }
+                    if (stage != FolderDownload::Stage::kDownloading) {
+                        return;
+                    }
+                    uint32_t request_id = 0;
+                    std::string path;
+                    bool start_file = false;
+                    bool finished = false;
+                    bool advanced = false;
+                    std::string timed_out;
+                    bool timed_out_cancelled = false;
+                    {
+                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                        if (folder_.stage != FolderDownload::Stage::kDownloading) {
+                            return;
+                        }
+                        if (folder_.download_id != 0) {
+                            if (now > folder_.transfer_deadline) {
+                                timed_out = folder_.download_path;
+                                timed_out_cancelled = folder_.cancel;
+                            } else {
+                                return;
+                            }
+                        } else if (folder_.transfer_id != 0) {
+                            return;
+                        } else if (folder_.files.empty()) {
+                            if (begin_next_root(folder_, now)) {
+                                advanced = true;
+                            } else {
+                                finished = true;
+                            }
+                        } else if (now >= folder_.retry_after) {
+                            bool busy = false;
+                            {
+                                std::lock_guard<std::mutex> file_lock(file_mutex_);
+                                busy = download_.stage == FileDownload::Stage::kReceiving;
+                            }
+                            if (!busy) {
+                                path = folder_.files.front().first;
+                                const std::string local = folder_.files.front().second;
+                                folder_.files.pop_front();
+                                request_id = next_browse_id_++;
+                                folder_.download_id = request_id;
+                                folder_.download_path = path;
+                                folder_.download_directory = local;
+                                folder_.current = path;
+                                folder_.transfer_deadline =
+                                    now + std::chrono::seconds(10);
+                                start_file = true;
+                            }
+                        }
+                    }
+                    if (!timed_out.empty()) {
+                        finish_folder_download(
+                            timed_out_cancelled ? 2 : 1,
+                            "the host did not answer the download of '" + timed_out + "'");
+                        return;
+                    }
+                    if (advanced) {
+                        publish_folder_progress();
+                        return;
+                    }
+                    if (finished) {
+                        finish_folder_download(0, {});
+                        return;
+                    }
+                    if (!start_file) {
+                        return;
+                    }
+                    chast::Error sent = session->request_file_download(request_id, path);
+                    if (!sent.ok()) {
+                        finish_folder_download(1, "download '" + path + "': " + sent.to_string());
+                        return;
+                    }
+                    publish_folder_progress();
                 };
 
                 // Moves the newest pointer state the host sent into the slot
@@ -3292,6 +5018,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                            "the host revoked terminal access");
                         return;
                     }
+                    if (terminal_phase_is(TerminalPhase::kRequesting)) {
+                        // The host has not answered yet, so the session has no
+                        // entry to read. Asking now would report the console as
+                        // ended and cancel the open that is still in flight.
+                        return;
+                    }
                     for (;;) {
                         {
                             std::lock_guard<std::mutex> lock(terminal_mutex_);
@@ -3327,6 +5059,351 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         std::lock_guard<std::mutex> lock(mutex_);
                         status_.terminal_bytes = terminal_bytes;
+                    }
+                };
+
+                // Camera sharing (protocol v29). The panel lists the host's
+                // cameras and watches at most one. The CCAM stream runs beside
+                // the desktop picture and has its own decoder: pictures decode
+                // straight into the camera sink's texture, so the camera never
+                // touches the CPU any more than the desktop does.
+                // `camera_pending` is the id StartCamera asked for and has no
+                // answer yet; `camera_active` means the stream is open;
+                // `camera_stopping` means a stop went out, so the stream's end
+                // is expected rather than a failure.
+                uint16_t camera_pending = 0;
+                bool camera_active = false;
+                bool camera_stopping = false;
+                std::unique_ptr<chast::IVideoDecoder> camera_decoder;
+                chast::VideoCodec camera_codec = chast::VideoCodec::H264;
+                uint32_t camera_decode_width = 0;
+                uint32_t camera_decode_height = 0;
+                uint64_t camera_frames = 0;
+                uint64_t camera_gaps = 0;
+                uint64_t camera_decode_errors = 0;
+                uint64_t camera_next_seq = 0;
+                bool camera_seq_valid = false;
+                std::vector<chast::DecodedFrame> camera_decoded;
+
+                auto set_camera_phase = [&](CameraPhase phase, int code,
+                                            std::string reason, std::string error) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.camera_phase = phase;
+                    status_.camera_code = code;
+                    status_.camera_reason = std::move(reason);
+                    status_.camera_error = std::move(error);
+                    ++status_.camera_updates;
+                };
+                auto camera_phase_is = [&](CameraPhase phase) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    return status_.camera_phase == phase;
+                };
+                // Forgets the session-side camera once its stream is over. The
+                // phase the panel sees is the caller's to set.
+                auto reset_camera = [&] {
+                    camera_active = false;
+                    camera_pending = 0;
+                    camera_stopping = false;
+                    camera_decoder.reset();
+                    camera_seq_valid = false;
+                    camera_decoded.clear();
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.camera_decoder.clear();
+                };
+
+                auto drain_camera = [&] {
+                    while (true) {
+                        CameraCommand command;
+                        {
+                            std::lock_guard<std::mutex> lock(camera_mutex_);
+                            if (pending_camera_.empty()) {
+                                return;
+                            }
+                            command = std::move(pending_camera_.front());
+                            pending_camera_.pop_front();
+                        }
+                        switch (command.kind) {
+                            case CameraCommand::Kind::kList: {
+                                if ((session->permissions() & chast::kPermissionCamera) ==
+                                    0) {
+                                    set_camera_phase(
+                                        CameraPhase::kFailed,
+                                        static_cast<int>(chast::CameraCode::Refused), {},
+                                        "the host did not grant camera access");
+                                    continue;
+                                }
+                                chast::Error requested = session->request_camera_list();
+                                if (!requested.ok()) {
+                                    set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                     "request: " + requested.to_string());
+                                    continue;
+                                }
+                                std::fprintf(stderr, "viewer: camera list requested\n");
+                                continue;
+                            }
+                            case CameraCommand::Kind::kStart: {
+                                if ((session->permissions() & chast::kPermissionCamera) ==
+                                    0) {
+                                    set_camera_phase(
+                                        CameraPhase::kFailed,
+                                        static_cast<int>(chast::CameraCode::Refused), {},
+                                        "the host did not grant camera access");
+                                    continue;
+                                }
+                                if (camera_sink_ == nullptr ||
+                                    camera_sink_->device() == nullptr) {
+                                    set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                     "the camera output is not available");
+                                    continue;
+                                }
+                                if (camera_active || camera_pending != 0) {
+                                    // A new start while the old camera is open
+                                    // replaces it; the host has one camera
+                                    // slot, so the old stream must close first.
+                                    session->request_camera_stop();
+                                    reset_camera();
+                                }
+                                chast::Error requested =
+                                    session->request_camera_start(command.camera_id);
+                                if (!requested.ok()) {
+                                    set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                     "request: " + requested.to_string());
+                                    continue;
+                                }
+                                camera_pending = command.camera_id;
+                                camera_stopping = false;
+                                std::fprintf(stderr, "viewer: camera %u requested\n",
+                                             static_cast<unsigned>(command.camera_id));
+                                continue;
+                            }
+                            case CameraCommand::Kind::kStop: {
+                                if (camera_active || camera_pending != 0) {
+                                    chast::Error stopped = session->request_camera_stop();
+                                    if (!stopped.ok()) {
+                                        std::lock_guard<std::mutex> lock(mutex_);
+                                        status_.camera_error =
+                                            "stop: " + stopped.to_string();
+                                    }
+                                }
+                                camera_stopping = true;
+                                camera_active = false;
+                                camera_pending = 0;
+                                camera_decoder.reset();
+                                camera_seq_valid = false;
+                                std::lock_guard<std::mutex> lock(mutex_);
+                                status_.camera_decoder.clear();
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                auto poll_camera = [&] {
+                    chast::CameraList list;
+                    while (session->take_camera_list(list)) {
+                        if (!camera_phase_is(CameraPhase::kListing)) {
+                            // The panel stopped waiting for this answer.
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.cameras = list.cameras;
+                            ++status_.camera_list_updates;
+                        }
+                        if (list.code != chast::CameraCode::Ok) {
+                            set_camera_phase(CameraPhase::kFailed,
+                                             static_cast<int>(list.code), list.reason, {});
+                            std::fprintf(stderr, "viewer: camera list refused: %s\n",
+                                         list.reason.empty() ? "no reason given"
+                                                             : list.reason.c_str());
+                            continue;
+                        }
+                        set_camera_phase(CameraPhase::kListed, 0, {}, {});
+                        std::fprintf(stderr, "viewer: camera list: %zu\n",
+                                     list.cameras.size());
+                    }
+
+                    chast::CameraResult result;
+                    while (session->take_camera_result(result)) {
+                        if (camera_pending == 0 || result.camera_id != camera_pending) {
+                            continue;
+                        }
+                        camera_pending = 0;
+                        if (!camera_phase_is(CameraPhase::kStarting)) {
+                            // The panel stopped while the answer was in
+                            // flight; an accepted camera must not outlive it.
+                            if (result.code == chast::CameraCode::Ok) {
+                                session->request_camera_stop();
+                            }
+                            continue;
+                        }
+                        if (result.code != chast::CameraCode::Ok) {
+                            set_camera_phase(CameraPhase::kFailed,
+                                             static_cast<int>(result.code), result.reason,
+                                             {});
+                            std::fprintf(stderr, "viewer: camera refused: %s\n",
+                                         result.reason.empty() ? "no reason given"
+                                                               : result.reason.c_str());
+                            continue;
+                        }
+                        camera_active = true;
+                        camera_stopping = false;
+                        set_camera_phase(CameraPhase::kStreaming, 0, {}, {});
+                        std::fprintf(stderr, "viewer: camera open\n");
+                    }
+
+                    if (!camera_active) {
+                        return;
+                    }
+                    if ((session->permissions() & chast::kPermissionCamera) == 0) {
+                        // The transport aborted the stream; nothing is left to
+                        // drain.
+                        reset_camera();
+                        set_camera_phase(CameraPhase::kFailed,
+                                         static_cast<int>(chast::CameraCode::Refused), {},
+                                         "the host revoked camera access");
+                        return;
+                    }
+                    for (;;) {
+                        chast::FrameHeader header;
+                        std::vector<uint8_t> payload;
+                        const chast::Error received = session->receive_camera_frame(
+                            header, payload, std::chrono::milliseconds(0));
+                        if (received.status() == chast::Status::WaitTimeout) {
+                            break;
+                        }
+                        if (!received.ok()) {
+                            const bool already_stopped =
+                                camera_phase_is(CameraPhase::kStopped);
+                            reset_camera();
+                            if (!already_stopped) {
+                                if (received.status() == chast::Status::Unavailable) {
+                                    set_camera_phase(
+                                        CameraPhase::kStopped, 0,
+                                        "the host ended the camera stream", {});
+                                } else {
+                                    set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                     received.to_string());
+                                }
+                            }
+                            std::fprintf(stderr, "viewer: camera ended: %s\n",
+                                         received.to_string().c_str());
+                            break;
+                        }
+                        if (payload.size() != header.payload_size ||
+                            chast::crc32(payload.data(), payload.size()) !=
+                                header.payload_crc32) {
+                            ++camera_decode_errors;
+                            if (camera_decode_errors >= 30) {
+                                session->request_camera_stop();
+                                reset_camera();
+                                set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                 "too many damaged camera frames");
+                                break;
+                            }
+                            continue;
+                        }
+                        if (camera_seq_valid && header.seq != camera_next_seq) {
+                            ++camera_gaps;
+                        }
+                        camera_next_seq = header.seq + 1;
+                        camera_seq_valid = true;
+                        if (!camera_decoder || header.codec != camera_codec ||
+                            header.width != camera_decode_width ||
+                            header.height != camera_decode_height) {
+                            chast::DecoderConfig camera_config;
+                            camera_config.codec = header.codec;
+                            camera_config.d3d11_device =
+                                camera_sink_ != nullptr ? camera_sink_->device()
+                                                        : nullptr;
+                            camera_config.gpu_handler =
+                                [&](const chast::GpuFrame& frame) -> chast::Error {
+                                ++camera_frames;
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    status_.camera_frames = camera_frames;
+                                    status_.camera_width = frame.width;
+                                    status_.camera_height = frame.height;
+                                }
+                                if (camera_sink_ != nullptr &&
+                                    camera_sink_->OnGpuFrame(
+                                        frame.texture, frame.subresource, frame.width,
+                                        frame.height, frame.crop_x, frame.crop_y,
+                                        frame.pts_ms)) {
+                                    return chast::Error::success();
+                                }
+                                if (camera_sink_ == nullptr) {
+                                    return chast::Error(
+                                        chast::Status::Unsupported,
+                                        "camera: the frame sink is not available");
+                                }
+                                if (!camera_sink_->error().empty()) {
+                                    return chast::Error(
+                                        chast::Status::CaptureFailed,
+                                        "camera: " + camera_sink_->error());
+                                }
+                                // No texture is attached yet; dropping keeps
+                                // the decoder running.
+                                return chast::Error::success();
+                            };
+                            std::string decoder_error;
+                            camera_decoder =
+                                camera_config.d3d11_device != nullptr
+                                    ? chast::create_decoder(camera_config, &decoder_error)
+                                    : nullptr;
+                            if (!camera_decoder) {
+                                if (decoder_error.empty()) {
+                                    decoder_error = "the camera output is not available";
+                                }
+                                session->request_camera_stop();
+                                reset_camera();
+                                set_camera_phase(
+                                    CameraPhase::kFailed,
+                                    static_cast<int>(chast::CameraCode::Failed), {},
+                                    "decoder (" + codec_name(header.codec) + "): " +
+                                        decoder_error);
+                                break;
+                            }
+                            camera_codec = header.codec;
+                            camera_decode_width = header.width;
+                            camera_decode_height = header.height;
+                            camera_decode_errors = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(mutex_);
+                                status_.camera_decoder =
+                                    camera_decoder->implementation();
+                            }
+                            std::fprintf(stderr, "viewer: camera decoder %s\n",
+                                         camera_decoder->implementation().c_str());
+                        }
+                        camera_decoded.clear();
+                        const chast::Error decode_error = camera_decoder->decode(
+                            payload.data(), payload.size(), header.pts_ms,
+                            header.keyframe, camera_decoded);
+                        if (!decode_error.ok()) {
+                            if (camera_sink_ != nullptr &&
+                                !camera_sink_->error().empty()) {
+                                const std::string sink_error = camera_sink_->error();
+                                session->request_camera_stop();
+                                reset_camera();
+                                set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                 "display: " + sink_error);
+                                break;
+                            }
+                            if (camera_decode_errors < 3) {
+                                std::fprintf(stderr, "viewer: camera decode: %s\n",
+                                             decode_error.to_string().c_str());
+                            }
+                            ++camera_decode_errors;
+                            if (camera_decode_errors >= 30) {
+                                session->request_camera_stop();
+                                reset_camera();
+                                set_camera_phase(CameraPhase::kFailed, 0, {},
+                                                 "too many camera decode failures");
+                                break;
+                            }
+                            continue;
+                        }
                     }
                 };
 
@@ -3765,6 +5842,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_chat();
                     poll_terminal();
                     drain_terminal();
+                    poll_camera();
+                    drain_camera();
                     drain_port_forward();
                     poll_port_forward();
                     receive_desktop();
@@ -3789,11 +5868,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                     }
                     drain_input();
+                    poll_local_clipboard_files();
                     poll_clipboard();
                     receive_clipboard();
                     drive_file_upload();
+                    // Browse answers are adopted before file offers: a walk's
+                    // download answer names the transfer whose offer follows,
+                    // and the offer must already know its mirrored directory.
+                    drain_file_browse();
+                    receive_file_browse();
                     drain_downloads();
+                    step_clipboard_files();
                     drain_download_cancels();
+                    step_folder_download();
                     receive_cursor();
                     drain_audio();
                     drain_microphone();
@@ -3813,9 +5900,23 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         chast::kPermissionClipboard)) != 0 ||
                         file_active || audio_announced || microphone_enabled ||
                         microphone_wanted_.load(std::memory_order_relaxed) ||
-                        port_forward != nullptr || terminal_active;
-                    chast::Error received_frame = session->receive_frame(
-                        header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
+                        port_forward != nullptr || terminal_active || camera_active;
+                    chast::Error received_frame = chast::Error::success();
+                    if (files_only) {
+                        // No media stream to wait on: the loop polls on short
+                        // sleeps so file requests keep flowing, and the
+                        // transport tells when the viewer left.
+                        std::this_thread::sleep_for(kMediaPoll);
+                        if (session->video_finished() || !session->peer_alive()) {
+                            video_finished = true;
+                            break;
+                        }
+                        received_frame =
+                            chast::Error(chast::Status::WaitTimeout, "no media stream");
+                    } else {
+                        received_frame = session->receive_frame(
+                            header, payload, fast_media_poll ? kMediaPoll : kReceiveTimeout);
+                    }
                     // Audio and microphone packets arrive on their own streams
                     // and never wake receive_frame(), so drain them as soon as
                     // the wait ends.
@@ -3830,6 +5931,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     drain_chat();
                     poll_terminal();
                     drain_terminal();
+                    poll_camera();
+                    drain_camera();
                     drain_port_forward();
                     poll_port_forward();
                     receive_desktop();
@@ -3849,11 +5952,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             video_finished = true;
                             break;
                         }
-                        if (now - last_frame >= kFrameStall) {
+                        if (!files_only && now - last_frame >= kFrameStall) {
                             fail("no frames arrived for 20 s");
                             break;
                         }
-                        if (sink_ != nullptr && !sink_->error().empty()) {
+                        if (!files_only && sink_ != nullptr && !sink_->error().empty()) {
                             fail("display: " + sink_->error());
                             break;
                         }
@@ -3998,6 +6101,21 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // so `frames` stays empty on this path.
                     sync_status(false);
                 }
+                // A clipboard file list cannot finish on a closed session;
+                // files that never landed are removed from the staging folder.
+                if (clipboard_files.stage != ClipboardFiles::Stage::kIdle) {
+                    if (clipboard_files.stage == ClipboardFiles::Stage::kReceiving) {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (download_.receiver) {
+                            download_.receiver->abort(true);
+                            download_.receiver.reset();
+                        }
+                        download_.stage = FileDownload::Stage::kFailed;
+                        download_.error =
+                            "the session ended before the clipboard files finished";
+                    }
+                    discard_clipboard_files();
+                }
             }
         }
     }
@@ -4064,6 +6182,28 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     }
     if (cancelled_upload != 0) {
         session->cancel_file_upload(cancelled_upload);
+    }
+    // A folder walk cannot continue on a closed session; nothing of it may
+    // leak into the next connection either.
+    {
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(browse_mutex_);
+            active = folder_.stage == FolderDownload::Stage::kListing ||
+                     folder_.stage == FolderDownload::Stage::kDownloading;
+            folder_ = FolderDownload{};
+            folder_request_.reset();
+            folder_transfers_.clear();
+            ignored_transfers_.clear();
+        }
+        if (active) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_.folder_download_active = false;
+            ++status_.folder_download_answers;
+            status_.folder_download_code = 1;
+            status_.folder_download_error =
+                "the session ended before the folder download finished";
+        }
     }
     // The uplink cannot outlive the session: capture stops first, then the
     // stream ends so the host tears down its decoder and player. The echo

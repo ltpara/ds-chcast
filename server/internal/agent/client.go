@@ -26,6 +26,12 @@ var Version = "dev"
 type softwareInfo struct {
 	Version string `json:"version"`
 	URL     string `json:"url"`
+	// SHA256, Size and Signature are present when the server hosts the file
+	// itself and signs the notice with its identity. The host agent needs all
+	// three to verify a staged release before running it.
+	SHA256    string `json:"sha256"`
+	Size      int64  `json:"size"`
+	Signature string `json:"signature"`
 }
 
 // updateAvailable mirrors RustDesk's SoftwareUpdate check: the server only

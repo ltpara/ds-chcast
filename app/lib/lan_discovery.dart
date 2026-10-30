@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'target.dart';
 import 'tunnel_agent.dart';
+import 'package:chast_viewer/l10n.dart';
 
 /// One host that answered a LAN discovery ping.
 class LanPeer {
@@ -174,28 +175,27 @@ class LanDiscovery {
       result = await pending.timeout(timeout + const Duration(seconds: 5));
     } on ProcessException catch (error) {
       throw LanDiscoveryException(
-        '无法启动局域网扫描（$exe）：${error.message}\n'
-        '请确认 chast-tunnel.exe 与会话程序位于同一目录。',
+        tr('无法启动局域网扫描（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。', <String, Object?>{'exe': exe, 'p2': error.message}),
       );
     } on TimeoutException {
-      throw const LanDiscoveryException('局域网扫描没有在预期时间内返回');
+      throw LanDiscoveryException(tr('局域网扫描没有在预期时间内返回'));
     } on Exception catch (error) {
-      throw LanDiscoveryException('局域网扫描失败：$error');
+      throw LanDiscoveryException(tr('局域网扫描失败：{error}', <String, Object?>{'error': error}));
     }
     if (result.exitCode != 0) {
       final String message = (result.stderr as String? ?? '').trim();
       throw LanDiscoveryException(
-        message.isEmpty ? '局域网扫描失败（${result.exitCode}）' : message,
+        message.isEmpty ? tr('局域网扫描失败（{p3}）', <String, Object?>{'p3': result.exitCode}) : message,
       );
     }
     Object? decoded;
     try {
       decoded = jsonDecode(result.stdout as String? ?? '');
     } on FormatException {
-      throw const LanDiscoveryException('局域网扫描返回了无效数据');
+      throw LanDiscoveryException(tr('局域网扫描返回了无效数据'));
     }
     if (decoded is! List) {
-      throw const LanDiscoveryException('局域网扫描返回了无效数据');
+      throw LanDiscoveryException(tr('局域网扫描返回了无效数据'));
     }
     final Map<String, LanPeer> peers = <String, LanPeer>{};
     for (final Object? item in decoded) {

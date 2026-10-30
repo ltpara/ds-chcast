@@ -166,10 +166,10 @@ func (s *server) accountConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 // auditConnections is the operator view: every account's reports, optionally
-// narrowed to one username. Account tokens are rejected here.
+// narrowed to one username. Console readers may view it; viewer accounts may
+// not.
 func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(r) {
-		writeError(w, http.StatusUnauthorized, "server key was not accepted")
+	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
 		return
 	}
 	if s.cfg.Accounts == nil {

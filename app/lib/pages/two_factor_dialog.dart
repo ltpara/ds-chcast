@@ -5,6 +5,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 typedef TwoFactorStatusLoader = Future<AccountInfo> Function(
   ServerSettings settings,
@@ -117,7 +118,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         setState(() {
           _loading = false;
           _loadFailed = true;
-          _error = '读取两步验证状态失败：$error';
+          _error = tr('读取两步验证状态失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -157,7 +158,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '生成密钥失败：$error';
+          _error = tr('生成密钥失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -169,7 +170,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
     }
     final String code = _code.text.trim();
     if (code.isEmpty) {
-      setState(() => _error = '请输入身份验证器中的 6 位验证码');
+      setState(() => _error = tr('请输入身份验证器中的 6 位验证码'));
       return;
     }
     setState(() {
@@ -192,7 +193,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         _secret = '';
         _uri = '';
         _code.clear();
-        _message = '两步验证已启用';
+        _message = tr('两步验证已启用');
       });
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -205,7 +206,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '启用两步验证失败：$error';
+          _error = tr('启用两步验证失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -218,11 +219,11 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
     final String password = _password.text;
     final String code = _code.text.trim();
     if (password.isEmpty) {
-      setState(() => _error = '请输入当前密码');
+      setState(() => _error = tr('请输入当前密码'));
       return;
     }
     if (code.isEmpty) {
-      setState(() => _error = '请输入身份验证器中的 6 位验证码');
+      setState(() => _error = tr('请输入身份验证器中的 6 位验证码'));
       return;
     }
     setState(() {
@@ -246,7 +247,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         _recoveryCodes = 0;
         _password.clear();
         _code.clear();
-        _message = '两步验证已关闭';
+        _message = tr('两步验证已关闭');
       });
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -259,7 +260,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '关闭两步验证失败：$error';
+          _error = tr('关闭两步验证失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -272,11 +273,11 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
     final String password = _password.text;
     final String code = _code.text.trim();
     if (password.isEmpty) {
-      setState(() => _error = '请输入当前密码');
+      setState(() => _error = tr('请输入当前密码'));
       return;
     }
     if (code.isEmpty) {
-      setState(() => _error = '请输入身份验证器中的 6 位验证码');
+      setState(() => _error = tr('请输入身份验证器中的 6 位验证码'));
       return;
     }
     setState(() {
@@ -300,7 +301,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         _recoveryCodes = codes.length;
         _password.clear();
         _code.clear();
-        _message = '已生成 ${codes.length} 个恢复码';
+        _message = tr('已生成 {p1} 个恢复码', <String, Object?>{'p1': codes.length});
       });
       await showDialog<void>(
         context: context,
@@ -317,7 +318,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '生成恢复码失败：$error';
+          _error = tr('生成恢复码失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -332,8 +333,8 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       maxLength: 6,
       autocorrect: false,
       enableSuggestions: false,
-      decoration: const InputDecoration(
-        labelText: '6 位验证码',
+      decoration: InputDecoration(
+        labelText: tr('6 位验证码'),
         counterText: '',
         prefixIcon: Icon(Icons.shield_outlined, size: 18),
       ),
@@ -384,7 +385,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
           OutlinedButton(
             key: const Key('two-factor-retry'),
             onPressed: _load,
-            child: const Text('重试'),
+            child: Text(tr('重试')),
           ),
         ],
       );
@@ -394,10 +395,10 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          _statusHeader(context, Icons.verified_user_outlined, '两步验证已启用'),
+          _statusHeader(context, Icons.verified_user_outlined, tr('两步验证已启用')),
           const SizedBox(height: 10),
           Text(
-            '登录时除密码外还需要身份验证器生成的验证码。关闭需要当前密码和一个有效验证码。',
+            tr('登录时除密码外还需要身份验证器生成的验证码。关闭需要当前密码和一个有效验证码。'),
             style: mutedStyle(context, size: 12),
           ),
           const SizedBox(height: 14),
@@ -407,8 +408,8 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
             obscureText: true,
             autocorrect: false,
             enableSuggestions: false,
-            decoration: const InputDecoration(
-              labelText: '当前密码',
+            decoration: InputDecoration(
+              labelText: tr('当前密码'),
               prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
             ),
           ),
@@ -417,8 +418,8 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
           const SizedBox(height: 10),
           Text(
             _recoveryCodes > 0
-                ? '剩余恢复码：$_recoveryCodes 个。恢复码用于身份验证器丢失时登录，每个只能使用一次。'
-                : '尚未生成恢复码。生成后可在身份验证器丢失时登录。重新生成会让旧恢复码全部失效。',
+                ? tr('剩余恢复码：{_recoveryCodes} 个。恢复码用于身份验证器丢失时登录，每个只能使用一次。', <String, Object?>{'_recoveryCodes': _recoveryCodes})
+                : tr('尚未生成恢复码。生成后可在身份验证器丢失时登录。重新生成会让旧恢复码全部失效。'),
             key: const Key('two-factor-recovery-count'),
             style: mutedStyle(context, size: 12),
           ),
@@ -427,7 +428,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
             key: const Key('two-factor-recovery-generate'),
             onPressed: _busy ? null : _generateRecovery,
             icon: const Icon(Icons.vpn_key_outlined, size: 17),
-            label: Text(_busy ? '正在生成…' : '生成恢复码'),
+            label: Text(_busy ? tr('正在生成…') : tr('生成恢复码')),
           ),
           const SizedBox(height: 12),
           FilledButton(
@@ -442,7 +443,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
                     height: 15,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Text('关闭两步验证'),
+                : Text(tr('关闭两步验证')),
           ),
         ],
       );
@@ -451,10 +452,10 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        _statusHeader(context, Icons.gpp_maybe_outlined, '两步验证未启用'),
+        _statusHeader(context, Icons.gpp_maybe_outlined, tr('两步验证未启用')),
         const SizedBox(height: 10),
         Text(
-          '启用后每次登录都需要身份验证器中的验证码。密钥只显示一次，请立即添加；丢失后可请管理员执行 user 2fa <用户名> off 重置。',
+          tr('启用后每次登录都需要身份验证器中的验证码。密钥只显示一次，请立即添加；丢失后可请管理员执行 user 2fa <用户名> off 重置。'),
           style: mutedStyle(context, size: 12),
         ),
         const SizedBox(height: 14),
@@ -463,10 +464,10 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
             key: const Key('two-factor-start'),
             onPressed: _busy ? null : _start,
             icon: const Icon(Icons.key_outlined, size: 17),
-            label: Text(_busy ? '正在生成…' : '生成密钥'),
+            label: Text(_busy ? tr('正在生成…') : tr('生成密钥')),
           )
         else ...<Widget>[
-          Text('密钥（手动添加到身份验证器）', style: mutedStyle(context, size: 11)),
+          Text(tr('密钥（手动添加到身份验证器）'), style: mutedStyle(context, size: 11)),
           const SizedBox(height: 4),
           SelectableText(
             _secret,
@@ -493,7 +494,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
                     height: 15,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Text('确认启用'),
+                : Text(tr('确认启用')),
           ),
         ],
       ],
@@ -507,7 +508,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
       key: const Key('two-factor-dialog'),
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('两步验证'),
+      title: Text(tr('两步验证')),
       content: SizedBox(
         width: 380,
         child: Column(
@@ -541,7 +542,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         TextButton(
           key: const Key('two-factor-close'),
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('关闭'),
+          child: Text(tr('关闭')),
         ),
       ],
     );
@@ -562,7 +563,7 @@ class _RecoveryCodesDialog extends StatelessWidget {
       key: const Key('recovery-codes-dialog'),
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('恢复码'),
+      title: Text(tr('恢复码')),
       content: SizedBox(
         width: 340,
         child: Column(
@@ -570,7 +571,7 @@ class _RecoveryCodesDialog extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
             Text(
-              '每个恢复码只能使用一次，重新生成会让这一组全部失效。请保存在离线、安全的地方。',
+              tr('每个恢复码只能使用一次，重新生成会让这一组全部失效。请保存在离线、安全的地方。'),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 12),
@@ -593,16 +594,16 @@ class _RecoveryCodesDialog extends StatelessWidget {
             await Clipboard.setData(ClipboardData(text: codes.join('\n')));
             if (context.mounted) {
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('恢复码已复制')),
+                SnackBar(content: Text(tr('恢复码已复制'))),
               );
             }
           },
-          child: const Text('复制全部'),
+          child: Text(tr('复制全部')),
         ),
         FilledButton(
           key: const Key('recovery-codes-close'),
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('我已保存'),
+          child: Text(tr('我已保存')),
         ),
       ],
     );

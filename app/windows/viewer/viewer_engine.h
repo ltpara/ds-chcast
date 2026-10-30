@@ -16,9 +16,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -97,6 +100,22 @@ enum class TerminalPhase {
     kFailed = 4,
 };
 
+// One camera the viewer is watching. Listing covers the round trip of a list
+// request, Starting covers StartCamera until the host's answer, and Streaming
+// means the CCAM stream is open. Stopped is terminal: the viewer asked to
+// stop or the host ended the stream (a device failure has no wire reason, so
+// camera_reason explains a host-initiated ending). Failed carries the host's
+// CameraCode and wording for a refusal, or a local error.
+enum class CameraPhase {
+    kIdle = 0,
+    kListing = 1,
+    kListed = 2,
+    kStarting = 3,
+    kStreaming = 4,
+    kStopped = 5,
+    kFailed = 6,
+};
+
 struct ViewerStatus {
     ViewerState state = ViewerState::kIdle;
     std::string error;
@@ -154,6 +173,10 @@ struct ViewerStatus {
     double latency_ms = 0.0;
     uint64_t elapsed_ms = 0;
     bool video_finished = false;
+    // The host answered with a file-transfer-only session: no video, audio,
+    // input or pointer stream exists, and the file browser is the session.
+    // `state` still reaches kStreaming once the host accepted the Hello.
+    bool files_only = false;
     // The permission mask the host last announced (chast::PermissionBit) and
     // how many masks have been applied, including the one from HelloAck. The
     // UI compares the mask to explain a live revocation.
@@ -202,11 +225,61 @@ struct ViewerStatus {
     // a resume starts at the partial length already on disk.
     FilePhase download_phase = FilePhase::kIdle;
     std::string download_name;
+    // The finished file's path on this viewer; empty until the download is
+    // renamed into place.
+    std::string download_path;
     uint64_t download_size = 0;
     uint64_t download_received = 0;
     std::string download_error;
     uint64_t files_received = 0;
     uint64_t file_receive_failures = 0;
+    // Shared-folder browsing. The entries themselves are taken through
+    // TakeFileList(); these fields describe the newest answer so a page can
+    // update without copying the list. `file_list_directory` echoes the
+    // request and `file_list_error` explains a refusal or send failure.
+    uint64_t file_list_answers = 0;
+    std::string file_list_directory;
+    uint32_t file_list_entries = 0;
+    bool file_list_truncated = false;
+    std::string file_list_error;
+    // The newest viewer-initiated download request. Ok means the host queued
+    // the transfer and its offer will show up in download_*; a refusal keeps
+    // the host's reason here.
+    uint64_t file_download_answers = 0;
+    int file_download_code = 0;
+    uint32_t file_download_transfer_id = 0;
+    std::string file_download_path;
+    std::string file_download_error;
+    // The newest file-operation answer (new folder, rename or remove). Ok means
+    // the host applied it; `file_op_path` echoes the entry it applied to and
+    // `file_op_error` explains a refusal. The page reloads its listing when
+    // the counter moves.
+    uint64_t file_op_answers = 0;
+    int file_op_code = 0;
+    std::string file_op_path;
+    std::string file_op_error;
+    // A folder download walks the browsed tree with ordinary list and download
+    // requests. Files land below `folder_download_destination`, mirroring the
+    // remote folders under the folder's own name; `folder_download_files_total`
+    // grows as folders are listed. When the walk ends,
+    // `folder_download_answers` moves and `folder_download_code` carries the
+    // outcome (0 done, 1 failed, 2 cancelled) with the reason in
+    // `folder_download_error`.
+    bool folder_download_active = false;
+    std::string folder_download_name;
+    std::string folder_download_destination;
+    uint64_t folder_download_files_total = 0;
+    uint64_t folder_download_files_done = 0;
+    std::string folder_download_current;
+    // Entries the running walk was asked for. 1 is one entry; higher counts
+    // are a batch of selected files and folders. `folder_download_batch`
+    // separates a multi-select batch (even of one file) from the folder row's
+    // recursive download, so the page words its progress correctly.
+    uint32_t folder_download_roots = 0;
+    bool folder_download_batch = false;
+    uint64_t folder_download_answers = 0;
+    int folder_download_code = 0;
+    std::string folder_download_error;
     // Pointer: updates received, and whether one is waiting for the UI. The
     // sprite is deliberately not part of ViewerStatus: it can be a quarter of
     // a megabyte and the UI polls the status four times a second, so it is
@@ -378,6 +451,30 @@ struct ViewerStatus {
     uint64_t terminal_bytes = 0;
     uint64_t terminal_updates = 0;
 
+    // Camera sharing (protocol v29). `camera_supported` mirrors the host's
+    // announced permission; the viewer watches at most one camera at a time.
+    // `camera_phase` is a CameraPhase value, `camera_code`/`camera_reason`
+    // carry the host's CameraCode and wording for a refusal or an ending, and
+    // `camera_error` explains a local failure. `camera_id` names the camera
+    // the phase describes. `cameras` is the newest list; the ids are only
+    // valid until the next answer, which is why `camera_list_updates` counts
+    // answers. `camera_width`/`camera_height` are the encoded surface size
+    // (16-aligned, so a camera whose height is not a multiple of 16 shows a
+    // thin black band) and `camera_frames` counts decoded pictures.
+    bool camera_supported = false;
+    CameraPhase camera_phase = CameraPhase::kIdle;
+    int camera_code = 0;
+    std::string camera_reason;
+    std::string camera_error;
+    uint16_t camera_id = 0;
+    std::vector<chast::CameraDescription> cameras;
+    uint64_t camera_list_updates = 0;
+    uint32_t camera_width = 0;
+    uint32_t camera_height = 0;
+    uint64_t camera_frames = 0;
+    std::string camera_decoder;
+    uint64_t camera_updates = 0;
+
     // Viewer-side recording. Nothing here crosses the wire: the viewer muxes
     // the host's already-encoded stream to a local MP4. `recording` is true
     // while a muxer is writing; the counters mirror the command-line tool,
@@ -395,7 +492,11 @@ struct ViewerStatus {
 
 class ViewerEngine {
 public:
-    explicit ViewerEngine(FrameSink* sink);
+    // `sink` publishes the desktop picture; `camera_sink`, when present,
+    // publishes the shared camera. The camera decodes on its own sink because
+    // it is an independent stream with its own size and timeline, and both
+    // sinks may render at the same time.
+    explicit ViewerEngine(FrameSink* sink, FrameSink* camera_sink = nullptr);
     ~ViewerEngine();
 
     ViewerEngine(const ViewerEngine&) = delete;
@@ -415,6 +516,11 @@ public:
     // `carrier_host_id`/`carrier_token` select a host on a shared carrier; they
     // stay empty for a per-host relay port. Fails when one is already running;
     // call Stop() first to switch targets or displays.
+    //
+    // `file_transfer_only` asks the host for a session without a screen
+    // stream (protocol v32). The host answers through
+    // ViewerStatus::files_only; a host that lacks file transfer refuses the
+    // Hello, so `display` and the sink are not used.
     bool Start(const std::string& host, uint16_t port, uint16_t display,
                std::string pinned_fingerprint = {},
                bool allow_unverified = false,
@@ -424,7 +530,8 @@ public:
                bool trust_device = false,
                ViewerTransport transport = ViewerTransport::kAuto,
                std::string carrier_host = {}, uint16_t carrier_port = 0,
-               std::string carrier_host_id = {}, std::string carrier_token = {});
+               std::string carrier_host_id = {}, std::string carrier_token = {},
+               bool file_transfer_only = false);
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
@@ -472,13 +579,86 @@ public:
     // baseline, so whatever changed in between is not flushed to the host.
     // The host's own clipboard permission is applied on top of this.
     void SetClipboardSync(bool enabled);
+    // Test hook: when set, a clipboard file list lands in this callback with
+    // the staged absolute paths instead of the Windows clipboard. The loopback
+    // probe uses it so an automated run never disturbs the operator's
+    // clipboard; returning false reports a failed write.
+    void SetClipboardFileSink(
+        std::function<bool(const std::vector<std::string>&)> sink);
+    // Test hook for the reverse direction: when set, this callback supplies the
+    // local file list (the CF_HDROP items) the viewer announces to the host.
+    // Unset reads the Windows clipboard; the loopback probe uses it so an
+    // automated run never touches the operator's clipboard.
+    void SetClipboardFileSource(
+        std::function<bool(std::vector<std::string>&)> source);
     // Queues local paths for upload (viewer -> host). Folders are expanded
     // into their regular files, preserving the folder as the first relative
-    // directory component. Returns false when the session is not streaming,
-    // the host did not grant file transfer, or no path was usable. Hashing
-    // and folder walks run on the file worker; progress arrives through
+    // directory component. `relative_prefix` names the directory below the
+    // host's receive root the files should land in (the folder being browsed);
+    // it is empty for the root. Returns false when the session is not
+    // streaming, the host did not grant file transfer, or no path was usable.
+    // Hashing and folder walks run on the file worker; progress arrives through
     // ViewerStatus::file_phase and the queue counters.
-    bool SendFiles(const std::vector<std::string>& paths);
+    bool SendFiles(const std::vector<std::string>& paths,
+                   std::string relative_prefix = {});
+
+    // Asks the host to list one directory below its shared receive root.
+    // `directory` is a '/'-separated relative path; empty lists the root.
+    // Returns false when no session is streaming, the host did not grant file
+    // transfer, or the request queue is full. The newest answer is taken
+    // through TakeFileList(); counters and the last refusal arrive in
+    // ViewerStatus::file_list_*.
+    bool RequestFileList(std::string directory);
+    // Asks the host to send one regular file from the shared root. The host
+    // answers through ViewerStatus::file_download_*; on Ok the offer then
+    // arrives like any host download and lands in the viewer's receive
+    // directory, with progress in download_*.
+    bool RequestFileDownload(std::string path);
+    // One listing the host sent, tagged with the directory it was requested
+    // for (the host echoes no path, so the engine remembers the request).
+    struct FileListAnswer {
+        std::string directory;
+        chast::FileListResult result;
+    };
+    // Copies the newest listing the host sent, once per answer. Returns false
+    // when nothing new arrived.
+    bool TakeFileList(FileListAnswer& answer);
+    // Asks the host to create a folder, rename one entry or remove one below
+    // its shared receive root. `path` is the '/'-separated relative path of
+    // the entry (for MakeDirectory, the folder to create); `new_name` is one
+    // path component and is only used by Rename. Returns false when no session
+    // is streaming, the host did not grant file transfer, an argument is
+    // invalid, or the request queue is full. The answer arrives through
+    // ViewerStatus::file_op_*; the page reloads the listing after it.
+    bool RequestFileOperation(chast::FileOperation op, std::string path,
+                              std::string new_name = {});
+    // One entry of a batch download: `path` is the '/'-separated relative
+    // path and `directory` says whether the walk must list it recursively.
+    struct DownloadRoot {
+        std::string path;
+        bool directory = false;
+    };
+    // Downloads several browsed entries into the viewer's receive directory in
+    // one walk: folders mirror below their own names, files land at the top of
+    // the receive directory. Roots are walked in order with ordinary list and
+    // download requests, one transfer at a time, and the page's newest listing
+    // stays untouched. Returns false when no session is streaming, the host
+    // did not grant file transfer, the list is empty or holds an invalid path,
+    // or a walk is already running. Progress arrives in
+    // ViewerStatus::folder_download_* with folder_download_roots saying how
+    // many entries were selected.
+    bool RequestBatchDownload(std::vector<DownloadRoot> roots);
+    // Downloads one browsed folder and everything below it into the viewer's
+    // receive directory, mirroring the remote tree below the folder's name.
+    // The walk sends ordinary list and download requests in browse order, one
+    // transfer at a time, and keeps the page's newest listing untouched.
+    // Returns false when no session is streaming, the host did not grant file
+    // transfer, `path` is empty or invalid, or a walk is already running.
+    // Progress arrives in ViewerStatus::folder_download_*.
+    bool RequestDirectoryDownload(std::string path);
+    // Stops the running walk; the transfer in flight is aborted and its partial
+    // file removed. The outcome is published as cancelled.
+    void CancelDirectoryDownload();
 
     // Binds a viewer-side port-forward listener on 127.0.0.1:local_port (0
     // picks a free port) and asks the host to relay it to
@@ -579,6 +759,23 @@ public:
     // waiting, with `ended` still telling whether the console finished.
     bool TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended);
 
+    // Asks the host to enumerate its cameras. Returns false when no session is
+    // streaming, the host did not grant kPermissionCamera, or a camera is
+    // starting or running. The answer (possibly a refusal) arrives through
+    // camera_phase/camera_code/camera_reason and the list in `cameras`.
+    bool RequestCameraList();
+    // Asks the host to open one listed camera. Returns false when no session
+    // is streaming, the host did not grant kPermissionCamera, `camera_id` is
+    // not in the newest list, or another camera is still starting or running.
+    // The answer arrives through camera_phase/camera_code; a refusal carries
+    // the host's reason and a success is followed by decoded pictures on the
+    // camera sink.
+    bool StartCamera(uint16_t camera_id);
+    // Stops the running camera (or cancels one that is still starting). Safe
+    // to call when nothing is running. The panel's own close moves the phase
+    // immediately; the host stops sending after it sees the stop.
+    void StopCamera();
+
     ViewerStatus Snapshot() const;
 
 private:
@@ -588,18 +785,29 @@ private:
              bool trust_device, ViewerTransport transport,
              std::string carrier_host, uint16_t carrier_port,
              std::string carrier_host_id, std::string carrier_token,
-             std::string audit_ref);
+             std::string audit_ref, bool file_transfer_only);
     void SetState(ViewerState state, std::string error = {});
     // Expands dropped folders and hashes queued uploads on its own thread, so
     // a multi-gigabyte read never stalls the session's receive loop.
     void FileWorker();
-    void ExpandUploadRoot(const std::string& root, uint64_t epoch);
-    bool EnqueueUpload(const std::string& path, std::string relative_path, uint64_t epoch);
+    struct PendingUploadRoot {
+        std::string path;
+        std::string prefix;
+    };
+    void ExpandUploadRoot(const PendingUploadRoot& root, uint64_t epoch);
+    bool EnqueueUpload(const std::string& path, std::string relative_path, uint64_t epoch,
+                       bool clipboard = false);
     void EnqueueUploadFailure(std::string name, std::string relative_path, std::string error,
                               uint64_t epoch);
     bool HasHashableUploadLocked() const;
+    // Shared validation and queueing for RequestBatchDownload and
+    // RequestDirectoryDownload. `batch` tells the page which wording to use.
+    bool QueueDownload(std::vector<DownloadRoot> roots, bool batch);
 
     FrameSink* sink_;
+    // The camera picture goes to its own Flutter texture; null means no
+    // camera can be started (the command-line tools only display the desktop).
+    FrameSink* camera_sink_;
     // Kept alive for the whole session because QuicClientConfig borrows it.
     std::shared_ptr<chast::DeviceIdentity> device_identity_;
     mutable std::mutex mutex_;
@@ -683,6 +891,22 @@ private:
     size_t terminal_output_bytes_ = 0;
     bool terminal_output_ended_ = true;
 
+    // Camera requests cross here in order: a stop that follows a start must
+    // reach the host after it, and a list answer is only useful to the panel
+    // that asked for it. A stop drops commands that were never sent, so a
+    // closed panel cannot leave a camera opening behind.
+    struct CameraCommand {
+        enum class Kind {
+            kList,
+            kStart,
+            kStop,
+        };
+        Kind kind = Kind::kList;
+        uint16_t camera_id = 0;
+    };
+    mutable std::mutex camera_mutex_;
+    std::deque<CameraCommand> pending_camera_;
+
     // Input crosses from the UI thread to the session thread here. The queue
     // is bounded: a stalled transport drops the newest events instead of
     // growing, which is the right trade for a pointer stream that is already
@@ -699,6 +923,9 @@ private:
     // and writes what the host sends; the toggle only crosses as a flag, and
     // the UI never moves clipboard bytes through Dart.
     std::atomic<bool> clipboard_sync_{true};
+    mutable std::mutex clipboard_sink_mutex_;
+    std::function<bool(const std::vector<std::string>&)> clipboard_file_sink_;
+    std::function<bool(std::vector<std::string>&)> clipboard_file_source_;
 
     // Uploads wait in one queue. The session thread works on the front while
     // the file worker expands folders and hashes upcoming entries; every
@@ -724,6 +951,9 @@ private:
         uint64_t resume_offset = 0;
         std::array<uint8_t, 32> digest{};
         uint32_t transfer_id = 0;
+        // The upload belongs to the local clipboard (protocol v34): the host
+        // stages it for CF_HDROP and the clipboard permission gates it.
+        bool clipboard = false;
         std::string error;
     };
     // The single incoming download. The session thread owns the receiver;
@@ -745,10 +975,88 @@ private:
         std::unique_ptr<chast::FileReceiver> receiver;
         std::string error;
     };
+    // Shared-folder browse requests cross in order: a listing, a download or
+    // an operation the operator clicked after it must reach the host in that
+    // order. The request ids map back to the paths they were made for so an
+    // answer can name its entry. The newest listing waits here for
+    // TakeFileList().
+    struct BrowseCommand {
+        enum class Kind {
+            kList,
+            kDownload,
+            kOperation,
+        };
+        Kind kind = Kind::kList;
+        uint32_t request_id = 0;
+        chast::FileOperation operation = chast::FileOperation::MakeDirectory;
+        std::string path;
+        std::string new_name;
+    };
+    // One walk of a remote folder. The session thread owns every field; the UI
+    // threads only queue a request and set `cancel`, all under browse_mutex_.
+    // `directories` still have to be listed, `files` pair a remote path with
+    // the local folder (relative to the receive directory) it must land in.
+    struct FolderDownload {
+        enum class Stage {
+            kIdle,
+            kListing,
+            kDownloading,
+            kDone,
+            kFailed,
+            kCancelled,
+        };
+        Stage stage = Stage::kIdle;
+        // Selected entries not started yet; `root`/`name` describe the one in
+        // progress. `directories` and `files` only ever hold its work.
+        std::deque<DownloadRoot> roots;
+        uint32_t batch_total = 0;
+        // True when the request came from the multi-select bar, including a
+        // batch that holds one file.
+        bool batch = false;
+        std::string root;
+        std::string name;
+        std::string destination;
+        std::deque<std::string> directories;
+        std::deque<std::pair<std::string, std::string>> files;
+        uint32_t listing_id = 0;
+        std::string listing_path;
+        uint32_t download_id = 0;
+        std::string download_path;
+        std::string download_directory;
+        uint32_t transfer_id = 0;
+        uint64_t files_total = 0;
+        uint64_t files_done = 0;
+        std::string current;
+        std::string error;
+        std::chrono::steady_clock::time_point retry_after;
+        std::chrono::steady_clock::time_point transfer_deadline;
+        bool cancel = false;
+        bool finished = false;
+    };
+    mutable std::mutex browse_mutex_;
+    std::deque<BrowseCommand> pending_browse_;
+    std::map<uint32_t, std::string> browse_paths_;
+    std::optional<FileListAnswer> newest_file_list_;
+    uint32_t next_browse_id_ = 1;
+    // Set by RequestBatchDownload/RequestDirectoryDownload, consumed by the
+    // session thread.
+    struct FolderRequest {
+        std::vector<DownloadRoot> roots;
+        bool batch = false;
+    };
+    std::optional<FolderRequest> folder_request_;
+    FolderDownload folder_;
+    // Transfer id -> local folder for the walk's transfers, so an offer lands
+    // in the mirrored tree instead of the receive root.
+    std::map<uint32_t, std::string> folder_transfers_;
+    // Transfers the walk turned away while cancelling. An offer that was
+    // already in flight is refused too instead of landing in the receive root.
+    std::set<uint32_t> ignored_transfers_;
+
     mutable std::mutex file_mutex_;
     std::condition_variable file_work_cv_;
     std::deque<FileUpload> uploads_;
-    std::deque<std::string> pending_upload_roots_;
+    std::deque<PendingUploadRoot> pending_upload_roots_;
     FileUpload last_upload_;
     FileDownload download_;
     std::thread file_worker_;

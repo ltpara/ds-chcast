@@ -508,6 +508,58 @@ void test_password_and_permissions() {
           "the decision enum is usable");
 }
 
+void test_file_transfer_mode() {
+    chast::HostSecurity::Config config;
+    config.mode = chast::HostAuthMode::Click;
+    config.default_permissions = chast::kPermissionAll;
+    chast::HostSecurity security(config);
+
+    chast::ClientHello hello = hello_with("");
+    hello.mode = chast::SessionMode::FileTransfer;
+    auto result = security.evaluate(hello, "192.168.1.20:6000", 1000);
+    check(result.decision == Decision::RequireApproval,
+          "a files-only Hello still goes through the approval policy");
+    check(result.permissions == chast::kPermissionFileTransfer,
+          "a files-only Hello is clamped to the file-transfer permission");
+
+    hello.requested_permissions = chast::kPermissionInput;
+    result = security.evaluate(hello, "192.168.1.20:6001", 1001);
+    check(result.permissions == 0,
+          "a files-only Hello asking for input is granted nothing");
+
+    config = security.config();
+    config.default_permissions = chast::kPermissionInput | chast::kPermissionClipboard;
+    security.set_config(config);
+    hello.requested_permissions = chast::kPermissionAll;
+    result = security.evaluate(hello, "192.168.1.20:6002", 1002);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::Declined,
+          "a files-only Hello is refused when file transfer is disabled");
+    check(result.reason.find("file transfer") != std::string::npos,
+          "the refusal names file transfer");
+
+    hello.mode = chast::SessionMode::Desktop;
+    result = security.evaluate(hello, "192.168.1.20:6003", 1003);
+    check(result.decision == Decision::RequireApproval,
+          "a desktop Hello is unaffected by the file-transfer gates");
+    check(result.permissions == (chast::kPermissionInput | chast::kPermissionClipboard),
+          "a desktop Hello keeps the default permissions");
+
+    config = security.config();
+    config.mode = chast::HostAuthMode::Both;
+    config.default_permissions = chast::kPermissionAll;
+    config.token_auth = true;
+    config.access_token = "FILEONLY123";
+    security.set_config(config);
+    hello = hello_with("");
+    hello.mode = chast::SessionMode::FileTransfer;
+    hello.access_token = "FILEONLY123";
+    result = security.evaluate(hello, "192.168.1.20:6004", 1004);
+    check(result.decision == Decision::Allow && result.via_token,
+          "automation may open a files-only session with the token");
+    check(result.permissions == chast::kPermissionFileTransfer,
+          "the token's files-only session carries only file transfer");
+}
+
 void test_signature_message() {
     chast::ClientHello hello;
     hello.nonce = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -542,6 +594,7 @@ int main() {
     test_lockout();
     test_service_mode();
     test_password_and_permissions();
+    test_file_transfer_mode();
     test_signature_message();
     if (failures != 0) {
         std::printf("host security checks FAILED (%d)\n", failures);

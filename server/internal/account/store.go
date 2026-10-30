@@ -66,6 +66,9 @@ var (
 	ErrInvalidGroupName   = errors.New("address book group name is required")
 	ErrUnknownGroup       = errors.New("unknown address book group")
 	ErrUnknownPeer        = errors.New("unknown address book peer")
+	ErrGroupCycle         = errors.New("address book group cannot contain itself")
+	ErrGroupDepth         = errors.New("address book group nesting is too deep")
+	ErrInvalidPosition    = errors.New("address book position must not be negative")
 	ErrPeerConflict       = errors.New("address book peer changed elsewhere")
 	ErrGroupConflict      = errors.New("address book group changed elsewhere")
 	ErrSelfShare          = errors.New("cannot share an address book with yourself")
@@ -78,7 +81,7 @@ var (
 	ErrTwoFactorEnabled     = errors.New("two-factor is already enabled")
 	ErrTwoFactorNotStarted  = errors.New("two-factor enrollment has not started")
 	ErrTwoFactorNotEnabled  = errors.New("two-factor is not enabled")
-	ErrInvalidRole          = errors.New("role must be admin or user")
+	ErrInvalidRole          = errors.New("role must be admin, operator, readonly or user")
 	ErrLastAdmin            = errors.New("at least one admin account must remain")
 	ErrAccountBanned        = errors.New("account is banned")
 
@@ -118,12 +121,25 @@ type User struct {
 }
 
 // Account roles. Admin may manage accounts and read server-wide audit data;
-// user owns only its own address book and sessions. The first account created
-// on a fresh server is the admin, so a self-hosted deployment always has one.
+// operator may read the console and change device labels, leases and identity
+// bindings; readonly may only read the console; user owns just its own address
+// book and sessions and has no console access. The first account created on a
+// fresh server is the admin, so a self-hosted deployment always has one.
 const (
-	RoleAdmin = "admin"
-	RoleUser  = "user"
+	RoleAdmin    = "admin"
+	RoleOperator = "operator"
+	RoleReadonly = "readonly"
+	RoleUser     = "user"
 )
+
+// ValidRole reports whether role names an account role.
+func ValidRole(role string) bool {
+	switch role {
+	case RoleAdmin, RoleOperator, RoleReadonly, RoleUser:
+		return true
+	}
+	return false
+}
 
 // Session describes one live login. The ID is random and reveals nothing
 // about the bearer token, so a viewer can revoke another device without ever
@@ -147,6 +163,9 @@ type Peer struct {
 	Tags      []string  `json:"tags,omitempty"`
 	GroupID   string    `json:"group_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// Position orders peers inside their group; clients use it for manual
+	// ordering. Equal positions fall back to peer id order.
+	Position int64 `json:"position,omitempty"`
 	// Revision is the per-user sequence number of the last write. Clients
 	// pass the newest revision they have seen back through Snapshot to fetch
 	// only later changes, including deletion tombstones.
@@ -157,14 +176,22 @@ type Peer struct {
 }
 
 // Group organizes peers inside one account's address book. Groups share the
-// owner's revision stream with peers so a single cursor covers both.
+// owner's revision stream with peers so a single cursor covers both. A group
+// may nest under another live group of the same user; Position orders
+// siblings, with the parent link carrying the tree shape.
 type Group struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name,omitempty"`
+	ParentID  string    `json:"parent_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+	Position  int64     `json:"position,omitempty"`
 	Revision  int64     `json:"revision,omitempty"`
 	Deleted   bool      `json:"deleted,omitempty"`
 }
+
+// maxGroupDepth caps nesting so a chain of ancestors always fits one screen
+// and cycle checks stay bounded even on damaged data.
+const maxGroupDepth = 8
 
 // Snapshot is a complete alive address book plus the changes after the
 // caller's last seen revision. Peers is always authoritative for the current
@@ -500,6 +527,21 @@ func (s *Store) CreateUserWithEmail(username, password, email string) (User, err
 // CreateUserWithRecovery creates an account with both optional recovery
 // channels. A duplicate address or number rejects the whole insert.
 func (s *Store) CreateUserWithRecovery(username, password, email, phone string) (User, error) {
+	return s.createUser(username, password, email, phone, "")
+}
+
+// CreateUserWithRole creates an account with an explicit console role. The
+// first account on a fresh server is always admin, so a self-hosted deployment
+// always keeps one account that can manage the others.
+func (s *Store) CreateUserWithRole(username, password, email, phone, role string) (User, error) {
+	role = strings.TrimSpace(role)
+	if role != "" && !ValidRole(role) {
+		return User{}, ErrInvalidRole
+	}
+	return s.createUser(username, password, email, phone, role)
+}
+
+func (s *Store) createUser(username, password, email, phone, role string) (User, error) {
 	username = strings.TrimSpace(username)
 	if !usernamePattern.MatchString(username) {
 		return User{}, ErrInvalidUsername
@@ -534,7 +576,9 @@ func (s *Store) CreateUserWithRecovery(username, password, email, phone string) 
 		return User{}, err
 	}
 	created := s.now().UTC()
-	role := RoleUser
+	if role == "" {
+		role = RoleUser
+	}
 	var existing int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&existing); err != nil {
 		return User{}, fmt.Errorf("account store %s: count users: %w", s.path, err)
@@ -754,7 +798,7 @@ func (s *Store) FindUser(username string) (User, error) {
 // otherwise the deployment would lose every way to manage accounts.
 func (s *Store) SetRole(username, role string) (User, error) {
 	role = strings.TrimSpace(role)
-	if role != RoleAdmin && role != RoleUser {
+	if !ValidRole(role) {
 		return User{}, ErrInvalidRole
 	}
 	s.mu.Lock()
@@ -1778,8 +1822,8 @@ func (s *Store) Peers(userID string) ([]Peer, error) {
 
 func (s *Store) peersLocked(userID string) ([]Peer, error) {
 	rows, err := s.db.Query(
-		`SELECT peer_id, name, tags, group_id, updated_at, revision FROM address_book
-		 WHERE user_id = ? AND deleted = 0 ORDER BY peer_id`,
+		`SELECT peer_id, name, tags, group_id, position, updated_at, revision FROM address_book
+		 WHERE user_id = ? AND deleted = 0 ORDER BY position, peer_id`,
 		userID,
 	)
 	if err != nil {
@@ -1793,7 +1837,7 @@ func (s *Store) peersLocked(userID string) ([]Peer, error) {
 			tags      string
 			updatedAt int64
 		)
-		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &updatedAt, &peer.Revision); err != nil {
+		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision); err != nil {
 			return nil, err
 		}
 		peer.Tags = decodeTags(tags)
@@ -1805,8 +1849,8 @@ func (s *Store) peersLocked(userID string) ([]Peer, error) {
 
 func (s *Store) groupsLocked(userID string) ([]Group, error) {
 	rows, err := s.db.Query(
-		`SELECT group_id, name, updated_at, revision FROM address_book_groups
-		 WHERE user_id = ? AND deleted = 0 ORDER BY name, group_id`,
+		`SELECT group_id, name, parent_id, position, updated_at, revision FROM address_book_groups
+		 WHERE user_id = ? AND deleted = 0 ORDER BY position, name, group_id`,
 		userID,
 	)
 	if err != nil {
@@ -1819,7 +1863,7 @@ func (s *Store) groupsLocked(userID string) ([]Group, error) {
 			group     Group
 			updatedAt int64
 		)
-		if err := rows.Scan(&group.ID, &group.Name, &updatedAt, &group.Revision); err != nil {
+		if err := rows.Scan(&group.ID, &group.Name, &group.ParentID, &group.Position, &updatedAt, &group.Revision); err != nil {
 			return nil, err
 		}
 		group.UpdatedAt = timeFromMillis(updatedAt)
@@ -1855,7 +1899,7 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	rows, err := s.db.Query(
-		`SELECT peer_id, name, tags, group_id, updated_at, revision, deleted FROM address_book
+		`SELECT peer_id, name, tags, group_id, position, updated_at, revision, deleted FROM address_book
 		 WHERE user_id = ? AND revision > ? ORDER BY revision, peer_id`,
 		userID, since,
 	)
@@ -1871,7 +1915,7 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 			updatedAt int64
 			deleted   int
 		)
-		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &updatedAt, &peer.Revision, &deleted); err != nil {
+		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision, &deleted); err != nil {
 			return Snapshot{}, err
 		}
 		peer.Tags = decodeTags(tags)
@@ -1884,7 +1928,7 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 	}
 	rows.Close()
 	groupRows, err := s.db.Query(
-		`SELECT group_id, name, updated_at, revision, deleted FROM address_book_groups
+		`SELECT group_id, name, parent_id, position, updated_at, revision, deleted FROM address_book_groups
 		 WHERE user_id = ? AND revision > ? ORDER BY revision, group_id`,
 		userID, since,
 	)
@@ -1899,7 +1943,7 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 			updatedAt int64
 			deleted   int
 		)
-		if err := groupRows.Scan(&group.ID, &group.Name, &updatedAt, &group.Revision, &deleted); err != nil {
+		if err := groupRows.Scan(&group.ID, &group.Name, &group.ParentID, &group.Position, &updatedAt, &group.Revision, &deleted); err != nil {
 			return Snapshot{}, err
 		}
 		group.UpdatedAt = timeFromMillis(updatedAt)
@@ -1962,18 +2006,27 @@ func (s *Store) UpdatePeerWithGroup(userID, peerID string, name *string, tags *[
 // inside the write transaction; otherwise ErrPeerConflict is returned and
 // nothing changes. Zero keeps the previous last-writer-wins behavior.
 func (s *Store) UpdatePeerWithGroupAt(userID, peerID string, name *string, tags *[]string, groupID *string, ifRevision int64) (Peer, error) {
+	return s.UpdatePeerAt(userID, peerID, name, tags, groupID, nil, ifRevision)
+}
+
+// UpdatePeerAt is UpdatePeerWithGroupAt with an optional manual position.
+// A nil position keeps the stored one; a negative value is rejected.
+func (s *Store) UpdatePeerAt(userID, peerID string, name *string, tags *[]string, groupID *string, position *int64, ifRevision int64) (Peer, error) {
 	if !registry.ValidID(peerID) {
 		return Peer{}, ErrInvalidPeerID
 	}
 	if groupID != nil && *groupID != "" && !registry.ValidID(*groupID) {
 		return Peer{}, ErrInvalidGroupID
 	}
+	if position != nil && *position < 0 {
+		return Peer{}, ErrInvalidPosition
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updatePeerLocked(userID, peerID, name, tags, groupID, ifRevision)
+	return s.updatePeerLocked(userID, peerID, name, tags, groupID, position, ifRevision)
 }
 
-func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]string, groupID *string, ifRevision int64) (Peer, error) {
+func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]string, groupID *string, position *int64, ifRevision int64) (Peer, error) {
 	var cleanName string
 	var cleanTags []string
 	if name != nil {
@@ -2000,13 +2053,14 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 	var existingTags string
 	updatedGroup := ""
 	var (
+		updatedPosition int64
 		currentRevision int64
 		deleted         bool
 	)
 	err = tx.QueryRow(
-		`SELECT name, tags, group_id, revision, deleted FROM address_book WHERE user_id = ? AND peer_id = ?`,
+		`SELECT name, tags, group_id, position, revision, deleted FROM address_book WHERE user_id = ? AND peer_id = ?`,
 		userID, peerID,
-	).Scan(&updatedName, &existingTags, &updatedGroup, &currentRevision, &deleted)
+	).Scan(&updatedName, &existingTags, &updatedGroup, &updatedPosition, &currentRevision, &deleted)
 	found := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Peer{}, fmt.Errorf("account store %s: read address book entry: %w", s.path, err)
@@ -2024,18 +2078,23 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 	if groupID != nil {
 		updatedGroup = *groupID
 	}
+	if position != nil {
+		updatedPosition = *position
+	}
 	revision, err := nextRevision(tx, userID)
 	if err != nil {
 		return Peer{}, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
 	}
 	now := s.now().UTC()
 	if _, err := tx.Exec(
-		`INSERT INTO address_book (user_id, peer_id, name, tags, group_id, updated_at, revision, deleted)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+		`INSERT INTO address_book (user_id, peer_id, name, tags, group_id, position, updated_at, revision, deleted)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
 		 ON CONFLICT(user_id, peer_id) DO UPDATE SET
 			name = excluded.name, tags = excluded.tags, group_id = excluded.group_id,
-			updated_at = excluded.updated_at, revision = excluded.revision, deleted = 0`,
-		userID, peerID, updatedName, encodeTags(updatedTags), updatedGroup, unixMillis(now), revision,
+			position = excluded.position, updated_at = excluded.updated_at,
+			revision = excluded.revision, deleted = 0`,
+		userID, peerID, updatedName, encodeTags(updatedTags), updatedGroup, updatedPosition,
+		unixMillis(now), revision,
 	); err != nil {
 		return Peer{}, fmt.Errorf("account store %s: update address book entry: %w", s.path, err)
 	}
@@ -2048,6 +2107,7 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 		Tags:      updatedTags,
 		GroupID:   updatedGroup,
 		UpdatedAt: now,
+		Position:  updatedPosition,
 		Revision:  revision,
 	}, nil
 }
@@ -2089,10 +2149,10 @@ func (s *Store) SetPeerGroupAt(userID, peerID, groupID string, ifRevision int64)
 		updatedAt int64
 	)
 	err = tx.QueryRow(
-		`SELECT peer_id, name, tags, group_id, updated_at, revision FROM address_book
+		`SELECT peer_id, name, tags, group_id, position, updated_at, revision FROM address_book
 		 WHERE user_id = ? AND peer_id = ? AND deleted = 0`,
 		userID, peerID,
-	).Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &updatedAt, &peer.Revision)
+	).Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Peer{}, ErrUnknownPeer
 	}
@@ -2139,12 +2199,39 @@ func (s *Store) UpsertGroup(userID, groupID, name string) (Group, error) {
 // group, or one written since the client read it, reports ErrGroupConflict.
 // Zero keeps last-writer-wins for older clients.
 func (s *Store) UpsertGroupAt(userID, groupID, name string, ifRevision int64) (Group, error) {
+	return s.UpdateGroupAt(userID, groupID, &name, nil, nil, ifRevision)
+}
+
+// UpdateGroupAt applies an optional rename and optional placement change to
+// one group. A nil name or position keeps the stored value; a non-nil parentID
+// moves the group, with an empty value promoting it to the root. New and
+// revived groups require a name. Placement is validated inside the write
+// transaction: the parent must be a live group of the same user, a moved group
+// cannot land inside itself, and the resulting tree may not exceed
+// maxGroupDepth.
+func (s *Store) UpdateGroupAt(userID, groupID string, name *string, parentID *string, position *int64, ifRevision int64) (Group, error) {
 	if !registry.ValidID(groupID) {
 		return Group{}, ErrInvalidGroupID
 	}
-	name = normalizeText(name, maxName)
-	if name == "" {
-		return Group{}, ErrInvalidGroupName
+	var cleanName string
+	if name != nil {
+		cleanName = normalizeText(*name, maxName)
+		if cleanName == "" {
+			return Group{}, ErrInvalidGroupName
+		}
+	}
+	var cleanParent string
+	if parentID != nil {
+		cleanParent = strings.TrimSpace(*parentID)
+		if cleanParent != "" && !registry.ValidID(cleanParent) {
+			return Group{}, ErrInvalidGroupID
+		}
+		if cleanParent == groupID {
+			return Group{}, ErrGroupCycle
+		}
+	}
+	if position != nil && *position < 0 {
+		return Group{}, ErrInvalidPosition
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2153,22 +2240,65 @@ func (s *Store) UpsertGroupAt(userID, groupID, name string, ifRevision int64) (G
 		return Group{}, fmt.Errorf("account store %s: begin address book group write: %w", s.path, err)
 	}
 	defer tx.Rollback()
-	if ifRevision > 0 {
-		var (
-			live    int64
-			deleted int
-		)
-		err := tx.QueryRow(
-			`SELECT revision, deleted FROM address_book_groups
-			 WHERE user_id = ? AND group_id = ?`,
-			userID, groupID,
-		).Scan(&live, &deleted)
-		if errors.Is(err, sql.ErrNoRows) ||
-			(err == nil && (deleted != 0 || live != ifRevision)) {
-			return Group{}, ErrGroupConflict
-		}
+	var (
+		storedName, storedParent        string
+		storedPosition, currentRevision int64
+		deleted                         int
+	)
+	err = tx.QueryRow(
+		`SELECT name, parent_id, position, revision, deleted FROM address_book_groups
+		 WHERE user_id = ? AND group_id = ?`,
+		userID, groupID,
+	).Scan(&storedName, &storedParent, &storedPosition, &currentRevision, &deleted)
+	exists := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Group{}, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
+	}
+	if ifRevision > 0 && (!exists || deleted != 0 || currentRevision != ifRevision) {
+		return Group{}, ErrGroupConflict
+	}
+	creating := !exists || deleted != 0
+	if creating && name == nil {
+		return Group{}, ErrInvalidGroupName
+	}
+	if creating {
+		storedName = cleanName
+		storedParent = ""
+		storedPosition = 0
+	} else if name != nil {
+		storedName = cleanName
+	}
+	if position != nil {
+		storedPosition = *position
+	}
+	validateDepth := creating || parentID != nil
+	if parentID != nil {
+		storedParent = cleanParent
+	} else if creating {
+		storedParent = ""
+	} else if storedParent != "" {
+		// A group revived after its parent was deleted would otherwise carry a
+		// dangling link; deleting a parent promotes children, so treat any
+		// parent that is no longer live as the root.
+		live, err := liveGroupLocked(tx, userID, storedParent)
 		if err != nil {
-			return Group{}, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
+			return Group{}, err
+		}
+		if !live {
+			storedParent = ""
+		}
+	}
+	if validateDepth && storedParent != "" {
+		parentDepth, err := groupParentDepthLocked(tx, userID, storedParent, groupID)
+		if err != nil {
+			return Group{}, err
+		}
+		height, err := groupHeightLocked(tx, userID, groupID, 0)
+		if err != nil {
+			return Group{}, err
+		}
+		if parentDepth+height > maxGroupDepth {
+			return Group{}, ErrGroupDepth
 		}
 	}
 	revision, err := nextRevision(tx, userID)
@@ -2177,19 +2307,105 @@ func (s *Store) UpsertGroupAt(userID, groupID, name string, ifRevision int64) (G
 	}
 	now := s.now().UTC()
 	if _, err := tx.Exec(
-		`INSERT INTO address_book_groups (user_id, group_id, name, updated_at, revision, deleted)
-		 VALUES (?, ?, ?, ?, ?, 0)
+		`INSERT INTO address_book_groups
+			(user_id, group_id, name, parent_id, position, updated_at, revision, deleted)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)
 		 ON CONFLICT(user_id, group_id) DO UPDATE SET
-			name = excluded.name, updated_at = excluded.updated_at,
+			name = excluded.name, parent_id = excluded.parent_id,
+			position = excluded.position, updated_at = excluded.updated_at,
 			revision = excluded.revision, deleted = 0`,
-		userID, groupID, name, unixMillis(now), revision,
+		userID, groupID, storedName, storedParent, storedPosition, unixMillis(now), revision,
 	); err != nil {
 		return Group{}, fmt.Errorf("account store %s: write address book group: %w", s.path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Group{}, fmt.Errorf("account store %s: commit address book group: %w", s.path, err)
 	}
-	return Group{ID: groupID, Name: name, UpdatedAt: now, Revision: revision}, nil
+	return Group{
+		ID:        groupID,
+		Name:      storedName,
+		ParentID:  storedParent,
+		Position:  storedPosition,
+		UpdatedAt: now,
+		Revision:  revision,
+	}, nil
+}
+
+// groupParentDepthLocked reports how many live groups sit above parentID while
+// rejecting an unknown or tombstoned parent and any parent chain that folds
+// back onto the group being moved.
+func groupParentDepthLocked(tx *sql.Tx, userID, parentID, groupID string) (int, error) {
+	depth := 0
+	current := parentID
+	for current != "" {
+		if current == groupID {
+			return 0, ErrGroupCycle
+		}
+		depth++
+		if depth > maxGroupDepth {
+			return 0, ErrGroupDepth
+		}
+		var next string
+		var deleted int
+		err := tx.QueryRow(
+			`SELECT parent_id, deleted FROM address_book_groups
+			 WHERE user_id = ? AND group_id = ?`,
+			userID, current,
+		).Scan(&next, &deleted)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted != 0) {
+			return 0, ErrUnknownGroup
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read address book group parent: %w", err)
+		}
+		current = next
+	}
+	return depth, nil
+}
+
+// groupHeightLocked counts the deepest live descendant chain below groupID.
+// The depth argument bounds recursion on damaged data that still contains a
+// cycle despite the write-time checks.
+func groupHeightLocked(tx *sql.Tx, userID, groupID string, depth int) (int, error) {
+	if depth > maxGroupDepth {
+		return maxGroupDepth + 1, nil
+	}
+	rows, err := tx.Query(
+		`SELECT group_id FROM address_book_groups
+		 WHERE user_id = ? AND parent_id = ? AND deleted = 0`,
+		userID, groupID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("list address book children: %w", err)
+	}
+	var children []string
+	for rows.Next() {
+		var child string
+		if err := rows.Scan(&child); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("list address book children: %w", err)
+		}
+		children = append(children, child)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("list address book children: %w", err)
+	}
+	rows.Close()
+	height := 1
+	for _, child := range children {
+		childHeight, err := groupHeightLocked(tx, userID, child, depth+1)
+		if err != nil {
+			return 0, err
+		}
+		if childHeight+1 > height {
+			height = childHeight + 1
+		}
+		if height > maxGroupDepth {
+			return height, nil
+		}
+	}
+	return height, nil
 }
 
 // DeleteGroup tombstones a group and removes its live peers from it. Every
@@ -2214,13 +2430,15 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 	}
 	defer tx.Rollback()
 	var (
-		deleted int
-		live    int64
+		deleted  int
+		live     int64
+		parentID string
 	)
 	err = tx.QueryRow(
-		`SELECT deleted, revision FROM address_book_groups WHERE user_id = ? AND group_id = ?`,
+		`SELECT deleted, revision, parent_id FROM address_book_groups
+		 WHERE user_id = ? AND group_id = ?`,
 		userID, groupID,
-	).Scan(&deleted, &live)
+	).Scan(&deleted, &live, &parentID)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted != 0) {
 		return false, nil
 	}
@@ -2241,6 +2459,44 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		unixMillis(now), revision, userID, groupID,
 	); err != nil {
 		return false, fmt.Errorf("account store %s: delete address book group: %w", s.path, err)
+	}
+	// Child groups move up to the deleted group's parent so the rest of the
+	// tree keeps its shape. Each child gets its own revision so incremental
+	// clients see the new parent link.
+	childRows, err := tx.Query(
+		`SELECT group_id FROM address_book_groups
+		 WHERE user_id = ? AND parent_id = ? AND deleted = 0 ORDER BY group_id`,
+		userID, groupID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
+	}
+	var childIDs []string
+	for childRows.Next() {
+		var childID string
+		if err := childRows.Scan(&childID); err != nil {
+			childRows.Close()
+			return false, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
+		}
+		childIDs = append(childIDs, childID)
+	}
+	if err := childRows.Err(); err != nil {
+		childRows.Close()
+		return false, fmt.Errorf("account store %s: list child groups: %w", s.path, err)
+	}
+	childRows.Close()
+	for _, childID := range childIDs {
+		childRevision, err := nextRevision(tx, userID)
+		if err != nil {
+			return false, fmt.Errorf("account store %s: advance address book revision: %w", s.path, err)
+		}
+		if _, err := tx.Exec(
+			`UPDATE address_book_groups SET parent_id = ?, updated_at = ?, revision = ?
+			 WHERE user_id = ? AND group_id = ?`,
+			parentID, unixMillis(now), childRevision, userID, childID,
+		); err != nil {
+			return false, fmt.Errorf("account store %s: promote child group: %w", s.path, err)
+		}
 	}
 	rows, err := tx.Query(
 		`SELECT peer_id FROM address_book
@@ -2640,15 +2896,42 @@ func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 			}
 			whole = scope.Permission
 		}
+		parents := make(map[string]string, len(groups))
+		for _, group := range groups {
+			parents[group.ID] = group.ParentID
+		}
+		permitted := make(map[string]string)
+		for _, scope := range item.scopes {
+			if scope.GroupID == "" {
+				continue
+			}
+			ids, err := s.groupSubtreeLocked(item.id, scope.GroupID)
+			if err != nil {
+				return nil, err
+			}
+			for _, id := range ids {
+				if permissionRank(scope.Permission) > permissionRank(permitted[id]) {
+					permitted[id] = scope.Permission
+				}
+			}
+		}
+		// Ancestors of a permitted group stay visible as containers so the
+		// nested tree keeps its shape; their own peers remain hidden.
+		containers := make(map[string]bool)
+		for id := range permitted {
+			for parent := parents[id]; parent != "" && !containers[parent]; parent = parents[parent] {
+				containers[parent] = true
+			}
+		}
 		visiblePeers := make([]Peer, 0, len(peers))
 		for _, peer := range peers {
-			if whole != "" || scopePermission(item.scopes, peer.GroupID) != "" {
+			if whole != "" || permitted[peer.GroupID] != "" {
 				visiblePeers = append(visiblePeers, peer)
 			}
 		}
 		visibleGroups := make([]Group, 0, len(groups))
 		for _, group := range groups {
-			if whole != "" || scopePermission(item.scopes, group.ID) != "" {
+			if whole != "" || permitted[group.ID] != "" || containers[group.ID] {
 				visibleGroups = append(visibleGroups, group)
 			}
 		}
@@ -2662,16 +2945,6 @@ func (s *Store) SharedBooks(userID string) ([]SharedBook, error) {
 		})
 	}
 	return out, nil
-}
-
-func scopePermission(scopes []SharedScope, groupID string) string {
-	best := ""
-	for _, scope := range scopes {
-		if scope.GroupID == groupID && permissionRank(scope.Permission) > permissionRank(best) {
-			best = scope.Permission
-		}
-	}
-	return best
 }
 
 // sharedGrants collects every grant a grantee holds on one owner. Unknown
@@ -2702,35 +2975,79 @@ func (s *Store) sharedGrantsLocked(granteeID, ownerUsername string) (sharedGrant
 	if err != nil {
 		return sharedGrants{}, fmt.Errorf("account store %s: read shared grants: %w", s.path, err)
 	}
-	defer rows.Close()
 	out := sharedGrants{ownerID: ownerID, groups: make(map[string]string)}
 	found := false
+	var scoped []SharedScope
 	for rows.Next() {
 		var (
 			groupID    string
 			permission string
 		)
 		if err := rows.Scan(&groupID, &permission); err != nil {
+			rows.Close()
 			return sharedGrants{}, err
 		}
 		found = true
 		if groupID == "" {
 			out.whole = permission
 		} else {
-			out.groups[groupID] = permission
+			scoped = append(scoped, SharedScope{GroupID: groupID, Permission: permission})
 		}
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return sharedGrants{}, err
 	}
+	rows.Close()
 	if !found {
 		return sharedGrants{}, ErrUnknownShare
+	}
+	// A group grant covers the named group and every group nested below it.
+	// Expanding here keeps the permission check itself a map lookup.
+	for _, scope := range scoped {
+		ids, err := s.groupSubtreeLocked(ownerID, scope.GroupID)
+		if err != nil {
+			return sharedGrants{}, err
+		}
+		for _, id := range ids {
+			if permissionRank(scope.Permission) > permissionRank(out.groups[id]) {
+				out.groups[id] = scope.Permission
+			}
+		}
 	}
 	return out, nil
 }
 
+// groupSubtreeLocked lists rootID and every live group nested below it. The
+// depth bound stops a damaged parent chain from looping forever.
+func (s *Store) groupSubtreeLocked(ownerID, rootID string) ([]string, error) {
+	rows, err := s.db.Query(
+		`WITH RECURSIVE subtree(id, depth) AS (
+			SELECT ?, 1
+			UNION
+			SELECT g.group_id, s.depth + 1 FROM address_book_groups g
+			JOIN subtree s ON g.parent_id = s.id
+			WHERE g.user_id = ? AND g.deleted = 0 AND s.depth < ?
+		) SELECT id FROM subtree`,
+		rootID, ownerID, maxGroupDepth,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("account store %s: read group subtree: %w", s.path, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // effective is the strongest permission covering groupID. The whole-book
-// grant covers every group; a group grant only covers its own group.
+// grant covers every group; a group grant covers its subtree.
 func (g sharedGrants) effective(groupID string) string {
 	best := g.whole
 	if permission := g.groups[groupID]; permissionRank(permission) > permissionRank(best) {
@@ -2818,7 +3135,7 @@ func (s *Store) UpdateSharedPeerAt(granteeID, ownerUsername, peerID string, name
 	if err := grants.require(PermissionWrite, groupID); err != nil {
 		return Peer{}, err
 	}
-	return s.updatePeerLocked(grants.ownerID, peerID, name, tags, nil, ifRevision)
+	return s.updatePeerLocked(grants.ownerID, peerID, name, tags, nil, nil, ifRevision)
 }
 
 func (s *Store) DeleteSharedPeer(granteeID, ownerUsername, peerID string) (bool, error) {
@@ -2885,7 +3202,7 @@ func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, n
 	if err := grants.require(PermissionWrite, groupID); err != nil {
 		return Peer{}, err
 	}
-	return s.updatePeerLocked(grants.ownerID, peerID, &name, &tags, groupArg, 0)
+	return s.updatePeerLocked(grants.ownerID, peerID, &name, &tags, groupArg, nil, 0)
 }
 
 // ShareBookAs lets a grantee with whole-book control permission manage

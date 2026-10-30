@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../theme.dart';
+import 'package:chast_viewer/l10n.dart';
 
 /// One line of session chat, either sent by this viewer or received from the
 /// host. The protocol carries plain UTF-8 text without a direction field; the
@@ -44,14 +45,14 @@ class ChatPanel extends StatefulWidget {
   static String? validate(String text) {
     final String value = text.trim();
     if (value.isEmpty) {
-      return '消息不能为空';
+      return tr('消息不能为空');
     }
     if (value.contains('\u0000')) {
-      return '消息不能包含空字符';
+      return tr('消息不能包含空字符');
     }
     final int bytes = utf8.encode(value).length;
     if (bytes > kMaxChatBytes) {
-      return '消息过长：$bytes / $kMaxChatBytes 字节';
+      return tr('消息过长：{bytes} / {kMaxChatBytes} 字节', <String, Object?>{'bytes': bytes, 'kMaxChatBytes': kMaxChatBytes});
     }
     return null;
   }
@@ -129,7 +130,7 @@ class _ChatPanelState extends State<ChatPanel> {
       return;
     }
     if (!queued) {
-      setState(() => _error = '发送失败：会话未就绪或发送队列已满');
+      setState(() => _error = tr('发送失败：会话未就绪或发送队列已满'));
       return;
     }
     _input.clear();
@@ -157,8 +158,8 @@ class _ChatPanelState extends State<ChatPanel> {
                   const SizedBox(width: 10),
                   const Icon(Icons.forum_rounded, size: 16, color: kAccentBright),
                   const SizedBox(width: 7),
-                  const Text(
-                    '会话聊天',
+                  Text(
+                    tr('会话聊天'),
                     style: TextStyle(
                       color: Colors.white,
                       fontSize: 12.5,
@@ -168,7 +169,7 @@ class _ChatPanelState extends State<ChatPanel> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      '收 ${widget.received} · 发 ${widget.sent}',
+                      tr('收 {p1} · 发 {p2}', <String, Object?>{'p1': widget.received, 'p2': widget.sent}),
                       textAlign: TextAlign.right,
                       style: const TextStyle(color: Colors.white38, fontSize: 10.5),
                     ),
@@ -178,7 +179,7 @@ class _ChatPanelState extends State<ChatPanel> {
                     height: 30,
                     child: IconButton(
                       padding: EdgeInsets.zero,
-                      tooltip: '关闭聊天',
+                      tooltip: tr('关闭聊天'),
                       icon: const Icon(Icons.close_rounded, size: 16),
                       color: Colors.white54,
                       onPressed: widget.onClose,
@@ -191,9 +192,9 @@ class _ChatPanelState extends State<ChatPanel> {
             const Divider(height: 1, color: Colors.white12),
             Expanded(
               child: widget.entries.isEmpty
-                  ? const Center(
+                  ? Center(
                       child: Text(
-                        '还没有消息。发送一条试试。',
+                        tr('还没有消息。发送一条试试。'),
                         style: TextStyle(color: Colors.white30, fontSize: 11),
                       ),
                     )
@@ -235,7 +236,7 @@ class _ChatPanelState extends State<ChatPanel> {
                       cursorColor: kAccentBright,
                       decoration: InputDecoration(
                         isDense: true,
-                        hintText: '输入消息，Enter 发送',
+                        hintText: tr('输入消息，Enter 发送'),
                         hintStyle:
                             const TextStyle(color: Colors.white30, fontSize: 11.5),
                         filled: true,
@@ -265,7 +266,7 @@ class _ChatPanelState extends State<ChatPanel> {
                     height: 34,
                     child: IconButton(
                       padding: EdgeInsets.zero,
-                      tooltip: '发送',
+                      tooltip: tr('发送'),
                       icon: const Icon(Icons.send_rounded, size: 17),
                       color: _sending ? Colors.white24 : kAccentBright,
                       onPressed: _sending ? null : _submit,
@@ -317,7 +318,7 @@ class _ChatBubble extends StatelessWidget {
               ),
               const SizedBox(height: 2),
               Text(
-                '${entry.mine ? '我' : '主机'} · $time',
+                tr('{p5} · {time}', <String, Object?>{'p5': entry.mine ? tr('我') : tr('主机'), 'time': time}),
                 style: const TextStyle(color: Colors.white30, fontSize: 9.5),
               ),
             ],

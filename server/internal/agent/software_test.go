@@ -1,6 +1,12 @@
 package agent
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/ltpara/ds-chcast/server/internal/identity"
+)
 
 func TestSoftwareUpdateAvailability(t *testing.T) {
 	previous := Version
@@ -46,5 +52,50 @@ func TestRegistrationRemembersSoftwareOffer(t *testing.T) {
 	h.mu.Unlock()
 	if seen != "" {
 		t.Fatalf("softwareSeen after the server stopped advertising = %q", seen)
+	}
+}
+
+func TestStartHostRejectsAutoUpdateWithoutPin(t *testing.T) {
+	_, err := StartHost(context.Background(), HostConfig{
+		ServerURL:  "http://127.0.0.1:1",
+		ID:         "devbox",
+		Key:        "host-secret-key",
+		AutoUpdate: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "--auto-update needs --server-pubkey") {
+		t.Fatalf("StartHost with --auto-update and no pin = %v", err)
+	}
+}
+
+func TestStartUpdateIgnoredWhenDisabled(t *testing.T) {
+	h, _ := testHostAgent(t)
+	h.startUpdate(softwareInfo{Version: "9.9.9", URL: "https://example.com/a.exe"})
+	h.mu.Lock()
+	tried := len(h.updatesTried)
+	h.mu.Unlock()
+	if tried != 0 {
+		t.Fatalf("auto-update off still recorded %d attempts", tried)
+	}
+}
+
+func TestStartUpdateStagesOncePerVersion(t *testing.T) {
+	srv, err := identity.GenerateServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _ := testHostAgent(t)
+	h.ctx = context.Background()
+	h.cfg.AutoUpdate = true
+	h.cfg.ServerPublicKey = srv.PublicKeyText()
+
+	offer := softwareInfo{Version: "9.9.9", URL: "https://example.com/chast-9.9.9.exe"}
+	h.startUpdate(offer)
+	h.startUpdate(offer)
+
+	h.mu.Lock()
+	tried := len(h.updatesTried)
+	h.mu.Unlock()
+	if tried != 1 {
+		t.Fatalf("updatesTried holds %d versions, want 1", tried)
 	}
 }

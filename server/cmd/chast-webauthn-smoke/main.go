@@ -1,7 +1,8 @@
 // Command chast-webauthn-smoke drives a running chast-server through the
 // security-key HTTP ceremonies using the in-repo software authenticator. It is
-// the real-process acceptance probe for P2-19: registration, listing, assertion
-// login, replay and tampered-signature rejection, and removal.
+// the real-process acceptance probe for P2-19: registration, listing,
+// password-gated and passwordless assertion login, replay and
+// tampered-signature rejection, and removal.
 package main
 
 import (
@@ -324,6 +325,65 @@ func run(serverURL, adminAddr, rpID, origin, username, password string, keep boo
 	}
 	report.check("issued token is accepted", status == http.StatusOK, string(data))
 
+	// Passwordless login: the username selects the key and no password is sent.
+	status, data, err = api.call(http.MethodPost, "/v1/account/login/webauthn/passwordless/begin", "",
+		map[string]string{"username": username})
+	if err != nil {
+		return fmt.Errorf("passwordless login begin: %w", err)
+	}
+	var passwordlessBegin beginReply
+	if err := json.Unmarshal(data, &passwordlessBegin); err != nil {
+		return fmt.Errorf("passwordless login begin reply: %w", err)
+	}
+	report.check("passwordless begin offers the registered key",
+		status == http.StatusOK && passwordlessBegin.Challenge != "" && passwordlessBegin.RPID == rpID &&
+			len(passwordlessBegin.Credentials) == 1 && passwordlessBegin.Credentials[0].ID == stored.ID,
+		string(data))
+	passwordlessChallenge, err := base64.RawURLEncoding.DecodeString(passwordlessBegin.Challenge)
+	if err != nil {
+		return fmt.Errorf("passwordless challenge: %w", err)
+	}
+	passwordlessClientData, passwordlessAuthData, passwordlessSignature, err := auth.Assert(passwordlessChallenge)
+	if err != nil {
+		return fmt.Errorf("passwordless assert: %w", err)
+	}
+	passwordlessAssertion := map[string]string{
+		"username":           username,
+		"credential_id":      stored.ID,
+		"client_data_json":   encode(passwordlessClientData),
+		"authenticator_data": encode(passwordlessAuthData),
+		"signature":          encode(passwordlessSignature),
+		"device_name":        "smoke-passwordless",
+	}
+	status, data, err = api.call(http.MethodPost, "/v1/account/login/webauthn/passwordless/finish", "", passwordlessAssertion)
+	if err != nil {
+		return fmt.Errorf("passwordless login: %w", err)
+	}
+	var passwordlessSession loginReply
+	if err := json.Unmarshal(data, &passwordlessSession); err != nil {
+		return fmt.Errorf("passwordless login reply: %w", err)
+	}
+	report.check("passwordless login issues password and refresh tokens",
+		status == http.StatusOK && passwordlessSession.Token != "" && passwordlessSession.RefreshToken != "",
+		string(data))
+	status, data, err = api.call(http.MethodGet, "/v1/account", passwordlessSession.Token, nil)
+	if err != nil {
+		return fmt.Errorf("passwordless account probe: %w", err)
+	}
+	report.check("passwordless token is accepted", status == http.StatusOK, string(data))
+	status, data, err = api.call(http.MethodPost, "/v1/account/login/webauthn/passwordless/finish", "", passwordlessAssertion)
+	if err != nil {
+		return fmt.Errorf("replay passwordless assertion: %w", err)
+	}
+	report.check("replayed passwordless assertion is rejected", status == http.StatusUnauthorized, string(data))
+	status, data, err = api.call(http.MethodPost, "/v1/account/login/webauthn/passwordless/begin", "",
+		map[string]string{"username": username + "-missing"})
+	if err != nil {
+		return fmt.Errorf("unknown passwordless begin: %w", err)
+	}
+	report.check("passwordless begin hides unknown accounts",
+		status == http.StatusAccepted && strings.Contains(string(data), "accepted"), string(data))
+
 	status, data, err = api.call(http.MethodPost, "/v1/account/login/webauthn/finish", "", assertion)
 	if err != nil {
 		return fmt.Errorf("replay assertion: %w", err)
@@ -406,14 +466,23 @@ func run(serverURL, adminAddr, rpID, origin, username, password string, keep boo
 	report.check("login without keys is answered like an enabled account",
 		status == http.StatusAccepted && strings.Contains(string(data), "accepted"), string(data))
 
+	status, data, err = api.call(http.MethodPost, "/v1/account/login/webauthn/passwordless/begin", "",
+		map[string]string{"username": username})
+	if err != nil {
+		return fmt.Errorf("passwordless begin without keys: %w", err)
+	}
+	report.check("passwordless begin without keys is answered like an enabled account",
+		status == http.StatusAccepted && strings.Contains(string(data), "accepted"), string(data))
+
 	audit, err := adminCommand(adminAddr, "audit 50")
 	if err != nil {
 		return fmt.Errorf("audit: %w", err)
 	}
-	report.check("audit records registration, login and removal",
+	report.check("audit records registration, both logins and removal",
 		strings.Contains(audit, "action=webauthn_register") &&
 			strings.Contains(audit, "action=webauthn_remove") &&
-			strings.Contains(audit, "password+security-key"),
+			strings.Contains(audit, "password+security-key") &&
+			strings.Contains(audit, "passwordless-security-key"),
 		audit)
 
 	if report.failed > 0 {

@@ -5,8 +5,8 @@
   `libs/hbb_common/protos/rendezvous.proto`（协议契约）与客户端调用点
   （`src/rendezvous_mediator.rs`、`src/client.rs`、`src/common.rs`、
   `src/ui_interface.rs`、`src/lan.rs`）。
-- 我们的实现以 `server/`（Go）为准，本文初稿写于协议 v25；端口转发（v26）与
-  远程终端（v27）之后已落地，当前协议版本为 **v27**。
+- 我们的实现以 `server/`（Go）为准，本文初稿写于协议 v25；端口转发（v26）、
+  远程终端（v27）与查看器录制权限（v28）之后已落地，当前协议版本为 **v28**。
 
 ## 结论
 
@@ -24,7 +24,9 @@
    补齐（P1 全部完成，P2-2 完成）；端口转发原生链路与 CLI 回环验收完成
    （协议 v26，属主机/会话层，见 `docs/m11-p2-port-forward-plan.md`）；
    远程终端与查看器 Flutter 面板完成（协议 v27，见
-   `docs/m11-p2-terminal-plan.md`），端口转发 GUI 也已接入。基于会合的 HTTP
+   `docs/m11-p2-terminal-plan.md`），端口转发 GUI 也已接入；主机授予的查看器
+   录制权限完成（协议 v28，对应 RustDesk `enable-record-session`，默认允许，
+   含主机审批/设置/托盘与查看器门控，见 `docs/roadmap.md` P2-25）。基于会合的 HTTP
    API 代理（P2-1）于 2026-10-28 判定不适用（开源 hbbs 未实现该消息，chast
    以 UDP/TCP 同端口号绑定即可单端口部署）；ACME 自动证书（P2-20）同日补齐
    （HTTP-01 自动申请与续期），SQLite schema 版本化迁移（P2-21）也于同日
@@ -150,6 +152,13 @@
     单机回环 `account_sync_smoke.dart ... share` 44 项全过（10 项分组范围）。
     覆盖旧库迁移、越权读写、跨分组添加、整本+分组叠加、组级控制不能管理授权
     与分组删除撤权。
+  - 分组嵌套与排序（2026-10-28，已完成）：账号库 schema v3 为分组增加
+    `parent_id`/`position`、为条目增加 `position`；上级须为同一账号的存活
+    分组，成环/深度超 8/负位置返回 400。读取按 `position,name,group_id`
+    与 `position,peer_id` 稳定排序；删组把子分组上移到被删组的上级、解绑
+    条目并撤销该范围授权；分组授权覆盖整棵子树，祖先只作为容器出现。
+    查看器按分组树缩进展示，分组对话框可改上级并上下重排同级，设备菜单
+    支持组内上移/下移。
 
 ### P1-1 主机 ID 迁移（`old_id`）——已完成
 
@@ -314,34 +323,42 @@
   不换码、重放拒绝与审计；查看器登录表单可切换邮件验证码（2026-10-28）。
   边界是邮件需先绑定邮箱，SMTP 失败不重试。
 - WebAuthn 安全密钥（2026-10-28 完成，P1-4 的强认证补充）：RustDesk 的两步
-  验证只有 TOTP 与恢复码，没有 WebAuthn，这项按 chast 自有设计补齐。密码仍
-  是第一因素，Windows Hello / FIDO2 平台认证器作为第二因素；只改 HTTP 账号
+  验证只有 TOTP 与恢复码，没有 WebAuthn，这项按 chast 自有设计补齐。
+  Windows Hello / FIDO2 平台认证器可作密码后的第二因素，也可免密码登录
+  （P2-30，2026-10-28：用户名选中已注册凭据后直接断言）；只改 HTTP 账号
   API，会话协议保持 v27。服务端 `internal/webauthn` 用极简 CBOR 解码支持
   ES256/RS256/EdDSA，校验 clientDataJSON 的 type/challenge/origin/
   crossOrigin、rpIdHash、UP 与签名，attestation 接受 `none`/`packed` 但不
   校验证书链；挑战 32 字节、5 分钟、按 `(user_id, purpose)` 单活，登录成功
-  与签发令牌同一事务消费，重放必然失败，签名计数非零回退拒绝。六个接口：
+  与签发令牌同一事务消费，重放必然失败，签名计数非零回退拒绝。八个接口：
   `POST /v1/account/webauthn/register/{begin,finish}`、
   `GET /v1/account/webauthn/credentials`、
   `POST /v1/account/webauthn/credentials/remove`、
-  `POST /v1/account/login/webauthn/{begin,finish}`；`--webauthn-rp-id` 与
-  `--webauthn-origin` 缺一关闭，相关路由返回 503。登录开始时无凭据返回 202
-  以免枚举；管理员 `user reset-2fa` 与删号清空凭据与挑战，封禁保留凭据但
-  登录 403，改密不删除凭据。验证：`internal/webauthn`/`account`/`api` 单测
-  覆盖三种算法、origin/rpId/challenge/UP/计数器/格式错误、限流、封禁、重放
-  与审计；`server/cmd/chast-webauthn-smoke` 用软件认证器连接真实
-  `chast-server` 完成 18 项回环检查（注册 → 列表 → 断言登录 → 重放拒绝 →
-  错误签名拒绝 → 删除）全部通过；查看器账号对话框可注册/命名/删除安全密钥，
-  登录页“使用安全密钥”完成密码 + 断言（2026-10-28，组件测试）。边界：
-  attestation 不校验证书链（安全依赖注册时的密码认证），不支持 passkey
-  无密码登录与跨设备同步；真实 Windows Hello 弹窗保留人工验收。
+  `POST /v1/account/login/webauthn/{begin,finish}`、
+  `POST /v1/account/login/webauthn/passwordless/{begin,finish}`；
+  `--webauthn-rp-id` 与 `--webauthn-origin` 缺一关闭，相关路由返回 503。
+  密码版与免密码登录使用独立 purpose，可同时挂起、互不替换也互不重放；
+  登录开始时无凭据返回 202 以免枚举，免密码 begin 对未知账号与无凭据统一
+  202 且不计限流失败，封禁只对有效断言返回 403；管理员 `user reset-2fa` 与
+  删号清空凭据与挑战，封禁保留凭据但登录 403，改密不删除凭据。验证：
+  `internal/webauthn`/`account`/`api` 单测覆盖三种算法、origin/rpId/challenge/
+  UP/计数器/格式错误、双 purpose、限流、封禁、重放与审计；
+  `server/cmd/chast-webauthn-smoke` 用软件认证器连接真实 `chast-server`
+  完成 25 项回环检查（注册 → 列表 → 密码 + 断言登录 → 免密码断言登录 →
+  令牌可用 → 重放拒绝 → 错误签名拒绝 → 未知账号/删除后 202 → 删除）全部
+  通过；查看器账号对话框可注册/命名/删除安全密钥，登录页“使用安全密钥”
+  与主表单“使用安全密钥登录”分别完成密码 + 断言与免密码断言
+  （2026-10-28，组件测试）。边界：attestation 不校验证书链（安全依赖注册时
+  的密码认证），免密码登录必须输入用户名（用户名作用域），不支持无用户名的
+  可发现凭据与跨设备同步；真实 Windows Hello 弹窗保留人工验收。
 - ACME 自动证书（2026-10-28 完成，P2-20，chast 自有设计）：hbbs 没有内建
   ACME，官方部署依赖反向代理或手工证书；chast 用 `--acme-domain` 由
   `golang.org/x/crypto/acme/autocert` 直接完成 HTTP-01 申请与续期，支持
   多域名、联系邮箱、EAB 与自定义 ACME 目录，证书和账户密钥缓存到
   `--acme-cache`（默认在 `--state` 同目录）；`--acme-http-listen` 只做挑战
   应答与 HTTPS 跳转，不暴露业务 API；与 `--tls-cert`/`--tls-key` 互斥，可与
-  `--tls-client-ca` 组合，挑战端口不能与 `--http-listen` 相同。验证：
+  `--tls-client-ca` 组合（CA 文件与文件证书模式一样热加载），挑战端口不能
+  与 `--http-listen` 相同。验证：
   `internal/acmecert` 单测覆盖域名解析、EAB、缓存命中、白名单外主机、mTLS
   与 302/404/403；真实进程回环用预置 `acme.test` 缓存证书启动，HTTPS
   `/v1/server` 返回 `"tls":true`，挑战监听 302/404，六项负向校验按预期
@@ -461,15 +478,24 @@
   `verify --terminal` 真实 cmd.exe 回显通过，`flutter test` 303 项与
   Release 构建通过；剩余双机/中继验收与真实 GUI 点击复核，详见
   `docs/m11-p2-terminal-plan.md`）；WebAuthn 安全密钥完成（2026-10-28，
-  密码 + Windows Hello/FIDO2 作为第二因素，六个 HTTP 接口，真实进程软件
-  认证器回环 18 项通过，详见
-  `docs/m11-p2-webauthn-plan.md`）；HTTP API 代理保留但价值低（我们直接
+  Windows Hello/FIDO2 可作第二因素或免密码登录，八个 HTTP 接口，真实进程
+  软件认证器回环 25 项通过，详见
+  `docs/m11-p2-webauthn-plan.md`）；查看器录制权限完成（2026-10-28，协议
+  v28，主机 `allow_record` 默认开启、审批/设置/托盘可切换，查看器无同意时
+  拒绝新录制且撤销不影响进行中的录制，真实主机回环允许/拒绝两条路径均
+  验证，见 `docs/roadmap.md` P2-25）；查看器录制归档完成（2026-10-28，
+  协议无变化，P2-29：可选上传、账号配额与保留期、账号云端录制管理，真实
+  `chast-server` 回环与 Dart 客户端跨栈回环通过）；管理台运营者录制管理同日
+  补齐（`GET /v1/recordings` 与 `GET/DELETE /v1/recordings/{id}`：`readonly`
+  跨账号列出/过滤/下载，`operator` 删除，删除审计记在属主名下并注明操作者；
+  控制台“录制”页签支持过滤、翻页、下载与二次确认删除，API 单测、真实服务端
+  与浏览器回环通过）；HTTP API 代理保留但价值低（我们直接
   暴露 HTTP/TLS API）。
 
 ## 5. 完成标准
 
 - 每项都有单元测试 + 回环验收记录，写回本文档与 `server/README.md`。
-- 协议字段只增不改；语义变化提升版本号（当前 v27）。
+- 协议字段只增不改；语义变化提升版本号（当前 v28）。
 - 不引入 RustDesk 代码或依赖；仅参考行为与字段语义。
 
 ## 6. 2026-10-27 复核：服务端剩余差距
@@ -489,7 +515,14 @@
    代理（`HttpProxyRequest`）判定不适用（2026-10-28：开源 hbbs 亦未实现；
    chast 的 UDP 会合与 TCP HTTP 可共用端口号，单端口绑定已回环验证）；软件
    更新已能托管发布文件并在通告中附带 SHA-256/大小/服务器签名
-   （`--software-dir`），仍不自动下载安装。
+   （`--software-dir`），主机代理也已能固定服务器公钥后自动校验、暂存并
+   启动安装器（2026-10-28，`--auto-update`，真实进程回环验收）；查看器在
+   固定服务器身份后也可“下载并安装”，由 `chast-tunnel apply-update` 等待
+   查看器退出后换入并重启（2026-10-28，P2-27，真实回环验收）；客户端分发
+   已补 Windows 单文件安装器 `chast-setup`（2026-10-28，P2-28，按用户/机器
+   安装、卸载项、快捷方式、可选服务），`tools/package-windows.ps1` 可产出
+   `dist/chast-<ver>-setup.exe`，因此“安装器”不再列为缺口；界面多语言
+   （i18n）已于 2026-10-28 完成；仍未做的是非 Windows 平台打包。
 3. **运维与规模化**：审计/连接/文件传输列表已支持 `before_id` 游标分页、
    `--audit-retention-days` 时间清理（管理台 `audit prune <days>`）与
    `format=csv` 整表导出（沿用 `action`/`username`/`host` 过滤，仍无外部
@@ -505,8 +538,9 @@
    `--tls-client-key`，节点池的 `--relay-node-*`）；服务端与中继会在
    `--tls-cert`/`--tls-key` 文件被替换后约 5 秒内热加载（坏文件保留旧证书），
    相当于 certbot 续期免重启；ACME 自动申请已于 2026-10-28 补齐（P2-20，
-   HTTP-01、缓存未命中才签发、可与 mTLS 组合），CA 客户端证书热加载需
-   重启；SQLite 单连接（`SetMaxOpenConns(1)`），已加前向版本化 schema 迁移
+   HTTP-01、缓存未命中才签发、可与 mTLS 组合），文件证书与 ACME 模式下的
+   客户端 CA 都随替换热加载（P2-26 及同日补强）；SQLite 单连接
+   （`SetMaxOpenConns(1)`），已加前向版本化 schema 迁移
    （2026-10-28，P2-21：`schema_migrations`/`registry_schema_migrations`
    记录版本，旧库自动补记，旧二进制拒绝打开新版本库），仍无 Postgres/
    水平扩展；账号持久封禁已补齐（封禁吊销全部令牌、拒绝密码登录，
@@ -516,4 +550,4 @@
    作废、管理台代设/代发、查看器短信找回通道），同日还补齐了短信登录码与
    邮件登录码（两步验证备用通道，`POST /v1/account/login/sms|email` +
    `sms_code|email_code`），WebAuthn 安全密钥也于 2026-10-28 补齐（密码 +
-   Windows Hello/FIDO2，服务端只存公钥）。
+   Windows Hello/FIDO2 或免密码断言，服务端只存公钥）。

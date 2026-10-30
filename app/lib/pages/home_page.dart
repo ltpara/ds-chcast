@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:chast_viewer/l10n.dart';
+
 import '../account_store.dart';
 import '../address_book_sync.dart';
 import '../app_info.dart';
@@ -15,12 +17,15 @@ import '../server_identity.dart';
 import '../server_settings.dart';
 import '../target.dart';
 import '../theme.dart';
+import '../tunnel_agent.dart';
 import '../trust_store.dart';
+import '../viewer_bridge.dart';
 import '../wake_on_lan.dart';
 import 'session_page.dart';
 import 'groups_dialog.dart';
 import 'account_sessions_dialog.dart';
 import 'change_password_dialog.dart';
+import 'recording_archive_dialog.dart';
 import 'recovery_dialog.dart';
 import 'security_key_dialog.dart';
 import 'shared_books_dialog.dart';
@@ -66,6 +71,11 @@ typedef AccountSecurityKeyLogin =
       required String username,
       required String password,
     });
+typedef AccountPasswordlessSecurityKeyLogin =
+    Future<AccountLoginResult> Function(
+      ServerSettings server, {
+      required String username,
+    });
 typedef AccountRefresh =
     Future<AccountLoginResult> Function(
       ServerSettings server,
@@ -91,6 +101,8 @@ typedef AddressBookPeerWriter =
     });
 typedef AddressBookPeerDeleter =
     Future<void> Function(ServerSettings server, String token, String peerId);
+typedef ViewerUpdateInstaller =
+    Future<void> Function(SoftwareInfo update, String serverPublicKey);
 
 class HomePage extends StatefulWidget {
   const HomePage({
@@ -107,6 +119,7 @@ class HomePage extends StatefulWidget {
     this.accountLoginSMS,
     this.accountLoginEmail,
     this.accountSecurityKeyLogin,
+    this.accountPasswordlessSecurityKeyLogin,
     this.accountRefresh,
     this.accountLogout,
     this.addressBookFetcher,
@@ -114,6 +127,8 @@ class HomePage extends StatefulWidget {
     this.addressBookPeerDeleter,
     this.wakeSender,
     this.lanDiscovery,
+    this.softwareUpdater,
+    this.appExit,
   });
 
   final String? initialTarget;
@@ -130,6 +145,7 @@ class HomePage extends StatefulWidget {
   final LoginSMSRequester? accountLoginSMS;
   final LoginEmailRequester? accountLoginEmail;
   final AccountSecurityKeyLogin? accountSecurityKeyLogin;
+  final AccountPasswordlessSecurityKeyLogin? accountPasswordlessSecurityKeyLogin;
   final AccountRefresh? accountRefresh;
   final AccountLogout? accountLogout;
   final AddressBookFetcher? addressBookFetcher;
@@ -137,6 +153,8 @@ class HomePage extends StatefulWidget {
   final AddressBookPeerDeleter? addressBookPeerDeleter;
   final WakeSender? wakeSender;
   final LanDiscovery? lanDiscovery;
+  final ViewerUpdateInstaller? softwareUpdater;
+  final void Function(int code)? appExit;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -161,6 +179,7 @@ class _HomePageState extends State<HomePage> {
   late final LoginSMSRequester _requestLoginSMS;
   late final LoginEmailRequester _requestLoginEmail;
   late final AccountSecurityKeyLogin _loginWithSecurityKey;
+  late final AccountPasswordlessSecurityKeyLogin _loginWithSecurityKeyOnly;
   late final AccountRefresh _refreshAccount;
   late final AccountLogout _logoutAccount;
   late final AddressBookFetcher _fetchAddressBook;
@@ -168,6 +187,8 @@ class _HomePageState extends State<HomePage> {
   late final AddressBookPeerDeleter _deleteAddressBookPeer;
   late final WakeSender _wakeSender;
   late final LanDiscovery _lanDiscovery;
+  late final ViewerUpdateInstaller _installUpdate;
+  late final void Function(int code) _exitApp;
 
   List<Device> _devices = <Device>[];
   List<AddressBookGroup> _groups = <AddressBookGroup>[];
@@ -199,10 +220,26 @@ class _HomePageState extends State<HomePage> {
     _serverStore = widget.serverStore ?? ServerSettingsStore();
     _trustStore = widget.trustStore ?? TrustStore();
     _identityStore = widget.identityStore ?? ServerIdentityStore();
-    _accountStore = widget.accountStore ?? AccountSessionStore();
+    _accountStore = widget.accountStore ??
+        AccountSessionStore(
+          protectSecret: ViewerBridge.protectSecret,
+          unprotectSecret: ViewerBridge.unprotectSecret,
+        );
     _lookupBatch = widget.lookupBatch ?? ServerApi.lookupBatch;
     _wakeSender = widget.wakeSender ?? WakeOnLan.send;
     _lanDiscovery = widget.lanDiscovery ?? const LanDiscovery();
+    _installUpdate =
+        widget.softwareUpdater ??
+        (SoftwareInfo update, String serverPublicKey) =>
+            TunnelAgent.applyUpdate(
+              version: update.version,
+              url: update.url,
+              sha256: update.sha256,
+              size: update.size,
+              signature: update.signature,
+              serverPublicKey: serverPublicKey,
+            );
+    _exitApp = widget.appExit ?? exit;
     _updateLabels = widget.labelsUpdater ?? ServerApi.updateLabels;
     _loginAccount =
         widget.accountLogin ??
@@ -258,6 +295,14 @@ class _HomePageState extends State<HomePage> {
           password: password,
           deviceName: _hostname,
         );
+    _loginWithSecurityKeyOnly =
+        widget.accountPasswordlessSecurityKeyLogin ??
+        (ServerSettings server, {required String username}) =>
+            loginWithSecurityKeyOnly(
+              server,
+              username: username,
+              deviceName: _hostname,
+            );
     _logoutAccount =
         widget.accountLogout ??
         (ServerSettings server, String token) =>
@@ -482,7 +527,7 @@ class _HomePageState extends State<HomePage> {
             if (pin != null) {
               for (final HostInfo info in batch.hosts.values) {
                 if (info.serverPublicKey != pin.identity.publicKey) {
-                  throw const ServerApiException('服务器身份已变化，已拒绝查询');
+                  throw ServerApiException(tr('服务器身份已变化，已拒绝查询'));
                 }
               }
             }
@@ -531,22 +576,25 @@ class _HomePageState extends State<HomePage> {
     return text.startsWith('[') || text.contains(':');
   }
 
-  Future<void> _connect(String input) async {
+  Future<void> _connect(
+    String input, {
+    bool fileTransferOnly = false,
+  }) async {
     if (_opening) {
       return;
     }
     final String text = input.trim();
     final String token = _token.text.trim();
     if (text.isEmpty) {
-      setState(() => _error = '请输入设备 ID 或主机地址');
+      setState(() => _error = tr('请输入设备 ID 或主机地址'));
       return;
     }
     if (!_looksLikeAddress(text) && !_server.configured) {
-      setState(() => _error = '设备 ID 需要先配置连接服务，或输入 主机:端口');
+      setState(() => _error = tr('设备 ID 需要先配置连接服务，或输入 主机:端口'));
       return;
     }
     if (utf8ByteLength(token) > 128) {
-      setState(() => _error = '访问令牌过长，最多 128 字节');
+      setState(() => _error = tr('访问令牌过长，最多 128 字节'));
       return;
     }
     final ConnectTarget? target = parseConnectInput(
@@ -555,19 +603,19 @@ class _HomePageState extends State<HomePage> {
       server: _server,
     );
     if (target == null) {
-      setState(() => _error = '格式无效：请输入设备 ID 或 主机:端口');
+      setState(() => _error = tr('格式无效：请输入设备 ID 或 主机:端口'));
       return;
     }
-    await _open(target);
+    await _open(target, fileTransferOnly: fileTransferOnly);
   }
 
-  Future<void> _connectDevice(Device device) async {
+  Future<void> _connectDevice(Device device, {bool fileTransferOnly = false}) async {
     if (_opening) {
       return;
     }
     final String token = _token.text.trim();
     if (utf8ByteLength(token) > 128) {
-      setState(() => _error = '访问令牌过长，最多 128 字节');
+      setState(() => _error = tr('访问令牌过长，最多 128 字节'));
       return;
     }
     final ConnectTarget? target;
@@ -586,14 +634,17 @@ class _HomePageState extends State<HomePage> {
       target = parseConnectTarget(device.id, token: token);
     }
     if (target == null) {
-      setState(() => _error = '设备地址无效：${device.id}');
+      setState(() => _error = tr('设备地址无效：{p1}', <String, Object?>{'p1': device.id}));
       return;
     }
     _address.text = target.label;
-    await _open(target);
+    await _open(target, fileTransferOnly: fileTransferOnly);
   }
 
-  Future<void> _open(ConnectTarget target) async {
+  Future<void> _open(
+    ConnectTarget target, {
+    bool fileTransferOnly = false,
+  }) async {
     if (_opening) {
       return;
     }
@@ -614,7 +665,9 @@ class _HomePageState extends State<HomePage> {
           return SessionPage(
             target: target,
             account: _account,
+            settings: _server,
             identityStore: _identityStore,
+            fileTransferOnly: fileTransferOnly,
           );
         },
       ),
@@ -729,8 +782,8 @@ class _HomePageState extends State<HomePage> {
       SnackBar(
         content: Text(
           peers.length == 1
-              ? '已添加 ${peers.first.label}'
-              : '已添加 ${peers.length} 台局域网设备',
+              ? tr('已添加 {p2}', <String, Object?>{'p2': peers.first.label})
+              : tr('已添加 {p3} 台局域网设备', <String, Object?>{'p3': peers.length}),
         ),
       ),
     );
@@ -773,11 +826,11 @@ class _HomePageState extends State<HomePage> {
     try {
       await _wakeSender(mac);
       if (mounted) {
-        _showSnack('已发送局域网唤醒包');
+        _showSnack(tr('已发送局域网唤醒包'));
       }
     } catch (error) {
       if (mounted) {
-        _showSnack('唤醒包发送失败：$error');
+        _showSnack(tr('唤醒包发送失败：{error}', <String, Object?>{'error': error}));
       }
     }
   }
@@ -804,14 +857,14 @@ class _HomePageState extends State<HomePage> {
       (Device item) => item.key == device.key,
       orElse: () => device.copyWith(tags: tags),
     );
-    _showSnack('账号标签已保存');
+    _showSnack(tr('账号标签已保存'));
     unawaited(_pushAccountPeer(updated, syncTags: true));
   }
 
   Future<void> _moveDeviceToGroup(Device device) async {
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
-      _showSnack('请先登录账号');
+      _showSnack(tr('请先登录账号'));
       return;
     }
     final String? choice = await showDialog<String>(
@@ -854,7 +907,7 @@ class _HomePageState extends State<HomePage> {
         setState(() => _devices = settled);
       }
       if (mounted) {
-        _showSnack(choice.isEmpty ? '已移到未分组' : '已移动到分组');
+        _showSnack(choice.isEmpty ? tr('已移到未分组') : tr('已移动到分组'));
       }
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
@@ -866,11 +919,11 @@ class _HomePageState extends State<HomePage> {
         return;
       }
       if (mounted) {
-        _showSnack('分组已保存在本机，将在下次同步上传');
+        _showSnack(tr('分组已保存在本机，将在下次同步上传'));
       }
     } catch (_) {
       if (mounted) {
-        _showSnack('分组已保存在本机，将在下次同步上传');
+        _showSnack(tr('分组已保存在本机，将在下次同步上传'));
       }
     }
   }
@@ -878,7 +931,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _manageGroups() async {
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
-      _showSnack('请先登录账号');
+      _showSnack(tr('请先登录账号'));
       return;
     }
     final Map<String, int> counts = <String, int>{};
@@ -913,19 +966,19 @@ class _HomePageState extends State<HomePage> {
       builder: (BuildContext context) {
         return AlertDialog(
           backgroundColor: Theme.of(context).colorScheme.surface,
-          title: const Text('删除设备'),
-          content: Text('从地址簿删除“${device.displayName}”？'),
+          title: Text(tr('删除设备')),
+          content: Text(tr('从地址簿删除“{p4}”？', <String, Object?>{'p4': device.displayName})),
           actions: <Widget>[
             TextButton(
               onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('取消'),
+              child: Text(tr('取消')),
             ),
             FilledButton(
               onPressed: () => Navigator.of(context).pop(true),
               style: FilledButton.styleFrom(
                 backgroundColor: Theme.of(context).colorScheme.error,
               ),
-              child: const Text('删除'),
+              child: Text(tr('删除')),
             ),
           ],
         );
@@ -988,7 +1041,7 @@ class _HomePageState extends State<HomePage> {
     }
     ScaffoldMessenger.of(
       context,
-    ).showSnackBar(const SnackBar(content: Text('服务端别名与标签已保存')));
+    ).showSnackBar(SnackBar(content: Text(tr('服务端别名与标签已保存'))));
     unawaited(_refreshPresence());
   }
 
@@ -1003,8 +1056,11 @@ class _HomePageState extends State<HomePage> {
           requestLoginSMS: _requestLoginSMS,
           requestLoginEmail: _requestLoginEmail,
           securityKeyLogin: _loginWithSecurityKey,
+          securityKeyPasswordlessLogin: _loginWithSecurityKeyOnly,
           syncing: _syncing,
           groups: _groups,
+          uploadRecordings: _server.uploadRecordings,
+          onUploadRecordingsChanged: _setUploadRecordings,
         );
       },
     );
@@ -1054,7 +1110,7 @@ class _HomePageState extends State<HomePage> {
       _groups = <AddressBookGroup>[];
       _groupsSynced = false;
     });
-    _showSnack('已退出账号');
+    _showSnack(tr('已退出账号'));
   }
 
   Future<void> _expireAccount() async {
@@ -1076,14 +1132,14 @@ class _HomePageState extends State<HomePage> {
     final AccountSession? account = _account;
     if (account == null) {
       if (announce) {
-        _showSnack('请先登录账号');
+        _showSnack(tr('请先登录账号'));
       }
       return;
     }
     if (!account.isActiveAt(DateTime.now())) {
       await _expireAccount();
       if (announce) {
-        _showSnack('账号登录已过期，请重新登录');
+        _showSnack(tr('账号登录已过期，请重新登录'));
       }
       return;
     }
@@ -1105,7 +1161,7 @@ class _HomePageState extends State<HomePage> {
           if (error.statusCode == HttpStatus.unauthorized) {
             await _expireAccount();
             if (announce) {
-              _showSnack('账号登录已过期，请重新登录');
+              _showSnack(tr('账号登录已过期，请重新登录'));
             }
             return;
           }
@@ -1167,7 +1223,7 @@ class _HomePageState extends State<HomePage> {
           if (error.statusCode == HttpStatus.unauthorized) {
             await _expireAccount();
             if (announce) {
-              _showSnack('账号登录已过期，请重新登录');
+              _showSnack(tr('账号登录已过期，请重新登录'));
             }
             return;
           }
@@ -1246,14 +1302,14 @@ class _HomePageState extends State<HomePage> {
       if (error.statusCode == HttpStatus.unauthorized) {
         await _expireAccount();
         if (announce) {
-          _showSnack('账号登录已过期，请重新登录');
+          _showSnack(tr('账号登录已过期，请重新登录'));
         }
       } else if (announce) {
-        _showSnack('地址簿同步失败：${error.message}');
+        _showSnack(tr('地址簿同步失败：{p5}', <String, Object?>{'p5': error.message}));
       }
     } catch (error) {
       if (announce) {
-        _showSnack('地址簿同步失败：$error');
+        _showSnack(tr('地址簿同步失败：{error}', <String, Object?>{'error': error}));
       }
     } finally {
       if (mounted) {
@@ -1272,15 +1328,15 @@ class _HomePageState extends State<HomePage> {
   ]) {
     final int uploaded = plan.pushes.length - failed;
     final List<String> details = <String>[
-      if (plan.added > 0) '新增 ${plan.added}',
-      if (plan.updated > 0) '更新 ${plan.updated}',
-      if (plan.removed > 0) '移除 ${plan.removed}',
-      if (uploaded > 0) '上传 $uploaded',
-      if (conflicts > 0) '冲突 $conflicts 已刷新',
-      if (failed > 0) '$failed 项上传失败',
-      if (pendingDeletes > 0) '待删除重试 $pendingDeletes',
+      if (plan.added > 0) tr('新增 {p6}', <String, Object?>{'p6': plan.added}),
+      if (plan.updated > 0) tr('更新 {p7}', <String, Object?>{'p7': plan.updated}),
+      if (plan.removed > 0) tr('移除 {p8}', <String, Object?>{'p8': plan.removed}),
+      if (uploaded > 0) tr('上传 {uploaded}', <String, Object?>{'uploaded': uploaded}),
+      if (conflicts > 0) tr('冲突 {conflicts} 已刷新', <String, Object?>{'conflicts': conflicts}),
+      if (failed > 0) tr('{failed} 项上传失败', <String, Object?>{'failed': failed}),
+      if (pendingDeletes > 0) tr('待删除重试 {pendingDeletes}', <String, Object?>{'pendingDeletes': pendingDeletes}),
     ];
-    return details.isEmpty ? '地址簿已同步' : '地址簿已同步（${details.join('，')}）';
+    return details.isEmpty ? tr('地址簿已同步') : tr('地址簿已同步（{p9}）', <String, Object?>{'p9': details.join('，')});
   }
 
   /// A successful upload settles the offline clear intent it carried and
@@ -1308,7 +1364,7 @@ class _HomePageState extends State<HomePage> {
     final AccountSession? account = _account;
     if (account == null || account.server != _server.url) {
       if (mounted) {
-        _showSnack('该条目已在其他设备修改，请重新同步');
+        _showSnack(tr('该条目已在其他设备修改，请重新同步'));
       }
       return;
     }
@@ -1363,10 +1419,10 @@ class _HomePageState extends State<HomePage> {
         _groupsSynced = true;
         _account = session;
       });
-      _showSnack('该条目已在其他设备修改，已刷新为服务器版本');
+      _showSnack(tr('该条目已在其他设备修改，已刷新为服务器版本'));
     } catch (_) {
       if (mounted) {
-        _showSnack('该条目已在其他设备修改，请重新同步');
+        _showSnack(tr('该条目已在其他设备修改，请重新同步'));
       }
     }
   }
@@ -1496,8 +1552,19 @@ class _HomePageState extends State<HomePage> {
     unawaited(_refreshPresence());
   }
 
+  Future<void> _setUploadRecordings(bool enabled) async {
+    final ServerSettings updated = _server.copyWith(
+      uploadRecordings: enabled,
+    );
+    setState(() => _server = updated);
+    await _serverStore.save(updated);
+  }
+
   Future<void> _showUpdate(SoftwareInfo update) async {
-    final bool? copy = await showDialog<bool>(
+    final ServerIdentityPin? pin = _serverPins[normalizeServerUrl(_server.url)];
+    final String? pinKey = pin?.identity.publicKey;
+    final bool canInstall = update.installable && pinKey != null;
+    final String? action = await showDialog<String>(
       context: context,
       builder: (BuildContext context) {
         return AlertDialog(
@@ -1505,14 +1572,14 @@ class _HomePageState extends State<HomePage> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(18),
           ),
-          title: const Text('发现新版本'),
+          title: Text(tr('发现新版本')),
           content: SizedBox(
             width: 420,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Text('当前版本 $chastVersion，连接服务提供 ${update.version}。'),
+                Text(tr('当前版本 {chastVersion}，连接服务提供 {p10}。', <String, Object?>{'chastVersion': chastVersion, 'p10': update.version})),
                 const SizedBox(height: 12),
                 SelectableText(
                   update.url,
@@ -1520,7 +1587,11 @@ class _HomePageState extends State<HomePage> {
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  '更新由运营者发布，查看器不会自动下载或安装。',
+                  canInstall
+                      ? tr('更新包带有服务端签名。校验通过后查看器退出，由 chast-tunnel 替换并重新启动。')
+                      : update.installable
+                      ? tr('尚未固定此服务器的身份，无法校验更新签名；连接一次后再试，或手动下载。')
+                      : tr('更新由运营者发布，查看器不会自动下载或安装。'),
                   style: mutedStyle(context, size: 10.5),
                 ),
               ],
@@ -1528,26 +1599,52 @@ class _HomePageState extends State<HomePage> {
           ),
           actions: <Widget>[
             TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('关闭'),
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(tr('关闭')),
             ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('复制下载地址'),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop('copy'),
+              child: Text(tr('复制下载地址')),
             ),
+            if (canInstall)
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop('install'),
+                child: Text(tr('下载并安装')),
+              ),
           ],
         );
       },
     );
-    if (copy != true) {
+    if (action == 'install' && pinKey != null) {
+      await _installUpdateAndExit(update, pinKey);
+      return;
+    }
+    if (action != 'copy') {
       return;
     }
     await Clipboard.setData(ClipboardData(text: update.url));
     if (mounted) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('下载地址已复制')));
+      ).showSnackBar(SnackBar(content: Text(tr('下载地址已复制'))));
     }
+  }
+
+  Future<void> _installUpdateAndExit(
+    SoftwareInfo update,
+    String serverPublicKey,
+  ) async {
+    try {
+      await _installUpdate(update, serverPublicKey);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(tr('无法启动更新：{error}', <String, Object?>{'error': error}))));
+      }
+      return;
+    }
+    _exitApp(0);
   }
 
   Future<void> _showAbout() async {
@@ -1559,17 +1656,14 @@ class _HomePageState extends State<HomePage> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(18),
           ),
-          title: const Text('关于 Chast'),
+          title: Text(tr('关于 Chast')),
           content: Text(
-            'Chast $chastVersion\n\n'
-            'Windows 桌面采集、Intel 硬件编码、MsQuic 直连显示与键鼠控制。'
-            '远端需以 chast-quic serve --input 启动才会接受输入；'
-            '设备 ID 经 chast-server 解析，直连失败时自动回退中继。',
+            tr('Chast {chastVersion}\n\nWindows 桌面采集、Intel 硬件编码、MsQuic 直连显示与键鼠控制。远端需以 chast-quic serve --input 启动才会接受输入；设备 ID 经 chast-server 解析，直连失败时自动回退中继。', <String, Object?>{'chastVersion': chastVersion}),
           ),
           actions: <Widget>[
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
-              child: const Text('关闭'),
+              child: Text(tr('关闭')),
             ),
           ],
         );
@@ -1736,7 +1830,7 @@ class _HomePageState extends State<HomePage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
                           Text(
-                            '控制远程桌面',
+                            tr('控制远程桌面'),
                             style: theme.textTheme.titleLarge?.copyWith(
                               fontSize: 19,
                               fontWeight: FontWeight.w600,
@@ -1744,7 +1838,7 @@ class _HomePageState extends State<HomePage> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            '输入设备 ID，或直接连接对端 chast QUIC 地址',
+                            tr('输入设备 ID，或直接连接对端 chast QUIC 地址'),
                             style: mutedStyle(context),
                           ),
                           const SizedBox(height: 18),
@@ -1759,7 +1853,7 @@ class _HomePageState extends State<HomePage> {
                               color: theme.colorScheme.onSurface,
                             ),
                             decoration: InputDecoration(
-                              hintText: '设备 ID 或 主机:端口',
+                              hintText: tr('设备 ID 或 主机:端口'),
                               hintStyle: TextStyle(
                                 fontSize: 18,
                                 fontWeight: FontWeight.w300,
@@ -1803,7 +1897,7 @@ class _HomePageState extends State<HomePage> {
                               color: theme.colorScheme.onSurface,
                             ),
                             decoration: InputDecoration(
-                              hintText: '访问令牌（主机启用时填写）',
+                              hintText: tr('访问令牌（主机启用时填写）'),
                               hintStyle: TextStyle(
                                 fontSize: 13,
                                 color: dark
@@ -1839,8 +1933,8 @@ class _HomePageState extends State<HomePage> {
                           const SizedBox(height: 6),
                           Text(
                             _server.configured
-                                ? '设备 ID 通过 ${_server.url} 解析；令牌只用于这次连接。'
-                                : '带 : 的地址直接连接；设备 ID 需先配置连接服务。',
+                                ? tr('设备 ID 通过 {p11} 解析；令牌只用于这次连接。', <String, Object?>{'p11': _server.url})
+                                : tr('带 : 的地址直接连接；设备 ID 需先配置连接服务。'),
                             style: mutedStyle(context, size: 10.5),
                           ),
                           if (_error != null) ...<Widget>[
@@ -1901,7 +1995,35 @@ class _HomePageState extends State<HomePage> {
                                                   ),
                                             ),
                                           )
-                                        : const Text('连接'),
+                                        : Text(tr('连接')),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Tooltip(
+                                message: tr('仅文件传输'),
+                                child: SizedBox(
+                                  width: 40,
+                                  height: 40,
+                                  child: Material(
+                                    color: fieldFill,
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(8),
+                                      onTap: _opening
+                                          ? null
+                                          : () => _connect(
+                                              _address.text,
+                                              fileTransferOnly: true,
+                                            ),
+                                      child: Icon(
+                                        Icons.folder_shared_rounded,
+                                        size: 20,
+                                        color: dark
+                                            ? Colors.white70
+                                            : const Color(0xFF5A6270),
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -1946,7 +2068,7 @@ class _HomePageState extends State<HomePage> {
                 Row(
                   children: <Widget>[
                     Text(
-                      '我的设备',
+                      tr('我的设备'),
                       style: theme.textTheme.titleMedium?.copyWith(
                         fontSize: 15,
                         fontWeight: FontWeight.w600,
@@ -1974,8 +2096,8 @@ class _HomePageState extends State<HomePage> {
                           ),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        child: const Text(
-                          '清除筛选',
+                        child: Text(
+                          tr('清除筛选'),
                           style: TextStyle(fontSize: 11),
                         ),
                       ),
@@ -1986,20 +2108,20 @@ class _HomePageState extends State<HomePage> {
                         onPressed: _manageGroups,
                         style: TextButton.styleFrom(foregroundColor: kAccent),
                         icon: const Icon(Icons.folder_outlined, size: 16),
-                        label: const Text('分组', style: TextStyle(fontSize: 12)),
+                        label: Text(tr('分组'), style: TextStyle(fontSize: 12)),
                       ),
                     TextButton.icon(
                       key: const Key('lan-scan'),
                       onPressed: _scanLan,
                       style: TextButton.styleFrom(foregroundColor: kAccent),
                       icon: const Icon(Icons.radar_rounded, size: 16),
-                      label: const Text('扫描', style: TextStyle(fontSize: 12)),
+                      label: Text(tr('扫描'), style: TextStyle(fontSize: 12)),
                     ),
                     TextButton.icon(
                       onPressed: _showAddDevice,
                       style: TextButton.styleFrom(foregroundColor: kAccent),
                       icon: const Icon(Icons.add_rounded, size: 16),
-                      label: const Text('添加', style: TextStyle(fontSize: 12)),
+                      label: Text(tr('添加'), style: TextStyle(fontSize: 12)),
                     ),
                   ],
                 ),
@@ -2022,7 +2144,7 @@ class _HomePageState extends State<HomePage> {
                   _emptyPanel(
                     context,
                     icon: Icons.bookmark_add_outlined,
-                    text: '添加常用设备，输入设备 ID 即可一键连接',
+                    text: tr('添加常用设备，输入设备 ID 即可一键连接'),
                     height: 104,
                   )
                 else ...<Widget>[
@@ -2032,7 +2154,7 @@ class _HomePageState extends State<HomePage> {
                     _emptyPanel(
                       context,
                       icon: Icons.search_off_rounded,
-                      text: '没有匹配的设备',
+                      text: tr('没有匹配的设备'),
                       height: 118,
                       action: TextButton(
                         key: const Key('device-filter-reset-empty'),
@@ -2046,8 +2168,8 @@ class _HomePageState extends State<HomePage> {
                           ),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        child: const Text(
-                          '清除筛选',
+                        child: Text(
+                          tr('清除筛选'),
                           style: TextStyle(fontSize: 12),
                         ),
                       ),
@@ -2059,7 +2181,7 @@ class _HomePageState extends State<HomePage> {
                 Row(
                   children: <Widget>[
                     Text(
-                      '最近连接',
+                      tr('最近连接'),
                       style: theme.textTheme.titleMedium?.copyWith(
                         fontSize: 15,
                         fontWeight: FontWeight.w600,
@@ -2076,7 +2198,7 @@ class _HomePageState extends State<HomePage> {
                       TextButton(
                         onPressed: _clearRecent,
                         style: TextButton.styleFrom(foregroundColor: kAccent),
-                        child: const Text('清空', style: TextStyle(fontSize: 12)),
+                        child: Text(tr('清空'), style: TextStyle(fontSize: 12)),
                       ),
                   ],
                 ),
@@ -2085,7 +2207,7 @@ class _HomePageState extends State<HomePage> {
                   _emptyPanel(
                     context,
                     icon: Icons.history_rounded,
-                    text: '连接过的设备会出现在这里，保存后进入我的设备',
+                    text: tr('连接过的设备会出现在这里，保存后进入我的设备'),
                     height: 112,
                   )
                 else
@@ -2133,7 +2255,7 @@ class _HomePageState extends State<HomePage> {
           style: TextStyle(fontSize: 12.5, color: theme.colorScheme.onSurface),
           decoration: InputDecoration(
             isDense: true,
-            hintText: '搜索名称、ID 或标签',
+            hintText: tr('搜索名称、ID 或标签'),
             hintStyle: TextStyle(
               fontSize: 12,
               color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
@@ -2151,7 +2273,7 @@ class _HomePageState extends State<HomePage> {
                 ? null
                 : IconButton(
                     key: const Key('device-search-clear'),
-                    tooltip: '清除搜索',
+                    tooltip: tr('清除搜索'),
                     splashRadius: 14,
                     icon: Icon(
                       Icons.close_rounded,
@@ -2192,7 +2314,7 @@ class _HomePageState extends State<HomePage> {
               _filterChip(
                 context,
                 key: const Key('tag-filter-all'),
-                label: '全部',
+                label: tr('全部'),
                 selected: activeTags.isEmpty,
                 onTap: () => setState(() => _selectedTags.clear()),
               ),
@@ -2259,9 +2381,14 @@ class _HomePageState extends State<HomePage> {
   Widget _buildSavedDevices(BuildContext context, List<Device> saved) {
     final bool accountReady =
         _account != null && _account!.server == _server.url;
+    final List<AddressBookGroup> groups = accountReady
+        ? <AddressBookGroup>[
+            for (final AddressBookGroup group in _groups)
+              if (!group.deleted) group,
+          ]
+        : const <AddressBookGroup>[];
     final Map<String, AddressBookGroup> groupsById = <String, AddressBookGroup>{
-      if (accountReady)
-        for (final AddressBookGroup group in _groups) group.id: group,
+      for (final AddressBookGroup group in groups) group.id: group,
     };
     final Map<String, List<Device>> grouped = <String, List<Device>>{
       for (final String id in groupsById.keys) id: <Device>[],
@@ -2278,11 +2405,33 @@ class _HomePageState extends State<HomePage> {
         ungrouped.add(device);
       }
     }
-    final List<AddressBookGroup> visible = <AddressBookGroup>[
-      for (final AddressBookGroup group in _groups)
-        if (groupsById.containsKey(group.id) &&
-            (grouped[group.id]?.isNotEmpty ?? false))
-          group,
+    for (final List<Device> devices in grouped.values) {
+      devices.sort(_comparePeerOrder);
+    }
+    final List<AddressBookGroupNode> nodes = addressBookGroupTreeOrder(groups);
+    final Map<String, int> subtreeCounts = <String, int>{};
+    for (final AddressBookGroupNode node in nodes.reversed) {
+      int count = grouped[node.group.id]?.length ?? 0;
+      for (final AddressBookGroupNode other in nodes) {
+        if (other.group.parentId == node.group.id) {
+          count += subtreeCounts[other.group.id] ?? 0;
+        }
+      }
+      subtreeCounts[node.group.id] = count;
+    }
+    final Set<String> hidden = <String>{};
+    for (final AddressBookGroupNode node in nodes) {
+      final String parent = node.group.parentId;
+      if (parent.isNotEmpty &&
+          (_collapsedGroups.contains(parent) || hidden.contains(parent))) {
+        hidden.add(node.group.id);
+      }
+    }
+    final List<AddressBookGroupNode> visible = <AddressBookGroupNode>[
+      for (final AddressBookGroupNode node in nodes)
+        if (!hidden.contains(node.group.id) &&
+            (subtreeCounts[node.group.id] ?? 0) > 0)
+          node,
     ];
     if (visible.isEmpty) {
       return Wrap(
@@ -2296,28 +2445,37 @@ class _HomePageState extends State<HomePage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        for (final AddressBookGroup group in visible) ...<Widget>[
+        for (final AddressBookGroupNode node in visible) ...<Widget>[
           _groupHeader(
             context,
-            key: Key('device-group-${group.id}'),
-            label: group.name,
-            count: grouped[group.id]!.length,
-            collapsed: _collapsedGroups.contains(group.id),
+            key: Key('device-group-${node.group.id}'),
+            label: node.group.name,
+            count: subtreeCounts[node.group.id] ?? 0,
+            depth: node.depth,
+            collapsed: _collapsedGroups.contains(node.group.id),
             onToggle: () => setState(() {
-              if (!_collapsedGroups.remove(group.id)) {
-                _collapsedGroups.add(group.id);
+              if (!_collapsedGroups.remove(node.group.id)) {
+                _collapsedGroups.add(node.group.id);
               }
             }),
           ),
-          if (!_collapsedGroups.contains(group.id))
+          if (!_collapsedGroups.contains(node.group.id))
             Padding(
-              padding: const EdgeInsets.only(top: 8),
+              padding: EdgeInsets.only(top: 8, left: node.depth * 16.0),
               child: Wrap(
                 spacing: 12,
                 runSpacing: 12,
                 children: <Widget>[
-                  for (final Device device in grouped[group.id]!)
-                    _deviceCard(device),
+                  for (final Device device in grouped[node.group.id]!)
+                    _deviceCard(
+                      device,
+                      onMoveUp: _canMovePeer(device, -1)
+                          ? () => _movePeerInGroup(device, -1)
+                          : null,
+                      onMoveDown: _canMovePeer(device, 1)
+                          ? () => _movePeerInGroup(device, 1)
+                          : null,
+                    ),
                 ],
               ),
             ),
@@ -2327,7 +2485,7 @@ class _HomePageState extends State<HomePage> {
           _groupHeader(
             context,
             key: const Key('device-group-ungrouped'),
-            label: '未分组',
+            label: tr('未分组'),
             count: ungrouped.length,
             collapsed: _collapsedGroups.contains(''),
             ungrouped: true,
@@ -2353,7 +2511,98 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _deviceCard(Device device) {
+  static int _comparePeerOrder(Device a, Device b) {
+    if (a.position != b.position) {
+      return a.position.compareTo(b.position);
+    }
+    return a.id.compareTo(b.id);
+  }
+
+  /// Saved peers of the same server and group, in server order.
+  List<Device> _groupPeers(String groupId) {
+    return <Device>[
+      for (final Device device in _devices)
+        if (device.saved &&
+            device.viaServer &&
+            device.server == _server.url &&
+            device.groupId == groupId)
+          device,
+    ]..sort(_comparePeerOrder);
+  }
+
+  bool _canMovePeer(Device device, int delta) {
+    final List<Device> peers = _groupPeers(device.groupId);
+    final int index =
+        peers.indexWhere((Device item) => item.key == device.key);
+    final int target = index + delta;
+    return index >= 0 && target >= 0 && target < peers.length;
+  }
+
+  Future<void> _movePeerInGroup(Device device, int delta) async {
+    final AccountSession? account = _account;
+    if (account == null || account.server != _server.url) {
+      return;
+    }
+    final List<Device> peers = _groupPeers(device.groupId);
+    final int index =
+        peers.indexWhere((Device item) => item.key == device.key);
+    final int target = index + delta;
+    if (index < 0 || target < 0 || target >= peers.length) {
+      return;
+    }
+    final List<Device> reordered = List<Device>.of(peers)
+      ..removeAt(index)
+      ..insert(target, device);
+    try {
+      for (int i = 0; i < reordered.length; i++) {
+        final Device item = reordered[i];
+        final int position = i + 1;
+        if (item.position == position) {
+          continue;
+        }
+        final AddressBookPeer written = await ServerApi.updateAddressBookPeer(
+          _server,
+          account.token,
+          item.id,
+          position: position,
+          ifRevision: item.revision > 0 ? item.revision : null,
+        );
+        final List<Device> settled = await _deviceStore.setPeerRevision(
+          item.key,
+          written.revision,
+          position: written.position,
+        );
+        if (mounted) {
+          setState(() => _devices = settled);
+        }
+      }
+      if (mounted) {
+        _showSnack(tr('分组内顺序已更新'));
+      }
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.unauthorized) {
+        await _expireAccount();
+        return;
+      }
+      if (error.statusCode == HttpStatus.conflict) {
+        await _refreshAfterConflict(device.id);
+        return;
+      }
+      if (mounted) {
+        _showSnack(tr('顺序未能上传，请稍后重试'));
+      }
+    } catch (_) {
+      if (mounted) {
+        _showSnack(tr('顺序未能上传，请稍后重试'));
+      }
+    }
+  }
+
+  Widget _deviceCard(
+    Device device, {
+    VoidCallback? onMoveUp,
+    VoidCallback? onMoveDown,
+  }) {
     final bool accountReady =
         _account != null &&
         _account!.server == _server.url &&
@@ -2364,11 +2613,14 @@ class _HomePageState extends State<HomePage> {
       presence: _presence[device.key] ?? DevicePresence.unknown,
       pinned: _trust.containsKey(device.trustKey),
       onTap: () => _connectDevice(device),
+      onFilesOnly: () => _connectDevice(device, fileTransferOnly: true),
       onRename: () => _renameDevice(device),
       onWake: () => _wakeDevice(device),
       onLabels: device.viaServer ? () => _editLabels(device) : null,
       onTags: accountReady ? () => _editTags(device) : null,
       onGroup: accountReady ? () => _moveDeviceToGroup(device) : null,
+      onMoveUp: onMoveUp,
+      onMoveDown: onMoveDown,
       onDelete: () => _deleteDevice(device),
     );
   }
@@ -2380,6 +2632,7 @@ class _HomePageState extends State<HomePage> {
     required int count,
     required bool collapsed,
     required VoidCallback onToggle,
+    int depth = 0,
     bool ungrouped = false,
   }) {
     final ThemeData theme = Theme.of(context);
@@ -2388,7 +2641,7 @@ class _HomePageState extends State<HomePage> {
       borderRadius: BorderRadius.circular(8),
       onTap: onToggle,
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+        padding: EdgeInsets.fromLTRB(2 + depth * 16.0, 4, 2, 4),
         child: Row(
           children: <Widget>[
             Icon(
@@ -2400,7 +2653,7 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(width: 7),
             Text(
-              label.isEmpty ? '未命名分组' : label,
+              label.isEmpty ? tr('未命名分组') : label,
               style: theme.textTheme.titleSmall?.copyWith(
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
@@ -2509,7 +2762,7 @@ class _Sidebar extends StatelessWidget {
     final Color subtle = dark ? Colors.white12 : const Color(0xFFE2E4E9);
     final String service = server.configured
         ? (Uri.tryParse(server.url)?.authority ?? server.url)
-        : '未配置';
+        : tr('未配置');
 
     return SizedBox(
       width: 208,
@@ -2538,27 +2791,34 @@ class _Sidebar extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 10),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      'chast',
-                      style: theme.textTheme.titleLarge?.copyWith(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -0.4,
-                        height: 1.0,
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Text(
+                        'chast',
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: -0.4,
+                          height: 1.0,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text('远程桌面', style: mutedStyle(context, size: 10)),
-                  ],
+                      const SizedBox(height: 3),
+                      Text(
+                        tr('远程桌面'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: mutedStyle(context, size: 10),
+                      ),
+                    ],
+                  ),
                 ),
               ],
             ),
             const SizedBox(height: 34),
             Text(
-              '本机信息',
+              tr('本机信息'),
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: FontWeight.w600,
@@ -2594,7 +2854,7 @@ class _Sidebar extends StatelessWidget {
                             ),
                             const SizedBox(height: 3),
                             Text(
-                              '查看器 · Windows',
+                              tr('查看器 · Windows'),
                               style: mutedStyle(context, size: 10),
                             ),
                           ],
@@ -2607,7 +2867,7 @@ class _Sidebar extends StatelessWidget {
             ),
             const SizedBox(height: 20),
             Text(
-              '连接服务',
+              tr('连接服务'),
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: FontWeight.w600,
@@ -2657,9 +2917,8 @@ class _Sidebar extends StatelessWidget {
                             const SizedBox(height: 2),
                             Text(
                               server.configured
-                                  ? '${server.mode.shortLabel}'
-                                        '${onlineCount > 0 ? ' · $onlineCount 台在线' : ''}'
-                                  : '点击配置',
+                                  ? tr('{p17}{p18}', <String, Object?>{'p17': server.mode.shortLabel, 'p18': onlineCount > 0 ? tr(' · {onlineCount} 台在线', <String, Object?>{'onlineCount': onlineCount}) : ''})
+                                  : tr('点击配置'),
                               style: mutedStyle(context, size: 9.5),
                             ),
                           ],
@@ -2690,8 +2949,8 @@ class _Sidebar extends StatelessWidget {
                 Expanded(
                   child: Text(
                     trustedCount > 0
-                        ? '已固定 $trustedCount 个主机身份'
-                        : '首次连接时记录主机证书指纹',
+                        ? tr('已固定 {trustedCount} 个主机身份', <String, Object?>{'trustedCount': trustedCount})
+                        : tr('首次连接时记录主机证书指纹'),
                     style: mutedStyle(context, size: 10),
                   ),
                 ),
@@ -2699,7 +2958,7 @@ class _Sidebar extends StatelessWidget {
             ),
             const SizedBox(height: 20),
             Text(
-              '账号',
+              tr('账号'),
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: FontWeight.w600,
@@ -2738,7 +2997,7 @@ class _Sidebar extends StatelessWidget {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: <Widget>[
                             Text(
-                              account?.username ?? '登录账号',
+                              account?.username ?? tr('登录账号'),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
@@ -2750,10 +3009,10 @@ class _Sidebar extends StatelessWidget {
                             const SizedBox(height: 2),
                             Text(
                               syncing
-                                  ? '同步中…'
+                                  ? tr('同步中…')
                                   : account == null
-                                  ? '登录以同步地址簿'
-                                  : '账号地址簿已连接',
+                                  ? tr('登录以同步地址簿')
+                                  : tr('账号地址簿已连接'),
                               style: mutedStyle(context, size: 9.5),
                             ),
                           ],
@@ -2809,8 +3068,8 @@ class _Sidebar extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 10),
-                  const Text(
-                    '直连优先',
+                  Text(
+                    tr('直连优先'),
                     style: TextStyle(
                       color: Colors.white,
                       fontSize: 14,
@@ -2819,7 +3078,7 @@ class _Sidebar extends StatelessWidget {
                   ),
                   const SizedBox(height: 3),
                   Text(
-                    '打洞失败自动中继\n端到端加密',
+                    tr('打洞失败自动中继\n端到端加密'),
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.85),
                       fontSize: 11,
@@ -2830,6 +3089,52 @@ class _Sidebar extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 14),
+            PopupMenuButton<String>(
+              key: const Key('language-menu'),
+              tooltip: tr('界面语言'),
+              initialValue: AppLanguage.code,
+              onSelected: AppLanguage.set,
+              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                CheckedPopupMenuItem<String>(
+                  value: kLanguageChinese,
+                  checked: AppLanguage.code == kLanguageChinese,
+                  child: Text(tr('简体中文')),
+                ),
+                CheckedPopupMenuItem<String>(
+                  value: kLanguageEnglish,
+                  checked: AppLanguage.code == kLanguageEnglish,
+                  child: const Text('English'),
+                ),
+              ],
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      Icons.translate_rounded,
+                      size: 14,
+                      color: dark ? Colors.white38 : const Color(0xFF8A919C),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        tr('界面语言'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: mutedStyle(context, size: 10),
+                      ),
+                    ),
+                    Text(
+                      AppLanguage.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: mutedStyle(context, size: 10),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 2),
             Row(
               children: <Widget>[
                 Icon(
@@ -2906,7 +3211,7 @@ class _UpdateBanner extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
                 Text(
-                  '查看器可更新到 ${update.version}',
+                  tr('查看器可更新到 {p19}', <String, Object?>{'p19': update.version}),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -2917,7 +3222,7 @@ class _UpdateBanner extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  '当前 $current · 由连接服务通告',
+                  tr('当前 {current} · 由连接服务通告', <String, Object?>{'current': current}),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: mutedStyle(context, size: 10.5),
@@ -2928,10 +3233,10 @@ class _UpdateBanner extends StatelessWidget {
           TextButton(
             onPressed: onDetails,
             style: TextButton.styleFrom(foregroundColor: kAccent),
-            child: const Text('下载地址', style: TextStyle(fontSize: 11.5)),
+            child: Text(tr('下载地址'), style: TextStyle(fontSize: 11.5)),
           ),
           IconButton(
-            tooltip: '忽略此版本',
+            tooltip: tr('忽略此版本'),
             onPressed: onDismiss,
             icon: Icon(
               Icons.close_rounded,
@@ -2992,7 +3297,7 @@ class _LabelsDialogState extends State<_LabelsDialog> {
     }
     final String alias = _alias.text.trim();
     if (alias.runes.length > 128) {
-      setState(() => _error = '别名最多 128 个字符');
+      setState(() => _error = tr('别名最多 128 个字符'));
       return;
     }
     final List<String> tags = <String>[];
@@ -3003,13 +3308,13 @@ class _LabelsDialogState extends State<_LabelsDialog> {
         continue;
       }
       if (tag.runes.length > 32) {
-        setState(() => _error = '单个标签最多 32 个字符：$tag');
+        setState(() => _error = tr('单个标签最多 32 个字符：{tag}', <String, Object?>{'tag': tag}));
         return;
       }
       tags.add(tag);
     }
     if (tags.length > 16) {
-      setState(() => _error = '最多 16 个标签');
+      setState(() => _error = tr('最多 16 个标签'));
       return;
     }
     setState(() {
@@ -3042,7 +3347,7 @@ class _LabelsDialogState extends State<_LabelsDialog> {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('服务端别名与标签'),
+      title: Text(tr('服务端别名与标签')),
       content: SizedBox(
         width: 420,
         child: Column(
@@ -3055,9 +3360,9 @@ class _LabelsDialogState extends State<_LabelsDialog> {
               autofocus: true,
               enabled: !_saving,
               maxLength: 128,
-              decoration: const InputDecoration(
-                labelText: '别名',
-                hintText: '例如：设计室',
+              decoration: InputDecoration(
+                labelText: tr('别名'),
+                hintText: tr('例如：设计室'),
                 counterText: '',
               ),
             ),
@@ -3066,15 +3371,14 @@ class _LabelsDialogState extends State<_LabelsDialog> {
               key: const Key('labels-tags'),
               controller: _tags,
               enabled: !_saving,
-              decoration: const InputDecoration(
-                labelText: '标签',
-                hintText: '用逗号分隔，例如：office, design',
+              decoration: InputDecoration(
+                labelText: tr('标签'),
+                hintText: tr('用逗号分隔，例如：office, design'),
               ),
             ),
             const SizedBox(height: 10),
             Text(
-              '标签最多 16 个、每个 32 个字符；留空可清除。'
-              '这些标签保存在连接服务上，本机重命名仍优先显示。',
+              tr('标签最多 16 个、每个 32 个字符；留空可清除。这些标签保存在连接服务上，本机重命名仍优先显示。'),
               style: mutedStyle(context, size: 11),
             ),
             if (_error != null) ...<Widget>[
@@ -3093,7 +3397,7 @@ class _LabelsDialogState extends State<_LabelsDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: _saving ? null : () => Navigator.of(context).pop(false),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('labels-save'),
@@ -3104,7 +3408,7 @@ class _LabelsDialogState extends State<_LabelsDialog> {
                   height: 16,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : const Text('保存'),
+              : Text(tr('保存')),
         ),
       ],
     );
@@ -3151,12 +3455,12 @@ class _TagsDialogState extends State<_TagsDialog> {
         continue;
       }
       if (tag.runes.length > 32) {
-        setState(() => _error = '单个标签最多 32 个字符：$tag');
+        setState(() => _error = tr('单个标签最多 32 个字符：{tag}', <String, Object?>{'tag': tag}));
         return;
       }
       tags.add(tag);
       if (tags.length > 16) {
-        setState(() => _error = '最多 16 个标签');
+        setState(() => _error = tr('最多 16 个标签'));
         return;
       }
     }
@@ -3168,7 +3472,7 @@ class _TagsDialogState extends State<_TagsDialog> {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('账号标签'),
+      title: Text(tr('账号标签')),
       content: SizedBox(
         width: 420,
         child: Column(
@@ -3179,16 +3483,15 @@ class _TagsDialogState extends State<_TagsDialog> {
               key: const Key('account-tags'),
               controller: _tags,
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: '标签',
-                hintText: '用逗号分隔，例如：office, design',
+              decoration: InputDecoration(
+                labelText: tr('标签'),
+                hintText: tr('用逗号分隔，例如：office, design'),
               ),
               onSubmitted: (_) => _save(),
             ),
             const SizedBox(height: 10),
             Text(
-              '标签最多 16 个、每个 32 个字符；留空可清除。'
-              '这些标签保存在账号地址簿，登录同一账号的其他查看器会同步。',
+              tr('标签最多 16 个、每个 32 个字符；留空可清除。这些标签保存在账号地址簿，登录同一账号的其他查看器会同步。'),
               style: mutedStyle(context, size: 11),
             ),
             if (_error != null) ...<Widget>[
@@ -3207,12 +3510,12 @@ class _TagsDialogState extends State<_TagsDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('account-tags-save'),
           onPressed: _save,
-          child: const Text('保存'),
+          child: Text(tr('保存')),
         ),
       ],
     );
@@ -3233,13 +3536,19 @@ class _GroupPickerDialog extends StatelessWidget {
       required Key key,
       required String label,
       required String value,
+      int depth = 0,
     }) {
       final bool active = value == selected;
       return ListTile(
         key: key,
         dense: true,
+        contentPadding: EdgeInsets.only(left: 16 + depth * 18.0, right: 16),
         leading: Icon(
-          value.isEmpty ? Icons.inbox_outlined : Icons.folder_outlined,
+          value.isEmpty
+              ? Icons.inbox_outlined
+              : depth == 0
+                  ? Icons.folder_outlined
+                  : Icons.subdirectory_arrow_right_rounded,
           size: 18,
           color: active
               ? kAccent
@@ -3258,26 +3567,28 @@ class _GroupPickerDialog extends StatelessWidget {
       );
     }
 
+    final List<AddressBookGroupNode> nodes = addressBookGroupTreeOrder(groups);
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
-      title: const Text('移动到分组'),
+      title: Text(tr('移动到分组')),
       content: SizedBox(
         width: 320,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            tile(key: const Key('group-pick-none'), label: '未分组', value: ''),
-            for (final AddressBookGroup group in groups)
+            tile(key: const Key('group-pick-none'), label: tr('未分组'), value: ''),
+            for (final AddressBookGroupNode node in nodes)
               tile(
-                key: Key('group-pick-${group.id}'),
-                label: group.name,
-                value: group.id,
+                key: Key('group-pick-${node.group.id}'),
+                label: node.group.name,
+                value: node.group.id,
+                depth: node.depth,
               ),
-            if (groups.isEmpty)
+            if (nodes.isEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 10),
                 child: Text(
-                  '还没有分组，可在“我的设备”标题栏的“分组”里创建。',
+                  tr('还没有分组，可在“我的设备”标题栏的“分组”里创建。'),
                   style: mutedStyle(context, size: 11),
                 ),
               ),
@@ -3287,7 +3598,7 @@ class _GroupPickerDialog extends StatelessWidget {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
       ],
     );
@@ -3318,7 +3629,7 @@ class _WakeDialogState extends State<_WakeDialog> {
   void _submit() {
     final String? mac = normalizeMac(_mac.text);
     if (mac == null) {
-      setState(() => _error = '请输入 12 位十六进制 MAC，例如 AA:BB:CC:DD:EE:FF');
+      setState(() => _error = tr('请输入 12 位十六进制 MAC，例如 AA:BB:CC:DD:EE:FF'));
       return;
     }
     Navigator.of(context).pop(mac);
@@ -3328,7 +3639,7 @@ class _WakeDialogState extends State<_WakeDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
-      title: const Text('局域网唤醒'),
+      title: Text(tr('局域网唤醒')),
       content: SizedBox(
         width: 380,
         child: Column(
@@ -3336,8 +3647,7 @@ class _WakeDialogState extends State<_WakeDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             Text(
-              '向“${widget.device.displayName}”发送 Wake-on-LAN 魔术包。'
-              '查看器必须与目标处于同一局域网，目标需启用网络唤醒。',
+              tr('向“{p21}”发送 Wake-on-LAN 魔术包。查看器必须与目标处于同一局域网，目标需启用网络唤醒。', <String, Object?>{'p21': widget.device.displayName}),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 14),
@@ -3346,7 +3656,7 @@ class _WakeDialogState extends State<_WakeDialog> {
               controller: _mac,
               autofocus: true,
               decoration: InputDecoration(
-                labelText: 'MAC 地址',
+                labelText: tr('MAC 地址'),
                 hintText: 'AA:BB:CC:DD:EE:FF',
                 errorText: _error,
               ),
@@ -3358,9 +3668,9 @@ class _WakeDialogState extends State<_WakeDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
-        FilledButton(onPressed: _submit, child: const Text('唤醒')),
+        FilledButton(onPressed: _submit, child: Text(tr('唤醒'))),
       ],
     );
   }
@@ -3372,24 +3682,30 @@ class _DeviceCard extends StatelessWidget {
     required this.presence,
     required this.pinned,
     required this.onTap,
+    required this.onFilesOnly,
     required this.onRename,
     required this.onWake,
     required this.onDelete,
     this.onLabels,
     this.onTags,
     this.onGroup,
+    this.onMoveUp,
+    this.onMoveDown,
   });
 
   final Device device;
   final DevicePresence presence;
   final bool pinned;
   final VoidCallback onTap;
+  final VoidCallback onFilesOnly;
   final VoidCallback onRename;
   final VoidCallback onWake;
   final VoidCallback onDelete;
   final VoidCallback? onLabels;
   final VoidCallback? onTags;
   final VoidCallback? onGroup;
+  final VoidCallback? onMoveUp;
+  final VoidCallback? onMoveDown;
 
   @override
   Widget build(BuildContext context) {
@@ -3479,14 +3795,16 @@ class _DeviceCard extends StatelessWidget {
                   ),
                 ),
                 PopupMenuButton<String>(
-                  tooltip: '设备操作',
+                  tooltip: tr('设备操作'),
                   icon: Icon(
                     Icons.more_vert_rounded,
                     size: 17,
                     color: dark ? Colors.white38 : const Color(0xFF9AA0A6),
                   ),
                   onSelected: (String value) {
-                    if (value == 'rename') {
+                    if (value == 'files') {
+                      onFilesOnly();
+                    } else if (value == 'rename') {
                       onRename();
                     } else if (value == 'wake') {
                       onWake();
@@ -3496,38 +3814,56 @@ class _DeviceCard extends StatelessWidget {
                       onTags?.call();
                     } else if (value == 'group') {
                       onGroup?.call();
+                    } else if (value == 'move-up') {
+                      onMoveUp?.call();
+                    } else if (value == 'move-down') {
+                      onMoveDown?.call();
                     } else if (value == 'delete') {
                       onDelete();
                     }
                   },
                   itemBuilder: (BuildContext context) =>
                       <PopupMenuEntry<String>>[
-                        const PopupMenuItem<String>(
-                          value: 'rename',
-                          child: Text('重命名'),
+                        PopupMenuItem<String>(
+                          value: 'files',
+                          child: Text(tr('仅文件传输')),
                         ),
-                        const PopupMenuItem<String>(
+                        PopupMenuItem<String>(
+                          value: 'rename',
+                          child: Text(tr('重命名')),
+                        ),
+                        PopupMenuItem<String>(
                           value: 'wake',
-                          child: Text('唤醒'),
+                          child: Text(tr('唤醒')),
                         ),
                         if (onLabels != null)
-                          const PopupMenuItem<String>(
+                          PopupMenuItem<String>(
                             value: 'labels',
-                            child: Text('服务端别名/标签'),
+                            child: Text(tr('服务端别名/标签')),
                           ),
                         if (onTags != null)
-                          const PopupMenuItem<String>(
+                          PopupMenuItem<String>(
                             value: 'tags',
-                            child: Text('账号标签'),
+                            child: Text(tr('账号标签')),
                           ),
                         if (onGroup != null)
-                          const PopupMenuItem<String>(
+                          PopupMenuItem<String>(
                             value: 'group',
-                            child: Text('移动到分组'),
+                            child: Text(tr('移动到分组')),
                           ),
-                        const PopupMenuItem<String>(
+                        if (onMoveUp != null)
+                          PopupMenuItem<String>(
+                            value: 'move-up',
+                            child: Text(tr('上移')),
+                          ),
+                        if (onMoveDown != null)
+                          PopupMenuItem<String>(
+                            value: 'move-down',
+                            child: Text(tr('下移')),
+                          ),
+                        PopupMenuItem<String>(
                           value: 'delete',
-                          child: Text('删除'),
+                          child: Text(tr('删除')),
                         ),
                       ],
                 ),
@@ -3549,31 +3885,31 @@ class _DeviceCard extends StatelessWidget {
     String text;
     if (!device.viaServer) {
       color = dark ? Colors.white30 : const Color(0xFFA8AEB8);
-      text = '直连地址';
+      text = tr('直连地址');
     } else {
       switch (presence.state) {
         case HostPresence.online:
           color = const Color(0xFF4CAF50);
-          final List<String> parts = <String>['在线'];
+          final List<String> parts = <String>[tr('在线')];
           if (presence.info?.hasDirectCandidate ?? false) {
-            parts.add('可直连');
+            parts.add(tr('可直连'));
           }
           if (presence.info?.hasRelay ?? false) {
-            parts.add('可中继');
+            parts.add(tr('可中继'));
           }
           text = parts.join(' · ');
         case HostPresence.offline:
           color = const Color(0xFF9E9E9E);
-          text = '离线';
+          text = tr('离线');
         case HostPresence.unreachable:
           color = const Color(0xFFFFB74D);
-          text = '服务不可达';
+          text = tr('服务不可达');
         case HostPresence.checking:
           color = kAccent;
-          text = '查询中';
+          text = tr('查询中');
         case HostPresence.unknown:
           color = const Color(0xFF9E9E9E);
-          text = '等待查询';
+          text = tr('等待查询');
       }
     }
     return Row(
@@ -3624,10 +3960,10 @@ class _RecentCard extends StatelessWidget {
     final String presenceText = !device.viaServer
         ? _formatTime(device.lastUsed!)
         : switch (presence.state) {
-            HostPresence.online => '在线 · ${_formatTime(device.lastUsed!)}',
-            HostPresence.offline => '离线',
-            HostPresence.unreachable => '服务不可达',
-            HostPresence.checking => '查询中',
+            HostPresence.online => tr('在线 · {p22}', <String, Object?>{'p22': _formatTime(device.lastUsed!)}),
+            HostPresence.offline => tr('离线'),
+            HostPresence.unreachable => tr('服务不可达'),
+            HostPresence.checking => tr('查询中'),
             HostPresence.unknown => _formatTime(device.lastUsed!),
           };
     return SizedBox(
@@ -3697,7 +4033,7 @@ class _RecentCard extends StatelessWidget {
                   ),
                 ),
                 IconButton(
-                  tooltip: '保存到我的设备',
+                  tooltip: tr('保存到我的设备'),
                   onPressed: onSave,
                   icon: Icon(
                     Icons.bookmark_add_outlined,
@@ -3770,7 +4106,7 @@ class _LanScanDialogState extends State<_LanScanDialog> {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('扫描局域网'),
+      title: Text(tr('扫描局域网')),
       content: SizedBox(
         width: 460,
         height: 320,
@@ -3781,7 +4117,7 @@ class _LanScanDialogState extends State<_LanScanDialog> {
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
                 child: Text(
-                  '未配置连接服务，发现的 ID 不能保存为可连接设备。',
+                  tr('未配置连接服务，发现的 ID 不能保存为可连接设备。'),
                   style: TextStyle(
                     color: Theme.of(context).colorScheme.error,
                     fontSize: 11,
@@ -3796,11 +4132,11 @@ class _LanScanDialogState extends State<_LanScanDialog> {
         TextButton(
           key: const Key('lan-scan-again'),
           onPressed: _scanning ? null : _scan,
-          child: const Text('重新扫描'),
+          child: Text(tr('重新扫描')),
         ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           key: const Key('lan-add'),
@@ -3811,7 +4147,7 @@ class _LanScanDialogState extends State<_LanScanDialog> {
                       .where((LanPeer peer) => _selected.contains(peer.id))
                       .toList(),
                 ),
-          child: Text(_selected.isEmpty ? '添加' : '添加 ${_selected.length} 台'),
+          child: Text(_selected.isEmpty ? tr('添加') : tr('添加 {p23} 台', <String, Object?>{'p23': _selected.length})),
         ),
       ],
     );
@@ -3842,7 +4178,7 @@ class _LanScanDialogState extends State<_LanScanDialog> {
     if (_peers.isEmpty) {
       return Center(
         child: Text(
-          '没有发现局域网主机\n确认主机正在运行、允许局域网发现，并放行 UDP 21129。',
+          tr('没有发现局域网主机\n确认主机正在运行、允许局域网发现，并放行 UDP 21129。'),
           textAlign: TextAlign.center,
           style: mutedStyle(context, size: 12),
         ),
@@ -3905,13 +4241,13 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
   void _save() {
     final String text = _target.text.trim();
     if (text.isEmpty) {
-      setState(() => _error = '请输入设备 ID 或地址');
+      setState(() => _error = tr('请输入设备 ID 或地址'));
       return;
     }
     if (!text.startsWith('[') &&
         !text.contains(':') &&
         !widget.server.configured) {
-      setState(() => _error = '设备 ID 需要先配置连接服务');
+      setState(() => _error = tr('设备 ID 需要先配置连接服务'));
       return;
     }
     final ConnectTarget? parsed = parseConnectInput(
@@ -3920,7 +4256,7 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
       server: widget.server,
     );
     if (parsed == null) {
-      setState(() => _error = '格式无效');
+      setState(() => _error = tr('格式无效'));
       return;
     }
     final Device created = parsed.viaServer
@@ -3942,11 +4278,11 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
   Widget build(BuildContext context) {
     final String service = widget.server.configured
         ? widget.server.url
-        : '未配置连接服务';
+        : tr('未配置连接服务');
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('添加设备'),
+      title: Text(tr('添加设备')),
       content: SizedBox(
         width: 420,
         child: Column(
@@ -3955,23 +4291,23 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
           children: <Widget>[
             TextField(
               controller: _name,
-              decoration: const InputDecoration(
-                labelText: '名称（可选）',
-                hintText: '例如：开发机',
+              decoration: InputDecoration(
+                labelText: tr('名称（可选）'),
+                hintText: tr('例如：开发机'),
               ),
             ),
             const SizedBox(height: 12),
             TextField(
               controller: _target,
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: '设备 ID 或地址',
-                hintText: 'devbox 或 192.168.1.10:4433',
+              decoration: InputDecoration(
+                labelText: tr('设备 ID 或地址'),
+                hintText: tr('devbox 或 192.168.1.10:4433'),
               ),
             ),
             const SizedBox(height: 10),
             Text(
-              '设备 ID 通过 $service 解析；带 : 的地址按直连保存。',
+              tr('设备 ID 通过 {service} 解析；带 : 的地址按直连保存。', <String, Object?>{'service': service}),
               style: mutedStyle(context, size: 11),
             ),
             if (_error.isNotEmpty) ...<Widget>[
@@ -3990,9 +4326,9 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
-        FilledButton(onPressed: _save, child: const Text('保存')),
+        FilledButton(onPressed: _save, child: Text(tr('保存'))),
       ],
     );
   }
@@ -4022,7 +4358,7 @@ class _RenameDialogState extends State<_RenameDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
-      title: const Text('重命名设备'),
+      title: Text(tr('重命名设备')),
       content: TextField(
         controller: _name,
         autofocus: true,
@@ -4032,11 +4368,11 @@ class _RenameDialogState extends State<_RenameDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
         FilledButton(
           onPressed: () => Navigator.of(context).pop(_name.text),
-          child: const Text('保存'),
+          child: Text(tr('保存')),
         ),
       ],
     );
@@ -4065,8 +4401,11 @@ class _AccountDialog extends StatefulWidget {
     required this.requestLoginSMS,
     required this.requestLoginEmail,
     required this.securityKeyLogin,
+    required this.securityKeyPasswordlessLogin,
     required this.syncing,
     this.groups = const <AddressBookGroup>[],
+    this.uploadRecordings = false,
+    this.onUploadRecordingsChanged,
   });
 
   final ServerSettings server;
@@ -4075,8 +4414,11 @@ class _AccountDialog extends StatefulWidget {
   final LoginSMSRequester requestLoginSMS;
   final LoginEmailRequester requestLoginEmail;
   final AccountSecurityKeyLogin securityKeyLogin;
+  final AccountPasswordlessSecurityKeyLogin securityKeyPasswordlessLogin;
   final bool syncing;
   final List<AddressBookGroup> groups;
+  final bool uploadRecordings;
+  final Future<void> Function(bool enabled)? onUploadRecordingsChanged;
 
   @override
   State<_AccountDialog> createState() => _AccountDialogState();
@@ -4096,8 +4438,15 @@ class _AccountDialogState extends State<_AccountDialog> {
   bool _useEmail = false;
   bool _sendingSms = false;
   bool _sendingEmail = false;
+  late bool _uploadRecordings;
   String _error = '';
   String _notice = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _uploadRecordings = widget.uploadRecordings;
+  }
 
   @override
   void dispose() {
@@ -4118,19 +4467,19 @@ class _AccountDialogState extends State<_AccountDialog> {
     final String sms = _sms.text.trim();
     final String email = _email.text.trim();
     if (username.isEmpty || password.isEmpty) {
-      setState(() => _error = '请输入用户名和密码');
+      setState(() => _error = tr('请输入用户名和密码'));
       return;
     }
     if (_useRecovery && recovery.isEmpty) {
-      setState(() => _error = '请输入恢复码');
+      setState(() => _error = tr('请输入恢复码'));
       return;
     }
     if (_useSms && sms.isEmpty) {
-      setState(() => _error = '请输入短信验证码');
+      setState(() => _error = tr('请输入短信验证码'));
       return;
     }
     if (_useEmail && email.isEmpty) {
-      setState(() => _error = '请输入邮件验证码');
+      setState(() => _error = tr('请输入邮件验证码'));
       return;
     }
     setState(() {
@@ -4162,7 +4511,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '登录失败：$error';
+          _error = tr('登录失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -4193,7 +4542,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     final String username = _username.text.trim();
     final String password = _password.text;
     if (username.isEmpty || password.isEmpty) {
-      setState(() => _error = '请输入用户名和密码');
+      setState(() => _error = tr('请输入用户名和密码'));
       return;
     }
     setState(() {
@@ -4226,7 +4575,46 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = '安全密钥登录失败：$error';
+          _error = tr('安全密钥登录失败：{error}', <String, Object?>{'error': error});
+        });
+      }
+    }
+  }
+
+  Future<void> _submitPasswordlessSecurityKey() async {
+    final String username = _username.text.trim();
+    if (username.isEmpty) {
+      setState(() => _error = tr('请输入用户名'));
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = '';
+      _notice = '';
+    });
+    try {
+      final AccountLoginResult result = await widget
+          .securityKeyPasswordlessLogin(widget.server, username: username);
+      _finishLogin(username, result);
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } on SecurityKeyException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = tr('安全密钥登录失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -4236,7 +4624,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     final String username = _username.text.trim();
     final String password = _password.text;
     if (username.isEmpty || password.isEmpty) {
-      setState(() => _error = '请输入用户名和密码');
+      setState(() => _error = tr('请输入用户名和密码'));
       return;
     }
     setState(() {
@@ -4253,7 +4641,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           _sendingSms = false;
-          _notice = '短信验证码已发送到绑定的手机号';
+          _notice = tr('短信验证码已发送到绑定的手机号');
         });
       }
     } on ServerApiException catch (error) {
@@ -4267,7 +4655,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           _sendingSms = false;
-          _error = '发送短信验证码失败：$error';
+          _error = tr('发送短信验证码失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -4277,7 +4665,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     final String username = _username.text.trim();
     final String password = _password.text;
     if (username.isEmpty || password.isEmpty) {
-      setState(() => _error = '请输入用户名和密码');
+      setState(() => _error = tr('请输入用户名和密码'));
       return;
     }
     setState(() {
@@ -4294,7 +4682,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           _sendingEmail = false;
-          _notice = '邮件验证码已发送到绑定的邮箱';
+          _notice = tr('邮件验证码已发送到绑定的邮箱');
         });
       }
     } on ServerApiException catch (error) {
@@ -4308,7 +4696,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       if (mounted) {
         setState(() {
           _sendingEmail = false;
-          _error = '发送邮件验证码失败：$error';
+          _error = tr('发送邮件验证码失败：{error}', <String, Object?>{'error': error});
         });
       }
     }
@@ -4388,6 +4776,37 @@ class _AccountDialogState extends State<_AccountDialog> {
     );
   }
 
+  Future<void> _openRecordings(AccountSession account) {
+    return showDialog<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return RecordingArchiveDialog(
+          server: widget.server,
+          account: account,
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleUploadRecordings(bool enabled) async {
+    final Future<void> Function(bool)? changed =
+        widget.onUploadRecordingsChanged;
+    if (changed == null) {
+      return;
+    }
+    setState(() => _uploadRecordings = enabled);
+    try {
+      await changed(enabled);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _uploadRecordings = !enabled;
+          _error = tr('保存录制上传设置失败：{error}', <String, Object?>{'error': error});
+        });
+      }
+    }
+  }
+
   Future<void> _openChangePassword(AccountSession account) async {
     final bool? changed = await showDialog<bool>(
       context: context,
@@ -4398,7 +4817,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     if (changed == true && mounted) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('密码已修改，其他设备已退出')));
+      ).showSnackBar(SnackBar(content: Text(tr('密码已修改，其他设备已退出'))));
     }
   }
 
@@ -4411,7 +4830,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     );
     if (email != null && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(email.isEmpty ? '找回邮箱已清除' : '找回邮箱已更新')),
+        SnackBar(content: Text(email.isEmpty ? tr('找回邮箱已清除') : tr('找回邮箱已更新'))),
       );
     }
   }
@@ -4425,7 +4844,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     );
     if (phone != null && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(phone.isEmpty ? '找回手机已清除' : '找回手机已更新')),
+        SnackBar(content: Text(phone.isEmpty ? tr('找回手机已清除') : tr('找回手机已更新'))),
       );
     }
   }
@@ -4457,7 +4876,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       _sendingSms = false;
       _sendingEmail = false;
       _error = '';
-      _notice = '密码已重置，请用新密码登录';
+      _notice = tr('密码已重置，请用新密码登录');
     });
   }
 
@@ -4468,7 +4887,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: Text(account == null ? '登录账号' : '账号'),
+      title: Text(account == null ? tr('登录账号') : tr('账号')),
       content: SizedBox(
         width: 380,
         child: account == null
@@ -4479,7 +4898,7 @@ class _AccountDialogState extends State<_AccountDialog> {
           ? <Widget>[
               TextButton(
                 onPressed: _busy ? null : () => Navigator.of(context).pop(),
-                child: const Text('取消'),
+                child: Text(tr('取消')),
               ),
               FilledButton(
                 key: const Key('account-login'),
@@ -4490,13 +4909,13 @@ class _AccountDialogState extends State<_AccountDialog> {
                         height: 15,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : const Text('登录'),
+                    : Text(tr('登录')),
               ),
             ]
           : <Widget>[
               TextButton(
                 onPressed: () => Navigator.of(context).pop(),
-                child: const Text('关闭'),
+                child: Text(tr('关闭')),
               ),
               TextButton(
                 key: const Key('account-logout'),
@@ -4506,7 +4925,7 @@ class _AccountDialogState extends State<_AccountDialog> {
                 style: TextButton.styleFrom(
                   foregroundColor: theme.colorScheme.error,
                 ),
-                child: const Text('退出登录'),
+                child: Text(tr('退出登录')),
               ),
               FilledButton(
                 key: const Key('account-sync'),
@@ -4515,7 +4934,7 @@ class _AccountDialogState extends State<_AccountDialog> {
                     : () => Navigator.of(
                         context,
                       ).pop(const _AccountResult(sync: true)),
-                child: Text(widget.syncing ? '同步中…' : '立即同步'),
+                child: Text(widget.syncing ? tr('同步中…') : tr('立即同步')),
               ),
             ],
     );
@@ -4527,7 +4946,7 @@ class _AccountDialogState extends State<_AccountDialog> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
         Text(
-          '账号地址簿保存在连接服务上，登录后可在多台查看器之间同步设备。',
+          tr('账号地址簿保存在连接服务上，登录后可在多台查看器之间同步设备。'),
           style: mutedStyle(context, size: 12),
         ),
         const SizedBox(height: 16),
@@ -4537,8 +4956,8 @@ class _AccountDialogState extends State<_AccountDialog> {
           autofocus: true,
           autocorrect: false,
           enableSuggestions: false,
-          decoration: const InputDecoration(
-            labelText: '用户名',
+          decoration: InputDecoration(
+            labelText: tr('用户名'),
             prefixIcon: Icon(Icons.person_outline_rounded, size: 18),
           ),
         ),
@@ -4549,18 +4968,28 @@ class _AccountDialogState extends State<_AccountDialog> {
           obscureText: true,
           autocorrect: false,
           enableSuggestions: false,
-          decoration: const InputDecoration(
-            labelText: '密码',
+          decoration: InputDecoration(
+            labelText: tr('密码'),
             prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
           ),
           onSubmitted: (_) => _submit(),
         ),
         Align(
           alignment: Alignment.centerLeft,
-          child: TextButton(
-            key: const Key('account-forgot-password'),
-            onPressed: _busy ? null : _openForgotPassword,
-            child: const Text('忘记密码？'),
+          child: Wrap(
+            spacing: 8,
+            children: <Widget>[
+              TextButton(
+                key: const Key('account-forgot-password'),
+                onPressed: _busy ? null : _openForgotPassword,
+                child: Text(tr('忘记密码？')),
+              ),
+              TextButton(
+                key: const Key('account-security-key-login'),
+                onPressed: _busy ? null : _submitPasswordlessSecurityKey,
+                child: Text(tr('使用安全密钥登录')),
+              ),
+            ],
           ),
         ),
         if (_needsTotp) ...<Widget>[
@@ -4572,8 +5001,8 @@ class _AccountDialogState extends State<_AccountDialog> {
               autofocus: true,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '恢复码',
+              decoration: InputDecoration(
+                labelText: tr('恢复码'),
                 hintText: 'ABCD-EFGH-IJKL-MNOP',
                 prefixIcon: Icon(Icons.key_outlined, size: 18),
               ),
@@ -4591,9 +5020,9 @@ class _AccountDialogState extends State<_AccountDialog> {
               ],
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '短信验证码',
-                hintText: '8 位数字',
+              decoration: InputDecoration(
+                labelText: tr('短信验证码'),
+                hintText: tr('8 位数字'),
                 prefixIcon: Icon(Icons.sms_outlined, size: 18),
               ),
               onSubmitted: (_) => _submit(),
@@ -4610,9 +5039,9 @@ class _AccountDialogState extends State<_AccountDialog> {
               ],
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '邮件验证码',
-                hintText: '8 位数字',
+              decoration: InputDecoration(
+                labelText: tr('邮件验证码'),
+                hintText: tr('8 位数字'),
                 prefixIcon: Icon(Icons.mail_outlined, size: 18),
               ),
               onSubmitted: (_) => _submit(),
@@ -4626,8 +5055,8 @@ class _AccountDialogState extends State<_AccountDialog> {
               maxLength: 6,
               autocorrect: false,
               enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '两步验证码',
+              decoration: InputDecoration(
+                labelText: tr('两步验证码'),
                 counterText: '',
                 prefixIcon: Icon(Icons.shield_outlined, size: 18),
               ),
@@ -4640,7 +5069,7 @@ class _AccountDialogState extends State<_AccountDialog> {
                 TextButton(
                   key: const Key('account-use-totp'),
                   onPressed: _busy ? null : _useTotpFactor,
-                  child: const Text('使用身份验证器验证码'),
+                  child: Text(tr('使用身份验证器验证码')),
                 )
               else
                 TextButton(
@@ -4653,36 +5082,36 @@ class _AccountDialogState extends State<_AccountDialog> {
                           _useEmail = false;
                           _error = '';
                         }),
-                  child: const Text('验证器丢失？使用恢复码'),
+                  child: Text(tr('验证器丢失？使用恢复码')),
                 ),
               if (_useSms)
                 TextButton(
                   key: const Key('account-send-sms'),
                   onPressed: _busy || _sendingSms ? null : _sendLoginSMS,
-                  child: Text(_sendingSms ? '发送中…' : '重新发送短信验证码'),
+                  child: Text(_sendingSms ? tr('发送中…') : tr('重新发送短信验证码')),
                 )
               else
                 TextButton(
                   key: const Key('account-use-sms'),
                   onPressed: _busy || _sendingSms ? null : _useSmsFactor,
-                  child: const Text('使用短信验证码'),
+                  child: Text(tr('使用短信验证码')),
                 ),
               if (_useEmail)
                 TextButton(
                   key: const Key('account-send-email'),
                   onPressed: _busy || _sendingEmail ? null : _sendLoginEmail,
-                  child: Text(_sendingEmail ? '发送中…' : '重新发送邮件验证码'),
+                  child: Text(_sendingEmail ? tr('发送中…') : tr('重新发送邮件验证码')),
                 )
               else
                 TextButton(
                   key: const Key('account-use-email'),
                   onPressed: _busy || _sendingEmail ? null : _useEmailFactor,
-                  child: const Text('使用邮件验证码'),
+                  child: Text(tr('使用邮件验证码')),
                 ),
               TextButton(
                 key: const Key('account-use-security-key'),
                 onPressed: _busy ? null : _submitSecurityKey,
-                child: const Text('使用安全密钥'),
+                child: Text(tr('使用安全密钥')),
               ),
             ],
           ),
@@ -4690,8 +5119,8 @@ class _AccountDialogState extends State<_AccountDialog> {
         const SizedBox(height: 10),
         Text(
           widget.server.configured
-              ? '登录到 ${widget.server.url}'
-              : '请先在连接服务中填写服务地址',
+              ? tr('登录到 {p25}', <String, Object?>{'p25': widget.server.url})
+              : tr('请先在连接服务中填写服务地址'),
           style: mutedStyle(context, size: 10.5),
         ),
         if (_notice.isNotEmpty) ...<Widget>[
@@ -4758,17 +5187,17 @@ class _AccountDialogState extends State<_AccountDialog> {
           ],
         ),
         const SizedBox(height: 16),
-        Text('账号地址簿会在此设备与其他已登录设备之间同步。', style: mutedStyle(context, size: 12)),
+        Text(tr('账号地址簿会在此设备与其他已登录设备之间同步。'), style: mutedStyle(context, size: 12)),
         const SizedBox(height: 8),
         Text(
-          '登录有效期至 ${_formatTime(account.expiresAt.toLocal())}',
+          tr('登录有效期至 {p26}', <String, Object?>{'p26': _formatTime(account.expiresAt.toLocal())}),
           style: mutedStyle(context, size: 11),
         ),
         const SizedBox(height: 4),
         Text(
           account.syncedAt == null
-              ? '尚未同步'
-              : '上次同步：${_formatTime(account.syncedAt!.toLocal())}',
+              ? tr('尚未同步')
+              : tr('上次同步：{p27}', <String, Object?>{'p27': _formatTime(account.syncedAt!.toLocal())}),
           style: mutedStyle(context, size: 11),
         ),
         const SizedBox(height: 14),
@@ -4776,49 +5205,69 @@ class _AccountDialogState extends State<_AccountDialog> {
           key: const Key('account-shared-books'),
           onPressed: _busy ? null : () => _openSharedBooks(account),
           icon: const Icon(Icons.folder_shared_outlined, size: 17),
-          label: const Text('共享地址簿'),
+          label: Text(tr('共享地址簿')),
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
           key: const Key('account-sessions'),
           onPressed: _busy ? null : () => _openSessions(account),
           icon: const Icon(Icons.devices_outlined, size: 17),
-          label: const Text('设备会话'),
+          label: Text(tr('设备会话')),
         ),
         const SizedBox(height: 8),
+        OutlinedButton.icon(
+          key: const Key('account-recordings'),
+          onPressed: _busy ? null : () => _openRecordings(account),
+          icon: const Icon(Icons.cloud_download_outlined, size: 17),
+          label: Text(tr('云端录制')),
+        ),
+        SwitchListTile(
+          key: const Key('account-upload-recordings'),
+          contentPadding: EdgeInsets.zero,
+          value: _uploadRecordings,
+          onChanged: _busy || widget.onUploadRecordingsChanged == null
+              ? null
+              : _toggleUploadRecordings,
+          title: Text(tr('自动上传录制'), style: const TextStyle(fontSize: 13.5)),
+          subtitle: Text(
+            tr('会话录制结束后，把 MP4 上传到当前账号，可在“云端录制”中下载或删除。'),
+            style: mutedStyle(context, size: 10.5),
+          ),
+        ),
+        const SizedBox(height: 4),
         OutlinedButton.icon(
           key: const Key('account-change-password'),
           onPressed: _busy ? null : () => _openChangePassword(account),
           icon: const Icon(Icons.password_rounded, size: 17),
-          label: const Text('修改密码'),
+          label: Text(tr('修改密码')),
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
           key: const Key('account-recovery-email'),
           onPressed: _busy ? null : () => _openRecoveryEmail(account),
           icon: const Icon(Icons.alternate_email_rounded, size: 17),
-          label: const Text('找回邮箱'),
+          label: Text(tr('找回邮箱')),
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
           key: const Key('account-recovery-phone'),
           onPressed: _busy ? null : () => _openRecoveryPhone(account),
           icon: const Icon(Icons.smartphone_rounded, size: 17),
-          label: const Text('找回手机'),
+          label: Text(tr('找回手机')),
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
           key: const Key('account-two-factor'),
           onPressed: _busy ? null : () => _openTwoFactor(account),
           icon: const Icon(Icons.shield_outlined, size: 17),
-          label: const Text('两步验证'),
+          label: Text(tr('两步验证')),
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
           key: const Key('account-security-keys'),
           onPressed: _busy ? null : () => _openSecurityKeys(account),
           icon: const Icon(Icons.fingerprint_rounded, size: 17),
-          label: const Text('安全密钥（Windows Hello）'),
+          label: Text(tr('安全密钥（Windows Hello）')),
         ),
       ],
     );
@@ -4882,14 +5331,14 @@ class _ServerDialogState extends State<_ServerDialog> {
     final String url = normalizeServerUrl(_url.text);
     if (url.isEmpty) {
       setState(() {
-        _status = '请输入有效的 http(s) 地址';
+        _status = tr('请输入有效的 http(s) 地址');
         _statusOk = false;
       });
       return;
     }
     setState(() {
       _testing = true;
-      _status = '正在检查…';
+      _status = tr('正在检查…');
       _statusOk = false;
     });
     try {
@@ -4898,7 +5347,7 @@ class _ServerDialogState extends State<_ServerDialog> {
       );
       if (mounted) {
         setState(() {
-          _status = '服务可用，密钥有效';
+          _status = tr('服务可用，密钥有效');
           _statusOk = true;
         });
       }
@@ -4921,7 +5370,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     final String url = normalizeServerUrl(text);
     if (text.isNotEmpty && url.isEmpty) {
       setState(() {
-        _status = '地址无效：示例 http://192.168.1.10:8443';
+        _status = tr('地址无效：示例 http://192.168.1.10:8443');
         _statusOk = false;
       });
       return;
@@ -4936,7 +5385,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     return AlertDialog(
       backgroundColor: Theme.of(context).colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: const Text('连接服务'),
+      title: Text(tr('连接服务')),
       content: SizedBox(
         width: 420,
         child: Column(
@@ -4946,8 +5395,8 @@ class _ServerDialogState extends State<_ServerDialog> {
             TextField(
               controller: _url,
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: '服务地址',
+              decoration: InputDecoration(
+                labelText: tr('服务地址'),
                 hintText: 'http://127.0.0.1:8443',
               ),
               onSubmitted: (_) => _save(),
@@ -4959,10 +5408,10 @@ class _ServerDialogState extends State<_ServerDialog> {
               autocorrect: false,
               enableSuggestions: false,
               decoration: InputDecoration(
-                labelText: '服务端密钥（可选）',
-                hintText: '与 --server-key 相同',
+                labelText: tr('服务端密钥（可选）'),
+                hintText: tr('与 --server-key 相同'),
                 suffixIcon: IconButton(
-                  tooltip: _showKey ? '隐藏密钥' : '显示密钥',
+                  tooltip: _showKey ? tr('隐藏密钥') : tr('显示密钥'),
                   icon: Icon(
                     _showKey ? Icons.visibility_off : Icons.visibility,
                   ),
@@ -4974,7 +5423,7 @@ class _ServerDialogState extends State<_ServerDialog> {
             const SizedBox(height: 12),
             DropdownButtonFormField<TunnelMode>(
               initialValue: _mode,
-              decoration: const InputDecoration(labelText: '路径策略'),
+              decoration: InputDecoration(labelText: tr('路径策略')),
               items: <DropdownMenuItem<TunnelMode>>[
                 for (final TunnelMode mode in TunnelMode.values)
                   DropdownMenuItem<TunnelMode>(
@@ -4993,7 +5442,7 @@ class _ServerDialogState extends State<_ServerDialog> {
               children: <Widget>[
                 TextButton(
                   onPressed: _testing ? null : _test,
-                  child: Text(_testing ? '检查中…' : '测试连接'),
+                  child: Text(_testing ? tr('检查中…') : tr('测试连接')),
                 ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -5029,8 +5478,8 @@ class _ServerDialogState extends State<_ServerDialog> {
                 Expanded(
                   child: Text(
                     _pin == null
-                        ? '服务器身份尚未固定：首次连接时会展示指纹'
-                        : '服务器身份 ${shortenServerFingerprint(_pin!.identity.fingerprint)}（已固定）',
+                        ? tr('服务器身份尚未固定：首次连接时会展示指纹')
+                        : tr('服务器身份 {p28}（已固定）', <String, Object?>{'p28': shortenServerFingerprint(_pin!.identity.fingerprint)}),
                     overflow: TextOverflow.ellipsis,
                     style: mutedStyle(context, size: 11),
                   ),
@@ -5039,13 +5488,12 @@ class _ServerDialogState extends State<_ServerDialog> {
                   TextButton(
                     key: const Key('server-identity-forget'),
                     onPressed: _forgetPin,
-                    child: const Text('清除固定'),
+                    child: Text(tr('清除固定')),
                   ),
               ],
             ),
             Text(
-              '服务端配置 --server-key 后，查看者解析设备 ID 和打洞也要带同一密钥；'
-              '留空表示服务端未启用密钥。留空服务地址即可关闭设备 ID 解析。',
+              tr('服务端配置 --server-key 后，查看者解析设备 ID 和打洞也要带同一密钥；留空表示服务端未启用密钥。留空服务地址即可关闭设备 ID 解析。'),
               style: mutedStyle(context, size: 10.5),
             ),
           ],
@@ -5054,9 +5502,9 @@ class _ServerDialogState extends State<_ServerDialog> {
       actions: <Widget>[
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
+          child: Text(tr('取消')),
         ),
-        FilledButton(onPressed: _save, child: const Text('保存')),
+        FilledButton(onPressed: _save, child: Text(tr('保存'))),
       ],
     );
   }
@@ -5069,10 +5517,10 @@ String _formatTime(DateTime time) {
   final String hm =
       '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
   if (day == today) {
-    return '今天 $hm';
+    return tr('今天 {hm}', <String, Object?>{'hm': hm});
   }
   if (today.difference(day).inDays == 1) {
-    return '昨天 $hm';
+    return tr('昨天 {hm}', <String, Object?>{'hm': hm});
   }
   return '${time.month.toString().padLeft(2, '0')}-${time.day.toString().padLeft(2, '0')} $hm';
 }

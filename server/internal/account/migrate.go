@@ -11,10 +11,73 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 1
+const accountSchemaVersion = 4
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
+	{Version: 2, Name: "archive checkpoints", Apply: applyArchiveCheckpoints},
+	{Version: 3, Name: "address book nesting", Apply: applyAddressBookNesting},
+	{Version: 4, Name: "recording archive", Apply: applyRecordingArchive},
+}
+
+// applyRecordingArchive adds the metadata side of uploaded viewer recordings.
+// The MP4 bytes live outside the database; a row disappears with its account
+// so a deleted user cannot keep files visible to operators.
+func applyRecordingArchive(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS recordings (
+			id          TEXT PRIMARY KEY,
+			user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name        TEXT NOT NULL DEFAULT '',
+			peer_id     TEXT NOT NULL DEFAULT '',
+			size        INTEGER NOT NULL,
+			sha256      TEXT NOT NULL DEFAULT '',
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			started_at  INTEGER NOT NULL DEFAULT 0,
+			created_at  INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS recordings_user ON recordings(user_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS recordings_created ON recordings(created_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create recording archive: %w", err)
+		}
+	}
+	return nil
+}
+
+// applyAddressBookNesting adds the parent link and manual ordering columns.
+// Every existing group becomes a root at position zero, which keeps the old
+// name-ordered presentation until a client reorders it.
+func applyAddressBookNesting(db *sql.DB) error {
+	for _, column := range []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{"address_book_groups", "parent_id", "parent_id TEXT NOT NULL DEFAULT ''"},
+		{"address_book_groups", "position", "position INTEGER NOT NULL DEFAULT 0"},
+		{"address_book", "position", "position INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureColumn(db, column.table, column.name, column.ddl); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return nil
+}
+
+// applyArchiveCheckpoints tracks how far the external JSONL archive has copied
+// each history table so a restart resumes instead of rewriting everything.
+func applyArchiveCheckpoints(db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS archive_checkpoints (
+		stream     TEXT PRIMARY KEY,
+		last_id    INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`)
+	if err != nil {
+		return fmt.Errorf("create archive checkpoints: %w", err)
+	}
+	return nil
 }
 
 func applyAccountBaseline(db *sql.DB) error {
@@ -119,6 +182,8 @@ func applyAccountBaseline(db *sql.DB) error {
 			updated_at INTEGER NOT NULL,
 			revision   INTEGER NOT NULL DEFAULT 0,
 			deleted    INTEGER NOT NULL DEFAULT 0,
+			group_id   TEXT NOT NULL DEFAULT '',
+			position   INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (user_id, peer_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS address_book_grants (
@@ -139,6 +204,8 @@ func applyAccountBaseline(db *sql.DB) error {
 			updated_at INTEGER NOT NULL,
 			revision   INTEGER NOT NULL DEFAULT 0,
 			deleted    INTEGER NOT NULL DEFAULT 0,
+			parent_id  TEXT NOT NULL DEFAULT '',
+			position   INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (user_id, group_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS audit_events (

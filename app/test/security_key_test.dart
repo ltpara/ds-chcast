@@ -210,6 +210,101 @@ void main() {
     expect(result.username, 'alice');
   });
 
+  test('loginWithSecurityKeyOnly starts, asserts and finishes without a password',
+      () async {
+    late HttpServer server;
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final ServerSettings settings = ServerSettings(
+      url: 'http://127.0.0.1:${server.port}',
+    );
+    final List<String> paths = <String>[];
+    final List<Object?> bodies = <Object?>[];
+    server.listen((HttpRequest request) async {
+      final String text = await utf8.decoder.bind(request).join();
+      paths.add(request.uri.path);
+      bodies.add(text.isEmpty ? null : jsonDecode(text));
+      request.response.headers.contentType = ContentType.json;
+      if (request.uri.path.endsWith('/begin')) {
+        request.response.write(jsonEncode(<String, Object?>{
+          'challenge': 'Y2hhbGxlbmdl',
+          'rp_id': 'chast.example.com',
+          'username': 'alice',
+          'timeout_ms': 60000,
+          'credentials': <Object?>[
+            <String, Object?>{'id': 'Y3JlZA', 'name': '此电脑'},
+          ],
+        }));
+      } else {
+        request.response.write(jsonEncode(<String, Object?>{
+          'token': 'acct-token',
+          'expires_in_ms': 900000,
+          'user': <String, Object?>{'username': 'alice'},
+        }));
+      }
+      await request.response.close();
+    });
+    mock((MethodCall call) async {
+      if (call.method == 'securityKeyAvailable') {
+        return true;
+      }
+      return <String, Object?>{
+        'credentialId': 'Y3JlZA',
+        'clientDataJSON': 'Y2xpZW50',
+        'authenticatorData': 'YXV0aA',
+        'signature': 'c2ln',
+      };
+    });
+
+    final AccountLoginResult result = await loginWithSecurityKeyOnly(
+      settings,
+      username: 'alice',
+      deviceName: '开发机',
+    );
+
+    expect(calls.map((MethodCall call) => call.method), <String>[
+      'securityKeyAvailable',
+      'securityKeyGetAssertion',
+    ]);
+    expect(paths, <String>[
+      '/v1/account/login/webauthn/passwordless/begin',
+      '/v1/account/login/webauthn/passwordless/finish',
+    ]);
+    expect(bodies.first, <String, Object?>{'username': 'alice'});
+    expect((bodies.last as Map<Object?, Object?>)['device_name'], '开发机');
+    expect(result.token, 'acct-token');
+    expect(result.username, 'alice');
+  });
+
+  test('loginWithSecurityKeyOnly reports an account without keys', () async {
+    late HttpServer server;
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final ServerSettings settings = ServerSettings(
+      url: 'http://127.0.0.1:${server.port}',
+    );
+    server.listen((HttpRequest request) async {
+      await request.drain<void>();
+      request.response.statusCode = 202;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode(<String, Object?>{'status': 'accepted'}));
+      await request.response.close();
+    });
+    mock((MethodCall call) async => true);
+
+    await expectLater(
+      loginWithSecurityKeyOnly(settings, username: 'alice'),
+      throwsA(
+        isA<ServerApiException>().having(
+          (ServerApiException error) => error.message,
+          'message',
+          '该账号未注册安全密钥',
+        ),
+      ),
+    );
+    expect(calls, isEmpty);
+  });
+
   test('loginWithSecurityKey reports an account without keys', () async {
     late HttpServer server;
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);

@@ -38,6 +38,11 @@ constexpr UINT_PTR kWindowSubclassId = 2;
 constexpr UINT kSecurityKeyDoneMessage = WM_APP + 0x51;
 // The Dart side uses a server URL or host:port as the password-store key.
 constexpr size_t kMaxTrustKeyLength = 512;
+// Binds account-token ciphertext to its purpose, so a blob lifted from another
+// DPAPI-protected file cannot be swapped in.
+constexpr char kAccountSecretEntropy[] = "chast.account.v1";
+constexpr size_t kMaxProtectPlaintext = 64 * 1024;
+constexpr size_t kMaxProtectedText = 128 * 1024;
 
 // A finished Windows Hello ceremony waiting for the platform thread.
 struct SecurityKeyCompletion {
@@ -218,7 +223,8 @@ bool write_text_file(const std::filesystem::path& path, const std::string& text,
 ViewerBridge::ViewerBridge(flutter::FlutterEngine* engine, HWND window)
     : engine_(engine), window_(window) {
     texture_sink_ = std::make_unique<GpuFrameSink>();
-    viewer_ = std::make_unique<ViewerEngine>(texture_sink_.get());
+    camera_sink_ = std::make_unique<GpuFrameSink>();
+    viewer_ = std::make_unique<ViewerEngine>(texture_sink_.get(), camera_sink_.get());
     channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
         engine_->messenger(), "chast/viewer", &flutter::StandardMethodCodec::GetInstance());
     channel_->SetMethodCallHandler(
@@ -270,8 +276,12 @@ void ViewerBridge::Shutdown() {
     if (texture_sink_) {
         texture_sink_->SetOutput(nullptr);
     }
+    if (camera_sink_) {
+        camera_sink_->SetOutput(nullptr);
+    }
     viewer_.reset();
     texture_sink_.reset();
+    camera_sink_.reset();
     channel_.reset();
 }
 
@@ -306,12 +316,6 @@ void ViewerBridge::HandleMethodCall(
     const std::string& method = call.method_name();
 
     if (method == "start") {
-        if (texture_sink_ == nullptr || !texture_sink_->ready()) {
-            result->Error("no_gpu", texture_sink_ != nullptr
-                                        ? texture_sink_->error()
-                                        : "the GPU frame sink is not available");
-            return;
-        }
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         std::string host;
         int64_t port = 0;
@@ -329,9 +333,24 @@ void ViewerBridge::HandleMethodCall(
         ViewerTransport transport = ViewerTransport::kAuto;
         bool allow_unverified = false;
         bool trust_device = false;
+        bool file_transfer_only = false;
+        if (args != nullptr) {
+            map_bool(*args, "fileTransferOnly", &file_transfer_only);
+        }
+        // A files-only session has no picture, so it needs neither the GPU
+        // sink nor a texture; a desktop session still does.
+        if (!file_transfer_only &&
+            (texture_sink_ == nullptr || !texture_sink_->ready())) {
+            result->Error("no_gpu", texture_sink_ != nullptr
+                                        ? texture_sink_->error()
+                                        : "the GPU frame sink is not available");
+            return;
+        }
         if (args == nullptr || !map_string(*args, "host", &host) ||
-            !map_int(*args, "port", &port) || !map_int(*args, "gpuOutput", &output) ||
-            host.empty() || port <= 0 || port > 65535 || output <= 0) {
+            !map_int(*args, "port", &port) ||
+            (!file_transfer_only && !map_int(*args, "gpuOutput", &output)) ||
+            host.empty() || port <= 0 || port > 65535 || output < 0 ||
+            (!file_transfer_only && output == 0)) {
             result->Error("bad_args",
                           "start wants a host, a port in 1..65535 and a GPU texture output");
             return;
@@ -394,14 +413,18 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         EnsureIdentity();
-        texture_sink_->SetOutput(reinterpret_cast<void*>(static_cast<intptr_t>(output)));
+        if (output > 0) {
+            texture_sink_->SetOutput(
+                reinterpret_cast<void*>(static_cast<intptr_t>(output)));
+        }
         if (!viewer_->Start(host, static_cast<uint16_t>(port),
                             static_cast<uint16_t>(display), std::move(fingerprint),
                             allow_unverified, std::move(access_token),
                             std::move(password), std::move(totp), identity_,
                             trust_device, transport, std::move(carrier_host),
                             static_cast<uint16_t>(carrier_port),
-                            std::move(carrier_host_id), std::move(carrier_token))) {
+                            std::move(carrier_host_id), std::move(carrier_token),
+                            file_transfer_only)) {
             texture_sink_->SetOutput(nullptr);
             result->Error("busy", "a session is already running");
             return;
@@ -412,8 +435,9 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "stop") {
         viewer_->Stop();
-        // The plugin texture may be unregistered as soon as this returns.
+        // The plugin textures may be unregistered as soon as this returns.
         texture_sink_->SetOutput(nullptr);
+        camera_sink_->SetOutput(nullptr);
         result->Success();
         return;
     }
@@ -466,6 +490,7 @@ void ViewerBridge::HandleMethodCall(
         map[key("elapsedMs")] =
             flutter::EncodableValue(static_cast<int64_t>(status.elapsed_ms));
         map[key("videoFinished")] = flutter::EncodableValue(status.video_finished);
+        map[key("filesOnly")] = flutter::EncodableValue(status.files_only);
         map[key("fullscreen")] = flutter::EncodableValue(fullscreen_);
         map[key("inputEnabled")] = flutter::EncodableValue(status.input_enabled);
         map[key("permissions")] =
@@ -510,6 +535,7 @@ void ViewerBridge::HandleMethodCall(
         map[key("downloadPhase")] =
             flutter::EncodableValue(static_cast<int32_t>(status.download_phase));
         map[key("downloadName")] = flutter::EncodableValue(status.download_name);
+        map[key("downloadPath")] = flutter::EncodableValue(status.download_path);
         map[key("downloadSize")] =
             flutter::EncodableValue(static_cast<int64_t>(status.download_size));
         map[key("downloadReceived")] =
@@ -519,6 +545,50 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.files_received));
         map[key("fileReceiveFailures")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_receive_failures));
+        map[key("fileListAnswers")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_list_answers));
+        map[key("fileListDirectory")] =
+            flutter::EncodableValue(status.file_list_directory);
+        map[key("fileListEntries")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_list_entries));
+        map[key("fileListTruncated")] = flutter::EncodableValue(status.file_list_truncated);
+        map[key("fileListError")] = flutter::EncodableValue(status.file_list_error);
+        map[key("fileDownloadAnswers")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_download_answers));
+        map[key("fileDownloadCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_download_code));
+        map[key("fileDownloadTransferId")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_download_transfer_id));
+        map[key("fileDownloadPath")] = flutter::EncodableValue(status.file_download_path);
+        map[key("fileDownloadError")] = flutter::EncodableValue(status.file_download_error);
+        map[key("fileOpAnswers")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_op_answers));
+        map[key("fileOpCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.file_op_code));
+        map[key("fileOpPath")] = flutter::EncodableValue(status.file_op_path);
+        map[key("fileOpError")] = flutter::EncodableValue(status.file_op_error);
+        map[key("folderDownloadActive")] =
+            flutter::EncodableValue(status.folder_download_active);
+        map[key("folderDownloadName")] =
+            flutter::EncodableValue(status.folder_download_name);
+        map[key("folderDownloadDestination")] =
+            flutter::EncodableValue(status.folder_download_destination);
+        map[key("folderDownloadFilesTotal")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.folder_download_files_total));
+        map[key("folderDownloadFilesDone")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.folder_download_files_done));
+        map[key("folderDownloadRoots")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.folder_download_roots));
+        map[key("folderDownloadBatch")] =
+            flutter::EncodableValue(status.folder_download_batch);
+        map[key("folderDownloadCurrent")] =
+            flutter::EncodableValue(status.folder_download_current);
+        map[key("folderDownloadAnswers")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.folder_download_answers));
+        map[key("folderDownloadCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.folder_download_code));
+        map[key("folderDownloadError")] =
+            flutter::EncodableValue(status.folder_download_error);
         map[key("cursorUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.cursor_updates));
         map[key("cursorPending")] = flutter::EncodableValue(status.cursor_pending);
@@ -620,6 +690,39 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.terminal_bytes));
         map[key("terminalUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.terminal_updates));
+        map[key("cameraSupported")] =
+            flutter::EncodableValue(status.camera_supported);
+        map[key("cameraPhase")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.camera_phase));
+        map[key("cameraCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.camera_code));
+        map[key("cameraReason")] = flutter::EncodableValue(status.camera_reason);
+        map[key("cameraError")] = flutter::EncodableValue(status.camera_error);
+        map[key("cameraId")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.camera_id));
+        map[key("cameraListUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.camera_list_updates));
+        map[key("cameraWidth")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.camera_width));
+        map[key("cameraHeight")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.camera_height));
+        map[key("cameraFrames")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.camera_frames));
+        map[key("cameraDecoder")] = flutter::EncodableValue(status.camera_decoder);
+        map[key("cameraUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.camera_updates));
+        {
+            flutter::EncodableList cameras;
+            for (const chast::CameraDescription& camera : status.cameras) {
+                flutter::EncodableMap entry;
+                entry[key("id")] =
+                    flutter::EncodableValue(static_cast<int32_t>(camera.id));
+                entry[key("name")] = flutter::EncodableValue(camera.name);
+                entry[key("default")] = flutter::EncodableValue(camera.is_default);
+                cameras.push_back(flutter::EncodableValue(std::move(entry)));
+            }
+            map[key("cameras")] = flutter::EncodableValue(std::move(cameras));
+        }
         map[key("displaySwitches")] =
             flutter::EncodableValue(static_cast<int64_t>(status.display_switches));
         map[key("displaySwitchFailures")] =
@@ -857,29 +960,49 @@ void ViewerBridge::HandleMethodCall(
         // Starting needs a streaming session; stopping must always be possible
         // so a teardown can turn the recorder off.
         if (!viewer_->SetRecording(enabled, directory) && enabled) {
-            result->Error("unavailable", "recording needs a streaming session");
+            result->Error("unavailable", "recording needs a live session with the host's consent");
             return;
         }
         result->Success(flutter::EncodableValue(enabled));
         return;
     }
 
-    if (method == "sendFile" || method == "sendFileAt") {
+    if (method == "sendFile" || method == "sendFileAt" || method == "sendFileTo") {
         if (viewer_ == nullptr) {
             result->Error("unavailable", "no viewer session is running");
             return;
         }
-        const auto start_upload = [this, &result](const std::vector<std::string>& paths) {
-            if (paths.empty() || !viewer_->SendFiles(paths)) {
+        const auto start_upload = [this, &result](const std::vector<std::string>& paths,
+                                                  const std::string& target = {}) {
+            if (paths.empty() || !viewer_->SendFiles(paths, target)) {
                 result->Error("unavailable",
                               "the files cannot be queued now (session ended or not permitted)");
                 return;
             }
             result->Success(flutter::EncodableValue(static_cast<int32_t>(paths.size())));
         };
+        // sendFileTo carries the directory being browsed, so picked files land
+        // in that shared subfolder instead of the receive root.
+        std::string target;
+        if (method == "sendFileTo") {
+            const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+            if (args == nullptr) {
+                result->Error("bad_args", "sendFileTo wants a directory argument");
+                return;
+            }
+            const auto directory = args->find(flutter::EncodableValue("directory"));
+            if (directory == args->end() ||
+                std::get_if<std::string>(&directory->second) == nullptr) {
+                result->Error("bad_args", "sendFileTo wants a directory argument");
+                return;
+            }
+            target = *std::get_if<std::string>(&directory->second);
+        }
         if (method == "sendFileAt") {
             // The paths come from a drop on the window, so they are already
             // absolute; SendFiles expands folders and skips anything else.
+            // The map form adds the directory being browsed so a drop lands
+            // beside the picker's uploads instead of always in the root.
             std::vector<std::string> paths;
             if (const auto* one = std::get_if<std::string>(call.arguments())) {
                 paths.push_back(*one);
@@ -890,12 +1013,30 @@ void ViewerBridge::HandleMethodCall(
                         paths.push_back(*item_path);
                     }
                 }
+            } else if (const auto* args =
+                           std::get_if<flutter::EncodableMap>(call.arguments())) {
+                const auto directory = args->find(flutter::EncodableValue("directory"));
+                if (directory != args->end() &&
+                    std::get_if<std::string>(&directory->second) != nullptr) {
+                    target = *std::get_if<std::string>(&directory->second);
+                }
+                const auto dropped = args->find(flutter::EncodableValue("paths"));
+                if (dropped != args->end()) {
+                    if (const auto* items =
+                            std::get_if<flutter::EncodableList>(&dropped->second)) {
+                        for (const flutter::EncodableValue& item : *items) {
+                            if (const auto* item_path = std::get_if<std::string>(&item)) {
+                                paths.push_back(*item_path);
+                            }
+                        }
+                    }
+                }
             }
             if (paths.empty()) {
                 result->Error("bad_args", "sendFileAt wants a path or a list of paths");
                 return;
             }
-            start_upload(paths);
+            start_upload(paths, target);
             return;
         }
         // The multi-select format needs a 64 KiB buffer; longer selections
@@ -914,7 +1055,139 @@ void ViewerBridge::HandleMethodCall(
             result->Success();
             return;
         }
-        start_upload(selected_paths(selected.data()));
+        start_upload(selected_paths(selected.data()), target);
+        return;
+    }
+
+    if (method == "requestFileList" || method == "requestFileDownload") {
+        const auto* path = std::get_if<std::string>(call.arguments());
+        if (path == nullptr) {
+            result->Error("bad_args", "the request wants a '/'-separated relative path");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr && (method == "requestFileList"
+                                       ? viewer_->RequestFileList(*path)
+                                       : viewer_->RequestFileDownload(*path));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "downloadFolder") {
+        const auto* path = std::get_if<std::string>(call.arguments());
+        if (path == nullptr) {
+            result->Error("bad_args", "downloadFolder wants a '/'-separated relative path");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->RequestDirectoryDownload(*path);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "downloadEntries") {
+        const auto* items = std::get_if<flutter::EncodableList>(call.arguments());
+        if (items == nullptr) {
+            result->Error("bad_args", "downloadEntries wants a list of entries");
+            return;
+        }
+        std::vector<ViewerEngine::DownloadRoot> roots;
+        roots.reserve(items->size());
+        for (const flutter::EncodableValue& item : *items) {
+            const auto* map = std::get_if<flutter::EncodableMap>(&item);
+            if (map == nullptr) {
+                result->Error("bad_args", "downloadEntries wants a list of entries");
+                return;
+            }
+            const auto path = map->find(flutter::EncodableValue("path"));
+            const auto* path_value =
+                path == map->end() ? nullptr : std::get_if<std::string>(&path->second);
+            if (path_value == nullptr) {
+                result->Error("bad_args", "downloadEntries wants a path for every entry");
+                return;
+            }
+            const auto directory = map->find(flutter::EncodableValue("directory"));
+            const bool* directory_value =
+                directory == map->end() ? nullptr : std::get_if<bool>(&directory->second);
+            ViewerEngine::DownloadRoot root;
+            root.path = *path_value;
+            root.directory = directory_value != nullptr && *directory_value;
+            roots.push_back(std::move(root));
+        }
+        const bool queued =
+            viewer_ != nullptr && viewer_->RequestBatchDownload(std::move(roots));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "cancelFolderDownload") {
+        if (viewer_ != nullptr) {
+            viewer_->CancelDirectoryDownload();
+        }
+        result->Success();
+        return;
+    }
+
+    if (method == "fileOperation") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+            result->Error("bad_args", "fileOperation wants an operation and a path");
+            return;
+        }
+        const auto operation = args->find(flutter::EncodableValue("operation"));
+        const auto path = args->find(flutter::EncodableValue("path"));
+        const auto* operation_value =
+            operation == args->end() ? nullptr : std::get_if<int32_t>(&operation->second);
+        const auto* path_value =
+            path == args->end() ? nullptr : std::get_if<std::string>(&path->second);
+        if (operation_value == nullptr || path_value == nullptr || *operation_value < 0 ||
+            *operation_value > static_cast<int32_t>(chast::FileOperation::Remove)) {
+            result->Error("bad_args", "fileOperation wants an operation and a path");
+            return;
+        }
+        std::string new_name;
+        const auto rename = args->find(flutter::EncodableValue("newName"));
+        if (rename != args->end()) {
+            if (const auto* name = std::get_if<std::string>(&rename->second)) {
+                new_name = *name;
+            }
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->RequestFileOperation(
+                static_cast<chast::FileOperation>(*operation_value), *path_value,
+                std::move(new_name));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "takeFileList") {
+        if (viewer_ == nullptr) {
+            result->Success();
+            return;
+        }
+        ViewerEngine::FileListAnswer answer;
+        if (!viewer_->TakeFileList(answer)) {
+            result->Success();
+            return;
+        }
+        flutter::EncodableMap map;
+        map[key("directory")] = flutter::EncodableValue(answer.directory);
+        map[key("code")] = flutter::EncodableValue(static_cast<int32_t>(answer.result.code));
+        map[key("reason")] = flutter::EncodableValue(answer.result.reason);
+        map[key("truncated")] = flutter::EncodableValue(answer.result.truncated);
+        flutter::EncodableList entries;
+        entries.reserve(answer.result.entries.size());
+        for (const chast::FileListEntry& entry : answer.result.entries) {
+            flutter::EncodableMap item;
+            item[key("name")] = flutter::EncodableValue(entry.name);
+            item[key("size")] = flutter::EncodableValue(static_cast<int64_t>(entry.size));
+            item[key("modifiedMs")] =
+                flutter::EncodableValue(static_cast<int64_t>(entry.modified_ms));
+            item[key("directory")] = flutter::EncodableValue(entry.directory);
+            entries.push_back(flutter::EncodableValue(std::move(item)));
+        }
+        map[key("entries")] = flutter::EncodableValue(std::move(entries));
+        result->Success(flutter::EncodableValue(std::move(map)));
         return;
     }
 
@@ -1087,6 +1360,57 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "setCameraOutput") {
+        const auto* output = std::get_if<int64_t>(call.arguments());
+        if (output == nullptr) {
+            result->Error("bad_args",
+                          "setCameraOutput wants the camera texture output, 0 to detach");
+            return;
+        }
+        if (*output < 0) {
+            result->Error("bad_args", "setCameraOutput wants a non-negative output");
+            return;
+        }
+        if (camera_sink_ == nullptr) {
+            result->Error("no_gpu", "the camera frame sink is not available");
+            return;
+        }
+        camera_sink_->SetOutput(*output == 0
+                                    ? nullptr
+                                    : reinterpret_cast<void*>(
+                                          static_cast<intptr_t>(*output)));
+        result->Success(flutter::EncodableValue(true));
+        return;
+    }
+
+    if (method == "requestCameraList") {
+        const bool ok = viewer_ != nullptr && viewer_->RequestCameraList();
+        result->Success(flutter::EncodableValue(ok));
+        return;
+    }
+
+    if (method == "startCamera") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t camera_id = 0;
+        if (args == nullptr || !map_int(*args, "cameraId", &camera_id) ||
+            camera_id <= 0 || camera_id > 65535) {
+            result->Error("bad_args", "startCamera wants a camera id in 1..65535");
+            return;
+        }
+        const bool started =
+            viewer_ != nullptr && viewer_->StartCamera(static_cast<uint16_t>(camera_id));
+        result->Success(flutter::EncodableValue(started));
+        return;
+    }
+
+    if (method == "stopCamera") {
+        if (viewer_ != nullptr) {
+            viewer_->StopCamera();
+        }
+        result->Success();
+        return;
+    }
+
     if (method == "startPortForward") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         if (args == nullptr) {
@@ -1244,6 +1568,29 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         result->Success();
+        return;
+    }
+
+    if (method == "protectSecret" || method == "unprotectSecret") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        const bool protect = method == "protectSecret";
+        if (text == nullptr || text->empty() ||
+            text->size() > (protect ? kMaxProtectPlaintext : kMaxProtectedText)) {
+            result->Error("bad_args", "the secret has an unsupported size");
+            return;
+        }
+        std::string output;
+        std::string error;
+        const bool ok =
+            protect ? chast::protect_secret(*text, chast::SecretScope::CurrentUser,
+                                            kAccountSecretEntropy, output, &error)
+                    : chast::unprotect_secret(*text, chast::SecretScope::CurrentUser,
+                                              kAccountSecretEntropy, output, &error);
+        if (!ok) {
+            result->Error("dpapi", error);
+            return;
+        }
+        result->Success(flutter::EncodableValue(std::move(output)));
         return;
     }
 

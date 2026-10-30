@@ -119,6 +119,7 @@ AddressBookPlan planAddressBookSync({
         server: serverUrl,
         tags: peer.tags,
         groupId: peer.groupId,
+        position: peer.position,
         revision: peer.revision,
         saved: true,
         addedAt: now,
@@ -147,11 +148,15 @@ AddressBookPlan planAddressBookSync({
     if (!old.saved) {
       promoted = true;
     }
-    if (changed || promoted || old.revision != peer.revision) {
+    if (changed ||
+        promoted ||
+        old.revision != peer.revision ||
+        old.position != peer.position) {
       merged[index] = old.copyWith(
         name: name,
         tags: tags,
         groupId: groupId,
+        position: peer.position,
         revision: peer.revision,
         saved: true,
       );
@@ -298,9 +303,78 @@ List<AddressBookGroup> mergeAddressBookGroups({
     }
   }
   final List<AddressBookGroup> merged = byId.values.toList()
-    ..sort((AddressBookGroup a, AddressBookGroup b) {
-      final int byName = a.name.compareTo(b.name);
-      return byName != 0 ? byName : a.id.compareTo(b.id);
-    });
+    ..sort(compareAddressBookGroups);
   return merged;
+}
+
+/// Orders sibling groups the way the server does: manual position first,
+/// then name, then id.
+int compareAddressBookGroups(AddressBookGroup a, AddressBookGroup b) {
+  if (a.position != b.position) {
+    return a.position.compareTo(b.position);
+  }
+  final int byName = a.name.compareTo(b.name);
+  return byName != 0 ? byName : a.id.compareTo(b.id);
+}
+
+/// One group in depth-first tree order, with [depth] zero at the root.
+class AddressBookGroupNode {
+  const AddressBookGroupNode(this.group, this.depth);
+
+  final AddressBookGroup group;
+  final int depth;
+}
+
+/// Flattens [groups] into depth-first order so a nested list can be rendered
+/// with indentation. Groups whose parent is missing or deleted are treated as
+/// roots, and a damaged parent cycle is cut after the first visit so the caller
+/// always receives every live group exactly once.
+List<AddressBookGroupNode> addressBookGroupTreeOrder(
+  List<AddressBookGroup> groups,
+) {
+  final Map<String, AddressBookGroup> byId = <String, AddressBookGroup>{
+    for (final AddressBookGroup group in groups)
+      if (!group.deleted) group.id: group,
+  };
+  final Map<String, List<AddressBookGroup>> children =
+      <String, List<AddressBookGroup>>{};
+  final List<AddressBookGroup> roots = <AddressBookGroup>[];
+  for (final AddressBookGroup group in byId.values) {
+    final String parent = group.parentId;
+    if (parent.isNotEmpty && parent != group.id && byId.containsKey(parent)) {
+      children.putIfAbsent(parent, () => <AddressBookGroup>[]).add(group);
+    } else {
+      roots.add(group);
+    }
+  }
+  for (final List<AddressBookGroup> siblings in children.values) {
+    siblings.sort(compareAddressBookGroups);
+  }
+  roots.sort(compareAddressBookGroups);
+
+  final List<AddressBookGroupNode> ordered = <AddressBookGroupNode>[];
+  final Set<String> visited = <String>{};
+  void visit(AddressBookGroup group, int depth) {
+    if (!visited.add(group.id)) {
+      return;
+    }
+    ordered.add(AddressBookGroupNode(group, depth));
+    for (final AddressBookGroup child
+        in children[group.id] ?? const <AddressBookGroup>[]) {
+      visit(child, depth + 1);
+    }
+  }
+
+  for (final AddressBookGroup root in roots) {
+    visit(root, 0);
+  }
+  // A cycle has no root; surface its members as roots instead of dropping them.
+  final List<AddressBookGroup> leftovers = <AddressBookGroup>[
+    for (final AddressBookGroup group in byId.values)
+      if (!visited.contains(group.id)) group,
+  ]..sort(compareAddressBookGroups);
+  for (final AddressBookGroup group in leftovers) {
+    visit(group, 0);
+  }
+  return ordered;
 }

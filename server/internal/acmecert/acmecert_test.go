@@ -91,7 +91,7 @@ func TestTLSConfigServesCachedCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	cfg, err := m.TLSConfig("")
+	cfg, err := m.TLSConfig("", 0)
 	if err != nil {
 		t.Fatalf("TLSConfig: %v", err)
 	}
@@ -149,16 +149,153 @@ func TestTLSConfigClientCA(t *testing.T) {
 	if err := os.WriteFile(caFile, certPEM, 0o600); err != nil {
 		t.Fatalf("write CA: %v", err)
 	}
-	cfg, err := m.TLSConfig(caFile)
+	cfg, err := m.TLSConfig(caFile, 0)
 	if err != nil {
 		t.Fatalf("TLSConfig: %v", err)
 	}
 	if cfg.ClientAuth != tls.RequireAndVerifyClientCert || cfg.ClientCAs == nil {
 		t.Fatalf("client auth = %v, pool = %v", cfg.ClientAuth, cfg.ClientCAs)
 	}
-	if _, err := m.TLSConfig(filepath.Join(dir, "missing.pem")); err == nil {
+	if _, err := m.TLSConfig(filepath.Join(dir, "missing.pem"), 0); err == nil {
 		t.Fatal("TLSConfig accepted a missing client CA")
 	}
+}
+
+func TestTLSConfigClientCAHotReload(t *testing.T) {
+	dir := t.TempDir()
+	writeCertCache(t, dir, "acme.test")
+	caA := newTestCA(t, "A")
+	caB := newTestCA(t, "B")
+	caFile := filepath.Join(dir, "client-ca.pem")
+	if err := os.WriteFile(caFile, caA.pem, 0o600); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+	m, err := New(Config{Domains: []string{"acme.test"}, CacheDir: dir, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cfg, err := m.TLSConfig(caFile, 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("TLSConfig: %v", err)
+	}
+	if !clientCAVerifies(t, cfg, caA) || clientCAVerifies(t, cfg, caB) {
+		t.Fatal("initial pool does not match the seeded client CA")
+	}
+
+	if err := os.WriteFile(caFile, caB.pem, 0o600); err != nil {
+		t.Fatalf("overwrite CA: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if !clientCAVerifies(t, cfg, caB) || clientCAVerifies(t, cfg, caA) {
+		t.Fatal("rotated client CA was not picked up")
+	}
+
+	if err := os.WriteFile(caFile, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatalf("break CA: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if !clientCAVerifies(t, cfg, caB) {
+		t.Fatal("a broken replacement dropped the previous client CA pool")
+	}
+}
+
+func TestTLSConfigClientCAStaticInterval(t *testing.T) {
+	dir := t.TempDir()
+	writeCertCache(t, dir, "acme.test")
+	caA := newTestCA(t, "A")
+	caB := newTestCA(t, "B")
+	caFile := filepath.Join(dir, "client-ca.pem")
+	if err := os.WriteFile(caFile, caA.pem, 0o600); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+	m, err := New(Config{Domains: []string{"acme.test"}, CacheDir: dir, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cfg, err := m.TLSConfig(caFile, 0)
+	if err != nil {
+		t.Fatalf("TLSConfig: %v", err)
+	}
+	if err := os.WriteFile(caFile, caB.pem, 0o600); err != nil {
+		t.Fatalf("overwrite CA: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !clientCAVerifies(t, cfg, caA) || clientCAVerifies(t, cfg, caB) {
+		t.Fatal("interval 0 reloaded the client CA")
+	}
+}
+
+type testCA struct {
+	pem    []byte
+	client *x509.Certificate
+}
+
+func newTestCA(t *testing.T, name string) *testCA {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: name + " test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create CA certificate: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse CA certificate: %v", err)
+	}
+	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate client key: %v", err)
+	}
+	clientTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: name + " client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, clientTmpl, caCert, &clientKey.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create client certificate: %v", err)
+	}
+	clientCert, err := x509.ParseCertificate(clientDER)
+	if err != nil {
+		t.Fatalf("parse client certificate: %v", err)
+	}
+	return &testCA{
+		pem:    pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		client: clientCert,
+	}
+}
+
+func clientCAVerifies(t *testing.T, cfg *tls.Config, ca *testCA) bool {
+	t.Helper()
+	per, err := cfg.GetConfigForClient(&tls.ClientHelloInfo{ServerName: "acme.test"})
+	if err != nil {
+		t.Fatalf("GetConfigForClient: %v", err)
+	}
+	if per == nil || per == cfg {
+		t.Fatal("GetConfigForClient did not return a per-handshake clone")
+	}
+	if per.ClientAuth != tls.RequireAndVerifyClientCert || per.ClientCAs == nil {
+		t.Fatalf("clone client auth = %v, pool = %v", per.ClientAuth, per.ClientCAs)
+	}
+	_, err = ca.client.Verify(x509.VerifyOptions{
+		Roots:     per.ClientCAs,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	return err == nil
 }
 
 func TestStartHTTPServesChallengesAndRedirects(t *testing.T) {

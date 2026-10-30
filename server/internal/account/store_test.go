@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -650,6 +651,245 @@ func TestAddressBookGroupOptimisticConcurrency(t *testing.T) {
 	revived, err := store.UpsertGroup(alice.ID, "studio", "Revive")
 	if err != nil || revived.Revision != 4 || revived.Deleted {
 		t.Fatalf("legacy group revive = %+v, %v", revived, err)
+	}
+}
+
+func TestAddressBookGroupNesting(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	root, err := store.UpsertGroup(alice.ID, "root", "Root")
+	if err != nil || root.ParentID != "" || root.Position != 0 {
+		t.Fatalf("create root = %+v, %v", root, err)
+	}
+	devName, devParent, devPosition := "Dev", "root", int64(5)
+	dev, err := store.UpdateGroupAt(alice.ID, "dev", &devName, &devParent, &devPosition, 0)
+	if err != nil || dev.ParentID != "root" || dev.Position != 5 || dev.Name != "Dev" {
+		t.Fatalf("create child = %+v, %v", dev, err)
+	}
+	rackName, rackParent, rackPosition := "Rack", "dev", int64(2)
+	rack, err := store.UpdateGroupAt(alice.ID, "rack", &rackName, &rackParent, &rackPosition, 0)
+	if err != nil || rack.ParentID != "dev" || rack.Position != 2 {
+		t.Fatalf("create grandchild = %+v, %v", rack, err)
+	}
+	alphaName, alphaPosition := "Alpha", int64(9)
+	if _, err := store.UpdateGroupAt(alice.ID, "alpha", &alphaName, nil, &alphaPosition, 0); err != nil {
+		t.Fatalf("create alpha: %v", err)
+	}
+	betaName, betaPosition := "Beta", int64(1)
+	if _, err := store.UpdateGroupAt(alice.ID, "beta", &betaName, nil, &betaPosition, 0); err != nil {
+		t.Fatalf("create beta: %v", err)
+	}
+	groups, err := store.groupsLocked(alice.ID)
+	if err != nil {
+		t.Fatalf("list groups: %v", err)
+	}
+	wantOrder := []string{"root", "beta", "rack", "dev", "alpha"}
+	if len(groups) != len(wantOrder) {
+		t.Fatalf("groups = %+v", groups)
+	}
+	for i, id := range wantOrder {
+		if groups[i].ID != id {
+			t.Fatalf("group order = %+v, want %v", groups, wantOrder)
+		}
+	}
+
+	renamed, err := store.UpdateGroupAt(alice.ID, "dev", &rackName, nil, nil, 0)
+	if err != nil || renamed.Name != "Rack" || renamed.ParentID != "root" || renamed.Position != 5 {
+		t.Fatalf("rename keeps placement = %+v, %v", renamed, err)
+	}
+
+	selfParent := "dev"
+	if _, err := store.UpdateGroupAt(alice.ID, "dev", nil, &selfParent, nil, 0); !errors.Is(err, ErrGroupCycle) {
+		t.Fatalf("self parent error = %v", err)
+	}
+	cycleParent := "rack"
+	if _, err := store.UpdateGroupAt(alice.ID, "root", nil, &cycleParent, nil, 0); !errors.Is(err, ErrGroupCycle) {
+		t.Fatalf("descendant parent error = %v", err)
+	}
+	ghost := "ghost"
+	if _, err := store.UpdateGroupAt(alice.ID, "dev", nil, &ghost, nil, 0); !errors.Is(err, ErrUnknownGroup) {
+		t.Fatalf("unknown parent error = %v", err)
+	}
+	badParent := "bad id"
+	if _, err := store.UpdateGroupAt(alice.ID, "dev", nil, &badParent, nil, 0); !errors.Is(err, ErrInvalidGroupID) {
+		t.Fatalf("invalid parent id error = %v", err)
+	}
+	negative := int64(-1)
+	if _, err := store.UpdateGroupAt(alice.ID, "dev", nil, nil, &negative, 0); !errors.Is(err, ErrInvalidPosition) {
+		t.Fatalf("negative group position error = %v", err)
+	}
+	if _, err := store.UpdateGroupAt(alice.ID, "nameless", nil, nil, nil, 0); !errors.Is(err, ErrInvalidGroupName) {
+		t.Fatalf("nameless create error = %v", err)
+	}
+	bob, err := store.CreateUser("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	foreignName := "Foreign"
+	if _, err := store.UpdateGroupAt(bob.ID, "foreign", &foreignName, &devParent, nil, 0); !errors.Is(err, ErrUnknownGroup) {
+		t.Fatalf("foreign parent error = %v", err)
+	}
+
+	parentID := "root"
+	for depth := 2; depth <= maxGroupDepth; depth++ {
+		id := fmt.Sprintf("deep%d", depth)
+		childName := fmt.Sprintf("Deep %d", depth)
+		if _, err := store.UpdateGroupAt(alice.ID, id, &childName, &parentID, nil, 0); err != nil {
+			t.Fatalf("create depth %d: %v", depth, err)
+		}
+		parentID = id
+	}
+	tooDeep := "Deep 9"
+	if _, err := store.UpdateGroupAt(alice.ID, "deep9", &tooDeep, &parentID, nil, 0); !errors.Is(err, ErrGroupDepth) {
+		t.Fatalf("depth cap error = %v", err)
+	}
+
+	if removed, err := store.DeleteGroup(alice.ID, "dev"); err != nil || !removed {
+		t.Fatalf("delete middle group = %v, %v", removed, err)
+	}
+	snapshot, err := store.Snapshot(alice.ID, 0)
+	if err != nil {
+		t.Fatalf("snapshot after delete: %v", err)
+	}
+	promoted := false
+	for _, group := range snapshot.Groups {
+		if group.ID == "rack" && group.ParentID == "root" {
+			promoted = true
+		}
+		if group.ID == "dev" {
+			t.Fatalf("deleted group still live: %+v", group)
+		}
+	}
+	if !promoted {
+		t.Fatalf("child group was not promoted: %+v", snapshot.Groups)
+	}
+	changeSeen := false
+	for _, change := range snapshot.GroupChanges {
+		if change.ID == "rack" && !change.Deleted && change.ParentID == "root" {
+			changeSeen = true
+		}
+	}
+	if !changeSeen {
+		t.Fatalf("promotion missing from group changes: %+v", snapshot.GroupChanges)
+	}
+
+	peerName, peerGroup := "Box", "root"
+	highPosition := int64(10)
+	if _, err := store.UpdatePeerAt(alice.ID, "peer-b", &peerName, nil, &peerGroup, &highPosition, 0); err != nil {
+		t.Fatalf("create peer-b: %v", err)
+	}
+	lowPosition := int64(3)
+	if _, err := store.UpdatePeerAt(alice.ID, "peer-a", &peerName, nil, &peerGroup, &lowPosition, 0); err != nil {
+		t.Fatalf("create peer-a: %v", err)
+	}
+	if _, err := store.UpdatePeerAt(alice.ID, "peer-c", &peerName, nil, &peerGroup, nil, 0); err != nil {
+		t.Fatalf("create peer-c: %v", err)
+	}
+	if _, err := store.UpdatePeerAt(alice.ID, "peer-d", &peerName, nil, &peerGroup, &negative, 0); !errors.Is(err, ErrInvalidPosition) {
+		t.Fatalf("negative peer position error = %v", err)
+	}
+	peers, err := store.Peers(alice.ID)
+	if err != nil {
+		t.Fatalf("list peers: %v", err)
+	}
+	wantPeers := []string{"peer-c", "peer-a", "peer-b"}
+	if len(peers) != len(wantPeers) {
+		t.Fatalf("peers = %+v", peers)
+	}
+	for i, id := range wantPeers {
+		if peers[i].ID != id {
+			t.Fatalf("peer order = %+v, want %v", peers, wantPeers)
+		}
+	}
+}
+
+func TestSharedBookGroupSubtree(t *testing.T) {
+	store := openTemp(t, "state.db")
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	bob, err := store.CreateUser("bob", "correct horse")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	carol, err := store.CreateUser("carol", "correct horse")
+	if err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "team", "Team"); err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	if _, err := store.UpsertGroup(alice.ID, "ops", "Ops"); err != nil {
+		t.Fatalf("create ops: %v", err)
+	}
+	devName, devParent := "Dev", "team"
+	if _, err := store.UpdateGroupAt(alice.ID, "dev", &devName, &devParent, nil, 0); err != nil {
+		t.Fatalf("create dev: %v", err)
+	}
+	box := "Box"
+	for peerID, groupID := range map[string]string{
+		"team-peer": "team",
+		"dev-peer":  "dev",
+		"ops-peer":  "ops",
+	} {
+		group := groupID
+		if _, err := store.UpdatePeerWithGroup(alice.ID, peerID, &box, nil, &group); err != nil {
+			t.Fatalf("seed %s: %v", peerID, err)
+		}
+	}
+	if _, err := store.ShareBookScoped(alice.ID, "bob", PermissionWrite, "team"); err != nil {
+		t.Fatalf("share team: %v", err)
+	}
+	books, err := store.SharedBooks(bob.ID)
+	if err != nil || len(books) != 1 {
+		t.Fatalf("bob books = %+v, %v", books, err)
+	}
+	visiblePeers := map[string]bool{}
+	for _, peer := range books[0].Peers {
+		visiblePeers[peer.ID] = true
+	}
+	if !visiblePeers["team-peer"] || !visiblePeers["dev-peer"] || visiblePeers["ops-peer"] {
+		t.Fatalf("bob visible peers = %+v", books[0].Peers)
+	}
+	visibleGroups := map[string]bool{}
+	for _, group := range books[0].Groups {
+		visibleGroups[group.ID] = true
+	}
+	if !visibleGroups["team"] || !visibleGroups["dev"] || visibleGroups["ops"] {
+		t.Fatalf("bob visible groups = %+v", books[0].Groups)
+	}
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "dev", "Shared", nil); err != nil {
+		t.Fatalf("write into granted subtree: %v", err)
+	}
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "escape", "ops", "Escape", nil); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("write outside granted subtree = %v", err)
+	}
+
+	if _, err := store.ShareBookScoped(alice.ID, "carol", PermissionRead, "dev"); err != nil {
+		t.Fatalf("share dev: %v", err)
+	}
+	carolBooks, err := store.SharedBooks(carol.ID)
+	if err != nil || len(carolBooks) != 1 {
+		t.Fatalf("carol books = %+v, %v", carolBooks, err)
+	}
+	carolPeers := map[string]bool{}
+	for _, peer := range carolBooks[0].Peers {
+		carolPeers[peer.ID] = true
+	}
+	if !carolPeers["dev-peer"] || !carolPeers["newbox"] ||
+		carolPeers["team-peer"] || carolPeers["ops-peer"] {
+		t.Fatalf("carol visible peers = %+v", carolBooks[0].Peers)
+	}
+	carolGroups := map[string]bool{}
+	for _, group := range carolBooks[0].Groups {
+		carolGroups[group.ID] = true
+	}
+	if !carolGroups["dev"] || !carolGroups["team"] || carolGroups["ops"] {
+		t.Fatalf("carol visible groups = %+v", carolBooks[0].Groups)
 	}
 }
 

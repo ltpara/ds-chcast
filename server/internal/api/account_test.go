@@ -35,6 +35,7 @@ type peerReply struct {
 	Name        string   `json:"name"`
 	Tags        []string `json:"tags"`
 	GroupID     string   `json:"group_id"`
+	Position    int64    `json:"position"`
 	UpdatedAtMS int64    `json:"updated_at_ms"`
 	Revision    int64    `json:"revision"`
 	Deleted     bool     `json:"deleted"`
@@ -43,6 +44,8 @@ type peerReply struct {
 type groupReply struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
+	ParentID    string `json:"parent_id"`
+	Position    int64  `json:"position"`
 	UpdatedAtMS int64  `json:"updated_at_ms"`
 	Revision    int64  `json:"revision"`
 	Deleted     bool   `json:"deleted"`
@@ -498,6 +501,121 @@ func TestAddressBookGroupOptimisticConcurrencyAPI(t *testing.T) {
 	}
 	if revived.Revision != 4 || revived.Deleted {
 		t.Fatalf("revived group = %+v", revived)
+	}
+}
+
+func TestAddressBookNestingAndOrderAPI(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	reply := login(t, s.URL, "alice", "correct horse")
+
+	status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/root",
+		`{"name":"Root","position":2}`, reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("create root: %d %s", status, body)
+	}
+	var root groupReply
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("root reply: %v", err)
+	}
+	if root.ParentID != "" || root.Position != 2 {
+		t.Fatalf("root group = %+v", root)
+	}
+	status, body = request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/child",
+		`{"name":"Child","parent_id":"root","position":1}`, reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("create child: %d %s", status, body)
+	}
+	var child groupReply
+	if err := json.Unmarshal(body, &child); err != nil {
+		t.Fatalf("child reply: %v", err)
+	}
+	if child.ParentID != "root" || child.Position != 1 {
+		t.Fatalf("child group = %+v", child)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/beta",
+		`{"name":"Beta","position":1}`, reply.Token); status != http.StatusOK {
+		t.Fatalf("create beta: %d %s", status, body)
+	}
+
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/child",
+		`{"parent_id":"child"}`, reply.Token); status != http.StatusBadRequest ||
+		!strings.Contains(string(body), "cannot contain itself") {
+		t.Fatalf("self parent: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/root",
+		`{"parent_id":"child"}`, reply.Token); status != http.StatusBadRequest ||
+		!strings.Contains(string(body), "cannot contain itself") {
+		t.Fatalf("descendant parent: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/beta",
+		`{"parent_id":"missing"}`, reply.Token); status != http.StatusBadRequest ||
+		!strings.Contains(string(body), "parent group is unknown") {
+		t.Fatalf("unknown parent: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/beta",
+		`{"position":-1}`, reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("negative group position: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/groups/beta",
+		`{"name":"Beta two","if_revision":999}`, reply.Token); status != http.StatusConflict {
+		t.Fatalf("stale group placement: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/peer-a",
+		`{"name":"A","group_id":"child","position":2}`, reply.Token); status != http.StatusOK {
+		t.Fatalf("create peer-a: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/peer-b",
+		`{"name":"B","group_id":"child","position":1}`, reply.Token); status != http.StatusOK {
+		t.Fatalf("create peer-b: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/peer-c",
+		`{"name":"C","position":3}`, reply.Token); status != http.StatusOK {
+		t.Fatalf("create peer-c: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPatch, s.URL+"/v1/addressbook/peers/peer-c",
+		`{"position":-1}`, reply.Token); status != http.StatusBadRequest {
+		t.Fatalf("negative peer position: %d %s", status, body)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("read nested book: %d %s", status, body)
+	}
+	var book addressBookReply
+	if err := json.Unmarshal(body, &book); err != nil {
+		t.Fatalf("nested book reply: %v", err)
+	}
+	if len(book.Groups) != 3 ||
+		book.Groups[0].ID != "beta" || book.Groups[1].ID != "child" || book.Groups[2].ID != "root" {
+		t.Fatalf("groups = %+v", book.Groups)
+	}
+	if len(book.Peers) != 3 ||
+		book.Peers[0].ID != "peer-b" || book.Peers[1].ID != "peer-a" || book.Peers[2].ID != "peer-c" {
+		t.Fatalf("peers = %+v", book.Peers)
+	}
+	if book.Peers[1].GroupID != "child" || book.Peers[1].Position != 2 {
+		t.Fatalf("placed peer = %+v", book.Peers[1])
+	}
+
+	if status, body := request(t, http.MethodDelete, s.URL+"/v1/addressbook/groups/root", "", reply.Token); status != http.StatusNoContent {
+		t.Fatalf("delete root group: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("book after group delete: %d %s", status, body)
+	}
+	var after addressBookReply
+	if err := json.Unmarshal(body, &after); err != nil {
+		t.Fatalf("post-delete reply: %v", err)
+	}
+	if len(after.Groups) != 2 || after.Groups[0].ID != "beta" || after.Groups[1].ID != "child" {
+		t.Fatalf("groups after delete = %+v", after.Groups)
+	}
+	if after.Groups[1].ParentID != "" || after.Groups[1].Revision <= child.Revision {
+		t.Fatalf("promoted child = %+v", after.Groups[1])
 	}
 }
 
@@ -1944,10 +2062,12 @@ func TestAuditLogEndpoint(t *testing.T) {
 	if status, body := request(t, http.MethodGet, s.URL+"/v1/audit", "", ""); status != http.StatusUnauthorized {
 		t.Fatalf("audit without operator key: %d %s", status, body)
 	}
-	if status, body := request(t, http.MethodGet, s.URL+"/v1/audit", "", token); status != http.StatusUnauthorized {
-		t.Fatalf("audit with viewer token: %d %s", status, body)
+	// The first account is the admin, so its token may read the trail too.
+	status, data := request(t, http.MethodGet, s.URL+"/v1/audit", "", token)
+	if status != http.StatusOK {
+		t.Fatalf("audit with admin token: %d %s", status, data)
 	}
-	status, data := request(t, http.MethodGet, s.URL+"/v1/audit", "", testutil.ServerKey)
+	status, data = request(t, http.MethodGet, s.URL+"/v1/audit", "", testutil.ServerKey)
 	if status != http.StatusOK {
 		t.Fatalf("audit: %d %s", status, data)
 	}
@@ -2092,9 +2212,15 @@ func TestConnectionAudit(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Fatalf("operator view without key: %d %s", status, body)
 	}
+	// The admin account token may read the operator view; an ordinary viewer
+	// account token may not.
 	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/connections", "", alice.Token)
-	if status != http.StatusUnauthorized {
-		t.Fatalf("account token accepted by operator view: %d %s", status, body)
+	if status != http.StatusOK {
+		t.Fatalf("operator view with admin token: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/connections", "", bob.Token)
+	if status != http.StatusForbidden {
+		t.Fatalf("operator view with viewer token: %d %s", status, body)
 	}
 	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/connections", "", testutil.ServerKey)
 	if status != http.StatusOK {
@@ -2242,8 +2368,12 @@ func TestFileTransferAudit(t *testing.T) {
 		t.Fatalf("operator view without key: %d %s", status, body)
 	}
 	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/file-transfers", "", alice.Token)
-	if status != http.StatusUnauthorized {
-		t.Fatalf("account token accepted by operator view: %d %s", status, body)
+	if status != http.StatusOK {
+		t.Fatalf("operator view with admin token: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/file-transfers", "", bob.Token)
+	if status != http.StatusForbidden {
+		t.Fatalf("operator view with viewer token: %d %s", status, body)
 	}
 	status, body = request(t, http.MethodGet, s.URL+"/v1/audit/file-transfers", "", testutil.ServerKey)
 	if status != http.StatusOK {

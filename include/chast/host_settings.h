@@ -81,6 +81,15 @@ struct HostSettings {
     // HelloAck reports terminal unavailable and every TerminalRequest is
     // refused.
     bool allow_terminal = false;
+    // Let the viewer stream one of this machine's cameras. Off by default:
+    // the camera looks into the room, so this is an explicit decision in the
+    // same spirit as port forwarding. Off means the HelloAck reports cameras
+    // unavailable and every ListCameras/StartCamera is refused.
+    bool allow_camera = false;
+    // Consent to the viewer recording the received stream locally, matching
+    // RustDesk's "enable-record-session". On by default; advisory, because the
+    // host cannot stop a recording once the stream has reached the viewer.
+    bool allow_record = true;
     // UTF-8 directory for received files. Empty means Downloads\chast.
     std::string file_receive_directory;
     // Send the system sound to the viewer. Off means no audio stream is

@@ -53,6 +53,10 @@ type webauthnLoginBeginRequest struct {
 	Password string `json:"password"`
 }
 
+type webauthnPasswordlessBeginRequest struct {
+	Username string `json:"username"`
+}
+
 type webauthnLoginBeginResponse struct {
 	Challenge   string                   `json:"challenge"`
 	RPID        string                   `json:"rp_id"`
@@ -365,7 +369,73 @@ func (s *server) beginWebAuthnLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// beginWebAuthnPasswordlessLogin offers the registered keys for a username
+// without asking for the password. Unknown accounts and accounts without a
+// key are answered with the same 202 an enrolled account gets when no key is
+// available, so this route does not tell an unauthenticated caller which
+// usernames exist. Only accounts that do have keys reveal that fact here,
+// which passwordless login necessarily does through the credential list.
+func (s *server) beginWebAuthnPasswordlessLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.webauthnReady() {
+		writeError(w, http.StatusServiceUnavailable, "security keys are not configured")
+		return
+	}
+	var req webauthnPasswordlessBeginRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		s.auditLogin(r, username, "missing credentials", false)
+		writeError(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	key := strings.ToLower(username) + "|" + s.clientIP(r)
+	if retry, ok := s.cfg.LoginLimiter.Allow(key); !ok {
+		s.auditLogin(r, username, "locked out", false)
+		writeLoginLocked(w, retry)
+		return
+	}
+	challenge, err := webauthn.NewChallenge()
+	if err != nil {
+		s.cfg.Logger.Error("webauthn challenge", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not start security key login")
+		return
+	}
+	user, credentials, err := s.cfg.Accounts.BeginWebAuthnPasswordlessLogin(username, challenge, webauthn.ChallengeTTL)
+	switch {
+	case errors.Is(err, account.ErrInvalidCredentials), errors.Is(err, account.ErrWebAuthnNotEnabled):
+		// No failure is recorded: an account without keys must stay usable
+		// through the password route, and a lockout would distinguish it from
+		// an unknown account.
+		s.auditLogin(r, username, "passwordless security key unavailable", false)
+		writeJSON(w, http.StatusAccepted, recoverResponse{Status: "accepted"})
+		return
+	case err != nil:
+		s.auditLogin(r, username, "security key internal error", false)
+		s.cfg.Logger.Error("webauthn passwordless begin login", "user", username, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not start security key login")
+		return
+	}
+	writeJSON(w, http.StatusOK, webauthnLoginBeginResponse{
+		Challenge:   base64.RawURLEncoding.EncodeToString(challenge),
+		RPID:        s.cfg.WebAuthnRPID,
+		Username:    user.Username,
+		TimeoutMS:   int(webauthn.TimeoutMS),
+		Credentials: viewWebAuthnCredentials(credentials),
+	})
+}
+
 func (s *server) finishWebAuthnLogin(w http.ResponseWriter, r *http.Request) {
+	s.finishWebAuthnAssertion(w, r, account.WebAuthnLogin, "password+security-key", "security-key")
+}
+
+func (s *server) finishWebAuthnPasswordlessLogin(w http.ResponseWriter, r *http.Request) {
+	s.finishWebAuthnAssertion(w, r, account.WebAuthnLoginPasswordless, "passwordless-security-key", "passwordless-security-key")
+}
+
+func (s *server) finishWebAuthnAssertion(w http.ResponseWriter, r *http.Request, purpose, successDetail, factor string) {
 	if !s.webauthnReady() {
 		writeError(w, http.StatusServiceUnavailable, "security keys are not configured")
 		return
@@ -440,7 +510,7 @@ func (s *server) finishWebAuthnLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not complete the login")
 		return
 	}
-	expected, err := s.cfg.Accounts.WebAuthnChallenge(user.ID, account.WebAuthnLogin)
+	expected, err := s.cfg.Accounts.WebAuthnChallenge(user.ID, purpose)
 	if err != nil {
 		if errors.Is(err, account.ErrWebAuthnChallenge) {
 			reject("security key challenge missing", http.StatusUnauthorized,
@@ -475,7 +545,7 @@ func (s *server) finishWebAuthnLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, token, _, refresh, _, err := s.cfg.Accounts.CompleteWebAuthnLogin(
-		user.Username, credential.ID, expected, counter, req.DeviceID, req.DeviceName)
+		user.Username, purpose, credential.ID, expected, counter, req.DeviceID, req.DeviceName)
 	switch {
 	case errors.Is(err, account.ErrAccountBanned):
 		s.auditLogin(r, username, "account banned", false)
@@ -496,12 +566,12 @@ func (s *server) finishWebAuthnLogin(w http.ResponseWriter, r *http.Request) {
 	if err := s.cfg.Accounts.SetSessionOrigin(token, ip, s.clientLocation(ip)); err != nil {
 		s.cfg.Logger.Error("account session origin", "error", err)
 	}
-	detail := "password+security-key"
+	detail := successDetail
 	if device := strings.TrimSpace(req.DeviceName); device != "" {
 		detail += " device=" + device
 	}
 	s.auditLogin(r, user.Username, detail, true)
-	s.cfg.Logger.Info("account login", "user", user.Username, "factor", "security-key")
+	s.cfg.Logger.Info("account login", "user", user.Username, "factor", factor)
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:              token,
 		ExpiresInMS:        account.AccessTokenTTL.Milliseconds(),

@@ -64,6 +64,49 @@ func TestRolesDefaultAndProtectLastAdmin(t *testing.T) {
 	}
 }
 
+func TestOperatorAndReadonlyRoles(t *testing.T) {
+	store := openTemp(t, "console-roles.db")
+	if _, err := store.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	if _, err := store.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if _, err := store.CreateUser("carol", "carol pass"); err != nil {
+		t.Fatalf("create carol: %v", err)
+	}
+	for role, want := range map[string]bool{
+		RoleAdmin: true, RoleOperator: true, RoleReadonly: true, RoleUser: true,
+		"root": false, "": false,
+	} {
+		if ValidRole(role) != want {
+			t.Fatalf("ValidRole(%q) = %v, want %v", role, ValidRole(role), want)
+		}
+	}
+
+	if _, err := store.SetRole("bob", RoleOperator); err != nil {
+		t.Fatalf("set operator: %v", err)
+	}
+	if _, err := store.SetRole("carol", RoleReadonly); err != nil {
+		t.Fatalf("set readonly: %v", err)
+	}
+	user, token, _, _, _, err := store.LoginWithRefresh("carol", "carol pass", "", "", "", "")
+	if err != nil || user.Role != RoleReadonly {
+		t.Fatalf("readonly login = %+v, %v", user, err)
+	}
+	if authed, err := store.Authenticate(token); err != nil || authed.Role != RoleReadonly {
+		t.Fatalf("readonly authenticate = %+v, %v", authed, err)
+	}
+
+	// Operators and readonly accounts are console roles, not admins: the last
+	// admin still cannot step down to either of them.
+	for _, role := range []string{RoleOperator, RoleReadonly} {
+		if _, err := store.SetRole("alice", role); !errors.Is(err, ErrLastAdmin) {
+			t.Fatalf("last admin to %s = %v", role, err)
+		}
+	}
+}
+
 func mustRefresh(t *testing.T, store *Store, username, password string) string {
 	t.Helper()
 	_, _, _, refresh, _, err := store.LoginWithRefresh(username, password, "", "", "", "")
@@ -143,5 +186,25 @@ func TestRoleVisibleInUserList(t *testing.T) {
 	}
 	if users[0].CreatedAt.IsZero() || time.Since(users[0].CreatedAt) > time.Minute {
 		t.Fatalf("created_at = %v", users[0].CreatedAt)
+	}
+}
+
+func TestCreateUserWithRole(t *testing.T) {
+	store := openTemp(t, "create-role.db")
+	// The bootstrap account stays admin even when the request asks for less,
+	// instead of being created and then rejected by the last-admin guard.
+	bootstrap, err := store.CreateUserWithRole("alice", "correct horse", "", "", RoleUser)
+	if err != nil || bootstrap.Role != RoleAdmin {
+		t.Fatalf("bootstrap account = %+v, %v", bootstrap, err)
+	}
+	if _, err := store.CreateUserWithRole("bob", "battery staple", "", "", "root"); !errors.Is(err, ErrInvalidRole) {
+		t.Fatalf("invalid role = %v", err)
+	}
+	if _, err := store.FindUser("bob"); !errors.Is(err, ErrUnknownUser) {
+		t.Fatalf("invalid role created an account: %v", err)
+	}
+	if user, err := store.CreateUserWithRole("bob", "battery staple", "", "", RoleOperator); err != nil ||
+		user.Role != RoleOperator {
+		t.Fatalf("operator account = %+v, %v", user, err)
 	}
 }

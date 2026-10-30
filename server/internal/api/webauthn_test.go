@@ -403,6 +403,206 @@ func TestWebAuthnAssertionRejections(t *testing.T) {
 	}
 }
 
+func TestWebAuthnPasswordlessFlow(t *testing.T) {
+	s := startWebAuthnAPI(t, nil)
+	alice, err := s.Accounts.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	auth, err := webauthntest.New(webauthn.AlgES256, s.RPID, s.Origin)
+	if err != nil {
+		t.Fatalf("authenticator: %v", err)
+	}
+	registrationChallenge := []byte("register-passwordless")
+	if _, err := s.Accounts.IssueWebAuthnChallenge(alice.ID, account.WebAuthnRegister, registrationChallenge, time.Minute); err != nil {
+		t.Fatalf("issue registration challenge: %v", err)
+	}
+	credential := auth.Credential()
+	if _, err := s.Accounts.FinishWebAuthnRegistration(alice.ID, registrationChallenge, account.WebAuthnCredential{
+		ID:        credential.ID,
+		PublicKey: credential.PublicKey,
+		Alg:       credential.Alg,
+		SignCount: credential.SignCount,
+	}, "key"); err != nil {
+		t.Fatalf("store credential: %v", err)
+	}
+	credentialID := base64.RawURLEncoding.EncodeToString(credential.ID)
+
+	// An unknown account and an empty username never reveal more than an
+	// account without a key would.
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/begin",
+		`{"username":"nobody"}`, "")
+	if status != http.StatusAccepted || !strings.Contains(string(data), "accepted") {
+		t.Fatalf("unknown account begin: %d %s", status, data)
+	}
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/begin",
+		`{"username":"  "}`, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("empty username begin: %d %s", status, data)
+	}
+
+	begin := func() []byte {
+		t.Helper()
+		status, data := request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/begin",
+			`{"username":"alice"}`, "")
+		if status != http.StatusOK {
+			t.Fatalf("passwordless begin: %d %s", status, data)
+		}
+		var reply webauthnBeginReply
+		if err := json.Unmarshal(data, &reply); err != nil || reply.RPID != s.RPID ||
+			len(reply.Credentials) != 1 || reply.Credentials[0].ID != credentialID {
+			t.Fatalf("passwordless begin = %s (%v)", data, err)
+		}
+		challenge, err := base64.RawURLEncoding.DecodeString(reply.Challenge)
+		if err != nil {
+			t.Fatalf("passwordless challenge: %v", err)
+		}
+		return challenge
+	}
+	assertionBody := func(challenge []byte) string {
+		t.Helper()
+		clientData, authData, signature, err := auth.Assert(challenge)
+		if err != nil {
+			t.Fatalf("assert: %v", err)
+		}
+		return webauthnFinishBody(map[string]string{
+			"username":           "alice",
+			"credential_id":      credentialID,
+			"client_data_json":   base64.RawURLEncoding.EncodeToString(clientData),
+			"authenticator_data": base64.RawURLEncoding.EncodeToString(authData),
+			"signature":          base64.RawURLEncoding.EncodeToString(signature),
+			"device_name":        "Desk",
+		})
+	}
+
+	challenge := begin()
+	body := assertionBody(challenge)
+	// The password-gated finish does not see the passwordless challenge.
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/finish", body, "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("password finish with passwordless challenge: %d %s", status, data)
+	}
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/finish", body, "")
+	if status != http.StatusOK {
+		t.Fatalf("passwordless finish: %d %s", status, data)
+	}
+	var reply loginReply
+	if err := json.Unmarshal(data, &reply); err != nil || reply.Token == "" || reply.RefreshToken == "" ||
+		reply.User.Username != "alice" {
+		t.Fatalf("passwordless reply = %s (%v)", data, err)
+	}
+	status, data = request(t, http.MethodGet, s.URL+"/v1/account", "", reply.Token)
+	if status != http.StatusOK {
+		t.Fatalf("passwordless token: %d %s", status, data)
+	}
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/finish", body, "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("replayed passwordless assertion: %d %s", status, data)
+	}
+
+	// A banned key holder can still start the ceremony, so the ban itself is
+	// only disclosed after a valid assertion.
+	if _, err := s.Accounts.CreateUser("bob", "battery staple"); err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	if _, err := s.Accounts.SetRole("bob", account.RoleAdmin); err != nil {
+		t.Fatalf("promote bob: %v", err)
+	}
+	if _, err := s.Accounts.SetBanned("alice", true); err != nil {
+		t.Fatalf("ban alice: %v", err)
+	}
+	bannedChallenge := begin()
+	body = assertionBody(bannedChallenge)
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/finish", body, "")
+	if status != http.StatusForbidden {
+		t.Fatalf("banned passwordless finish: %d %s", status, data)
+	}
+	if _, err := s.Accounts.SetBanned("alice", false); err != nil {
+		t.Fatalf("unban alice: %v", err)
+	}
+
+	events, err := s.Accounts.AuditEventsFor(account.AuditLogin, 20)
+	if err != nil {
+		t.Fatalf("login audit: %v", err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Success && strings.Contains(event.Detail, "passwordless-security-key") &&
+			strings.Contains(event.Detail, "device=Desk") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("login audit has no passwordless entry: %+v", events)
+	}
+
+	if err := s.Accounts.RemoveWebAuthnCredential(alice.ID, credential.ID, "correct horse"); err != nil {
+		t.Fatalf("remove credential: %v", err)
+	}
+	status, data = request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/begin",
+		`{"username":"alice"}`, "")
+	if status != http.StatusAccepted || !strings.Contains(string(data), "accepted") {
+		t.Fatalf("begin without keys: %d %s", status, data)
+	}
+}
+
+func TestWebAuthnPasswordlessLockout(t *testing.T) {
+	limiter := authlimit.New(authlimit.Config{Window: time.Minute, MaxFailures: 2, Lockout: time.Minute})
+	s := startWebAuthnAPI(t, limiter)
+	alice, err := s.Accounts.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	auth, err := webauthntest.New(webauthn.AlgES256, s.RPID, s.Origin)
+	if err != nil {
+		t.Fatalf("authenticator: %v", err)
+	}
+	challenge := []byte("register-lockout")
+	if _, err := s.Accounts.IssueWebAuthnChallenge(alice.ID, account.WebAuthnRegister, challenge, time.Minute); err != nil {
+		t.Fatalf("issue challenge: %v", err)
+	}
+	credential := auth.Credential()
+	if _, err := s.Accounts.FinishWebAuthnRegistration(alice.ID, challenge, account.WebAuthnCredential{
+		ID: credential.ID, PublicKey: credential.PublicKey, Alg: credential.Alg,
+	}, "key"); err != nil {
+		t.Fatalf("store credential: %v", err)
+	}
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/begin",
+		`{"username":"alice"}`, "")
+	if status != http.StatusOK {
+		t.Fatalf("passwordless begin: %d %s", status, data)
+	}
+	var reply webauthnBeginReply
+	if err := json.Unmarshal(data, &reply); err != nil {
+		t.Fatalf("passwordless begin reply: %v", err)
+	}
+	loginChallenge, err := base64.RawURLEncoding.DecodeString(reply.Challenge)
+	if err != nil {
+		t.Fatalf("challenge: %v", err)
+	}
+	clientData, authData, signature, err := auth.Assert(loginChallenge)
+	if err != nil {
+		t.Fatalf("assert: %v", err)
+	}
+	bad := webauthnFinishBody(map[string]string{
+		"username":           "alice",
+		"credential_id":      base64.RawURLEncoding.EncodeToString(credential.ID),
+		"client_data_json":   base64.RawURLEncoding.EncodeToString(clientData),
+		"authenticator_data": base64.RawURLEncoding.EncodeToString(authData),
+		"signature":          base64.RawURLEncoding.EncodeToString(webauthntest.TamperSignature(signature)),
+	})
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/finish", bad, ""); status != http.StatusUnauthorized {
+		t.Fatalf("first failure: %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/finish", bad, ""); status != http.StatusTooManyRequests {
+		t.Fatalf("second failure: %d %s", status, data)
+	}
+	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/login/webauthn/passwordless/begin",
+		`{"username":"alice"}`, ""); status != http.StatusTooManyRequests {
+		t.Fatalf("locked begin: %d %s", status, data)
+	}
+}
+
 func TestWebAuthnRoutesRequireConfiguration(t *testing.T) {
 	s := startWebAuthnAPI(t, nil)
 	// The same store with an unconfigured handler answers 503 on every route.

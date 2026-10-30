@@ -5,6 +5,17 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
 
+Future<String> fakeProtect(String plaintext) async =>
+    base64Encode(utf8.encode('sealed:$plaintext'));
+
+Future<String> fakeUnprotect(String blob) async {
+  final String text = utf8.decode(base64Decode(blob));
+  if (!text.startsWith('sealed:')) {
+    throw const FormatException('not a sealed blob');
+  }
+  return text.substring('sealed:'.length);
+}
+
 void main() {
   late Directory temp;
   late File file;
@@ -153,5 +164,88 @@ void main() {
     await store.clear();
     expect(await file.exists(), isFalse);
     expect(await store.load(), isNull);
+  });
+
+  test('a protector keeps tokens out of the plaintext file', () async {
+    final AccountSessionStore store = AccountSessionStore(
+      file: file,
+      protectSecret: fakeProtect,
+      unprotectSecret: fakeUnprotect,
+    );
+    await store.save(AccountSession(
+      server: 'http://127.0.0.1:8443',
+      username: 'alice',
+      token: 'token-value',
+      expiresAt: DateTime.utc(2027),
+      refreshToken: 'refresh-value',
+    ));
+
+    final String raw = await file.readAsString();
+    expect(raw, isNot(contains('token-value')));
+    expect(raw, isNot(contains('refresh-value')));
+    final Map<String, Object?> envelope =
+        jsonDecode(raw) as Map<String, Object?>;
+    expect(envelope['version'], 1);
+    expect(envelope['protected'], isA<String>());
+    expect(envelope.containsKey('token'), isFalse);
+
+    final AccountSession? loaded = await store.load();
+    expect(loaded?.token, 'token-value');
+    expect(loaded?.refreshToken, 'refresh-value');
+  });
+
+  test('a legacy plaintext file is migrated when loaded with a protector',
+      () async {
+    await file.writeAsString(jsonEncode(<String, Object?>{
+      'server': 'http://127.0.0.1:8443',
+      'username': 'alice',
+      'token': 'access-value',
+      'expiresAt': DateTime.utc(2027).millisecondsSinceEpoch,
+    }));
+    final AccountSessionStore store = AccountSessionStore(
+      file: file,
+      protectSecret: fakeProtect,
+      unprotectSecret: fakeUnprotect,
+    );
+
+    final AccountSession? loaded = await store.load();
+    expect(loaded?.token, 'access-value');
+    final String raw = await file.readAsString();
+    expect(raw, isNot(contains('access-value')));
+    expect((jsonDecode(raw) as Map<String, Object?>)['protected'], isA<String>());
+
+    expect((await store.load())?.token, 'access-value');
+  });
+
+  test('an envelope this account cannot open has no session', () async {
+    await file.writeAsString(jsonEncode(<String, Object?>{
+      'version': 1,
+      'protected': 'AAAA',
+    }));
+    final AccountSessionStore throwing = AccountSessionStore(
+      file: file,
+      unprotectSecret: (String _) async => throw const FormatException('no'),
+    );
+    expect(await throwing.load(), isNull);
+
+    final AccountSessionStore withoutProtector =
+        AccountSessionStore(file: file);
+    expect(await withoutProtector.load(), isNull);
+  });
+
+  test('a failing protector still persists the session plainly', () async {
+    final AccountSessionStore store = AccountSessionStore(
+      file: file,
+      protectSecret: (String _) async => throw StateError('dpapi'),
+    );
+    await store.save(AccountSession(
+      server: 'http://127.0.0.1:8443',
+      username: 'alice',
+      token: 'token-value',
+      expiresAt: DateTime.utc(2027),
+    ));
+    expect(await file.readAsString(), contains('token-value'));
+    expect((await AccountSessionStore(file: file).load())?.token,
+        'token-value');
   });
 }

@@ -106,6 +106,7 @@ type addressBookPeer struct {
 	Name        string   `json:"name,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
 	GroupID     string   `json:"group_id,omitempty"`
+	Position    int64    `json:"position,omitempty"`
 	UpdatedAtMS int64    `json:"updated_at_ms"`
 	Revision    int64    `json:"revision,omitempty"`
 	Deleted     bool     `json:"deleted,omitempty"`
@@ -114,6 +115,8 @@ type addressBookPeer struct {
 type addressBookGroup struct {
 	ID          string `json:"id"`
 	Name        string `json:"name,omitempty"`
+	ParentID    string `json:"parent_id,omitempty"`
+	Position    int64  `json:"position,omitempty"`
 	UpdatedAtMS int64  `json:"updated_at_ms"`
 	Revision    int64  `json:"revision,omitempty"`
 	Deleted     bool   `json:"deleted,omitempty"`
@@ -131,12 +134,15 @@ type addressBookPeerRequest struct {
 	Name       *string   `json:"name"`
 	Tags       *[]string `json:"tags"`
 	GroupID    *string   `json:"group_id"`
+	Position   *int64    `json:"position"`
 	IfRevision *int64    `json:"if_revision"`
 }
 
 type addressBookGroupRequest struct {
-	Name       string `json:"name"`
-	IfRevision *int64 `json:"if_revision"`
+	Name       *string `json:"name"`
+	ParentID   *string `json:"parent_id"`
+	Position   *int64  `json:"position"`
+	IfRevision *int64  `json:"if_revision"`
 }
 
 type sharedAddressBookPeerRequest struct {
@@ -211,6 +217,7 @@ func viewAddressBookPeer(peer account.Peer) addressBookPeer {
 		Name:        peer.Name,
 		Tags:        peer.Tags,
 		GroupID:     peer.GroupID,
+		Position:    peer.Position,
 		UpdatedAtMS: peer.UpdatedAt.UnixMilli(),
 		Revision:    peer.Revision,
 		Deleted:     peer.Deleted,
@@ -221,6 +228,8 @@ func viewAddressBookGroup(group account.Group) addressBookGroup {
 	return addressBookGroup{
 		ID:          group.ID,
 		Name:        group.Name,
+		ParentID:    group.ParentID,
+		Position:    group.Position,
 		UpdatedAtMS: group.UpdatedAt.UnixMilli(),
 		Revision:    group.Revision,
 		Deleted:     group.Deleted,
@@ -1103,8 +1112,12 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Name == nil && req.Tags == nil && req.GroupID == nil {
-		writeError(w, http.StatusBadRequest, "name, tags or group_id is required")
+	if req.Name == nil && req.Tags == nil && req.GroupID == nil && req.Position == nil {
+		writeError(w, http.StatusBadRequest, "name, tags, group_id or position is required")
+		return
+	}
+	if req.Position != nil && *req.Position < 0 {
+		writeError(w, http.StatusBadRequest, "position must not be negative")
 		return
 	}
 	if req.IfRevision != nil && *req.IfRevision <= 0 {
@@ -1120,7 +1133,7 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 		peer account.Peer
 		err  error
 	)
-	if req.Name == nil && req.Tags == nil {
+	if req.Name == nil && req.Tags == nil && req.Position == nil {
 		groupID := strings.TrimSpace(*req.GroupID)
 		peer, err = s.cfg.Accounts.SetPeerGroupAt(user.ID, peerID, groupID, ifRevision)
 	} else {
@@ -1129,7 +1142,7 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 			trimmed := strings.TrimSpace(*req.GroupID)
 			groupID = &trimmed
 		}
-		peer, err = s.cfg.Accounts.UpdatePeerWithGroupAt(user.ID, peerID, req.Name, req.Tags, groupID, ifRevision)
+		peer, err = s.cfg.Accounts.UpdatePeerAt(user.ID, peerID, req.Name, req.Tags, groupID, req.Position, ifRevision)
 	}
 	switch {
 	case errors.Is(err, account.ErrInvalidPeerID):
@@ -1137,6 +1150,9 @@ func (s *server) updateAddressBookPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, account.ErrInvalidGroupID):
 		writeError(w, http.StatusBadRequest, "group id is invalid")
+		return
+	case errors.Is(err, account.ErrInvalidPosition):
+		writeError(w, http.StatusBadRequest, "position must not be negative")
 		return
 	case errors.Is(err, account.ErrUnknownGroup):
 		writeError(w, http.StatusBadRequest, "address book group is unknown")
@@ -1165,6 +1181,14 @@ func (s *server) updateAddressBookGroup(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.Name == nil && req.ParentID == nil && req.Position == nil {
+		writeError(w, http.StatusBadRequest, "name, parent_id or position is required")
+		return
+	}
+	if req.Position != nil && *req.Position < 0 {
+		writeError(w, http.StatusBadRequest, "position must not be negative")
+		return
+	}
 	if req.IfRevision != nil && *req.IfRevision <= 0 {
 		writeError(w, http.StatusBadRequest, "if_revision must be positive")
 		return
@@ -1173,13 +1197,27 @@ func (s *server) updateAddressBookGroup(w http.ResponseWriter, r *http.Request) 
 	if req.IfRevision != nil {
 		ifRevision = *req.IfRevision
 	}
-	group, err := s.cfg.Accounts.UpsertGroupAt(user.ID, r.PathValue("id"), req.Name, ifRevision)
+	group, err := s.cfg.Accounts.UpdateGroupAt(
+		user.ID, r.PathValue("id"), req.Name, req.ParentID, req.Position, ifRevision,
+	)
 	switch {
 	case errors.Is(err, account.ErrInvalidGroupID):
 		writeError(w, http.StatusBadRequest, "group id is invalid")
 		return
 	case errors.Is(err, account.ErrInvalidGroupName):
 		writeError(w, http.StatusBadRequest, account.ErrInvalidGroupName.Error())
+		return
+	case errors.Is(err, account.ErrUnknownGroup):
+		writeError(w, http.StatusBadRequest, "parent group is unknown")
+		return
+	case errors.Is(err, account.ErrGroupCycle):
+		writeError(w, http.StatusBadRequest, "group cannot contain itself")
+		return
+	case errors.Is(err, account.ErrGroupDepth):
+		writeError(w, http.StatusBadRequest, "group nesting is too deep")
+		return
+	case errors.Is(err, account.ErrInvalidPosition):
+		writeError(w, http.StatusBadRequest, "position must not be negative")
 		return
 	case errors.Is(err, account.ErrGroupConflict):
 		writeError(w, http.StatusConflict, "address book group changed elsewhere")
