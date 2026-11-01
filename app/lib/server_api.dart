@@ -570,6 +570,16 @@ class AddressBookGroup {
   final int revision;
   final bool deleted;
 
+  Map<String, Object?> toJson() => <String, Object?>{
+        'id': id,
+        'name': name,
+        'parent_id': parentId,
+        'position': position,
+        'updated_at_ms': updatedAtMs,
+        'revision': revision,
+        if (deleted) 'deleted': true,
+      };
+
   static AddressBookGroup? fromJson(Object? value) {
     if (value is! Map) {
       return null;
@@ -2561,7 +2571,9 @@ class ServerApi {
 
   /// Adds a peer to a shared book. The server requires write or control
   /// permission and writes it into the owner's book; [groupId] places it in
-  /// one group and a group grant may only target its own group.
+  /// one group and a group grant may only target its own group. [ifRevision]
+  /// is the owner's book revision last read: a newer revision means someone
+  /// else wrote first and the server answers 409.
   static Future<AddressBookPeer> addSharedAddressBookPeer(
     ServerSettings settings,
     String token,
@@ -2570,6 +2582,7 @@ class ServerApi {
     String? name,
     List<String>? tags,
     String groupId = '',
+    int? ifRevision,
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -2607,6 +2620,7 @@ class ServerApi {
         'name': name?.trim() ?? '',
         'tags': cleaned,
         if (groupId.trim().isNotEmpty) 'group_id': groupId.trim(),
+        if (ifRevision != null && ifRevision > 0) 'if_revision': ifRevision,
       },
       unauthorized: tr('账号登录已失效，请重新登录'),
       notFound: tr('地址簿未共享给当前账号'),

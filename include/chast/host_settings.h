@@ -107,6 +107,10 @@ struct HostSettings {
     // Cancel the viewer's microphone out of the loopback capture. Needs a live
     // microphone playback reference; with no CMIC stream it stays bypassed.
     bool audio_aec = true;
+    // Stop feeding the encoder after this much digital silence; 0 disables the
+    // gate. The gate never moves the playout timeline, it only stops producing
+    // packets while nothing is audible.
+    uint32_t audio_silence_gate_ms = 2000;
     // Let the viewer black out this machine's physical displays while the
     // session runs (privacy mode). Off by default: the overlay covers every
     // monitor, so a person sitting at the machine cannot see the desktop until

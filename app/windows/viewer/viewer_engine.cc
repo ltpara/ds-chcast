@@ -21,6 +21,7 @@
 #include "chast/decoder.h"
 #include "chast/file_transfer.h"
 #include "chast/identity.h"
+#include "chast/png.h"
 #include "chast/port_forward_client.h"
 #include "chast/protocol.h"
 #include "chast/quic.h"
@@ -48,9 +49,10 @@ constexpr char kClipboardFilePathPrefix[] = ".chast-clipboard/";
 // offer itself is not bounded: the host hashes the file first.
 constexpr auto kClipboardAnswerTimeout = std::chrono::seconds(10);
 
-// A recording file name that is unlikely to collide: the local wall clock.
-// Mp4Recorder appends "-N" to the stem when a size change rolls over.
-std::string record_file_path(const std::string& directory) {
+// A file name stamp that is unlikely to collide: the local wall clock. The
+// recording muxer appends "-N" when a size change rolls over; screenshots use
+// the same stamp and pick the first free suffix.
+std::string local_stamp() {
     std::time_t now = std::time(nullptr);
     std::tm local{};
     localtime_s(&local, &now);
@@ -58,8 +60,47 @@ std::string record_file_path(const std::string& directory) {
     std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d-%02d%02d%02d",
                   local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
                   local.tm_hour, local.tm_min, local.tm_sec);
-    return (std::filesystem::path(directory) / ("chast-" + std::string(stamp) + ".mp4"))
+    return stamp;
+}
+
+std::filesystem::path path_from_utf8(const std::string& path) {
+    return std::filesystem::path(
+        std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
+}
+
+std::string utf8_from_path(const std::filesystem::path& path) {
+    const std::u8string text = path.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+
+std::string record_file_path(const std::string& directory) {
+    return (std::filesystem::path(directory) / ("chast-" + local_stamp() + ".mp4"))
         .string();
+}
+
+// Where screenshots land when the UI does not name a folder.
+std::string default_screenshot_directory() {
+    wchar_t* profile = nullptr;
+    size_t length = 0;
+    if (_wdupenv_s(&profile, &length, L"USERPROFILE") == 0 && profile != nullptr) {
+        const std::filesystem::path value(profile);
+        std::free(profile);
+        if (!value.empty()) {
+            return utf8_from_path(value / "Pictures" / "chast");
+        }
+    }
+    return utf8_from_path(std::filesystem::current_path());
+}
+
+std::string screenshot_file_path(const std::string& directory) {
+    const std::filesystem::path folder = path_from_utf8(directory);
+    const std::string stem = "chast-" + local_stamp();
+    std::filesystem::path candidate = folder / (stem + ".png");
+    std::error_code ec;
+    for (int suffix = 1; suffix < 1000 && std::filesystem::exists(candidate, ec); ++suffix) {
+        candidate = folder / (stem + "-" + std::to_string(suffix) + ".png");
+    }
+    return utf8_from_path(candidate);
 }
 
 // Where recordings land when the UI does not name a folder. RustDesk keeps
@@ -233,16 +274,6 @@ int64_t steady_us(std::chrono::steady_clock::time_point time) {
     return std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count();
 }
 
-std::filesystem::path path_from_utf8(const std::string& path) {
-    return std::filesystem::path(
-        std::u8string(reinterpret_cast<const char8_t*>(path.data()), path.size()));
-}
-
-std::string utf8_from_path(const std::filesystem::path& path) {
-    const std::u8string text = path.u8string();
-    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
-}
-
 }  // namespace
 
 ViewerEngine::ViewerEngine(FrameSink* sink, FrameSink* camera_sink)
@@ -367,6 +398,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(chat_mutex_);
         pending_chat_.clear();
         received_chat_.clear();
+        pending_text_.clear();
     }
     // A console belongs to one session too; neither its commands nor its
     // unread output may leak into the next connection.
@@ -732,6 +764,14 @@ void ViewerEngine::CancelDirectoryDownload() {
     }
 }
 
+void ViewerEngine::CancelUploads() {
+    upload_cancel_.store(true);
+}
+
+void ViewerEngine::CancelDownload() {
+    download_cancel_.store(true);
+}
+
 bool ViewerEngine::TakeFileList(FileListAnswer& answer) {
     std::lock_guard<std::mutex> lock(browse_mutex_);
     if (!newest_file_list_) {
@@ -1004,6 +1044,74 @@ bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
     return true;
 }
 
+bool ViewerEngine::SaveScreenshot(std::string directory) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || status_.files_only) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(screenshot_mutex_);
+    pending_screenshot_ = std::move(directory);
+    return true;
+}
+
+void ViewerEngine::ProcessScreenshot() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // The button is disabled until the first picture, but a tap can land
+        // between streaming and the first decoded frame; keep the request for
+        // the next pass instead of reporting a failure.
+        if (status_.published == 0) {
+            return;
+        }
+    }
+    std::optional<std::string> directory;
+    {
+        std::lock_guard<std::mutex> lock(screenshot_mutex_);
+        directory = std::move(pending_screenshot_);
+        pending_screenshot_.reset();
+    }
+    if (!directory) {
+        return;
+    }
+
+    std::string error;
+    std::string path;
+    std::vector<uint8_t> bgra;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (sink_ == nullptr) {
+        error = "the session has no picture sink";
+    } else if (!sink_->CaptureBgra(bgra, width, height, &error)) {
+        if (error.empty()) {
+            error = "the picture could not be read back";
+        }
+    } else if (width == 0 || height == 0 || bgra.empty()) {
+        error = "the remote picture is empty";
+    } else {
+        const std::string folder =
+            directory->empty() ? default_screenshot_directory() : *directory;
+        path = screenshot_file_path(folder);
+        if (!chast::write_png_bgra(path, bgra.data(), width, height, width * 4, &error)) {
+            path.clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!path.empty()) {
+            status_.screenshot_path = path;
+        }
+        status_.screenshot_error = error;
+        ++status_.screenshot_updates;
+    }
+    if (error.empty()) {
+        std::fprintf(stderr, "viewer: screenshot saved to %s\n", path.c_str());
+    } else {
+        std::fprintf(stderr, "viewer: screenshot failed: %s\n", error.c_str());
+    }
+}
+
 bool ViewerEngine::SetMicrophone(bool enabled) {
     if (enabled) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1094,6 +1202,27 @@ bool ViewerEngine::SendChat(const std::string& text) {
         return false;
     }
     pending_chat_.push_back(text);
+    return true;
+}
+
+bool ViewerEngine::SendText(const std::string& text) {
+    if (!chast::valid_text_input(text)) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(chat_mutex_);
+    if (pending_text_.size() >= 16) {
+        return false;
+    }
+    pending_text_.push_back(text);
     return true;
 }
 
@@ -1429,8 +1558,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint32_t clipboard_received_formats = 0;
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
+    uint64_t file_cancels = 0;
     uint64_t files_received = 0;
     uint64_t file_receive_failures = 0;
+    uint64_t download_cancels = 0;
     uint64_t cursor_updates = 0;
     bool audio_announced = false;
     bool audio_finished = false;
@@ -1446,6 +1577,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t audio_decoded = 0;
     uint64_t audio_errors = 0;
     uint64_t audio_underruns = 0;
+    uint64_t audio_starved_ms = 0;
+    uint64_t audio_dropped = 0;
     uint64_t audio_recoveries = 0;
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
@@ -1487,6 +1620,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t stream_option_results = 0;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
+    bool frame_age_valid = false;
+    double audio_latency_ms = -1.0;
+    double av_skew_ms = -1.0;
     bool clock_synced = false;
     int64_t clock_offset_us = 0;
     uint64_t digest = chast::kFrameDigestSeed;
@@ -1517,6 +1653,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     std::string transport_error;
     std::unique_ptr<chast::IAudioDecoder> audio_decoder;
     std::unique_ptr<chast::IAudioPlayer> audio_player;
+    // Datagram audio needs its own ordering: a forward jump is a loss to
+    // conceal, a packet behind the highest sequence is too late to play.
+    uint64_t expected_audio_seq = 0;
+    bool have_audio_seq = false;
     // One reference per session: system-audio PCM feeds it while the player is
     // audible, and the microphone capture cancels against the same ring. It
     // stays inactive until a player actually starts.
@@ -1561,8 +1701,21 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             const chast::AudioPlayerStats audio_stats = audio_player->stats();
             audio_buffer_ms = audio_stats.buffer_ms;
             audio_underruns = audio_stats.underruns;
+            audio_starved_ms = audio_stats.starved_ms;
+            audio_dropped = audio_stats.dropped;
             audio_recoveries = audio_stats.recoveries;
             audio_recovering = audio_stats.recovering;
+            if (clock_synced) {
+                audio_latency_ms = chast::audio_playout_latency_ms(
+                    audio_stats.playout_capture_ms, audio_stats.playout_scheduled_ms,
+                    clock_offset_us);
+                av_skew_ms = audio_latency_ms >= 0.0 && frame_age_valid
+                                 ? audio_latency_ms - latency_ms
+                                 : -1.0;
+            }
+        } else {
+            audio_latency_ms = -1.0;
+            av_skew_ms = -1.0;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1597,10 +1750,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.clipboard_received_formats = clipboard_received_formats;
             status_.files_sent = files_sent;
             status_.file_failures = file_failures;
+            status_.file_cancels = file_cancels;
             status_.files_received = files_received;
             status_.file_receive_failures = file_receive_failures;
+            status_.download_cancels = download_cancels;
             {
                 std::lock_guard<std::mutex> file_lock(file_mutex_);
+                status_.download_cancellable = download_.cancellable;
                 status_.download_name = download_.name;
                 status_.download_path = download_.path;
                 status_.download_size = download_.size;
@@ -1670,9 +1826,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.audio_decoded = audio_decoded;
             status_.audio_errors = audio_errors;
             status_.audio_underruns = audio_underruns;
+            status_.audio_starved_ms = audio_starved_ms;
+            status_.audio_dropped = audio_dropped;
             status_.audio_recoveries = audio_recoveries;
             status_.audio_recovering = audio_recovering;
             status_.audio_buffer_ms = audio_buffer_ms;
+            status_.audio_latency_ms = audio_latency_ms;
+            status_.av_skew_ms = av_skew_ms;
             status_.audio_error = audio_error;
             status_.audio_device = audio_device;
             status_.audio_device_name = audio_device_name;
@@ -1967,6 +2127,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     const chast::AudioPlayerStats stats = audio_player->stats();
                     audio_buffer_ms = stats.buffer_ms;
                     audio_underruns = stats.underruns;
+                    audio_starved_ms = stats.starved_ms;
+                    audio_dropped = stats.dropped;
                     audio_recoveries = stats.recoveries;
                     audio_recovering = stats.recovering;
                     audio_player->stop();
@@ -2005,6 +2167,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // the delay after a stall.
                 player_config.arrival_anchored = true;
                 player_config.lead_ms = 0;
+                // The first blocks include session setup; anchor once on the
+                // fastest of six so that delay does not stay for the session.
+                player_config.anchor_gather_blocks = 6;
                 std::unique_ptr<chast::IAudioPlayer> player =
                     chast::create_audio_player(player_config, &setup_error);
                 std::string used = wanted;
@@ -2697,7 +2862,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // not receive one rejection per entry for a permission that is
                 // already gone. Clipboard uploads belong to the clipboard
                 // permission and stay queued.
-                auto purge_uploads = [&](const std::string& message) {
+                auto purge_uploads = [&](const std::string& message,
+                                         bool cancelled = false) {
                     uint32_t active_id = 0;
                     std::string name;
                     size_t dropped = 0;
@@ -2724,7 +2890,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 finished.stage = FileUpload::Stage::kFailed;
                                 finished.error = message;
                                 last_upload_ = std::move(finished);
-                                ++file_failures;
+                                if (cancelled) {
+                                    ++file_cancels;
+                                } else {
+                                    ++file_failures;
+                                }
                             }
                             it = uploads_.erase(it);
                             ++dropped;
@@ -3213,6 +3383,55 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // CancelDownload() lands here. Only an ordinary single-file
+                // download is stopped: a walk has CancelDirectoryDownload()
+                // and clipboard transfers follow the clipboard permission.
+                auto cancel_download = [&] {
+                    uint32_t transfer_id = 0;
+                    uint64_t received = 0;
+                    std::string name;
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (download_.stage != FileDownload::Stage::kReceiving) {
+                            return;
+                        }
+                        transfer_id = download_.transfer_id;
+                        received = download_.received;
+                        name = download_.name;
+                        if (clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
+                            clipboard_files.transfer_id == transfer_id) {
+                            return;
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(browse_mutex_);
+                        if (folder_transfers_.find(transfer_id) != folder_transfers_.end()) {
+                            return;
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(file_mutex_);
+                        if (download_.stage != FileDownload::Stage::kReceiving ||
+                            download_.transfer_id != transfer_id) {
+                            return;
+                        }
+                        if (download_.receiver) {
+                            // A cancel throws the partial file away; only a
+                            // failure keeps it for a resume.
+                            download_.receiver->abort(false);
+                            download_.receiver.reset();
+                        }
+                        download_.stage = FileDownload::Stage::kFailed;
+                        download_.error = "the viewer cancelled the download";
+                    }
+                    ++download_cancels;
+                    (void)session->send_file_result(transfer_id, chast::FileCode::Cancelled,
+                                                    received,
+                                                    "the viewer cancelled the download");
+                    std::fprintf(stderr, "viewer: download %s cancelled by the viewer\n",
+                                 name.c_str());
+                };
+
                 // The folder walk's shared state lives under browse_mutex_; the
                 // page polls these copies through ViewerStatus.
                 auto publish_folder_progress = [&] {
@@ -3422,6 +3641,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         options.name = offer.name;
                         options.relative_path =
                             clipboard_transfer ? std::string() : offer.relative_path;
+                        bool walk_offer = false;
                         if (clipboard_transfer) {
                             // The entry's rel_path holds the copied folder
                             // layout, so the file lands under the same
@@ -3440,6 +3660,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             std::lock_guard<std::mutex> lock(browse_mutex_);
                             auto it = folder_transfers_.find(offer.transfer_id);
                             if (it != folder_transfers_.end()) {
+                                walk_offer = true;
                                 options.relative_path = it->second;
                             }
                         }
@@ -3484,6 +3705,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             download_.received = resume_offset;
                             download_.answer_time = Clock::now();
                             download_.receiver = std::move(receiver);
+                            download_.cancellable = !clipboard_transfer && !walk_offer;
                         }
                         if (clipboard_transfer) {
                             clipboard_files.stage = ClipboardFiles::Stage::kReceiving;
@@ -4381,6 +4603,44 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             break;
                         }
                         ++audio_received;
+                        if (!have_audio_seq) {
+                            have_audio_seq = true;
+                            expected_audio_seq = audio_header.seq;
+                        }
+                        if (audio_header.seq < expected_audio_seq) {
+                            // Too late to play; a newer packet already
+                            // covered this slot, with concealment if needed.
+                            continue;
+                        }
+                        if (audio_header.seq > expected_audio_seq && audio_player &&
+                            audio_decoder) {
+                            const uint32_t missing = static_cast<uint32_t>(
+                                audio_header.seq - expected_audio_seq);
+                            const uint32_t fill = std::min<uint32_t>(missing, 5);
+                            for (uint32_t back = fill; back > 0; --back) {
+                                std::vector<chast::DecodedAudio> concealed_blocks;
+                                chast::Error concealed = audio_decoder->conceal(
+                                    audio_header, back, concealed_blocks);
+                                if (!concealed.ok()) {
+                                    break;
+                                }
+                                for (const chast::DecodedAudio& block : concealed_blocks) {
+                                    chast::Error pushed = audio_player->push(block);
+                                    if (!pushed.ok()) {
+                                        ++audio_errors;
+                                        break;
+                                    }
+                                    if (!audio_muted_applied && block.channels >= 1 &&
+                                        block.channels <= 2 && !block.samples.empty()) {
+                                        audio_reference->push(
+                                            block.samples.data(),
+                                            block.samples.size() / block.channels,
+                                            block.channels);
+                                    }
+                                }
+                            }
+                        }
+                        expected_audio_seq = audio_header.seq + 1;
                         if (!audio_player || !audio_decoder) {
                             // Local playback is unavailable; keep consuming so
                             // the transport queue cannot grow.
@@ -4774,6 +5034,27 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.chat_sent = chat_sent;
                         }
                         std::fprintf(stderr, "viewer: chat sent (%zu bytes)\n", text.size());
+                    }
+                };
+
+                // Composed text is queued like chat, but a block the host
+                // refused ends the drain: the permission was revoked and the
+                // next block would fail for the same reason.
+                auto drain_text = [&] {
+                    std::deque<std::string> outbox;
+                    {
+                        std::lock_guard<std::mutex> lock(chat_mutex_);
+                        outbox.swap(pending_text_);
+                    }
+                    for (const std::string& text : outbox) {
+                        chast::Error sent = session->send_text_input(text);
+                        if (!sent.ok()) {
+                            std::fprintf(stderr, "viewer: send text input: %s\n",
+                                         sent.to_string().c_str());
+                            break;
+                        }
+                        std::fprintf(stderr, "viewer: text input sent (%zu bytes)\n",
+                                     text.size());
                     }
                 };
 
@@ -5840,6 +6121,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     receive_chat();
                     drain_chat();
+                    drain_text();
                     poll_terminal();
                     drain_terminal();
                     poll_camera();
@@ -5871,6 +6153,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     poll_local_clipboard_files();
                     poll_clipboard();
                     receive_clipboard();
+                    if (upload_cancel_.exchange(false)) {
+                        purge_uploads("the viewer cancelled the upload", true);
+                    }
                     drive_file_upload();
                     // Browse answers are adopted before file offers: a walk's
                     // download answer names the transfer whose offer follows,
@@ -5879,6 +6164,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_file_browse();
                     drain_downloads();
                     step_clipboard_files();
+                    if (download_cancel_.exchange(false)) {
+                        cancel_download();
+                    }
                     drain_download_cancels();
                     step_folder_download();
                     receive_cursor();
@@ -5929,6 +6217,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     receive_chat();
                     drain_chat();
+                    drain_text();
                     poll_terminal();
                     drain_terminal();
                     poll_camera();
@@ -5961,6 +6250,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             break;
                         }
                         sync_status(false);
+                        ProcessScreenshot();
                         continue;
                     }
                     if (received_frame.status() == chast::Status::Unavailable) {
@@ -5990,6 +6280,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         // instead of showing a bogus age.
                         if (age_us > -100000 && age_us < 10000000) {
                             latency_ms = static_cast<double>(std::max<int64_t>(age_us, 0)) / 1000.0;
+                            frame_age_valid = true;
                         }
                     }
                     if (header.keyframe) {
@@ -6100,6 +6391,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // Pictures arrive through gpu_handler while decode() runs,
                     // so `frames` stays empty on this path.
                     sync_status(false);
+                    ProcessScreenshot();
                 }
                 // A clipboard file list cannot finish on a closed session;
                 // files that never landed are removed from the staging folder.

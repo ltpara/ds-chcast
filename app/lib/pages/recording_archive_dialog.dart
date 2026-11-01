@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../account_store.dart';
 import '../server_api.dart';
@@ -24,6 +25,8 @@ typedef RecordingDeleter =
       String recordingId,
     );
 
+enum _RecordingSort { time, name, size }
+
 /// Lists the recordings the signed-in account uploaded to the server, with
 /// download and delete actions. Downloads go to the user's Videos folder;
 /// deleting removes both the server file and its metadata.
@@ -36,6 +39,8 @@ class RecordingArchiveDialog extends StatefulWidget {
     this.downloadRecording,
     this.deleteRecording,
     this.downloadDirectory,
+    this.onOpenDownload,
+    this.onRevealDownload,
   });
 
   final ServerSettings server;
@@ -47,9 +52,16 @@ class RecordingArchiveDialog extends StatefulWidget {
   /// Overrides the Videos folder; tests pass a temporary directory.
   final Directory? downloadDirectory;
 
+  /// Opens a finished download with its default application. Tests inject a
+  /// recorder; the default starts explorer.exe with the file.
+  final Future<void> Function(String path)? onOpenDownload;
+
+  /// Opens the shell on a finished download with the file selected. Tests
+  /// inject a recorder; the default starts explorer.exe.
+  final Future<void> Function(String path)? onRevealDownload;
+
   @override
-  State<RecordingArchiveDialog> createState() =>
-      _RecordingArchiveDialogState();
+  State<RecordingArchiveDialog> createState() => _RecordingArchiveDialogState();
 }
 
 class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
@@ -59,13 +71,55 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
   String _downloaded = '';
   String _busyId = '';
   bool _deleting = false;
+  String _query = '';
+  final TextEditingController _filter = TextEditingController();
+  _RecordingSort _sort = _RecordingSort.time;
+  bool _sortAscending = false;
 
   bool get _busy => _busyId.isNotEmpty || _deleting;
+
+  List<RemoteRecording> get _visibleRecordings {
+    final String query = _query.trim().toLowerCase();
+    final List<RemoteRecording> rows = query.isEmpty
+        ? List<RemoteRecording>.of(_archive.recordings)
+        : _archive.recordings.where((RemoteRecording recording) {
+            return recording.name.toLowerCase().contains(query) ||
+                recording.peerId.toLowerCase().contains(query) ||
+                recording.id.toLowerCase().contains(query);
+          }).toList();
+    int compare(RemoteRecording a, RemoteRecording b) {
+      int result;
+      switch (_sort) {
+        case _RecordingSort.time:
+          result = a.createdAtMs.compareTo(b.createdAtMs);
+        case _RecordingSort.name:
+          result = a.name.toLowerCase().compareTo(b.name.toLowerCase());
+        case _RecordingSort.size:
+          result = a.size.compareTo(b.size);
+      }
+      if (result == 0) {
+        result = a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      }
+      if (result == 0) {
+        result = a.id.compareTo(b.id);
+      }
+      return _sortAscending ? result : -result;
+    }
+
+    rows.sort(compare);
+    return rows;
+  }
 
   @override
   void initState() {
     super.initState();
     _load();
+  }
+
+  @override
+  void dispose() {
+    _filter.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -130,7 +184,11 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
         _downloaded = file.path;
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(tr('已保存到 {path}', <String, Object?>{'path': file.path}))),
+        SnackBar(
+          content: Text(
+            tr('已保存到 {path}', <String, Object?>{'path': file.path}),
+          ),
+        ),
       );
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -153,9 +211,7 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
     if (_busy) {
       return;
     }
-    final String name = recording.name.isEmpty
-        ? tr('未命名录制')
-        : recording.name;
+    final String name = recording.name.isEmpty ? tr('未命名录制') : recording.name;
     final bool confirmed =
         await showDialog<bool>(
           context: context,
@@ -212,7 +268,9 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
         );
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(tr('已删除“{name}”', <String, Object?>{'name': name}))),
+        SnackBar(
+          content: Text(tr('已删除“{name}”', <String, Object?>{'name': name})),
+        ),
       );
     } on ServerApiException catch (error) {
       if (mounted) {
@@ -228,6 +286,35 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
           _error = tr('删除云端录制失败：{error}', <String, Object?>{'error': error});
         });
       }
+    }
+  }
+
+  // Opening and revealing are conveniences, not transfer steps: a shell that
+  // cannot start must not replace the saved-path footer with an error.
+  Future<void> _openDownload(String path) async {
+    final Future<void> Function(String path)? injected = widget.onOpenDownload;
+    if (injected != null) {
+      await injected(path);
+      return;
+    }
+    try {
+      await Process.start('explorer.exe', <String>[path]);
+    } on ProcessException {
+      // Explorer is unavailable; the footer still names the saved file.
+    }
+  }
+
+  Future<void> _revealDownload(String path) async {
+    final Future<void> Function(String path)? injected =
+        widget.onRevealDownload;
+    if (injected != null) {
+      await injected(path);
+      return;
+    }
+    try {
+      await Process.start('explorer.exe', <String>['/select,', path]);
+    } on ProcessException {
+      // Explorer is unavailable; the footer still names the saved file.
     }
   }
 
@@ -251,17 +338,107 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
             const SizedBox(height: 10),
             Text(
               _archive.quotaBytes > 0
-                  ? tr('已用 {used}，配额 {quota}', <String, Object?>{'used': _formatBytes(_archive.usageBytes), 'quota': _formatBytes(_archive.quotaBytes)})
-                  : tr('已用 {used}', <String, Object?>{'used': _formatBytes(_archive.usageBytes)}),
+                  ? tr('已用 {used}，配额 {quota}', <String, Object?>{
+                      'used': _formatBytes(_archive.usageBytes),
+                      'quota': _formatBytes(_archive.quotaBytes),
+                    })
+                  : tr('已用 {used}', <String, Object?>{
+                      'used': _formatBytes(_archive.usageBytes),
+                    }),
               key: const Key('recording-usage'),
               style: mutedStyle(context, size: 11),
             ),
             if (_archive.maxUploadBytes > 0)
               Text(
-                tr('单次上传上限 {size}', <String, Object?>{'size': _formatBytes(_archive.maxUploadBytes)}),
+                tr('单次上传上限 {size}', <String, Object?>{
+                  'size': _formatBytes(_archive.maxUploadBytes),
+                }),
                 style: mutedStyle(context, size: 11),
               ),
             const SizedBox(height: 12),
+            if (!_loading && _archive.recordings.isNotEmpty) ...<Widget>[
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: TextField(
+                      key: const Key('recordings-filter'),
+                      controller: _filter,
+                      style: const TextStyle(fontSize: 12),
+                      decoration: InputDecoration(
+                        isDense: true,
+                        hintText: tr('筛选录制（名称、设备 ID 或录制 ID）'),
+                        hintStyle: const TextStyle(fontSize: 12),
+                        prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                        suffixIcon: _query.isEmpty
+                            ? null
+                            : IconButton(
+                                key: const Key('recordings-filter-clear'),
+                                tooltip: tr('清除筛选'),
+                                icon: const Icon(Icons.close_rounded, size: 16),
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () {
+                                  _filter.clear();
+                                  setState(() => _query = '');
+                                },
+                              ),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      onChanged: (String value) =>
+                          setState(() => _query = value),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  PopupMenuButton<_RecordingSort>(
+                    key: const Key('recordings-sort'),
+                    tooltip: tr('排序方式'),
+                    icon: const Icon(Icons.sort_rounded, size: 18),
+                    onSelected: (_RecordingSort value) {
+                      setState(() {
+                        _sort = value;
+                        _sortAscending = value == _RecordingSort.name;
+                      });
+                    },
+                    itemBuilder: (BuildContext context) =>
+                        <PopupMenuEntry<_RecordingSort>>[
+                          CheckedPopupMenuItem<_RecordingSort>(
+                            key: const Key('recordings-sort-time'),
+                            value: _RecordingSort.time,
+                            checked: _sort == _RecordingSort.time,
+                            child: Text(tr('按时间')),
+                          ),
+                          CheckedPopupMenuItem<_RecordingSort>(
+                            key: const Key('recordings-sort-name'),
+                            value: _RecordingSort.name,
+                            checked: _sort == _RecordingSort.name,
+                            child: Text(tr('按名称')),
+                          ),
+                          CheckedPopupMenuItem<_RecordingSort>(
+                            key: const Key('recordings-sort-size'),
+                            value: _RecordingSort.size,
+                            checked: _sort == _RecordingSort.size,
+                            child: Text(tr('按大小')),
+                          ),
+                        ],
+                  ),
+                  IconButton(
+                    key: const Key('recordings-sort-direction'),
+                    tooltip: _sortAscending ? tr('降序') : tr('升序'),
+                    visualDensity: VisualDensity.compact,
+                    icon: Icon(
+                      _sortAscending
+                          ? Icons.arrow_upward_rounded
+                          : Icons.arrow_downward_rounded,
+                      size: 18,
+                    ),
+                    onPressed: () =>
+                        setState(() => _sortAscending = !_sortAscending),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+            ],
             if (_loading)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 28),
@@ -276,26 +453,55 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
                   style: mutedStyle(context, size: 12),
                 ),
               )
+            else if (_visibleRecordings.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 18),
+                child: Text(
+                  tr('没有匹配的录制'),
+                  key: const Key('recordings-no-match'),
+                  style: mutedStyle(context, size: 12),
+                ),
+              )
             else
               ConstrainedBox(
                 constraints: const BoxConstraints(maxHeight: 300),
                 child: ListView.separated(
                   key: const Key('recordings-list'),
                   shrinkWrap: true,
-                  itemCount: _archive.recordings.length,
+                  itemCount: _visibleRecordings.length,
                   separatorBuilder: (BuildContext context, int index) =>
                       const SizedBox(height: 8),
                   itemBuilder: (BuildContext context, int index) {
-                    return _recordingTile(context, _archive.recordings[index]);
+                    return _recordingTile(context, _visibleRecordings[index]);
                   },
                 ),
               ),
             if (_downloaded.isNotEmpty) ...<Widget>[
               const SizedBox(height: 8),
-              Text(
-                tr('已保存到 {path}', <String, Object?>{'path': _downloaded}),
-                key: const Key('recordings-saved'),
-                style: mutedStyle(context, size: 10.5),
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: Text(
+                      tr('已保存到 {path}', <String, Object?>{'path': _downloaded}),
+                      key: const Key('recordings-saved'),
+                      style: mutedStyle(context, size: 10.5),
+                    ),
+                  ),
+                  IconButton(
+                    key: const Key('recordings-open'),
+                    tooltip: tr('打开文件'),
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.open_in_new_rounded, size: 16),
+                    onPressed: () => _openDownload(_downloaded),
+                  ),
+                  IconButton(
+                    key: const Key('recordings-reveal'),
+                    tooltip: tr('在文件夹中显示'),
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.folder_open_rounded, size: 16),
+                    onPressed: () => _revealDownload(_downloaded),
+                  ),
+                ],
               ),
             ],
             if (_error.isNotEmpty) ...<Widget>[
@@ -323,11 +529,28 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
     );
   }
 
+  Future<void> _copyId(RemoteRecording recording) async {
+    bool copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: recording.id));
+    } catch (_) {
+      copied = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (!copied) {
+      setState(() => _error = tr('复制失败'));
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(tr('ID 已复制'))));
+  }
+
   Widget _recordingTile(BuildContext context, RemoteRecording recording) {
     final ThemeData theme = Theme.of(context);
-    final String name = recording.name.isEmpty
-        ? tr('未命名录制')
-        : recording.name;
+    final String name = recording.name.isEmpty ? tr('未命名录制') : recording.name;
     final DateTime? created = recording.createdAt;
     final List<String> details = <String>[
       _formatBytes(recording.size),
@@ -360,9 +583,19 @@ class _RecordingArchiveDialogState extends State<RecordingArchiveDialog> {
                     color: theme.colorScheme.onSurface,
                   ),
                 ),
-                Text(details.join(' · '), style: mutedStyle(context, size: 10.5)),
+                Text(
+                  details.join(' · '),
+                  style: mutedStyle(context, size: 10.5),
+                ),
               ],
             ),
+          ),
+          IconButton(
+            key: ValueKey<String>('recording-copy-${recording.id}'),
+            onPressed: () => _copyId(recording),
+            tooltip: tr('复制 ID'),
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.copy_rounded, size: 17),
           ),
           IconButton(
             key: ValueKey<String>('recording-download-${recording.id}'),

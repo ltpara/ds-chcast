@@ -17,9 +17,13 @@
 // jitter buffer it does not need. Each burst anchors at its arrival, and the
 // capture stamps only space the blocks inside that burst; blocks that miss
 // their slot are dropped, and the queue cap bounds the delay after a stall.
-// The microphone uplink's host-side player anchors on arrival the same way,
-// with the default 80 ms lead as its jitter buffer. A caller that does know
-// the host clock can leave `arrival_anchored` off and rely on LatencyReply.
+// With `adaptive_jitter` a windowed controller adds a bounded lead only while
+// arrivals miss their slots, so a degraded link trades some latency for
+// continuity while a healthy one keeps the zero-lead relationship to the
+// video and gives any learned lead back. The microphone uplink's host-side
+// player anchors on arrival the same way, with the default 80 ms lead as its
+// jitter buffer. A caller that does know the host clock can leave
+// `arrival_anchored` off and rely on LatencyReply.
 //
 // Both directions use the device's own mix format and libswresample for the
 // format and channel conversion, so a 44.1 kHz endpoint, a mono headset or a
@@ -28,6 +32,7 @@
 // vcpkg library (Opus::opus), never FFmpeg's wrapper; AAC-LC remains available
 // for older recordings and the codec tests.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -121,6 +126,14 @@ public:
     // (Opus) are removed from the first output.
     virtual Error decode(const AudioHeader& header, const uint8_t* data, size_t size,
                          std::vector<DecodedAudio>& out) = 0;
+    // Synthesizes one frame lost from an unreliable audio path. `next` is
+    // the packet that revealed the gap; `frames_back` counts from it (1 is
+    // the packet immediately before `next`). Opus uses its built-in
+    // concealment; decoders without it return Unsupported. The receiver
+    // calls this in order for a bounded gap before decoding `next`, so the
+    // returned PCM carries an estimated capture time.
+    virtual Error conceal(const AudioHeader& next, uint32_t frames_back,
+                          std::vector<DecodedAudio>& out) = 0;
     virtual Error flush(std::vector<DecodedAudio>& out) = 0;
 
     virtual uint32_t sample_rate() const noexcept = 0;
@@ -359,6 +372,266 @@ struct AudioOutputDevice {
 
 std::vector<AudioOutputDevice> list_audio_outputs(std::string* error);
 
+// Adaptive playout lead for arrival-anchored audio. The viewer's system
+// sound starts with no fixed lead so it cannot trail the video on a healthy
+// link. This controller adds lead only after a window of arrivals shows
+// blocks missing their slots (negative slack), and gives it back once
+// arrivals are consistently early again. Observations are grouped into
+// windows, so one late or early block cannot move the lead back and forth and
+// at most one change happens per window. Startup and stall re-anchors are
+// excluded: their first blocks reflect queue fill and recovery bursts rather
+// than link jitter, and would otherwise pin a short session at a high lead.
+class JitterLeadController {
+public:
+    struct Config {
+        int64_t max_lead_ms = 120;
+        // A window raises the lead only when at least `raise_min_blocks`
+        // blocks land at or below `raise_at_ms` slack. A single reordered
+        // packet is left to concealment instead of delaying the session.
+        int64_t raise_at_ms = -20;
+        int64_t raise_min_blocks = 2;
+        int64_t raise_margin_ms = 10;
+        int64_t raise_step_max_ms = 40;
+        // Consecutive windows with every block more than `decay_above_ms`
+        // early give the lead back, one step per window after the hold.
+        int64_t decay_above_ms = 20;
+        int64_t decay_hold_windows = 2;
+        int64_t decay_step_ms = 20;
+        int64_t window_ms = 500;
+        // Windows that start before these deadlines never change the lead:
+        // session start and the burst after a stall release are not link
+        // conditions. Once the deadline passes, normal adaptation resumes.
+        int64_t startup_grace_ms = 1000;
+        int64_t release_grace_ms = 500;
+    };
+
+    JitterLeadController() = default;
+    explicit JitterLeadController(const Config& config) : config_(config) {}
+
+    // Observes (scheduled play time - arrival time) for one block and returns
+    // the lead to schedule with from now on.
+    int64_t observe(int64_t slack_ms, int64_t now_ms) {
+        if (!window_open_) {
+            grace_until_ms_ = now_ms + config_.startup_grace_ms;
+            open(now_ms, slack_ms);
+            return lead_ms_;
+        }
+        window_min_ms_ = (std::min)(window_min_ms_, slack_ms);
+        if (slack_ms <= config_.raise_at_ms) {
+            ++window_late_;
+        }
+        if (now_ms - window_start_ms_ < config_.window_ms) {
+            return lead_ms_;
+        }
+        const bool settling = window_start_ms_ < grace_until_ms_;
+        if (!settling && window_late_ >= config_.raise_min_blocks) {
+            int64_t want = (-window_min_ms_) + config_.raise_margin_ms;
+            want = (std::min)(want, config_.raise_step_max_ms);
+            want = (std::min)(want, config_.max_lead_ms - lead_ms_);
+            if (want > 0) {
+                lead_ms_ += want;
+                ++raises_;
+            }
+            early_windows_ = 0;
+        } else if (!settling && window_min_ms_ > config_.decay_above_ms) {
+            if (early_windows_ < config_.decay_hold_windows) {
+                ++early_windows_;
+            } else if (lead_ms_ > 0) {
+                lead_ms_ = (std::max)(int64_t{0}, lead_ms_ - config_.decay_step_ms);
+                ++decays_;
+            }
+        } else {
+            early_windows_ = 0;
+        }
+        open(now_ms, slack_ms);
+        return lead_ms_;
+    }
+
+    int64_t lead_ms() const { return lead_ms_; }
+    uint64_t raises() const { return raises_; }
+    uint64_t decays() const { return decays_; }
+
+    // Drops the learned lead and starts a fresh window without forgetting
+    // the session's raise/decay counters. The player calls this when a stall
+    // re-anchors the timeline.
+    void release(int64_t now_ms) {
+        lead_ms_ = 0;
+        early_windows_ = 0;
+        grace_until_ms_ = (std::max)(grace_until_ms_, now_ms + config_.release_grace_ms);
+        open(now_ms, 0);
+    }
+
+    void reset() {
+        lead_ms_ = 0;
+        raises_ = 0;
+        decays_ = 0;
+        window_open_ = false;
+        window_start_ms_ = 0;
+        window_min_ms_ = 0;
+        window_late_ = 0;
+        early_windows_ = 0;
+        grace_until_ms_ = 0;
+    }
+
+private:
+    void open(int64_t now_ms, int64_t slack_ms) {
+        window_open_ = true;
+        window_start_ms_ = now_ms;
+        window_min_ms_ = slack_ms;
+        window_late_ = slack_ms <= config_.raise_at_ms ? 1 : 0;
+    }
+
+    Config config_{};
+    int64_t lead_ms_ = 0;
+    int64_t window_start_ms_ = 0;
+    int64_t window_min_ms_ = 0;
+    int64_t window_late_ = 0;
+    int64_t early_windows_ = 0;
+    int64_t grace_until_ms_ = 0;
+    uint64_t raises_ = 0;
+    uint64_t decays_ = 0;
+    bool window_open_ = false;
+};
+
+// Long-session drift for capture-anchored playout. The configured lead is
+// intentional, so this does not chase an absolute phase: it learns the
+// best-case arrival phase of the first window and returns later windows to
+// it. The best case is the largest slack (smallest one-way delay), which a
+// burst of queued blocks cannot drag down the way a window minimum can.
+// A persistent departure means the local scheduling timeline is drifting
+// against the host capture clock (or the path's base delay moved); without
+// correction the lead slowly drains until blocks miss their slots (negative
+// departure) or latency grows (positive departure). Steps change the
+// host/local offset and are capped per window; a departure must repeat for
+// `confirm_windows` windows so one jittery window cannot move the timeline.
+// Callers should subtract any intentional lead from slack first, so a lead
+// change is not mistaken for drift. The first closed window after a start or
+// re-anchor is skipped: it can contain the arrival anchor's transient, which
+// says nothing about the path. Only used with a live clock offset, never with
+// the arrival anchor, and disabled by default.
+class PlayoutDriftController {
+public:
+    struct Config {
+        int64_t window_ms = 5000;
+        int64_t confirm_windows = 2;
+        int64_t dead_band_ms = 15;
+        int64_t max_step_ms = 20;
+        // Closed windows skipped before the reference is learned.
+        int64_t warmup_windows = 1;
+    };
+
+    PlayoutDriftController() = default;
+    explicit PlayoutDriftController(const Config& config) : config_(config) {}
+
+    // Observes the lead-independent arrival phase (scheduled play time minus
+    // arrival time, with the intentional lead removed) and returns the offset
+    // step in ms to add to the host-minus-local offset: positive plays
+    // earlier, negative later. At most one step per window.
+    int64_t observe(int64_t phase_ms, int64_t now_ms) {
+        if (!window_open_) {
+            open(now_ms);
+            add(phase_ms);
+            return 0;
+        }
+        add(phase_ms);
+        if (now_ms - window_start_ms_ < config_.window_ms) {
+            return 0;
+        }
+        const int64_t window_best = window_best_ms_;
+        // The closing block belongs to the window it helped close; the next
+        // window starts empty so one sample cannot count twice.
+        open(now_ms);
+        if (!have_reference_) {
+            if (windows_skipped_ < config_.warmup_windows) {
+                ++windows_skipped_;
+                pending_ = 0;
+                return 0;
+            }
+            reference_ms_ = window_best;
+            have_reference_ = true;
+            pending_ = 0;
+            return 0;
+        }
+        const int64_t deviation = window_best - reference_ms_;
+        if (deviation >= -config_.dead_band_ms &&
+            deviation <= config_.dead_band_ms) {
+            pending_ = 0;
+            return 0;
+        }
+        const int64_t sign = deviation > 0 ? 1 : -1;
+        if (pending_ > 0 && sign == pending_sign_) {
+            ++pending_;
+        } else {
+            pending_sign_ = sign;
+            pending_ = 1;
+        }
+        if (pending_ < config_.confirm_windows) {
+            return 0;
+        }
+        const int64_t step =
+            deviation > 0 ? (std::min)(deviation, config_.max_step_ms)
+                          : (std::max)(deviation, -config_.max_step_ms);
+        correction_ms_ += step;
+        ++corrections_;
+        // Keep the confirmation while the departure persists, so a sustained
+        // drift is corrected once per window instead of pausing to re-confirm.
+        pending_ = config_.confirm_windows;
+        return step;
+    }
+
+    // Cumulative offset applied since the timeline was learned. Positive
+    // means playback was moved earlier; `corrections` counts the steps.
+    int64_t correction_ms() const { return correction_ms_; }
+    uint64_t corrections() const { return corrections_; }
+
+    // Forgets the reference and the open window, including the accumulated
+    // correction. Called when the timeline is rebuilt (endpoint reopen), so
+    // the old reference cannot leak into the new one.
+    void reset() {
+        window_open_ = false;
+        window_has_sample_ = false;
+        window_start_ms_ = 0;
+        window_best_ms_ = 0;
+        reference_ms_ = 0;
+        have_reference_ = false;
+        windows_skipped_ = 0;
+        pending_ = 0;
+        pending_sign_ = 0;
+        correction_ms_ = 0;
+        corrections_ = 0;
+    }
+
+private:
+    void open(int64_t now_ms) {
+        window_open_ = true;
+        window_has_sample_ = false;
+        window_start_ms_ = now_ms;
+        window_best_ms_ = 0;
+    }
+
+    void add(int64_t phase_ms) {
+        if (!window_has_sample_) {
+            window_best_ms_ = phase_ms;
+            window_has_sample_ = true;
+        } else {
+            window_best_ms_ = (std::max)(window_best_ms_, phase_ms);
+        }
+    }
+
+    Config config_{};
+    int64_t window_start_ms_ = 0;
+    int64_t window_best_ms_ = 0;
+    int64_t reference_ms_ = 0;
+    int64_t pending_ = 0;
+    int64_t pending_sign_ = 0;
+    int64_t correction_ms_ = 0;
+    uint64_t corrections_ = 0;
+    bool window_open_ = false;
+    bool window_has_sample_ = false;
+    bool have_reference_ = false;
+    int64_t windows_skipped_ = 0;
+};
+
 struct AudioPlayerConfig {
     // Empty follows the default render endpoint. A non-empty id pins that
     // device; when it disappears the player keeps retrying the same id and
@@ -379,18 +652,90 @@ struct AudioPlayerConfig {
     // re-anchors instead of replaying the stale timeline. `set_clock_offset`
     // is ignored in this mode.
     bool arrival_anchored = false;
+    // Collect this many blocks before setting the first arrival anchor, then
+    // anchor on the fastest one plus a small safety margin. The gathered
+    // blocks are skipped, so playback starts on the corrected timeline
+    // instead of carrying the startup handshake delay for the whole session.
+    // 0 anchors on the first block. Only used with `arrival_anchored`.
+    uint32_t anchor_gather_blocks = 0;
+    // Grow the playout lead past `lead_ms` when arrivals miss their slots,
+    // and return it after the link settles. Works on both timelines: with
+    // `arrival_anchored` it starts from zero, and with a host capture offset
+    // it adds up to its ceiling on top of `lead_ms`. The microphone uplink
+    // keeps its fixed lead.
+    bool adaptive_jitter = false;
+    // Correct long-session clock drift on a capture-anchored timeline. The
+    // controller learns the best-case arrival phase of the first window and
+    // slowly moves the host/local offset when it departs, so the configured
+    // lead stays intact instead of draining (late drift) or growing (early
+    // drift). Needs a live clock offset from LatencyReply; ignored with
+    // `arrival_anchored`. Experimental and off by default.
+    bool clock_drift_correction = false;
 };
 
 struct AudioPlayerStats {
     uint64_t packets = 0;        // decoded blocks accepted
     uint64_t played_frames = 0;  // frames handed to the render endpoint
     uint64_t underruns = 0;      // times playback ran dry after audio had started
+    // Total scheduled silence between consecutive written blocks. Underruns
+    // count events past a 30 ms threshold and stay blind to streams that keep
+    // dropping blocks; this is the actual dry time on the playout timeline,
+    // and the metric to compare playout strategies with.
+    uint64_t starved_ms = 0;
     uint64_t dropped = 0;        // stale or over-capacity blocks discarded
     uint64_t recoveries = 0;     // render endpoint reopened after a device change
     uint32_t buffer_ms = 0;      // queued audio plus endpoint padding
     uint32_t lead_ms = 0;
+    // Extra lead the adaptive controller added on top of `lead_ms`, and how
+    // often it raised or returned part of it.
+    uint32_t jitter_ms = 0;
+    uint64_t jitter_raises = 0;
+    uint64_t jitter_decays = 0;
+    // Cumulative offset the drift controller added to the host/local clock
+    // mapping (positive moved playback earlier) and how many steps it took.
+    int64_t drift_ms = 0;
+    uint64_t drift_corrections = 0;
     bool recovering = false;     // endpoint lost, retrying the default device
+    // The most recently rendered block's host capture stamp and the local
+    // steady-clock time it was scheduled to play. Both stay 0 until a block
+    // reaches the endpoint and are cleared when the endpoint is rebuilt.
+    // A viewer holding a LatencyReply offset turns the pair into the audio
+    // playout latency it can compare with frame age.
+    uint64_t playout_capture_ms = 0;
+    int64_t playout_scheduled_ms = 0;
+    // Range of (scheduled local play time - arrival local time) over the
+    // blocks queued since the last anchor or startup gather. A consistently
+    // positive average means the anchor implies more delay than the blocks
+    // need; a negative minimum means the anchor was optimistic and blocks
+    // risk being dropped.
+    int64_t slack_min_ms = 0;
+    int64_t slack_max_ms = 0;
+    double slack_avg_ms = 0.0;
+    uint64_t slack_early = 0;  // blocks arriving more than 20 ms early
+    uint64_t slack_late = 0;   // blocks arriving more than 20 ms late
+    // How far the startup anchor gather moved playback earlier than the
+    // first-block anchor would have. Positive means the gather removed that
+    // much avoidable delay; 0 means it did not run or found no profit.
+    int64_t anchor_shift_ms = 0;
 };
+
+// Playout latency of an audio block in the host's clock: the local scheduled
+// time adjusted by the host-minus-local offset from LatencyReply, minus the
+// block's capture stamp. Returns a negative value when the pair is unset or
+// the result is implausible (a stale offset or a replay), so callers can
+// report "not measured" instead of a wild number.
+inline double audio_playout_latency_ms(uint64_t capture_ms, int64_t scheduled_ms,
+                                       int64_t host_minus_local_us) {
+    if (capture_ms == 0 || scheduled_ms == 0) {
+        return -1.0;
+    }
+    const int64_t latency_us = scheduled_ms * 1000 + host_minus_local_us -
+                               static_cast<int64_t>(capture_ms) * 1000;
+    if (latency_us <= -100000 || latency_us >= 10000000) {
+        return -1.0;
+    }
+    return static_cast<double>(latency_us > 0 ? latency_us : 0) / 1000.0;
+}
 
 class IAudioPlayer {
 public:

@@ -69,6 +69,13 @@ public:
     // is already stale at that point.
     void submit(const InputEvent& event);
 
+    // Queues a block of composed text (protocol v36). The injection thread
+    // types it as Unicode, so it lands as the viewer sent it regardless of the
+    // host keyboard layout. Invalid text (see valid_text_input()) is rejected
+    // and counted instead of queued. Same non-blocking queue and drop policy
+    // as submit().
+    void submit_text(const std::string& text);
+
     // Queues a release of everything held so far. It lands behind the events
     // already submitted and ahead of anything later, so a burst of pointer
     // moves cannot be applied after the viewer has given up control.
@@ -86,6 +93,10 @@ private:
 
     void run();
     void apply(const InputEvent& event);
+    // Types composed text as Unicode. '\n' and '\t' become Return and Tab,
+    // '\r' is skipped (viewers send CRLF pairs), and every other code point
+    // is injected with KEYEVENTF_UNICODE, surrogates paired as one character.
+    void apply_text(const std::string& text);
     // Brings held modifiers in line with the bitmap the peer reported.
     void sync_modifiers(uint16_t reported);
     // Taps Caps/Num/Scroll once when the peer's lock state differs from this
@@ -109,7 +120,9 @@ private:
     std::condition_variable cv_;
     struct Pending {
         bool release = false;
+        bool has_text = false;
         InputEvent event;
+        std::string text;
     };
     std::deque<Pending> queue_;
     bool stopping_ = false;

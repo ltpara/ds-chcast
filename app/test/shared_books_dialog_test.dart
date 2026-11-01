@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
@@ -23,18 +24,20 @@ void main() {
     final _Selection selection = _Selection();
     await tester.pumpWidget(
       MaterialApp(
-        home: Builder(
-          builder: (BuildContext context) {
-            return TextButton(
-              onPressed: () async {
-                selection.peer = await showDialog<AddressBookPeer>(
-                  context: context,
-                  builder: (BuildContext context) => dialog,
-                );
-              },
-              child: const Text('打开'),
-            );
-          },
+        home: Scaffold(
+          body: Builder(
+            builder: (BuildContext context) {
+              return TextButton(
+                onPressed: () async {
+                  selection.peer = await showDialog<AddressBookPeer>(
+                    context: context,
+                    builder: (BuildContext context) => dialog,
+                  );
+                },
+                child: const Text('打开'),
+              );
+            },
+          ),
         ),
       ),
     );
@@ -42,6 +45,162 @@ void main() {
     await tester.pumpAndSettle();
     return selection;
   }
+
+  testWidgets('shared entries can be searched by name, id and tag', (
+    tester,
+  ) async {
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      loadGrants: (ServerSettings server, String token) async =>
+          const AddressBookGrants(),
+      loadBooks: (ServerSettings server, String token) async =>
+          const <SharedAddressBook>[
+            SharedAddressBook(
+              owner: 'carol',
+              revision: 9,
+              peers: <AddressBookPeer>[
+                AddressBookPeer(
+                  id: 'labbox',
+                  name: '实验室',
+                  tags: <String>['lab'],
+                ),
+                AddressBookPeer(
+                  id: 'officemac',
+                  name: 'Office Mac',
+                  tags: <String>['办公'],
+                ),
+              ],
+            ),
+            SharedAddressBook(
+              owner: 'dave',
+              revision: 3,
+              peers: <AddressBookPeer>[AddressBookPeer(id: 'home', name: '家里')],
+            ),
+          ],
+    );
+    await open(tester, dialog);
+    expect(find.text('实验室'), findsOneWidget);
+    expect(find.text('Office Mac'), findsOneWidget);
+    expect(find.text('家里'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('shared-books-search')),
+      'OFFICE',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Office Mac'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
+    expect(find.text('家里'), findsNothing);
+    expect(find.text('dave'), findsNothing);
+    expect(find.text('1 台'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('shared-books-search')),
+      'labbox',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('实验室'), findsOneWidget);
+    expect(find.text('Office Mac'), findsNothing);
+
+    await tester.enterText(find.byKey(const Key('shared-books-search')), '办公');
+    await tester.pumpAndSettle();
+    expect(find.text('Office Mac'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
+
+    await tester.enterText(find.byKey(const Key('shared-books-search')), 'zzz');
+    await tester.pumpAndSettle();
+    expect(find.text('没有匹配的共享条目'), findsOneWidget);
+    expect(find.text('carol'), findsNothing);
+  });
+
+  testWidgets('a shared entry copies its peer id without write access', (
+    tester,
+  ) async {
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (MethodCall call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map<Object?, Object?>)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      loadGrants: (ServerSettings server, String token) async =>
+          const AddressBookGrants(),
+      loadBooks: (ServerSettings server, String token) async =>
+          const <SharedAddressBook>[
+            SharedAddressBook(
+              owner: 'carol',
+              revision: 9,
+              peers: <AddressBookPeer>[
+                AddressBookPeer(id: 'labbox', name: '实验室'),
+              ],
+            ),
+          ],
+    );
+    await open(tester, dialog);
+
+    await tester.tap(find.byKey(const Key('shared-copy-id-carol-labbox')));
+    await tester.pump();
+    expect(copied, 'labbox');
+    expect(find.text('ID 已复制'), findsOneWidget);
+  });
+
+  testWidgets('the refresh button reloads shared books and grants', (
+    tester,
+  ) async {
+    int loads = 0;
+    int grantLoads = 0;
+    List<SharedAddressBook> books = const <SharedAddressBook>[
+      SharedAddressBook(
+        owner: 'carol',
+        revision: 9,
+        peers: <AddressBookPeer>[AddressBookPeer(id: 'labbox', name: '实验室')],
+      ),
+    ];
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      loadGrants: (ServerSettings server, String token) async {
+        grantLoads++;
+        return const AddressBookGrants();
+      },
+      loadBooks: (ServerSettings server, String token) async {
+        loads++;
+        return books;
+      },
+    );
+    await open(tester, dialog);
+    expect(loads, 1);
+    expect(find.text('实验室'), findsOneWidget);
+
+    books = const <SharedAddressBook>[
+      SharedAddressBook(
+        owner: 'carol',
+        revision: 10,
+        peers: <AddressBookPeer>[AddressBookPeer(id: 'newbox', name: '新机器')],
+      ),
+    ];
+    await tester.tap(find.byKey(const Key('shared-books-refresh')));
+    await tester.pumpAndSettle();
+
+    expect(loads, 2);
+    expect(grantLoads, 2);
+    expect(find.text('新机器'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
+  });
 
   testWidgets('a shared peer can be selected for a connection', (tester) async {
     final SharedBooksDialog dialog = SharedBooksDialog(
@@ -132,12 +291,17 @@ void main() {
             return AddressBookGrant(username: username, permission: permission);
           },
       revoke:
-          (ServerSettings server, String token, String username, {String? groupId}) async {
-        revoked.add(username);
-        outgoing.removeWhere(
-          (AddressBookGrant grant) => grant.username == username,
-        );
-      },
+          (
+            ServerSettings server,
+            String token,
+            String username, {
+            String? groupId,
+          }) async {
+            revoked.add(username);
+            outgoing.removeWhere(
+              (AddressBookGrant grant) => grant.username == username,
+            );
+          },
     );
     await open(tester, dialog);
 
@@ -218,11 +382,7 @@ void main() {
               owner: 'carol',
               permission: 'write',
               peers: <AddressBookPeer>[
-                AddressBookPeer(
-                  id: 'sharedbox',
-                  name: '共享设备',
-                  revision: 5,
-                ),
+                AddressBookPeer(id: 'sharedbox', name: '共享设备', revision: 5),
               ],
             ),
           ],
@@ -291,6 +451,7 @@ void main() {
             SharedAddressBook(
               owner: 'carol',
               permission: 'write',
+              revision: 12,
               peers: <AddressBookPeer>[
                 AddressBookPeer(id: 'sharedbox', name: '共享设备'),
               ],
@@ -305,8 +466,11 @@ void main() {
             String? name,
             List<String>? tags,
             String? groupId,
+            int? ifRevision,
           }) async {
-            added.add('$owner/$peerId/$name/${tags?.join('+')}@${groupId ?? ''}');
+            added.add(
+              '$owner/$peerId/$name/${tags?.join('+')}@${groupId ?? ''}/${ifRevision ?? 0}',
+            );
             return AddressBookPeer(
               id: peerId,
               name: name ?? '',
@@ -333,7 +497,7 @@ void main() {
     await tester.tap(find.byKey(const Key('shared-add-save')));
     await tester.pumpAndSettle();
 
-    expect(added, <String>['carol/dlbox/下载机/lab+vip@']);
+    expect(added, <String>['carol/dlbox/下载机/lab+vip@/12']);
     expect(find.byKey(const Key('shared-add-id')), findsNothing);
     expect(find.byKey(const Key('shared-books-error')), findsNothing);
   });
@@ -497,6 +661,7 @@ void main() {
             String? name,
             List<String>? tags,
             String? groupId,
+            int? ifRevision,
           }) async {
             added.add('$owner/$peerId@${groupId ?? ''}');
             return AddressBookPeer(id: peerId, groupId: groupId ?? '');
@@ -508,10 +673,15 @@ void main() {
       find.byKey(const Key('shared-peer-menu-carol-devbox')),
       findsOneWidget,
     );
-    expect(find.byKey(const Key('shared-peer-menu-carol-office')), findsNothing);
+    expect(
+      find.byKey(const Key('shared-peer-menu-carol-office')),
+      findsNothing,
+    );
     expect(find.byKey(const Key('shared-peer-menu-carol-loose')), findsNothing);
     expect(find.byKey(const Key('shared-add-carol')), findsOneWidget);
 
+    await tester.ensureVisible(find.byKey(const Key('shared-scope')));
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('shared-scope')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('实验室').last);
@@ -524,10 +694,7 @@ void main() {
 
     expect(shared, <String>['erin/read@lab']);
     expect(find.textContaining('分组 实验室'), findsOneWidget);
-    expect(
-      find.byKey(const Key('shared-revoke-erin-lab')),
-      findsOneWidget,
-    );
+    expect(find.byKey(const Key('shared-revoke-erin-lab')), findsOneWidget);
 
     await tester.ensureVisible(find.byKey(const Key('shared-add-carol')));
     await tester.pumpAndSettle();

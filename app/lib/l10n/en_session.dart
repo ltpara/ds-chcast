@@ -6,8 +6,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   'Ctrl+Alt+Del 未发送：{detail}': 'Ctrl+Alt+Del not sent: {detail}',
   'Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪':
       'Ctrl+Alt+Del could not be queued: remote input is not ready',
-  '{denial}\n\n服务端说明：{reason}':
-      '{denial}\n\nHost message: {reason}',
+  '{denial}\n\n服务端说明：{reason}': '{denial}\n\nHost message: {reason}',
   '主机不允许隐私模式': 'The host does not allow privacy mode',
   '主机不支持发送 Ctrl+Alt+Del（托盘主机需改用服务运行）':
       'The host cannot send Ctrl+Alt+Del (tray mode requires the service)',
@@ -22,10 +21,8 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The host cannot capture the desktop right now (lock screen or UAC); capture resumes automatically',
   '主机未发送 Ctrl+Alt+Del': 'The host did not send Ctrl+Alt+Del',
   '主机未授予输入权限': 'Input permission was not granted by the host',
-  '主机未授权隐私模式，无法切换':
-      'The host did not authorize privacy mode; cannot toggle',
-  '主机未授权麦克风，无法开启':
-      'The host did not authorize the microphone; cannot enable',
+  '主机未授权隐私模式，无法切换': 'The host did not authorize privacy mode; cannot toggle',
+  '主机未授权麦克风，无法开启': 'The host did not authorize the microphone; cannot enable',
   '主机系统不支持隐私模式': 'The host system does not support privacy mode',
   '主机调用 SendSAS 失败': 'The host failed to call SendSAS',
   '以后连接若遇到不同身份会被拒绝，并在确认后更换。':
@@ -40,8 +37,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '准备发送': 'Ready to send',
   '切换分辨率失败': 'Failed to change resolution',
   '切换分辨率失败：{reason}': 'Failed to change resolution: {reason}',
-  '切换显示失败，已回到当前输出':
-      'Failed to switch display; reverted to the current output',
+  '切换显示失败，已回到当前输出': 'Failed to switch display; reverted to the current output',
   '切换显示失败：{reason}': 'Failed to switch display: {reason}',
   '剪贴板': 'Clipboard',
   '原生查看器尚未加载': 'The native viewer is not loaded yet',
@@ -56,16 +52,13 @@ const Map<String, String> kEnglishSession = <String, String>{
   '已固定 {p26} · 当前 {p27}': 'Pinned {p26} · current {p27}',
   '已静音': 'Muted',
   '开始转发': 'Start forwarding',
-  '当前会话无法修改麦克风处理':
-      'Microphone processing cannot be changed in this session',
-  '当前会话无法切换输出设备':
-      'Output device cannot be switched in this session',
+  '当前会话无法修改麦克风处理': 'Microphone processing cannot be changed in this session',
+  '当前会话无法切换输出设备': 'Output device cannot be switched in this session',
   '当前无法修改画面设置': 'Picture settings cannot be changed right now',
   '录制': 'Record',
   '接收 {p28} 帧 · 解码 {p29} 帧{p30}':
       'Received {p28} frames · decoded {p29} frames{p30}',
-  '摄像头请求未发送，请稍后重试':
-      'Camera request was not sent; try again later',
+  '摄像头请求未发送，请稍后重试': 'Camera request was not sent; try again later',
   '文件传输': 'File transfer',
   '文件发送失败': 'File send failed',
   '文件发送失败：{reason}': 'File send failed: {reason}',
@@ -112,8 +105,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '正在建立连接…': 'Connecting…',
   '正在接收': 'Receiving',
   '正在校验': 'Verifying',
-  '正在自动重连（第 {p24}/{p25} 次）':
-      'Reconnecting automatically ({p24}/{p25})',
+  '正在自动重连（第 {p24}/{p25} 次）': 'Reconnecting automatically ({p24}/{p25})',
   '正在转发 127.0.0.1:{p7} → {p8}:{p9}\n连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}':
       'Forwarding 127.0.0.1:{p7} → {p8}:{p9}\nConnections {p10} · failed {p11} · up {p12} · down {p13}',
   '此前固定的指纹': 'Previously pinned fingerprint',
@@ -150,10 +142,8 @@ const Map<String, String> kEnglishSession = <String, String>{
   '重新连接': 'Reconnect',
   '队列剩余 {p18} 个': '{p18} left in queue',
   '隐私模式': 'Privacy mode',
-  '隐私模式已关闭：主机本地画面已恢复':
-      'Privacy mode off: the host display is visible again',
-  '隐私模式已开启：主机本地画面已被遮挡':
-      'Privacy mode on: the host display is blanked',
+  '隐私模式已关闭：主机本地画面已恢复': 'Privacy mode off: the host display is visible again',
+  '隐私模式已开启：主机本地画面已被遮挡': 'Privacy mode on: the host display is blanked',
   '隐私模式未能切换': 'Privacy mode could not be toggled',
   '隧道 · {_tunnelPath}': 'Tunnel · {_tunnelPath}',
   '音频': 'Audio',
@@ -168,6 +158,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '任务管理器': 'Task Manager',
   '会话建立后可录制到本地':
       'Recording to a local file is available once the session is established',
+  '会话建立后可截图': 'Screenshots are available once the session is established',
   '会话聊天': 'Session chat',
   '修改分辨率（会话内生效，断开后恢复）':
       'Change resolution (applies to this session; restored on disconnect)',
@@ -180,18 +171,15 @@ const Map<String, String> kEnglishSession = <String, String>{
   '关闭远程摄像头': 'Close remote camera',
   '关闭远程终端': 'Close remote terminal',
   '关闭远程键鼠': 'Disable remote input',
-  '关闭隐私模式（恢复主机本地画面）':
-      'Disable privacy mode (restore host display)',
-  '关闭麦克风（长按选择设备）':
-      'Disable microphone (long-press to pick device)',
+  '关闭隐私模式（恢复主机本地画面）': 'Disable privacy mode (restore host display)',
+  '关闭麦克风（长按选择设备）': 'Disable microphone (long-press to pick device)',
   '兼容性最好': 'Best compatibility',
   '切换显示器': 'Switch display',
   '切换窗口': 'Switch window',
   '原始大小': 'Original size',
   '发送文件到主机': 'Send file to host',
   '取消固定': 'Unpin',
-  '取消静音（长按选择输出设备）':
-      'Unmute (long-press to pick output device)',
+  '取消静音（长按选择输出设备）': 'Unmute (long-press to pick output device)',
   '同画质更省带宽': 'Same quality with less bandwidth',
   '噪声抑制': 'Noise suppression',
   '回声消除': 'Echo cancellation',
@@ -199,18 +187,20 @@ const Map<String, String> kEnglishSession = <String, String>{
   '均衡': 'Balanced',
   '安全注意序列（需主机以服务方式运行）':
       'Secure attention sequence (host must run as a service)',
-  '带宽最低，优先帧率与延迟':
-      'Lowest bandwidth, favors frame rate and latency',
+  '带宽最低，优先帧率与延迟': 'Lowest bandwidth, favors frame rate and latency',
   '帧率上限': 'Frame rate cap',
   '开启远程键鼠': 'Enable remote input',
-  '开启隐私模式（遮挡主机本地画面）':
-      'Enable privacy mode (blank the host display)',
-  '开启麦克风（长按选择设备）':
-      'Enable microphone (long-press to pick device)',
+  '开启隐私模式（遮挡主机本地画面）': 'Enable privacy mode (blank the host display)',
+  '开启麦克风（长按选择设备）': 'Enable microphone (long-press to pick device)',
   '开始菜单': 'Start menu',
   '录制到本地（保存为 MP4）': 'Record locally (save as MP4)',
   '恢复剪贴板同步': 'Resume clipboard sync',
   '抑制平稳底噪，语音优先': 'Suppress steady noise, prioritize voice',
+  '截图失败': 'Screenshot failed',
+  '截图失败：{reason}': 'Screenshot failed: {reason}',
+  '截图已保存': 'Screenshot saved',
+  '截图已保存：{path}': 'Screenshot saved: {path}',
+  '截图（保存为本地 PNG）': 'Screenshot (save as local PNG)',
   '收起工具栏': 'Hide toolbar',
   '文件正在发送': 'File is being sent',
   '断开连接': 'Disconnect',
@@ -218,8 +208,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '显示或隐藏统计': 'Show or hide stats',
   '暂停剪贴板同步': 'Pause clipboard sync',
   '最高 {cap} 帧/秒': 'Max {cap} fps',
-  '服务端尚未公布显示器列表':
-      'The host has not published a display list yet',
+  '服务端尚未公布显示器列表': 'The host has not published a display list yet',
   '服务端未启用声音': 'The host has not enabled sound',
   '服务端未开放剪贴板': 'The host has not enabled the clipboard',
   '服务端未开放摄像头': 'The host has not enabled the camera',
@@ -236,16 +225,13 @@ const Map<String, String> kEnglishSession = <String, String>{
   '正在读取主机的显示模式': 'Reading the host display modes',
   '流畅': 'Smooth',
   '特殊按键': 'Special keys',
-  '用本机播放的系统声音作参考':
-      'Play the system sound locally as a reference',
+  '用本机播放的系统声音作参考': 'Play the system sound locally as a reference',
   '由主机选择，优先 HEVC': 'Chosen by the host, prefer HEVC',
   '由服务端选择输出': 'Output chosen by the host',
   '画质': 'Quality',
-  '画面质量、帧率上限与编码器':
-      'Picture quality, frame rate cap and encoder',
+  '画面质量、帧率上限与编码器': 'Picture quality, frame rate cap and encoder',
   '画面适应方式': 'Picture fit',
-  '端口转发进行中（点击查看或停止）':
-      'Port forwarding active (click to view or stop)',
+  '端口转发进行中（点击查看或停止）': 'Port forwarding active (click to view or stop)',
   '系统默认设备': 'System default device',
   '系统默认输出': 'System default output',
   '系统默认麦克风': 'System default microphone',
@@ -289,9 +275,23 @@ const Map<String, String> kEnglishSession = <String, String>{
   '重试': 'Retry',
   '主机': 'Host',
   '关闭聊天': 'Close chat',
+  '复制聊天记录（含双方消息）': 'Copy chat history (both sides)',
+  '已复制聊天记录': 'Chat history copied',
+  '没有可复制的聊天记录': 'There is nothing to copy',
   '发送': 'Send',
   '发送失败：会话未就绪或发送队列已满':
       'Send failed: the session is not ready or the send queue is full',
+  '发送文本': 'Send text',
+  '发送失败：会话未就绪、未开启输入或发送队列已满':
+      'Send failed: the session is not ready, input is off or the send queue is full',
+  '文本不能为空': 'The text cannot be empty',
+  '文本不能包含空字符': 'The text cannot contain null characters',
+  '文本会以 Unicode 发送，不依赖主机键盘布局':
+      'The text is sent as Unicode, independent of the host keyboard layout',
+  '文本过长：{bytes} / {kMaxTextInputBytes} 字节':
+      'Text too long: {bytes} / {kMaxTextInputBytes} bytes',
+  '输入要在这台主机上键入的文本': 'Enter the text to type on the host',
+  '需要远程键鼠控制': 'Turn on remote input first',
   '我': 'Me',
   '收 {p1} · 发 {p2}': 'Rx {p1} · Tx {p2}',
   '消息不能为空': 'The message cannot be empty',
@@ -299,8 +299,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '消息过长：{bytes} / {kMaxChatBytes} 字节':
       'Message too long: {bytes} / {kMaxChatBytes} bytes',
   '输入消息，Enter 发送': 'Type a message, Enter to send',
-  '还没有消息。发送一条试试。':
-      'No messages yet. Send one to get started.',
+  '还没有消息。发送一条试试。': 'No messages yet. Send one to get started.',
   ' · {p17} 失败': ' · {p17} failed',
   ' · {p21} 失败': ' · {p21} failed',
   ' · 丢 {p36}': ' · lost {p36}',
@@ -328,6 +327,9 @@ const Map<String, String> kEnglishSession = <String, String>{
   '本机无法播放': 'Cannot play locally',
   '目标': 'Target',
   '缓冲': 'Buffer',
+  '音画': 'A/V',
+  '音频 {p45} ms · 空转 {p47} ms · 丢 {p48} · 差 {p46} ms':
+      'audio {p45} ms · starved {p47} ms · dropped {p48} · skew {p46} ms',
   '编码': 'Encode',
   '解码': 'Decode',
   '设备恢复中 · ': 'Device recovering · ',
@@ -338,8 +340,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '{p3} 字节': '{p3} bytes',
   '主机已结束该控制台': 'The host ended this console',
   '主机已结束该控制台：{reason}': 'The host ended this console: {reason}',
-  '关闭终端（同时结束主机上的控制台）':
-      'Close the terminal (also ends the console on the host)',
+  '关闭终端（同时结束主机上的控制台）': 'Close the terminal (also ends the console on the host)',
   '准备中': 'Preparing',
   '失败': 'Failed',
   '已结束': 'Ended',
@@ -351,6 +352,19 @@ const Map<String, String> kEnglishSession = <String, String>{
       'Click the panel to type · Ctrl+V to paste · Esc goes to the host',
   '申请中…': 'Requesting…',
   '粘贴（Ctrl+V）': 'Paste (Ctrl+V)',
+  '复制终端内容（Ctrl+Shift+C，含滚动历史）':
+      'Copy console contents (Ctrl+Shift+C, including scrollback)',
+  '已复制终端内容': 'Console contents copied',
+  '回到底部': 'Jump to bottom',
+  '搜索终端内容（Ctrl+F）': 'Search console (Ctrl+F)',
+  '输入要查找的文本（历史与当前屏幕）': 'Find text (scrollback and current screen)',
+  '无匹配': 'No matches',
+  '上一个匹配': 'Previous match',
+  '下一个匹配': 'Next match',
+  '关闭搜索': 'Close search',
+  '缩小字号': 'Smaller text',
+  '放大字号': 'Larger text',
+  '终端没有可复制的内容': 'There is nothing to copy',
   '终端不可用（主机拒绝或权限已撤销）':
       'The terminal is unavailable (rejected by the host or permission revoked)',
   '重新申请终端': 'Request the terminal again',
@@ -362,14 +376,35 @@ const Map<String, String> kEnglishSession = <String, String>{
   '返回上一级': 'Up one level',
   '正在读取目录…': 'Reading directory…',
   '这个文件夹是空的': 'This folder is empty',
-  '条目太多，主机只返回了前一部分':
-      'Too many entries; the host returned only the first part',
+  '条目太多，主机只返回了前一部分': 'Too many entries; the host returned only the first part',
   '下载到本机': 'Download to this computer',
   '正在下载 {name} · {p1} / {p2}': 'Downloading {name} · {p1} / {p2}',
+  '上一级': 'Parent folder',
+  '复制路径': 'Copy path',
+  '路径已复制': 'Path copied',
+  '共 {n} 项': '{n} items',
+  '匹配 {n} / {total} 项': '{n} of {total} items',
   '上传文件到此处': 'Upload files here',
   '正在上传到 {dir}（队列剩余 {n} 个）': 'Uploading to {dir} ({n} left in queue)',
+  '正在上传到 {dir} · {p1} / {p2} · {pct}%（队列剩余 {n} 个）':
+      'Uploading to {dir} · {p1} / {p2} · {pct}% ({n} left in queue)',
   '上传完成，列表已刷新': 'Upload finished; the list was refreshed',
   '上传失败：{reason}': 'Upload failed: {reason}',
+  '取消上传': 'Cancel the upload',
+  '已取消上传': 'Upload cancelled',
+  '取消下载': 'Cancel the download',
+  '已取消下载': 'Download cancelled',
+  '在文件夹中显示': 'Show in folder',
+  '打开文件': 'Open file',
+  '打开文件夹': 'Open folder',
+  '筛选当前文件夹': 'Filter this folder',
+  '没有匹配的条目': 'No matching entries',
+  '排序': 'Sort',
+  '按名称': 'By name',
+  '按大小': 'By size',
+  '按时间': 'By time',
+  '升序': 'Ascending',
+  '降序': 'Descending',
   '点击文件右侧的下载按钮保存到本机；多选可批量下载或删除；标题栏的上传按钮会把文件传到当前文件夹':
       'Use the download button to save a file here; multi-select batches downloads and deletes; the upload button in the title bar sends files to the current folder',
   '请求无法发送：会话未就绪或主机未授权文件传输':
@@ -382,8 +417,8 @@ const Map<String, String> kEnglishSession = <String, String>{
   '操作完成，列表已刷新': 'Done; the list was refreshed',
   '主机拒绝了操作': 'The host refused the operation',
   '名称不能为空': 'The name cannot be empty',
-  '名称不能包含 / \\ : 或使用 . 与 ..':
-      'The name cannot contain / \\ : or be . or ..',
+  '名称不能包含 / \\ : 或使用 . 与 ..': 'The name cannot contain / \\ : or be . or ..',
+  '同名文件已存在': 'An entry with that name already exists',
   '删除“{name}”？': 'Delete "{name}"?',
   '文件夹必须为空才能删除，此操作不可撤销。':
       'A folder must be empty before it can be deleted; this cannot be undone.',
@@ -402,8 +437,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '已选 {n} 项': '{n} selected',
   '正在下载选中的 {n} 项 · {done}/{total} 个文件':
       'Downloading {n} selected entries · {done}/{total} files',
-  '选中的 {n} 项已下载到 {path}':
-      'The {n} selected entries were saved to {path}',
+  '选中的 {n} 项已下载到 {path}': 'The {n} selected entries were saved to {path}',
   '正在删除选中的 {n} 项…': 'Deleting {n} selected entries…',
   '删除选中的 {n} 项？': 'Delete the {n} selected entries?',
   '已删除 {n} 项': 'Deleted {n} entries',

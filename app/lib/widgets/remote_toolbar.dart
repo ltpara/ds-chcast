@@ -70,6 +70,9 @@ class RemoteToolbar extends StatelessWidget {
     required this.onToggleControl,
     required this.specialKeysAvailable,
     required this.onSpecialAction,
+    required this.onSendText,
+    this.screenshotAvailable = false,
+    this.onScreenshot,
     required this.onToggleClipboard,
     required this.onSendFile,
     required this.fileBrowseOpen,
@@ -155,6 +158,13 @@ class RemoteToolbar extends StatelessWidget {
   /// host. The button stays visible but disabled otherwise.
   final bool specialKeysAvailable;
   final ValueChanged<RemoteSpecialAction> onSpecialAction;
+  final VoidCallback onSendText;
+
+  /// Viewer-side screenshot: the engine reads the newest decoded picture back
+  /// from the GPU and writes a PNG on this machine. Optional so tests and
+  /// sessions without a picture keep the toolbar unchanged.
+  final bool screenshotAvailable;
+  final VoidCallback? onScreenshot;
   final VoidCallback onToggleClipboard;
   final VoidCallback onSendFile;
 
@@ -459,6 +469,22 @@ class RemoteToolbar extends StatelessWidget {
             _SpecialKeysButton(
               available: specialKeysAvailable,
               onSelected: onSpecialAction,
+            ),
+            _BarButton(
+              icon: Icons.text_fields_rounded,
+              tooltip: specialKeysAvailable
+                  ? tr('发送文本')
+                  : tr('需要远程键鼠控制'),
+              disabled: !specialKeysAvailable,
+              onTap: onSendText,
+            ),
+            _BarButton(
+              icon: Icons.photo_camera_rounded,
+              tooltip: !screenshotAvailable
+                  ? tr('会话建立后可截图')
+                  : tr('截图（保存为本地 PNG）'),
+              disabled: !screenshotAvailable,
+              onTap: () => onScreenshot?.call(),
             ),
             _BarButton(
               icon: clipboardEnabled

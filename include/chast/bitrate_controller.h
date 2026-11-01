@@ -9,6 +9,13 @@
 // congestion window. Those lower the target; a sustained clean period raises
 // it again, never past the configured ceiling.
 //
+// The first frames of a session are a key-frame burst far above the target, so
+// the send queue can pass the congestion window for one interval on any path.
+// That is why a queue-only cut needs the pressure on two consecutive samples:
+// loss and RTT react to their first sample, but a queue that drains before the
+// next one was a burst, and cutting for it would lower quality at the start of
+// every session.
+//
 // A percent cut every cooldown is the right response to a slow drift, but not
 // to a capacity step: while the target walks down 15-30% at a time the
 // encoder keeps producing above the bottleneck, and a reliable ordered stream
@@ -148,6 +155,7 @@ private:
     uint32_t down_cooldown_ms_ = 0;
     uint32_t up_cooldown_ms_ = 0;
     uint32_t healthy_ms_ = 0;
+    uint32_t queue_pressure_samples_ = 0;
     uint64_t previous_lost_packets_ = 0;
     uint64_t previous_sent_packets_ = 0;
     uint64_t previous_sent_bytes_ = 0;

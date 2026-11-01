@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../account_store.dart';
 import '../server_api.dart';
@@ -57,6 +59,7 @@ typedef SharedPeerAdder =
       String? name,
       List<String>? tags,
       String? groupId,
+      int? ifRevision,
     });
 typedef SharedBookGrantsLoader =
     Future<AddressBookGrants> Function(
@@ -143,6 +146,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   bool _loading = true;
   bool _busy = false;
   String _error = '';
+  String _query = '';
 
   String _groupName(String groupId) {
     for (final AddressBookGroup group in widget.groups) {
@@ -161,7 +165,10 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   }
 
   bool _canWritePeer(SharedAddressBook book, AddressBookPeer peer) {
-    return addressBookPermissionAllows(book.permissionFor(peer.groupId), 'write');
+    return addressBookPermissionAllows(
+      book.permissionFor(peer.groupId),
+      'write',
+    );
   }
 
   bool _canAddPeer(SharedAddressBook book) {
@@ -242,7 +249,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
           setState(() {
             _busy = false;
             if (_error.isEmpty) {
-              _error = tr('该条目已在其他设备修改，已刷新为服务器版本');
+              _error = tr('该条目或地址簿已在其他设备修改，已刷新为服务器版本');
             }
           });
         }
@@ -365,6 +372,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
         name: draft.name,
         tags: draft.tags,
         groupId: draft.groupId,
+        ifRevision: book.revision > 0 ? book.revision : null,
       );
     }, tr('添加共享条目失败'));
   }
@@ -375,7 +383,10 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
       builder: (BuildContext context) => AlertDialog(
         title: Text(tr('删除共享条目')),
         content: Text(
-          tr('从 {p2} 的地址簿删除 {p3}？', <String, Object?>{'p2': book.owner, 'p3': peer.name.isEmpty ? peer.id : peer.name}),
+          tr('从 {p2} 的地址簿删除 {p3}？', <String, Object?>{
+            'p2': book.owner,
+            'p3': peer.name.isEmpty ? peer.id : peer.name,
+          }),
         ),
         actions: <Widget>[
           TextButton(
@@ -404,6 +415,24 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
     }, tr('删除共享条目失败'));
   }
 
+  Future<void> _copyPeerId(String id) async {
+    bool copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: id));
+    } catch (_) {
+      copied = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(copied ? tr('ID 已复制') : tr('复制失败')),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   Future<void> _manageGrants(SharedAddressBook book) async {
     await showDialog<void>(
       context: context,
@@ -422,13 +451,69 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
     }
   }
 
+  bool _peerMatches(AddressBookPeer peer, String query) {
+    final String needle = query.trim().toLowerCase();
+    if (needle.isEmpty) {
+      return true;
+    }
+    return peer.id.toLowerCase().contains(needle) ||
+        peer.name.toLowerCase().contains(needle) ||
+        peer.tags.any((String tag) => tag.toLowerCase().contains(needle));
+  }
+
+  List<AddressBookPeer> _visiblePeers(SharedAddressBook book) =>
+      <AddressBookPeer>[
+        for (final AddressBookPeer peer in book.peers)
+          if (_peerMatches(peer, _query)) peer,
+      ];
+
+  List<SharedAddressBook> _visibleBooks() {
+    if (_query.trim().isEmpty) {
+      return _books;
+    }
+    return <SharedAddressBook>[
+      for (final SharedAddressBook book in _books)
+        if (_visiblePeers(book).isNotEmpty) book,
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     return AlertDialog(
       backgroundColor: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      title: Text(tr('共享地址簿')),
+      title: Row(
+        children: <Widget>[
+          Expanded(child: Text(tr('共享地址簿'))),
+          if (_books.isNotEmpty)
+            SizedBox(
+              width: 170,
+              child: TextField(
+                key: const Key('shared-books-search'),
+                style: const TextStyle(fontSize: 12),
+                decoration: InputDecoration(
+                  isDense: true,
+                  prefixIcon: const Icon(Icons.search_rounded, size: 16),
+                  hintText: tr('搜索共享条目'),
+                  border: const OutlineInputBorder(),
+                  contentPadding: const EdgeInsets.symmetric(
+                    vertical: 2,
+                    horizontal: 8,
+                  ),
+                ),
+                onChanged: (String value) => setState(() => _query = value),
+              ),
+            ),
+          IconButton(
+            key: const Key('shared-books-refresh'),
+            tooltip: tr('刷新共享地址簿'),
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            visualDensity: VisualDensity.compact,
+            onPressed: _loading || _busy ? null : _load,
+          ),
+        ],
+      ),
       content: SizedBox(
         width: 480,
         child: ConstrainedBox(
@@ -472,11 +557,14 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                       ],
                       const SizedBox(height: 14),
                       _sectionTitle(context, tr('共享给我的地址簿')),
-                      if (_books.isEmpty)
-                        Text(tr('暂无共享'), style: mutedStyle(context, size: 12))
+                      if (_visibleBooks().isEmpty)
+                        Text(
+                          tr(_books.isEmpty ? '暂无共享' : '没有匹配的共享条目'),
+                          style: mutedStyle(context, size: 12),
+                        )
                       else
                         for (final SharedAddressBook book
-                            in _books) ...<Widget>[
+                            in _visibleBooks()) ...<Widget>[
                           Padding(
                             padding: const EdgeInsets.only(top: 8, bottom: 2),
                             child: Row(
@@ -505,7 +593,9 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                 ),
                                 const SizedBox(width: 6),
                                 Text(
-                                  tr('{p5} 台', <String, Object?>{'p5': book.peers.length}),
+                                  tr('{p5} 台', <String, Object?>{
+                                    'p5': _visiblePeers(book).length,
+                                  }),
                                   style: mutedStyle(context, size: 10.5),
                                 ),
                                 if (_canAddPeer(book))
@@ -545,7 +635,9 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                               ),
                             )
                           else
-                            for (final AddressBookPeer peer in book.peers)
+                            for (final AddressBookPeer peer in _visiblePeers(
+                              book,
+                            ))
                               ListTile(
                                 dense: true,
                                 contentPadding: const EdgeInsets.only(
@@ -569,6 +661,19 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                                 trailing: Row(
                                   mainAxisSize: MainAxisSize.min,
                                   children: <Widget>[
+                                    IconButton(
+                                      key: Key(
+                                        'shared-copy-id-${book.owner}-${peer.id}',
+                                      ),
+                                      tooltip: tr('复制 ID'),
+                                      icon: const Icon(
+                                        Icons.copy_rounded,
+                                        size: 16,
+                                      ),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: () =>
+                                          unawaited(_copyPeerId(peer.id)),
+                                    ),
                                     if (_canWritePeer(book, peer))
                                       PopupMenuButton<String>(
                                         key: Key(
@@ -612,7 +717,10 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                       const SizedBox(height: 14),
                       _sectionTitle(context, tr('我共享的地址簿')),
                       if (_grants.outgoing.isEmpty)
-                        Text(tr('尚未共享给其他用户'), style: mutedStyle(context, size: 12))
+                        Text(
+                          tr('尚未共享给其他用户'),
+                          style: mutedStyle(context, size: 12),
+                        )
                       else
                         for (final AddressBookGrant grant in _grants.outgoing)
                           ListTile(
@@ -684,7 +792,10 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
-                          Text(tr('共享范围'), style: mutedStyle(context, size: 11.5)),
+                          Text(
+                            tr('共享范围'),
+                            style: mutedStyle(context, size: 11.5),
+                          ),
                           const SizedBox(width: 8),
                           DropdownButton<String>(
                             key: const Key('shared-scope'),
@@ -1051,9 +1162,7 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                                 '${grant.groupId.isEmpty ? '' : '-${grant.groupId}'}',
                               ),
                               tooltip: tr('撤销共享'),
-                              onPressed: _busy
-                                  ? null
-                                  : () => _revoke(grant),
+                              onPressed: _busy ? null : () => _revoke(grant),
                               icon: Icon(
                                 Icons.link_off_rounded,
                                 size: 18,
@@ -1064,7 +1173,10 @@ class _SharedBookGrantsDialogState extends State<SharedBookGrantsDialog> {
                       const SizedBox(height: 8),
                       Row(
                         children: <Widget>[
-                          Text(tr('共享范围'), style: mutedStyle(context, size: 11.5)),
+                          Text(
+                            tr('共享范围'),
+                            style: mutedStyle(context, size: 11.5),
+                          ),
                           const SizedBox(width: 8),
                           DropdownButton<String>(
                             key: const Key('shared-book-scope'),
@@ -1235,7 +1347,12 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
       return;
     }
     Navigator.of(context).pop(
-      _PeerDraft(id, _name.text.trim(), _splitTags(_tags.text), groupId: _groupId),
+      _PeerDraft(
+        id,
+        _name.text.trim(),
+        _splitTags(_tags.text),
+        groupId: _groupId,
+      ),
     );
   }
 
@@ -1251,10 +1368,7 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
             controller: _id,
             autocorrect: false,
             enableSuggestions: false,
-            decoration: InputDecoration(
-              isDense: true,
-              labelText: tr('设备 ID'),
-            ),
+            decoration: InputDecoration(isDense: true, labelText: tr('设备 ID')),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -1278,10 +1392,7 @@ class _AddSharedPeerDialogState extends State<_AddSharedPeerDialog> {
             decoration: InputDecoration(isDense: true, labelText: tr('分组')),
             items: <DropdownMenuItem<String>>[
               if (widget.allowUngrouped)
-                DropdownMenuItem<String>(
-                  value: '',
-                  child: Text(tr('未分组')),
-                ),
+                DropdownMenuItem<String>(value: '', child: Text(tr('未分组'))),
               for (final AddressBookGroup group in widget.groups)
                 DropdownMenuItem<String>(
                   value: group.id,

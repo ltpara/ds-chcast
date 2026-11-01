@@ -11,7 +11,6 @@ import '../viewer_bridge.dart';
 import 'package:chast_viewer/l10n.dart';
 
 const double _kFontSize = 13;
-const double _kLineHeight = 16;
 const double _kBodyPadding = 8;
 
 /// The xterm 16-colour palette, matching the dark console look.
@@ -51,6 +50,8 @@ class TerminalPanel extends StatefulWidget {
     required this.onResize,
     required this.onClose,
     required this.onDismiss,
+    this.initialFontSize = 13,
+    this.onFontSizeChanged,
   });
 
   final ViewerStatus status;
@@ -61,17 +62,26 @@ class TerminalPanel extends StatefulWidget {
   final Future<bool> Function(int columns, int rows) onResize;
   final Future<void> Function() onClose;
   final VoidCallback onDismiss;
+  final int initialFontSize;
+  final ValueChanged<int>? onFontSizeChanged;
 
   @override
   State<TerminalPanel> createState() => _TerminalPanelState();
 }
 
 class _TerminalPanelState extends State<TerminalPanel> {
-  static final double _cellWidth = _measureCellWidth();
+  static const double _minFontSize = 10;
+  static const double _maxFontSize = 20;
+
+  double _fontSize = _kFontSize;
+  late double _cellWidth = _measureCellWidth(_fontSize);
+  double get _lineHeight => (_fontSize * 1.23).roundToDouble();
 
   final TerminalGrid _grid = TerminalGrid();
   final TerminalUtf8Decoder _decoder = TerminalUtf8Decoder();
   final ScrollController _scroll = ScrollController();
+  final TextEditingController _search = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
 
   Timer? _poll;
   Timer? _resizeDebounce;
@@ -81,6 +91,10 @@ class _TerminalPanelState extends State<TerminalPanel> {
   bool _draining = false;
   bool _ended = false;
   bool _follow = true;
+  bool _searching = false;
+  String _searchQuery = '';
+  List<int> _matches = <int>[];
+  int _matchIndex = 0;
   int _layoutColumns = 0;
   int _layoutRows = 0;
   int _sentColumns = 0;
@@ -89,6 +103,10 @@ class _TerminalPanelState extends State<TerminalPanel> {
   @override
   void initState() {
     super.initState();
+    _fontSize = widget.initialFontSize.toDouble().clamp(
+      _minFontSize,
+      _maxFontSize,
+    );
     _grid.onReply = _send;
     _scroll.addListener(_onScroll);
   }
@@ -99,18 +117,20 @@ class _TerminalPanelState extends State<TerminalPanel> {
     _resizeDebounce?.cancel();
     _scroll.removeListener(_onScroll);
     _scroll.dispose();
+    _search.dispose();
+    _searchFocus.dispose();
     unawaited(_closeQuietly());
     super.dispose();
   }
 
-  static double _measureCellWidth() {
+  static double _measureCellWidth(double fontSize) {
     final TextPainter painter = TextPainter(
-      text: const TextSpan(
+      text: TextSpan(
         text: 'MMMMMMMMMMMMMMMM',
         style: TextStyle(
           fontFamily: 'Consolas',
-          fontFamilyFallback: <String>['Cascadia Mono', 'Courier New'],
-          fontSize: _kFontSize,
+          fontFamilyFallback: const <String>['Cascadia Mono', 'Courier New'],
+          fontSize: fontSize,
           height: 1.0,
         ),
       ),
@@ -119,7 +139,24 @@ class _TerminalPanelState extends State<TerminalPanel> {
     final double width = painter.width / 16;
     painter.dispose();
     // A font-less environment (widget tests) still needs a usable cell.
-    return width.isFinite && width > 0 ? width : 7.8;
+    return width.isFinite && width > 0 ? width : 7.8 * fontSize / _kFontSize;
+  }
+
+  void _setFontSize(double delta) {
+    final double next = (_fontSize + delta).clamp(_minFontSize, _maxFontSize);
+    if (next == _fontSize) {
+      return;
+    }
+    setState(() {
+      _fontSize = next;
+      _cellWidth = _measureCellWidth(next);
+      // Force the layout builder to re-measure and tell the host the new size.
+      _layoutColumns = 0;
+      _layoutRows = 0;
+    });
+    _follow = true;
+    _scheduleScrollToBottom();
+    widget.onFontSizeChanged?.call(next.round());
   }
 
   void _onScroll() {
@@ -299,13 +336,60 @@ class _TerminalPanelState extends State<TerminalPanel> {
     if (text == null || text.isEmpty || !mounted) {
       return;
     }
-    final String normalised =
-        text.replaceAll('\r\n', '\n').replaceAll('\n', '\r');
+    final String normalised = text
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\n', '\r');
     if (_grid.bracketedPaste) {
       _send('\x1b[200~$normalised\x1b[201~');
     } else {
       _send(normalised);
     }
+  }
+
+  // The grid pads every row to the terminal width, so trailing blanks are
+  // dropped per row. Scrollback is included: users copy the console to paste
+  // logs elsewhere, and the visible screen alone would lose the beginning.
+  String _consoleContents() {
+    final List<List<TerminalCell>> rows = <List<TerminalCell>>[
+      ..._grid.scrollback,
+      ..._grid.lines,
+    ];
+    final StringBuffer out = StringBuffer();
+    for (final List<TerminalCell> row in rows) {
+      final StringBuffer line = StringBuffer();
+      for (final TerminalCell cell in row) {
+        if (!cell.continuation) {
+          line.write(cell.text);
+        }
+      }
+      out.write(line.toString().trimRight());
+      out.write('\n');
+    }
+    return out.toString().trimRight();
+  }
+
+  Future<void> _copyAll() async {
+    final String text = _consoleContents();
+    if (text.isEmpty) {
+      _showNotice(tr('终端没有可复制的内容'));
+      return;
+    }
+    bool copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: text));
+    } catch (_) {
+      copied = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    _showNotice(copied ? tr('已复制终端内容') : tr('复制失败'));
+  }
+
+  void _showNotice(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 2)),
+    );
   }
 
   bool get _canType =>
@@ -319,6 +403,116 @@ class _TerminalPanelState extends State<TerminalPanel> {
       if (mounted && _scroll.hasClients) {
         _scroll.jumpTo(_scroll.position.maxScrollExtent);
       }
+    });
+  }
+
+  void _scrollToBottom() {
+    setState(() => _follow = true);
+    if (_scroll.hasClients) {
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    }
+  }
+
+  void _scrollPage(int direction) {
+    if (!_scroll.hasClients) {
+      return;
+    }
+    final ScrollPosition position = _scroll.position;
+    final double page = math.max(
+      _lineHeight,
+      position.viewportDimension - _lineHeight,
+    );
+    final double target = (position.pixels + direction * page).clamp(
+      0.0,
+      position.maxScrollExtent,
+    );
+    _scroll.jumpTo(target);
+    setState(() => _follow = target >= position.maxScrollExtent - 4);
+  }
+
+  void _scrollToEdge({required bool top}) {
+    if (!_scroll.hasClients) {
+      return;
+    }
+    final ScrollPosition position = _scroll.position;
+    final double target = top ? 0 : position.maxScrollExtent;
+    _scroll.jumpTo(target);
+    setState(() => _follow = target >= position.maxScrollExtent - 4);
+  }
+
+  // --------------------------------------------------------------- search
+
+  void _openSearch() {
+    setState(() => _searching = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _searchFocus.requestFocus();
+      }
+    });
+  }
+
+  void _closeSearch() {
+    _search.clear();
+    setState(() {
+      _searching = false;
+      _searchQuery = '';
+      _matches = <int>[];
+      _matchIndex = 0;
+    });
+    widget.focusNode.requestFocus();
+  }
+
+  static String _rowText(List<TerminalCell> row) {
+    final StringBuffer out = StringBuffer();
+    for (final TerminalCell cell in row) {
+      if (!cell.continuation) {
+        out.write(cell.text);
+      }
+    }
+    return out.toString().trimRight();
+  }
+
+  void _updateSearch(String value) {
+    final String query = value.trim().toLowerCase();
+    final List<int> matches = <int>[];
+    if (query.isNotEmpty) {
+      final List<List<TerminalCell>> rows = <List<TerminalCell>>[
+        ..._grid.scrollback,
+        ..._grid.lines,
+      ];
+      for (int i = 0; i < rows.length; i++) {
+        if (_rowText(rows[i]).toLowerCase().contains(query)) {
+          matches.add(i);
+        }
+      }
+    }
+    setState(() {
+      _searchQuery = query;
+      _matches = matches;
+      _matchIndex = matches.isEmpty ? 0 : matches.length - 1;
+    });
+    if (matches.isNotEmpty) {
+      _jumpToMatch(matches.length - 1);
+    }
+  }
+
+  void _stepMatch(int delta) {
+    if (_matches.isEmpty) {
+      return;
+    }
+    _jumpToMatch((_matchIndex + delta) % _matches.length);
+  }
+
+  void _jumpToMatch(int index) {
+    setState(() => _matchIndex = index);
+    final int row = _matches[index];
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) {
+        return;
+      }
+      final double max = _scroll.position.maxScrollExtent;
+      final double target = (_kBodyPadding + row * _lineHeight).clamp(0.0, max);
+      _scroll.jumpTo(target);
     });
   }
 
@@ -343,13 +537,41 @@ class _TerminalPanelState extends State<TerminalPanel> {
     if (event is KeyUpEvent) {
       return KeyEventResult.handled;
     }
-    if (!_canType) {
-      return KeyEventResult.handled;
-    }
     final HardwareKeyboard keyboard = HardwareKeyboard.instance;
     final bool ctrl = keyboard.isControlPressed;
     final bool shift = keyboard.isShiftPressed;
     final LogicalKeyboardKey key = event.logicalKey;
+    if (_searching) {
+      if (key == LogicalKeyboardKey.escape) {
+        _closeSearch();
+      }
+      return KeyEventResult.handled;
+    }
+    if (shift &&
+        (key == LogicalKeyboardKey.pageUp ||
+            key == LogicalKeyboardKey.pageDown ||
+            key == LogicalKeyboardKey.home ||
+            key == LogicalKeyboardKey.end)) {
+      if (key == LogicalKeyboardKey.home) {
+        _scrollToEdge(top: true);
+      } else if (key == LogicalKeyboardKey.end) {
+        _scrollToEdge(top: false);
+      } else {
+        _scrollPage(key == LogicalKeyboardKey.pageUp ? -1 : 1);
+      }
+      return KeyEventResult.handled;
+    }
+    if (!_canType) {
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.keyF && ctrl && !shift) {
+      _openSearch();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.keyC && ctrl && shift) {
+      unawaited(_copyAll());
+      return KeyEventResult.handled;
+    }
     if ((key == LogicalKeyboardKey.keyV && ctrl) ||
         (key == LogicalKeyboardKey.insert && shift)) {
       unawaited(_paste());
@@ -380,13 +602,18 @@ class _TerminalPanelState extends State<TerminalPanel> {
 
   @override
   Widget build(BuildContext context) {
-    final bool busy = widget.status.terminalPhase == ViewerTerminalPhase.requesting;
+    final bool busy =
+        widget.status.terminalPhase == ViewerTerminalPhase.requesting;
     return Focus(
       focusNode: widget.focusNode,
       onKeyEvent: _onKey,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () => widget.focusNode.requestFocus(),
+        onTap: () {
+          if (!_searching) {
+            widget.focusNode.requestFocus();
+          }
+        },
         child: Material(
           color: _kBackground,
           elevation: 12,
@@ -402,6 +629,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
               children: <Widget>[
                 _buildHeader(busy),
                 const Divider(height: 1, thickness: 1, color: Colors.white12),
+                if (_searching) _buildSearchBar(),
                 Expanded(child: _buildBody()),
                 const Divider(height: 1, thickness: 1, color: Colors.white12),
                 _buildFooter(),
@@ -469,6 +697,28 @@ class _TerminalPanelState extends State<TerminalPanel> {
               onTap: _reopen,
             ),
           _headerButton(
+            icon: Icons.text_decrease_rounded,
+            tooltip: tr('缩小字号'),
+            disabled: _fontSize <= _minFontSize,
+            onTap: () => _setFontSize(-1),
+          ),
+          _headerButton(
+            icon: Icons.text_increase_rounded,
+            tooltip: tr('放大字号'),
+            disabled: _fontSize >= _maxFontSize,
+            onTap: () => _setFontSize(1),
+          ),
+          _headerButton(
+            icon: Icons.search_rounded,
+            tooltip: tr('搜索终端内容（Ctrl+F）'),
+            onTap: _openSearch,
+          ),
+          _headerButton(
+            icon: Icons.copy_rounded,
+            tooltip: tr('复制终端内容（Ctrl+Shift+C，含滚动历史）'),
+            onTap: () => unawaited(_copyAll()),
+          ),
+          _headerButton(
             icon: Icons.content_paste_rounded,
             tooltip: tr('粘贴（Ctrl+V）'),
             disabled: !_canType,
@@ -524,16 +774,80 @@ class _TerminalPanelState extends State<TerminalPanel> {
     }
   }
 
+  Widget _buildSearchBar() {
+    final String count = _searchQuery.isEmpty
+        ? ''
+        : (_matches.isEmpty
+              ? tr('无匹配')
+              : '${_matchIndex + 1}/${_matches.length}');
+    return Container(
+      height: 36,
+      color: const Color(0xFF1B1C20),
+      padding: const EdgeInsets.only(left: 10, right: 4),
+      child: Row(
+        children: <Widget>[
+          const Icon(Icons.search_rounded, size: 15, color: Colors.white38),
+          const SizedBox(width: 6),
+          Expanded(
+            child: TextField(
+              key: const Key('terminal-search-field'),
+              controller: _search,
+              focusNode: _searchFocus,
+              style: const TextStyle(fontSize: 12, color: _kForeground),
+              cursorColor: kAccentBright,
+              decoration: InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                hintText: tr('输入要查找的文本（历史与当前屏幕）'),
+                hintStyle: const TextStyle(
+                  fontSize: 11.5,
+                  color: Colors.white30,
+                ),
+              ),
+              onChanged: _updateSearch,
+              onSubmitted: (_) => _stepMatch(-1),
+            ),
+          ),
+          Text(
+            count,
+            key: const Key('terminal-search-count'),
+            style: const TextStyle(fontSize: 10.5, color: Colors.white54),
+          ),
+          _headerButton(
+            icon: Icons.keyboard_arrow_up_rounded,
+            tooltip: tr('上一个匹配'),
+            disabled: _matches.isEmpty,
+            onTap: () => _stepMatch(-1),
+          ),
+          _headerButton(
+            icon: Icons.keyboard_arrow_down_rounded,
+            tooltip: tr('下一个匹配'),
+            disabled: _matches.isEmpty,
+            onTap: () => _stepMatch(1),
+          ),
+          _headerButton(
+            icon: Icons.close_rounded,
+            tooltip: tr('关闭搜索'),
+            onTap: _closeSearch,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildBody() {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
-        final double width =
-            math.max(0, constraints.maxWidth - _kBodyPadding * 2);
-        final double height =
-            math.max(0, constraints.maxHeight - _kBodyPadding * 2);
-        final int columns =
-            (width / _cellWidth).floor().clamp(1, 500);
-        final int rows = (height / _kLineHeight).floor().clamp(1, 200);
+        final double width = math.max(
+          0,
+          constraints.maxWidth - _kBodyPadding * 2,
+        );
+        final double height = math.max(
+          0,
+          constraints.maxHeight - _kBodyPadding * 2,
+        );
+        final int columns = (width / _cellWidth).floor().clamp(1, 500);
+        final int rows = (height / _lineHeight).floor().clamp(1, 200);
         if ((columns != _layoutColumns || rows != _layoutRows) && columns > 0) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             _applySize(columns, rows);
@@ -544,37 +858,90 @@ class _TerminalPanelState extends State<TerminalPanel> {
         final int historyLength = history.length;
         final int screenRows = _grid.rows;
         final bool cursorOnScreen = !_ended && _grid.cursorVisible;
+        final Set<int> matchLines = _searching
+            ? _matches.toSet()
+            : const <int>{};
         return Column(
           children: <Widget>[
             if (notice.isNotEmpty) _buildNotice(notice),
             Expanded(
-              child: ListView.builder(
-                controller: _scroll,
-                padding: const EdgeInsets.symmetric(
-                    horizontal: _kBodyPadding, vertical: _kBodyPadding),
-                itemExtent: _kLineHeight,
-                itemCount: historyLength + screenRows,
-                itemBuilder: (BuildContext context, int index) {
-                  final bool inHistory = index < historyLength;
-                  final List<TerminalCell> cells = inHistory
-                      ? history[index]
-                      : _grid.lines[index - historyLength];
-                  final int cursorColumn = !inHistory &&
-                          cursorOnScreen &&
-                          index - historyLength == _grid.cursorRow
-                      ? _grid.cursorColumn
-                      : -1;
-                  return _TerminalLine(
-                    cells: cells,
-                    cellWidth: _cellWidth,
-                    cursorColumn: cursorColumn,
-                  );
-                },
+              child: Stack(
+                children: <Widget>[
+                  ListView.builder(
+                    controller: _scroll,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: _kBodyPadding,
+                      vertical: _kBodyPadding,
+                    ),
+                    itemExtent: _lineHeight,
+                    itemCount: historyLength + screenRows,
+                    itemBuilder: (BuildContext context, int index) {
+                      final bool inHistory = index < historyLength;
+                      final List<TerminalCell> cells = inHistory
+                          ? history[index]
+                          : _grid.lines[index - historyLength];
+                      final int cursorColumn =
+                          !inHistory &&
+                              cursorOnScreen &&
+                              index - historyLength == _grid.cursorRow
+                          ? _grid.cursorColumn
+                          : -1;
+                      return _TerminalLine(
+                        cells: cells,
+                        cellWidth: _cellWidth,
+                        cursorColumn: cursorColumn,
+                        fontSize: _fontSize,
+                        lineHeight: _lineHeight,
+                        highlighted: matchLines.contains(index),
+                      );
+                    },
+                  ),
+                  if (!_follow)
+                    Positioned(
+                      right: _kBodyPadding,
+                      bottom: _kBodyPadding,
+                      child: _buildJumpToBottom(),
+                    ),
+                ],
               ),
             ),
           ],
         );
       },
+    );
+  }
+
+  Widget _buildJumpToBottom() {
+    return Tooltip(
+      message: tr('回到底部'),
+      child: Material(
+        color: const Color(0xFF2A2C31),
+        elevation: 4,
+        shape: const StadiumBorder(),
+        child: InkWell(
+          key: const Key('terminal-bottom'),
+          customBorder: const StadiumBorder(),
+          onTap: _scrollToBottom,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                const Icon(
+                  Icons.arrow_downward_rounded,
+                  size: 14,
+                  color: kAccentBright,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  tr('回到底部'),
+                  style: const TextStyle(fontSize: 12, color: _kForeground),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -584,14 +951,18 @@ class _TerminalPanelState extends State<TerminalPanel> {
     }
     if (_ended) {
       final String reason = widget.status.terminalReason;
-      return reason.isEmpty ? tr('主机已结束该控制台') : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
+      return reason.isEmpty
+          ? tr('主机已结束该控制台')
+          : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
     }
     switch (widget.status.terminalPhase) {
       case ViewerTerminalPhase.requesting:
         return '';
       case ViewerTerminalPhase.ended:
         final String reason = widget.status.terminalReason;
-        return reason.isEmpty ? tr('主机已结束该控制台') : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
+        return reason.isEmpty
+            ? tr('主机已结束该控制台')
+            : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
       case ViewerTerminalPhase.failed:
         final String detail = widget.status.terminalError.isNotEmpty
             ? widget.status.terminalError
@@ -609,8 +980,11 @@ class _TerminalPanelState extends State<TerminalPanel> {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       child: Row(
         children: <Widget>[
-          const Icon(Icons.info_outline_rounded,
-              size: 13, color: Colors.amberAccent),
+          const Icon(
+            Icons.info_outline_rounded,
+            size: 13,
+            color: Colors.amberAccent,
+          ),
           const SizedBox(width: 6),
           Expanded(
             child: Text(
@@ -654,11 +1028,17 @@ class _TerminalLine extends StatelessWidget {
     required this.cells,
     required this.cellWidth,
     required this.cursorColumn,
+    required this.fontSize,
+    required this.lineHeight,
+    this.highlighted = false,
   });
 
   final List<TerminalCell> cells;
   final double cellWidth;
   final int cursorColumn;
+  final double fontSize;
+  final double lineHeight;
+  final bool highlighted;
 
   @override
   Widget build(BuildContext context) {
@@ -671,11 +1051,17 @@ class _TerminalLine extends StatelessWidget {
       if (text.isEmpty) {
         return;
       }
-      spans.add(TextSpan(
-        text: text.toString(),
-        style: _styleFor(runFg ?? kTerminalDefaultColor,
-            runBg ?? kTerminalDefaultColor, runAttrs),
-      ));
+      spans.add(
+        TextSpan(
+          text: text.toString(),
+          style: _styleFor(
+            runFg ?? kTerminalDefaultColor,
+            runBg ?? kTerminalDefaultColor,
+            runAttrs,
+            fontSize,
+          ),
+        ),
+      );
       text = StringBuffer();
     }
 
@@ -683,7 +1069,8 @@ class _TerminalLine extends StatelessWidget {
       if (cell.continuation) {
         continue;
       }
-      if (runFg != null && (cell.fg != runFg || cell.bg != runBg || cell.attrs != runAttrs)) {
+      if (runFg != null &&
+          (cell.fg != runFg || cell.bg != runBg || cell.attrs != runAttrs)) {
         flush();
       }
       runFg = cell.fg;
@@ -693,50 +1080,53 @@ class _TerminalLine extends StatelessWidget {
     }
     flush();
 
-    return SizedBox(
-      height: _kLineHeight,
-      child: Stack(
-        children: <Widget>[
-          RichText(
-            text: TextSpan(
-              style: _baseStyle,
-              children: spans,
+    return ColoredBox(
+      color: highlighted
+          ? kAccentBright.withValues(alpha: 0.14)
+          : const Color(0x00000000),
+      child: SizedBox(
+        height: lineHeight,
+        child: Stack(
+          children: <Widget>[
+            RichText(
+              text: TextSpan(style: _baseStyleFor(fontSize), children: spans),
+              maxLines: 1,
+              softWrap: false,
+              overflow: TextOverflow.clip,
             ),
-            maxLines: 1,
-            softWrap: false,
-            overflow: TextOverflow.clip,
-          ),
-          if (cursorColumn >= 0)
-            Positioned(
-              left: cursorColumn * cellWidth,
-              top: 0,
-              width: cellWidth,
-              height: _kLineHeight,
-              child: IgnorePointer(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: kAccentBright.withValues(alpha: 0.42),
-                    border: Border.all(
+            if (cursorColumn >= 0)
+              Positioned(
+                left: cursorColumn * cellWidth,
+                top: 0,
+                width: cellWidth,
+                height: lineHeight,
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: kAccentBright.withValues(alpha: 0.42),
+                      border: Border.all(
                         color: kAccentBright.withValues(alpha: 0.8),
-                        width: 0.8),
+                        width: 0.8,
+                      ),
+                    ),
                   ),
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
-  static const TextStyle _baseStyle = TextStyle(
+  static TextStyle _baseStyleFor(double fontSize) => TextStyle(
     fontFamily: 'Consolas',
-    fontFamilyFallback: <String>['Cascadia Mono', 'Courier New'],
-    fontSize: _kFontSize,
+    fontFamilyFallback: const <String>['Cascadia Mono', 'Courier New'],
+    fontSize: fontSize,
     height: 1.0,
     color: _kForeground,
   );
 
-  static TextStyle _styleFor(int fg, int bg, int attrs) {
+  static TextStyle _styleFor(int fg, int bg, int attrs, double fontSize) {
     bool inverse = (attrs & TerminalAttr.inverse) != 0;
     Color foreground = _colorFor(fg, _kForeground);
     Color background = _colorFor(bg, _kBackground);
@@ -754,14 +1144,16 @@ class _TerminalLine extends StatelessWidget {
     return TextStyle(
       fontFamily: 'Consolas',
       fontFamilyFallback: const <String>['Cascadia Mono', 'Courier New'],
-      fontSize: _kFontSize,
+      fontSize: fontSize,
       height: 1.0,
       color: foreground,
       backgroundColor: background == _kBackground ? null : background,
-      fontWeight:
-          (attrs & TerminalAttr.bold) != 0 ? FontWeight.w700 : FontWeight.w400,
-      fontStyle:
-          (attrs & TerminalAttr.italic) != 0 ? FontStyle.italic : FontStyle.normal,
+      fontWeight: (attrs & TerminalAttr.bold) != 0
+          ? FontWeight.w700
+          : FontWeight.w400,
+      fontStyle: (attrs & TerminalAttr.italic) != 0
+          ? FontStyle.italic
+          : FontStyle.normal,
       decoration: (attrs & TerminalAttr.underline) != 0
           ? TextDecoration.underline
           : TextDecoration.none,

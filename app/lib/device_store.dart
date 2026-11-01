@@ -113,20 +113,20 @@ class Device {
   }
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'id': id,
-        'name': name,
-        'server': server,
-        'tags': tags,
-        'groupId': groupId,
-        'position': position,
-        'tagsCleared': tagsCleared,
-        'groupCleared': groupCleared,
-        'saved': saved,
-        'mac': mac,
-        'revision': revision,
-        'lastUsed': lastUsed?.millisecondsSinceEpoch,
-        'addedAt': addedAt.millisecondsSinceEpoch,
-      };
+    'id': id,
+    'name': name,
+    'server': server,
+    'tags': tags,
+    'groupId': groupId,
+    'position': position,
+    'tagsCleared': tagsCleared,
+    'groupCleared': groupCleared,
+    'saved': saved,
+    'mac': mac,
+    'revision': revision,
+    'lastUsed': lastUsed?.millisecondsSinceEpoch,
+    'addedAt': addedAt.millisecondsSinceEpoch,
+  };
 
   /// Trims and de-duplicates tags, matching the server's limits so a local
   /// edit cannot create a row the server would silently rewrite.
@@ -156,7 +156,9 @@ class Device {
     }
     final String id = rawId.trim();
     final String rawServer = value['server']?.toString() ?? '';
-    final String server = rawServer.isEmpty ? '' : normalizeServerUrl(rawServer);
+    final String server = rawServer.isEmpty
+        ? ''
+        : normalizeServerUrl(rawServer);
     if (rawServer.isNotEmpty && server.isEmpty) {
       // A broken server field must not silently turn a host id into a direct
       // address (which would be parsed as a hostname and dialed wrong).
@@ -218,11 +220,11 @@ class PendingDeletion {
   String get key => '$server|$username|$id';
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'server': server,
-        'username': username,
-        'id': id,
-        'deletedAt': deletedAt.millisecondsSinceEpoch,
-      };
+    'server': server,
+    'username': username,
+    'id': id,
+    'deletedAt': deletedAt.millisecondsSinceEpoch,
+  };
 
   static PendingDeletion? fromJson(Object? value) {
     if (value is! Map) {
@@ -261,8 +263,8 @@ class PendingDeletion {
 /// is retried instead of being pulled back on the next sync.
 class DeviceStore {
   DeviceStore({File? file, File? deletionsFile})
-      : _injected = file,
-        _injectedDeletions = deletionsFile;
+    : _injected = file,
+      _injectedDeletions = deletionsFile;
 
   static const int maxRecent = 8;
 
@@ -318,7 +320,9 @@ class DeviceStore {
   /// its saved flag and name when an ad-hoc connection touches it.
   Future<List<Device>> touch(Device device) async {
     final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == device.key);
+    final int index = devices.indexWhere(
+      (Device item) => item.key == device.key,
+    );
     final DateTime now = DateTime.now();
     if (index >= 0) {
       final Device old = devices[index];
@@ -338,16 +342,18 @@ class DeviceStore {
         addedAt: old.addedAt,
       );
     } else {
-      devices.add(Device(
-        id: device.id,
-        name: device.name,
-        server: device.server,
-        tags: Device.cleanTags(device.tags),
-        saved: false,
-        mac: device.mac,
-        lastUsed: now,
-        addedAt: now,
-      ));
+      devices.add(
+        Device(
+          id: device.id,
+          name: device.name,
+          server: device.server,
+          tags: Device.cleanTags(device.tags),
+          saved: false,
+          mac: device.mac,
+          lastUsed: now,
+          addedAt: now,
+        ),
+      );
     }
     return _save(devices);
   }
@@ -356,14 +362,18 @@ class DeviceStore {
   /// used; a newly saved host has never been connected from this app.
   Future<List<Device>> save(Device device) async {
     final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == device.key);
+    final int index = devices.indexWhere(
+      (Device item) => item.key == device.key,
+    );
     final DateTime now = DateTime.now();
     if (index >= 0) {
       final Device old = devices[index];
-      final List<String> tags =
-          device.tags.isEmpty ? old.tags : Device.cleanTags(device.tags);
-      final String groupId =
-          old.groupId.isEmpty ? device.groupId.trim() : old.groupId;
+      final List<String> tags = device.tags.isEmpty
+          ? old.tags
+          : Device.cleanTags(device.tags);
+      final String groupId = old.groupId.isEmpty
+          ? device.groupId.trim()
+          : old.groupId;
       devices[index] = Device(
         id: device.id,
         name: device.name.isEmpty ? old.name : device.name,
@@ -379,17 +389,19 @@ class DeviceStore {
         addedAt: old.addedAt,
       );
     } else {
-      devices.add(Device(
-        id: device.id,
-        name: device.name,
-        server: device.server,
-        tags: Device.cleanTags(device.tags),
-        groupId: device.groupId.trim(),
-        saved: true,
-        mac: device.mac,
-        revision: device.revision,
-        addedAt: now,
-      ));
+      devices.add(
+        Device(
+          id: device.id,
+          name: device.name,
+          server: device.server,
+          tags: Device.cleanTags(device.tags),
+          groupId: device.groupId.trim(),
+          saved: true,
+          mac: device.mac,
+          revision: device.revision,
+          addedAt: now,
+        ),
+      );
     }
     return _save(devices);
   }
@@ -506,6 +518,13 @@ class DeviceStore {
     return _save(devices);
   }
 
+  /// Removes one ad-hoc entry; a saved address-book row with the same key stays.
+  Future<List<Device>> removeRecent(String key) async {
+    final List<Device> devices = await load();
+    devices.removeWhere((Device item) => !item.saved && item.key == key);
+    return _save(devices);
+  }
+
   /// Replaces the whole store; account sync builds the merged list itself.
   Future<List<Device>> replaceAll(List<Device> devices) {
     return _save(List<Device>.of(devices));
@@ -551,14 +570,17 @@ class DeviceStore {
   }
 
   Future<List<PendingDeletion>> _savePendingDeletions(
-      List<PendingDeletion> deletions) async {
+    List<PendingDeletion> deletions,
+  ) async {
     final File? file = _deletionsFile();
     if (file != null) {
       try {
         await file.parent.create(recursive: true);
-        await file.writeAsString(jsonEncode(<Object?>[
-          for (final PendingDeletion deletion in deletions) deletion.toJson(),
-        ]));
+        await file.writeAsString(
+          jsonEncode(<Object?>[
+            for (final PendingDeletion deletion in deletions) deletion.toJson(),
+          ]),
+        );
       } catch (_) {
         // Retrying next sync is best effort, like the address book itself.
       }
@@ -568,8 +590,9 @@ class DeviceStore {
 
   Future<List<Device>> _save(List<Device> devices) async {
     // Only recent entries are capped; the address book is user-managed.
-    final List<Device> recent = devices.where((Device item) => !item.saved).toList()
-      ..sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
+    final List<Device> recent =
+        devices.where((Device item) => !item.saved).toList()
+          ..sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
     if (recent.length > maxRecent) {
       final Set<String> drop = recent
           .skip(maxRecent)
@@ -582,9 +605,11 @@ class DeviceStore {
     if (file != null) {
       try {
         await file.parent.create(recursive: true);
-        await file.writeAsString(jsonEncode(<Object?>[
-          for (final Device device in devices) device.toJson(),
-        ]));
+        await file.writeAsString(
+          jsonEncode(<Object?>[
+            for (final Device device in devices) device.toJson(),
+          ]),
+        );
       } catch (_) {
         // The address book is a convenience; failing to persist it must not
         // block a connection.

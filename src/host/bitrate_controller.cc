@@ -288,14 +288,25 @@ BitrateDecision BitrateController::update(const BitrateSample& sample, uint32_t 
         queue_pressure = true;
     }
 
+    // A key frame is a burst far above the target, so the first sample of a
+    // session can find the send queue past the congestion window on any path.
+    // Only a queue that is still over the threshold on the next sample is
+    // pressure; loss and RTT keep reacting to their first sample.
+    if (queue_pressure && queue_ratio > kQueueModerateRatio) {
+        ++queue_pressure_samples_;
+    } else {
+        queue_pressure_samples_ = 0;
+    }
+    const bool queue_evidence = queue_pressure_samples_ >= 2;
+
     down_cooldown_ms_ =
         elapsed_ms >= down_cooldown_ms_ ? 0 : down_cooldown_ms_ - elapsed_ms;
     up_cooldown_ms_ = elapsed_ms >= up_cooldown_ms_ ? 0 : up_cooldown_ms_ - elapsed_ms;
 
     const bool severe = (loss_valid && loss_ratio > kSevereLossRatio) ||
-                        (queue_pressure && queue_ratio > kQueueSevereRatio);
+                        (queue_evidence && queue_ratio > kQueueSevereRatio);
     const bool moderate = (loss_valid && loss_ratio > kModerateLossRatio) || rtt_pressure ||
-                          (queue_pressure && queue_ratio > kQueueModerateRatio);
+                          (queue_evidence && queue_ratio > kQueueModerateRatio);
 
     if (severe || moderate) {
         healthy_ms_ = 0;

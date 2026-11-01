@@ -16,9 +16,13 @@ void main() {
       'audioDecoded': 1198,
       'audioErrors': 1,
       'audioUnderruns': 2,
+      'audioStarvedMs': 560,
+      'audioDropped': 24,
       'audioRecoveries': 3,
       'audioRecovering': true,
       'audioBufferMs': 84,
+      'audioLatencyMs': 42.5,
+      'avSkewMs': -7.5,
       'audioError': 'playback: device removed',
     });
     expect(status.audioAnnounced, isTrue);
@@ -31,9 +35,13 @@ void main() {
     expect(status.audioDecoded, 1198);
     expect(status.audioErrors, 1);
     expect(status.audioUnderruns, 2);
+    expect(status.audioStarvedMs, 560);
+    expect(status.audioDropped, 24);
     expect(status.audioRecoveries, 3);
     expect(status.audioRecovering, isTrue);
     expect(status.audioBufferMs, 84);
+    expect(status.audioLatencyMs, 42.5);
+    expect(status.avSkewMs, -7.5);
     expect(status.audioError, 'playback: device removed');
     expect(status.acceptsAudio, isTrue);
     expect(status.audioSampleRateLabel, '48 kHz');
@@ -54,9 +62,13 @@ void main() {
     expect(status.audioDecoded, 0);
     expect(status.audioErrors, 0);
     expect(status.audioUnderruns, 0);
+    expect(status.audioStarvedMs, 0);
+    expect(status.audioDropped, 0);
     expect(status.audioRecoveries, 0);
     expect(status.audioRecovering, isFalse);
     expect(status.audioBufferMs, 0);
+    expect(status.audioLatencyMs, -1);
+    expect(status.avSkewMs, -1);
     expect(status.audioError, isEmpty);
     expect(status.acceptsAudio, isFalse);
     expect(status.audioSampleRateLabel, isEmpty);

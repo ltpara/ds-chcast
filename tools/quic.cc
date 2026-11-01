@@ -1,11 +1,12 @@
 // QUIC transport harness: capture -> encode -> MsQuic -> decode.
 //
-//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal] [--allow-camera]
-//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio] [--play] [--audit-ref HEX]
+//   chast-quic serve   --port 4433 --codec h264 --seconds 10 [--display N] [--save sent.h264] [--input] [--clipboard] [--audio [--audio-silence-gate-ms N]] [--encoder auto|vpl|ffmpeg] [--audit-spool FILE] [--allow-port-forward] [--allow-terminal] [--allow-camera]
+//   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--adaptive-jitter] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--file-browse] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
 //                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
-//                      [--record out.mp4]
+//                      [--netem [--audio [--audio-stream] [--play [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]]]]] [--record out.mp4]
+//                      [--netem-delay-ms N] [--netem-jitter-ms N] [--netem-loss-percent X] [--netem-rate-kbps N]
 //
 // serve runs the sender: one client connects, the actual encoder codec and
 // picture size are announced, and every access unit is written to a
@@ -94,11 +95,14 @@
 // With --audio the serve end captures the system sound through WASAPI and
 // connect decodes the second uni-stream, printing packet/sample/energy
 // counters. With --play connect also renders the decoded blocks through WASAPI
+// and reports the playout latency and the A/V skew against the last frame age.
 // and prints the player's buffer depth and underrun count, which is the only
 // way the tool exercises the viewer's real render path. verify substitutes a
 // generated 440 Hz tone (encoded by the real AAC codec) so it can assert packet
 // counts, CRCs, decoded duration and energy without a sound card, and probes a
-// server whose audio gate is closed.
+// server whose audio gate is closed. --audio-silence-gate-ms N changes how long
+// digital silence must last before the loopback encoder stops (default 2000,
+// 0 disables), so a soak can tell player starvation from host-side silence.
 //
 // With --microphone verify also covers the viewer uplink: a synthetic 440 Hz
 // mono Opus source opens a CMIC stream on a host that granted the microphone,
@@ -162,6 +166,7 @@
 #include "chast/security.h"
 #include "crash_handler.h"
 #include "mp4_recorder.h"
+#include "netem_relay.h"
 
 namespace {
 
@@ -265,14 +270,33 @@ struct FakeClipboard {
 
 // In-memory chat transcript shared by verify's host and its test driver. Each
 // side records exactly what the other sent, so a missing, duplicated or
-// reordered line fails the loopback's exact-match checks.
+// reordered line fails the loopback's exact-match checks. The same probe also
+// carries the composed text block the viewer injects on the host (v36).
 struct ChatProbe {
     std::mutex mutex;
     std::vector<std::string> host_received;
+    std::vector<std::string> host_texts;
 };
 
 inline constexpr char kHostChatLine[] = "chast chat: host to viewer";
 inline constexpr char kViewerChatLine[] = "chast chat: viewer to host";
+// UTF-8 "第一行" so the probe exercises multi-byte text, plus a newline that
+// the host injector turns into a Return tap.
+inline constexpr char kViewerTextLine[] =
+    "chast text: \xE7\xAC\xAC\xE4\xB8\x80\xE8\xA1\x8C\nsecond line";
+
+// apply_text counts one injection per Unicode code point, so the dry-run
+// injector's applied counter grows by this much for kViewerTextLine.
+size_t utf8_code_point_count(const char* text) {
+    size_t count = 0;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p;
+         ++p) {
+        if ((*p & 0xC0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
 
 // Deterministic payload for verify --file-upload. Several 64 KiB CFIL chunks
 // of pseudo-random bytes, so a truncated or reordered transfer cannot match.
@@ -837,6 +861,30 @@ struct Options {
     // connect only: render the decoded audio through WASAPI as well, so the
     // real playback path reports its buffer and underruns. Implies --audio.
     bool play = false;
+    // connect/verify: keep system audio on the reliable stream instead of the
+    // v35 QUIC DATAGRAM transport, for A/B measurements on the same build.
+    bool audio_stream = false;
+    // Only with --play: grow the playout lead when arrivals miss their slots,
+    // mirroring a jitter buffer that adapts to the observed link.
+    bool adaptive_jitter = false;
+    // Only with --play: schedule on the host capture timeline with a fixed
+    // lead instead of anchoring on arrival, so the same build can A/B the
+    // sender-time playout the status doc recommends against the adaptive one.
+    bool audio_capture_anchor = false;
+    uint32_t audio_lead_ms = 40;
+    // Only with --play: correct the slow drift between the host capture clock
+    // and the local timeline by moving the clock offset instead of the lead.
+    // Implies capture anchoring; experimental and off by default.
+    bool audio_drift_correction = false;
+    // Only with --play: skew the receiver's capture stamps by this many parts
+    // per million to simulate a drifting host clock on a single machine. The
+    // sign follows the timestamp: negative schedules blocks earlier over time,
+    // which drains the lead. 0 disables the injection.
+    int audio_drift_ppm = 0;
+    // serve: stop encoding after this much digital silence (0 disables the
+    // gate). The soak harness turns the gate off so host silence is not
+    // counted as player starvation.
+    uint32_t audio_silence_gate_ms = 2000;
     // verify only: the host encodes a generated 440 Hz tone instead of opening
     // the real loopback endpoint, so the check needs no sound card.
     bool synthetic_audio = false;
@@ -898,9 +946,30 @@ struct Options {
     // display does not report. The session runs long enough for the whole
     // walk because every step waits for the previous answer.
     bool display_mode = false;
+    // verify only: send the two mid-session display-switch requests. The
+    // weak-network check clears it because a switch needs the input permission
+    // and that check runs without input.
+    bool display_switch = true;
     // verify only: ask for the merged layout (kDisplayAll) instead of one
     // output, then check the union geometry and the no-op merge switch.
     bool merged = false;
+    // verify only: run the loopback through an in-process weak-link relay
+    // (delay, jitter, loss and a bandwidth bottleneck for a window) and
+    // require the adaptive bitrate controller to cut and recover without
+    // losing an access unit. The relay listens on --port and the host on
+    // --port + 1.
+    bool netem = false;
+    // verify --netem: override the documented impairment profile. Negative
+    // values keep the acceptance default, so 0 is still a valid override (a
+    // loss-only probe wants no added jitter). A zero rate keeps the default
+    // bottleneck. These exist to isolate one impairment at a time; the
+    // defaults remain the acceptance profile.
+    double netem_delay_ms = -1.0;
+    double netem_jitter_ms = -1.0;
+    double netem_loss_percent = -1.0;
+    // Negative keeps the acceptance bottleneck; 0 disables the rate limit for
+    // a loss-only probe.
+    int netem_rate_kbps = -1;
     // verify only: upload a deterministic 300 KiB payload through CFIL and
     // check the host wrote it, byte for byte, into the receive directory.
     bool file_upload = false;
@@ -1103,9 +1172,52 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.clipboard = true;
             } else if (arg == "--audio") {
                 options.audio = true;
+            } else if (arg == "--audio-silence-gate-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms > 60000) {
+                    std::fprintf(stderr, "--audio-silence-gate-ms wants 0..60000\n");
+                    return false;
+                }
+                options.audio_silence_gate_ms = static_cast<uint32_t>(ms);
+            } else if (arg == "--audio-stream") {
+                options.audio = true;
+                options.audio_stream = true;
             } else if (arg == "--play") {
                 options.audio = true;
                 options.play = true;
+            } else if (arg == "--adaptive-jitter") {
+                options.audio = true;
+                options.play = true;
+                options.adaptive_jitter = true;
+            } else if (arg == "--audio-capture-anchor") {
+                options.audio = true;
+                options.play = true;
+                options.audio_capture_anchor = true;
+            } else if (arg == "--audio-lead-ms" && i + 1 < argc) {
+                const unsigned long ms = std::stoul(argv[++i]);
+                if (ms == 0 || ms > 500) {
+                    std::fprintf(stderr, "--audio-lead-ms wants 1..500\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_capture_anchor = true;
+                options.audio_lead_ms = static_cast<uint32_t>(ms);
+            } else if (arg == "--audio-drift-correction") {
+                options.audio = true;
+                options.play = true;
+                options.audio_capture_anchor = true;
+                options.audio_drift_correction = true;
+            } else if (arg == "--audio-drift-ppm" && i + 1 < argc) {
+                const long ppm = std::stol(argv[++i]);
+                if (ppm == 0 || ppm < -5000 || ppm > 5000) {
+                    std::fprintf(stderr, "--audio-drift-ppm wants -5000..5000, nonzero\n");
+                    return false;
+                }
+                options.audio = true;
+                options.play = true;
+                options.audio_capture_anchor = true;
+                options.audio_drift_ppm = static_cast<int>(ppm);
             } else if (arg == "--microphone") {
                 options.microphone = true;
             } else if (arg == "--privacy") {
@@ -1131,6 +1243,20 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.display_mode = true;
             } else if (arg == "--merged") {
                 options.merged = true;
+            } else if (arg == "--netem") {
+                options.netem = true;
+            } else if (arg == "--netem-delay-ms" && i + 1 < argc) {
+                options.netem = true;
+                options.netem_delay_ms = std::stod(argv[++i]);
+            } else if (arg == "--netem-jitter-ms" && i + 1 < argc) {
+                options.netem = true;
+                options.netem_jitter_ms = std::stod(argv[++i]);
+            } else if (arg == "--netem-loss-percent" && i + 1 < argc) {
+                options.netem = true;
+                options.netem_loss_percent = std::stod(argv[++i]);
+            } else if (arg == "--netem-rate-kbps" && i + 1 < argc) {
+                options.netem = true;
+                options.netem_rate_kbps = std::stoi(argv[++i]);
             } else if (arg == "--file-upload") {
                 options.file_upload = true;
             } else if (arg == "--file-download") {
@@ -1390,6 +1516,34 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "--merged and --display-mode are mutually exclusive\n");
         return false;
     }
+    if (options.netem) {
+        if (options.mode != "verify") {
+            std::fprintf(stderr, "--netem only applies to verify\n");
+            return false;
+        }
+        if (options.transport != "udp") {
+            std::fprintf(stderr, "--netem relays QUIC datagrams over UDP; do not combine it "
+                                 "with --transport %s\n", options.transport.c_str());
+            return false;
+        }
+        if (options.port == 0 || options.port >= 65535) {
+            std::fprintf(stderr, "--netem needs --port with a free port + 1\n");
+            return false;
+        }
+        const bool extra_probe =
+            options.merged || options.display_mode || options.stream_options ||
+            options.file_upload || options.file_download || options.file_browse ||
+            options.port_forward || options.port_forward_denied || options.port_forward_local ||
+            options.terminal || options.terminal_denied || options.camera ||
+            options.camera_denied || options.microphone || options.privacy || options.sas ||
+            options.input_real || !options.record.empty() || !options.carrier.empty();
+        if (extra_probe) {
+            std::fprintf(stderr,
+                         "--netem runs the focused video loopback; do not combine it with "
+                         "other probes, --record or --carrier\n");
+            return false;
+        }
+    }
     if (!options.send_clipboard.empty()) {
         if (options.mode != "connect") {
             std::fprintf(stderr, "--send-clipboard only applies to connect\n");
@@ -1530,9 +1684,11 @@ struct SenderStats {
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
     bool clipboard_enabled = false;
-    // Chat lines the host sent and received (verify's built-in exchange).
+    // Chat lines the host sent and received (verify's built-in exchange), and
+    // composed text blocks accepted for injection.
     uint64_t chat_sent = 0;
     uint64_t chat_received = 0;
+    uint64_t text_received = 0;
     bool chat_greeting_queued = false;
     // Audio format the host announced, whether it stayed active, and the
     // HostServer counters for packets it handed to the transport.
@@ -1594,6 +1750,7 @@ struct SenderStats {
     // frame rate the ladder picked, how often the controller changed it, and
     // the transport RTT the controller sampled.
     uint32_t target_bitrate = 0;
+    uint32_t abr_lowest_target = 0;
     uint32_t framerate = 0;
     uint64_t abr_changes = 0;
     double rtt_ms = 0.0;
@@ -1644,12 +1801,15 @@ struct ReceiverStats {
     uint64_t clipboard_errors = 0;
     bool clipboard_enabled = false;
     // Chat probe: the lines the viewer sent and received, and any transport
-    // refusal. The host's side is recorded in ChatProbe.
+    // refusal. The host's side is recorded in ChatProbe. The composed text
+    // block reuses the same probe but has its own counters.
     bool chat_probe = false;
     uint64_t chat_sent = 0;
     uint64_t chat_received = 0;
     uint64_t chat_errors = 0;
     std::vector<std::string> chat_texts;
+    uint64_t text_sent = 0;
+    uint64_t text_errors = 0;
     // The verify probe first injects a CCLB blob whose declared size is past
     // the protocol limit, then sends a valid item to prove the session is
     // still alive and old content was kept.
@@ -1748,9 +1908,16 @@ struct ReceiverStats {
     chast::AudioInfo audio_info;
     bool audio_announced = false;
     bool audio_finished = false;
+    // v35 transport the host picked: QUIC DATAGRAM frames or the reliable
+    // audio stream. Datagrams may be lost or reordered, so the counters below
+    // separate real losses (forward sequence jumps) from reordering.
+    bool audio_datagram = false;
     uint64_t audio_received = 0;
     uint64_t audio_bytes = 0;
     uint64_t audio_gaps = 0;
+    uint64_t audio_reordered = 0;
+    uint64_t audio_missing = 0;
+    uint64_t audio_concealed = 0;
     uint64_t audio_crc_errors = 0;
     uint64_t audio_decode_errors = 0;
     uint64_t audio_protocol_errors = 0;
@@ -1763,9 +1930,33 @@ struct ReceiverStats {
     // Only with --play: what the WASAPI renderer actually did.
     uint64_t audio_played = 0;
     uint64_t audio_underruns = 0;
+    uint64_t audio_starved_ms = 0;
     uint64_t audio_player_drops = 0;
     uint64_t audio_player_recoveries = 0;
     uint32_t audio_buffer_ms = 0;
+    // Earliest/latest (scheduled - arrival) seen by the player since its last
+    // anchor. Positive maximum means the anchor carried avoidable delay.
+    int64_t audio_slack_min_ms = 0;
+    int64_t audio_slack_max_ms = 0;
+    double audio_slack_avg_ms = 0.0;
+    uint64_t audio_slack_early = 0;
+    uint64_t audio_slack_late = 0;
+    // Extra playout lead the adaptive controller added and its adjustments.
+    uint32_t audio_jitter_ms = 0;
+    uint64_t audio_jitter_raises = 0;
+    uint64_t audio_jitter_decays = 0;
+    // Cumulative offset the drift controller applied (positive: earlier) and
+    // its step count.
+    int64_t audio_drift_ms = 0;
+    uint64_t audio_drift_corrections = 0;
+    // How much the startup anchor gather moved playback earlier.
+    int64_t audio_anchor_shift_ms = 0;
+    // Host-clock audio playout latency (capture to scheduled render) and the
+    // A/V skew against the last frame age. Negative until a block has played
+    // and LatencyReply supplied an offset; a positive skew means audio reaches
+    // the viewer later than video captured at the same moment.
+    double audio_playout_ms = -1.0;
+    double av_skew_ms = -1.0;
     std::string audio_player_error;
     // Microphone uplink probe (verify --microphone): the host grant, the CMIC
     // stream the viewer opened and closed, and the packets it handed to the
@@ -2035,6 +2226,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     config.settings.allow_input = options.input;
     config.settings.allow_clipboard = options.clipboard;
     config.settings.allow_audio = options.audio;
+    config.audio_silence_gate_ms = options.audio_silence_gate_ms;
     config.settings.allow_microphone = options.microphone;
     config.settings.allow_privacy_mode = options.privacy;
     if (options.sas) {
@@ -2176,6 +2368,10 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
             std::lock_guard<std::mutex> lock(chat->mutex);
             chat->host_received.push_back(text);
         };
+        config.text_input = [chat](const std::string& text) {
+            std::lock_guard<std::mutex> lock(chat->mutex);
+            chat->host_texts.push_back(text);
+        };
     }
 
     std::string error;
@@ -2272,6 +2468,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.sas_failures = status.stats.sas_failures;
     stats.chat_sent = status.stats.chat_sent;
     stats.chat_received = status.stats.chat_received;
+    stats.text_received = status.stats.text_received;
     stats.stream_option_requests = status.stats.stream_option_requests;
     stats.stream_option_changes = status.stats.stream_option_changes;
     stats.stream_option_failures = status.stats.stream_option_failures;
@@ -2295,6 +2492,7 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.cursor_sent = status.stats.cursor_sent;
     stats.send_errors = status.stats.send_errors;
     stats.target_bitrate = status.stats.target_bitrate;
+    stats.abr_lowest_target = status.stats.lowest_target_bitrate;
     stats.framerate = status.stats.framerate;
     stats.abr_changes = status.stats.abr_changes;
     stats.rtt_ms = status.stats.rtt_ms;
@@ -2321,11 +2519,11 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
                     static_cast<unsigned long long>(status.stats.cursor_bytes),
                     static_cast<unsigned long long>(status.stats.cursor_dropped),
                     static_cast<unsigned long long>(status.stats.cursor_errors));
-        std::printf("sender: target-bitrate=%u kbps framerate=%u abr-changes=%llu rtt=%.1f ms "
-                    "send-rate=%.1f kbps\n",
-                    stats.target_bitrate / 1000u, stats.framerate,
-                    static_cast<unsigned long long>(stats.abr_changes), stats.rtt_ms,
-                    stats.send_kbps);
+        std::printf("sender: target-bitrate=%u kbps lowest=%u kbps framerate=%u "
+                    "abr-changes=%llu rtt=%.1f ms send-rate=%.1f kbps\n",
+                    stats.target_bitrate / 1000u, stats.abr_lowest_target / 1000u,
+                    stats.framerate, static_cast<unsigned long long>(stats.abr_changes),
+                    stats.rtt_ms, stats.send_kbps);
         std::printf("sender: picture=%ux%u source=%ux%u resolution=%u%% changes=%llu\n",
                     stats.width, stats.height, stats.source_width, stats.source_height,
                     stats.resolution_percent,
@@ -2476,6 +2674,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     client_config.password = options.password;
     client_config.totp = options.totp;
     client_config.audit_ref = options.audit_ref;
+    client_config.audio_datagram = !options.audio_stream;
     if (client_config.totp.empty() && !options.totp_secret.empty()) {
         // Computed right before the Hello so the 30 s window is fresh.
         std::vector<uint8_t> key;
@@ -2529,6 +2728,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.framerate = info.framerate;
     stats.audio_info = info.audio;
     stats.audio_announced = info.audio.enabled;
+    stats.audio_datagram = info.audio_datagram;
     stats.microphone_announced = info.microphone_enabled;
     if (!options.quiet) {
         std::printf("quic: connected, server streams %s %ux%u from %ux%u at %u kbps (%s)\n",
@@ -4260,10 +4460,20 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     std::unique_ptr<chast::IAudioPlayer> audio_player;
     if (options.play) {
         chast::AudioPlayerConfig player_config;
-        // The viewer GUI plays system audio on arrival; mirror that here so
-        // the CLI measurement exercises the same path.
-        player_config.arrival_anchored = true;
-        player_config.lead_ms = 0;
+        if (options.audio_capture_anchor) {
+            // Sender-time scheduling: capture stamps plus a fixed lead, with
+            // the host clock offset arriving from the first latency reply.
+            player_config.arrival_anchored = false;
+            player_config.lead_ms = options.audio_lead_ms;
+        } else {
+            // The viewer GUI plays system audio on arrival; mirror that here
+            // so the CLI measurement exercises the same path.
+            player_config.arrival_anchored = true;
+            player_config.lead_ms = 0;
+            player_config.anchor_gather_blocks = 6;
+        }
+        player_config.adaptive_jitter = options.adaptive_jitter;
+        player_config.clock_drift_correction = options.audio_drift_correction;
         std::string player_error;
         audio_player = chast::create_audio_player(player_config, &player_error);
         if (!audio_player) {
@@ -4328,7 +4538,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     // already streaming (the host answers Ok without rebuilding), then one past
     // the end of the announced list (NotFound). They are spaced wider than the
     // host's 1 s switch rate limit.
-    if (options.mode == "verify" && !info.displays.empty()) {
+    if (options.mode == "verify" && options.display_switch && !info.displays.empty()) {
         if (options.merged) {
             // Asking for the merge that is already running must be a no-op.
             stats.switch_ok_index = chast::kDisplayAll;
@@ -4402,6 +4612,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.framerate = info.framerate;
             stats.audio_info = info.audio;
             stats.audio_announced = info.audio.enabled;
+            stats.audio_datagram = info.audio_datagram;
             if (!ensure_audio_decoder(info.audio)) {
                 return false;
             }
@@ -4887,12 +5098,34 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             stats.audio_energy_values += block.samples.size();
         }
     };
+    // Test-only clock skew for the drift A/B: changing the capture stamps
+    // simulates a host clock drifting against the viewer, while the clock
+    // offset from LatencyReply stays the true one. The skew follows the
+    // block's capture time relative to the first played block, so setup and
+    // decode delays cannot leak into the synthetic drift.
+    uint64_t drift_first_capture_ms = 0;
     auto play_audio = [&](const std::vector<chast::DecodedAudio>& blocks) {
         if (!audio_player) {
             return;
         }
         for (const chast::DecodedAudio& block : blocks) {
-            if (chast::Error pushed = audio_player->push(block); !pushed.ok()) {
+            chast::DecodedAudio adjusted;
+            const chast::DecodedAudio* pushed_block = &block;
+            if (options.audio_drift_ppm != 0 && block.capture_ms != 0) {
+                if (drift_first_capture_ms == 0) {
+                    drift_first_capture_ms = block.capture_ms;
+                }
+                const int64_t elapsed_ms =
+                    static_cast<int64_t>(block.capture_ms) -
+                    static_cast<int64_t>(drift_first_capture_ms);
+                const int64_t skew =
+                    elapsed_ms * static_cast<int64_t>(options.audio_drift_ppm) / 1000000;
+                adjusted = block;
+                const int64_t capture = static_cast<int64_t>(block.capture_ms) + skew;
+                adjusted.capture_ms = capture > 0 ? static_cast<uint64_t>(capture) : 0;
+                pushed_block = &adjusted;
+            }
+            if (chast::Error pushed = audio_player->push(*pushed_block); !pushed.ok()) {
                 if (stats.audio_player_error.empty()) {
                     stats.audio_player_error = pushed.to_string();
                 }
@@ -4904,6 +5137,9 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         if (!options.audio) {
             return;
         }
+        // PLC sounds continuously stretched past a few frames; cap the fill
+        // at 100 ms and let a longer outage stay silent.
+        constexpr uint32_t kMaxConcealedAudioFrames = 5;
         for (;;) {
             chast::Error next = session->receive_audio(audio_header, audio_payload, wait);
             wait = std::chrono::milliseconds(0);
@@ -4923,8 +5159,36 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             }
             ++stats.audio_received;
             stats.audio_bytes += audio_payload.size();
-            if (audio_header.seq != expected_audio_seq) {
+            // Datagrams may arrive out of order, so only a forward jump is a
+            // loss; a packet behind the highest sequence seen is reordering.
+            if (audio_header.seq < expected_audio_seq) {
+                // Its slot already passed; playing it now would move the
+                // timeline backwards. The gap was concealed when the
+                // following packet arrived.
+                ++stats.audio_reordered;
+                continue;
+            }
+            if (audio_header.seq > expected_audio_seq) {
+                const uint32_t missing =
+                    static_cast<uint32_t>(audio_header.seq - expected_audio_seq);
                 ++stats.audio_gaps;
+                stats.audio_missing += missing;
+                if (audio_decoder) {
+                    const uint32_t fill = (std::min)(missing, kMaxConcealedAudioFrames);
+                    for (uint32_t back = fill; back > 0; --back) {
+                        std::vector<chast::DecodedAudio> concealed_blocks;
+                        chast::Error concealed =
+                            audio_decoder->conceal(audio_header, back, concealed_blocks);
+                        if (!concealed.ok()) {
+                            break;
+                        }
+                        if (!concealed_blocks.empty()) {
+                            ++stats.audio_concealed;
+                            count_audio(concealed_blocks);
+                            play_audio(concealed_blocks);
+                        }
+                    }
+                }
             }
             expected_audio_seq = audio_header.seq + 1;
             if (!audio_decoder) {
@@ -5038,6 +5302,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     // the reply once the stream is live and drain whatever arrived each pass.
     stats.chat_probe = options.chat_probe != nullptr;
     bool chat_sent = false;
+    bool text_input_sent = false;
     const auto chat_at = start + std::chrono::milliseconds(1500);
 
     // Stream preferences: request the encoder already running, change the
@@ -5502,6 +5767,18 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 ++stats.chat_sent;
             }
         }
+        if (stats.chat_probe && stats.input_enabled && !text_input_sent &&
+            std::chrono::steady_clock::now() >= chat_at) {
+            text_input_sent = true;
+            if (chast::Error sent = session->send_text_input(kViewerTextLine);
+                !sent.ok()) {
+                ++stats.text_errors;
+                std::fprintf(stderr, "send_text_input: %s\n",
+                             sent.to_string().c_str());
+            } else {
+                ++stats.text_sent;
+            }
+        }
         drain_microphone();
         {
             const auto probe_now = std::chrono::steady_clock::now();
@@ -5531,10 +5808,14 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         // Control slots keep only the newest message, so a long wait on video
         // can swallow an announcement that a later one replaces. Wake often
         // enough that each StreamInfo and switch answer is taken on its own.
-        chast::Error received =
-            session->receive_frame(header, payload, std::chrono::milliseconds(250));
-        // Audio is on its own stream and does not wake this call; drain it
-        // right after every video wait so it never queues behind a stall.
+        // Audio does not wake receive_frame, and the GUI polls at 10 ms while
+        // it is active; mirror that or the CLI skew would include a whole
+        // video wait the GUI does not pay.
+        const std::chrono::milliseconds receive_wait =
+            (options.audio || options.microphone) ? std::chrono::milliseconds(10)
+                                                  : std::chrono::milliseconds(250);
+        chast::Error received = session->receive_frame(header, payload, receive_wait);
+        // Drain audio right after every wait so it never queues behind a stall.
         drain_audio(std::chrono::milliseconds(0));
         drain_microphone();
         drain_privacy_state();
@@ -5907,9 +6188,28 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         const chast::AudioPlayerStats played = audio_player->stats();
         stats.audio_played = played.played_frames;
         stats.audio_underruns = played.underruns;
+        stats.audio_starved_ms = played.starved_ms;
         stats.audio_player_drops = played.dropped;
         stats.audio_player_recoveries = played.recoveries;
         stats.audio_buffer_ms = played.buffer_ms;
+        stats.audio_slack_min_ms = played.slack_min_ms;
+        stats.audio_slack_max_ms = played.slack_max_ms;
+        stats.audio_slack_avg_ms = played.slack_avg_ms;
+        stats.audio_slack_early = played.slack_early;
+        stats.audio_slack_late = played.slack_late;
+        stats.audio_jitter_ms = played.jitter_ms;
+        stats.audio_jitter_raises = played.jitter_raises;
+        stats.audio_jitter_decays = played.jitter_decays;
+        stats.audio_drift_ms = played.drift_ms;
+        stats.audio_drift_corrections = played.drift_corrections;
+        stats.audio_anchor_shift_ms = played.anchor_shift_ms;
+        if (clock_synced) {
+            stats.audio_playout_ms = chast::audio_playout_latency_ms(
+                played.playout_capture_ms, played.playout_scheduled_ms, clock_offset_us);
+            if (stats.audio_playout_ms >= 0.0 && stats.last_frame_age_ms >= 0.0) {
+                stats.av_skew_ms = stats.audio_playout_ms - stats.last_frame_age_ms;
+            }
+        }
         if (stats.audio_player_error.empty() && !audio_player->error().empty()) {
             stats.audio_player_error = audio_player->error();
         }
@@ -6120,27 +6420,57 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                         static_cast<unsigned long long>(stats.cursor_shapes),
                         stats.cursor_visible ? 1 : 0, stats.cursor_x, stats.cursor_y);
             if (options.audio) {
-                std::printf("receiver: audio announced=%d finished=%d packets=%llu bytes=%llu "
-                            "gaps=%llu crc-errors=%llu decode-errors=%llu samples=%llu "
+                std::printf("receiver: audio transport=%s announced=%d finished=%d "
+                            "packets=%llu bytes=%llu gaps=%llu missing=%llu reordered=%llu "
+                            "concealed=%llu crc-errors=%llu decode-errors=%llu samples=%llu "
                             "(%.2f s) rms=%.0f\n",
+                            stats.audio_datagram ? "datagram" : "stream",
                             stats.audio_announced ? 1 : 0, stats.audio_finished ? 1 : 0,
                             static_cast<unsigned long long>(stats.audio_received),
                             static_cast<unsigned long long>(stats.audio_bytes),
                             static_cast<unsigned long long>(stats.audio_gaps),
+                            static_cast<unsigned long long>(stats.audio_missing),
+                            static_cast<unsigned long long>(stats.audio_reordered),
+                            static_cast<unsigned long long>(stats.audio_concealed),
                             static_cast<unsigned long long>(stats.audio_crc_errors),
                             static_cast<unsigned long long>(stats.audio_decode_errors),
                             static_cast<unsigned long long>(stats.audio_samples),
                             stats.audio_seconds, stats.audio_rms);
                 if (options.play) {
                     std::printf("receiver: playback played=%llu frames underruns=%llu "
-                                "dropped=%llu recoveries=%llu buffer=%u ms%s%s\n",
+                                "starved=%llu ms dropped=%llu recoveries=%llu buffer=%u ms "
+                                "slack=%+lld..%+lld avg=%+.1f ms early=%llu late=%llu "
+                                "jit=%u ms raises=%llu decays=%llu drift=%+lld ms "
+                                "steps=%llu anchor=%+lld ms%s%s\n",
                                 static_cast<unsigned long long>(stats.audio_played),
                                 static_cast<unsigned long long>(stats.audio_underruns),
+                                static_cast<unsigned long long>(stats.audio_starved_ms),
                                 static_cast<unsigned long long>(stats.audio_player_drops),
                                 static_cast<unsigned long long>(stats.audio_player_recoveries),
                                 stats.audio_buffer_ms,
+                                static_cast<long long>(stats.audio_slack_min_ms),
+                                static_cast<long long>(stats.audio_slack_max_ms),
+                                stats.audio_slack_avg_ms,
+                                static_cast<unsigned long long>(stats.audio_slack_early),
+                                static_cast<unsigned long long>(stats.audio_slack_late),
+                                stats.audio_jitter_ms,
+                                static_cast<unsigned long long>(stats.audio_jitter_raises),
+                                static_cast<unsigned long long>(stats.audio_jitter_decays),
+                                static_cast<long long>(stats.audio_drift_ms),
+                                static_cast<unsigned long long>(stats.audio_drift_corrections),
+                                static_cast<long long>(stats.audio_anchor_shift_ms),
                                 stats.audio_player_error.empty() ? "" : " error=",
                                 stats.audio_player_error.c_str());
+                    if (stats.audio_playout_ms >= 0.0) {
+                        if (stats.last_frame_age_ms >= 0.0) {
+                            std::printf("receiver: av audio-latency=%.1f ms "
+                                        "av-skew=%+.1f ms (positive means audio later)\n",
+                                        stats.audio_playout_ms, stats.av_skew_ms);
+                        } else {
+                            std::printf("receiver: av audio-latency=%.1f ms\n",
+                                        stats.audio_playout_ms);
+                        }
+                    }
                 }
             }
             if (options.microphone) {
@@ -6177,11 +6507,16 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                stats.clipboard_errors == 0 && saw_video_end;
     if (options.audio) {
         const double video_seconds = static_cast<double>(elapsed_ms) / 1000.0;
+        // Datagram audio may lose packets; the floor still catches a transport
+        // that silently stopped carrying sound.
+        const double audio_floor =
+            stats.audio_datagram ? (std::min)(video_seconds - 1.0, video_seconds * 0.9)
+                                 : video_seconds - 1.0;
         stats.ok = stats.ok && stats.audio_announced && stats.audio_finished &&
                    stats.audio_received > 0 && stats.audio_crc_errors == 0 &&
-                   stats.audio_decode_errors == 0 && stats.audio_gaps == 0 &&
-                   stats.audio_protocol_errors == 0 &&
-                   stats.audio_seconds > video_seconds - 1.0 &&
+                   stats.audio_decode_errors == 0 &&
+                   (stats.audio_datagram || stats.audio_gaps == 0) &&
+                   stats.audio_protocol_errors == 0 && stats.audio_seconds > audio_floor &&
                    stats.audio_seconds < video_seconds + 1.0 && stats.audio_rms > 1000.0 &&
                    stats.audio_rms < 15000.0;
     }
@@ -7900,7 +8235,8 @@ int run_verify(const Options& options) {
     local.fake_clipboard = std::make_shared<FakeClipboard>();
     // Chat is covered both ways too: the host greets the viewer at the stream
     // announcement, the viewer replies once live, and both sides record what
-    // they received for the exact-match checks below.
+    // they received for the exact-match checks below. The viewer also sends
+    // one composed text block (protocol v36) that the host injects as Unicode.
     local.chat_probe = std::make_shared<ChatProbe>();
     // Audio is covered with a generated tone and the real AAC codec, so the
     // check runs the same path without touching the machine's sound devices.
@@ -8667,7 +9003,10 @@ int run_verify(const Options& options) {
             same = same_event(sent.input_events[i], received.input_sent[i]);
         }
         check(same, "input events arrived intact and in order");
-        check(sent.input_stats.applied == received.input_sent.size(),
+        check(sent.input_stats.applied ==
+                  received.input_sent.size() +
+                      (received.text_sent ? utf8_code_point_count(kViewerTextLine)
+                                          : 0),
               "every input event was injected");
         check(sent.input_stats.rejected == 0 && sent.input_stats.failed == 0 &&
                   sent.input_stats.dropped == 0,
@@ -8792,9 +9131,11 @@ int run_verify(const Options& options) {
 
     if (local.chat_probe) {
         std::vector<std::string> host_lines;
+        std::vector<std::string> host_texts;
         {
             std::lock_guard<std::mutex> lock(local.chat_probe->mutex);
             host_lines = local.chat_probe->host_received;
+            host_texts = local.chat_probe->host_texts;
         }
         check(received.chat_probe, "the viewer ran the chat probe");
         check(received.chat_sent == 1 && received.chat_errors == 0,
@@ -8806,10 +9147,18 @@ int run_verify(const Options& options) {
               "the host received the viewer's chat line verbatim");
         check(sent.chat_sent == 1 && sent.chat_received == 1,
               "the host counted one chat line in each direction");
-        if (received.chat_texts.size() != 1 || host_lines.size() != 1) {
+        check(received.text_sent == 1 && received.text_errors == 0,
+              "the viewer sent exactly one composed text block");
+        check(host_texts.size() == 1 && host_texts.front() == kViewerTextLine,
+              "the host received the viewer's text block verbatim");
+        check(sent.text_received == 1,
+              "the host counted one composed text block for injection");
+        if (received.chat_texts.size() != 1 || host_lines.size() != 1 ||
+            host_texts.size() != 1) {
             std::printf("     chat: viewer received %zu, host received %zu, "
-                        "viewer errors %llu\n",
+                        "host texts %zu, viewer errors %llu\n",
                         received.chat_texts.size(), host_lines.size(),
+                        host_texts.size(),
                         static_cast<unsigned long long>(received.chat_errors));
         }
     }
@@ -9025,15 +9374,40 @@ int run_verify(const Options& options) {
             // must not turn into errors or losses on the wire.
             check(sent.audio_errors == 0 && sent.audio_dropped <= 8,
                   "the mode change cost at most a fraction of a second of audio");
+        } else if (local.stream_options) {
+            // Switching the encoder family rebuilds the encoder mid-session and
+            // holds the host loop like a mode change. The full serial suite can
+            // push the capture queue past its margin, so allow the same short
+            // gap without permitting wire errors.
+            check(sent.audio_errors == 0 && sent.audio_dropped <= 8,
+                  "the encoder switch cost at most a fraction of a second of audio");
         } else {
             check(sent.audio_errors == 0 && sent.audio_dropped == 0,
                   "the host's audio path reported no errors or drops");
         }
-        check(received.audio_received == sent.audio_packets,
-              "every sent audio packet was received");
+        if (local.audio_stream) {
+            check(!received.audio_datagram,
+                  "the viewer's opt-out kept system audio on the reliable stream");
+        } else {
+            check(received.audio_datagram,
+                  "the host chose the v35 QUIC DATAGRAM audio transport");
+        }
+        const uint64_t audio_lost =
+            sent.audio_packets > received.audio_received
+                ? sent.audio_packets - received.audio_received
+                : 0;
+        if (received.audio_datagram) {
+            // Loss is the point of an unreliable transport; a clean loopback
+            // must still come out nearly whole, which is what this bounds.
+            check(received.audio_received > 0 && audio_lost * 50 <= sent.audio_packets,
+                  "the datagram transport delivered at least 98% of sent audio packets");
+        } else {
+            check(received.audio_received == sent.audio_packets,
+                  "every sent audio packet was received");
+            check(received.audio_gaps == 0, "no audio sequence gaps");
+        }
         check(received.audio_crc_errors == 0, "no audio payload CRC errors");
         check(received.audio_decode_errors == 0, "no audio decode errors");
-        check(received.audio_gaps == 0, "no audio sequence gaps");
         check(received.audio_protocol_errors == 0, "no audio protocol violations");
         check(received.audio_finished, "the audio stream ended with a FIN");
         check(received.audio_samples > 0 &&
@@ -9127,6 +9501,356 @@ int run_verify(const Options& options) {
     return 0;
 }
 
+// The manual weak-network acceptance in docs/weak-network-acceptance.md runs
+// chast-netem as a separate process. This closes the same loop in one process:
+// the relay listens on --port and forwards to the host on --port + 1, the path
+// carries delay, jitter, loss and a bandwidth bottleneck for a window and is
+// clean again afterwards, and the checks require the session to stay intact
+// while the adaptive bitrate controller cuts and recovers.
+int run_weak_network(const Options& options) {
+    // The documented profile: an 80 ms one-way path with 20 ms of jitter, 3%
+    // loss and a 1 Mbps bottleneck, degraded for eight seconds and then clean.
+    // A third of the 3 Mbps configured rate survives at the bottleneck, so the
+    // controller must use its bitrate, frame-rate and resolution levers. The
+    // --netem-* options can replace individual values to isolate one impairment
+    // (a loss-heavy, low-jitter probe for packet-level redundancy).
+    constexpr double kDelayMs = 80.0;
+    constexpr double kJitterMs = 20.0;
+    constexpr double kLossPercent = 3.0;
+    constexpr uint32_t kRateKbps = 1000;
+    constexpr double kQueueMs = 500.0;
+    constexpr double kDegradeAt = 4.0;
+    constexpr double kRecoverAt = 12.0;
+    constexpr double kMinimumSeconds = 25.0;
+    constexpr uint32_t kDefaultBitrateKbps = 3000;
+
+    // Overrides isolate one impairment at a time; only the documented profile
+    // asserts ABR behavior, because a custom link may legitimately keep the
+    // levers still.
+    const double delay_ms =
+        options.netem_delay_ms >= 0.0 ? options.netem_delay_ms : kDelayMs;
+    const double jitter_ms =
+        options.netem_jitter_ms >= 0.0 ? options.netem_jitter_ms : kJitterMs;
+    const double loss_percent =
+        options.netem_loss_percent >= 0.0 ? options.netem_loss_percent : kLossPercent;
+    const uint32_t rate_kbps =
+        options.netem_rate_kbps >= 0 ? static_cast<uint32_t>(options.netem_rate_kbps)
+                                     : kRateKbps;
+    const bool profile_overridden =
+        options.netem_delay_ms >= 0.0 || options.netem_jitter_ms >= 0.0 ||
+        options.netem_loss_percent >= 0.0 || options.netem_rate_kbps >= 0;
+
+    Options local = options;
+    local.insecure = false;
+    if (local.token.empty()) {
+        local.token = generate_token();
+    }
+    local.token_reuse = false;
+    // The check is about the video path; drop every probe whose answer depends
+    // on devices, input or files so a failure can only come from the link.
+    local.input = false;
+    local.input_real = false;
+    local.input_dry_run = false;
+    local.clipboard = false;
+    local.send_clipboard.clear();
+    local.fake_clipboard.reset();
+    local.chat_probe.reset();
+    // The check is about the video path by default; --audio adds the system
+    // sound QoS comparison over the same impaired link, using the synthetic
+    // tone and (with --play) the real WASAPI renderer.
+    const bool audio_probe = options.audio;
+    local.audio = audio_probe;
+    local.play = audio_probe && options.play;
+    local.synthetic_audio = audio_probe;
+    local.audio_stream = options.audio_stream;
+    local.microphone = false;
+    local.microphone_recorder.reset();
+    local.privacy = false;
+    local.sas = false;
+    local.stream_options = false;
+    local.reannounce = false;
+    local.resolution = 0;
+    local.display_mode = false;
+    local.display_switch = false;
+    local.merged = false;
+    local.file_upload = false;
+    local.file_download = false;
+    local.file_browse = false;
+    local.port_forward = false;
+    local.port_forward_denied = false;
+    local.port_forward_local = false;
+    local.terminal = false;
+    local.terminal_denied = false;
+    local.camera = false;
+    local.camera_denied = false;
+    local.transport = "udp";
+    local.carrier.clear();
+    local.carrier_host_id.clear();
+    local.carrier_token.clear();
+    local.bind = "127.0.0.1";
+    local.host = "127.0.0.1";
+    if (local.bitrate_kbps == 0) {
+        local.bitrate_kbps = kDefaultBitrateKbps;
+    }
+    if (local.seconds < kMinimumSeconds) {
+        local.seconds = kMinimumSeconds;
+    }
+    if (!local.display_set) {
+        // Ask for the primary output explicitly, like the rest of verify.
+        local.display_set = true;
+        local.display = 0;
+    }
+
+    const uint32_t configured_bps = local.bitrate_kbps * 1000u;
+    const uint32_t floor_bps = std::max<uint32_t>(500000u, configured_bps / 10u);
+
+    const bool keep_file = !options.save.empty();
+    const std::string path =
+        keep_file ? options.save : ".chast-quic-verify-netem.bin";
+
+    Options receiver_options = local;
+    receiver_options.save.clear();
+    receiver_options.display_set = true;
+    receiver_options.display = local.display;
+    Options sender_options = local;
+    sender_options.port = static_cast<uint16_t>(options.port + 1);
+
+    chast_tools::netem::Options profile;
+    profile.bind_address = "127.0.0.1";
+    profile.forward_host = "127.0.0.1";
+    profile.listen_port = options.port;
+    profile.forward_port = static_cast<uint16_t>(options.port + 1);
+    profile.delay_ms = delay_ms;
+    profile.jitter_ms = jitter_ms;
+    profile.loss_percent = loss_percent;
+    profile.rate_kbps = rate_kbps;
+    profile.queue_ms = kQueueMs;
+    profile.degrade_at = kDegradeAt;
+    profile.recover_at = kRecoverAt;
+    profile.seconds = local.seconds + 30.0;
+    profile.quiet = local.quiet;
+    // Anchor the window to the session, not to process startup: capture and
+    // encoder setup can take seconds on a loaded machine.
+    profile.start_on_first_packet = true;
+
+    chast_tools::netem::Relay relay(profile);
+    std::string relay_error;
+    if (!relay.start(&relay_error)) {
+        std::fprintf(stderr, "weak-network relay: %s\n", relay_error.c_str());
+        return 1;
+    }
+    bool relay_ok = false;
+    std::thread relay_thread([&] { relay_ok = relay.run(); });
+
+    std::promise<ServerReady> listening;
+    std::shared_future<ServerReady> server_ready = listening.get_future().share();
+    ReceiverStats received;
+    std::thread receiver([&] { received = run_receiver(receiver_options, server_ready); });
+    SenderStats sent;
+    std::thread sender([&] { sent = run_sender(sender_options, path, &listening); });
+    sender.join();
+    receiver.join();
+    relay.request_stop();
+    relay_thread.join();
+    const chast_tools::netem::RelayStats relay_stats = relay.stats();
+    const chast_tools::netem::DirectionStats& to_viewer = relay_stats.host_to_viewer;
+    const chast_tools::netem::DirectionStats& to_host = relay_stats.viewer_to_host;
+
+    std::printf("---- weak-network check ----\n");
+    bool failed = false;
+    auto check = [&](bool condition, const char* what) {
+        std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
+        if (!condition) {
+            failed = true;
+        }
+    };
+
+    check(sent.error.empty(), "sender completed");
+    if (!sent.error.empty()) {
+        std::printf("     sender: %s\n", sent.error.c_str());
+    }
+    check(received.error.empty(), "receiver completed");
+    if (!received.error.empty()) {
+        std::printf("     receiver: %s\n", received.error.c_str());
+    }
+    check(relay_ok, "the relay ran until the session ended");
+    check(!sent.fingerprint.empty() && received.peer_fingerprint == sent.fingerprint,
+          "the viewer connected to the pinned server identity");
+    check(received.transport == "udp", "the session ran over UDP through the relay");
+
+    check(sent.keyframes > 0 && received.keyframes == sent.keyframes,
+          "every key frame arrived");
+    check(received.received == sent.encoded, "every encoded access unit arrived");
+    check(received.decoded > 0, "the viewer decoded pictures through the lossy path");
+    check(received.crc_errors == 0, "no video payload CRC errors over the lossy link");
+    check(received.decode_errors == 0, "no video decode errors over the lossy link");
+    check(received.gaps == 0, "no video sequence gaps over the reliable stream");
+    check(received.protocol_errors == 0, "no video protocol violations");
+    check(sent.send_errors == 0, "the host reported no send errors");
+
+    check(sent.rtt_ms > 0.0, "the host sampled transport RTT");
+    const uint32_t lowest_target = sent.abr_lowest_target;
+    if (profile_overridden) {
+        std::printf("     profile: custom --netem values; ABR assertions skipped\n");
+    } else {
+        check(sent.abr_changes > 0, "the weak link made the controller change the target");
+        check(lowest_target > 0 && lowest_target < configured_bps,
+              "the target dropped below the configured bitrate");
+        check(lowest_target >= floor_bps, "the target never fell below the controller floor");
+        check(lowest_target > 0 && sent.target_bitrate > lowest_target,
+              "the target recovered after the link came back");
+        check(sent.target_bitrate > 0 && sent.target_bitrate < configured_bps,
+              "the cut did not snap back to the configured ceiling");
+        check(sent.resolution_changes > 0, "the resolution ladder moved with the target");
+    }
+
+    // The handshake carries the initial description, so stream_updates counts
+    // only mid-session refreshes. Every applied rate decision announces once; a
+    // rung that only moves the picture size adds one more, which is why the
+    // upper bound includes the resolution changes.
+    check(sent.stream_updates_sent >= sent.abr_changes &&
+              sent.stream_updates_sent <= sent.abr_changes + sent.resolution_changes,
+          "each rate decision re-announced the stream");
+    // The control stream keeps only the latest StreamInfo, so back-to-back
+    // announcements coalesce; what must hold is that a mid-session description
+    // arrived and that the final one is the host's running description.
+    check(received.stream_updates > 0, "the viewer saw the stream announcements");
+    check(received.target_bitrate == sent.target_bitrate &&
+              received.framerate == sent.framerate,
+          "the last announcement matched the running target");
+    check(received.latency.valid && received.latency.replies > 0,
+          "the latency probe survived the relay");
+    check(received.max_frame_age_ms >= 0.0 && received.max_frame_age_ms < 15000.0,
+          "the worst frame age stayed within the weak-link budget");
+
+    check(to_viewer.received > 0 && to_viewer.forwarded > 0,
+          "video datagrams crossed the relay");
+    check(to_viewer.loss_drops > 0, "the relay dropped video datagrams while degraded");
+    check(to_viewer.send_errors == 0 && to_host.send_errors == 0,
+          "the relay forwarded without socket errors");
+    check(to_host.received > 0, "the viewer's own traffic crossed the relay");
+
+    // The receiver rebuilds its decoder at a resolution switch, so a few units
+    // can arrive before the new key frame and are counted as skipped, not as
+    // errors. The offline replay only has to prove the saved stream itself is
+    // well formed and complete.
+    const StreamDigest replay = digest_saved_stream(path, sent.codec);
+    if (!replay.error.empty()) {
+        std::printf("     replay: %s\n", replay.error.c_str());
+    }
+    check(replay.error.empty(), "the sent stream can be replayed offline");
+    check(replay.units == sent.encoded,
+          "the saved stream splits into the sent access units");
+    check(replay.decoded > 0, "offline decode produced pictures");
+
+    if (audio_probe) {
+        check(sent.audio_announced && received.audio_announced,
+              "both ends announced system audio for the weak-link probe");
+        if (local.audio_stream) {
+            check(!received.audio_datagram,
+                  "the viewer's opt-out kept audio on the reliable stream");
+        } else {
+            check(received.audio_datagram, "the host chose the datagram audio transport");
+        }
+        check(sent.audio_packets > 0 && received.audio_received > 0,
+              "audio packets crossed the weak link");
+        check(received.audio_crc_errors == 0 && received.audio_decode_errors == 0 &&
+                  received.audio_protocol_errors == 0,
+              "loss never turned into audio CRC, decode or protocol errors");
+        check(received.audio_finished, "the audio stream ended with a FIN");
+        const uint64_t audio_lost = sent.audio_packets > received.audio_received
+                                        ? sent.audio_packets - received.audio_received
+                                        : 0;
+        if (received.audio_datagram) {
+            check(audio_lost * 10 <= sent.audio_packets,
+                  "datagram audio stayed within 10% packet loss");
+        } else {
+            check(received.audio_received == sent.audio_packets,
+                  "the reliable stream delivered every audio packet");
+        }
+        check(received.audio_concealed <= received.audio_missing,
+              "concealment never filled more frames than the sequence gaps");
+        const double lost_share =
+            sent.audio_packets == 0
+                ? 0.0
+                : 100.0 * static_cast<double>(audio_lost) /
+                      static_cast<double>(sent.audio_packets);
+        std::printf("     audio: transport=%s sent %llu, received %llu (%.2f%% loss), "
+                    "gaps %llu, reordered %llu, missing %llu, concealed %llu, "
+                    "host drops %llu, decoded %.2f s\n",
+                    received.audio_datagram ? "datagram" : "stream",
+                    static_cast<unsigned long long>(sent.audio_packets),
+                    static_cast<unsigned long long>(received.audio_received), lost_share,
+                    static_cast<unsigned long long>(received.audio_gaps),
+                    static_cast<unsigned long long>(received.audio_reordered),
+                    static_cast<unsigned long long>(received.audio_missing),
+                    static_cast<unsigned long long>(received.audio_concealed),
+                    static_cast<unsigned long long>(sent.audio_dropped),
+                    received.audio_seconds);
+        if (local.play) {
+            check(received.audio_player_error.empty() && received.audio_played > 0,
+                  "the WASAPI player rendered the weak-link audio");
+            std::printf("     audio playback: played %llu, underruns %llu, "
+                        "starved %llu ms, dropped %llu, "
+                        "buffer %u ms, slack %+lld..%+lld avg %+.1f ms, "
+                        "jit %u ms (+%llu/-%llu), av-skew %+.1f ms\n",
+                        static_cast<unsigned long long>(received.audio_played),
+                        static_cast<unsigned long long>(received.audio_underruns),
+                        static_cast<unsigned long long>(received.audio_starved_ms),
+                        static_cast<unsigned long long>(received.audio_player_drops),
+                        received.audio_buffer_ms,
+                        static_cast<long long>(received.audio_slack_min_ms),
+                        static_cast<long long>(received.audio_slack_max_ms),
+                        received.audio_slack_avg_ms,
+                        received.audio_jitter_ms,
+                        static_cast<unsigned long long>(received.audio_jitter_raises),
+                        static_cast<unsigned long long>(received.audio_jitter_decays),
+                        received.av_skew_ms);
+        }
+    }
+
+    std::printf("     link: target %u -> lowest %u kbps, %llu change(s), "
+                "%u%% picture, %u fps at the end\n",
+                configured_bps / 1000u, lowest_target / 1000u,
+                static_cast<unsigned long long>(sent.abr_changes),
+                sent.resolution_percent, sent.framerate);
+    std::printf("     frames: sent %llu, received %llu, decoded %llu, keyframes %llu, "
+                "max frame age %.0f ms, stream updates %llu sent/%llu received\n",
+                static_cast<unsigned long long>(sent.encoded),
+                static_cast<unsigned long long>(received.received),
+                static_cast<unsigned long long>(received.decoded),
+                static_cast<unsigned long long>(received.keyframes),
+                received.max_frame_age_ms,
+                static_cast<unsigned long long>(sent.stream_updates_sent),
+                static_cast<unsigned long long>(received.stream_updates));
+    std::printf("     relay: host->viewer rx=%llu fwd=%llu loss=%llu qdrop=%llu "
+                "maxq=%.0f ms | viewer->host rx=%llu loss=%llu qdrop=%llu\n",
+                static_cast<unsigned long long>(to_viewer.received),
+                static_cast<unsigned long long>(to_viewer.forwarded),
+                static_cast<unsigned long long>(to_viewer.loss_drops),
+                static_cast<unsigned long long>(to_viewer.queue_drops), to_viewer.max_queue_ms,
+                static_cast<unsigned long long>(to_host.received),
+                static_cast<unsigned long long>(to_host.loss_drops),
+                static_cast<unsigned long long>(to_host.queue_drops));
+
+    if (!keep_file) {
+        std::remove(path.c_str());
+    } else {
+        std::printf("saved the sent stream to %s\n", path.c_str());
+    }
+
+    if (failed) {
+        std::printf("QUIC weak-network FAILED\n");
+        return 1;
+    }
+    std::printf("QUIC weak-network PASSED: %llu access units, lowest %u kbps, "
+                "%llu ABR change(s), max frame age %.0f ms\n",
+                static_cast<unsigned long long>(sent.encoded), lowest_target / 1000u,
+                static_cast<unsigned long long>(sent.abr_changes),
+                received.max_frame_age_ms);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -9154,6 +9878,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "chast-quic connect: %s\n", stats.error.c_str());
         }
         return stats.ok ? 0 : 1;
+    }
+    if (options.netem) {
+        return run_weak_network(options);
     }
     return run_verify(options);
 }

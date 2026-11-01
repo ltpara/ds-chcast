@@ -539,7 +539,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
                                   : hello.audit_ref.size();
     std::vector<uint8_t> payload(6 + token_size + 2 + password_size + 2 + 2 + key_size +
                                  1 + 2 + name_size + kHelloNonceBytes + 8 + 1 + 2 +
-                                 signature_size + 2 + totp_size + 2 + audit_size + 1);
+                                 signature_size + 2 + totp_size + 2 + audit_size + 2);
     uint8_t* cursor = payload.data();
     put_u16(cursor, kProtocolVersion);
     put_u16(cursor, hello.display);
@@ -581,6 +581,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
         cursor += audit_size;
     }
     put_u8(cursor, static_cast<uint8_t>(hello.mode));
+    put_u8(cursor, hello.capabilities);
     return make_control(ControlType::Hello, payload);
 }
 
@@ -689,6 +690,14 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         return false;
     }
     hello.mode = static_cast<SessionMode>(mode);
+    if (!reader.u8(hello.capabilities)) {
+        set_error(error, "Hello carries no client capabilities");
+        return false;
+    }
+    if ((hello.capabilities & ~kClientCapabilitiesKnown) != 0) {
+        set_error(error, "Hello carries unknown client capabilities");
+        return false;
+    }
     if (!reader.at_end()) {
         set_error(error, "Hello carries trailing bytes");
         return false;
@@ -794,7 +803,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.record_enabled ? kServerInfoRecordEnabled : 0) |
                         (info.camera_enabled ? kServerInfoCameraEnabled : 0) |
                         (info.merged ? kServerInfoMergedLayout : 0) |
-                        (info.files_only ? kServerInfoFileTransferOnly : 0)));
+                        (info.files_only ? kServerInfoFileTransferOnly : 0) |
+                        (info.audio_datagram && info.audio.enabled ? kServerInfoAudioDatagram : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -895,6 +905,11 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.merged = (flags & kServerInfoMergedLayout) != 0;
     info.files_only = (flags & kServerInfoFileTransferOnly) != 0;
     const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
+    info.audio_datagram = (flags & kServerInfoAudioDatagram) != 0;
+    if (info.audio_datagram && !audio_flag) {
+        set_error(error, "HelloAck announces datagram audio without audio");
+        return false;
+    }
     if (!codec_from_wire(codec, info.codec)) {
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
@@ -1301,6 +1316,36 @@ bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
     text.assign(payload.begin(), payload.end());
     if (!valid_utf8(text)) {
         set_error(error, "ChatMessage text is not valid UTF-8");
+        return false;
+    }
+    return true;
+}
+
+bool valid_text_input(const std::string& text) {
+    return !text.empty() && text.size() <= kMaxTextInputBytes && valid_utf8(text);
+}
+
+std::vector<uint8_t> make_text_input(const std::string& text) {
+    if (!valid_text_input(text)) {
+        return {};
+    }
+    return make_control(ControlType::TextInput,
+                        std::vector<uint8_t>(text.begin(), text.end()));
+}
+
+bool parse_text_input(const std::vector<uint8_t>& payload, std::string& text,
+                      std::string* error) {
+    if (payload.empty()) {
+        set_error(error, "TextInput carries no text");
+        return false;
+    }
+    if (payload.size() > kMaxTextInputBytes) {
+        set_error(error, "TextInput text is too long");
+        return false;
+    }
+    text.assign(payload.begin(), payload.end());
+    if (!valid_utf8(text)) {
+        set_error(error, "TextInput text is not valid UTF-8");
         return false;
     }
     return true;

@@ -52,6 +52,9 @@ void main() {
       'lastFileError': 'the host refused it',
       'filesSent': 1,
       'fileFailures': 2,
+      'fileCancels': 1,
+      'downloadCancels': 2,
+      'downloadCancellable': true,
     });
     expect(status.fileActive, isTrue);
     expect(status.fileProgress, 0.25);
@@ -62,6 +65,9 @@ void main() {
     expect(status.lastFileError, 'the host refused it');
     expect(status.filesSent, 1);
     expect(status.fileFailures, 2);
+    expect(status.fileCancels, 1);
+    expect(status.downloadCancels, 2);
+    expect(status.downloadCancellable, isTrue);
     expect(status.acceptsFiles, isTrue);
   });
 

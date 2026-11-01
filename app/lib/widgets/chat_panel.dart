@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -52,7 +53,10 @@ class ChatPanel extends StatefulWidget {
     }
     final int bytes = utf8.encode(value).length;
     if (bytes > kMaxChatBytes) {
-      return tr('消息过长：{bytes} / {kMaxChatBytes} 字节', <String, Object?>{'bytes': bytes, 'kMaxChatBytes': kMaxChatBytes});
+      return tr('消息过长：{bytes} / {kMaxChatBytes} 字节', <String, Object?>{
+        'bytes': bytes,
+        'kMaxChatBytes': kMaxChatBytes,
+      });
     }
     return null;
   }
@@ -67,11 +71,13 @@ class _ChatPanelState extends State<ChatPanel> {
   bool _sending = false;
   String? _error;
   int _lastLength = 0;
+  bool _follow = true;
 
   @override
   void initState() {
     super.initState();
     _lastLength = widget.entries.length;
+    _scroll.addListener(_onScroll);
     _scheduleScroll();
   }
 
@@ -86,18 +92,40 @@ class _ChatPanelState extends State<ChatPanel> {
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     _input.dispose();
     _scroll.dispose();
     super.dispose();
   }
 
+  void _onScroll() {
+    if (!_scroll.hasClients) {
+      return;
+    }
+    final bool atBottom =
+        _scroll.position.pixels >= _scroll.position.maxScrollExtent - 4;
+    if (atBottom != _follow) {
+      setState(() => _follow = atBottom);
+    }
+  }
+
   void _scheduleScroll() {
+    if (!_follow) {
+      return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients) {
         return;
       }
       _scroll.jumpTo(_scroll.position.maxScrollExtent);
     });
+  }
+
+  void _scrollToBottom() {
+    setState(() => _follow = true);
+    if (_scroll.hasClients) {
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    }
   }
 
   Future<void> _submit() async {
@@ -136,6 +164,71 @@ class _ChatPanelState extends State<ChatPanel> {
     _input.clear();
   }
 
+  Future<void> _copyHistory() async {
+    if (widget.entries.isEmpty) {
+      setState(() => _error = tr('没有可复制的聊天记录'));
+      return;
+    }
+    final StringBuffer out = StringBuffer();
+    for (final ChatEntry entry in widget.entries) {
+      final String hh = entry.at.hour.toString().padLeft(2, '0');
+      final String mm = entry.at.minute.toString().padLeft(2, '0');
+      out.writeln(
+        '${entry.mine ? tr('我') : tr('主机')} · $hh:$mm: ${entry.text}',
+      );
+    }
+    bool copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: out.toString().trimRight()));
+    } catch (_) {
+      copied = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (!copied) {
+      setState(() => _error = tr('复制失败'));
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(tr('已复制聊天记录'))));
+  }
+
+  Widget _buildJumpToBottom() {
+    return Tooltip(
+      message: tr('回到底部'),
+      child: Material(
+        color: const Color(0xFF303138),
+        elevation: 4,
+        shape: const StadiumBorder(),
+        child: InkWell(
+          key: const Key('chat-bottom'),
+          customBorder: const StadiumBorder(),
+          onTap: _scrollToBottom,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                const Icon(
+                  Icons.arrow_downward_rounded,
+                  size: 13,
+                  color: kAccentBright,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  tr('回到底部'),
+                  style: const TextStyle(color: Colors.white70, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Material(
@@ -156,7 +249,11 @@ class _ChatPanelState extends State<ChatPanel> {
               child: Row(
                 children: <Widget>[
                   const SizedBox(width: 10),
-                  const Icon(Icons.forum_rounded, size: 16, color: kAccentBright),
+                  const Icon(
+                    Icons.forum_rounded,
+                    size: 16,
+                    color: kAccentBright,
+                  ),
                   const SizedBox(width: 7),
                   Text(
                     tr('会话聊天'),
@@ -169,9 +266,31 @@ class _ChatPanelState extends State<ChatPanel> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      tr('收 {p1} · 发 {p2}', <String, Object?>{'p1': widget.received, 'p2': widget.sent}),
+                      tr('收 {p1} · 发 {p2}', <String, Object?>{
+                        'p1': widget.received,
+                        'p2': widget.sent,
+                      }),
                       textAlign: TextAlign.right,
-                      style: const TextStyle(color: Colors.white38, fontSize: 10.5),
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 10.5,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 30,
+                    height: 30,
+                    child: IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 30,
+                        height: 30,
+                      ),
+                      visualDensity: VisualDensity.compact,
+                      tooltip: tr('复制聊天记录（含双方消息）'),
+                      icon: const Icon(Icons.copy_rounded, size: 15),
+                      color: Colors.white54,
+                      onPressed: () => unawaited(_copyHistory()),
                     ),
                   ),
                   SizedBox(
@@ -191,21 +310,34 @@ class _ChatPanelState extends State<ChatPanel> {
             ),
             const Divider(height: 1, color: Colors.white12),
             Expanded(
-              child: widget.entries.isEmpty
-                  ? Center(
-                      child: Text(
-                        tr('还没有消息。发送一条试试。'),
-                        style: TextStyle(color: Colors.white30, fontSize: 11),
-                      ),
-                    )
-                  : ListView.builder(
-                      controller: _scroll,
-                      padding: const EdgeInsets.fromLTRB(10, 10, 10, 6),
-                      itemCount: widget.entries.length,
-                      itemBuilder: (BuildContext context, int index) {
-                        return _ChatBubble(entry: widget.entries[index]);
-                      },
+              child: Stack(
+                children: <Widget>[
+                  widget.entries.isEmpty
+                      ? Center(
+                          child: Text(
+                            tr('还没有消息。发送一条试试。'),
+                            style: TextStyle(
+                              color: Colors.white30,
+                              fontSize: 11,
+                            ),
+                          ),
+                        )
+                      : ListView.builder(
+                          controller: _scroll,
+                          padding: const EdgeInsets.fromLTRB(10, 10, 10, 6),
+                          itemCount: widget.entries.length,
+                          itemBuilder: (BuildContext context, int index) {
+                            return _ChatBubble(entry: widget.entries[index]);
+                          },
+                        ),
+                  if (!_follow)
+                    Positioned(
+                      right: 10,
+                      bottom: 10,
+                      child: _buildJumpToBottom(),
                     ),
+                ],
+              ),
             ),
             if (_error != null)
               Padding(
@@ -214,7 +346,10 @@ class _ChatPanelState extends State<ChatPanel> {
                   alignment: Alignment.centerLeft,
                   child: Text(
                     _error!,
-                    style: const TextStyle(color: Colors.orangeAccent, fontSize: 10.5),
+                    style: const TextStyle(
+                      color: Colors.orangeAccent,
+                      fontSize: 10.5,
+                    ),
                   ),
                 ),
               ),
@@ -237,19 +372,26 @@ class _ChatPanelState extends State<ChatPanel> {
                       decoration: InputDecoration(
                         isDense: true,
                         hintText: tr('输入消息，Enter 发送'),
-                        hintStyle:
-                            const TextStyle(color: Colors.white30, fontSize: 11.5),
+                        hintStyle: const TextStyle(
+                          color: Colors.white30,
+                          fontSize: 11.5,
+                        ),
                         filled: true,
                         fillColor: const Color(0xFF1B1C21),
-                        contentPadding:
-                            const EdgeInsets.symmetric(horizontal: 9, vertical: 9),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 9,
+                          vertical: 9,
+                        ),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(6),
                           borderSide: BorderSide.none,
                         ),
                         focusedBorder: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(6),
-                          borderSide: const BorderSide(color: kAccent, width: 1),
+                          borderSide: const BorderSide(
+                            color: kAccent,
+                            width: 1,
+                          ),
                         ),
                       ),
                       onSubmitted: (_) => _submit(),
@@ -291,8 +433,7 @@ class _ChatBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final String time =
-        '${_two(entry.at.hour)}:${_two(entry.at.minute)}';
+    final String time = '${_two(entry.at.hour)}:${_two(entry.at.minute)}';
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Align(
@@ -300,8 +441,9 @@ class _ChatBubble extends StatelessWidget {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 250),
           child: Column(
-            crossAxisAlignment:
-                entry.mine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            crossAxisAlignment: entry.mine
+                ? CrossAxisAlignment.end
+                : CrossAxisAlignment.start,
             children: <Widget>[
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
@@ -313,12 +455,19 @@ class _ChatBubble extends StatelessWidget {
                 ),
                 child: SelectableText(
                   entry.text,
-                  style: const TextStyle(color: Colors.white, fontSize: 12, height: 1.3),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    height: 1.3,
+                  ),
                 ),
               ),
               const SizedBox(height: 2),
               Text(
-                tr('{p5} · {time}', <String, Object?>{'p5': entry.mine ? tr('我') : tr('主机'), 'time': time}),
+                tr('{p5} · {time}', <String, Object?>{
+                  'p5': entry.mine ? tr('我') : tr('主机'),
+                  'time': time,
+                }),
                 style: const TextStyle(color: Colors.white30, fontSize: 9.5),
               ),
             ],

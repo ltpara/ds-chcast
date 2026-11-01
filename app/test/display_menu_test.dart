@@ -54,6 +54,7 @@ void main() {
     Future<void> Function(bool, bool)? onSetAudioProcessing,
     bool specialKeysAvailable = false,
     ValueChanged<RemoteSpecialAction>? onSpecialAction,
+    VoidCallback? onSendText,
     bool terminalAvailable = false,
     bool terminalOpen = false,
     VoidCallback? onToggleTerminal,
@@ -112,6 +113,7 @@ void main() {
           onToggleControl: () {},
           specialKeysAvailable: specialKeysAvailable,
           onSpecialAction: onSpecialAction ?? (_) {},
+          onSendText: onSendText ?? () {},
           onToggleClipboard: () {},
           onSendFile: onSendFile ?? () {},
           fileBrowseOpen: false,
@@ -369,6 +371,30 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Alt+Tab'), findsNothing);
     expect(picked, isNull);
+  });
+
+  testWidgets('the send-text button reports taps only while control is on',
+      (WidgetTester tester) async {
+    int taps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onSendText: () => ++taps,
+    ));
+
+    await tester.tap(find.byIcon(Icons.text_fields_rounded));
+    expect(taps, 0);
+
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      specialKeysAvailable: true,
+      onSendText: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.text_fields_rounded));
+    expect(taps, 1);
   });
 
   testWidgets('the picture menu reports quality, frame cap and encoder picks',

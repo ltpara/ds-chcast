@@ -60,6 +60,17 @@ namespace {
 // consuming the audio handed to it, so this doubles as the stall window.
 constexpr int64_t kStartupConfirmationMs = 5000;
 
+// The first arrival-anchored blocks carry session setup and decoder warm-up,
+// so anchoring on the first one schedules the whole session behind. Gather a
+// few blocks, anchor on the fastest arrival and keep only this margin for
+// jitter. The gathered blocks never had a slot and are skipped, so playback
+// begins on the corrected timeline instead of replaying the startup backlog.
+constexpr int64_t kAnchorGatherMarginMs = 5;
+constexpr int64_t kAnchorGatherMaxWaitMs = 300;
+// The measured startup pessimism is 33-58 ms; a single unusually fast block
+// must not move the anchor further than that or later blocks miss their slots.
+constexpr int64_t kAnchorGatherMaxShiftMs = 60;
+
 Error av_error(int code, const char* what) {
     char text[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(code, text, sizeof(text));
@@ -95,6 +106,11 @@ private:
         size_t frames = 0;
         size_t written = 0;
         uint64_t host_capture_ms = 0;
+        // Lead fixed when the block was queued. An adaptive raise must not
+        // delay blocks that are already on their way to the endpoint, or a
+        // partial block would hold half of its samples back and the endpoint
+        // could run dry between halves.
+        int64_t play_lead_ms = 0;
     };
 
     void thread_main();
@@ -115,6 +131,13 @@ private:
     size_t bytes_per_frame() const {
         return static_cast<size_t>(format_.channels) *
                (format_.format == AV_SAMPLE_FMT_FLT ? 4 : 2);
+    }
+    int64_t playout_lead_ms() const {
+        return static_cast<int64_t>(lead_ms_.load()) + jitter_ms_.load();
+    }
+    // Base clock offset plus the slow drift correction the controller added.
+    int64_t effective_offset_ms() const {
+        return offset_ms_.load() + drift_step_ms_.load();
     }
 
     AudioPlayerConfig config_;
@@ -154,7 +177,21 @@ private:
     uint64_t queued_frames_ = 0;
     bool have_pushed_ = false;
     bool primed_ = false;
+    // Startup anchor gather state; guarded by mutex_. Only one gather runs,
+    // before the first offset exists.
+    size_t gather_blocks_ = 0;
+    int64_t gather_first_latency_ms_ = 0;
+    int64_t gather_first_arrival_ms_ = 0;
+    int64_t gather_best_latency_ms_ = 0;
     int64_t last_end_local_ms_ = 0;
+    // End of the audio handed to the endpoint on the playout timeline. Unlike
+    // last_end_local_ms_ it survives underrun resets, so a dry stretch counts
+    // once in starved_ms_ no matter how many render wake-ups it spans.
+    int64_t played_end_ms_ = 0;
+    // Adaptive playout lead; only push() touches the controller, guarded by
+    // mutex_, and the render thread reads the atomic copy.
+    JitterLeadController jitter_;
+    PlayoutDriftController drift_;
     size_t fade_frames_ = 0;
     size_t fade_remaining_ = 0;
     bool applied_mute_ = false;
@@ -168,9 +205,24 @@ private:
     std::atomic<uint64_t> packets_{0};
     std::atomic<uint64_t> played_frames_{0};
     std::atomic<uint64_t> underruns_{0};
+    std::atomic<uint64_t> starved_ms_{0};
     std::atomic<uint64_t> dropped_{0};
     std::atomic<uint64_t> recoveries_{0};
     std::atomic<uint32_t> buffer_ms_{0};
+    std::atomic<uint64_t> playout_capture_ms_{0};
+    std::atomic<int64_t> playout_scheduled_ms_{0};
+    std::atomic<int64_t> slack_min_ms_{0};
+    std::atomic<int64_t> slack_max_ms_{0};
+    std::atomic<int64_t> slack_sum_ms_{0};
+    std::atomic<uint64_t> slack_blocks_{0};
+    std::atomic<uint64_t> slack_early_{0};
+    std::atomic<uint64_t> slack_late_{0};
+    std::atomic<int64_t> anchor_shift_ms_{0};
+    std::atomic<int64_t> jitter_ms_{0};
+    std::atomic<uint64_t> jitter_raises_{0};
+    std::atomic<uint64_t> jitter_decays_{0};
+    std::atomic<int64_t> drift_step_ms_{0};
+    std::atomic<uint64_t> drift_corrections_{0};
 };
 
 bool WasapiPlayer::start_thread(std::string* error) {
@@ -371,8 +423,22 @@ bool WasapiPlayer::open_endpoint(std::string* error) {
         queued_frames_ = 0;
         have_pushed_ = false;
         primed_ = false;
+        gather_blocks_ = 0;
+        gather_first_latency_ms_ = 0;
+        gather_first_arrival_ms_ = 0;
+        gather_best_latency_ms_ = 0;
         last_end_local_ms_ = 0;
+        played_end_ms_ = 0;
+        jitter_.reset();
+        jitter_ms_.store(0);
+        jitter_raises_.store(0);
+        jitter_decays_.store(0);
+        drift_.reset();
+        drift_step_ms_.store(0);
+        drift_corrections_.store(0);
         buffer_ms_.store(0);
+        playout_capture_ms_.store(0);
+        playout_scheduled_ms_.store(0);
     }
     return true;
 }
@@ -403,7 +469,10 @@ void WasapiPlayer::close_endpoint() {
         have_pushed_ = false;
         primed_ = false;
         last_end_local_ms_ = 0;
+        played_end_ms_ = 0;
         buffer_ms_.store(0);
+        playout_capture_ms_.store(0);
+        playout_scheduled_ms_.store(0);
     }
     render_.reset();
     volume_.reset();
@@ -597,7 +666,7 @@ bool WasapiPlayer::render() {
             // play while the queue waits. Prime it with silence once, up to
             // the lead, so blocks can be submitted a buffer early without
             // pulling the first sample forward.
-            const uint64_t lead_frames = static_cast<uint64_t>(lead_ms_.load()) *
+            const uint64_t lead_frames = static_cast<uint64_t>(playout_lead_ms()) *
                                          static_cast<uint64_t>(device_rate) / 1000u;
             const UINT32 prime = static_cast<UINT32>(
                 (std::min)(lead_frames, static_cast<uint64_t>(buffer_frames_)));
@@ -621,6 +690,12 @@ bool WasapiPlayer::render() {
             fade_remaining_ = fade_frames_;
             last_end_local_ms_ =
                 now + static_cast<int64_t>(prime) * 1000 / device_rate;
+            // The priming silence is the lead doing its job, not starvation;
+            // a zero-length prime leaves the timeline unset so the first block
+            // is not charged for the scheduling gap before it.
+            if (prime > 0) {
+                played_end_ms_ = (std::max)(played_end_ms_, last_end_local_ms_);
+            }
         }
         for (;;) {
             if (queue_.empty()) {
@@ -638,8 +713,8 @@ bool WasapiPlayer::render() {
 
             Block& head = queue_.front();
             const int64_t play_local =
-                static_cast<int64_t>(head.host_capture_ms) - offset_ms_.load() +
-                static_cast<int64_t>(lead_ms_.load());
+                static_cast<int64_t>(head.host_capture_ms) - effective_offset_ms() +
+                head.play_lead_ms;
             const int64_t duration_ms =
                 static_cast<int64_t>(head.frames) * 1000 / device_rate;
             if (play_local + duration_ms <= now) {
@@ -666,6 +741,13 @@ bool WasapiPlayer::render() {
 
             const size_t remaining = head.frames - head.written;
             const size_t write_frames = std::min<size_t>(remaining, available);
+            if (head.written == 0) {
+                // Report the block's scheduled start, not the chunk just
+                // written, so a partially rendered block does not move the
+                // playout latency forward on every render wake-up.
+                playout_capture_ms_.store(head.host_capture_ms);
+                playout_scheduled_ms_.store(play_local);
+            }
             BYTE* data = nullptr;
             hr = render_->GetBuffer(static_cast<UINT32>(write_frames), &data);
             if (FAILED(hr)) {
@@ -692,6 +774,13 @@ bool WasapiPlayer::render() {
             padding += static_cast<UINT32>(write_frames);
             const int64_t end_local =
                 play_local + static_cast<int64_t>(head.written) * 1000 / device_rate;
+            // Anything between the last written audio and this block's slot
+            // plays as silence. Counting the timeline gap here charges a long
+            // dry stretch once, whatever the render wake-up schedule was.
+            if (played_end_ms_ > 0 && play_local > played_end_ms_) {
+                starved_ms_.fetch_add(static_cast<uint64_t>(play_local - played_end_ms_));
+            }
+            played_end_ms_ = (std::max)(played_end_ms_, end_local);
             last_end_local_ms_ = (std::max)(last_end_local_ms_, end_local);
             if (head.written == head.frames) {
                 queue_.pop_front();
@@ -820,6 +909,40 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             return Error(Status::Unavailable,
                          error_.empty() ? std::string("audio playback is stopping") : error_);
         }
+        const size_t gather_target =
+            config_.arrival_anchored ? config_.anchor_gather_blocks : 0;
+        if (!have_offset_.load() && gather_target > 0) {
+            const int64_t arrival = wasapi::now_ms();
+            const int64_t latency = arrival - static_cast<int64_t>(audio.capture_ms);
+            if (gather_blocks_ == 0) {
+                gather_first_latency_ms_ = latency;
+                gather_first_arrival_ms_ = arrival;
+            }
+            if (gather_blocks_ == 0 || latency < gather_best_latency_ms_) {
+                gather_best_latency_ms_ = latency;
+            }
+            ++gather_blocks_;
+            if (gather_blocks_ < gather_target &&
+                arrival - gather_first_arrival_ms_ < kAnchorGatherMaxWaitMs) {
+                // Skipping the gathered blocks keeps the startup backlog from
+                // becoming a permanent lead over the video.
+                return Error::success();
+            }
+            const int64_t margin = gather_blocks_ > 1 ? kAnchorGatherMarginMs : 0;
+            const int64_t anchor_latency =
+                (std::max)(gather_best_latency_ms_ + margin,
+                           gather_first_latency_ms_ - kAnchorGatherMaxShiftMs);
+            offset_ms_.store(-anchor_latency);
+            have_offset_.store(true);
+            anchor_shift_ms_.store((std::max)(
+                int64_t{0}, gather_first_latency_ms_ - anchor_latency));
+            slack_min_ms_.store(0);
+            slack_max_ms_.store(0);
+            slack_sum_ms_.store(0);
+            slack_blocks_.store(0);
+            slack_early_.store(0);
+            slack_late_.store(0);
+        }
         if (!have_offset_.load()) {
             // No offset yet: anchor this block at its arrival, so playback
             // starts after the jitter buffer (default mode) or immediately
@@ -836,11 +959,76 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             offset_ms_.store(static_cast<int64_t>(audio.capture_ms) - wasapi::now_ms());
             queue_.clear();
             queued_frames_ = 0;
+            playout_capture_ms_.store(0);
+            playout_scheduled_ms_.store(0);
+            slack_min_ms_.store(0);
+            slack_max_ms_.store(0);
+            slack_sum_ms_.store(0);
+            slack_blocks_.store(0);
+            slack_early_.store(0);
+            slack_late_.store(0);
+            if (config_.adaptive_jitter) {
+                // The stall broke the timeline the learned lead was measured
+                // against; start the new anchor at zero lead so playback
+                // resumes at the lowest latency. Session counters stay.
+                jitter_.release(wasapi::now_ms());
+                jitter_ms_.store(0);
+            }
+        }
+        const int64_t arrival_ms = wasapi::now_ms();
+        int64_t schedule_local = static_cast<int64_t>(audio.capture_ms) -
+                                 effective_offset_ms() + playout_lead_ms();
+        int64_t slack = schedule_local - arrival_ms;
+        // The capture-anchored timeline can adapt too: `lead_ms` is the base
+        // jitter buffer and the controller adds up to its own ceiling on top
+        // when arrivals miss the scheduled slot.
+        if (config_.adaptive_jitter) {
+            const int64_t observed = jitter_.observe(slack, arrival_ms);
+            if (observed != jitter_ms_.load()) {
+                jitter_ms_.store(observed);
+                jitter_raises_.store(jitter_.raises());
+                jitter_decays_.store(jitter_.decays());
+                // The reporting block moves with the new lead instead of
+                // being dropped for the deficit it just measured.
+                schedule_local = static_cast<int64_t>(audio.capture_ms) -
+                                 effective_offset_ms() + playout_lead_ms();
+                slack = schedule_local - arrival_ms;
+            }
+        }
+        if (config_.clock_drift_correction && !config_.arrival_anchored) {
+            // The lead is removed so an adaptive raise cannot look like drift;
+            // the offset (including earlier drift steps) still shows up in the
+            // phase, which is what makes the controller converge.
+            const int64_t step =
+                drift_.observe(slack - playout_lead_ms(), arrival_ms);
+            if (step != 0) {
+                drift_step_ms_.fetch_add(step);
+                drift_corrections_.store(drift_.corrections());
+                // The reporting block follows the corrected offset instead of
+                // reporting the departure that was just applied.
+                schedule_local = static_cast<int64_t>(audio.capture_ms) -
+                                 effective_offset_ms() + playout_lead_ms();
+                slack = schedule_local - arrival_ms;
+            }
+        }
+        if (slack < slack_min_ms_.load()) {
+            slack_min_ms_.store(slack);
+        }
+        if (slack > slack_max_ms_.load()) {
+            slack_max_ms_.store(slack);
+        }
+        slack_sum_ms_.fetch_add(slack);
+        slack_blocks_.fetch_add(1);
+        if (slack > 20) {
+            slack_early_.fetch_add(1);
+        } else if (slack < -20) {
+            slack_late_.fetch_add(1);
         }
         Block block;
         block.pcm = std::move(pcm);
         block.frames = frames;
         block.host_capture_ms = audio.capture_ms;
+        block.play_lead_ms = playout_lead_ms();
         queue_.push_back(std::move(block));
         queued_frames_ += frames;
         have_pushed_ = true;
@@ -865,8 +1053,24 @@ void WasapiPlayer::set_clock_offset(int64_t host_minus_local_ms) {
     if (config_.arrival_anchored) {
         return;
     }
-    offset_ms_.store(host_minus_local_ms);
-    have_offset_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool had_offset = have_offset_.load();
+        const int64_t previous = offset_ms_.load();
+        // A large base change is a re-anchor rather than clock tracking: the
+        // drift reference belongs to the old timeline and the accumulated
+        // step is superseded by the fresh offset.
+        const int64_t change = host_minus_local_ms > previous
+                                   ? host_minus_local_ms - previous
+                                   : previous - host_minus_local_ms;
+        if (had_offset && change > 50) {
+            drift_.reset();
+            drift_step_ms_.store(0);
+            drift_corrections_.store(0);
+        }
+        offset_ms_.store(host_minus_local_ms);
+        have_offset_.store(true);
+    }
     if (event_) {
         SetEvent(event_);
     }
@@ -891,11 +1095,29 @@ AudioPlayerStats WasapiPlayer::stats() const {
     stats.packets = packets_.load();
     stats.played_frames = played_frames_.load();
     stats.underruns = underruns_.load();
+    stats.starved_ms = starved_ms_.load();
     stats.dropped = dropped_.load();
     stats.recoveries = recoveries_.load();
     stats.buffer_ms = buffer_ms_.load();
     stats.lead_ms = lead_ms_.load();
     stats.recovering = recovering_.load();
+    stats.playout_capture_ms = playout_capture_ms_.load();
+    stats.playout_scheduled_ms = playout_scheduled_ms_.load();
+    stats.slack_min_ms = slack_min_ms_.load();
+    stats.slack_max_ms = slack_max_ms_.load();
+    const uint64_t slack_blocks = slack_blocks_.load();
+    if (slack_blocks > 0) {
+        stats.slack_avg_ms =
+            static_cast<double>(slack_sum_ms_.load()) / static_cast<double>(slack_blocks);
+    }
+    stats.slack_early = slack_early_.load();
+    stats.slack_late = slack_late_.load();
+    stats.anchor_shift_ms = anchor_shift_ms_.load();
+    stats.jitter_ms = static_cast<uint32_t>((std::max)(int64_t{0}, jitter_ms_.load()));
+    stats.jitter_raises = jitter_raises_.load();
+    stats.jitter_decays = jitter_decays_.load();
+    stats.drift_ms = drift_step_ms_.load();
+    stats.drift_corrections = drift_corrections_.load();
     return stats;
 }
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 
 namespace chast_viewer {
@@ -255,6 +256,8 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
 
     slots_ = std::move(fresh);
     next_slot_ = 0;
+    last_slot_valid_ = false;
+    readback_.reset();
     enumerator_ = std::move(enumerator);
     processor_ = std::move(processor);
     pipeline_input_width_ = input.Width;
@@ -369,7 +372,74 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
     // context is ordered, so the next pass over this slot cannot overwrite it
     // before the copy has read it.
     set_texture_(output, slot.texture.get());
+    last_slot_ = next_slot_;
+    last_slot_valid_ = true;
     next_slot_ = (next_slot_ + 1) % kSlotCount;
+    return true;
+}
+
+bool GpuFrameSink::CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width,
+                               uint32_t& height, std::string* error) {
+    auto fail = [&](std::string message) {
+        if (error != nullptr) {
+            *error = std::move(message);
+        }
+        return false;
+    };
+    if (!ready_ || !device_ || !context_) {
+        return fail("the display sink is not ready");
+    }
+    if (!last_slot_valid_ || !slots_[last_slot_].texture) {
+        return fail("no remote picture has been rendered yet");
+    }
+
+    ID3D11Texture2D* texture = slots_[last_slot_].texture.get();
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        return fail("the display surface is not BGRA");
+    }
+
+    if (readback_) {
+        D3D11_TEXTURE2D_DESC existing{};
+        readback_->GetDesc(&existing);
+        if (existing.Width != desc.Width || existing.Height != desc.Height) {
+            readback_.reset();
+        }
+    }
+    if (!readback_) {
+        D3D11_TEXTURE2D_DESC staging = desc;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.BindFlags = 0;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging.MiscFlags = 0;
+        const HRESULT hr = device_->CreateTexture2D(&staging, nullptr, readback_.put());
+        if (FAILED(hr) || !readback_) {
+            return fail(fail_hr("CreateTexture2D(readback)", hr));
+        }
+    }
+
+    context_->CopyResource(readback_.get(), texture);
+    if (!wait_for_gpu()) {
+        return fail(this->error());
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT hr = context_->Map(readback_.get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || mapped.pData == nullptr) {
+        return fail(fail_hr("Map(readback)", hr));
+    }
+    width = desc.Width;
+    height = desc.Height;
+    const size_t row = static_cast<size_t>(width) * 4;
+    bgra.resize(row * height);
+    for (uint32_t y = 0; y < height; ++y) {
+        std::memcpy(bgra.data() + static_cast<size_t>(y) * row,
+                    static_cast<const uint8_t*>(mapped.pData) +
+                        static_cast<size_t>(y) * mapped.RowPitch,
+                    row);
+    }
+    context_->Unmap(readback_.get(), 0);
     return true;
 }
 

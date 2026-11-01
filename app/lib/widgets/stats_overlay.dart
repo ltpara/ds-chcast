@@ -134,6 +134,12 @@ class StatsOverlay extends StatelessWidget {
               tr('缓冲'),
               tr('{p27} ms · 收 {p28}{p30}{p32}', <String, Object?>{'p27': status.audioBufferMs, 'p28': status.audioReceived, 'p30': status.audioUnderruns > 0 ? tr(' · 欠载 {p29}', <String, Object?>{'p29': status.audioUnderruns}) : '', 'p32': status.audioRecoveries > 0 ? tr(' · 恢复 {p31}', <String, Object?>{'p31': status.audioRecoveries}) : ''}),
             ),
+            _row(
+              tr('音画'),
+              status.audioLatencyMs >= 0
+                  ? tr('音频 {p45} ms · 空转 {p47} ms · 丢 {p48} · 差 {p46} ms', <String, Object?>{'p45': status.audioLatencyMs.toStringAsFixed(0), 'p46': status.avSkewMs == -1 ? '—' : status.avSkewMs.toStringAsFixed(0), 'p47': status.audioStarvedMs, 'p48': status.audioDropped})
+                  : '—',
+            ),
           ] else
             _row(
               tr('音频'),

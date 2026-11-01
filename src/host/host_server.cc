@@ -1322,6 +1322,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             audio_config.device_id = settings_.audio_device;
             audio_config.reference = audio_reference;
             audio_config.echo_cancellation = audio_aec;
+            audio_config.silence_gate_ms = config_.audio_silence_gate_ms;
             audio_capture = create_loopback_capture(audio_config, &audio_error);
         }
         if (audio_capture) {
@@ -1758,8 +1759,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     continue;
                 }
                 if (sent.status() == Status::WaitTimeout) {
-                    // The shared send queue is full; video owns the path and
-                    // this packet is a short gap, not a reason to stop audio.
+                    // No room on the transport right now (a full shared send
+                    // queue, or a datagram that exceeds the current path
+                    // budget); video owns the path and this packet is a short
+                    // gap, not a reason to stop audio.
                     ++audio_send_drops;
                     continue;
                 }
@@ -2941,6 +2944,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 return true;
             }
             stats.target_bitrate = decision.target_bps;
+            if (stats.lowest_target_bitrate == 0 ||
+                decision.target_bps < stats.lowest_target_bitrate) {
+                stats.lowest_target_bitrate = decision.target_bps;
+            }
             stats.framerate = decision.framerate;
             ++stats.abr_changes;
             // The capture cadence has to follow the rate the encoder now
@@ -3190,6 +3197,15 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 config_.chat_message(chat_text);
             }
         }
+        std::string injected_text;
+        while (session_->take_text_input(injected_text)) {
+            ++stats.text_received;
+            log("text input: received " + std::to_string(injected_text.size()) +
+                " bytes");
+            if (config_.text_input) {
+                config_.text_input(injected_text);
+            }
+        }
         {
             std::deque<std::string> outbox;
             {
@@ -3316,9 +3332,28 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (frame_interval != Clock::duration::zero()) {
             const auto wait_now = Clock::now();
             if (next_frame_due > wait_now) {
-                if (!sleep_unless_stopping(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(next_frame_due -
-                                                                            wait_now))) {
+                // Audio leaves the host close to its capture time only if the
+                // pump runs between video frames: one drain per frame turns
+                // the pacing interval into burstiness, and the viewer has to
+                // anchor playback after the slowest arrival or drop packets.
+                // Slice the wait into short pumps; the deadline stays
+                // absolute so the video frame rate is unchanged.
+                bool stopped = false;
+                while (next_frame_due > Clock::now()) {
+                    const auto remaining = next_frame_due - Clock::now();
+                    const auto slice = (std::min)(
+                        remaining,
+                        std::chrono::duration_cast<Clock::duration>(
+                            std::chrono::milliseconds(5)));
+                    if (!sleep_unless_stopping(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(slice))) {
+                        stopped = true;
+                        break;
+                    }
+                    drain_audio();
+                    drain_microphone();
+                }
+                if (stopped) {
                     break;
                 }
             }
@@ -3332,9 +3367,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 
         // A running camera needs the session loop's pump to run at the camera
         // rate even when the desktop is static; the idle capture wait would
-        // starve it to 10 fps.
-        const CaptureResult result =
-            capturer->capture(std::chrono::milliseconds(camera.streaming() ? 10 : 100));
+        // starve it to 10 fps. System audio needs the same pump: the loopback
+        // endpoint produces every few milliseconds, and sending only at video
+        // frame boundaries makes the viewer drain whole bursts, which either
+        // starves the playback endpoint or forces it to buffer a frame.
+        const bool audio_active = audio_capture != nullptr;
+        const CaptureResult result = capturer->capture(
+            std::chrono::milliseconds(camera.streaming() ? 10 : (audio_active ? 5 : 100)));
         const auto captured_at = Clock::now();
         // The endpoint keeps producing while capture waits for the next
         // present; drain here so audio does not wait behind a slow frame.
@@ -4267,7 +4306,7 @@ void HostServer::drain_file_browse(HostServerStats& stats) {
 }
 
 void HostServer::send_file_failure(const std::string& message, bool report,
-                                   HostServerStats& stats) {
+                                   HostServerStats& stats, bool cancelled) {
     uint32_t transfer_id = 0;
     std::string name;
     {
@@ -4289,13 +4328,44 @@ void HostServer::send_file_failure(const std::string& message, bool report,
         send_.counted = true;
     }
     download_stream_.close();
-    ++stats.file_send_failures;
+    if (cancelled) {
+        ++stats.file_send_cancels;
+    } else {
+        ++stats.file_send_failures;
+    }
     if (report) {
         // The receiver would otherwise wait for a stream that never ends.
         (void)session_->send_file_cancel(transfer_id, FileCode::Cancelled, message);
         session_->cancel_file_upload(transfer_id);
     }
-    log("file: sending " + name + " failed: " + message);
+    log("file: sending " + name + (cancelled ? " cancelled: " : " failed: ") + message);
+    publish_download();
+    publish_stats(stats);
+}
+
+void HostServer::note_file_send_error(const std::string& message, bool report,
+                                      HostServerStats& stats) {
+    {
+        std::lock_guard<std::mutex> lock(download_mutex_);
+        switch (send_.stage) {
+            case FileSend::Stage::kOffered:
+            case FileSend::Stage::kSending:
+            case FileSend::Stage::kFinishing:
+                break;
+            default:
+                return;
+        }
+        // A viewer that cancels aborts its receive stream before the host
+        // drains its FileResult, so the next write can fail first. Hold the
+        // error until the grace expires; the kFailed branch in
+        // drive_file_download() claims it as a cancel if one is queued.
+        send_.stage = FileSend::Stage::kFailed;
+        send_.error = message;
+        send_.counted = false;
+        send_.report_failure = report;
+        send_.failure_deadline = Clock::now() + std::chrono::milliseconds(1000);
+    }
+    download_stream_.close();
     publish_download();
     publish_stats(stats);
 }
@@ -4384,17 +4454,63 @@ void HostServer::drive_file_download(HostServerStats& stats) {
         return;
     }
     if (snapshot.stage == FileSend::Stage::kFailed) {
-        bool first = false;
+        // A failed write may be a viewer cancel in flight: its reset reaches
+        // us before the FileResult. Collect the queues first, then count a
+        // cancel immediately or a real failure once the grace expires.
+        uint32_t transfer_id = 0;
+        bool pending = false;
         {
             std::lock_guard<std::mutex> lock(download_mutex_);
-            if (send_.stage == FileSend::Stage::kFailed && !send_.counted) {
+            pending = send_.stage == FileSend::Stage::kFailed && !send_.counted;
+            transfer_id = send_.transfer_id;
+        }
+        bool cancelled = false;
+        if (pending) {
+            FileResult result;
+            while (session_->take_file_result(result)) {
+                if (result.transfer_id == transfer_id &&
+                    result.code == FileCode::Cancelled) {
+                    cancelled = true;
+                }
+            }
+            FileCancel cancel;
+            while (session_->take_file_cancel(cancel)) {
+                if (cancel.transfer_id == transfer_id) {
+                    cancelled = true;
+                }
+            }
+        }
+        bool first = false;
+        bool as_cancel = false;
+        bool report = false;
+        std::string message;
+        {
+            std::lock_guard<std::mutex> lock(download_mutex_);
+            if (send_.stage == FileSend::Stage::kFailed && !send_.counted &&
+                (cancelled || Clock::now() >= send_.failure_deadline)) {
                 send_.counted = true;
                 first = true;
+                as_cancel = cancelled;
+                report = send_.report_failure;
+                if (as_cancel) {
+                    send_.error = "the viewer cancelled the download";
+                }
+                message = send_.error;
             }
         }
         if (first) {
-            ++stats.file_send_failures;
-            log("file: " + snapshot.name + " failed: " + snapshot.error);
+            if (as_cancel) {
+                ++stats.file_send_cancels;
+                log("file: sending " + snapshot.name + " cancelled: " + message);
+            } else {
+                ++stats.file_send_failures;
+                log("file: " + snapshot.name + " failed: " + message);
+                if (report) {
+                    (void)session_->send_file_cancel(transfer_id, FileCode::Cancelled,
+                                                     message);
+                    session_->cancel_file_upload(transfer_id);
+                }
+            }
             publish_download();
             publish_stats(stats);
         }
@@ -4432,9 +4548,13 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             log("file: sent " + snapshot.name + " (" +
                 std::to_string(result.received) + " bytes)");
         } else {
-            send_file_failure(
-                result.reason.empty() ? "the viewer rejected the file" : result.reason,
-                false, stats);
+            const bool cancelled = result.code == FileCode::Cancelled;
+            std::string reason = result.reason;
+            if (reason.empty()) {
+                reason = cancelled ? "the viewer cancelled the download"
+                                   : "the viewer rejected the file";
+            }
+            send_file_failure(reason, false, stats, cancelled);
         }
         publish_download();
         publish_stats(stats);
@@ -4455,7 +4575,7 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             send_file_failure(
                 cancel.reason.empty() ? "the viewer cancelled the download"
                                       : cancel.reason,
-                false, stats);
+                false, stats, true);
             return;
         }
     }
@@ -4573,7 +4693,7 @@ void HostServer::drive_file_download(HostServerStats& stats) {
                     break;
                 }
                 if (!wrote.ok()) {
-                    send_file_failure("send: " + wrote.to_string(), true, stats);
+                    note_file_send_error("send: " + wrote.to_string(), true, stats);
                     return;
                 }
                 sent_bytes += static_cast<uint64_t>(got);
@@ -4587,7 +4707,7 @@ void HostServer::drive_file_download(HostServerStats& stats) {
             if (sent_bytes >= snapshot.size) {
                 Error finished = session_->finish_file_upload(snapshot.transfer_id);
                 if (!finished.ok()) {
-                    send_file_failure("finish: " + finished.to_string(), true, stats);
+                    note_file_send_error("finish: " + finished.to_string(), true, stats);
                     return;
                 }
                 {

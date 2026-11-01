@@ -69,12 +69,34 @@ class AppLanguage {
     if (file == null) {
       return;
     }
+    // Other preferences (the picture choices) share this file, so a language
+    // change merges instead of replacing the whole map.
+    final Map<String, Object?> payload = _readMap()..['language'] = code;
     try {
       file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(<String, Object?>{'language': code}));
+      file.writeAsStringSync(jsonEncode(payload));
     } catch (_) {
       // Language is a preference; failing to persist it is not fatal.
     }
+  }
+
+  static Map<String, Object?> _readMap() {
+    final File? file = _file();
+    if (file == null) {
+      return <String, Object?>{};
+    }
+    try {
+      if (!file.existsSync()) {
+        return <String, Object?>{};
+      }
+      final Object? decoded = jsonDecode(file.readAsStringSync());
+      if (decoded is Map<String, Object?>) {
+        return Map<String, Object?>.of(decoded);
+      }
+    } catch (_) {
+      // A corrupt settings file must not stop the viewer from starting.
+    }
+    return <String, Object?>{};
   }
 
   static File? _file() {

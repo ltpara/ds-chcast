@@ -2517,6 +2517,7 @@ void main() {
       ' dlbox ',
       name: '下载机',
       tags: <String>['lab', ' lab ', 'vip'],
+      ifRevision: 9,
     );
     expect(added.id, 'dlbox');
     expect(added.name, '下载机');
@@ -2536,7 +2537,7 @@ void main() {
       'POST /v1/addressbook/shared/carol/grants '
           '{"username":"dave","permission":"write"}',
       'POST /v1/addressbook/shared/carol/peers '
-          '{"id":"dlbox","name":"下载机","tags":["lab","vip"]}',
+          '{"id":"dlbox","name":"下载机","tags":["lab","vip"],"if_revision":9}',
       'DELETE /v1/addressbook/shared/carol/grants/Dave ',
     ]);
     await expectLater(

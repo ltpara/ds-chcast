@@ -54,6 +54,7 @@ target_link_libraries(chast.security PUBLIC chast.base bcrypt crypt32)
 
 add_library(chast.dxgi STATIC
     src/win/com.cc
+    src/win/png_writer.cc
     src/capture/display.cc
     src/capture/display_mode.cc
     src/capture/rotation.cc
@@ -78,6 +79,7 @@ target_link_libraries(chast.dxgi PUBLIC
     user32
     gdi32
     ole32
+    windowscodecs
     delayimp
     d3dcompiler)
 
@@ -375,6 +377,11 @@ if(CHAST_BUILD_TESTS)
     target_include_directories(chast-cursor-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(chast-cursor-test PRIVATE chast.dxgi)
 
+    # PNG writing for screenshots: signature, decoded pixels and alpha forcing
+    # through WIC. No GPU, no network.
+    add_executable(chast-png-writer-test tests/png_writer_test.cc)
+    target_link_libraries(chast-png-writer-test PRIVATE chast.dxgi ole32 windowscodecs)
+
     # The viewer's sprite installer: validation, the scaled-handle cache and
     # release. Builds handles from a screen DC only, so it needs no desktop.
     add_executable(chast-remote-cursor-test tests/remote_cursor_test.cc
@@ -420,6 +427,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-audio-dsp-test tests/audio_dsp_test.cc)
     target_link_libraries(chast-audio-dsp-test PRIVATE chast.audio)
 
+    # Adaptive playout lead for arrival-anchored audio: windowed slack,
+    # hysteresis, the raise ceiling and the give-back. No device.
+    add_executable(chast-audio-playout-test tests/audio_playout_test.cc)
+    target_link_libraries(chast-audio-playout-test PRIVATE chast.audio)
+
     # Receive-side file handling: name sanitizing, resumable .part files and
     # digest verification, all inside a temporary directory.
     add_executable(chast-file-transfer-test tests/file_transfer_test.cc)
@@ -442,6 +454,7 @@ if(CHAST_BUILD_TESTS)
 
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
+    add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
     add_test(NAME desktop COMMAND chast-desktop-test)
@@ -453,6 +466,7 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME bitrate COMMAND chast-bitrate-test)
     add_test(NAME audio COMMAND chast-audio-codec-test)
     add_test(NAME audio_dsp COMMAND chast-audio-dsp-test)
+    add_test(NAME audio_playout COMMAND chast-audio-playout-test)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
     add_test(NAME carrier COMMAND chast-carrier-test)
 
@@ -581,4 +595,13 @@ if(CHAST_BUILD_TESTS)
         COMMAND chast-quic verify --port 45511 --seconds 4
                 --record .chast-quic-record-hevc-test.mp4 --codec hevc --quiet)
     set_tests_properties(quic_recording_hevc PROPERTIES TIMEOUT 120)
+    # The documented weak-network acceptance as an automated loop: an
+    # in-process relay sits between the viewer (--port) and the host
+    # (--port + 1) and adds 80 ms + 20 ms jitter, 3% loss and a 1 Mbps
+    # bottleneck for eight seconds, then goes clean. The 3 Mbps stream must
+    # stay intact while the ABR cuts below the bottleneck and climbs back,
+    # and every decision must re-announce the stream.
+    add_test(NAME quic_weak_network
+        COMMAND chast-quic verify --port 45513 --netem --quiet)
+    set_tests_properties(quic_weak_network PROPERTIES TIMEOUT 180)
 endif()

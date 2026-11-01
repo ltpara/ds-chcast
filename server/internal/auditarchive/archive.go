@@ -5,10 +5,14 @@ package auditarchive
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,7 +31,27 @@ const batch = 500
 type Options struct {
 	Compress      bool
 	RetentionDays int
+	// RemoteURL enables HTTP delivery of closed archive files: every closed
+	// file is PUT to <RemoteURL>/<file name>. Delivery is at-least-once; a
+	// successful upload writes a <file>.delivered marker next to it so later
+	// passes skip it. While delivery is enabled an expired file is kept until
+	// its marker exists, so retention never deletes evidence that has not
+	// reached the remote sink.
+	RemoteURL string
+	// RemoteToken is sent as "Authorization: Bearer <token>" with every
+	// upload. Empty sends no Authorization header.
+	RemoteToken string
+	// S3 selects native AWS Signature Version 4 delivery to an S3-compatible
+	// endpoint and replaces RemoteURL/RemoteToken: every closed file is PUT to
+	// <endpoint>/<bucket>/<file> with a signed Authorization header. Delivery
+	// stays at-least-once and the local copy is kept until the marker exists.
+	S3 *S3Options
 }
+
+// deliveredSuffix marks an archive file the remote endpoint accepted. The
+// suffix keeps the marker out of splitArchiveName, so markers are never
+// mistaken for archives or uploaded.
+const deliveredSuffix = ".delivered"
 
 // Archiver appends new history rows to one JSONL file per stream and UTC day.
 // Checkpoints live in the account database and advance only after the file
@@ -40,10 +64,20 @@ type Archiver struct {
 	opts   Options
 	now    func() time.Time
 	mu     sync.Mutex
+
+	// Remote delivery. remote is empty when disabled; client and retryDelay
+	// are fields so tests can run without real waits. s3 is non-nil when the
+	// target is signed with SigV4; remote then holds the unsigned bucket URL
+	// for operators and logs.
+	remote      string
+	remoteToken string
+	s3          *s3Signer
+	client      *http.Client
+	retryDelay  func(attempt int) time.Duration
 }
 
 // Result reports how many rows one pass copied and which closed files it
-// compressed or removed.
+// compressed, removed or uploaded.
 type Result struct {
 	Audit         int
 	Connections   int
@@ -51,6 +85,10 @@ type Result struct {
 	Files         []string
 	Compressed    []string
 	Pruned        []string
+	Delivered     []string
+	// DeliveryError is the first upload failure of this pass. The file stays
+	// pending and the next pass retries it.
+	DeliveryError string
 }
 
 func New(dir string, store *account.Store, logger *slog.Logger, opts Options) (*Archiver, error) {
@@ -74,7 +112,73 @@ func New(dir string, store *account.Store, logger *slog.Logger, opts Options) (*
 	if opts.RetentionDays < 0 {
 		return nil, fmt.Errorf("audit archive retention days must not be negative")
 	}
-	return &Archiver{dir: abs, store: store, logger: logger, opts: opts, now: time.Now}, nil
+	remote, err := normalizeRemote(opts.RemoteURL)
+	if err != nil {
+		return nil, err
+	}
+	if opts.RemoteToken != "" && remote == "" {
+		return nil, fmt.Errorf("audit archive remote token needs a remote URL")
+	}
+	if opts.S3 != nil && (remote != "" || opts.RemoteToken != "") {
+		return nil, fmt.Errorf("audit archive remote URL and S3 delivery are mutually exclusive")
+	}
+	archiver := &Archiver{dir: abs, store: store, logger: logger, opts: opts, now: time.Now}
+	if opts.S3 != nil {
+		signer, signErr := newS3Signer(*opts.S3)
+		if signErr != nil {
+			return nil, signErr
+		}
+		archiver.s3 = signer
+		archiver.remote = signer.bucketURL()
+	}
+	if remote != "" {
+		archiver.remote = remote
+		archiver.remoteToken = opts.RemoteToken
+	}
+	if archiver.remote != "" {
+		archiver.client = &http.Client{
+			Timeout: 2 * time.Minute,
+			// Every upload carries a one-shot body (and, for S3, a signature
+			// bound to the original host and path), so a redirect can never be
+			// replayed safely. Surface 3xx as a delivery error instead of
+			// letting net/http try.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		archiver.retryDelay = func(attempt int) time.Duration {
+			return time.Duration(attempt) * time.Second
+		}
+	}
+	return archiver, nil
+}
+
+// normalizeRemote validates the upload base URL. Credentials, queries and
+// fragments are refused: appending a file name to them would produce the
+// wrong target, and credentials belong in the token option so they never end
+// up in a log line.
+func normalizeRemote(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("audit archive remote URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("audit archive remote URL must be http or https")
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("audit archive remote URL has no host")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("audit archive remote URL must not carry credentials; use the remote token option")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("audit archive remote URL must not carry a query or fragment")
+	}
+	return strings.TrimRight(raw, "/"), nil
 }
 
 func (a *Archiver) Dir() string { return a.dir }
@@ -126,7 +230,180 @@ func (a *Archiver) Run() (Result, error) {
 			return result, fmt.Errorf("archive %s: %w", step.stream, err)
 		}
 	}
+	if a.remote != "" {
+		a.deliver(day, &result)
+	}
 	return result, nil
+}
+
+// Remote reports the upload base URL, empty when delivery is disabled.
+func (a *Archiver) Remote() string { return a.remote }
+
+// deliver uploads every closed-day archive that the remote endpoint has not
+// accepted yet. Files are independent: the first failure is recorded and the
+// rest stay pending, so a broken endpoint cannot stall the archive pass or
+// lose the local copy.
+func (a *Archiver) deliver(today string, result *Result) {
+	entries, err := os.ReadDir(a.dir)
+	if err != nil {
+		result.DeliveryError = "scan: " + err.Error()
+		a.logger.Warn("audit archive: cannot scan the directory for delivery", "error", err)
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		_, day, _, ok := splitArchiveName(entry.Name())
+		if !ok || day >= today {
+			continue
+		}
+		path := filepath.Join(a.dir, entry.Name())
+		if deliveredMarkerExists(path) {
+			continue
+		}
+		if err := a.upload(path); err != nil {
+			result.DeliveryError = entry.Name() + ": " + err.Error()
+			a.logger.Warn("audit archive: remote delivery failed", "file", entry.Name(),
+				"remote", a.remote, "error", err)
+			return
+		}
+		result.Delivered = append(result.Delivered, entry.Name())
+	}
+}
+
+// upload PUTs one file and writes the marker only after a 2xx answer. A
+// failed upload leaves the file pending for the next pass; retries within the
+// pass cover a transient receiver error.
+func (a *Archiver) upload(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	digest, err := fileSHA256(path)
+	if err != nil {
+		return err
+	}
+	name := filepath.Base(path)
+	target := a.targetFor(name)
+	var lastErr error
+	const attempts = 3
+	for attempt := 1; attempt <= attempts; attempt++ {
+		lastErr = a.putFile(target, path, name, info.Size(), digest)
+		if lastErr == nil {
+			return writeDeliveredMarker(path, deliveredMarker{
+				File:        name,
+				Bytes:       info.Size(),
+				SHA256:      digest,
+				DeliveredAt: a.now().UTC().Format(time.RFC3339),
+				URL:         target,
+			})
+		}
+		if attempt < attempts {
+			time.Sleep(a.retryDelay(attempt))
+		}
+	}
+	return lastErr
+}
+
+// targetFor returns the object URL for one archive file: a signed S3 object
+// when S3 delivery is configured, otherwise the plain HTTP sink URL.
+func (a *Archiver) targetFor(name string) string {
+	if a.s3 != nil {
+		return a.s3.target(name)
+	}
+	return a.remote + "/" + url.PathEscape(name)
+}
+
+func (a *Archiver) putFile(target, path, name string, size int64, digest string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	request, err := http.NewRequest(http.MethodPut, target, file)
+	if err != nil {
+		return err
+	}
+	// A file body has no automatic length; without it the receiver cannot
+	// distinguish a truncated upload from a complete one.
+	request.ContentLength = size
+	request.Header.Set("Content-Type", contentTypeFor(name))
+	if a.s3 != nil {
+		// The digest is the payload hash, so SigV4 never re-reads the file.
+		a.s3.sign(request, digest, a.now())
+	} else {
+		request.Header.Set("X-Chast-Audit-Sha256", digest)
+		request.Header.Set("Idempotency-Key", name)
+		if a.remoteToken != "" {
+			request.Header.Set("Authorization", "Bearer "+a.remoteToken)
+		}
+	}
+	response, err := a.client.Do(request)
+	if err != nil {
+		return err
+	}
+	io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return fmt.Errorf("receiver answered %s", response.Status)
+	}
+	return nil
+}
+
+func contentTypeFor(name string) string {
+	if strings.HasSuffix(name, ".gz") {
+		return "application/gzip"
+	}
+	return "application/x-ndjson"
+}
+
+func fileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+type deliveredMarker struct {
+	File        string `json:"file"`
+	Bytes       int64  `json:"bytes"`
+	SHA256      string `json:"sha256"`
+	DeliveredAt string `json:"delivered_at"`
+	URL         string `json:"url"`
+}
+
+// writeDeliveredMarker publishes the marker atomically: a half-written marker
+// would be read as "already delivered" and skip the upload forever.
+func writeDeliveredMarker(path string, marker deliveredMarker) error {
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	markerPath := path + deliveredSuffix
+	tmp := markerPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, markerPath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func deliveredMarkerExists(path string) bool {
+	_, err := os.Stat(path + deliveredSuffix)
+	return err == nil
 }
 
 // compact gzips every closed-day JSONL file and removes files outside the
@@ -157,10 +434,19 @@ func (a *Archiver) compact(now time.Time, today string, result *Result) {
 		}
 		path := filepath.Join(a.dir, entry.Name())
 		if cutoff != "" && day < cutoff {
+			// With remote delivery enabled, evidence leaves the disk only after
+			// the receiver accepted it. An undelivered file is retried by the
+			// delivery step of this pass and pruned on a later one.
+			if a.remote != "" && !deliveredMarkerExists(path) {
+				continue
+			}
 			if err := os.Remove(path); err != nil {
 				a.logger.Warn("audit archive: cannot prune", "file", entry.Name(), "error", err)
 				continue
 			}
+			// Best effort: an orphaned marker is ignored by the uploader and
+			// harmless, but leaving it would hide a later file of the same name.
+			os.Remove(path + deliveredSuffix)
 			result.Pruned = append(result.Pruned, entry.Name())
 			continue
 		}
@@ -172,6 +458,9 @@ func (a *Archiver) compact(now time.Time, today string, result *Result) {
 			continue
 		}
 		result.Compressed = append(result.Compressed, entry.Name()+".gz")
+		// The .gz is a new object for the uploader. A marker left over from a
+		// plain file delivered before compression was enabled must not hide it.
+		os.Remove(path + deliveredSuffix)
 	}
 }
 

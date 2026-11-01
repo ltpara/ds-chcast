@@ -334,6 +334,82 @@ void main() {
     expect(writes, <String>['ops/null/team@4']);
   });
 
+  testWidgets('dragging a group reorders its siblings', (tester) async {
+    final List<String> writes = <String>[];
+    const List<AddressBookGroup> flat = <AddressBookGroup>[
+      AddressBookGroup(id: 'alpha', name: 'Alpha', position: 1, revision: 2),
+      AddressBookGroup(id: 'beta', name: 'Beta', position: 2, revision: 3),
+    ];
+    final GroupsDialog dialog = GroupsDialog(
+      server: settings,
+      token: 'account-token',
+      groups: flat,
+      rename:
+          (ServerSettings server, String token, String groupId, String? name,
+              {String? parentId, int? position, int? ifRevision}) async {
+        writes.add('$groupId/$position@$ifRevision');
+        final AddressBookGroup old = flat.firstWhere(
+          (AddressBookGroup group) => group.id == groupId,
+        );
+        return AddressBookGroup(
+          id: groupId,
+          name: name ?? old.name,
+          parentId: parentId ?? old.parentId,
+          position: position ?? old.position,
+          revision: (ifRevision ?? old.revision) + 1,
+        );
+      },
+    );
+    await open(tester, dialog);
+
+    final Offset start =
+        tester.getCenter(find.byKey(const Key('group-drag-beta')));
+    final Offset end =
+        tester.getCenter(find.byKey(const Key('group-row-alpha')));
+    final TestGesture gesture = await tester.startGesture(start);
+    await tester.pump();
+    await gesture.moveTo(end);
+    await tester.pump();
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(writes, <String>['beta/1@3', 'alpha/2@2']);
+  });
+
+  testWidgets('dragging across parents is ignored', (tester) async {
+    final List<String> writes = <String>[];
+    const List<AddressBookGroup> nested = <AddressBookGroup>[
+      AddressBookGroup(id: 'team', name: 'Team', revision: 2),
+      AddressBookGroup(id: 'dev', name: 'Dev', parentId: 'team', revision: 3),
+      AddressBookGroup(id: 'ops', name: 'Ops', revision: 4),
+    ];
+    final GroupsDialog dialog = GroupsDialog(
+      server: settings,
+      token: 'account-token',
+      groups: nested,
+      rename:
+          (ServerSettings server, String token, String groupId, String? name,
+              {String? parentId, int? position, int? ifRevision}) async {
+        writes.add('$groupId/$position');
+        return AddressBookGroup(id: groupId, name: name ?? '');
+      },
+    );
+    await open(tester, dialog);
+
+    final Offset start =
+        tester.getCenter(find.byKey(const Key('group-drag-dev')));
+    final Offset end =
+        tester.getCenter(find.byKey(const Key('group-row-ops')));
+    final TestGesture gesture = await tester.startGesture(start);
+    await tester.pump();
+    await gesture.moveTo(end);
+    await tester.pump();
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(writes, isEmpty);
+  });
+
   testWidgets('the parent picker hides the group and its descendants', (
     tester,
   ) async {

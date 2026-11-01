@@ -6,28 +6,31 @@ import '../server_settings.dart';
 import '../theme.dart';
 import 'package:chast_viewer/l10n.dart';
 
-typedef GroupWriter = Future<AddressBookGroup> Function(
-  ServerSettings settings,
-  String token,
-  String groupId,
-  String? name, {
-  String? parentId,
-  int? position,
-  int? ifRevision,
-});
-typedef GroupDeleter = Future<void> Function(
-  ServerSettings settings,
-  String token,
-  String groupId, {
-  int? ifRevision,
-});
+typedef GroupWriter =
+    Future<AddressBookGroup> Function(
+      ServerSettings settings,
+      String token,
+      String groupId,
+      String? name, {
+      String? parentId,
+      int? position,
+      int? ifRevision,
+    });
+typedef GroupDeleter =
+    Future<void> Function(
+      ServerSettings settings,
+      String token,
+      String groupId, {
+      int? ifRevision,
+    });
 typedef GroupReloader = Future<List<AddressBookGroup>> Function();
 
 /// Creates, edits, reorders and deletes groups in the signed-in account's
 /// address book. Groups form a shallow tree: an edit dialog picks the parent,
-/// and the arrow buttons move a group among its siblings. The dialog returns
-/// true when any group was changed so the caller can resync peers (deleting a
-/// group moves its peers back to ungrouped and promotes its child groups).
+/// the arrow buttons move a group among its siblings, and dragging the handle
+/// reorders siblings (never across parents). The dialog returns true when any
+/// group was changed so the caller can resync peers (deleting a group moves
+/// its peers back to ungrouped and promotes its child groups).
 class GroupsDialog extends StatefulWidget {
   const GroupsDialog({
     super.key,
@@ -79,10 +82,8 @@ class _GroupsDialogState extends State<GroupsDialog> {
   Future<void> _create() async {
     final _GroupEditorResult? result = await showDialog<_GroupEditorResult>(
       context: context,
-      builder: (BuildContext context) => _GroupEditorDialog(
-        title: tr('新建分组'),
-        groups: _groups,
-      ),
+      builder: (BuildContext context) =>
+          _GroupEditorDialog(title: tr('新建分组'), groups: _groups),
     );
     if (result == null || !mounted) {
       return;
@@ -92,12 +93,12 @@ class _GroupsDialogState extends State<GroupsDialog> {
     await _run(() async {
       final AddressBookGroup group =
           await (widget.create ?? ServerApi.updateAddressBookGroup)(
-        widget.server,
-        widget.token,
-        id,
-        result.name,
-        parentId: result.parentId.isEmpty ? null : result.parentId,
-      );
+            widget.server,
+            widget.token,
+            id,
+            result.name,
+            parentId: result.parentId.isEmpty ? null : result.parentId,
+          );
       _upsert(group);
     });
   }
@@ -121,13 +122,13 @@ class _GroupsDialogState extends State<GroupsDialog> {
       try {
         final AddressBookGroup updated =
             await (widget.rename ?? ServerApi.updateAddressBookGroup)(
-          widget.server,
-          widget.token,
-          group.id,
-          result.name == group.name ? null : result.name,
-          parentId: result.parentId,
-          ifRevision: group.revision > 0 ? group.revision : null,
-        );
+              widget.server,
+              widget.token,
+              group.id,
+              result.name == group.name ? null : result.name,
+              parentId: result.parentId,
+              ifRevision: group.revision > 0 ? group.revision : null,
+            );
         _upsert(updated);
       } on ServerApiException catch (error) {
         if (error.statusCode != 409) {
@@ -153,6 +154,40 @@ class _GroupsDialogState extends State<GroupsDialog> {
     final List<AddressBookGroup> reordered = List<AddressBookGroup>.of(siblings)
       ..removeAt(index)
       ..insert(target, group);
+    await _applyOrder(reordered);
+  }
+
+  /// Moves [moved] into [target]'s slot. Only siblings (same parent) can be
+  /// reordered, so a drag never changes the tree shape.
+  Future<void> _moveGroupOnto(
+    AddressBookGroup moved,
+    AddressBookGroup target,
+  ) async {
+    if (moved.id == target.id || moved.parentId != target.parentId) {
+      return;
+    }
+    final List<AddressBookGroup> siblings = <AddressBookGroup>[
+      for (final AddressBookGroup item in _groups)
+        if (item.parentId == moved.parentId) item,
+    ]..sort(compareAddressBookGroups);
+    final int from = siblings.indexWhere(
+      (AddressBookGroup item) => item.id == moved.id,
+    );
+    final int to = siblings.indexWhere(
+      (AddressBookGroup item) => item.id == target.id,
+    );
+    if (from < 0 || to < 0 || from == to) {
+      return;
+    }
+    siblings
+      ..removeAt(from)
+      ..insert(to, moved);
+    await _applyOrder(siblings);
+  }
+
+  /// Writes sequential positions for [reordered], skipping rows that already
+  /// sit at the right spot so a one-step move only touches two rows.
+  Future<void> _applyOrder(List<AddressBookGroup> reordered) async {
     await _run(() async {
       try {
         for (int i = 0; i < reordered.length; i++) {
@@ -163,13 +198,13 @@ class _GroupsDialogState extends State<GroupsDialog> {
           }
           final AddressBookGroup updated =
               await (widget.rename ?? ServerApi.updateAddressBookGroup)(
-            widget.server,
-            widget.token,
-            item.id,
-            null,
-            position: position,
-            ifRevision: item.revision > 0 ? item.revision : null,
-          );
+                widget.server,
+                widget.token,
+                item.id,
+                null,
+                position: position,
+                ifRevision: item.revision > 0 ? item.revision : null,
+              );
           _upsert(updated, markChanged: false);
         }
         _changed = true;
@@ -189,7 +224,9 @@ class _GroupsDialogState extends State<GroupsDialog> {
         backgroundColor: Theme.of(context).colorScheme.surface,
         title: Text(tr('删除分组')),
         content: Text(
-          tr('删除分组“{p2}”？组内设备会移到未分组，子分组会上移一层，都不会被删除。', <String, Object?>{'p2': group.name}),
+          tr('删除分组“{p2}”？组内设备会移到未分组，子分组会上移一层，都不会被删除。', <String, Object?>{
+            'p2': group.name,
+          }),
         ),
         actions: <Widget>[
           TextButton(
@@ -350,74 +387,159 @@ class _GroupsDialogState extends State<GroupsDialog> {
                     final int siblingIndex = siblings.indexWhere(
                       (AddressBookGroup other) => other.id == group.id,
                     );
-                    return ListTile(
-                      key: Key('group-row-${group.id}'),
-                      dense: true,
-                      contentPadding: EdgeInsets.only(left: node.depth * 18.0),
-                      leading: Icon(
-                        node.depth == 0
-                            ? Icons.folder_outlined
-                            : Icons.subdirectory_arrow_right_rounded,
-                        size: 18,
-                        color: kAccent,
-                      ),
-                      title: Text(
-                        group.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13),
-                      ),
-                      subtitle: Text(
-                        tr('{count} 台设备', <String, Object?>{'count': count}),
-                        style: mutedStyle(context, size: 10),
-                      ),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: <Widget>[
-                          IconButton(
-                            tooltip: tr('上移'),
-                            key: Key('group-up-${group.id}'),
-                            visualDensity: VisualDensity.compact,
-                            onPressed: _busy || siblingIndex <= 0
-                                ? null
-                                : () => _moveGroup(group, -1),
-                            icon: const Icon(
-                              Icons.arrow_upward_rounded,
-                              size: 16,
-                            ),
-                          ),
-                          IconButton(
-                            tooltip: tr('下移'),
-                            key: Key('group-down-${group.id}'),
-                            visualDensity: VisualDensity.compact,
-                            onPressed: _busy ||
-                                    siblingIndex < 0 ||
-                                    siblingIndex >= siblings.length - 1
-                                ? null
-                                : () => _moveGroup(group, 1),
-                            icon: const Icon(
-                              Icons.arrow_downward_rounded,
-                              size: 16,
-                            ),
-                          ),
-                          IconButton(
-                            tooltip: tr('编辑'),
-                            key: Key('group-rename-${group.id}'),
-                            visualDensity: VisualDensity.compact,
-                            onPressed: _busy ? null : () => _editGroup(group),
-                            icon: const Icon(Icons.edit_outlined, size: 16),
-                          ),
-                          IconButton(
-                            tooltip: tr('删除分组'),
-                            key: Key('group-delete-${group.id}'),
-                            visualDensity: VisualDensity.compact,
-                            onPressed:
-                                _busy ? null : () => _deleteGroup(group),
-                            icon: Icon(Icons.delete_outline_rounded,
-                                size: 16, color: theme.colorScheme.error),
-                          ),
-                        ],
-                      ),
+                    return DragTarget<AddressBookGroup>(
+                      onWillAcceptWithDetails:
+                          (DragTargetDetails<AddressBookGroup> details) =>
+                              !_busy &&
+                              details.data.id != group.id &&
+                              details.data.parentId == group.parentId,
+                      onAcceptWithDetails:
+                          (DragTargetDetails<AddressBookGroup> details) =>
+                              _moveGroupOnto(details.data, group),
+                      builder:
+                          (
+                            BuildContext context,
+                            List<AddressBookGroup?> candidate,
+                            List<dynamic> rejected,
+                          ) {
+                            return DecoratedBox(
+                              decoration: candidate.isEmpty
+                                  ? const BoxDecoration()
+                                  : BoxDecoration(
+                                      color: kAccent.withValues(alpha: 0.08),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                              child: ListTile(
+                                key: Key('group-row-${group.id}'),
+                                dense: true,
+                                contentPadding: EdgeInsets.only(
+                                  left: node.depth * 18.0,
+                                ),
+                                leading: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: <Widget>[
+                                    Draggable<AddressBookGroup>(
+                                      key: Key('group-drag-${group.id}'),
+                                      data: group,
+                                      maxSimultaneousDrags: _busy ? 0 : 1,
+                                      feedback: Material(
+                                        color: Colors.transparent,
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 10,
+                                            vertical: 6,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: theme.colorScheme.surface,
+                                            borderRadius: BorderRadius.circular(
+                                              6,
+                                            ),
+                                            border: Border.all(color: kAccent),
+                                          ),
+                                          child: Text(
+                                            group.name,
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      child: MouseRegion(
+                                        cursor: _busy
+                                            ? SystemMouseCursors.basic
+                                            : SystemMouseCursors.grab,
+                                        child: Icon(
+                                          Icons.drag_indicator_rounded,
+                                          size: 16,
+                                          color: theme.colorScheme.onSurface
+                                              .withValues(alpha: 0.45),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Icon(
+                                      node.depth == 0
+                                          ? Icons.folder_outlined
+                                          : Icons
+                                                .subdirectory_arrow_right_rounded,
+                                      size: 18,
+                                      color: kAccent,
+                                    ),
+                                  ],
+                                ),
+                                title: Text(
+                                  group.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontSize: 13),
+                                ),
+                                subtitle: Text(
+                                  tr('{count} 台设备', <String, Object?>{
+                                    'count': count,
+                                  }),
+                                  style: mutedStyle(context, size: 10),
+                                ),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: <Widget>[
+                                    IconButton(
+                                      tooltip: tr('上移'),
+                                      key: Key('group-up-${group.id}'),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: _busy || siblingIndex <= 0
+                                          ? null
+                                          : () => _moveGroup(group, -1),
+                                      icon: const Icon(
+                                        Icons.arrow_upward_rounded,
+                                        size: 16,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      tooltip: tr('下移'),
+                                      key: Key('group-down-${group.id}'),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed:
+                                          _busy ||
+                                              siblingIndex < 0 ||
+                                              siblingIndex >=
+                                                  siblings.length - 1
+                                          ? null
+                                          : () => _moveGroup(group, 1),
+                                      icon: const Icon(
+                                        Icons.arrow_downward_rounded,
+                                        size: 16,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      tooltip: tr('编辑'),
+                                      key: Key('group-rename-${group.id}'),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: _busy
+                                          ? null
+                                          : () => _editGroup(group),
+                                      icon: const Icon(
+                                        Icons.edit_outlined,
+                                        size: 16,
+                                      ),
+                                    ),
+                                    IconButton(
+                                      tooltip: tr('删除分组'),
+                                      key: Key('group-delete-${group.id}'),
+                                      visualDensity: VisualDensity.compact,
+                                      onPressed: _busy
+                                          ? null
+                                          : () => _deleteGroup(group),
+                                      icon: Icon(
+                                        Icons.delete_outline_rounded,
+                                        size: 16,
+                                        color: theme.colorScheme.error,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
                     );
                   },
                 ),
@@ -451,8 +573,9 @@ class _GroupEditorDialog extends StatefulWidget {
 }
 
 class _GroupEditorDialogState extends State<_GroupEditorDialog> {
-  late final TextEditingController _name =
-      TextEditingController(text: widget.editing?.name ?? '');
+  late final TextEditingController _name = TextEditingController(
+    text: widget.editing?.name ?? '',
+  );
   late String _parentId = widget.editing?.parentId ?? '';
   String _error = '';
 
@@ -501,8 +624,9 @@ class _GroupEditorDialogState extends State<_GroupEditorDialog> {
   Widget build(BuildContext context) {
     final Set<String> blocked = _blockedParents();
     final List<AddressBookGroupNode> options = <AddressBookGroupNode>[
-      for (final AddressBookGroupNode node
-          in addressBookGroupTreeOrder(widget.groups))
+      for (final AddressBookGroupNode node in addressBookGroupTreeOrder(
+        widget.groups,
+      ))
         if (!blocked.contains(node.group.id)) node,
     ];
     return AlertDialog(

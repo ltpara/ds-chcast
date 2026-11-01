@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'server_api.dart';
 import 'server_settings.dart';
 
 /// A logged-in viewer account tied to one connection service.
@@ -19,6 +20,7 @@ class AccountSession {
     this.refreshExpiresAt,
     this.syncedAt,
     this.bookRevision = 0,
+    this.groups = const <AddressBookGroup>[],
   });
 
   final String server;
@@ -36,6 +38,11 @@ class AccountSession {
   /// sync sends it as `since` so deletions that happened offline arrive as
   /// tombstones instead of being overwritten by a local re-upload.
   final int bookRevision;
+
+  /// Alive groups as of [bookRevision]. A non-empty list lets the first sync
+  /// after launch request only the delta; an empty list (fresh login or a
+  /// legacy session) still reads the whole book for group names.
+  final List<AddressBookGroup> groups;
 
   bool get hasToken => token.isNotEmpty;
 
@@ -58,6 +65,7 @@ class AccountSession {
     DateTime? refreshExpiresAt,
     DateTime? syncedAt,
     int? bookRevision,
+    List<AddressBookGroup>? groups,
   }) {
     return AccountSession(
       server: server,
@@ -68,6 +76,7 @@ class AccountSession {
       refreshExpiresAt: refreshExpiresAt ?? this.refreshExpiresAt,
       syncedAt: syncedAt ?? this.syncedAt,
       bookRevision: bookRevision ?? this.bookRevision,
+      groups: groups ?? this.groups,
     );
   }
 
@@ -81,6 +90,11 @@ class AccountSession {
           'refreshExpiresAt': refreshExpiresAt!.toUtc().millisecondsSinceEpoch,
         'syncedAt': syncedAt?.toUtc().millisecondsSinceEpoch,
         'bookRevision': bookRevision,
+        if (groups.isNotEmpty)
+          'groups': <Object?>[
+            for (final AddressBookGroup group in groups)
+              if (!group.deleted) group.toJson(),
+          ],
       };
 
   static AccountSession? fromJson(Object? value) {
@@ -104,6 +118,13 @@ class AccountSession {
     final String refreshToken =
         value['refreshToken']?.toString().trim() ?? '';
     final Object? rawRefreshExpires = value['refreshExpiresAt'];
+    final Object? rawGroups = value['groups'];
+    final List<AddressBookGroup> groups = <AddressBookGroup>[
+      if (rawGroups is List)
+        for (final Object? item in rawGroups)
+          if (AddressBookGroup.fromJson(item) case final AddressBookGroup group)
+            if (!group.deleted) group,
+    ];
     return AccountSession(
       server: server,
       username: username,
@@ -126,6 +147,7 @@ class AccountSession {
           : null,
       bookRevision:
           rawRevision is num && rawRevision.toInt() > 0 ? rawRevision.toInt() : 0,
+      groups: groups,
     );
   }
 }

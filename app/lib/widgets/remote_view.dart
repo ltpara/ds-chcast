@@ -28,6 +28,28 @@ const List<int> _mouseButtons = <int>[
   ViewerMouse.forward,
 ];
 
+/// Maps a position inside the drawn frame to virtual-desktop pixels for the
+/// announced display. The frame's (0, 0) is the display's top-left, so the
+/// display origin is added here. Clamping to the display rect keeps a press
+/// on the frame edge, or a rounding overshoot, from landing on a neighbouring
+/// monitor in a multi-display layout. A missing source size falls back to a
+/// 1x1 rect, matching the session page's empty-status defaults.
+(int x, int y) frameToDesktop(
+  Offset frame, {
+  required int originX,
+  required int originY,
+  required int width,
+  required int height,
+}) {
+  final int w = width > 0 ? width : 1;
+  final int h = height > 0 ? height : 1;
+  final int x =
+      (originX + frame.dx).round().clamp(originX, originX + w - 1).toInt();
+  final int y =
+      (originY + frame.dy).round().clamp(originY, originY + h - 1).toInt();
+  return (x, y);
+}
+
 class RemoteView extends StatefulWidget {
   const RemoteView({
     super.key,

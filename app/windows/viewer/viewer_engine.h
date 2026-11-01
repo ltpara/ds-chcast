@@ -52,6 +52,20 @@ public:
     virtual bool OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint32_t width,
                             uint32_t height, uint32_t crop_x, uint32_t crop_y,
                             uint64_t pts_ms) = 0;
+    // Copies the most recently published picture into system memory as
+    // top-down BGRA. Called on the session thread, so it never races with
+    // OnGpuFrame. Returns false before the first picture or when the readback
+    // fails, with the reason in `error`.
+    virtual bool CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height,
+                             std::string* error) {
+        (void)bgra;
+        (void)width;
+        (void)height;
+        if (error != nullptr) {
+            *error = "this frame sink cannot capture pixels";
+        }
+        return false;
+    }
     virtual std::string error() const = 0;
 };
 
@@ -220,6 +234,9 @@ struct ViewerStatus {
     std::string last_file_error;
     uint64_t files_sent = 0;
     uint64_t file_failures = 0;
+    // Uploads the viewer dropped through CancelUploads(); counted apart from
+    // failures so the page can word a user cancel as cancelled.
+    uint64_t file_cancels = 0;
     // The host's most recent download. The bytes are written to the receive
     // directory as they arrive, so `download_received` counts bytes on disk;
     // a resume starts at the partial length already on disk.
@@ -233,6 +250,13 @@ struct ViewerStatus {
     std::string download_error;
     uint64_t files_received = 0;
     uint64_t file_receive_failures = 0;
+    // Downloads the viewer stopped through CancelDownload(); counted apart
+    // from receive failures so the page can word a user cancel as cancelled.
+    uint64_t download_cancels = 0;
+    // True while the transfer belongs to an ordinary single-file request. A
+    // folder walk has CancelDirectoryDownload() and clipboard transfers follow
+    // the clipboard permission, so CancelDownload() only acts when this is set.
+    bool download_cancellable = false;
     // Shared-folder browsing. The entries themselves are taken through
     // TakeFileList(); these fields describe the newest answer so a page can
     // update without copying the list. `file_list_directory` echoes the
@@ -306,6 +330,19 @@ struct ViewerStatus {
     uint64_t audio_recoveries = 0;
     bool audio_recovering = false;
     uint32_t audio_buffer_ms = 0;
+    // Audio playout latency on the host clock (capture to scheduled render)
+    // and the skew against `latency_ms`: positive means audio reaches the
+    // viewer later than a video frame captured at the same moment. Negative
+    // until a block has played, a clock offset exists and a frame age was
+    // measured.
+    double audio_latency_ms = -1.0;
+    double av_skew_ms = -1.0;
+    // Scheduled silence between written blocks and blocks discarded after a
+    // missed slot or queue overflow. These mirror the CLI playback line; the
+    // dual-machine audio acceptance compares starved time across playout
+    // strategies, so the overlay has to show it too.
+    uint64_t audio_starved_ms = 0;
+    uint64_t audio_dropped = 0;
     std::string audio_error;
     // The playback endpoint the player is using: empty follows the default
     // output. Selecting another one rebuilds the player but keeps the decoder
@@ -488,6 +525,15 @@ struct ViewerStatus {
     uint32_t record_segments = 0;
     std::string record_path;
     std::string record_error;
+
+    // Viewer-side screenshots. Nothing crosses the wire: the engine reads the
+    // newest decoded picture back from the GPU and writes a PNG on this
+    // machine. `screenshot_updates` counts finished attempts (success or
+    // failure), `screenshot_path` is the file the last successful one wrote
+    // and `screenshot_error` explains the last failure.
+    uint64_t screenshot_updates = 0;
+    std::string screenshot_path;
+    std::string screenshot_error;
 };
 
 class ViewerEngine {
@@ -602,6 +648,12 @@ public:
     bool SendFiles(const std::vector<std::string>& paths,
                    std::string relative_prefix = {});
 
+    // Drops every ordinary viewer-to-host upload still queued or in flight and
+    // asks the host to cancel the active transfer. Clipboard uploads belong to
+    // the clipboard permission and are kept. Safe from any thread; the session
+    // thread performs the purge on its next pass.
+    void CancelUploads();
+
     // Asks the host to list one directory below its shared receive root.
     // `directory` is a '/'-separated relative path; empty lists the root.
     // Returns false when no session is streaming, the host did not grant file
@@ -614,6 +666,11 @@ public:
     // arrives like any host download and lands in the viewer's receive
     // directory, with progress in download_*.
     bool RequestFileDownload(std::string path);
+    // Stops the single-file download in progress: the host is told the
+    // transfer is cancelled and the partial file is removed. Folder-walk and
+    // clipboard transfers keep running because they have their own cancel
+    // paths. Safe to call when nothing is downloading.
+    void CancelDownload();
     // One listing the host sent, tagged with the directory it was requested
     // for (the host echoes no path, so the engine remembers the request).
     struct FileListAnswer {
@@ -694,6 +751,15 @@ public:
     // / record_path / record_error.
     bool SetRecording(bool enabled, std::string directory = {});
 
+    // Queues a screenshot of the current remote picture. The session thread
+    // reads the newest decoded frame back from the GPU and writes a PNG into
+    // `directory` (empty means %USERPROFILE%\Pictures\chast) with a timestamped
+    // name. Returns false when no picture stream is running or the session is
+    // file-transfer-only. The outcome arrives through
+    // ViewerStatus::screenshot_updates/path/error; a newer request replaces one
+    // that has not run yet.
+    bool SaveScreenshot(std::string directory = {});
+
     // Turns the microphone uplink on or off. Opening the capture device and
     // the CMIC stream happens on the session thread; switching off stops them
     // and ends the stream immediately. Returns false when no session is
@@ -735,6 +801,10 @@ public:
     bool SendChat(const std::string& text);
     // Pops the oldest line the host sent. Returns false when none is waiting.
     bool TakeChat(std::string& text);
+    // Queues one block of composed text for the host to type as Unicode.
+    // Returns false for empty or oversized text, when no session is streaming,
+    // when the host did not grant input control, or when the queue is full.
+    bool SendText(const std::string& text);
 
     // Opens the session's remote console at the given character size. Returns
     // false when no session is streaming, the host did not grant
@@ -803,6 +873,10 @@ private:
     // Shared validation and queueing for RequestBatchDownload and
     // RequestDirectoryDownload. `batch` tells the page which wording to use.
     bool QueueDownload(std::vector<DownloadRoot> roots, bool batch);
+    // Applies the newest screenshot request. Runs on the session thread after
+    // a picture was published, because the sink's readback and the decoder
+    // share one D3D11 device.
+    void ProcessScreenshot();
 
     FrameSink* sink_;
     // The camera picture goes to its own Flutter texture; null means no
@@ -837,6 +911,12 @@ private:
     mutable std::mutex record_mutex_;
     std::string record_dir_;
 
+    // Newest screenshot request; the session thread consumes it after the next
+    // published picture. A slot rather than a queue keeps a burst of taps from
+    // turning into a burst of full-resolution reads and PNG writes.
+    mutable std::mutex screenshot_mutex_;
+    std::optional<std::string> pending_screenshot_;
+
     // Newest privacy request, for the same reason as the display switch: the
     // operator wants the state they picked last, not a replay of every toggle.
     mutable std::mutex privacy_mutex_;
@@ -864,6 +944,9 @@ private:
     mutable std::mutex chat_mutex_;
     std::deque<std::string> pending_chat_;
     std::deque<std::string> received_chat_;
+    // Composed text shares the mutex but not the queue: unlike chat it is
+    // input, so it is queued only while the host grants input control.
+    std::deque<std::string> pending_text_;
 
     // One remote console crosses in both directions. Commands keep their
     // order: typing, resizes and the close must reach the host in the order
@@ -973,6 +1056,8 @@ private:
         uint64_t received = 0;
         std::chrono::steady_clock::time_point answer_time;
         std::unique_ptr<chast::FileReceiver> receiver;
+        // Only an ordinary single-file request can be stopped here.
+        bool cancellable = false;
         std::string error;
     };
     // Shared-folder browse requests cross in order: a listing, a download or
@@ -1064,6 +1149,10 @@ private:
     // Bumped whenever the queue is purged; a worker that was walking a folder
     // or hashing a file then discards its result instead of re-adding it.
     uint64_t upload_epoch_ = 0;
+    // Set by CancelUploads(); the session thread turns it into a purge.
+    std::atomic<bool> upload_cancel_{false};
+    // Set by CancelDownload(); the session thread cancels the active transfer.
+    std::atomic<bool> download_cancel_{false};
     uint32_t next_file_id_ = 1;
 
     // Pointer state crosses the same way, but only the newest update is kept:

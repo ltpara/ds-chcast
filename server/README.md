@@ -200,6 +200,13 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 查看者的空帧是保活，服务器回一个空帧，双方都能借此识别静默断链；
 主机侧的空帧同样由服务器应答。
 
+WebSocket 查看者可以放在 TLS 终止的 HTTP 反向代理之后：代理保留
+`GET /chast` 路径，或把 `/carrier/chast` 之类的前缀改写到 `/chast`。2026-10-31
+回环用例 `TestSharedCarrierWebSocketThroughTLSProxy` 在 Go 反向代理后完成了
+wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）；真实 nginx/CDN 仍需
+部署复核。原始 TCP 的主机与查看者链路不是 HTTP，HTTP 反代无法承载，需要 L4
+转发（如 nginx stream）或直接暴露；共享载体监听本身不终止 TLS。
+
 已认证的主机链路也计入在线判定：即使 UDP keepalive 全部丢失，查询仍返回
 `online:true`、有效的 `carrier_token` 与 `transport:"carrier"`，并且不再下发
 过期的 UDP 候选；主机链路断开后（读超时 90 s），只有 UDP keepalive 也不新鲜时
@@ -263,7 +270,7 @@ message 本身即 payload），单帧上限 64 KiB。令牌来自认证查询的
 | `POST` | `/v1/addressbook/grants` | Bearer account token | 提交 `username`、`permission` 与可选 `group_id` 授权整本或某个分组；同一范围重复提交幂等并可改权限；未知用户/分组 404、非法分组 ID 400、自共享 400 |
 | `DELETE` | `/v1/addressbook/grants/{username}` | Bearer account token | 不带查询参数撤销该用户全部授权；带 `?group_id=<id>`（可为空串）只撤销该范围；不存在 404 |
 | `GET` | `/v1/addressbook/shared` | Bearer account token | 授权给我的地址簿：`books[].peers`/`groups` 只含授权范围，`scopes` 列出整本与分组权限，`permission` 为最高权限 |
-| `POST` | `/v1/addressbook/shared/{owner}/peers` | Bearer account token | 在属主地址簿新增条目，可选 `group_id`；需要整本或目标分组的读写权限 |
+| `POST` | `/v1/addressbook/shared/{owner}/peers` | Bearer account token | 在属主地址簿新增条目，可选 `group_id`；需要整本或目标分组的读写权限；可选 `if_revision`（属主地址簿修订号），409 时需重新读取 |
 | `PATCH` | `/v1/addressbook/shared/{owner}/peers/{id}` | Bearer account token | 修改属主条目；需要整本或该条目所属分组的读写权限，可选 `if_revision`，409 时需重新读取 |
 | `DELETE` | `/v1/addressbook/shared/{owner}/peers/{id}` | Bearer account token | 删除属主条目；需要整本或该条目所属分组的读写权限，可带 `?if_revision` |
 | `GET` | `/v1/addressbook/shared/{owner}/grants` | Bearer account token | 查看属主地址簿的授出授权（含 `group_id`）；要求整本 `control` |
@@ -418,7 +425,10 @@ Authorization: Bearer <account token>
 同步上传）保持最后写入者优先。分组改名同样接受 `if_revision`（冲突 409），
 删除分组用 `?if_revision=N` 查询参数；共享地址簿的
 `PATCH`/`DELETE /v1/addressbook/shared/{owner}/peers/{id}` 接受同一令牌
-（删除用 `?if_revision=N` 查询参数），冲突同样返回 409。
+（删除用 `?if_revision=N` 查询参数），冲突同样返回 409；共享新增
+`POST /v1/addressbook/shared/{owner}/peers` 也接受 `if_revision`，含义是
+属主地址簿修订号（新条目没有自己的条目修订号），不匹配同样 409 且不写入，
+省略时保持最后写入者优先。
 
 分组与条目共享同一账号的地址簿修订号：创建和改名都走 `PATCH`，删除先把
 分组写成墓碑，再给组内每个存活条目单独推进修订号并清空 `group_id`，因此一次
@@ -526,7 +536,11 @@ admin 不能降级或封禁；只有当库中还有别的账号时也不能删�
 `POST /v1/account/refresh` 轮换两者，旧访问令牌立刻失效，旧刷新令牌标记
 `rotated_at` 与 `replaced_by`。已轮换的刷新令牌再次出现时按泄漏处理：撤销整个
 会话（访问与刷新行），返回 401 并写 `session_refresh` 审计，
-`detail=replay; session revoked`。登出、撤销单个会话、撤销其他会话、自助改密
+`detail=replay; session revoked`。唯一例外是丢失响应的重试：轮换后
+`RefreshReuseGrace`（2 min）内、且服务器刚发出的替换令牌从未被使用时，旧令牌
+可以让会话继续——服务器作废从未送达的替换令牌并再发一对新令牌（旧的从此不能
+再用）；替换令牌已被使用或超出窗口仍按泄漏撤销。登出、撤销单个会话、撤销其他
+会话、自助改密
 与管理台重置密码都会同时删除刷新行；只有会话级动作（如改密保留当前会话）
 保留当前会话的刷新令牌。旧库升级时 `access_expires_at=0`，这些存量长令牌按
 原 `expires_at` 继续有效直到自然过期，新登录立即改用短访问令牌。查看器在访问
@@ -595,6 +609,31 @@ RFC3339Nano。检查点保存在 `state.db` 的 `archive_checkpoints` 表，重�
 文件不动；压缩与清理失败只记日志，不影响新行归档。管理台 `audit archive`
 查看目录与各流最后已归档 ID，`audit archive run` 立即执行一次并输出行数、
 压缩数与清理数。
+
+配置 `--audit-archive-remote` 后，已关闭的日文件还会逐字节 HTTP PUT 到
+`<url>/<文件名>`（`--audit-archive-remote-token` 作为 `Authorization: Bearer`），
+请求带 `X-Chast-Audit-Sha256` 与 `Idempotency-Key: <文件名>`；接收方答 2xx
+后在归档目录写 `<文件名>.delivered` 标记，后续扫描跳过。投递是至少一次：
+单个文件每轮最多尝试 3 次（间隔 1 s、2 s），仍失败只记日志并留到下一轮，
+本地归档文件不动；接收方应按文件名或摘要去重。启用远端投递后，
+`--audit-archive-retention-days` 只删除已投递的文件，未出站的证据不会被
+本地清理先删掉。端点必须直接答 2xx：客户端不跟随重定向，3xx 直接算一次
+失败（请求体不会重放）；需要直连对象存储时改用下面的 S3 模式，不必自建
+转发端。
+
+配置 `--audit-archive-s3-endpoint` 等参数后，服务器自己用 AWS Signature
+Version 4 签名并 PUT 到 S3 兼容端点。默认走 path-style
+`<endpoint>/<bucket>/<文件名>`；`--audit-archive-s3-addressing virtual` 把桶
+放进主机名（`<bucket>.<endpoint-host>/<文件名>`），这是 AWS 对 2020 年 9 月
+之后新建桶的要求，端点因此必须是 DNS 名而不是 IP 地址。两种模式都带
+`Authorization`、`X-Amz-Date`、`X-Amz-Content-Sha256`（复用本地文件的
+SHA-256）以及设置会话令牌时的 `X-Amz-Security-Token`，签名覆盖实际请求的
+主机名与路径，`Content-Type` 为 `application/x-ndjson` 或
+`application/gzip`。它与 `--audit-archive-remote` 互斥，投递语义相同：至少
+一次、单文件每轮最多 3 次、2xx 后写 `.delivered` 标记、保留清理只删已投递
+文件；客户端不跟随重定向（3xx 直接失败），端点必须直接答 2xx。access/
+secret key 与会话令牌都走命令行参数，会出现在进程列表里，应借助服务管理器
+或受限账户隔离。
 
 账号可启用 TOTP 两步验证：`POST /v1/account/2fa/start` 生成 20 字节随机密钥
 （base32、无填充），返回一次性的 `secret` 与
@@ -840,10 +879,12 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   的 `relay_challenge/auth`；查看者按自己 socket 的地址族选择端点。
   `relays` 由 `--advertise`/`--relay-servers` 加 `--advertise-v6` 组成，主
   入口仍是轮换选中的 IPv4 地址。
-  纯 IPv6 主机需要 `--listen` 与转发目标 `--local` 同族（或用双栈 socket）：
-  代理的单个 UDP socket 同时承担中继与本地转发，绑定 `[::1]` 时无法写往
-  `127.0.0.1`，日志会记录 `IPv4 keepalive write failed` 并在 v6 路径正常
-  工作。
+  主机代理的 punch socket 与本地转发目标可以不同族（2026-10-31 起）：绑
+  `[::1]` 时若 `--local` 仍是默认 `127.0.0.1`，代理会额外打开一个仅用于
+  本地转发的同族 socket，本地回包再经 punch socket 送回查看者；通配 `[::]`
+  仍按双栈处理，原有配置行为不变。会合与打洞本身仍需要服务器提供可达的
+  地址族（`--punch-listen [::]` + `--advertise-v6`，或 IPv4 会合）；无
+  IPv4 回环的纯 IPv6 主机应让 `--local` 与 C++ 主机监听都使用 `::1`。
 - `--carrier-listen-v6` 为共享载体在同一端口号上再开一组 IPv6 TCP 监听，
   例如 `--carrier-listen 0.0.0.0:8445 --carrier-listen-v6 ::`；`--advertise-v6`
   同时给出时，注册、查询与 `/v1/server` 会在 `carrier` 之外下发
@@ -924,6 +965,24 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   清理，两者独立运行。已关闭的日文件默认 gzip（`--audit-archive-compress`，
   默认 true）；`--audit-archive-retention-days`（默认 0，永久保留）按 UTC 日
   删除窗口外的归档文件；压缩与清理在每次归档开始时先执行，失败只记日志。
+- `--audit-archive-remote`（默认空，关闭）把已关闭的日文件 HTTP PUT 到
+  `<url>/<文件名>`，`--audit-archive-remote-token` 作为 Bearer 令牌。每个
+  文件每轮重试 3 次（1 s、2 s），2xx 后写 `<文件名>.delivered` 标记；启用
+  投递后 `--audit-archive-retention-days` 只删除已投递文件。URL 只接受
+  http/https，拒绝内嵌凭据、查询与片段；令牌不能单独设置。端点必须直接
+  答 2xx（客户端不跟随重定向，3xx 直接失败），接收方按文件名或
+  `X-Chast-Audit-Sha256` 去重。
+- `--audit-archive-s3-endpoint`（默认空，关闭）改为直接投递到 S3 兼容
+  存储，需同时给出 `--audit-archive-s3-bucket`、`--audit-archive-s3-access-key`
+  与 `--audit-archive-s3-secret-key`；`--audit-archive-s3-region`（默认
+  `us-east-1`）与 `--audit-archive-s3-session-token`（默认空）可选。
+  `--audit-archive-s3-addressing`（默认 `path`）选择 `path` 或 `virtual`
+  寻址：`virtual` 把桶放进主机名，要求端点可解析为 DNS 名（AWS 新桶
+  需要），签名的 host 与实际请求一致。请求用
+  SigV4 签名、走 path-style `<endpoint>/<bucket>/<文件名>` 或 virtual-style
+  `<bucket>.<endpoint-host>/<文件名>`，其余投递、标记
+  与保留语义同 `--audit-archive-remote`，两者互斥且同样依赖
+  `--audit-archive-dir`。secret key 与会话令牌会出现在进程列表里。
 - `--addressbook-tombstone-days`（默认 0，保留全部）在启动与每 6 小时删除
   早于该天数的地址簿条目与分组墓碑（管理台 `ab prune <days>` 可手工执行），
   存活条目不删除。离线时间超过保留窗口的客户端会错过墓碑，需一次整本快照
@@ -1121,7 +1180,7 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   | `ab prune <days>` | 删除早于指定天数的地址簿条目与分组墓碑并输出两类行数；存活条目不受影响，`0` 或负数被拒绝 |
   | `audit [count]` | 按时间倒序查看账号安全审计（默认 20 条，最多 200 条），含登录、登出、改密、两步验证、会话撤销与改名、角色变更、封禁/解封、手动解锁、用户名、结果、IP 与说明 |
   | `audit prune <days>` | 删除早于指定天数的账号安全审计、连接与文件传输记录，输出三类删除行数；`0` 或负数被拒绝 |
-  | `audit archive [run]` | 查看归档目录与各流最后已归档 ID；`run` 立即归档一次并输出三类新增行数、写入文件数、压缩数与清理数；未配置 `--audit-archive-dir` 时提示如何启用 |
+  | `audit archive [run]` | 查看归档目录、远端投递目标与各流最后已归档 ID；`run` 立即归档一次并输出三类新增行数、写入文件数、压缩数、清理数与投递数；未配置 `--audit-archive-dir` 时提示如何启用 |
   | `connections [count]` | 按上报顺序倒序查看查看器上报的连接记录（默认 20 条，最多 200 条），含用户名、对端、方向、结果、IP、时长与说明 |
   | `transfers [count]` | 按上报顺序倒序查看文件传输记录（默认 20 条，最多 200 条），含用户名、对端、方向、文件名/大小/数量、结果、IP 与说明 |
   | `punch-requests`/`pr [start] [count]`、`pr -` | 分页查看/清空打洞日志 |
@@ -1835,7 +1894,8 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   `permission` 升级/降级；`GET /v1/addressbook/grants` 返回授出/收到两组授权与
   权限；`DELETE /v1/addressbook/grants/{username}` 撤销（不存在 404）；
   `GET /v1/addressbook/shared` 返回授权给我的完整地址簿。读写权限还可
-  `POST /v1/addressbook/shared/{owner}/peers` 向属主地址簿新增条目，并可用
+  `POST /v1/addressbook/shared/{owner}/peers` 向属主地址簿新增条目（可选
+  `if_revision` 属主地址簿修订号，冲突 409），并可用
   `PATCH`/`DELETE /v1/addressbook/shared/{owner}/peers/{id}` 修改或删除已有
   条目（属主修订号推进，删除写墓碑）；完全控制还可
   `GET`/`POST`/`DELETE /v1/addressbook/shared/{owner}/grants` 管理该地址簿的

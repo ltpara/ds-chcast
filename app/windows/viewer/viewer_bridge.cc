@@ -532,6 +532,8 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.files_sent));
         map[key("fileFailures")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_failures));
+        map[key("fileCancels")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_cancels));
         map[key("downloadPhase")] =
             flutter::EncodableValue(static_cast<int32_t>(status.download_phase));
         map[key("downloadName")] = flutter::EncodableValue(status.download_name);
@@ -545,6 +547,10 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.files_received));
         map[key("fileReceiveFailures")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_receive_failures));
+        map[key("downloadCancels")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.download_cancels));
+        map[key("downloadCancellable")] =
+            flutter::EncodableValue(status.download_cancellable);
         map[key("fileListAnswers")] =
             flutter::EncodableValue(static_cast<int64_t>(status.file_list_answers));
         map[key("fileListDirectory")] =
@@ -606,6 +612,10 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.record_skipped));
         map[key("recordSegments")] =
             flutter::EncodableValue(static_cast<int32_t>(status.record_segments));
+        map[key("screenshotUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.screenshot_updates));
+        map[key("screenshotPath")] = flutter::EncodableValue(status.screenshot_path);
+        map[key("screenshotError")] = flutter::EncodableValue(status.screenshot_error);
         map[key("audioSampleRate")] =
             flutter::EncodableValue(static_cast<int32_t>(status.audio_sample_rate));
         map[key("audioChannels")] =
@@ -620,11 +630,17 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.audio_errors));
         map[key("audioUnderruns")] =
             flutter::EncodableValue(static_cast<int64_t>(status.audio_underruns));
+        map[key("audioStarvedMs")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_starved_ms));
+        map[key("audioDropped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.audio_dropped));
         map[key("audioRecoveries")] =
             flutter::EncodableValue(static_cast<int64_t>(status.audio_recoveries));
         map[key("audioRecovering")] = flutter::EncodableValue(status.audio_recovering);
         map[key("audioBufferMs")] =
             flutter::EncodableValue(static_cast<int64_t>(status.audio_buffer_ms));
+        map[key("audioLatencyMs")] = flutter::EncodableValue(status.audio_latency_ms);
+        map[key("avSkewMs")] = flutter::EncodableValue(status.av_skew_ms);
         map[key("audioError")] = flutter::EncodableValue(status.audio_error);
         map[key("audioDevice")] = flutter::EncodableValue(status.audio_device);
         map[key("audioDeviceName")] = flutter::EncodableValue(status.audio_device_name);
@@ -967,6 +983,29 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "takeScreenshot") {
+        if (viewer_ == nullptr) {
+            result->Error("unavailable", "no viewer session is running");
+            return;
+        }
+        std::string directory;
+        if (const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+            args != nullptr) {
+            if (const auto it = args->find(flutter::EncodableValue("directory"));
+                it != args->end()) {
+                if (const auto* value = std::get_if<std::string>(&it->second)) {
+                    directory = *value;
+                }
+            }
+        }
+        if (!viewer_->SaveScreenshot(std::move(directory))) {
+            result->Error("unavailable", "a screenshot needs a live picture stream");
+            return;
+        }
+        result->Success(flutter::EncodableValue(true));
+        return;
+    }
+
     if (method == "sendFile" || method == "sendFileAt" || method == "sendFileTo") {
         if (viewer_ == nullptr) {
             result->Error("unavailable", "no viewer session is running");
@@ -1127,6 +1166,22 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "cancelUploads") {
+        if (viewer_ != nullptr) {
+            viewer_->CancelUploads();
+        }
+        result->Success();
+        return;
+    }
+
+    if (method == "cancelDownload") {
+        if (viewer_ != nullptr) {
+            viewer_->CancelDownload();
+        }
+        result->Success();
+        return;
+    }
+
     if (method == "fileOperation") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         if (args == nullptr) {
@@ -1263,6 +1318,17 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "sendSas") {
         const bool queued = viewer_ != nullptr && viewer_->SendSas();
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "sendText") {
+        const auto* text = std::get_if<std::string>(call.arguments());
+        if (text == nullptr) {
+            result->Error("bad_args", "sendText wants the composed text");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->SendText(*text);
         result->Success(flutter::EncodableValue(queued));
         return;
     }

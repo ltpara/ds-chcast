@@ -78,17 +78,42 @@ void test_queue_pressure() {
 
     chast::BitrateSample backed_up = healthy_sample(1100);
     backed_up.queued_bytes = 700000;  // 70% of the congestion window
-    chast::BitrateDecision decision = controller.update(backed_up, 1000);
+    chast::BitrateDecision decision = controller.update(backed_up, 500);
+    check(!decision.changed && controller.target_bps() == 10000000,
+          "a queue over the threshold for one interval is not pressure yet");
+
+    backed_up.sent_packets = 1200;
+    decision = controller.update(backed_up, 500);
     check(decision.changed && decision.target_bps == 8500000 &&
               std::string(decision.reason) == "queue",
-          "a filling send queue drops the target");
+          "a filling send queue drops the target on the second sample");
 
     chast::BitrateController severe(10000000, 1000000, 30);
     severe.update(healthy_sample(1000), 1000);
     backed_up.queued_bytes = 1200000;
-    decision = severe.update(backed_up, 1000);
+    decision = severe.update(backed_up, 500);
+    check(!decision.changed && severe.target_bps() == 10000000,
+          "a queue past the congestion window waits for the second sample");
+    decision = severe.update(backed_up, 500);
     check(decision.changed && decision.target_bps == 7000000,
-          "a queue past the congestion window drops the target by 30%");
+          "a sustained queue past the congestion window drops the target by 30%");
+
+    // The first sample of a session carries the key-frame burst, which can
+    // fill the queue several times over on any path and still drain before
+    // the next sample. That is not a capacity signal.
+    chast::BitrateController startup(4000000, 500000, 30);
+    startup.update(healthy_sample(1000), 500);
+    chast::BitrateSample burst = healthy_sample(1100);
+    burst.congestion_window = 211968;
+    burst.queued_bytes = 921828;
+    decision = startup.update(burst, 500);
+    check(!decision.changed, "a startup key-frame burst is not queue pressure");
+    burst.sent_packets = 1200;
+    burst.congestion_window = 743142;
+    burst.queued_bytes = 0;
+    decision = startup.update(burst, 500);
+    check(!decision.changed && startup.target_bps() == 4000000,
+          "a burst that drains before the next sample leaves the target alone");
 }
 
 // A capacity step down must land in one decision, not walk down 15-30% every

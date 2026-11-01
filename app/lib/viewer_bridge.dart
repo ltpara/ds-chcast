@@ -371,6 +371,7 @@ class ViewerStatus {
     this.lastFileError = '',
     this.filesSent = 0,
     this.fileFailures = 0,
+    this.fileCancels = 0,
     this.downloadPhase = ViewerFilePhase.idle,
     this.downloadName = '',
     this.downloadPath = '',
@@ -379,6 +380,8 @@ class ViewerStatus {
     this.downloadError = '',
     this.filesReceived = 0,
     this.fileReceiveFailures = 0,
+    this.downloadCancels = 0,
+    this.downloadCancellable = false,
     this.fileListAnswers = 0,
     this.fileListDirectory = '',
     this.fileListEntries = 0,
@@ -416,6 +419,9 @@ class ViewerStatus {
     this.recordKeyframes = 0,
     this.recordSkipped = 0,
     this.recordSegments = 0,
+    this.screenshotUpdates = 0,
+    this.screenshotPath = '',
+    this.screenshotError = '',
     this.audioSampleRate = 0,
     this.audioChannels = 0,
     this.audioBitrate = 0,
@@ -423,9 +429,13 @@ class ViewerStatus {
     this.audioDecoded = 0,
     this.audioErrors = 0,
     this.audioUnderruns = 0,
+    this.audioStarvedMs = 0,
+    this.audioDropped = 0,
     this.audioRecoveries = 0,
     this.audioRecovering = false,
     this.audioBufferMs = 0,
+    this.audioLatencyMs = -1,
+    this.avSkewMs = -1,
     this.audioError = '',
     this.audioDevice = '',
     this.audioDeviceName = '',
@@ -633,6 +643,10 @@ class ViewerStatus {
   final int filesSent;
   final int fileFailures;
 
+  /// Uploads the viewer dropped after the user asked to cancel them. They are
+  /// kept apart from [fileFailures] so a page can word them as cancelled.
+  final int fileCancels;
+
   /// The most recent host-to-viewer download. [downloadPhase] is a
   /// [ViewerFilePhase] value; [downloadReceived] counts bytes on disk, so a
   /// resumed transfer starts above zero. [filesReceived] and
@@ -648,6 +662,16 @@ class ViewerStatus {
   final String downloadError;
   final int filesReceived;
   final int fileReceiveFailures;
+
+  /// Downloads the viewer stopped through [ViewerBridge.cancelDownload];
+  /// counted apart from [fileReceiveFailures] so a user cancel can be worded
+  /// as cancelled.
+  final int downloadCancels;
+
+  /// Whether the active download is an ordinary single-file request. Folder
+  /// walks have their own cancel and clipboard transfers follow the clipboard
+  /// permission, so the page offers no cancel action for those.
+  final bool downloadCancellable;
 
   /// Shared-folder browsing. [fileListAnswers] changes with every listing the
   /// host sent (the entries themselves come from [ViewerBridge.takeFileList]);
@@ -727,6 +751,15 @@ class ViewerStatus {
   final int recordKeyframes;
   final int recordSkipped;
   final int recordSegments;
+
+  /// Viewer-side screenshots: the engine reads the newest decoded picture back
+  /// from the GPU and writes a PNG on this machine, so nothing crosses the
+  /// wire. [screenshotUpdates] counts finished attempts, [screenshotPath] is
+  /// the file the last success wrote and [screenshotError] explains the last
+  /// failure.
+  final int screenshotUpdates;
+  final String screenshotPath;
+  final String screenshotError;
   final int audioSampleRate;
   final int audioChannels;
   final int audioBitrate;
@@ -735,12 +768,25 @@ class ViewerStatus {
   final int audioErrors;
   final int audioUnderruns;
 
+  /// Scheduled silence on the playout timeline (not just underrun events)
+  /// and blocks discarded after a missed slot or queue overflow, mirroring
+  /// the CLI playback line. These are the counters the dual-machine audio
+  /// acceptance compares, especially while blocks are being dropped.
+  final int audioStarvedMs;
+  final int audioDropped;
+
   /// Render-endpoint rebuilds caused by a lost or changed default output.
   /// [audioRecovering] is true while the renderer sits between attempts; the
   /// audio stream stays up, so this is not an error.
   final int audioRecoveries;
   final bool audioRecovering;
   final int audioBufferMs;
+
+  /// Host-clock audio playout latency (capture to scheduled render) and its
+  /// skew against [latencyMs]: positive means audio reaches the viewer later
+  /// than video captured at the same moment. Negative until measured.
+  final double audioLatencyMs;
+  final double avSkewMs;
   final String audioError;
 
   /// The playback endpoint the engine is using: empty follows the Windows
@@ -1133,6 +1179,7 @@ class ViewerStatus {
       lastFileError: asString(map['lastFileError']),
       filesSent: asInt(map['filesSent']),
       fileFailures: asInt(map['fileFailures']),
+      fileCancels: asInt(map['fileCancels']),
       downloadPhase: asInt(map['downloadPhase']),
       downloadName: asString(map['downloadName']),
       downloadPath: asString(map['downloadPath']),
@@ -1141,6 +1188,8 @@ class ViewerStatus {
       downloadError: asString(map['downloadError']),
       filesReceived: asInt(map['filesReceived']),
       fileReceiveFailures: asInt(map['fileReceiveFailures']),
+      downloadCancels: asInt(map['downloadCancels']),
+      downloadCancellable: map['downloadCancellable'] == true,
       fileListAnswers: asInt(map['fileListAnswers']),
       fileListDirectory: asString(map['fileListDirectory']),
       fileListEntries: asInt(map['fileListEntries']),
@@ -1178,6 +1227,9 @@ class ViewerStatus {
       recordKeyframes: asInt(map['recordKeyframes']),
       recordSkipped: asInt(map['recordSkipped']),
       recordSegments: asInt(map['recordSegments']),
+      screenshotUpdates: asInt(map['screenshotUpdates']),
+      screenshotPath: asString(map['screenshotPath']),
+      screenshotError: asString(map['screenshotError']),
       audioSampleRate: asInt(map['audioSampleRate']),
       audioChannels: asInt(map['audioChannels']),
       audioBitrate: asInt(map['audioBitrate']),
@@ -1185,9 +1237,13 @@ class ViewerStatus {
       audioDecoded: asInt(map['audioDecoded']),
       audioErrors: asInt(map['audioErrors']),
       audioUnderruns: asInt(map['audioUnderruns']),
+      audioStarvedMs: asInt(map['audioStarvedMs']),
+      audioDropped: asInt(map['audioDropped']),
       audioRecoveries: asInt(map['audioRecoveries']),
       audioRecovering: map['audioRecovering'] == true,
       audioBufferMs: asInt(map['audioBufferMs']),
+      audioLatencyMs: (map['audioLatencyMs'] as num?)?.toDouble() ?? -1.0,
+      avSkewMs: (map['avSkewMs'] as num?)?.toDouble() ?? -1.0,
       audioError: asString(map['audioError']),
       audioDevice: asString(map['audioDevice']),
       audioDeviceName: asString(map['audioDeviceName']),
@@ -1558,6 +1614,15 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// Queues one block of composed text for the host to type as Unicode, so
+  /// the host keyboard layout does not matter. False means it was not queued:
+  /// no streaming session, the host did not grant input control, empty or
+  /// oversized text (over 4096 bytes), or a full outgoing queue.
+  static Future<bool> sendText(String text) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendText', text);
+    return queued ?? false;
+  }
+
   /// Pops the oldest line the host sent, or null when none is waiting. The
   /// page drains this on its poll timer, so a burst arrives in order.
   static Future<String?> takeChat() {
@@ -1729,6 +1794,19 @@ class ViewerBridge {
     });
   }
 
+  /// Queues a screenshot of the current remote picture. The engine reads the
+  /// newest decoded frame back from the GPU and writes a PNG on this machine;
+  /// nothing is sent to the host. [directory] is the target folder (empty
+  /// means the engine's default, `%USERPROFILE%\\Pictures\\chast`). Throws a
+  /// [PlatformException] when no picture stream is running. The outcome
+  /// arrives through [ViewerStatus.screenshotUpdates],
+  /// [ViewerStatus.screenshotPath] and [ViewerStatus.screenshotError].
+  static Future<void> takeScreenshot({String directory = ''}) {
+    return _channel.invokeMethod<void>('takeScreenshot', <String, Object?>{
+      'directory': directory,
+    });
+  }
+
   /// Opens the system file picker and queues the chosen files for upload to
   /// the host. Returns how many roots were queued, or null when the dialog was
   /// cancelled. Throws a [PlatformException] when no session is streaming or
@@ -1845,6 +1923,20 @@ class ViewerBridge {
   /// outcome is published as cancelled.
   static Future<void> cancelFolderDownload() async {
     await _channel.invokeMethod<void>('cancelFolderDownload');
+  }
+
+  /// Stops the single-file download in progress and removes its partial file.
+  /// Folder-walk and clipboard transfers keep running; a cancel while nothing
+  /// is downloading is a no-op.
+  static Future<void> cancelDownload() async {
+    await _channel.invokeMethod<void>('cancelDownload');
+  }
+
+  /// Drops every ordinary upload still queued or in flight and asks the host
+  /// to abort the active transfer. Clipboard uploads keep running; a cancel
+  /// while nothing is uploading is a no-op.
+  static Future<void> cancelUploads() async {
+    await _channel.invokeMethod<void>('cancelUploads');
   }
 
   /// Pops the newest directory listing the host sent. Returns null when none

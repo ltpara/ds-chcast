@@ -19,6 +19,7 @@ import '../target.dart';
 import '../theme.dart';
 import '../tunnel_agent.dart';
 import '../trust_store.dart';
+import '../view_filter.dart';
 import '../viewer_bridge.dart';
 import '../wake_on_lan.dart';
 import 'session_page.dart';
@@ -99,6 +100,14 @@ typedef AddressBookPeerWriter =
       String? groupId,
       int? ifRevision,
     });
+typedef AddressBookPeerOrderWriter =
+    Future<AddressBookPeer> Function(
+      ServerSettings server,
+      String token,
+      String peerId, {
+      int? position,
+      int? ifRevision,
+    });
 typedef AddressBookPeerDeleter =
     Future<void> Function(ServerSettings server, String token, String peerId);
 typedef ViewerUpdateInstaller =
@@ -124,6 +133,7 @@ class HomePage extends StatefulWidget {
     this.accountLogout,
     this.addressBookFetcher,
     this.addressBookPeerWriter,
+    this.addressBookPeerOrderWriter,
     this.addressBookPeerDeleter,
     this.wakeSender,
     this.lanDiscovery,
@@ -145,11 +155,13 @@ class HomePage extends StatefulWidget {
   final LoginSMSRequester? accountLoginSMS;
   final LoginEmailRequester? accountLoginEmail;
   final AccountSecurityKeyLogin? accountSecurityKeyLogin;
-  final AccountPasswordlessSecurityKeyLogin? accountPasswordlessSecurityKeyLogin;
+  final AccountPasswordlessSecurityKeyLogin?
+  accountPasswordlessSecurityKeyLogin;
   final AccountRefresh? accountRefresh;
   final AccountLogout? accountLogout;
   final AddressBookFetcher? addressBookFetcher;
   final AddressBookPeerWriter? addressBookPeerWriter;
+  final AddressBookPeerOrderWriter? addressBookPeerOrderWriter;
   final AddressBookPeerDeleter? addressBookPeerDeleter;
   final WakeSender? wakeSender;
   final LanDiscovery? lanDiscovery;
@@ -184,6 +196,7 @@ class _HomePageState extends State<HomePage> {
   late final AccountLogout _logoutAccount;
   late final AddressBookFetcher _fetchAddressBook;
   late final AddressBookPeerWriter _writeAddressBookPeer;
+  late final AddressBookPeerOrderWriter _writePeerOrder;
   late final AddressBookPeerDeleter _deleteAddressBookPeer;
   late final WakeSender _wakeSender;
   late final LanDiscovery _lanDiscovery;
@@ -220,7 +233,8 @@ class _HomePageState extends State<HomePage> {
     _serverStore = widget.serverStore ?? ServerSettingsStore();
     _trustStore = widget.trustStore ?? TrustStore();
     _identityStore = widget.identityStore ?? ServerIdentityStore();
-    _accountStore = widget.accountStore ??
+    _accountStore =
+        widget.accountStore ??
         AccountSessionStore(
           protectSecret: ViewerBridge.protectSecret,
           unprotectSecret: ViewerBridge.unprotectSecret,
@@ -333,6 +347,23 @@ class _HomePageState extends State<HomePage> {
             ifRevision: ifRevision,
           );
         };
+    _writePeerOrder =
+        widget.addressBookPeerOrderWriter ??
+        (
+          ServerSettings server,
+          String token,
+          String peerId, {
+          int? position,
+          int? ifRevision,
+        }) {
+          return ServerApi.updateAddressBookPeer(
+            server,
+            token,
+            peerId,
+            position: position,
+            ifRevision: ifRevision,
+          );
+        };
     _deleteAddressBookPeer =
         widget.addressBookPeerDeleter ??
         (ServerSettings server, String token, String peerId) =>
@@ -365,6 +396,8 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _load() async {
     final List<Device> devices = await _deviceStore.load();
+    final Set<String> savedTags = ViewFilter.load();
+    final Set<String> collapsedGroups = ViewFilter.loadCollapsed();
     final ServerSettings server = await _serverStore.load();
     final Map<String, String> trust = await _trustStore.load();
     final Map<String, ServerIdentityPin> pins = await _identityStore.load();
@@ -381,12 +414,26 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) {
       return;
     }
+    // The session carries the group rows from its last sync. Without them the
+    // first read after launch has to fetch the whole book just for names.
+    final List<AddressBookGroup> cachedGroups =
+        account != null && account.groups.isNotEmpty
+        ? account.groups
+        : const <AddressBookGroup>[];
     setState(() {
       _devices = devices;
       _server = server;
       _trust = trust;
       _serverPins = pins;
       _account = account;
+      _groups = cachedGroups;
+      _groupsSynced = cachedGroups.isNotEmpty;
+      _selectedTags
+        ..clear()
+        ..addAll(savedTags);
+      _collapsedGroups
+        ..clear()
+        ..addAll(collapsedGroups);
       _loading = false;
     });
     unawaited(_refreshPresence());
@@ -405,20 +452,24 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Renews the access token before it lapses. A rejected refresh token means
-  /// the session is gone (logout, password change or replay detection), so the
-  /// stored session is dropped and the account UI falls back to signed out.
-  Future<void> _renewAccountIfNeeded() async {
+  /// Renews the access/refresh pair. Returns false only when the stored
+  /// refresh token cannot be used any more; a transient failure keeps the
+  /// session for the next tick and still counts as usable. `force` skips the
+  /// "still fresh" shortcut so a 401 gets one renewal attempt before sign-out.
+  Future<bool> _renewAccount({bool force = false}) async {
     final AccountSession? account = _account;
-    if (account == null || account.server != _server.url || _renewing) {
-      return;
+    if (account == null || account.server != _server.url) {
+      return false;
+    }
+    if (_renewing) {
+      return true;
     }
     final DateTime now = DateTime.now().toUtc();
-    if (account.isActiveAt(now.add(const Duration(minutes: 2)))) {
-      return;
+    if (!force && account.isActiveAt(now.add(const Duration(minutes: 2)))) {
+      return true;
     }
     if (!account.canRefreshAt(now)) {
-      return;
+      return false;
     }
     _renewing = true;
     try {
@@ -427,7 +478,7 @@ class _HomePageState extends State<HomePage> {
         account.refreshToken,
       );
       if (!mounted || !identical(_account, account)) {
-        return;
+        return true;
       }
       final DateTime issued = DateTime.now().toUtc();
       final AccountSession session = account.copyWith(
@@ -444,21 +495,47 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         setState(() => _account = session);
       }
+      return true;
     } on ServerApiException catch (error) {
-      if (error.statusCode == HttpStatus.unauthorized &&
-          mounted &&
-          identical(_account, account)) {
-        await _accountStore.clear();
-        if (mounted) {
-          setState(() => _account = null);
-        }
-      }
+      return error.statusCode != HttpStatus.unauthorized;
     } catch (_) {
       // A transient network failure leaves the stored refresh token intact;
       // the next tick retries before the access token expires.
+      return true;
     } finally {
       _renewing = false;
     }
+  }
+
+  Future<void> _renewAccountIfNeeded() async {
+    if (_account == null) {
+      return;
+    }
+    if (!await _renewAccount()) {
+      await _expireAccount();
+    }
+  }
+
+  /// A 401 on an account call can come from a renewal whose response was
+  /// lost: the server rotated the pair while the viewer kept the retired
+  /// refresh token. Renew once before dropping the session; the server
+  /// accepts that retry inside its reuse window.
+  Future<void> _recoverAccountSession() async {
+    if (!await _renewAccount(force: true)) {
+      await _expireAccount();
+    }
+  }
+
+  Future<void> _handleSyncUnauthorized(bool announce, String message) async {
+    await _recoverAccountSession();
+    if (!announce) {
+      return;
+    }
+    _showSnack(
+      _account == null
+          ? tr('账号登录已过期，请重新登录')
+          : tr('地址簿同步失败：{p5}', <String, Object?>{'p5': message}),
+    );
   }
 
   Future<void> _reloadDevices() async {
@@ -576,10 +653,7 @@ class _HomePageState extends State<HomePage> {
     return text.startsWith('[') || text.contains(':');
   }
 
-  Future<void> _connect(
-    String input, {
-    bool fileTransferOnly = false,
-  }) async {
+  Future<void> _connect(String input, {bool fileTransferOnly = false}) async {
     if (_opening) {
       return;
     }
@@ -609,7 +683,10 @@ class _HomePageState extends State<HomePage> {
     await _open(target, fileTransferOnly: fileTransferOnly);
   }
 
-  Future<void> _connectDevice(Device device, {bool fileTransferOnly = false}) async {
+  Future<void> _connectDevice(
+    Device device, {
+    bool fileTransferOnly = false,
+  }) async {
     if (_opening) {
       return;
     }
@@ -634,7 +711,9 @@ class _HomePageState extends State<HomePage> {
       target = parseConnectTarget(device.id, token: token);
     }
     if (target == null) {
-      setState(() => _error = tr('设备地址无效：{p1}', <String, Object?>{'p1': device.id}));
+      setState(
+        () => _error = tr('设备地址无效：{p1}', <String, Object?>{'p1': device.id}),
+      );
       return;
     }
     _address.text = target.label;
@@ -711,12 +790,41 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _clearRecent() async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        title: Text(tr('清空最近连接')),
+        content: Text(tr('清空最近连接？已保存到我的设备的条目不受影响。')),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(tr('取消')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(tr('清空')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
     final List<Device> devices = await _deviceStore.clearRecent();
     if (!mounted) {
       return;
     }
     setState(() => _devices = devices);
     unawaited(_refreshPresence());
+  }
+
+  Future<void> _removeRecent(Device device) async {
+    final List<Device> devices = await _deviceStore.removeRecent(device.key);
+    if (!mounted) {
+      return;
+    }
+    setState(() => _devices = devices);
   }
 
   Future<void> _promote(Device device) async {
@@ -875,6 +983,16 @@ class _HomePageState extends State<HomePage> {
     if (choice == null || !mounted) {
       return;
     }
+    await _assignDeviceToGroup(device, choice);
+  }
+
+  /// Writes the group locally first so the card moves even when the upload
+  /// fails; the pending group flag retries it on the next sync.
+  Future<void> _assignDeviceToGroup(Device device, String choice) async {
+    final AccountSession? account = _account;
+    if (account == null || account.server != _server.url) {
+      return;
+    }
     final List<Device> devices = await _deviceStore.updateGroup(
       device.key,
       choice,
@@ -911,7 +1029,7 @@ class _HomePageState extends State<HomePage> {
       }
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
-        await _expireAccount();
+        await _recoverAccountSession();
         return;
       }
       if (error.statusCode == HttpStatus.conflict) {
@@ -967,7 +1085,9 @@ class _HomePageState extends State<HomePage> {
         return AlertDialog(
           backgroundColor: Theme.of(context).colorScheme.surface,
           title: Text(tr('删除设备')),
-          content: Text(tr('从地址簿删除“{p4}”？', <String, Object?>{'p4': device.displayName})),
+          content: Text(
+            tr('从地址簿删除“{p4}”？', <String, Object?>{'p4': device.displayName}),
+          ),
           actions: <Widget>[
             TextButton(
               onPressed: () => Navigator.of(context).pop(false),
@@ -1129,7 +1249,7 @@ class _HomePageState extends State<HomePage> {
   /// entries the account does not have. A 401 drops the stored token so the
   /// next attempt goes through the login dialog instead of looping.
   Future<void> _syncAddressBook({bool announce = true}) async {
-    final AccountSession? account = _account;
+    AccountSession? account = _account;
     if (account == null) {
       if (announce) {
         _showSnack(tr('请先登录账号'));
@@ -1137,11 +1257,19 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     if (!account.isActiveAt(DateTime.now())) {
-      await _expireAccount();
-      if (announce) {
-        _showSnack(tr('账号登录已过期，请重新登录'));
+      // The access token lapsed (suspend, clock jump); a session-level
+      // refresh token can still bring the account back.
+      if (!await _renewAccount(force: true)) {
+        await _expireAccount();
+        if (announce) {
+          _showSnack(tr('账号登录已过期，请重新登录'));
+        }
+        return;
       }
-      return;
+      account = _account;
+      if (account == null || !account.isActiveAt(DateTime.now())) {
+        return;
+      }
     }
     if (_syncing || account.server != _server.url) {
       return;
@@ -1159,10 +1287,7 @@ class _HomePageState extends State<HomePage> {
           await _deleteAddressBookPeer(_server, account.token, deletion.id);
         } on ServerApiException catch (error) {
           if (error.statusCode == HttpStatus.unauthorized) {
-            await _expireAccount();
-            if (announce) {
-              _showSnack(tr('账号登录已过期，请重新登录'));
-            }
+            await _handleSyncUnauthorized(announce, error.message);
             return;
           }
           if (error.statusCode != HttpStatus.notFound) {
@@ -1180,8 +1305,8 @@ class _HomePageState extends State<HomePage> {
               deletion.username == account.username)
             deletion.id,
       };
-      // The group cache lives in memory, so the first sync after launch reads
-      // the whole book to learn group names even when the peer cursor is old.
+      // The group cache travels with the session, so the first sync after
+      // launch reads the whole book only when no cache exists.
       final int since = _groupsSynced ? account.bookRevision : 0;
       final AddressBookSnapshot snapshot = await _fetchAddressBook(
         _server,
@@ -1221,10 +1346,7 @@ class _HomePageState extends State<HomePage> {
           written[push.id] = peer;
         } on ServerApiException catch (error) {
           if (error.statusCode == HttpStatus.unauthorized) {
-            await _expireAccount();
-            if (announce) {
-              _showSnack(tr('账号登录已过期，请重新登录'));
-            }
+            await _handleSyncUnauthorized(announce, error.message);
             return;
           }
           if (error.statusCode == HttpStatus.conflict) {
@@ -1281,6 +1403,7 @@ class _HomePageState extends State<HomePage> {
       final AccountSession session = account.copyWith(
         syncedAt: DateTime.now(),
         bookRevision: refreshed?.revision ?? snapshot.revision,
+        groups: groups,
       );
       await _accountStore.save(session);
       if (!mounted) {
@@ -1300,10 +1423,7 @@ class _HomePageState extends State<HomePage> {
       }
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
-        await _expireAccount();
-        if (announce) {
-          _showSnack(tr('账号登录已过期，请重新登录'));
-        }
+        await _handleSyncUnauthorized(announce, error.message);
       } else if (announce) {
         _showSnack(tr('地址簿同步失败：{p5}', <String, Object?>{'p5': error.message}));
       }
@@ -1329,14 +1449,23 @@ class _HomePageState extends State<HomePage> {
     final int uploaded = plan.pushes.length - failed;
     final List<String> details = <String>[
       if (plan.added > 0) tr('新增 {p6}', <String, Object?>{'p6': plan.added}),
-      if (plan.updated > 0) tr('更新 {p7}', <String, Object?>{'p7': plan.updated}),
-      if (plan.removed > 0) tr('移除 {p8}', <String, Object?>{'p8': plan.removed}),
-      if (uploaded > 0) tr('上传 {uploaded}', <String, Object?>{'uploaded': uploaded}),
-      if (conflicts > 0) tr('冲突 {conflicts} 已刷新', <String, Object?>{'conflicts': conflicts}),
+      if (plan.updated > 0)
+        tr('更新 {p7}', <String, Object?>{'p7': plan.updated}),
+      if (plan.removed > 0)
+        tr('移除 {p8}', <String, Object?>{'p8': plan.removed}),
+      if (uploaded > 0)
+        tr('上传 {uploaded}', <String, Object?>{'uploaded': uploaded}),
+      if (conflicts > 0)
+        tr('冲突 {conflicts} 已刷新', <String, Object?>{'conflicts': conflicts}),
       if (failed > 0) tr('{failed} 项上传失败', <String, Object?>{'failed': failed}),
-      if (pendingDeletes > 0) tr('待删除重试 {pendingDeletes}', <String, Object?>{'pendingDeletes': pendingDeletes}),
+      if (pendingDeletes > 0)
+        tr('待删除重试 {pendingDeletes}', <String, Object?>{
+          'pendingDeletes': pendingDeletes,
+        }),
     ];
-    return details.isEmpty ? tr('地址簿已同步') : tr('地址簿已同步（{p9}）', <String, Object?>{'p9': details.join('，')});
+    return details.isEmpty
+        ? tr('地址簿已同步')
+        : tr('地址簿已同步（{p9}）', <String, Object?>{'p9': details.join('，')});
   }
 
   /// A successful upload settles the offline clear intent it carried and
@@ -1401,9 +1530,15 @@ class _HomePageState extends State<HomePage> {
         );
       }
       final List<Device> devices = await _deviceStore.replaceAll(next);
+      final List<AddressBookGroup> groups = mergeAddressBookGroups(
+        current: _groups,
+        snapshot: snapshot,
+        since: 0,
+      );
       final AccountSession session = account.copyWith(
         syncedAt: DateTime.now(),
         bookRevision: snapshot.revision,
+        groups: groups,
       );
       await _accountStore.save(session);
       if (!mounted) {
@@ -1411,11 +1546,7 @@ class _HomePageState extends State<HomePage> {
       }
       setState(() {
         _devices = devices;
-        _groups = mergeAddressBookGroups(
-          current: _groups,
-          snapshot: snapshot,
-          since: 0,
-        );
+        _groups = groups;
         _groupsSynced = true;
         _account = session;
       });
@@ -1472,7 +1603,7 @@ class _HomePageState extends State<HomePage> {
       }
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
-        await _expireAccount();
+        await _recoverAccountSession();
         return;
       }
       if (error.statusCode == HttpStatus.conflict) {
@@ -1503,7 +1634,7 @@ class _HomePageState extends State<HomePage> {
       await _deleteAddressBookPeer(_server, account.token, device.id);
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
-        await _expireAccount();
+        await _recoverAccountSession();
         return;
       }
       if (error.statusCode != HttpStatus.notFound) {
@@ -1553,9 +1684,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _setUploadRecordings(bool enabled) async {
-    final ServerSettings updated = _server.copyWith(
-      uploadRecordings: enabled,
-    );
+    final ServerSettings updated = _server.copyWith(uploadRecordings: enabled);
     setState(() => _server = updated);
     await _serverStore.save(updated);
   }
@@ -1579,7 +1708,12 @@ class _HomePageState extends State<HomePage> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Text(tr('当前版本 {chastVersion}，连接服务提供 {p10}。', <String, Object?>{'chastVersion': chastVersion, 'p10': update.version})),
+                Text(
+                  tr('当前版本 {chastVersion}，连接服务提供 {p10}。', <String, Object?>{
+                    'chastVersion': chastVersion,
+                    'p10': update.version,
+                  }),
+                ),
                 const SizedBox(height: 12),
                 SelectableText(
                   update.url,
@@ -1622,12 +1756,10 @@ class _HomePageState extends State<HomePage> {
     if (action != 'copy') {
       return;
     }
-    await Clipboard.setData(ClipboardData(text: update.url));
-    if (mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(tr('下载地址已复制'))));
+    if (!mounted) {
+      return;
     }
+    await _copyText(context, update.url, tr('下载地址已复制'));
   }
 
   Future<void> _installUpdateAndExit(
@@ -1638,9 +1770,13 @@ class _HomePageState extends State<HomePage> {
       await _installUpdate(update, serverPublicKey);
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(tr('无法启动更新：{error}', <String, Object?>{'error': error}))));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('无法启动更新：{error}', <String, Object?>{'error': error}),
+            ),
+          ),
+        );
       }
       return;
     }
@@ -1658,7 +1794,10 @@ class _HomePageState extends State<HomePage> {
           ),
           title: Text(tr('关于 Chast')),
           content: Text(
-            tr('Chast {chastVersion}\n\nWindows 桌面采集、Intel 硬件编码、MsQuic 直连显示与键鼠控制。远端需以 chast-quic serve --input 启动才会接受输入；设备 ID 经 chast-server 解析，直连失败时自动回退中继。', <String, Object?>{'chastVersion': chastVersion}),
+            tr(
+              'Chast {chastVersion}\n\nWindows 桌面采集、Intel 硬件编码、MsQuic 直连显示与键鼠控制。远端需以 chast-quic serve --input 启动才会接受输入；设备 ID 经 chast-server 解析，直连失败时自动回退中继。',
+              <String, Object?>{'chastVersion': chastVersion},
+            ),
           ),
           actions: <Widget>[
             TextButton(
@@ -1718,18 +1857,56 @@ class _HomePageState extends State<HomePage> {
     if (query.isEmpty && tags.isEmpty) {
       return saved;
     }
+    final Set<String> groupHits = _groupsMatchingQuery(query);
     return <Device>[
       for (final Device device in saved)
-        if (_matchesFilter(device, query, tags)) device,
+        if (_matchesFilter(device, query, tags, groupHits)) device,
     ];
   }
 
-  bool _matchesFilter(Device device, String query, Set<String> tags) {
+  /// Group ids whose name, or the name of an ancestor, contains [query].
+  /// Only groups cached from the account take part.
+  Set<String> _groupsMatchingQuery(String query) {
+    final Set<String> hits = <String>{};
+    if (query.isEmpty || _groups.isEmpty) {
+      return hits;
+    }
+    final Map<String, AddressBookGroup> byId = <String, AddressBookGroup>{
+      for (final AddressBookGroup group in _groups)
+        if (!group.deleted) group.id: group,
+    };
+    for (final AddressBookGroup group in byId.values) {
+      String id = group.id;
+      final Set<String> seen = <String>{};
+      while (id.isNotEmpty && seen.add(id)) {
+        final AddressBookGroup? current = byId[id];
+        if (current == null) {
+          break;
+        }
+        if (current.name.toLowerCase().contains(query)) {
+          hits.add(group.id);
+          break;
+        }
+        id = current.parentId;
+      }
+    }
+    return hits;
+  }
+
+  bool _matchesFilter(
+    Device device,
+    String query,
+    Set<String> tags,
+    Set<String> groupHits,
+  ) {
     final List<String> visibleTags = _visibleTags(device);
     if (tags.isNotEmpty && !visibleTags.any(tags.contains)) {
       return false;
     }
     if (query.isEmpty) {
+      return true;
+    }
+    if (device.groupId.isNotEmpty && groupHits.contains(device.groupId)) {
       return true;
     }
     final DevicePresence? presence = _presence[device.key];
@@ -1750,6 +1927,7 @@ class _HomePageState extends State<HomePage> {
       _deviceQuery = '';
       _selectedTags.clear();
     });
+    ViewFilter.save(_selectedTags);
   }
 
   int get _onlineCount => _presence.values
@@ -1933,7 +2111,10 @@ class _HomePageState extends State<HomePage> {
                           const SizedBox(height: 6),
                           Text(
                             _server.configured
-                                ? tr('设备 ID 通过 {p11} 解析；令牌只用于这次连接。', <String, Object?>{'p11': _server.url})
+                                ? tr(
+                                    '设备 ID 通过 {p11} 解析；令牌只用于这次连接。',
+                                    <String, Object?>{'p11': _server.url},
+                                  )
                                 : tr('带 : 的地址直接连接；设备 ID 需先配置连接服务。'),
                             style: mutedStyle(context, size: 10.5),
                           ),
@@ -2096,10 +2277,7 @@ class _HomePageState extends State<HomePage> {
                           ),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        child: Text(
-                          tr('清除筛选'),
-                          style: TextStyle(fontSize: 11),
-                        ),
+                        child: Text(tr('清除筛选'), style: TextStyle(fontSize: 11)),
                       ),
                     const Spacer(),
                     if (_account != null && _account!.server == _server.url)
@@ -2168,14 +2346,11 @@ class _HomePageState extends State<HomePage> {
                           ),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                        child: Text(
-                          tr('清除筛选'),
-                          style: TextStyle(fontSize: 12),
-                        ),
+                        child: Text(tr('清除筛选'), style: TextStyle(fontSize: 12)),
                       ),
                     )
                   else
-                    _buildSavedDevices(context, filtered),
+                    _buildSavedDevices(context, filtered, filtering: filtering),
                 ],
                 const SizedBox(height: 30),
                 Row(
@@ -2221,7 +2396,11 @@ class _HomePageState extends State<HomePage> {
                           presence:
                               _presence[device.key] ?? DevicePresence.unknown,
                           onTap: () => _connectDevice(device),
+                          onFilesOnly: () =>
+                              _connectDevice(device, fileTransferOnly: true),
+                          onRename: () => _renameDevice(device),
                           onSave: () => _promote(device),
+                          onRemove: () => _removeRecent(device),
                         ),
                     ],
                   ),
@@ -2316,7 +2495,10 @@ class _HomePageState extends State<HomePage> {
                 key: const Key('tag-filter-all'),
                 label: tr('全部'),
                 selected: activeTags.isEmpty,
-                onTap: () => setState(() => _selectedTags.clear()),
+                onTap: () {
+                  setState(() => _selectedTags.clear());
+                  ViewFilter.save(_selectedTags);
+                },
               ),
               for (final String tag in tags)
                 _filterChip(
@@ -2324,11 +2506,14 @@ class _HomePageState extends State<HomePage> {
                   key: Key('tag-filter-$tag'),
                   label: tag,
                   selected: activeTags.contains(tag),
-                  onTap: () => setState(() {
-                    if (!_selectedTags.remove(tag)) {
-                      _selectedTags.add(tag);
-                    }
-                  }),
+                  onTap: () {
+                    setState(() {
+                      if (!_selectedTags.remove(tag)) {
+                        _selectedTags.add(tag);
+                      }
+                    });
+                    ViewFilter.save(_selectedTags);
+                  },
                 ),
             ],
           ),
@@ -2378,7 +2563,11 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _buildSavedDevices(BuildContext context, List<Device> saved) {
+  Widget _buildSavedDevices(
+    BuildContext context,
+    List<Device> saved, {
+    required bool filtering,
+  }) {
     final bool accountReady =
         _account != null && _account!.server == _server.url;
     final List<AddressBookGroup> groups = accountReady
@@ -2420,11 +2609,13 @@ class _HomePageState extends State<HomePage> {
       subtreeCounts[node.group.id] = count;
     }
     final Set<String> hidden = <String>{};
-    for (final AddressBookGroupNode node in nodes) {
-      final String parent = node.group.parentId;
-      if (parent.isNotEmpty &&
-          (_collapsedGroups.contains(parent) || hidden.contains(parent))) {
-        hidden.add(node.group.id);
+    if (!filtering) {
+      for (final AddressBookGroupNode node in nodes) {
+        final String parent = node.group.parentId;
+        if (parent.isNotEmpty &&
+            (_collapsedGroups.contains(parent) || hidden.contains(parent))) {
+          hidden.add(node.group.id);
+        }
       }
     }
     final List<AddressBookGroupNode> visible = <AddressBookGroupNode>[
@@ -2438,7 +2629,8 @@ class _HomePageState extends State<HomePage> {
         spacing: 12,
         runSpacing: 12,
         children: <Widget>[
-          for (final Device device in saved) _deviceCard(device),
+          for (final Device device in saved)
+            _deviceCard(device, draggable: false),
         ],
       );
     }
@@ -2452,14 +2644,18 @@ class _HomePageState extends State<HomePage> {
             label: node.group.name,
             count: subtreeCounts[node.group.id] ?? 0,
             depth: node.depth,
-            collapsed: _collapsedGroups.contains(node.group.id),
-            onToggle: () => setState(() {
-              if (!_collapsedGroups.remove(node.group.id)) {
-                _collapsedGroups.add(node.group.id);
-              }
-            }),
+            dropGroupId: node.group.id,
+            collapsed: !filtering && _collapsedGroups.contains(node.group.id),
+            onToggle: () {
+              setState(() {
+                if (!_collapsedGroups.remove(node.group.id)) {
+                  _collapsedGroups.add(node.group.id);
+                }
+              });
+              ViewFilter.saveCollapsed(_collapsedGroups);
+            },
           ),
-          if (!_collapsedGroups.contains(node.group.id))
+          if (filtering || !_collapsedGroups.contains(node.group.id))
             Padding(
               padding: EdgeInsets.only(top: 8, left: node.depth * 16.0),
               child: Wrap(
@@ -2469,6 +2665,7 @@ class _HomePageState extends State<HomePage> {
                   for (final Device device in grouped[node.group.id]!)
                     _deviceCard(
                       device,
+                      reorderable: true,
                       onMoveUp: _canMovePeer(device, -1)
                           ? () => _movePeerInGroup(device, -1)
                           : null,
@@ -2481,21 +2678,27 @@ class _HomePageState extends State<HomePage> {
             ),
           const SizedBox(height: 14),
         ],
-        if (ungrouped.isNotEmpty) ...<Widget>[
+        if (ungrouped.isNotEmpty ||
+            (accountReady && groups.isNotEmpty && !filtering)) ...<Widget>[
           _groupHeader(
             context,
             key: const Key('device-group-ungrouped'),
             label: tr('未分组'),
             count: ungrouped.length,
-            collapsed: _collapsedGroups.contains(''),
+            collapsed: !filtering && _collapsedGroups.contains(''),
+            dropGroupId: '',
             ungrouped: true,
-            onToggle: () => setState(() {
-              if (!_collapsedGroups.remove('')) {
-                _collapsedGroups.add('');
-              }
-            }),
+            onToggle: () {
+              setState(() {
+                if (!_collapsedGroups.remove('')) {
+                  _collapsedGroups.add('');
+                }
+              });
+              ViewFilter.saveCollapsed(_collapsedGroups);
+            },
           ),
-          if (!_collapsedGroups.contains(''))
+          if (ungrouped.isNotEmpty &&
+              (filtering || !_collapsedGroups.contains('')))
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Wrap(
@@ -2532,8 +2735,7 @@ class _HomePageState extends State<HomePage> {
 
   bool _canMovePeer(Device device, int delta) {
     final List<Device> peers = _groupPeers(device.groupId);
-    final int index =
-        peers.indexWhere((Device item) => item.key == device.key);
+    final int index = peers.indexWhere((Device item) => item.key == device.key);
     final int target = index + delta;
     return index >= 0 && target >= 0 && target < peers.length;
   }
@@ -2544,8 +2746,7 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final List<Device> peers = _groupPeers(device.groupId);
-    final int index =
-        peers.indexWhere((Device item) => item.key == device.key);
+    final int index = peers.indexWhere((Device item) => item.key == device.key);
     final int target = index + delta;
     if (index < 0 || target < 0 || target >= peers.length) {
       return;
@@ -2553,6 +2754,32 @@ class _HomePageState extends State<HomePage> {
     final List<Device> reordered = List<Device>.of(peers)
       ..removeAt(index)
       ..insert(target, device);
+    await _applyPeerOrder(device, reordered);
+  }
+
+  /// Drops [moved] into [target]'s slot; only peers of the same group trade
+  /// places, so a card drop never changes groups.
+  Future<void> _movePeerOnto(Device moved, Device target) async {
+    if (moved.key == target.key || moved.groupId != target.groupId) {
+      return;
+    }
+    final List<Device> peers = _groupPeers(moved.groupId);
+    final int from = peers.indexWhere((Device item) => item.key == moved.key);
+    final int to = peers.indexWhere((Device item) => item.key == target.key);
+    if (from < 0 || to < 0 || from == to) {
+      return;
+    }
+    peers
+      ..removeAt(from)
+      ..insert(to, moved);
+    await _applyPeerOrder(moved, peers);
+  }
+
+  Future<void> _applyPeerOrder(Device device, List<Device> reordered) async {
+    final AccountSession? account = _account;
+    if (account == null || account.server != _server.url) {
+      return;
+    }
     try {
       for (int i = 0; i < reordered.length; i++) {
         final Device item = reordered[i];
@@ -2560,7 +2787,7 @@ class _HomePageState extends State<HomePage> {
         if (item.position == position) {
           continue;
         }
-        final AddressBookPeer written = await ServerApi.updateAddressBookPeer(
+        final AddressBookPeer written = await _writePeerOrder(
           _server,
           account.token,
           item.id,
@@ -2581,7 +2808,7 @@ class _HomePageState extends State<HomePage> {
       }
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.unauthorized) {
-        await _expireAccount();
+        await _recoverAccountSession();
         return;
       }
       if (error.statusCode == HttpStatus.conflict) {
@@ -2602,16 +2829,19 @@ class _HomePageState extends State<HomePage> {
     Device device, {
     VoidCallback? onMoveUp,
     VoidCallback? onMoveDown,
+    bool draggable = true,
+    bool reorderable = false,
   }) {
     final bool accountReady =
         _account != null &&
         _account!.server == _server.url &&
         device.viaServer &&
         device.server == _server.url;
-    return _DeviceCard(
+    final Widget card = _DeviceCard(
       device: device,
       presence: _presence[device.key] ?? DevicePresence.unknown,
       pinned: _trust.containsKey(device.trustKey),
+      draggable: draggable && accountReady,
       onTap: () => _connectDevice(device),
       onFilesOnly: () => _connectDevice(device, fileTransferOnly: true),
       onRename: () => _renameDevice(device),
@@ -2623,6 +2853,32 @@ class _HomePageState extends State<HomePage> {
       onMoveDown: onMoveDown,
       onDelete: () => _deleteDevice(device),
     );
+    if (!reorderable) {
+      return card;
+    }
+    return DragTarget<Device>(
+      key: Key('device-drop-${device.id}'),
+      onWillAcceptWithDetails: (DragTargetDetails<Device> details) =>
+          _canReorderOnto(details.data, device),
+      onAcceptWithDetails: (DragTargetDetails<Device> details) =>
+          _movePeerOnto(details.data, device),
+      builder:
+          (
+            BuildContext context,
+            List<Device?> candidate,
+            List<dynamic> rejected,
+          ) {
+            return Container(
+              foregroundDecoration: candidate.isEmpty
+                  ? null
+                  : BoxDecoration(
+                      border: Border.all(color: kAccent, width: 2),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+              child: card,
+            );
+          },
+    );
   }
 
   Widget _groupHeader(
@@ -2632,11 +2888,12 @@ class _HomePageState extends State<HomePage> {
     required int count,
     required bool collapsed,
     required VoidCallback onToggle,
+    String? dropGroupId,
     int depth = 0,
     bool ungrouped = false,
   }) {
     final ThemeData theme = Theme.of(context);
-    return InkWell(
+    final Widget header = InkWell(
       key: key,
       borderRadius: BorderRadius.circular(8),
       onTap: onToggle,
@@ -2673,6 +2930,50 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+    if (dropGroupId == null) {
+      return header;
+    }
+    return DragTarget<Device>(
+      onWillAcceptWithDetails: (DragTargetDetails<Device> details) =>
+          _canDropDevice(details.data, dropGroupId),
+      onAcceptWithDetails: (DragTargetDetails<Device> details) =>
+          _assignDeviceToGroup(details.data, dropGroupId),
+      builder:
+          (
+            BuildContext context,
+            List<Device?> candidate,
+            List<dynamic> rejected,
+          ) {
+            return DecoratedBox(
+              decoration: candidate.isEmpty
+                  ? const BoxDecoration()
+                  : BoxDecoration(
+                      color: kAccent.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+              child: header,
+            );
+          },
+    );
+  }
+
+  bool _canDropDevice(Device device, String groupId) {
+    return _isMovablePeer(device) && device.groupId != groupId;
+  }
+
+  bool _canReorderOnto(Device moved, Device target) {
+    return _isMovablePeer(moved) &&
+        moved.groupId == target.groupId &&
+        moved.key != target.key;
+  }
+
+  bool _isMovablePeer(Device device) {
+    final AccountSession? account = _account;
+    return account != null &&
+        account.server == _server.url &&
+        device.saved &&
+        device.viaServer &&
+        device.server == _server.url;
   }
 
   Widget _emptyPanel(
@@ -2917,7 +3218,17 @@ class _Sidebar extends StatelessWidget {
                             const SizedBox(height: 2),
                             Text(
                               server.configured
-                                  ? tr('{p17}{p18}', <String, Object?>{'p17': server.mode.shortLabel, 'p18': onlineCount > 0 ? tr(' · {onlineCount} 台在线', <String, Object?>{'onlineCount': onlineCount}) : ''})
+                                  ? tr('{p17}{p18}', <String, Object?>{
+                                      'p17': server.mode.shortLabel,
+                                      'p18': onlineCount > 0
+                                          ? tr(
+                                              ' · {onlineCount} 台在线',
+                                              <String, Object?>{
+                                                'onlineCount': onlineCount,
+                                              },
+                                            )
+                                          : '',
+                                    })
                                   : tr('点击配置'),
                               style: mutedStyle(context, size: 9.5),
                             ),
@@ -2949,7 +3260,9 @@ class _Sidebar extends StatelessWidget {
                 Expanded(
                   child: Text(
                     trustedCount > 0
-                        ? tr('已固定 {trustedCount} 个主机身份', <String, Object?>{'trustedCount': trustedCount})
+                        ? tr('已固定 {trustedCount} 个主机身份', <String, Object?>{
+                            'trustedCount': trustedCount,
+                          })
                         : tr('首次连接时记录主机证书指纹'),
                     style: mutedStyle(context, size: 10),
                   ),
@@ -3222,7 +3535,9 @@ class _UpdateBanner extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  tr('当前 {current} · 由连接服务通告', <String, Object?>{'current': current}),
+                  tr('当前 {current} · 由连接服务通告', <String, Object?>{
+                    'current': current,
+                  }),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: mutedStyle(context, size: 10.5),
@@ -3308,7 +3623,10 @@ class _LabelsDialogState extends State<_LabelsDialog> {
         continue;
       }
       if (tag.runes.length > 32) {
-        setState(() => _error = tr('单个标签最多 32 个字符：{tag}', <String, Object?>{'tag': tag}));
+        setState(
+          () =>
+              _error = tr('单个标签最多 32 个字符：{tag}', <String, Object?>{'tag': tag}),
+        );
         return;
       }
       tags.add(tag);
@@ -3455,7 +3773,10 @@ class _TagsDialogState extends State<_TagsDialog> {
         continue;
       }
       if (tag.runes.length > 32) {
-        setState(() => _error = tr('单个标签最多 32 个字符：{tag}', <String, Object?>{'tag': tag}));
+        setState(
+          () =>
+              _error = tr('单个标签最多 32 个字符：{tag}', <String, Object?>{'tag': tag}),
+        );
         return;
       }
       tags.add(tag);
@@ -3547,8 +3868,8 @@ class _GroupPickerDialog extends StatelessWidget {
           value.isEmpty
               ? Icons.inbox_outlined
               : depth == 0
-                  ? Icons.folder_outlined
-                  : Icons.subdirectory_arrow_right_rounded,
+              ? Icons.folder_outlined
+              : Icons.subdirectory_arrow_right_rounded,
           size: 18,
           color: active
               ? kAccent
@@ -3576,7 +3897,11 @@ class _GroupPickerDialog extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            tile(key: const Key('group-pick-none'), label: tr('未分组'), value: ''),
+            tile(
+              key: const Key('group-pick-none'),
+              label: tr('未分组'),
+              value: '',
+            ),
             for (final AddressBookGroupNode node in nodes)
               tile(
                 key: Key('group-pick-${node.group.id}'),
@@ -3647,7 +3972,10 @@ class _WakeDialogState extends State<_WakeDialog> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             Text(
-              tr('向“{p21}”发送 Wake-on-LAN 魔术包。查看器必须与目标处于同一局域网，目标需启用网络唤醒。', <String, Object?>{'p21': widget.device.displayName}),
+              tr(
+                '向“{p21}”发送 Wake-on-LAN 魔术包。查看器必须与目标处于同一局域网，目标需启用网络唤醒。',
+                <String, Object?>{'p21': widget.device.displayName},
+              ),
               style: mutedStyle(context, size: 12),
             ),
             const SizedBox(height: 14),
@@ -3676,6 +4004,29 @@ class _WakeDialogState extends State<_WakeDialog> {
   }
 }
 
+Future<void> _copyDeviceId(BuildContext context, String id) =>
+    _copyText(context, id, tr('ID 已复制'));
+
+/// Copies [text] and reports the real outcome; a rejected clipboard write must
+/// not look like a successful copy.
+Future<void> _copyText(BuildContext context, String text, String done) async {
+  bool copied = true;
+  try {
+    await Clipboard.setData(ClipboardData(text: text));
+  } catch (_) {
+    copied = false;
+  }
+  if (!context.mounted) {
+    return;
+  }
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(copied ? done : tr('复制失败')),
+      duration: const Duration(seconds: 2),
+    ),
+  );
+}
+
 class _DeviceCard extends StatelessWidget {
   const _DeviceCard({
     required this.device,
@@ -3691,11 +4042,13 @@ class _DeviceCard extends StatelessWidget {
     this.onGroup,
     this.onMoveUp,
     this.onMoveDown,
+    this.draggable = false,
   });
 
   final Device device;
   final DevicePresence presence;
   final bool pinned;
+  final bool draggable;
   final VoidCallback onTap;
   final VoidCallback onFilesOnly;
   final VoidCallback onRename;
@@ -3706,6 +4059,61 @@ class _DeviceCard extends StatelessWidget {
   final VoidCallback? onGroup;
   final VoidCallback? onMoveUp;
   final VoidCallback? onMoveDown;
+
+  Future<void> _copyId(BuildContext context) =>
+      _copyDeviceId(context, device.id);
+
+  Future<void> _copyServer(BuildContext context) =>
+      _copyText(context, device.server, tr('服务器地址已复制'));
+
+  /// The server icon doubles as the drag handle so the rest of the card keeps
+  /// normal tap behaviour; dropping it on a group header moves the peer.
+  Widget _deviceIcon(ThemeData theme, String title) {
+    final Widget icon = Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: kAccent.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Icon(
+        device.viaServer ? Icons.dns_outlined : Icons.lan_outlined,
+        color: kAccent,
+        size: 20,
+      ),
+    );
+    if (!draggable) {
+      return icon;
+    }
+    return Tooltip(
+      message: tr('拖到分组标题或同组卡片'),
+      child: Draggable<Device>(
+        key: Key('device-drag-${device.id}'),
+        data: device,
+        maxSimultaneousDrags: 1,
+        feedback: Material(
+          color: Colors.transparent,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: kAccent),
+            ),
+            child: Text(
+              title,
+              style: TextStyle(
+                fontSize: 12,
+                color: theme.colorScheme.onSurface,
+              ),
+            ),
+          ),
+        ),
+        childWhenDragging: Opacity(opacity: 0.35, child: icon),
+        child: MouseRegion(cursor: SystemMouseCursors.grab, child: icon),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3739,19 +4147,7 @@ class _DeviceCard extends StatelessWidget {
             ),
             child: Row(
               children: <Widget>[
-                Container(
-                  width: 40,
-                  height: 40,
-                  decoration: BoxDecoration(
-                    color: kAccent.withValues(alpha: 0.10),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Icon(
-                    device.viaServer ? Icons.dns_outlined : Icons.lan_outlined,
-                    color: kAccent,
-                    size: 20,
-                  ),
-                ),
+                _deviceIcon(theme, title),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Column(
@@ -3804,6 +4200,10 @@ class _DeviceCard extends StatelessWidget {
                   onSelected: (String value) {
                     if (value == 'files') {
                       onFilesOnly();
+                    } else if (value == 'copy-id') {
+                      unawaited(_copyId(context));
+                    } else if (value == 'copy-server') {
+                      unawaited(_copyServer(context));
                     } else if (value == 'rename') {
                       onRename();
                     } else if (value == 'wake') {
@@ -3828,6 +4228,15 @@ class _DeviceCard extends StatelessWidget {
                           value: 'files',
                           child: Text(tr('仅文件传输')),
                         ),
+                        PopupMenuItem<String>(
+                          value: 'copy-id',
+                          child: Text(tr('复制 ID')),
+                        ),
+                        if (device.server.isNotEmpty)
+                          PopupMenuItem<String>(
+                            value: 'copy-server',
+                            child: Text(tr('复制服务器地址')),
+                          ),
                         PopupMenuItem<String>(
                           value: 'rename',
                           child: Text(tr('重命名')),
@@ -3938,13 +4347,55 @@ class _RecentCard extends StatelessWidget {
     required this.device,
     required this.presence,
     required this.onTap,
+    required this.onFilesOnly,
+    required this.onRename,
     required this.onSave,
+    required this.onRemove,
   });
 
   final Device device;
   final DevicePresence presence;
   final VoidCallback onTap;
+  final VoidCallback onFilesOnly;
+  final VoidCallback onRename;
   final VoidCallback onSave;
+  final VoidCallback onRemove;
+
+  /// A context menu keeps the card compact; save and remove stay on their
+  /// one-click buttons and repeat here so touch users can reach everything
+  /// through a long press.
+  Future<void> _showContextMenu(BuildContext context, Offset position) async {
+    final String? value = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: <PopupMenuEntry<String>>[
+        PopupMenuItem<String>(value: 'files', child: Text(tr('仅文件传输'))),
+        PopupMenuItem<String>(value: 'copy-id', child: Text(tr('复制 ID'))),
+        PopupMenuItem<String>(value: 'rename', child: Text(tr('重命名'))),
+        PopupMenuItem<String>(value: 'save', child: Text(tr('保存到我的设备'))),
+        PopupMenuItem<String>(value: 'remove', child: Text(tr('从最近连接中移除'))),
+      ],
+    );
+    if (!context.mounted) {
+      return;
+    }
+    if (value == 'files') {
+      onFilesOnly();
+    } else if (value == 'copy-id') {
+      await _copyDeviceId(context, device.id);
+    } else if (value == 'rename') {
+      onRename();
+    } else if (value == 'save') {
+      onSave();
+    } else if (value == 'remove') {
+      onRemove();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3960,88 +4411,113 @@ class _RecentCard extends StatelessWidget {
     final String presenceText = !device.viaServer
         ? _formatTime(device.lastUsed!)
         : switch (presence.state) {
-            HostPresence.online => tr('在线 · {p22}', <String, Object?>{'p22': _formatTime(device.lastUsed!)}),
+            HostPresence.online => tr('在线 · {p22}', <String, Object?>{
+              'p22': _formatTime(device.lastUsed!),
+            }),
             HostPresence.offline => tr('离线'),
             HostPresence.unreachable => tr('服务不可达'),
             HostPresence.checking => tr('查询中'),
             HostPresence.unknown => _formatTime(device.lastUsed!),
           };
     return SizedBox(
+      key: Key('recent-${device.key}'),
       width: 250,
       height: 86,
-      child: Material(
-        color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.circular(14),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          hoverColor: kAccent.withValues(alpha: 0.05),
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(14, 8, 4, 8),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: subtle),
-            ),
-            child: Row(
-              children: <Widget>[
-                Container(
-                  width: 38,
-                  height: 38,
-                  decoration: BoxDecoration(
-                    color: kAccent.withValues(alpha: 0.10),
-                    borderRadius: BorderRadius.circular(10),
+      child: GestureDetector(
+        onSecondaryTapDown: (TapDownDetails details) {
+          unawaited(_showContextMenu(context, details.globalPosition));
+        },
+        onLongPressStart: (LongPressStartDetails details) {
+          unawaited(_showContextMenu(context, details.globalPosition));
+        },
+        child: Material(
+          color: theme.colorScheme.surface,
+          borderRadius: BorderRadius.circular(14),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            hoverColor: kAccent.withValues(alpha: 0.05),
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(14, 8, 4, 8),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: subtle),
+              ),
+              child: Row(
+                children: <Widget>[
+                  Container(
+                    width: 38,
+                    height: 38,
+                    decoration: BoxDecoration(
+                      color: kAccent.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Icon(
+                      device.viaServer
+                          ? Icons.dns_outlined
+                          : Icons.desktop_windows_rounded,
+                      color: kAccent,
+                      size: 19,
+                    ),
                   ),
-                  child: Icon(
-                    device.viaServer
-                        ? Icons.dns_outlined
-                        : Icons.desktop_windows_rounded,
-                    color: kAccent,
-                    size: 19,
-                  ),
-                ),
-                const SizedBox(width: 11),
-                Expanded(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: theme.colorScheme.onSurface,
+                  const SizedBox(width: 11),
+                  Expanded(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: theme.colorScheme.onSurface,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        subtitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: mutedStyle(context, size: 10),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        presenceText,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: mutedStyle(context, size: 9.5),
-                      ),
-                    ],
+                        const SizedBox(height: 3),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: mutedStyle(context, size: 10),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          presenceText,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: mutedStyle(context, size: 9.5),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                IconButton(
-                  tooltip: tr('保存到我的设备'),
-                  onPressed: onSave,
-                  icon: Icon(
-                    Icons.bookmark_add_outlined,
-                    size: 17,
-                    color: dark ? Colors.white54 : const Color(0xFF7C8390),
+                  IconButton(
+                    tooltip: tr('保存到我的设备'),
+                    onPressed: onSave,
+                    icon: Icon(
+                      Icons.bookmark_add_outlined,
+                      size: 17,
+                      color: dark ? Colors.white54 : const Color(0xFF7C8390),
+                    ),
                   ),
-                ),
-              ],
+                  IconButton(
+                    tooltip: tr('从最近连接中移除'),
+                    onPressed: onRemove,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 26,
+                      minHeight: 26,
+                    ),
+                    icon: Icon(
+                      Icons.close_rounded,
+                      size: 15,
+                      color: dark ? Colors.white38 : const Color(0xFF9AA1AC),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -4147,7 +4623,11 @@ class _LanScanDialogState extends State<_LanScanDialog> {
                       .where((LanPeer peer) => _selected.contains(peer.id))
                       .toList(),
                 ),
-          child: Text(_selected.isEmpty ? tr('添加') : tr('添加 {p23} 台', <String, Object?>{'p23': _selected.length})),
+          child: Text(
+            _selected.isEmpty
+                ? tr('添加')
+                : tr('添加 {p23} 台', <String, Object?>{'p23': _selected.length}),
+          ),
         ),
       ],
     );
@@ -4307,7 +4787,9 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
             ),
             const SizedBox(height: 10),
             Text(
-              tr('设备 ID 通过 {service} 解析；带 : 的地址按直连保存。', <String, Object?>{'service': service}),
+              tr('设备 ID 通过 {service} 解析；带 : 的地址按直连保存。', <String, Object?>{
+                'service': service,
+              }),
               style: mutedStyle(context, size: 11),
             ),
             if (_error.isNotEmpty) ...<Widget>[
@@ -4526,7 +5008,9 @@ class _AccountDialogState extends State<_AccountDialog> {
       _AccountResult(
         session: AccountSession(
           server: widget.server.url,
-          username: result.username.isEmpty ? fallbackUsername : result.username,
+          username: result.username.isEmpty
+              ? fallbackUsername
+              : result.username,
           token: result.token,
           expiresAt: issued.add(Duration(milliseconds: result.expiresInMs)),
           refreshToken: result.refreshToken,
@@ -4780,10 +5264,7 @@ class _AccountDialogState extends State<_AccountDialog> {
     return showDialog<void>(
       context: context,
       builder: (BuildContext context) {
-        return RecordingArchiveDialog(
-          server: widget.server,
-          account: account,
-        );
+        return RecordingArchiveDialog(server: widget.server, account: account);
       },
     );
   }
@@ -5187,17 +5668,24 @@ class _AccountDialogState extends State<_AccountDialog> {
           ],
         ),
         const SizedBox(height: 16),
-        Text(tr('账号地址簿会在此设备与其他已登录设备之间同步。'), style: mutedStyle(context, size: 12)),
+        Text(
+          tr('账号地址簿会在此设备与其他已登录设备之间同步。'),
+          style: mutedStyle(context, size: 12),
+        ),
         const SizedBox(height: 8),
         Text(
-          tr('登录有效期至 {p26}', <String, Object?>{'p26': _formatTime(account.expiresAt.toLocal())}),
+          tr('登录有效期至 {p26}', <String, Object?>{
+            'p26': _formatTime(account.expiresAt.toLocal()),
+          }),
           style: mutedStyle(context, size: 11),
         ),
         const SizedBox(height: 4),
         Text(
           account.syncedAt == null
               ? tr('尚未同步')
-              : tr('上次同步：{p27}', <String, Object?>{'p27': _formatTime(account.syncedAt!.toLocal())}),
+              : tr('上次同步：{p27}', <String, Object?>{
+                  'p27': _formatTime(account.syncedAt!.toLocal()),
+                }),
           style: mutedStyle(context, size: 11),
         ),
         const SizedBox(height: 14),
@@ -5479,7 +5967,11 @@ class _ServerDialogState extends State<_ServerDialog> {
                   child: Text(
                     _pin == null
                         ? tr('服务器身份尚未固定：首次连接时会展示指纹')
-                        : tr('服务器身份 {p28}（已固定）', <String, Object?>{'p28': shortenServerFingerprint(_pin!.identity.fingerprint)}),
+                        : tr('服务器身份 {p28}（已固定）', <String, Object?>{
+                            'p28': shortenServerFingerprint(
+                              _pin!.identity.fingerprint,
+                            ),
+                          }),
                     overflow: TextOverflow.ellipsis,
                     style: mutedStyle(context, size: 11),
                   ),
@@ -5493,7 +5985,9 @@ class _ServerDialogState extends State<_ServerDialog> {
               ],
             ),
             Text(
-              tr('服务端配置 --server-key 后，查看者解析设备 ID 和打洞也要带同一密钥；留空表示服务端未启用密钥。留空服务地址即可关闭设备 ID 解析。'),
+              tr(
+                '服务端配置 --server-key 后，查看者解析设备 ID 和打洞也要带同一密钥；留空表示服务端未启用密钥。留空服务地址即可关闭设备 ID 解析。',
+              ),
               style: mutedStyle(context, size: 10.5),
             ),
           ],

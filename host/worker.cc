@@ -181,6 +181,7 @@ int run_worker(std::string* error) {
 
     HostServerConfig config;
     config.settings = settings;
+    config.audio_silence_gate_ms = settings.audio_silence_gate_ms;
     config.identity_scope = IdentityScope::LocalMachine;
     // No interactive operator: the policy forces password-only mode, keeps no
     // temporary password and never asks for click approval.

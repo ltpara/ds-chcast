@@ -77,9 +77,38 @@ public:
 
     ID3D11Device* device() override { return device_.Get(); }
 
-    bool OnGpuFrame(ID3D11Texture2D*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-                    uint64_t) override {
+    bool OnGpuFrame(ID3D11Texture2D*, uint32_t, uint32_t width, uint32_t height, uint32_t,
+                    uint32_t, uint64_t) override {
+        width_ = width;
+        height_ = height;
         frames_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // The probe publishes no real texture, so the screenshot path is fed a
+    // deterministic pattern at the streamed size. The engine's PNG write,
+    // status reporting and file naming are what this run checks; the GPU
+    // readback itself belongs to the plugin-backed sink.
+    bool CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height,
+                     std::string* error) override {
+        if (width_ == 0 || height_ == 0) {
+            if (error != nullptr) {
+                *error = "the probe has no picture yet";
+            }
+            return false;
+        }
+        width = width_;
+        height = height_;
+        bgra.resize(static_cast<size_t>(width) * height * 4);
+        for (uint32_t y = 0; y < height; ++y) {
+            uint8_t* row = bgra.data() + static_cast<size_t>(y) * width * 4;
+            for (uint32_t x = 0; x < width; ++x) {
+                row[x * 4] = static_cast<uint8_t>(x & 0xFF);
+                row[x * 4 + 1] = static_cast<uint8_t>(y & 0xFF);
+                row[x * 4 + 2] = static_cast<uint8_t>((x + y) & 0xFF);
+                row[x * 4 + 3] = 0;  // the PNG writer must force this opaque
+            }
+        }
         return true;
     }
 
@@ -91,6 +120,8 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     std::atomic<uint64_t> frames_{0};
+    uint32_t width_ = 0;
+    uint32_t height_ = 0;
 };
 
 uint16_t pick_free_port() {
@@ -157,6 +188,10 @@ struct ShareSeed {
     std::string batch_name;
     std::string empties_name;
     std::string loose_name;
+    // A large file at the share root whose name is unique per run: a
+    // single-file download lands in the receive root, so a shared name such as
+    // "Big.bin" would risk touching the operator's own files.
+    std::string cancel_name;
 };
 
 bool seed_share(const fs::path& share, const ShareSeed& names, std::string* error) {
@@ -190,6 +225,15 @@ bool seed_share(const fs::path& share, const ShareSeed& names, std::string* erro
     fs::resize_file(big, kBigFileBytes, ec);
     if (ec) {
         *error = "cannot create " + utf8(big) + ": " + ec.message();
+        return false;
+    }
+    const fs::path cancelled = share / names.cancel_name;
+    if (!write_file(cancelled, {}, error)) {
+        return false;
+    }
+    fs::resize_file(cancelled, kBigFileBytes, ec);
+    if (ec) {
+        *error = "cannot create " + utf8(cancelled) + ": " + ec.message();
         return false;
     }
     return true;
@@ -853,6 +897,198 @@ bool check_upload(const fs::path& share, std::string* error) {
     return true;
 }
 
+// Queues one large upload and cancels it while it is still hashing, before any
+// byte can reach the host. The cancel must count apart from failures and must
+// not be reported as a sent file.
+bool run_upload_cancel(chast_viewer::ViewerEngine& engine, const fs::path& work,
+                       std::chrono::milliseconds timeout, std::string* error) {
+    const fs::path big = work / "cancel-me.bin";
+    std::string bytes(64u * 1024u * 1024u, '\x5A');
+    if (!write_file(big, bytes, error)) {
+        return false;
+    }
+    const chast_viewer::ViewerStatus before = engine.Snapshot();
+    if (!engine.SendFiles({utf8(big)}, "incoming")) {
+        *error = "SendFiles was refused";
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool hashing = false;
+    bool cancelled = false;
+    for (;;) {
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        if (status.file_failures != before.file_failures) {
+            *error = "the cancel was reported as a failure: " + status.last_file_error;
+            return false;
+        }
+        if (status.files_sent != before.files_sent) {
+            *error = "the upload finished before it could be cancelled";
+            return false;
+        }
+        if (!cancelled && status.file_phase == chast_viewer::FilePhase::kHashing) {
+            hashing = true;
+            engine.CancelUploads();
+            cancelled = true;
+        }
+        if (cancelled && status.file_cancels > before.file_cancels) {
+            if (!hashing) {
+                *error = "the cancel was counted without an upload";
+                return false;
+            }
+            return true;
+        }
+        if (status.state != chast_viewer::ViewerState::kStreaming) {
+            *error = "the session ended during the cancel";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error = "the cancel was not reported";
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+}
+
+// A cancelled upload may leave a partial file, but it must never reach the
+// host in full.
+bool check_upload_cancelled(const fs::path& share, std::string* error) {
+    std::error_code ec;
+    const fs::path path = share / "incoming" / "cancel-me.bin";
+    if (!fs::exists(path, ec)) {
+        return true;
+    }
+    const uintmax_t size = fs::file_size(path, ec);
+    if (ec) {
+        *error = "cannot size " + utf8(path) + ": " + ec.message();
+        return false;
+    }
+    if (size >= 64u * 1024u * 1024u) {
+        *error = "the cancelled upload reached the host in full";
+        return false;
+    }
+    return true;
+}
+
+// Requests the unique large file and cancels while bytes are still arriving.
+// A viewer cancel is not a receive failure, must not count as a received file,
+// and must delete the partial file instead of keeping it for a resume.
+bool run_download_cancel(chast_viewer::ViewerEngine& engine, chast::HostServer& host,
+                         const std::string& path, std::chrono::milliseconds timeout,
+                         std::string* error) {
+    const chast_viewer::ViewerStatus before = engine.Snapshot();
+    const chast::HostServerStats host_before = host.status().stats;
+    if (!engine.RequestFileDownload(path)) {
+        *error = "RequestFileDownload(" + path + ") was refused";
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool started = false;
+    bool cancelled = false;
+    for (;;) {
+        const chast_viewer::ViewerStatus status = engine.Snapshot();
+        if (status.file_receive_failures != before.file_receive_failures) {
+            *error = "the download failed before it could be cancelled: " +
+                     status.download_error;
+            return false;
+        }
+        if (status.files_received != before.files_received) {
+            *error = "the download finished before it could be cancelled";
+            return false;
+        }
+        if (!started && status.file_download_answers != before.file_download_answers &&
+            status.file_download_code != 0) {
+            *error = "the download request was answered with code " +
+                     std::to_string(status.file_download_code) + ": " +
+                     status.file_download_error;
+            return false;
+        }
+        if (!cancelled && status.download_phase == chast_viewer::FilePhase::kSending &&
+            status.download_received >= 1024u * 1024u) {
+            if (status.download_size != kBigFileBytes) {
+                *error = "the download offered " + std::to_string(status.download_size) +
+                         " bytes, expected " + std::to_string(kBigFileBytes);
+                return false;
+            }
+            if (!status.download_cancellable) {
+                *error = "the single-file download was not marked cancellable";
+                return false;
+            }
+            started = true;
+            engine.CancelDownload();
+            cancelled = true;
+        }
+        if (cancelled && status.download_cancels > before.download_cancels) {
+            if (!started) {
+                *error = "the cancel was counted without a download";
+                return false;
+            }
+            if (status.download_phase != chast_viewer::FilePhase::kFailed) {
+                *error = "the cancelled download ended in phase " +
+                         std::to_string(static_cast<int>(status.download_phase));
+                return false;
+            }
+            if (status.download_error.find("cancelled") == std::string::npos) {
+                *error = "the cancelled download reported '" + status.download_error + "'";
+                return false;
+            }
+            if (!status.download_path.empty()) {
+                *error = "the cancelled download kept a final path";
+                return false;
+            }
+            // The host drains the viewer's FileResult asynchronously and must
+            // book it as a cancel, not as a send failure.
+            for (;;) {
+                const chast::HostServerStats now = host.status().stats;
+                if (now.file_send_cancels > host_before.file_send_cancels) {
+                    if (now.file_send_cancels != host_before.file_send_cancels + 1) {
+                        *error = "the host counted " +
+                                 std::to_string(now.file_send_cancels -
+                                                host_before.file_send_cancels) +
+                                 " download cancels, expected one";
+                        return false;
+                    }
+                    if (now.file_send_failures != host_before.file_send_failures) {
+                        *error = "the viewer's cancel was booked as a host send failure";
+                        return false;
+                    }
+                    return true;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    *error = "the host did not count the viewer's download cancel";
+                    return false;
+                }
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+        if (status.state != chast_viewer::ViewerState::kStreaming) {
+            *error = "the session ended during the download cancel";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            *error = "the download cancel was not reported";
+            return false;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
+// A cancelled download deletes its partial file, so neither the final name nor
+// the .part pieces may remain in the receive root.
+bool check_download_cancelled(const fs::path& downloads, const std::string& name,
+                              std::string* error) {
+    std::error_code ec;
+    const std::vector<std::string> leftovers = {name, name + ".part",
+                                                name + ".part.chast"};
+    for (const std::string& leftover : leftovers) {
+        const fs::path path = downloads / from_utf8(leftover);
+        if (fs::exists(path, ec)) {
+            *error = "the cancelled download left " + utf8(path) + " behind";
+            return false;
+        }
+    }
+    return true;
+}
+
 const char* terminal_phase_name(chast_viewer::TerminalPhase phase) {
     switch (phase) {
         case chast_viewer::TerminalPhase::kClosed:
@@ -1001,6 +1237,143 @@ bool run_terminal(chast_viewer::ViewerEngine& engine, std::chrono::milliseconds 
     return true;
 }
 
+// Parses the signature and the IHDR every PNG begins with, so a screenshot is
+// checked for being a real picture of the streamed size and not just a file
+// with a plausible name.
+bool read_png_header(const fs::path& path, uint32_t* width, uint32_t* height,
+                     std::string* error) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        *error = "cannot open " + utf8(path);
+        return false;
+    }
+    unsigned char header[24] = {};
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (file.gcount() != static_cast<std::streamsize>(sizeof(header))) {
+        *error = utf8(path) + " is too short to be a PNG";
+        return false;
+    }
+    static const unsigned char kSignature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (std::memcmp(header, kSignature, sizeof(kSignature)) != 0) {
+        *error = utf8(path) + " does not start with the PNG signature";
+        return false;
+    }
+    if (header[12] != 'I' || header[13] != 'H' || header[14] != 'D' || header[15] != 'R') {
+        *error = utf8(path) + " has no IHDR chunk";
+        return false;
+    }
+    *width = (static_cast<uint32_t>(header[16]) << 24) |
+             (static_cast<uint32_t>(header[17]) << 16) |
+             (static_cast<uint32_t>(header[18]) << 8) | static_cast<uint32_t>(header[19]);
+    *height = (static_cast<uint32_t>(header[20]) << 24) |
+              (static_cast<uint32_t>(header[21]) << 16) |
+              (static_cast<uint32_t>(header[22]) << 8) | static_cast<uint32_t>(header[23]);
+    return true;
+}
+
+bool check_screenshot(const std::string& path, const fs::path& directory, uint32_t width,
+                      uint32_t height, std::string* error) {
+    const fs::path file = from_utf8(path);
+    std::error_code ec;
+    const uintmax_t size = fs::file_size(file, ec);
+    if (ec || size < 24) {
+        *error = "the screenshot " + path + " is missing or too short";
+        return false;
+    }
+    if (!fs::equivalent(file.parent_path(), directory, ec) || ec) {
+        *error = "the screenshot landed in " + utf8(file.parent_path()) + " instead of " +
+                 utf8(directory);
+        return false;
+    }
+    uint32_t png_width = 0;
+    uint32_t png_height = 0;
+    if (!read_png_header(file, &png_width, &png_height, error)) {
+        return false;
+    }
+    if (png_width != width || png_height != height) {
+        *error = "the screenshot is " + std::to_string(png_width) + "x" +
+                 std::to_string(png_height) + ", expected " + std::to_string(width) + "x" +
+                 std::to_string(height);
+        return false;
+    }
+    return true;
+}
+
+// Drives SaveScreenshot the way the toolbar does: queue a request, then poll
+// the status until the counter moves. Both requests happen in the same second,
+// so the second one also proves the collision suffix keeps both files.
+bool run_screenshots(chast_viewer::ViewerEngine& engine, const fs::path& directory,
+                     std::chrono::milliseconds timeout, std::string* first_path,
+                     std::string* second_path, std::string* error) {
+    std::error_code ec;
+    fs::create_directories(directory, ec);
+    if (ec) {
+        *error = "cannot create " + utf8(directory) + ": " + ec.message();
+        return false;
+    }
+    const chast_viewer::ViewerStatus before = engine.Snapshot();
+    auto wait_for_update = [&](uint64_t previous, chast_viewer::ViewerStatus* status) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            *status = engine.Snapshot();
+            if (status->screenshot_updates > previous) {
+                return true;
+            }
+            if (status->state != chast_viewer::ViewerState::kStreaming) {
+                *error = "the session ended while a screenshot was pending";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                *error = "the screenshot was not written in time";
+                return false;
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+    };
+
+    if (!engine.SaveScreenshot(utf8(directory))) {
+        *error = "SaveScreenshot was refused";
+        return false;
+    }
+    chast_viewer::ViewerStatus status = before;
+    if (!wait_for_update(before.screenshot_updates, &status)) {
+        return false;
+    }
+    if (!status.screenshot_error.empty()) {
+        *error = "the first screenshot failed: " + status.screenshot_error;
+        return false;
+    }
+    if (status.screenshot_path.empty()) {
+        *error = "the first screenshot reported no path";
+        return false;
+    }
+    *first_path = status.screenshot_path;
+    if (!check_screenshot(*first_path, directory, status.width, status.height, error)) {
+        return false;
+    }
+
+    if (!engine.SaveScreenshot(utf8(directory))) {
+        *error = "the second SaveScreenshot was refused";
+        return false;
+    }
+    if (!wait_for_update(status.screenshot_updates, &status)) {
+        return false;
+    }
+    if (!status.screenshot_error.empty()) {
+        *error = "the second screenshot failed: " + status.screenshot_error;
+        return false;
+    }
+    *second_path = status.screenshot_path;
+    if (*second_path == *first_path) {
+        *error = "both screenshots landed at " + *second_path;
+        return false;
+    }
+    if (!check_screenshot(*second_path, directory, status.width, status.height, error)) {
+        return false;
+    }
+    return true;
+}
+
 bool check_no_files(const fs::path& directory, std::string* error) {
     std::error_code ec;
     if (!fs::exists(directory, ec)) {
@@ -1052,7 +1425,8 @@ int main(int argc, char** argv) {
                           "probe-" + std::to_string(suffix) + "-big",
                           "probe-" + std::to_string(suffix) + "-batch",
                           "probe-" + std::to_string(suffix) + "-empties",
-                          "probe-" + std::to_string(suffix) + "-loose.txt"};
+                          "probe-" + std::to_string(suffix) + "-loose.txt",
+                          "probe-" + std::to_string(suffix) + "-cancel.bin"};
     const fs::path work_directory =
         fs::temp_directory_path() / ("chast-viewer-probe-" + std::to_string(suffix));
     const fs::path share = work_directory / "share";
@@ -1145,6 +1519,17 @@ int main(int argc, char** argv) {
                         // error already set
                     } else if (!check_upload(share, &error)) {
                         // error already set
+                    } else if (!run_upload_cancel(*engine, work_directory, 10s,
+                                                  &error)) {
+                        // error already set
+                    } else if (!check_upload_cancelled(share, &error)) {
+                        // error already set
+                    } else if (!run_download_cancel(*engine, *host, names.cancel_name,
+                                                    30s, &error)) {
+                        // error already set
+                    } else if (!check_download_cancelled(downloads, names.cancel_name,
+                                                         &error)) {
+                        // error already set
                     } else {
                         // Media would have to arrive continuously; a moment of
                         // silence proves the session never carried a picture.
@@ -1159,7 +1544,9 @@ int main(int argc, char** argv) {
                         } else {
                             std::printf(
                                 "viewer-probe: files-only session -> %llu files walked, "
-                                "%llu uploaded, 0 frames, 0 displays, permissions=0x%04X\n",
+                                "%llu uploaded, 1 upload cancelled, 1 download cancelled "
+                                "(host counted it), 0 frames, 0 displays, "
+                                "permissions=0x%04X\n",
                                 static_cast<unsigned long long>(walk.done),
                                 static_cast<unsigned long long>(uploaded),
                                 static_cast<unsigned>(after.permissions));
@@ -1519,10 +1906,27 @@ int main(int argc, char** argv) {
                                             "viewer-probe: terminal 80x24 -> marker echoed, "
                                             "resized to 100x30, closed (%llu bytes)\n",
                                             static_cast<unsigned long long>(terminal_bytes));
-                                        std::printf("viewer-probe: %llu decoded pictures\n",
-                                                    static_cast<unsigned long long>(
-                                                        sink.frames()));
-                                        exit_code = 0;
+                                        std::string first_shot;
+                                        std::string second_shot;
+                                        if (!run_screenshots(*engine,
+                                                             work_directory / "screenshots",
+                                                             15s, &first_shot, &second_shot,
+                                                             &error)) {
+                                            // error already set
+                                        } else {
+                                            const chast_viewer::ViewerStatus shot =
+                                                engine->Snapshot();
+                                            std::printf(
+                                                "viewer-probe: screenshots %s and %s (%ux%u "
+                                                "PNG, collision suffix)\n",
+                                                first_shot.c_str(), second_shot.c_str(),
+                                                static_cast<unsigned>(shot.width),
+                                                static_cast<unsigned>(shot.height));
+                                            std::printf("viewer-probe: %llu decoded pictures\n",
+                                                        static_cast<unsigned long long>(
+                                                            sink.frames()));
+                                            exit_code = 0;
+                                        }
                                     }
                                 }
                             }
@@ -1550,6 +1954,11 @@ int main(int argc, char** argv) {
     fs::remove_all(downloads / names.batch_name, ec);
     fs::remove_all(downloads / names.empties_name, ec);
     fs::remove(downloads / names.loose_name, ec);
+    for (const std::string& leftover :
+         {names.cancel_name, names.cancel_name + ".part",
+          names.cancel_name + ".part.chast"}) {
+        fs::remove(downloads / from_utf8(leftover), ec);
+    }
     CoUninitialize();
     return exit_code;
 }

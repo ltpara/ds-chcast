@@ -97,6 +97,12 @@ void test_hello() {
           "Hello round-trips the v32 file-transfer session mode");
     sent.mode = chast::SessionMode::Desktop;
 
+    sent.capabilities = chast::kClientCapabilityAudioDatagram;
+    check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
+              got.capabilities == chast::kClientCapabilityAudioDatagram,
+          "Hello round-trips the v35 datagram-audio capability");
+    sent.capabilities = 0;
+
     sent.access_token.clear();
     sent.password.clear();
     sent.device_key.clear();
@@ -165,8 +171,11 @@ void test_hello() {
     rejects_hello(payload_of(chast::make_hello(upper_ref)),
                   "Hello with a non-canonical audit reference is rejected");
     std::vector<uint8_t> unknown_mode = payload_of(chast::make_hello(sent));
-    unknown_mode.back() = 7;
+    unknown_mode[unknown_mode.size() - 2] = 7;
     rejects_hello(unknown_mode, "Hello with an unknown session mode is rejected");
+    std::vector<uint8_t> unknown_capability = payload_of(chast::make_hello(sent));
+    unknown_capability.back() = 0x80;
+    rejects_hello(unknown_capability, "Hello with an unknown client capability is rejected");
 }
 
 void test_access_denied() {
@@ -293,6 +302,19 @@ void test_hello_ack() {
               got.audio.extradata == sent.audio.extradata,
           "HelloAck keeps the audio description and decoder config");
 
+    chast::ServerInfo datagram = sent;
+    datagram.audio_datagram = true;
+    chast::ServerInfo datagram_got;
+    check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(datagram)), datagram_got,
+                                 &error) &&
+              datagram_got.audio_datagram && datagram_got.audio.enabled,
+          "HelloAck round-trips the v35 datagram-audio flag");
+    datagram.audio_datagram = false;
+    check(chast::parse_hello_ack(payload_of(chast::make_hello_ack(datagram)), datagram_got,
+                                 &error) &&
+              !datagram_got.audio_datagram,
+          "HelloAck leaves datagram audio off when it is not announced");
+
     chast::ServerInfo opus = sent;
     opus.audio.codec = chast::AudioCodec::Opus;
     opus.audio.frame_samples = chast::kOpusFrameSamples;
@@ -357,6 +379,11 @@ void test_hello_ack() {
     audio_block_only[audio_at] = 0;
     rejects_ack(std::move(audio_block_only),
                 "a HelloAck that announces audio without the flag is rejected");
+    std::vector<uint8_t> datagram_without_audio = ack_payload();
+    datagram_without_audio[kFlagsAt] = 0x00;
+    datagram_without_audio[kFlagsAt + 1] = 0x10;  // the v35 datagram-audio flag alone
+    rejects_ack(std::move(datagram_without_audio),
+                "a HelloAck that announces datagram audio without audio is rejected");
     std::vector<uint8_t> unknown_audio_codec = ack_payload();
     unknown_audio_codec[audio_at + 1] = 3;
     rejects_ack(std::move(unknown_audio_codec),
@@ -1603,6 +1630,41 @@ void test_chat() {
           "a ChatMessage with invalid UTF-8 is rejected");
 }
 
+void test_text_input() {
+    std::string error;
+    const std::string text = "订单 #42\n第二行 😀";
+    const std::vector<uint8_t> message = chast::make_text_input(text);
+    check(message.size() == chast::kControlHeaderSize + text.size(),
+          "TextInput carries the UTF-8 text as its payload");
+    check(message.size() > 7 &&
+              message[6] == static_cast<uint8_t>(chast::ControlType::TextInput),
+          "TextInput names its control type");
+    std::string got;
+    check(chast::parse_text_input(payload_of(message), got, &error) && got == text,
+          "TextInput round-trips UTF-8 text and newlines");
+
+    const std::string largest(chast::kMaxTextInputBytes, 'a');
+    check(chast::valid_text_input(largest), "the text input length limit is accepted");
+    check(chast::parse_text_input(payload_of(chast::make_text_input(largest)), got,
+                                  &error) &&
+              got == largest,
+          "text input at the length limit round-trips");
+    check(chast::make_text_input(largest + "a").empty(),
+          "text input past the length limit is not encoded");
+    check(!chast::valid_text_input(""), "an empty text input is rejected");
+    check(!chast::valid_text_input(std::string("a\0b", 3)),
+          "a text input with NUL is rejected");
+    check(!chast::valid_text_input("\xED\xA0\x80"), "a text input surrogate is rejected");
+
+    check(!chast::parse_text_input({}, got, &error),
+          "a TextInput without text is rejected");
+    check(!chast::parse_text_input(
+              std::vector<uint8_t>(chast::kMaxTextInputBytes + 1, 'a'), got, &error),
+          "an oversized TextInput is rejected");
+    check(!chast::parse_text_input({0xED, 0xA0, 0x80}, got, &error),
+          "a TextInput with invalid UTF-8 is rejected");
+}
+
 void test_port_forward() {
     std::string error;
     chast::PortForwardRequest request;
@@ -2283,6 +2345,27 @@ void test_injector_dry_run() {
             fixture.injector->stop();
             const chast::InputStats stats = fixture.injector->stats();
             check(stats.applied == 20, "rapid modifier toggling injects every transition once");
+        }
+    }
+
+    // Composed text is typed as Unicode, so the host layout does not matter.
+    // CRLF produces one Return, a surrogate pair is one character, and a block
+    // that fails valid_text_input() is rejected instead of queued.
+    {
+        InjectorFixture fixture{chast::InputInjector::create(true, &error)};
+        if (fixture.injector) {
+            fixture.injector->submit_text("A中\n");
+            fixture.injector->submit_text("😀\r\n");
+            fixture.injector->submit_text("");
+            fixture.injector->submit_text(std::string("a\0b", 3));
+            fixture.injector->submit_text(std::string(chast::kMaxTextInputBytes + 1, 'a'));
+            fixture.injector->stop();
+            const chast::InputStats stats = fixture.injector->stats();
+            check(stats.applied == 5,
+                  "text input counts one injection per code point and newline");
+            check(stats.rejected == 3, "empty, NUL and oversized text are rejected");
+            check(stats.failed == 0 && stats.dropped == 0,
+                  "composed text injects cleanly");
         }
     }
 
@@ -3040,6 +3123,7 @@ int main(int argc, char** argv) {
     test_clipboard();
     test_clipboard_files();
     test_chat();
+    test_text_input();
     test_port_forward();
     test_terminal();
     test_camera();

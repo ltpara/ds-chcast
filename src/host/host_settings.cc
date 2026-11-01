@@ -457,6 +457,14 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.audio_aec)) {
                 warn(result.warning, "audio_aec '" + value + "' is not a boolean");
             }
+        } else if (key == "audio_silence_gate_ms") {
+            uint32_t ms = 0;
+            if (!parse_u32(value, ms) || ms > 60000) {
+                warn(result.warning, "audio_silence_gate_ms '" + value +
+                                         "' is not 0..60000; using 2000");
+            } else {
+                settings.audio_silence_gate_ms = ms;
+            }
         } else if (key == "auth_mode") {
             HostAuthMode mode = HostAuthMode::Both;
             if (!parse_auth_mode(value, mode)) {
@@ -734,6 +742,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "audio=" << (settings.allow_audio ? 1 : 0) << "\n"
          << "audio_device=" << settings.audio_device << "\n"
          << "audio_aec=" << (settings.audio_aec ? 1 : 0) << "\n"
+         << "audio_silence_gate_ms=" << settings.audio_silence_gate_ms << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"

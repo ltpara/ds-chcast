@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +7,15 @@ import 'package:flutter/services.dart';
 import '../theme.dart';
 import '../viewer_bridge.dart';
 import 'package:chast_viewer/l10n.dart';
+
+// How the current listing is ordered locally. Directories always stay ahead
+// of files, so this only ranks within each group. Public so the session page
+// can remember the choice for the next open.
+enum FileBrowserSort { name, size, modified }
+
+// Reports a sort change to the page; `ascending` is the new direction.
+typedef FileBrowserSortChanged =
+    void Function(FileBrowserSort sort, bool ascending);
 
 /// Modeless browser for the host's shared folder. The page owns the transport
 /// (request, download, listing pop); the panel keeps the current directory,
@@ -22,8 +32,16 @@ class FileBrowserPanel extends StatefulWidget {
     required this.onDownloadFolder,
     required this.onDownloadEntries,
     required this.onCancelFolderDownload,
+    required this.onCancelUpload,
+    required this.onCancelDownload,
     required this.onClose,
     this.onDirectoryChanged,
+    this.onRevealDownload,
+    this.onOpenDownload,
+    this.initialDirectory = '',
+    this.initialSort = FileBrowserSort.name,
+    this.initialSortAscending = true,
+    this.onSortChanged,
     this.width = 460,
     this.height = 480,
   });
@@ -44,11 +62,31 @@ class FileBrowserPanel extends StatefulWidget {
   // viewer could not accept it (no session, permission revoked or another
   // walk running).
   final Future<bool> Function(List<ViewerFileSelection> entries)
-      onDownloadEntries;
+  onDownloadEntries;
   final Future<void> Function() onCancelFolderDownload;
+  // Drops the ordinary uploads still queued or in flight; clipboard uploads
+  // keep going.
+  final Future<void> Function() onCancelUpload;
+  // Stops the single-file download in progress and removes its partial file;
+  // folder-walk and clipboard transfers keep going.
+  final Future<void> Function() onCancelDownload;
   // Reports the directory whose listing was accepted, so dropped files can
   // follow the browser instead of always landing in the shared root.
   final ValueChanged<String>? onDirectoryChanged;
+  // Opens the shell on a finished download. Tests inject a recorder; the
+  // default starts explorer.exe with the file selected.
+  final Future<void> Function(String path)? onRevealDownload;
+  // Opens a finished download with its default application; a folder opens in
+  // Explorer. Tests inject a recorder.
+  final Future<void> Function(String path)? onOpenDownload;
+  // The first directory to list. The session page passes the folder the last
+  // browser showed so reopening does not jump back to the shared root.
+  final String initialDirectory;
+  // The ordering to start with. The session page passes the last choice so
+  // reopening keeps it; `onSortChanged` updates that memory.
+  final FileBrowserSort initialSort;
+  final bool initialSortAscending;
+  final FileBrowserSortChanged? onSortChanged;
   // Opens the local file picker and queues the chosen files into the shared
   // directory argument. Returns how many roots were queued; null means the
   // picker was cancelled.
@@ -57,7 +95,11 @@ class FileBrowserPanel extends StatefulWidget {
   // the shared root; `newName` is only used by rename. False means the
   // request could not be queued.
   final Future<bool> Function(
-      ViewerFileOperation op, String path, String newName) onFileOperation;
+    ViewerFileOperation op,
+    String path,
+    String newName,
+  )
+  onFileOperation;
   final VoidCallback onClose;
 
   @override
@@ -76,9 +118,16 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   // status poll that returns to idle then refreshes the listing once.
   bool _uploadAwaitingEnd = false;
   bool _uploadWasActive = false;
+  // Set between a cancel request and the status that stops reporting the
+  // upload, so the progress row does not reappear under the cancel wording.
+  bool _uploadCancelPending = false;
   String _uploadBaselineLast = '';
   String? _uploadResult;
   bool _uploadResultFailed = false;
+  // Set between a download cancel request and the status that stops reporting
+  // the download; the cancel wording replaces the progress row meanwhile.
+  bool _downloadCancelPending = false;
+  String? _downloadResult;
   // The newest host answer to a new-folder/rename/remove request. A success
   // reloads the listing; a refusal keeps the host's reason in the footer.
   int _takenOpAnswers = 0;
@@ -102,6 +151,68 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   String _batchFirstError = '';
   final List<String> _deleteQueue = <String>[];
 
+  // Client-side name filter over the current listing. Cleared when the
+  // accepted listing names a different directory, so entering a folder never
+  // lands on a stale filter from its parent.
+  final TextEditingController _filterController = TextEditingController();
+  String _filter = '';
+  // A saved initial folder may have been removed on the host. The first
+  // refusal retries the shared root once instead of leaving an empty pane.
+  bool _initialFallbackTried = false;
+  // Local ordering of the accepted listing; the host always sends directories
+  // first by name, and this only reshuffles what the page shows.
+  FileBrowserSort _sort = FileBrowserSort.name;
+  bool _sortAscending = true;
+
+  List<ViewerFileEntry> get _visibleEntries {
+    final String needle = _filter.toLowerCase();
+    final List<ViewerFileEntry> entries = needle.isEmpty
+        ? List<ViewerFileEntry>.of(_entries)
+        : _entries
+              .where(
+                (ViewerFileEntry entry) =>
+                    entry.name.toLowerCase().contains(needle),
+              )
+              .toList();
+    // Directories stay first whatever the ranking; the default (name,
+    // ascending) reproduces the host's order, so an untouched browser does
+    // not move rows around.
+    entries.sort((ViewerFileEntry a, ViewerFileEntry b) {
+      if (a.directory != b.directory) {
+        return a.directory ? -1 : 1;
+      }
+      int result;
+      if (_sort == FileBrowserSort.size) {
+        result = a.size.compareTo(b.size);
+      } else if (_sort == FileBrowserSort.modified) {
+        result = a.modifiedMs.compareTo(b.modifiedMs);
+      } else {
+        result = a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      }
+      if (!_sortAscending) {
+        result = -result;
+      }
+      // The name breaks ties so equal sizes or times keep a stable order even
+      // though List.sort is not stable.
+      return result != 0
+          ? result
+          : a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return entries;
+  }
+
+  bool get _allVisibleSelected =>
+      _visibleEntries.isNotEmpty &&
+      _visibleEntries.every(
+        (ViewerFileEntry entry) => _selected.contains(entry.name),
+      );
+
+  @override
+  void dispose() {
+    _filterController.dispose();
+    super.dispose();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -109,9 +220,11 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     _takenDownloadAnswers = widget.status.fileDownloadAnswers;
     _takenOpAnswers = widget.status.fileOpAnswers;
     _takenFolderAnswers = widget.status.folderDownloadAnswers;
+    _sort = widget.initialSort;
+    _sortAscending = widget.initialSortAscending;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        unawaited(_request(''));
+        unawaited(_request(widget.initialDirectory));
       }
     });
   }
@@ -129,6 +242,8 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         _error = reason.isEmpty ? tr('主机拒绝了下载请求') : reason;
       } else {
         _error = null;
+        // A freshly accepted request hides the previous cancel wording.
+        _downloadResult = null;
       }
     }
     if (widget.status.fileOpAnswers != _takenOpAnswers) {
@@ -177,17 +292,38 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
             : tr('文件夹下载失败：{reason}', <String, Object?>{'reason': reason});
       }
     }
-    if (_uploadAwaitingEnd) {
-      // A tiny file can finish before the first poll shows it as active; the
-      // finished entry then only shows up in lastFileName.
-      final bool active = widget.status.fileActive || widget.status.fileQueue > 0;
-      final bool finished = widget.status.lastFileName.isNotEmpty &&
-          widget.status.lastFileName != _uploadBaselineLast;
-      if (active) {
-        _uploadWasActive = true;
-      } else if (_uploadWasActive || finished) {
-        _finishUpload();
+    final bool uploadActive =
+        widget.status.fileActive || widget.status.fileQueue > 0;
+    if (uploadActive) {
+      // A new upload hides the previous outcome. Drops start uploads without
+      // passing through _upload(), so the clear belongs here.
+      if (!_uploadCancelPending) {
+        _uploadResult = null;
       }
+      if (_uploadAwaitingEnd) {
+        _uploadWasActive = true;
+      }
+    } else {
+      _uploadCancelPending = false;
+      if (_uploadAwaitingEnd) {
+        // A tiny file can finish before the first poll shows it as active; the
+        // finished entry then only shows up in lastFileName.
+        final bool finished =
+            widget.status.lastFileName.isNotEmpty &&
+            widget.status.lastFileName != _uploadBaselineLast;
+        if (_uploadWasActive || finished) {
+          _finishUpload();
+        }
+      }
+    }
+    if (widget.status.downloadActive) {
+      // A new download hides the previous cancel wording, unless the cancel
+      // has not landed on the status yet.
+      if (!_downloadCancelPending) {
+        _downloadResult = null;
+      }
+    } else {
+      _downloadCancelPending = false;
     }
   }
 
@@ -226,6 +362,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
       _error = null;
       _uploadResult = null;
       _uploadResultFailed = false;
+      _uploadCancelPending = false;
       _uploadAwaitingEnd = true;
       _uploadWasActive = false;
       _uploadBaselineLast = widget.status.lastFileName;
@@ -274,26 +411,51 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
       return;
     }
     final ViewerFileListing answer = listing;
+    final bool directoryChanged = answer.directory != _directory;
+    bool retryRoot = false;
     setState(() {
       _loading = false;
       if (answer.ok) {
-        if (answer.directory != _directory) {
+        if (directoryChanged) {
           _directory = answer.directory;
+          _filter = '';
+          _filterController.clear();
           widget.onDirectoryChanged?.call(_directory);
+          _selected.clear();
+        } else {
+          // Uploads, renames and the refresh button re-request the same
+          // directory; a pending batch selection should survive that, but a
+          // name that vanished from the new listing must not linger.
+          _selected.retainAll(
+            answer.entries.map((ViewerFileEntry entry) => entry.name),
+          );
         }
         _entries = answer.entries;
         _truncated = answer.truncated;
         _error = null;
-        _selected.clear();
+      } else if (_directory.isEmpty &&
+          widget.initialDirectory.isNotEmpty &&
+          !_initialFallbackTried) {
+        // The folder that was open when the browser last closed is gone or
+        // no longer readable; start at the shared root instead.
+        _initialFallbackTried = true;
+        retryRoot = true;
+        _error = null;
+        _loading = true;
       } else {
         _error = answer.reason.isEmpty ? tr('主机拒绝列出这个目录') : answer.reason;
       }
     });
+    if (retryRoot) {
+      widget.onDirectoryChanged?.call('');
+      unawaited(_request(''));
+    }
   }
 
   Future<void> _download(ViewerFileEntry entry) async {
-    final String path =
-        _directory.isEmpty ? entry.name : '$_directory/${entry.name}';
+    final String path = _directory.isEmpty
+        ? entry.name
+        : '$_directory/${entry.name}';
     bool queued = false;
     try {
       queued = await widget.onRequestDownload(path);
@@ -352,6 +514,119 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     setState(() => _error = tr('请求无法发送：会话未就绪或主机未授权文件传输'));
   }
 
+  Future<void> _cancelUpload() async {
+    bool failed = false;
+    try {
+      await widget.onCancelUpload();
+    } on PlatformException {
+      failed = true;
+    } on MissingPluginException {
+      failed = true;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (failed) {
+      setState(() => _error = tr('请求无法发送：会话未就绪或主机未授权文件传输'));
+      return;
+    }
+    setState(() {
+      _uploadCancelPending = true;
+      _uploadAwaitingEnd = false;
+      _uploadWasActive = false;
+      _uploadResultFailed = false;
+      _uploadResult = tr('已取消上传');
+    });
+    unawaited(_request(_directory));
+  }
+
+  Future<void> _cancelDownload() async {
+    bool failed = false;
+    try {
+      await widget.onCancelDownload();
+    } on PlatformException {
+      failed = true;
+    } on MissingPluginException {
+      failed = true;
+    }
+    if (!mounted) {
+      return;
+    }
+    if (failed) {
+      setState(() => _error = tr('请求无法发送：会话未就绪或主机未授权文件传输'));
+      return;
+    }
+    setState(() {
+      _downloadCancelPending = true;
+      _downloadResult = tr('已取消下载');
+    });
+  }
+
+  // A reveal is a convenience, not a transfer step: a shell that cannot start
+  // must not replace the "saved" footer with an error.
+  Future<void> _revealDownload(String path) async {
+    final Future<void> Function(String path)? injected =
+        widget.onRevealDownload;
+    if (injected != null) {
+      await injected(path);
+      return;
+    }
+    try {
+      await Process.start('explorer.exe', <String>['/select,', path]);
+    } on ProcessException {
+      // Explorer is unavailable; the footer still names the saved file.
+    }
+  }
+
+  // Opening is a convenience like revealing: a shell that cannot start must
+  // not replace the "saved" footer with an error.
+  Future<void> _openDownload(String path) async {
+    final Future<void> Function(String path)? injected = widget.onOpenDownload;
+    if (injected != null) {
+      await injected(path);
+      return;
+    }
+    try {
+      // Explorer opens a file with its default application and a directory in
+      // a window; passing the path as data avoids a command shell.
+      await Process.start('explorer.exe', <String>[path]);
+    } on ProcessException {
+      // Explorer is unavailable; the footer still names the saved path.
+    }
+  }
+
+  Future<void> _copyPath(String path) async {
+    bool copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: path));
+    } catch (_) {
+      copied = false;
+    }
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(copied ? tr('路径已复制') : tr('复制失败')),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _copySelectedPaths() async {
+    // Host order, one per line; the batch buttons act on the same set.
+    final List<String> paths = <String>[];
+    for (final ViewerFileEntry entry in _entries) {
+      if (_selected.contains(entry.name)) {
+        paths.add(_join(entry.name));
+      }
+    }
+    if (paths.isEmpty) {
+      return;
+    }
+    await _copyPath(paths.join('\n'));
+  }
+
   void _toggleSelection(String name) {
     setState(() {
       if (!_selected.add(name)) {
@@ -362,22 +637,25 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
 
   void _toggleSelectAll() {
     setState(() {
-      if (_selected.length == _entries.length) {
-        _selected.clear();
+      final List<ViewerFileEntry> visible = _visibleEntries;
+      if (_allVisibleSelected) {
+        for (final ViewerFileEntry entry in visible) {
+          _selected.remove(entry.name);
+        }
       } else {
-        _selected
-          ..clear()
-          ..addAll(_entries.map((ViewerFileEntry entry) => entry.name));
+        _selected.addAll(visible.map((ViewerFileEntry entry) => entry.name));
       }
     });
   }
 
   List<ViewerFileSelection> _selection() => <ViewerFileSelection>[
-        for (final ViewerFileEntry entry in _entries)
-          if (_selected.contains(entry.name))
-            ViewerFileSelection(
-                path: _join(entry.name), directory: entry.directory),
-      ];
+    for (final ViewerFileEntry entry in _entries)
+      if (_selected.contains(entry.name))
+        ViewerFileSelection(
+          path: _join(entry.name),
+          directory: entry.directory,
+        ),
+  ];
 
   Future<void> _downloadSelected() async {
     final List<ViewerFileSelection> entries = _selection();
@@ -480,19 +758,21 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
       return;
     }
     final String path = _deleteQueue.removeAt(0);
-    unawaited(_sendRemove(path).then((bool queued) {
-      if (!mounted || !_batchDeleting) {
-        return;
-      }
-      if (!queued) {
-        ++_batchFailures;
-        if (_batchFirstError.isEmpty) {
-          _batchFirstError = tr('请求无法发送：会话未就绪或主机未授权文件传输');
+    unawaited(
+      _sendRemove(path).then((bool queued) {
+        if (!mounted || !_batchDeleting) {
+          return;
         }
-        _deleteQueue.clear();
-        _finishBatchDelete();
-      }
-    }));
+        if (!queued) {
+          ++_batchFailures;
+          if (_batchFirstError.isEmpty) {
+            _batchFirstError = tr('请求无法发送：会话未就绪或主机未授权文件传输');
+          }
+          _deleteQueue.clear();
+          _finishBatchDelete();
+        }
+      }),
+    );
   }
 
   void _finishBatchDelete() {
@@ -530,8 +810,11 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     return null;
   }
 
-  Future<void> _operate(ViewerFileOperation op, String path,
-      {String newName = ''}) async {
+  Future<void> _operate(
+    ViewerFileOperation op,
+    String path, {
+    String newName = '',
+  }) async {
     if (_batchDeleting) {
       return;
     }
@@ -553,6 +836,18 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     });
   }
 
+  // Windows hosts compare names case-insensitively, so the guard does too;
+  // the host stays authoritative when a truncated listing hid the real clash.
+  bool _nameTaken(String name, {String? except}) {
+    final String folded = name.toLowerCase();
+    final String? ignored = except?.toLowerCase();
+    return _entries.any(
+      (ViewerFileEntry entry) =>
+          entry.name.toLowerCase() == folded &&
+          entry.name.toLowerCase() != ignored,
+    );
+  }
+
   Future<void> _createFolder() async {
     final String? name = await _promptName(
       title: tr('新建文件夹'),
@@ -562,7 +857,8 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     if (name == null || !mounted) {
       return;
     }
-    final String? complaint = _checkName(name);
+    final String? complaint =
+        _checkName(name) ?? (_nameTaken(name) ? tr('同名文件已存在') : null);
     if (complaint != null) {
       setState(() => _error = complaint);
       return;
@@ -579,13 +875,18 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     if (name == null || name == entry.name || !mounted) {
       return;
     }
-    final String? complaint = _checkName(name);
+    final String? complaint =
+        _checkName(name) ??
+        (_nameTaken(name, except: entry.name) ? tr('同名文件已存在') : null);
     if (complaint != null) {
       setState(() => _error = complaint);
       return;
     }
-    await _operate(ViewerFileOperation.rename, _join(entry.name),
-        newName: name);
+    await _operate(
+      ViewerFileOperation.rename,
+      _join(entry.name),
+      newName: name,
+    );
   }
 
   Future<void> _delete(ViewerFileEntry entry) async {
@@ -598,9 +899,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
           style: const TextStyle(fontSize: 13.5),
         ),
         content: Text(
-          entry.directory
-              ? tr('文件夹必须为空才能删除，此操作不可撤销。')
-              : tr('此操作不可撤销。'),
+          entry.directory ? tr('文件夹必须为空才能删除，此操作不可撤销。') : tr('此操作不可撤销。'),
           style: const TextStyle(fontSize: 11.5),
         ),
         actions: <Widget>[
@@ -680,8 +979,11 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
               child: Row(
                 children: <Widget>[
                   const SizedBox(width: 10),
-                  const Icon(Icons.folder_open_rounded,
-                      size: 16, color: kAccentBright),
+                  const Icon(
+                    Icons.folder_open_rounded,
+                    size: 16,
+                    color: kAccentBright,
+                  ),
                   const SizedBox(width: 7),
                   Text(
                     tr('主机共享文件夹'),
@@ -715,8 +1017,10 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
                     child: IconButton(
                       padding: EdgeInsets.zero,
                       tooltip: tr('新建文件夹'),
-                      icon: const Icon(Icons.create_new_folder_outlined,
-                          size: 16),
+                      icon: const Icon(
+                        Icons.create_new_folder_outlined,
+                        size: 16,
+                      ),
                       color: Colors.white54,
                       onPressed: _batchDeleting
                           ? null
@@ -731,8 +1035,9 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
                       tooltip: tr('上传文件到此处'),
                       icon: const Icon(Icons.upload_file_rounded, size: 16),
                       color: Colors.white54,
-                      onPressed:
-                          _batchDeleting ? null : () => unawaited(_upload()),
+                      onPressed: _batchDeleting
+                          ? null
+                          : () => unawaited(_upload()),
                     ),
                   ),
                   SizedBox(
@@ -765,19 +1070,40 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
             ),
             const Divider(height: 1, color: Colors.white12),
             _buildBreadcrumb(),
+            if (_entries.isNotEmpty || _filter.isNotEmpty) _buildFilter(),
             if (_selecting) _buildSelectionBar(),
             const Divider(height: 1, color: Colors.white12),
             Expanded(child: _buildBody()),
             if (_error != null)
               Padding(
                 padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    _error!,
-                    style: const TextStyle(
-                        color: Colors.orangeAccent, fontSize: 10.5),
-                  ),
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        _error!,
+                        style: const TextStyle(
+                          color: Colors.orangeAccent,
+                          fontSize: 10.5,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    TextButton(
+                      key: const ValueKey<String>('file-retry'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: kAccentBright,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        minimumSize: const Size(0, 26),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      onPressed: () => unawaited(_request(_directory)),
+                      child: Text(
+                        tr('重试'),
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             _buildFooter(),
@@ -788,8 +1114,9 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
   }
 
   Widget _buildBreadcrumb() {
-    final List<String> parts =
-        _directory.isEmpty ? const <String>[] : _directory.split('/');
+    final List<String> parts = _directory.isEmpty
+        ? const <String>[]
+        : _directory.split('/');
     final List<Widget> items = <Widget>[
       InkWell(
         onTap: _directory.isEmpty ? null : () => unawaited(_request('')),
@@ -808,23 +1135,29 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         path.write('/');
       }
       path.write(parts[i]);
-      items.add(const Padding(
-        padding: EdgeInsets.symmetric(horizontal: 3),
-        child: Text('/',
-            style: TextStyle(color: Colors.white24, fontSize: 11)),
-      ));
-      final bool last = i == parts.length - 1;
-      final String target = path.toString();
-      items.add(InkWell(
-        onTap: last ? null : () => unawaited(_request(target)),
-        child: Text(
-          parts[i],
-          style: TextStyle(
-            color: last ? kAccentBright : Colors.white70,
-            fontSize: 11.5,
+      items.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 3),
+          child: Text(
+            '/',
+            style: TextStyle(color: Colors.white24, fontSize: 11),
           ),
         ),
-      ));
+      );
+      final bool last = i == parts.length - 1;
+      final String target = path.toString();
+      items.add(
+        InkWell(
+          onTap: last ? null : () => unawaited(_request(target)),
+          child: Text(
+            parts[i],
+            style: TextStyle(
+              color: last ? kAccentBright : Colors.white70,
+              fontSize: 11.5,
+            ),
+          ),
+        ),
+      );
     }
     return SizedBox(
       height: 30,
@@ -836,9 +1169,155 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     );
   }
 
+  Widget _buildFilter() {
+    return SizedBox(
+      height: 30,
+      child: Row(
+        children: <Widget>[
+          if (_directory.isNotEmpty)
+            SizedBox(
+              width: 26,
+              height: 26,
+              child: IconButton(
+                padding: EdgeInsets.zero,
+                tooltip: tr('上一级'),
+                icon: const Icon(Icons.arrow_back_rounded, size: 13),
+                color: Colors.white54,
+                onPressed: () {
+                  final List<String> parts = _directory.split('/')
+                    ..removeLast();
+                  unawaited(_request(parts.join('/')));
+                },
+              ),
+            ),
+          const SizedBox(width: 10),
+          const Icon(Icons.search_rounded, size: 14, color: Colors.white30),
+          const SizedBox(width: 4),
+          Expanded(
+            child: TextField(
+              key: const ValueKey<String>('file-filter'),
+              controller: _filterController,
+              style: const TextStyle(color: Colors.white70, fontSize: 11),
+              cursorColor: kAccentBright,
+              decoration: InputDecoration(
+                isDense: true,
+                border: InputBorder.none,
+                hintText: tr('筛选当前文件夹'),
+                hintStyle: const TextStyle(color: Colors.white24, fontSize: 11),
+              ),
+              onChanged: (String value) => setState(() => _filter = value),
+            ),
+          ),
+          if (_filter.isNotEmpty)
+            SizedBox(
+              width: 26,
+              height: 26,
+              child: IconButton(
+                padding: EdgeInsets.zero,
+                tooltip: tr('清除筛选'),
+                icon: const Icon(Icons.close_rounded, size: 12),
+                color: Colors.white54,
+                onPressed: () {
+                  _filterController.clear();
+                  setState(() => _filter = '');
+                },
+              ),
+            ),
+          SizedBox(
+            width: 26,
+            height: 26,
+            child: PopupMenuButton<FileBrowserSort>(
+              tooltip: tr('排序'),
+              padding: EdgeInsets.zero,
+              iconSize: 14,
+              icon: const Icon(
+                Icons.swap_vert_rounded,
+                size: 14,
+                color: Colors.white54,
+              ),
+              onSelected: (FileBrowserSort mode) {
+                setState(() => _sort = mode);
+                widget.onSortChanged?.call(_sort, _sortAscending);
+              },
+              itemBuilder: (BuildContext context) =>
+                  <PopupMenuEntry<FileBrowserSort>>[
+                    CheckedPopupMenuItem<FileBrowserSort>(
+                      value: FileBrowserSort.name,
+                      checked: _sort == FileBrowserSort.name,
+                      child: Text(
+                        tr('按名称'),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    CheckedPopupMenuItem<FileBrowserSort>(
+                      value: FileBrowserSort.size,
+                      checked: _sort == FileBrowserSort.size,
+                      child: Text(
+                        tr('按大小'),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    CheckedPopupMenuItem<FileBrowserSort>(
+                      value: FileBrowserSort.modified,
+                      checked: _sort == FileBrowserSort.modified,
+                      child: Text(
+                        tr('按时间'),
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+            ),
+          ),
+          SizedBox(
+            width: 26,
+            height: 26,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              // The tooltip names what pressing the button will do.
+              tooltip: _sortAscending ? tr('降序') : tr('升序'),
+              icon: Icon(
+                _sortAscending
+                    ? Icons.arrow_upward_rounded
+                    : Icons.arrow_downward_rounded,
+                size: 13,
+              ),
+              color: Colors.white54,
+              onPressed: () {
+                setState(() => _sortAscending = !_sortAscending);
+                widget.onSortChanged?.call(_sort, _sortAscending);
+              },
+            ),
+          ),
+          const SizedBox(width: 4),
+          Text(
+            _filter.isEmpty
+                ? tr('共 {n} 项', <String, Object?>{'n': _visibleEntries.length})
+                : tr('匹配 {n} / {total} 项', <String, Object?>{
+                    'n': _visibleEntries.length,
+                    'total': _entries.length,
+                  }),
+            style: const TextStyle(color: Colors.white38, fontSize: 10.5),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSelectionBar() {
-    final bool all =
-        _entries.isNotEmpty && _selected.length == _entries.length;
+    final bool all = _allVisibleSelected;
+    // Folders carry no size of their own, so only files add to the total.
+    // The sum covers every selected name, including rows hidden by the
+    // filter, because the batch buttons act on the whole selection.
+    int selectedBytes = 0;
+    for (final ViewerFileEntry entry in _entries) {
+      if (!entry.directory && _selected.contains(entry.name)) {
+        selectedBytes += entry.size;
+      }
+    }
+    final String selectedText = tr('已选 {n} 项', <String, Object?>{
+      'n': _selected.length,
+    });
     final bool transfersBusy =
         widget.status.downloadActive || widget.status.folderDownloadActive;
     final bool canAct = _selected.isNotEmpty && !_batchDeleting;
@@ -856,7 +1335,7 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
           TextButton(
             key: const ValueKey<String>('file-select-all'),
             style: compact,
-            onPressed: _entries.isEmpty ? null : _toggleSelectAll,
+            onPressed: _visibleEntries.isEmpty ? null : _toggleSelectAll,
             child: Text(
               all ? tr('清空') : tr('全选'),
               style: const TextStyle(fontSize: 11),
@@ -864,10 +1343,18 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
           ),
           const SizedBox(width: 4),
           Text(
-            tr('已选 {n} 项', <String, Object?>{'n': _selected.length}),
+            selectedBytes > 0
+                ? '$selectedText · ${_formatSize(selectedBytes)}'
+                : selectedText,
             style: const TextStyle(color: Colors.white54, fontSize: 10.5),
           ),
           const Spacer(),
+          TextButton(
+            key: const ValueKey<String>('file-batch-copy'),
+            style: compact,
+            onPressed: canAct ? () => unawaited(_copySelectedPaths()) : null,
+            child: Text(tr('复制路径'), style: const TextStyle(fontSize: 11)),
+          ),
           TextButton(
             key: const ValueKey<String>('file-batch-download'),
             style: compact,
@@ -907,54 +1394,71 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
       );
     }
     final List<Widget> rows = <Widget>[];
+    final List<ViewerFileEntry> visible = _visibleEntries;
     if (_directory.isNotEmpty) {
-      rows.add(_entryRow(
-        icon: Icons.arrow_upward_rounded,
-        name: tr('返回上一级'),
-        detail: '',
-        onTap: () {
-          final int slash = _directory.lastIndexOf('/');
-          unawaited(_request(slash <= 0 ? '' : _directory.substring(0, slash)));
-        },
-      ));
+      rows.add(
+        _entryRow(
+          icon: Icons.arrow_upward_rounded,
+          name: tr('返回上一级'),
+          detail: '',
+          onTap: () {
+            final int slash = _directory.lastIndexOf('/');
+            unawaited(
+              _request(slash <= 0 ? '' : _directory.substring(0, slash)),
+            );
+          },
+        ),
+      );
     }
-    for (final ViewerFileEntry entry in _entries) {
+    for (final ViewerFileEntry entry in visible) {
       final bool transfersBusy =
           widget.status.downloadActive || widget.status.folderDownloadActive;
-      rows.add(_entryRow(
-        icon: entry.directory
-            ? Icons.folder_rounded
-            : Icons.insert_drive_file_outlined,
-        name: entry.name,
-        detail: entry.directory
-            ? _formatTime(entry.modifiedMs)
-            : <String>[
-                _formatSize(entry.size),
-                _formatTime(entry.modifiedMs),
-              ].where((String part) => part.isNotEmpty).join(' · '),
-        accent: entry.directory,
-        selected: _selected.contains(entry.name),
-        onToggle: _selecting ? () => _toggleSelection(entry.name) : null,
-        onTap: _selecting
-            ? () => _toggleSelection(entry.name)
-            : (entry.directory
-                ? () => unawaited(_request(_join(entry.name)))
-                : null),
-        onDownload: transfersBusy
-            ? null
-            : (entry.directory
-                ? () => unawaited(_downloadFolder(entry))
-                : () => unawaited(_download(entry))),
-        downloadTooltip:
-            entry.directory ? tr('下载文件夹到本机') : tr('下载到本机'),
-        onRename: _batchDeleting ? null : () => unawaited(_rename(entry)),
-        onDelete: _batchDeleting ? null : () => unawaited(_delete(entry)),
-      ));
+      rows.add(
+        _entryRow(
+          icon: entry.directory
+              ? Icons.folder_rounded
+              : Icons.insert_drive_file_outlined,
+          name: entry.name,
+          detail: entry.directory
+              ? _formatTime(entry.modifiedMs)
+              : <String>[
+                  _formatSize(entry.size),
+                  _formatTime(entry.modifiedMs),
+                ].where((String part) => part.isNotEmpty).join(' · '),
+          accent: entry.directory,
+          selected: _selected.contains(entry.name),
+          onToggle: _selecting ? () => _toggleSelection(entry.name) : null,
+          onTap: _selecting
+              ? () => _toggleSelection(entry.name)
+              : (entry.directory
+                    ? () => unawaited(_request(_join(entry.name)))
+                    : null),
+          onDownload: transfersBusy
+              ? null
+              : (entry.directory
+                    ? () => unawaited(_downloadFolder(entry))
+                    : () => unawaited(_download(entry))),
+          // A double click is the file-transfer equivalent of the trailing
+          // arrow; folders already open on the first click.
+          onDoubleTap: entry.directory || transfersBusy || _selecting
+              ? null
+              : () => unawaited(_download(entry)),
+          downloadTooltip: entry.directory ? tr('下载文件夹到本机') : tr('下载到本机'),
+          onRename: _batchDeleting ? null : () => unawaited(_rename(entry)),
+          onDelete: _batchDeleting ? null : () => unawaited(_delete(entry)),
+          onCopyPath: _batchDeleting
+              ? null
+              : () => unawaited(_copyPath(_join(entry.name))),
+        ),
+      );
     }
     if (rows.isEmpty) {
+      final bool filtering = _filter.isNotEmpty && _entries.isNotEmpty;
       return Center(
         child: Text(
-          _loading ? tr('正在读取目录…') : tr('这个文件夹是空的'),
+          _loading
+              ? tr('正在读取目录…')
+              : (filtering ? tr('没有匹配的条目') : tr('这个文件夹是空的')),
           style: const TextStyle(color: Colors.white30, fontSize: 11),
         ),
       );
@@ -963,6 +1467,14 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
       padding: const EdgeInsets.symmetric(vertical: 4),
       children: <Widget>[
         ...rows,
+        if (_filter.isNotEmpty && visible.isEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            child: Text(
+              tr('没有匹配的条目'),
+              style: const TextStyle(color: Colors.white30, fontSize: 11),
+            ),
+          ),
         if (_truncated)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
@@ -975,6 +1487,82 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     );
   }
 
+  List<PopupMenuEntry<String>> _entryMenuItems() => <PopupMenuEntry<String>>[
+    PopupMenuItem<String>(
+      value: 'copy-path',
+      height: 34,
+      child: Text(
+        tr('复制路径'),
+        style: const TextStyle(color: Colors.white, fontSize: 11.5),
+      ),
+    ),
+    PopupMenuItem<String>(
+      value: 'rename',
+      height: 34,
+      child: Text(
+        tr('重命名'),
+        style: const TextStyle(color: Colors.white, fontSize: 11.5),
+      ),
+    ),
+    PopupMenuItem<String>(
+      value: 'delete',
+      height: 34,
+      child: Text(
+        tr('删除'),
+        style: const TextStyle(color: Colors.white, fontSize: 11.5),
+      ),
+    ),
+  ];
+
+  void _runEntryMenu(
+    String value, {
+    VoidCallback? onRename,
+    VoidCallback? onDelete,
+    VoidCallback? onCopyPath,
+  }) {
+    if (value == 'rename') {
+      onRename?.call();
+    } else if (value == 'delete') {
+      onDelete?.call();
+    } else if (value == 'copy-path') {
+      onCopyPath?.call();
+    }
+  }
+
+  /// A right click or long press on the row opens the same menu as the
+  /// trailing button; the long press is the touch-screen equivalent.
+  Future<void> _showEntryContextMenu(
+    BuildContext context,
+    Offset position, {
+    VoidCallback? onRename,
+    VoidCallback? onDelete,
+    VoidCallback? onCopyPath,
+  }) async {
+    if (onRename == null) {
+      return;
+    }
+    final String? value = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      color: kPanelDark,
+      items: _entryMenuItems(),
+    );
+    if (value == null) {
+      return;
+    }
+    _runEntryMenu(
+      value,
+      onRename: onRename,
+      onDelete: onDelete,
+      onCopyPath: onCopyPath,
+    );
+  }
+
   Widget _entryRow({
     required IconData icon,
     required String name,
@@ -984,103 +1572,134 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     String? downloadTooltip,
     VoidCallback? onTap,
     VoidCallback? onDownload,
+    VoidCallback? onDoubleTap,
     VoidCallback? onToggle,
     VoidCallback? onRename,
     VoidCallback? onDelete,
+    VoidCallback? onCopyPath,
   }) {
-    return InkWell(
-      onTap: onTap,
-      child: SizedBox(
-        height: 34,
-        child: Row(
-          children: <Widget>[
-            const SizedBox(width: 12),
-            if (_selecting)
-              SizedBox(
-                width: 26,
-                height: 26,
-                child: onToggle == null
-                    ? null
-                    : Checkbox(
-                        value: selected,
-                        onChanged: (_) => onToggle(),
-                        materialTapTargetSize:
-                            MaterialTapTargetSize.shrinkWrap,
-                        visualDensity: VisualDensity.compact,
-                        side: const BorderSide(color: Colors.white38),
-                        activeColor: kAccentBright,
-                        checkColor: Colors.black,
+    return GestureDetector(
+      onSecondaryTapDown: (TapDownDetails details) {
+        unawaited(
+          _showEntryContextMenu(
+            context,
+            details.globalPosition,
+            onRename: onRename,
+            onDelete: onDelete,
+            onCopyPath: onCopyPath,
+          ),
+        );
+      },
+      onLongPressStart: (LongPressStartDetails details) {
+        unawaited(
+          _showEntryContextMenu(
+            context,
+            details.globalPosition,
+            onRename: onRename,
+            onDelete: onDelete,
+            onCopyPath: onCopyPath,
+          ),
+        );
+      },
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(
+          height: 34,
+          child: Row(
+            children: <Widget>[
+              const SizedBox(width: 12),
+              if (_selecting)
+                SizedBox(
+                  width: 26,
+                  height: 26,
+                  child: onToggle == null
+                      ? null
+                      : Checkbox(
+                          value: selected,
+                          onChanged: (_) => onToggle(),
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          visualDensity: VisualDensity.compact,
+                          side: const BorderSide(color: Colors.white38),
+                          activeColor: kAccentBright,
+                          checkColor: Colors.black,
+                        ),
+                ),
+              // The double click only covers the informational part of the
+              // row: a recognizer spanning the whole row would hold the tap
+              // arena open and delay the trailing download/menu buttons.
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onDoubleTap: onDoubleTap,
+                  child: Row(
+                    children: <Widget>[
+                      Icon(
+                        icon,
+                        size: 17,
+                        color: accent ? kAccentBright : Colors.white54,
                       ),
-              ),
-            Icon(icon,
-                size: 17, color: accent ? kAccentBright : Colors.white54),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                name,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Colors.white, fontSize: 12),
-              ),
-            ),
-            if (detail.isNotEmpty)
-              Text(
-                detail,
-                style: const TextStyle(color: Colors.white30, fontSize: 10),
-              ),
-            if (onDownload != null)
-              SizedBox(
-                width: 30,
-                height: 30,
-                child: IconButton(
-                  padding: EdgeInsets.zero,
-                  tooltip: downloadTooltip ?? tr('下载到本机'),
-                  icon: const Icon(Icons.download_rounded, size: 16),
-                  color: kAccentBright,
-                  onPressed: onDownload,
-                ),
-              )
-            else
-              const SizedBox(width: 30),
-            if (onRename != null)
-              SizedBox(
-                width: 30,
-                height: 30,
-                child: PopupMenuButton<String>(
-                  padding: EdgeInsets.zero,
-                  tooltip: tr('更多操作'),
-                  icon: const Icon(Icons.more_vert_rounded, size: 16),
-                  iconColor: Colors.white54,
-                  color: kPanelDark,
-                  onSelected: (String value) {
-                    if (value == 'rename') {
-                      onRename();
-                    } else if (value == 'delete') {
-                      onDelete?.call();
-                    }
-                  },
-                  itemBuilder: (BuildContext context) =>
-                      <PopupMenuEntry<String>>[
-                    PopupMenuItem<String>(
-                      value: 'rename',
-                      height: 34,
-                      child: Text(tr('重命名'),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          name,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                              color: Colors.white, fontSize: 11.5)),
-                    ),
-                    PopupMenuItem<String>(
-                      value: 'delete',
-                      height: 34,
-                      child: Text(tr('删除'),
+                            color: Colors.white,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                      if (detail.isNotEmpty)
+                        Text(
+                          detail,
                           style: const TextStyle(
-                              color: Colors.white, fontSize: 11.5)),
-                    ),
-                  ],
+                            color: Colors.white30,
+                            fontSize: 10,
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
-              )
-            else
-              const SizedBox(width: 30),
-            const SizedBox(width: 8),
-          ],
+              ),
+              if (onDownload != null)
+                SizedBox(
+                  width: 30,
+                  height: 30,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    tooltip: downloadTooltip ?? tr('下载到本机'),
+                    icon: const Icon(Icons.download_rounded, size: 16),
+                    color: kAccentBright,
+                    onPressed: onDownload,
+                  ),
+                )
+              else
+                const SizedBox(width: 30),
+              if (onRename != null)
+                SizedBox(
+                  width: 30,
+                  height: 30,
+                  child: PopupMenuButton<String>(
+                    padding: EdgeInsets.zero,
+                    tooltip: tr('更多操作'),
+                    icon: const Icon(Icons.more_vert_rounded, size: 16),
+                    iconColor: Colors.white54,
+                    color: kPanelDark,
+                    onSelected: (String value) => _runEntryMenu(
+                      value,
+                      onRename: onRename,
+                      onDelete: onDelete,
+                      onCopyPath: onCopyPath,
+                    ),
+                    itemBuilder: (BuildContext context) => _entryMenuItems(),
+                  ),
+                )
+              else
+                const SizedBox(width: 30),
+              const SizedBox(width: 8),
+            ],
+          ),
         ),
       ),
     );
@@ -1092,9 +1711,8 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
     if (status.folderDownloadActive) {
       final bool batch = status.folderDownloadBatch;
       final double progress = status.folderDownloadFilesTotal > 0
-          ? (status.folderDownloadFilesDone /
-                  status.folderDownloadFilesTotal)
-              .clamp(0.0, 1.0)
+          ? (status.folderDownloadFilesDone / status.folderDownloadFilesTotal)
+                .clamp(0.0, 1.0)
           : 0.0;
       child = Row(
         children: <Widget>[
@@ -1104,18 +1722,22 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
               children: <Widget>[
                 Text(
                   batch
-                      ? tr('正在下载选中的 {n} 项 · {done}/{total} 个文件',
+                      ? tr(
+                          '正在下载选中的 {n} 项 · {done}/{total} 个文件',
                           <String, Object?>{
                             'n': status.folderDownloadRoots,
                             'done': status.folderDownloadFilesDone,
                             'total': status.folderDownloadFilesTotal,
-                          })
-                      : tr('正在下载文件夹 {name} · {done}/{total} 个文件',
+                          },
+                        )
+                      : tr(
+                          '正在下载文件夹 {name} · {done}/{total} 个文件',
                           <String, Object?>{
                             'name': status.folderDownloadName,
                             'done': status.folderDownloadFilesDone,
                             'total': status.folderDownloadFilesTotal,
-                          }),
+                          },
+                        ),
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white54, fontSize: 10.5),
                 ),
@@ -1151,28 +1773,52 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
           ),
         ],
       );
-    } else if (status.downloadActive) {
+    } else if (status.downloadActive && !_downloadCancelPending) {
       final double progress = status.downloadSize > 0
           ? (status.downloadReceived / status.downloadSize).clamp(0.0, 1.0)
           : 0.0;
-      child = Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      final String label = tr('正在下载 {name} · {p1} / {p2}', <String, Object?>{
+        'name': status.downloadName,
+        'p1': _formatSize(status.downloadReceived),
+        'p2': _formatSize(status.downloadSize),
+      });
+      child = Row(
         children: <Widget>[
-          Text(
-            tr('正在下载 {name} · {p1} / {p2}', <String, Object?>{
-              'name': status.downloadName,
-              'p1': _formatSize(status.downloadReceived),
-              'p2': _formatSize(status.downloadSize),
-            }),
-            style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  // An unknown total (size 0) cannot yield a percentage.
+                  status.downloadSize > 0
+                      ? '$label · ${(progress * 100).round()}%'
+                      : label,
+                  style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+                ),
+                const SizedBox(height: 4),
+                LinearProgressIndicator(
+                  value: progress,
+                  minHeight: 3,
+                  backgroundColor: Colors.white12,
+                  color: kAccentBright,
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 4),
-          LinearProgressIndicator(
-            value: progress,
-            minHeight: 3,
-            backgroundColor: Colors.white12,
-            color: kAccentBright,
-          ),
+          if (status.downloadCancellable) ...<Widget>[
+            const SizedBox(width: 6),
+            SizedBox(
+              width: 28,
+              height: 28,
+              child: IconButton(
+                padding: EdgeInsets.zero,
+                tooltip: tr('取消下载'),
+                icon: const Icon(Icons.close_rounded, size: 14),
+                color: Colors.white54,
+                onPressed: () => unawaited(_cancelDownload()),
+              ),
+            ),
+          ],
         ],
       );
     } else if (_batchDeleting) {
@@ -1181,17 +1827,107 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         style: const TextStyle(color: Colors.white54, fontSize: 10.5),
       );
     } else if (_folderResult != null) {
-      child = Text(
+      final String destination = status.folderDownloadDestination;
+      final Widget label = Text(
         _folderResult!,
         style: TextStyle(
           color: _folderResultFailed ? Colors.orangeAccent : Colors.greenAccent,
           fontSize: 10.5,
         ),
       );
+      child = !_folderResultFailed && destination.isNotEmpty
+          ? Row(
+              children: <Widget>[
+                Expanded(child: label),
+                const SizedBox(width: 6),
+                SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    tooltip: tr('打开文件夹'),
+                    icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                    color: Colors.white54,
+                    onPressed: () => unawaited(_openDownload(destination)),
+                  ),
+                ),
+                SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    tooltip: tr('在文件夹中显示'),
+                    icon: const Icon(Icons.folder_open_rounded, size: 14),
+                    color: Colors.white54,
+                    onPressed: () => unawaited(_revealDownload(destination)),
+                  ),
+                ),
+                SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    tooltip: tr('复制路径'),
+                    icon: const Icon(Icons.copy_rounded, size: 13),
+                    color: Colors.white54,
+                    onPressed: () => unawaited(_copyPath(destination)),
+                  ),
+                ),
+              ],
+            )
+          : label;
     } else if (status.downloadPhase == ViewerFilePhase.done &&
         status.downloadPath.isNotEmpty) {
+      child = Row(
+        children: <Widget>[
+          Expanded(
+            child: Text(
+              tr('已保存到 {path}', <String, Object?>{'path': status.downloadPath}),
+              style: const TextStyle(color: Colors.greenAccent, fontSize: 10.5),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: 6),
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              tooltip: tr('打开文件'),
+              icon: const Icon(Icons.open_in_new_rounded, size: 14),
+              color: Colors.white54,
+              onPressed: () => unawaited(_openDownload(status.downloadPath)),
+            ),
+          ),
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              tooltip: tr('在文件夹中显示'),
+              icon: const Icon(Icons.folder_open_rounded, size: 14),
+              color: Colors.white54,
+              onPressed: () => unawaited(_revealDownload(status.downloadPath)),
+            ),
+          ),
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              tooltip: tr('复制路径'),
+              icon: const Icon(Icons.copy_rounded, size: 13),
+              color: Colors.white54,
+              onPressed: () => unawaited(_copyPath(status.downloadPath)),
+            ),
+          ),
+        ],
+      );
+    } else if (_downloadResult != null) {
+      // A cancel that landed on the engine; the failed phase below carries the
+      // engine's wording, which the page replaces while this is set.
       child = Text(
-        tr('已保存到 {path}', <String, Object?>{'path': status.downloadPath}),
+        _downloadResult!,
         style: const TextStyle(color: Colors.greenAccent, fontSize: 10.5),
       );
     } else if (status.downloadPhase == ViewerFilePhase.failed &&
@@ -1200,14 +1936,64 @@ class _FileBrowserPanelState extends State<FileBrowserPanel> {
         status.downloadError,
         style: const TextStyle(color: Colors.orangeAccent, fontSize: 10.5),
       );
-    } else if (_uploadAwaitingEnd &&
-        (status.fileActive || status.fileQueue > 0)) {
-      child = Text(
-        tr('正在上传到 {dir}（队列剩余 {n} 个）', <String, Object?>{
-          'dir': _directory.isEmpty ? tr('共享文件夹') : _directory,
-          'n': status.fileQueue,
-        }),
-        style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+    } else if ((status.fileActive || status.fileQueue > 0) &&
+        !_uploadCancelPending) {
+      final String target = _directory.isEmpty ? tr('共享文件夹') : _directory;
+      // The engine reports the size once the offer arrives; before that only
+      // the queue is known, so the footer keeps the wording without a bar.
+      final bool sized = status.fileSize > 0;
+      final String label = sized
+          ? tr(
+              '正在上传到 {dir} · {p1} / {p2} · {pct}%（队列剩余 {n} 个）',
+              <String, Object?>{
+                'dir': target,
+                'p1': _formatSize(status.fileSent),
+                'p2': _formatSize(status.fileSize),
+                'pct': (status.fileProgress * 100).round(),
+                'n': status.fileQueue,
+              },
+            )
+          : tr('正在上传到 {dir}（队列剩余 {n} 个）', <String, Object?>{
+              'dir': target,
+              'n': status.fileQueue,
+            });
+      child = Row(
+        children: <Widget>[
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white54, fontSize: 10.5),
+                ),
+                if (sized) ...<Widget>[
+                  const SizedBox(height: 4),
+                  LinearProgressIndicator(
+                    value: status.fileProgress,
+                    minHeight: 3,
+                    backgroundColor: Colors.white12,
+                    color: kAccentBright,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              tooltip: tr('取消上传'),
+              icon: const Icon(Icons.close_rounded, size: 14),
+              color: Colors.white54,
+              onPressed: () => unawaited(_cancelUpload()),
+            ),
+          ),
+        ],
       );
     } else if (_uploadResult != null) {
       child = Text(
@@ -1260,8 +2046,9 @@ class _NameDialog extends StatefulWidget {
 }
 
 class _NameDialogState extends State<_NameDialog> {
-  late final TextEditingController _name =
-      TextEditingController(text: widget.initial);
+  late final TextEditingController _name = TextEditingController(
+    text: widget.initial,
+  );
 
   @override
   void dispose() {
@@ -1278,10 +2065,7 @@ class _NameDialogState extends State<_NameDialog> {
         controller: _name,
         autofocus: true,
         style: const TextStyle(fontSize: 12.5),
-        decoration: InputDecoration(
-          hintText: tr('名称'),
-          isDense: true,
-        ),
+        decoration: InputDecoration(hintText: tr('名称'), isDense: true),
         onSubmitted: (String value) => Navigator.of(context).pop(value.trim()),
       ),
       actions: <Widget>[

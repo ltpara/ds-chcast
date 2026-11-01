@@ -52,6 +52,8 @@ public:
     Error open();
     Error decode(const AudioHeader& header, const uint8_t* data, size_t size,
                  std::vector<DecodedAudio>& out) override;
+    Error conceal(const AudioHeader& next, uint32_t frames_back,
+                  std::vector<DecodedAudio>& out) override;
     Error flush(std::vector<DecodedAudio>& out) override;
 
     uint32_t sample_rate() const noexcept override { return info_.sample_rate; }
@@ -269,6 +271,12 @@ Error AacDecoder::decode(const AudioHeader& header, const uint8_t* data, size_t 
         return av_error(status, "avcodec_send_packet(AAC)");
     }
     return receive(header.pts_ms, header.capture_ms, samples_before, out);
+}
+
+Error AacDecoder::conceal(const AudioHeader&, uint32_t, std::vector<DecodedAudio>&) {
+    // FFmpeg's AAC decoder has no PLC entry point. Datagram audio is always
+    // Opus, so this only matters for the legacy AAC stream.
+    return Error(Status::Unsupported, "AAC playback has no packet loss concealment");
 }
 
 Error AacDecoder::flush(std::vector<DecodedAudio>& out) {

@@ -325,6 +325,30 @@ void InputInjector::submit(const InputEvent& event) {
     cv_.notify_one();
 }
 
+void InputInjector::submit_text(const std::string& text) {
+    if (!valid_text_input(text)) {
+        std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+        ++stats_.rejected;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) {
+            return;
+        }
+        if (queue_.size() >= 1024) {
+            std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+            ++stats_.dropped;
+            return;
+        }
+        Pending pending;
+        pending.has_text = true;
+        pending.text = text;
+        queue_.push_back(pending);
+    }
+    cv_.notify_one();
+}
+
 void InputInjector::release_held() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -374,6 +398,8 @@ void InputInjector::run() {
                 follow_input_desktop_if_due();
                 if (pending.release) {
                     release_all();
+                } else if (pending.has_text) {
+                    apply_text(pending.text);
                 } else {
                     apply(pending.event);
                 }
@@ -629,6 +655,92 @@ void InputInjector::apply_key(const KeyEvent& event) {
     } else {
         ++stats_.failed;
     }
+}
+
+void InputInjector::apply_text(const std::string& text) {
+    // Text arrived through valid_text_input(), so the UTF-8 needs no repair
+    // here. Counting is per code point, not per SendInput call: a surrogate
+    // pair is one character to the user even though it takes four inputs.
+    const auto tap_virtual_key = [this](WORD vk) {
+        INPUT down{};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wVk = vk;
+        INPUT up = down;
+        up.ki.dwFlags = KEYEVENTF_KEYUP;
+        return send(down) == 1 && send(up) == 1;
+    };
+    const auto type_code_point = [this](uint32_t code_point) {
+        uint16_t units[2];
+        int count = 1;
+        if (code_point <= 0xFFFF) {
+            units[0] = static_cast<uint16_t>(code_point);
+        } else {
+            const uint32_t rest = code_point - 0x10000;
+            units[0] = static_cast<uint16_t>(0xD800 + (rest >> 10));
+            units[1] = static_cast<uint16_t>(0xDC00 + (rest & 0x3FF));
+            count = 2;
+        }
+        bool ok = true;
+        for (int i = 0; i < count; ++i) {
+            INPUT down{};
+            down.type = INPUT_KEYBOARD;
+            down.ki.wScan = units[i];
+            down.ki.dwFlags = KEYEVENTF_UNICODE;
+            INPUT up = down;
+            up.ki.dwFlags |= KEYEVENTF_KEYUP;
+            if (send(down) != 1 || send(up) != 1) {
+                ok = false;
+            }
+        }
+        return ok;
+    };
+
+    size_t applied = 0;
+    size_t failed = 0;
+    size_t i = 0;
+    while (i < text.size()) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        uint32_t code_point = 0;
+        size_t length = 1;
+        if (lead < 0x80) {
+            code_point = lead;
+        } else if ((lead & 0xE0) == 0xC0) {
+            code_point = lead & 0x1Fu;
+            length = 2;
+        } else if ((lead & 0xF0) == 0xE0) {
+            code_point = lead & 0x0Fu;
+            length = 3;
+        } else {
+            code_point = lead & 0x07u;
+            length = 4;
+        }
+        for (size_t j = 1; j < length; ++j) {
+            code_point = (code_point << 6) |
+                         (static_cast<unsigned char>(text[i + j]) & 0x3Fu);
+        }
+        i += length;
+
+        bool ok = true;
+        if (code_point == '\r') {
+            // Viewers send CRLF pairs; Return goes out once, on the '\n'.
+            continue;
+        } else if (code_point == '\n') {
+            ok = tap_virtual_key(VK_RETURN);
+        } else if (code_point == '\t') {
+            ok = tap_virtual_key(VK_TAB);
+        } else {
+            ok = type_code_point(code_point);
+        }
+        if (ok) {
+            ++applied;
+        } else {
+            ++failed;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    stats_.applied += applied;
+    stats_.failed += failed;
 }
 
 void InputInjector::release_all() {

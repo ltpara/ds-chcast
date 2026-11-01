@@ -49,6 +49,15 @@ constexpr size_t kMaxInFlightBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInFlightSends = 4096;
 constexpr uint64_t kKeepAliveMs = 5000;
 
+// v35 datagram audio. A 20 ms stereo packet at the configured 128 kbps is
+// about 370 bytes; requiring 512 bytes of payload budget keeps datagram mode
+// off a path whose first datagram would not even carry one frame.
+constexpr size_t kMinAudioDatagramBudget = kAudioHeaderSize + 512;
+// The viewer drains this queue on every media poll. The bound is generous
+// (several seconds of 20 ms packets) but stops a stalled consumer from
+// growing without limit.
+constexpr size_t kMaxAudioDatagramQueue = 256;
+
 // Receive-side bounds for the protocol v16 streams. They are deliberately
 // larger than one legitimate item so a slow consumer is not punished, but
 // small enough that a peer cannot turn the session into an allocator.
@@ -496,6 +505,14 @@ struct QuicSession::Impl {
     std::atomic<HQUIC> control{nullptr};
     std::atomic<HQUIC> video{nullptr};
     std::atomic<HQUIC> audio{nullptr};
+    // v35 audio over QUIC DATAGRAM. DATAGRAM_STATE_CHANGED reports whether
+    // the peer accepts datagrams and the largest one its path can carry.
+    std::atomic<bool> datagram_send_enabled{false};
+    std::atomic<uint16_t> datagram_max_send_length{0};
+    // Server: the viewer's Hello capability. Client: unused. The latched
+    // mode is fixed at announce() so both sides agree for the whole session.
+    std::atomic<bool> client_audio_datagram{false};
+    std::atomic<bool> audio_datagram_active{false};
     // Server: the accepted viewer-initiated CMIC stream. Client: the stream
     // this side opened for the microphone. Null while the microphone is off.
     std::atomic<HQUIC> microphone{nullptr};
@@ -620,6 +637,24 @@ struct QuicSession::Impl {
     std::optional<AccessDenial> denial_code;
     std::deque<std::vector<uint8_t>> received;
     std::deque<std::vector<uint8_t>> audio_received;
+    // Client: whole audio packets that arrived as QUIC DATAGRAM frames. They
+    // are served before the stream parser so a reordered datagram can never
+    // be spliced into a partially received stream packet.
+    std::deque<std::vector<uint8_t>> audio_datagrams;
+    // Client: first time receive_audio noticed the audio stream FIN while
+    // datagram audio was active. Datagrams and the FIN travel separate paths,
+    // so the last packets may still be in flight; the reader waits out a short
+    // quiet period instead of reporting a loss that never happened.
+    std::chrono::steady_clock::time_point audio_datagram_drain_until{};
+    // Server: datagram payloads are owned by the application until MsQuic
+    // reports a final send state. The callback frees the context; this list
+    // also releases leftovers during teardown.
+    struct DatagramSend {
+        std::vector<uint8_t> bytes;
+        QUIC_BUFFER buffer{};
+    };
+    std::mutex datagram_mutex;
+    std::vector<DatagramSend*> datagram_sends;
     ControlParser control_parser;
     FrameParser frame_parser;
     AudioParser audio_parser;
@@ -701,6 +736,10 @@ struct QuicSession::Impl {
     // drops the newest message rather than replaying stale conversation.
     std::deque<std::string> chats;
     uint64_t chats_seen = 0;
+    // Composed text blocks waiting for the application. Like input events,
+    // this queue is for observation; the injector consumes them itself.
+    std::deque<std::string> texts;
+    uint64_t texts_seen = 0;
     std::deque<FileOffer> file_offers;
     uint64_t file_offers_seen = 0;
     std::deque<FileChunk> file_chunks;
@@ -916,6 +955,58 @@ struct QuicSession::Impl {
                     connected = true;
                 }
                 cv.notify_all();
+                break;
+            }
+            case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED: {
+                datagram_send_enabled.store(event.DATAGRAM_STATE_CHANGED.SendEnabled != FALSE);
+                datagram_max_send_length.store(event.DATAGRAM_STATE_CHANGED.MaxSendLength);
+                break;
+            }
+            case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED: {
+                if (role != Role::Client) {
+                    break;
+                }
+                const QUIC_BUFFER* buffer = event.DATAGRAM_RECEIVED.Buffer;
+                if (!buffer || buffer->Length < kAudioHeaderSize ||
+                    buffer->Length > kAudioHeaderSize + kMaxAudioPayload) {
+                    break;
+                }
+                // A malformed datagram is dropped in place: there is no byte
+                // stream to resynchronise, and one bad packet must not end a
+                // session the reliable streams keep alive.
+                AudioHeader header;
+                std::string error;
+                if (!decode_audio_header(buffer->Buffer, buffer->Length, header, &error) ||
+                    header.payload_size == 0 ||
+                    header.payload_size != buffer->Length - kAudioHeaderSize) {
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (audio_datagrams.size() >= kMaxAudioDatagramQueue) {
+                        audio_datagrams.pop_front();
+                    }
+                    audio_datagrams.emplace_back(buffer->Buffer,
+                                                 buffer->Buffer + buffer->Length);
+                }
+                cv.notify_all();
+                break;
+            }
+            case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED: {
+                void* context = event.DATAGRAM_SEND_STATE_CHANGED.ClientContext;
+                if (!context ||
+                    !QUIC_DATAGRAM_SEND_STATE_IS_FINAL(
+                        event.DATAGRAM_SEND_STATE_CHANGED.State)) {
+                    break;
+                }
+                auto* send = static_cast<DatagramSend*>(context);
+                {
+                    std::lock_guard<std::mutex> lock(datagram_mutex);
+                    datagram_sends.erase(
+                        std::remove(datagram_sends.begin(), datagram_sends.end(), send),
+                        datagram_sends.end());
+                }
+                delete send;
                 break;
             }
             case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
@@ -2369,6 +2460,8 @@ struct QuicSession::Impl {
                     requested_mode = hello.mode;
                     requested_peer = remote_address();
                     session_audit_ref = hello.audit_ref;
+                    client_audio_datagram.store(
+                        (hello.capabilities & kClientCapabilityAudioDatagram) != 0);
                     pending_hello = std::move(hello);
                     hello_ready = true;
                 }
@@ -2492,6 +2585,33 @@ struct QuicSession::Impl {
                 if (injector) {
                     injector->submit(event);
                 }
+                break;
+            }
+            case ControlType::TextInput: {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionInput) == 0) {
+                    // Composed text is typing, so it follows the same input
+                    // permission as InputEvent, including mid-session
+                    // revocation.
+                    break;
+                }
+                std::string text;
+                if (!parse_text_input(payload, text, &error)) {
+                    note_transport_failure("TextInput: " + error);
+                    break;
+                }
+                if (injector) {
+                    injector->submit_text(text);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (texts.size() >= 64) {
+                        texts.pop_front();
+                    }
+                    texts.push_back(std::move(text));
+                    ++texts_seen;
+                }
+                cv.notify_all();
                 break;
             }
             case ControlType::InputRelease: {
@@ -3581,6 +3701,51 @@ struct QuicSession::Impl {
         send_cv.notify_all();
     }
 
+    // v35: one whole audio packet as a QUIC DATAGRAM. Never waits. When the
+    // congestion window is full the frame is lost and playback conceals it;
+    // queueing it would recreate the reliable stream's head-of-line stall.
+    Error send_audio_datagram(std::vector<uint8_t> bytes) {
+        HQUIC handle = connection.load();
+        if (!handle || transport_down.load()) {
+            return Error(Status::Unavailable, "the connection closed before the send");
+        }
+        const size_t limit = datagram_max_send_length.load();
+        if (limit == 0 || bytes.size() > limit) {
+            // One frame that does not fit the path is a 20 ms gap, not a
+            // reason to stop audio; the announcement already required room
+            // for a full packet when the mode was latched.
+            return Error(Status::WaitTimeout, "the audio packet does not fit a datagram");
+        }
+        auto* send = new DatagramSend;
+        send->bytes = std::move(bytes);
+        send->buffer.Buffer = send->bytes.data();
+        send->buffer.Length = static_cast<uint32_t>(send->bytes.size());
+        {
+            std::lock_guard<std::mutex> lock(datagram_mutex);
+            datagram_sends.push_back(send);
+        }
+        const QUIC_STATUS status =
+            api->DatagramSend(handle, &send->buffer, 1, QUIC_SEND_FLAG_NONE, send);
+        if (QUIC_FAILED(status)) {
+            {
+                std::lock_guard<std::mutex> lock(datagram_mutex);
+                datagram_sends.erase(
+                    std::remove(datagram_sends.begin(), datagram_sends.end(), send),
+                    datagram_sends.end());
+            }
+            delete send;
+            if (status == QUIC_STATUS_ABORTED || status == QUIC_STATUS_INVALID_STATE) {
+                return Error(Status::Unavailable, "the connection closed before the send");
+            }
+            if (status == QUIC_STATUS_BUFFER_TOO_SMALL ||
+                status == QUIC_STATUS_OUT_OF_MEMORY) {
+                return Error(Status::WaitTimeout, "the datagram send queue is full");
+            }
+            return quic_error(status, "QUIC DatagramSend");
+        }
+        return Error::success();
+    }
+
     // `wait_for_capacity` is false only for messages sent from a MsQuic
     // callback (a latency reply). Blocking there could stall the transport's
     // own worker, so such a send is dropped when the queue is full instead.
@@ -3786,6 +3951,19 @@ struct QuicSession::Impl {
             // so the state can be cleared without a late event overwriting it.
             api->ConnectionClose(connection_handle);
         }
+        // Datagram sends die with the connection: their final send state never
+        // arrives once ConnectionClose returned, so release the buffers here.
+        {
+            std::lock_guard<std::mutex> lock(datagram_mutex);
+            for (DatagramSend* send : datagram_sends) {
+                delete send;
+            }
+            datagram_sends.clear();
+        }
+        datagram_send_enabled.store(false);
+        datagram_max_send_length.store(0);
+        client_audio_datagram.store(false);
+        audio_datagram_active.store(false);
         {
             std::lock_guard<std::mutex> lock(mutex);
             connected = false;
@@ -3876,6 +4054,8 @@ struct QuicSession::Impl {
             last_reply_probe_us = 0;
             received.clear();
             audio_received.clear();
+            audio_datagrams.clear();
+            audio_datagram_drain_until = std::chrono::steady_clock::time_point{};
             control_parser.reset();
             frame_parser.reset();
             audio_parser.reset();
@@ -4040,6 +4220,13 @@ struct QuicSession::Impl {
             api->ConnectionClose(connection_handle);
             connection = nullptr;
         }
+        {
+            std::lock_guard<std::mutex> lock(datagram_mutex);
+            for (DatagramSend* send : datagram_sends) {
+                delete send;
+            }
+            datagram_sends.clear();
+        }
         if (configuration) {
             api->ConfigurationClose(configuration);
             configuration = nullptr;
@@ -4104,6 +4291,10 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     settings.IsSet.PeerUnidiStreamCount = TRUE;
     settings.ServerResumptionLevel = QUIC_SERVER_RESUME_AND_ZERORTT;
     settings.IsSet.ServerResumptionLevel = TRUE;
+    // v35: receive datagrams so the transport advertises a datagram frame
+    // size; system audio leaves the host on this path.
+    settings.DatagramReceiveEnabled = TRUE;
+    settings.IsSet.DatagramReceiveEnabled = TRUE;
 
     QUIC_BUFFER alpn{};
     alpn.Buffer = reinterpret_cast<uint8_t*>(const_cast<char*>(kAlpn));
@@ -4193,6 +4384,10 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
     settings.PeerUnidiStreamCount =
         static_cast<uint16_t>(kMaxClipboardStreams + kMaxPortForwardConnections + 2);
     settings.IsSet.PeerUnidiStreamCount = TRUE;
+    // v35: receiving datagrams is what tells the host its datagram audio is
+    // welcome; a client that leaves this off gets the reliable stream.
+    settings.DatagramReceiveEnabled = TRUE;
+    settings.IsSet.DatagramReceiveEnabled = TRUE;
 
     QUIC_BUFFER alpn{};
     alpn.Buffer = reinterpret_cast<uint8_t*>(const_cast<char*>(kAlpn));
@@ -4663,6 +4858,30 @@ Error QuicSession::announce(const ServerInfo& info) {
         }
     }
 
+    // v35: latch the audio transport once. The announcement and every later
+    // send use the same decision, so a late DATAGRAM_STATE_CHANGED cannot
+    // move audio between transports mid-session. Without a viewer
+    // capability, peer datagram support, or a large enough datagram budget,
+    // audio stays on the reliable stream.
+    bool audio_datagram =
+        ack.audio.enabled && impl.client_audio_datagram.load() &&
+        impl.datagram_send_enabled.load() &&
+        impl.datagram_max_send_length.load() >= kMinAudioDatagramBudget;
+    if (audio_datagram) {
+        // The stream carries no packets in this mode, but the viewer
+        // classifies server streams by their leading magic and the FIN that
+        // ends audio travels here. Send the magic once so the stream stays
+        // identifiable; on failure fall back to the reliable transport.
+        static const uint8_t kAudioMagic[4] = {'C', 'A', 'U', 'D'};
+        if (!impl.try_send_bytes(impl.audio.load(),
+                                 std::vector<uint8_t>(kAudioMagic, kAudioMagic + 4),
+                                 QUIC_SEND_FLAG_NONE)) {
+            audio_datagram = false;
+        }
+    }
+    ack.audio_datagram = audio_datagram;
+    impl.audio_datagram_active.store(audio_datagram);
+
     impl.announced = true;
     Error sent = impl.send_bytes(impl.control.load(), make_hello_ack(ack),
                                  QUIC_SEND_FLAG_NONE);
@@ -4714,6 +4933,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     }
     update.audio.enabled =
         update.audio.enabled && (granted & kPermissionAudio) != 0 && audio_stream_open;
+    update.audio_datagram = impl.audio_datagram_active.load();
     if (!update.audio.enabled) {
         update.audio.extradata.clear();
     }
@@ -5183,7 +5403,10 @@ Error QuicSession::send_audio(AudioHeader header, const uint8_t* payload, size_t
     encode_audio_header(header, bytes.data());
     std::memcpy(bytes.data() + kAudioHeaderSize, payload, size);
     // Never waits: a full queue would otherwise stall the capture loop and,
-    // with it, video. Dropping a packet is a short gap in the AAC stream.
+    // with it, video. Dropping a packet is a short gap in the audio stream.
+    if (impl.audio_datagram_active.load()) {
+        return impl.send_audio_datagram(std::move(bytes));
+    }
     return impl.send_bytes_impl(audio, std::move(bytes), QUIC_SEND_FLAG_NONE, false);
 }
 
@@ -5311,6 +5534,7 @@ Error QuicSession::handshake(ServerInfo& info, std::chrono::milliseconds timeout
     hello.audit_ref = impl.client_config.audit_ref;
     hello.requested_permissions = impl.client_config.requested_permissions & kPermissionAll;
     hello.mode = impl.client_config.session_mode;
+    hello.capabilities = impl.client_config.audio_datagram ? kClientCapabilityAudioDatagram : 0;
     if (impl.client_config.device_identity) {
         const DeviceIdentity& identity = *impl.client_config.device_identity;
         hello.device_key = identity.public_key();
@@ -5426,6 +5650,24 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock<std::mutex> lock(impl.mutex);
     for (;;) {
+        // v35: datagrams are whole packets, so they bypass the byte-stream
+        // parser. Serving them first also keeps the stream parser's buffer
+        // contiguous when the host falls back to the stream.
+        while (impl.peer_info.audio_datagram && !impl.audio_datagrams.empty()) {
+            std::vector<uint8_t> packet = std::move(impl.audio_datagrams.front());
+            impl.audio_datagrams.pop_front();
+            AudioHeader datagram_header;
+            std::string datagram_error;
+            if (!decode_audio_header(packet.data(), packet.size(), datagram_header,
+                                     &datagram_error) ||
+                datagram_header.payload_size == 0 ||
+                datagram_header.payload_size != packet.size() - kAudioHeaderSize) {
+                continue;
+            }
+            header = datagram_header;
+            payload.assign(packet.data() + kAudioHeaderSize, packet.data() + packet.size());
+            return Error::success();
+        }
         while (!impl.audio_received.empty()) {
             std::vector<uint8_t> chunk = std::move(impl.audio_received.front());
             impl.audio_received.pop_front();
@@ -5453,8 +5695,29 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
         }
 
         if (impl.audio_finished) {
-            if (impl.audio_parser.buffered() > 0) {
+            // In datagram mode the stream carries only the identification
+            // magic, so a four-byte remainder is the expected tail.
+            const size_t stream_tail = impl.audio_parser.buffered();
+            const bool datagram_magic_only = impl.peer_info.audio_datagram && stream_tail <= 4;
+            if (stream_tail > 0 && !datagram_magic_only) {
                 return Error(Status::CaptureFailed, "audio stream ended mid-packet");
+            }
+            if (impl.peer_info.audio_datagram) {
+                // The FIN and the datagrams take independent paths; give the
+                // tail a bounded quiet period so a clean stop drains it.
+                const auto now = std::chrono::steady_clock::now();
+                if (impl.audio_datagram_drain_until ==
+                    std::chrono::steady_clock::time_point{}) {
+                    impl.audio_datagram_drain_until =
+                        now + std::chrono::milliseconds(150);
+                }
+                if (now < impl.audio_datagram_drain_until && now < deadline) {
+                    const auto wake =
+                        deadline < impl.audio_datagram_drain_until ? deadline
+                                                                   : impl.audio_datagram_drain_until;
+                    impl.cv.wait_until(lock, wake);
+                    continue;
+                }
             }
             return Error(Status::Unavailable, "the server finished the audio stream");
         }
@@ -5878,6 +6141,42 @@ bool QuicSession::take_chat(std::string& text) {
 uint64_t QuicSession::chats_received() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->chats_seen;
+}
+
+Error QuicSession::send_text_input(const std::string& text) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "send_text_input is a viewer operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+    }
+    if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+        return Error(Status::PermissionDenied, "input is disabled by the host");
+    }
+    std::vector<uint8_t> message = make_text_input(text);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid text input");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_text_input(std::string& text) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->texts.empty()) {
+        return false;
+    }
+    text = std::move(impl_->texts.front());
+    impl_->texts.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::text_inputs_received() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->texts_seen;
 }
 
 bool QuicSession::take_file_offer(FileOffer& offer) {
@@ -7996,6 +8295,11 @@ bool QuicSession::video_finished() const {
 bool QuicSession::audio_finished() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->audio_finished;
+}
+
+bool QuicSession::audio_datagram() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->peer_info.audio_datagram;
 }
 
 Error QuicSession::async_error() const {

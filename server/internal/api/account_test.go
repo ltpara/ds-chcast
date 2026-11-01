@@ -88,6 +88,8 @@ func TestAccountRefreshRotatesAndDetectsReplay(t *testing.T) {
 		t.Fatalf("create alice: %v", err)
 	}
 	first := login(t, s.URL, "alice", "correct horse")
+	now := time.Now().UTC()
+	s.Accounts.SetClock(func() time.Time { return now })
 	refreshBody := func(token string) string {
 		body, err := json.Marshal(map[string]string{"refresh_token": token})
 		if err != nil {
@@ -95,15 +97,23 @@ func TestAccountRefreshRotatesAndDetectsReplay(t *testing.T) {
 		}
 		return string(body)
 	}
+	refresh := func(token string) (int, loginReply, []byte) {
+		t.Helper()
+		status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+			refreshBody(token), "")
+		var reply loginReply
+		if status == http.StatusOK {
+			if err := json.Unmarshal(data, &reply); err != nil {
+				t.Fatalf("refresh reply: %v", err)
+			}
+		}
+		return status, reply, data
+	}
 
-	status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
-		refreshBody(first.RefreshToken), "")
+	now = now.Add(time.Second)
+	status, second, data := refresh(first.RefreshToken)
 	if status != http.StatusOK {
 		t.Fatalf("refresh: %d %s", status, data)
-	}
-	var second loginReply
-	if err := json.Unmarshal(data, &second); err != nil {
-		t.Fatalf("refresh reply: %v", err)
 	}
 	if second.Token == "" || second.Token == first.Token ||
 		second.RefreshToken == "" || second.RefreshToken == first.RefreshToken {
@@ -119,16 +129,43 @@ func TestAccountRefreshRotatesAndDetectsReplay(t *testing.T) {
 		t.Fatalf("new access token = %d %s", status, data)
 	}
 
-	status, data = request(t, http.MethodPost, s.URL+"/v1/account/refresh",
-		refreshBody(first.RefreshToken), "")
+	// The viewer lost the rotation response and retries with the old token
+	// inside the grace window; the server resumes the session.
+	now = now.Add(10 * time.Second)
+	status, third, data := refresh(first.RefreshToken)
+	if status != http.StatusOK {
+		t.Fatalf("lost-response retry = %d %s", status, data)
+	}
+	if third.RefreshToken == second.RefreshToken {
+		t.Fatalf("lost-response retry did not hand out a fresh pair: %+v", third)
+	}
+	if status, data := request(t, http.MethodGet, s.URL+"/v1/account", "", third.Token); status != http.StatusOK {
+		t.Fatalf("recovered access token = %d %s", status, data)
+	}
+
+	now = now.Add(time.Second)
+	status, fourth, data := refresh(third.RefreshToken)
+	if status != http.StatusOK {
+		t.Fatalf("rotate recovered token = %d %s", status, data)
+	}
+	now = now.Add(time.Second)
+	status, fifth, data := refresh(fourth.RefreshToken)
+	if status != http.StatusOK {
+		t.Fatalf("rotate again = %d %s", status, data)
+	}
+
+	// Presenting the recovered token now that its replacement was spent is a
+	// replay even inside the window: the session is revoked.
+	now = now.Add(time.Second)
+	status, _, data = refresh(third.RefreshToken)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("replayed refresh = %d %s", status, data)
 	}
-	if status, data := request(t, http.MethodGet, s.URL+"/v1/account", "", second.Token); status != http.StatusUnauthorized {
+	if status, data := request(t, http.MethodGet, s.URL+"/v1/account", "", fifth.Token); status != http.StatusUnauthorized {
 		t.Fatalf("replay kept the session alive: %d %s", status, data)
 	}
 	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
-		refreshBody(second.RefreshToken), ""); status != http.StatusUnauthorized {
+		refreshBody(fifth.RefreshToken), ""); status != http.StatusUnauthorized {
 		t.Fatalf("rotated refresh after replay = %d %s", status, data)
 	}
 	if status, data := request(t, http.MethodPost, s.URL+"/v1/account/refresh", `{}`, ""); status != http.StatusUnauthorized {
@@ -939,8 +976,30 @@ func TestSharedAddressBookAPI(t *testing.T) {
 		`{"name":"工作室","tags":["lab"]}`, alice.Token); status != http.StatusOK {
 		t.Fatalf("restore alice peer: %d %s", status, body)
 	}
+	var beforeAdd addressBookReply
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook", "", alice.Token)
+	if err := json.Unmarshal(body, &beforeAdd); err != nil || status != http.StatusOK {
+		t.Fatalf("owner revision before shared add: %d %s (%v)", status, body, err)
+	}
+	// A new shared entry has no peer revision, so the grantee sends the book
+	// revision it last read; a stale baseline must not be written.
 	status, body = request(t, http.MethodPost, s.URL+"/v1/addressbook/shared/alice/peers",
-		`{"id":"addedbox","name":"共享新增","tags":["added","added"]}`, bob.Token)
+		fmt.Sprintf(`{"id":"stalebox","name":"过期新增","if_revision":%d}`, beforeAdd.Revision+100), bob.Token)
+	if status != http.StatusConflict || !strings.Contains(string(body), "changed elsewhere") {
+		t.Fatalf("stale shared add: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/addressbook/shared/alice/peers",
+		`{"id":"zerobox","if_revision":0}`, bob.Token); status != http.StatusBadRequest {
+		t.Fatalf("non-positive shared add if_revision: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/addressbook", "", alice.Token)
+	var afterStale addressBookReply
+	if err := json.Unmarshal(body, &afterStale); err != nil || status != http.StatusOK ||
+		afterStale.Revision != beforeAdd.Revision || len(afterStale.Peers) != len(beforeAdd.Peers) {
+		t.Fatalf("stale shared add wrote to the book: %d %s (%v)", status, body, err)
+	}
+	status, body = request(t, http.MethodPost, s.URL+"/v1/addressbook/shared/alice/peers",
+		fmt.Sprintf(`{"id":"addedbox","name":"共享新增","tags":["added","added"],"if_revision":%d}`, beforeAdd.Revision), bob.Token)
 	var added peerReply
 	if err := json.Unmarshal(body, &added); err != nil || status != http.StatusOK ||
 		added.ID != "addedbox" || added.Name != "共享新增" ||

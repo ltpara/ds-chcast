@@ -79,6 +79,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.file_receive_directory == b.file_receive_directory &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
+           a.audio_silence_gate_ms == b.audio_silence_gate_ms &&
            a.allow_privacy_mode == b.allow_privacy_mode && a.auth_mode == b.auth_mode &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
@@ -112,6 +113,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_microphone = true;
     settings.audio_device = "{0.0.1.00000000}.{5f3a2c1b-9d4e-4a6f-8b7c-1234567890ab}";
     settings.audio_aec = false;
+    settings.audio_silence_gate_ms = 0;
     settings.allow_privacy_mode = true;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
@@ -183,6 +185,8 @@ void test_missing_file(const std::filesystem::path& dir) {
           "a fresh host does not accept the viewer microphone");
     check(loaded.settings.audio_device.empty(), "a fresh host follows the default output");
     check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
+    check(loaded.settings.audio_silence_gate_ms == 2000,
+          "a fresh host gates digital silence after two seconds");
     check(!loaded.settings.allow_privacy_mode, "a fresh host does not blank the local screen");
     check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
@@ -215,6 +219,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "audio=perhaps\n"
                "audio_device=" + std::string(1100, 'd') + "\n"
                "audio_aec=perhaps\n"
+               "audio_silence_gate_ms=99999\n"
                "microphone=perhaps\n"
                "privacy_mode=perhaps\n"
                "record=perhaps\n"
@@ -245,6 +250,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
     check(settings.audio_device.empty(), "an oversized output id is dropped");
     check(settings.audio_aec, "an unparsable AEC toggle keeps the default");
+    check(settings.audio_silence_gate_ms == 2000,
+          "an out-of-range silence gate falls back");
     check(!settings.allow_microphone,
           "an unparsable microphone toggle keeps the private default");
     check(!settings.allow_privacy_mode,
@@ -266,7 +273,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
-                            "audio_device", "audio_aec", "microphone", "privacy_mode",
+                            "audio_device", "audio_aec", "audio_silence_gate_ms",
+                            "microphone", "privacy_mode",
                             "record", "token_mode", "token", "codec",
                             "bitrate_kbps",
                             "framerate",
@@ -283,11 +291,11 @@ void test_invalid_values(const std::filesystem::path& dir) {
 
 void test_audio_settings(const std::filesystem::path& dir) {
     const std::filesystem::path path = dir / "audio.ini";
-    write_text(path, "audio_device=\naudio_aec=off\n");
+    write_text(path, "audio_device=\naudio_aec=off\naudio_silence_gate_ms=0\n");
     const chast::HostSettingsLoad empty = chast::load_host_settings(path.string());
     check(empty.warning.empty() && empty.settings.audio_device.empty() &&
-              !empty.settings.audio_aec,
-          "an empty output id and AEC off load without warnings");
+              !empty.settings.audio_aec && empty.settings.audio_silence_gate_ms == 0,
+          "an empty output id, AEC off and gate 0 load without warnings");
 
     write_text(path, "audio_device={0.0.1.00000000}.{missing}\naudio_aec=1\n");
     const chast::HostSettingsLoad pinned = chast::load_host_settings(path.string());

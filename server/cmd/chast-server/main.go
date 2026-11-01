@@ -97,6 +97,15 @@ func run() error {
 		archiveEvery    = flag.Duration("audit-archive-interval", time.Hour, "how often new history rows are appended to the archive")
 		archiveGzip     = flag.Bool("audit-archive-compress", true, "gzip archive files once their UTC day is closed")
 		archiveKeep     = flag.Int("audit-archive-retention-days", 0, "delete archive files whose UTC day is older than this many days; 0 keeps them")
+		archiveRemote   = flag.String("audit-archive-remote", "", "upload closed archive files to this HTTP(S) base URL; each file is PUT to <url>/<file>")
+		archiveToken    = flag.String("audit-archive-remote-token", "", "bearer token sent with --audit-archive-remote uploads")
+		archiveS3URL    = flag.String("audit-archive-s3-endpoint", "", "path-style S3 endpoint for signed archive uploads, for example https://s3.example.com; replaces --audit-archive-remote")
+		archiveS3Region = flag.String("audit-archive-s3-region", "us-east-1", "region used in the SigV4 scope for --audit-archive-s3-endpoint")
+		archiveS3Bucket = flag.String("audit-archive-s3-bucket", "", "bucket that receives closed audit files through --audit-archive-s3-endpoint")
+		archiveS3Key    = flag.String("audit-archive-s3-access-key", "", "access key id for --audit-archive-s3-endpoint uploads")
+		archiveS3Secret = flag.String("audit-archive-s3-secret-key", "", "secret access key for --audit-archive-s3-endpoint uploads; visible in the process list")
+		archiveS3Token  = flag.String("audit-archive-s3-session-token", "", "optional session token sent with --audit-archive-s3-endpoint uploads")
+		archiveS3Style  = flag.String("audit-archive-s3-addressing", "path", "S3 addressing for --audit-archive-s3-endpoint: path (<endpoint>/<bucket>/<file>) or virtual (<bucket>.<endpoint-host>/<file>)")
 		tombstoneDays   = flag.Int("addressbook-tombstone-days", 0, "delete address-book tombstones older than this many days; 0 keeps them")
 		recordingsDir   = flag.String("recordings-dir", "", "directory for viewer recordings uploaded to accounts; empty disables the archive")
 		recordingsQuota = flag.Int("recordings-quota-mb", 8192, "per-account recording storage limit in MiB; 0 disables the quota")
@@ -728,6 +737,28 @@ func run() error {
 		}()
 	}
 	var archiveConsole *auditarchive.Archiver
+	s3Requested := *archiveS3URL != "" || *archiveS3Bucket != "" || *archiveS3Key != "" ||
+		*archiveS3Secret != "" || *archiveS3Token != ""
+	if (*archiveRemote != "" || *archiveToken != "") && *auditArchive == "" {
+		return fmt.Errorf("--audit-archive-remote requires --audit-archive-dir")
+	}
+	if s3Requested {
+		if *auditArchive == "" {
+			return fmt.Errorf("--audit-archive-s3-endpoint requires --audit-archive-dir")
+		}
+		if *archiveRemote != "" || *archiveToken != "" {
+			return fmt.Errorf("--audit-archive-s3-endpoint and --audit-archive-remote are mutually exclusive")
+		}
+		if *archiveS3URL == "" || *archiveS3Bucket == "" || *archiveS3Key == "" ||
+			*archiveS3Secret == "" {
+			return fmt.Errorf("--audit-archive-s3-endpoint requires bucket, access key and secret key")
+		}
+		switch strings.ToLower(strings.TrimSpace(*archiveS3Style)) {
+		case "", "path", "virtual":
+		default:
+			return fmt.Errorf("--audit-archive-s3-addressing must be path or virtual")
+		}
+	}
 	if *auditArchive != "" {
 		if accounts == nil {
 			return fmt.Errorf("--audit-archive-dir requires --state")
@@ -738,9 +769,24 @@ func run() error {
 		if *archiveKeep < 0 {
 			return fmt.Errorf("--audit-archive-retention-days must not be negative")
 		}
+		var s3Options *auditarchive.S3Options
+		if s3Requested {
+			s3Options = &auditarchive.S3Options{
+				Endpoint:     *archiveS3URL,
+				Region:       *archiveS3Region,
+				Bucket:       *archiveS3Bucket,
+				AccessKey:    *archiveS3Key,
+				SecretKey:    *archiveS3Secret,
+				SessionToken: *archiveS3Token,
+				Addressing:   *archiveS3Style,
+			}
+		}
 		archiver, err := auditarchive.New(*auditArchive, accounts, log, auditarchive.Options{
 			Compress:      *archiveGzip,
 			RetentionDays: *archiveKeep,
+			RemoteURL:     *archiveRemote,
+			RemoteToken:   *archiveToken,
+			S3:            s3Options,
 		})
 		if err != nil {
 			return fmt.Errorf("--audit-archive-dir: %w", err)
@@ -761,9 +807,13 @@ func run() error {
 				log.Info("audit archive compacted", "compressed", len(result.Compressed),
 					"pruned", len(result.Pruned))
 			}
+			if len(result.Delivered) > 0 {
+				log.Info("audit archive delivered to remote", "files", len(result.Delivered),
+					"remote", *archiveRemote)
+			}
 		}
 		log.Info("audit archive enabled", "dir", archiver.Dir(), "interval", *archiveEvery,
-			"compress", *archiveGzip, "retention_days", *archiveKeep)
+			"compress", *archiveGzip, "retention_days", *archiveKeep, "remote", *archiveRemote)
 		archive()
 		go func() {
 			ticker := time.NewTicker(*archiveEvery)

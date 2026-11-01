@@ -228,6 +228,7 @@ const std::map<std::wstring, std::wstring>& english_strings() {
         {L"系统声音输出（捕获与查看者麦克风共用）", L"System sound output (shared with capture and the viewer microphone)"},
         {L"刷新", L"Refresh"},
         {L"回声消除（以查看者麦克风播放为参考）", L"Echo cancellation (uses viewer microphone playback as reference)"},
+        {L"静音 2 秒后暂停发送系统声音", L"Pause system audio after 2 s of silence"},
         {L"留空跟随系统默认；固定设备不可用时系统声音不会启动。", L"Empty follows the system default; sound stops if a pinned device is missing."},
         {L"共享未启动", L"Sharing is not running"},
         {L"已启用", L"Enabled"},

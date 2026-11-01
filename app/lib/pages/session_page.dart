@@ -10,17 +10,20 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
+import '../stream_prefs.dart';
 import '../target.dart';
 import '../theme.dart';
 import '../reconnect_policy.dart';
 import '../remote_key_sequence.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
+import '../view_prefs.dart';
 import '../viewer_bridge.dart';
 import '../widgets/camera_panel.dart';
 import '../widgets/chat_panel.dart';
 import '../widgets/file_browser_panel.dart';
 import '../widgets/remote_toolbar.dart';
+import '../widgets/send_text_dialog.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
 import '../widgets/terminal_panel.dart';
@@ -102,8 +105,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // owns the keyboard every key goes to the host's console instead of the
   // remote desktop. The panel itself owns the screen model and the output
   // poll; the page only decides when it is on screen.
-  final FocusNode _terminalFocus =
-      FocusNode(debugLabel: 'remote-terminal');
+  final FocusNode _terminalFocus = FocusNode(debugLabel: 'remote-terminal');
   bool _terminalOpen = false;
   bool _terminalTyping = false;
   // Host camera preview. The native side decodes into a second plugin
@@ -119,6 +121,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // The directory the open browser last listed; dropped files follow it so
   // they land where the user is looking instead of the receive root.
   String _fileBrowserDirectory = '';
+  // The ordering the open browser was last left in, remembered for the next
+  // open during this session.
+  FileBrowserSort _fileBrowserSort = FileBrowserSort.name;
+  bool _fileBrowserSortAscending = true;
+  int _terminalFontSize = 13;
   // The last port-forward failure already shown, so a stable error text does
   // not pop a snack bar on every poll. Cleared when the engine clears it.
   String _portForwardErrorSeen = '';
@@ -157,10 +164,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   int _modesRequestedLists = 0;
   DateTime _modesRequestedAt = DateTime.fromMillisecondsSinceEpoch(0);
   bool _modesRefreshPending = false;
-  // Picture preferences for this session. A fresh host session starts with its
-  // own defaults, so the page keeps the choices and re-sends them after every
-  // start. A change is optimistic: a refusal restores the previous selection
-  // and explains itself in a snack bar.
+  // Picture preferences, remembered across launches like RustDesk's image
+  // quality. A fresh host session starts with its own defaults, so the page
+  // seeds these from ui.json and re-sends them after every start. A change is
+  // optimistic: a refusal restores the previous selection and explains itself
+  // in a snack bar.
   ViewerStreamCodec _streamCodec = ViewerStreamCodec.auto;
   ViewerStreamQuality _streamQuality = ViewerStreamQuality.high;
   int _streamMaxFps = 0;
@@ -211,7 +219,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // this trail because no session existed yet.
   DateTime? _auditStartedAt;
 
-  bool get _inputActive => _controlEnabled && _status.acceptsInput && _startError == null;
+  bool get _inputActive =>
+      _controlEnabled && _status.acceptsInput && _startError == null;
 
   /// Physical cursor pixels per captured pixel. The native side needs this to
   /// size the host's sprite the way the frame is being drawn, so a stream
@@ -226,6 +235,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _chatInputFocus.addListener(_onChatFocusChanged);
     _terminalFocus.addListener(_onTerminalFocusChanged);
     ViewerBridge.setDropHandler(_sendDroppedFiles);
+    final StreamPreferences prefs = StreamPreferences.load();
+    _streamCodec = _streamCodecFor(prefs.codec);
+    _streamQuality = _streamQualityFor(prefs.quality);
+    _streamMaxFps = prefs.maxFps;
+    final ViewPreferences viewPrefs = ViewPreferences.load();
+    _fit = viewPrefs.fit == 1 ? ViewFit.original : ViewFit.adaptive;
+    _statsVisible = viewPrefs.stats;
+    _fileBrowserSort = _fileSortFor(viewPrefs.fileSort);
+    _fileBrowserSortAscending = viewPrefs.fileSortAscending;
+    _fileBrowserDirectory = viewPrefs.browserDirectory;
+    _terminalFontSize = viewPrefs.terminalFontSize;
     _startPolling();
     _starting = _start();
     unawaited(_starting);
@@ -348,9 +368,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         !widget.settings.uploadRecordings) {
       return;
     }
-    _recordingUploads.add(
-      _FinishedRecording(path: path, startedAt: startedAt),
-    );
+    _recordingUploads.add(_FinishedRecording(path: path, startedAt: startedAt));
     unawaited(_processRecordingUploads());
   }
 
@@ -377,7 +395,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(tr('正在上传录制：{name}', <String, Object?>{'name': name})),
+                content: Text(
+                  tr('正在上传录制：{name}', <String, Object?>{'name': name}),
+                ),
                 duration: const Duration(seconds: 2),
               ),
             );
@@ -398,7 +418,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(tr('录制已上传：{name}', <String, Object?>{'name': name})),
+                content: Text(
+                  tr('录制已上传：{name}', <String, Object?>{'name': name}),
+                ),
                 duration: const Duration(seconds: 3),
               ),
             );
@@ -407,7 +429,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(tr('录制上传失败：{error}', <String, Object?>{'error': error.message})),
+                content: Text(
+                  tr('录制上传失败：{error}', <String, Object?>{
+                    'error': error.message,
+                  }),
+                ),
                 duration: const Duration(seconds: 4),
               ),
             );
@@ -416,7 +442,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(tr('录制上传失败：{error}', <String, Object?>{'error': error})),
+                content: Text(
+                  tr('录制上传失败：{error}', <String, Object?>{'error': error}),
+                ),
                 duration: const Duration(seconds: 4),
               ),
             );
@@ -466,7 +494,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         // retrying it in a loop would just hide the failure.
         _cancelAutoReconnect();
         if (mounted) {
-          setState(() => _startError = tr('无法通过连接服务打开设备：{p1}', <String, Object?>{'p1': error.message}));
+          setState(
+            () => _startError = tr('无法通过连接服务打开设备：{p1}', <String, Object?>{
+              'p1': error.message,
+            }),
+          );
         }
         return;
       }
@@ -524,10 +556,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     try {
       live = await ServerApi.serverIdentity(settings);
     } on ServerApiException catch (error) {
-      throw TunnelException(tr('无法读取服务器身份：{p2}', <String, Object?>{'p2': error.message}));
+      throw TunnelException(
+        tr('无法读取服务器身份：{p2}', <String, Object?>{'p2': error.message}),
+      );
     }
-    final ServerIdentityPin? pinned =
-        await _identityStore.pinFor(settings.url);
+    final ServerIdentityPin? pinned = await _identityStore.pinFor(settings.url);
     if (pinned != null && pinned.identity.publicKey == live.publicKey) {
       return live.publicKey;
     }
@@ -592,7 +625,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!_credentialsLoaded) {
       _credentialsLoaded = true;
       try {
-        final String? saved = await ViewerBridge.loadPassword(widget.target.trustKey);
+        final String? saved = await ViewerBridge.loadPassword(
+          widget.target.trustKey,
+        );
         if (saved != null && saved.isNotEmpty) {
           _password = saved;
           _rememberPassword = true;
@@ -627,8 +662,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         carrierToken = '';
       } else {
         carrierHost = widget.target.host;
-        carrierPort =
-            widget.target.port < 65535 ? widget.target.port + 1 : 0;
+        carrierPort = widget.target.port < 65535 ? widget.target.port + 1 : 0;
         carrierHostId = '';
         carrierToken = '';
       }
@@ -751,7 +785,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // so every later connection to this endpoint is pinned to it.
     if (_pinnedFingerprint.isEmpty && status.serverFingerprint.isNotEmpty) {
       _pinnedFingerprint = status.serverFingerprint;
-      unawaited(_trustStore.trust(widget.target.trustKey, status.serverFingerprint));
+      unawaited(
+        _trustStore.trust(widget.target.trustKey, status.serverFingerprint),
+      );
     }
     _trackRecording(status);
     final int previousPermissions = _status.permissions;
@@ -783,7 +819,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // A refused password or one-time code is a step, not an end: the session
     // is dead, but the card stays away while the dialog collects fresh
     // credentials and reconnects.
-    final bool challenge = _startError == null &&
+    final bool challenge =
+        _startError == null &&
         status.isOver &&
         !_over &&
         _isCredentialChallenge(status.denial);
@@ -807,7 +844,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _pollTimer?.cancel();
       _collapsed = false;
     }
-    final bool droppedControl = (nowOver || !status.inputEnabled) && _controlEnabled;
+    final bool droppedControl =
+        (nowOver || !status.inputEnabled) && _controlEnabled;
     if (droppedControl) {
       _controlEnabled = false;
     }
@@ -816,9 +854,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // must still read as two answers, and a late answer for a request the
     // picker has already replaced must not win.
     final int? pendingDisplay = _pendingDisplay;
-    final bool switchRefused = pendingDisplay != null &&
+    final bool switchRefused =
+        pendingDisplay != null &&
         status.displaySwitchFailures > _status.displaySwitchFailures;
-    final bool switchAccepted = pendingDisplay != null &&
+    final bool switchAccepted =
+        pendingDisplay != null &&
         !switchRefused &&
         status.displaySwitches > _status.displaySwitches;
     // A mode change is answered the same way: the counters say whether this
@@ -832,6 +872,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // the reason stay in the status until the next upload starts.
     final bool fileDone = status.filesSent > _status.filesSent;
     final bool fileFailed = status.fileFailures > _status.fileFailures;
+    final bool fileCancelled = status.fileCancels > _status.fileCancels;
     final bool downloadDone = status.filesReceived > _status.filesReceived;
     final bool downloadFailed =
         status.fileReceiveFailures > _status.fileReceiveFailures;
@@ -876,12 +917,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    if (streamSettled) {
+      _saveStreamPreferences();
+    }
     if (streamSettled && streamRefused) {
       final String reason = status.streamOptionError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('画面设置未生效') : tr('画面设置未生效：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('画面设置未生效')
+                : tr('画面设置未生效：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
     }
     if (justOver) {
       if (_cameraOpen) {
@@ -899,68 +949,149 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     if (switchRefused) {
       final String reason = status.displaySwitchError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('切换显示失败，已回到当前输出') : tr('切换显示失败：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('切换显示失败，已回到当前输出')
+                : tr('切换显示失败：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
     }
     if (modeChangeRefused) {
       final String reason = status.displayModeError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('切换分辨率失败') : tr('切换分辨率失败：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('切换分辨率失败')
+                : tr('切换分辨率失败：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
     }
     if (fileDone) {
       final String name = status.lastFileName;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(name.isEmpty ? tr('文件已发送') : tr('文件已发送：{name}', <String, Object?>{'name': name})),
-        duration: const Duration(seconds: 3),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            name.isEmpty
+                ? tr('文件已发送')
+                : tr('文件已发送：{name}', <String, Object?>{'name': name}),
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
     } else if (fileFailed) {
       final String reason = status.lastFileError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('文件发送失败') : tr('文件发送失败：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 5),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('文件发送失败')
+                : tr('文件发送失败：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } else if (fileCancelled) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('已取消上传')),
+          duration: const Duration(seconds: 3),
+        ),
+      );
     }
     if (downloadDone) {
       final String name = status.downloadName;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(name.isEmpty ? tr('文件已接收') : tr('文件已接收：{name}', <String, Object?>{'name': name})),
-        duration: const Duration(seconds: 3),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            name.isEmpty
+                ? tr('文件已接收')
+                : tr('文件已接收：{name}', <String, Object?>{'name': name}),
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
     } else if (downloadFailed) {
       final String reason = status.downloadError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('文件接收失败') : tr('文件接收失败：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 5),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('文件接收失败')
+                : tr('文件接收失败：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
     }
     if (uploadsDone > 0) {
-      unawaited(_reportFileEvent('upload', status.lastFileName,
-          uploadsDone == 1 ? status.fileSize : 0, uploadsDone, true, ''));
+      unawaited(
+        _reportFileEvent(
+          'upload',
+          status.lastFileName,
+          uploadsDone == 1 ? status.fileSize : 0,
+          uploadsDone,
+          true,
+          '',
+        ),
+      );
     }
     if (uploadsFailed > 0) {
-      unawaited(_reportFileEvent('upload', status.lastFileName, 0,
-          uploadsFailed, false, status.lastFileError));
+      unawaited(
+        _reportFileEvent(
+          'upload',
+          status.lastFileName,
+          0,
+          uploadsFailed,
+          false,
+          status.lastFileError,
+        ),
+      );
     }
     if (downloadsDone > 0) {
-      unawaited(_reportFileEvent('download', status.downloadName,
-          downloadsDone == 1 ? status.downloadSize : 0, downloadsDone, true, ''));
+      unawaited(
+        _reportFileEvent(
+          'download',
+          status.downloadName,
+          downloadsDone == 1 ? status.downloadSize : 0,
+          downloadsDone,
+          true,
+          '',
+        ),
+      );
     }
     if (downloadsFailed > 0) {
-      unawaited(_reportFileEvent('download', status.downloadName, 0,
-          downloadsFailed, false, status.downloadError));
+      unawaited(
+        _reportFileEvent(
+          'download',
+          status.downloadName,
+          0,
+          downloadsFailed,
+          false,
+          status.downloadError,
+        ),
+      );
     }
     // A microphone failure stops only the uplink; video and system sound keep
     // running. The counter tells a new failure from the stale reason text.
     if (!nowOver && status.microphoneErrors > _status.microphoneErrors) {
       final String reason = status.microphoneError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('麦克风已停止') : tr('麦克风已停止：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 5),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('麦克风已停止')
+                : tr('麦克风已停止：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
     }
     // Every privacy answer is one event. A refusal or a host-initiated
     // disable explains itself; a success just confirms the new state.
@@ -972,12 +1103,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             ? _privacyCodeText(status.privacyCode)
             : '${_privacyCodeText(status.privacyCode)}：$reason';
       } else {
-        text = status.privacyEnabled ? tr('隐私模式已开启：主机本地画面已被遮挡') : tr('隐私模式已关闭：主机本地画面已恢复');
+        text = status.privacyEnabled
+            ? tr('隐私模式已开启：主机本地画面已被遮挡')
+            : tr('隐私模式已关闭：主机本地画面已恢复');
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(text),
-        duration: const Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
     }
     // Every Ctrl+Alt+Del request gets one answer. A refusal or unsupported
     // host explains itself; success confirms the sequence was injected.
@@ -987,34 +1119,63 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (status.sasCode == ViewerSasCode.ok.code) {
         text = tr('Ctrl+Alt+Del 已发送到主机');
       } else {
-        final String detail =
-            reason.isEmpty ? _sasCodeText(status.sasCode) : reason;
-        text = tr('Ctrl+Alt+Del 未发送：{detail}', <String, Object?>{'detail': detail});
+        final String detail = reason.isEmpty
+            ? _sasCodeText(status.sasCode)
+            : reason;
+        text = tr('Ctrl+Alt+Del 未发送：{detail}', <String, Object?>{
+          'detail': detail,
+        });
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(text),
-        duration: const Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
+    }
+    // Screenshots finish on the session thread; the counter pairs the newest
+    // path or failure with this poll.
+    if (!nowOver && status.screenshotUpdates > _status.screenshotUpdates) {
+      final String reason = status.screenshotError;
+      final String path = status.screenshotPath;
+      final String text;
+      if (reason.isNotEmpty) {
+        text = tr('截图失败：{reason}', <String, Object?>{'reason': reason});
+      } else if (path.isEmpty) {
+        text = tr('截图已保存');
+      } else {
+        text = tr('截图已保存：{path}', <String, Object?>{'path': path});
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
     }
     if (chatArrived) {
       unawaited(_drainChat());
     }
     if (!nowOver && chatFailed) {
       final String reason = status.chatError;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(reason.isEmpty ? tr('聊天消息发送失败') : tr('聊天消息发送失败：{reason}', <String, Object?>{'reason': reason})),
-        duration: const Duration(seconds: 5),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('聊天消息发送失败')
+                : tr('聊天消息发送失败：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
     }
     if (!nowOver) {
       if (status.portForwardError.isEmpty) {
         _portForwardErrorSeen = '';
       } else if (status.portForwardError != _portForwardErrorSeen) {
         _portForwardErrorSeen = status.portForwardError;
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('端口转发：{p4}', <String, Object?>{'p4': status.portForwardError})),
-          duration: const Duration(seconds: 5),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('端口转发：{p4}', <String, Object?>{'p4': status.portForwardError}),
+            ),
+            duration: const Duration(seconds: 5),
+          ),
+        );
       }
     }
     if (droppedControl) {
@@ -1044,7 +1205,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _syncCursor() {
     final bool enabled = _inputActive;
     final double scale = _cursorTargetScale;
-    if (_cursorSynced && enabled == _cursorWanted && _status.cursorUpdates == _cursorSeen &&
+    if (_cursorSynced &&
+        enabled == _cursorWanted &&
+        _status.cursorUpdates == _cursorSeen &&
         (_cursorScale - scale).abs() < 0.001) {
       return;
     }
@@ -1155,10 +1318,40 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  void _takeScreenshot() {
+    unawaited(_saveScreenshot());
+  }
+
+  Future<void> _saveScreenshot() async {
+    try {
+      await ViewerBridge.takeScreenshot();
+    } on PlatformException catch (error) {
+      if (mounted) {
+        final String reason = error.message ?? '';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              reason.isEmpty
+                  ? tr('截图失败')
+                  : tr('截图失败：{reason}', <String, Object?>{'reason': reason}),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } on MissingPluginException {
+      // The viewer is going away.
+    }
+  }
+
   Future<void> _sendFile() => _startUpload(ViewerBridge.sendFile);
 
-  Future<void> _sendDroppedFiles(List<String> paths) => _startUpload(() =>
-      ViewerBridge.sendFilesTo(paths, _fileBrowserOpen ? _fileBrowserDirectory : ''));
+  Future<void> _sendDroppedFiles(List<String> paths) => _startUpload(
+    () => ViewerBridge.sendFilesTo(
+      paths,
+      _fileBrowserOpen ? _fileBrowserDirectory : '',
+    ),
+  );
 
   Future<void> _startUpload(Future<int?> Function() start) async {
     if (_filePickBusy) {
@@ -1168,18 +1361,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     try {
       final int? queued = await start();
       if (queued != null && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('已加入发送队列（{queued} 项），进度显示在画面下方', <String, Object?>{'queued': queued})),
-          duration: const Duration(seconds: 2),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('已加入发送队列（{queued} 项），进度显示在画面下方', <String, Object?>{
+                'queued': queued,
+              }),
+            ),
+            duration: const Duration(seconds: 2),
+          ),
+        );
       }
     } on PlatformException catch (error) {
       if (mounted) {
         final String reason = error.message ?? '';
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(reason.isEmpty ? tr('无法发送文件') : tr('无法发送文件：{reason}', <String, Object?>{'reason': reason})),
-          duration: const Duration(seconds: 4),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              reason.isEmpty
+                  ? tr('无法发送文件')
+                  : tr('无法发送文件：{reason}', <String, Object?>{'reason': reason}),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
       }
     } on MissingPluginException {
       // The viewer is going away.
@@ -1243,7 +1448,44 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _scheduleHide();
   }
 
-  void _setFit(ViewFit fit) => setState(() => _fit = fit);
+  void _setFit(ViewFit fit) {
+    setState(() => _fit = fit);
+    _saveViewPreferences();
+  }
+
+  void _saveViewPreferences() {
+    ViewPreferences.save(
+      ViewPreferences(
+        fit: _fit == ViewFit.original ? 1 : 0,
+        stats: _statsVisible,
+        fileSort: _fileBrowserSort.index,
+        fileSortAscending: _fileBrowserSortAscending,
+        browserDirectory: _fileBrowserDirectory,
+        terminalFontSize: _terminalFontSize,
+      ),
+    );
+  }
+
+  void _toggleStats() {
+    setState(() => _statsVisible = !_statsVisible);
+    _saveViewPreferences();
+  }
+
+  void _rememberFileSort(FileBrowserSort sort, bool ascending) {
+    _fileBrowserSort = sort;
+    _fileBrowserSortAscending = ascending;
+    _saveViewPreferences();
+  }
+
+  void _rememberFileBrowserDirectory(String directory) {
+    _fileBrowserDirectory = directory;
+    _saveViewPreferences();
+  }
+
+  void _rememberTerminalFontSize(int size) {
+    _terminalFontSize = size;
+    _saveViewPreferences();
+  }
 
   Future<void> _setFullscreen(bool enable) async {
     try {
@@ -1256,9 +1498,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message ?? tr('无法切换全屏'))),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法切换全屏'))));
     } on MissingPluginException {
       // No native window to resize.
     }
@@ -1289,17 +1531,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (!mounted || applied) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(tr('主机未授权麦克风，无法开启')),
-        duration: Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('主机未授权麦克风，无法开启')),
+          duration: Duration(seconds: 4),
+        ),
+      );
     } on PlatformException catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message ?? tr('无法切换麦克风'))),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法切换麦克风'))));
     } on MissingPluginException {
       // The native viewer is going away.
     }
@@ -1315,17 +1559,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (!mounted || applied) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(tr('主机未授权隐私模式，无法切换')),
-        duration: Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('主机未授权隐私模式，无法切换')),
+          duration: Duration(seconds: 4),
+        ),
+      );
     } on PlatformException catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message ?? tr('无法切换隐私模式'))),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法切换隐私模式'))));
     } on MissingPluginException {
       // The native viewer is going away.
     }
@@ -1366,7 +1612,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 setDialogState(() => error = tr('本地端口须为 0–65535（0 表示自动分配）'));
                 return;
               }
-              if (host.isEmpty || remote == null || remote < 1 || remote > 65535) {
+              if (host.isEmpty ||
+                  remote == null ||
+                  remote < 1 ||
+                  remote > 65535) {
                 setDialogState(() => error = tr('请填写目标主机和 1–65535 的目标端口'));
                 return;
               }
@@ -1382,7 +1631,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
                     Text(
-                      tr('本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。本地端口填 0 由系统分配。'),
+                      tr(
+                        '本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。本地端口填 0 由系统分配。',
+                      ),
                       style: TextStyle(fontSize: 12, height: 1.4),
                     ),
                     const SizedBox(height: 12),
@@ -1414,7 +1665,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                     if (_status.portForwardActive) ...<Widget>[
                       const SizedBox(height: 14),
                       Text(
-                        tr('正在转发 127.0.0.1:{p7} → {p8}:{p9}\n连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}', <String, Object?>{'p7': _status.portForwardLocalPort, 'p8': _status.portForwardRemoteHost, 'p9': _status.portForwardRemotePort, 'p10': _status.portForwardConnections, 'p11': _status.portForwardFailures, 'p12': _formatBytes(_status.portForwardBytesUp), 'p13': _formatBytes(_status.portForwardBytesDown)}),
+                        tr(
+                          '正在转发 127.0.0.1:{p7} → {p8}:{p9}\n连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}',
+                          <String, Object?>{
+                            'p7': _status.portForwardLocalPort,
+                            'p8': _status.portForwardRemoteHost,
+                            'p9': _status.portForwardRemotePort,
+                            'p10': _status.portForwardConnections,
+                            'p11': _status.portForwardFailures,
+                            'p12': _formatBytes(_status.portForwardBytesUp),
+                            'p13': _formatBytes(_status.portForwardBytesDown),
+                          },
+                        ),
                         style: const TextStyle(fontSize: 11.5, height: 1.5),
                       ),
                     ],
@@ -1443,7 +1705,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 ),
                 FilledButton(
                   onPressed: start,
-                  child: Text(_status.portForwardActive ? tr('更换目标') : tr('开始转发')),
+                  child: Text(
+                    _status.portForwardActive ? tr('更换目标') : tr('开始转发'),
+                  ),
                 ),
               ],
             );
@@ -1476,10 +1740,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (!mounted || queued) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(tr('无法开始端口转发：主机未开放该权限')),
-        duration: Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('无法开始端口转发：主机未开放该权限')),
+          duration: Duration(seconds: 4),
+        ),
+      );
     } on PlatformException catch (failure) {
       if (!mounted) {
         return;
@@ -1510,12 +1776,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// device plugged in mid-session is offered too.
   Future<List<ViewerMicrophoneDevice>> _loadMicrophones() async {
     try {
-      final List<ViewerMicrophoneDevice> devices = await ViewerBridge.listMicrophones();
+      final List<ViewerMicrophoneDevice> devices =
+          await ViewerBridge.listMicrophones();
       if (devices.isEmpty && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('没有可用的麦克风设备')),
-          duration: Duration(seconds: 4),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('没有可用的麦克风设备')),
+            duration: Duration(seconds: 4),
+          ),
+        );
       }
       return devices;
     } on PlatformException catch (error) {
@@ -1544,12 +1813,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// menu, so a device plugged in mid-session is offered too.
   Future<List<ViewerAudioOutput>> _loadAudioOutputs() async {
     try {
-      final List<ViewerAudioOutput> devices = await ViewerBridge.listAudioOutputs();
+      final List<ViewerAudioOutput> devices =
+          await ViewerBridge.listAudioOutputs();
       if (devices.isEmpty && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('没有可用的音频输出设备')),
-          duration: Duration(seconds: 4),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('没有可用的音频输出设备')),
+            duration: Duration(seconds: 4),
+          ),
+        );
       }
       return devices;
     } on PlatformException catch (error) {
@@ -1570,17 +1842,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (!mounted || applied) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(tr('当前会话无法切换输出设备')),
-        duration: Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('当前会话无法切换输出设备')),
+          duration: Duration(seconds: 4),
+        ),
+      );
     } on PlatformException catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message ?? tr('无法切换音频输出'))),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法切换音频输出'))));
     } on MissingPluginException {
       // The native viewer is going away.
     }
@@ -1595,17 +1869,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (!mounted || applied) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(tr('当前会话无法修改麦克风处理')),
-        duration: Duration(seconds: 4),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('当前会话无法修改麦克风处理')),
+          duration: Duration(seconds: 4),
+        ),
+      );
     } on PlatformException catch (error) {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message ?? tr('无法修改麦克风处理'))),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法修改麦克风处理'))));
     } on MissingPluginException {
       // The native viewer is going away.
     }
@@ -1677,7 +1953,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (streamed == null) {
       return;
     }
-    if (_modesRefreshPending && status.displayModeLists > _modesRequestedLists) {
+    if (_modesRefreshPending &&
+        status.displayModeLists > _modesRequestedLists) {
       _modesRefreshPending = false;
     }
     if (status.displayModesDisplay == streamed && !_modesRefreshPending) {
@@ -1729,10 +2006,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return;
     }
     if (!queued) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(tr('无法切换分辨率：会话未在串流，或主机未开放输入')),
-        duration: Duration(seconds: 3),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('无法切换分辨率：会话未在串流，或主机未开放输入')),
+          duration: Duration(seconds: 3),
+        ),
+      );
     }
   }
 
@@ -1752,8 +2031,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         nextFps == _streamMaxFps) {
       return;
     }
-    final _StreamOptionSnapshot previous =
-        _StreamOptionSnapshot(_streamCodec, _streamQuality, _streamMaxFps);
+    final _StreamOptionSnapshot previous = _StreamOptionSnapshot(
+      _streamCodec,
+      _streamQuality,
+      _streamMaxFps,
+    );
     setState(() {
       _streamCodec = nextCodec;
       _streamQuality = nextQuality;
@@ -1789,10 +2071,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _streamMaxFps = previous.maxFps;
       _streamRollback = null;
     });
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(tr('当前无法修改画面设置')),
-      duration: Duration(seconds: 3),
-    ));
+    _saveStreamPreferences();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(tr('当前无法修改画面设置')), duration: Duration(seconds: 3)),
+    );
+  }
+
+  /// Only the settled values are written: a choice the host refused must not
+  /// reappear as the remembered one on the next launch.
+  void _saveStreamPreferences() {
+    StreamPreferences.save(
+      StreamPreferences(
+        codec: _streamCodec.code,
+        quality: _streamQuality.code,
+        maxFps: _streamMaxFps,
+      ),
+    );
   }
 
   /// True when the server proved a different identity than the one stored for
@@ -1848,18 +2142,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final String gainedNames = names(gained);
     final String text;
     if (lostNames.isNotEmpty && gainedNames.isNotEmpty) {
-      text = tr('主机已收回 {lostNames}，并授予 {gainedNames}。', <String, Object?>{'lostNames': lostNames, 'gainedNames': gainedNames});
+      text = tr('主机已收回 {lostNames}，并授予 {gainedNames}。', <String, Object?>{
+        'lostNames': lostNames,
+        'gainedNames': gainedNames,
+      });
     } else if (lostNames.isNotEmpty) {
-      text = tr('主机已收回 {lostNames}。', <String, Object?>{'lostNames': lostNames});
+      text = tr('主机已收回 {lostNames}。', <String, Object?>{
+        'lostNames': lostNames,
+      });
     } else if (gainedNames.isNotEmpty) {
-      text = tr('主机已授予 {gainedNames}。', <String, Object?>{'gainedNames': gainedNames});
+      text = tr('主机已授予 {gainedNames}。', <String, Object?>{
+        'gainedNames': gainedNames,
+      });
     } else {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(text),
-      duration: const Duration(seconds: 4),
-    ));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+    );
   }
 
   /// Collects the credential the host asked for and reconnects with it. A
@@ -1870,7 +2170,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return;
     }
     _authPromptOpen = true;
-    final bool passwordStep = denial == ViewerDenial.passwordRequired ||
+    final bool passwordStep =
+        denial == ViewerDenial.passwordRequired ||
         denial == ViewerDenial.wrongPassword;
     final _CredentialResult? entered = await showDialog<_CredentialResult>(
       context: context,
@@ -1940,7 +2241,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_closing || _autoTimer != null) {
       return;
     }
-    final bool eligible = _startError == null &&
+    final bool eligible =
+        _startError == null &&
         status.state == ViewerState.failed &&
         status.denial == 0 &&
         !_identityChanged;
@@ -1948,8 +2250,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _cancelAutoReconnect();
       return;
     }
-    final bool seriesActive =
-        _autoPolicy.waiting && _autoPolicy.attempt > 0;
+    final bool seriesActive = _autoPolicy.waiting && _autoPolicy.attempt > 0;
     if (!seriesActive && !_sawFrame) {
       return;
     }
@@ -2338,10 +2639,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         await _gpuTexture.unregisterTexture(id);
       }
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('无法创建摄像头纹理')),
-          duration: Duration(seconds: 4),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('无法创建摄像头纹理')),
+            duration: Duration(seconds: 4),
+          ),
+        );
       }
       return;
     }
@@ -2416,10 +2719,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       await ViewerBridge.stopCamera();
       final bool started = await ViewerBridge.startCamera(cameraId);
       if (!started && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('摄像头请求未发送，请稍后重试')),
-          duration: Duration(seconds: 4),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('摄像头请求未发送，请稍后重试')),
+            duration: Duration(seconds: 4),
+          ),
+        );
       }
     } on MissingPluginException {
       // The session is gone; the status already says so.
@@ -2436,6 +2741,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     } on PlatformException {
       // The engine cleans up when the stream ends anyway.
     }
+  }
+
+  Future<void> _openSendTextDialog() async {
+    await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) =>
+          SendTextDialog(onSend: (String text) => ViewerBridge.sendText(text)),
+    );
   }
 
   void _toggleChat() {
@@ -2561,40 +2874,43 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _sendMouse(int action, {int buttons = 0, int x = 0, int y = 0}) {
-    unawaited(_guardSend(ViewerBridge.sendMouse(
-      action: action,
-      buttons: buttons,
-      x: x,
-      y: y,
-      modifiers: _inputState(),
-    )));
+    unawaited(
+      _guardSend(
+        ViewerBridge.sendMouse(
+          action: action,
+          buttons: buttons,
+          x: x,
+          y: y,
+          modifiers: _inputState(),
+        ),
+      ),
+    );
   }
 
   Future<void> _sendKey(int usage, bool down) {
-    return _guardSend(ViewerBridge.sendKey(
-      usage: usage,
-      down: down,
-      modifiers: _inputState(),
-    ));
+    return _guardSend(
+      ViewerBridge.sendKey(usage: usage, down: down, modifiers: _inputState()),
+    );
   }
 
   /// Like [_sendKey], but with an explicit bitmap so a synthetic chord can
   /// describe the modifiers it is holding instead of what this machine's
   /// keyboard happens to have down.
   Future<void> _sendKeyWithBits(int usage, bool down, int modifiers) {
-    return _guardSend(ViewerBridge.sendKey(
-      usage: usage,
-      down: down,
-      modifiers: modifiers,
-    ));
+    return _guardSend(
+      ViewerBridge.sendKey(usage: usage, down: down, modifiers: modifiers),
+    );
   }
 
   /// Sends one toolbar shortcut as a press chord: modifiers down, the key
   /// down and up, then the modifiers up in reverse order. Every event carries
   /// the bitmap at that instant, matching a physical chord on the host.
   Future<void> _sendChord(List<int> modifierUsages, int keyUsage) async {
-    for (final RemoteKeyEvent event
-        in buildRemoteChord(modifierUsages, keyUsage, _inputState())) {
+    for (final RemoteKeyEvent event in buildRemoteChord(
+      modifierUsages,
+      keyUsage,
+      _inputState(),
+    )) {
       await _sendKeyWithBits(event.usage, event.down, event.modifiers);
     }
   }
@@ -2602,8 +2918,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   /// Win is itself a modifier, so a tap clears its bit before the key-up event
   /// rather than sending a second, duplicate down.
   Future<void> _sendWinTap() async {
-    for (final RemoteKeyEvent event
-        in buildRemoteWinTap(_inputState(), ViewerModifier.leftGui)) {
+    for (final RemoteKeyEvent event in buildRemoteWinTap(
+      _inputState(),
+      ViewerModifier.leftGui,
+    )) {
       await _sendKeyWithBits(event.usage, event.down, event.modifiers);
     }
   }
@@ -2622,10 +2940,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         queued = false;
       }
       if (!queued && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(tr('Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪')),
-          duration: Duration(seconds: 3),
-        ));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪')),
+            duration: Duration(seconds: 3),
+          ),
+        );
       }
       return;
     }
@@ -2668,24 +2988,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   int get _sourceHeight =>
       _status.sourceHeight > 0 ? _status.sourceHeight : _status.height;
 
-  int _desktopX(Offset frame) {
-    final int left = _status.originX;
-    final int width = _sourceWidth > 0 ? _sourceWidth : 1;
-    return (left + frame.dx).round().clamp(left, left + width - 1).toInt();
-  }
-
-  int _desktopY(Offset frame) {
-    final int top = _status.originY;
-    final int height = _sourceHeight > 0 ? _sourceHeight : 1;
-    return (top + frame.dy).round().clamp(top, top + height - 1).toInt();
-  }
+  (int, int) _desktopPoint(Offset frame) => frameToDesktop(
+    frame,
+    originX: _status.originX,
+    originY: _status.originY,
+    width: _sourceWidth,
+    height: _sourceHeight,
+  );
 
   void _onPointerHover(Offset frame, int buttons) {
-    _sendMouse(ViewerMouse.move, buttons: buttons, x: _desktopX(frame), y: _desktopY(frame));
+    final (int x, int y) = _desktopPoint(frame);
+    _sendMouse(ViewerMouse.move, buttons: buttons, x: x, y: y);
   }
 
   void _onPointerMove(Offset frame, int buttons) {
-    _sendMouse(ViewerMouse.move, buttons: buttons, x: _desktopX(frame), y: _desktopY(frame));
+    final (int x, int y) = _desktopPoint(frame);
+    _sendMouse(ViewerMouse.move, buttons: buttons, x: x, y: y);
   }
 
   void _onPointerButton(Offset frame, int button, bool down) {
@@ -2703,16 +3021,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _onPointerScroll(Offset frame, Offset delta) {
     _wheelY += delta.dy;
     _wheelX += delta.dx;
-    final int stepsY =
-        (_wheelY / kViewerScrollPixelsPerNotch).truncate().clamp(-10, 10).toInt();
+    final int stepsY = (_wheelY / kViewerScrollPixelsPerNotch)
+        .truncate()
+        .clamp(-10, 10)
+        .toInt();
     if (stepsY != 0) {
       _wheelY -= stepsY * kViewerScrollPixelsPerNotch;
       // Flutter's positive dy scrolls down; Windows WHEEL_DELTA is positive
       // when the wheel turns up (away from the user).
       _sendMouse(ViewerMouse.wheel, y: -stepsY * kViewerWheelDelta);
     }
-    final int stepsX =
-        (_wheelX / kViewerScrollPixelsPerNotch).truncate().clamp(-10, 10).toInt();
+    final int stepsX = (_wheelX / kViewerScrollPixelsPerNotch)
+        .truncate()
+        .clamp(-10, 10)
+        .toInt();
     if (stepsX != 0) {
       _wheelX -= stepsX * kViewerScrollPixelsPerNotch;
       _sendMouse(ViewerMouse.wheelHorizontal, x: stepsX * kViewerWheelDelta);
@@ -2771,9 +3093,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       // The server's own reason follows the viewer's wording; it is what a
       // host operator sees in their log, so it helps to compare.
       const String prefix = 'handshake: permission denied: ';
-      final String reason =
-          _status.error.startsWith(prefix) ? _status.error.substring(prefix.length) : '';
-      return reason.isEmpty ? denial : tr('{denial}\n\n服务端说明：{reason}', <String, Object?>{'denial': denial, 'reason': reason});
+      final String reason = _status.error.startsWith(prefix)
+          ? _status.error.substring(prefix.length)
+          : '';
+      return reason.isEmpty
+          ? denial
+          : tr('{denial}\n\n服务端说明：{reason}', <String, Object?>{
+              'denial': denial,
+              'reason': reason,
+            });
     }
     if (_status.error.isNotEmpty) {
       return _status.error;
@@ -2879,14 +3207,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_openPortForwardDialog()),
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
-                        onSelectDisplay: (int index) => unawaited(_switchDisplay(index)),
-                        modes: _status.displayModesDisplay ==
+                        onSelectDisplay: (int index) =>
+                            unawaited(_switchDisplay(index)),
+                        modes:
+                            _status.displayModesDisplay ==
                                     _status.streamedDisplayIndex &&
                                 _status.displayModesCode == 0
                             ? _status.displayModes
                             : const <ViewerDisplayMode>[],
-                        modeChangeAvailable: _status.acceptsInput &&
-                            !_status.mergedLayout,
+                        modeChangeAvailable:
+                            _status.acceptsInput && !_status.mergedLayout,
                         onSelectMode: (ViewerDisplayMode mode) =>
                             unawaited(_changeDisplayMode(mode)),
                         streamOptionsAvailable: _status.isLive,
@@ -2903,6 +3233,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         specialKeysAvailable: _inputActive,
                         onSpecialAction: (RemoteSpecialAction action) =>
                             unawaited(_sendSpecialAction(action)),
+                        onSendText: () => unawaited(_openSendTextDialog()),
+                        screenshotAvailable: _status.hasFrame,
+                        onScreenshot: _takeScreenshot,
                         onToggleClipboard: _toggleClipboardSync,
                         onSendFile: () => unawaited(_sendFile()),
                         fileBrowseOpen: _fileBrowserOpen,
@@ -2916,16 +3249,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         cameraOpen: _cameraOpen,
                         onToggleCamera: _toggleCamera,
                         onToggleAudio: () => unawaited(_toggleAudioMute()),
-                        onToggleMicrophone: () => unawaited(_toggleMicrophone()),
+                        onToggleMicrophone: () =>
+                            unawaited(_toggleMicrophone()),
                         onTogglePrivacy: () => unawaited(_togglePrivacy()),
-                        recordingAvailable: _status.acceptsRecording ||
-                            _status.recording,
+                        recordingAvailable:
+                            _status.acceptsRecording || _status.recording,
                         recordingDenied:
                             _status.isLive && !_status.acceptsRecording,
                         recording: _status.recording,
                         onToggleRecording: _toggleRecording,
                         onTogglePin: _togglePin,
-                        onToggleStats: () => setState(() => _statsVisible = !_statsVisible),
+                        onToggleStats: _toggleStats,
                         onToggleFullscreen: _toggleFullscreen,
                         onCollapse: _collapse,
                         onExpand: _expand,
@@ -2943,24 +3277,33 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       child: IgnorePointer(
                         child: Container(
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 7),
+                            horizontal: 12,
+                            vertical: 7,
+                          ),
                           decoration: BoxDecoration(
                             color: Colors.black.withValues(alpha: 0.68),
                             borderRadius: BorderRadius.circular(6),
-                            border: Border.all(color: Colors.amber.withValues(alpha: 0.45)),
+                            border: Border.all(
+                              color: Colors.amber.withValues(alpha: 0.45),
+                            ),
                           ),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: <Widget>[
-                              const Icon(Icons.lock_rounded,
-                                  size: 14, color: Colors.amberAccent),
+                              const Icon(
+                                Icons.lock_rounded,
+                                size: 14,
+                                color: Colors.amberAccent,
+                              ),
                               const SizedBox(width: 7),
                               Text(
                                 _status.desktop == ViewerDesktopKind.secure
                                     ? tr('主机已进入安全桌面（锁屏或 UAC），画面暂停')
                                     : tr('主机暂时无法采集桌面（锁屏或 UAC），恢复后自动继续'),
                                 style: const TextStyle(
-                                    color: Colors.white70, fontSize: 11),
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                ),
                               ),
                             ],
                           ),
@@ -2984,7 +3327,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                     bottom: 10,
                     child: IgnorePointer(
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 9,
+                          vertical: 5,
+                        ),
                         decoration: BoxDecoration(
                           color: Colors.black.withValues(alpha: 0.55),
                           borderRadius: BorderRadius.circular(6),
@@ -2992,7 +3338,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         ),
                         child: Text(
                           tr('远程键鼠已开启 · Esc 与 F11 已转发，工具栏可退出'),
-                          style: TextStyle(color: Colors.white54, fontSize: 10.5),
+                          style: TextStyle(
+                            color: Colors.white54,
+                            fontSize: 10.5,
+                          ),
                         ),
                       ),
                     ),
@@ -3065,7 +3414,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         status: _status,
                         textureId: _cameraTextureId,
                         onRefresh: () => unawaited(
-                            _guardSend(ViewerBridge.requestCameraList())),
+                          _guardSend(ViewerBridge.requestCameraList()),
+                        ),
                         onStart: (int cameraId) =>
                             unawaited(_startCamera(cameraId)),
                         onStop: () => unawaited(_stopCamera()),
@@ -3087,14 +3437,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             focusNode: _terminalFocus,
                             onOpen: (int columns, int rows) =>
                                 ViewerBridge.openTerminal(
-                                    columns: columns, rows: rows),
+                                  columns: columns,
+                                  rows: rows,
+                                ),
                             onTakeOutput: ViewerBridge.takeTerminalOutput,
                             onSendInput: ViewerBridge.sendTerminalInput,
                             onResize: (int columns, int rows) =>
                                 ViewerBridge.resizeTerminal(
-                                    columns: columns, rows: rows),
+                                  columns: columns,
+                                  rows: rows,
+                                ),
                             onClose: ViewerBridge.closeTerminal,
                             onDismiss: _closeTerminalPanel,
+                            initialFontSize: _terminalFontSize,
+                            onFontSizeChanged: _rememberTerminalFontSize,
                           ),
                         ),
                       ),
@@ -3111,14 +3467,25 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onTakeList: ViewerBridge.takeFileList,
                       onUpload: ViewerBridge.sendFileTo,
                       onFileOperation:
-                          (ViewerFileOperation op, String path, String newName) =>
-                              ViewerBridge.fileOperation(op, path,
-                                  newName: newName),
+                          (
+                            ViewerFileOperation op,
+                            String path,
+                            String newName,
+                          ) => ViewerBridge.fileOperation(
+                            op,
+                            path,
+                            newName: newName,
+                          ),
                       onDownloadFolder: ViewerBridge.downloadFolder,
                       onDownloadEntries: ViewerBridge.downloadEntries,
                       onCancelFolderDownload: ViewerBridge.cancelFolderDownload,
-                      onDirectoryChanged: (String directory) =>
-                          _fileBrowserDirectory = directory,
+                      onCancelUpload: ViewerBridge.cancelUploads,
+                      onCancelDownload: ViewerBridge.cancelDownload,
+                      initialDirectory: _fileBrowserDirectory,
+                      onDirectoryChanged: _rememberFileBrowserDirectory,
+                      initialSort: _fileBrowserSort,
+                      initialSortAscending: _fileBrowserSortAscending,
+                      onSortChanged: _rememberFileSort,
                       onClose: _closeFileBrowser,
                     ),
                   ),
@@ -3154,8 +3521,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               color: const Color(0xFF1A1B20),
               child: Row(
                 children: <Widget>[
-                  const Icon(Icons.folder_shared_rounded,
-                      size: 16, color: kAccentBright),
+                  const Icon(
+                    Icons.folder_shared_rounded,
+                    size: 16,
+                    color: kAccentBright,
+                  ),
                   const SizedBox(width: 8),
                   Text(
                     tr('文件传输'),
@@ -3172,14 +3542,18 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                          color: Colors.white54, fontSize: 11.5),
+                        color: Colors.white54,
+                        fontSize: 11.5,
+                      ),
                     ),
                   ),
                   if (live)
                     Text(
                       _status.transportLabel,
                       style: const TextStyle(
-                          color: Colors.white38, fontSize: 11),
+                        color: Colors.white38,
+                        fontSize: 11,
+                      ),
                     ),
                   const SizedBox(width: 8),
                   SizedBox(
@@ -3188,8 +3562,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                     child: IconButton(
                       tooltip: tr('关闭'),
                       padding: EdgeInsets.zero,
-                      icon: const Icon(Icons.close_rounded,
-                          size: 17, color: Colors.white70),
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        size: 17,
+                        color: Colors.white70,
+                      ),
                       onPressed: _leave,
                     ),
                   ),
@@ -3204,42 +3581,62 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   child: _autoPolicy.waiting && showOverlay
                       ? _buildAutoReconnect(false)
                       : showOverlay
-                          ? _buildDisconnected(false)
-                          : !live
-                              ? _buildWaiting()
-                              : LayoutBuilder(
-                                  builder: (BuildContext context,
-                                      BoxConstraints constraints) {
-                                    final double panelWidth =
-                                        (constraints.maxWidth - 48)
-                                            .clamp(300.0, 860.0);
-                                    final double panelHeight =
-                                        (constraints.maxHeight - 32)
-                                            .clamp(280.0, 720.0);
-                                    return FileBrowserPanel(
-                                      width: panelWidth,
-                                      height: panelHeight,
-                                      status: _status,
-                                      onRequestList: ViewerBridge.requestFileList,
-                                      onRequestDownload:
-                                          ViewerBridge.requestFileDownload,
-                                      onTakeList: ViewerBridge.takeFileList,
-                                      onUpload: ViewerBridge.sendFileTo,
-                                      onFileOperation: (ViewerFileOperation op,
-                                              String path, String newName) =>
-                                          ViewerBridge.fileOperation(op, path,
-                                              newName: newName),
-                                      onDownloadFolder: ViewerBridge.downloadFolder,
-                                      onDownloadEntries:
-                                          ViewerBridge.downloadEntries,
-                                      onCancelFolderDownload:
-                                          ViewerBridge.cancelFolderDownload,
-                                      onDirectoryChanged: (String directory) =>
-                                          _fileBrowserDirectory = directory,
-                                      onClose: _leave,
+                      ? _buildDisconnected(false)
+                      : !live
+                      ? _buildWaiting()
+                      : LayoutBuilder(
+                          builder:
+                              (
+                                BuildContext context,
+                                BoxConstraints constraints,
+                              ) {
+                                final double panelWidth =
+                                    (constraints.maxWidth - 48).clamp(
+                                      300.0,
+                                      860.0,
                                     );
-                                  },
-                                ),
+                                final double panelHeight =
+                                    (constraints.maxHeight - 32).clamp(
+                                      280.0,
+                                      720.0,
+                                    );
+                                return FileBrowserPanel(
+                                  width: panelWidth,
+                                  height: panelHeight,
+                                  status: _status,
+                                  onRequestList: ViewerBridge.requestFileList,
+                                  onRequestDownload:
+                                      ViewerBridge.requestFileDownload,
+                                  onTakeList: ViewerBridge.takeFileList,
+                                  onUpload: ViewerBridge.sendFileTo,
+                                  onFileOperation:
+                                      (
+                                        ViewerFileOperation op,
+                                        String path,
+                                        String newName,
+                                      ) => ViewerBridge.fileOperation(
+                                        op,
+                                        path,
+                                        newName: newName,
+                                      ),
+                                  onDownloadFolder: ViewerBridge.downloadFolder,
+                                  onDownloadEntries:
+                                      ViewerBridge.downloadEntries,
+                                  onCancelFolderDownload:
+                                      ViewerBridge.cancelFolderDownload,
+                                  onCancelUpload: ViewerBridge.cancelUploads,
+                                  onCancelDownload: ViewerBridge.cancelDownload,
+                                  initialDirectory: _fileBrowserDirectory,
+                                  onDirectoryChanged:
+                                      _rememberFileBrowserDirectory,
+                                  initialSort: _fileBrowserSort,
+                                  initialSortAscending:
+                                      _fileBrowserSortAscending,
+                                  onSortChanged: _rememberFileSort,
+                                  onClose: _leave,
+                                );
+                              },
+                        ),
                 ),
               ),
             ),
@@ -3316,14 +3713,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           children: <Widget>[
             Row(
               children: <Widget>[
-                const Icon(Icons.upload_file_rounded, size: 13, color: Colors.white70),
+                const Icon(
+                  Icons.upload_file_rounded,
+                  size: 13,
+                  color: Colors.white70,
+                ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     path,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Colors.white70, fontSize: 10.5),
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 10.5,
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -3350,13 +3754,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   if (detail.isNotEmpty)
                     Text(
                       detail,
-                      style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 9.5,
+                      ),
                     ),
                   if (waiting.isNotEmpty) ...<Widget>[
                     const Spacer(),
                     Text(
                       waiting,
-                      style: const TextStyle(color: Colors.white38, fontSize: 9.5),
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 9.5,
+                      ),
                     ),
                   ],
                 ],
@@ -3374,7 +3784,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final ViewerStatus status = _status;
     final String detail = status.downloadSize > 0
         ? '${_formatBytes(status.downloadReceived)} / '
-            '${_formatBytes(status.downloadSize)}'
+              '${_formatBytes(status.downloadSize)}'
         : '';
     return IgnorePointer(
       child: Container(
@@ -3391,14 +3801,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           children: <Widget>[
             Row(
               children: <Widget>[
-                const Icon(Icons.download_rounded, size: 13, color: Colors.white70),
+                const Icon(
+                  Icons.download_rounded,
+                  size: 13,
+                  color: Colors.white70,
+                ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     status.downloadName,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Colors.white70, fontSize: 10.5),
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 10.5,
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -3465,7 +3882,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             if (_tunnelPath.isNotEmpty) ...<Widget>[
               const SizedBox(height: 4),
               Text(
-                tr('隧道 · {_tunnelPath}', <String, Object?>{'_tunnelPath': _tunnelPath}),
+                tr('隧道 · {_tunnelPath}', <String, Object?>{
+                  '_tunnelPath': _tunnelPath,
+                }),
                 style: const TextStyle(
                   color: Colors.white30,
                   fontSize: 11,
@@ -3512,7 +3931,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             borderRadius: BorderRadius.circular(14),
             border: Border.all(color: Colors.white12),
             boxShadow: const <BoxShadow>[
-              BoxShadow(color: Color(0x80000000), blurRadius: 30, offset: Offset(0, 12)),
+              BoxShadow(
+                color: Color(0x80000000),
+                blurRadius: 30,
+                offset: Offset(0, 12),
+              ),
             ],
           ),
           child: Column(
@@ -3538,7 +3961,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               ),
               const SizedBox(height: 8),
               Text(
-                tr('正在自动重连（第 {p24}/{p25} 次）', <String, Object?>{'p24': _autoPolicy.attempt, 'p25': AutoReconnectPolicy.limit}),
+                tr('正在自动重连（第 {p24}/{p25} 次）', <String, Object?>{
+                  'p24': _autoPolicy.attempt,
+                  'p25': AutoReconnectPolicy.limit,
+                }),
                 style: const TextStyle(color: Colors.white54, fontSize: 12.5),
               ),
               if (detail.isNotEmpty) ...<Widget>[
@@ -3547,7 +3973,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   detail,
                   textAlign: TextAlign.center,
                   style: const TextStyle(
-                      color: Colors.white38, fontSize: 11.5, height: 1.4),
+                    color: Colors.white38,
+                    fontSize: 11.5,
+                    height: 1.4,
+                  ),
                 ),
               ],
               const SizedBox(height: 18),
@@ -3569,8 +3998,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Widget _buildDisconnected(bool hasFrame) {
     final int anomalies =
-        _status.crcErrors + _status.decodeErrors + _status.protocolErrors + _status.gaps;
-    final bool failed = _startError != null || _status.state == ViewerState.failed;
+        _status.crcErrors +
+        _status.decodeErrors +
+        _status.protocolErrors +
+        _status.gaps;
+    final bool failed =
+        _startError != null || _status.state == ViewerState.failed;
     return Container(
       color: hasFrame ? Colors.black.withValues(alpha: 0.55) : Colors.black,
       child: Center(
@@ -3582,7 +4015,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             borderRadius: BorderRadius.circular(14),
             border: Border.all(color: Colors.white12),
             boxShadow: const <BoxShadow>[
-              BoxShadow(color: Color(0x80000000), blurRadius: 30, offset: Offset(0, 12)),
+              BoxShadow(
+                color: Color(0x80000000),
+                blurRadius: 30,
+                offset: Offset(0, 12),
+              ),
             ],
           ),
           child: Column(
@@ -3592,13 +4029,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 width: 46,
                 height: 46,
                 decoration: BoxDecoration(
-                  color: (failed ? Colors.redAccent : kAccent).withValues(alpha: 0.14),
+                  color: (failed ? Colors.redAccent : kAccent).withValues(
+                    alpha: 0.14,
+                  ),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(
                   _denied
                       ? Icons.lock_outline_rounded
-                      : (failed ? Icons.link_off_rounded : Icons.videocam_off_rounded),
+                      : (failed
+                            ? Icons.link_off_rounded
+                            : Icons.videocam_off_rounded),
                   size: 23,
                   color: failed ? Colors.redAccent : kAccentBright,
                 ),
@@ -3616,7 +4057,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
               Text(
                 _overDetail,
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white54, fontSize: 12.5, height: 1.5),
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 12.5,
+                  height: 1.5,
+                ),
               ),
               if (_identityChanged) ...<Widget>[
                 const SizedBox(height: 14),
@@ -3625,14 +4070,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   decoration: BoxDecoration(
                     color: const Color(0xFFFFB74D).withValues(alpha: 0.08),
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFFFFB74D).withValues(alpha: 0.32)),
+                    border: Border.all(
+                      color: const Color(0xFFFFB74D).withValues(alpha: 0.32),
+                    ),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Row(
                         children: <Widget>[
-                          Icon(Icons.shield_outlined, size: 14, color: Color(0xFFFFB74D)),
+                          Icon(
+                            Icons.shield_outlined,
+                            size: 14,
+                            color: Color(0xFFFFB74D),
+                          ),
                           SizedBox(width: 6),
                           Text(
                             tr('服务器证书指纹已变化'),
@@ -3646,13 +4097,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        tr('已固定 {p26} · 当前 {p27}', <String, Object?>{'p26': shortenFingerprint(_pinnedFingerprint), 'p27': shortenFingerprint(_status.serverFingerprint)}),
-                        style: const TextStyle(color: Colors.white54, fontSize: 11, height: 1.4),
+                        tr('已固定 {p26} · 当前 {p27}', <String, Object?>{
+                          'p26': shortenFingerprint(_pinnedFingerprint),
+                          'p27': shortenFingerprint(_status.serverFingerprint),
+                        }),
+                        style: const TextStyle(
+                          color: Colors.white54,
+                          fontSize: 11,
+                          height: 1.4,
+                        ),
                       ),
                       const SizedBox(height: 4),
                       Text(
                         tr('对端可能重装或换了证书。确认这是同一台机器后再信任；否则请不要继续，避免连到冒充的主机。'),
-                        style: TextStyle(color: Colors.white38, fontSize: 11, height: 1.4),
+                        style: TextStyle(
+                          color: Colors.white38,
+                          fontSize: 11,
+                          height: 1.4,
+                        ),
                       ),
                     ],
                   ),
@@ -3663,7 +4125,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 Container(height: 1, color: Colors.white12),
                 const SizedBox(height: 10),
                 Text(
-                  tr('接收 {p28} 帧 · 解码 {p29} 帧{p30}', <String, Object?>{'p28': _status.received, 'p29': _status.decoded, 'p30': anomalies > 0 ? tr(' · 异常 {anomalies}', <String, Object?>{'anomalies': anomalies}) : ''}),
+                  tr('接收 {p28} 帧 · 解码 {p29} 帧{p30}', <String, Object?>{
+                    'p28': _status.received,
+                    'p29': _status.decoded,
+                    'p30': anomalies > 0
+                        ? tr(' · 异常 {anomalies}', <String, Object?>{
+                            'anomalies': anomalies,
+                          })
+                        : '',
+                  }),
                   style: const TextStyle(color: Colors.white38, fontSize: 11),
                 ),
               ],
@@ -3681,7 +4151,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(8),
                       ),
-                      textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                      textStyle: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                     child: Text(tr('返回并修改令牌')),
                   ),
@@ -3714,17 +4187,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                           onPressed: _reconnecting
                               ? null
                               : (_identityChanged
-                                  ? () => unawaited(_trustNewIdentity())
-                                  : _reconnect),
+                                    ? () => unawaited(_trustNewIdentity())
+                                    : _reconnect),
                           style: FilledButton.styleFrom(
                             backgroundColor: kAccent,
                             foregroundColor: Colors.white,
-                            disabledBackgroundColor: kAccent.withValues(alpha: 0.5),
+                            disabledBackgroundColor: kAccent.withValues(
+                              alpha: 0.5,
+                            ),
                             elevation: 0,
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(8),
                             ),
-                            textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                            textStyle: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
                           child: _reconnecting
                               ? const SizedBox(
@@ -3732,10 +4210,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                                   height: 15,
                                   child: CircularProgressIndicator(
                                     strokeWidth: 2,
-                                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                    valueColor: AlwaysStoppedAnimation<Color>(
+                                      Colors.white,
+                                    ),
                                   ),
                                 )
-                              : Text(_identityChanged ? tr('信任并重新连接') : tr('重新连接')),
+                              : Text(
+                                  _identityChanged ? tr('信任并重新连接') : tr('重新连接'),
+                                ),
                         ),
                       ),
                     ),
@@ -3783,8 +4265,9 @@ class _CredentialDialog extends StatefulWidget {
 }
 
 class _CredentialDialogState extends State<_CredentialDialog> {
-  late final TextEditingController _text =
-      TextEditingController(text: widget.passwordStep ? widget.initialPassword : '');
+  late final TextEditingController _text = TextEditingController(
+    text: widget.passwordStep ? widget.initialPassword : '',
+  );
   late bool _remember = widget.initialRemember;
   String? _error;
 
@@ -3797,7 +4280,9 @@ class _CredentialDialogState extends State<_CredentialDialog> {
   void _submit() {
     final String value = _text.text.trim();
     if (value.isEmpty) {
-      setState(() => _error = widget.passwordStep ? tr('请输入密码') : tr('请输入两步验证码'));
+      setState(
+        () => _error = widget.passwordStep ? tr('请输入密码') : tr('请输入两步验证码'),
+      );
       return;
     }
     Navigator.of(context).pop(_CredentialResult(value, _remember));
@@ -3817,7 +4302,11 @@ class _CredentialDialogState extends State<_CredentialDialog> {
             if (widget.detail.isNotEmpty) ...<Widget>[
               Text(
                 widget.detail,
-                style: const TextStyle(color: Colors.white54, fontSize: 12, height: 1.4),
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
               ),
               const SizedBox(height: 14),
             ],
@@ -3825,8 +4314,9 @@ class _CredentialDialogState extends State<_CredentialDialog> {
               controller: _text,
               autofocus: true,
               obscureText: passwordStep,
-              keyboardType:
-                  passwordStep ? TextInputType.visiblePassword : TextInputType.number,
+              keyboardType: passwordStep
+                  ? TextInputType.visiblePassword
+                  : TextInputType.number,
               maxLength: passwordStep ? 128 : 16,
               onSubmitted: (_) => _submit(),
               decoration: InputDecoration(
@@ -3838,7 +4328,8 @@ class _CredentialDialogState extends State<_CredentialDialog> {
             const SizedBox(height: 8),
             CheckboxListTile(
               value: _remember,
-              onChanged: (bool? value) => setState(() => _remember = value ?? false),
+              onChanged: (bool? value) =>
+                  setState(() => _remember = value ?? false),
               contentPadding: EdgeInsets.zero,
               controlAffinity: ListTileControlAffinity.leading,
               dense: true,
@@ -3851,7 +4342,10 @@ class _CredentialDialogState extends State<_CredentialDialog> {
         ),
       ),
       actions: <Widget>[
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: Text(tr('取消'))),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
         FilledButton(onPressed: _submit, child: Text(tr('连接'))),
       ],
     );
@@ -3891,6 +4385,24 @@ ViewerStreamQuality _streamQualityFor(int code) {
   return ViewerStreamQuality.high;
 }
 
+ViewerStreamCodec _streamCodecFor(int code) {
+  for (final ViewerStreamCodec codec in ViewerStreamCodec.values) {
+    if (codec.code == code) {
+      return codec;
+    }
+  }
+  return ViewerStreamCodec.auto;
+}
+
+FileBrowserSort _fileSortFor(int index) {
+  for (final FileBrowserSort sort in FileBrowserSort.values) {
+    if (sort.index == index) {
+      return sort;
+    }
+  }
+  return FileBrowserSort.name;
+}
+
 /// First-use and rotation confirmation for the rendezvous server key. The
 /// fingerprint is the only value a user can compare out of band, so both the
 /// old and the new one are shown in full when it changes.
@@ -3925,20 +4437,14 @@ class _ServerIdentityDialog extends StatelessWidget {
             Text(server, style: theme.textTheme.bodySmall),
             const SizedBox(height: 12),
             if (changed) ...<Widget>[
-              Text(
-                tr('此前固定的指纹'),
-                style: theme.textTheme.labelMedium,
-              ),
+              Text(tr('此前固定的指纹'), style: theme.textTheme.labelMedium),
               const SizedBox(height: 4),
               SelectableText(
                 formatServerFingerprint(previous!.fingerprint),
                 style: mono,
               ),
               const SizedBox(height: 12),
-              Text(
-                tr('本次连接提供的指纹'),
-                style: theme.textTheme.labelMedium,
-              ),
+              Text(tr('本次连接提供的指纹'), style: theme.textTheme.labelMedium),
             ] else
               Text(
                 tr('首次连接将固定这台服务器的身份。请与管理员公布的值核对：'),

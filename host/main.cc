@@ -693,6 +693,7 @@ void start_server() {
     }
     HostServerConfig config;
     config.settings = g_app->settings;
+    config.audio_silence_gate_ms = g_app->settings.audio_silence_gate_ms;
     config.serve_once = false;
     config.first_client_timeout_ms = 0;
     // The policy decides when to ask; the dialog is available for both and
@@ -1737,6 +1738,7 @@ enum SecurityDialogId {
     kSecAudioDevice,
     kSecAudioRefresh,
     kSecAudioAec,
+    kSecAudioGate,
     kSecSave,
     kSecCancel,
 };
@@ -1779,6 +1781,7 @@ struct SecurityDialogState {
     HWND token_edit = nullptr;
     HWND audio_device = nullptr;
     HWND audio_aec = nullptr;
+    HWND audio_gate = nullptr;
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
@@ -2076,6 +2079,14 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
                 : dialog.selected_audio_device;
     }
     updated.audio_aec = is_checked(dialog.audio_aec);
+    if (dialog.audio_gate != nullptr) {
+        // Keep a custom threshold (host.ini) when the box stays checked; the
+        // checkbox only distinguishes "off" from the default 2 s.
+        updated.audio_silence_gate_ms =
+            is_checked(dialog.audio_gate)
+                ? (updated.audio_silence_gate_ms != 0 ? updated.audio_silence_gate_ms : 2000)
+                : 0;
+    }
 
     updated.token_auth = is_checked(dialog.token_auth);
     updated.token_mode = is_checked(dialog.one_time) ? HostTokenMode::OneTime
@@ -2532,8 +2543,13 @@ bool edit_security_settings(HostSettings& result) {
         add(L"BUTTON", audio_aec_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 358,
             std::max(400, check_px(audio_aec_text)), 24, kSecAudioAec, nullptr,
             &dialog.advanced_page);
+    const wchar_t* audio_gate_text = tr(L"静音 2 秒后暂停发送系统声音");
+    dialog.audio_gate =
+        add(L"BUTTON", audio_gate_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 386,
+            std::max(400, check_px(audio_gate_text)), 24, kSecAudioGate, nullptr,
+            &dialog.advanced_page);
     add(L"STATIC", tr(L"留空跟随系统默认；固定设备不可用时系统声音不会启动。"), SS_LEFT, 0, 32,
-        386, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
+        414, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
     const int sec_cancel_left = dialog_width - 20 - 90;
     add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 574,
@@ -2569,6 +2585,7 @@ bool edit_security_settings(HostSettings& result) {
                            : std::wstring(tr(L"共享未启动")));
     dialog.selected_audio_device = settings.audio_device;
     set_check(dialog.audio_aec, settings.audio_aec);
+    set_check(dialog.audio_gate, settings.audio_silence_gate_ms != 0);
     refresh_audio_devices(dialog);
 
     if (!settings.totp_secret.empty()) {

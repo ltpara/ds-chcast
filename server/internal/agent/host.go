@@ -102,8 +102,11 @@ type HostInfo struct {
 }
 
 type HostAgent struct {
-	cfg          HostConfig
+	cfg HostConfig
+	// conn carries rendezvous, relay and viewer traffic; localOut exists only
+	// when the local control address needs the other address family.
 	conn         *net.UDPConn
+	localOut     *net.UDPConn
 	api          *apiClient
 	servers      *serverPool
 	log          *slog.Logger
@@ -154,8 +157,8 @@ type HostAgent struct {
 	natType       string
 	upnpPort      int
 
-	// remote is only touched by the read loop: it is the source of the last
-	// datagram that came from a viewer path (direct or via the relay).
+	// remote is guarded by mu: both read loops use it. It is the source of the
+	// last datagram that came from a viewer path (direct or via the relay).
 	remote *net.UDPAddr
 
 	keepaliveOnce  sync.Once
@@ -202,6 +205,10 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", cfg.ListenAddr, err)
 	}
+	localOut, err := localForwardConn(conn, local)
+	if err != nil {
+		cfg.Logger.Warn("local forwarding stays on the punch socket", "error", err)
+	}
 	var carrierAddr *net.TCPAddr
 	if cfg.CarrierAddr != "" {
 		carrierAddr, err = net.ResolveTCPAddr("tcp", cfg.CarrierAddr)
@@ -217,6 +224,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	h := &HostAgent{
 		cfg:            cfg,
 		conn:           conn,
+		localOut:       localOut,
 		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS),
 		servers:        servers,
 		log:            cfg.Logger.With("agent", "host", "id", cfg.ID),
@@ -236,11 +244,17 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	reg, err := h.registerWithFailover(ctx)
 	if err != nil {
 		conn.Close()
+		if localOut != nil {
+			localOut.Close()
+		}
 		cancel()
 		return nil, fmt.Errorf("register: %w", err)
 	}
 	if err := h.checkRegistration(reg); err != nil {
 		conn.Close()
+		if localOut != nil {
+			localOut.Close()
+		}
 		cancel()
 		return nil, err
 	}
@@ -263,6 +277,9 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	}
 
 	go h.readLoop()
+	if h.localOut != nil {
+		go h.localLoop()
+	}
 	go h.keepaliveLoop()
 	go h.relayHelloLoop()
 	go h.refreshLoop()
@@ -276,6 +293,27 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	h.log.Info("host agent listening", "on", conn.LocalAddr().String(), "forwarding_to", local.String(), "relay", reg.Relay)
 	h.reportInfo()
 	return h, nil
+}
+
+// localForwardConn opens a second datagram socket when the punch socket is
+// bound to one address family and the local control address uses the other:
+// a socket bound to ::1 cannot write to 127.0.0.1. A wildcard IPv6 bind is
+// treated as dual-stack, which the supported platforms provide by default.
+func localForwardConn(conn *net.UDPConn, local *net.UDPAddr) (*net.UDPConn, error) {
+	bind, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || local == nil || local.IP == nil {
+		return nil, nil
+	}
+	connV4 := bind.IP.To4() != nil
+	localV4 := local.IP.To4() != nil
+	if connV4 == localV4 || (!connV4 && bind.IP.IsUnspecified()) {
+		return nil, nil
+	}
+	network := "udp4"
+	if !localV4 {
+		network = "udp6"
+	}
+	return net.ListenUDP(network, nil)
 }
 
 func (h *HostAgent) LocalAddr() net.Addr { return h.conn.LocalAddr() }
@@ -317,6 +355,9 @@ func (h *HostAgent) reportInfo() {
 func (h *HostAgent) Close() {
 	h.cancel()
 	h.conn.Close()
+	if h.localOut != nil {
+		h.localOut.Close()
+	}
 }
 
 // WaitReady waits for the first keepalive acknowledgement, which is what makes
@@ -648,15 +689,50 @@ func (h *HostAgent) readLoop() {
 			continue
 		}
 		if sameAddr(src, h.local) {
-			if h.remote == nil {
+			h.mu.Lock()
+			remote := cloneAddr(h.remote)
+			h.mu.Unlock()
+			if remote == nil {
 				continue
 			}
-			h.conn.WriteToUDP(data, h.remote)
+			h.conn.WriteToUDP(data, remote)
 			continue
 		}
 		h.noteViewer(src)
+		h.mu.Lock()
 		h.remote = cloneAddr(src)
-		h.conn.WriteToUDP(data, h.local)
+		h.mu.Unlock()
+		if h.localOut != nil {
+			h.localOut.WriteToUDP(data, h.local)
+		} else {
+			h.conn.WriteToUDP(data, h.local)
+		}
+	}
+}
+
+// localLoop carries replies from local control addresses that cannot be
+// reached from the punch socket's address family; the punch socket still
+// carries them to the viewer.
+func (h *HostAgent) localLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, src, err := h.localOut.ReadFromUDP(buf)
+		if err != nil {
+			if h.ctx.Err() == nil {
+				h.log.Error("host agent local read", "error", err)
+			}
+			return
+		}
+		if n == 0 || !sameAddr(src, h.local) {
+			continue
+		}
+		h.mu.Lock()
+		remote := cloneAddr(h.remote)
+		h.mu.Unlock()
+		if remote == nil {
+			continue
+		}
+		h.conn.WriteToUDP(buf[:n], remote)
 	}
 }
 

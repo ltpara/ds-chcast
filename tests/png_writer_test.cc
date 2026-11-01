@@ -1,0 +1,207 @@
+// PNG writer: signature, decoded size and pixels, alpha forcing and argument
+// validation. Uses WIC for the decode, so it checks what any PNG reader sees
+// instead of trusting the encoder's own bookkeeping.
+
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
+#include <wincodec.h>
+
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include "chast/com_ptr.h"
+#include "chast/png.h"
+
+namespace {
+
+int failures = 0;
+
+void check(bool condition, const char* what) {
+    std::printf("%s %s\n", condition ? "ok  " : "FAIL", what);
+    if (!condition) {
+        ++failures;
+    }
+}
+
+bool has_png_signature(const std::filesystem::path& path) {
+    static const unsigned char signature[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    std::ifstream input(path, std::ios::binary);
+    unsigned char header[8]{};
+    input.read(reinterpret_cast<char*>(header), sizeof(header));
+    return input.gcount() == static_cast<std::streamsize>(sizeof(header)) &&
+           std::memcmp(header, signature, sizeof(signature)) == 0;
+}
+
+bool decode_png(const std::filesystem::path& path, uint32_t& width, uint32_t& height,
+                std::vector<uint8_t>& pixels, std::string& error) {
+    chast::ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(factory.put()));
+    chast::ComPtr<IWICBitmapDecoder> decoder;
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                WICDecodeMetadataCacheOnLoad,
+                                                decoder.put());
+    }
+    chast::ComPtr<IWICBitmapFrameDecode> frame;
+    if (SUCCEEDED(hr)) {
+        hr = decoder->GetFrame(0, frame.put());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = frame->GetSize(&width, &height);
+    }
+    chast::ComPtr<IWICFormatConverter> converter;
+    if (SUCCEEDED(hr)) {
+        hr = factory->CreateFormatConverter(converter.put());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = converter->Initialize(frame.get(), GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+    }
+    if (FAILED(hr)) {
+        error = "WIC could not decode the PNG";
+        return false;
+    }
+    pixels.assign(static_cast<size_t>(width) * height * 4, 0);
+    hr = converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(pixels.size()),
+                               pixels.data());
+    if (FAILED(hr)) {
+        error = "WIC could not read the decoded pixels";
+        return false;
+    }
+    return true;
+}
+
+void test_round_trip(const std::filesystem::path& directory) {
+    constexpr uint32_t kWidth = 5;
+    constexpr uint32_t kHeight = 3;
+    std::vector<uint8_t> source(static_cast<size_t>(kWidth) * kHeight * 4);
+    for (uint32_t y = 0; y < kHeight; ++y) {
+        for (uint32_t x = 0; x < kWidth; ++x) {
+            uint8_t* pixel = source.data() + (static_cast<size_t>(y) * kWidth + x) * 4;
+            pixel[0] = static_cast<uint8_t>(10 + x * 20);  // B
+            pixel[1] = static_cast<uint8_t>(20 + y * 30);  // G
+            pixel[2] = static_cast<uint8_t>(200 - x * 5);  // R
+            pixel[3] = 0;                                  // A, must come back opaque
+        }
+    }
+
+    // A nested folder exercises the writer's own directory creation.
+    const std::filesystem::path path = directory / "nested" / "shot.png";
+    std::string error;
+    check(chast::write_png_bgra(path.string(), source.data(), kWidth, kHeight, kWidth * 4,
+                                &error),
+          "a BGRA image is written");
+    check(error.empty(), "a successful write reports no error");
+    check(std::filesystem::exists(path) && std::filesystem::file_size(path) > 0,
+          "the PNG file exists and is not empty");
+    check(has_png_signature(path), "the file starts with the PNG signature");
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> decoded;
+    error.clear();
+    const bool read = decode_png(path, width, height, decoded, error);
+    check(read, "WIC decodes the PNG back");
+    check(width == kWidth && height == kHeight, "the decoded size matches the source");
+    if (read && width == kWidth && height == kHeight) {
+        bool pixels_match = true;
+        bool alpha_opaque = true;
+        for (uint32_t y = 0; y < kHeight; ++y) {
+            for (uint32_t x = 0; x < kWidth; ++x) {
+                const uint8_t* expected =
+                    source.data() + (static_cast<size_t>(y) * kWidth + x) * 4;
+                const uint8_t* actual =
+                    decoded.data() + (static_cast<size_t>(y) * kWidth + x) * 4;
+                if (actual[0] != expected[0] || actual[1] != expected[1] ||
+                    actual[2] != expected[2]) {
+                    pixels_match = false;
+                }
+                if (actual[3] != 0xFF) {
+                    alpha_opaque = false;
+                }
+            }
+        }
+        check(pixels_match, "the decoded colour channels match the source");
+        check(alpha_opaque, "the alpha channel is forced opaque");
+    }
+}
+
+void test_unicode_directory(const std::filesystem::path& directory) {
+    const uint8_t source[4] = {0x7F, 0x40, 0x20, 0};
+    const std::filesystem::path path = directory / L"截图" / L"shot.png";
+    const std::u8string text = path.u8string();
+    const std::string utf8_path(reinterpret_cast<const char*>(text.data()), text.size());
+    std::string error;
+    check(chast::write_png_bgra(utf8_path, source, 1, 1, 4, &error) && error.empty() &&
+              std::filesystem::exists(path),
+          "a UTF-8 path with a non-ASCII folder is written");
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> decoded;
+    error.clear();
+    check(decode_png(path, width, height, decoded, error) && width == 1 && height == 1,
+          "the non-ASCII path decodes back");
+}
+
+void test_validation() {
+    uint8_t pixel[4] = {1, 2, 3, 4};
+    std::string error;
+    check(!chast::write_png_bgra("", pixel, 1, 1, 4, &error) && !error.empty(),
+          "an empty file name is refused");
+    check(!chast::write_png_bgra("image.png", nullptr, 1, 1, 4, &error) && !error.empty(),
+          "null pixels are refused");
+    check(!chast::write_png_bgra("image.png", pixel, 0, 1, 4, &error) && !error.empty(),
+          "a zero width is refused");
+    check(!chast::write_png_bgra("image.png", pixel, 1, 0, 4, &error) && !error.empty(),
+          "a zero height is refused");
+    check(!chast::write_png_bgra("image.png", pixel, 2, 1, 4, &error) && !error.empty(),
+          "a row shorter than the width is refused");
+}
+
+}  // namespace
+
+int main() {
+    // The writer initialises COM itself; the decode helper below needs it on
+    // this thread as well.
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    wchar_t temp[MAX_PATH];
+    const DWORD length = GetTempPathW(MAX_PATH, temp);
+    std::filesystem::path directory;
+    if (length > 0) {
+        directory = std::filesystem::path(temp) /
+                    ("chast-png-test-" + std::to_string(GetCurrentProcessId()));
+    }
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::filesystem::create_directories(directory, ignored);
+
+    test_validation();
+    if (!directory.empty()) {
+        test_round_trip(directory);
+        test_unicode_directory(directory);
+    } else {
+        std::printf("FAIL could not create a temp directory\n");
+        ++failures;
+    }
+    std::filesystem::remove_all(directory, ignored);
+    if (SUCCEEDED(com)) {
+        CoUninitialize();
+    }
+
+    if (failures != 0) {
+        std::printf("png writer checks FAILED (%d)\n", failures);
+        return 1;
+    }
+    std::printf("png writer checks passed\n");
+    return 0;
+}

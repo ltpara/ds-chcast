@@ -41,6 +41,8 @@ public:
     bool OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint32_t width,
                     uint32_t height, uint32_t crop_x, uint32_t crop_y,
                     uint64_t pts_ms) override;
+    bool CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height,
+                     std::string* error) override;
     std::string error() const override;
 
 private:
@@ -83,6 +85,11 @@ private:
     // Slots are only touched by the session thread.
     std::array<Slot, kSlotCount> slots_;
     size_t next_slot_ = 0;
+    // The slot holding the newest picture the plugin was handed, for the
+    // screenshot readback. Only meaningful once last_slot_valid_ is set.
+    size_t last_slot_ = 0;
+    bool last_slot_valid_ = false;
+    chast::ComPtr<ID3D11Texture2D> readback_;
 
     UINT pipeline_input_width_ = 0;
     UINT pipeline_input_height_ = 0;

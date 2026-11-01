@@ -211,6 +211,7 @@ func TestRefreshRotationDetectsReplay(t *testing.T) {
 	if _, err := store.Authenticate(second); err != nil {
 		t.Fatalf("new access token: %v", err)
 	}
+	now = now.Add(RefreshReuseGrace + time.Second)
 	if _, _, _, _, _, err := store.RefreshSession(refresh); !errors.Is(err, ErrRefreshReused) {
 		t.Fatalf("replayed refresh error = %v, want ErrRefreshReused", err)
 	}
@@ -222,6 +223,74 @@ func TestRefreshRotationDetectsReplay(t *testing.T) {
 	}
 	if _, _, _, _, _, err := store.RefreshSession("  "); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("empty refresh error = %v", err)
+	}
+}
+
+// TestRefreshReuseGrace covers the lost-response retry the grace window
+// exists for, plus the two cases that stay replays: a second use of the same
+// retired token and a retired token whose replacement was already spent.
+func TestRefreshReuseGrace(t *testing.T) {
+	store := openTemp(t, "state.db")
+	if _, err := store.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+
+	_, _, _, refresh, _, err := store.LoginWithRefresh("alice", "correct horse", "", "", "", "")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	now = now.Add(time.Minute)
+	_, _, _, lost, _, err := store.RefreshSession(refresh)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	// The rotation response never reached the viewer; it retries inside the
+	// window while the undelivered replacement is still unused.
+	now = now.Add(30 * time.Second)
+	_, recoveredAccess, _, recovered, _, err := store.RefreshSession(refresh)
+	if err != nil {
+		t.Fatalf("lost-response retry: %v", err)
+	}
+	if recovered == refresh || recovered == lost {
+		t.Fatalf("lost-response retry reused a token")
+	}
+	if _, err := store.Authenticate(recoveredAccess); err != nil {
+		t.Fatalf("recovered access token: %v", err)
+	}
+	// The same retired token cannot be spent twice: the recovery moved the
+	// session past it.
+	now = now.Add(time.Second)
+	if _, _, _, _, _, err := store.RefreshSession(refresh); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("second lost-response retry = %v, want ErrRefreshReused", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(recovered); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("replay did not revoke the recovered token: %v", err)
+	}
+
+	// A retired token whose replacement was already used is a replay even
+	// inside the window.
+	_, _, _, fresh, _, err := store.LoginWithRefresh("alice", "correct horse", "", "", "", "")
+	if err != nil {
+		t.Fatalf("second login: %v", err)
+	}
+	now = now.Add(time.Second)
+	_, _, _, once, _, err := store.RefreshSession(fresh)
+	if err != nil {
+		t.Fatalf("rotate fresh: %v", err)
+	}
+	now = now.Add(time.Second)
+	_, _, _, twice, _, err := store.RefreshSession(once)
+	if err != nil {
+		t.Fatalf("rotate once: %v", err)
+	}
+	now = now.Add(time.Second)
+	if _, _, _, _, _, err := store.RefreshSession(fresh); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("spent replacement replay = %v, want ErrRefreshReused", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(twice); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("spent-replacement replay kept the session: %v", err)
 	}
 }
 
@@ -862,10 +931,13 @@ func TestSharedBookGroupSubtree(t *testing.T) {
 	if !visibleGroups["team"] || !visibleGroups["dev"] || visibleGroups["ops"] {
 		t.Fatalf("bob visible groups = %+v", books[0].Groups)
 	}
-	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "dev", "Shared", nil); err != nil {
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "stalebox", "dev", "Stale", nil, books[0].Revision+1); !errors.Is(err, ErrPeerConflict) {
+		t.Fatalf("stale shared add = %v", err)
+	}
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "dev", "Shared", nil, books[0].Revision); err != nil {
 		t.Fatalf("write into granted subtree: %v", err)
 	}
-	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "escape", "ops", "Escape", nil); !errors.Is(err, ErrPermissionDenied) {
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "escape", "ops", "Escape", nil, 0); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("write outside granted subtree = %v", err)
 	}
 
@@ -1289,13 +1361,13 @@ func TestSharedAddressBookGroupScopes(t *testing.T) {
 	if _, err := store.AddSharedPeer(bob.ID, "alice", "newbox", "越权新增", nil); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("ungrouped add through a group grant = %v", err)
 	}
-	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "work", "越权新增", nil); !errors.Is(err, ErrPermissionDenied) {
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "work", "越权新增", nil, 0); !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("add into another group = %v", err)
 	}
-	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "ghost", "不存在的组", nil); !errors.Is(err, ErrUnknownGroup) {
+	if _, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "ghost", "不存在的组", nil, 0); !errors.Is(err, ErrUnknownGroup) {
 		t.Fatalf("add into an unknown group = %v", err)
 	}
-	added, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "lab", "新增设备", []string{"lab"})
+	added, err := store.AddSharedPeerScoped(bob.ID, "alice", "newbox", "lab", "新增设备", []string{"lab"}, 0)
 	if err != nil || added.GroupID != "lab" || added.ID != "newbox" {
 		t.Fatalf("add into the granted group = %+v, %v", added, err)
 	}

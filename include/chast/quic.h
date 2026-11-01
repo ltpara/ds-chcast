@@ -299,6 +299,10 @@ struct QuicClientConfig {
     // Development escape hatch: accept any certificate. Never use it on an
     // untrusted network; there is no identity check behind it.
     bool allow_any_certificate = false;
+    // v35: advertise the datagram-audio capability in Hello so the host sends
+    // system audio as QUIC DATAGRAM frames. On by default; false asks for the
+    // reliable audio stream (A/B measurements and very small datagram paths).
+    bool audio_datagram = true;
 };
 
 class QuicSession {
@@ -525,9 +529,15 @@ public:
     // nothing arrived in time, or Unavailable once the server finished the
     // audio stream; either is normal when audio is optional. A malformed
     // packet returns CaptureFailed, which the caller may treat as "audio
-    // broken" without ending the video session.
+    // broken" without ending the video session. When audio_datagram() is
+    // true the bytes come from QUIC DATAGRAM frames, so packets can be lost
+    // or reordered and the header sequence number is the only ordering clue.
     Error receive_audio(AudioHeader& header, std::vector<uint8_t>& payload,
                         std::chrono::milliseconds timeout);
+    // True when the host announced audio over QUIC DATAGRAM in HelloAck (v35).
+    // Valid once the handshake completed; the audio stream is still open and
+    // carries the FIN that ends the session's audio.
+    bool audio_datagram() const;
     // Opens the viewer-initiated CMIC stream and writes its format header.
     // Opening the stream is the microphone switch: the host starts decoding
     // on the header and stops when the stream ends, so there is no control
@@ -685,6 +695,21 @@ public:
     bool take_chat(std::string& text);
     // Total ChatMessages received since the connection started.
     uint64_t chats_received() const;
+
+    // ----- composed text input (viewer -> host, protocol v36) -----
+    //
+    // The viewer's own input method composes the text and sends the result;
+    // the host types it as Unicode, so a layout the host lacks cannot mangle
+    // it. The server injects it like InputEvent and keeps a copy for tools.
+
+    // Sends one block of composed text. Requires the input permission and, on
+    // the client, the completed handshake; the server cannot send it. Empty,
+    // oversized or invalid UTF-8 text returns InvalidCall.
+    Error send_text_input(const std::string& text);
+    // Server: pops the oldest text block the viewer sent since the last call.
+    bool take_text_input(std::string& text);
+    // Total TextInputs received since the connection started.
+    uint64_t text_inputs_received() const;
 
     // ----- port forwarding (protocol v26, both roles) -----
     //

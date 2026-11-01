@@ -3,6 +3,7 @@
 // production creates (system sound and microphone); AAC is decode-only and its
 // cases here only assert that encoding it is refused. No device, no network.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -78,6 +79,17 @@ double zero_crossing_hz(const std::vector<int16_t>& samples, size_t first_frame,
     return static_cast<double>(crossings) / (2.0 * seconds);
 }
 
+chast::AudioHeader audio_header(const chast::EncodedAudio& packet, uint16_t channels) {
+    chast::AudioHeader header;
+    header.pts_ms = packet.capture_ms - kCaptureBaseMs;
+    header.capture_ms = packet.capture_ms;
+    header.sample_rate = kRate;
+    header.frame_samples = chast::kOpusFrameSamples;
+    header.channels = channels;
+    header.codec = chast::AudioCodec::Opus;
+    return header;
+}
+
 void test_opus_round_trip(uint16_t channels, uint32_t bitrate, const char* label) {
     chast::AudioEncoderConfig config;
     config.codec = chast::AudioCodec::Opus;
@@ -151,13 +163,7 @@ void test_opus_round_trip(uint16_t channels, uint32_t bitrate, const char* label
     bool first_block_pts = false;
     bool format_ok = true;
     for (const chast::EncodedAudio& packet : packets) {
-        chast::AudioHeader header;
-        header.pts_ms = packet.capture_ms - kCaptureBaseMs;
-        header.capture_ms = packet.capture_ms;
-        header.sample_rate = kRate;
-        header.frame_samples = chast::kOpusFrameSamples;
-        header.channels = channels;
-        header.codec = chast::AudioCodec::Opus;
+        const chast::AudioHeader header = audio_header(packet, channels);
         std::vector<chast::DecodedAudio> blocks;
         chast::Error result =
             decoder->decode(header, packet.data.data(), packet.data.size(), blocks);
@@ -200,6 +206,134 @@ void test_opus_round_trip(uint16_t channels, uint32_t bitrate, const char* label
           "the decoded Opus tone stays near 440 Hz");
     std::printf("     %zu packets, %zu frames, RMS %.3f, %.1f Hz\n", packets.size(),
                 frames, level, frequency);
+}
+
+void test_opus_conceal() {
+    chast::AudioEncoderConfig config;
+    config.codec = chast::AudioCodec::Opus;
+    config.sample_rate = kRate;
+    config.channels = kChannels;
+    config.bitrate = 128000;
+    std::string error;
+    auto encoder = chast::create_audio_encoder(config, &error);
+    check(encoder != nullptr, "the Opus encoder opens for concealment");
+    if (!encoder) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+
+    constexpr size_t kFrames = kRate;
+    const std::vector<int16_t> pcm = make_tone(kFrames, kChannels);
+    std::vector<chast::EncodedAudio> packets;
+    for (size_t offset = 0; offset < kFrames; offset += chast::kOpusFrameSamples) {
+        const size_t chunk = (std::min)(static_cast<size_t>(chast::kOpusFrameSamples),
+                                        kFrames - offset);
+        const uint64_t capture_ms =
+            kCaptureBaseMs + static_cast<uint64_t>(offset) * 1000 / kRate;
+        chast::Error encoded =
+            encoder->encode(pcm.data() + offset * kChannels, chunk, capture_ms, packets);
+        if (!encoded.ok()) {
+            check(false, "the concealment packets encode");
+            return;
+        }
+    }
+    check(encoder->flush(packets).ok() && packets.size() >= 8,
+          "the concealment case has a full packet run");
+    if (packets.size() < 8) {
+        return;
+    }
+
+    chast::AudioInfo info;
+    info.enabled = true;
+    info.codec = chast::AudioCodec::Opus;
+    info.sample_rate = encoder->sample_rate();
+    info.channels = encoder->channels();
+    info.bitrate = encoder->bitrate();
+    info.frame_samples = encoder->frame_samples();
+    info.extradata = encoder->extradata();
+    auto decoder = chast::create_audio_decoder(info, &error);
+    check(decoder != nullptr, "the Opus decoder opens for concealment");
+    if (!decoder) {
+        std::printf("     %s\n", error.c_str());
+        return;
+    }
+
+    const size_t drop = packets.size() / 2;
+    const auto prime = [&](chast::IAudioDecoder& target, size_t count) {
+        for (size_t index = 0; index < count; ++index) {
+            std::vector<chast::DecodedAudio> blocks;
+            chast::Error decoded =
+                target.decode(audio_header(packets[index], kChannels),
+                              packets[index].data.data(), packets[index].data.size(), blocks);
+            if (!decoded.ok()) {
+                return false;
+            }
+        }
+        return true;
+    };
+    check(prime(*decoder, drop), "the packets before the gap decode");
+
+    std::vector<chast::DecodedAudio> no_offset;
+    check(!decoder->conceal(audio_header(packets[drop + 1], kChannels), 0, no_offset).ok(),
+          "conceal refuses a zero frame offset");
+
+    // A second decoder primed with the same packets shows which slot the lost
+    // packet would have occupied, so the concealment can be compared with it.
+    auto reference = chast::create_audio_decoder(info, &error);
+    check(reference != nullptr, "the reference Opus decoder opens for the gap");
+    if (!reference) {
+        return;
+    }
+    std::vector<chast::DecodedAudio> expected;
+    check(prime(*reference, drop) &&
+              reference
+                  ->decode(audio_header(packets[drop], kChannels),
+                           packets[drop].data.data(), packets[drop].data.size(), expected)
+                  .ok() &&
+              expected.size() == 1,
+          "the reference decoder produces the missing packet's slot");
+
+    std::vector<chast::DecodedAudio> concealed;
+    chast::Error conceal_result =
+        decoder->conceal(audio_header(packets[drop + 1], kChannels), 1, concealed);
+    check(conceal_result.ok(), "Opus concealment fills the missing packet");
+    if (!conceal_result.ok()) {
+        std::printf("     %s\n", conceal_result.to_string().c_str());
+        return;
+    }
+    const bool shape_ok =
+        concealed.size() == 1 &&
+        concealed.front().samples.size() ==
+            static_cast<size_t>(chast::kOpusFrameSamples) * kChannels &&
+        concealed.front().sample_rate == kRate && concealed.front().channels == kChannels;
+    check(shape_ok, "the concealed block is one 20 ms frame in the announced format");
+    if (!shape_ok || expected.size() != 1) {
+        return;
+    }
+    const chast::DecodedAudio& fill = concealed.front();
+    check(fill.capture_ms == expected.front().capture_ms,
+          "the concealed block carries the missing packet's capture time");
+    check(fill.pts_ms == expected.front().pts_ms,
+          "the concealed block occupies the missing packet's timeline slot");
+    const double energy = rms(fill.samples, 0, chast::kOpusFrameSamples, kChannels);
+    check(energy > 0.02, "the concealed block extrapolates the tone instead of silence");
+
+    std::vector<chast::DecodedAudio> after;
+    const bool after_ok =
+        decoder
+            ->decode(audio_header(packets[drop + 1], kChannels),
+                     packets[drop + 1].data.data(), packets[drop + 1].data.size(), after)
+            .ok();
+    check(after_ok && !after.empty(), "the decoder keeps decoding after concealment");
+    std::printf("     concealed RMS %.3f after %zu packets\n", energy, drop);
+
+    auto fresh = chast::create_audio_decoder(info, &error);
+    check(fresh != nullptr, "a fresh Opus decoder opens for the first-gap case");
+    if (fresh) {
+        std::vector<chast::DecodedAudio> none;
+        check(!fresh->conceal(audio_header(packets[drop + 1], kChannels), 1, none).ok(),
+              "conceal before the first decoded packet is refused");
+    }
 }
 
 void test_opus() {
@@ -258,12 +392,34 @@ void test_bad_config() {
           "the AAC decoder refuses a missing AudioSpecificConfig");
 }
 
+void test_playout_latency() {
+    const auto approx = [](double value, double want) {
+        return std::fabs(value - want) < 0.01;
+    };
+    check(chast::audio_playout_latency_ms(0, 0, 0) < 0.0,
+          "playout latency stays unset before a block is rendered");
+    check(chast::audio_playout_latency_ms(1000, 0, 0) < 0.0,
+          "playout latency needs a scheduled time");
+    check(approx(chast::audio_playout_latency_ms(1000, 1250, 0), 250.0),
+          "playout latency is scheduled minus capture in host time");
+    check(approx(chast::audio_playout_latency_ms(1000, 1050, 500000), 550.0),
+          "a host-minus-local offset moves the schedule into host time");
+    check(approx(chast::audio_playout_latency_ms(1000, 950, 0), 0.0),
+          "a slightly early schedule clamps to zero instead of a negative age");
+    check(chast::audio_playout_latency_ms(1000, 500, 0) < 0.0,
+          "an implausibly stale schedule is rejected");
+    check(chast::audio_playout_latency_ms(1000, 12000, 0) < 0.0,
+          "an implausibly distant schedule is rejected");
+}
+
 }  // namespace
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     test_opus();
+    test_opus_conceal();
     test_bad_config();
+    test_playout_latency();
 
     if (failures == 0) {
         std::printf("audio codec checks passed\n");

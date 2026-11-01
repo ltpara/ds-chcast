@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 32.
+// The chast wire protocol, version 36.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 34;
+inline constexpr uint16_t kProtocolVersion = 36;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -296,6 +296,13 @@ enum class ControlType : uint16_t {
     // code (u8, see FileCode), reason length (u16), UTF-8 reason. A refusal
     // leaves the file system untouched.
     FileOpResult = 50,
+    // Viewer -> host: one block of text composed on the viewer, injected on
+    // the host as Unicode. Payload: UTF-8 text (no length prefix, the control
+    // payload is the text). The viewer's own input method composes the text,
+    // so the host never needs the matching keyboard layout; the injector maps
+    // each code point to KEYEVENTF_UNICODE, with '\n' and '\t' as Return and
+    // Tab. Requires the input permission like InputEvent. Protocol v36.
+    TextInput = 51,
 };
 
 // ----- input -----
@@ -751,6 +758,10 @@ inline constexpr uint16_t kServerInfoCameraEnabled = 0x0400;
 // picture and source sizes in the message are zero. The viewer never creates
 // a decoder for such a session.
 inline constexpr uint16_t kServerInfoFileTransferOnly = 0x0800;
+// v35: system audio travels in QUIC DATAGRAM frames instead of the reliable
+// audio stream. The viewer serves these packets before the stream parser; a
+// lost datagram is a short gap, not a retransmission that stalls playback.
+inline constexpr uint16_t kServerInfoAudioDatagram = 0x1000;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
 // this mask rather than with every known flag.
@@ -766,7 +777,8 @@ inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
                                                        kServerInfoCameraEnabled;
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoMergedLayout |
-                                                  kServerInfoFileTransferOnly;
+                                                  kServerInfoFileTransferOnly |
+                                                  kServerInfoAudioDatagram;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
@@ -941,6 +953,9 @@ struct ServerInfo {
     // The viewer may list and start cameras. Decoded from the permission
     // mask; the device is still checked when it is requested.
     bool camera_enabled = false;
+    // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
+    // audio stream. Set only alongside audio.enabled.
+    bool audio_datagram = false;
     std::string encoder;
     std::vector<DisplayDescription> displays;
     AudioInfo audio;
@@ -1017,6 +1032,12 @@ inline constexpr uint8_t kAuthFlagTrustDevice = 0x01;  // add this key to the tr
 inline constexpr uint8_t kAuthFlagSigned = 0x02;       // signature is present
 inline constexpr uint8_t kAuthFlagsKnown = kAuthFlagTrustDevice | kAuthFlagSigned;
 
+// ClientHello capabilities (v35). Bit 0 says the viewer can receive system
+// audio as QUIC DATAGRAM frames and prefers them; the host falls back to the
+// reliable audio stream when it is clear.
+inline constexpr uint8_t kClientCapabilityAudioDatagram = 0x01;
+inline constexpr uint8_t kClientCapabilitiesKnown = kClientCapabilityAudioDatagram;
+
 struct ClientHello {
     uint16_t display = kDisplayAuto;
     std::string access_token;
@@ -1045,6 +1066,10 @@ struct ClientHello {
     // v32: desktop by default; FileTransfer asks the host for a control-only
     // file session. The host answers with ServerInfo::files_only.
     SessionMode mode = SessionMode::Desktop;
+    // v35: bits from the kClientCapability* set. Default empty; the transport
+    // fills it from its configuration so a client can opt out of datagram
+    // audio for A/B measurements.
+    uint8_t capabilities = 0;
 };
 
 // The server accepts an empty reference or 8..64 lowercase hex digits. The
@@ -1133,6 +1158,17 @@ bool valid_chat_text(const std::string& text);
 std::vector<uint8_t> make_chat_message(const std::string& text);
 bool parse_chat_message(const std::vector<uint8_t>& payload, std::string& text,
                         std::string* error);
+
+// Composed text injection (protocol v36). The payload is the raw UTF-8 text,
+// between 1 and kMaxTextInputBytes; NUL and invalid UTF-8 are rejected. The
+// injector types it on the host as Unicode, so a multi-line block and any
+// script the host layout cannot produce still arrive intact.
+inline constexpr size_t kMaxTextInputBytes = 4096;
+bool valid_text_input(const std::string& text);
+// Returns an empty vector when `text` fails valid_text_input().
+std::vector<uint8_t> make_text_input(const std::string& text);
+bool parse_text_input(const std::vector<uint8_t>& payload, std::string& text,
+                      std::string* error);
 
 // ----- port forwarding -----
 //

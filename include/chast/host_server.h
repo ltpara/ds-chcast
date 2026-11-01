@@ -66,6 +66,9 @@ struct HostServerStats {
     // resolution_percent is the encoded picture size as a percentage of the
     // captured frame (100, 75 or 50).
     uint32_t target_bitrate = 0;  // bits per second
+    // Lowest target a rate decision applied this session, so a verification
+    // run can tell a link that forced a cut from one that never reacted.
+    uint32_t lowest_target_bitrate = 0;  // bits per second
     uint16_t framerate = 0;
     uint16_t resolution_percent = 100;
     uint64_t abr_changes = 0;
@@ -97,16 +100,23 @@ struct HostServerStats {
     // ungated by permissions; an admitted session is the authorization.
     uint64_t chat_sent = 0;
     uint64_t chat_received = 0;
+    // Composed text blocks accepted from the viewer for Unicode injection
+    // (protocol v36). Gated by the input permission like InputEvent.
+    uint64_t text_received = 0;
     // Viewer uploads that were verified and renamed into place, their total
     // size, and offers that were refused or failed before that.
     uint64_t files_received = 0;
     uint64_t file_bytes_received = 0;
     uint64_t file_failures = 0;
     // Operator downloads the viewer accepted and verified, their total size,
-    // and attempts that failed before the viewer confirmed the digest.
+    // attempts that failed before the viewer confirmed the digest, and
+    // downloads the viewer stopped itself. A cancel is not a send failure: it
+    // is counted apart so the operator can tell “the viewer cancelled” from
+    // “the host could not send”.
     uint64_t files_sent = 0;
     uint64_t file_bytes_sent = 0;
     uint64_t file_send_failures = 0;
+    uint64_t file_send_cancels = 0;
     // System sound. audio_active says whether the current session announced
     // and is still sending audio; the counters cover packets handed to the
     // transport, encoded bytes, packets dropped by the capture or send queues,
@@ -218,6 +228,10 @@ struct HostServerConfig {
     bool dry_run_input = false;
     bool want_hdr = true;
     bool capture_cursor = true;
+    // Loopback silence gate: after this much digital silence the encoder stops
+    // receiving samples. Zero encodes silence too, keeping the receiver's
+    // playout fed so starvation measurements are not confused with host gating.
+    uint32_t audio_silence_gate_ms = 2000;
     // Which hardware encoder family to use. Auto keeps oneVPL first and falls
     // back to FFmpeg's nvenc/amf/qsv; the command line can pin one for tests.
     EncoderBackend encoder_backend = EncoderBackend::Auto;
@@ -287,6 +301,10 @@ struct HostServerConfig {
     // Called on the host thread for every ChatMessage the viewer sent. The
     // operator UI appends it to the chat window; the message is not echoed.
     std::function<void(const std::string&)> chat_message;
+    // Called on the host thread for every composed text block the injector
+    // accepted (protocol v36). The text has already been queued for Unicode
+    // injection; the hook is for diagnostics and the loopback check.
+    std::function<void(const std::string&)> text_input;
     // Called after an upload passed its digest and was renamed into place.
     std::function<void(const std::string& path, uint64_t bytes)> file_received;
     // Creates the system-audio source. Empty opens the default render
@@ -441,6 +459,14 @@ private:
         uint64_t resume_offset = 0;
         std::array<uint8_t, 32> digest{};
         std::chrono::steady_clock::time_point answer_time;
+        // A stream write can fail because the viewer cancelled: its reset
+        // closes the stream before its FileResult is drained. Such an error
+        // stays uncounted until this deadline so the queued cancel can claim
+        // it; an epoch value counts immediately.
+        std::chrono::steady_clock::time_point failure_deadline;
+        // Whether the deferred error still has to be reported to the viewer
+        // when it is finally booked as a failure.
+        bool report_failure = false;
         // Set once the frame loop has counted this failure, so a terminal
         // state is not tallied again on every pass.
         bool counted = false;
@@ -516,7 +542,11 @@ private:
     void end_upload(FileCode code, const std::string& reason, bool keep_partial,
                     bool report, HostServerStats& stats);
     void send_file_failure(const std::string& message, bool report,
-                           HostServerStats& stats);
+                           HostServerStats& stats, bool cancelled = false);
+    // A stream write failed, but the viewer may have cancelled first: keep the
+    // error uncounted for a short grace so the queued cancel can claim it.
+    void note_file_send_error(const std::string& message, bool report,
+                              HostServerStats& stats);
     void audit_upload(const std::string& name, uint64_t bytes, bool success,
                       const std::string& detail);
 

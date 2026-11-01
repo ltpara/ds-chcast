@@ -271,6 +271,8 @@ public:
     Error open();
     Error decode(const AudioHeader& header, const uint8_t* data, size_t size,
                  std::vector<DecodedAudio>& out) override;
+    Error conceal(const AudioHeader& next, uint32_t frames_back,
+                  std::vector<DecodedAudio>& out) override;
     Error flush(std::vector<DecodedAudio>& out) override;
 
     uint32_t sample_rate() const noexcept override { return kOpusRate; }
@@ -281,6 +283,7 @@ private:
     OpusDecoder* decoder_ = nullptr;
     int pre_skip_remaining_ = 0;
     uint64_t audible_frames_ = 0;
+    bool have_decoded_ = false;
     bool flushed_ = false;
 };
 
@@ -346,6 +349,7 @@ Error OpusDecoderImpl::decode(const AudioHeader& header, const uint8_t* data, si
     if (frames == 0) {
         return Error::success();
     }
+    have_decoded_ = true;
 
     size_t skip = 0;
     if (pre_skip_remaining_ > 0) {
@@ -362,6 +366,63 @@ Error OpusDecoderImpl::decode(const AudioHeader& header, const uint8_t* data, si
         // Pre-skip removes the encoder's lookahead, so the first audible
         // sample is the packet's first input sample.
         block.pts_ms = header.pts_ms + audible_frames_ * 1000 / kOpusRate;
+        const size_t channels = info_.channels;
+        block.samples.assign(pcm.data() + skip * channels,
+                             pcm.data() + static_cast<size_t>(frames) * channels);
+        audible_frames_ += audible;
+        out.push_back(std::move(block));
+    }
+    return Error::success();
+}
+
+Error OpusDecoderImpl::conceal(const AudioHeader& next, uint32_t frames_back,
+                               std::vector<DecodedAudio>& out) {
+    if (flushed_) {
+        return Error(Status::InvalidCall, "conceal after the Opus decoder was flushed");
+    }
+    if (frames_back == 0) {
+        return Error(Status::InvalidCall, "conceal needs a non-zero frame offset");
+    }
+    if (!have_decoded_) {
+        // PLC extrapolates from the last packet; before the first one there
+        // is nothing to extrapolate, and silence is the better answer.
+        return Error(Status::Unavailable, "no decoded packet to conceal from");
+    }
+    if (next.channels != info_.channels || next.sample_rate != kOpusRate) {
+        return Error(Status::InvalidCall,
+                     "the Opus packet disagrees with the announced format");
+    }
+    const uint32_t frame_samples =
+        next.frame_samples > 0 ? next.frame_samples : kOpusFrameSamples;
+    if (frame_samples > static_cast<uint32_t>(kOpusMaxFrameSamples)) {
+        return Error(Status::InvalidCall, "the Opus frame is longer than 120 ms");
+    }
+    std::vector<int16_t> pcm(static_cast<size_t>(frame_samples) * info_.channels);
+    const int frames = opus_decode(decoder_, nullptr, 0, pcm.data(),
+                                   static_cast<int>(frame_samples), 0);
+    if (frames < 0) {
+        return Error(Status::CaptureFailed, opus_error(frames, "opus_decode(conceal)"));
+    }
+    if (frames == 0) {
+        return Error::success();
+    }
+    const uint64_t frame_ms = static_cast<uint64_t>(frames) * 1000 / kOpusRate;
+    const uint64_t back_ms = static_cast<uint64_t>(frames_back) * frame_ms;
+    size_t skip = 0;
+    if (pre_skip_remaining_ > 0) {
+        skip = (std::min)(static_cast<size_t>(pre_skip_remaining_),
+                          static_cast<size_t>(frames));
+        pre_skip_remaining_ -= static_cast<int>(skip);
+    }
+    const size_t audible = static_cast<size_t>(frames) - skip;
+    if (audible > 0) {
+        DecodedAudio block;
+        block.sample_rate = kOpusRate;
+        block.channels = info_.channels;
+        // The gap sat immediately before the packet that revealed it.
+        block.capture_ms = next.capture_ms > back_ms ? next.capture_ms - back_ms : 0;
+        block.pts_ms = next.pts_ms > back_ms ? next.pts_ms - back_ms : 0;
+        block.pts_ms += audible_frames_ * 1000 / kOpusRate;
         const size_t channels = info_.channels;
         block.samples.assign(pcm.data() + skip * channels,
                              pcm.data() + static_cast<size_t>(frames) * channels);

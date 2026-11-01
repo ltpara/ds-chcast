@@ -146,10 +146,11 @@ type addressBookGroupRequest struct {
 }
 
 type sharedAddressBookPeerRequest struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Tags    []string `json:"tags"`
-	GroupID string   `json:"group_id"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Tags       []string `json:"tags"`
+	GroupID    string   `json:"group_id"`
+	IfRevision *int64   `json:"if_revision"`
 }
 
 type addressBookGrantView struct {
@@ -339,9 +340,10 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// refresh rotates a refresh token into a new access/refresh pair. A replayed
-// token means the pair leaked or a previous rotation response was lost; the
-// store revokes the session in both cases, so the client must log in again.
+// refresh rotates a refresh token into a new access/refresh pair. A rotated
+// token is retried by viewers that lost the previous response; the store
+// resumes the session inside its grace window while the replacement is
+// unused. Anything else is a replay and the session is revoked.
 func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
@@ -972,8 +974,16 @@ func (s *server) addSharedAddressBookPeer(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.IfRevision != nil && *req.IfRevision <= 0 {
+		writeError(w, http.StatusBadRequest, "if_revision must be positive")
+		return
+	}
+	var ifRevision int64
+	if req.IfRevision != nil {
+		ifRevision = *req.IfRevision
+	}
 	peer, err := s.cfg.Accounts.AddSharedPeerScoped(
-		user.ID, r.PathValue("owner"), req.ID, req.GroupID, req.Name, req.Tags,
+		user.ID, r.PathValue("owner"), req.ID, req.GroupID, req.Name, req.Tags, ifRevision,
 	)
 	if s.sharedAddressBookError(w, "shared address book add", err) {
 		return

@@ -36,6 +36,11 @@ const (
 	// AccessTokenTTL keeps the bearer token short so a copied token ages out
 	// quickly; viewers renew it with the refresh token without a password.
 	AccessTokenTTL = 30 * time.Minute
+	// RefreshReuseGrace keeps a just-rotated refresh token usable while its
+	// replacement is still unused. A viewer that lost the rotation response
+	// retries with the old token on its next tick; without the window that
+	// retry would look like a replay and revoke the whole session.
+	RefreshReuseGrace = 2 * time.Minute
 
 	maxName           = 128
 	maxTag            = 32
@@ -237,12 +242,13 @@ type SharedBook struct {
 // connection serialises writes and the WAL journal lets registry traffic keep
 // reading while a login or address-book write is in flight.
 type Store struct {
-	path      string
-	db        *sql.DB
-	mu        sync.Mutex
-	now       func() time.Time
-	tokenTTL  time.Duration
-	accessTTL time.Duration
+	path         string
+	db           *sql.DB
+	mu           sync.Mutex
+	now          func() time.Time
+	tokenTTL     time.Duration
+	accessTTL    time.Duration
+	refreshGrace time.Duration
 }
 
 func Open(path string) (*Store, error) {
@@ -277,11 +283,12 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("account store %s: %w", path, err)
 	}
 	return &Store{
-		path:      path,
-		db:        db,
-		now:       time.Now,
-		tokenTTL:  TokenTTL,
-		accessTTL: AccessTokenTTL,
+		path:         path,
+		db:           db,
+		now:          time.Now,
+		tokenTTL:     TokenTTL,
+		accessTTL:    AccessTokenTTL,
+		refreshGrace: RefreshReuseGrace,
 	}, nil
 }
 
@@ -1467,8 +1474,11 @@ func (s *Store) Authenticate(token string) (User, error) {
 
 // RefreshSession rotates a refresh token and returns a fresh access/refresh
 // pair for the same session. Presenting a token that was already rotated
-// revokes the whole session: either the viewer lost the rotation response or
-// somebody else replayed a copied token, and neither should keep access.
+// revokes the whole session, except for one bounded case: a retry within
+// RefreshReuseGrace whose replacement token is still unused. That is the
+// viewer that lost the rotation response, and retiring the undelivered
+// replacement keeps the session alive. Once the replacement has been used,
+// the presented token can only be a copy, so the session is revoked.
 func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, string, time.Time, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
@@ -1501,15 +1511,46 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 		return User{}, "", time.Time{}, "", time.Time{},
 			fmt.Errorf("account store %s: refresh lookup: %w", s.path, err)
 	}
+	retire := tokenHash(refreshToken)
 	if rotated != 0 {
-		if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
-			return User{}, "", time.Time{}, "", time.Time{}, err
+		grace := s.refreshGrace.Milliseconds()
+		if unixMillis(now)-rotated > grace {
+			if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
+				return User{}, "", time.Time{}, "", time.Time{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return User{}, "", time.Time{}, "", time.Time{},
+					fmt.Errorf("account store %s: commit refresh replay: %w", s.path, err)
+			}
+			return User{}, "", time.Time{}, "", time.Time{}, ErrRefreshReused
 		}
-		if err := tx.Commit(); err != nil {
+		var (
+			replacement        string
+			replacementCreated int64
+		)
+		err = tx.QueryRow(
+			`SELECT token_hash, created_at FROM refresh_tokens
+			 WHERE user_id = ? AND session_id = ? AND rotated_at = 0`,
+			userID, sessionID,
+		).Scan(&replacement, &replacementCreated)
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
+		}
+		if err != nil {
 			return User{}, "", time.Time{}, "", time.Time{},
-				fmt.Errorf("account store %s: commit refresh replay: %w", s.path, err)
+				fmt.Errorf("account store %s: refresh replacement lookup: %w", s.path, err)
 		}
-		return User{}, "", time.Time{}, "", time.Time{}, ErrRefreshReused
+		if replacementCreated != rotated {
+			if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
+				return User{}, "", time.Time{}, "", time.Time{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return User{}, "", time.Time{}, "", time.Time{},
+					fmt.Errorf("account store %s: commit refresh replay: %w", s.path, err)
+			}
+			return User{}, "", time.Time{}, "", time.Time{}, ErrRefreshReused
+		}
+		retire = replacement
 	}
 	if expires <= unixMillis(now) {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
@@ -1566,7 +1607,7 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 	}
 	if _, err := tx.Exec(
 		`UPDATE refresh_tokens SET rotated_at = ?, replaced_by = ? WHERE token_hash = ?`,
-		unixMillis(now), tokenHash(refresh), tokenHash(refreshToken),
+		unixMillis(now), tokenHash(refresh), retire,
 	); err != nil {
 		return User{}, "", time.Time{}, "", time.Time{},
 			fmt.Errorf("account store %s: retire refresh token: %w", s.path, err)
@@ -3169,12 +3210,16 @@ func (s *Store) DeleteSharedPeerAt(granteeID, ownerUsername, peerID string, ifRe
 // control grant. An existing live or tombstoned entry with the same id is
 // overwritten and revived, matching the owner's own PATCH upsert behaviour.
 func (s *Store) AddSharedPeer(granteeID, ownerUsername, peerID, name string, tags []string) (Peer, error) {
-	return s.AddSharedPeerScoped(granteeID, ownerUsername, peerID, "", name, tags)
+	return s.AddSharedPeerScoped(granteeID, ownerUsername, peerID, "", name, tags, 0)
 }
 
 // AddSharedPeerScoped adds a peer to the owner's ungrouped list (empty
 // groupID) or to one group. Group grants may only write into their own group.
-func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, name string, tags []string) (Peer, error) {
+// A positive ifRevision is the owner's book revision the grantee last read;
+// a mismatch means someone else wrote to the book in the meantime, so a new
+// entry gets the same 409 protection as an update (it has no peer revision of
+// its own to compare).
+func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, name string, tags []string, ifRevision int64) (Peer, error) {
 	if !registry.ValidID(peerID) {
 		return Peer{}, ErrInvalidPeerID
 	}
@@ -3201,6 +3246,18 @@ func (s *Store) AddSharedPeerScoped(granteeID, ownerUsername, peerID, groupID, n
 	}
 	if err := grants.require(PermissionWrite, groupID); err != nil {
 		return Peer{}, err
+	}
+	if ifRevision > 0 {
+		var current int64
+		// s.mu serialises every writer in this process, so the checked
+		// revision cannot change before updatePeerLocked commits.
+		err := s.db.QueryRow(`SELECT book_revision FROM users WHERE id = ?`, grants.ownerID).Scan(&current)
+		if err != nil {
+			return Peer{}, fmt.Errorf("account store %s: read shared address book revision: %w", s.path, err)
+		}
+		if current != ifRevision {
+			return Peer{}, ErrPeerConflict
+		}
 	}
 	return s.updatePeerLocked(grants.ownerID, peerID, &name, &tags, groupArg, nil, 0)
 }

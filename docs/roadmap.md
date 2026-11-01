@@ -29,7 +29,7 @@
   - 客户端：`QuicSession::take_stream_update()` 暴露最近的更新；`chast-quic connect` 与 Flutter `ViewerEngine` 在编码格式或尺寸变化时重建解码器（GPU 模式下仍走 D3D11VA 与同一个 sink），origin/显示器列表/输入闸门同步刷新。帧头与描述不一致时会先查一次更新，避免视频流先于控制流到达的竞态被记成协议违规。
   - 设计取舍：重建后总是重新公告（即使尺寸未变），让客户端状态与采集器严格一致，也省掉逐字段比较；`StreamInfo` 复用 HelloAck 载荷而不是定义新结构，解析代码只有一份。
   - 已知限制：旋转面板若 GPU 无法旋转，编码器仍按原逻辑拒绝该帧并结束会话（与重建前一致）；实际分辨率/旋转变化需要真机操作，自动化环境只能覆盖 `--reannounce` 的会话路径。
-- 多显示器输入坐标（负 origin、跨屏）与切换后的回归测试；当前 `verify` 已断言“流参数等于所选显示器的 rect”，两屏以上的真机演练待补。
+- 多显示器输入坐标（负 origin、跨屏）：帧→虚拟桌面映射已提取为 `frameToDesktop`（`app/lib/widgets/remote_view.dart`），`input_mapping_test.dart` 覆盖负/正 origin、边缘钳制、取整、缺省尺寸与切换后重映射（2026-10-31）；`verify` 已断言“流参数等于所选显示器的 rect”，两屏以上的真机演练待补。
 
 ### M2.1 验证（2026-10-21）
 
@@ -200,8 +200,20 @@
   - 工具：新增 `chast-netem`（`tools/netem.cc`），在查看者与主机之间做 UDP 透明中继，按时间窗口注入单程时延、抖动、独立丢包和每方向带宽瓶颈；QUIC 拥塞控制、丢包检测与 ABR 接收的都是真实数据报信号。中继收发缓冲设为 16 MiB——默认 64 KiB 装不下切档后的双 IDR 突发，会在工具内静默丢包并伪造成链路拥塞。
   - 结果（单机，1920×1080，80 ms + 0–20 ms 抖动、3% 丢包、1000 kbps，劣化 20 s 后恢复）：档位 3000→500 kbps、30→10 fps、100%→50% 用时约 10.4 s，随后按 +100 kbps/3 s 单调回到 2700 kbps / 30 fps / 100%；1850/1850 帧解码，CRC/解码/协议/序号错误全为 0；干净对照 751/751 帧、`abr-changes=0`、最大帧龄 21.5 ms。
   - 阶跃收敛（2026-10-27 已完成）：ABR 采样 1 s→500 ms；控制器按传输发送字节差、再按区间丢包折算交付速率。交付速率跌破目标 70% 且发送队列涨过拥塞窗口 65% 时，一次性落到交付速率的 65%（并绕过 1.5 s 下降冷却）；两个条件缺一不可——只有 RTT 升高而交付完好是纯时延事件，保持 15% 降幅，而线速率低但队列空闲是屏幕内容本身少，不是容量信号。其余仍走 -15%/-30% 与现有冷却/恢复阶梯。加门槛后四次复测：首次降档后 0.50–0.55 s 落到 500 kbps（原约 10.4 s），帧龄峰值 2.1–3.3 s（原 7954 ms），>1 s 的帧 75–137（原 278），>3 s 的帧 0–6（加门槛前 31–35），完整性零错误；峰值差异来自阶跃瞬间拥塞窗口（81–199 KB），不是控制器。`chast-bitrate-test` 127 项断言覆盖阶跃落位、落位门槛（交付与队列）、冷却穿越、丢包折算、地板与噪声阈值；`ctest -C Release` 25/25（387.6 s）。
+  - 自动化（2026-10-30）：手工双进程流程折进 `chast-quic verify --netem`（ctest `quic_weak_network`）：进程内主机/查看器经内嵌 UDP 中继连接，固定 80 ms + 0–20 ms 抖动、3% 丢包、1000 kbps，会话第 4–12 s 劣化，断言 ABR 降档到地板、分辨率联动、恢复不弹回天花板、每帧到达并解码、离线重放一致。实测 28.16 s 通过（3000→500 kbps、100%→50%、355/355 帧、最大帧龄 2.9 s）；中继实现抽到 `tools/netem_relay.h`，与 `chast-netem` 共用。
   - 仍保留：1–3.3 s 的帧龄峰值由 0.5 s 的发现窗口、阶跃瞬间的在途数据与可靠有序流的既有排队决定；再往下压需要“发送端时延预算 + 跳帧 + 强制 IDR”或“视频改走 QUIC DATAGRAM”。
   - 已知限制：单机回环没有真实无线抖动、突发丢包、NAT/PMTU 与跨机时钟偏差；65% 余量与丢包折算在突发丢包下的表现待双机检验；Flutter 查看器呈现路径与双机验收仍待做。
+- 已完成：系统音频 QUIC DATAGRAM（协议 v35，2026-10-31）。
+  - 问题：视频验收档（80 ms + 20 ms 抖动、3% 丢包、1000 kbps）下可靠有序的音频与视频共享拥塞窗口，被重传拖后 0.2–3 s，三种排程策略都大量丢块。
+  - 协商：Hello 末尾 capabilities 字节（bit 0 音频 DATAGRAM），ServerInfo flags 新增 `0x1000`，HelloAck 与每次 StreamInfo 都携带；Host 在 DATAGRAM 发送开启且 `MaxSendLength ≥ AudioHeader + 512` 时锁定，可靠 `CAUD` 流只发一次识别魔数并保留结束 FIN；任何一步失败整场回退可靠流。AudioHeader 与 Opus 载荷不变。
+  - 接收：查看者优先排空 256 包 DATAGRAM 队列、按序号统计缺口与重排，流 FIN 后最多等 150 ms 收尾；`QuicClientConfig::audio_datagram` 默认开，CLI `--audio-stream` 仅作 A/B 对照，`verify --netem --audio [--audio-stream] [--play]` 自动化。
+  - 验证（单机）：回环 200/200 包、FIN 与时长断言通过，`protocol|audio|audio_dsp|quic_loopback` 4/4、`quic_weak_network` 仍通过；视频验收档 DATAGRAM 1248/1251（0.24% 丢）、解码 24.95 s，可靠流 1250/1250、24.99 s；带播放 slack 均值 −99.5 ms/最差 −1026 ms 对 −882.4/−5934 ms，欠载 1:1，av-skew +30.2 对 +26.0 ms。
+- 已完成：Opus 丢包隐藏（PLC，2026-10-31，`docs/status-2026-10-25.md` §6.7）。
+  - 解码器新增 `IAudioDecoder::conceal(next, frames_back, out)`，Opus 用内建 PLC 合成丢失帧（AAC 返回 `Unsupported`，无历史时拒绝）；隐藏块按 `next.capture_ms - frames_back × 帧长` 落在丢失包的时间线槽位，`pts_ms` 与正常解码同一公式并推进 `audible_frames_`。
+  - CLI 与 GUI 查看器维护 `expected_seq`：前跳最多补 5 帧（100 ms），更长断流保持静音，落后于最高序号的迟到包直接跳过；CLI 接收摘要新增 `concealed`，`verify --netem --audio` 断言隐藏帧不超过缺口帧。
+  - 验证：`chast-audio-codec-test` 新增 15 项断言（格式、捕获时间、与参考解码器一致的槽位、非静音能量、后续解码、无历史拒绝）；全量构建与五套 ctest 5/5。弱网 25 s 无播放 1245/1253（0.64% 丢、missing/concealed 30/30、解码 25.05 s）；两次 `--play` 39/39 与 32/32，欠载 1–2、丢块 400–403、slack 均值 −35.3/−47.2 ms、av-skew +56.2/+41.5 ms；可靠流对照 0 缺口、均值 −1187.5 ms。
+  - 已知限制：`missing` 含重排后过期的包，数值大于真正丢包数；0 lead 下过期隐藏块仍被播放器丢弃，欠载/丢块与加 PLC 前同一量级；音乐级连续需要自适应抖动缓冲（§6.8，默认关闭）或包级修复（§6.9 已评估 Opus FEC/1+1 复制，不采用）。
+  - 剩余：DATAGRAM 尾包可能随会话关闭丢失；真实无线突发、双机可听内容与 Flutter 播放路径待验。
 
 ## M7 — 安全模型
 
@@ -215,8 +227,9 @@
     83 项断言全过（151 个访问单元，新增 2FA/可信设备/锁定/白名单回环）；
     CLI 正确/错误密码与 TOTP 端到端；真实审批窗在查看者超时后自动关闭；
     Flutter `analyze` 无问题、62 项测试通过、Windows Release 构建成功。
-  - 待办：关闭一次未能复现的 COMCTL32 崩溃；完成查看器密码/2FA 对话框的
-    人工 GUI 验收。
+  - 收尾（2026-10-23 关闭）：COMCTL32 页签崩溃路径已加固（`WM_NOTIFY`
+    校验通知来源，页签切换移出通知栈），三页签两轮各 300 次点击压测无
+    异常、无新增 dump；查看器密码/2FA/信任/撤销对话框已人工 GUI 验收。
 
 ## M8 — 发射端加固（进行中）
 
@@ -417,8 +430,9 @@
     ./...` 通过；`flutter analyze` 无问题、106 项测试、Windows Release 构建
     通过。
   - 已知限制：真实 UDP 封锁→自动回退、经服务中继的 C++ 主机 + Flutter 全链路、
-    WebSocket 经过真实 HTTP 代理、以及双机弱网吞吐/延迟仍需人工验收；载体不做
-    TCP 打洞、不做多查看者，不改变协议版本。
+    真实 HTTP 代理/CDN 与双机弱网吞吐/延迟仍需人工验收（2026-10-31 已加
+    WebSocket 经 TLS 终止反向代理的回环用例）；载体不做 TCP 打洞、不做
+    多查看者，不改变协议版本。
 
 ## M10.1 — 服务端向 RustDesk 对齐（已完成）
 
@@ -448,8 +462,10 @@
     `B2A69C6EA526D137`，WS 回环 692 帧、摘要 `EB0FC78F17BE208E`，CRC/解码/
     序号错误均为 0；错误令牌被拒绝，`shared_carrier` 统计符合预期；
     `flutter analyze` 无问题、`flutter test` 106 项通过。
-  - 已知限制：真实 NAT/IPv6 跨网分类、共享载体经过真实 HTTP 代理需要双机或
-    部署环境复核；共享载体仍为单查看者；服务端 HTTP 明文与限流由 M10.2 补齐。
+  - 已知限制：真实 NAT/IPv6 跨网分类需要双机复核；共享载体的 WebSocket
+    查看者已有 TLS 终止反向代理回环用例（2026-10-31，含路径前缀改写），
+    真实 HTTP 代理/CDN 仍待部署复核；共享载体仍为单查看者；服务端 HTTP
+    明文与限流由 M10.2 补齐。
 
 ## M10.2 — 服务端运维能力（已完成）
 
@@ -797,7 +813,8 @@
     `PATCH`/`DELETE /v1/addressbook/shared/{owner}/peers/{id}` 也接受
     `if_revision`（删除用查询参数），与属主自己的写入共用条目修订号；查看器
     共享对话框携带条目修订号，409 后重新读取共享地址簿并用服务器条目覆盖、
-    提示已刷新；共享新增仍为最后写入者优先。
+    提示已刷新；共享新增可带属主地址簿修订号作为基线（P2-48），省略时仍为
+    最后写入者优先。
   - 账号安全：登录失败锁定与设备会话（2026-10-25）。
     - `internal/authlimit` 以“用户名小写 + 客户端 IP”为键统计失败：默认
       10 分钟窗口内 5 次失败后锁定 1 分钟，锁定期返回 `429` 与 `Retry-After`，
@@ -1180,9 +1197,12 @@
     作用于“我的设备”，不覆盖最近连接、共享地址簿对话框或分组标题，只做
     大小写不敏感的子串匹配，没有拼音/模糊匹配、按分组/在线状态筛选，筛选
     状态不跨重启保存。地址簿逐条乐观并发控制只覆盖查看器对自有地址簿的
-    `PATCH`：省略 `if_revision` 的旧客户端、共享新增以及分组改名/删除
+    `PATCH`：省略 `if_revision` 的旧客户端、共享新增（可带属主地址簿修订号，
+    省略时仍为最后写入者优先）以及分组改名/删除
     仍是最后写入者优先；冲突后查看器放弃本地未上传的旧值并采用服务器版本，
-    不提供逐字段合并或自动重试；墓碑会长期保留（尚未按时间或已同步水位清理），
+    不提供逐字段合并或自动重试；墓碑默认长期保留，可用
+    `--addressbook-tombstone-days` 或管理台 `ab prune <days>` 按时间清理
+    （P2-9，默认 0 保留；按已同步水位清理仍未实现），
     查看器只在已保存条目上应用删除，最近连接不受墓碑影响；删除已有按账号隔离
     的本地待办并在每次同步前重试（成功/404 清理，401 保留）；清空标签/分组的
     意图会持久化并在恢复后上传，但跨设备同时编辑的意图在 409 后会被服务器版本替换。
@@ -1262,8 +1282,11 @@
      双栈监听，`carrier_v6` 随注册/查询/`/v1/server` 与节点租约下发，代理按
      可达地址族排序并回退；回环验证查看者从 IPv4 首选回退 `[::1]` 完成载体
      数据报往返（`TestViewerCarrierIPv6Fallback`）。
-     剩余：纯 IPv6 主机经 IPv4 会合注册的降级路径（代理单 socket 不能跨族写
-     本地转发）、双机跨网复核。
+     跨族本地转发已补（2026-10-31）：punch socket 与 `--local` 不同族时代理
+     另开一个仅用于本地转发的同族 socket，`[::1]` 监听 + `127.0.0.1` 控制
+     可用，`TestHostForwardsAcrossLocalFamilies`/`TestLocalForwardConnMatchesFamilies`
+     覆盖往返与四组合；会合/打洞仍要求服务器提供可达地址族。剩余：双机
+     跨网复核。
   2. **P0 查看器固定服务器公钥**：RustDesk 内置 `RS_PUB_KEY` 并有
      `KeyExchange`/`get_key_confirmed`；我们只有 CLI `--server-pubkey`，
      Flutter 查看器只保存 `serverKey`。要点：首次连接展示指纹（TOFU）、
@@ -1298,6 +1321,9 @@
      旧库长令牌保持可用。审计新增 `session_refresh`（rotated/replay/invalid）。
      查看器持久化刷新令牌并在访问令牌到期前自动续期，401 登出、瞬时错误保留。
      回环 39 项探针与管理台审计验证；`go test ./...`、Flutter 270 项通过。
+     2026-10-31 补进程级重启探针（`server/cmd/chast-server/restart_test.go`）：
+     真实二进制建号登录后硬杀，重启后访问令牌仍有效、refresh 轮换跨两次重启
+     可用，重放已消费令牌 401 且撤销在再次重启后仍生效。
   7. **P1 UPnP**（2026-10-26 完成）：`upnp_port` 随 keepalive/查询/打洞双向
      转发；`chast-tunnel host|viewer --upnp` 经 SSDP 发现 IGD，UDP 内外同端口
      映射（租期 1800 s，每 15 min 续租，退出删除），718 冲突顺序换端口；
@@ -1866,7 +1892,8 @@
      `--audit-archive-dir … --audit-archive-retention-days 7` 启动，日志
      `audit archive compacted compressed=1 pruned=2`，30 天与 9 天旧文件被删、
      2 天前文件转为 gzip 且解压内容一致、今日文件与 `notes.txt` 未动。边界：
-     没有远端投递（S3/HTTP），迟到合并的主机审计不回写旧日文件。
+     远端投递另见 P2-44（HTTP）与 P2-46（S3 SigV4），迟到合并的主机审计
+     不回写旧日文件。
  47. **P2-39 文件浏览器多选批量下载/删除**（2026-10-30 完成，协议 v31 复用）：
      面板标题栏新增“多选”，行复选框与整行点击切换选择（多选时文件夹行
      不再导航），选择条提供全选/清空、已选计数、批量下载与删除。下载走
@@ -1953,6 +1980,927 @@
      `quic_loopback` 129 项通过。全量串行 ctest 复跑见文首状态快照。
      边界：仅提升单条 Text 格式体上限，流总量 40 MiB 与
      format 数 5 不变；主机读侧仍受 Win32 剪贴板本身与轮询周期约束。
+ 52. **P2-44 审计归档远端 HTTP 投递（2026-10-30 完成，协议无变化）**：
+     服务端新增 `--audit-archive-remote`/`--audit-archive-remote-token`，
+     每轮归档后把已关闭的 JSONL/gzip 文件按 `<base>/<文件名>` PUT 到
+     HTTP(S) 接收端，带 `Content-Type`（`application/x-ndjson` 或
+     `application/gzip`）、`X-Chast-Audit-Sha256`（十六进制摘要）、
+     `Idempotency-Key: <文件名>` 与可选 `Authorization: Bearer`；显式
+     ContentLength，要求 2xx，每文件每轮最多 3 次尝试（1 s、2 s 退避）。
+     成功后原子写入 `<文件>.delivered` 标记（文件、字节数、SHA-256、
+     时间、URL），后续轮次跳过；当天文件永不投递，外来文件与
+     `.delivered` 不参与归档名解析。启用投递后保留清理只删除已投递的
+     过期文件，未送达的证据留在本地等下一轮，gzip 改写后旧标记删除；
+     URL 校验拒绝非 http(s)、缺主机、userinfo、query 与 fragment，令牌
+     必须与 URL 同时出现。管理台 `audit archive run/status` 输出新增
+     `delivered` 计数、投递失败原因与远端地址。验证：`internal/auditarchive`
+     新增 5 项测试（URL 校验、单次上传与标记、3 次重试、保留清理门禁、
+     未配置时行为不变），`go vet ./...`、`go test ./...` 与三程序构建
+     通过；真实进程探针确认 PUT 头、逐字节请求体、标记与服务端日志。
+     边界：只投递已关闭文件，S3 原生签名由 P2-46（path-style）与
+     P2-47（virtual-hosted）补齐；仍无远端去重队列
+     （至少一次语义由接收端按 `Idempotency-Key` 去重）；重定向不重放 PUT
+     请求体。
+ 53. **P2-45 A/V skew 遥测与泵送修正（2026-10-31 完成测量链路、主机/CLI
+     泵送与起播锚点聚合，单机回环 40 ms 目标与弱网丢块基线达成）**：
+     播放器 `AudioPlayerStats` 新增最近提交块的 `playout_capture_ms` 与
+     `playout_scheduled_ms`（端点重建、停顿重锚定与队列清空时归零），
+     `audio_playout_latency_ms` 用 `LatencyReply` 的主机减本地偏移把本地
+     排程换算到主机时钟并减去采集戳，拒绝未起播、缺失排程与
+     <−100 ms / ≥10 s 的不可信值；查看器引擎把结果与视频帧龄相减得到
+     带符号 `av_skew_ms`（正数表示音频更晚），经桥接发布为
+     `audioLatencyMs`/`avSkewMs`。CLI `connect --audio --play` 输出
+     `receiver: av audio-latency=... av-skew=...`，Flutter 统计浮层在
+     音频启用时显示“音频 N ms · 差 ±N ms”，未测量时为 `—`。测量同时
+     修了两处节奏：CLI 音频/麦克风活跃时 `receive_wait` 从 250 ms 降到
+     10 ms，与 GUI 的 `kMediaPoll` 对齐（此前 CLI 把整段视频等待计入
+     音频延迟）；主机在 `audio_capture` 活跃时把捕获等待切成 10 ms，
+     音频按 10 ms 泵送，不再只随视频帧成串发送。验证：
+     `chast-audio-codec-test` 新增 7 项测算；`flutter analyze`、
+     `audio_status_test`（含新字段与 `-1` 默认值）、Windows debug 构建
+     通过；单机回环修正前 35 s / 28 s 为 `audio-latency 138.4/136.4 ms`、
+     `frame-age 15.8/16.9 ms`、`skew +122.5/+119.4 ms`，欠载/丢块 0。
+     实验矩阵显示 1440p60 视频饱和时 frame-age=150.0 ms、skew −75.0 ms；
+     720p60 为 5.9 ms / +75.1 ms；仅改 CLI 轮询为 21.6 ms / 81.2 ms /
+     +59.6 ms 但欠载 114、丢块 193，再改主机泵送后最终 35 s 为
+     `frame-age 8.5 ms`、`audio-latency 85.1 ms`、`skew +76.6 ms`、
+     欠载 1、丢块 4、buffer 50 ms。第二轮新增到达余量统计
+     （`slack = 排程 − 到达`，min/max/avg 与 ±20 ms 早/晚计数，CLI 播放
+     行输出），并把主机帧间 pacing 等待切成 5 ms 片、每片泵送一次
+     音频/麦克风，音频活跃时的空闲捕获等待 10 ms → 5 ms；三次 35 s
+     回环为 `audio-latency 67.0/69.0/77.0 ms`、`skew +58.5/+58.0/+63.7
+     ms`、欠载 1、丢块 1–2、buffer 40 ms。slack 显示约 1750 块中
+     1743 个比排程早 20 ms 以上（均值 +42.3 ms）、仅 1 个晚 20 ms 以上，
+     锚定块比稳定态慢 30–45 ms；但端点已排队约 40 ms 音频，仅提前锚点
+     不会降低可听延迟。第三轮逐项实验并回退：10 ms Opus 帧（协议 v35）
+     两轮 `audio-latency 78.0/79.0 ms`、`skew +68.8/+69.9 ms`、包数
+     翻倍；60 ms 共享模式端点缓冲两轮 `87.0/95.0 ms` 与 `+76.5/+83.9 ms`，
+     现有口径无法证明可听收益；运行中锚点校正两轮 `skew +48.4/+52.6 ms`，
+     其中一轮欠载 6、丢块 17、最小余量 −99 ms。回退后重建并通过
+     `ctest -R "^(audio|protocol|quic_loopback)$"` 3/3。第四轮改为起播
+     聚合 6 块、按最快到达锚定（5 ms 余量、校正上限 60 ms，聚合块
+     跳过）：未加限制三轮 `skew +39.0/+22.0/+37.4 ms`，其中校正 75 ms
+     的一轮因最快块是离群值，丢块升到 36；加上限后最终两轮
+     `audio-latency 47.1/48.1 ms`、`skew +38.1/+38.6 ms`、欠载 0、
+     丢块 4、`buffer 0–10 ms`。五轮全部达到 |skew| ≤ 40 ms，单机回环
+     目标达成；丢块高于第三轮 1–2。第五轮用 `chast-netem` UDP 中继
+     复核弱网：轻档（20 ms 延迟 + 5 ms 抖动 + 0.2% 丢包）聚合两轮
+     0 欠载/0 丢块、`skew +261.9/+274.3 ms`，旧 80 ms lead 基线 10/42，
+     首块锚定 1/83；视频验收档（80 ms + 20 ms 抖动 + 3% 丢包 + 1 Mbps）
+     聚合播出 21.22 s、5 欠载、878 丢块，旧 lead 3.45 s、48、1927，
+     首块锚定 16.91 s、130、1183，两档均满足“不高于旧基线”。轻档起播
+     仍有约 240–250 ms 积压（首块 370 ms，前 17 块 9 ms 内成串到达）；
+     加长窗口按最快块锚定（30 块/400 ms 上限）在干净回环也过度前移
+     （246 丢块/25 欠载），未采用。视频验收档的丢块根因是 QUIC 把抖动
+     当丢包、ABR 降到 500 kbps/10 fps，可靠音频被视频与重传拖后
+     0.2–3 s；该缺口已由协议 v35 的 QUIC DATAGRAM 音频解决（见上文
+     M6）。CLI 播放
+     行新增 `anchor=` 遥测。边界：该口径不含端点自身 padding 与视频
+     呈现延迟，真实可听延迟更大；单机 loopback 反馈使听感测量不可用。
+     后续按 `docs/m6.3-lipsync-plan.md` 做双机/双端点可听测量、PLC/
+     自适应抖动缓冲，最后才考虑视频呈现缓冲。
+ 54. **P2-46 审计归档 S3 SigV4 原生投递（2026-10-31 完成，协议无变化）**：
+     服务端新增 `--audit-archive-s3-endpoint`、`-region`、`-bucket`、
+     `-access-key`、`-secret-key` 与 `-session-token`，归档轮次结束后由
+     服务器自己按 AWS Signature Version 4 签名并 PUT 到 S3 兼容端点：
+     path-style `<endpoint>/<bucket>/<文件名>`，签名覆盖 `host`、`date` 与
+     全部 `x-amz-*` 头，`X-Amz-Content-Sha256` 复用本地文件 SHA-256，设置
+     会话令牌时附带 `X-Amz-Security-Token`；`Content-Type`、显式
+     ContentLength、每文件 3 次重试、`.delivered` 标记与保留清理门禁与
+     HTTP 投递共用。endpoint、bucket、access key、secret key 缺一即启动
+     失败；与 `--audit-archive-remote` 互斥，且都依赖
+     `--audit-archive-dir`。验证：签名器对 AWS 官方 PutObject 示例逐字
+     匹配 `Signature=98ad7217…` 与载荷哈希；httptest 断言带路径前缀的
+     端点、会话令牌、`X-Amz-Date`、请求体、标记内容与二次运行不重传；
+     10 项参数校验拒绝用例；投递客户端不跟随重定向，
+     `TestRemoteDeliveryDoesNotFollowRedirects` 证明 307 直接失败且请求体
+     不会到达跳转目标；`go vet ./...`、三程序构建与全量
+     `go test ./...` 通过；真实二进制确认三条启动错误（缺归档目录、缺
+     bucket/密钥、与 HTTP 投递同用）均非零退出。边界：仍无远端去重队列
+     （至少一次由桶版本或接收端负责）；重定向不重放请求体；bucket 必须
+     已存在，不代为创建。
+55. **P2-47 S3 虚拟主机寻址（2026-10-31 完成，协议无变化）**：
+     `--audit-archive-s3-addressing`（默认 `path`）新增 `virtual`，把桶放进
+     主机名（`<bucket>.<endpoint-host>/<文件名>`），满足 AWS 对 2020-09
+     之后新建桶只接受 virtual-hosted 的要求；端点路径前缀保留，签名的
+     `host` 与实际请求主机一致。`virtual` 要求端点可解析为 DNS 名，IP
+     端点启动即拒；未知取值同样报错。验证：`TestS3VirtualHostedDelivery`
+     用自定义拨号把虚拟主机请求送到回环服务器，按服务端看到的 `Host`
+     重算规范请求并逐字比对签名，断言路径不含桶名、`Remote()` 与投递标记
+     使用虚拟主机 URL；参数校验扩到 12 项；真实二进制确认未知寻址值与
+     IP 端点上的 `virtual` 均非零退出；`go vet ./...`、三程序构建与全量
+     `go test ./...` 通过。边界同 P2-46：无远端去重队列、重定向不重放、
+     桶必须已存在；真实 AWS 桶与自定义域名（CNAME）未实测。
+56. **P2-48 共享地址簿新增 OCC（2026-10-31 完成，协议无变化）**：
+     `POST /v1/addressbook/shared/{owner}/peers` 增加可选正整数
+     `if_revision`，语义是属主地址簿修订号（`GET /v1/addressbook/shared`
+     的 `revision`）；存储层在写锁内比对 `users.book_revision`，不匹配
+     409 且不写入，`0`/负数 400，省略保持最后写入者优先。查看器共享对话框
+     以 `SharedAddressBook.revision` 为基线，409 后刷新整本共享地址簿并
+     提示“该条目或地址簿已在其他设备修改”；英文文案同步。验证：
+     `internal/account` 覆盖过期基线冲突与匹配基线成功；`internal/api`
+     断言 409/400、冲突后修订号与条目数不变、匹配基线成功；
+     `flutter analyze` 无问题，`server_api_test` + `shared_books_dialog_test`
+     96 项通过（含 `if_revision` 上报断言）；`go vet`、`go build ./...` 与
+     全量 `go test ./...` 通过。边界：基线是整本修订号，任何属主写入都会
+     使新增 409，需先刷新；旧客户端省略时仍为最后写入者优先。
+57. **P2-49 查看器分组名缓存随会话持久化（2026-10-31 完成，协议无变化）**：
+     地址簿分组此前只在查看器内存中，重启后的首次同步总是 `since=0`
+     全量拉取；现在 `AccountSession` 增加 `groups`（仅存活分组，随账号会话
+     一起保存与清除），同步成功与冲突刷新都把合并后的分组和新修订号一起
+     写入会话；启动加载会话时若分组缓存非空即视为已同步，首次请求以
+     `bookRevision` 为 `since`，`mergeAddressBookGroups` 按增量应用。
+     新登录、旧版会话（无 `groups` 字段）与空分组列表仍全量读取。验证：
+     `account_store_test` 覆盖分组往返（删除墓碑过滤、旧文件无字段、
+     `copyWith` 保留）；`home_page_test` 新增“缓存分组使首次同步增量”用例
+     （`bookRevision=5` 时首次请求 `since=5`，同步后修订号 6 且缓存保留）；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test` 433 项通过。
+     边界：空分组列表无法区分“确实没有分组”和“从未缓存”，仍走全量读取。
+58. **P2-50 共享地址簿搜索（2026-10-31 完成，协议无变化）**：共享地址簿
+     对话框标题栏新增搜索框，按名称、ID 与标签做大小写不敏感子串过滤；
+     命中的条目按属主分组保留，无匹配的属主整组隐藏，组头条目数与列表
+     一致，全部无匹配时显示“没有匹配的共享条目”，清空后恢复。验证：
+     `shared_books_dialog_test` 新增用例覆盖名称（大小写）、ID、中文标签、
+     隐藏无匹配属主、计数与空结果文案；既有分组共享用例改为先
+     `ensureVisible` 再操作（对话框因标题栏增高在 600px 测试面上需滚动）；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test` 434 项通过。
+     边界：只过滤当前已加载的共享条目，不查询服务器。
+59. **P2-51 “我的设备”标签筛选跨重启（2026-10-31 完成，协议无变化）**：
+     新增 `app/lib/view_filter.dart`，把选中的标签集合保存到
+     `%APPDATA%\chast\ui-filter.json`（`{"tags":[...]}`，保存时去空白、
+     去重并排序；文件缺失、损坏或字段类型不符时按“全部”处理）。
+     `home_page.dart` 在 `_load()` 里恢复筛选，“全部”与逐标签 chip 以及
+     `_clearDeviceFilters` 在变更后立即写盘；搜索框文本仍刻意不持久化，
+     避免上次会话的查询词在重启后无声隐藏设备。验证：
+     `view_filter_test` 覆盖往返、空白/重复归一、缺失/损坏文件与清空写入；
+     `home_page_test` 新增“重启后恢复筛选并再次保存”用例（启动即只剩 lab、
+     点“全部”清空文件、再点 office 写回），并在该文件 `setUp` 中用临时
+     目录隔离筛选文件，防止读到开发者真实配置；`flutter analyze --no-pub`
+     无问题，全量 `flutter test` 439 项通过。
+     边界：筛选按存储的精确标签名匹配；标签改名或最后一个设备被删除后，
+     旧标签在渲染时被忽略（等价于“全部”），但文件里会保留原值。
+     共享地址簿搜索词与“我的设备”搜索词均不持久化。
+60. **P2-52 地址簿分组折叠状态跨重启（2026-10-31 完成，协议无变化）**：
+     复用 `view_filter.dart` 同一 `ui-filter.json`，新增 `collapsed` 键与
+     `loadCollapsed`/`saveCollapsed`；每次写入先读回现有 JSON 再合并键，
+     因此标签与折叠状态互不覆盖。`home_page.dart` 在 `_load()` 恢复折叠
+     集合，分组头（含 `''` 未分组桶）折叠/展开后立即写盘。验证：
+     `view_filter_test` 新增两键共存用例（先存标签再存折叠、反向覆盖、
+     清空折叠不影响标签）；`home_page_test` 新增“折叠的分组重启后仍折叠”
+     用例（启动时 g1 折叠、点分组头展开并清空文件）；`flutter analyze
+     --no-pub` 无问题，全量 `flutter test` 441 项通过。
+     边界：折叠按分组 ID 记录，分组被删除后旧 ID 留在文件中（不再匹配）；
+     跨服务器切换账号时旧分组 ID 同样不会误匹配（ID 全局随机）；未分组的
+     `''` 桶只在存在可见分组时显示，因此折叠它仅在分组视图下有意义。
+61. **P2-53 分组拖拽排序（2026-10-31 完成，协议无变化）**：分组对话框每行
+     新增拖动手柄（`Draggable` + 行级 `DragTarget`），拖到同层任一分组上即
+     移动到该槽位；跨父分组、拖到自身或忙碌时拒绝（`onWillAccept`）。
+     定序与上下移共用 `_applyOrder`：按 1..n 写回位置，只更新位置变化的行
+     并携带 `ifRevision`，409 仍走既有刷新提示。验证：`groups_dialog_test`
+     新增“拖动 beta 到 alpha 依次写回 beta/1、alpha/2”与“跨层拖拽不写”
+     两用例，既有上下移用例保持通过；`flutter analyze --no-pub` 无问题，
+     全量 `flutter test` 443 项通过。边界：只支持同层排序（拖拽不改变父子
+     关系，层级仍用编辑对话框的“上级分组”）；触摸滚动与拖拽共用纵向手势，
+     目标平台是桌面鼠标。
+62. **P2-54 拖动设备到分组标题（2026-10-31 完成，协议无变化）**：设备卡片的
+     服务端图标改为拖动柄（`Draggable<Device>`，悬停显示抓手光标与提示），
+     拖到任一分组标题即把该设备移入该组（含“未分组”），标题悬停时高亮；
+     只在已登录当前服务器、条目属于该服务器且目标组与当前组不同时接收
+     （`_canDropDevice`），拖回原组不产生写请求。移动复用 `_moveDeviceToGroup`
+     抽出的 `_assignDeviceToGroup`：先写本地分组与待同步标记，再按条目
+     `ifRevision` 上传，失败保留本地并提示“将在下次同步上传”，401/409 仍走
+     既有登出与冲突刷新。卡片其余区域与菜单点击行为不变，无分组视图（没有
+     标题可投放）不显示拖动柄。验证：`home_page_test` 新增“拖工作室图标到
+     Lab 标题 → `studio|lab` 上传、本地分组变为 lab、Work 标题消失、Lab 保留，
+     再拖回 Lab 不产生第二次上传”用例；`flutter analyze --no-pub` 无问题，
+     全量 `flutter test` 444 项通过。边界：没有“未分组”标题时（所有设备都在
+     组内）不能拖出分组，仍需菜单里的“移动到分组”；拖拽不排序同组卡片。
+63. **P2-55 同组设备拖拽排序（2026-10-31 完成，协议无变化）**：把设备图标
+     拖到同组另一张卡片即插入该卡片的位置，悬停卡片显示强调色边框；跨组、
+     拖到自身或非本服条目拒收（`_canReorderOnto`）。排序与菜单上下移共用
+     从 `_movePeerInGroup` 抽出的 `_applyPeerOrder`：按 1..n 写回、跳过位置
+     未变的行、逐条带 `ifRevision`，409 仍刷新冲突，顺序写接口新增
+     `addressBookPeerOrderWriter` 测试缝，默认走
+     `ServerApi.updateAddressBookPeer`。验证：`home_page_test` 在同一用例里
+     把工作室拖到 Lab 标题后再拖到实验室卡片，断言依次写 `studio/1`、
+     `lab/2`、本地 `position` 变为 1/2 并提示“分组内顺序已更新”；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test` 444 项通过，
+     `flutter build windows --release` 通过（29.8 s）。边界：只支持同组内
+     排序，跨组仍拖到分组标题；触摸滚动与拖拽共用纵向手势，目标平台是
+     桌面鼠标。
+64. **P2-56 分组名搜索与筛选期自动展开（2026-10-31 完成，协议无变化）**：
+     “我的设备”搜索词同时匹配分组名，且沿 `parentId` 向上匹配祖先组
+     （`_groupsMatchingQuery`），命中分组下的条目即便自身名称/ID/标签不含
+     关键词也保留；筛选期间忽略折叠状态，所有命中分组与“未分组”自动展开，
+     标题折叠箭头显示为展开态，但不清除 `ui-filter.json` 里保存的折叠集合，
+     清空筛选后恢复原折叠。无分组缓存或筛选无命中时的回退视图保持原样。
+     验证：`home_page_test` 的“filters narrow grouped devices and their
+     headers”用例新增：折叠 Work（工作室隐藏）→ 搜索 `work` 命中分组名，
+     工作室重新可见、Lab 与未分组隐藏、计数 1/3 → 清除搜索后工作室再次
+     隐藏且折叠集合仍含 `work` → 重新展开；`flutter analyze --no-pub`
+     无问题，全量 `flutter test` 444 项通过，`flutter build windows
+     --release` 通过（35.3 s）。边界：拼音/模糊匹配仍不支持；筛选只匹配
+     当前服务器缓存的分组名。
+65. **P2-57 空“未分组”投放区（2026-10-31 完成，协议无变化）**：账号已有
+     分组且所有条目都在组内时仍渲染“未分组”标题（计数 0、可折叠），作为
+     把卡片拖回未分组的投放目标；投放走既有 `_assignDeviceToGroup('')`
+     （本地先改 `groupId`、写 `studio|`、提示“已移到未分组”）。仅在账号
+     已同步出分组且未处于筛选态时显示该空标题，未分组有内容时行为与之前
+     一致。验证：`home_page_test` 的拖拽用例在跨组与组内排序之后，等排序
+     提示结束后把工作室从 Lab 拖到空“未分组”标题，断言写入
+     `studio|`、本地 `groupId` 变为空、提示“已移到未分组”、Lab 标题消失；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test` 444 项通过，
+     `flutter build windows --release` 通过（32.3 s）。边界：没有分组或处于
+     筛选态时不显示空标题；拖拽仍不改变分组父子层级。
+66. **P2-58 刷新令牌丢失响应的宽限恢复（2026-10-31 完成，协议无变化）**：
+     轮换后的旧刷新令牌在 `RefreshReuseGrace`（2 min）内再次出现、且服务器
+     刚发出的替换令牌从未被使用时，按“丢失响应”处理：作废未送达的替换令牌、
+     为同一会话再发一对新令牌；替换令牌已被使用、或超出窗口仍按重放撤销整个
+     会话（`ErrRefreshReused`，401 + `detail=replay; session revoked`）。
+     旧令牌只能用一次——恢复后会话已越过它，再次重放即吊销。验证：
+     `store_test` 新增 `TestRefreshReuseGrace`（窗口内恢复、二次重放吊销、
+     替换已用即吊销），`TestRefreshRotationDetectsReplay` 改为越过窗口后重放；
+     `api/account_test` 的回环用例在同一会话里先做窗口内恢复（200 + 新令牌），
+     再连续轮换两次后用已恢复令牌重放（401，新访问令牌同时失效，审计仍见
+     rotated 与 replay）。查看器在地址簿接口收到 401 时先用刷新令牌强制续期
+     一次，只有续期被拒才退出登录；本地访问令牌已过期但会话仍可续期时也先
+     续期再同步（`home_page_test` 新增“401 续期而非退出”与“续期被拒才退出”
+     两个用例）。`go vet ./...`、`go build ./...`、全量
+     `go test ./... -count=1` 通过；`flutter analyze --no-pub` 无问题，
+     `home_page_test` 43 项、全量 `flutter test` 446 项通过，
+     `flutter build windows --release` 通过（32.3 s）。边界：只覆盖“响应丢失”的窄窗口，不缓存
+     已签发令牌明文；连续多次丢失响应仍可能落到吊销；宽限内的重放不再立即
+     撤销，靠“替换令牌必须未被使用”把可利用面限制在一次跳转。
+67. **P2-59 查看器发送文本与主机 Unicode 注入（2026-11-01 完成，协议 v36）**：
+     协议新增 `ControlType::TextInput = 51`（查看器→主机，负载为 1–4096 字节
+     UTF-8，NUL/非法 UTF-8 拒绝），`kProtocolVersion` 升到 36。主机对
+     TextInput 沿用输入权限（含中途撤销）校验，解析后交给
+     `InputInjector::submit_text` 排队；注入线程把文本解成码点，用
+     `KEYEVENTF_UNICODE` 逐码点按下/抬起，`\n`/`\t` 走 Return/Tab，`\r`
+     跳过，代理对算一个码点；无效文本入队前计入 rejected，队列满计 dropped。
+     查看器 `ViewerEngine::SendText` 只在 streaming 且输入已授权时排队
+     （上限 16），会话线程 `drain_text` 调 `send_text_input`；桥接新增
+     `sendText`，Dart 端 `ViewerBridge.sendText`。工具栏在“特殊键”旁新增
+     “发送文本”按钮（仅远程键鼠开启时可点），新对话框 `SendTextDialog`
+     保留空白与换行、按 UTF-8 字节校验 4096 上限，失败留在对话框内提示。
+     验证：`protocol_test` 新增 TextInput 往返/上限/NUL/代理项用例；干跑
+     注入器新增“A中\n”与“😀\r\n”共 5 次注入、空/NUL/超长共 3 次拒绝；
+     `send_text_dialog_test` 4 项（校验、发送关闭、失败保留、取消）与
+     `display_menu_test` 的按钮门控通过；`flutter analyze --no-pub` 无问题，
+     全量 `flutter test` 451 项通过，`flutter build windows --release` 通过
+     （193.2 s）；C++ Release 全量构建通过。回环 `verify --merged` 在同一
+     会话里多发一条 UTF-8 文本块（含中文与换行）：查看器计数 1 条、主机回调
+     逐字节收到同一文本、`HostServerStats::text_received` 计 1，且干跑注入
+     计数按 27 个码点增长，三条断言均通过；全量 ctest 38/38 通过
+     （576.64 s，探针接入前；接入后 `quic_merged` 复跑通过）。边界：文本走
+     控制流且逐码点注入，超长文本需查看器分块；双机真实输入法与宿主应用
+     兼容性待验。
+68. **P2-60 查看器取消上传（2026-11-01 完成）**：文件浏览器页脚在上传进行中
+     （`fileActive` 或有排队项）显示“取消上传”按钮，拖放发起的上传同样可见。
+     `ViewerEngine::CancelUploads()` 只置位原子标志，会话线程在下一轮调用既有
+     `purge_uploads`：递增 `upload_epoch_` 让在途的目录遍历/哈希结果失效、清空
+     普通上传队列与待办根目录、关闭文件流并 `cancel_file_upload` 让主机中止
+     当前传输；剪贴板上传属于剪贴板权限，不受影响。取消单独计入
+     `ViewerStatus.file_cancels`（桥接字段 `fileCancels`、桥接方法
+     `cancelUploads`），会话页用“已取消上传”提示而不是失败原因，面板在状态停止
+     上报上传前隐藏进度行并刷新列表。验证：`chast-viewer-probe --files-only`
+     新增一步，排队 64 MiB 文件后在哈希阶段取消，断言 `file_cancels` 增长而
+     `files_sent`/`file_failures` 不变、主机侧没有完整文件（`viewer_files_only`
+     通过 2.83 s，探针打印“3 files walked, 3 uploaded, 1 upload cancelled”）；
+     `file_browser_panel_test` 新增按钮取消与拖放上传可取消 2 项，
+     `clipboard_status_test` 覆盖 `fileCancels` 解析；`flutter analyze --no-pub`
+     无问题，全量 `flutter test` 453 项通过，`flutter build windows --release`
+     通过（120.6 s）；C++ Release 全量构建通过，全量串行 `ctest` 38/38 通过
+     （569.78 s，2026-11-01，`quic_weak_network` 最后）。边界：回环在哈希阶段
+     取消，传输中取消走同一条 purge 路径但未单独实测；真实双机大文件取消待验。
+69. **P2-61 查看器取消单文件下载（2026-11-01 完成）**：文件浏览器页脚在普通
+     单文件下载进行中显示“取消下载”按钮。`ViewerStatus.download_cancellable`
+     （桥接 `downloadCancellable`）只在浏览器发起的单文件传输时为真；文件夹
+     遍历有自己的 `CancelDirectoryDownload`，剪贴板拉取跟随剪贴板权限，两者
+     页脚不显示该按钮。`ViewerEngine::CancelDownload()` 只置位原子标志，
+     会话线程在下一轮 `drain_downloads` 之后核对接收阶段、传输号与
+     `folder_transfers_`/剪贴板归属，再 `abort(false)` 删除
+     `.part`/`.part.chast` 临时文件、把阶段置为 failed，并向主机发送
+     `FileResult{code=Cancelled}`；主机既有的 `take_file_result` 路径随即
+     关闭发送流并按失败收尾。取消单独计入 `ViewerStatus.download_cancels`
+     （桥接 `downloadCancels`、桥接方法 `cancelDownload`），不与接收失败
+     混计；页脚在状态停止上报该下载前显示“已取消下载”，不把引擎的失败
+     措辞透出，新下载开始时清除提示。验证：`chast-viewer-probe --files-only`
+     新增一步，请求接收根下按运行命名的 16 MiB 种子文件，等到已接收 ≥1 MiB
+     再取消，断言 `download_cancels` 增长、`files_received`/
+     `file_receive_failures` 不变、阶段 failed、传输被标记为可取消，且本机
+     接收根没有该文件的 `.bin`/`.part`/`.part.chast` 残留（探针打印
+     “3 files walked, 3 uploaded, 1 upload cancelled, 1 download cancelled”）；
+     `file_browser_panel_test` 的取消用例额外断言不可取消的剪贴板式下载
+     只有进度、没有取消按钮；`clipboard_status_test` 覆盖
+     `downloadCancellable` 解析；`flutter analyze --no-pub` 无问题，全量
+     `flutter test` 454 项通过，`flutter build windows --release` 通过
+     （54.0 s）；C++ Release 全量构建通过。首次全量串行 `ctest` 在
+     `quic_stream_options_ffmpeg` 的“主机音频零丢包”断言上失败（其余 37 项
+     通过，571.48 s）：该用例会话中切换编码器族，重建期间主机循环短暂停顿，
+     整轮负载下偶发丢包；单测重跑通过（32.58 s）。断言已与显示模式重建对齐：
+     `stream_options` 会话允许 ≤8 个音频丢包、仍要求 0 音频错误
+     （`tools/quic.cc`），重建 `chast-quic` 后全量串行 `ctest` 复跑 38/38
+     通过（569.03 s，2026-11-01，`quic_weak_network` 最后）。边界：回环覆盖
+     传输中取消；主机把该取消并入既有失败路径（`file_send_failures` 增长、
+     无独立主机侧取消计数），真实双机大文件取消与断线竞态待验。
+70. **P2-62 主机侧区分取消与发送失败（2026-11-01 完成）**：查看者取消下载时
+     先复位接收流、再发 `FileResult{Cancelled}`，主机的下一次分块写入可能
+     先失败（`send: invalid call: ...`），过去会并入 `file_send_failures`，
+     统计与日志把用户取消误报为发送失败。现在
+     `HostServerStats.file_send_cancels` 单独计数查看者取消
+     （`FileResult{Cancelled}` 与 `FileCancel` 两条路径），
+     `file_send_failures` 只覆盖真正的发送失败。分块发送与收尾的传输错误改走
+     `note_file_send_error`：传输先挂为 failed 但暂不计数，最多 1 s 宽限内由
+     `drive_file_download` 的 failed 分支轮询已到达的取消报文；取消先到则
+     认领为取消（错误文案改为“the viewer cancelled the download”，不重复
+     通知查看者），宽限结束仍无取消才按失败计数并照旧通知查看者。验证：
+     `chast-viewer-probe --files-only` 在取消步骤后读取进程内主机的
+     `status().stats`，断言 `file_send_cancels` 恰好 +1 且
+     `file_send_failures` 不变；竞态修复前 5 次有 1 次主机先记失败，修复后
+     连续 10 次通过，探针打印“… 1 download cancelled (host counted it)”。
+     C++ Release 全量构建通过，全量串行 `ctest` 38/38 通过（570.85 s，
+     2026-11-01，`quic_weak_network` 最后）。边界：1 s 宽限按真实链路 RTT
+     预留但仅有回环证据；主机托盘在宽限期内会短暂显示底层写入错误，认领后
+     改为取消文案；真实双机取消/断线竞态仍待验。
+71. **P2-63 下载完成后在文件夹中显示（2026-11-01 完成）**：单文件下载完成后
+     页脚原来只有“已保存到 {path}”文本，用户需自行打开资源管理器定位。
+     现在完成态页脚改为一行：路径文本（超长省略）加 28×28 的
+     `Icons.folder_open_rounded` 按钮，tooltip“在文件夹中显示”，点击执行
+     `explorer.exe /select, <path>`，直接在资源管理器中选中刚保存的文件。
+     `FileBrowserPanel` 新增可选 `onRevealDownload` 注入点供测试替换默认
+     实现；默认实现捕获 `ProcessException` 后静默返回——定位只是便利动作，
+     失败不应覆盖“已保存”提示。`downloadPath` 为空时按钮不出现。验证：
+     新增 2 个组件测试（注入回调后点击断言收到完整路径；完成态无路径时
+     按钮不存在），`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 456 项通过，`flutter build windows --release
+     --no-pub` 成功。纯 Dart/Flutter 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：默认分支未在组件测试中启动真实 Explorer
+     （仅经注入验证传参），启动失败的静默处理只有代码层保证；非 Windows
+     平台未测试。
+72. **P2-64 文件浏览器按名称筛选（2026-11-01 完成）**：文件浏览器在面包屑下
+     新增 30 px 筛选行（放大镜图标 + `file-filter` 输入框 + 清除按钮），
+     对当前目录已收到的条目做大小写不敏感的子串匹配。输入为空显示全部；
+     无匹配时文件夹内显示“没有匹配的条目”，根目录空列表也落到同一提示。
+     多选“全选”只作用于当前可见条目，被筛掉的已选条目仍保留在批量下载/
+     删除的目标集合中；接受的新列表指向其它目录时自动清空筛选，子目录不会
+     继承父目录的过滤词。原测试用 `find.byType(TextField)` 定位新建/重命名
+     对话框，面板新增输入框后会命中两个控件，现改为限定在 `AlertDialog`
+     内。验证：新增 2 个组件测试（大小写不敏感筛选 + 无匹配提示 + 清除
+     恢复；进入目录清空筛选并显示新列表），`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 458 项通过，`flutter build
+     windows --release --no-pub` 31.3 s 成功。纯 Dart/Flutter 切片，未
+     改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只过滤已收到的
+     单目录列表（截断列表只过滤已返回部分，不向主机发查询）；排序不变；
+     无拼音/模糊匹配；筛选不跨面板关闭持久化。另记：英文词典由 const map
+     展开合并，重复键（'清除筛选' 已存在于 `en_home.dart`）不是编译错误，
+     而会让 `kEnglishMessages[key]` 触发运行时断言，`l10n_test` 能捕获；
+     本次复用已有英文值，未新增重复键。
+73. **P2-65 文件浏览器记住上次目录（2026-11-01 完成）**：`FileBrowserPanel`
+     新增 `initialDirectory`（默认空串），挂载后的首个列表请求改为该目录；
+     会话页把已有的 `_fileBrowserDirectory` 传入覆盖层和文件传输专用页，
+     因此关闭再打开浏览器会回到上次浏览的文件夹（同一会话内，字段随连接
+     生命周期）。保存的目录已在主机端失效时，首次拒绝会清掉错误并自动
+     重试共享根一次（`_initialFallbackTried` 防循环），同时通过
+     `onDirectoryChanged('')` 把会话页的记忆刷新为根目录，避免每次重开
+     都撞同一个失效路径。验证：新增 2 个组件测试（带 `initialDirectory`
+     时首个请求就是该目录并采纳其列表；主机拒绝时依次请求该目录和 `''`，
+     根列表最终显示且无错误文案），`flutter analyze --no-pub` 无问题，
+     全量 `flutter test --no-pub` 460 项通过，`flutter build windows
+     --release --no-pub` 31.4 s 成功。纯 Dart/Flutter 切片，未改动协议与
+     C++，因此未重跑 C++ 构建与 ctest。边界：只记住本次会话的目录，不
+     写盘、不跨查看器重启；回退只针对首次打开（浏览中途进入子目录失败
+     仍显示主机原因）；覆盖层与仅文件传输页共用同一记忆。
+74. **P2-66 文件夹下载完成后在文件夹中显示（2026-11-01 完成）**：文件夹/批量
+     下载成功时，页脚原有“文件夹已下载到 {path}”文本现在与单文件完成态
+     一致，右侧带 28×28 定位按钮（复用“在文件夹中显示”与
+     `_revealDownload`，Explorer 会在其所在目录选中该文件夹）；取消或
+     失败状态不显示按钮，目的地为空时也不显示。验证：扩展
+     `folder download answers report done, cancel and failure` 组件测试
+     （完成态点击后注入回调收到下载目录；取消态没有按钮），
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 460
+     项通过，`flutter build windows --release --no-pub` 31.1 s 成功。纯
+     Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：
+     目录定位依赖 `explorer.exe /select,`，与单文件共用同一默认实现
+     （测试只验证注入路径）；取消/失败不提供定位。
+75. **P2-67 文件浏览器按名称/大小/时间排序（2026-11-01 完成）**：筛选行
+     右侧新增排序菜单（名称/大小/时间，当前项带勾选）与升降序按钮
+     （tooltip 说明按下后的方向）。排序完全在本地：先按名称过滤再排序，
+     目录始终排在文件之前，方向只作用于组内；名称排序不区分大小写，
+     大小/时间相等时用名称打破平局，不依赖 `List.sort` 的稳定性。默认
+     （名称升序）与主机返回顺序一致，未操作时行序不变。验证：新增 2 个
+     组件测试（按大小排序后行位次及升降序切换；按时间排序时目录仍居首
+     且两个方向都生效），`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 462 项通过，`flutter build windows --release
+     --no-pub` 30.7 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。测试注意：`CheckedPopupMenuItem` 的文字自身不接收
+     点击，直接 `tap(find.text(...))` 会触发 hit-test 警告，改为点击外层
+     `CheckedPopupMenuItem`。边界：排序不持久化，关闭重开面板回到名称
+     升序；只对主机已返回的当前目录列表排序（截断列表不会补全）；排序
+     控件占用筛选输入的横向空间。
+76. **P2-68 多选栏显示选中文件总大小（2026-11-01 完成）**：多选状态栏在
+     “已选 {n} 项”后追加选中文件的合计大小（复用 `_formatSize`，例如
+     “已选 3 项 · 3.0 KiB”）；文件夹没有自身大小因此不计入，只选文件夹
+     时保持纯计数；合计覆盖全部已选名称（包括被筛选隐藏的行），与批量
+     下载/删除的实际作用范围一致。验证：新增 1 个组件测试（只选文件夹
+     显示“已选 1 项”，再选两个文件后显示“已选 3 项 · 3.0 KiB”），并
+     更新全选测试的期望文本；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 463 项通过，`flutter build windows --release
+     --no-pub` 30.7 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：只汇总主机列表已带的大小（目录与截断列表
+     不补全）；该大小不参与排序或下载决策。
+77. **P2-69 文件浏览器记住排序方式（2026-11-01 完成）**：排序枚举由私有
+     `_EntrySort` 改为公开 `FileBrowserSort`，面板新增 `initialSort`、
+     `initialSortAscending` 与 `onSortChanged`；会话页像记住目录一样记住
+     字段与方向（随连接生命周期），因此关闭再打开浏览器保持上次排序。
+     默认仍是名称升序，未操作时与主机顺序一致。验证：新增 1 个组件测试
+     （选“按大小”后切降序，回调依次收到 size:true、size:false；卸载后
+     以记忆值重建面板，行序为最大优先且方向按钮 tooltip 变为“升序”），
+     测试 harness 传递新参数；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 464 项通过，`flutter build windows --release
+     --no-pub` 31.3 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：排序只在本次连接内记忆，不写盘、不跨查看器
+     重启；覆盖层与仅文件传输页共用同一记忆；只排序已获取的列表。
+78. **P2-70 直接打开已完成的下载（2026-11-01 完成）**：单文件与文件夹下载
+     完成条在“在文件夹中显示”旁增加“打开文件/打开文件夹”，经新的
+     `onOpenDownload` 回调注入；未注入时默认 `Process.start(
+     'explorer.exe', [path])`，文件交给默认程序、目录开窗口，路径作为参数
+     传递、不经 shell。取消/失败或无目标路径时不显示按钮。验证：扩展
+     “a finished download can be revealed in the folder”“folder download
+     answers report done, cancel and failure”（点“打开文件”“打开文件夹”
+     分别断言收到的目标路径，取消后按钮消失）与“no reveal button when the
+     finished download has no path”；`flutter analyze --no-pub` 无问题，
+     全量 `flutter test --no-pub` 464 项通过，`flutter build windows
+     --release --no-pub` 34.1 s 成功。纯 Dart 切片，未重跑 C++ 构建与
+     ctest。边界：默认路径只在 Windows 有意义；打开动作不校验目标是否仍
+     存在，失败静默（完成条仍显示保存路径）。
+79. **P2-71 同目录刷新保留多选（2026-11-01 完成）**：`_takeAnswer` 接受列表
+     时不再无条件清空选择：目录未变（上传完成、重命名/删除后的自动重载、
+     标题栏刷新）时用新列表的条目名 `retainAll` 保留仍存在的已选名称，
+     主机已不存在的名称自动移除；只有目录变化才清空选择并清空筛选。
+     修复了“多选一批文件 → 拖入上传/刷新列表 → 选择被静默丢失”的行为。
+     验证：新增 1 个组件测试（选 `a.bin` 后点刷新，同目录新列表含
+     `a.bin`+`c.bin` 时仍为“已选 1 项”；再刷新到只含 `b.bin` 的列表后
+     变为“已选 0 项”且 `a.bin` 消失），`flutter analyze --no-pub` 无问题，
+     全量 `flutter test --no-pub` 465 项通过，`flutter build windows
+     --release --no-pub` 30.7 s 成功。纯 Dart 切片，未改动协议与 C++，
+     因此未重跑 C++ 构建与 ctest。边界：选择记忆只在同一目录内生效；
+     筛选词仍在目录变化时清空；被筛掉但仍存在的已选名称继续保留。
+80. **P2-72 单文件下载页脚显示百分比（2026-11-01 完成）**：下载进度行在
+     “正在下载 {name} · {p1} / {p2}”后追加按字节计算的百分比（四舍五入，
+     与进度条同源）；主机未给出总大小（`downloadSize == 0`）时不显示百分比，
+     避免出现无意义的 0%。验证：扩展 `the footer follows the host-to-viewer
+     download state` 组件测试（1.0/2.0 KiB 断言“· 50%”；新增总大小为 0 的
+     进度态断言仍只有字节数），`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 465 项通过，`flutter build windows --release
+     --no-pub` 30.9 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：百分比四舍五入，进度条与文本共用同一 clamp
+     值；文件夹/批量下载仍用文件计数，不显示百分比。
+81. **P2-73 设备菜单复制 ID（2026-11-01 完成）**：首页设备卡片的“设备操作”
+     菜单在“仅文件传输”后新增“复制 ID”，把 `device.id` 写入剪贴板并提示
+     “ID 已复制”（2 秒）；与 RustDesk 设备列表的 Copy ID 对齐。英文词典
+     新增 `'复制 ID'`/`'ID 已复制'`，无重复键。验证：新增 1 个组件测试
+     （mock `SystemChannels.platform` 截获 `Clipboard.setData`，点菜单项后
+     断言复制内容为 `devbox` 并出现提示），`flutter analyze --no-pub` 无问题，
+     全量 `flutter test --no-pub` 466 项通过，`flutter build windows
+     --release --no-pub` 31.2 s 成功。纯 Dart 切片，未改动协议与 C++，因此
+     未重跑 C++ 构建与 ctest。边界：复制的只是条目 ID，不附带服务器前缀；
+     剪贴板写入失败没有额外提示（与“复制下载地址”同一实现风格）。
+82. **P2-74 文件浏览器显示条目计数（2026-11-01 完成）**：筛选行右侧新增
+     条目计数，无筛选时显示“共 N 项”，筛选时显示“匹配 M / N 项”（M 为
+     可见条目、N 为当前目录全部条目，二者都含文件夹）。英文词典新增
+     `'共 {n} 项'`/`'匹配 {n} / {total} 项'`，无重复键。验证：新增组件测试
+     （3 条目目录先断言“共 3 项”，输入 `ALPHA` 后为“匹配 1 / 3 项”，输入
+     `zzz` 后为“匹配 0 / 3 项”），`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 467 项通过，`flutter build windows --release
+     --no-pub` 30.9 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：计数只统计当前目录一层，不含子目录内容；
+     加载中或出错时按已收到的条目显示（通常为 0）。
+83. **P2-75 复制下载路径（2026-11-01 完成）**：单文件与文件夹/批量下载的
+     完成页脚在“打开”“在文件夹中显示”旁新增“复制路径”按钮（28×28），
+     把保存路径写入剪贴板并提示“路径已复制”（2 秒）；取消、失败或无路径
+     时不显示。英文词典新增 `'复制路径'`/`'路径已复制'`，无重复键。验证：
+     扩展现有“下载完成后在文件夹中显示”测试，mock `SystemChannels.platform`
+     截获 `Clipboard.setData`，点按钮后断言复制内容为
+     `C:\Users\me\Downloads\chast\x.bin` 并出现提示；无路径用例断言按钮
+     不存在；`flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub`
+     467 项通过，`flutter build windows --release --no-pub` 29.6 s 成功。
+     纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：
+     只覆盖已完成且有保存路径的页脚；复制的路径不检查文件是否仍存在，
+     剪贴板写入失败没有额外提示（与“复制 ID”同一风格）。
+84. **P2-76 设备菜单复制服务器地址（2026-11-01 完成）**：首页设备卡片的
+     “设备操作”菜单在“复制 ID”后新增“复制服务器地址”，仅当条目带有
+     服务器 URL 时出现；复制该 URL 到剪贴板并提示“服务器地址已复制”
+     （2 秒）。英文词典新增 `'复制服务器地址'`/`'服务器地址已复制'`，
+     无重复键。验证：扩展现有设备菜单测试，先复制 ID、等前一条 2 秒
+     提示退场，再打开菜单复制地址，断言剪贴板依次收到 `devbox` 与
+     `http://127.0.0.1:8443`，并出现新提示；`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 467 项通过，`flutter build
+     windows --release --no-pub` 30.0 s 成功。纯 Dart 切片，未改动协议与
+     C++，因此未重跑 C++ 构建与 ctest。边界：本机/局域网条目没有服务器
+     URL 时不显示该项；复制的是模型里保存的基础 URL，不附加主机 ID；
+     剪贴板失败无额外提示。
+85. **P2-77 多选栏复制选中路径（2026-11-01 完成）**：多选状态栏在“下载”
+     左侧新增“复制路径”按钮，把每个选中条目按主机列表顺序拼成
+     `路径1\n路径2` 写入剪贴板（根目录为条目名，子目录带相对路径），
+     复用“路径已复制”提示；没有选中项时按钮禁用。验证：新增组件测试
+     在多选模式下全选一个目录与一个文件，mock 剪贴板后断言内容为
+     `photos\na.bin` 并出现提示；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 468 项通过，`flutter build windows --release
+     --no-pub` 30.0 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：复制的是主机共享目录内的相对路径而非本机
+     保存路径；被筛选隐藏但仍选中的条目也会写入（与批量下载/删除的
+     作用集合一致）；路径按换行拼接，未做引号或 shell 转义。
+86. **P2-78 返回上一级文件夹（2026-11-01 完成）**：筛选行最左侧在非共享
+     根目录时新增“上一级”返回按钮，去掉 `_directory` 的最后一段后重新
+     请求父目录；沿用目录切换逻辑，筛选词与多选状态随之清空。英文词典
+     新增 `'上一级'`，无重复键。验证：新增组件测试断言根目录不显示按钮，
+     点进 `photos` 后出现，点击请求序列为 `''`、`photos`、`''`，回到根
+     目录后按钮消失；`flutter analyze --no-pub` 无问题，全量 `flutter
+     test --no-pub` 469 项通过，`flutter build windows --release --no-pub`
+     30.5 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与
+     ctest。边界：一次只退一层，根目录即共享根（不能再退）；面包屑仍可
+     直接跳到任意祖先；按钮占用筛选行左侧空间，仅在子目录出现。
+87. **P2-79 条目菜单复制路径（2026-11-01 完成）**：文件/文件夹行“更多操作”
+     菜单在“重命名”前新增“复制路径”，复制该项在主机共享目录内的相对
+     路径（根目录为条目名，子目录带前缀），复用 `_copyPath` 的
+     “路径已复制”提示；删除进行中菜单不出现。文本复用现有英文键
+     `'复制路径'`，未新增词典项。验证：新增组件测试打开 `a.bin` 的
+     更多操作菜单并点击该项，mock 剪贴板后断言内容为 `a.bin` 且出现
+     提示；`flutter analyze --no-pub` 无问题，全量 `flutter test
+     --no-pub` 470 项通过，`flutter build windows --release --no-pub`
+     30.5 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与
+     ctest。边界：复制的是主机共享目录相对路径，不是本机保存路径或
+     绝对路径；文件夹也可复制；与多选栏复制同一拼接口径（无引号/转义）。
+88. **P2-80 复制路径容忍剪贴板失败（2026-11-01 完成）**：文件浏览器的三处
+     复制入口（完成页脚、多选栏、条目菜单）共用 `_copyPath`；该函数现在
+     捕获 `Clipboard.setData` 抛出的异常并直接返回，不再产生未处理的异步
+     错误，也不显示“路径已复制”提示，页脚内容保持不变。验证：新增组件
+     测试把 `SystemChannels.platform` 的剪贴板调用改为抛
+     `PlatformException`，点击“复制路径”后断言没有成功提示且
+     “已保存到 …”仍在；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 471 项通过，`flutter build windows --release
+     --no-pub` 39.2 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑
+     C++ 构建与 ctest。边界：仅文件浏览器的复制入口加了保护；主页
+     “复制 ID/复制服务器地址”仍保持原样（失败仍会冒泡）；被吞掉的失败
+     不写日志、不提示用户。
+89. **P2-81 查看器截图（2026-11-01 完成）**：查看器工具栏在“发送文本”后新增
+     相机图标按钮，首帧到达后才可用。点击后会话线程把最近一次渲染的共享
+     BGRA 纹理 `CopyResource` 到缓存的可读 staging 纹理并 `Map` 回系统内存，
+     WIC（`src/win/png_writer.cc`，`chast::write_png_bgra`）再编码为 PNG。
+     默认目录 `%USERPROFILE%\Pictures\chast`，文件名
+     `chast-YYYYMMDD-HHMMSS.png`；同一秒内重名追加 `-1`/`-2`，目录自动创建，
+     GPU 表面的 alpha 统一置为不透明。结果经
+     `ViewerStatus::screenshot_updates/screenshot_path/screenshot_error` 回传，
+     Flutter 在计数前进时提示“截图已保存：路径”或“截图失败：原因”；首帧
+     之前到达的请求保持待处理，不误报失败。协议无变化，主机不参与。
+     验证：新增 `png_writer` 单测（参数拒绝、嵌套目录创建、PNG 签名、解码
+     尺寸/像素、alpha 置 255、中文目录的 UTF-8 路径）；`viewer_folder_download`
+     回环在真实 HostServer + ViewerEngine 上连续请求两张截图，断言计数前进、
+     无错误、文件存在、PNG IHDR 尺寸等于流尺寸（2560×1440）、同一秒内文件名
+     不同且都落在请求目录；`cmake --build build --config Release` 与探针重编
+     通过；全量串行 ctest 39/39（571.94 s，新增 `png_writer` 共 39 项；此前
+     一次与 Flutter 构建/测试并发的全量出现三项已知的“主机音频无错误/丢帧”
+     负载抖动断言失败，三项空闲单独复跑均通过，最终二进制上空闲复跑全量
+     39/39）；`flutter analyze --no-pub` 无问题，全量 `flutter test
+     --no-pub` 474 项通过（新增截图状态解析 3 项），`flutter build windows
+     --release --no-pub` 21.4 s 成功。边界：PNG 在会话线程内同步编码，
+     4K 截图会短暂占用会话线程（视频/音频处理顺延）；截图是查看者解码并
+     渲染后的尺寸而非主机桌面原始分辨率；仅文件会话不可截图；合并多显示器
+     布局下是整个流表面而非单屏；画面静止时读到当前静态帧，不向主机请求
+     关键帧。
+90. **P2-82 画面偏好跨启动记忆（2026-11-01 完成）**：查看器把画面菜单的
+     编码器（自动/H.264/HEVC）、画质预设（高清/均衡/流畅）与帧率上限
+     （不限/15/30/60）写入 `%APPDATA%\chast\ui.json`，下次启动在首连前读出
+     并重新下发给主机；此前每次重启都回到自动/高清/不限。只持久化落定后的
+     值：主机确认时保存实际生效值，主机拒绝或平台未排队时保存回退后的值，
+     被拒绝的选择不会在下次启动重现。语言设置与画面偏好共用该文件，两处
+     写入都改为读改写合并，未知键原样保留；读取按单键校验，非法值逐项回退。
+     验证：新增 `stream_prefs_test` 7 项（缺省、往返、逐键非法值、损坏/
+     畸形文件、保存归一化并保留外部键、语言改动保留画面偏好、画面改动保留
+     语言）；`flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub`
+     481 项通过，`flutter build windows --release --no-pub` 32.8 s 成功。
+     纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：记忆是
+     全局的，不按目标主机区分；画质以主机实际生效值为准；仅文件会话不读取。
+91. **P2-83 视图偏好跨启动记忆（2026-11-01 完成）**：查看器把工具栏的画面适配
+     方式（自适应/原始像素，对应 RustDesk 的 view style）与统计浮层显隐写入
+     `%APPDATA%\chast\ui.json`，下次启动建立会话前读出并直接沿用；此前每次
+     启动都回到自适应且浮层关闭。与语言、画面偏好共用该文件，写入同样读改写
+     合并，未知键原样保留；`view_fit` 只接受 0/1，`view_stats` 必须是布尔值，
+     非法值逐项回退默认，文件损坏不阻塞启动。工具栏切换适配或浮层时立即保存
+     （本地显示状态无需主机确认）；仅文件会话也会读取这些全局记忆，但不影响
+     其行为。验证：新增 `view_prefs_test` 7 项（缺省、往返、逐键非法值、损坏/
+     畸形文件、保存归一化并保留外部键、语言/画面改动保留视图偏好、视图改动
+     保留语言与画面偏好）；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 488 项通过（此前 481 + 新增 7），
+     `flutter build windows --release --no-pub` 30.4 s 成功。纯 Dart 切片，未
+     改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：记忆是全局的，不按
+     目标主机区分；全屏状态与工具栏收起状态不记忆。
+92. **P2-84 文件浏览排序跨启动记忆（2026-11-01 完成）**：文件浏览器的排序方式
+     （名称/大小/修改时间）与升降序此前只在单次连接内保留，重开查看器或新连接
+     回到名称升序；现在与视图偏好一起写入 `%APPDATA%\chast\ui.json`
+     （`file_sort` 0–2、`file_sort_asc` 布尔），会话页在 `initState` 读取并作为
+     两个文件面板的初始排序，`onSortChanged` 立即合并保存。与语言、画面、视图
+     偏好共用同一文件且读改写保留未知键；非法排序值回退名称、非法方向回退升序。
+     验证：`view_prefs_test` 增至 8 项（排序往返与逐键非法值并入既有用例，新增
+     “排序改动保留语言与画面偏好”）；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 489 项通过（此前 488 + 新增 1），
+     `flutter build windows --release --no-pub` 30.4 s 成功。纯 Dart 切片，未
+     改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：记忆是全局的，不按
+     目标主机区分；只影响浏览器显示顺序，不改变主机返回的目录内容。
+93. **P2-85 文件浏览目录跨启动记忆（2026-11-01 完成）**：文件浏览器上次停留的
+     共享目录此前只在单次连接内保留（P2-65），新连接从共享根开始；现在与排序、
+     视图偏好一起写入 `%APPDATA%\chast\ui.json` 的 `browser_dir`，会话页在
+     `initState` 读取并作为两个文件面板的初始目录，`onDirectoryChanged` 立即
+     合并保存。目录按 `/` 归一化后只保留真实路径段（去掉空段、`.` 与 `..`），
+     因此存储值无法越出共享根；主机拒绝旧目录时沿用 P2-65 的根目录回退并写回
+     空目录。验证：`view_prefs_test` 增至 9 项（新增目录归一化用例，并把目录键
+     并入往返、逐键非法值、保存归一化与三向保留）；`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 490 项通过（此前 489 + 新增 1），
+     `flutter build windows --release --no-pub` 32.7 s 成功。纯 Dart 切片，未
+     改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：目录记忆是全局的，
+     连接不同主机时若旧目录不存在会回到共享根；不记忆本地下载目录。
+94. **P2-86 最近连接单条移除（2026-11-01 完成）**：首页“最近连接”此前只能整表
+     清空，不能只去掉一条误连的记录；现在每张最近卡片在“保存到我的设备”旁新增
+     一个紧凑关闭按钮（26×26，tooltip“从最近连接中移除”），点击后只删除该条
+     未保存记录并立即刷新列表，地址簿与其它最近条目保留。`DeviceStore.removeRecent
+     (key)` 只移除 `!saved && key` 匹配的行，对已保存条目或未知键调用都是空操作，
+     仍走同一 `_save` 的排序与上限逻辑。英文词典新增
+     `'从最近连接中移除': 'Remove from recent'`，无重复键。验证：
+     `device_store_test` 新增“removeRecent drops one ad-hoc entry and keeps the
+     rest”（删一条最近后另两条仍在；对已保存 key 与不存在的 key 调用不改动）；
+     `home_page_test` 首页用例在关闭设备菜单后点击该按钮，断言 `10.0.0.2:4433`
+     消失、“清空”随列表清空而消失、地址簿“办公室”仍在；`flutter analyze
+     --no-pub` 无问题，全量 `flutter test --no-pub` 491 项通过（此前 490 +
+     新增 1），`flutter build windows --release --no-pub` 29.6 s 成功。纯 Dart
+     切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只移除本地最近
+     记录，不影响地址簿或服务端；没有撤销与二次确认；该按钮只出现在未保存条目上。
+95. **P2-87 最近连接右键操作菜单（2026-11-01 完成）**：最近连接卡片新增桌面右键
+     菜单，提供“仅文件传输”“复制 ID”“重命名”，与保存/移除的一键按钮互补而
+     不额外占用卡片宽度；右键菜单复用已有英文键，无新增词典项。复制 ID 的提示
+     逻辑提取为顶层 `_copyDeviceId`，已保存卡片与最近卡片共用；重命名沿用
+     `_renameDevice`，直连最近条目只改本地记录，服务端条目的上传路径不变。
+     验证：`home_page_test` 新增用例右键 `recent-direct|10.0.0.2:4433` 卡片，
+     断言三个菜单项，点击“复制 ID”后剪贴板收到 `10.0.0.2:4433` 并出现
+     “ID 已复制”，再右键重命名为“书房”并断言标题更新；`flutter analyze
+     --no-pub` 无问题，全量 `flutter test --no-pub` 492 项通过（此前 491 +
+     新增 1），`flutter build windows --release --no-pub` 30.2 s 成功。纯 Dart
+     切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：右键菜单是
+     桌面交互，触屏没有等价入口；“仅文件传输”仍走既有连接流程，未在组件测试
+     中实际发起会话；重命名直连条目不会同步到服务端。
+96. **P2-88 文件浏览器上传进度（2026-11-01 完成）**：上传页脚在引擎报告文件
+     大小后显示已传/总量、百分比与 3 px 进度条，布局与下载页脚一致：文字为
+     “正在上传到 {dir} · {p1} / {p2} · {pct}%（队列剩余 {n} 个）”，进度条取
+     `status.fileProgress`；大小未知（排队/哈希阶段 `fileSize == 0`）时保持原
+     “正在上传到 {dir}（队列剩余 {n} 个）”文案且不画进度条。数值全部来自桥接
+     已有的 `fileSize`/`fileSent`，未改协议与 C++，新增一个英文词典项。
+     验证：`file_browser_panel_test` 新增用例以 1024/2048 字节断言“1.0 KiB /
+     2.0 KiB · 50%”与进度条 0.5，再以 2048/2048 断言 100% 与 1.0；既有“丢弃
+     的上传仍可取消”用例补充大小未知时不出现进度条；`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 493 项通过（此前 492 + 新增 1），
+     `flutter build windows --release --no-pub` 30.4 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：进度只描述引擎当前
+     发送的文件，队列中后续文件没有单独进度；目录名过长时第一行省略号截断。
+97. **P2-89 最近连接菜单补全与长按入口（2026-11-01 完成）**：最近卡片右键
+     菜单在“仅文件传输/复制 ID/重命名”之后补充“保存到我的设备”“从最近连接
+     中移除”，与卡片上的一键按钮调用同一回调；卡片新增长按打开同一菜单，
+     作为触屏等价入口，未新增词典项。验证：`home_page_test` 既有右键用例
+     补充两项断言，新增 1 项长按 `recent-direct|10.0.0.9:4433` 打开菜单并
+     点击“从最近连接中移除”，断言卡片消失；`flutter analyze --no-pub` 无
+     问题，全量 `flutter test --no-pub` 494 项通过（此前 493 + 新增 1），
+     `flutter build windows --release --no-pub` 29.5 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：桌面仍以右键
+     为主，长按面向触屏；菜单与按钮共享回调、没有二次确认；“仅文件传输”
+     仍未在组件测试中实际发起会话。
+98. **P2-90 主页复制失败的明确提示（2026-11-01 完成）**：主页的设备 ID、
+     服务器地址与更新下载地址三个复制入口统一走顶层 `_copyText`：剪贴板
+     写入失败时显示“复制失败”而不是继续提示“已复制”，成功路径文案不变；
+     新增英文键“复制失败”。验证：`home_page_test` 既有复制用例在成功复制
+     两次后把平台 mock 改为抛出 `PlatformException`，再次复制服务器地址，
+     断言剪贴板没有新增内容、只出现“复制失败”且没有“服务器地址已复制”；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 494 项
+     通过（无新增用例），`flutter build windows --release --no-pub` 30.3 s
+     成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：失败提示不区分原因（权限、剪贴板被占用等）；文件浏览器的复制
+     路径仍按 P2-80 保持静默失败。
+99. **P2-91 文件行右键菜单（2026-11-01 完成）**：文件浏览器的每个条目行在
+     尾随“更多操作”按钮之外新增右键入口，`GestureDetector.onSecondaryTapDown`
+     在指针全局位置调用 `showMenu`，菜单项与按钮共用 `_entryMenuItems()`
+     （复制路径/重命名/删除）与 `_runEntryMenu`，行为完全一致；目录行同样生效。
+     没有可操作回调的行（“返回上一级”）右键不弹菜单。未新增词典项。验证：
+     `file_browser_panel_test` 新增 2 项用例——右键文件行出现三项菜单并点击
+     “复制路径”把 `a.bin` 写入剪贴板且提示“路径已复制”；右键“返回上一级”
+     不出现菜单；`flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub`
+     496 项通过（此前 494 + 新增 2），`flutter build windows --release --no-pub`
+     32.0 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：右键菜单只覆盖条目行，批量选择栏仍用按钮；菜单在触屏上不可达，
+     但行内尾随按钮提供了等价入口。
+100. **P2-92 文件浏览器复制失败的明确提示（2026-11-01 完成）**：`_copyPath`
+     在 `Clipboard.setData` 抛错时改为提示“复制失败”，成功仍是“路径已复制”，
+     与 P2-90 的主页行为一致；完成页脚、批量和行内菜单三个入口共用该函数，
+     复用了已有英文键，未新增词典项。验证：P2-80 的剪贴板失败用例改名并补充
+     断言“复制失败”出现、“路径已复制”不出现且页脚路径仍在；`flutter analyze
+     --no-pub` 无问题，全量 `flutter test --no-pub` 496 项通过（无新增用例），
+     `flutter build windows --release --no-pub` 30.2 s 成功。纯 Dart 切片，未
+     改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：提示不区分失败原因；
+     批量复制仍是整串一次写入，失败时不回退到逐条复制。
+101. **P2-93 文件行长按菜单（2026-11-01 完成）**：`_entryRow` 的
+     `GestureDetector` 在右键之外新增 `onLongPressStart`，以按下位置打开同一
+     `_showEntryContextMenu`，作为触屏等价入口；“返回上一级”仍不弹菜单。
+     长按会赢得手势竞争，目录行不会误进入子目录。验证：
+     `file_browser_panel_test` 新增 1 项，长按 `photos` 目录行断言三项菜单出现；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 497 项通过
+     （此前 496 + 新增 1），`flutter build windows --release --no-pub` 30.2 s
+     成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：长按只覆盖条目行，批量选择栏仍用按钮；菜单与按钮共享回调、
+     没有二次确认。
+102. **P2-94 清空最近连接前二次确认（2026-11-01 完成）**：主页“清空”改为先弹
+     `AlertDialog`（标题“清空最近连接”，正文说明已保存的设备不受影响），
+     取消保持列表不变，确认后才调用 `clearRecent()`；新增两个英文键。
+     验证：`home_page_test` 新增 1 项——一条已保存设备加一条最近记录，点
+     “清空”出现确认框，取消后卡片仍在，再次确认后最近卡片与“清空”按钮消失、
+     已保存设备保留；同时给测试内存仓库补 `clearRecent()` 覆写，避免组件测试
+     落到真实的 `devices.json` 持久化路径；`flutter analyze --no-pub` 无问题，
+     全量 `flutter test --no-pub` 498 项通过（此前 497 + 新增 1），`flutter
+     build windows --release --no-pub` 30.4 s 成功。纯 Dart 切片，未改动协议
+     与 C++，因此未重跑 C++ 构建与 ctest。边界：只加确认，没有撤销；单条
+     移除仍不确认。
+103. **P2-95 文件列表错误可重试（2026-11-01 完成）**：条目区的错误行改为
+     左侧原因文本加右侧“重试”按钮，重试对当前目录重新发起列表请求并清空
+     错误；复用已有英文键，未新增词典项。验证：`file_browser_panel_test`
+     新增 1 项——首次挂载请求被拒显示错误与“重试”，点击后再次请求同一目录
+     （`''`）且错误消失；`flutter analyze --no-pub` 无问题，全量 `flutter test
+     --no-pub` 499 项通过（此前 498 + 新增 1），`flutter build windows
+     --release --no-pub` 30.3 s 成功。纯 Dart 切片，未改动协议与 C++，因此未
+     重跑 C++ 构建与 ctest。边界：重试只重发列表请求，不自动重试失败的上传/
+     下载/删除；请求失败后页脚仍显示上次的结果。
+104. **P2-96 文件行双击下载（2026-11-01 完成）**：文件浏览器的文件行在非
+     选择态双击即向主机发起该文件下载，与尾部下载按钮同一请求；文件夹仍
+     单击进入，选择态与传输进行中双击不触发。双击识别只包住行的信息区
+     （图标/名称/详情），避免识别器横跨整行而把尾部下载与菜单按钮的点击
+     拖到双击超时之后。验证：`file_browser_panel_test` 新增 2 项——文件行
+     双击只发一次 `notes.txt` 下载且文件夹双击不下载，选择态双击只切换勾选；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 501 项
+     通过（此前 499 + 新增 2），`flutter build windows --release --no-pub`
+     30.1 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与
+     ctest。边界：双击只覆盖单文件下载，不处理文件夹；本地同名覆盖确认仍
+     由引擎侧决定。
+105. **P2-97 重命名/新建文件夹的同名冲突拦截（2026-11-01 完成）**：新建
+     文件夹与重命名在提交前用当前列表做大小写不敏感的查重（Windows 主机
+     语义），重命名跳过自身；命中时在条目区提示“同名文件已存在”，不发操作
+     请求；列表被截断时仍以主机拒绝为准。新增英文键 `'同名文件已存在'`。
+     验证：`file_browser_panel_test` 新增 2 项——重命名 `notes.txt` 为
+     `PHOTOS`（大小写不同但同名）零请求并显示提示；新建 `Photos` 同名
+     文件夹同样被拦截；`flutter analyze --no-pub` 无问题，全量 `flutter test
+     --no-pub` 503 项通过（此前 501 + 新增 2），`flutter build windows
+     --release --no-pub` 30.4 s 成功。纯 Dart 切片，未改动协议与 C++，因此
+     未重跑 C++ 构建与 ctest。边界：只查当前已加载的列表，截断目录或其他
+     写入方造成的冲突仍由主机裁决；仅大小写变化的改名仍提交给主机。
+106. **P2-98 共享地址簿条目复制 ID（2026-11-01 完成）**：共享地址簿的每个
+     条目在尾部新增复制 ID 按钮，只读条目同样可用，写权限菜单与“连接”
+     不变；复用 `ID 已复制` / `复制失败` 文案，剪贴板失败时提示失败而不抛出。
+     验证：`shared_books_dialog_test` 新增 1 项并在测试夹具加 `Scaffold`
+     承接 SnackBar——点击 `labbox` 的复制按钮写入该 ID 并显示“ID 已复制”；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 504 项
+     通过（此前 503 + 新增 1），`flutter build windows --release --no-pub`
+     30.4 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与
+     ctest。边界：只复制条目 ID，不复制共享源服务器地址或标签。
+107. **P2-99 终端内容复制（2026-11-01 完成）**：远程终端面板标题栏新增复制
+     按钮与 `Ctrl+Shift+C` 快捷键，复制滚动历史加当前画面；每行去掉右侧
+     填充空格，宽字符跳过后继单元格，末尾空行裁掉。空内容提示“终端没有
+     可复制的内容”，剪贴板异常提示“复制失败”，成功提示“已复制终端内容”。
+     `Ctrl+Shift+C` 由面板先行拦截，不再作为 `Ctrl+C` 中断发给主机。
+     验证：`terminal_panel_test` 新增 2 项——40 行输出使首行进入 scrollback，
+     按钮复制同时包含首行与末行并显示成功提示；`Ctrl+Shift+C` 写入剪贴板且
+     `sendInput` 保持为空。`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 506 项通过（此前 504 + 新增 2），
+     `flutter build windows --release --no-pub` 31.1 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只提供整屏/历史
+     复制，不含鼠标选区与部分复制。
+108. **P2-100 共享地址簿手动刷新（2026-11-01 完成）**：共享地址簿对话框标题栏
+     新增刷新按钮，重新读取授权与共享条目；加载或写入进行中禁用，搜索词与
+     范围选择保持不变，失败仍走既有错误行与重试。验证：
+     `shared_books_dialog_test` 新增 1 项——首次打开各加载一次，点击刷新后
+     授权与条目各再加载一次，列表从“实验室”更新为“新机器”；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 507 项
+     通过（此前 506 + 新增 1），`flutter build windows --release --no-pub`
+     31.6 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与
+     ctest。边界：只刷新对话框数据，不合并其他设备尚未同步的本地改动。
+109. **P2-101 云端录制筛选（2026-11-01 完成）**：云端录制对话框在录制列表上方
+     新增筛选输入框，按名称、设备 ID 与录制 ID 做大小写不敏感的包含匹配，
+     带清除按钮；无匹配时提示“没有匹配的录制”，过滤后的条目仍可下载/删除。
+     验证：`recording_archive_dialog_test` 新增 1 项——两条录制分别按名称
+     （大小写不敏感）、设备 ID、录制 ID 筛出目标条目，未知词显示无匹配提示
+     且列表与空态都不出现，清除后恢复两条；`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 508 项通过（此前 507 + 新增 1），
+     `flutter build windows --release --no-pub` 31.3 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只做本地列表过滤，
+     不含服务端分页/排序与按时间范围检索。
+110. **P2-102 云端录制排序（2026-11-01 完成）**：云端录制对话框在筛选框右侧新增
+     排序菜单与升降序按钮，可按时间、名称、大小排序；默认时间新→旧，切换到名称
+     时默认升序、大小默认大→小，名称比较忽略大小写并以名称/ID 兜底保证稳定。
+     验证：`recording_archive_dialog_test` 新增 1 项——三条录制默认按时间新→旧，
+     切到名称后升序、按方向按钮转降序，再切到大小后大→小，并断言方向按钮的
+     下一次方向提示；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 509 项通过（此前 508 + 新增 1），
+     `flutter build windows --release --no-pub` 31.3 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只对已加载列表排序，
+     排序选择不跨对话框关闭持久化。
+111. **P2-103 云端录制下载后打开/定位（2026-11-01 完成）**：云端录制下载完成后，
+     “已保存到”一行右侧新增“打开文件”和“在文件夹中显示”按钮；默认分别调用
+     `explorer.exe <path>` 与 `explorer.exe /select, <path>`，路径按参数传递，
+     `ProcessException` 静默忽略以免覆盖已保存路径；测试可注入回调。
+     验证：扩展现有下载用例——下载后断言保存文案并点击两个按钮，注入的打开/
+     定位回调各收到临时目录下的完整文件路径；`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 509 项通过（无新增用例），
+     `flutter build windows --release --no-pub` 31.8 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：默认 Explorer
+     行为仅通过注入验证，未在真实桌面点击；打开不检查文件是否仍存在。
+112. **P2-104 终端字号调整（2026-11-01 完成）**：远程终端面板标题栏新增
+     “缩小字号/放大字号”按钮，字号 10–20 逐级调整；单元格宽度按新字号重新用
+     `TextPainter` 测量、行高按 1.23 倍行距推导，列数/行数随之重算并通知主机
+     调整控制台尺寸；调整后视图保持在底部。验证：`terminal_panel_test` 新增
+     1 项——放大后上报列数变小、缩小后回到初始列数；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 510 项
+     通过（此前 509 + 新增 1），`flutter build windows --release --no-pub`
+     31.7 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：字体族固定为 Consolas/Cascadia Mono/Courier New 回退；字号跨启动
+     记忆见 P2-112。
+113. **P2-105 终端回到底部按钮（2026-11-01 完成）**：远程终端内容滚动离开底部后，
+     滚动区右下角显示“回到底部”浮动按钮；点击后恢复自动跟随并跳到最新输出。
+     使用既有 `_follow` 状态判断，回到底部后按钮自动隐藏。验证：
+     `terminal_panel_test` 新增 1 项——60 行输出后按钮隐藏，上滚 200 px 后出现，
+     点击后隐藏且滚动位置等于 `maxScrollExtent`；`flutter analyze --no-pub`
+     无问题，全量 `flutter test --no-pub` 511 项通过（此前 510 + 新增 1），
+     `flutter build windows --release --no-pub` 30.5 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：按钮只在滚动区
+     有可滚动距离时出现；点击为瞬时跳转，不带平滑动画。
+114. **P2-106 聊天面板滚动跟随（2026-11-01 完成）**：聊天面板记录用户是否停留在
+     底部；上翻历史时新消息不再强制拉到底部，并在右下角显示“回到底部”浮动
+     按钮，点击后恢复跟随。验证：`chat_panel_test` 新增 1 项——40 条消息上翻
+     120 px 后按钮出现，追加新消息时滚动位置保持不变，点击按钮后回到底部且
+     按钮消失；`flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub`
+     512 项通过（此前 511 + 新增 1），`flutter build windows --release --no-pub`
+     30.2 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：若面板关闭重开，跟随状态重置为底部。
+115. **P2-107 终端历史搜索（2026-11-01 完成）**：远程终端新增搜索按钮与 Ctrl+F
+     快捷键，搜索条在滚动历史与当前屏幕中做大小写不敏感的子串匹配，显示
+     “当前/总数”或“无匹配”，上下按钮循环跳转并高亮匹配行；Esc 或关闭按钮
+     退出搜索并把焦点还给终端。搜索期间普通按键不再发往主机，避免 Esc 等
+     未消费按键泄漏到控制台。验证：`terminal_panel_test` 新增 1 项——60 行
+     输出中两处 NEEDLE，打开搜索输入大写查询得到 2/2，上一个到 1/2、
+     下一个回 2/2，关闭后搜索框消失；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 513 项通过（此前 512 + 新增 1），
+     `flutter build windows --release --no-pub` 31.6 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只按整行匹配高亮，
+     不标出具体命中列；搜索不区分大小写，不支持正则。
+116. **P2-108 聊天记录复制（2026-11-01 完成）**：会话聊天标题栏新增复制按钮，
+     按“我/主机 · HH:MM: 内容”把完整对话写入剪贴板；成功提示 SnackBar，
+     空会话或写入失败时在面板内提示。验证：`chat_panel_test` 新增 1 项——
+     两条双向消息复制后剪贴板内容同时包含“主机 · 03:04: from host”和
+     “我 · 05:06: from me”；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 514 项通过（此前 513 + 新增 1），
+     `flutter build windows --release --no-pub` 31.8 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：导出为纯文本，
+     不含日期；面板内消息本身仍可单独选择复制。
+117. **P2-109 终端历史翻页（2026-11-01 完成）**：远程终端新增 `Shift+PageUp` /
+     `Shift+PageDown` 翻页浏览，每次按一屏减一行滚动；翻离底部显示“回到底部”
+     按钮，翻回底部自动恢复跟随。组合键由面板先行拦截，不再作为 `PgUp`/`PgDn`
+     序列发往主机，普通 `PageUp`/`PageDown` 行为不变。验证：
+     `terminal_panel_test` 新增 1 项——60 行输出后按 `Shift+PageUp` 位置前移
+     且出现按钮，连续 `Shift+PageDown` 回到底部且按钮消失，`sendInput` 全程
+     为空；`flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub`
+     515 项通过（此前 514 + 新增 1），`flutter build windows --release --no-pub`
+     30.6 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：步长固定一屏，不提供半页/按行滚动快捷键；首尾跳转见 P2-110。
+118. **P2-110 终端历史跳到首尾（2026-11-01 完成）**：`Shift+Home`/`Shift+End`
+     直接跳到滚动历史的最旧/最新一行；跳离底部显示“回到底部”，回到最新输出
+     时恢复跟随。与 P2-109 共用组合键拦截，普通 `Home`/`End` 仍发往主机。
+     验证：`terminal_panel_test` 新增 1 项——60 行输出后 `Shift+Home` 位置为 0
+     且出现按钮，`Shift+End` 回到 `maxScrollExtent` 且按钮消失；
+     `flutter analyze --no-pub` 无问题，全量 `flutter test --no-pub` 516 项
+     通过（此前 515 + 新增 1），`flutter build windows --release --no-pub`
+     29.8 s 成功。纯 Dart 切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。
+     边界：仅在终端获得焦点时生效；跳转为瞬时定位，不带平滑滚动。
+119. **P2-111 云端录制复制 ID（2026-11-01 完成）**：云端录制条目新增复制 ID
+     按钮，写入条目 ID；成功提示“ID 已复制”，剪贴板异常时在对话框内提示
+     “复制失败”。复用已有英文键，未新增词典项。验证：
+     `recording_archive_dialog_test` 新增 1 项——点击复制按钮写入完整 ID 并
+     显示“ID 已复制”；`flutter analyze --no-pub` 无问题，全量 `flutter test
+     --no-pub` 517 项通过（此前 516 + 新增 1），`flutter build windows
+     --release --no-pub` 30.3 s 成功。纯 Dart 切片，未改动协议与 C++，因此
+     未重跑 C++ 构建与 ctest。边界：只复制录制 ID，不复制名称、下载地址或
+     本地保存路径。
+120. **P2-112 终端字号跨启动记忆（2026-11-01 完成）**：终端字号写入
+     `ui.json` 的 `terminal_font_size`（10–20，越界回落 13），会话页加载后
+     作为终端初始字号下发，字号按钮调整时即时保存；与画面/文件浏览器偏好
+     共用同一文件且保留其他键。验证：`view_prefs_test` 扩展默认值、保存/加载、
+     非法值与保存归一化断言；`terminal_panel_test` 新增 1 项——以 18 号启动后
+     缩小上报 17、放大上报 18；`flutter analyze --no-pub` 无问题，全量
+     `flutter test --no-pub` 518 项通过（此前 517 + 新增 1），
+     `flutter build windows --release --no-pub` 30.1 s 成功。纯 Dart 切片，
+     未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只记住字号，不记忆
+     面板开关、位置或搜索状态；现有 `ui.json` 无该键时按 13 处理。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
@@ -1961,7 +2909,49 @@
 
 - 音频质量调优：唇音同步已按 RustDesk 对齐为“到达即播”（查看者系统
   声音到达锚定、0 lead，2026-10-27，见 `docs/m6.3-lipsync-plan.md`）；
-  A/V skew 实测与长期漂移校正待双机/双端点。端点跟随已实现（默认设备
+  A/V skew 遥测已接入 CLI 与浮层（2026-10-31，P2-45），单机回环实测
+  从约 +120 ms 压到 +38 ms（第四轮起播聚合 6 块、按最快到达锚定，
+  +38.1/+38.6 ms；此前三轮 +58.5/+58.0/+63.7），单机回环 40 ms 目标
+  已达成；10 ms Opus 帧、60 ms 端点缓冲与运行中锚点校正已实验并回退，
+  丢块由 1–2 升到 4；第五轮 `chast-netem` 弱网复核的欠载/丢块低于旧
+  80 ms lead 基线（轻档 0/0 vs 10/42，视频验收档 5/878 vs 48/1927），
+  但视频验收档暴露音频被拥塞拖后 0.2–3 s 的 QoS 缺口。该缺口已由协议
+  v35 的 QUIC DATAGRAM 音频解决（2026-10-31，见上文 M6）：视频验收档
+  DATAGRAM 1248/1251（0.24% 丢）/解码 24.95 s，带播放 slack 均值
+  −99.5 ms、最差 −1026 ms（可靠流 −882.4/−5934 ms），欠载 1:1。
+  剩余：双机可听内容（PLC 已补 2026-10-31；长期漂移校正已实现为
+  默认关闭的实验开关，见 `docs/status-2026-10-25.md` §6.11；10 分钟
+  单机 soak 已通过：−300 ppm 下 drift −180 ms/10 步、丢 1 块、
+  空转 111 ms；洁净对照 drift +0/0 步、0 丢包，空转 70.6 s 全部来自
+  主机静音门控 `gates=2`；门控已接通 `--audio-silence-gate-ms N` 与
+  host.ini `audio_silence_gate_ms`（默认 2000，0 关闭；关闭后 80 s 回环
+  starved 7 ms、0 丢），安全设置“高级”页已有同名复选框（勾选保留自定义
+  值/默认 2000，取消写 0；未人工点击），真实声卡 ppm 与双机待验）。
+  自适应缓冲已实现为 `JitterLeadController` 与 CLI `--adaptive-jitter`
+  （2026-10-31，见 `docs/status-2026-10-25.md` §6.8）：视频验收档
+  播出帧 +3…+17%、丢块 −10…−36%；补 `starved_ms` 空转指标后复测，
+  实际静默 6.2–6.9 s 对默认 8.0 s（−14…−23%），播出帧 +19…+22%。
+  欠载事件数（1–13 对 1–2）是计数盲区而非连续性回归。仍**默认
+  关闭**：2026-10-31 已补起播 1 s/重锚 0.5 s 宽限并把回收保持降到
+  2 窗，4 s 干净回环 lead 80–120 ms → 40 ms、skew +123…+154 →
+  +76…+91 ms，25 s 干净链路仍多约 16 ms；需双机可听验收（及按
+  发送侧时刻排程）后再决定默认开启。查看器统计浮层已显示空转/丢块
+  （`audioStarvedMs/audioDropped`，2026-10-31），双机验收可直接读数。
+  发送侧固定 lead 已可 A/B（2026-10-31，见 §6.10）：CLI
+  `--audio-capture-anchor` / `--audio-lead-ms N` 按主机采集时间加
+  固定 lead 排程，并可叠加自适应。洁净链路上固定 40 ms skew
+  +29.9 ms、丢块 1（到达锚定 +34.9 ms、丢块 4），40 ms 底 + 自适应
+  两次为 27 ms 空转、+26.2…+26.7 ms skew；弱网空转固定
+  40/80/120/160 ms 为 8.3/6.7/4.0–4.4/3.2 s、skew +33…+154 ms，
+  自适应 6.5 s/+45.6 ms，组合模式 4.0–6.4 s/+33 ms。GUI 默认不变；
+  组合方案是首选候选，待双机可听验收选择。
+  包级冗余已评估不采用（2026-10-31，见 `docs/status-2026-10-25.md`
+  §6.9）：Opus 带内 FEC 只覆盖 SILK/LPC，CELT 音乐模式无冗余；
+  1+1 DATAGRAM 复制被 MsQuic 合并进同一 UDP 数据报、副本共享丢包，
+  弱网 A/B 无稳定收益（默认档 missing 51–52 对 40），已回退。修复
+  副本需延迟 5–10 ms 独立发送或交织奇偶 FEC，另加接收端 lead，
+  留待双机可听验收后评估。
+  端点跟随已实现（默认设备
   1 s 内切换、固定端点重试同 id），播放器已按 RustDesk 的 5 s 启动
   确认对齐（已交出音频 5 s 内不被消费即重建）；真实热插拔验收待做
   （AEC/降噪/设备选择已在 M9.4 完成）。

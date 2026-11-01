@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/account_store.dart';
+import 'package:chast_viewer/server_api.dart';
 
 Future<String> fakeProtect(String plaintext) async =>
     base64Encode(utf8.encode('sealed:$plaintext'));
@@ -59,6 +60,54 @@ void main() {
     expect(loaded.copyWith(bookRevision: 13).syncedAt, synced);
     expect(loaded.isActiveAt(DateTime.utc(2026, 12, 1)), isTrue);
     expect(loaded.isActiveAt(DateTime.utc(2027, 1, 2, 3, 4, 5)), isFalse);
+  });
+
+  test('cached groups ride along and tombstones are dropped', () async {
+    final AccountSessionStore store = AccountSessionStore(file: file);
+    await store.save(AccountSession(
+      server: 'http://127.0.0.1:8443',
+      username: 'alice',
+      token: 'token-value',
+      expiresAt: DateTime.utc(2027, 1, 2),
+      bookRevision: 7,
+      groups: const <AddressBookGroup>[
+        AddressBookGroup(
+          id: 'g1',
+          name: '实验室',
+          parentId: 'root',
+          position: 2,
+          revision: 3,
+        ),
+        AddressBookGroup(id: 'gone', name: '旧组', deleted: true),
+      ],
+    ));
+
+    final AccountSession? loaded = await store.load();
+    expect(loaded?.bookRevision, 7);
+    expect(loaded?.groups.length, 1);
+    final AddressBookGroup group = loaded!.groups.single;
+    expect(group.id, 'g1');
+    expect(group.name, '实验室');
+    expect(group.parentId, 'root');
+    expect(group.position, 2);
+    expect(group.revision, 3);
+    expect(loaded.copyWith().groups.single.id, 'g1');
+  });
+
+  test('a session written before the group cache loads with none', () async {
+    await file.writeAsString(
+      jsonEncode(<String, Object?>{
+        'server': 'http://127.0.0.1:8443',
+        'username': 'alice',
+        'token': 'token-value',
+        'expiresAt': DateTime.utc(2027, 1, 2).millisecondsSinceEpoch,
+        'bookRevision': 9,
+      }),
+    );
+    final AccountSession? loaded = await AccountSessionStore(file: file).load();
+    expect(loaded?.bookRevision, 9);
+    expect(loaded?.groups, isEmpty);
+    expect(loaded?.copyWith(bookRevision: 10).groups, isEmpty);
   });
 
   test('refresh token round-trips and outlives the access token', () async {
