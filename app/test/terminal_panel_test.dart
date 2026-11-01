@@ -210,6 +210,44 @@ void main() {
     expect(sizes, <int>[17, 18]);
   });
 
+  testWidgets('resets the console font to the default size', (
+    WidgetTester tester,
+  ) async {
+    final FocusNode focus = FocusNode(debugLabel: 'terminal-test');
+    addTearDown(focus.dispose);
+    final List<int> sizes = <int>[];
+
+    await tester.pumpWidget(
+      _host(
+        focus: focus,
+        status: const ViewerStatus(
+          terminalSupported: true,
+          terminalPhase: ViewerTerminalPhase.open,
+        ),
+        initialFontSize: 18,
+        onFontSizeChanged: sizes.add,
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('重置字号'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 150));
+    await tester.pump();
+    expect(sizes, <int>[13]);
+
+    final IconButton reset = tester.widget<IconButton>(
+      find.descendant(
+        of: find.byTooltip('重置字号'),
+        matching: find.byType(IconButton),
+      ),
+    );
+    expect(reset.onPressed, isNull);
+  });
+
   testWidgets('shows a jump-to-bottom button after scrolling up', (
     WidgetTester tester,
   ) async {

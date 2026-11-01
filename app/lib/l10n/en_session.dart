@@ -364,6 +364,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '关闭搜索': 'Close search',
   '缩小字号': 'Smaller text',
   '放大字号': 'Larger text',
+  '重置字号': 'Reset text size',
   '终端没有可复制的内容': 'There is nothing to copy',
   '终端不可用（主机拒绝或权限已撤销）':
       'The terminal is unavailable (rejected by the host or permission revoked)',

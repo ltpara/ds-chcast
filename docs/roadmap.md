@@ -2901,6 +2901,14 @@
      `flutter build windows --release --no-pub` 30.1 s 成功。纯 Dart 切片，
      未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：只记住字号，不记忆
      面板开关、位置或搜索状态；现有 `ui.json` 无该键时按 13 处理。
+121. **P2-113 终端字号一键复位（2026-11-01 完成）**：远程终端标题栏在放大/
+     缩小字号按钮之后新增复位按钮，点击把字号恢复为默认 13 并立即回报保存；
+     当前已是默认字号时按钮置灰。验证：`terminal_panel_test` 新增 1 项——
+     以 18 号启动后点击复位上报 13，且复位按钮变为禁用；`flutter analyze
+     --no-pub` 无问题，全量 `flutter test --no-pub` 519 项通过（此前 518 +
+     新增 1），`flutter build windows --release --no-pub` 33.9 s 成功。纯 Dart
+     切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：复位到固定
+     默认值 13，不区分“本次会话初始字号”；没有键盘快捷键。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

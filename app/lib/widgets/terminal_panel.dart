@@ -72,6 +72,7 @@ class TerminalPanel extends StatefulWidget {
 class _TerminalPanelState extends State<TerminalPanel> {
   static const double _minFontSize = 10;
   static const double _maxFontSize = 20;
+  static const double _defaultFontSize = 13;
 
   double _fontSize = _kFontSize;
   late double _cellWidth = _measureCellWidth(_fontSize);
@@ -143,20 +144,28 @@ class _TerminalPanelState extends State<TerminalPanel> {
   }
 
   void _setFontSize(double delta) {
-    final double next = (_fontSize + delta).clamp(_minFontSize, _maxFontSize);
-    if (next == _fontSize) {
+    _applyFontSize(_fontSize + delta);
+  }
+
+  void _resetFontSize() {
+    _applyFontSize(_defaultFontSize);
+  }
+
+  void _applyFontSize(double next) {
+    final double clamped = next.clamp(_minFontSize, _maxFontSize);
+    if (clamped == _fontSize) {
       return;
     }
     setState(() {
-      _fontSize = next;
-      _cellWidth = _measureCellWidth(next);
+      _fontSize = clamped;
+      _cellWidth = _measureCellWidth(clamped);
       // Force the layout builder to re-measure and tell the host the new size.
       _layoutColumns = 0;
       _layoutRows = 0;
     });
     _follow = true;
     _scheduleScrollToBottom();
-    widget.onFontSizeChanged?.call(next.round());
+    widget.onFontSizeChanged?.call(clamped.round());
   }
 
   void _onScroll() {
@@ -707,6 +716,12 @@ class _TerminalPanelState extends State<TerminalPanel> {
             tooltip: tr('放大字号'),
             disabled: _fontSize >= _maxFontSize,
             onTap: () => _setFontSize(1),
+          ),
+          _headerButton(
+            icon: Icons.restart_alt_rounded,
+            tooltip: tr('重置字号'),
+            disabled: _fontSize == _defaultFontSize,
+            onTap: _resetFontSize,
           ),
           _headerButton(
             icon: Icons.search_rounded,
