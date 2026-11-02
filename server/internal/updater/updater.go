@@ -35,6 +35,11 @@ type Notice struct {
 	SHA256    string
 	Size      int64
 	Signature string
+	// PublisherKeyID and PublisherSignature carry the release publisher's
+	// independent proof. They are present when the server was configured with
+	// a publisher key; a client that pins that key requires them.
+	PublisherKeyID     string
+	PublisherSignature string
 }
 
 // Complete reports whether the server hosted the file itself and signed the
@@ -64,6 +69,33 @@ func Verify(n Notice, serverPublicKey string) error {
 	}
 	if !identity.Verify(pub, identity.SoftwareMessage(n.Version, n.URL, n.SHA256, n.Size), n.Signature) {
 		return errors.New("update notice signature was not accepted")
+	}
+	return nil
+}
+
+// VerifyPublisher checks the publisher proof against a pinned publisher key.
+// An empty pin keeps deployments without a publisher key working unchanged; a
+// pinned key makes the publisher fields mandatory.
+func VerifyPublisher(n Notice, publisherPublicKey string) error {
+	if strings.TrimSpace(publisherPublicKey) == "" {
+		return nil
+	}
+	if n.Version == "" || n.URL == "" || n.SHA256 == "" || n.Size <= 0 {
+		return errors.New("publisher verification needs version, url, sha256 and a positive size")
+	}
+	if n.PublisherKeyID == "" || n.PublisherSignature == "" {
+		return errors.New("update notice carries no publisher signature; the pinned publisher key requires one")
+	}
+	pub, err := identity.ParsePublicKey(publisherPublicKey)
+	if err != nil {
+		return err
+	}
+	wantID := identity.PublisherKeyID(publisherPublicKey)
+	if n.PublisherKeyID != wantID {
+		return fmt.Errorf("update notice names publisher key %q, but the pinned key is %q", n.PublisherKeyID, wantID)
+	}
+	if !identity.Verify(pub, identity.PublisherMessage(n.Version, n.URL, n.SHA256, n.Size), n.PublisherSignature) {
+		return errors.New("update notice publisher signature was not accepted")
 	}
 	return nil
 }

@@ -38,13 +38,18 @@ type FileEvent struct {
 	Size       int64
 	Files      int
 	ClientIP   string
+	// Location and Route mirror the viewer's session report: the GeoIP label
+	// of its address and the transport path it used. Host-side rows keep both
+	// empty.
+	Location   string
+	Route      string
 	OccurredAt time.Time
 	Success    bool
 	Detail     string
 }
 
 func (s *Store) RecordFileTransfer(
-	userID, username, peerID, direction, name, clientIP, auditRef string,
+	userID, username, peerID, direction, name, clientIP, auditRef, location, route string,
 	size int64,
 	files int,
 	occurredAt time.Time,
@@ -79,6 +84,11 @@ func (s *Store) RecordFileTransfer(
 		username = "-"
 	}
 	clientIP = normalizeText(clientIP, maxTransferIP)
+	location = normalizeAuditLocation(location)
+	route, err = normalizeAuditRoute(route)
+	if err != nil {
+		return FileEvent{}, fmt.Errorf("%w: %v", ErrInvalidTransfer, err)
+	}
 	detail = normalizeText(detail, maxTransferDetail)
 	if occurredAt.IsZero() {
 		occurredAt = s.now()
@@ -95,6 +105,8 @@ func (s *Store) RecordFileTransfer(
 		Size:       size,
 		Files:      files,
 		ClientIP:   clientIP,
+		Location:   location,
+		Route:      route,
 		OccurredAt: occurredAt,
 		Success:    success,
 		Detail:     detail,
@@ -155,10 +167,12 @@ func (s *Store) insertFileEventLocked(event FileEvent, userID string) (FileEvent
 	result, err := s.db.Exec(
 		`INSERT INTO file_events
 			(user_id, username, peer_id, direction, name, size, files,
-			 client_ip, occurred_at, success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 client_ip, location, route, occurred_at, success, detail,
+			 host_id, audit_ref, source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		userID, event.Username, event.PeerID, event.Direction, event.Name,
-		event.Size, event.Files, event.ClientIP, unixMillis(event.OccurredAt),
+		event.Size, event.Files, event.ClientIP, event.Location, event.Route,
+		unixMillis(event.OccurredAt),
 		event.Success, event.Detail, event.HostID, event.AuditRef, event.Source,
 	)
 	if err != nil {
@@ -234,7 +248,8 @@ func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) 
 		args = append(args, beforeID)
 	}
 	query := `SELECT id, username, peer_id, direction, name, size, files,
-			client_ip, occurred_at, success, detail, host_id, audit_ref, source
+			client_ip, location, route, occurred_at, success, detail,
+			host_id, audit_ref, source
 		 FROM file_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
@@ -252,8 +267,9 @@ func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) 
 		)
 		if err := rows.Scan(&event.ID, &event.Username, &event.PeerID,
 			&event.Direction, &event.Name, &event.Size, &event.Files,
-			&event.ClientIP, &occurred, &event.Success, &event.Detail,
-			&event.HostID, &event.AuditRef, &event.Source); err != nil {
+			&event.ClientIP, &event.Location, &event.Route, &occurred,
+			&event.Success, &event.Detail, &event.HostID, &event.AuditRef,
+			&event.Source); err != nil {
 			return nil, fmt.Errorf("account store %s: scan file transfer: %w", s.path, err)
 		}
 		event.OccurredAt = timeFromMillis(occurred)

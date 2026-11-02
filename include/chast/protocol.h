@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 36;
+inline constexpr uint16_t kProtocolVersion = 37;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -303,6 +303,16 @@ enum class ControlType : uint16_t {
     // each code point to KEYEVENTF_UNICODE, with '\n' and '\t' as Return and
     // Tab. Requires the input permission like InputEvent. Protocol v36.
     TextInput = 51,
+    // Viewer -> host: reboot this machine. No payload. The host checks the
+    // restart permission and its settings, then schedules a short-delayed
+    // forced restart and answers RestartResult. A session ends with the
+    // machine, so the answer is the only useful evidence the viewer gets.
+    // Protocol v37.
+    RestartRequest = 52,
+    // Host -> viewer: the outcome of RestartRequest. Payload: code (u8),
+    // reason length (u16), UTF-8 reason. See RestartCode. Ok means the
+    // restart was scheduled; the machine reboots after a few seconds.
+    RestartResult = 53,
 };
 
 // ----- input -----
@@ -740,9 +750,10 @@ bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo
 // microphone stream; bit 5 that SetPrivacyMode is accepted; bit 7 that the
 // viewer may ask for TCP port forwarding; bit 8 that remote terminals are
 // accepted; bit 9 that the host consents to viewer-side recording; bit 10 that
-// cameras may be listed and started. Bit 6 is
-// not a permission: it says the picture is a merged layout of every attached
-// output, with origin/source covering their union.
+// cameras may be listed and started; bit 11 that RestartRequest is accepted.
+// Bit 6 is not a permission: it says the picture is a merged layout of every
+// attached output, with origin/source covering their union. Bits 13 and 14
+// are session-shape markers that are not permissions either.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
 inline constexpr uint16_t kServerInfoAudioEnabled = 0x0004;
@@ -754,10 +765,14 @@ inline constexpr uint16_t kServerInfoPortForwardEnabled = 0x0080;
 inline constexpr uint16_t kServerInfoTerminalEnabled = 0x0100;
 inline constexpr uint16_t kServerInfoRecordEnabled = 0x0200;
 inline constexpr uint16_t kServerInfoCameraEnabled = 0x0400;
+// The viewer may send RestartRequest. Aligned with kPermissionRestart so the
+// flag word and the appended mask stay comparable bit for bit.
+inline constexpr uint16_t kServerInfoRestartEnabled = 0x0800;
 // This session carries files only: no video or audio stream follows, and the
 // picture and source sizes in the message are zero. The viewer never creates
-// a decoder for such a session.
-inline constexpr uint16_t kServerInfoFileTransferOnly = 0x0800;
+// a decoder for such a session. v37 moved this bit from 0x0800, which now
+// carries the restart permission.
+inline constexpr uint16_t kServerInfoFileTransferOnly = 0x2000;
 // v35: system audio travels in QUIC DATAGRAM frames instead of the reliable
 // audio stream. The viewer serves these packets before the stream parser; a
 // lost datagram is a short gap, not a retransmission that stalls playback.
@@ -774,7 +789,8 @@ inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
                                                        kServerInfoPortForwardEnabled |
                                                        kServerInfoTerminalEnabled |
                                                        kServerInfoRecordEnabled |
-                                                       kServerInfoCameraEnabled;
+                                                       kServerInfoCameraEnabled |
+                                                       kServerInfoRestartEnabled;
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoMergedLayout |
                                                   kServerInfoFileTransferOnly |
@@ -791,7 +807,7 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // for the viewer to keep a local recording of the received stream (the host
 // cannot enforce it, so it is an advisory permission like RustDesk's
 // "enable-record-session"); camera gates ListCameras, StartCamera and CCAM
-// streams.
+// streams; restart gates RestartRequest and reboots the host.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -807,12 +823,16 @@ enum PermissionBit : uint16_t {
     kPermissionTerminal = 0x0100,
     kPermissionRecord = 0x0200,
     kPermissionCamera = 0x0400,
+    // Reboot the host machine. Off unless the operator opts in, because it
+    // interrupts whoever is sitting at the machine.
+    kPermissionRestart = 0x0800,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
                                            kPermissionMicrophone | kPermissionPrivacyMode |
                                            kPermissionPortForward | kPermissionTerminal |
-                                           kPermissionRecord | kPermissionCamera;
+                                           kPermissionRecord | kPermissionCamera |
+                                           kPermissionRestart;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -953,6 +973,10 @@ struct ServerInfo {
     // The viewer may list and start cameras. Decoded from the permission
     // mask; the device is still checked when it is requested.
     bool camera_enabled = false;
+    // The viewer may ask the host to reboot. Decoded from the permission
+    // mask; each request is still checked against the host's settings and its
+    // platform's privileges when it arrives.
+    bool restart_enabled = false;
     // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
     // audio stream. Set only alongside audio.enabled.
     bool audio_datagram = false;
@@ -1474,6 +1498,31 @@ bool parse_send_sas(const std::vector<uint8_t>& payload, std::string* error);
 std::vector<uint8_t> make_sas_result(SasCode code, const std::string& reason);
 bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
                       std::string& reason, std::string* error);
+
+// ----- remote restart -----
+//
+// The host owns the policy: the restart permission must be granted and the
+// allow_restart setting must be on, so a default host refuses. The restart is
+// scheduled with a short delay and answered immediately; the session dies
+// with the machine, so RestartResult is the only confirmation the viewer gets.
+
+// Why a restart request was refused or could not be scheduled.
+enum class RestartCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // restart permission is not granted to this viewer
+    Disabled = 2,     // the host's settings leave restart off
+    Unsupported = 3,  // this host cannot reboot itself
+    Failed = 4,       // the shutdown privilege or API call failed
+};
+inline constexpr size_t kMaxRestartReason = 256;
+
+std::vector<uint8_t> make_restart_request();
+bool parse_restart_request(const std::vector<uint8_t>& payload, std::string* error);
+// The maker truncates `reason` on a UTF-8 boundary; the parser rejects an
+// over-long or malformed reason instead of truncating it.
+std::vector<uint8_t> make_restart_result(RestartCode code, const std::string& reason);
+bool parse_restart_result(const std::vector<uint8_t>& payload, RestartCode& code,
+                          std::string& reason, std::string* error);
 
 // ----- stream options -----
 //

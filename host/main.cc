@@ -93,6 +93,7 @@ enum ControlId {
     kTerminalCheck,
     kRecordCheck,
     kCameraCheck,
+    kRestartCheck,
     kSendFileButton,
     kAudioCheck,
     kMicrophoneCheck,
@@ -318,6 +319,7 @@ enum ApprovalDialogId {
     kApprovalMicrophone,
     kApprovalPrivacy,
     kApprovalRecord,
+    kApprovalRestart,
     kApprovalAllow,
     kApprovalDeny,
 };
@@ -331,6 +333,7 @@ struct ApprovalDialogState {
     HWND microphone = nullptr;
     HWND privacy = nullptr;
     HWND record = nullptr;
+    HWND restart = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
@@ -351,28 +354,24 @@ bool approval_peer_alive(const ApprovalDialogState& dialog) {
 void finish_approval(ApprovalDialogState& dialog, bool allowed) {
     dialog.allowed = allowed;
     if (allowed) {
-        uint16_t mask = 0;
-        if (SendMessageW(dialog.input, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionInput;
-        }
-        if (SendMessageW(dialog.clipboard, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionClipboard;
-        }
-        if (SendMessageW(dialog.file, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionFileTransfer;
-        }
-        if (SendMessageW(dialog.audio, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionAudio;
-        }
-        if (SendMessageW(dialog.microphone, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionMicrophone;
-        }
-        if (SendMessageW(dialog.privacy, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionPrivacyMode;
-        }
-        if (SendMessageW(dialog.record, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-            mask |= kPermissionRecord;
-        }
+        // Start from what the settings offered the viewer: bits without a
+        // checkbox here (port forward, terminal, camera) must survive the
+        // approval instead of being silently dropped. Each checkbox can only
+        // take its own bit away.
+        uint16_t mask = dialog.request != nullptr ? dialog.request->permissions : 0;
+        const auto narrow = [&mask](HWND box, uint16_t bit) {
+            if (SendMessageW(box, BM_GETCHECK, 0, 0) != BST_CHECKED) {
+                mask &= static_cast<uint16_t>(~bit);
+            }
+        };
+        narrow(dialog.input, kPermissionInput);
+        narrow(dialog.clipboard, kPermissionClipboard);
+        narrow(dialog.file, kPermissionFileTransfer);
+        narrow(dialog.audio, kPermissionAudio);
+        narrow(dialog.microphone, kPermissionMicrophone);
+        narrow(dialog.privacy, kPermissionPrivacyMode);
+        narrow(dialog.record, kPermissionRecord);
+        narrow(dialog.restart, kPermissionRestart);
         dialog.result = mask;
     }
     if (dialog.window != nullptr) {
@@ -486,11 +485,14 @@ ClientApproval server_approve(const ClientRequest& request) {
     const wchar_t* microphone_text = tr(L"麦克风（上行）");
     const wchar_t* privacy_text = tr(L"隐私模式（黑屏）");
     const wchar_t* record_text = tr(L"查看者录制会话");
+    const wchar_t* restart_text = tr(L"远程重启");
     const int column1 = std::max(130, std::max(check_px(input_text), check_px(file_text)));
     const int column2 = std::max(130, std::max(check_px(clipboard_text), check_px(microphone_text)));
     const int column3 =
         std::max(130, std::max(check_px(audio_text),
-                               std::max(check_px(privacy_text), check_px(record_text))));
+                               std::max(check_px(privacy_text),
+                                        std::max(check_px(record_text),
+                                                 check_px(restart_text)))));
     const int second = 20 + column1 + 20;
     const int third = second + column2 + 20;
     const int dialog_width = third + column3 + 20;
@@ -570,13 +572,15 @@ ClientApproval server_approve(const ClientRequest& request) {
         (tr(L"接收目录：") +
          (receive_directory.empty() ? std::wstring(tr(L"（不可用）")) : widen(receive_directory)))
             .c_str(),
-        SS_LEFT | SS_ENDELLIPSIS, second, 220, third - second - 10, 18, 0, nullptr);
+        SS_LEFT | SS_ENDELLIPSIS, second, 220, dialog_width - 20 - second, 18, 0, nullptr);
     dialog.microphone = permission_check(microphone_text, kPermissionMicrophone, 20, column1,
                                          244, kApprovalMicrophone);
     dialog.privacy = permission_check(privacy_text, kPermissionPrivacyMode, second, column2, 244,
                                       kApprovalPrivacy);
     dialog.record = permission_check(record_text, kPermissionRecord, third, column3, 244,
                                      kApprovalRecord);
+    dialog.restart = permission_check(restart_text, kPermissionRestart, third, column3, 216,
+                                      kApprovalRestart);
 
     const int deny_left = dialog_width - 20 - 90;
     const int allow_left = deny_left - 10 - 90;
@@ -865,6 +869,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionCamera) != 0) {
         add(tr(L"摄像头"));
     }
+    if ((mask & kPermissionRestart) != 0) {
+        add(tr(L"远程重启"));
+    }
     return text.empty() ? tr(L"只看") : text;
 }
 
@@ -881,7 +888,8 @@ uint16_t current_gate_mask() {
                                                                      : 0) |
                                  (g_app->settings.allow_terminal ? kPermissionTerminal : 0) |
                                  (g_app->settings.allow_record ? kPermissionRecord : 0) |
-                                 (g_app->settings.allow_camera ? kPermissionCamera : 0));
+                                 (g_app->settings.allow_camera ? kPermissionCamera : 0) |
+                                 (g_app->settings.allow_restart ? kPermissionRestart : 0));
 }
 
 std::wstring security_summary_text(const HostStatus& status) {
@@ -1251,6 +1259,7 @@ enum TunnelDialogId {
     kDialogId,
     kDialogKey,
     kDialogListen,
+    kDialogSocks5,
     kDialogEnabled,
 };
 
@@ -1261,6 +1270,7 @@ struct TunnelDialogState {
     HWND id = nullptr;
     HWND key = nullptr;
     HWND listen = nullptr;
+    HWND socks5 = nullptr;
     HWND enabled = nullptr;
     bool done = false;
     bool accepted = false;
@@ -1520,6 +1530,17 @@ bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, s
         }
         updated.tunnel_listen = normalized;
     }
+
+    const std::string proxy = trim_ascii(narrow(control_text(dialog.socks5)));
+    if (proxy.empty()) {
+        updated.socks5.clear();
+    } else {
+        if (!parse_socks5_proxy(proxy, normalized)) {
+            error = "SOCKS5 代理无效，需要 socks5://[用户名:密码@]主机:端口";
+            return false;
+        }
+        updated.socks5 = normalized;
+    }
     return validate_tunnel_settings(updated, &error);
 }
 
@@ -1597,7 +1618,7 @@ bool edit_tunnel_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 660 : 540;
     const int tunnel_content = dialog_width - 40;
-    RECT frame{0, 0, px(dialog_width), px(470)};
+    RECT frame{0, 0, px(dialog_width), px(540)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -1650,13 +1671,17 @@ bool edit_tunnel_settings(HostSettings& result) {
         tr(L"\n隧道端口必须不同，例如 0.0.0.0:14434");
     add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 316, dialog_width - 20 - 276, 40, 0,
         nullptr);
+    add(L"STATIC", tr(L"SOCKS5 代理（可选，仅 HTTP API 与中继 TCP）"), SS_LEFT, 0, 20, 366,
+        400, 20, 0, nullptr);
+    dialog.socks5 = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 388,
+                        tunnel_content, 26, kDialogSocks5, nullptr);
     const wchar_t* enable_text = tr(L"启用连接服务（注册到会合服务器）");
-    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 366,
+    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 436,
                          std::max(400, check_px(enable_text)), 24, kDialogEnabled, nullptr);
     const int tunnel_cancel_left = dialog_width - 20 - 100;
     add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left - 10 - 100,
-        408, 100, 32, IDOK, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 408, 100, 32,
+        478, 100, 32, IDOK, nullptr);
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 478, 100, 32,
         IDCANCEL, nullptr);
 
     set_text(dialog.url, widen(g_app->settings.server_url));
@@ -1664,6 +1689,7 @@ bool edit_tunnel_settings(HostSettings& result) {
     set_text(dialog.id, widen(g_app->settings.tunnel_id));
     set_text(dialog.key, widen(g_app->settings.tunnel_key));
     set_text(dialog.listen, widen(g_app->settings.tunnel_listen));
+    set_text(dialog.socks5, widen(g_app->settings.socks5));
     set_check(dialog.enabled, g_app->settings.tunnel);
 
     EnableWindow(g_app->window, FALSE);
@@ -1729,6 +1755,7 @@ enum SecurityDialogId {
     kSecAllowTerminal,
     kSecAllowRecord,
     kSecAllowCamera,
+    kSecAllowRestart,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1739,6 +1766,7 @@ enum SecurityDialogId {
     kSecAudioRefresh,
     kSecAudioAec,
     kSecAudioGate,
+    kSecIdleMinutes,
     kSecSave,
     kSecCancel,
 };
@@ -1772,6 +1800,7 @@ struct SecurityDialogState {
     HWND allow_terminal = nullptr;
     HWND allow_record = nullptr;
     HWND allow_camera = nullptr;
+    HWND allow_restart = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -1782,6 +1811,7 @@ struct SecurityDialogState {
     HWND audio_device = nullptr;
     HWND audio_aec = nullptr;
     HWND audio_gate = nullptr;
+    HWND idle_minutes = nullptr;
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
@@ -1998,6 +2028,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_terminal = is_checked(dialog.allow_terminal);
     updated.allow_record = is_checked(dialog.allow_record);
     updated.allow_camera = is_checked(dialog.allow_camera);
+    updated.allow_restart = is_checked(dialog.allow_restart);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2086,6 +2117,20 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
             is_checked(dialog.audio_gate)
                 ? (updated.audio_silence_gate_ms != 0 ? updated.audio_silence_gate_ms : 2000)
                 : 0;
+    }
+
+    {
+        const std::string idle_text = trim_ascii(narrow(control_text(dialog.idle_minutes)));
+        const bool digits = !idle_text.empty() && idle_text.size() <= 5 &&
+                            std::all_of(idle_text.begin(), idle_text.end(), [](char c) {
+                                return c >= '0' && c <= '9';
+                            });
+        const unsigned long minutes =
+            digits ? std::strtoul(idle_text.c_str(), nullptr, 10) : 10081UL;
+        if (minutes > 10080) {
+            return complain(tr(L"空闲断开必须是 0 到 10080 之间的整数分钟。"));
+        }
+        updated.auto_disconnect_minutes = static_cast<uint32_t>(minutes);
     }
 
     updated.token_auth = is_checked(dialog.token_auth);
@@ -2284,7 +2329,7 @@ bool edit_security_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 700 : 620;
     const int page_text_width = dialog_width - 80;
-    RECT frame{0, 0, px(dialog_width), px(626)};
+    RECT frame{0, 0, px(dialog_width), px(668)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -2317,7 +2362,7 @@ bool edit_security_settings(HostSettings& result) {
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12),
-                                 px(dialog_width - 32), px(546), window,
+                                 px(dialog_width - 32), px(588), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
@@ -2500,6 +2545,12 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", tr(L"允许查看器串流本机的一台摄像头（与桌面画面同时）。"), SS_LEFT, 0,
         camera_left, 520, page_right - camera_left, 20, 0, nullptr, &dialog.access_page);
 
+    const wchar_t* allow_restart_text = tr(L"允许远程重启");
+    dialog.allow_restart = page_check(allow_restart_text, 32, 544, kSecAllowRestart);
+    const int restart_left = 32 + std::max(120, check_px(allow_restart_text)) + 10;
+    add(L"STATIC", tr(L"允许查看器重启本机；重启会中断当前会话和本机上的工作。"), SS_LEFT, 0,
+        restart_left, 548, page_right - restart_left, 20, 0, nullptr, &dialog.access_page);
+
     // ----- advanced page -----
     add(L"STATIC", tr(L"访问令牌（仅供 CLI 与自动化，默认关闭）"), SS_LEFT, 0, 32, 56, 500, 20, 0,
         nullptr, &dialog.advanced_page);
@@ -2551,10 +2602,21 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", tr(L"留空跟随系统默认；固定设备不可用时系统声音不会启动。"), SS_LEFT, 0, 32,
         414, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
+    const wchar_t* idle_label = tr(L"空闲断开（分钟，0 表示关闭）");
+    const int idle_label_width = text_px(idle_label);
+    add(L"STATIC", idle_label, SS_LEFT, 0, 32, 448, idle_label_width + 8, 20, 0, nullptr,
+        &dialog.advanced_page);
+    dialog.idle_minutes =
+        add(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
+            32 + idle_label_width + 12, 444, 80, 26, kSecIdleMinutes, nullptr,
+            &dialog.advanced_page);
+    add(L"STATIC", tr(L"查看者在此时长内没有输入、聊天或剪贴板操作时，主机会关闭会话。"),
+        SS_LEFT, 0, 32, 474, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
+
     const int sec_cancel_left = dialog_width - 20 - 90;
-    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 574,
+    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 616,
         90, 32, kSecSave, nullptr, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 574, 90, 32,
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 616, 90, 32,
         kSecCancel, nullptr, nullptr);
 
     // ----- initial state -----
@@ -2573,6 +2635,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_terminal, settings.allow_terminal);
     set_check(dialog.allow_record, settings.allow_record);
     set_check(dialog.allow_camera, settings.allow_camera);
+    set_check(dialog.allow_restart, settings.allow_restart);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2586,6 +2649,7 @@ bool edit_security_settings(HostSettings& result) {
     dialog.selected_audio_device = settings.audio_device;
     set_check(dialog.audio_aec, settings.audio_aec);
     set_check(dialog.audio_gate, settings.audio_silence_gate_ms != 0);
+    set_text(dialog.idle_minutes, widen(std::to_string(settings.auto_disconnect_minutes)));
     refresh_audio_devices(dialog);
 
     if (!settings.totp_secret.empty()) {
@@ -2706,6 +2770,8 @@ void show_tray_menu() {
                 kRecordCheck, tr(L"允许查看者录制会话"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_camera ? MF_CHECKED : 0),
                 kCameraCheck, tr(L"允许查看器串流本机摄像头"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_restart ? MF_CHECKED : 0),
+                kRestartCheck, tr(L"允许查看器重启本机"));
     const bool can_send = running && status.state == HostState::Streaming &&
                           (status.session_permissions & kPermissionFileTransfer) != 0;
     AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
@@ -2944,6 +3010,20 @@ void handle_command(int id) {
                 restart_server();
                 append_log_line(g_app->settings.allow_camera ? tr(L"摄像头已开启")
                                                              : tr(L"摄像头已关闭"));
+            }
+            break;
+        case kRestartCheck:
+            g_app->settings.allow_restart = !g_app->settings.allow_restart;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+                append_log_line(g_app->settings.allow_restart
+                                    ? tr(L"远程重启已开启（本次会话实时生效）")
+                                    : tr(L"远程重启已关闭（本次会话实时生效）"));
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_restart ? tr(L"远程重启已开启")
+                                                              : tr(L"远程重启已关闭"));
             }
             break;
         case kAudioCheck:

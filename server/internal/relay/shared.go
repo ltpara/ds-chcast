@@ -15,6 +15,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 // SharedCarrier is one TCP/WebSocket listener that serves every host. Host
@@ -29,6 +30,7 @@ type SharedCarrier struct {
 	auth   Authenticator
 	policy *Policy
 	log    *slog.Logger
+	tracer *tracing.Tracer
 
 	mu       sync.Mutex
 	hosts    map[string]*sharedHost
@@ -105,7 +107,7 @@ func listenSharedCarrier(bind string, bind6 net.IP) ([]net.Listener, error) {
 	return nil, lastErr
 }
 
-func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, policy *Policy, log *slog.Logger) (*SharedCarrier, error) {
+func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, policy *Policy, log *slog.Logger, tracer *tracing.Tracer) (*SharedCarrier, error) {
 	lns, err := listenSharedCarrier(bind, bind6)
 	if err != nil {
 		return nil, err
@@ -116,6 +118,7 @@ func newSharedCarrier(bind string, bind6 net.IP, auth Authenticator, policy *Pol
 		auth:   auth,
 		policy: policy,
 		log:    log,
+		tracer: tracer,
 		hosts:  make(map[string]*sharedHost),
 	}
 	for _, ln := range lns {
@@ -414,7 +417,26 @@ func (sc *SharedCarrier) hostLoop(link *sharedHost, br *bufio.Reader) {
 
 func (sc *SharedCarrier) serveViewer(v *carrierViewer, hello carrier.SharedViewerHello) {
 	defer v.close()
+	var parent tracing.TraceContext
+	if sc.tracer != nil {
+		parent, _ = sc.tracer.ParseTraceparent(hello.Traceparent)
+	}
+	transport := "tcp"
+	if v.ws != nil {
+		transport = "websocket"
+	}
+	span := sc.tracer.StartSpan("relay.carrier_session", parent)
+	closeReason := "viewer_left"
+	defer func() {
+		sc.tracer.EndSpan(span,
+			tracing.String("carrier.kind", "shared"),
+			tracing.String("relay.transport", transport),
+			tracing.String("relay.host_id", hello.HostID),
+			tracing.String("relay.viewer_ip", peerIP(v.peer)),
+			tracing.String("relay.close_reason", closeReason))
+	}()
 	if hello.HostID == "" || sc.auth == nil || !sc.auth.VerifyCarrier(hello.HostID, hello.Token) {
+		closeReason = "rejected"
 		sc.mu.Lock()
 		sc.rejected++
 		sc.mu.Unlock()
@@ -422,21 +444,25 @@ func (sc *SharedCarrier) serveViewer(v *carrierViewer, hello carrier.SharedViewe
 	}
 	sc.mu.Lock()
 	if sc.closed {
+		closeReason = "shutdown"
 		sc.mu.Unlock()
 		return
 	}
 	host := sc.hosts[hello.HostID]
 	if host == nil {
+		closeReason = "offline"
 		sc.mu.Unlock()
 		return
 	}
 	if host.viewer != nil {
+		closeReason = "busy"
 		sc.busy++
 		sc.mu.Unlock()
 		return
 	}
 	session, err := sc.policy.Open("shared:"+hello.HostID, peerIP(v.peer))
 	if err != nil {
+		closeReason = "blocked"
 		sc.blocked++
 		sc.mu.Unlock()
 		return

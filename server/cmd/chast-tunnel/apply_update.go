@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 	"github.com/ltpara/ds-chcast/server/internal/updater"
 )
 
@@ -24,12 +25,17 @@ func runApplyUpdate(args []string) error {
 	digest := fs.String("sha256", "", "lowercase SHA-256 of the release")
 	size := fs.Int64("size", 0, "release size in bytes")
 	signature := fs.String("signature", "", "server signature over version, url, sha256 and size")
+	publisherKeyID := fs.String("publisher-key-id", "", "publisher key id carried by the notice")
+	publisherSignature := fs.String("publisher-signature", "", "publisher signature over version, url, sha256 and size")
 	serverPubKey := fs.String("server-pubkey", "", "pinned server Ed25519 public key; required")
+	publisherPubKey := fs.String("publisher-pubkey", "", "pinned release publisher Ed25519 public key; when set the notice must carry a matching publisher signature")
 	target := fs.String("target", "", "binary to replace, e.g. chast_viewer.exe")
 	launch := fs.String("launch", "", "binary to start after the swap; defaults to --target")
+	socks5 := fs.String("socks5", "", "download through socks5://[user:pass@]host:port")
 	staging := fs.String("dir", "", "staging directory (default: system temp)")
 	waitPID := fs.Int("wait-pid", 0, "wait for this process to exit before swapping")
 	waitTimeout := fs.Duration("wait-timeout", 90*time.Second, "how long to wait for --wait-pid")
+	healthTimeout := fs.Duration("health-timeout", 2*time.Minute, "how long the new image has to write its health marker; 0 retires the backup immediately")
 	retireTimeout := fs.Duration("retire-timeout", 20*time.Second, "how long to retry removing the previous binary")
 	logPath := fs.String("log", "", "append progress to this file; stderr is always written")
 	fs.Parse(args)
@@ -45,13 +51,18 @@ func runApplyUpdate(args []string) error {
 	}
 
 	notice := updater.Notice{
-		Version:   *version,
-		URL:       *url,
-		SHA256:    *digest,
-		Size:      *size,
-		Signature: *signature,
+		Version:            *version,
+		URL:                *url,
+		SHA256:             *digest,
+		Size:               *size,
+		Signature:          *signature,
+		PublisherKeyID:     *publisherKeyID,
+		PublisherSignature: *publisherSignature,
 	}
 	if err := updater.Verify(notice, *serverPubKey); err != nil {
+		return err
+	}
+	if err := updater.VerifyPublisher(notice, *publisherPubKey); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*target) == "" {
@@ -72,7 +83,11 @@ func runApplyUpdate(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	staged, err := updater.Fetch(ctx, nil, notice, *staging)
+	socks, err := netproxy.Parse(*socks5)
+	if err != nil {
+		return fmt.Errorf("--socks5: %w", err)
+	}
+	staged, err := updater.Fetch(ctx, socks.HTTPClient(10*time.Minute), notice, *staging)
 	if err != nil {
 		return err
 	}
@@ -85,7 +100,36 @@ func runApplyUpdate(args []string) error {
 	if launchPath == "" {
 		launchPath = *target
 	}
-	if err := updater.Launch(launchPath); err != nil {
+	if *healthTimeout <= 0 {
+		if err := updater.Launch(launchPath); err != nil {
+			if restoreErr := updater.Restore(*target, backup); restoreErr != nil {
+				return fmt.Errorf("start %s: %v (restoring the previous binary also failed: %v)", launchPath, err, restoreErr)
+			}
+			if relaunchErr := updater.Launch(*target); relaunchErr != nil {
+				return fmt.Errorf("start %s: %v (the previous binary was restored but starting it also failed: %v)", launchPath, err, relaunchErr)
+			}
+			logf("restored and restarted the previous binary at %s", *target)
+			return fmt.Errorf("start %s: %w", launchPath, err)
+		}
+		logf("started %s", launchPath)
+		updater.Retire(backup, *retireTimeout)
+		logf("update to %s finished", notice.Version)
+		return nil
+	}
+
+	pending, err := updater.Begin(*target, backup, notice.Version, *healthTimeout)
+	if err != nil {
+		if restoreErr := updater.Restore(*target, backup); restoreErr != nil {
+			return fmt.Errorf("%v (restoring the previous binary also failed: %v)", err, restoreErr)
+		}
+		if relaunchErr := updater.Launch(*target); relaunchErr != nil {
+			return fmt.Errorf("%v (the previous binary was restored but starting it also failed: %v)", err, relaunchErr)
+		}
+		return err
+	}
+	running, err := updater.Start(launchPath)
+	if err != nil {
+		pending.Cancel()
 		if restoreErr := updater.Restore(*target, backup); restoreErr != nil {
 			return fmt.Errorf("start %s: %v (restoring the previous binary also failed: %v)", launchPath, err, restoreErr)
 		}
@@ -95,9 +139,25 @@ func runApplyUpdate(args []string) error {
 		logf("restored and restarted the previous binary at %s", *target)
 		return fmt.Errorf("start %s: %w", launchPath, err)
 	}
-	logf("started %s", launchPath)
+	logf("started %s (waiting up to %s for its health marker)", launchPath, *healthTimeout)
+	if err := pending.AwaitHealth(running.Done(), 0); err != nil {
+		logf("new image did not confirm its health: %v; rolling back", err)
+		if stopErr := running.Stop(15 * time.Second); stopErr != nil {
+			logf("could not stop the rejected image: %v", stopErr)
+		}
+		if restoreErr := pending.Rollback(); restoreErr != nil {
+			return fmt.Errorf("roll back %s after %v: %w", *target, err, restoreErr)
+		}
+		pending.Cancel()
+		if relaunchErr := updater.Launch(*target); relaunchErr != nil {
+			return fmt.Errorf("%v; the previous image was restored but starting it failed: %w", err, relaunchErr)
+		}
+		logf("restored and restarted the previous binary at %s", *target)
+		return fmt.Errorf("update to %s was rolled back: %w", notice.Version, err)
+	}
+	pending.Cancel()
 	updater.Retire(backup, *retireTimeout)
-	logf("update to %s finished", notice.Version)
+	logf("update to %s finished; the new image confirmed its health", notice.Version)
 	return nil
 }
 

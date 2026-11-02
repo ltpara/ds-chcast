@@ -1193,10 +1193,12 @@
     条目，被授权者连接目标仍需目标主机自己的密码与审批。地址簿分组支持
     嵌套与按钮式上下排序，但不支持鼠标拖拽；分组名称只在查看器内存中
     缓存，重启后的首次同步必须全量读取，离线只能保留旧分组 ID 且无法新建/
-    改名/删除分组；账号标签只是逐设备标签，不参与授权。搜索与标签筛选只
-    作用于“我的设备”，不覆盖最近连接、共享地址簿对话框或分组标题，只做
-    大小写不敏感的子串匹配，没有拼音/模糊匹配、按分组/在线状态筛选，筛选
-    状态不跨重启保存。地址簿逐条乐观并发控制只覆盖查看器对自有地址簿的
+    改名/删除分组；账号标签只是逐设备标签，不参与授权。“我的设备”与共享
+    地址簿对话框的搜索都做大小写不敏感子串匹配并支持 GB2312 一级汉字拼音
+    首字母（DEV-08，不做全拼/模糊匹配），搜索词按视图分别持久化到
+    `ui-filter.json`、清空即删除并在重启后恢复；标签筛选只作用于“我的设备”，
+    不覆盖最近连接、不按分组/在线状态筛选，也不搜索分组标题。地址簿逐条
+    乐观并发控制只覆盖查看器对自有地址簿的
     `PATCH`：省略 `if_revision` 的旧客户端、共享新增（可带属主地址簿修订号，
     省略时仍为最后写入者优先）以及分组改名/删除
     仍是最后写入者优先；冲突后查看器放弃本地未上传的旧值并采用服务器版本，
@@ -1334,7 +1336,8 @@
      地点写入账号安全审计 `location` 与登录会话 `login_ip`/`location`，
      管理台审计与查看器设备会话对话框展示。未配置时只记录 IP，不做在线查询、
      不带地点数据；单测覆盖最长前缀、坏行/缺文件、落库与 API，Flutter 270 项
-     测试含会话地点展示。
+     测试含会话地点展示。2026-11-02 连接/文件审计复用同一离线表记录地点与
+     查看器上报的传输路由（DEV-05，见上文第 126 项）。
   9. **P2-2 局域网发现**（2026-10-26 完成）：`chast-tunnel host` 默认在
      UDP 21129 应答 `CHASTL1` + JSON 的 ping（`--lan-discovery=false` 关闭），
      pong 只带 ID/主机名/用户名/平台/版本/MAC；查看器用
@@ -2909,6 +2912,229 @@
      新增 1），`flutter build windows --release --no-pub` 33.9 s 成功。纯 Dart
      切片，未改动协议与 C++，因此未重跑 C++ 构建与 ctest。边界：复位到固定
      默认值 13，不区分“本次会话初始字号”；没有键盘快捷键。
+122. **DEV-01 更新发布者签名与启动回滚（2026-11-02 完成，协议无变化）**：
+     发布侧新增 `chast-software-publisher-v1` 域与 `chast-release` 工具
+     （`keygen`/`sign`/`verify`/`keyid`），在发布文件旁生成
+     `<file>.manifest.json`（版本/URL/SHA-256/大小/`publisher_key_id`/
+     `publisher_sig`）。`chast-server --software-publisher-key` 与
+     `--software-manifest`（默认按发布文件名推导）在启动时强制清单与托管
+     文件一致，并把两个发布者字段随 `software` 块转发；主机
+     `--publisher-pubkey` 与 `apply-update --publisher-pubkey` 在固定公钥时
+     要求匹配签名，未固定时保持只校验服务器签名。`apply-update` 换入后写
+     `<target>.chast-update.json`（nonce/截止时间）再启动，查看器首帧就绪后
+     由 `confirm-update --target` 写 `.chast-update.ok`；新映像早退、启动失败
+     或超时未确认（`--health-timeout`，默认 2 分钟）时终止新映像、还原
+     `*.old-<纳秒>` 备份并重启旧查看器，`--health-timeout 0` 保留旧行为。
+     验证：`internal/identity`/`software`/`updater`/`cmd/chast-release` 单测
+     覆盖域隔离、清单篡改与发布者固定；Windows 真实进程集成测试
+     `TestApplyUpdateWatchdog` 的五个子用例（健康、早退回滚、超时杀进程
+     回滚、confirm-update、错误 pin 拒绝）全部通过；真实 `chast-server`
+     回环确认发布者字段下发、下载摘要一致、篡改清单启动退出 1；
+     `go vet ./...`、`go test ./... -count=1`、三个二进制构建与
+     `flutter analyze`/519 项 Flutter 测试通过。边界：主机代理的
+     `--auto-update` 启动厂商安装器，不持有其备份，因此只做双重签名校验，
+     不做启动回滚；发布者固定为显式可选。
+123. **DEV-07 主机自报元数据签名（2026-11-02 完成，协议无变化）**：
+     新增 `chast-host-metadata-v1` 域，`HostMetadataMessage` 对 `id`、
+     `hostname`、`platform`、`version` 与注册时间戳做长度前缀规范编码；
+     主机代理在 `POST /v1/hosts` 的可选 `metadata_sig` 中携带绑定私钥的
+     Ed25519 签名。服务端在任何注册表变更前用本次提交的公钥验签：缺签名
+     默认放行以兼容旧客户端，签名存在但被篡改/时间戳不符/属于其他 ID 一律
+     401；`--require-host-metadata-sig` 拒绝无签名注册。验签结果写入
+     `Identity.MetadataSigned`，SQLite schema 升到 v2
+     （`schemamig` 增量加列，旧行默认 0），`/v1/identities` 与 Web 管理台
+     设备表显示签名状态。验证：`internal/identity` 覆盖字段/ID/时间戳篡改
+     与域隔离；`internal/api` 五个用例覆盖落库、篡改/外 ID 拒绝、兼容与
+     强制模式；`internal/registry` 覆盖状态持久化、无签名续约清回 false 与
+     v1→v2 迁移；`internal/agent` 在强制模式服务端完成真实注册；
+     `internal/webadmin` 断言新列资产；真实 `chast-server` 回环确认强制模式
+     三种非法注册 401、正确签名 200、重启后状态保持，兼容模式下旧主机注册
+     200 且 `metadata_signed:false`；`go vet`/`go build`/全量
+     `go test ./... -count=1` 通过。边界：签名只覆盖展示元数据与注册
+     时间戳，不覆盖路由字段；`metadata_signed` 反映最近一次注册，强制模式
+     需所有主机升级后再启用。
+124. **DEV-02 数据面 tracing 与 SQLite/队列指标（2026-11-02 完成，协议无变化）**：
+     lookup 响应的 `traceparent` 由查看者代理带入 `punch_request`、
+     `relay_viewer` 与共享载体 hello（`wire`/`carrier` 增量字段），服务端新增
+     `punch.request`、`relay.viewer_auth`、`relay.udp_session` 与
+     `relay.carrier_session` span；UDP 会话 span 与查看者鉴权同级挂在该
+     查看者 lookup span 下，关闭时记录 `relay.close_reason`。`internal/sqlitex`
+     以 `database/sql` driver 包装 registry/account 的 modernc SQLite，按
+     `store`/`op` 暴露语句与事务耗时、错误、慢查询（≥50 ms）及单连接池
+     等待/状态；tracing 队列暴露 `chast_trace_queue_depth` 与
+     `chast_trace_spans_dropped_total`。验证：回环验收
+     `TestLoopbackTraceCoversLookupPunchAndRelay` 用真实 HTTP lookup、UDP
+     打洞与中继把四个 span 串成一条 trace；relay/rendezvous/tracing 单测
+     覆盖 parent 与错误状态；`internal/sqlitex` 覆盖驱动计时与错误归属；
+     `go vet`/`go build`/全量 `go test ./... -count=1` 通过。边界：服务端
+     不解析 QUIC，无握手/流 span；采样在进程启动时读取，修改需重启；传输
+     仍为 OTLP/HTTP JSON，未引入 gRPC。
+125. **DEV-04 账号按组授权与配额（2026-11-02 完成，协议无变化）**：
+     SQLite schema v5 新增 `access_groups`/`access_group_members`/
+     `access_group_devices`，访问组独立于地址簿分组 ACL。组角色
+     `readonly`/`write`/`admin` 分别覆盖查看、设备分配、成员与配额管理；
+     server-key 与全局 admin 管理任意组，其余账号必须入组。设备/成员
+     配额超限或下调到当前用量以下返回 409 并说明原因；每组保护最后一个
+     可用 admin，被封禁的 admin 可被降级/移除且不计入。新增
+     `/v1/access-groups` CRUD、成员、设备与组内连接/文件审计端点；
+     审计按 `host_id`/`peer_id` 匹配设备，组端点不支持 CSV。Web 管理台
+     新增“访问组”页签（列表、设置、成员角色、设备分配），审计页签在
+     连接/文件子页支持按组过滤并禁用 CSV。验证：存储单测覆盖角色、配额
+     边界、最后 admin 与审计隔离；HTTP 单测覆盖匿名/非成员/只读越权与
+     配额文案；管理台资产断言通过；真实 `chast-server` 回环在浏览器完成
+     三档角色、配额拒绝、最后 admin 回滚、组审计过滤与全局管理员管理，
+     另以 curl 负向检查越权全部 403；`go vet`/`go build`/全量
+     `go test ./... -count=1` 通过。边界：组只影响账号授权与组审计，
+     不改变查看器地址簿 UI；组配额限制分配数而非在线主机数。
+126. **DEV-05 连接审计 GeoIP 与路由关联（2026-11-02 完成，协议无变化）**：
+     SQLite schema v6 给连接与文件审计增加 `location`/`route`。服务端仍用
+     可选离线 GeoIP 表按客户端 IP 解析地点，未配置时地点为空、IP 照常
+     记录；查看器在连接与文件报告中上报本次实际路径
+     `direct`/`relay`/`carrier`（无服务端为 `direct`），非法值 400。
+     同一会话继续按 `audit_ref` 合并查看器与主机报告，地点/路由只由查看器
+     侧非空值补齐。查看器文件传输由轮询窗口聚合改为逐文件：引擎维护有界
+     审计日志（最近 128 条，带首序号与丢弃计数），逐条经桥接交给页面，
+     每条报告 `files=1`；会话引用变化时重置游标，溢出时跳过缺口。审计
+     查询、CSV 与管理台连接/文件表均显示地点与路由。验证：GeoIP/迁移/
+     合并/HTTP 单测；真实 `chast-server` 回环（`127.0.0.1/32
+     GeoLab-Loopback`）连接与文件均返回地点 `GeoLab-Loopback`、路由
+     `relay` 并共享同一 `audit_ref`，未配置 GeoIP 的实例只显示 IP；
+     C++ 探针断言逐文件日志覆盖三文件上传、上传取消与下载取消；
+     `go vet`/`go build`/全量 `go test ./... -count=1`、C++ Release 构建与
+     全量 ctest、`flutter analyze`/测试/Release 构建通过。边界：地点仅
+     来自离线表；主机侧单独记录无地点/路由；逐文件日志只保留最近 128 条。
+127. **DEV-06 审计归档去重与迟到合并（2026-11-02 完成，协议无变化）**：
+     归档按事件日期落文件（账号审计 `created_at`、连接 `started_at` 回退
+     `ended_at`、文件 `occurred_at`，缺失/未来归当天）；已关闭日期的迟到
+     数据受控重写该日文件（明文或 gz，临时文件 fsync 后原子改名），并
+     删除另一格式与 `.delivered` 标记使改写内容重投。投递账本
+     `delivery-ledger.json` 以 `<UTC 日期>-<内容 SHA256>` 为键、按投递目标
+     分域，命中时恢复标记且不重传；损坏账本从空开始；`Idempotency-Key`
+     改为内容哈希，网络重试去重、合并改写后重投。`Result.Merged` 与管理台
+     `audit archive run` 的 `merged=N` 展示迟到合并数。验证：归档合并
+     （明文/gz）、重复投递、标记丢失、换目标与账本损坏单测；真实
+     `chast-server` 回环把两天前的连接并入对应日 gz，模拟 HTTP 端点单次
+     PUT 且重启删标记后仍不重传。边界：S3 走同一 HTTP PUT 路径、无分片
+     上传；账本按目标 URL 分域；归档查询无跨日索引。
+128. **DEV-08 地址簿拼音搜索与搜索词持久化（2026-11-02 完成，非对齐缺口）**：
+     搜索在大小写不敏感子串之外增加拼音首字母：汉字按 GB2312 一级字序
+     取主读音首字母，ASCII 字母数字保留小写、空白标点丢弃，因此“我的
+     电脑”可被 `wddn` 命中；首字母表由 `tools/gen_pinyin.py` 离线生成
+     （3755 字、23 组，不引入依赖），“我的设备”的设备名/ID/标签/别名/
+     主机标签/分组名与共享对话框的 ID/名称/标签统一接入。搜索词按视图
+     持久化到 `ui-filter.json` 的 `deviceSearch`/`sharedSearch`，清空即
+     删除，两视图互不覆盖。验证：匹配器/表/ViewFilter 单测与两处 widget
+     测试（拼音命中、重启恢复、清空、互不影响）；`flutter analyze` 无
+     问题、全量 `flutter test` 528 项通过。边界：仅首字母、多音字取主
+     读音、生僻字只做字面匹配、搜索词不随账号同步。
+129. **ENV-11 主机审批/聊天/托盘中英文布局复核（2026-11-02 完成，协议无变化）**：
+     用回环主机真实触发审批窗、聊天窗与托盘菜单，在
+     `CHAST_UI_LANGUAGE=en|zh` 下逐窗截图复核；主窗、审批窗、聊天窗与
+     托盘菜单均无截断、无重叠。复核发现审批窗“接收目录”只占第二列，
+     默认路径显示为 `C:\Users\...`；已把该行放宽到对话框剩余全宽并重建
+     复测，中英文都完整显示默认 `C:\Users\admin\Downloads\chast`。本机
+     100% 缩放；主机未声明 DPI 感知，150% 下由 Windows 整窗位图缩放、
+     逻辑布局不变，真实高 DPI 重排仍属 ENV-08。证据见
+     `docs/status-2026-10-25.md` §6.52。
+130. **DEV-10 跨子网/中继协助 Wake-on-LAN（2026-11-02 完成，非对齐缺口）**：
+     服务端新增内存唤醒队列与 `POST /v1/hosts/{id}/wake`，注册响应增量
+     携带 `wake` 数组；除目标自身外的在线代理在下一次注册刷新时领取任务。
+     `chast-tunnel host --wake-relay [--wake-targets …]` 默认关闭，开启后
+     在目标所在链路广播 102 字节魔术包；查看器在已登录同一服务器时提供
+     “通过连接服务转发”，保留本地直发。鉴权接受 server-key、账号令牌或
+     开放服务器，非管理员必须能在自己的地址簿或共享地址簿中找到目标；
+     每目标 30 s 冷却、队列上限 64、任务 60 s 过期、按代理去重，审计动作
+     `device_wake`。验证：Go 单测覆盖投递/去重/冷却/鉴权/校验与中继包
+     字节；真实回环由 202 在 3.65 s 后触发代理刷新并收到唯一 102 字节包，
+     匿名 401、坏 MAC 400、未知主机 404、冷却 429；账号路径另以普通账号
+     `viewer` 验证未入簿 403、入簿后 202 并由代理实发 102 字节包；全量
+     `go test ./... -count=1`、`go vet`、`flutter analyze`、全量
+     `flutter test` 531 项通过。证据见 `docs/status-2026-10-25.md` §6.53。
+     边界：队列在内存中，服务端重启丢失；代理只在注册刷新时领取，最坏
+     延迟约为 TTL/2；未在真实网卡/主板上验证开机。
+131. **远程重启完整闭环（2026-11-02 完成，协议 v37）**：新增
+     `RestartRequest`/`RestartResult`（控制消息 52/53，`RestartCode`
+     Ok/Denied/Disabled/Unsupported/Failed，原因上限 256 字节 UTF-8）与
+     `kPermissionRestart = 0x0800`，HelloAck/StreamInfo 的权限掩码与标志位
+     同步下发；`kServerInfoFileTransferOnly` 由 0x0800 移到 0x2000 腾出
+     对齐位，`kProtocolVersion` 升到 37。主机在设置中新增 `restart=` 开关
+     （默认关，旧掩码缺该位时以显式行回填），审批窗、安全对话框与托盘均可
+     切换；请求到达后依次检查会话权限与设置，再经
+     `OpenProcessToken`+`SeShutdownPrivilege`+`InitiateSystemShutdownExW`
+     安排 5 秒后重启（计划内、强制关闭应用），先安排后应答，避免报告一次
+     不会发生的重启；`HostServerConfig::restart_system` 可注入平台回调。
+     查看器 `ViewerEngine` 新增 `RequestRestart()`、权限门控与结果排空，
+     桥接发布 `restartSupported/restartCode/restartError/restartUpdates`，
+     Dart 新增 `ViewerRestartCode` 与 `requestRestart()`；Flutter 特殊键
+     菜单新增“远程重启”，确认对话框后发送，成功提示约 5 秒后断线，失败按
+     代码给出中英文原因。验证：`test_restart` 覆盖往返/尾随字节/未知码/
+     原因截断/坏 UTF-8，HelloAck 往返新增 restart 位；主机设置测试覆盖旧
+     掩码默认关、`restart=1` 回填与 `restart=0` 撤销；新增
+     `chast-quic verify --restart` 回环（注入假回调，绝不重启本机）断言
+     主机应答 Ok 且只计 1 次请求，另一台未授权的探针主机必须不出现在
+     HelloAck 且请求在查看器本地以 PermissionDenied 拒绝、视频不断流，
+     ctest `quic_restart` 通过；Release 全目标构建、`protocol`/
+     `host_settings` ctest、`flutter analyze` 与 531 项 Flutter 测试通过。
+     边界：回环只证明请求/应答与权限闸门，真实
+     `InitiateSystemShutdownExW` 与“5 秒后确实重启”需在真机验收；服务
+     模式下的关机权限随 worker 令牌而定，不保证具备。
+132. **主机空闲自动断开（2026-11-02 完成，协议无变化，P2-115）**：主机设置
+     新增 `auto_disconnect_minutes`（0 关闭，默认 0，上限 10080 分钟），
+     安全设置在“高级”页新增分钟输入框，保存时校验 0..10080 并对越界值
+     报错；托管/托盘/服务共用同一份设置。会话侧在输入、聊天、剪贴板、
+     文本注入、切屏/显示模式/串流偏好请求、隐私模式、SAS、重启与端口
+     转发请求到达时重置计时；仅文件会话以传输完成/失败/取消作为活动
+     信号，终端字节与文件浏览不计。超时后主机记录 `idle_disconnects`、
+     写 `idle: no viewer activity for N s; closing the session` 并正常
+     结束会话；`HostServerConfig::auto_disconnect_ms` 是回环测试用的
+     毫秒覆盖，不进入设置文件。验证：主机设置测试覆盖默认关闭、30 分钟
+     往返、10080 上限、越界/非数字回退与告警；`chast-quic verify
+     --idle-disconnect` 以 2 s 测试超时证明连续输入可跨两个超时窗口保住
+     会话，静默后主机自行断开且 `idle_disconnects == 1`，另一台未设超时
+     的主机保持同一静默会话；ctest `quic_idle_disconnect` 通过（43.04 s），
+     Release 构建与 `host_settings`/`host_i18n` 测试通过。边界：分钟粒度，
+     查看器看到的是普通断开提示而非专门原因；只统计查看器侧交互，主机
+     本机键鼠不算；文件浏览不续期。
+133. **`chast://` 深链接（2026-11-02 完成，协议无变化，P2-116）**：新增
+     `app/lib/deep_link.dart` 纯解析器，支持 `chast://<id>`、
+     `chast://<host>:<port>`（含 IPv6 字面量）、
+     `chast://connection/new/<id>` 与 `chast://file-transfer/new/<id>`；
+     查询串与片段忽略，模式名大小写不敏感，主机 ID 保持大小写；裸 ID、
+     缺 ID、多余路径段与其他 scheme 一律拒绝，不做猜测。Windows runner
+     已把命令行经 `set_dart_entrypoint_arguments` 交给 Dart，`main` 用
+     `parseLaunchArguments` 识别深链接并保留 `--connect`/`--connect=`
+     两种旧写法；`HomePage` 接到初始目标后自动连接，文件传输链接以
+     `initialFileTransferOnly` 直接打开仅文件会话。安装器
+     `chast-setup` 新增 `--protocol`（默认开启）：按用户写
+     `HKCU\Software\Classes\chast`、`--machine` 写 HKLM，默认值
+     `URL:chast Protocol`、空 `URL Protocol`、
+     `DefaultIcon="<exe>,0"`，命令写在 `shell\open\command` **子键**的
+     默认值（`"<exe>" "%1"`，路径带引号）；卸载删除整棵 scheme 键。
+     `Options.ProtocolScheme` 是测试缝，单测用临时 scheme 做真实注册表
+     往返，绝不触碰真实 `chast` 关联。验证：14 项 Dart 解析测试、全量
+     545 项 Flutter 测试与 `flutter analyze` 通过；Go 端
+     `TestProtocolRegistrationRoundtrip`（注册值/子键/无多余根值/卸载
+     清除）、`TestProtocolCommandQuotesPath` 与 `TestProtocolKey`
+     （非法 scheme 拒绝）通过；真机把发布负载装到 `build/deeplink-root`，
+     `reg query` 复核键形后 `Start-Process 'chast://127.0.0.1:45684'`
+     由 Windows Shell 唤起已安装查看器，回环主机记录批准、连接、
+     `capturing display 0` 与 `mfxhw64 (VDENC AVC) 1920x1080` 出流
+     （截图 `build/deeplink-session2.png`）；`--uninstall` 后 scheme 键
+     与安装目录均消失。边界：查看器已在运行时再点链接会开第二个窗口，
+     不做单实例转发；查询参数不参与连接参数；未注册 scheme 时由系统
+     弹出“打开方式”，应用不做兜底。
+134. **查看器设备收藏（2026-11-02 完成，协议无变化，P2-117）**：`Device`
+     新增本地 `favorite` 标记，随 `devices.json` 持久化，
+     `touch`/`save` 与 JSON 往返均保留；不上传账号地址簿。
+     `DeviceStore.setFavorite` 切换标记，最近连接上限不再淘汰收藏项。
+     设备卡片显示星标，菜单提供“收藏/取消收藏”，筛选栏新增“仅看收藏”
+     开关并与搜索/标签叠加；`ViewFilter` 以 `favoritesOnly` 键持久化
+     （关闭即删除键），“全部”只清标签，标题栏“清除筛选”清空全部条件。
+     验证：`flutter analyze` 无问题，全量 549 项 Flutter 测试通过（新增
+     收藏持久化/淘汰保护、筛选持久化与组件测试）；真实 Release 进程使用
+     隔离 APPDATA 启动，确认星标、筛选按钮、`1/3` 过滤结果与
+     `ui-filter.json` 落盘。边界：收藏仅作用于“我的设备”，最近连接卡片
+     无收藏入口，不随账号同步。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
@@ -2991,6 +3217,25 @@
   免驱路径，与虚拟显示器同属驱动签名前置问题。
 - M8.7 的 Windows 安装器（P2-28）与界面多语言（i18n，2026-10-28）均已
   完成，见 `docs/m8-plan.md`；虚拟显示器因驱动前置问题暂不做。
+
+## M10.2 — SOCKS5 代理（已完成，2026-11-02）
+
+- 已完成：服务 HTTP API 与全部 TCP 载体经 `socks5://[user:pass@]host:port`
+  代理（`socks5h://` 等价、远端 DNS），主机设置/托盘与查看器首页均可配置；
+  协议无变化。
+- 设计取舍：QUIC 与 UDP 路径不分流到 SOCKS5（不能承载数据报），带代理时
+  拒绝 `--mode direct` 与无共享载体的主机，保证不会静默直连泄漏。
+- 实现：Go `server/internal/netproxy` 的 `ContextDialer` 接 HTTP 客户端与
+  载体拨号，主机只代理远端一跳；Dart `app/lib/socks5.dart` 实现 RFC
+  1928/1929 握手并接管 `HttpClient.connectionFactory`，https 在交接前完成
+  TLS 以免破坏单订阅 Socket。
+- 验证（2026-11-02，单机回环）：独立带认证 SOCKS5 守护进程记录到主机与
+  查看器的 `CONNECT 127.0.0.1:18443` 与 `CONNECT 127.0.0.1:18445`
+  均经代理；查看器 `path=carrier`，主机链路稳定 >100 s；`--mode direct`
+  与不可达代理均失败关闭。Go 全量测试、Flutter 559 项、`ctest -R host_` 通过。
+  真实企业代理/双机与代理断开重连待验收。
+- 已知限制：不实现 UDP ASSOCIATE；代理只覆盖 TCP，直连 NAT 打洞仍由
+  本地 UDP 完成。
 
 ## 推进原则
 

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
+	"github.com/ltpara/ds-chcast/server/internal/wake"
 )
 
 // Version is reported to the server as peer metadata and can be overridden at
@@ -32,6 +34,10 @@ type softwareInfo struct {
 	SHA256    string `json:"sha256"`
 	Size      int64  `json:"size"`
 	Signature string `json:"signature"`
+	// PublisherKeyID and PublisherSignature prove the release came from the
+	// publisher. They are checked when the agent pins a publisher key.
+	PublisherKeyID     string `json:"publisher_key_id"`
+	PublisherSignature string `json:"publisher_sig"`
 }
 
 // updateAvailable mirrors RustDesk's SoftwareUpdate check: the server only
@@ -45,18 +51,41 @@ type apiClient struct {
 	base      string
 	serverKey string
 	http      *http.Client
+	// proxy is the operator's SOCKS5 endpoint, nil for a direct connection.
+	// Requests reach the API through it; keepalives and lookups share it.
+	proxy *netproxy.Proxy
+	// trace is the traceparent of the last response that carried one. The
+	// viewer forwards it over the data plane so server-side punch and relay
+	// spans stay in the lookup trace.
+	trace string
 }
 
-func newAPIClient(base, serverKey string, tlsConfig *tls.Config) *apiClient {
-	client := &http.Client{Timeout: 5 * time.Second}
-	if tlsConfig != nil {
-		client.Transport = &http.Transport{TLSClientConfig: tlsConfig.Clone()}
-	}
+func newAPIClient(base, serverKey string, tlsConfig *tls.Config, socks *netproxy.Proxy) *apiClient {
 	return &apiClient{
 		base:      strings.TrimRight(base, "/"),
 		serverKey: serverKey,
-		http:      client,
+		http:      newHTTPClient(5*time.Second, tlsConfig, socks),
+		proxy:     socks,
 	}
+}
+
+// newHTTPClient builds a client for one outbound HTTP purpose. A SOCKS5
+// proxy replaces the transport dialer; TLS settings still apply inside the
+// tunnel, so an HTTPS API stays end-to-end encrypted.
+func newHTTPClient(timeout time.Duration, tlsConfig *tls.Config, socks *netproxy.Proxy) *http.Client {
+	client := &http.Client{Timeout: timeout}
+	if tlsConfig == nil && socks == nil {
+		return client
+	}
+	transport := &http.Transport{}
+	if tlsConfig != nil {
+		transport.TLSClientConfig = tlsConfig.Clone()
+	}
+	if socks != nil {
+		transport.DialContext = socks.DialContext
+	}
+	client.Transport = transport
+	return client
 }
 
 // setBase points the client at another rendezvous server after a failover.
@@ -72,6 +101,15 @@ func (c *apiClient) endpoint() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.base
+}
+
+func (c *apiClient) traceparent() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.trace
 }
 
 type registerResult struct {
@@ -91,6 +129,9 @@ type registerResult struct {
 	Software          *softwareInfo `json:"software"`
 	ConfigSerial      int64         `json:"config_serial"`
 	RendezvousServers []string      `json:"rendezvous_servers"`
+	// Wake carries cross-subnet Wake-on-LAN jobs queued since the previous
+	// registration. Only agents started with the relay enabled act on them.
+	Wake []wake.Job `json:"wake"`
 }
 
 type lookupResult struct {
@@ -130,15 +171,20 @@ type apiError struct {
 func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
 	timestamp := time.Now().Unix()
 	hostname, _ := os.Hostname()
+	platform := runtime.GOOS + "/" + runtime.GOARCH
 	body := map[string]any{
 		"id":          id,
 		"public_key":  identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey)),
 		"fingerprint": fingerprint,
 		"hostname":    hostname,
-		"platform":    runtime.GOOS + "/" + runtime.GOARCH,
+		"platform":    platform,
 		"version":     Version,
 		"timestamp":   timestamp,
 		"signature":   identity.Sign(privateKey, identity.RegisterMessage(id, fingerprint, timestamp)),
+		// The metadata proof lets the server trust the display fields even
+		// when registration crosses an untrusted link.
+		"metadata_sig": identity.Sign(privateKey,
+			identity.HostMetadataMessage(id, hostname, platform, Version, timestamp)),
 	}
 	if oldID != "" {
 		body["old_id"] = oldID
@@ -188,6 +234,11 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
+	if traceparent := resp.Header.Get("traceparent"); traceparent != "" {
+		c.mu.Lock()
+		c.trace = traceparent
+		c.mu.Unlock()
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("%s %s: read reply: %w", method, path, err)

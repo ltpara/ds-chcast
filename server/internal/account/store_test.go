@@ -2220,11 +2220,11 @@ func TestConnectionReportsMergeByAuditRef(t *testing.T) {
 		t.Fatalf("host row = %+v", host)
 	}
 
-	report := func() (ConnectionEvent, error) {
+	report := func(location, route string) (ConnectionEvent, error) {
 		return store.RecordConnection(alice.ID, "alice", "viewerbox", connectionViewer,
-			"127.0.0.1", ref, at, at.Add(2*time.Minute), true, "")
+			"127.0.0.1", ref, location, route, at, at.Add(2*time.Minute), true, "")
 	}
-	merged, err := report()
+	merged, err := report("Tokyo, JP", "relay")
 	if err != nil {
 		t.Fatalf("viewer report: %v", err)
 	}
@@ -2233,12 +2233,17 @@ func TestConnectionReportsMergeByAuditRef(t *testing.T) {
 		merged.PeerID != "viewerbox" || merged.Direction != connectionViewer {
 		t.Fatalf("merged row = %+v", merged)
 	}
+	if merged.Location != "Tokyo, JP" || merged.Route != "relay" {
+		t.Fatalf("merged location/route = %+v", merged)
+	}
 	if !merged.EndedAt.Equal(at.Add(2 * time.Minute)) {
 		t.Fatalf("merged window = %v", merged)
 	}
 
-	// A retry from either side must not pretend the other one reported twice.
-	if repeat, err := report(); err != nil || repeat.Source != connectionBoth {
+	// A retry from either side must not pretend the other one reported twice,
+	// and a report without a location must not erase the one already stored.
+	if repeat, err := report("", ""); err != nil || repeat.Source != connectionBoth ||
+		repeat.Location != "Tokyo, JP" || repeat.Route != "relay" {
 		t.Fatalf("repeated viewer report = %+v, %v", repeat, err)
 	}
 	if repeat, err := store.RecordHostConnection("audithost", ref,

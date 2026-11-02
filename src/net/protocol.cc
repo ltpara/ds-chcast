@@ -802,6 +802,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.terminal_enabled ? kServerInfoTerminalEnabled : 0) |
                         (info.record_enabled ? kServerInfoRecordEnabled : 0) |
                         (info.camera_enabled ? kServerInfoCameraEnabled : 0) |
+                        (info.restart_enabled ? kServerInfoRestartEnabled : 0) |
                         (info.merged ? kServerInfoMergedLayout : 0) |
                         (info.files_only ? kServerInfoFileTransferOnly : 0) |
                         (info.audio_datagram && info.audio.enabled ? kServerInfoAudioDatagram : 0)));
@@ -864,6 +865,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     if (info.camera_enabled) {
         permissions |= kPermissionCamera;
+    }
+    if (info.restart_enabled) {
+        permissions |= kPermissionRestart;
     }
     put_u16(cursor, permissions);
     return payload;
@@ -1115,6 +1119,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.terminal_enabled = (permissions & kPermissionTerminal) != 0;
     info.record_enabled = (permissions & kPermissionRecord) != 0;
     info.camera_enabled = (permissions & kPermissionCamera) != 0;
+    info.restart_enabled = (permissions & kPermissionRestart) != 0;
     return true;
 }
 
@@ -2575,6 +2580,56 @@ bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
         return false;
     }
     code = static_cast<SasCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_restart_request() {
+    return make_control(ControlType::RestartRequest, {});
+}
+
+bool parse_restart_request(const std::vector<uint8_t>& payload, std::string* error) {
+    if (!payload.empty()) {
+        set_error(error, "RestartRequest must carry no payload");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_restart_result(RestartCode code, const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxRestartReason);
+    std::vector<uint8_t> payload(3 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::RestartResult, payload);
+}
+
+bool parse_restart_result(const std::vector<uint8_t>& payload, RestartCode& code,
+                          std::string& reason, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed RestartResult");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(RestartCode::Failed)) {
+        set_error(error, "unknown restart result code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxRestartReason) {
+        set_error(error, "RestartResult reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "RestartResult carries a malformed reason");
+        return false;
+    }
+    code = static_cast<RestartCode>(raw_code);
     return true;
 }
 

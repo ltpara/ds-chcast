@@ -108,6 +108,10 @@ class TunnelAgent {
     required int size,
     required String signature,
     required String serverPublicKey,
+    String publisherKeyId = '',
+    String publisherSignature = '',
+    String publisherPublicKey = '',
+    String socks5 = '',
     String? executable,
   }) async {
     if (!Platform.isWindows) {
@@ -128,8 +132,21 @@ class TunnelAgent {
         '$size',
         '--signature',
         signature,
+        if (publisherKeyId.isNotEmpty) ...<String>[
+          '--publisher-key-id',
+          publisherKeyId,
+        ],
+        if (publisherSignature.isNotEmpty) ...<String>[
+          '--publisher-signature',
+          publisherSignature,
+        ],
+        if (publisherPublicKey.isNotEmpty) ...<String>[
+          '--publisher-pubkey',
+          publisherPublicKey,
+        ],
         '--server-pubkey',
         serverPublicKey,
+        if (socks5.isNotEmpty) ...<String>['--socks5', socks5],
         '--target',
         Platform.resolvedExecutable,
         '--wait-pid',
@@ -140,6 +157,39 @@ class TunnelAgent {
       mode: ProcessStartMode.detached,
     );
   }
+
+  /// Publisher key pinned for this installation through the environment. An
+  /// empty value keeps the server-only signature check.
+  static String get publisherPin {
+    final String? value = Platform.environment['CHAST_PUBLISHER_PUBKEY'];
+    return value == null ? '' : value.trim();
+  }
+
+  /// Confirms a pending in-place update once the new viewer has rendered its
+  /// first frame. Any failure is ignored: the updater watchdog restores the
+  /// previous image when the marker never arrives.
+  static Future<void> confirmUpdate() async {
+    if (!Platform.isWindows) {
+      return;
+    }
+    final String target = Platform.resolvedExecutable;
+    try {
+      if (!await File(updaterStatePath(target)).exists()) {
+        return;
+      }
+      await Process.start(
+        defaultExecutable(),
+        <String>['confirm-update', '--target', target],
+        mode: ProcessStartMode.detached,
+      );
+    } catch (_) {
+      // The watchdog handles a missing or unusable helper.
+    }
+  }
+
+  /// Sidecar that `apply-update` writes next to the replaced binary.
+  static String updaterStatePath(String target) =>
+      '$target.chast-update.json';
 
   static String defaultExecutable() {
     final String? override = Platform.environment['CHAST_TUNNEL'];
@@ -162,6 +212,7 @@ class TunnelAgent {
     required TunnelMode mode,
     String key = '',
     String serverPublicKey = '',
+    String socks5 = '',
   }) {
     return <String>[
       'viewer',
@@ -178,6 +229,7 @@ class TunnelAgent {
         '--server-pubkey',
         serverPublicKey,
       ],
+      if (socks5.isNotEmpty) ...<String>['--socks5', socks5],
     ];
   }
 
@@ -202,6 +254,7 @@ class TunnelAgent {
           mode: server.mode,
           key: server.key,
           serverPublicKey: serverPublicKey,
+          socks5: server.socks5,
         );
     final Process process;
     try {

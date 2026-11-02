@@ -2,6 +2,7 @@ package identity
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -58,6 +59,33 @@ func TestMigrateSignatureBindsBothIDs(t *testing.T) {
 	}
 	if Verify(pub, RegisterMessage("newbox", "", 1700000000), sig) {
 		t.Fatal("migration signature doubled as a registration proof")
+	}
+}
+
+func TestHostMetadataSignatureBindsReportedFields(t *testing.T) {
+	priv := PrivateKeyFromSecret("host-secret")
+	pub := priv.Public().(ed25519.PublicKey)
+	sig := Sign(priv, HostMetadataMessage("devbox", "STUDIO-PC", "windows/amd64", "0.36.0", 1700000000))
+	if !Verify(pub, HostMetadataMessage("devbox", "STUDIO-PC", "windows/amd64", "0.36.0", 1700000000), sig) {
+		t.Fatal("valid metadata signature rejected")
+	}
+	for name, tampered := range map[string][]byte{
+		"hostname":  HostMetadataMessage("devbox", "ATTACKER", "windows/amd64", "0.36.0", 1700000000),
+		"platform":  HostMetadataMessage("devbox", "STUDIO-PC", "linux/amd64", "0.36.0", 1700000000),
+		"version":   HostMetadataMessage("devbox", "STUDIO-PC", "windows/amd64", "9.9.9", 1700000000),
+		"id":        HostMetadataMessage("otherbox", "STUDIO-PC", "windows/amd64", "0.36.0", 1700000000),
+		"timestamp": HostMetadataMessage("devbox", "STUDIO-PC", "windows/amd64", "0.36.0", 1700000001),
+	} {
+		if Verify(pub, tampered, sig) {
+			t.Fatalf("metadata signature accepted after tampering with %s", name)
+		}
+	}
+	if Verify(pub, RegisterMessage("devbox", "", 1700000000), sig) {
+		t.Fatal("metadata signature doubled as a registration proof")
+	}
+	if Verify(pub, HostMetadataMessage("devbox", "STUDIO-PC", "windows/amd64", "0.36.0", 1700000000),
+		Sign(priv, RegisterMessage("devbox", "", 1700000000))) {
+		t.Fatal("registration signature verified under the metadata domain")
 	}
 }
 
@@ -127,6 +155,30 @@ func TestSoftwareSignature(t *testing.T) {
 	var missing *Server
 	if _, err := missing.SignSoftware("2.1.0", "https://example.com/x", "ab12", 1); err == nil {
 		t.Fatal("nil identity signed a notice")
+	}
+}
+
+func TestPublisherSignatureIsDomainSeparated(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubText := PublicKeyText(pub)
+	if got := PublisherKeyID(pubText); len(got) != 16 {
+		t.Fatalf("PublisherKeyID = %q, want 16 hex characters", got)
+	}
+	if PublisherKeyID("not a key") != "" {
+		t.Fatal("PublisherKeyID accepted an invalid key")
+	}
+	sig := Sign(priv, PublisherMessage("2.1.0", "https://example.com/chast-2.1.0.exe", "ab12", 4096))
+	if !Verify(pub, PublisherMessage("2.1.0", "https://example.com/chast-2.1.0.exe", "ab12", 4096), sig) {
+		t.Fatal("publisher signature did not verify")
+	}
+	if Verify(pub, SoftwareMessage("2.1.0", "https://example.com/chast-2.1.0.exe", "ab12", 4096), sig) {
+		t.Fatal("publisher signature verified under the server domain")
+	}
+	if Verify(pub, PublisherMessage("2.1.1", "https://example.com/chast-2.1.0.exe", "ab12", 4096), sig) {
+		t.Fatal("publisher signature did not bind the version")
 	}
 }
 

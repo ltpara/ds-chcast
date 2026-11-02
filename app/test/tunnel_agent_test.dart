@@ -115,6 +115,27 @@ void main() {
         'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
       ],
     );
+    expect(
+      TunnelAgent.arguments(
+        server: 'https://chast.example',
+        hostId: 'devbox',
+        mode: TunnelMode.auto,
+        socks5: 'socks5://127.0.0.1:9050',
+      ),
+      <String>[
+        'viewer',
+        '--server',
+        'https://chast.example',
+        '--id',
+        'devbox',
+        '--listen',
+        '127.0.0.1:0',
+        '--mode',
+        'auto',
+        '--socks5',
+        'socks5://127.0.0.1:9050',
+      ],
+    );
   });
 
   test('a missing executable is reported as a tunnel failure', () async {

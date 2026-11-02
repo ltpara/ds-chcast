@@ -102,6 +102,19 @@ enum class FilePhase {
     kFailed = 5,
 };
 
+// One file transfer that reached an end, journaled for the audit report. The
+// page drains entries by seq so one poll can span several files without
+// collapsing them into a count; the journal only keeps the newest entries and
+// `file_audit_first_seq` says where the retained window starts.
+struct FileAuditEntry {
+    uint64_t seq = 0;
+    bool download = false;
+    std::string name;
+    uint64_t size = 0;
+    bool success = false;
+    std::string detail;
+};
+
 // One remote console's life on the viewer. Requesting covers the round trip
 // from OpenTerminal() to the host's answer; Ended means the host stopped the
 // console (its code and reason are in the status) and every byte it printed
@@ -253,6 +266,15 @@ struct ViewerStatus {
     // Downloads the viewer stopped through CancelDownload(); counted apart
     // from receive failures so the page can word a user cancel as cancelled.
     uint64_t download_cancels = 0;
+    // Finished transfers this session, one entry per file, newest last. The
+    // page reports each new seq with the session's audit_ref; counters above
+    // stay for the UI, where a batch still reads as one line. A long session
+    // keeps only the newest entries: `file_audit_first_seq` is the oldest seq
+    // still listed (0 until an entry was dropped) and `file_audit_dropped`
+    // counts everything ever dropped, so the page can notice a gap.
+    std::vector<FileAuditEntry> file_audit;
+    uint64_t file_audit_first_seq = 0;
+    uint64_t file_audit_dropped = 0;
     // True while the transfer belongs to an ordinary single-file request. A
     // folder walk has CancelDirectoryDownload() and clipboard transfers follow
     // the clipboard permission, so CancelDownload() only acts when this is set.
@@ -399,6 +421,14 @@ struct ViewerStatus {
     int sas_code = 0;
     std::string sas_error;
     uint64_t sas_updates = 0;
+    // Remote reboot. `restart_supported` mirrors the host's permission;
+    // `restart_code` is the answer to the last request (0 = Ok, meaning the
+    // reboot was scheduled and the machine will drop the session shortly) and
+    // `restart_updates` pairs that answer with a poll.
+    bool restart_supported = false;
+    int restart_code = 0;
+    std::string restart_error;
+    uint64_t restart_updates = 0;
     // Session chat. Both directions are ungated once the host admits the
     // viewer. `chat_error` explains a queued line that the transport then
     // failed to send; inbound text is taken through TakeChat() so the status
@@ -794,6 +824,11 @@ public:
     // through ViewerStatus::sas_code/sas_error/sas_updates; a newer request
     // replaces one that has not been sent yet.
     bool SendSas();
+    // Queues one reboot request. Returns false when no session is streaming or
+    // the host did not grant kPermissionRestart. The answer arrives through
+    // ViewerStatus::restart_code/restart_error/restart_updates; Ok means the
+    // reboot is scheduled and the session is about to drop with the machine.
+    bool RequestRestart();
 
     // Queues one UTF-8 chat line for the host. Returns false for empty or
     // oversized text, when no session is streaming, or when the outgoing queue
@@ -924,6 +959,8 @@ private:
     // SAS is an action, not a state: one pending request is enough, and a
     // second tap replaces an unsent one instead of queueing a burst.
     std::atomic<bool> pending_sas_{false};
+    // Same reasoning for the reboot request.
+    std::atomic<bool> pending_restart_{false};
 
     // The port-forward target crosses to the session thread here. One slot is
     // enough: the operator picks a target, and a newer pick replaces an

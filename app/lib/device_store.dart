@@ -21,6 +21,7 @@ class Device {
     this.tagsCleared = false,
     this.groupCleared = false,
     this.saved = false,
+    this.favorite = false,
     this.mac = '',
     this.revision = 0,
     this.lastUsed,
@@ -56,6 +57,10 @@ class Device {
   final bool groupCleared;
   final bool saved;
 
+  /// Local favorite marker. It is a preference of this viewer, so it is never
+  /// uploaded to the account address book and another viewer keeps its own.
+  final bool favorite;
+
   /// Server revision of the address-book row this entry was last synced from.
   /// Zero means unknown, so the next upload omits the concurrency token.
   final int revision;
@@ -90,6 +95,7 @@ class Device {
     bool? tagsCleared,
     bool? groupCleared,
     bool? saved,
+    bool? favorite,
     String? mac,
     int? revision,
     DateTime? lastUsed,
@@ -105,6 +111,7 @@ class Device {
       tagsCleared: tagsCleared ?? this.tagsCleared,
       groupCleared: groupCleared ?? this.groupCleared,
       saved: saved ?? this.saved,
+      favorite: favorite ?? this.favorite,
       mac: mac ?? this.mac,
       revision: revision ?? this.revision,
       lastUsed: lastUsed ?? this.lastUsed,
@@ -122,6 +129,7 @@ class Device {
     'tagsCleared': tagsCleared,
     'groupCleared': groupCleared,
     'saved': saved,
+    'favorite': favorite,
     'mac': mac,
     'revision': revision,
     'lastUsed': lastUsed?.millisecondsSinceEpoch,
@@ -186,6 +194,7 @@ class Device {
       tagsCleared: value['tagsCleared'] == true,
       groupCleared: value['groupCleared'] == true,
       saved: value['saved'] == true,
+      favorite: value['favorite'] == true,
       mac: normalizeMac(value['mac']?.toString() ?? '') ?? '',
       revision: rawRevision is num && rawRevision >= 0
           ? rawRevision.toInt()
@@ -336,6 +345,7 @@ class DeviceStore {
         tagsCleared: tags.isEmpty ? old.tagsCleared : false,
         groupCleared: old.groupCleared,
         saved: old.saved || device.saved,
+        favorite: old.favorite,
         mac: device.mac.isNotEmpty ? device.mac : old.mac,
         revision: old.revision,
         lastUsed: now,
@@ -349,6 +359,7 @@ class DeviceStore {
           server: device.server,
           tags: Device.cleanTags(device.tags),
           saved: false,
+          favorite: device.favorite,
           mac: device.mac,
           lastUsed: now,
           addedAt: now,
@@ -383,6 +394,7 @@ class DeviceStore {
         tagsCleared: tags.isEmpty ? old.tagsCleared : false,
         groupCleared: groupId.isEmpty ? old.groupCleared : false,
         saved: true,
+        favorite: old.favorite,
         mac: device.mac.isNotEmpty ? device.mac : old.mac,
         revision: old.revision,
         lastUsed: old.lastUsed,
@@ -397,6 +409,7 @@ class DeviceStore {
           tags: Device.cleanTags(device.tags),
           groupId: device.groupId.trim(),
           saved: true,
+          favorite: device.favorite,
           mac: device.mac,
           revision: device.revision,
           addedAt: now,
@@ -430,6 +443,17 @@ class DeviceStore {
     final int index = devices.indexWhere((Device item) => item.key == key);
     if (index >= 0) {
       devices[index] = devices[index].copyWith(mac: normalizeMac(mac) ?? '');
+    }
+    return _save(devices);
+  }
+
+  /// Toggles this viewer's favorite marker. The flag never leaves this
+  /// machine; the account address book has no favorite field.
+  Future<List<Device>> setFavorite(String key, bool favorite) async {
+    final List<Device> devices = await load();
+    final int index = devices.indexWhere((Device item) => item.key == key);
+    if (index >= 0) {
+      devices[index] = devices[index].copyWith(favorite: favorite);
     }
     return _save(devices);
   }
@@ -589,9 +613,10 @@ class DeviceStore {
   }
 
   Future<List<Device>> _save(List<Device> devices) async {
-    // Only recent entries are capped; the address book is user-managed.
+    // Only recent entries are capped; the address book is user-managed and a
+    // favorite must survive the cap even if it was never saved.
     final List<Device> recent =
-        devices.where((Device item) => !item.saved).toList()
+        devices.where((Device item) => !item.saved && !item.favorite).toList()
           ..sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
     if (recent.length > maxRecent) {
       final Set<String> drop = recent

@@ -117,6 +117,12 @@ func platformInstall(opts Options, payloadBytes int64) error {
 		}
 		opts.logf("created the Start Menu shortcut")
 	}
+	if opts.Protocol {
+		if err := registerProtocol(opts); err != nil {
+			return err
+		}
+		opts.logf("registered the chast:// URL scheme")
+	}
 	return nil
 }
 
@@ -132,6 +138,9 @@ func platformUninstall(opts Options) error {
 		}
 	}
 	removeShortcut(opts)
+	if err := removeProtocol(opts); err != nil {
+		return err
+	}
 	key, err := uninstallKey(opts)
 	if err != nil {
 		return err
@@ -198,6 +207,89 @@ func uninstallKey(opts Options) (string, error) {
 		hive = "HKLM"
 	}
 	return hive + `\Software\Microsoft\Windows\CurrentVersion\Uninstall\` + appID, nil
+}
+
+// protocolKey points at the per-user or machine-wide URL scheme entry.
+// ProtocolScheme is a test seam; installations always use "chast".
+func protocolKey(opts Options) (string, error) {
+	scheme := strings.TrimSpace(opts.ProtocolScheme)
+	if scheme == "" {
+		scheme = "chast"
+	}
+	if !validScheme(scheme) {
+		return "", fmt.Errorf("invalid URL scheme %q", scheme)
+	}
+	hive := "HKCU"
+	if opts.Machine {
+		hive = "HKLM"
+	}
+	return hive + `\Software\Classes\` + scheme, nil
+}
+
+func validScheme(scheme string) bool {
+	for i, c := range scheme {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return scheme != ""
+}
+
+// protocolCommand keeps the target quoted so an install path with spaces
+// still resolves, and leaves %1 for the shell to substitute.
+func protocolCommand(root string) string {
+	return fmt.Sprintf("%s %s", quoteForCmd(filepath.Join(root, viewerExe)), quoteForCmd("%1"))
+}
+
+func registerProtocol(opts Options) error {
+	key, err := protocolKey(opts)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(opts.Root, viewerExe)
+	if _, err := os.Stat(target); err != nil {
+		return fmt.Errorf("register the URL scheme: %w", err)
+	}
+	values := []struct{ name, data string }{
+		{"", "URL:chast Protocol"},
+		{"URL Protocol", ""},
+		{"DefaultIcon", target + ",0"},
+	}
+	for _, value := range values {
+		args := []string{"add", key}
+		if value.name == "" {
+			args = append(args, "/ve")
+		} else {
+			args = append(args, "/v", value.name)
+		}
+		args = append(args, "/t", "REG_SZ", "/d", value.data, "/f")
+		if out, err := run("reg.exe", args...); err != nil {
+			return fmt.Errorf("register the URL scheme: %w (%s)", err, firstLine(out))
+		}
+	}
+	commandKey := key + `\shell\open\command`
+	if out, err := run("reg.exe", "add", commandKey, "/ve", "/t", "REG_SZ", "/d",
+		protocolCommand(opts.Root), "/f"); err != nil {
+		return fmt.Errorf("register the URL scheme: %w (%s)", err, firstLine(out))
+	}
+	return nil
+}
+
+func removeProtocol(opts Options) error {
+	key, err := protocolKey(opts)
+	if err != nil {
+		return err
+	}
+	if _, err := run("reg.exe", "query", key); err != nil {
+		return nil
+	}
+	if out, err := run("reg.exe", "delete", key, "/f"); err != nil {
+		return fmt.Errorf("remove the URL scheme: %w (%s)", err, firstLine(out))
+	}
+	return nil
 }
 
 func writeUninstallEntry(opts Options, payloadBytes int64) error {

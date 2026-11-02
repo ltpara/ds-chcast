@@ -130,6 +130,9 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.record_enabled) {
         mask |= kPermissionRecord;
     }
+    if (info.restart_enabled) {
+        mask |= kPermissionRestart;
+    }
     return mask;
 }
 
@@ -610,6 +613,12 @@ struct QuicSession::Impl {
     SasCode sas_code = SasCode::Ok;
     std::string sas_reason;
     uint64_t sas_results_seen = 0;
+    size_t restart_requests_pending = 0;
+    uint64_t restart_requests_seen = 0;
+    bool restart_result_ready = false;
+    RestartCode restart_code = RestartCode::Ok;
+    std::string restart_reason;
+    uint64_t restart_results_seen = 0;
     // Server: the newest SetStreamOptions request. Client: the newest answer,
     // carrying the effective settings even when the request was refused.
     bool stream_options_request_ready = false;
@@ -2967,6 +2976,44 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::RestartRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                if (!parse_restart_request(payload, &error)) {
+                    note_transport_failure("RestartRequest: " + error);
+                    break;
+                }
+                // Like SendSas: the host answers Denied or Disabled itself,
+                // which is more useful than dropping the request here.
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++restart_requests_pending;
+                    ++restart_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::RestartResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                RestartCode code = RestartCode::Failed;
+                std::string reason;
+                if (!parse_restart_result(payload, code, reason, &error)) {
+                    note_transport_failure("RestartResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    restart_code = code;
+                    restart_reason = std::move(reason);
+                    restart_result_ready = true;
+                    ++restart_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::SetStreamOptions: {
                 if (role != Role::Server) {
                     break;
@@ -4025,6 +4072,12 @@ struct QuicSession::Impl {
             sas_code = SasCode::Ok;
             sas_reason.clear();
             sas_results_seen = 0;
+            restart_requests_pending = 0;
+            restart_requests_seen = 0;
+            restart_result_ready = false;
+            restart_code = RestartCode::Ok;
+            restart_reason.clear();
+            restart_results_seen = 0;
             stream_options_request_ready = false;
             stream_options_request = StreamOptions{};
             stream_options_requests_seen = 0;
@@ -4121,6 +4174,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_record) {
             mask |= kPermissionRecord;
+        }
+        if (server_config.allow_restart) {
+            mask |= kPermissionRestart;
         }
         return mask;
     }
@@ -4798,6 +4854,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.terminal_enabled = (granted & kPermissionTerminal) != 0;
     ack.camera_enabled = (granted & kPermissionCamera) != 0;
     ack.record_enabled = (granted & kPermissionRecord) != 0;
+    ack.restart_enabled = (granted & kPermissionRestart) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -4926,6 +4983,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.terminal_enabled = (granted & kPermissionTerminal) != 0;
     update.camera_enabled = (granted & kPermissionCamera) != 0;
     update.record_enabled = (granted & kPermissionRecord) != 0;
+    update.restart_enabled = (granted & kPermissionRestart) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -5205,6 +5263,65 @@ bool QuicSession::take_sas_result(SasCode& code, std::string& reason) {
 uint64_t QuicSession::sas_results() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->sas_results_seen;
+}
+
+bool QuicSession::take_restart_request() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->restart_requests_pending == 0) {
+        return false;
+    }
+    --impl_->restart_requests_pending;
+    return true;
+}
+
+uint64_t QuicSession::restart_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->restart_requests_seen;
+}
+
+Error QuicSession::send_restart_result(RestartCode code, const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_restart_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_restart_result(code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_restart() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_restart is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionRestart) == 0) {
+            return Error(Status::PermissionDenied, "restart is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_restart_request(), QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_restart_result(RestartCode& code, std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->restart_result_ready) {
+        return false;
+    }
+    code = impl_->restart_code;
+    reason = impl_->restart_reason;
+    impl_->restart_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::restart_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->restart_results_seen;
 }
 
 bool QuicSession::take_stream_options_request(StreamOptions& options) {

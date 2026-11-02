@@ -47,7 +47,14 @@ func TestServesConsoleAssets(t *testing.T) {
 	}{
 		{"mount point", "/admin/", "text/html", "chast 管理台"},
 		{"index", "/admin/index.html", "text/html", "<!doctype html>"},
+		{"index metadata column", "/admin/index.html", "text/html", "<th>元数据签名</th>"},
+		{"index access groups", "/admin/index.html", "text/html", `data-tab="groups"`},
+		{"index audit group filter", "/admin/index.html", "text/html", `id="audit-group"`},
 		{"script", "/admin/app.js", "text/javascript", "'use strict'"},
+		{"script metadata status", "/admin/app.js", "text/javascript", "peer.metadata_signed"},
+		{"script access groups", "/admin/app.js", "text/javascript", "/v1/access-groups"},
+		{"script audit location", "/admin/app.js", "text/javascript", "event.location ||"},
+		{"script audit route", "/admin/app.js", "text/javascript", "routeLabel(event.route)"},
 		{"style", "/admin/style.css", "text/css", "--bg"},
 	}
 	for _, tc := range cases {

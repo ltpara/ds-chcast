@@ -39,7 +39,9 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/relayaddr"
 	"github.com/ltpara/ds-chcast/server/internal/relaypool"
 	"github.com/ltpara/ds-chcast/server/internal/software"
+	"github.com/ltpara/ds-chcast/server/internal/sqlitex"
 	"github.com/ltpara/ds-chcast/server/internal/tracing"
+	"github.com/ltpara/ds-chcast/server/internal/wake"
 	"github.com/ltpara/ds-chcast/server/internal/webadmin"
 )
 
@@ -65,6 +67,11 @@ type Config struct {
 	RelayHost string
 	ServerKey string
 	TTL       time.Duration
+	// RequireHostMetadataSig rejects registrations that do not carry a
+	// host-key signature over hostname/platform/version. It is off by default
+	// so agents predating the signature keep registering; a signature that is
+	// present but invalid is always rejected.
+	RequireHostMetadataSig bool
 	// RelayOnly hides direct candidates from lookups, mirroring RustDesk's
 	// ALWAYS_USE_RELAY: viewers can still reach the host through the relay or
 	// the shared carrier, but never punch. The admin console flips it at
@@ -121,6 +128,11 @@ type Config struct {
 	SoftwareSHA256    string
 	SoftwareSize      int64
 	SoftwareSignature string
+	// SoftwarePublisherKeyID and SoftwarePublisherSignature carry the release
+	// publisher's independent proof. They are empty unless the operator
+	// configured --software-publisher-key.
+	SoftwarePublisherKeyID     string
+	SoftwarePublisherSignature string
 	// Accounts backs user login and the per-user address book. Nil means the
 	// server runs without persistent state, so those routes report 503.
 	Accounts *account.Store
@@ -167,6 +179,8 @@ type server struct {
 
 	recoveryMu   sync.Mutex
 	recoveryLast map[string]time.Time
+
+	wake *wake.Broker
 }
 
 // httpDurationBuckets are the Prometheus histogram bounds in seconds. The
@@ -196,6 +210,7 @@ func New(cfg Config) http.Handler {
 		durationCount:   make(map[string]uint64),
 		durationBuckets: make(map[string][]uint64),
 		recoveryLast:    make(map[string]time.Time),
+		wake:            wake.New(wake.DefaultTTL, wake.DefaultCooldown, wake.DefaultMaxJobs),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/hosts", s.register)
@@ -274,6 +289,20 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/file-transfers", s.recordAccountFileTransfer)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
+	mux.HandleFunc("POST /v1/hosts/{id}/wake", s.wakeHost)
+	mux.HandleFunc("GET /v1/access-groups", s.listAccessGroups)
+	mux.HandleFunc("POST /v1/access-groups", s.createAccessGroup)
+	mux.HandleFunc("GET /v1/access-groups/{id}", s.accessGroup)
+	mux.HandleFunc("PATCH /v1/access-groups/{id}", s.updateAccessGroup)
+	mux.HandleFunc("DELETE /v1/access-groups/{id}", s.deleteAccessGroup)
+	mux.HandleFunc("GET /v1/access-groups/{id}/members", s.accessGroupMembers)
+	mux.HandleFunc("PUT /v1/access-groups/{id}/members/{username}", s.setAccessGroupMember)
+	mux.HandleFunc("DELETE /v1/access-groups/{id}/members/{username}", s.removeAccessGroupMember)
+	mux.HandleFunc("GET /v1/access-groups/{id}/devices", s.accessGroupDevices)
+	mux.HandleFunc("POST /v1/access-groups/{id}/devices", s.addAccessGroupDevice)
+	mux.HandleFunc("DELETE /v1/access-groups/{id}/devices/{device}", s.removeAccessGroupDevice)
+	mux.HandleFunc("GET /v1/access-groups/{id}/connections", s.accessGroupConnections)
+	mux.HandleFunc("GET /v1/access-groups/{id}/file-transfers", s.accessGroupFileTransfers)
 	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /v1/accounts", s.adminCreateAccount)
 	mux.HandleFunc("PATCH /v1/accounts/{username}", s.adminUpdateAccount)
@@ -298,6 +327,10 @@ type registerRequest struct {
 	Version     string `json:"version"`
 	Timestamp   int64  `json:"timestamp"`
 	Signature   string `json:"signature"`
+	// MetadataSignature proves the host key signed hostname, platform and
+	// version together with the registration timestamp. It is optional for
+	// compatibility; when present and invalid the registration is rejected.
+	MetadataSignature string `json:"metadata_sig,omitempty"`
 	// OldID asks the server to move a durable identity to ID. It must be
 	// accompanied by MigrateSignature, made with the same host key over both
 	// ids, which proves the caller owns the old record.
@@ -329,6 +362,9 @@ type registerResponse struct {
 	// answering.
 	ConfigSerial      int64    `json:"config_serial,omitempty"`
 	RendezvousServers []string `json:"rendezvous_servers,omitempty"`
+	// Wake carries cross-subnet Wake-on-LAN jobs for this agent to broadcast on
+	// its own link. Agents without the relay enabled ignore the field.
+	Wake []wake.Job `json:"wake,omitempty"`
 }
 
 // softwareInfo mirrors RustDesk's SoftwareUpdate reply: the newest version and
@@ -343,6 +379,11 @@ type softwareInfo struct {
 	SHA256    string `json:"sha256,omitempty"`
 	Size      int64  `json:"size,omitempty"`
 	Signature string `json:"signature,omitempty"`
+	// PublisherKeyID and PublisherSignature prove the release came from the
+	// publisher named by the operator's --software-publisher-key. A client that
+	// pins the same key verifies them in addition to Signature.
+	PublisherKeyID     string `json:"publisher_key_id,omitempty"`
+	PublisherSignature string `json:"publisher_sig,omitempty"`
 }
 
 type lookupResponse struct {
@@ -435,6 +476,18 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "registration signature was not accepted")
 		return
 	}
+	metadataSigned := false
+	if req.MetadataSignature != "" {
+		metadataMsg := identity.HostMetadataMessage(req.ID, req.Hostname, req.Platform, req.Version, req.Timestamp)
+		if !identity.Verify(pub, metadataMsg, req.MetadataSignature) {
+			writeError(w, http.StatusUnauthorized, "host metadata signature was not accepted")
+			return
+		}
+		metadataSigned = true
+	} else if s.cfg.RequireHostMetadataSig {
+		writeError(w, http.StatusUnauthorized, "host metadata signature is required")
+		return
+	}
 	if req.OldID != "" {
 		if !registry.ValidID(req.OldID) {
 			writeError(w, http.StatusBadRequest, "old_id must be 1..64 characters of [A-Za-z0-9_.-]")
@@ -461,14 +514,15 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, err := s.cfg.Registry.Register(registry.RegisterRequest{
-		ID:          req.ID,
-		PublicKey:   req.PublicKey,
-		Fingerprint: req.Fingerprint,
-		Hostname:    req.Hostname,
-		Platform:    req.Platform,
-		Version:     req.Version,
-		TTL:         s.cfg.TTL,
-		OldID:       req.OldID,
+		ID:             req.ID,
+		PublicKey:      req.PublicKey,
+		Fingerprint:    req.Fingerprint,
+		Hostname:       req.Hostname,
+		Platform:       req.Platform,
+		Version:        req.Version,
+		MetadataSigned: metadataSigned,
+		TTL:            s.cfg.TTL,
+		OldID:          req.OldID,
 	})
 	if err != nil {
 		if errors.Is(err, registry.ErrKeyMismatch) {
@@ -512,6 +566,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Software:        s.software(),
 	}
 	resp.ConfigSerial, resp.RendezvousServers = s.rendezvousConfig()
+	resp.Wake = s.wake.PendingFor(req.ID)
 	if binding, err := s.binding(host, now); err == nil {
 		resp.Binding = binding
 	} else {
@@ -865,11 +920,13 @@ func (s *server) software() *softwareInfo {
 		return nil
 	}
 	return &softwareInfo{
-		Version:   s.cfg.SoftwareVersion,
-		URL:       s.cfg.SoftwareURL,
-		SHA256:    s.cfg.SoftwareSHA256,
-		Size:      s.cfg.SoftwareSize,
-		Signature: s.cfg.SoftwareSignature,
+		Version:            s.cfg.SoftwareVersion,
+		URL:                s.cfg.SoftwareURL,
+		SHA256:             s.cfg.SoftwareSHA256,
+		Size:               s.cfg.SoftwareSize,
+		Signature:          s.cfg.SoftwareSignature,
+		PublisherKeyID:     s.cfg.SoftwarePublisherKeyID,
+		PublisherSignature: s.cfg.SoftwarePublisherSignature,
 	}
 }
 
@@ -1106,6 +1163,8 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "# HELP chast_server_info Build information.\n# TYPE chast_server_info gauge\nchast_server_info{version=%q,tls=%q} 1\n",
 		apiVer, strconv.FormatBool(s.cfg.TLS))
 	gauge("chast_uptime_seconds", "Seconds since the API process started.", fmt.Sprintf("%.3f", time.Since(s.started).Seconds()))
+	gauge("chast_trace_queue_depth", "Spans waiting for the OTLP exporter.", s.cfg.Tracer.QueueDepth())
+	counter("chast_trace_spans_dropped_total", "Spans dropped because the export queue was full.", "", s.cfg.Tracer.DroppedSpans())
 	gauge("chast_hosts", "Live host leases.", s.cfg.Registry.Count())
 	gauge("chast_identities", "Permanent ID to public-key bindings.", s.cfg.Registry.IdentityCount())
 	gauge("chast_server_relay_only", "Whether the server hides direct candidates.", boolFloat(s.relayOnly()))
@@ -1167,6 +1226,45 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 		counter("chast_carrier_rejected_total", "Shared carrier handshakes rejected.", "", shared.Rejected)
 		counter("chast_carrier_blocked_total", "Shared carrier viewers refused because the address was blocklisted.", "", shared.Blocked)
 		counterPair("chast_carrier_bytes_total", "Shared carrier bytes.", `direction="to_host"`, shared.ToHostBytes, `direction="to_viewer"`, shared.ToViewerBytes)
+	}
+
+	fmt.Fprintf(&b, "# HELP chast_sqlite_queries_total SQLite statements executed.\n# TYPE chast_sqlite_queries_total counter\n")
+	fmt.Fprintf(&b, "# HELP chast_sqlite_errors_total SQLite statements that returned an error.\n# TYPE chast_sqlite_errors_total counter\n")
+	fmt.Fprintf(&b, "# HELP chast_sqlite_slow_queries_total SQLite statements slower than %s.\n# TYPE chast_sqlite_slow_queries_total counter\n", sqlitex.SlowQuery)
+	fmt.Fprintf(&b, "# HELP chast_sqlite_query_seconds_total Time spent in SQLite statements.\n# TYPE chast_sqlite_query_seconds_total counter\n")
+	fmt.Fprintf(&b, "# HELP chast_sqlite_query_seconds_max Slowest SQLite statement observed.\n# TYPE chast_sqlite_query_seconds_max gauge\n")
+	fmt.Fprintf(&b, "# HELP chast_sqlite_queries_in_flight SQLite statements being executed now.\n# TYPE chast_sqlite_queries_in_flight gauge\n")
+	for _, storeStats := range sqlitex.Snapshot() {
+		for _, op := range storeStats.Ops {
+			labels := fmt.Sprintf(`{store=%q,op=%q}`, storeStats.Store, op.Op)
+			fmt.Fprintf(&b, "chast_sqlite_queries_total%s %d\n", labels, op.Queries)
+			fmt.Fprintf(&b, "chast_sqlite_errors_total%s %d\n", labels, op.Errors)
+			fmt.Fprintf(&b, "chast_sqlite_slow_queries_total%s %d\n", labels, op.Slow)
+			fmt.Fprintf(&b, "chast_sqlite_query_seconds_total%s %.6f\n", labels, op.Seconds)
+			fmt.Fprintf(&b, "chast_sqlite_query_seconds_max%s %.6f\n", labels, op.MaxSeconds)
+		}
+		fmt.Fprintf(&b, "chast_sqlite_queries_in_flight{store=%q} %d\n", storeStats.Store, storeStats.InFlight)
+	}
+
+	fmt.Fprintf(&b, "# HELP chast_sqlite_pool_connections SQLite connection-pool slots by state.\n# TYPE chast_sqlite_pool_connections gauge\n")
+	fmt.Fprintf(&b, "# HELP chast_sqlite_pool_wait_total SQLite statements that had to wait for a connection.\n# TYPE chast_sqlite_pool_wait_total counter\n")
+	fmt.Fprintf(&b, "# HELP chast_sqlite_pool_wait_seconds_total Seconds spent waiting for a SQLite connection.\n# TYPE chast_sqlite_pool_wait_seconds_total counter\n")
+	for _, name := range []string{sqlitex.Registry, sqlitex.Account} {
+		var pool sqlitex.PoolStats
+		switch name {
+		case sqlitex.Registry:
+			pool = s.cfg.Registry.SQLitePoolStats()
+		case sqlitex.Account:
+			if s.cfg.Accounts != nil {
+				pool = s.cfg.Accounts.SQLitePoolStats()
+			}
+		}
+		fmt.Fprintf(&b, "chast_sqlite_pool_connections{store=%q,state=\"open\"} %d\n", name, pool.OpenConnections)
+		fmt.Fprintf(&b, "chast_sqlite_pool_connections{store=%q,state=\"in_use\"} %d\n", name, pool.InUse)
+		fmt.Fprintf(&b, "chast_sqlite_pool_connections{store=%q,state=\"idle\"} %d\n", name, pool.Idle)
+		fmt.Fprintf(&b, "chast_sqlite_pool_connections{store=%q,state=\"max_open\"} %d\n", name, pool.MaxOpenConnections)
+		fmt.Fprintf(&b, "chast_sqlite_pool_wait_total{store=%q} %d\n", name, pool.WaitCount)
+		fmt.Fprintf(&b, "chast_sqlite_pool_wait_seconds_total{store=%q} %.6f\n", name, pool.WaitSeconds)
 	}
 
 	s.mu.Lock()

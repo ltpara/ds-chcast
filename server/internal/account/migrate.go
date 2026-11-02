@@ -11,13 +11,94 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 4
+const accountSchemaVersion = 6
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
 	{Version: 2, Name: "archive checkpoints", Apply: applyArchiveCheckpoints},
 	{Version: 3, Name: "address book nesting", Apply: applyAddressBookNesting},
 	{Version: 4, Name: "recording archive", Apply: applyRecordingArchive},
+	{Version: 5, Name: "access groups", Apply: applyAccessGroups},
+	{Version: 6, Name: "audit location and route", Apply: applyAuditLocationRoute},
+}
+
+// applyAuditLocationRoute adds the resolved login location and the transport
+// route a viewer reported for a session. Both stay empty on host-side rows,
+// which cannot see either, and on records written before this migration.
+// A table may be missing when a fixture recorded the baseline without running
+// it; in that case the baseline creates the columns when it finally applies.
+func applyAuditLocationRoute(db *sql.DB) error {
+	for _, column := range []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{"connection_events", "location", "location TEXT NOT NULL DEFAULT ''"},
+		{"connection_events", "route", "route TEXT NOT NULL DEFAULT ''"},
+		{"file_events", "location", "location TEXT NOT NULL DEFAULT ''"},
+		{"file_events", "route", "route TEXT NOT NULL DEFAULT ''"},
+	} {
+		exists, err := tableExists(db, column.table)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", column.table, err)
+		}
+		if !exists {
+			continue
+		}
+		if err := ensureColumn(db, column.table, column.name, column.ddl); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return nil
+}
+
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+	).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// applyAccessGroups adds the group/member/device tables behind scoped console
+// authorization. They are independent of address-book groups: a device group
+// authorizes audit visibility, while address-book groups only organize peers.
+func applyAccessGroups(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS access_groups (
+			id          TEXT PRIMARY KEY,
+			name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			description TEXT NOT NULL DEFAULT '',
+			max_devices INTEGER NOT NULL DEFAULT 0,
+			max_members INTEGER NOT NULL DEFAULT 0,
+			created_at  INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_group_members (
+			group_id   TEXT NOT NULL REFERENCES access_groups(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role       TEXT NOT NULL DEFAULT 'readonly',
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (group_id, user_id),
+			CHECK (role IN ('readonly', 'write', 'admin'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS access_group_members_user
+			ON access_group_members(user_id)`,
+		`CREATE TABLE IF NOT EXISTS access_group_devices (
+			group_id   TEXT NOT NULL REFERENCES access_groups(id) ON DELETE CASCADE,
+			device_id  TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (group_id, device_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS access_group_devices_device
+			ON access_group_devices(device_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create access groups: %w", err)
+		}
+	}
+	return nil
 }
 
 // applyRecordingArchive adds the metadata side of uploaded viewer recordings.

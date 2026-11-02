@@ -822,3 +822,57 @@ func TestIPv6OnlyHostIsOnline(t *testing.T) {
 		t.Fatal("IPv6-only host reported offline")
 	}
 }
+
+func TestRegisterTracksMetadataSignatureStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{
+		ID: "devbox", PublicKey: pub, Hostname: "STUDIO",
+		MetadataSigned: true, TTL: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, ok := reg.Identity("devbox")
+	if !ok || !record.MetadataSigned {
+		t.Fatalf("identity after signed registration = %+v", record)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok = reopened.Identity("devbox")
+	if !ok || !record.MetadataSigned || record.Hostname != "STUDIO" {
+		t.Fatalf("identity after reload = %+v", record)
+	}
+	// The flag describes the latest report: an unsigned renewal clears it.
+	if _, err := reopened.Register(RegisterRequest{
+		ID: "devbox", PublicKey: pub, TTL: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reopened.Identity("devbox")
+	if record.MetadataSigned {
+		t.Fatalf("unsigned renewal kept the signature status: %+v", record)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	record, _ = again.Identity("devbox")
+	if record.MetadataSigned || record.Hostname != "STUDIO" {
+		t.Fatalf("identity after unsigned reload = %+v", record)
+	}
+}

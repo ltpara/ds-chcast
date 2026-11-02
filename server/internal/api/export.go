@@ -156,7 +156,8 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	export := s.newCSVExport(w, "chast-connections", "connection", []string{
 		"id", "started_at", "ended_at", "duration_ms", "username", "peer_id",
-		"host_id", "audit_ref", "source", "direction", "client_ip", "success", "detail",
+		"host_id", "audit_ref", "source", "direction", "client_ip", "location",
+		"route", "success", "detail",
 	})
 	var before int64
 	for {
@@ -187,6 +188,8 @@ func (s *server) connectionsCSV(w http.ResponseWriter, r *http.Request) {
 				event.Source,
 				event.Direction,
 				event.ClientIP,
+				event.Location,
+				event.Route,
 				strconv.FormatBool(event.Success),
 				event.Detail,
 			})
@@ -207,7 +210,8 @@ func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request) {
 	host := strings.TrimSpace(r.URL.Query().Get("host"))
 	export := s.newCSVExport(w, "chast-file-transfers", "file transfer", []string{
 		"id", "occurred_at", "username", "peer_id", "host_id", "audit_ref",
-		"source", "direction", "name", "size", "files", "client_ip", "success", "detail",
+		"source", "direction", "name", "size", "files", "client_ip", "location",
+		"route", "success", "detail",
 	})
 	var before int64
 	for {
@@ -239,6 +243,8 @@ func (s *server) fileTransfersCSV(w http.ResponseWriter, r *http.Request) {
 				strconv.FormatInt(event.Size, 10),
 				strconv.Itoa(event.Files),
 				event.ClientIP,
+				event.Location,
+				event.Route,
 				strconv.FormatBool(event.Success),
 				event.Detail,
 			})

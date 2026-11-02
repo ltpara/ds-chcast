@@ -4,14 +4,19 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 /// Persists small pieces of address-book UI state so a viewer comes back the
-/// way it was left: the tag filter applied to "我的设备" and the collapsed
-/// state of address-book groups. The search boxes are deliberately not
-/// persisted: a forgotten text query would hide devices with no visible cause.
+/// way it was left: the tag and favorite filters and search text of
+/// "我的设备", the search text of the shared-books dialog, and the collapsed
+/// state of address-book groups. The two search keys are separate so one view
+/// cannot overwrite the other, and the restored text is visible in its search
+/// box.
 class ViewFilter {
   ViewFilter._();
 
   static const String _tagsKey = 'tags';
   static const String _collapsedKey = 'collapsed';
+  static const String _deviceSearchKey = 'deviceSearch';
+  static const String _sharedSearchKey = 'sharedSearch';
+  static const String _favoritesOnlyKey = 'favoritesOnly';
 
   /// Redirects the filter file away from the real user profile in tests.
   @visibleForTesting
@@ -37,6 +42,68 @@ class ViewFilter {
 
   static void saveCollapsed(Iterable<String> groups) {
     _write(_collapsedKey, _clean(groups, dropEmpty: false).toList()..sort());
+  }
+
+  /// Search text of "我的设备". Clearing the box removes the key again.
+  static String loadDeviceSearch() {
+    return _readString(_deviceSearchKey);
+  }
+
+  static void saveDeviceSearch(String query) {
+    _writeString(_deviceSearchKey, query);
+  }
+
+  /// Search text of the shared-books dialog, stored apart from the device
+  /// page so the two views restore independently.
+  static String loadSharedSearch() {
+    return _readString(_sharedSearchKey);
+  }
+
+  static void saveSharedSearch(String query) {
+    _writeString(_sharedSearchKey, query);
+  }
+
+  /// Whether "我的设备" shows favorites only. Off removes the key so the
+  /// default file stays minimal.
+  static bool loadFavoritesOnly() {
+    return _readMap()[_favoritesOnlyKey] == true;
+  }
+
+  static void saveFavoritesOnly(bool enabled) {
+    final File? file = _file();
+    if (file == null) {
+      return;
+    }
+    final Map<String, Object?> payload = _readMap();
+    if (enabled) {
+      payload[_favoritesOnlyKey] = true;
+    } else if (payload.remove(_favoritesOnlyKey) == null) {
+      return;
+    }
+    _persist(file, payload);
+  }
+
+  static String _readString(String key) {
+    final Object? raw = _readMap()[key];
+    return raw is String ? raw.trim() : '';
+  }
+
+  static void _writeString(String key, String value) {
+    final String trimmed = value.trim();
+    final File? file = _file();
+    if (file == null) {
+      return;
+    }
+    final Map<String, Object?> payload = _readMap();
+    if (trimmed.isEmpty) {
+      if (!payload.containsKey(key)) {
+        return;
+      }
+      payload.remove(key);
+    } else {
+      payload[key] = trimmed;
+    }
+    _persist(file, payload);
   }
 
   static Set<String> _clean(Object? raw, {required bool dropEmpty}) {
@@ -74,7 +141,10 @@ class ViewFilter {
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap()..[key] = values;
+    _persist(file, _readMap()..[key] = values);
+  }
+
+  static void _persist(File file, Map<String, Object?> payload) {
     try {
       file.parent.createSync(recursive: true);
       file.writeAsStringSync(jsonEncode(payload));

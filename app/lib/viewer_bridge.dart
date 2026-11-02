@@ -310,6 +310,50 @@ class ViewerAudioOutput {
   }
 }
 
+/// One file transfer that reached an end, as journaled by the viewer engine.
+/// [seq] strictly increases within a session, so the page reports each entry
+/// exactly once; [download] says which direction it went.
+class ViewerFileAuditEntry {
+  const ViewerFileAuditEntry({
+    required this.seq,
+    required this.download,
+    required this.name,
+    required this.size,
+    required this.success,
+    required this.detail,
+  });
+
+  final int seq;
+  final bool download;
+  final String name;
+  final int size;
+  final bool success;
+  final String detail;
+
+  factory ViewerFileAuditEntry.fromMap(Map<Object?, Object?> map) {
+    return ViewerFileAuditEntry(
+      seq: (map['seq'] as num?)?.toInt() ?? 0,
+      download: map['download'] == true,
+      name: map['name']?.toString() ?? '',
+      size: (map['size'] as num?)?.toInt() ?? 0,
+      success: map['success'] == true,
+      detail: map['detail']?.toString() ?? '',
+    );
+  }
+
+  /// Parses the engine's list, dropping entries without a seq so a malformed
+  /// element cannot shadow the rest.
+  static List<ViewerFileAuditEntry> listFrom(Object? value) {
+    if (value is! List<Object?>) {
+      return const <ViewerFileAuditEntry>[];
+    }
+    return <ViewerFileAuditEntry>[
+      for (final Object? item in value)
+        if (item is Map<Object?, Object?>) ViewerFileAuditEntry.fromMap(item),
+    ].where((ViewerFileAuditEntry entry) => entry.seq > 0).toList(growable: false);
+  }
+}
+
 class ViewerStatus {
   const ViewerStatus({
     this.state = ViewerState.idle,
@@ -381,6 +425,9 @@ class ViewerStatus {
     this.filesReceived = 0,
     this.fileReceiveFailures = 0,
     this.downloadCancels = 0,
+    this.fileAudit = const <ViewerFileAuditEntry>[],
+    this.fileAuditFirstSeq = 0,
+    this.fileAuditDropped = 0,
     this.downloadCancellable = false,
     this.fileListAnswers = 0,
     this.fileListDirectory = '',
@@ -463,6 +510,10 @@ class ViewerStatus {
     this.sasCode = 0,
     this.sasError = '',
     this.sasUpdates = 0,
+    this.restartSupported = false,
+    this.restartCode = 0,
+    this.restartError = '',
+    this.restartUpdates = 0,
     this.chatSent = 0,
     this.chatReceived = 0,
     this.chatFailures = 0,
@@ -668,6 +719,16 @@ class ViewerStatus {
   /// as cancelled.
   final int downloadCancels;
 
+  /// Finished transfers journaled by the engine, one entry per file, oldest
+  /// first. The page reports entries whose [ViewerFileAuditEntry.seq] exceeds
+  /// the last one it sent. [fileAuditFirstSeq] is the oldest retained seq once
+  /// the journal dropped older entries (0 before that), and [fileAuditDropped]
+  /// counts every entry ever dropped, so a stalled page can see the gap
+  /// instead of silently losing files.
+  final List<ViewerFileAuditEntry> fileAudit;
+  final int fileAuditFirstSeq;
+  final int fileAuditDropped;
+
   /// Whether the active download is an ordinary single-file request. Folder
   /// walks have their own cancel and clipboard transfers follow the clipboard
   /// permission, so the page offers no cancel action for those.
@@ -846,6 +907,16 @@ class ViewerStatus {
   final String sasError;
   final int sasUpdates;
 
+  /// Remote reboot answers. [restartSupported] mirrors the host's permission;
+  /// [restartCode] is the host's [ViewerRestartCode] (0 = Ok, meaning the
+  /// reboot was scheduled and the machine will drop this session shortly),
+  /// [restartError] its explanation, and [restartUpdates] counts answers so
+  /// the page can pair each one with its poll.
+  final bool restartSupported;
+  final int restartCode;
+  final String restartError;
+  final int restartUpdates;
+
   /// Session chat counters. Both directions are ungated once the host admits
   /// the viewer. [chatFailures] counts queued lines the transport failed to
   /// send, with [chatError] explaining the most recent one. Inbound text is
@@ -1010,6 +1081,8 @@ class ViewerStatus {
       isLive && (permissions & ViewerPermission.portForward) != 0;
   // The terminal panel needs a live session and the host's terminal bit.
   bool get acceptsTerminal => isLive && terminalSupported;
+  // The restart action needs a live session and the host's restart bit.
+  bool get acceptsRestart => isLive && restartSupported;
   // Recording needs a live session and the host's consent bit. A recording
   // already in progress keeps running if the permission is revoked.
   bool get acceptsRecording =>
@@ -1189,6 +1262,9 @@ class ViewerStatus {
       filesReceived: asInt(map['filesReceived']),
       fileReceiveFailures: asInt(map['fileReceiveFailures']),
       downloadCancels: asInt(map['downloadCancels']),
+      fileAudit: ViewerFileAuditEntry.listFrom(map['fileAudit']),
+      fileAuditFirstSeq: asInt(map['fileAuditFirstSeq']),
+      fileAuditDropped: asInt(map['fileAuditDropped']),
       downloadCancellable: map['downloadCancellable'] == true,
       fileListAnswers: asInt(map['fileListAnswers']),
       fileListDirectory: asString(map['fileListDirectory']),
@@ -1271,6 +1347,10 @@ class ViewerStatus {
       sasCode: asInt(map['sasCode']),
       sasError: asString(map['sasError']),
       sasUpdates: asInt(map['sasUpdates']),
+      restartSupported: map['restartSupported'] == true,
+      restartCode: asInt(map['restartCode']),
+      restartError: asString(map['restartError']),
+      restartUpdates: asInt(map['restartUpdates']),
       chatSent: asInt(map['chatSent']),
       chatReceived: asInt(map['chatReceived']),
       chatFailures: asInt(map['chatFailures']),
@@ -1603,6 +1683,16 @@ class ViewerBridge {
   /// [ViewerStatus.sasUpdates].
   static Future<bool> sendSas() async {
     final bool? queued = await _channel.invokeMethod<bool>('sendSas');
+    return queued ?? false;
+  }
+
+  /// Asks the host to reboot itself. False means the request was not queued
+  /// (no live session or the host did not grant restart); the host's answer
+  /// then arrives in [ViewerStatus.restartCode] /
+  /// [ViewerStatus.restartError], counted by [ViewerStatus.restartUpdates].
+  /// Ok means the reboot is scheduled and the session is about to drop.
+  static Future<bool> requestRestart() async {
+    final bool? queued = await _channel.invokeMethod<bool>('requestRestart');
     return queued ?? false;
   }
 
@@ -2214,6 +2304,21 @@ abstract final class ViewerPermission {
   // The host's consent to a local recording of the received stream; advisory,
   // because the host cannot see or stop the recording itself.
   static const int record = 0x0200;
+  // Reboot the host machine; off unless the operator opted in.
+  static const int restart = 0x0800;
+}
+
+/// Why a reboot request did not take effect (chast::RestartCode in
+/// chast/protocol.h). Ok means the restart was scheduled.
+enum ViewerRestartCode {
+  ok(0),
+  denied(1),
+  disabled(2),
+  unsupported(3),
+  failed(4);
+
+  const ViewerRestartCode(this.code);
+  final int code;
 }
 
 /// Why Ctrl+Alt+Del did not reach the host's secure desktop

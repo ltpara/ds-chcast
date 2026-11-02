@@ -218,6 +218,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // once to the signed-in account's server. Handshake failures stay out of
   // this trail because no session existed yet.
   DateTime? _auditStartedAt;
+  // Finished-file journal cursor. The ref ties it to one engine session: a
+  // reconnect starts a fresh journal at seq 1, so the cursor must reset with
+  // it. `_lastFileAuditDropped` notices an overflow between two polls.
+  String _fileAuditRef = '';
+  int _reportedFileAuditSeq = 0;
+  int _lastFileAuditDropped = 0;
 
   bool get _inputActive =>
       _controlEnabled && _status.acceptsInput && _startError == null;
@@ -286,6 +292,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _releaseRemoteInput();
   }
 
+  /// Transport path this session actually used, for the audit record. A
+  /// target without a rendezvous server is always direct; a tunneled session
+  /// reports the path the tunnel settled on, and stays empty while it never
+  /// settled.
+  String get _auditRoute {
+    if (!widget.target.viaServer) {
+      return 'direct';
+    }
+    switch (_tunnel?.path) {
+      case 'direct':
+      case 'relay':
+      case 'carrier':
+        return _tunnel!.path;
+      default:
+        return '';
+    }
+  }
+
   Future<void> _reportFinishedSession(DateTime startedAt, String detail) async {
     final AccountSession? account = widget.account;
     if (account == null || !account.isActiveAt(DateTime.now())) {
@@ -296,13 +320,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         : widget.target.label;
     try {
       await ServerApi.reportConnection(
-        ServerSettings(url: account.server),
+        widget.settings.copyWith(url: account.server),
         account.token,
         peerId: peer,
         startedAt: startedAt,
         endedAt: DateTime.now(),
         detail: detail,
         auditRef: _status.auditRef,
+        route: _auditRoute,
       );
     } catch (_) {
       // Audit delivery must not disturb the session or the returned page.
@@ -313,7 +338,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     String direction,
     String name,
     int size,
-    int files,
     bool success,
     String detail,
   ) async {
@@ -326,19 +350,54 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         : widget.target.label;
     try {
       await ServerApi.reportFileTransfers(
-        ServerSettings(url: account.server),
+        widget.settings.copyWith(url: account.server),
         account.token,
         peerId: peer,
         direction: direction,
         name: name,
         size: size,
-        files: files,
         success: success,
         detail: detail,
         auditRef: _status.auditRef,
+        route: _auditRoute,
       );
     } catch (_) {
       // Audit delivery is best effort, exactly like the session report.
+    }
+  }
+
+  /// Reports each finished file the engine journaled since the last poll.
+  /// One entry is one file, so a poll that spans several completions still
+  /// produces one audit record per file, each with its own outcome.
+  void _reportFileAudit(ViewerStatus status) {
+    if (status.auditRef != _fileAuditRef) {
+      _fileAuditRef = status.auditRef;
+      _reportedFileAuditSeq = 0;
+      _lastFileAuditDropped = 0;
+    }
+    if (status.fileAuditDropped > _lastFileAuditDropped &&
+        status.fileAuditFirstSeq > 0) {
+      // The journal overflowed between polls. Skip the dropped window so a
+      // retained entry cannot be mistaken for one that was never reported.
+      _lastFileAuditDropped = status.fileAuditDropped;
+      if (status.fileAuditFirstSeq - 1 > _reportedFileAuditSeq) {
+        _reportedFileAuditSeq = status.fileAuditFirstSeq - 1;
+      }
+    }
+    for (final ViewerFileAuditEntry entry in status.fileAudit) {
+      if (entry.seq <= _reportedFileAuditSeq) {
+        continue;
+      }
+      _reportedFileAuditSeq = entry.seq;
+      unawaited(
+        _reportFileEvent(
+          entry.download ? 'download' : 'upload',
+          entry.name,
+          entry.size,
+          entry.success,
+          entry.detail,
+        ),
+      );
     }
   }
 
@@ -405,7 +464,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           final DateTime endedAt = DateTime.now();
           final DateTime startedAt = job.startedAt ?? endedAt;
           await ServerApi.uploadRecording(
-            ServerSettings(url: account.server),
+            widget.settings.copyWith(url: account.server),
             account.token,
             file: file,
             name: name,
@@ -526,6 +585,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       url: widget.target.server,
       mode: widget.target.mode,
       key: widget.target.serverKey,
+      socks5: widget.target.socks5,
     );
     _tunnelStarting ??= () async {
       final String serverKey = await _confirmedServerKey(settings);
@@ -876,13 +936,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final bool downloadDone = status.filesReceived > _status.filesReceived;
     final bool downloadFailed =
         status.fileReceiveFailures > _status.fileReceiveFailures;
-    // A poll can swallow several completions, especially for small files.
-    // The audit keeps the count and the last name/size seen in this window.
-    final int uploadsDone = status.filesSent - _status.filesSent;
-    final int uploadsFailed = status.fileFailures - _status.fileFailures;
-    final int downloadsDone = status.filesReceived - _status.filesReceived;
-    final int downloadsFailed =
-        status.fileReceiveFailures - _status.fileReceiveFailures;
     final bool chatArrived = status.chatReceived > _status.chatReceived;
     final bool chatFailed = status.chatFailures > _status.chatFailures;
     if (modeChangeAccepted) {
@@ -1030,54 +1083,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         ),
       );
     }
-    if (uploadsDone > 0) {
-      unawaited(
-        _reportFileEvent(
-          'upload',
-          status.lastFileName,
-          uploadsDone == 1 ? status.fileSize : 0,
-          uploadsDone,
-          true,
-          '',
-        ),
-      );
-    }
-    if (uploadsFailed > 0) {
-      unawaited(
-        _reportFileEvent(
-          'upload',
-          status.lastFileName,
-          0,
-          uploadsFailed,
-          false,
-          status.lastFileError,
-        ),
-      );
-    }
-    if (downloadsDone > 0) {
-      unawaited(
-        _reportFileEvent(
-          'download',
-          status.downloadName,
-          downloadsDone == 1 ? status.downloadSize : 0,
-          downloadsDone,
-          true,
-          '',
-        ),
-      );
-    }
-    if (downloadsFailed > 0) {
-      unawaited(
-        _reportFileEvent(
-          'download',
-          status.downloadName,
-          0,
-          downloadsFailed,
-          false,
-          status.downloadError,
-        ),
-      );
-    }
+    _reportFileAudit(status);
     // A microphone failure stops only the uplink; video and system sound keep
     // running. The counter tells a new failure from the stale reason text.
     if (!nowOver && status.microphoneErrors > _status.microphoneErrors) {
@@ -1128,6 +1134,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
+    }
+    // Every reboot request gets one answer. Ok means the restart is scheduled
+    // and the session will drop with the machine; anything else explains why
+    // nothing happened.
+    if (!nowOver && status.restartUpdates > _status.restartUpdates) {
+      final String reason = status.restartError;
+      final String text;
+      if (status.restartCode == ViewerRestartCode.ok.code) {
+        text = tr('主机已安排重启：约 5 秒后重启，当前会话将断开');
+      } else {
+        final String detail = reason.isEmpty
+            ? _restartCodeText(status.restartCode)
+            : reason;
+        text = tr('重启未执行：{detail}', <String, Object?>{'detail': detail});
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 5)),
       );
     }
     // Screenshots finish on the session thread; the counter pairs the newest
@@ -2927,6 +2951,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   Future<void> _sendSpecialAction(RemoteSpecialAction action) async {
+    if (action == RemoteSpecialAction.restart) {
+      await _requestRestart();
+      return;
+    }
     if (!_inputActive) {
       return;
     }
@@ -2964,7 +2992,66 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       case RemoteSpecialAction.sas:
         return;
+      case RemoteSpecialAction.restart:
+        return;
     }
+  }
+
+  /// Reboot needs an explicit confirmation: it interrupts whoever is at the
+  /// machine, cannot be undone, and ends this session with it.
+  Future<void> _requestRestart() async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        title: Text(tr('远程重启主机？')),
+        content: Text(tr('主机将在约 5 秒后强制重启，未保存的工作会丢失，当前会话也会断开。')),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(tr('取消')),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(tr('重启主机')),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+    bool queued = false;
+    try {
+      queued = await ViewerBridge.requestRestart();
+    } on PlatformException {
+      queued = false;
+    } on MissingPluginException {
+      queued = false;
+    }
+    if (!queued && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('重启请求未能排队：主机未授权或会话已结束')),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+  }
+
+  String _restartCodeText(int code) {
+    if (code == ViewerRestartCode.denied.code) {
+      return tr('主机未授予重启权限');
+    }
+    if (code == ViewerRestartCode.disabled.code) {
+      return tr('主机已在设置中关闭远程重启');
+    }
+    if (code == ViewerRestartCode.unsupported.code) {
+      return tr('主机不支持远程重启');
+    }
+    if (code == ViewerRestartCode.failed.code) {
+      return tr('主机安排重启失败');
+    }
+    return tr('主机未执行重启');
   }
 
   String _sasCodeText(int code) {
@@ -3231,6 +3318,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_changeStreamOptions(maxFps: fps)),
                         onToggleControl: _toggleControl,
                         specialKeysAvailable: _inputActive,
+                        restartAvailable: _status.acceptsRestart,
                         onSpecialAction: (RemoteSpecialAction action) =>
                             unawaited(_sendSpecialAction(action)),
                         onSendText: () => unawaited(_openSendTextDialog()),

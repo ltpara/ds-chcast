@@ -17,6 +17,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 	"github.com/ltpara/ds-chcast/server/internal/upnp"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
@@ -36,6 +37,11 @@ type ViewerConfig struct {
 	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
 	// client certificate for mTLS, or both. Nil uses the system roots.
 	TLS *tls.Config
+	// Socks5 routes the HTTP API and the TCP carrier through a SOCKS5 proxy
+	// (socks5://[user:pass@]host:port). With a proxy the agent refuses UDP
+	// direct and relay paths instead of leaking datagrams around it, so the
+	// host must advertise a shared carrier.
+	Socks5 string
 	// ServerPublicKey pins the rendezvous server identity. When set, lookups
 	// must carry a valid server-signed binding for the host.
 	ServerPublicKey string
@@ -74,6 +80,7 @@ type ViewerAgent struct {
 	cfg     ViewerConfig
 	conn    *net.UDPConn
 	api     *apiClient
+	socks   *netproxy.Proxy
 	servers *serverPool
 	log     *slog.Logger
 
@@ -142,6 +149,10 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 			return nil, fmt.Errorf("--server-pubkey: %w", err)
 		}
 	}
+	socks, err := netproxy.Parse(cfg.Socks5)
+	if err != nil {
+		return nil, fmt.Errorf("--socks5: %w", err)
+	}
 	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
 	if err != nil {
 		return nil, fmt.Errorf("rendezvous servers: %w", err)
@@ -158,7 +169,8 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 	v := &ViewerAgent{
 		cfg:     cfg,
 		conn:    conn,
-		api:     newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS),
+		api:     newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS, socks),
+		socks:   socks,
 		servers: servers,
 		log:     cfg.Logger.With("agent", "viewer", "id", cfg.HostID),
 		ctx:     ctx,
@@ -206,103 +218,125 @@ func StartViewer(parent context.Context, cfg ViewerConfig) (*ViewerAgent, error)
 		v.log.Info("software update available",
 			"version", host.Software.Version, "current", Version, "url", host.Software.URL)
 	}
-	v.punch, err = resolveUDP(host.Punch)
-	if err != nil {
-		conn.Close()
-		cancel()
-		return nil, fmt.Errorf("punch address: %w", err)
-	}
-	// A viewer bound to an IPv6-only socket cannot reach the IPv4 rendezvous
-	// port, so it needs the IPv6 endpoint to ask for a punch at all.
-	if punch6, err := resolveUDP(host.PunchV6); err == nil && punch6 != nil &&
-		familyAllowed(conn.LocalAddr().(*net.UDPAddr).IP, punch6.IP) {
-		v.punch6 = punch6
-	}
-	candidateTexts := append([]string{}, host.Candidates...)
-	if host.Candidate != "" {
-		candidateTexts = append(candidateTexts, host.Candidate)
-	}
-	if host.CandidateV6 != "" {
-		candidateTexts = append(candidateTexts, host.CandidateV6)
-	}
-	candidateTexts = append(candidateTexts, host.LocalAddrs...)
-	candidateTexts = append(candidateTexts, host.LocalAddrsV6...)
-	if mapped := candidateWithUpnpPort(host.Candidate, host.UpnpPort); mapped != "" {
-		candidateTexts = append(candidateTexts, mapped)
-	}
-	v.candidates = mergeCandidates(conn.LocalAddr().(*net.UDPAddr), candidateTexts)
-	if len(v.candidates) > 0 {
-		v.direct = v.candidates[0]
-	}
 	v.natType = host.NATType
 	v.carrier = host.Carrier
 	v.carrierV6 = host.CarrierV6
 	v.carrierToken = host.CarrierToken
 	v.relayOnly = host.RelayOnly
 	v.transport = host.Transport
-	relayTexts := host.Relays
-	if len(relayTexts) == 0 && host.Relay != "" {
-		relayTexts = []string{host.Relay}
-	}
-	v.relay = selectRelayAddr(conn.LocalAddr().(*net.UDPAddr), relayTexts)
-	if v.relay == nil && len(relayTexts) > 0 {
-		conn.Close()
-		cancel()
-		return nil, fmt.Errorf("relay address %q is not reachable from %s", strings.Join(relayTexts, ", "), cfg.ListenAddr)
+	if v.socks == nil {
+		v.punch, err = resolveUDP(host.Punch)
+		if err != nil {
+			conn.Close()
+			cancel()
+			return nil, fmt.Errorf("punch address: %w", err)
+		}
+		// A viewer bound to an IPv6-only socket cannot reach the IPv4
+		// rendezvous port, so it needs the IPv6 endpoint to ask for a punch
+		// at all.
+		if punch6, err := resolveUDP(host.PunchV6); err == nil && punch6 != nil &&
+			familyAllowed(conn.LocalAddr().(*net.UDPAddr).IP, punch6.IP) {
+			v.punch6 = punch6
+		}
+		candidateTexts := append([]string{}, host.Candidates...)
+		if host.Candidate != "" {
+			candidateTexts = append(candidateTexts, host.Candidate)
+		}
+		if host.CandidateV6 != "" {
+			candidateTexts = append(candidateTexts, host.CandidateV6)
+		}
+		candidateTexts = append(candidateTexts, host.LocalAddrs...)
+		candidateTexts = append(candidateTexts, host.LocalAddrsV6...)
+		if mapped := candidateWithUpnpPort(host.Candidate, host.UpnpPort); mapped != "" {
+			candidateTexts = append(candidateTexts, mapped)
+		}
+		v.candidates = mergeCandidates(conn.LocalAddr().(*net.UDPAddr), candidateTexts)
+		if len(v.candidates) > 0 {
+			v.direct = v.candidates[0]
+		}
+		relayTexts := host.Relays
+		if len(relayTexts) == 0 && host.Relay != "" {
+			relayTexts = []string{host.Relay}
+		}
+		v.relay = selectRelayAddr(conn.LocalAddr().(*net.UDPAddr), relayTexts)
+		if v.relay == nil && len(relayTexts) > 0 {
+			conn.Close()
+			cancel()
+			return nil, fmt.Errorf("relay address %q is not reachable from %s", strings.Join(relayTexts, ", "), cfg.ListenAddr)
+		}
+	} else {
+		// UDP cannot cross a SOCKS5 stream proxy. Leaving direct and relay
+		// candidates unset keeps a misconfigured path from leaking datagrams
+		// around the proxy.
+		v.log.Info("SOCKS5 proxy configured; only the TCP carrier is eligible", "proxy", v.socks.Address())
 	}
 	carrierReady := v.carrierToken != "" && len(v.carrierCandidates()) > 0
 	useCarrier := false
 
-	switch cfg.Mode {
-	case ModeCarrier:
-		if !carrierReady {
+	if v.socks != nil {
+		switch {
+		case cfg.Mode == ModeDirect:
 			conn.Close()
 			cancel()
-			return nil, fmt.Errorf("host has no shared carrier address")
+			return nil, fmt.Errorf("socks5 proxy cannot carry UDP direct; use auto or the TCP carrier")
+		case !carrierReady:
+			conn.Close()
+			cancel()
+			return nil, fmt.Errorf("socks5 proxy needs a shared carrier, but the host advertised none")
 		}
 		useCarrier = true
-	case ModeRelay:
-		if host.Transport == "carrier" && carrierReady {
+	} else {
+		switch cfg.Mode {
+		case ModeCarrier:
+			if !carrierReady {
+				conn.Close()
+				cancel()
+				return nil, fmt.Errorf("host has no shared carrier address")
+			}
 			useCarrier = true
-		} else if v.relay != nil {
-			v.remote = v.relay
-			v.latched = true
-		} else if carrierReady {
-			useCarrier = true
-		} else {
-			conn.Close()
-			cancel()
-			return nil, fmt.Errorf("host has no relay or carrier address")
-		}
-	case ModeDirect:
-		if host.RelayOnly {
-			conn.Close()
-			cancel()
-			return nil, fmt.Errorf("server forces relay; direct mode is unavailable")
-		}
-		if v.direct == nil {
-			conn.Close()
-			cancel()
-			return nil, fmt.Errorf("host has no direct candidate")
-		}
-		v.remote = v.direct
-		v.latched = true
-	default:
-		switch {
-		case !host.RelayOnly && v.direct != nil:
+		case ModeRelay:
+			if host.Transport == "carrier" && carrierReady {
+				useCarrier = true
+			} else if v.relay != nil {
+				v.remote = v.relay
+				v.latched = true
+			} else if carrierReady {
+				useCarrier = true
+			} else {
+				conn.Close()
+				cancel()
+				return nil, fmt.Errorf("host has no relay or carrier address")
+			}
+		case ModeDirect:
+			if host.RelayOnly {
+				conn.Close()
+				cancel()
+				return nil, fmt.Errorf("server forces relay; direct mode is unavailable")
+			}
+			if v.direct == nil {
+				conn.Close()
+				cancel()
+				return nil, fmt.Errorf("host has no direct candidate")
+			}
 			v.remote = v.direct
-		case host.Transport == "carrier" && carrierReady:
-			useCarrier = true
-		case v.relay != nil:
-			v.remote = v.relay
 			v.latched = true
-			v.log.Warn("host has no direct candidate; using relay")
-		case carrierReady:
-			useCarrier = true
 		default:
-			conn.Close()
-			cancel()
-			return nil, fmt.Errorf("host has neither a direct, relay nor carrier address")
+			switch {
+			case !host.RelayOnly && v.direct != nil:
+				v.remote = v.direct
+			case host.Transport == "carrier" && carrierReady:
+				useCarrier = true
+			case v.relay != nil:
+				v.remote = v.relay
+				v.latched = true
+				v.log.Warn("host has no direct candidate; using relay")
+			case carrierReady:
+				useCarrier = true
+			default:
+				conn.Close()
+				cancel()
+				return nil, fmt.Errorf("host has neither a direct, relay nor carrier address")
+			}
 		}
 	}
 	v.carrierMode = useCarrier
@@ -425,7 +459,8 @@ func (v *ViewerAgent) sendPunchRequest() {
 	if v.punch == nil && v.punch6 == nil {
 		return
 	}
-	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce, UpnpPort: v.upnpPort}
+	msg := wire.Message{Type: wire.TypePunchRequest, HostID: v.cfg.HostID, Nonce: v.nonce,
+		UpnpPort: v.upnpPort, Traceparent: v.api.traceparent()}
 	if v.cfg.ServerKey != "" {
 		msg.Timestamp = time.Now().Unix()
 		msg.Auth = identity.PunchAuth(v.cfg.ServerKey, v.cfg.HostID, v.nonce, msg.Timestamp)
@@ -459,9 +494,10 @@ func (v *ViewerAgent) relayAuthLoop() {
 		return
 	}
 	msg := wire.Encode(wire.Message{
-		Type:   wire.TypeRelayViewer,
-		HostID: v.cfg.HostID,
-		Token:  v.carrierToken,
+		Type:        wire.TypeRelayViewer,
+		HostID:      v.cfg.HostID,
+		Token:       v.carrierToken,
+		Traceparent: v.api.traceparent(),
 	})
 	for i := 0; i < relayAuthAttempts; i++ {
 		if v.relayAuthOK.Load() {
@@ -556,12 +592,18 @@ func (v *ViewerAgent) carrierLoop() {
 }
 
 func (v *ViewerAgent) runCarrierLink() error {
-	dialer := &net.Dialer{Timeout: viewerCarrierDial}
 	var conn net.Conn
 	var err error
 	endpoint := ""
 	for _, candidate := range v.carrierCandidates() {
-		conn, err = dialer.DialContext(v.ctx, "tcp", candidate)
+		dialCtx, cancel := context.WithTimeout(v.ctx, viewerCarrierDial)
+		if v.socks != nil {
+			conn, err = v.socks.DialContext(dialCtx, "tcp", candidate)
+		} else {
+			dialer := &net.Dialer{}
+			conn, err = dialer.DialContext(dialCtx, "tcp", candidate)
+		}
+		cancel()
 		if err == nil {
 			endpoint = candidate
 			break
@@ -577,7 +619,8 @@ func (v *ViewerAgent) runCarrierLink() error {
 		}
 		return err
 	}
-	hello, err := json.Marshal(carrier.SharedViewerHello{HostID: v.cfg.HostID, Token: v.carrierToken})
+	hello, err := json.Marshal(carrier.SharedViewerHello{HostID: v.cfg.HostID,
+		Token: v.carrierToken, Traceparent: v.api.traceparent()})
 	if err != nil {
 		conn.Close()
 		return err

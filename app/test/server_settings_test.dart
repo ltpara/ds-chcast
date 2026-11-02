@@ -39,14 +39,30 @@ void main() {
       url: 'https://chast.example/',
       mode: TunnelMode.relay,
       key: 'dev-secret',
+      socks5: 'socks5://alice:s3cret@127.0.0.1:1080',
       uploadRecordings: true,
     ));
     final ServerSettings loaded = await store.load();
     expect(loaded.url, 'https://chast.example');
     expect(loaded.mode, TunnelMode.relay);
     expect(loaded.key, 'dev-secret');
+    expect(loaded.socks5, 'socks5://alice:s3cret@127.0.0.1:1080');
     expect(loaded.uploadRecordings, isTrue);
     expect(loaded.configured, isTrue);
+  });
+
+  test('an unusable stored proxy is dropped on load', () async {
+    final Directory dir = await Directory.systemTemp.createTemp('chast-settings-');
+    addTearDown(() => dir.delete(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}server.json');
+    await file.writeAsString(
+      '{"url":"https://chast.example","mode":"auto","key":"",'
+      '"socks5":"http://127.0.0.1:8080","upload_recordings":false}',
+    );
+
+    final ServerSettings loaded = await ServerSettingsStore(file: file).load();
+    expect(loaded.configured, isTrue);
+    expect(loaded.socks5, isEmpty);
   });
 
   test('a corrupt file loads as unconfigured', () async {

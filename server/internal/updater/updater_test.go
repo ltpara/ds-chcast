@@ -3,6 +3,8 @@ package updater
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -106,6 +108,57 @@ func TestVerifyRejectsWrongServerKey(t *testing.T) {
 	}
 	if err := Verify(n, ""); err == nil || !strings.Contains(err.Error(), "pinned server key") {
 		t.Fatalf("Verify without a pin = %v, want a pinned key error", err)
+	}
+}
+
+func TestVerifyPublisher(t *testing.T) {
+	srv, err := identity.GenerateServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("installer bytes")
+	n := signedNotice(t, srv, "2.1.0", "https://downloads.example.com/software/chast-2.1.0.exe", body)
+	pubText := identity.PublicKeyText(pub)
+	n.PublisherKeyID = identity.PublisherKeyID(pubText)
+	n.PublisherSignature = identity.Sign(priv,
+		identity.PublisherMessage(n.Version, n.URL, n.SHA256, n.Size))
+	if err := VerifyPublisher(n, pubText); err != nil {
+		t.Fatalf("VerifyPublisher: %v", err)
+	}
+	if err := VerifyPublisher(n, ""); err != nil {
+		t.Fatalf("empty pin: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Notice)
+		key    string
+		want   string
+	}{
+		{"no publisher signature", func(n *Notice) { n.PublisherSignature = "" }, pubText, "no publisher signature"},
+		{"wrong key", func(n *Notice) {}, srv.PublicKeyText(), "pinned key"},
+		{"key id", func(n *Notice) { n.PublisherKeyID = "0123456789abcdef" }, pubText, "pinned key"},
+		{"version", func(n *Notice) { n.Version = "9.9.9" }, pubText, "signature"},
+		{"url", func(n *Notice) { n.URL = "https://evil.example.com/software/chast-2.1.0.exe" }, pubText, "signature"},
+		{"digest", func(n *Notice) { n.SHA256 = digestOf([]byte("other")) }, pubText, "signature"},
+		{"size", func(n *Notice) { n.Size++ }, pubText, "signature"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := n
+			tc.mutate(&got)
+			err := VerifyPublisher(got, tc.key)
+			if err == nil {
+				t.Fatal("VerifyPublisher accepted a tampered notice")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not mention %q", err, tc.want)
+			}
+		})
 	}
 }
 

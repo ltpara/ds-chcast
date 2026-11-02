@@ -56,6 +56,9 @@ type Message struct {
 	Signature   string `json:"signature,omitempty"`
 	Auth        string `json:"auth,omitempty"`
 	Token       string `json:"token,omitempty"`
+	// Traceparent carries the W3C context the viewer got from the authenticated
+	// lookup, so punch and relay spans join the lookup trace.
+	Traceparent string `json:"traceparent,omitempty"`
 	Timestamp   int64  `json:"timestamp,omitempty"`
 	Relay       string `json:"relay,omitempty"`
 	OK          bool   `json:"ok"`

@@ -23,12 +23,13 @@ type traceAttr struct {
 }
 
 type traceSpan struct {
-	TraceID    string      `json:"traceId"`
-	SpanID     string      `json:"spanId"`
-	Name       string      `json:"name"`
-	Kind       int         `json:"kind"`
-	Attributes []traceAttr `json:"attributes"`
-	Status     struct {
+	TraceID      string      `json:"traceId"`
+	SpanID       string      `json:"spanId"`
+	ParentSpanID string      `json:"parentSpanId"`
+	Name         string      `json:"name"`
+	Kind         int         `json:"kind"`
+	Attributes   []traceAttr `json:"attributes"`
+	Status       struct {
 		Code int `json:"code"`
 	} `json:"status"`
 }

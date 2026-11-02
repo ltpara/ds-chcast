@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:chast_viewer/l10n.dart';
+import 'socks5.dart';
 
 /// How a server-assisted viewer reaches the host. Direct and relay are meant
 /// for troubleshooting and for validating one path at a time; auto is the
@@ -90,11 +91,16 @@ class ServerSettings {
     this.url = '',
     this.mode = TunnelMode.auto,
     this.key = '',
+    this.socks5 = '',
     this.uploadRecordings = false,
   });
 
   final String url;
   final TunnelMode mode;
+
+  /// Normalized `socks5://[user:pass@]host:port` for the service HTTP API and
+  /// TCP carriers; empty means direct. QUIC and UDP paths never use it.
+  final String socks5;
 
   /// Bearer key for the connection service; empty when the service runs
   /// without `--server-key`. The viewer now needs it to resolve a host and to
@@ -111,12 +117,14 @@ class ServerSettings {
     String? url,
     TunnelMode? mode,
     String? key,
+    String? socks5,
     bool? uploadRecordings,
   }) {
     return ServerSettings(
       url: url ?? this.url,
       mode: mode ?? this.mode,
       key: key ?? this.key,
+      socks5: socks5 ?? this.socks5,
       uploadRecordings: uploadRecordings ?? this.uploadRecordings,
     );
   }
@@ -125,6 +133,7 @@ class ServerSettings {
         'url': url,
         'mode': mode.name,
         'key': key,
+        'socks5': socks5,
         'upload_recordings': uploadRecordings,
       };
 
@@ -137,6 +146,8 @@ class ServerSettings {
       url: url,
       mode: TunnelModeName.parse(value['mode']),
       key: value['key']?.toString().trim() ?? '',
+      socks5:
+          Socks5Proxy.normalize(value['socks5']?.toString() ?? '') ?? '',
       uploadRecordings: value['upload_recordings'] == true,
     );
   }

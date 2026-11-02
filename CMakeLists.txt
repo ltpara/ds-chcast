@@ -246,6 +246,7 @@ add_library(chast.host STATIC
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
     src/win/privacy.cc
+    src/win/restart.cc
     src/win/sas.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -510,6 +511,20 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME quic_camera_denied
         COMMAND chast-quic verify --port 45509 --camera-denied --quiet)
     set_tests_properties(quic_camera_denied PROPERTIES TIMEOUT 120)
+    # Remote reboot: the host grants kPermissionRestart and answers Ok through
+    # an injected restart_system callback, so no machine is ever rebooted. A
+    # second host that keeps the setting off must not announce the bit, and the
+    # viewer's request must fail locally without reaching it.
+    add_test(NAME quic_restart
+        COMMAND chast-quic verify --port 45520 --restart --quiet)
+    set_tests_properties(quic_restart PROPERTIES TIMEOUT 180)
+    # Idle auto-disconnect: the host uses a millisecond test timeout instead of
+    # the settings' minutes. Input keeps the session open across the timeout;
+    # once the viewer goes quiet the host closes it, and a host without a
+    # timeout keeps the same quiet session open.
+    add_test(NAME quic_idle_disconnect
+        COMMAND chast-quic verify --port 45522 --idle-disconnect --quiet)
+    set_tests_properties(quic_idle_disconnect PROPERTIES TIMEOUT 180)
     add_test(NAME quic_stream_options
         COMMAND chast-quic verify --port 45434 --stream-options --quiet)
     set_tests_properties(quic_stream_options PROPERTIES TIMEOUT 120)

@@ -831,6 +831,25 @@ bool seed_upload(const fs::path& work, const fs::path& share, std::string* error
                       std::string("\x10\x20\x30\xFE\xFF", 5) + "deep", error);
 }
 
+// Journal entries added since [before]. The probes run far below the journal
+// cap, so the retained window covers the whole session.
+std::vector<chast_viewer::FileAuditEntry> new_file_audit(
+    const chast_viewer::ViewerStatus& before, const chast_viewer::ViewerStatus& after) {
+    uint64_t last = 0;
+    for (const chast_viewer::FileAuditEntry& entry : before.file_audit) {
+        if (entry.seq > last) {
+            last = entry.seq;
+        }
+    }
+    std::vector<chast_viewer::FileAuditEntry> added;
+    for (const chast_viewer::FileAuditEntry& entry : after.file_audit) {
+        if (entry.seq > last) {
+            added.push_back(entry);
+        }
+    }
+    return added;
+}
+
 // Queues the staged file and folder into the browsed folder, the same way a
 // drop on the window reaches SendFiles. Waits until all three files finish.
 bool run_upload(chast_viewer::ViewerEngine& engine, const fs::path& staging,
@@ -848,6 +867,24 @@ bool run_upload(chast_viewer::ViewerEngine& engine, const fs::path& staging,
         const chast_viewer::ViewerStatus status = engine.Snapshot();
         if (status.files_sent >= expected) {
             *sent = status.files_sent - before.files_sent;
+            // The walk's last download may reach the journal one sync later;
+            // only this call's uploads matter here.
+            size_t uploads = 0;
+            for (const chast_viewer::FileAuditEntry& entry : new_file_audit(before, status)) {
+                if (entry.download) {
+                    continue;
+                }
+                if (!entry.success || entry.name.empty()) {
+                    *error = "the journal recorded an unexpected upload entry";
+                    return false;
+                }
+                ++uploads;
+            }
+            if (uploads != 3) {
+                *error = "the journal recorded " + std::to_string(uploads) +
+                         " uploads, expected 3";
+                return false;
+            }
             return true;
         }
         if (status.file_failures != before.file_failures) {
@@ -935,6 +972,23 @@ bool run_upload_cancel(chast_viewer::ViewerEngine& engine, const fs::path& work,
                 *error = "the cancel was counted without an upload";
                 return false;
             }
+            size_t uploads = 0;
+            for (const chast_viewer::FileAuditEntry& entry : new_file_audit(before, status)) {
+                if (entry.download) {
+                    continue;
+                }
+                ++uploads;
+                if (entry.success || entry.name.empty() ||
+                    entry.detail.find("cancelled") == std::string::npos) {
+                    *error = "the cancelled upload was not journaled as one failure";
+                    return false;
+                }
+            }
+            if (uploads != 1) {
+                *error = "the cancel journaled " + std::to_string(uploads) +
+                         " uploads, expected 1";
+                return false;
+            }
             return true;
         }
         if (status.state != chast_viewer::ViewerState::kStreaming) {
@@ -1020,6 +1074,23 @@ bool run_download_cancel(chast_viewer::ViewerEngine& engine, chast::HostServer& 
         if (cancelled && status.download_cancels > before.download_cancels) {
             if (!started) {
                 *error = "the cancel was counted without a download";
+                return false;
+            }
+            size_t downloads = 0;
+            for (const chast_viewer::FileAuditEntry& entry : new_file_audit(before, status)) {
+                if (!entry.download) {
+                    continue;
+                }
+                ++downloads;
+                if (entry.success || entry.name.empty() ||
+                    entry.detail.find("cancelled") == std::string::npos) {
+                    *error = "the cancelled download was not journaled as one failure";
+                    return false;
+                }
+            }
+            if (downloads != 1) {
+                *error = "the cancel journaled " + std::to_string(downloads) +
+                         " downloads, expected 1";
                 return false;
             }
             if (status.download_phase != chast_viewer::FilePhase::kFailed) {

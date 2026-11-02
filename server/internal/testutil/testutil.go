@@ -46,7 +46,10 @@ type Options struct {
 	TLS          bool
 	RelayOnly    bool
 	Registration *abuse.Blocker
-	RelayServers []string
+	// RequireHostMetadataSig rejects registrations without a signed metadata
+	// report, matching --require-host-metadata-sig.
+	RequireHostMetadataSig bool
+	RelayServers           []string
 	// RelayNodes are standalone relay node base URLs. RelayNodeKey is their
 	// shared control key; empty falls back to RelayNodeKey.
 	RelayNodes []string
@@ -61,6 +64,10 @@ type Options struct {
 	// file named by SoftwareURL and signs the notice with its server identity,
 	// matching the chast-server wiring.
 	SoftwareDir string
+	// SoftwarePublisherKeyID and SoftwarePublisherSignature are forwarded in
+	// the notice so tests can exercise publisher pinning.
+	SoftwarePublisherKeyID     string
+	SoftwarePublisherSignature string
 	// RendezvousConfig pushes alternative rendezvous servers to clients.
 	RendezvousConfig *configpush.Config
 	// NoAccounts leaves login and address-book routes unavailable, matching a
@@ -163,7 +170,10 @@ func StartWith(t testing.TB, opts Options) *Server {
 		}
 	}
 	var relayOpts []relay.Option
-	relayOpts = append(relayOpts, relay.WithViewerTokenRequired(true))
+	relayOpts = append(relayOpts,
+		relay.WithViewerTokenRequired(true),
+		relay.WithTracer(opts.Tracer),
+	)
 	if opts.CarrierV6 {
 		relayOpts = append(relayOpts, relay.WithCarrierBind6("::1"))
 	}
@@ -179,6 +189,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 	}
 	meet, err := rendezvous.New("127.0.0.1:0", reg, relayAddr, log,
 		rendezvous.WithServerKey(ServerKey),
+		rendezvous.WithTracer(opts.Tracer),
 	)
 	if err != nil {
 		rm.Close()
@@ -256,45 +267,49 @@ func StartWith(t testing.TB, opts Options) *Server {
 		}
 	}
 	handler := api.New(api.Config{
-		Registry:          reg,
-		Relay:             rm,
-		Identity:          serverIdentity,
-		PunchAddr:         meet.Addr(),
-		RelayHost:         "127.0.0.1",
-		ServerKey:         ServerKey,
-		TTL:               60 * time.Second,
-		Logger:            log,
-		Limiter:           ratelimit.New(opts.RateLimit, opts.RateBurst),
-		LoginLimiter:      loginLimiter,
-		ProxyHeader:       opts.ProxyHeader,
-		TLS:               opts.TLS,
-		GeoIP:             opts.GeoIP,
-		RelayOnly:         relayOnly,
-		Blocker:           opts.Registration,
-		PunchLog:          punchLog,
-		IPChanges:         ipChanges,
-		RelayAddrs:        relayAddrs,
-		RelayExtra:        opts.RelayExtra,
-		CarrierV6Host:     carrierV6Host,
-		RelayPool:         pool,
-		PunchReadBuffer:   meet.ReadBuffer(),
-		SoftwareVersion:   opts.SoftwareVersion,
-		SoftwareURL:       opts.SoftwareURL,
-		SoftwareDir:       opts.SoftwareDir,
-		SoftwareSHA256:    softwareSHA256,
-		SoftwareSize:      softwareSize,
-		SoftwareSignature: softwareSignature,
-		Rendezvous:        opts.RendezvousConfig,
-		Accounts:          accounts,
-		Recordings:        recordingArchive,
-		Mailer:            opts.Mailer,
-		SMS:               opts.SMS,
-		RecoveryURL:       opts.RecoveryURL,
-		RecoveryTTL:       opts.RecoveryTTL,
-		SMSTTL:            opts.SMSTTL,
-		WebAuthnRPID:      opts.WebAuthnRPID,
-		WebAuthnOrigins:   opts.WebAuthnOrigins,
-		Tracer:            opts.Tracer,
+		Registry:               reg,
+		Relay:                  rm,
+		Identity:               serverIdentity,
+		PunchAddr:              meet.Addr(),
+		RelayHost:              "127.0.0.1",
+		ServerKey:              ServerKey,
+		TTL:                    60 * time.Second,
+		RequireHostMetadataSig: opts.RequireHostMetadataSig,
+		Logger:                 log,
+		Limiter:                ratelimit.New(opts.RateLimit, opts.RateBurst),
+		LoginLimiter:           loginLimiter,
+		ProxyHeader:            opts.ProxyHeader,
+		TLS:                    opts.TLS,
+		GeoIP:                  opts.GeoIP,
+		RelayOnly:              relayOnly,
+		Blocker:                opts.Registration,
+		PunchLog:               punchLog,
+		IPChanges:              ipChanges,
+		RelayAddrs:             relayAddrs,
+		RelayExtra:             opts.RelayExtra,
+		CarrierV6Host:          carrierV6Host,
+		RelayPool:              pool,
+		PunchReadBuffer:        meet.ReadBuffer(),
+		SoftwareVersion:        opts.SoftwareVersion,
+		SoftwareURL:            opts.SoftwareURL,
+		SoftwareDir:            opts.SoftwareDir,
+		SoftwareSHA256:         softwareSHA256,
+		SoftwareSize:           softwareSize,
+		SoftwareSignature:      softwareSignature,
+
+		SoftwarePublisherKeyID:     opts.SoftwarePublisherKeyID,
+		SoftwarePublisherSignature: opts.SoftwarePublisherSignature,
+		Rendezvous:                 opts.RendezvousConfig,
+		Accounts:                   accounts,
+		Recordings:                 recordingArchive,
+		Mailer:                     opts.Mailer,
+		SMS:                        opts.SMS,
+		RecoveryURL:                opts.RecoveryURL,
+		RecoveryTTL:                opts.RecoveryTTL,
+		SMSTTL:                     opts.SMSTTL,
+		WebAuthnRPID:               opts.WebAuthnRPID,
+		WebAuthnOrigins:            opts.WebAuthnOrigins,
+		Tracer:                     opts.Tracer,
 	})
 	hs := httptest.NewServer(handler)
 	s := &Server{

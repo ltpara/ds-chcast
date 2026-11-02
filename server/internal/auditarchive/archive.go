@@ -86,6 +86,9 @@ type Result struct {
 	Compressed    []string
 	Pruned        []string
 	Delivered     []string
+	// Merged counts rows whose event day was already closed when they were
+	// copied. They are appended to that day's file instead of today's.
+	Merged int
 	// DeliveryError is the first upload failure of this pass. The file stays
 	// pending and the next pass retries it.
 	DeliveryError string
@@ -223,8 +226,9 @@ func (a *Archiver) Run() (Result, error) {
 		{account.HistoryFileTransfers, &result.FileTransfers, a.readFileTransfers},
 	}
 	for _, step := range steps {
-		count, files, err := a.runStream(step.stream, day, step.read)
+		count, merged, files, err := a.runStream(step.stream, day, step.read)
 		*step.count = count
+		result.Merged += merged
 		result.Files = append(result.Files, files...)
 		if err != nil {
 			return result, fmt.Errorf("archive %s: %w", step.stream, err)
@@ -250,6 +254,8 @@ func (a *Archiver) deliver(today string, result *Result) {
 		a.logger.Warn("audit archive: cannot scan the directory for delivery", "error", err)
 		return
 	}
+	ledger := a.loadLedger()
+	dirty := false
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -262,51 +268,98 @@ func (a *Archiver) deliver(today string, result *Result) {
 		if deliveredMarkerExists(path) {
 			continue
 		}
-		if err := a.upload(path); err != nil {
+		digest, err := fileSHA256(path)
+		if err != nil {
+			result.DeliveryError = entry.Name() + ": " + err.Error()
+			a.logger.Warn("audit archive: cannot hash for delivery", "file", entry.Name(), "error", err)
+			return
+		}
+		if record, found := ledger.Entries[ledgerKey(day, digest)]; found {
+			// This exact content already reached this sink; a lost marker does
+			// not justify a second upload.
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				result.DeliveryError = entry.Name() + ": " + statErr.Error()
+				return
+			}
+			if err := writeDeliveredMarker(path, deliveredMarker{
+				File:        entry.Name(),
+				Bytes:       info.Size(),
+				SHA256:      digest,
+				DeliveredAt: record.DeliveredAt,
+				URL:         a.targetFor(entry.Name()),
+			}); err != nil {
+				a.logger.Warn("audit archive: cannot restore delivered marker",
+					"file", entry.Name(), "error", err)
+			}
+			continue
+		}
+		marker, err := a.upload(path, digest)
+		if err != nil {
 			result.DeliveryError = entry.Name() + ": " + err.Error()
 			a.logger.Warn("audit archive: remote delivery failed", "file", entry.Name(),
 				"remote", a.remote, "error", err)
+			if dirty {
+				a.saveLedger(ledger)
+			}
 			return
 		}
+		if err := writeDeliveredMarker(path, marker); err != nil {
+			// The ledger still records the accepted upload, so the next pass
+			// restores the marker instead of uploading the same bytes again.
+			a.logger.Warn("audit archive: cannot write delivered marker",
+				"file", entry.Name(), "error", err)
+		}
+		ledger.Entries[ledgerKey(day, digest)] = ledgerRecord{
+			Day:         day,
+			SHA256:      digest,
+			File:        entry.Name(),
+			Bytes:       marker.Bytes,
+			DeliveredAt: marker.DeliveredAt,
+			URL:         marker.URL,
+		}
+		dirty = true
 		result.Delivered = append(result.Delivered, entry.Name())
+	}
+	if dirty {
+		if err := a.saveLedger(ledger); err != nil {
+			a.logger.Warn("audit archive: cannot persist the delivery ledger", "error", err)
+		}
 	}
 }
 
-// upload PUTs one file and writes the marker only after a 2xx answer. A
-// failed upload leaves the file pending for the next pass; retries within the
-// pass cover a transient receiver error.
-func (a *Archiver) upload(path string) error {
+// upload PUTs one file and returns the marker to write after success. A failed
+// upload leaves the file pending for the next pass; retries within the pass
+// cover a transient receiver error.
+func (a *Archiver) upload(path, digest string) (deliveredMarker, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return err
+		return deliveredMarker{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("not a regular file")
-	}
-	digest, err := fileSHA256(path)
-	if err != nil {
-		return err
+		return deliveredMarker{}, fmt.Errorf("not a regular file")
 	}
 	name := filepath.Base(path)
 	target := a.targetFor(name)
+	marker := deliveredMarker{
+		File:        name,
+		Bytes:       info.Size(),
+		SHA256:      digest,
+		DeliveredAt: a.now().UTC().Format(time.RFC3339),
+		URL:         target,
+	}
 	var lastErr error
 	const attempts = 3
 	for attempt := 1; attempt <= attempts; attempt++ {
 		lastErr = a.putFile(target, path, name, info.Size(), digest)
 		if lastErr == nil {
-			return writeDeliveredMarker(path, deliveredMarker{
-				File:        name,
-				Bytes:       info.Size(),
-				SHA256:      digest,
-				DeliveredAt: a.now().UTC().Format(time.RFC3339),
-				URL:         target,
-			})
+			return marker, nil
 		}
 		if attempt < attempts {
 			time.Sleep(a.retryDelay(attempt))
 		}
 	}
-	return lastErr
+	return deliveredMarker{}, lastErr
 }
 
 // targetFor returns the object URL for one archive file: a signed S3 object
@@ -337,7 +390,10 @@ func (a *Archiver) putFile(target, path, name string, size int64, digest string)
 		a.s3.sign(request, digest, a.now())
 	} else {
 		request.Header.Set("X-Chast-Audit-Sha256", digest)
-		request.Header.Set("Idempotency-Key", name)
+		// The key is the content hash, not the file name: a rewritten day file
+		// must reach an idempotent receiver as new content, while a retry of the
+		// same bytes stays deduplicated on the receiver side too.
+		request.Header.Set("Idempotency-Key", digest)
 		if a.remoteToken != "" {
 			request.Header.Set("Authorization", "Bearer "+a.remoteToken)
 		}
@@ -404,6 +460,63 @@ func writeDeliveredMarker(path string, marker deliveredMarker) error {
 func deliveredMarkerExists(path string) bool {
 	_, err := os.Stat(path + deliveredSuffix)
 	return err == nil
+}
+
+// ledgerName is the delivery ledger kept next to the archives. splitArchiveName
+// rejects it, so neither compaction nor delivery mistakes it for an archive.
+const ledgerName = "delivery-ledger.json"
+
+// deliveryLedger remembers which content already reached the configured sink.
+// Entries are keyed by archive day and content hash, so identical bytes are
+// uploaded once even if the marker file was lost or the file was rewritten to
+// the same content. A different sink means every entry is stale.
+type deliveryLedger struct {
+	Remote  string                  `json:"remote"`
+	Entries map[string]ledgerRecord `json:"entries"`
+}
+
+type ledgerRecord struct {
+	Day         string `json:"day"`
+	SHA256      string `json:"sha256"`
+	File        string `json:"file"`
+	Bytes       int64  `json:"bytes"`
+	DeliveredAt string `json:"delivered_at"`
+	URL         string `json:"url"`
+}
+
+func ledgerKey(day, digest string) string { return day + "-" + digest }
+
+func (a *Archiver) loadLedger() *deliveryLedger {
+	ledger := &deliveryLedger{Remote: a.remote, Entries: map[string]ledgerRecord{}}
+	data, err := os.ReadFile(filepath.Join(a.dir, ledgerName))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			a.logger.Warn("audit archive: cannot read the delivery ledger", "error", err)
+		}
+		return ledger
+	}
+	var stored deliveryLedger
+	if err := json.Unmarshal(data, &stored); err != nil {
+		// A corrupt ledger only costs deduplication; markers still prevent
+		// most repeat uploads, so delivery continues with an empty one.
+		a.logger.Warn("audit archive: ignoring a corrupt delivery ledger", "error", err)
+		return ledger
+	}
+	if stored.Remote != a.remote {
+		return ledger
+	}
+	if stored.Entries != nil {
+		ledger.Entries = stored.Entries
+	}
+	return ledger
+}
+
+func (a *Archiver) saveLedger(ledger *deliveryLedger) error {
+	data, err := json.Marshal(ledger)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(a.dir, ledgerName), data)
 }
 
 // compact gzips every closed-day JSONL file and removes files outside the
@@ -548,51 +661,52 @@ func compressJSONL(path string) error {
 	return nil
 }
 
-func (a *Archiver) runStream(stream, day string, read func(afterID int64, limit int) ([]record, error)) (int, []string, error) {
+func (a *Archiver) runStream(stream, day string, read func(afterID int64, limit int) ([]record, error)) (int, int, []string, error) {
 	checkpoint, err := a.store.ArchiveCheckpoint(stream)
 	if err != nil {
-		return 0, nil, err
+		return 0, 0, nil, err
 	}
-	path := filepath.Join(a.dir, stream+"-"+day+".jsonl")
 	var (
-		file    *os.File
 		files   []string
+		seen    = map[string]bool{}
 		written int
+		merged  int
 	)
+	// Every row goes to the file of its own UTC event day. Rows that arrive
+	// while their day is already closed (a late host report, for example) are
+	// merged into that day's file so archive queries by date still find them.
 	for {
 		records, err := read(checkpoint, batch)
 		if err != nil {
-			closeFile(file)
-			return written, files, err
+			return written, merged, files, err
 		}
 		if len(records) == 0 {
 			break
 		}
-		if file == nil {
-			file, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-			if err != nil {
-				return written, files, fmt.Errorf("open %s: %w", path, err)
+		groups, order := groupByDay(records, day)
+		for _, target := range order {
+			lines := groups[target]
+			var path string
+			if target == day {
+				path = filepath.Join(a.dir, stream+"-"+day+".jsonl")
+				if err := appendLines(path, lines); err != nil {
+					return written, merged, files, err
+				}
+			} else {
+				path, err = a.mergeClosed(stream, target, lines)
+				if err != nil {
+					return written, merged, files, err
+				}
+				merged += len(lines)
 			}
-			files = append(files, path)
-		}
-		var buf bytes.Buffer
-		buf.Grow(len(records) * 160)
-		for _, record := range records {
-			buf.Write(record.line)
-			buf.WriteByte('\n')
-		}
-		if _, err := file.Write(buf.Bytes()); err != nil {
-			closeFile(file)
-			return written, files, fmt.Errorf("write %s: %w", path, err)
-		}
-		if err := file.Sync(); err != nil {
-			closeFile(file)
-			return written, files, fmt.Errorf("sync %s: %w", path, err)
+			if !seen[path] {
+				seen[path] = true
+				files = append(files, path)
+			}
 		}
 		last := records[len(records)-1].id
 		if err := a.store.AdvanceArchiveCheckpoint(stream, last); err != nil {
-			closeFile(file)
-			return written, files, err
+			return written, merged, files, err
 		}
 		checkpoint = last
 		written += len(records)
@@ -600,22 +714,199 @@ func (a *Archiver) runStream(stream, day string, read func(afterID int64, limit 
 			break
 		}
 	}
-	if err := closeFile(file); err != nil {
-		return written, files, fmt.Errorf("close %s: %w", path, err)
-	}
-	return written, files, nil
+	return written, merged, files, nil
 }
 
-func closeFile(file *os.File) error {
-	if file == nil {
-		return nil
+// groupByDay splits one page into the archive files it belongs to. Days after
+// today can only come from a clock that moved backwards; they follow today so
+// no future-named file is created.
+func groupByDay(records []record, today string) (map[string][][]byte, []string) {
+	groups := make(map[string][][]byte)
+	order := make([]string, 0, 3)
+	for _, record := range records {
+		target := record.day
+		if target == "" || target > today {
+			target = today
+		}
+		if _, ok := groups[target]; !ok {
+			order = append(order, target)
+		}
+		groups[target] = append(groups[target], record.line)
 	}
-	return file.Close()
+	return groups, order
+}
+
+// appendLines appends complete JSONL records to one file and fsyncs them
+// before the caller advances the checkpoint.
+func appendLines(path string, lines [][]byte) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	var buf bytes.Buffer
+	for _, line := range lines {
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if _, err := file.Write(buf.Bytes()); err != nil {
+		file.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return fmt.Errorf("sync %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+	return nil
+}
+
+// mergeClosed rewrites a closed-day file with late rows appended. The new
+// content is written to a temp file, fsynced and renamed over the old one, so
+// a crash leaves either version intact. A delivered marker is removed because
+// the bytes the remote sink accepted are no longer current.
+func (a *Archiver) mergeClosed(stream, day string, lines [][]byte) (string, error) {
+	base := stream + "-" + day + ".jsonl"
+	plain := filepath.Join(a.dir, base)
+	compressed := plain + ".gz"
+	var existing []byte
+	if _, err := os.Stat(compressed); err == nil {
+		existing, err = readGzipFile(compressed)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", compressed, err)
+		}
+	} else if _, err := os.Stat(plain); err == nil {
+		existing, err = os.ReadFile(plain)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", plain, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(existing) + len(lines)*160)
+	buf.Write(existing)
+	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	for _, line := range lines {
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	target := plain
+	if a.opts.Compress {
+		target = compressed
+		if err := writeGzipFile(compressed, buf.Bytes()); err != nil {
+			return "", err
+		}
+		if err := os.Remove(plain); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+	} else {
+		if err := writeFileAtomic(plain, buf.Bytes()); err != nil {
+			return "", err
+		}
+		if err := os.Remove(compressed); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	// The merge replaces whichever variant was current, so a marker on either
+	// name would hide the new version from the uploader.
+	for _, name := range []string{plain, compressed} {
+		if err := os.Remove(name + deliveredSuffix); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return target, nil
+}
+
+func readGzipFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	reader, err := gzip.NewReader(file)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+// writeGzipFile produces a complete gzip container through a temp file and an
+// atomic rename; the reader never sees a half-written archive.
+func writeGzipFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	writer := gzip.NewWriter(out)
+	_, writeErr := writer.Write(data)
+	closeErr := writer.Close()
+	syncErr := out.Sync()
+	outErr := out.Close()
+	if writeErr != nil || closeErr != nil || syncErr != nil || outErr != nil {
+		os.Remove(tmp)
+		if writeErr != nil {
+			return writeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if syncErr != nil {
+			return syncErr
+		}
+		return outErr
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		os.Remove(tmp)
+		if writeErr != nil {
+			return writeErr
+		}
+		if syncErr != nil {
+			return syncErr
+		}
+		return closeErr
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 type record struct {
 	id   int64
+	day  string
 	line []byte
+}
+
+// recordDay is the UTC archive day of an event. A missing timestamp falls back
+// to the current day so the row still lands somewhere sensible.
+func recordDay(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return at.UTC().Format("20060102")
 }
 
 type auditLine struct {
@@ -686,7 +977,7 @@ func (a *Archiver) readAudit(afterID int64, limit int) ([]record, error) {
 		if err != nil {
 			return nil, err
 		}
-		records = append(records, record{id: event.ID, line: line})
+		records = append(records, record{id: event.ID, day: recordDay(event.CreatedAt), line: line})
 	}
 	return records, nil
 }
@@ -717,7 +1008,11 @@ func (a *Archiver) readConnections(afterID int64, limit int) ([]record, error) {
 		if err != nil {
 			return nil, err
 		}
-		records = append(records, record{id: event.ID, line: line})
+		dayAt := event.StartedAt
+		if dayAt.IsZero() {
+			dayAt = event.EndedAt
+		}
+		records = append(records, record{id: event.ID, day: recordDay(dayAt), line: line})
 	}
 	return records, nil
 }
@@ -749,7 +1044,7 @@ func (a *Archiver) readFileTransfers(afterID int64, limit int) ([]record, error)
 		if err != nil {
 			return nil, err
 		}
-		records = append(records, record{id: event.ID, line: line})
+		records = append(records, record{id: event.ID, day: recordDay(event.OccurredAt), line: line})
 	}
 	return records, nil
 }

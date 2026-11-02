@@ -37,8 +37,12 @@ type Options struct {
 	Service  bool
 	Shortcut bool
 	Register bool
-	Quiet    bool
-	Logf     func(format string, args ...any)
+	// Protocol registers the chast:// URL scheme for the viewer. The scheme
+	// is overridable so tests never touch a real chast association.
+	Protocol       bool
+	ProtocolScheme string
+	Quiet          bool
+	Logf           func(format string, args ...any)
 }
 
 func (o Options) logf(format string, args ...any) {

@@ -116,6 +116,15 @@ struct HostSettings {
     // monitor, so a person sitting at the machine cannot see the desktop until
     // the session ends or the operator revokes the permission.
     bool allow_privacy_mode = false;
+    // Let the viewer reboot this machine. Off by default: a restart
+    // interrupts whoever is sitting at the machine and closes every session,
+    // so it is an explicit decision in the same spirit as the terminal.
+    bool allow_restart = false;
+    // Close the session after this many minutes without viewer activity
+    // (input, chat or clipboard). 0 keeps it open until one side leaves and is
+    // the default: a forgotten viewer should not hold the screen forever, but
+    // long unattended transfers must not be cut either.
+    uint32_t auto_disconnect_minutes = 0;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.
@@ -164,6 +173,10 @@ struct HostSettings {
     // Public-facing UDP socket of chast-tunnel host. It must differ from the
     // QUIC port above because both are UDP listeners.
     std::string tunnel_listen = "0.0.0.0:14434";
+    // SOCKS5 proxy for the service HTTP API and the relay TCP carrier, as
+    // socks5://[user:pass@]host:port. The QUIC listener and every UDP path
+    // stay direct: SOCKS5 cannot carry datagrams. Empty means no proxy.
+    std::string socks5;
     // JSONL spool the host appends finished inbound sessions and uploads to;
     // chast-tunnel host signs each line and forwards it to the service. Empty
     // means the file next to host.ini (<stem>.audit.jsonl), which load fills
@@ -228,6 +241,9 @@ bool parse_tunnel_id(const std::string& input, std::string& normalized);
 bool valid_tunnel_key(const std::string& key);
 bool parse_tunnel_listen(const std::string& input, std::string& normalized);
 bool tunnel_listen_port(const std::string& listen, uint16_t& port);
+// socks5://[user:pass@]host[:port], socks5h:// (treated the same) or a bare
+// host:port. Empty input is not valid here; callers treat empty as "off".
+bool parse_socks5_proxy(const std::string& input, std::string& normalized);
 // Spool next to a settings file: <dir>/<stem>.audit.jsonl. Empty for an empty
 // settings path.
 std::string audit_spool_path_for(const std::string& settings_path);

@@ -1,33 +1,27 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
+import 'deep_link.dart';
 import 'l10n.dart';
 import 'pages/home_page.dart';
 import 'theme.dart';
+import 'tunnel_agent.dart';
 
 void main(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
   AppLanguage.load();
-  runApp(ChastApp(connectTarget: _connectTarget(args)));
-}
-
-String? _connectTarget(List<String> args) {
-  for (int i = 0; i < args.length; ++i) {
-    final String arg = args[i];
-    if (arg == '--connect' && i + 1 < args.length) {
-      return args[i + 1];
-    }
-    if (arg.startsWith('--connect=')) {
-      return arg.substring('--connect='.length);
-    }
-  }
-  return null;
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(TunnelAgent.confirmUpdate());
+  });
+  runApp(ChastApp(initialConnection: parseLaunchArguments(args)));
 }
 
 class ChastApp extends StatelessWidget {
-  const ChastApp({super.key, this.connectTarget});
+  const ChastApp({super.key, this.initialConnection});
 
-  final String? connectTarget;
+  final DeepLinkRequest? initialConnection;
 
   @override
   Widget build(BuildContext context) {
@@ -48,7 +42,11 @@ class ChastApp extends StatelessWidget {
           theme: buildChastTheme(Brightness.light),
           darkTheme: buildChastTheme(Brightness.dark),
           themeMode: ThemeMode.system,
-          home: HomePage(initialTarget: connectTarget),
+          home: HomePage(
+            initialTarget: initialConnection?.target,
+            initialFileTransferOnly:
+                initialConnection?.fileTransferOnly ?? false,
+          ),
         );
       },
     );

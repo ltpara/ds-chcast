@@ -34,8 +34,14 @@ const (
 	AuditDeviceLabels      = "device_labels"
 	AuditDeviceReset       = "device_reset"
 	AuditDeviceLeaseRemove = "device_lease_remove"
+	AuditDeviceWake        = "device_wake"
 	AuditRecordingUpload   = "recording_upload"
 	AuditRecordingDelete   = "recording_delete"
+	AuditAccessGroupCreate = "access_group_create"
+	AuditAccessGroupUpdate = "access_group_update"
+	AuditAccessGroupDelete = "access_group_delete"
+	AuditAccessGroupMember = "access_group_member"
+	AuditAccessGroupDevice = "access_group_device"
 )
 
 // auditRetention keeps the table bounded without an external maintenance job.

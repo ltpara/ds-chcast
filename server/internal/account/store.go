@@ -22,10 +22,9 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/schemamig"
+	"github.com/ltpara/ds-chcast/server/internal/sqlitex"
 )
 
 const (
@@ -259,7 +258,7 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("account directory %s: %w", dir, err)
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open(sqlitex.AccountDriver, path)
 	if err != nil {
 		return nil, fmt.Errorf("open account store %s: %w", path, err)
 	}
@@ -293,6 +292,14 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// SQLitePoolStats reports connection-pool queueing for the account database.
+func (s *Store) SQLitePoolStats() sqlitex.PoolStats {
+	if s == nil {
+		return sqlitex.PoolStats{}
+	}
+	return sqlitex.Pool(s.db)
+}
 
 // backfillAdminRole promotes the earliest account when an upgrade from a
 // database without roles would otherwise leave the server with no admin.
@@ -729,11 +736,12 @@ func (s *Store) DeleteUser(username string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var (
+		id     string
 		role   string
 		banned bool
 	)
-	err := s.db.QueryRow(`SELECT role, banned FROM users WHERE username = ?`,
-		strings.TrimSpace(username)).Scan(&role, &banned)
+	err := s.db.QueryRow(`SELECT id, role, banned FROM users WHERE username = ?`,
+		strings.TrimSpace(username)).Scan(&id, &role, &banned)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrUnknownUser
 	}
@@ -754,6 +762,15 @@ func (s *Store) DeleteUser(username string) error {
 		// admin again; leaving users behind without an admin is not.
 		if admins <= 1 && total > 1 {
 			return ErrLastAdmin
+		}
+	}
+	if !banned {
+		lastGroupAdmin, err := s.lastUsableGroupAdminLocked(id)
+		if err != nil {
+			return err
+		}
+		if lastGroupAdmin {
+			return ErrLastGroupAdmin
 		}
 	}
 	res, err := s.db.Exec(`DELETE FROM users WHERE username = ?`, strings.TrimSpace(username))
@@ -871,15 +888,24 @@ func (s *Store) SetBanned(username string, banned bool) (User, error) {
 	if err != nil {
 		return User{}, fmt.Errorf("account store %s: find user: %w", s.path, err)
 	}
-	if banned && !wasBanned && user.Role == RoleAdmin {
-		var admins int
-		if err := s.db.QueryRow(
-			`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
-		).Scan(&admins); err != nil {
-			return User{}, fmt.Errorf("account store %s: count admins: %w", s.path, err)
+	if banned && !wasBanned {
+		if user.Role == RoleAdmin {
+			var admins int
+			if err := s.db.QueryRow(
+				`SELECT COUNT(*) FROM users WHERE role = ? AND banned = 0`, RoleAdmin,
+			).Scan(&admins); err != nil {
+				return User{}, fmt.Errorf("account store %s: count admins: %w", s.path, err)
+			}
+			if admins <= 1 {
+				return User{}, ErrLastAdmin
+			}
 		}
-		if admins <= 1 {
-			return User{}, ErrLastAdmin
+		lastGroupAdmin, err := s.lastUsableGroupAdminLocked(user.ID)
+		if err != nil {
+			return User{}, err
+		}
+		if lastGroupAdmin {
+			return User{}, ErrLastGroupAdmin
 		}
 	}
 	tx, err := s.db.Begin()

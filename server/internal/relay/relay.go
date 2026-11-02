@@ -28,6 +28,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -83,6 +84,9 @@ type Manager struct {
 
 	wantedReadBuffer int
 	readBuffer       int
+
+	// tracer records viewer sessions. It is nil when tracing is disabled.
+	tracer *tracing.Tracer
 }
 
 // Option customizes the relay manager before its ports are bound.
@@ -99,6 +103,11 @@ func WithReadBuffer(size int) Option {
 // token before its datagrams are forwarded, matching hbbr's key check.
 func WithViewerTokenRequired(required bool) Option {
 	return func(m *Manager) { m.requireViewerToken = required }
+}
+
+// WithTracer records viewer authentication and session spans.
+func WithTracer(tracer *tracing.Tracer) Option {
+	return func(m *Manager) { m.tracer = tracer }
 }
 
 // WithBind6 listens on an additional IPv6 address with the same port numbers.
@@ -177,6 +186,10 @@ type port struct {
 	hostLink   *hostLink
 	viewer     *carrierViewer
 	udpSession *Session
+	// udpSpan covers the viewer's UDP session and udpParent is the trace
+	// context proved by relay_viewer. Both are guarded by mu.
+	udpSpan   *tracing.Span
+	udpParent tracing.TraceContext
 
 	tcpToHost   uint64
 	tcpToViewer uint64
@@ -656,6 +669,7 @@ func (m *Manager) Allocate(hostID string) (int, error) {
 				p.viewerAuthAddr = nil
 				p.hostSeen = time.Time{}
 				p.viewerSeen = time.Time{}
+				p.endUDPSpanLocked("reallocated")
 				if p.udpSession != nil {
 					p.udpSession.Close()
 					p.udpSession = nil
@@ -694,6 +708,7 @@ func (m *Manager) Release(hostID string) {
 			p.viewerAuthAddr = nil
 			p.hostSeen = time.Time{}
 			p.viewerSeen = time.Time{}
+			p.endUDPSpanLocked("released")
 			if p.udpSession != nil {
 				p.udpSession.Close()
 				p.udpSession = nil
@@ -725,6 +740,7 @@ func (m *Manager) Close() {
 			p.mu.Lock()
 			conn, tcp := p.conn, p.tcp
 			p.conn, p.tcp = nil, nil
+			p.endUDPSpanLocked("shutdown")
 			if p.udpSession != nil {
 				p.udpSession.Close()
 				p.udpSession = nil
@@ -757,7 +773,7 @@ func (m *Manager) Close() {
 // EnableSharedCarrier starts the single-port carrier used by hosts whose
 // registration names it. It is optional: per-port TCP carriers stay available.
 func (m *Manager) EnableSharedCarrier(bind string) error {
-	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.policy, m.log)
+	sc, err := newSharedCarrier(bind, m.carrierBind6IP, m.auth, m.policy, m.log, m.tracer)
 	if err != nil {
 		return err
 	}
@@ -949,12 +965,28 @@ func (p *port) reservedHost() string {
 // detachUDPViewerLocked releases the viewer slot after its session was
 // blocklisted, so a different address can attach once the list is cleared.
 func (p *port) detachUDPViewerLocked() {
+	p.endUDPSpanLocked("blocked")
 	if p.udpSession != nil {
 		p.udpSession.Close()
 		p.udpSession = nil
 	}
 	p.viewerAddr = nil
 	p.viewerSeen = time.Time{}
+}
+
+// endUDPSpanLocked finishes the viewer session span. The caller holds p.mu.
+// The trace parent is kept so a viewer that reconnects without another
+// relay_viewer stays in the same trace.
+func (p *port) endUDPSpanLocked(reason string) {
+	if p.udpSpan == nil {
+		return
+	}
+	p.set.manager.tracer.EndSpan(p.udpSpan,
+		tracing.Int("relay.port", p.number),
+		tracing.String("relay.family", p.family),
+		tracing.String("relay.transport", "udp"),
+		tracing.String("relay.close_reason", reason))
+	p.udpSpan = nil
 }
 
 func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time.Time) {
@@ -1023,6 +1055,7 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 	if p.viewerAddr == nil || now.Sub(p.viewerSeen) > viewerIdle {
 		session, err := p.set.manager.policy.Open(fmt.Sprintf("udp:%d/%s", p.number, p.family), src.IP.String())
 		if err != nil {
+			p.endUDPSpanLocked("blocked")
 			if p.udpSession != nil {
 				p.udpSession.Close()
 				p.udpSession = nil
@@ -1031,10 +1064,12 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 			p.dropped++
 			return
 		}
+		p.endUDPSpanLocked("expired")
 		if p.udpSession != nil {
 			p.udpSession.Close()
 		}
 		p.udpSession = session
+		p.udpSpan = p.set.manager.tracer.StartSpan("relay.udp_session", p.udpParent)
 		p.viewerAddr = cloneAddr(src)
 		p.viewerSeen = now
 	} else if !sameAddr(p.viewerAddr, src) {
@@ -1113,6 +1148,7 @@ func (p *port) handleAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr,
 		// old mapping is gone, so drop the viewer instead of mixing sources.
 		p.viewerAddr = nil
 		p.viewerSeen = time.Time{}
+		p.endUDPSpanLocked("host_moved")
 		if p.udpSession != nil {
 			p.udpSession.Close()
 			p.udpSession = nil
@@ -1130,8 +1166,15 @@ func (p *port) reply(conn *net.UDPConn, to *net.UDPAddr, m wire.Message) {
 
 // handleViewerAuth is the UDP counterpart of the carrier viewer hello. A valid
 // token reserves the source address, and a new valid source supersedes a stale
-// viewer association so a reconnect does not have to wait for viewerIdle.
+// viewer association so a reconnect does not have to wait for viewerIdle. The
+// accepted trace context parents the session span that starts with the first
+// viewer datagram.
 func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr, hostID string) {
+	var parent tracing.TraceContext
+	if p.set.manager.tracer != nil {
+		parent, _ = p.set.manager.tracer.ParseTraceparent(msg.Traceparent)
+	}
+	span := p.set.manager.tracer.StartSpan("relay.viewer_auth", parent)
 	ack := wire.Message{Type: wire.TypeRelayViewerAck}
 	switch {
 	case hostID == "" || msg.HostID != hostID:
@@ -1145,9 +1188,20 @@ func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UD
 			}
 			p.viewerAuthAddr = cloneAddr(src)
 		}
+		p.udpParent = parent
 		p.set.manager.log.Info("relay viewer authenticated", "port", p.number, "remote", src.String())
 		ack.OK = true
 	}
+	attrs := []tracing.Attr{
+		tracing.Int("relay.port", p.number),
+		tracing.String("relay.family", p.family),
+		tracing.String("relay.transport", "udp"),
+		tracing.String("relay.viewer_ip", src.IP.String()),
+	}
+	if ack.Error != "" {
+		attrs = append(attrs, tracing.String("error", ack.Error))
+	}
+	p.set.manager.tracer.EndSpan(span, attrs...)
 	p.reply(conn, src, ack)
 }
 
@@ -1182,19 +1236,26 @@ func (p *port) handleTCP(conn net.Conn) {
 			conn.Close()
 			return
 		}
+		traceparent := ""
 		if p.set.manager.requireViewerToken {
 			body, err := ws.ReadMessage()
-			if err != nil || !p.viewerHelloOK(body) {
+			if err != nil {
 				conn.Close()
 				return
 			}
+			hello, ok := p.viewerHello(body)
+			if !ok {
+				conn.Close()
+				return
+			}
+			traceparent = hello.Traceparent
 		}
 		_ = conn.SetDeadline(time.Time{})
 		p.serveViewer(&carrierViewer{
 			conn: conn,
 			ws:   ws,
 			peer: conn.RemoteAddr().String(),
-		})
+		}, traceparent)
 	case strings.HasPrefix(string(prefix), "CHAS"):
 		line, err := carrier.ReadLine(br, 64)
 		if err != nil {
@@ -1203,12 +1264,19 @@ func (p *port) handleTCP(conn net.Conn) {
 		}
 		switch line + "\n" {
 		case carrier.MagicRaw:
+			traceparent := ""
 			if p.set.manager.requireViewerToken {
-				hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
-				if err != nil || !p.viewerHelloTextOK(hello) {
+				line, err := carrier.ReadLine(br, carrier.MaxHandshake)
+				if err != nil {
 					p.refuseConn(conn, "viewer token was not accepted")
 					return
 				}
+				hello, ok := p.viewerHelloText(line)
+				if !ok {
+					p.refuseConn(conn, "viewer token was not accepted")
+					return
+				}
+				traceparent = hello.Traceparent
 			}
 			_ = conn.SetDeadline(time.Time{})
 			p.serveViewer(&carrierViewer{
@@ -1216,10 +1284,15 @@ func (p *port) handleTCP(conn net.Conn) {
 				send:   carrier.NewFrameWriter(conn),
 				frames: carrier.NewFrameReader(br),
 				peer:   conn.RemoteAddr().String(),
-			})
+			}, traceparent)
 		case carrier.MagicViewer:
-			hello, err := carrier.ReadLine(br, carrier.MaxHandshake)
-			if err != nil || !p.viewerHelloTextOK(hello) {
+			line, err := carrier.ReadLine(br, carrier.MaxHandshake)
+			if err != nil {
+				p.refuseConn(conn, "viewer token was not accepted")
+				return
+			}
+			hello, ok := p.viewerHelloText(line)
+			if !ok {
 				p.refuseConn(conn, "viewer token was not accepted")
 				return
 			}
@@ -1229,7 +1302,7 @@ func (p *port) handleTCP(conn net.Conn) {
 				send:   carrier.NewFrameWriter(conn),
 				frames: carrier.NewFrameReader(br),
 				peer:   conn.RemoteAddr().String(),
-			})
+			}, hello.Traceparent)
 		case carrier.MagicHost:
 			p.serveHost(conn, br)
 		default:
@@ -1391,20 +1464,20 @@ func (p *port) refuseConn(conn net.Conn, reason string) {
 	conn.Close()
 }
 
-func (p *port) viewerHelloTextOK(line string) bool {
+func (p *port) viewerHelloText(line string) (carrier.SharedViewerHello, bool) {
 	var hello carrier.SharedViewerHello
 	if json.Unmarshal([]byte(line), &hello) != nil {
-		return false
+		return carrier.SharedViewerHello{}, false
 	}
-	return p.viewerTokenOK(hello.HostID, hello.Token)
+	return hello, p.viewerTokenOK(hello.HostID, hello.Token)
 }
 
-func (p *port) viewerHelloOK(body []byte) bool {
+func (p *port) viewerHello(body []byte) (carrier.SharedViewerHello, bool) {
 	var hello carrier.SharedViewerHello
 	if json.Unmarshal(body, &hello) != nil {
-		return false
+		return carrier.SharedViewerHello{}, false
 	}
-	return p.viewerTokenOK(hello.HostID, hello.Token)
+	return hello, p.viewerTokenOK(hello.HostID, hello.Token)
 }
 
 func (p *port) viewerTokenOK(id, token string) bool {
@@ -1413,14 +1486,30 @@ func (p *port) viewerTokenOK(id, token string) bool {
 		p.set.manager.auth.VerifyCarrier(id, token)
 }
 
-func (p *port) serveViewer(v *carrierViewer) {
+func (p *port) serveViewer(v *carrierViewer, traceparent string) {
+	var parent tracing.TraceContext
+	if p.set.manager.tracer != nil {
+		parent, _ = p.set.manager.tracer.ParseTraceparent(traceparent)
+	}
+	span := p.set.manager.tracer.StartSpan("relay.carrier_session", parent)
+	closeReason := "closed"
+	defer func() {
+		p.set.manager.tracer.EndSpan(span,
+			tracing.Int("relay.port", p.number),
+			tracing.String("relay.family", p.family),
+			tracing.String("relay.transport", "carrier"),
+			tracing.String("carrier.kind", "port"),
+			tracing.String("relay.close_reason", closeReason))
+	}()
 	p.mu.Lock()
 	if p.hostLink == nil {
+		closeReason = "no_host"
 		p.mu.Unlock()
 		v.close()
 		return
 	}
 	if p.viewer != nil {
+		closeReason = "busy"
 		p.tcpBusy++
 		p.mu.Unlock()
 		v.close()
@@ -1428,6 +1517,7 @@ func (p *port) serveViewer(v *carrierViewer) {
 	}
 	session, err := p.set.manager.policy.Open(fmt.Sprintf("carrier:%d/%s", p.number, p.family), peerIP(v.peer))
 	if err != nil {
+		closeReason = "blocked"
 		p.blocked++
 		p.mu.Unlock()
 		v.close()
@@ -1472,6 +1562,9 @@ func (p *port) serveViewer(v *carrierViewer) {
 	stillPaired := p.viewer == v
 	if stillPaired {
 		p.viewer = nil
+		closeReason = "viewer_left"
+	} else {
+		closeReason = "host_left"
 	}
 	p.mu.Unlock()
 	v.close()

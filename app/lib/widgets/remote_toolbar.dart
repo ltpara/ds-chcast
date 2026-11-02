@@ -16,6 +16,7 @@ enum RemoteSpecialAction {
   altF4,
   taskManager,
   sas,
+  restart,
 }
 
 /// The two microphone processing switches the long-press menu exposes above
@@ -92,6 +93,7 @@ class RemoteToolbar extends StatelessWidget {
     this.recordingDenied = false,
     this.recording = false,
     this.onToggleRecording,
+    this.restartAvailable = false,
     required this.onTogglePin,
     required this.onToggleStats,
     required this.onToggleFullscreen,
@@ -159,6 +161,11 @@ class RemoteToolbar extends StatelessWidget {
   final bool specialKeysAvailable;
   final ValueChanged<RemoteSpecialAction> onSpecialAction;
   final VoidCallback onSendText;
+
+  /// True when the host granted the restart permission. The restart entry
+  /// lives in the special-keys menu but does not need the input gate, so the
+  /// menu stays reachable while only restart is allowed.
+  final bool restartAvailable;
 
   /// Viewer-side screenshot: the engine reads the newest decoded picture back
   /// from the GPU and writes a PNG on this machine. Optional so tests and
@@ -468,6 +475,7 @@ class RemoteToolbar extends StatelessWidget {
             ),
             _SpecialKeysButton(
               available: specialKeysAvailable,
+              restartAvailable: restartAvailable,
               onSelected: onSpecialAction,
             ),
             _BarButton(
@@ -711,9 +719,14 @@ class _CollapsedBar extends StatelessWidget {
 /// service capability does not have to be known up front; a refusal from the
 /// host explains itself in the session page.
 class _SpecialKeysButton extends StatelessWidget {
-  const _SpecialKeysButton({required this.available, required this.onSelected});
+  const _SpecialKeysButton({
+    required this.available,
+    required this.restartAvailable,
+    required this.onSelected,
+  });
 
   final bool available;
+  final bool restartAvailable;
   final ValueChanged<RemoteSpecialAction> onSelected;
 
   Future<void> _open(BuildContext context) async {
@@ -733,15 +746,22 @@ class _SpecialKeysButton extends StatelessWidget {
       color: const Color(0xFF24252B),
       elevation: 8,
       items: <PopupMenuEntry<RemoteSpecialAction>>[
-        _item(RemoteSpecialAction.win, Icons.window_rounded, 'Win', tr('开始菜单')),
-        _item(RemoteSpecialAction.altTab, Icons.swap_horiz_rounded, 'Alt+Tab',
-            tr('切换窗口')),
-        _item(RemoteSpecialAction.altF4, Icons.close_rounded, 'Alt+F4', tr('关闭当前窗口')),
-        _item(RemoteSpecialAction.taskManager, Icons.task_alt_rounded,
-            'Ctrl+Shift+Esc', tr('任务管理器')),
-        const PopupMenuDivider(),
-        _item(RemoteSpecialAction.sas, Icons.lock_reset_rounded, 'Ctrl+Alt+Del',
-            tr('安全注意序列（需主机以服务方式运行）')),
+        if (available) ...[
+          _item(RemoteSpecialAction.win, Icons.window_rounded, 'Win', tr('开始菜单')),
+          _item(RemoteSpecialAction.altTab, Icons.swap_horiz_rounded, 'Alt+Tab',
+              tr('切换窗口')),
+          _item(RemoteSpecialAction.altF4, Icons.close_rounded, 'Alt+F4', tr('关闭当前窗口')),
+          _item(RemoteSpecialAction.taskManager, Icons.task_alt_rounded,
+              'Ctrl+Shift+Esc', tr('任务管理器')),
+          const PopupMenuDivider(),
+          _item(RemoteSpecialAction.sas, Icons.lock_reset_rounded, 'Ctrl+Alt+Del',
+              tr('安全注意序列（需主机以服务方式运行）')),
+        ],
+        if (restartAvailable) ...[
+          if (available) const PopupMenuDivider(),
+          _item(RemoteSpecialAction.restart, Icons.restart_alt_rounded, tr('远程重启'),
+              tr('重启主机；未保存的工作会丢失')),
+        ],
       ],
     );
     if (selected != null) {
@@ -783,11 +803,12 @@ class _SpecialKeysButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final bool enabled = available || restartAvailable;
     return Builder(
       builder: (BuildContext buttonContext) => _BarButton(
         icon: Icons.keyboard_command_key_rounded,
-        tooltip: available ? tr('特殊按键') : tr('先开启远程键鼠'),
-        disabled: !available,
+        tooltip: enabled ? tr('特殊按键') : tr('先开启远程键鼠'),
+        disabled: !enabled,
         onTap: () => unawaited(_open(buttonContext)),
       ),
     );

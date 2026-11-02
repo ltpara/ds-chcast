@@ -42,6 +42,7 @@
       <button type="button" class="tab active" data-tab="overview" role="tab">概览</button>
       <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
       <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
+      <button type="button" class="tab" data-tab="groups" role="tab">访问组</button>
       <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
       <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
       <button type="button" class="tab" data-tab="server" role="tab">服务</button>
@@ -87,7 +88,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>ID</th><th>别名</th><th>标签</th><th>主机名</th><th>平台</th><th>版本</th><th>状态</th><th>中继 / 地址</th><th>最近在线</th><th class="actions-col">操作</th></tr>
+              <tr><th>ID</th><th>别名</th><th>标签</th><th>主机名</th><th>平台</th><th>版本</th><th>元数据签名</th><th>状态</th><th>中继 / 地址</th><th>最近在线</th><th class="actions-col">操作</th></tr>
             </thead>
             <tbody id="device-rows"></tbody>
           </table>
@@ -127,6 +128,84 @@
       </div>
     </section>
 
+    <section id="panel-groups" class="panel-page">
+      <div id="group-create-panel" class="panel hidden">
+        <div class="panel-head"><h2>新建访问组</h2></div>
+        <form id="group-create" class="inline-form" autocomplete="off">
+          <label>名称<input id="group-name" required maxlength="64" spellcheck="false"></label>
+          <label>描述<input id="group-description" maxlength="256" spellcheck="false"></label>
+          <label>设备配额（0 不限）<input id="group-max-devices" type="number" min="0" value="0"></label>
+          <label>成员配额（0 不限）<input id="group-max-members" type="number" min="0" value="0"></label>
+          <button type="submit" class="primary">创建</button>
+        </form>
+        <p class="muted">访问组独立于地址簿分组：组角色 readonly 可查看组与审计，write 可分配设备，admin 可管理成员与配额；设备 ID 使用会合 ID。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>访问组</h2><button type="button" id="group-refresh">刷新</button></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>名称</th><th>描述</th><th>设备</th><th>成员</th><th>我的权限</th><th>创建时间</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="group-rows"></tbody>
+          </table>
+        </div>
+        <p id="group-empty" class="muted hidden">还没有访问组</p>
+      </div>
+      <div id="group-detail" class="hidden">
+        <div class="panel">
+          <div class="panel-head">
+            <h2 id="group-detail-title">组详情</h2>
+            <span id="group-detail-summary" class="muted"></span>
+          </div>
+          <form id="group-settings-form" class="inline-form hidden" autocomplete="off">
+            <label>名称<input id="group-settings-name" required maxlength="64" spellcheck="false"></label>
+            <label>描述<input id="group-settings-description" maxlength="256" spellcheck="false"></label>
+            <label>设备配额（0 不限）<input id="group-settings-max-devices" type="number" min="0"></label>
+            <label>成员配额（0 不限）<input id="group-settings-max-members" type="number" min="0"></label>
+            <button type="submit" class="primary">保存设置</button>
+          </form>
+        </div>
+        <div class="grid-2">
+          <div class="panel">
+            <div class="panel-head"><h2>成员</h2></div>
+            <form id="group-member-form" class="inline-form" autocomplete="off">
+              <label>用户名<input id="group-member-name" required maxlength="64" spellcheck="false" autocomplete="off"></label>
+              <label>组角色
+                <select id="group-member-role">
+                  <option value="readonly">readonly（只读）</option>
+                  <option value="write">write（可写设备）</option>
+                  <option value="admin">admin（管理成员与配额）</option>
+                </select>
+              </label>
+              <button type="submit" class="primary">添加</button>
+            </form>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>成员</th><th>组角色</th><th>加入时间</th><th>状态</th><th class="actions-col">操作</th></tr></thead>
+                <tbody id="group-member-rows"></tbody>
+              </table>
+            </div>
+            <p id="group-member-empty" class="muted hidden">还没有成员</p>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>设备</h2></div>
+            <form id="group-device-form" class="inline-form" autocomplete="off">
+              <label>设备 ID<input id="group-device-id" required maxlength="64" spellcheck="false"></label>
+              <button type="submit" class="primary">分配</button>
+            </form>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>设备 ID</th><th>加入时间</th><th class="actions-col">操作</th></tr></thead>
+                <tbody id="group-device-rows"></tbody>
+              </table>
+            </div>
+            <p id="group-device-empty" class="muted hidden">还没有分配设备</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="panel-recordings" class="panel-page">
       <div class="panel">
         <div class="panel-head">
@@ -163,6 +242,7 @@
             <button type="button" class="subtab" data-audit="files">文件传输</button>
           </div>
           <span class="spacer"></span>
+          <select id="audit-group" class="hidden" aria-label="访问组过滤"></select>
           <input id="audit-filter" type="search" placeholder="动作" spellcheck="false">
           <input id="audit-host" class="hidden" type="search" placeholder="主机 ID（可选）" spellcheck="false">
           <button type="button" id="audit-reload">查询</button>

@@ -316,6 +316,105 @@ bool tunnel_listen_port(const std::string& listen, uint16_t& port) {
     return true;
 }
 
+bool parse_socks5_proxy(const std::string& input, std::string& normalized) {
+    const std::string text = trim(input);
+    if (text.empty() || text.size() > 512) {
+        return false;
+    }
+    bool has_scheme = false;
+    std::string rest = text;
+    const size_t scheme_end = text.find("://");
+    if (scheme_end != std::string::npos) {
+        const std::string scheme = lower(text.substr(0, scheme_end));
+        if (scheme != "socks5" && scheme != "socks5h") {
+            return false;
+        }
+        has_scheme = true;
+        rest = text.substr(scheme_end + 3);
+    }
+    if (rest.empty() || rest.find_first_of("/?#") != std::string::npos) {
+        return false;
+    }
+    std::string credentials;
+    if (has_scheme) {
+        const size_t at = rest.rfind('@');
+        if (at != std::string::npos) {
+            credentials = rest.substr(0, at);
+            rest = rest.substr(at + 1);
+            if (credentials.empty() || credentials.front() == ':') {
+                return false;
+            }
+            for (unsigned char c : credentials) {
+                if (c < 0x21 || c > 0x7E) {
+                    return false;
+                }
+            }
+        }
+    } else if (rest.find('@') != std::string::npos) {
+        return false;
+    }
+    std::string host;
+    std::string port_text;
+    if (!rest.empty() && rest.front() == '[') {
+        const size_t close = rest.find(']');
+        if (close == std::string::npos) {
+            return false;
+        }
+        host = rest.substr(1, close - 1);
+        const std::string tail = rest.substr(close + 1);
+        if (!tail.empty()) {
+            if (tail.front() != ':') {
+                return false;
+            }
+            port_text = tail.substr(1);
+        }
+        if (host.empty()) {
+            return false;
+        }
+        for (unsigned char c : host) {
+            if (!std::isxdigit(c) && c != ':' && c != '.' && c != '%') {
+                return false;
+            }
+        }
+        host = "[" + host + "]";
+    } else {
+        const size_t colon = rest.rfind(':');
+        if (colon != std::string::npos) {
+            host = rest.substr(0, colon);
+            port_text = rest.substr(colon + 1);
+        } else {
+            host = rest;
+        }
+        if (host.empty()) {
+            return false;
+        }
+        for (unsigned char c : host) {
+            if (!alphanumeric(c) && c != '.' && c != '-' && c != '_') {
+                return false;
+            }
+        }
+    }
+    uint32_t port = 1080;
+    if (!port_text.empty()) {
+        if (port_text.size() > 5 ||
+            port_text.find_first_not_of("0123456789") != std::string::npos ||
+            !parse_u32(port_text, port) || port == 0 || port > 65535) {
+            return false;
+        }
+    } else if (!has_scheme) {
+        return false;
+    }
+    normalized = "socks5://";
+    if (!credentials.empty()) {
+        normalized += credentials;
+        normalized += "@";
+    }
+    normalized += host;
+    normalized += ":";
+    normalized += std::to_string(port);
+    return true;
+}
+
 std::string audit_spool_path_for(const std::string& settings_path) {
     if (settings_path.empty()) {
         return {};
@@ -443,6 +542,18 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         } else if (key == "privacy_mode") {
             if (!parse_bool(value, settings.allow_privacy_mode)) {
                 warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
+            }
+        } else if (key == "restart") {
+            if (!parse_bool(value, settings.allow_restart)) {
+                warn(result.warning, "restart '" + value + "' is not a boolean");
+            }
+        } else if (key == "auto_disconnect_minutes") {
+            uint32_t minutes = 0;
+            if (!parse_u32(value, minutes) || minutes > 10080) {
+                warn(result.warning, "auto_disconnect_minutes '" + value +
+                                         "' is not 0..10080; leaving it off");
+            } else {
+                settings.auto_disconnect_minutes = minutes;
             }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
@@ -653,6 +764,18 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             } else {
                 settings.tunnel_listen = normalized;
             }
+        } else if (key == "socks5") {
+            if (value.empty()) {
+                settings.socks5.clear();
+            } else {
+                std::string normalized;
+                if (!parse_socks5_proxy(value, normalized)) {
+                    warn(result.warning,
+                         "socks5 is not socks5://[user:pass@]host:port; clearing it");
+                } else {
+                    settings.socks5 = normalized;
+                }
+            }
         } else if (key == "audit_spool") {
             // Empty keeps the file next to host.ini; there is no separate
             // switch, because a host that forwards nothing writes nothing.
@@ -687,9 +810,9 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_terminal = (permissions_mask & kPermissionTerminal) != 0;
         settings.allow_privacy_mode = (permissions_mask & kPermissionPrivacyMode) != 0;
         // The mask is authoritative for every gate it predates, but not for
-        // record or camera: older builds never wrote those bits, and the
-        // explicit record=/camera= lines (which save always emits alongside
-        // the mask) decide them.
+        // record, camera or restart: older builds never wrote those bits, and
+        // the explicit record=/camera=/restart= lines (which save always emits
+        // alongside the mask) decide them.
     }
     return result;
 }
@@ -715,6 +838,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_terminal ? kPermissionTerminal : 0) |
         (settings.allow_camera ? kPermissionCamera : 0) |
         (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0) |
+        (settings.allow_restart ? kPermissionRestart : 0) |
         (settings.allow_record ? kPermissionRecord : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
@@ -745,6 +869,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "audio_silence_gate_ms=" << settings.audio_silence_gate_ms << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
+         << "restart=" << (settings.allow_restart ? 1 : 0) << "\n"
+         << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"
@@ -764,7 +890,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "tunnel_id=" << settings.tunnel_id << "\n"
          << "tunnel_old_id=" << settings.tunnel_old_id << "\n"
          << "tunnel_key=" << settings.tunnel_key << "\n"
-         << "tunnel_listen=" << settings.tunnel_listen << "\n";
+         << "tunnel_listen=" << settings.tunnel_listen << "\n"
+         << "socks5=" << settings.socks5 << "\n";
     // Only a custom spool is written; the derived default would otherwise
     // pin a machine-specific path into a file that may be copied elsewhere.
     const std::string default_spool = audit_spool_path_for(path);

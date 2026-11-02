@@ -5,6 +5,7 @@
   const LEGACY_KEY = 'chast.admin.key';
   const REFRESH_MS = 15000;
   const ROLE_RANK = { readonly: 1, operator: 2, admin: 3 };
+  const GROUP_ROLE_RANK = { readonly: 1, write: 2, admin: 3 };
 
   const $ = (id) => document.getElementById(id);
 
@@ -24,6 +25,14 @@
     recordingBefore: 0,
     recordingRows: [],
     recordingGen: 0,
+    groups: [],
+    groupsDisabled: false,
+    groupID: '',
+    group: null,
+    groupMembers: [],
+    groupDevices: [],
+    groupGen: 0,
+    auditGroupID: '',
   };
 
   class ApiError extends Error {
@@ -91,6 +100,18 @@
     if (n < 60) return n + ' 秒';
     if (n < 3600) return (n / 60).toFixed(1) + ' 分钟';
     return (n / 3600).toFixed(1) + ' 小时';
+  }
+
+  function routeLabel(route) {
+    switch (route) {
+      case 'direct': return '直连';
+      case 'relay': return '中继';
+      case 'carrier': return '载体';
+      case undefined:
+      case null:
+      case '': return '—';
+      default: return String(route);
+    }
   }
 
   function fmtDurationMS(ms) {
@@ -353,6 +374,7 @@
     const admin = can('admin');
     const write = can('operator');
     document.querySelector('.tab[data-tab="accounts"]').classList.toggle('hidden', !admin);
+    $('group-create-panel').classList.toggle('hidden', !admin);
     $('device-readonly').classList.toggle('hidden', write);
     $('recording-readonly').classList.toggle('hidden', write);
     if (!admin && state.tab === 'accounts') switchTab('overview');
@@ -374,6 +396,10 @@
     state.auditGen++;
     state.recordingRows = [];
     state.recordingGen++;
+    state.groups = [];
+    state.groupsDisabled = false;
+    state.auditGroupID = '';
+    clearGroupDetail();
     const dialog = $('device-dialog');
     if (dialog.open) dialog.close();
     clearSession();
@@ -419,8 +445,13 @@
     if (tab === 'overview') refreshOverview().catch(reportError);
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
+    else if (tab === 'groups') loadGroups().catch(reportError);
     else if (tab === 'recordings') loadRecordings(true).catch(reportError);
-    else if (tab === 'audit') loadAudit(true).catch(reportError);
+    else if (tab === 'audit') {
+      if (!state.groups.length) loadGroups(true).catch(() => {});
+      syncAuditControls();
+      loadAudit(true).catch(reportError);
+    }
     else if (tab === 'server') loadServerPanel().catch(reportError);
   }
 
@@ -673,6 +704,15 @@
     tr.appendChild(cell(peer.hostname || '—'));
     tr.appendChild(cell(peer.platform || '—'));
     tr.appendChild(cell(peer.version || '—'));
+    if (peer.metadata_signed) {
+      const signed = pill('已签名', 'ok');
+      signed.title = '主机名、平台与版本已由主机密钥签名';
+      tr.appendChild(cell(signed));
+    } else {
+      const unsigned = pill('未签名');
+      unsigned.title = '旧版主机或注册时未携带 metadata_sig';
+      tr.appendChild(cell(unsigned));
+    }
     tr.appendChild(cell(peer.online ? pill('在线', 'ok') : pill('离线')));
 
     const where = el('div', 'stack');
@@ -859,6 +899,368 @@
     });
   }
 
+  // ---------- access groups ----------
+
+  function groupRole() {
+    if (can('admin')) return 'admin';
+    return state.group && state.group.role ? state.group.role : '';
+  }
+
+  function groupCan(level) {
+    return (GROUP_ROLE_RANK[groupRole()] || 0) >= GROUP_ROLE_RANK[level];
+  }
+
+  function fmtQuota(count, max) {
+    return (count || 0) + ' / ' + (max ? max : '不限');
+  }
+
+  function fmtGroupTime(value) {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? fmtTime(ms) : '—';
+  }
+
+  function quotaValue(id) {
+    const raw = $(id).value.trim();
+    const value = raw === '' ? 0 : Number(raw);
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error('配额必须是不小于 0 的整数。');
+    }
+    return value;
+  }
+
+  async function loadGroups(silent) {
+    try {
+      const data = await api('/v1/access-groups');
+      state.groups = Array.isArray(data && data.groups) ? data.groups : [];
+      state.groupsDisabled = false;
+      if (state.groupID && !state.groups.some((group) => group.id === state.groupID)) {
+        clearGroupDetail();
+      }
+      renderGroups();
+      renderAuditGroupOptions();
+      syncAuditControls();
+      return state.groups;
+    } catch (err) {
+      if (err && err.status === 503) {
+        state.groups = [];
+        state.groupsDisabled = true;
+        clearGroupDetail();
+        renderGroups();
+        renderAuditGroupOptions();
+        syncAuditControls();
+        return state.groups;
+      }
+      if (silent) return state.groups;
+      throw err;
+    }
+  }
+
+  function renderGroups() {
+    const body = $('group-rows');
+    clear(body);
+    state.groups.forEach((group) => body.appendChild(groupRow(group)));
+    const empty = $('group-empty');
+    empty.textContent = state.groupsDisabled ? '服务端未启用账号系统。'
+      : can('admin') ? '还没有访问组。' : '你还没有加入任何访问组。';
+    empty.classList.toggle('hidden', state.groups.length > 0);
+  }
+
+  function groupRow(group) {
+    const tr = document.createElement('tr');
+    const name = cell(group.name);
+    name.title = 'ID ' + group.id;
+    tr.appendChild(name);
+
+    const description = cell(group.description || '—');
+    description.className = 'wrap';
+    tr.appendChild(description);
+
+    tr.appendChild(cell(fmtQuota(group.device_count, group.max_devices)));
+    tr.appendChild(cell(fmtQuota(group.member_count, group.max_members)));
+
+    let role = group.role || '';
+    let roleLabel = role;
+    let roleKind = role === 'admin' ? 'ok' : role === 'write' ? 'warn' : '';
+    if (!role && can('admin')) {
+      roleLabel = '全局管理员';
+      roleKind = 'ok';
+    }
+    tr.appendChild(cell(roleLabel ? pill(roleLabel, roleKind) : '—'));
+    tr.appendChild(cell(fmtGroupTime(group.created_at)));
+
+    const actions = el('div', 'actions-wrap');
+    const manage = button('管理', 'small');
+    manage.addEventListener('click', () => openGroup(group.id));
+    actions.appendChild(manage);
+    if (can('admin')) {
+      const remove = button('删除', 'small danger');
+      remove.addEventListener('click', () => withButton(remove, () => deleteGroup(group)));
+      actions.appendChild(remove);
+    }
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function openGroup(id) {
+    state.groupID = id;
+    $('group-detail').classList.remove('hidden');
+    loadGroupDetail(id).catch(handleGroupDetailError);
+  }
+
+  function handleGroupDetailError(err) {
+    if (err && (err.status === 403 || err.status === 404)) {
+      const missing = err.status === 404;
+      clearGroupDetail();
+      loadGroups(true).catch(() => {});
+      toast(missing ? '访问组已不存在。' : '你已不是该访问组成员。', true);
+      return;
+    }
+    reportError(err);
+  }
+
+  function clearGroupDetail() {
+    state.groupGen++;
+    state.groupID = '';
+    state.group = null;
+    state.groupMembers = [];
+    state.groupDevices = [];
+    $('group-detail').classList.add('hidden');
+  }
+
+  async function loadGroupDetail(id) {
+    const generation = ++state.groupGen;
+    const base = '/v1/access-groups/' + encodeURIComponent(id);
+    const [group, members, devices] = await Promise.all([
+      api(base),
+      api(base + '/members'),
+      api(base + '/devices'),
+    ]);
+    if (generation !== state.groupGen) return;
+    state.group = group || null;
+    state.groupMembers = Array.isArray(members && members.members) ? members.members : [];
+    state.groupDevices = Array.isArray(devices && devices.devices) ? devices.devices : [];
+    renderGroupDetail();
+  }
+
+  async function refreshGroupViews() {
+    await loadGroups(true);
+    if (!state.groupID) return;
+    try {
+      await loadGroupDetail(state.groupID);
+    } catch (err) {
+      handleGroupDetailError(err);
+    }
+  }
+
+  function renderGroupDetail() {
+    const group = state.group;
+    if (!group) return;
+    const admin = groupCan('admin');
+    const write = groupCan('write');
+    $('group-detail').classList.remove('hidden');
+    $('group-detail-title').textContent = group.name;
+
+    const bits = [
+      'ID ' + group.id,
+      '设备 ' + fmtQuota(group.device_count, group.max_devices),
+      '成员 ' + fmtQuota(group.member_count, group.max_members),
+    ];
+    const role = groupRole();
+    if (role) bits.push('我的权限 ' + (can('admin') && !group.role ? '全局管理员' : role));
+    $('group-detail-summary').textContent = bits.join(' · ');
+
+    $('group-settings-form').classList.toggle('hidden', !admin);
+    if (admin) {
+      $('group-settings-name').value = group.name;
+      $('group-settings-description').value = group.description || '';
+      $('group-settings-max-devices').value = String(group.max_devices || 0);
+      $('group-settings-max-members').value = String(group.max_members || 0);
+    }
+    $('group-member-form').classList.toggle('hidden', !admin);
+    $('group-device-form').classList.toggle('hidden', !write);
+
+    renderGroupMembers(admin);
+    renderGroupDevices(write);
+  }
+
+  function renderGroupMembers(editable) {
+    const body = $('group-member-rows');
+    clear(body);
+    state.groupMembers.forEach((member) => body.appendChild(groupMemberRow(member, editable)));
+    $('group-member-empty').classList.toggle('hidden', state.groupMembers.length > 0);
+  }
+
+  function groupMemberRow(member, editable) {
+    const tr = document.createElement('tr');
+    const name = cell(member.username);
+    name.className = 'mono';
+    if (member.banned) name.title = '账号已封禁，其组角色不可用';
+    tr.appendChild(name);
+
+    const select = document.createElement('select');
+    ['readonly', 'write', 'admin'].forEach((role) => {
+      const option = document.createElement('option');
+      option.value = role;
+      option.textContent = role;
+      if (member.role === role) option.selected = true;
+      select.appendChild(option);
+    });
+    select.disabled = !editable;
+    select.addEventListener('change', () => withButton(select, async () => {
+      try {
+        await api('/v1/access-groups/' + encodeURIComponent(state.groupID) + '/members/' +
+          encodeURIComponent(member.username), {
+          method: 'PUT',
+          body: { role: select.value },
+        });
+        toast('已将 ' + member.username + ' 设为 ' + select.value);
+      } finally {
+        await refreshGroupViews();
+      }
+    }));
+    tr.appendChild(cell(select));
+
+    tr.appendChild(cell(fmtGroupTime(member.created_at)));
+    tr.appendChild(cell(member.banned ? pill('已封禁', 'bad') : pill('正常', 'ok')));
+
+    const actions = el('div', 'actions-wrap');
+    if (editable) {
+      const remove = button('移除', 'small danger');
+      remove.addEventListener('click', () => withButton(remove, async () => {
+        if (!window.confirm('从访问组移除 ' + member.username + '？')) return;
+        await api('/v1/access-groups/' + encodeURIComponent(state.groupID) + '/members/' +
+          encodeURIComponent(member.username), { method: 'DELETE' });
+        toast('已移除 ' + member.username);
+        await refreshGroupViews();
+      }));
+      actions.appendChild(remove);
+    } else {
+      actions.appendChild(el('span', 'muted', '只读'));
+    }
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  function renderGroupDevices(editable) {
+    const body = $('group-device-rows');
+    clear(body);
+    state.groupDevices.forEach((device) => body.appendChild(groupDeviceRow(device, editable)));
+    $('group-device-empty').classList.toggle('hidden', state.groupDevices.length > 0);
+  }
+
+  function groupDeviceRow(device, editable) {
+    const tr = document.createElement('tr');
+    const id = cell(device.device_id);
+    id.className = 'mono';
+    tr.appendChild(id);
+    tr.appendChild(cell(fmtGroupTime(device.created_at)));
+
+    const actions = el('div', 'actions-wrap');
+    if (editable) {
+      const remove = button('移除', 'small danger');
+      remove.addEventListener('click', () => withButton(remove, async () => {
+        if (!window.confirm('从访问组移除设备 ' + device.device_id + '？')) return;
+        await api('/v1/access-groups/' + encodeURIComponent(state.groupID) + '/devices/' +
+          encodeURIComponent(device.device_id), { method: 'DELETE' });
+        toast('已移除 ' + device.device_id);
+        await refreshGroupViews();
+      }));
+      actions.appendChild(remove);
+    } else {
+      actions.appendChild(el('span', 'muted', '只读'));
+    }
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  async function createGroup() {
+    const submit = $('group-create').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      const group = await api('/v1/access-groups', {
+        method: 'POST',
+        body: {
+          name: $('group-name').value.trim(),
+          description: $('group-description').value.trim(),
+          max_devices: quotaValue('group-max-devices'),
+          max_members: quotaValue('group-max-members'),
+        },
+      });
+      $('group-name').value = '';
+      $('group-description').value = '';
+      $('group-max-devices').value = '0';
+      $('group-max-members').value = '0';
+      toast('已创建访问组 ' + (group && group.name ? group.name : ''));
+      await loadGroups(true);
+      if (group && group.id) openGroup(group.id);
+    });
+  }
+
+  async function saveGroupSettings() {
+    const group = state.group;
+    if (!group) return;
+    const submit = $('group-settings-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/access-groups/' + encodeURIComponent(group.id), {
+        method: 'PATCH',
+        body: {
+          name: $('group-settings-name').value.trim(),
+          description: $('group-settings-description').value.trim(),
+          max_devices: quotaValue('group-settings-max-devices'),
+          max_members: quotaValue('group-settings-max-members'),
+        },
+      });
+      toast('已保存访问组设置');
+      await refreshGroupViews();
+    });
+  }
+
+  async function deleteGroup(group) {
+    if (!window.confirm('删除访问组 ' + group.name + '？成员与设备分配会一并移除。')) return;
+    await api('/v1/access-groups/' + encodeURIComponent(group.id), { method: 'DELETE' });
+    if (state.auditGroupID === group.id) {
+      state.auditGroupID = '';
+      if (state.tab === 'audit') loadAudit(true).catch(reportError);
+    }
+    if (state.groupID === group.id) clearGroupDetail();
+    toast('已删除访问组 ' + group.name);
+    await loadGroups(true);
+  }
+
+  async function addGroupMember() {
+    const group = state.group;
+    if (!group) return;
+    const username = $('group-member-name').value.trim();
+    if (!username) return;
+    const submit = $('group-member-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/access-groups/' + encodeURIComponent(group.id) + '/members/' +
+        encodeURIComponent(username), {
+        method: 'PUT',
+        body: { role: $('group-member-role').value },
+      });
+      $('group-member-name').value = '';
+      toast('已添加 ' + username);
+      await refreshGroupViews();
+    });
+  }
+
+  async function addGroupDevice() {
+    const group = state.group;
+    if (!group) return;
+    const deviceID = $('group-device-id').value.trim();
+    if (!deviceID) return;
+    const submit = $('group-device-form').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      const reply = await api('/v1/access-groups/' + encodeURIComponent(group.id) + '/devices', {
+        method: 'POST',
+        body: { device_id: deviceID },
+      });
+      $('group-device-id').value = '';
+      toast(reply && reply.added ? '已分配 ' + deviceID : deviceID + ' 已在组内');
+      await refreshGroupViews();
+    });
+  }
+
   // ---------- recordings ----------
 
   async function loadRecordings(reset) {
@@ -998,7 +1400,7 @@
       filterKey: 'username',
       filterPlaceholder: '用户名（可选）',
       hasHost: true,
-      columns: ['开始', '用户', '对端', '方向', '来源', '客户端 IP', '时长', '结果', '详情'],
+      columns: ['开始', '用户', '对端', '方向', '来源', '客户端 IP', '地点', '路由', '时长', '结果', '详情'],
       row(event) {
         return [
           fmtTime(event.started_at_ms),
@@ -1007,6 +1409,8 @@
           event.direction || '—',
           event.source || '—',
           event.client_ip || '—',
+          event.location || '—',
+          routeLabel(event.route),
           fmtDurationMS(event.duration_ms),
           pillBool(event.success),
           event.detail || '—',
@@ -1018,7 +1422,7 @@
       filterKey: 'username',
       filterPlaceholder: '用户名（可选）',
       hasHost: true,
-      columns: ['时间', '用户', '对端', '方向', '文件', '大小', '客户端 IP', '结果', '详情'],
+      columns: ['时间', '用户', '对端', '方向', '文件', '大小', '客户端 IP', '地点', '路由', '结果', '详情'],
       row(event) {
         const size = fmtBytes(event.size) + (event.files > 1 ? '（' + event.files + ' 个）' : '');
         return [
@@ -1029,6 +1433,8 @@
           event.name || '—',
           size,
           event.client_ip || '—',
+          event.location || '—',
+          routeLabel(event.route),
           pillBool(event.success),
           event.detail || '—',
         ];
@@ -1043,19 +1449,63 @@
     });
     const spec = AUDIT[tab];
     $('audit-filter').placeholder = spec.filterPlaceholder;
-    $('audit-host').classList.toggle('hidden', !spec.hasHost);
     $('audit-filter').value = '';
     $('audit-host').value = '';
+    syncAuditControls();
     loadAudit(true).catch(reportError);
+  }
+
+  function auditGrouped() {
+    return Boolean(state.auditGroupID) &&
+      (state.auditTab === 'connections' || state.auditTab === 'files');
+  }
+
+  function auditPath(spec) {
+    if (!auditGrouped()) return spec.path;
+    return '/v1/access-groups/' + encodeURIComponent(state.auditGroupID) +
+      (state.auditTab === 'connections' ? '/connections' : '/file-transfers');
+  }
+
+  function renderAuditGroupOptions() {
+    const select = $('audit-group');
+    clear(select);
+    const all = document.createElement('option');
+    all.value = '';
+    all.textContent = '全部访问组';
+    select.appendChild(all);
+    state.groups.forEach((group) => {
+      const option = document.createElement('option');
+      option.value = group.id;
+      option.textContent = group.name;
+      select.appendChild(option);
+    });
+    if (state.auditGroupID && !state.groups.some((group) => group.id === state.auditGroupID)) {
+      state.auditGroupID = '';
+    }
+    select.value = state.auditGroupID;
+  }
+
+  // syncAuditControls hides the per-user filters when a group scope is active,
+  // because the group endpoints page by device membership only.
+  function syncAuditControls() {
+    const spec = AUDIT[state.auditTab];
+    const grouped = auditGrouped();
+    $('audit-group').classList.toggle('hidden', state.auditTab === 'events' || state.groups.length === 0);
+    $('audit-filter').classList.toggle('hidden', grouped);
+    $('audit-host').classList.toggle('hidden', grouped || !spec.hasHost);
+    $('audit-csv').disabled = grouped;
+    $('audit-csv').title = grouped ? '按访问组筛选暂不支持 CSV 导出' : '';
   }
 
   function auditParams(spec) {
     const params = new URLSearchParams();
-    const filter = $('audit-filter').value.trim();
-    if (filter) params.set(spec.filterKey, filter);
-    if (spec.hasHost) {
-      const host = $('audit-host').value.trim();
-      if (host) params.set('host', host);
+    if (!auditGrouped()) {
+      const filter = $('audit-filter').value.trim();
+      if (filter) params.set(spec.filterKey, filter);
+      if (spec.hasHost) {
+        const host = $('audit-host').value.trim();
+        if (host) params.set('host', host);
+      }
     }
     return params;
   }
@@ -1072,7 +1522,7 @@
     params.set('limit', '50');
     const cursor = state.auditBefore;
     if (cursor) params.set('before_id', String(cursor));
-    const data = await api(spec.path + '?' + params.toString()) || {};
+    const data = await api(auditPath(spec) + '?' + params.toString()) || {};
     if (generation !== state.auditGen) return;
     const list = data.events || data.connections || data.transfers || [];
     state.auditRows = state.auditRows.concat(list);
@@ -1098,15 +1548,24 @@
     });
     $('audit-empty').classList.toggle('hidden', state.auditRows.length > 0);
     $('audit-more').classList.toggle('hidden', !state.auditBefore);
-    $('audit-summary').textContent = '已显示 ' + state.auditRows.length + ' 条' +
+    let summary = '已显示 ' + state.auditRows.length + ' 条' +
       (state.auditBefore ? '，还有更多' : state.auditRows.length ? '，已到末尾' : '');
+    if (auditGrouped()) {
+      const group = state.groups.find((item) => item.id === state.auditGroupID);
+      if (group) summary += ' · 访问组 ' + group.name;
+    }
+    $('audit-summary').textContent = summary;
   }
 
   async function exportAudit() {
+    if (auditGrouped()) {
+      toast('按访问组筛选暂不支持 CSV 导出', true);
+      return;
+    }
     const spec = AUDIT[state.auditTab];
     const params = auditParams(spec);
     params.set('format', 'csv');
-    const target = spec.path + '?' + params.toString();
+    const target = auditPath(spec) + '?' + params.toString();
     let resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
     if (resp.status === 401 && await refreshSession()) {
       resp = await fetch(target, { headers: authHeaders(), cache: 'no-store' });
@@ -1221,6 +1680,28 @@
       toast('已刷新');
     }));
 
+    $('group-create').addEventListener('submit', (event) => {
+      event.preventDefault();
+      createGroup();
+    });
+    $('group-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadGroups();
+      if (state.groupID) await loadGroupDetail(state.groupID);
+      toast('已刷新');
+    }));
+    $('group-settings-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveGroupSettings();
+    });
+    $('group-member-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      addGroupMember();
+    });
+    $('group-device-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      addGroupDevice();
+    });
+
     $('recording-reload').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
       await loadRecordings(true);
     }));
@@ -1241,6 +1722,11 @@
       await loadAudit(false);
     }));
     $('audit-csv').addEventListener('click', (event) => withButton(event.currentTarget, exportAudit));
+    $('audit-group').addEventListener('change', () => {
+      state.auditGroupID = $('audit-group').value;
+      syncAuditControls();
+      loadAudit(true).catch(reportError);
+    });
     [$('audit-filter'), $('audit-host')].forEach((input) => {
       input.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') loadAudit(true).catch(reportError);

@@ -2181,6 +2181,8 @@ type connectionReply struct {
 	AuditRef    string `json:"audit_ref"`
 	Source      string `json:"source"`
 	ClientIP    string `json:"client_ip"`
+	Location    string `json:"location"`
+	Route       string `json:"route"`
 	StartedAtMS int64  `json:"started_at_ms"`
 	EndedAtMS   int64  `json:"ended_at_ms"`
 	DurationMS  int64  `json:"duration_ms"`
@@ -2218,6 +2220,7 @@ func TestConnectionAudit(t *testing.T) {
 		{"malformed", `{"peer_id":`},
 		{"empty peer", `{"peer_id":"  "}`},
 		{"unknown direction", `{"peer_id":"devbox","direction":"host"}`},
+		{"unknown route", `{"peer_id":"devbox","route":"kcp"}`},
 		{"ends before start", `{"peer_id":"devbox","started_at_ms":2000,"ended_at_ms":1000}`},
 	} {
 		if status, body := request(t, http.MethodPost, s.URL+"/v1/account/connections", tc.body, alice.Token); status != http.StatusBadRequest {
@@ -2340,6 +2343,8 @@ type fileTransferReply struct {
 	Size         int64  `json:"size"`
 	Files        int    `json:"files"`
 	ClientIP     string `json:"client_ip"`
+	Location     string `json:"location"`
+	Route        string `json:"route"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
 	Success      bool   `json:"success"`
 	Detail       string `json:"detail"`
@@ -2375,6 +2380,7 @@ func TestFileTransferAudit(t *testing.T) {
 		{"malformed", `{"peer_id":`},
 		{"empty peer", `{"peer_id":"  "}`},
 		{"unknown direction", `{"peer_id":"devbox","direction":"viewer"}`},
+		{"unknown route", `{"peer_id":"devbox","direction":"upload","route":"kcp"}`},
 		{"negative size", `{"peer_id":"devbox","direction":"upload","size":-1}`},
 		{"too many files", `{"peer_id":"devbox","direction":"upload","files":2000}`},
 	} {
@@ -2536,5 +2542,96 @@ func TestLoginRecordsGeoIPLocation(t *testing.T) {
 	}
 	if view.Sessions[0].LoginIP != "127.0.0.1" || view.Sessions[0].Location != "Local lab" {
 		t.Fatalf("sessions view origin = %+v", view.Sessions[0])
+	}
+}
+
+func TestAuditGeoIPLocationAndRoute(t *testing.T) {
+	table := filepath.Join(t.TempDir(), "geoip.txt")
+	if err := os.WriteFile(table, []byte("127.0.0.0/8\tLocal lab\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locator, err := geoip.Load(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testutil.StartWith(t, testutil.Options{GeoIP: locator})
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	alice := login(t, s.URL, "alice", "correct horse")
+
+	status, body := request(t, http.MethodPost, s.URL+"/v1/account/connections",
+		`{"peer_id":"devbox","route":"relay","detail":"via relay"}`, alice.Token)
+	if status != http.StatusCreated {
+		t.Fatalf("report connection: %d %s", status, body)
+	}
+	var connection connectionReply
+	if err := json.Unmarshal(body, &connection); err != nil {
+		t.Fatal(err)
+	}
+	if connection.ClientIP != "127.0.0.1" || connection.Location != "Local lab" ||
+		connection.Route != "relay" {
+		t.Fatalf("connection location/route = %+v", connection)
+	}
+
+	status, body = request(t, http.MethodPost, s.URL+"/v1/account/file-transfers",
+		`{"peer_id":"devbox","direction":"upload","name":"report.pdf","route":"carrier"}`,
+		alice.Token)
+	if status != http.StatusCreated {
+		t.Fatalf("report transfer: %d %s", status, body)
+	}
+	var transfer fileTransferReply
+	if err := json.Unmarshal(body, &transfer); err != nil {
+		t.Fatal(err)
+	}
+	if transfer.ClientIP != "127.0.0.1" || transfer.Location != "Local lab" ||
+		transfer.Route != "carrier" {
+		t.Fatalf("transfer location/route = %+v", transfer)
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/account/connections", "", alice.Token)
+	if status != http.StatusOK {
+		t.Fatalf("list connections: %d %s", status, body)
+	}
+	var connections connectionsReply
+	if err := json.Unmarshal(body, &connections); err != nil || len(connections.Connections) != 1 {
+		t.Fatalf("connections = %+v, %v", connections.Connections, err)
+	}
+	if connections.Connections[0].Location != "Local lab" ||
+		connections.Connections[0].Route != "relay" {
+		t.Fatalf("listed connection = %+v", connections.Connections[0])
+	}
+
+	status, body = request(t, http.MethodGet, s.URL+"/v1/account/file-transfers", "", alice.Token)
+	if status != http.StatusOK {
+		t.Fatalf("list transfers: %d %s", status, body)
+	}
+	var transfers fileTransfersReply
+	if err := json.Unmarshal(body, &transfers); err != nil || len(transfers.Transfers) != 1 {
+		t.Fatalf("transfers = %+v, %v", transfers.Transfers, err)
+	}
+	if transfers.Transfers[0].Location != "Local lab" || transfers.Transfers[0].Route != "carrier" {
+		t.Fatalf("listed transfer = %+v", transfers.Transfers[0])
+	}
+}
+
+func TestAuditRouteWithoutGeoIP(t *testing.T) {
+	s := testutil.Start(t)
+	if _, err := s.Accounts.CreateUser("alice", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	alice := login(t, s.URL, "alice", "correct horse")
+	status, body := request(t, http.MethodPost, s.URL+"/v1/account/connections",
+		`{"peer_id":"devbox","route":"direct"}`, alice.Token)
+	if status != http.StatusCreated {
+		t.Fatalf("report connection: %d %s", status, body)
+	}
+	var connection connectionReply
+	if err := json.Unmarshal(body, &connection); err != nil {
+		t.Fatal(err)
+	}
+	if connection.ClientIP != "127.0.0.1" || connection.Location != "" ||
+		connection.Route != "direct" {
+		t.Fatalf("connection without GeoIP = %+v", connection)
 	}
 }

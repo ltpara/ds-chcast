@@ -11,10 +11,12 @@ import '../address_book_sync.dart';
 import '../app_info.dart';
 import '../device_store.dart';
 import '../lan_discovery.dart';
+import '../search_match.dart';
 import '../security_key.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
+import '../socks5.dart';
 import '../target.dart';
 import '../theme.dart';
 import '../tunnel_agent.dart';
@@ -112,11 +114,19 @@ typedef AddressBookPeerDeleter =
     Future<void> Function(ServerSettings server, String token, String peerId);
 typedef ViewerUpdateInstaller =
     Future<void> Function(SoftwareInfo update, String serverPublicKey);
+typedef RelayWaker =
+    Future<void> Function(
+      ServerSettings server,
+      String token,
+      String hostId,
+      String mac,
+    );
 
 class HomePage extends StatefulWidget {
   const HomePage({
     super.key,
     this.initialTarget,
+    this.initialFileTransferOnly = false,
     this.deviceStore,
     this.serverStore,
     this.trustStore,
@@ -136,12 +146,17 @@ class HomePage extends StatefulWidget {
     this.addressBookPeerOrderWriter,
     this.addressBookPeerDeleter,
     this.wakeSender,
+    this.relayWaker,
     this.lanDiscovery,
     this.softwareUpdater,
     this.appExit,
   });
 
   final String? initialTarget;
+
+  /// Set by a `chast://file-transfer/new/<id>` link so the first automatic
+  /// connection opens the file-only session.
+  final bool initialFileTransferOnly;
 
   /// Test seams. Product code uses the files under %APPDATA%\chast.
   final DeviceStore? deviceStore;
@@ -164,6 +179,7 @@ class HomePage extends StatefulWidget {
   final AddressBookPeerOrderWriter? addressBookPeerOrderWriter;
   final AddressBookPeerDeleter? addressBookPeerDeleter;
   final WakeSender? wakeSender;
+  final RelayWaker? relayWaker;
   final LanDiscovery? lanDiscovery;
   final ViewerUpdateInstaller? softwareUpdater;
   final void Function(int code)? appExit;
@@ -180,6 +196,7 @@ class _HomePageState extends State<HomePage> {
   final TextEditingController _deviceSearch = TextEditingController();
   String _deviceQuery = '';
   final Set<String> _selectedTags = <String>{};
+  bool _favoritesOnly = false;
   late final DeviceStore _deviceStore;
   late final ServerSettingsStore _serverStore;
   late final TrustStore _trustStore;
@@ -199,6 +216,7 @@ class _HomePageState extends State<HomePage> {
   late final AddressBookPeerOrderWriter _writePeerOrder;
   late final AddressBookPeerDeleter _deleteAddressBookPeer;
   late final WakeSender _wakeSender;
+  late final RelayWaker _relayWake;
   late final LanDiscovery _lanDiscovery;
   late final ViewerUpdateInstaller _installUpdate;
   late final void Function(int code) _exitApp;
@@ -241,6 +259,7 @@ class _HomePageState extends State<HomePage> {
         );
     _lookupBatch = widget.lookupBatch ?? ServerApi.lookupBatch;
     _wakeSender = widget.wakeSender ?? WakeOnLan.send;
+    _relayWake = widget.relayWaker ?? ServerApi.wake;
     _lanDiscovery = widget.lanDiscovery ?? const LanDiscovery();
     _installUpdate =
         widget.softwareUpdater ??
@@ -251,7 +270,11 @@ class _HomePageState extends State<HomePage> {
               sha256: update.sha256,
               size: update.size,
               signature: update.signature,
+              publisherKeyId: update.publisherKeyId,
+              publisherSignature: update.publisherSignature,
+              publisherPublicKey: TunnelAgent.publisherPin,
               serverPublicKey: serverPublicKey,
+              socks5: _server.socks5,
             );
     _exitApp = widget.appExit ?? exit;
     _updateLabels = widget.labelsUpdater ?? ServerApi.updateLabels;
@@ -398,6 +421,8 @@ class _HomePageState extends State<HomePage> {
     final List<Device> devices = await _deviceStore.load();
     final Set<String> savedTags = ViewFilter.load();
     final Set<String> collapsedGroups = ViewFilter.loadCollapsed();
+    final String savedSearch = ViewFilter.loadDeviceSearch();
+    final bool savedFavoritesOnly = ViewFilter.loadFavoritesOnly();
     final ServerSettings server = await _serverStore.load();
     final Map<String, String> trust = await _trustStore.load();
     final Map<String, ServerIdentityPin> pins = await _identityStore.load();
@@ -420,6 +445,7 @@ class _HomePageState extends State<HomePage> {
         account != null && account.groups.isNotEmpty
         ? account.groups
         : const <AddressBookGroup>[];
+    _deviceSearch.text = savedSearch;
     setState(() {
       _devices = devices;
       _server = server;
@@ -434,6 +460,8 @@ class _HomePageState extends State<HomePage> {
       _collapsedGroups
         ..clear()
         ..addAll(collapsedGroups);
+      _deviceQuery = savedSearch;
+      _favoritesOnly = savedFavoritesOnly;
       _loading = false;
     });
     unawaited(_refreshPresence());
@@ -446,7 +474,10 @@ class _HomePageState extends State<HomePage> {
       final String target = widget.initialTarget!;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          _connect(target);
+          _connect(
+            target,
+            fileTransferOnly: widget.initialFileTransferOnly,
+          );
         }
       });
     }
@@ -590,6 +621,7 @@ class _HomePageState extends State<HomePage> {
             url: group.key,
             mode: _server.mode,
             key: _server.key,
+            socks5: _server.socks5,
           );
           try {
             final BatchLookupResult batch = await _lookupBatch(
@@ -706,6 +738,7 @@ class _HomePageState extends State<HomePage> {
         displayName: device.name,
         mode: _server.mode,
         serverKey: _server.key,
+        socks5: _server.socks5,
       );
     } else {
       target = parseConnectTarget(device.id, token: token);
@@ -919,22 +952,52 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _wakeDevice(Device device) async {
-    final String? mac = await showDialog<String>(
+    final AccountSession? account = _account;
+    final bool relayAvailable =
+        account != null && account.server == _server.url && _server.configured;
+    final _WakeChoice? choice = await showDialog<_WakeChoice>(
       context: context,
-      builder: (BuildContext context) => _WakeDialog(device: device),
+      builder: (BuildContext context) =>
+          _WakeDialog(device: device, relayAvailable: relayAvailable),
     );
-    if (mac == null || !mounted) {
+    if (choice == null || !mounted) {
       return;
     }
-    final List<Device> devices = await _deviceStore.updateMac(device.key, mac);
+    final List<Device> devices = await _deviceStore.updateMac(
+      device.key,
+      choice.mac,
+    );
     if (!mounted) {
       return;
     }
     setState(() => _devices = devices);
     try {
-      await _wakeSender(mac);
+      if (choice.relay) {
+        final AccountSession? relayAccount = _account;
+        if (relayAccount == null || relayAccount.server != _server.url) {
+          _showSnack(tr('请先登录账号'));
+          return;
+        }
+        await _relayWake(_server, relayAccount.token, device.id, choice.mac);
+        if (mounted) {
+          _showSnack(tr('已请求主机代理转发唤醒包'));
+        }
+      } else {
+        await _wakeSender(choice.mac);
+        if (mounted) {
+          _showSnack(tr('已发送局域网唤醒包'));
+        }
+      }
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.unauthorized) {
+        await _recoverAccountSession();
+        if (mounted) {
+          _showSnack(tr('账号已过期，请重试'));
+        }
+        return;
+      }
       if (mounted) {
-        _showSnack(tr('已发送局域网唤醒包'));
+        _showSnack(tr('唤醒包发送失败：{error}', <String, Object?>{'error': error}));
       }
     } catch (error) {
       if (mounted) {
@@ -1147,6 +1210,7 @@ class _HomePageState extends State<HomePage> {
                 url: device.server,
                 mode: _server.mode,
                 key: _server.key,
+                socks5: _server.socks5,
               ),
               hostId: device.id,
               alias: presence.info?.alias ?? '',
@@ -1854,7 +1918,7 @@ class _HomePageState extends State<HomePage> {
 
   List<Device> _filteredSavedDevices(List<Device> saved, Set<String> tags) {
     final String query = _deviceQuery.trim().toLowerCase();
-    if (query.isEmpty && tags.isEmpty) {
+    if (query.isEmpty && tags.isEmpty && !_favoritesOnly) {
       return saved;
     }
     final Set<String> groupHits = _groupsMatchingQuery(query);
@@ -1883,7 +1947,7 @@ class _HomePageState extends State<HomePage> {
         if (current == null) {
           break;
         }
-        if (current.name.toLowerCase().contains(query)) {
+        if (matchesSearch(<String>[current.name], query)) {
           hits.add(group.id);
           break;
         }
@@ -1900,6 +1964,9 @@ class _HomePageState extends State<HomePage> {
     Set<String> groupHits,
   ) {
     final List<String> visibleTags = _visibleTags(device);
+    if (_favoritesOnly && !device.favorite) {
+      return false;
+    }
     if (tags.isNotEmpty && !visibleTags.any(tags.contains)) {
       return false;
     }
@@ -1918,7 +1985,7 @@ class _HomePageState extends State<HomePage> {
       presence?.info?.alias ?? '',
       ...?presence?.info?.tags,
     ];
-    return fields.any((String value) => value.toLowerCase().contains(query));
+    return matchesSearch(fields, query);
   }
 
   void _clearDeviceFilters() {
@@ -1926,8 +1993,24 @@ class _HomePageState extends State<HomePage> {
       _deviceSearch.clear();
       _deviceQuery = '';
       _selectedTags.clear();
+      _favoritesOnly = false;
     });
     ViewFilter.save(_selectedTags);
+    ViewFilter.saveDeviceSearch('');
+    ViewFilter.saveFavoritesOnly(false);
+  }
+
+  Future<void> _toggleFavorite(Device device) async {
+    final bool favorite = !device.favorite;
+    final List<Device> devices = await _deviceStore.setFavorite(
+      device.key,
+      favorite,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() => _devices = devices);
+    _showSnack(favorite ? tr('已收藏') : tr('已取消收藏'));
   }
 
   int get _onlineCount => _presence.values
@@ -1984,7 +2067,11 @@ class _HomePageState extends State<HomePage> {
     final Set<String> activeTags = _activeTags(saved);
     final List<Device> filtered = _filteredSavedDevices(saved, activeTags);
     final bool filtering =
-        _deviceQuery.trim().isNotEmpty || activeTags.isNotEmpty;
+        _deviceQuery.trim().isNotEmpty ||
+        activeTags.isNotEmpty ||
+        _favoritesOnly;
+    final bool favoritesEmpty =
+        _favoritesOnly && _deviceQuery.trim().isEmpty && activeTags.isEmpty;
     final List<Device> recent = _recentDevices;
     final SoftwareInfo? update = _availableUpdate;
 
@@ -2331,8 +2418,12 @@ class _HomePageState extends State<HomePage> {
                   if (filtered.isEmpty)
                     _emptyPanel(
                       context,
-                      icon: Icons.search_off_rounded,
-                      text: tr('没有匹配的设备'),
+                      icon: favoritesEmpty
+                          ? Icons.star_border_rounded
+                          : Icons.search_off_rounded,
+                      text: favoritesEmpty
+                          ? tr('还没有收藏的设备')
+                          : tr('没有匹配的设备'),
                       height: 118,
                       action: TextButton(
                         key: const Key('device-filter-reset-empty'),
@@ -2430,7 +2521,10 @@ class _HomePageState extends State<HomePage> {
         TextField(
           key: const Key('device-search'),
           controller: _deviceSearch,
-          onChanged: (String value) => setState(() => _deviceQuery = value),
+          onChanged: (String value) {
+            setState(() => _deviceQuery = value);
+            ViewFilter.saveDeviceSearch(value);
+          },
           style: TextStyle(fontSize: 12.5, color: theme.colorScheme.onSurface),
           decoration: InputDecoration(
             isDense: true,
@@ -2462,6 +2556,7 @@ class _HomePageState extends State<HomePage> {
                     onPressed: () {
                       _deviceSearch.clear();
                       setState(() => _deviceQuery = '');
+                      ViewFilter.saveDeviceSearch('');
                     },
                   ),
             suffixIconConstraints: const BoxConstraints(
@@ -2484,12 +2579,12 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
         ),
-        if (tags.isNotEmpty) ...<Widget>[
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: <Widget>[
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: <Widget>[
+            if (tags.isNotEmpty)
               _filterChip(
                 context,
                 key: const Key('tag-filter-all'),
@@ -2500,24 +2595,33 @@ class _HomePageState extends State<HomePage> {
                   ViewFilter.save(_selectedTags);
                 },
               ),
-              for (final String tag in tags)
-                _filterChip(
-                  context,
-                  key: Key('tag-filter-$tag'),
-                  label: tag,
-                  selected: activeTags.contains(tag),
-                  onTap: () {
-                    setState(() {
-                      if (!_selectedTags.remove(tag)) {
-                        _selectedTags.add(tag);
-                      }
-                    });
-                    ViewFilter.save(_selectedTags);
-                  },
-                ),
-            ],
-          ),
-        ],
+            _filterChip(
+              context,
+              key: const Key('favorite-filter'),
+              label: tr('仅看收藏'),
+              selected: _favoritesOnly,
+              onTap: () {
+                setState(() => _favoritesOnly = !_favoritesOnly);
+                ViewFilter.saveFavoritesOnly(_favoritesOnly);
+              },
+            ),
+            for (final String tag in tags)
+              _filterChip(
+                context,
+                key: Key('tag-filter-$tag'),
+                label: tag,
+                selected: activeTags.contains(tag),
+                onTap: () {
+                  setState(() {
+                    if (!_selectedTags.remove(tag)) {
+                      _selectedTags.add(tag);
+                    }
+                  });
+                  ViewFilter.save(_selectedTags);
+                },
+              ),
+          ],
+        ),
       ],
     );
   }
@@ -2845,6 +2949,7 @@ class _HomePageState extends State<HomePage> {
       onTap: () => _connectDevice(device),
       onFilesOnly: () => _connectDevice(device, fileTransferOnly: true),
       onRename: () => _renameDevice(device),
+      onFavorite: () => _toggleFavorite(device),
       onWake: () => _wakeDevice(device),
       onLabels: device.viaServer ? () => _editLabels(device) : null,
       onTags: accountReady ? () => _editTags(device) : null,
@@ -3930,10 +4035,21 @@ class _GroupPickerDialog extends StatelessWidget {
   }
 }
 
+class _WakeChoice {
+  const _WakeChoice(this.mac, {required this.relay});
+
+  final String mac;
+  final bool relay;
+}
+
 class _WakeDialog extends StatefulWidget {
-  const _WakeDialog({required this.device});
+  const _WakeDialog({required this.device, this.relayAvailable = false});
 
   final Device device;
+
+  /// True when the viewer is signed in to the device's connection service, so
+  /// an opted-in host agent can broadcast the packet on the target's link.
+  final bool relayAvailable;
 
   @override
   State<_WakeDialog> createState() => _WakeDialogState();
@@ -3944,6 +4060,7 @@ class _WakeDialogState extends State<_WakeDialog> {
     text: widget.device.mac,
   );
   String? _error;
+  bool _relay = false;
 
   @override
   void dispose() {
@@ -3957,7 +4074,7 @@ class _WakeDialogState extends State<_WakeDialog> {
       setState(() => _error = tr('请输入 12 位十六进制 MAC，例如 AA:BB:CC:DD:EE:FF'));
       return;
     }
-    Navigator.of(context).pop(mac);
+    Navigator.of(context).pop(_WakeChoice(mac, relay: _relay));
   }
 
   @override
@@ -3990,6 +4107,22 @@ class _WakeDialogState extends State<_WakeDialog> {
               ),
               onSubmitted: (_) => _submit(),
             ),
+            if (widget.relayAvailable) ...<Widget>[
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                key: const Key('wake-relay'),
+                value: _relay,
+                onChanged: (bool? value) =>
+                    setState(() => _relay = value ?? false),
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: Text(tr('通过连接服务转发')),
+                subtitle: Text(
+                  tr('发送给目标所在局域网中已开启 --wake-relay 的主机代理，适合跨子网唤醒。'),
+                  style: mutedStyle(context, size: 12),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -4035,6 +4168,7 @@ class _DeviceCard extends StatelessWidget {
     required this.onTap,
     required this.onFilesOnly,
     required this.onRename,
+    required this.onFavorite,
     required this.onWake,
     required this.onDelete,
     this.onLabels,
@@ -4052,6 +4186,7 @@ class _DeviceCard extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onFilesOnly;
   final VoidCallback onRename;
+  final VoidCallback onFavorite;
   final VoidCallback onWake;
   final VoidCallback onDelete;
   final VoidCallback? onLabels;
@@ -4168,6 +4303,15 @@ class _DeviceCard extends StatelessWidget {
                               ),
                             ),
                           ),
+                          if (device.favorite) ...<Widget>[
+                            const SizedBox(width: 4),
+                            Icon(
+                              Icons.star_rounded,
+                              key: Key('device-favorite-${device.id}'),
+                              size: 13,
+                              color: const Color(0xFFFFB300),
+                            ),
+                          ],
                           if (pinned) ...<Widget>[
                             const SizedBox(width: 5),
                             Icon(
@@ -4206,6 +4350,8 @@ class _DeviceCard extends StatelessWidget {
                       unawaited(_copyServer(context));
                     } else if (value == 'rename') {
                       onRename();
+                    } else if (value == 'favorite') {
+                      onFavorite();
                     } else if (value == 'wake') {
                       onWake();
                     } else if (value == 'labels') {
@@ -4240,6 +4386,12 @@ class _DeviceCard extends StatelessWidget {
                         PopupMenuItem<String>(
                           value: 'rename',
                           child: Text(tr('重命名')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'favorite',
+                          child: Text(
+                            device.favorite ? tr('取消收藏') : tr('收藏'),
+                          ),
                         ),
                         PopupMenuItem<String>(
                           value: 'wake',
@@ -5775,6 +5927,7 @@ class _ServerDialog extends StatefulWidget {
 class _ServerDialogState extends State<_ServerDialog> {
   late final TextEditingController _url;
   late final TextEditingController _key;
+  late final TextEditingController _socks5;
   late TunnelMode _mode;
   bool _testing = false;
   bool _showKey = false;
@@ -5787,6 +5940,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     super.initState();
     _url = TextEditingController(text: widget.initial.url);
     _key = TextEditingController(text: widget.initial.key);
+    _socks5 = TextEditingController(text: widget.initial.socks5);
     _mode = widget.initial.mode;
     _url.addListener(_loadPin);
     unawaited(_loadPin());
@@ -5797,6 +5951,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     _url.removeListener(_loadPin);
     _url.dispose();
     _key.dispose();
+    _socks5.dispose();
     super.dispose();
   }
 
@@ -5815,6 +5970,17 @@ class _ServerDialogState extends State<_ServerDialog> {
     await _loadPin();
   }
 
+  String? _readProxy() {
+    final String? proxy = Socks5Proxy.normalize(_socks5.text);
+    if (proxy == null) {
+      setState(() {
+        _status = tr('SOCKS5 代理无效，需要 socks5://[用户名:密码@]主机:端口');
+        _statusOk = false;
+      });
+    }
+    return proxy;
+  }
+
   Future<void> _test() async {
     final String url = normalizeServerUrl(_url.text);
     if (url.isEmpty) {
@@ -5824,6 +5990,10 @@ class _ServerDialogState extends State<_ServerDialog> {
       });
       return;
     }
+    final String? socks5 = _readProxy();
+    if (socks5 == null) {
+      return;
+    }
     setState(() {
       _testing = true;
       _status = tr('正在检查…');
@@ -5831,7 +6001,12 @@ class _ServerDialogState extends State<_ServerDialog> {
     });
     try {
       await ServerApi.check(
-        ServerSettings(url: url, mode: _mode, key: _key.text.trim()),
+        ServerSettings(
+          url: url,
+          mode: _mode,
+          key: _key.text.trim(),
+          socks5: socks5,
+        ),
       );
       if (mounted) {
         setState(() {
@@ -5863,9 +6038,18 @@ class _ServerDialogState extends State<_ServerDialog> {
       });
       return;
     }
-    Navigator.of(
-      context,
-    ).pop(ServerSettings(url: url, mode: _mode, key: _key.text.trim()));
+    final String? socks5 = _readProxy();
+    if (socks5 == null) {
+      return;
+    }
+    Navigator.of(context).pop(
+      ServerSettings(
+        url: url,
+        mode: _mode,
+        key: _key.text.trim(),
+        socks5: socks5,
+      ),
+    );
   }
 
   @override
@@ -5924,6 +6108,22 @@ class _ServerDialogState extends State<_ServerDialog> {
                   setState(() => _mode = value);
                 }
               },
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _socks5,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: InputDecoration(
+                labelText: tr('SOCKS5 代理（可选，服务 API 与中继 TCP）'),
+                hintText: 'socks5://user:pass@127.0.0.1:1080',
+              ),
+              onSubmitted: (_) => _save(),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              tr('启用代理后 HTTP API 与 TCP 载体走代理，UDP 直连与打洞会停用，避免泄露真实地址。'),
+              style: mutedStyle(context, size: 10.5),
             ),
             const SizedBox(height: 10),
             Row(

@@ -48,6 +48,41 @@ void main() {
     expect(ViewFilter.load(), isEmpty);
   });
 
+  test('search text round-trips per view without clobbering', () {
+    ViewFilter.saveDeviceSearch(' 实验 ');
+    ViewFilter.saveSharedSearch('sys');
+    expect(jsonDecode(File(path).readAsStringSync()), <String, Object?>{
+      'deviceSearch': '实验',
+      'sharedSearch': 'sys',
+    });
+    expect(ViewFilter.loadDeviceSearch(), '实验');
+    expect(ViewFilter.loadSharedSearch(), 'sys');
+
+    ViewFilter.save(<String>{'lab'});
+    ViewFilter.saveCollapsed(<String>{'g1'});
+    expect(ViewFilter.loadSharedSearch(), 'sys');
+    expect(ViewFilter.loadDeviceSearch(), '实验');
+
+    ViewFilter.saveSharedSearch('office');
+    expect(ViewFilter.loadDeviceSearch(), '实验');
+    expect(ViewFilter.loadSharedSearch(), 'office');
+  });
+
+  test('clearing a search removes only its own key', () {
+    ViewFilter.saveDeviceSearch('实验');
+    ViewFilter.saveSharedSearch('sys');
+    ViewFilter.saveDeviceSearch('   ');
+    final Map<String, Object?> payload =
+        jsonDecode(File(path).readAsStringSync()) as Map<String, Object?>;
+    expect(payload.containsKey('deviceSearch'), isFalse);
+    expect(payload['sharedSearch'], 'sys');
+    expect(ViewFilter.loadDeviceSearch(), isEmpty);
+
+    ViewFilter.saveSharedSearch('');
+    expect(jsonDecode(File(path).readAsStringSync()), <String, Object?>{});
+    expect(ViewFilter.loadSharedSearch(), isEmpty);
+  });
+
   test('collapsed groups and tags share the file without clobbering', () {
     ViewFilter.save(<String>{'lab'});
     ViewFilter.saveCollapsed(<String>{'', 'g1'});
@@ -60,5 +95,20 @@ void main() {
     ViewFilter.saveCollapsed(const <String>{});
     expect(ViewFilter.load(), <String>{'office'});
     expect(ViewFilter.loadCollapsed(), isEmpty);
+  });
+
+  test('the favorites-only filter round-trips and clears its key', () {
+    expect(ViewFilter.loadFavoritesOnly(), isFalse);
+    ViewFilter.saveFavoritesOnly(true);
+    expect(ViewFilter.loadFavoritesOnly(), isTrue);
+
+    ViewFilter.save(<String>{'lab'});
+    expect(ViewFilter.loadFavoritesOnly(), isTrue);
+
+    ViewFilter.saveFavoritesOnly(false);
+    expect(ViewFilter.loadFavoritesOnly(), isFalse);
+    expect(jsonDecode(File(path).readAsStringSync()), <String, Object?>{
+      'tags': <String>['lab'],
+    });
   });
 }

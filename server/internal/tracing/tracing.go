@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,6 +46,7 @@ type Tracer struct {
 	done     chan struct{}
 	once     sync.Once
 	wg       sync.WaitGroup
+	dropped  atomic.Uint64
 }
 
 type span struct {
@@ -52,12 +54,11 @@ type span struct {
 	spanID   string
 	parentID string
 	name     string
-	method   string
-	route    string
-	status   int
+	kind     int
+	attrs    []otlpAttribute
+	err      bool
 	start    time.Time
 	end      time.Time
-	scheme   string
 }
 
 // Span is the live state returned by Begin and handed back to End. Callers
@@ -66,8 +67,31 @@ type Span struct {
 	traceID  string
 	spanID   string
 	parentID string
+	name     string
 	start    time.Time
 }
+
+// TraceContext is the parent of a non-HTTP span. It is carried by UDP control
+// messages so a punch or relay session stays in the trace that started at the
+// HTTP lookup.
+type TraceContext struct {
+	TraceID string
+	SpanID  string
+	Sampled bool
+}
+
+// Attr is one span attribute. Values are strings or ints, which is everything
+// the data plane needs and keeps the OTLP encoder small.
+type Attr struct {
+	Key   string
+	Value any
+}
+
+// String returns a string attribute.
+func String(key, value string) Attr { return Attr{Key: key, Value: value} }
+
+// Int returns an integer attribute.
+func Int(key string, value int) Attr { return Attr{Key: key, Value: value} }
 
 // New starts the exporter goroutine. A configuration without an endpoint
 // returns nil, which disables every call site.
@@ -151,17 +175,117 @@ func (t *Tracer) End(sp *Span, r *http.Request, status int) {
 		spanID:   sp.spanID,
 		parentID: sp.parentID,
 		name:     name,
-		method:   r.Method,
-		route:    route,
-		status:   status,
+		kind:     2,
 		start:    sp.start,
 		end:      time.Now(),
-		scheme:   scheme,
+		err:      status >= 500,
+		attrs: []otlpAttribute{
+			{Key: "http.request.method", Value: stringValue(r.Method)},
+			{Key: "http.route", Value: stringValue(route)},
+			{Key: "url.scheme", Value: stringValue(scheme)},
+			{Key: "http.response.status_code", Value: intValue(status)},
+		},
 	}
+	t.enqueue(out)
+}
+
+// ParseTraceparent decodes a W3C traceparent header into a parent context.
+// An invalid or unsampled value yields ok=false.
+func (t *Tracer) ParseTraceparent(value string) (TraceContext, bool) {
+	traceID, spanID, sampled, ok := parseTraceparent(value)
+	if !ok || !sampled {
+		return TraceContext{}, false
+	}
+	return TraceContext{TraceID: traceID, SpanID: spanID, Sampled: true}, true
+}
+
+// StartSpan begins an internal span for non-HTTP work. A sampled parent keeps
+// its trace; without a parent the local sampler decides and may return nil.
+func (t *Tracer) StartSpan(name string, parent TraceContext) *Span {
+	if !t.Enabled() {
+		return nil
+	}
+	if parent.Sampled && len(parent.TraceID) == 32 && len(parent.SpanID) == 16 &&
+		lowerHex(parent.TraceID) && lowerHex(parent.SpanID) &&
+		parent.TraceID != strings.Repeat("0", 32) && parent.SpanID != strings.Repeat("0", 16) {
+		return &Span{traceID: parent.TraceID, spanID: newID(8), parentID: parent.SpanID, name: name, start: time.Now()}
+	}
+	if t.sample < 1 && randv2.Float64() >= t.sample {
+		return nil
+	}
+	return &Span{traceID: newID(16), spanID: newID(8), name: name, start: time.Now()}
+}
+
+// Context returns the parent context for child spans.
+func (sp *Span) Context() TraceContext {
+	if sp == nil {
+		return TraceContext{}
+	}
+	return TraceContext{TraceID: sp.traceID, SpanID: sp.spanID, Sampled: true}
+}
+
+// Traceparent renders the span as a W3C traceparent header for propagation
+// over control messages. A nil span renders the empty string.
+func (sp *Span) Traceparent() string {
+	if sp == nil {
+		return ""
+	}
+	return "00-" + sp.traceID + "-" + sp.spanID + "-01"
+}
+
+// EndSpan finishes an internal span. An error attribute marks the span failed
+// so collectors can group rejected data-plane attempts with slow ones.
+func (t *Tracer) EndSpan(sp *Span, attrs ...Attr) {
+	if t == nil || sp == nil {
+		return
+	}
+	out := span{
+		traceID:  sp.traceID,
+		spanID:   sp.spanID,
+		parentID: sp.parentID,
+		name:     sp.name,
+		kind:     1,
+		start:    sp.start,
+		end:      time.Now(),
+	}
+	out.attrs = make([]otlpAttribute, 0, len(attrs))
+	for _, attr := range attrs {
+		switch v := attr.Value.(type) {
+		case string:
+			out.attrs = append(out.attrs, otlpAttribute{Key: attr.Key, Value: stringValue(v)})
+			if attr.Key == "error" {
+				out.err = true
+			}
+		case int:
+			out.attrs = append(out.attrs, otlpAttribute{Key: attr.Key, Value: intValue(v)})
+		}
+	}
+	t.enqueue(out)
+}
+
+func (t *Tracer) enqueue(out span) {
 	select {
 	case t.queue <- out:
 	default:
+		t.dropped.Add(1)
 	}
+}
+
+// QueueDepth reports spans waiting for the exporter batch. It is the data
+// plane's backpressure signal when a collector is slow.
+func (t *Tracer) QueueDepth() int {
+	if t == nil {
+		return 0
+	}
+	return len(t.queue)
+}
+
+// DroppedSpans counts spans discarded because the export queue was full.
+func (t *Tracer) DroppedSpans() uint64 {
+	if t == nil {
+		return 0
+	}
+	return t.dropped.Load()
 }
 
 // Handler wraps next with Begin/End. Use it where the served handler does not
@@ -321,24 +445,18 @@ func (t *Tracer) export(batch []span) {
 	spans := make([]otlpSpan, 0, len(batch))
 	for _, s := range batch {
 		code := 0
-		if s.status >= 500 {
+		if s.err {
 			code = 2
-		}
-		attrs := []otlpAttribute{
-			{Key: "http.request.method", Value: stringValue(s.method)},
-			{Key: "http.route", Value: stringValue(s.route)},
-			{Key: "url.scheme", Value: stringValue(s.scheme)},
-			{Key: "http.response.status_code", Value: intValue(s.status)},
 		}
 		spans = append(spans, otlpSpan{
 			TraceID:           s.traceID,
 			SpanID:            s.spanID,
 			ParentSpanID:      s.parentID,
 			Name:              s.name,
-			Kind:              2,
+			Kind:              s.kind,
 			StartTimeUnixNano: strconv.FormatInt(s.start.UnixNano(), 10),
 			EndTimeUnixNano:   strconv.FormatInt(s.end.UnixNano(), 10),
-			Attributes:        attrs,
+			Attributes:        s.attrs,
 			Status:            otlpStatus{Code: code},
 		})
 	}

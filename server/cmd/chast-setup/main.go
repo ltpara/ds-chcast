@@ -30,6 +30,7 @@ func run() error {
 		service     = flag.Bool("service", false, "register chast-host as a Windows service (requires --machine)")
 		shortcut    = flag.Bool("shortcut", true, "create a Start Menu shortcut")
 		register    = flag.Bool("register", true, "write the Programs and Features entry")
+		protocol    = flag.Bool("protocol", true, "register the chast:// URL scheme")
 		uninstall   = flag.Bool("uninstall", false, "remove the installed files and registration")
 		list        = flag.Bool("list", false, "list the payload entries and exit")
 		quiet       = flag.Bool("quiet", false, "suppress progress output")
@@ -44,6 +45,7 @@ func run() error {
 		Service:  *service,
 		Shortcut: *shortcut,
 		Register: *register,
+		Protocol: *protocol,
 		Quiet:    *quiet,
 	}
 	install.Logf = func(format string, args ...any) {

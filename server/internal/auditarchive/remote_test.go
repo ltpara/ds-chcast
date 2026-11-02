@@ -162,7 +162,7 @@ func TestRemoteDeliveryUploadsClosedFilesOnce(t *testing.T) {
 	}
 	if audit.method != http.MethodPut || audit.auth != "Bearer s3cret" ||
 		audit.contentType != "application/x-ndjson" ||
-		audit.idempotency != "audit-20261028.jsonl" ||
+		audit.idempotency != sha256Hex([]byte(auditBody)) ||
 		audit.digest != sha256Hex([]byte(auditBody)) || string(audit.body) != auditBody {
 		t.Fatalf("audit upload = %+v", audit)
 	}
@@ -171,6 +171,7 @@ func TestRemoteDeliveryUploadsClosedFilesOnce(t *testing.T) {
 		t.Fatalf("gzip file was not uploaded: %v", uploads)
 	}
 	if connections.contentType != "application/gzip" || connections.digest != sha256Hex(connections.body) ||
+		connections.idempotency != connections.digest ||
 		string(gunzipBytes(t, connections.body)) != connectionBody {
 		t.Fatalf("gzip upload = %+v", connections)
 	}
@@ -315,6 +316,160 @@ func TestRemoteDeliveryDisabledWithoutURL(t *testing.T) {
 	}
 	if len(result.Pruned) != 1 || !strings.Contains(result.Pruned[0], "audit-20261001") {
 		t.Fatalf("local-only retention = %v", result.Pruned)
+	}
+}
+
+// A marker may be lost (manual cleanup, a rewritten day file that kept the
+// same bytes); the persisted ledger must still stop a second upload.
+func TestRemoteDeliveryLedgerDeduplicatesContent(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit-20261028.jsonl")
+	const first = "{\"stream\":\"audit\",\"id\":1}\n"
+	writeFile(t, path, first)
+
+	recorder := &uploadRecorder{uploads: map[string]receivedUpload{}}
+	server := httptest.NewServer(http.HandlerFunc(recorder.handler))
+	defer server.Close()
+	newArchiver := func() *Archiver {
+		t.Helper()
+		archiver, err := New(dir, store, nil, Options{RemoteURL: server.URL})
+		if err != nil {
+			t.Fatalf("new archiver: %v", err)
+		}
+		archiver.now = func() time.Time { return time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC) }
+		return archiver
+	}
+
+	archiver := newArchiver()
+	result, err := archiver.Run()
+	if err != nil || len(result.Delivered) != 1 {
+		t.Fatalf("first delivery = %+v, %v", result, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ledgerName)); err != nil {
+		t.Fatalf("ledger was not written: %v", err)
+	}
+
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	result, err = archiver.Run()
+	if err != nil || len(result.Delivered) != 0 {
+		t.Fatalf("ledger hit delivered again: %+v, %v", result, err)
+	}
+	if _, attempts := recorder.snapshot(); attempts != 1 {
+		t.Fatalf("ledger hit uploaded %d times", attempts)
+	}
+	if !deliveredMarkerExists(path) {
+		t.Fatal("ledger hit did not restore the marker")
+	}
+
+	// New content gets a new ledger key and is uploaded once.
+	merged := first + "{\"stream\":\"audit\",\"id\":2}\n"
+	writeFile(t, path, merged)
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	result, err = archiver.Run()
+	if err != nil || len(result.Delivered) != 1 {
+		t.Fatalf("changed delivery = %+v, %v", result, err)
+	}
+	uploads, attempts := recorder.snapshot()
+	if attempts != 2 {
+		t.Fatalf("changed content attempts = %d", attempts)
+	}
+	digest := sha256Hex([]byte(merged))
+	if upload := uploads["audit-20261028.jsonl"]; upload.digest != digest || upload.idempotency != digest {
+		t.Fatalf("changed upload = %+v", upload)
+	}
+
+	// A fresh archiver loads the ledger from disk.
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	restarted := newArchiver()
+	result, err = restarted.Run()
+	if err != nil || len(result.Delivered) != 0 {
+		t.Fatalf("restarted archiver delivered again: %+v, %v", result, err)
+	}
+	if _, attempts := recorder.snapshot(); attempts != 2 {
+		t.Fatalf("restarted archiver uploaded %d times", attempts)
+	}
+	if !deliveredMarkerExists(path) {
+		t.Fatal("restarted archiver did not restore the marker")
+	}
+}
+
+// The ledger belongs to one sink; pointing the archiver elsewhere must send
+// the evidence again even when the bytes did not change.
+func TestRemoteDeliveryLedgerScopedToSink(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit-20261028.jsonl")
+	writeFile(t, path, "{\"stream\":\"audit\",\"id\":1}\n")
+
+	recorderA := &uploadRecorder{uploads: map[string]receivedUpload{}}
+	serverA := httptest.NewServer(http.HandlerFunc(recorderA.handler))
+	defer serverA.Close()
+	first, err := New(dir, store, nil, Options{RemoteURL: serverA.URL})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	first.now = func() time.Time { return time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC) }
+	if result, err := first.Run(); err != nil || len(result.Delivered) != 1 {
+		t.Fatalf("first sink delivery = %+v, %v", result, err)
+	}
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+
+	recorderB := &uploadRecorder{uploads: map[string]receivedUpload{}}
+	serverB := httptest.NewServer(http.HandlerFunc(recorderB.handler))
+	defer serverB.Close()
+	second, err := New(dir, store, nil, Options{RemoteURL: serverB.URL})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	second.now = first.now
+	result, err := second.Run()
+	if err != nil || len(result.Delivered) != 1 {
+		t.Fatalf("second sink delivery = %+v, %v", result, err)
+	}
+	if _, attempts := recorderB.snapshot(); attempts != 1 {
+		t.Fatalf("second sink attempts = %d", attempts)
+	}
+	if _, attempts := recorderA.snapshot(); attempts != 1 {
+		t.Fatalf("first sink attempts changed: %d", attempts)
+	}
+}
+
+// A corrupt ledger only costs deduplication; delivery must still progress and
+// replace it with a valid one.
+func TestRemoteDeliveryLedgerToleratesCorruption(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "audit-20261028.jsonl"), "{\"stream\":\"audit\",\"id\":1}\n")
+	writeFile(t, filepath.Join(dir, ledgerName), "{not json")
+
+	recorder := &uploadRecorder{uploads: map[string]receivedUpload{}}
+	server := httptest.NewServer(http.HandlerFunc(recorder.handler))
+	defer server.Close()
+	archiver, err := New(dir, store, nil, Options{RemoteURL: server.URL})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	archiver.now = func() time.Time { return time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC) }
+	result, err := archiver.Run()
+	if err != nil || len(result.Delivered) != 1 || result.DeliveryError != "" {
+		t.Fatalf("delivery = %+v, %v", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ledgerName))
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	var ledger deliveryLedger
+	if err := json.Unmarshal(data, &ledger); err != nil || len(ledger.Entries) != 1 {
+		t.Fatalf("replacement ledger = %s, %v", data, err)
 	}
 }
 

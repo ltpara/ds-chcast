@@ -39,19 +39,19 @@ func TestEventPaginationAndRetention(t *testing.T) {
 	fresh := now
 	for i := 0; i < 2; i++ {
 		if _, err := store.RecordConnection(alice.ID, alice.Username, "devbox", "viewer",
-			"127.0.0.1", "", old, old.Add(time.Minute), true, "old"); err != nil {
+			"127.0.0.1", "", "", "", old, old.Add(time.Minute), true, "old"); err != nil {
 			t.Fatalf("record old connection: %v", err)
 		}
 		if _, err := store.RecordConnection(alice.ID, alice.Username, "devbox", "viewer",
-			"127.0.0.1", "", fresh, fresh.Add(time.Minute), true, "new"); err != nil {
+			"127.0.0.1", "", "", "", fresh, fresh.Add(time.Minute), true, "new"); err != nil {
 			t.Fatalf("record new connection: %v", err)
 		}
 		if _, err := store.RecordFileTransfer(alice.ID, alice.Username, "devbox", "upload",
-			"old.pdf", "127.0.0.1", "", 1, 1, old, true, ""); err != nil {
+			"old.pdf", "127.0.0.1", "", "", "", 1, 1, old, true, ""); err != nil {
 			t.Fatalf("record old transfer: %v", err)
 		}
 		if _, err := store.RecordFileTransfer(alice.ID, alice.Username, "devbox", "upload",
-			"new.pdf", "127.0.0.1", "", 1, 1, fresh, true, ""); err != nil {
+			"new.pdf", "127.0.0.1", "", "", "", 1, 1, fresh, true, ""); err != nil {
 			t.Fatalf("record new transfer: %v", err)
 		}
 	}

@@ -163,6 +163,10 @@ struct QuicServerConfig {
     // announce() only reports record_enabled and the viewer hides its record
     // button. On by default, matching RustDesk's "enable-record-session".
     bool allow_record = true;
+    // Accept RestartRequest and reboot the machine. Off by default: a restart
+    // interrupts whoever is sitting at the machine, so the host opts in
+    // explicitly. announce() clears restart_enabled when false.
+    bool allow_restart = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -472,6 +476,17 @@ public:
     // Answers SendSas. A reason is kept for every code so the viewer can show
     // why the secure desktop was not reached.
     Error send_sas_result(SasCode code, const std::string& reason = {});
+    // Pops one pending RestartRequest. The host answers every request with
+    // send_restart_result(); the permission and setting checks belong to the
+    // host, so a viewer that may not restart gets Denied or Disabled instead
+    // of silence.
+    bool take_restart_request();
+    // Number of RestartRequest messages received. Observation hook for tools
+    // and the host's own counters.
+    uint64_t restart_requests() const;
+    // Answers RestartRequest. Ok means the restart was scheduled; the session
+    // ends with the machine, so this is the only confirmation the viewer gets.
+    Error send_restart_result(RestartCode code, const std::string& reason = {});
     // Pops the newest SetStreamOptions request. Only the newest is kept: a
     // viewer that changes several menus in a row wants the final combination.
     // The host answers each taken request with send_stream_options_result().
@@ -626,6 +641,16 @@ public:
     bool take_sas_result(SasCode& code, std::string& reason);
     // Total SAS answers received. Observation hook for tools.
     uint64_t sas_results() const;
+    // Asks the host to reboot itself. Requires the handshake and restart
+    // permission; the host re-checks its own settings. The answer arrives
+    // through take_restart_result(). The restart is scheduled with a short
+    // delay, so there is time to read the answer before the session drops.
+    Error request_restart();
+    // Pops the newest restart answer. `reason` is the host's UTF-8
+    // explanation, empty when it has none.
+    bool take_restart_result(RestartCode& code, std::string& reason);
+    // Total restart answers received. Observation hook for tools.
+    uint64_t restart_results() const;
     // Asks the host to change this session's video preferences (encoder,
     // frame-rate ceiling and quality preset). The host can only lower its own
     // budget; the answer arrives through take_stream_options_result(). No

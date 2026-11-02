@@ -16,7 +16,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,9 +23,12 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 	"github.com/ltpara/ds-chcast/server/internal/updater"
 	"github.com/ltpara/ds-chcast/server/internal/upnp"
+	"github.com/ltpara/ds-chcast/server/internal/wake"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
+	"github.com/ltpara/ds-chcast/server/internal/wol"
 )
 
 type HostConfig struct {
@@ -38,6 +40,10 @@ type HostConfig struct {
 	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
 	// client certificate for mTLS, or both. Nil uses the system roots.
 	TLS *tls.Config
+	// Socks5 routes the HTTP API and the relay carrier through a SOCKS5 proxy
+	// (socks5://[user:pass@]host:port). The local carrier and all UDP paths
+	// stay direct: the local hop is loopback and SOCKS5 cannot carry UDP.
+	Socks5 string
 	// ServerPublicKey pins the rendezvous server identity. When set, the
 	// registration reply must contain a valid server-signed host binding.
 	ServerPublicKey string
@@ -70,9 +76,21 @@ type HostConfig struct {
 	// It requires ServerPublicKey: without a pin the notice cannot be
 	// verified, so the agent refuses to run a downloaded binary.
 	AutoUpdate bool
+	// PublisherPublicKey pins the release publisher. When set, the advertised
+	// notice must also carry a publisher signature made by this key, so a
+	// compromised rendezvous server cannot push its own installer.
+	PublisherPublicKey string
 	// UpdateDir is where the installer is staged. Empty uses the system temp
 	// directory.
 	UpdateDir string
+	// WakeRelay makes this agent a cross-subnet Wake-on-LAN proxy: jobs queued
+	// by the server for any target are broadcast on this machine's link. It is
+	// opt-in because it sends packets to addresses outside this host.
+	WakeRelay bool
+	// WakeTargets overrides the broadcast destinations for diagnostics (for
+	// example 127.0.0.1:9 to observe the packet locally). Empty uses the
+	// limited broadcast plus each interface's directed broadcast.
+	WakeTargets []string
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
 	// goroutine, so it must not block.
@@ -108,6 +126,7 @@ type HostAgent struct {
 	conn         *net.UDPConn
 	localOut     *net.UDPConn
 	api          *apiClient
+	socks        *netproxy.Proxy
 	servers      *serverPool
 	log          *slog.Logger
 	local        *net.UDPAddr
@@ -149,6 +168,9 @@ type HostAgent struct {
 	// updatesTried keeps the versions this process already staged or
 	// rejected, so a flapping server cannot loop the download.
 	updatesTried map[string]bool
+	// wakeSeen remembers relayed wake job ids so a duplicate delivery from a
+	// restarted or failed-over server does not broadcast twice.
+	wakeSeen map[string]bool
 	// observedPunch and observedRelay are this host's public mappings as seen
 	// by the rendezvous port and by its relay port. Comparing them classifies
 	// the NAT without a second server.
@@ -184,8 +206,17 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 			return nil, fmt.Errorf("--server-pubkey: %w", err)
 		}
 	}
+	if cfg.PublisherPublicKey != "" {
+		if _, err := identity.ParsePublicKey(cfg.PublisherPublicKey); err != nil {
+			return nil, fmt.Errorf("--publisher-pubkey: %w", err)
+		}
+	}
 	if cfg.AutoUpdate && cfg.ServerPublicKey == "" {
 		return nil, fmt.Errorf("--auto-update needs --server-pubkey so the update notice can be verified")
+	}
+	socks, err := netproxy.Parse(cfg.Socks5)
+	if err != nil {
+		return nil, fmt.Errorf("--socks5: %w", err)
 	}
 	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
 	if err != nil {
@@ -225,7 +256,8 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		cfg:            cfg,
 		conn:           conn,
 		localOut:       localOut,
-		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS),
+		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS, socks),
+		socks:          socks,
 		servers:        servers,
 		log:            cfg.Logger.With("agent", "host", "id", cfg.ID),
 		local:          local,
@@ -513,6 +545,7 @@ func (h *HostAgent) applyRegistration(reg registerResult) {
 		h.softwareSeen = ""
 	}
 	h.mu.Unlock()
+	h.relayWakeJobs(reg.Wake)
 	if notice != nil {
 		h.log.Info("software update available",
 			"version", notice.Version, "current", Version, "url", notice.URL)
@@ -541,21 +574,24 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 	h.mu.Unlock()
 
 	notice := updater.Notice{
-		Version:   n.Version,
-		URL:       n.URL,
-		SHA256:    n.SHA256,
-		Size:      n.Size,
-		Signature: n.Signature,
+		Version:            n.Version,
+		URL:                n.URL,
+		SHA256:             n.SHA256,
+		Size:               n.Size,
+		Signature:          n.Signature,
+		PublisherKeyID:     n.PublisherKeyID,
+		PublisherSignature: n.PublisherSignature,
 	}
 	go func() {
 		if err := updater.Verify(notice, h.cfg.ServerPublicKey); err != nil {
 			h.log.Error("software update rejected", "version", notice.Version, "error", err)
 			return
 		}
-		client := &http.Client{Timeout: 15 * time.Minute}
-		if h.cfg.TLS != nil {
-			client.Transport = &http.Transport{TLSClientConfig: h.cfg.TLS.Clone()}
+		if err := updater.VerifyPublisher(notice, h.cfg.PublisherPublicKey); err != nil {
+			h.log.Error("software update publisher rejected", "version", notice.Version, "error", err)
+			return
 		}
+		client := newHTTPClient(15*time.Minute, h.cfg.TLS, h.socks)
 		ctx, cancel := context.WithTimeout(h.ctx, 15*time.Minute)
 		defer cancel()
 		path, err := updater.Fetch(ctx, client, notice, h.cfg.UpdateDir)
@@ -572,6 +608,42 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 		}
 		h.log.Info("software update installer started", "version", notice.Version, "path", path)
 	}()
+}
+
+// relayWakeJobs broadcasts queued Wake-on-LAN jobs on this machine's link. The
+// server already delivers each job once per agent, so the local set of seen ids
+// only guards against a duplicate after a server failover or restart. A relay
+// failure is logged and the job dropped: the request already returned 202 and
+// the target's MAC does not change, so the caller can simply retry later.
+func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
+	if !h.cfg.WakeRelay || len(jobs) == 0 {
+		return
+	}
+	targets := h.cfg.WakeTargets
+	if len(targets) == 0 {
+		targets = wol.Targets(wol.Port)
+	}
+	for _, job := range jobs {
+		h.mu.Lock()
+		seen := h.wakeSeen[job.ID]
+		if !seen {
+			if h.wakeSeen == nil || len(h.wakeSeen) >= 512 {
+				h.wakeSeen = make(map[string]bool)
+			}
+			h.wakeSeen[job.ID] = true
+		}
+		h.mu.Unlock()
+		if seen {
+			continue
+		}
+		sent, err := wol.SendTo(job.MAC, targets)
+		if err != nil {
+			h.log.Warn("wake relay failed", "target", job.Target, "mac", job.MAC, "error", err)
+			continue
+		}
+		h.log.Info("wake relayed", "target", job.Target, "mac", job.MAC,
+			"packets", sent, "job", job.ID)
+	}
 }
 
 func (h *HostAgent) getPunch() *net.UDPAddr {
@@ -1018,7 +1090,15 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	localFrames := carrier.NewFrameReader(bufio.NewReader(local))
 	localSend := carrier.NewFrameWriter(local)
 
-	conn, err := net.DialTimeout("tcp", relayAddr, carrierDial)
+	// Only the remote hop is proxied; the local carrier above stays loopback.
+	var conn net.Conn
+	if h.socks != nil {
+		dialCtx, cancel := context.WithTimeout(h.ctx, carrierDial)
+		conn, err = h.socks.DialContext(dialCtx, "tcp", relayAddr)
+		cancel()
+	} else {
+		conn, err = net.DialTimeout("tcp", relayAddr, carrierDial)
+	}
 	if err != nil {
 		return false, fmt.Errorf("relay carrier %s: %w", relayAddr, err)
 	}

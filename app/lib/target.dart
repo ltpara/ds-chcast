@@ -10,6 +10,7 @@ class ConnectTarget {
     this.displayName = '',
     this.mode = TunnelMode.auto,
     this.serverKey = '',
+    this.socks5 = '',
   });
 
   final String host;
@@ -27,6 +28,10 @@ class ConnectTarget {
   final String displayName;
   final TunnelMode mode;
   final String serverKey;
+
+  /// SOCKS5 proxy for the service API and TCP carrier, carried from the
+  /// configured server so a session does not silently bypass it.
+  final String socks5;
 
   bool get viaServer => server.isNotEmpty;
 
@@ -78,6 +83,7 @@ ConnectTarget? parseConnectInput(
       hostId: text,
       mode: server.mode,
       serverKey: server.key,
+      socks5: server.socks5,
     );
   }
   return parseConnectTarget(text, token: key);

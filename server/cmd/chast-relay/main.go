@@ -155,6 +155,7 @@ func run() error {
 		relay.WithViewerTokenRequired(true),
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
+		relay.WithTracer(tracer),
 	)
 	if err != nil {
 		return err

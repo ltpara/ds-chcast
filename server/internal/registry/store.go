@@ -13,10 +13,9 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/schemamig"
+	"github.com/ltpara/ds-chcast/server/internal/sqlitex"
 )
 
 const sqliteHeader = "SQLite format 3\x00"
@@ -39,7 +38,7 @@ func NewStore(path string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("state directory %s: %w", dir, err)
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open(sqlitex.RegistryDriver, path)
 	if err != nil {
 		return nil, fmt.Errorf("open state %s: %w", path, err)
 	}
@@ -127,11 +126,19 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// SQLitePoolStats reports connection-pool queueing for the peer database.
+func (s *Store) SQLitePoolStats() sqlitex.PoolStats {
+	if s == nil {
+		return sqlitex.PoolStats{}
+	}
+	return sqlitex.Pool(s.db)
+}
+
 func (s *Store) Load() ([]Identity, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT id, public_key, fingerprint, hostname, platform, version,
-		alias, tags, created_at, last_seen FROM peers ORDER BY id`)
+		metadata_signed, alias, tags, created_at, last_seen FROM peers ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("state %s: load peers: %w", s.path, err)
 	}
@@ -141,13 +148,15 @@ func (s *Store) Load() ([]Identity, error) {
 		var (
 			record              Identity
 			tags                string
+			metadataSigned      int
 			createdAt, lastSeen int64
 		)
 		if err := rows.Scan(&record.ID, &record.PublicKey, &record.Fingerprint,
-			&record.Hostname, &record.Platform, &record.Version, &record.Alias, &tags,
-			&createdAt, &lastSeen); err != nil {
+			&record.Hostname, &record.Platform, &record.Version, &metadataSigned,
+			&record.Alias, &tags, &createdAt, &lastSeen); err != nil {
 			return nil, fmt.Errorf("state %s: read peer: %w", s.path, err)
 		}
+		record.MetadataSigned = metadataSigned != 0
 		if !ValidID(record.ID) {
 			return nil, fmt.Errorf("state %s contains invalid id %q", s.path, record.ID)
 		}
@@ -181,20 +190,21 @@ func (s *Store) Save(record Identity) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO peers
-		(id, public_key, fingerprint, hostname, platform, version, alias, tags, created_at, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, public_key, fingerprint, hostname, platform, version, metadata_signed, alias, tags, created_at, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			public_key = excluded.public_key,
 			fingerprint = excluded.fingerprint,
 			hostname = excluded.hostname,
 			platform = excluded.platform,
 			version = excluded.version,
+			metadata_signed = excluded.metadata_signed,
 			alias = excluded.alias,
 			tags = excluded.tags,
 			last_seen = excluded.last_seen`,
 		record.ID, record.PublicKey, record.Fingerprint, record.Hostname,
-		record.Platform, record.Version, record.Alias, encodeTags(record.Tags),
-		unixMillis(record.CreatedAt), unixMillis(record.LastSeen))
+		record.Platform, record.Version, record.MetadataSigned, record.Alias,
+		encodeTags(record.Tags), unixMillis(record.CreatedAt), unixMillis(record.LastSeen))
 	if err != nil {
 		return fmt.Errorf("state %s: save peer %s: %w", s.path, record.ID, err)
 	}

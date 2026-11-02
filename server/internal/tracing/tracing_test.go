@@ -285,6 +285,121 @@ func TestNilTracerIsInert(t *testing.T) {
 	}
 }
 
+func TestGenericSpanJoinsParentTrace(t *testing.T) {
+	col, srv := newCollector(t)
+	tr := New(Config{Endpoint: srv.URL, Sample: 1})
+	parent := TraceContext{
+		TraceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+		SpanID:  "00f067aa0ba902b7",
+		Sampled: true,
+	}
+	span := tr.StartSpan("punch.request", parent)
+	if span == nil {
+		t.Fatal("span was not started")
+	}
+	child := tr.StartSpan("relay.udp_session", span.Context())
+	if child == nil {
+		t.Fatal("child span was not started")
+	}
+	if got := span.Traceparent(); !strings.HasPrefix(got, "00-"+parent.TraceID+"-") {
+		t.Fatalf("traceparent = %q", got)
+	}
+	tr.EndSpan(span,
+		String("punch.host_id", "devbox"),
+		Int("punch.host_candidates", 2),
+	)
+	tr.EndSpan(child,
+		Int("relay.port", 41000),
+		String("relay.close_reason", "viewer_left"),
+	)
+	closeTracer(t, tr)
+
+	spans := col.spans()
+	if len(spans) != 2 {
+		t.Fatalf("exported %d spans, want 2", len(spans))
+	}
+	byName := make(map[string]otlpSpan, len(spans))
+	for _, s := range spans {
+		byName[s.Name] = s
+	}
+	punch, ok := byName["punch.request"]
+	if !ok {
+		t.Fatalf("punch span missing: %+v", spans)
+	}
+	if punch.TraceID != parent.TraceID || punch.ParentSpanID != parent.SpanID {
+		t.Fatalf("punch trace=%q parent=%q", punch.TraceID, punch.ParentSpanID)
+	}
+	if punch.Kind != 1 || punch.Status.Code != 0 {
+		t.Fatalf("punch kind/status = %d/%d", punch.Kind, punch.Status.Code)
+	}
+	if got := attribute(t, punch.Attributes, "punch.host_id"); got != "devbox" {
+		t.Fatalf("punch.host_id = %q", got)
+	}
+	if got := attribute(t, punch.Attributes, "punch.host_candidates"); got != "2" {
+		t.Fatalf("punch.host_candidates = %q", got)
+	}
+	session, ok := byName["relay.udp_session"]
+	if !ok {
+		t.Fatalf("session span missing: %+v", spans)
+	}
+	if session.TraceID != parent.TraceID || session.ParentSpanID != punch.SpanID {
+		t.Fatalf("session trace=%q parent=%q, want parent %q", session.TraceID, session.ParentSpanID, punch.SpanID)
+	}
+	if got := attribute(t, session.Attributes, "relay.close_reason"); got != "viewer_left" {
+		t.Fatalf("close reason = %q", got)
+	}
+}
+
+func TestGenericSpanErrorAttribute(t *testing.T) {
+	col, srv := newCollector(t)
+	tr := New(Config{Endpoint: srv.URL, Sample: 1})
+	span := tr.StartSpan("relay.viewer_auth", TraceContext{})
+	if span == nil {
+		t.Fatal("span was not started")
+	}
+	tr.EndSpan(span, String("error", "viewer token was not accepted"))
+	closeTracer(t, tr)
+	spans := col.spans()
+	if len(spans) != 1 {
+		t.Fatalf("exported %d spans, want 1", len(spans))
+	}
+	if spans[0].Status.Code != 2 {
+		t.Fatalf("error status = %d", spans[0].Status.Code)
+	}
+	if len(spans[0].TraceID) != 32 || len(spans[0].SpanID) != 16 || spans[0].ParentSpanID != "" {
+		t.Fatalf("local trace ids = %q/%q parent %q", spans[0].TraceID, spans[0].SpanID, spans[0].ParentSpanID)
+	}
+}
+
+func TestQueueDepthAndDroppedSpans(t *testing.T) {
+	var nilTracer *Tracer
+	if nilTracer.QueueDepth() != 0 || nilTracer.DroppedSpans() != 0 {
+		t.Fatal("nil tracer reported queue activity")
+	}
+	tr := New(Config{Endpoint: "http://127.0.0.1:1", Sample: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := tr.Close(ctx); err != nil {
+		t.Fatalf("close before queue test: %v", err)
+	}
+	for i := 0; i < queueSize; i++ {
+		tr.EndSpan(tr.StartSpan("relay.udp_session", TraceContext{}))
+	}
+	if got := tr.QueueDepth(); got != queueSize {
+		t.Fatalf("queue depth = %d, want %d", got, queueSize)
+	}
+	const extra = 8
+	for i := 0; i < extra; i++ {
+		tr.EndSpan(tr.StartSpan("relay.udp_session", TraceContext{}))
+	}
+	if got := tr.DroppedSpans(); got != extra {
+		t.Fatalf("dropped = %d, want %d", got, extra)
+	}
+	if got := tr.QueueDepth(); got != queueSize {
+		t.Fatalf("queue depth after overflow = %d, want %d", got, queueSize)
+	}
+}
+
 func TestParseTraceparent(t *testing.T) {
 	trace := "4bf92f3577b34da6a3ce929d0e0e4736"
 	span := "00f067aa0ba902b7"

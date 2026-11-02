@@ -19,6 +19,7 @@ const (
 	maxConnectionIP     = 64
 	maxConnectionSpan   = 30 * 24 * time.Hour
 	maxAuditRef         = 64
+	maxAuditLocation    = 128
 	connectionViewer    = "viewer"
 	connectionHost      = "host"
 	connectionBoth      = "both"
@@ -36,6 +37,11 @@ type ConnectionEvent struct {
 	AuditRef  string
 	Source    string
 	ClientIP  string
+	// Location is the GeoIP label resolved when the viewer reported the
+	// session; Route is its transport path ("direct", "relay" or "carrier").
+	// Both stay empty on host-side rows and without a GeoIP table.
+	Location  string
+	Route     string
 	StartedAt time.Time
 	EndedAt   time.Time
 	Success   bool
@@ -59,6 +65,23 @@ func mergeSource(existing, incoming string) string {
 	return connectionBoth
 }
 
+// normalizeAuditRoute accepts the transport path the viewer actually used.
+// An empty value is valid: host-side reports cannot know it and viewers older
+// than the route field keep their records linkable without one.
+func normalizeAuditRoute(raw string) (string, error) {
+	route := strings.ToLower(strings.TrimSpace(raw))
+	switch route {
+	case "", "direct", "relay", "carrier":
+		return route, nil
+	}
+	return "", fmt.Errorf("route %q", raw)
+}
+
+// normalizeAuditLocation keeps the operator-supplied GeoIP label compact.
+func normalizeAuditLocation(raw string) string {
+	return normalizeText(raw, maxAuditLocation)
+}
+
 // normalizeAuditRef accepts the lowercase hex reference both sides generate
 // for one session. An empty value means the report cannot be linked.
 func normalizeAuditRef(raw string) (string, error) {
@@ -78,7 +101,7 @@ func normalizeAuditRef(raw string) (string, error) {
 }
 
 func (s *Store) RecordConnection(
-	userID, username, peerID, direction, clientIP, auditRef string,
+	userID, username, peerID, direction, clientIP, auditRef, location, route string,
 	startedAt, endedAt time.Time,
 	success bool,
 	detail string,
@@ -103,10 +126,15 @@ func (s *Store) RecordConnection(
 		username = "-"
 	}
 	clientIP = normalizeText(clientIP, maxConnectionIP)
+	location = normalizeAuditLocation(location)
 	detail = normalizeText(detail, maxConnectionDetail)
 	ref, err := normalizeAuditRef(auditRef)
 	if err != nil {
 		return ConnectionEvent{}, err
+	}
+	route, err = normalizeAuditRoute(route)
+	if err != nil {
+		return ConnectionEvent{}, fmt.Errorf("%w: %v", ErrInvalidConnection, err)
 	}
 	startedAt, endedAt, err = s.connectionWindow(startedAt, endedAt)
 	if err != nil {
@@ -128,6 +156,12 @@ func (s *Store) RecordConnection(
 			merged.PeerID = peerID
 			merged.Direction = connectionViewer
 			merged.ClientIP = clientIP
+			if location != "" {
+				merged.Location = location
+			}
+			if route != "" {
+				merged.Route = route
+			}
 			merged.StartedAt = earliest(existing.StartedAt, startedAt)
 			merged.EndedAt = latest(existing.EndedAt, endedAt)
 			merged.Success = existing.Success && success
@@ -146,6 +180,8 @@ func (s *Store) RecordConnection(
 		AuditRef:  ref,
 		Source:    connectionViewer,
 		ClientIP:  clientIP,
+		Location:  location,
+		Route:     route,
 		StartedAt: startedAt,
 		EndedAt:   endedAt,
 		Success:   success,
@@ -260,10 +296,11 @@ func mergeConnectionDetail(existing, incoming string) string {
 func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (ConnectionEvent, error) {
 	result, err := s.db.Exec(
 		`INSERT INTO connection_events
-			(user_id, username, peer_id, direction, client_ip, started_at, ended_at,
-			 success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(user_id, username, peer_id, direction, client_ip, location, route,
+			 started_at, ended_at, success, detail, host_id, audit_ref, source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		userID, event.Username, event.PeerID, event.Direction, event.ClientIP,
+		event.Location, event.Route,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
 		event.Detail, event.HostID, event.AuditRef, event.Source,
 	)
@@ -289,17 +326,18 @@ func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (Co
 // account a viewer report may already have supplied.
 func (s *Store) updateConnectionLocked(event ConnectionEvent, userID string) error {
 	query := `UPDATE connection_events SET username=?, peer_id=?, direction=?,
-			client_ip=?, started_at=?, ended_at=?, success=?, detail=?,
-			host_id=?, audit_ref=?, source=? WHERE id=?`
+			client_ip=?, location=?, route=?, started_at=?, ended_at=?,
+			success=?, detail=?, host_id=?, audit_ref=?, source=? WHERE id=?`
 	args := []any{
 		event.Username, event.PeerID, event.Direction, event.ClientIP,
+		event.Location, event.Route,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
 		event.Detail, event.HostID, event.AuditRef, event.Source, event.ID,
 	}
 	if userID != "" {
 		query = `UPDATE connection_events SET user_id=?, username=?, peer_id=?,
-			direction=?, client_ip=?, started_at=?, ended_at=?, success=?, detail=?,
-			host_id=?, audit_ref=?, source=? WHERE id=?`
+			direction=?, client_ip=?, location=?, route=?, started_at=?, ended_at=?,
+			success=?, detail=?, host_id=?, audit_ref=?, source=? WHERE id=?`
 		args = append([]any{userID}, args...)
 	}
 	if _, err := s.db.Exec(query, args...); err != nil {
@@ -310,8 +348,8 @@ func (s *Store) updateConnectionLocked(event ConnectionEvent, userID string) err
 
 func (s *Store) connectionByRefLocked(ref string) (ConnectionEvent, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source
+		`SELECT id, username, peer_id, direction, client_ip, location, route,
+			started_at, ended_at, success, detail, host_id, audit_ref, source
 		 FROM connection_events WHERE audit_ref = ? ORDER BY id LIMIT 1`, ref)
 	event, err := scanConnection(row)
 	if err == errNoRows {
@@ -379,8 +417,8 @@ func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit
 		where = "(" + where + ") AND id < ?"
 		args = append(args, beforeID)
 	}
-	query := `SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source
+	query := `SELECT id, username, peer_id, direction, client_ip, location, route,
+			started_at, ended_at, success, detail, host_id, audit_ref, source
 		 FROM connection_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
@@ -417,9 +455,9 @@ func scanConnection(row rowScanner) (ConnectionEvent, error) {
 		ended   int64
 	)
 	if err := row.Scan(&event.ID, &event.Username, &event.PeerID,
-		&event.Direction, &event.ClientIP, &started, &ended,
-		&event.Success, &event.Detail, &event.HostID, &event.AuditRef,
-		&event.Source); err != nil {
+		&event.Direction, &event.ClientIP, &event.Location, &event.Route,
+		&started, &ended, &event.Success, &event.Detail, &event.HostID,
+		&event.AuditRef, &event.Source); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConnectionEvent{}, errNoRows
 		}

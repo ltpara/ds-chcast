@@ -81,7 +81,12 @@ const Map<String, String> kEnglishHome = <String, String>{
   '尚未固定此服务器的身份，无法校验更新签名；连接一次后再试，或手动下载。':
       'This server\'s identity is not pinned yet, so the update signature cannot be checked. Connect once and retry, or download manually.',
   '局域网唤醒': 'Wake-on-LAN',
+  '通过连接服务转发': 'Relay via the connection service',
+  '发送给目标所在局域网中已开启 --wake-relay 的主机代理，适合跨子网唤醒。':
+      'Sent to a host agent with --wake-relay on the target\'s LAN; use this across subnets.',
+  '账号已过期，请重试': 'The account has expired; try again',
   '已发送局域网唤醒包': 'Wake-on-LAN packet sent',
+  '已请求主机代理转发唤醒包': 'Wake relay requested',
   '已固定 {trustedCount} 个主机身份': '{trustedCount} host identities pinned',
   '已添加 {p2}': 'Added {p2}',
   '已添加 {p3} 台局域网设备': 'Added {p3} LAN devices',
@@ -246,6 +251,12 @@ const Map<String, String> kEnglishHome = <String, String>{
   '邮件验证码已发送到绑定的邮箱': 'The email code was sent to the linked address',
   '重命名': 'Rename',
   '重命名设备': 'Rename device',
+  '仅看收藏': 'Favorites only',
+  '收藏': 'Add to Favorites',
+  '取消收藏': 'Remove from Favorites',
+  '已收藏': 'Added to favorites',
+  '已取消收藏': 'Removed from favorites',
+  '还没有收藏的设备': 'No favorite devices yet',
   '重新发送短信验证码': 'Resend SMS code',
   '重新发送邮件验证码': 'Resend email code',
   '重新扫描': 'Scan again',
@@ -290,4 +301,8 @@ const Map<String, String> kEnglishHome = <String, String>{
   '读取云端录制失败：{error}': 'Could not load cloud recordings: {error}',
   '读取录制文件失败：{error}': 'Could not read the recording file: {error}',
   '保存录制文件失败：{error}': 'Could not save the recording file: {error}',
+  'SOCKS5 代理（可选，服务 API 与中继 TCP）':
+      'SOCKS5 proxy (optional; service API and relay TCP)',
+  '启用代理后 HTTP API 与 TCP 载体走代理，UDP 直连与打洞会停用，避免泄露真实地址。':
+      'With a proxy, the HTTP API and TCP carrier use it; UDP direct and hole punching are disabled so the real address is not exposed.',
 };

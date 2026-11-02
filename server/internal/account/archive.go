@@ -100,8 +100,8 @@ func (s *Store) AuditEventsAfter(afterID int64, limit int) ([]AuditEvent, error)
 // ConnectionsAfter returns connection rows newer than afterID, oldest first.
 func (s *Store) ConnectionsAfter(afterID int64, limit int) ([]ConnectionEvent, error) {
 	limit = archivePage(limit)
-	query := `SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source
+	query := `SELECT id, username, peer_id, direction, client_ip, location, route,
+			started_at, ended_at, success, detail, host_id, audit_ref, source
 		 FROM connection_events WHERE id > ? ORDER BY id ASC LIMIT ?`
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -129,7 +129,8 @@ func (s *Store) ConnectionsAfter(afterID int64, limit int) ([]ConnectionEvent, e
 func (s *Store) FileTransfersAfter(afterID int64, limit int) ([]FileEvent, error) {
 	limit = archivePage(limit)
 	query := `SELECT id, username, peer_id, direction, name, size, files,
-			client_ip, occurred_at, success, detail, host_id, audit_ref, source
+			client_ip, location, route, occurred_at, success, detail,
+			host_id, audit_ref, source
 		 FROM file_events WHERE id > ? ORDER BY id ASC LIMIT ?`
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,8 +147,9 @@ func (s *Store) FileTransfersAfter(afterID int64, limit int) ([]FileEvent, error
 		)
 		if err := rows.Scan(&event.ID, &event.Username, &event.PeerID,
 			&event.Direction, &event.Name, &event.Size, &event.Files,
-			&event.ClientIP, &occurred, &event.Success, &event.Detail,
-			&event.HostID, &event.AuditRef, &event.Source); err != nil {
+			&event.ClientIP, &event.Location, &event.Route, &occurred,
+			&event.Success, &event.Detail, &event.HostID, &event.AuditRef,
+			&event.Source); err != nil {
 			return nil, fmt.Errorf("account store %s: archive file transfers: %w", s.path, err)
 		}
 		event.OccurredAt = timeFromMillis(occurred)

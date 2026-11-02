@@ -28,6 +28,11 @@ const (
 	// another. The signature is made with the key already bound to the old id,
 	// which is what proves the caller owns it.
 	DomainMigrate = "chast-id-migrate-v1"
+	// DomainHostMetadata covers the hostname/platform/version a host reports
+	// during registration. Those fields are display metadata rather than
+	// routing state, but an attacker on the path could otherwise impersonate a
+	// machine by rewriting them.
+	DomainHostMetadata = "chast-host-metadata-v1"
 	// DomainKeepalive covers the rendezvous keepalive challenge.
 	DomainKeepalive = "chast-keepalive-v1"
 	// DomainRelay covers the UDP relay host hello challenge.
@@ -46,6 +51,10 @@ const (
 	// URL, SHA-256 and size. Clients that pin the server key can reject a
 	// notice or binary swapped between the server and the download host.
 	DomainSoftware = "chast-software-v1"
+	// DomainSoftwarePublisher covers the release publisher's independent proof
+	// over the same fields. It uses a separate domain so the server signature
+	// and the publisher signature cannot be replayed as each other.
+	DomainSoftwarePublisher = "chast-software-publisher-v1"
 )
 
 var (
@@ -111,6 +120,15 @@ func MigrateMessage(oldID, newID string, unix int64) []byte {
 	return fieldsMessage(DomainMigrate, oldID, newID, strconv.FormatInt(unix, 10))
 }
 
+// HostMetadataMessage binds the self-reported display metadata to the host id
+// and the registration timestamp. Sharing the registration timestamp keeps
+// the proof inside the same freshness window, so a captured signature cannot
+// be replayed indefinitely.
+func HostMetadataMessage(id, hostname, platform, version string, unix int64) []byte {
+	return fieldsMessage(DomainHostMetadata, id, hostname, platform, version,
+		strconv.FormatInt(unix, 10))
+}
+
 func boolText(value bool) string {
 	if value {
 		return "1"
@@ -138,6 +156,25 @@ func HostAuditFileMessage(hostID, auditRef, direction, name string, size, occurr
 // trusting a downloaded binary.
 func SoftwareMessage(version, downloadURL, digest string, size int64) []byte {
 	return fieldsMessage(DomainSoftware, version, downloadURL, digest, strconv.FormatInt(size, 10))
+}
+
+// PublisherMessage binds the same release fields under the publisher domain.
+// A deployment that pins a publisher key can reject a notice signed only by
+// the rendezvous server, which keeps the signing key off the server.
+func PublisherMessage(version, downloadURL, digest string, size int64) []byte {
+	return fieldsMessage(DomainSoftwarePublisher, version, downloadURL, digest, strconv.FormatInt(size, 10))
+}
+
+// PublisherKeyID derives the short identifier announced with a publisher
+// signature. Clients compare it with the id derived from their pinned key
+// before verifying, so a notice cannot silently point at another key.
+func PublisherKeyID(pubText string) string {
+	pub, err := ParsePublicKey(pubText)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:8])
 }
 
 // SignSoftware signs one update notice with the server identity.

@@ -79,6 +79,8 @@ func run() error {
 		softwareVer     = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
 		softwareURL     = flag.String("software-url", "", "download URL advertised with --software-version")
 		softwareDir     = flag.String("software-dir", "", "release directory published read-only at /software/{name}; the file named by --software-url is hashed and signed in the notice")
+		softwarePubKey  = flag.String("software-publisher-key", "", "publisher Ed25519 public key; the release manifest must carry its signature and the notice forwards the proof")
+		softwareMani    = flag.String("software-manifest", "", "publisher-signed release manifest; defaults to <software-dir>/<artifact>.manifest.json")
 		smtpAddr        = flag.String("smtp-addr", "", "SMTP host:port used to send password-reset mail; empty disables email recovery")
 		smtpFrom        = flag.String("smtp-from", "", "From address for password-reset mail; required with --smtp-addr")
 		smtpUser        = flag.String("smtp-user", "", "SMTP username for PLAIN authentication; empty sends without auth")
@@ -115,6 +117,7 @@ func run() error {
 		configSerial    = flag.Int64("config-serial", 0, "serial of the pushed rendezvous list; 0 becomes 1 when a list is set")
 		hostTTL         = flag.Duration("host-ttl", 60*time.Second, "how long a registration survives without renewal")
 		offline         = flag.Duration("offline-after", 30*time.Second, "keepalive silence that makes a host offline")
+		requireMetaSig  = flag.Bool("require-host-metadata-sig", false, "reject registrations that do not sign hostname/platform/version with the host key")
 		stateFile       = flag.String("state", "chast-server-state.db", "persistent SQLite peer database; a legacy .json next to it is imported once; empty disables persistence")
 		identityFile    = flag.String("identity", "chast-server-identity.key", "Ed25519 server identity seed; created on first run, empty for ephemeral")
 		tlsCert         = flag.String("tls-cert", "", "PEM certificate for the HTTP API; requires --tls-key")
@@ -214,6 +217,24 @@ func run() error {
 			return fmt.Errorf("--software-dir requires --software-url to point under %s", software.RoutePrefix)
 		}
 		softwareName = name
+	}
+	publisherKeyText := strings.TrimSpace(*softwarePubKey)
+	manifestPath := strings.TrimSpace(*softwareMani)
+	if publisherKeyText != "" {
+		if softwareVersion == "" {
+			return errors.New("--software-publisher-key requires --software-version and --software-url")
+		}
+		if _, err := identity.ParsePublicKey(publisherKeyText); err != nil {
+			return fmt.Errorf("--software-publisher-key: %w", err)
+		}
+		if manifestPath == "" {
+			if softwareName == "" {
+				return errors.New("--software-publisher-key needs --software-manifest unless --software-dir locates the sidecar")
+			}
+			manifestPath = software.ManifestPath(*softwareDir, softwareName)
+		}
+	} else if manifestPath != "" {
+		return errors.New("--software-manifest requires --software-publisher-key")
 	}
 	smtpServer := strings.TrimSpace(*smtpAddr)
 	smtpFromAddr := strings.TrimSpace(*smtpFrom)
@@ -513,22 +534,44 @@ func run() error {
 	log.Info("server identity", "public_key", serverIdentity.PublicKeyText())
 
 	var (
-		softwareSHA256    string
-		softwareSize      int64
-		softwareSignature string
+		softwareSHA256             string
+		softwareSize               int64
+		softwareSignature          string
+		softwarePublisherKeyID     string
+		softwarePublisherSignature string
 	)
+	var softwareArtifact *software.Artifact
 	if softwareName != "" {
 		artifact, err := software.Load(*softwareDir, softwareName)
 		if err != nil {
 			return fmt.Errorf("--software-dir: %w", err)
 		}
+		softwareArtifact = artifact
 		softwareSHA256 = artifact.SHA256
 		softwareSize = artifact.Size
+		log.Info("software update artifact", "name", artifact.Name, "size", softwareSize, "sha256", softwareSHA256)
+	}
+	if publisherKeyText != "" {
+		manifest, err := software.LoadVerifiedManifest(
+			manifestPath, publisherKeyText, softwareVersion, softwareDownload, softwareArtifact)
+		if err != nil {
+			return fmt.Errorf("software manifest %s: %w", manifestPath, err)
+		}
+		if softwareArtifact == nil {
+			// The publisher signed the digest; the server only forwards it.
+			softwareSHA256 = manifest.SHA256
+			softwareSize = manifest.Size
+		}
+		softwarePublisherKeyID = manifest.PublisherKeyID
+		softwarePublisherSignature = manifest.PublisherSignature
+		log.Info("software publisher manifest verified",
+			"path", manifestPath, "publisher_key_id", softwarePublisherKeyID)
+	}
+	if softwareSHA256 != "" {
 		softwareSignature, err = serverIdentity.SignSoftware(softwareVersion, softwareDownload, softwareSHA256, softwareSize)
 		if err != nil {
 			return err
 		}
-		log.Info("software update artifact", "name", artifact.Name, "size", softwareSize, "sha256", softwareSHA256)
 	}
 
 	reg, err := registry.NewPersistent(*offline, *stateFile)
@@ -582,6 +625,7 @@ func run() error {
 		relay.WithViewerTokenRequired(*serverKey != ""),
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
+		relay.WithTracer(tracer),
 	)
 	if err != nil {
 		return err
@@ -630,6 +674,7 @@ func run() error {
 		rendezvous.WithReadBuffer(*rmem),
 		rendezvous.WithPunchRateMax(*punchRateMax),
 		rendezvous.WithServerKey(*serverKey),
+		rendezvous.WithTracer(tracer),
 	)
 	if err != nil {
 		return err
@@ -801,7 +846,7 @@ func run() error {
 			if result.Audit+result.Connections+result.FileTransfers > 0 {
 				log.Info("audit archive wrote rows", "audit", result.Audit,
 					"connections", result.Connections, "transfers", result.FileTransfers,
-					"files", result.Files)
+					"merged", result.Merged, "files", result.Files)
 			}
 			if len(result.Compressed)+len(result.Pruned) > 0 {
 				log.Info("audit archive compacted", "compressed", len(result.Compressed),
@@ -884,27 +929,30 @@ func run() error {
 	}
 
 	handler := api.New(api.Config{
-		Registry:      reg,
-		Relay:         relayManager,
-		Identity:      serverIdentity,
-		PunchAddr:     punchAddr,
-		PunchAddrV6:   punchAddrV6,
-		RelayHost:     advertised,
-		ServerKey:     *serverKey,
-		TTL:           *hostTTL,
-		RelayOnly:     relayOnlyFlag,
-		Blocker:       blocker,
-		Accounts:      accounts,
-		Recordings:    recordingArchive,
-		GeoIP:         geoLocator,
-		PunchLog:      punchLog,
-		IPChanges:     ipChanges,
-		RelayAddrs:    relayAddrs,
-		RelayExtra:    relayExtra,
-		CarrierV6Host: carrierV6Host,
-		RelayPool:     pool,
-		Logger:        log,
-		Limiter:       ratelimit.New(*apiRate, float64(*apiBurst)),
+		Registry:    reg,
+		Relay:       relayManager,
+		Identity:    serverIdentity,
+		PunchAddr:   punchAddr,
+		PunchAddrV6: punchAddrV6,
+		RelayHost:   advertised,
+		ServerKey:   *serverKey,
+		TTL:         *hostTTL,
+		// RequireHostMetadataSig rejects old agents that cannot sign their
+		// display metadata; off by default keeps mixed deployments working.
+		RequireHostMetadataSig: *requireMetaSig,
+		RelayOnly:              relayOnlyFlag,
+		Blocker:                blocker,
+		Accounts:               accounts,
+		Recordings:             recordingArchive,
+		GeoIP:                  geoLocator,
+		PunchLog:               punchLog,
+		IPChanges:              ipChanges,
+		RelayAddrs:             relayAddrs,
+		RelayExtra:             relayExtra,
+		CarrierV6Host:          carrierV6Host,
+		RelayPool:              pool,
+		Logger:                 log,
+		Limiter:                ratelimit.New(*apiRate, float64(*apiBurst)),
 		LoginLimiter: newLoginLimiter(accounts, authlimit.Config{
 			Window:      *loginWindow,
 			MaxFailures: *loginFails,
@@ -919,15 +967,18 @@ func run() error {
 		SoftwareSHA256:    softwareSHA256,
 		SoftwareSize:      softwareSize,
 		SoftwareSignature: softwareSignature,
-		Rendezvous:        rendezvousConfig,
-		Mailer:            apiMailer,
-		SMS:               apiSMS,
-		RecoveryURL:       resetPage,
-		RecoveryTTL:       *recoveryTTL,
-		SMSTTL:            *smsTTL,
-		WebAuthnRPID:      relyingParty,
-		WebAuthnOrigins:   webauthnOrigins,
-		Tracer:            tracer,
+
+		SoftwarePublisherKeyID:     softwarePublisherKeyID,
+		SoftwarePublisherSignature: softwarePublisherSignature,
+		Rendezvous:                 rendezvousConfig,
+		Mailer:                     apiMailer,
+		SMS:                        apiSMS,
+		RecoveryURL:                resetPage,
+		RecoveryTTL:                *recoveryTTL,
+		SMSTTL:                     *smsTTL,
+		WebAuthnRPID:               relyingParty,
+		WebAuthnOrigins:            webauthnOrigins,
+		Tracer:                     tracer,
 	})
 	httpServer := &http.Server{
 		Addr:              *httpListen,

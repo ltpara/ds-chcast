@@ -80,7 +80,10 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
            a.audio_silence_gate_ms == b.audio_silence_gate_ms &&
-           a.allow_privacy_mode == b.allow_privacy_mode && a.auth_mode == b.auth_mode &&
+           a.allow_privacy_mode == b.allow_privacy_mode &&
+           a.allow_restart == b.allow_restart &&
+           a.auto_disconnect_minutes == b.auto_disconnect_minutes &&
+           a.auth_mode == b.auth_mode &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
            a.allow_permission_change == b.allow_permission_change &&
@@ -93,7 +96,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.server_key == b.server_key && a.tunnel_id == b.tunnel_id &&
            a.tunnel_old_id == b.tunnel_old_id &&
            a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen &&
-           a.audit_spool == b.audit_spool;
+           a.socks5 == b.socks5 && a.audit_spool == b.audit_spool;
 }
 
 void test_round_trip(const std::filesystem::path& dir) {
@@ -115,6 +118,8 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.audio_aec = false;
     settings.audio_silence_gate_ms = 0;
     settings.allow_privacy_mode = true;
+    settings.allow_restart = true;
+    settings.auto_disconnect_minutes = 30;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
     settings.password_hash =
@@ -152,6 +157,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.tunnel_old_id = "devbox.home";
     settings.tunnel_key = "host secret 123";
     settings.tunnel_listen = "127.0.0.1:46000";
+    settings.socks5 = "socks5://alice:s3cret@127.0.0.1:1080";
     settings.audit_spool = "D:\\审计\\host.audit.jsonl";
 
     std::string error;
@@ -189,6 +195,8 @@ void test_missing_file(const std::filesystem::path& dir) {
           "a fresh host gates digital silence after two seconds");
     check(!loaded.settings.allow_privacy_mode, "a fresh host does not blank the local screen");
     check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
+    check(loaded.settings.auto_disconnect_minutes == 0,
+          "a fresh host keeps an idle session open");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
     check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
@@ -223,6 +231,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "microphone=perhaps\n"
                "privacy_mode=perhaps\n"
                "record=perhaps\n"
+               "auto_disconnect_minutes=20000\n"
                "approve=off\n"
                "token_mode=forever\n"
                "token=" + std::string(200, 'x') + "\n"
@@ -237,6 +246,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "tunnel_id=bad id\n"
                "tunnel_key=short\n"
                "tunnel_listen=127.0.0.1:0\n"
+               "socks5=socks5://127.0.0.1:1080/path\n"
                "unknown_key=whatever\n"
                "this line has no equals\n");
     const chast::HostSettingsLoad loaded = chast::load_host_settings(path.string());
@@ -257,6 +267,8 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(!settings.allow_privacy_mode,
           "an unparsable privacy toggle keeps the private default");
     check(settings.allow_record, "an unparsable record toggle keeps the consent default");
+    check(settings.auto_disconnect_minutes == 0,
+          "an out-of-range idle timeout stays off");
     check(!settings.require_approval, "a valid boolean is still applied");
     check(settings.token_mode == chast::HostTokenMode::OneTime, "an unknown token mode falls back");
     check(settings.access_token.empty(), "an oversized token is dropped");
@@ -271,15 +283,16 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel_id.empty(), "an invalid device id is dropped");
     check(settings.tunnel_key.empty(), "a short device key is dropped");
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
+    check(settings.socks5.empty(), "an invalid proxy is dropped");
 
     for (const char* key : {"port", "input", "clipboard", "file_transfer", "audio",
                             "audio_device", "audio_aec", "audio_silence_gate_ms",
                             "microphone", "privacy_mode",
-                            "record", "token_mode", "token", "codec",
+                            "record", "auto_disconnect_minutes", "token_mode", "token", "codec",
                             "bitrate_kbps",
                             "framerate",
                             "quality", "display", "tunnel", "server_url", "server_key",
-                            "tunnel_id", "tunnel_key", "tunnel_listen"}) {
+                            "tunnel_id", "tunnel_key", "tunnel_listen", "socks5"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
     }
@@ -303,6 +316,32 @@ void test_audio_settings(const std::filesystem::path& dir) {
               pinned.settings.audio_device == "{0.0.1.00000000}.{missing}" &&
               pinned.settings.audio_aec,
           "a device id that is not plugged in is preserved for the session");
+}
+
+void test_idle_timeout_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "idle.ini";
+    write_text(path, "auto_disconnect_minutes=10080\n");
+    chast::HostSettingsLoad loaded = chast::load_host_settings(path.string());
+    check(loaded.warning.empty() && loaded.settings.auto_disconnect_minutes == 10080,
+          "the longest idle timeout is accepted");
+
+    write_text(path, "auto_disconnect_minutes=30\n");
+    loaded = chast::load_host_settings(path.string());
+    check(loaded.warning.empty() && loaded.settings.auto_disconnect_minutes == 30,
+          "an idle timeout is read back");
+
+    write_text(path, "auto_disconnect_minutes=soon\n");
+    loaded = chast::load_host_settings(path.string());
+    check(loaded.settings.auto_disconnect_minutes == 0 &&
+              loaded.warning.find("auto_disconnect_minutes") != std::string::npos,
+          "a non-numeric idle timeout is reported and stays off");
+
+    chast::HostSettings settings;
+    settings.auto_disconnect_minutes = 15;
+    std::string error;
+    check(chast::save_host_settings(path.string(), settings, &error), "an idle timeout saves");
+    check(chast::load_host_settings(path.string()).settings.auto_disconnect_minutes == 15,
+          "an idle timeout survives save and load");
 }
 
 void test_tokens() {
@@ -367,6 +406,20 @@ void test_security_migration(const std::filesystem::path& dir) {
           "the permissions mask carries the privacy-mode grant");
     check(loaded.settings.allow_record,
           "a mask written before the record bit keeps the consent default");
+    check(!loaded.settings.allow_restart,
+          "a mask written before the restart bit keeps the off default");
+
+    const std::filesystem::path with_restart = dir / "with-restart.ini";
+    write_text(with_restart, "permissions=37\nrestart=1\n");
+    loaded = chast::load_host_settings(with_restart.string());
+    check(loaded.settings.allow_restart,
+          "an explicit restart=1 survives a mask that predates the bit");
+
+    const std::filesystem::path no_restart = dir / "no-restart.ini";
+    write_text(no_restart, "permissions=2085\nrestart=0\n");
+    loaded = chast::load_host_settings(no_restart.string());
+    check(!loaded.settings.allow_restart,
+          "an explicit restart=0 revokes a mask that carries the bit");
 
     const std::filesystem::path no_record = dir / "no-record.ini";
     write_text(no_record, "permissions=37\nrecord=0\n");
@@ -475,6 +528,31 @@ void test_service_parsers() {
     check(!chast::parse_tunnel_listen("127.0.0.1:0", out), "the port cannot be zero");
     check(!chast::parse_tunnel_listen("::1:14434", out),
           "an unbracketed IPv6 listener is rejected");
+
+    check(chast::parse_socks5_proxy("socks5://127.0.0.1:1080", out) &&
+              out == "socks5://127.0.0.1:1080",
+          "a SOCKS5 proxy parses");
+    check(chast::parse_socks5_proxy("socks5h://proxy.example", out) &&
+              out == "socks5://proxy.example:1080",
+          "socks5h is accepted and the default port is filled in");
+    check(chast::parse_socks5_proxy("socks5://alice:s3cret@10.0.0.5:7890", out) &&
+              out == "socks5://alice:s3cret@10.0.0.5:7890",
+          "proxy credentials survive normalization");
+    check(chast::parse_socks5_proxy("127.0.0.1:9050", out) &&
+              out == "socks5://127.0.0.1:9050",
+          "a bare host:port is accepted");
+    check(chast::parse_socks5_proxy("[::1]:1080", out) &&
+              out == "socks5://[::1]:1080",
+          "an IPv6 proxy keeps its brackets");
+    check(!chast::parse_socks5_proxy("", out), "an empty proxy is not a value");
+    check(!chast::parse_socks5_proxy("http://127.0.0.1:8080", out),
+          "a non-SOCKS5 scheme is rejected");
+    check(!chast::parse_socks5_proxy("127.0.0.1", out), "a bare proxy needs a port");
+    check(!chast::parse_socks5_proxy("socks5://127.0.0.1:1080/path", out),
+          "a proxy path is rejected");
+    check(!chast::parse_socks5_proxy("socks5://:1080", out), "a proxy needs a host");
+    check(!chast::parse_socks5_proxy("socks5://127.0.0.1:70000", out),
+          "a proxy port above 65535 is rejected");
 
     uint16_t port = 0;
     check(chast::tunnel_listen_port("0.0.0.0:14434", port) && port == 14434,
@@ -617,6 +695,7 @@ int main() {
     test_missing_file(dir);
     test_invalid_values(dir);
     test_audio_settings(dir);
+    test_idle_timeout_settings(dir);
     test_tokens();
     test_security_migration(dir);
     test_totp_storage();

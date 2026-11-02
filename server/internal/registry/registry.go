@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/sqlitex"
 )
 
 var (
@@ -46,16 +47,20 @@ func ValidID(id string) bool { return idPattern.MatchString(id) }
 // information in its SQLite peer table so an offline peer still has a name and
 // a version.
 type Identity struct {
-	ID          string    `json:"id"`
-	PublicKey   string    `json:"public_key"`
-	Fingerprint string    `json:"fingerprint,omitempty"`
-	Hostname    string    `json:"hostname,omitempty"`
-	Platform    string    `json:"platform,omitempty"`
-	Version     string    `json:"version,omitempty"`
-	Alias       string    `json:"alias,omitempty"`
-	Tags        []string  `json:"tags,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	LastSeen    time.Time `json:"last_seen,omitempty"`
+	ID          string `json:"id"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Hostname    string `json:"hostname,omitempty"`
+	Platform    string `json:"platform,omitempty"`
+	Version     string `json:"version,omitempty"`
+	// MetadataSigned records whether the latest registration carried a valid
+	// host-key signature over Hostname, Platform and Version. Old agents
+	// register unsigned; the console shows which peers were verified.
+	MetadataSigned bool      `json:"metadata_signed"`
+	Alias          string    `json:"alias,omitempty"`
+	Tags           []string  `json:"tags,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	LastSeen       time.Time `json:"last_seen,omitempty"`
 }
 
 type Host struct {
@@ -104,11 +109,14 @@ type RegisterRequest struct {
 	PublicKey   string
 	Fingerprint string
 	// Hostname, Platform and Version are display metadata. Empty values keep
-	// whatever a previous registration reported.
-	Hostname string
-	Platform string
-	Version  string
-	TTL      time.Duration
+	// whatever a previous registration reported. MetadataSigned says the
+	// caller verified the host key over those values; it is stored as the
+	// current report status, so an unsigned renewal clears it.
+	Hostname       string
+	Platform       string
+	Version        string
+	MetadataSigned bool
+	TTL            time.Duration
 	// OldID is the id this device used before. The caller must have proven
 	// ownership of it; Register moves its durable record to ID, preserving the
 	// creation time and operator labels, and releases its lease. An unknown
@@ -255,14 +263,15 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 		}
 	} else {
 		record = Identity{
-			ID:          req.ID,
-			PublicKey:   req.PublicKey,
-			Fingerprint: req.Fingerprint,
-			Hostname:    normalizeMetadata(req.Hostname, maxHostname),
-			Platform:    normalizeMetadata(req.Platform, maxPlatform),
-			Version:     normalizeMetadata(req.Version, maxVersion),
-			CreatedAt:   now,
-			LastSeen:    now,
+			ID:             req.ID,
+			PublicKey:      req.PublicKey,
+			Fingerprint:    req.Fingerprint,
+			Hostname:       normalizeMetadata(req.Hostname, maxHostname),
+			Platform:       normalizeMetadata(req.Platform, maxPlatform),
+			Version:        normalizeMetadata(req.Version, maxVersion),
+			MetadataSigned: req.MetadataSigned,
+			CreatedAt:      now,
+			LastSeen:       now,
 		}
 		if err := r.storeIdentityLocked(record); err != nil {
 			return Host{}, err
@@ -304,6 +313,7 @@ func applyRegistrationMetadata(record Identity, req RegisterRequest) Identity {
 	if req.Version != "" {
 		record.Version = normalizeMetadata(req.Version, maxVersion)
 	}
+	record.MetadataSigned = req.MetadataSigned
 	return record
 }
 
@@ -535,6 +545,14 @@ func (r *Registry) Close() error {
 		return nil
 	}
 	return r.store.Close()
+}
+
+// SQLitePoolStats reports connection-pool queueing for the peer database.
+func (r *Registry) SQLitePoolStats() sqlitex.PoolStats {
+	if r == nil {
+		return sqlitex.PoolStats{}
+	}
+	return r.store.SQLitePoolStats()
 }
 
 // PublicKey returns the verified Ed25519 key bound to id.
@@ -769,6 +787,7 @@ func identityChanged(a, b Identity) bool {
 		a.Hostname != b.Hostname ||
 		a.Platform != b.Platform ||
 		a.Version != b.Version ||
+		a.MetadataSigned != b.MetadataSigned ||
 		a.Alias != b.Alias ||
 		!slices.Equal(a.Tags, b.Tags) ||
 		!a.CreatedAt.Equal(b.CreatedAt) ||

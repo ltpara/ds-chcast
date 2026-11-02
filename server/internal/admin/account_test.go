@@ -230,6 +230,7 @@ func TestAccountConsoleCommands(t *testing.T) {
 	started := time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)
 	if _, err := s.Accounts.RecordConnection(
 		bob.ID, bob.Username, "devbox", "viewer", "127.0.0.1", "",
+		"", "",
 		started, started.Add(time.Minute), true, "",
 	); err != nil {
 		t.Fatalf("record connection: %v", err)
@@ -247,7 +248,8 @@ func TestAccountConsoleCommands(t *testing.T) {
 	}
 
 	if _, err := s.Accounts.RecordFileTransfer(
-		bob.ID, bob.Username, "devbox", "upload", "report.pdf", "127.0.0.1", "", 4096, 2,
+		bob.ID, bob.Username, "devbox", "upload", "report.pdf", "127.0.0.1", "",
+		"", "", 4096, 2,
 		started.Add(time.Minute), true, "",
 	); err != nil {
 		t.Fatalf("record file transfer: %v", err)
@@ -318,13 +320,14 @@ func TestAuditConsolePrune(t *testing.T) {
 	for _, at := range []time.Time{old, fresh} {
 		if _, err := s.Accounts.RecordConnection(
 			alice.ID, alice.Username, "devbox", "viewer", "127.0.0.1", "",
+			"", "",
 			at, at.Add(time.Minute), true, "",
 		); err != nil {
 			t.Fatalf("record connection: %v", err)
 		}
 		if _, err := s.Accounts.RecordFileTransfer(
 			alice.ID, alice.Username, "devbox", "upload", at.Format("150405")+".pdf",
-			"127.0.0.1", "", 1, 1, at, true, "",
+			"127.0.0.1", "", "", "", 1, 1, at, true, "",
 		); err != nil {
 			t.Fatalf("record transfer: %v", err)
 		}
@@ -592,10 +595,10 @@ func TestConsoleAuditArchive(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("append audit: %v", err)
 	}
-	if out := send(t, c.Addr(), "audit archive run"); !strings.Contains(out, "audit=1 connections=0 transfers=0 files=1") {
+	if out := send(t, c.Addr(), "audit archive run"); !strings.Contains(out, "audit=1 connections=0 transfers=0 files=1 merged=0") {
 		t.Fatalf("archive run: %q", out)
 	}
-	if out := send(t, c.Addr(), "audit archive run"); !strings.Contains(out, "audit=0 connections=0 transfers=0 files=0") {
+	if out := send(t, c.Addr(), "audit archive run"); !strings.Contains(out, "audit=0 connections=0 transfers=0 files=0 merged=0") {
 		t.Fatalf("idle archive run: %q", out)
 	}
 	if out := send(t, c.Addr(), "audit archive nope"); !strings.Contains(out, "usage: audit archive") {

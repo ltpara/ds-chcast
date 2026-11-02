@@ -133,6 +133,9 @@ constexpr uint32_t kViewerTerminalId = 1;
 // Safety valve for a folder that expands into a huge tree; the UI would
 // otherwise build an unbounded queue on the session thread.
 constexpr size_t kMaxQueuedUploads = 10000;
+// Finished transfers kept for the audit journal. The page drains it on every
+// poll, so this only has to cover a stall or a long folder walk.
+constexpr size_t kFileAuditLimit = 128;
 
 std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
@@ -228,6 +231,22 @@ const char* sas_code_name(chast::SasCode code) {
             return "the host could not send Ctrl+Alt+Del";
     }
     return "the host refused Ctrl+Alt+Del";
+}
+
+const char* restart_code_name(chast::RestartCode code) {
+    switch (code) {
+        case chast::RestartCode::Ok:
+            return "the restart was scheduled";
+        case chast::RestartCode::Denied:
+            return "restarting is not permitted by the host";
+        case chast::RestartCode::Disabled:
+            return "restarting is disabled on the host";
+        case chast::RestartCode::Unsupported:
+            return "this host cannot restart itself";
+        case chast::RestartCode::Failed:
+            return "the host could not schedule the restart";
+    }
+    return "the host refused the restart";
 }
 
 const char* desktop_kind_name(chast::DesktopKind kind) {
@@ -387,6 +406,8 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     // A SAS request queued for a session that ended must not fire into the
     // next one.
     pending_sas_.store(false, std::memory_order_release);
+    // A reboot is even less transferable between sessions.
+    pending_restart_.store(false, std::memory_order_release);
     // Port forwarding belongs to one session too; the listener lives on the
     // session thread and goes away with it.
     {
@@ -1184,6 +1205,21 @@ bool ViewerEngine::SendSas() {
     return true;
 }
 
+bool ViewerEngine::RequestRestart() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            (status_.permissions & chast::kPermissionRestart) == 0) {
+            return false;
+        }
+    }
+    pending_restart_.store(true, std::memory_order_release);
+    return true;
+}
+
 bool ViewerEngine::SendChat(const std::string& text) {
     if (!chast::valid_chat_text(text)) {
         return false;
@@ -1562,6 +1598,29 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t files_received = 0;
     uint64_t file_receive_failures = 0;
     uint64_t download_cancels = 0;
+    // Finished-file journal for the audit report (see ViewerStatus). Only this
+    // thread touches it; sync_status copies it into the polled status.
+    std::vector<FileAuditEntry> file_audit;
+    uint64_t file_audit_next_seq = 1;
+    uint64_t file_audit_first_seq = 0;
+    uint64_t file_audit_dropped = 0;
+    auto record_file_audit = [&](bool download, const std::string& name, uint64_t size,
+                                 bool success, const std::string& detail) {
+        FileAuditEntry entry;
+        entry.seq = file_audit_next_seq++;
+        entry.download = download;
+        entry.name = name;
+        entry.size = size;
+        entry.success = success;
+        entry.detail = detail;
+        file_audit.push_back(std::move(entry));
+        if (file_audit.size() > kFileAuditLimit) {
+            const size_t dropped = file_audit.size() - kFileAuditLimit;
+            file_audit.erase(file_audit.begin(), file_audit.begin() + dropped);
+            file_audit_dropped += dropped;
+            file_audit_first_seq = file_audit.front().seq;
+        }
+    };
     uint64_t cursor_updates = 0;
     bool audio_announced = false;
     bool audio_finished = false;
@@ -1606,6 +1665,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     int sas_code = 0;
     std::string sas_error;
     uint64_t sas_updates = 0;
+    int restart_code = 0;
+    std::string restart_error;
+    uint64_t restart_updates = 0;
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
@@ -1754,6 +1816,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.files_received = files_received;
             status_.file_receive_failures = file_receive_failures;
             status_.download_cancels = download_cancels;
+            status_.file_audit = file_audit;
+            status_.file_audit_first_seq = file_audit_first_seq;
+            status_.file_audit_dropped = file_audit_dropped;
             {
                 std::lock_guard<std::mutex> file_lock(file_mutex_);
                 status_.download_cancellable = download_.cancellable;
@@ -1872,6 +1937,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.sas_code = sas_code;
             status_.sas_error = sas_error;
             status_.sas_updates = sas_updates;
+            status_.restart_code = restart_code;
+            status_.restart_error = restart_error;
+            status_.restart_updates = restart_updates;
             status_.display_switches = display_switches;
             status_.display_switch_failures = display_switch_failures;
             status_.display_switch_error = display_switch_error;
@@ -2270,6 +2338,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 const bool terminal_allowed =
                     (mask & chast::kPermissionTerminal) != 0;
                 const bool camera_allowed = (mask & chast::kPermissionCamera) != 0;
+                const bool restart_allowed = (mask & chast::kPermissionRestart) != 0;
                 {
                     std::lock_guard<std::mutex> lock(input_mutex_);
                     input_enabled_ = input;
@@ -2291,6 +2360,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.port_forward_enabled = forward_allowed;
                     status_.terminal_supported = terminal_allowed;
                     status_.camera_supported = camera_allowed;
+                    status_.restart_supported = restart_allowed;
                 }
                 // The transport aborts the stream on revocation; stopping here
                 // releases the microphone at once and tells the UI why.
@@ -2886,6 +2956,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             if (!reported) {
                                 reported = true;
                                 name = it->name;
+                                const uint64_t size = it->size;
                                 FileUpload finished = std::move(*it);
                                 finished.stage = FileUpload::Stage::kFailed;
                                 finished.error = message;
@@ -2895,6 +2966,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 } else {
                                     ++file_failures;
                                 }
+                                record_file_audit(false, name, size, false, message);
                             }
                             it = uploads_.erase(it);
                             ++dropped;
@@ -3115,8 +3187,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             }
                             if (stage == FileUpload::Stage::kFailed) {
                                 ++file_failures;
+                                record_file_audit(false, uploads_.front().name,
+                                                  uploads_.front().size, false,
+                                                  uploads_.front().error);
                             } else {
                                 ++files_sent;
+                                record_file_audit(false, uploads_.front().name,
+                                                  uploads_.front().size, true, "");
                             }
                             last_upload_ = std::move(uploads_.front());
                             uploads_.pop_front();
@@ -3353,6 +3430,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto download_fail = [&](const std::string& message, bool report) {
                     uint32_t transfer_id = 0;
                     std::string name;
+                    uint64_t size = 0;
                     bool clipboard_transfer = false;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
@@ -3361,6 +3439,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         transfer_id = download_.transfer_id;
                         name = download_.name;
+                        size = download_.size;
                         if (download_.receiver) {
                             download_.receiver->abort(true);
                             download_.receiver.reset();
@@ -3376,6 +3455,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                         message);
                     }
                     ++file_receive_failures;
+                    record_file_audit(true, name, size, false, message);
                     std::fprintf(stderr, "viewer: download %s failed: %s\n", name.c_str(),
                                  message.c_str());
                     if (clipboard_transfer) {
@@ -3389,6 +3469,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto cancel_download = [&] {
                     uint32_t transfer_id = 0;
                     uint64_t received = 0;
+                    uint64_t size = 0;
                     std::string name;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
@@ -3397,6 +3478,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         transfer_id = download_.transfer_id;
                         received = download_.received;
+                        size = download_.size;
                         name = download_.name;
                         if (clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
                             clipboard_files.transfer_id == transfer_id) {
@@ -3425,6 +3507,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         download_.error = "the viewer cancelled the download";
                     }
                     ++download_cancels;
+                    record_file_audit(true, name, size, false,
+                                      "the viewer cancelled the download");
                     (void)session->send_file_result(transfer_id, chast::FileCode::Cancelled,
                                                     received,
                                                     "the viewer cancelled the download");
@@ -3606,6 +3690,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 continue;
                             }
                             ++file_receive_failures;
+                            record_file_audit(true, offer.name, offer.size, false, reason);
                             // The walk's file was turned away; queue it again
                             // instead of ending the whole walk.
                             bool walk_transfer = false;
@@ -3673,6 +3758,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             options, &resume_offset, &receive_error);
                         if (!receiver) {
                             ++file_receive_failures;
+                            record_file_audit(true, offer.name, offer.size, false,
+                                              receive_error);
                             (void)session->send_file_answer(offer.transfer_id, chast::FileCode::Refused,
                                                             0, receive_error);
                             std::fprintf(stderr, "viewer: download %s refused: %s\n",
@@ -3837,8 +3924,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         download_fail(finish_error, true);
                         return;
                     }
+                    std::string finished_name;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
+                        finished_name = download_.name;
                         download_.receiver.reset();
                         download_.stage = FileDownload::Stage::kDone;
                         download_.path = final_path;
@@ -3871,6 +3960,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         clipboard_files.retry_after = Clock::now();
                     }
                     ++files_received;
+                    record_file_audit(true, finished_name, bytes, true, "");
                     chast::Error sent =
                         session->send_file_result(transfer_id, chast::FileCode::Ok, bytes);
                     if (!sent.ok()) {
@@ -4985,11 +5075,57 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends a queued reboot request. Like SAS, a local failure is
+                // reported as a RestartResult would be so the UI always gets
+                // an answer.
+                auto drain_restart = [&] {
+                    if (!pending_restart_.exchange(false, std::memory_order_acq_rel)) {
+                        return;
+                    }
+                    chast::Error sent = session->request_restart();
+                    if (sent.ok()) {
+                        return;
+                    }
+                    restart_code = static_cast<int>(chast::RestartCode::Failed);
+                    restart_error = "request: " + sent.to_string();
+                    ++restart_updates;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.restart_code = restart_code;
+                    status_.restart_error = restart_error;
+                    status_.restart_updates = restart_updates;
+                    std::fprintf(stderr, "viewer: request restart: %s\n",
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts the host's answer. Ok means the machine will reboot
+                // within a few seconds and this session ends with it.
+                auto receive_restart = [&] {
+                    chast::RestartCode code = chast::RestartCode::Failed;
+                    std::string reason;
+                    while (session->take_restart_result(code, reason)) {
+                        restart_code = static_cast<int>(code);
+                        restart_error = code == chast::RestartCode::Ok
+                                            ? std::string()
+                                            : (reason.empty() ? restart_code_name(code) : reason);
+                        ++restart_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.restart_code = restart_code;
+                            status_.restart_error = restart_error;
+                            status_.restart_updates = restart_updates;
+                        }
+                        std::fprintf(stderr, "viewer: restart %s%s%s\n",
+                                     code == chast::RestartCode::Ok ? "scheduled"
+                                                                    : "refused",
+                                     restart_error.empty() ? "" : ": ",
+                                     restart_error.c_str());
+                    }
+                };
+
                 // Chat is ungated: an admitted session is the authorization.
                 // Text goes into the UI queue; the status only carries counts,
                 // so a 4 KiB line never inflates the poll.
-                auto receive_chat = [&] {
-                    std::string text;
+                auto receive_chat = [&] {                    std::string text;
                     while (session->take_chat(text)) {
                         ++chat_received;
                         {
@@ -6119,6 +6255,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_privacy();
                     drain_sas();
                     receive_sas();
+                    drain_restart();
+                    receive_restart();
                     receive_chat();
                     drain_chat();
                     drain_text();
@@ -6215,6 +6353,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_privacy();
                     drain_sas();
                     receive_sas();
+                    drain_restart();
+                    receive_restart();
                     receive_chat();
                     drain_chat();
                     drain_text();
@@ -6450,30 +6590,55 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             }
             if (stage == FileUpload::Stage::kFailed) {
                 ++file_failures;
+                record_file_audit(false, uploads_.front().name,
+                                  uploads_.front().size, false,
+                                  uploads_.front().error);
             } else {
                 ++files_sent;
+                record_file_audit(false, uploads_.front().name,
+                                  uploads_.front().size, true, "");
             }
             last_upload_ = std::move(uploads_.front());
             uploads_.pop_front();
         }
         if (!uploads_.empty()) {
+            const char* reason = "the session ended before the file finished";
+            // Every entry that cannot continue is one failed file in the
+            // audit, not just the head that stays visible in the status.
             for (const FileUpload& upload : uploads_) {
-                if (upload.stage == FileUpload::Stage::kOffered ||
-                    upload.stage == FileUpload::Stage::kSending ||
-                    upload.stage == FileUpload::Stage::kFinishing) {
+                if (cancelled_upload == 0 &&
+                    (upload.stage == FileUpload::Stage::kOffered ||
+                     upload.stage == FileUpload::Stage::kSending ||
+                     upload.stage == FileUpload::Stage::kFinishing)) {
                     cancelled_upload = upload.transfer_id;
-                    break;
                 }
+                record_file_audit(false, upload.name, upload.size, false, reason);
             }
             last_upload_ = std::move(uploads_.front());
             last_upload_.stage = FileUpload::Stage::kFailed;
-            last_upload_.error = "the session ended before the file finished";
+            last_upload_.error = reason;
             uploads_.clear();
         }
         pending_upload_roots_.clear();
     }
     if (cancelled_upload != 0) {
         session->cancel_file_upload(cancelled_upload);
+    }
+    // A download cannot continue on a closed session either. The partial file
+    // stays for a resume, and the file is accounted like any other failure.
+    {
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        if (download_.stage == FileDownload::Stage::kReceiving) {
+            if (download_.receiver) {
+                download_.receiver->abort(true);
+                download_.receiver.reset();
+            }
+            download_.stage = FileDownload::Stage::kFailed;
+            download_.error = "the session ended before the file finished";
+            ++file_receive_failures;
+            record_file_audit(true, download_.name, download_.size, false,
+                              download_.error);
+        }
     }
     // A folder walk cannot continue on a closed session; nothing of it may
     // leak into the next connection either.

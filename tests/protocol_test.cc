@@ -142,7 +142,7 @@ void test_hello() {
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
     unknown_permissions[8] = 0x00;  // version, display, token length, password length
-    unknown_permissions[9] = 0x08;  // bit 11: outside every permission this build knows
+    unknown_permissions[9] = 0x10;  // bit 12: outside every permission this build knows
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
     std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
@@ -233,6 +233,7 @@ void test_hello_ack() {
     sent.terminal_enabled = true;
     sent.record_enabled = true;
     sent.camera_enabled = true;
+    sent.restart_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -279,10 +280,12 @@ void test_hello_ack() {
     check(got.terminal_enabled, "HelloAck keeps the terminal flag");
     check(got.record_enabled, "HelloAck keeps the record flag");
     check(got.camera_enabled, "HelloAck keeps the camera flag");
+    check(got.restart_enabled, "HelloAck keeps the restart flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
               got.file_transfer_enabled && got.microphone_enabled &&
               got.privacy_mode_enabled && got.port_forward_enabled &&
-              got.terminal_enabled && got.record_enabled && got.camera_enabled,
+              got.terminal_enabled && got.record_enabled && got.camera_enabled &&
+              got.restart_enabled,
           "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
@@ -427,7 +430,7 @@ void test_hello_ack() {
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
     unknown_permissions[unknown_permissions.size() - 2] = 0x00;
-    unknown_permissions[unknown_permissions.size() - 1] = 0x08;
+    unknown_permissions[unknown_permissions.size() - 1] = 0x10;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
 
@@ -439,6 +442,7 @@ void test_hello_ack() {
     sent.port_forward_enabled = false;
     sent.terminal_enabled = false;
     sent.record_enabled = false;
+    sent.restart_enabled = false;
     sent.audio.enabled = false;
     sent.audio.extradata.clear();
     chast::ServerInfo disabled;
@@ -447,7 +451,7 @@ void test_hello_ack() {
               !disabled.file_transfer_enabled && !disabled.audio.enabled &&
               !disabled.microphone_enabled && !disabled.privacy_mode_enabled &&
               !disabled.port_forward_enabled && !disabled.terminal_enabled &&
-              !disabled.record_enabled,
+              !disabled.record_enabled && !disabled.restart_enabled,
           "HelloAck reports every permission disabled");
 }
 
@@ -586,7 +590,7 @@ void test_permission_update() {
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
     unknown[0] = 0x00;
-    unknown[1] = 0x08;
+    unknown[1] = 0x10;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -642,6 +646,55 @@ void test_sas() {
           "SasResult with a malformed reason is rejected");
     check(!chast::parse_sas_result(std::vector<uint8_t>(), code, reason, &error),
           "empty SasResult is rejected");
+}
+
+void test_restart() {
+    std::string error;
+    check(chast::parse_restart_request(
+              payload_of(chast::make_restart_request()), &error),
+          "RestartRequest round-trips an empty request");
+    check(payload_of(chast::make_restart_request()).empty(),
+          "RestartRequest has no payload");
+    std::vector<uint8_t> trailing = payload_of(chast::make_restart_request());
+    trailing.push_back(0);
+    check(!chast::parse_restart_request(trailing, &error),
+          "RestartRequest with trailing bytes is rejected");
+
+    chast::RestartCode code = chast::RestartCode::Failed;
+    std::string reason;
+    check(chast::parse_restart_result(
+              payload_of(chast::make_restart_result(chast::RestartCode::Ok, {})),
+              code, reason, &error) &&
+              code == chast::RestartCode::Ok && reason.empty(),
+          "RestartResult round-trips a success");
+    check(chast::parse_restart_result(
+              payload_of(chast::make_restart_result(
+                  chast::RestartCode::Disabled, "remote restart is off")),
+              code, reason, &error) &&
+              code == chast::RestartCode::Disabled &&
+              reason == "remote restart is off",
+          "RestartResult round-trips a refusal with its reason");
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_restart_result(chast::RestartCode::Denied, {}));
+    unknown_code[0] = 5;
+    check(!chast::parse_restart_result(unknown_code, code, reason, &error),
+          "RestartResult with an unknown code is rejected");
+    const std::string long_reason(400, 'x');
+    check(chast::parse_restart_result(
+              payload_of(chast::make_restart_result(chast::RestartCode::Failed,
+                                                    long_reason)),
+              code, reason, &error) &&
+              reason.size() == chast::kMaxRestartReason,
+          "RestartResult truncates an oversized reason to the protocol limit");
+    std::vector<uint8_t> bad_utf8 =
+        payload_of(chast::make_restart_result(chast::RestartCode::Failed, {}));
+    bad_utf8[1] = 1;
+    bad_utf8[2] = 0;
+    bad_utf8.push_back(0xFF);
+    check(!chast::parse_restart_result(bad_utf8, code, reason, &error),
+          "RestartResult with a malformed reason is rejected");
+    check(!chast::parse_restart_result(std::vector<uint8_t>(), code, reason, &error),
+          "empty RestartResult is rejected");
 }
 
 void test_stream_options() {
@@ -3108,6 +3161,7 @@ int main(int argc, char** argv) {
     test_merged_hello_ack();
     test_permission_update();
     test_sas();
+    test_restart();
     test_stream_options();
     test_privacy_mode();
     test_display_switch();

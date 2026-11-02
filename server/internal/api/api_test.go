@@ -692,10 +692,34 @@ func TestRegistrationBlocker(t *testing.T) {
 		"chast_relay_blacklist_speed_bps 33554432",
 		"chast_relay_blocked_sessions_total 0",
 		"chast_relay_rate_dropped_total{unit=\"datagrams\"} 0",
+		"# HELP chast_trace_queue_depth",
+		"# HELP chast_trace_spans_dropped_total",
+		"# HELP chast_sqlite_queries_total",
+		"# HELP chast_sqlite_errors_total",
+		"# HELP chast_sqlite_slow_queries_total",
+		"# HELP chast_sqlite_query_seconds_max",
+		"# HELP chast_sqlite_queries_in_flight",
+		"# HELP chast_sqlite_pool_connections",
+		"# HELP chast_sqlite_pool_wait_total",
+		`chast_sqlite_pool_connections{store="account",state="max_open"} 1`,
+		`chast_sqlite_queries_in_flight{store="account"} 0`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, text)
 		}
+	}
+	recorded := false
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.HasPrefix(line, `chast_sqlite_queries_total{store="account",`) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] != "0" {
+			recorded = true
+		}
+	}
+	if !recorded {
+		t.Fatalf("no account SQLite statement was counted:\n%s", text)
 	}
 }
 
@@ -860,8 +884,10 @@ func TestHealthServerInfoAndStats(t *testing.T) {
 
 func TestSoftwareUpdateAdvertisement(t *testing.T) {
 	s := testutil.StartWith(t, testutil.Options{
-		SoftwareVersion: "2.1.0",
-		SoftwareURL:     "https://downloads.example.com/chast-2.1.0.exe",
+		SoftwareVersion:            "2.1.0",
+		SoftwareURL:                "https://downloads.example.com/chast-2.1.0.exe",
+		SoftwarePublisherKeyID:     "0123456789abcdef",
+		SoftwarePublisherSignature: "publisher-proof",
 	})
 	now := time.Now().Unix()
 	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
@@ -870,8 +896,10 @@ func TestSoftwareUpdateAdvertisement(t *testing.T) {
 		t.Fatalf("register: %d %s", status, body)
 	}
 	type software struct {
-		Version string `json:"version"`
-		URL     string `json:"url"`
+		Version            string `json:"version"`
+		URL                string `json:"url"`
+		PublisherKeyID     string `json:"publisher_key_id"`
+		PublisherSignature string `json:"publisher_sig"`
 	}
 	var reg struct {
 		Software *software `json:"software"`
@@ -880,7 +908,9 @@ func TestSoftwareUpdateAdvertisement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if reg.Software == nil || reg.Software.Version != "2.1.0" ||
-		reg.Software.URL != "https://downloads.example.com/chast-2.1.0.exe" {
+		reg.Software.URL != "https://downloads.example.com/chast-2.1.0.exe" ||
+		reg.Software.PublisherKeyID != "0123456789abcdef" ||
+		reg.Software.PublisherSignature != "publisher-proof" {
 		t.Fatalf("register software = %+v", reg.Software)
 	}
 

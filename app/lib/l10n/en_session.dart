@@ -6,6 +6,24 @@ const Map<String, String> kEnglishSession = <String, String>{
   'Ctrl+Alt+Del 未发送：{detail}': 'Ctrl+Alt+Del not sent: {detail}',
   'Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪':
       'Ctrl+Alt+Del could not be queued: remote input is not ready',
+  '主机已安排重启：约 5 秒后重启，当前会话将断开':
+      'The host scheduled a restart: it reboots in about 5 seconds and this session will drop',
+  '主机将在约 5 秒后强制重启，未保存的工作会丢失，当前会话也会断开。':
+      'The host will force a restart in about 5 seconds; unsaved work will be lost and this session will end.',
+  '主机不支持远程重启': 'The host cannot restart itself',
+  '主机未执行重启': 'The host did not restart',
+  '主机未授予重启权限': 'The host did not grant restart permission',
+  '主机已在设置中关闭远程重启':
+      'Remote restart is disabled in the host settings',
+  '主机安排重启失败': 'The host failed to schedule the restart',
+  '重启主机': 'Restart machine',
+  '重启主机；未保存的工作会丢失':
+      'Restart the machine; unsaved work will be lost',
+  '重启未执行：{detail}': 'Restart not performed: {detail}',
+  '重启请求未能排队：主机未授权或会话已结束':
+      'The restart request could not be queued: the host did not grant it or the session has ended',
+  '远程重启': 'Remote restart',
+  '远程重启主机？': 'Restart the remote machine?',
   '{denial}\n\n服务端说明：{reason}': '{denial}\n\nHost message: {reason}',
   '主机不允许隐私模式': 'The host does not allow privacy mode',
   '主机不支持发送 Ctrl+Alt+Del（托盘主机需改用服务运行）':

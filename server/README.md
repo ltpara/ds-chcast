@@ -16,10 +16,10 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | WebAuthn 安全密钥 | `--webauthn-rp-id`/`--webauthn-origin` + `/v1/account/webauthn/*` 与 `/v1/account/login/webauthn/*` | Windows Hello / FIDO2 平台认证器可作为登录第二因素（密码 + 断言）或免密码登录（用户名选中已注册凭据后直接断言）；服务端只存 COSE 公钥，挑战 32 字节、5 分钟单活并在登录成功时与令牌同一事务消费，重放必然失败；两种登录使用独立 purpose，互不替换也互不重放；支持 ES256/RS256/EdDSA，attestation 接受 `none`/`packed` 但不校验证书链；查看器账号对话框可注册/命名/删除，登录页提供“使用安全密钥”与“使用安全密钥登录”；未配置时相关接口返回 503 |
 | 登录地点（GeoIP） | `--geoip-file` + 审计 `location` / 会话 `location` | 可选离线表，每行 `CIDR 地点`，按最长前缀把登录 IP 映射为地点（IPv4、IPv6 与 IPv4-mapped 归一）；写入账号安全审计与设备会话列表，管理台与查看器会话对话框显示；缺省不解析，只记录 IP |
 | 日志轮转与归档 | `--log-file` + `--log-max-size`/`--log-max-backups`/`--log-max-age`/`--log-compress` | slog 文本日志同时写 stderr 与文件；按大小轮转为时间戳文件，可选 gzip，按数量与年龄清理旧归档；`chast-relay` 同名旗标 |
-| 请求链路 tracing | `--trace-endpoint` + `--trace-sample`/`--trace-service` | 每个 HTTP 请求按 OTLP/HTTP JSON 导出 span（`service.name`、路由、方法、状态码、≥500 标记错误），接受上游 W3C `traceparent` 并在响应回写；默认关闭，collector 不可达或队列满时丢弃 span，不阻塞请求；`chast-server` 覆盖 API（含 429），`chast-relay` 覆盖节点控制面 |
+| 请求链路 tracing | `--trace-endpoint` + `--trace-sample`/`--trace-service` | 每个 HTTP 请求按 OTLP/HTTP JSON 导出 span（`service.name`、路由、方法、状态码、≥500 标记错误），接受上游 W3C `traceparent` 并在响应回写；查看者代理把 lookup 响应的 `traceparent` 继续带入 `punch_request`、`relay_viewer` 与共享载体 hello，服务端据此把 `punch.request`、`relay.viewer_auth`、`relay.udp_session`、`relay.carrier_session` 串进同一条 trace（打洞/中继 span 以 lookup span 为父，附带端口、传输与关闭原因）；默认关闭，collector 不可达或队列满时丢弃 span，不阻塞请求；`chast-server` 覆盖 API（含 429），`chast-relay` 覆盖节点控制面 |
 | HTTPS 与 mTLS | `--tls-cert`/`--tls-key` 或 `--acme-domain` + `--tls-client-ca`；代理与隧道 `--tls-ca`/`--tls-client-cert`/`--tls-client-key` | 服务端与节点控制面可直接 HTTPS；给出客户端 CA 时要求并校验客户端证书。证书既可来自文件，也可由内建 ACME（HTTP-01）自动申请与续期；证书文件与客户端 CA 都在替换后自动热加载（最迟 5 秒，坏文件保留旧内容），ACME 模式下的客户端 CA 同样热加载。代理、`chast-tunnel` 与节点池可信任私有 CA 并出示客户端证书，未配置时行为不变 |
-| 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤 |
-| 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤，同样保留最新 10000 条 |
+| 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，以及实际传输路由（`direct`/`relay`/`carrier`，省略为空）；服务端推导账号与客户端 IP、按可选离线 GeoIP 表补地点并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤 |
+| 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器逐文件上报完成/失败的上传与下载（每条 `files=1`），含方向、文件名与大小、结果、说明、`audit_ref` 与传输路由；服务端同样按 GeoIP 表补地点，账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤，同样保留最新 10000 条 |
 | 录制归档（可选上传） | `--recordings-dir` + `/v1/account/recordings` + 管理台 `recordings` | 查看器结束本地录制后可按设置把 MP4 上传到账号（原始字节流，元数据在查询串）；服务端按账号隔离存储、校验 SHA-256、限制单文件与账号配额，并在审计中记录上传/删除；账号可列出、下载和删除自己的录制，超过保留天数的文件随每 6 小时清理；运营者经 `readonly` 即可跨账号列出/下载，`operator` 可删除，删除审计记在属主名下并注明操作者 |
 | Web 管理台（RustDesk 仅在 Pro 侧提供） | `GET /admin/`（与 HTTP API 同端口的内嵌页面） | 无需额外进程或前端构建：登录只输入 server-key（存于浏览器 `sessionStorage`，不设 cookie 或服务端会话），覆盖总览、设备（全量含离线、搜索/在线过滤、别名标签、重置身份）、账号（创建/角色/封禁/密码/2FA/删除）、录制（跨账号列出/按用户过滤/下载/删除）、三类审计分页与 CSV 下载、服务器与软件更新信息；401 自动锁屏，调用仍是同源 Bearer `/v1/*` |
 | 主机入站审计 | `POST /v1/hosts/{id}/audit` + `GET /v1/audit/connections?host=` + `GET /v1/audit/file-transfers?host=` | 查看器每会话生成 `audit_ref` 随 Hello 传给主机（协议 v25）；主机把会话与入站上传写 JSONL spool，`chast-tunnel host --audit-spool` 用主机 Ed25519 密钥逐条签名上报。服务端按引用合并两侧，会话一条主记录（`source`=viewer/host/both），文件保留主机逐文件行；运营者可按主机过滤 |
@@ -29,7 +29,7 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | 离线清空标签/分组 | 查看器本地意图 + 同步 `PATCH` | 清空全部标签或移出分组会持久化显式意图；离线期间不被服务端旧值回填，恢复后上传空值，成功或服务端已匹配才撤销意图 |
 | Wake-on-LAN | 查看器本地广播 | 设备菜单可为已保存或最近设备填写 MAC，向 `255.255.255.255:9` 发送 102 字节魔法包；MAC 规范化后只写入本地 `devices.json`，不随账号同步 |
 | `PeerDiscovery` 局域网发现 | `chast-tunnel host --lan-discovery` + `chast-tunnel discover` | 主机在 UDP 21129 应答 `CHASTL1` ping，返回 ID/主机名/用户名/平台/版本/MAC；`discover` 向受限广播、各网卡定向广播与回环探测，并按 ID 合并同一主机的多个来源地址。无认证、只暴露展示元数据、不授权连接；主机侧默认开启，可 `--lan-discovery=false` 关闭 |
-| `SoftwareUpdate` | `--software-version`/`--software-url`（+ 可选 `--software-dir`）+ `chast-tunnel host --auto-update` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；设置 `--software-dir` 时由服务端在 `/software/{name}` 只读托管发布文件，并在通告中附 SHA-256、大小与服务器 Ed25519 签名；主机代理可固定服务器公钥后自动校验、暂存并启动安装器，未开启时只记提示；查看器固定服务器身份后可“下载并安装”，由随包 `chast-tunnel apply-update` 在查看器退出后换入并重启 |
+| `SoftwareUpdate` | `--software-version`/`--software-url`（+ 可选 `--software-dir`）+ `chast-tunnel host --auto-update` + `software` 响应块 | 向主机与查看者通告最新版本与下载地址；设置 `--software-dir` 时由服务端在 `/software/{name}` 只读托管发布文件，并在通告中附 SHA-256、大小与服务器 Ed25519 签名；可选 `--software-publisher-key` 让服务端在启动时校验发布者清单并转发 `publisher_key_id`/`publisher_sig`；主机代理可固定服务器公钥与（可选）发布者公钥后自动校验、暂存并启动安装器；查看器固定服务器身份后可“下载并安装”，由随包 `chast-tunnel apply-update` 在查看器退出后换入并重启，新映像未在超时内写入健康标记时回滚到备份 |
 | `PunchHoleRequest` / `PunchHole` | UDP `punch_request` / `punch_peer` | 交换观察到的公网地址并让双方互发探针 |
 | `FetchLocalAddr` | `local_addrs` + `nat_type` | 主机上报局域网候选与 NAT 分类 |
 | UPnP 端口映射 | `--upnp` + `upnp_port`（keepalive、punch、查询） | 代理向本地 IGD 申请 UDP 端口映射并每 15 min 续租，服务端把映射外部端口随双方候选转发；缺省关闭，只有 IPv4 |
@@ -102,8 +102,9 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 主机代理：
 
 - 用 `POST /v1/hosts` 提交 `id`、Ed25519 公钥、可选指纹、时间戳与注册签名；
-  代理同时上报 `hostname`、`platform`、`version`（展示元数据，不参与签名）；
-  私钥由 `--key` 派生，从不上传。首次登记后公钥永久绑定；
+  代理同时上报 `hostname`、`platform`、`version`，并用同一主机私钥在
+  `metadata_sig` 中签名这组展示元数据（绑定 ID 与注册时间戳）；私钥由
+  `--key` 派生，从不上传。首次登记后公钥永久绑定；
 - 用数据套接字向 UDP 会合端口发送 keepalive；服务器回
   `keepalive_challenge`，代理签名后发 `keepalive_auth`，服务器记录其
   **观察到的公网地址**、`local_addrs`、`nat_type` 与可选 `upnp_port`；
@@ -216,11 +217,11 @@ wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）�
 
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
+| `POST` | `/v1/hosts` | `Authorization: Bearer <server-key>`（配置了才需要）+ 主机注册签名 | 注册或续约，可带 `hostname`/`platform`/`version` 元数据与可选 `metadata_sig`（主机私钥对展示元数据的签名）；改 ID 时带 `old_id` 与 `migrate_signature`；返回 `relay`、`relays`、`punch`、`binding`、`carrier`、可选的 `carrier_v6` 与 `carrier_token`、迁移成功时的 `migrated_from` 与可选的 `software` |
 | `GET` | `/v1/hosts/{id}` | 配置了 server-key 时需要 Bearer server-key | 身份、绑定、在线状态、主机名/平台/版本、别名/标签、候选、NAT、租约中继/会合地址、`transport`、`relay_only` 与可选的 `software`；共享载体（`carrier`/`carrier_v6`）与令牌只在该主机在线时返回 |
 | `GET` | `/v1/hosts?ids=<id,...>` | 配置了 server-key 时需要 Bearer server-key | 批量查询，逗号分隔、最多 200 个 ID；返回 `hosts` 数组（字段同单机查询）、`missing` 未知 ID 列表与顶层 `software` |
 | `PATCH` | `/v1/identities/{id}` | Bearer server-key | 设置或清除运营者别名/标签；省略字段保持不变，`""`/`[]` 表示清除 |
-| `GET` | `/v1/identities?q=&online=&limit=&offset=` | Bearer server-key | 全量持久身份（含离线）：`identities`（注册表字段 + `online`、在线时的 `relay`/`candidate`、`last_seen_ms`）、过滤后的 `total` 与 `online`；`q` 对 ID/指纹/主机名/平台/版本/别名/标签做大小写不敏感子串匹配，`online=1`（或 `true`）只返回在线；`limit` 1–1000 默认 200、`offset` 0–1000000 |
+| `GET` | `/v1/identities?q=&online=&limit=&offset=` | Bearer server-key | 全量持久身份（含离线）：`identities`（注册表字段含 `metadata_signed` + `online`、在线时的 `relay`/`candidate`、`last_seen_ms`）、过滤后的 `total` 与 `online`；`q` 对 ID/指纹/主机名/平台/版本/别名/标签做大小写不敏感子串匹配，`online=1`（或 `true`）只返回在线；`limit` 1–1000 默认 200、`offset` 0–1000000 |
 | `POST` | `/v1/account/login` | 用户名 + 密码（+ 可选 `totp_code`、`recovery_code`、`sms_code` 或 `email_code`） | 返回 `token`、`expires_in_ms`（30 min）、`refresh_token`、`refresh_expires_in_ms`（720 h）与 `user`；可带 `device_id`/`device_name` 记录来源；未知用户也做一次哈希校验以拉平时间；启用两步验证后缺少验证码返回 401 与 `X-Chast-2FA: required`，错误/重放的验证码、恢复码、短信码或邮件码返回 401 与 `X-Chast-2FA: invalid`；多种验证码同时提供时优先 TOTP，其次恢复码，再次短信码，最后邮件码；密码正确但账号被封禁返回 403 `account is banned`；同一用户名+客户端 IP 连续失败达到阈值后返回 `429` 与 `Retry-After`，锁定期内正确密码也拒绝 |
 | `POST` | `/v1/account/login/sms` | 用户名 + 密码 | 为启用两步验证且绑定了找回手机的账号发送 8 位短信登录码，成功返回 202 `{"status":"accepted"}`；未启用两步验证、未绑手机与网关失败同样 202，不泄露账号状态；密码错误 401、封禁 403；同一客户端 IP+用户名每分钟最多请求一次（429），被限流的请求不会替换已发出的验证码；验证码默认 10 分钟（`--sms-ttl`）有效、5 次错误后作废，登录成功时在签发令牌的同一事务中消费 |
 | `POST` | `/v1/account/login/email` | 用户名 + 密码 | 为启用两步验证且绑定了找回邮箱的账号发送 8 位邮件登录码，成功返回 202 `{"status":"accepted"}`；未启用两步验证、未绑邮箱与 SMTP 发信失败同样 202，不泄露账号状态；密码错误 401、封禁 403；同一客户端 IP+用户名每分钟最多请求一次（429），被限流的请求不会替换已发出的验证码；验证码默认 30 分钟（`--recovery-ttl`）有效、5 次错误后作废，登录成功时在签发令牌的同一事务中消费 |
@@ -261,6 +262,19 @@ wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）�
 | `POST` | `/v1/accounts/{username}/phone` | Bearer server-key 或 admin 账号令牌 | 提交 `phone` 设置或清除（空串）账号的找回手机并作废未用验证码；重复手机 409、非法号码 400、未知账号 404，写入 `account_phone` 审计 |
 | `POST` | `/v1/accounts/{username}/sms` | Bearer server-key 或 admin 账号令牌 | 为账号签发一个短信验证码并交给网关，返回 202 `{"status":"sent"}`，响应与审计都不含验证码；未知账号或未设手机 400，网关失败 502，未配置短信 503 |
 | `POST` | `/v1/accounts/{username}/2fa/reset` | Bearer server-key 或 admin 账号令牌 | 清除账号的两步验证密钥，返回 204；未知账号 404 |
+| `GET` | `/v1/access-groups` | Bearer server-key、admin 或组内成员 | server-key 与全局 admin 返回全部组；其他账号只返回自己的成员关系并带 `role`；未启用账号存储 503 |
+| `POST` | `/v1/access-groups` | Bearer server-key 或 admin 账号令牌 | 提交 `name`、可选 `description`、`max_devices`/`max_members`（0 表示不限）与可选 `admin`（额外种子组管理员，server-key 借此把新组交给首位运营者）；重名 409，非法名称/配额 400 |
+| `GET` | `/v1/access-groups/{id}` | server-key、全局 admin 或组内成员 | 返回组设置与 `device_count`/`member_count`；非成员 403，未知组 404 |
+| `PATCH` | `/v1/access-groups/{id}` | server-key、全局 admin 或组 admin | 修改名称/描述/配额；重名 409，配额低于当前用量 409 |
+| `DELETE` | `/v1/access-groups/{id}` | Bearer server-key 或 admin 账号令牌 | 删除组及其成员/设备分配，返回 204；未知组 404 |
+| `GET` | `/v1/access-groups/{id}/members` | 组 readonly 及以上、server-key 或全局 admin | 成员列表：用户名、组角色、加入时间与被封禁标记 |
+| `PUT` | `/v1/access-groups/{id}/members/{username}` | 组 admin、server-key 或全局 admin | 添加成员或改组角色（`readonly`/`write`/`admin`）；成员超配额 409，最后一个可用 admin 不能降级（409） |
+| `DELETE` | `/v1/access-groups/{id}/members/{username}` | 组 admin、server-key 或全局 admin | 移除成员；最后一个可用 admin 不能移除（409），被封禁的 admin 可以移除 |
+| `GET` | `/v1/access-groups/{id}/devices` | 组 readonly 及以上、server-key 或全局 admin | 组内设备 ID 列表与加入时间 |
+| `POST` | `/v1/access-groups/{id}/devices` | 组 write 及以上、server-key 或全局 admin | 提交 `device_id`（会合 ID）；新增 201 且 `added:true`，已存在 200 且 `added:false`；设备超配额 409，非法 ID 400 |
+| `DELETE` | `/v1/access-groups/{id}/devices/{device}` | 组 write 及以上、server-key 或全局 admin | 解除设备分配，返回 204；未分配 404 |
+| `GET` | `/v1/access-groups/{id}/connections` | 组 readonly 及以上、server-key 或全局 admin | 组内设备的连接审计，按 `host_id`/`peer_id` 匹配，支持 `limit`/`before_id`；不支持 CSV 导出 |
+| `GET` | `/v1/access-groups/{id}/file-transfers` | 组 readonly 及以上、server-key 或全局 admin | 组内设备的文件传输审计，按设备匹配并支持 `limit`/`before_id`；不支持 CSV 导出 |
 | `GET` | `/v1/addressbook?since=N` | Bearer account token | 返回当前 `revision`、存活条目 `peers`、存活分组 `groups`，以及 `since` 之后的条目变更/墓碑 `changes` 与分组变更 `group_changes`；省略 `since` 时从 0 开始，越界值回落到全量历史 |
 | `PATCH` | `/v1/addressbook/peers/{id}` | Bearer account token | 添加或部分更新名称/标签/`group_id`/`position`；省略字段保持不变，`""`/`[]` 清除，标签去重，`position` 必须非负；只带 `group_id` 时要求条目与目标分组都存在；可选正整数 `if_revision` 作为条目级并发令牌，过期/缺失/已删除返回 409，省略时仍为最后写入者优先 |
 | `DELETE` | `/v1/addressbook/peers/{id}` | Bearer account token | 删除条目；不存在返回 404 |
@@ -282,10 +296,10 @@ wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）�
 | `GET` | `/v1/server` | 无 | 服务器公钥、会合地址、共享载体（`carrier`/`carrier_v6`）、中继地址列表、独立节点健康、TTL、是否启用 TLS、可选的 `software`，以及会合/中继 UDP 套接字的生效接收缓冲 |
 | `GET` | `/v1/stats` | 配置了 server-key 时需要 | 注册数、身份数、中继与共享载体计数、审计计数、中继地址数、`relay_nodes` 与节点健康 |
 | `GET` | `/v1/audit?limit=N&action=<action>&before_id=<id>&format=json\|csv` | Bearer server-key | 账号安全审计（登录、登出、改密、两步验证与恢复码、会话撤销与改名、角色与管理操作），按时间倒序；`limit` 为 1–200（默认 50），`action` 精确过滤，`before_id` 取上一页返回的 `next_before_id` 续页；返回 `events`（含 `id`、`created_at_ms`、`username`、`action`、`detail`、`client_ip`、`location` 与 `success`）与仅在该页已满时给出的 `next_before_id`；`format=csv` 改为下载整表（忽略分页参数），未启用账号存储返回 503 |
-| `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail` 与 `direction`；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大或方向非法返回 400 |
+| `POST` | `/v1/account/connections` | Bearer account token | 查看器上报一次已结束的会话：`peer_id`、起始/结束毫秒时间、`success`、可选 `detail`、`direction`、`audit_ref` 与 `route`（`direct`/`relay`/`carrier`，省略为空）；返回 201 与规范化后的记录；`peer_id` 为空、结束早于开始、跨度过大、方向/`audit_ref`/`route` 非法返回 400 |
 | `GET` | `/v1/account/connections?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的连接记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
 | `GET` | `/v1/audit/connections?limit=N&username=<name>&host=<id>&before_id=<id>&format=json\|csv` | Bearer server-key | 运营者连接审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；每项含 `audit_ref`、`host_id` 与 `source`（`viewer`/`host`/`both`）；`format=csv` 下载整表并沿用 `username`/`host` 过滤，忽略分页参数；未启用账号存储返回 503 |
-| `POST` | `/v1/account/file-transfers` | Bearer account token | 查看器上报一个轮询窗口内结束的文件传输：`peer_id`、`direction`（`upload`/`download`）、可选 `name`/`size`、`files`（默认 1）、`success`、可选 `detail` 与 `occurred_at_ms`；返回 201；空对端、未知方向、负大小或文件数越界返回 400 |
+| `POST` | `/v1/account/file-transfers` | Bearer account token | 查看器逐文件上报一次结束的传输（每条 `files=1`）：`peer_id`、`direction`（`upload`/`download`）、可选 `name`/`size`、`files`（默认 1）、`success`、可选 `detail`、`occurred_at_ms`、`audit_ref` 与 `route`（`direct`/`relay`/`carrier`）；返回 201；空对端、未知方向、负大小、文件数越界或 `audit_ref`/`route` 非法返回 400 |
 | `GET` | `/v1/account/file-transfers?limit=N&before_id=<id>` | Bearer account token | 当前账号自己的文件传输记录，按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页 |
 | `GET` | `/v1/audit/file-transfers?limit=N&username=<name>&host=<id>&before_id=<id>&format=json\|csv` | Bearer server-key | 运营者文件传输审计，可按用户名或主机 ID 过滤（大小写不敏感，空值表示全部），按上报顺序倒序（最新在前）；`limit` 为 1–200（默认 50），可用 `next_before_id` 续页；主机逐文件行与查看器汇总行并存；`format=csv` 下载整表并沿用过滤，忽略分页参数；未启用账号存储返回 503 |
 | `POST` | `/v1/account/recordings?name=<文件名>&peer_id=<id>&started_ms=<毫秒>&duration_ms=<毫秒>` | Bearer account token | 上传一段查看器录制：请求体为 MP4 原始字节，元数据在查询串（文件名可为 UTF-8，响应与下载用 RFC 5987 名称）；服务端边写边算 SHA-256，超出 `--recordings-max-mb` 或账号配额返回 413，空请求体返回 400，成功返回 201 与录制记录、`usage_bytes`、`quota_bytes`；未启用归档返回 503 |
@@ -473,6 +487,16 @@ admin 不能降级或封禁；只有当库中还有别的账号时也不能删�
 全部访问与刷新令牌，密码正确时登录返回 403，但错误密码仍按普通失败处理，
 不向未通过密码校验的人暴露封禁状态。角色变更与管理操作写入账号安全审计。
 
+访问组是独立于地址簿分组的授权单位：组角色 `readonly`/`write`/`admin` 只在
+该组内生效，分别允许查看组与组审计、分配设备、管理成员与配额；全局 `admin`
+与 server-key 可管理任意组，其他账号必须先成为成员。组用 `max_devices`/
+`max_members` 限制用量（0 不限），新增成员/设备或把配额降到当前用量以下都会
+返回 409 并说明原因。每组同样保护最后一个可用 admin：不能降级、移除，也不能
+删除或封禁该账号；被封禁的 admin 不计入。成员与设备分配随账号删除级联清理，
+设备 ID 使用会合 ID，并按 `host_id` 或 `peer_id` 关联连接与文件审计记录。
+存储位于 SQLite schema v5 的 `access_groups`/`access_group_members`/
+`access_group_devices` 表。
+
 登录失败在 10 分钟窗口内累计 5 次后，把“用户名小写 + 客户端 IP”锁定 1 分钟，
 期间返回 `429` 与 `Retry-After`，正确密码也不会放行；成功登录清零。可用
 `--login-max-failures`、`--login-window`、`--login-lockout` 调整，
@@ -561,25 +585,29 @@ admin 不能降级或封禁；只有当库中还有别的账号时也不能删�
 
 连接审计与账号安全审计分开存放：查看器在会话结束时（首帧到达后才开始计时，
 纯握手失败不计入）向 `POST /v1/account/connections` 上报对端 ID、起止时间、
-是否成功与可选说明，服务端从令牌与请求推导用户名和客户端 IP，记录到 SQLite
-的 `connection_events`。上报是尽力而为的，网络或服务端错误不会影响会话本身；
-同一账号可读取自己的记录，运营者用 `GET /v1/audit/connections`（Bearer
+是否成功、可选说明、`audit_ref` 与实际传输路由 `route`
+（`direct`/`relay`/`carrier`，未知路径省略），服务端从令牌与请求推导用户名和
+客户端 IP，并用可选离线 GeoIP 表把 IP 解析为 `location`，记录到 SQLite 的
+`connection_events`。未配置 GeoIP 时 `location` 为空、IP 照常记录；非法
+`route` 返回 400。上报是尽力而为的，网络或服务端错误不会影响会话本身；同一
+账号可读取自己的记录，运营者用 `GET /v1/audit/connections`（Bearer
 server-key）或管理台 `connections [count]` 查看全部账号并可按用户名过滤。
 表内同样保留最新 10000 条，超出后按 ID 删除最旧记录。除查看器上报外，主机
 也会上报自己看到的入站会话：`chast-host` 把事件写进本地 spool，隧道代理用
 主机密钥签名后 `POST /v1/hosts/{id}/audit`（`kind=session`，`internal/api/host_audit.go`），
-服务端校验签名与时间窗后用查看器在 Hello 里带来的 `audit_ref` 合并到同一行。
-同一机制也承载主机侧的文件完成事件（`kind=file`），因此一次传输在两侧都有
-记录。
+服务端校验签名与时间窗后用查看器在 Hello 里带来的 `audit_ref` 合并到同一行，
+地点/路由只由查看器侧非空值补齐。同一机制也承载主机侧的文件完成事件
+（`kind=file`），因此一次传输在两侧都有记录。
 
-文件传输审计使用独立的 `file_events` 表：查看器在两个轮询之间发现上传或下载
-完成/失败计数推进时，向 `POST /v1/account/file-transfers` 上报方向、最后文件名
-与大小、文件数、结果和可选说明；服务端同样从令牌与请求推导账号和客户端 IP。
-一次上报可覆盖同一窗口内的多个文件，此时 `name`/`size` 只描述最后一个，`files`
-给出数量。账号可用 `GET /v1/account/file-transfers` 读取自己的记录，运营者用
-`GET /v1/audit/file-transfers` 或管理台 `transfers [count]` 查看全部并可按用户名
-过滤；保留最新 10000 条。查看器一侧按轮询窗口聚合，主机一侧由签名审计上报逐
-文件记录，两侧按 `audit_ref` 合并；不含传输中的实时进度。
+文件传输审计使用独立的 `file_events` 表：查看器引擎为每个完成或失败的文件
+写一条有界审计日志（最近 128 条，带 `first_seq`/`dropped` 水位），页面按序号
+逐条向 `POST /v1/account/file-transfers` 上报方向、文件名、大小、结果、说明、
+`audit_ref` 与传输路由，每条 `files=1`；服务端同样从令牌与请求推导账号和
+客户端 IP，并按 GeoIP 表补地点。账号可用 `GET /v1/account/file-transfers`
+读取自己的记录，运营者用 `GET /v1/audit/file-transfers` 或管理台
+`transfers [count]` 查看全部并可按用户名过滤；保留最新 10000 条。查看器与
+主机两侧都按逐文件记录并按 `audit_ref` 合并；不含传输中的实时进度，超过
+保留窗口的历史文件只有计数器。
 
 三类运营者历史都支持 CSV 导出：在 `/v1/audit`、`/v1/audit/connections` 与
 `/v1/audit/file-transfers` 上加 `format=csv` 即返回
@@ -594,12 +622,15 @@ server-key）或管理台 `connections [count]` 查看全部账号并可按用�
 
 需要长期留存时，可用 `--audit-archive-dir` 把三类历史外置为 JSONL：每隔
 `--audit-archive-interval`（默认 1h，启动时先同步执行一次）把各表 `id` 大于
-检查点的行追加到 `<stream>-<UTC 日>.jsonl`（`audit-`、`connections-`、
-`file-transfers-`），每行是一条完整记录加 `stream` 字段，时间为 UTC
-RFC3339Nano。检查点保存在 `state.db` 的 `archive_checkpoints` 表，重启从上次
-位置继续；每批先写文件并 `fsync` 再推进检查点，因此崩溃最多造成重启后的
-重复行（按 `stream`+`id` 去重），不会丢行。归档按行写入时的内容保存，事后
-才合并进连接/传输行的主机审计不会重写旧文件；归档不改变库内保留策略，
+检查点的行按事件自身的 UTC 日写入 `<stream>-<事件日>.jsonl`（`audit-`、
+`connections-`、`file-transfers-`），每行是一条完整记录加 `stream` 字段，
+时间为 UTC RFC3339Nano。审计行用 `created_at`、连接用 `started_at`、文件
+传输用 `occurred_at` 决定日期，因此事后才送达的主机审计仍会并入它发生的
+那一天：对已关闭的日文件做受控重写（临时文件 + `fsync` + 重命名），并清除
+该文件的 `.delivered` 标记，使远端收到合并后的版本。检查点保存在
+`state.db` 的 `archive_checkpoints` 表，重启从上次位置继续；每批先写文件并
+`fsync` 再推进检查点，因此崩溃最多造成重启后的重复行（按 `stream`+`id`
+去重），不会丢行。归档不改变库内保留策略，
 `--audit-retention-days` 仍按自己的窗口清理，需要长期证据时应先保证归档文件
 已被外部系统收取再缩短保留天数。关闭的 UTC 日文件默认在后续扫描时压缩为
 `<stream>-<UTC 日>.jsonl.gz`（`--audit-archive-compress=false` 关闭），压缩
@@ -608,14 +639,18 @@ RFC3339Nano。检查点保存在 `state.db` 的 `archive_checkpoints` 表，重�
 早于该天数的 `.jsonl` 与 `.jsonl.gz`，只匹配归档自己的命名，目录里的其他
 文件不动；压缩与清理失败只记日志，不影响新行归档。管理台 `audit archive`
 查看目录与各流最后已归档 ID，`audit archive run` 立即执行一次并输出行数、
-压缩数与清理数。
+写入文件数、合并数、压缩数、清理数与投递数。
 
 配置 `--audit-archive-remote` 后，已关闭的日文件还会逐字节 HTTP PUT 到
 `<url>/<文件名>`（`--audit-archive-remote-token` 作为 `Authorization: Bearer`），
-请求带 `X-Chast-Audit-Sha256` 与 `Idempotency-Key: <文件名>`；接收方答 2xx
-后在归档目录写 `<文件名>.delivered` 标记，后续扫描跳过。投递是至少一次：
-单个文件每轮最多尝试 3 次（间隔 1 s、2 s），仍失败只记日志并留到下一轮，
-本地归档文件不动；接收方应按文件名或摘要去重。启用远端投递后，
+请求带 `X-Chast-Audit-Sha256` 与 `Idempotency-Key: <内容 SHA-256>`；接收方
+答 2xx 后写 `<文件名>.delivered` 标记，并把“UTC 日 + 内容哈希”记入归档目录
+的 `delivery-ledger.json`。后续扫描先看标记、再查账本：标记丢失时账本仍会
+跳过相同内容的再次上传并补写标记；文件被合并重写后摘要变化，会作为新内容
+投递一次。账本按投递目标（URL 或 S3 桶）作用域，换目标后全部重新投递；
+账本损坏只记日志并按空账本继续。投递仍是至少一次：单个文件每轮最多尝试
+3 次（间隔 1 s、2 s），仍失败只记日志并留到下一轮，本地归档文件不动；
+接收方应按 `X-Chast-Audit-Sha256` 去重。启用远端投递后，
 `--audit-archive-retention-days` 只删除已投递的文件，未出站的证据不会被
 本地清理先删掉。端点必须直接答 2xx：客户端不跟随重定向，3xx 直接算一次
 失败（请求体不会重放）；需要直连对象存储时改用下面的 S3 模式，不必自建
@@ -801,8 +836,12 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
 - **运维身份**：`chast-server-identity.key` 与 `chast-server-state.db` 含
   服务器私钥与主机公钥/元数据记录，应按服务账号权限保护；丢失身份文件会使
   既有 `binding` 全部失效。`hostname`/`platform`/`version` 是主机自报的
-  展示字段，不参与注册签名；`alias`/`tags` 是运营者经 Bearer API 维护的
-  服务端字段。这些展示信息都不能作为安全判断依据。
+  展示字段；注册时主机用绑定私钥在 `metadata_sig` 中签名这组字段
+  （域 `chast-host-metadata-v1`，绑定 ID 与注册时间戳），服务端验签通过才
+  落库。缺签名（旧客户端）默认放行，签名存在但无效一律 401；
+  `--require-host-metadata-sig` 可拒绝无签名注册。签名状态按身份持久化并在
+  `/v1/identities` 与管理台显示，但这些展示信息仍不能作为安全判断依据。
+  `alias`/`tags` 是运营者经 Bearer API 维护的服务端字段。
 
 ## 公网部署：TLS、限流、指标与管理
 
@@ -905,20 +944,45 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   下发 `sha256`/`size`/`signature`；客户端固定服务器公钥即可同时校验通告
   与下载内容。设置该旗标时 URL 必须指向 `/software/` 下的文件名；URL 在
   `/software/` 下但未设置目录时启动只警告，由其他主机负责下载。
+- `--software-publisher-key` 与 `--software-manifest` 增加独立的发布者签名：
+  清单默认是发布文件旁的 `<file>.manifest.json`，含
+  `version`/`url`/`sha256`/`size`/`publisher_key_id`/`publisher_sig`，
+  `publisher_sig` 是发布者私钥对 `chast-software-publisher-v1` 域下同一组
+  字段的 Ed25519 签名。给定公钥后服务端启动时强制校验清单与文件摘要、大小
+  完全一致，并把 `publisher_key_id`/`publisher_sig` 随 `software` 块转发；
+  缺清单、篡改版本/URL/摘要/大小、错误公钥或错误 key id 都会让启动失败。
+  清单由 `chast-release` 生成：
+  `chast-release keygen -out publisher.key` 输出公钥与 key id；
+  `chast-release sign -key publisher.key -file <release> -version <v> -url <url>`
+  写出清单；`chast-release verify -manifest <m> -file <release>
+  -publisher-key <pub>` 供发布流水线复核。host 用 `--publisher-pubkey`、
+  查看器用 `CHAST_PUBLISHER_PUBKEY` 固定发布者公钥后，通告缺少发布者签名
+  或 key id 不符都会被拒绝；不固定时保持只校验服务器签名。
+- `--require-host-metadata-sig` 要求每次注册都携带 `metadata_sig`（主机私钥对
+  `id`、`hostname`、`platform`、`version` 与注册时间戳的 Ed25519 签名）；
+  默认关闭，旧客户端照常注册。签名存在但无效或被篡改的注册在任何模式下都
+  返回 401，验签通过的 `metadata_signed` 按身份持久化并出现在
+  `/v1/identities` 与管理台设备表。
 - `chast-tunnel host --auto-update` 让主机代理自动应用上述通告：必须同时
-  给出 `--server-pubkey`，否则启动直接失败；收到带摘要与签名的通告后先按
+  给出 `--server-pubkey`，否则启动直接失败；可选 `--publisher-pubkey`
+  要求通告同时携带匹配的发布者签名。收到带摘要与签名的通告后先按
   签名校验版本/URL/摘要/大小，再下载到 `--auto-update-dir`（默认系统临时
   目录），边下载边核对 SHA-256 与长度，一致才改名为最终文件并以分离进程
   启动安装器，每个版本最多尝试一次。未固定公钥、签名不符、超限、下载失败
   或启动失败都只记日志（`software update rejected`/`download failed`/
   `launch failed`），不执行任何下载文件，也不影响注册与远程会话。
 - 查看器在已固定服务器身份（`ServerIdentityStore`）时，把更新对话框的
-  “下载并安装”交给同目录的 `chast-tunnel apply-update`：helper 用 pin 验签、
-  流式下载核对 SHA-256 与长度、等待查看器 PID 退出、把当前 exe 改名为
-  `*.old-<纳秒>` 备份、换入新文件并启动，成功后删除备份；新文件无法启动
-  时还原并重启旧文件。`apply-update` 拒绝替换正在运行的自身；缺 pin、签名
-  不符与被篡改的大小都在下载前拒绝。未固定身份或通告不带签名时只显示横幅
-  与“复制下载地址”。
+  “下载并安装”交给同目录的 `chast-tunnel apply-update`：helper 先用 pin
+  验服务器签名、再按 `--publisher-pubkey`（查看器取
+  `CHAST_PUBLISHER_PUBKEY`）验发布者签名，流式下载核对 SHA-256 与长度、
+  等待查看器 PID 退出、把当前 exe 改名为 `*.old-<纳秒>` 备份、换入新文件
+  并启动。默认 `--health-timeout 2m`：helper 在换入后先写
+  `<target>.chast-update.json`（含 nonce 与截止时间），新查看器首帧就绪后由
+  `chast-tunnel confirm-update --target <exe>` 写 `<target>.chast-update.ok`；
+  标记到达才删除备份。新进程提前退出、超时未确认或启动失败都会终止新映像、
+  还原备份并重启旧查看器；`--health-timeout 0` 恢复“启动即删除备份”的旧
+  行为。`apply-update` 拒绝替换正在运行的自身；缺 pin、签名不符与被篡改的
+  大小都在下载前拒绝。未固定身份或通告不带签名时只显示横幅与“复制下载地址”。
 - `--api-rate`（默认 50 请求/秒）与 `--api-burst`（默认 100）是所有 HTTP
   路径共用的按 IP 令牌桶，`--api-rate 0` 关闭。超限返回 `429` 和
   `Retry-After: 1`，计入 `chast_http_rate_limited_total`。默认按 TCP 对端
@@ -957,7 +1021,8 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   启动清理后只在确有删除时记录一行日志；管理台 `audit prune <days>` 可随时
   手工执行。值为 0 或负数表示不按时间清理，只保留行数上限。
 - `--audit-archive-dir`（默认空，关闭）把账号安全审计、连接与文件传输历史
-  追加到该目录的 `<stream>-<UTC 日>.jsonl`（见上文“审计”小节）；目录不存在
+  写入该目录的 `<stream>-<事件 UTC 日>.jsonl`（见上文“审计”小节）；迟到
+  记录会受控重写对应日文件。目录不存在
   时以 0700 创建，文件以 0600 追加。它依赖 `--state`，未启用持久状态时启动
   失败。`--audit-archive-interval`（默认 1h）是扫描间隔，启动时先同步归档
   一次；检查点持久化在 `archive_checkpoints` 表，重启不重复已有行。先写文件
@@ -967,11 +1032,13 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   删除窗口外的归档文件；压缩与清理在每次归档开始时先执行，失败只记日志。
 - `--audit-archive-remote`（默认空，关闭）把已关闭的日文件 HTTP PUT 到
   `<url>/<文件名>`，`--audit-archive-remote-token` 作为 Bearer 令牌。每个
-  文件每轮重试 3 次（1 s、2 s），2xx 后写 `<文件名>.delivered` 标记；启用
-  投递后 `--audit-archive-retention-days` 只删除已投递文件。URL 只接受
-  http/https，拒绝内嵌凭据、查询与片段；令牌不能单独设置。端点必须直接
-  答 2xx（客户端不跟随重定向，3xx 直接失败），接收方按文件名或
-  `X-Chast-Audit-Sha256` 去重。
+  文件每轮重试 3 次（1 s、2 s），2xx 后写 `<文件名>.delivered` 标记；投递
+  账本 `delivery-ledger.json` 按“UTC 日 + 内容哈希”记录已送达内容，标记
+  丢失不会重传相同摘要，换投递目标后账本失效并全部重传。启用投递后
+  `--audit-archive-retention-days` 只删除已投递文件。URL 只接受 http/https，
+  拒绝内嵌凭据、查询与片段；令牌不能单独设置。端点必须直接答 2xx（客户端
+  不跟随重定向，3xx 直接失败），接收方按 `X-Chast-Audit-Sha256` 去重，
+  `Idempotency-Key` 也使用该内容摘要。
 - `--audit-archive-s3-endpoint`（默认空，关闭）改为直接投递到 S3 兼容
   存储，需同时给出 `--audit-archive-s3-bucket`、`--audit-archive-s3-access-key`
   与 `--audit-archive-s3-secret-key`；`--audit-archive-s3-region`（默认
@@ -980,7 +1047,7 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   寻址：`virtual` 把桶放进主机名，要求端点可解析为 DNS 名（AWS 新桶
   需要），签名的 host 与实际请求一致。请求用
   SigV4 签名、走 path-style `<endpoint>/<bucket>/<文件名>` 或 virtual-style
-  `<bucket>.<endpoint-host>/<文件名>`，其余投递、标记
+  `<bucket>.<endpoint-host>/<文件名>`，其余投递、标记、账本
   与保留语义同 `--audit-archive-remote`，两者互斥且同样依赖
   `--audit-archive-dir`。secret key 与会话令牌会出现在进程列表里。
 - `--addressbook-tombstone-days`（默认 0，保留全部）在启动与每 6 小时删除
@@ -1019,6 +1086,15 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `traceparent`，便于把客户端日志与导出的 span 关联。导出失败或队列满只
   丢弃 span，不阻塞业务请求；退出时最多等待 3 s 冲刷。`chast-relay` 旗标
   相同，覆盖节点控制面。
+- 数据面 span 不要求额外配置：查看者把 lookup 响应的 `traceparent` 连同
+  `punch_request`、`relay_viewer` 与共享载体 hello 一起发送，服务端据此生成
+  `punch.request`（`punch.host_id`/`punch.viewer_ip`/`punch.host_candidates`）、
+  `relay.viewer_auth`、`relay.udp_session` 与 `relay.carrier_session`
+  （`relay.port`、`relay.transport`、`relay.close_reason` 等）。UDP 会话 span
+  与查看者鉴权 span 同级，父 span 是产生该 `traceparent` 的 lookup 请求。
+  服务端只转发不透明 QUIC 数据报，无法观察 QUIC 握手与流生命周期；会话
+  span 覆盖服务端能看到的中继/载体数据面时长。采样率与 endpoint 在进程
+  启动时读取，修改后需重启生效。
 - `GET /metrics` 输出 Prometheus 文本格式，配置 `--server-key` 后需要 Bearer
   认证。API 请求延迟以 `chast_http_request_duration_seconds` 直方图暴露，
   按端点分标签，分桶 0.001–10 秒加 `+Inf`，同时给出 `_sum`/`_count`。采集器示例：
@@ -1036,6 +1112,19 @@ scrape_configs:
 - 指标标签不含主机 ID 与客户端地址：`endpoint` 来自路由模式、`code` 为状态
   码，基数受控。`/v1/stats` 保留为 JSON 快照，二者读取同一份注册表与中继
   统计。
+- SQLite 使用驱动级埋点（`internal/sqlitex`，覆盖 registry 与 account 两个
+  store）：`chast_sqlite_queries_total`、`chast_sqlite_errors_total`、
+  `chast_sqlite_slow_queries_total`（阈值 50 ms）、
+  `chast_sqlite_query_seconds_total`、`chast_sqlite_query_seconds_max` 与
+  `chast_sqlite_queries_in_flight` 按 `store`/`op` 标签暴露；`op` 是低基数
+  动作名（如 `select peers`、`insert users`、`begin`、`commit`、`pragma
+  table_info`）。`chast_sqlite_pool_connections{store,state}`（open/in_use/
+  idle/max_open）、`chast_sqlite_pool_wait_total` 与
+  `chast_sqlite_pool_wait_seconds_total` 给出连接池排队信号；两个 store
+  都是单连接，等待计数即事务串行化积压，慢 `commit` 提示 WAL 写锁竞争。
+- tracing 自身暴露 `chast_trace_queue_depth` 与
+  `chast_trace_spans_dropped_total`：导出队列上限 512，每 2 s 或 128 条
+  批量发送，丢弃计数持续增长说明 collector 跟不上。
 - 配置来源按 hbbs 的顺序叠加：命令行显式参数 > `--config` 指定的 INI >
   `--env-file` 指定的 dotenv（默认 `.env`，缺失时跳过，`--env-file ""` 关闭）
   > 环境变量。INI 只读 `key=value`，分节头与 `#`/`;` 注释被忽略；dotenv
@@ -1180,7 +1269,7 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   | `ab prune <days>` | 删除早于指定天数的地址簿条目与分组墓碑并输出两类行数；存活条目不受影响，`0` 或负数被拒绝 |
   | `audit [count]` | 按时间倒序查看账号安全审计（默认 20 条，最多 200 条），含登录、登出、改密、两步验证、会话撤销与改名、角色变更、封禁/解封、手动解锁、用户名、结果、IP 与说明 |
   | `audit prune <days>` | 删除早于指定天数的账号安全审计、连接与文件传输记录，输出三类删除行数；`0` 或负数被拒绝 |
-  | `audit archive [run]` | 查看归档目录、远端投递目标与各流最后已归档 ID；`run` 立即归档一次并输出三类新增行数、写入文件数、压缩数、清理数与投递数；未配置 `--audit-archive-dir` 时提示如何启用 |
+  | `audit archive [run]` | 查看归档目录、远端投递目标与各流最后已归档 ID；`run` 立即归档一次并输出三类新增行数、写入文件数、迟到合并数、压缩数、清理数与投递数；未配置 `--audit-archive-dir` 时提示如何启用 |
   | `connections [count]` | 按上报顺序倒序查看查看器上报的连接记录（默认 20 条，最多 200 条），含用户名、对端、方向、结果、IP、时长与说明 |
   | `transfers [count]` | 按上报顺序倒序查看文件传输记录（默认 20 条，最多 200 条），含用户名、对端、方向、文件名/大小/数量、结果、IP 与说明 |
   | `punch-requests`/`pr [start] [count]`、`pr -` | 分页查看/清空打洞日志 |
@@ -1260,15 +1349,21 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
   - `admin`：多出“账号”页签，可创建账号并指定角色、改角色、封禁/解封、
     重置密码（可生成一次性密码）、重置两步验证与删除；最后一个 admin 的
     保护与 API 一致。
+  - 访问组：组内角色独立于控制台角色。成员只看到自己的组；`readonly` 可
+    查看组、成员、设备与组审计，`write` 可分配/移除设备，`admin` 可改设置、
+    成员与配额。server-key 与全局 admin 可管理任意组并创建/删除组；组角色
+    不改变控制台角色。
   - 服务器密钥在任何页签都不受限制；主机注册、查询、指标等
     host-only 接口仍只接受服务器密钥。
-- 页面分六个页签：总览（注册/身份/中继/打洞计数、中继节点健康、带宽与名单
+- 页面分七个页签：总览（注册/身份/中继/打洞计数、中继节点健康、带宽与名单
   策略、端口分配）、设备（`GET /v1/identities` 全量含离线；ID/主机名/别名/
   标签搜索与仅在线过滤；按角色提供编辑别名/标签、重置身份或只释放租约）、
-  账号（仅 admin）、录制（跨账号列出、按属主过滤、查看用量与单文件上限、
-  下载与按角色删除）、审计（账号安全事件、连接、文件传输三类，`before_id`
-  游标翻页与 `format=csv` 下载）、服务器（版本、公钥、TTL、TLS/中继模式、
-  软件更新签名与会合服务器列表）。
+  账号（仅 admin）、访问组（组列表与设置、成员角色、设备分配与用量；非成员
+  看不到该组，组角色决定可编辑哪一部分）、录制（跨账号列出、按属主过滤、
+  查看用量与单文件上限、下载与按角色删除）、审计（账号安全事件、连接、
+  文件传输三类，连接与文件可按访问组过滤，`before_id` 游标翻页与
+  `format=csv` 下载；按组过滤时不支持 CSV）、服务器（版本、公钥、TTL、
+  TLS/中继模式、软件更新签名与会合服务器列表）。
 - 总览与设备页每 15 s 自动刷新，页面隐藏时暂停；账号、录制与审计表格不
   自动刷新，避免翻页或输入时被打断。
 - 静态资源在编译时用 `//go:embed` 打入二进制，只放行上述三个文件名；CSP
@@ -1344,7 +1439,7 @@ chast-quic connect --host 127.0.0.1 --port 24434 --token <token>
 127.0.0.1,127.0.0.2`，再用管理通道 `rs`/`tg` 查看分配。IP 变更审计默认
 启用（180 s 窗口、360 s 保留，上限 65536 个 ID）。
 `chast-tunnel host --help` / `viewer --help` / `discover --help` /
-`apply-update --help` 列出全部参数。
+`apply-update --help` / `confirm-update --help` 列出全部参数。
 
 ## 查看者集成（Flutter）
 
@@ -1355,8 +1450,13 @@ stdout 事件交回，`ViewerEngine` 再连接该端口。代理默认从查看�
 
 更新也由这个可执行文件完成：首页更新对话框调用 `TunnelAgent.applyUpdate`，
 以 `apply-update --version/--url/--sha256/--size/--signature/--server-pubkey
+[--publisher-key-id/--publisher-signature/--publisher-pubkey]
 --target <查看器 exe> --wait-pid <当前 PID>` 分离启动 helper 后退出；helper
-等待该 PID 消失再换入新映像并重新启动查看器。
+等待该 PID 消失再换入新映像并重新启动查看器。新查看器窗口就绪后，
+`main.dart` 检测到 `<exe>.chast-update.json` 便以分离进程执行
+`confirm-update --target <查看器 exe>` 写入健康标记；标记未在
+`--health-timeout`（默认 2 分钟）内出现时，helper 终止新映像、还原备份并
+重启旧查看器。`CHAST_PUBLISHER_PUBKEY` 非空时同时固定发布者公钥。
 
 stdout 是面向嵌入方的 JSON Lines 事件流（诊断仍在 stderr）：
 
@@ -1962,9 +2062,13 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   已支持按分组共享，但分组不支持嵌套或拖拽排序；
   分组名称只在查看器内存中缓存，重启后的首次同步必须全量读取，离线时只能
   保留旧分组 ID 且无法新建/改名/删除分组；账号标签仍只是逐设备标签，没有按
-  组授权；搜索与标签筛选只作用于“我的设备”，不覆盖最近连接、共享地址簿或
-  分组标题，只做大小写不敏感子串匹配，没有拼音/模糊、按分组/在线状态筛选，
-  筛选状态不跨重启保存。地址簿条目级乐观并发控制覆盖查看器对自有地址簿的
+  组授权；“我的设备”与共享地址簿搜索都做大小写不敏感子串匹配并支持
+  GB2312 一级汉字拼音首字母（2026-11-02，DEV-08：`search_match.dart` +
+  `pinyin_initials.dart`，不做全拼/模糊匹配），
+  两个搜索词分别存于 `%APPDATA%\chast\ui-filter.json` 的 `deviceSearch` 与
+  `sharedSearch` 键、清空即删除，重启后恢复；标签筛选只作用于“我的设备”，
+  不覆盖最近连接、不按在线状态筛选，也不搜索分组标题。地址簿条目级乐观并发
+  控制覆盖查看器对自有地址簿的
   `PATCH` 与共享编辑/删除，分组级覆盖改名/删除；省略 `if_revision` 的旧客户端、
   共享新增仍是最后写入者优先；冲突后查看器放弃本地未上传的旧值并采用服务器版本，
   不提供逐字段合并或自动重试；墓碑长期保留，尚未按时间或已同步水位清理；查看器只在已保存
@@ -2491,6 +2595,28 @@ devbox/devbox2/devbox3、`--mode relay` 查看者与 UDP 回显目标。
   且没有“账号”页签。
 - 边界：浏览器验收使用单机回环与临时数据；未做真实跨网大文件下载或并发
   运营者操作。
+
+2026-11-02，数据面 tracing 与 SQLite/队列指标（DEV-02）在单机回环上验证：
+
+- 回环导出验收 `TestLoopbackTraceCoversLookupPunchAndRelay`：假 OTLP/HTTP
+  collector + `testutil` 服务，注册 `devbox`、真实 UDP keepalive、
+  `GET /v1/hosts/devbox` 取回响应 `traceparent` 与 carrier token、带 MAC
+  的 `punch_request` 完成打洞、`relay_hello`/`relay_viewer` 后转发一个
+  数据报。导出的 lookup span、`punch.request`、`relay.viewer_auth` 与
+  `relay.udp_session` 共享同一 trace，后三者父 span 均为 lookup；
+  `punch.host_id`、`relay.transport=udp`、`relay.port` 与
+  `relay.close_reason=shutdown`（关闭中继后）均有断言。
+- `internal/relay` 的 `TestRelayTraceJoinsViewerContext` 与
+  `internal/rendezvous` 的 `TestPunchSpanJoinsViewerContext` 分别覆盖
+  UDP 会话/打洞 span 的父上下文与属性；`internal/tracing` 覆盖 error 状态、
+  队列深度与丢弃计数。
+- 指标：`/metrics` 测试断言 `chast_sqlite_*` 与 `chast_trace_*` 的
+  HELP/TYPE 与样本；`internal/sqlitex` 用真实 driver 覆盖语句/事务计时、
+  错误归属、慢查询计数与单连接池状态，并确认 registry/account 实际 store
+  使用包装 driver。
+- `go vet ./...`、`go build ./...`、`go test ./... -count=1` 通过。
+- 边界：服务端看不到 QUIC 握手与流生命周期；采样配置重启生效；本次只有
+  单机回环，双机真实链路 trace 仍需 ENV-01。
 
 环境边界：单机回环只有一张网卡，`symmetric` NAT 分类、局域网候选与跨网行为需要
 双机复核。IPv6 会合、打洞与中继已在单机双栈回环验证（服务端

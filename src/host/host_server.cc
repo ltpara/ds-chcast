@@ -28,6 +28,7 @@
 #include "chast/port_forward_relay.h"
 #include "chast/terminal_relay.h"
 #include "chast/privacy.h"
+#include "chast/restart.h"
 #include "chast/sas.h"
 
 namespace chast {
@@ -135,6 +136,22 @@ const char* sas_code_name(SasCode code) {
     return "unknown";
 }
 
+const char* restart_code_name(RestartCode code) {
+    switch (code) {
+        case RestartCode::Ok:
+            return "ok";
+        case RestartCode::Denied:
+            return "denied";
+        case RestartCode::Disabled:
+            return "disabled";
+        case RestartCode::Unsupported:
+            return "unsupported";
+        case RestartCode::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
 uint16_t settings_permissions(const HostSettings& settings) {
     uint16_t mask = 0;
     if (settings.allow_input) {
@@ -166,6 +183,9 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_record) {
         mask |= kPermissionRecord;
+    }
+    if (settings.allow_restart) {
+        mask |= kPermissionRestart;
     }
     return mask;
 }
@@ -475,6 +495,7 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_terminal = settings_.allow_terminal;
     quic.allow_camera = settings_.allow_camera;
     quic.allow_record = settings_.allow_record;
+    quic.allow_restart = settings_.allow_restart;
     quic.allow_audio = settings_.allow_audio;
     quic.allow_microphone = settings_.allow_microphone;
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
@@ -1031,6 +1052,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     stats.privacy_mode_changes = 0;
     stats.sas_requests = 0;
     stats.sas_failures = 0;
+    stats.restart_requests = 0;
+    stats.restart_failures = 0;
     stats.resolution_percent = 100;
     stats.resolution_changes = 0;
     // The last scale the ladder asked for. A merged canvas may cap it lower,
@@ -1300,6 +1323,49 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         } else {
             ++stats.send_errors;
             *error = "sas_result: " + sent.to_string();
+        }
+        return false;
+    };
+    // A restart ends the session with the machine. The shutdown is scheduled
+    // first and answered second: the API's delay keeps the process alive long
+    // enough for the answer to reach the viewer, and answering Ok before the
+    // call could report a reboot that will never happen.
+    auto restart = [&]() -> bool {
+        ++stats.restart_requests;
+        RestartCode code = RestartCode::Ok;
+        std::string reason;
+        if ((session_->permissions() & kPermissionRestart) == 0) {
+            code = RestartCode::Denied;
+            reason = "restart is not permitted for this viewer";
+        } else if (!settings_.allow_restart) {
+            code = RestartCode::Disabled;
+            reason = "restart is disabled in the host settings";
+        } else if (config_.restart_system) {
+            if (!config_.restart_system(&reason)) {
+                code = RestartCode::Failed;
+                if (reason.empty()) {
+                    reason = "the restart callback failed";
+                }
+            }
+        } else if (!schedule_restart(&reason)) {
+            code = RestartCode::Failed;
+        }
+        if (code == RestartCode::Ok) {
+            log("remote restart scheduled; this machine reboots in a few seconds");
+        } else {
+            ++stats.restart_failures;
+            log(std::string("restart refused (") + restart_code_name(code) + "): " +
+                (reason.empty() ? "no reason given" : reason));
+        }
+        Error sent = session_->send_restart_result(code, reason);
+        if (sent.ok()) {
+            return true;
+        }
+        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "restart_result: " + sent.to_string();
         }
         return false;
     };
@@ -1578,9 +1644,21 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         ++stats.clipboard_received;
     };
 
+    const Clock::duration idle_timeout =
+        config_.auto_disconnect_ms != 0
+            ? std::chrono::duration_cast<Clock::duration>(
+                  std::chrono::milliseconds(config_.auto_disconnect_ms))
+            : std::chrono::duration_cast<Clock::duration>(
+                  std::chrono::minutes(settings_.auto_disconnect_minutes));
+    auto last_activity = Clock::now();
+    // Only viewer actions that show a person is present reset the timer.
+    // Serving video, sending audio and background pumps do not.
+    const auto touch_activity = [&] { last_activity = Clock::now(); };
+
     auto drain_peer = [&] {
         for (const InputEvent& event : session_->take_input_events()) {
             ++stats.input_events;
+            touch_activity();
             if (config_.input_event) {
                 config_.input_event(event);
             }
@@ -1593,6 +1671,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         ClipboardContent content;
         while (session_->take_clipboard_content(content)) {
             apply_peer_clipboard(std::move(content));
+            touch_activity();
         }
         // A viewer that only speaks the v15 text message still works: treat
         // its ClipboardUpdate as a text-only item.
@@ -1605,6 +1684,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             text.data.assign(update.text.begin(), update.text.end());
             legacy.formats.push_back(std::move(text));
             apply_peer_clipboard(std::move(legacy));
+            touch_activity();
         }
     };
 
@@ -3138,37 +3218,56 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
         }
-        uint16_t switch_index = kDisplayAuto;
-        if (session_->take_display_switch_request(switch_index) &&
-            !switch_display(switch_index)) {
-            const bool clean = error->empty();
+        if (idle_timeout > Clock::duration::zero() && now - last_activity >= idle_timeout) {
+            ++stats.idle_disconnects;
+            const long long idle_seconds =
+                (std::max)(1LL, config_.auto_disconnect_ms != 0
+                                    ? static_cast<long long>(config_.auto_disconnect_ms) / 1000
+                                    : static_cast<long long>(settings_.auto_disconnect_minutes) * 60);
+            log("idle: no viewer activity for " + std::to_string(idle_seconds) +
+                " s; closing the session");
             drain_peer();
-            return clean;
+            return true;
+        }
+        uint16_t switch_index = kDisplayAuto;
+        if (session_->take_display_switch_request(switch_index)) {
+            touch_activity();
+            if (!switch_display(switch_index)) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
         }
         uint16_t modes_index = 0;
-        if (session_->take_list_display_modes_request(modes_index) &&
-            !send_mode_list(modes_index)) {
-            const bool clean = error->empty();
-            drain_peer();
-            return clean;
+        if (session_->take_list_display_modes_request(modes_index)) {
+            touch_activity();
+            if (!send_mode_list(modes_index)) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
         }
         uint16_t mode_index = 0;
         uint16_t mode_width = 0;
         uint16_t mode_height = 0;
         uint16_t mode_refresh = 0;
         if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
-                                                    mode_refresh) &&
-            !change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
-            const bool clean = error->empty();
-            drain_peer();
-            return clean;
+                                                    mode_refresh)) {
+            touch_activity();
+            if (!change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
         }
         StreamOptions options;
-        if (session_->take_stream_options_request(options) &&
-            !apply_stream_options(options)) {
-            const bool clean = error->empty();
-            drain_peer();
-            return clean;
+        if (session_->take_stream_options_request(options)) {
+            touch_activity();
+            if (!apply_stream_options(options)) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
         }
         if (!apply_pending_permissions()) {
             const bool clean = error->empty();
@@ -3176,14 +3275,28 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return clean;
         }
         bool privacy_requested = false;
-        if (session_->take_privacy_mode_request(privacy_requested) &&
-            !set_privacy_mode(privacy_requested)) {
-            const bool clean = error->empty();
-            drain_peer();
-            return clean;
+        if (session_->take_privacy_mode_request(privacy_requested)) {
+            touch_activity();
+            if (!set_privacy_mode(privacy_requested)) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
         }
         while (session_->take_sas_request()) {
+            touch_activity();
             if (!send_sas()) {
+                const bool clean = error->empty();
+                drain_peer();
+                return clean;
+            }
+        }
+        // A scheduled restart does not end the loop early: the shutdown delay
+        // exists so the answer and the last frames reach the viewer before the
+        // session drops with the machine.
+        while (session_->take_restart_request()) {
+            touch_activity();
+            if (!restart()) {
                 const bool clean = error->empty();
                 drain_peer();
                 return clean;
@@ -3191,6 +3304,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
+            touch_activity();
             ++stats.chat_received;
             log("chat: received " + std::to_string(chat_text.size()) + " bytes");
             if (config_.chat_message) {
@@ -3199,6 +3313,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         std::string injected_text;
         while (session_->take_text_input(injected_text)) {
+            touch_activity();
             ++stats.text_received;
             log("text input: received " + std::to_string(injected_text.size()) +
                 " bytes");
@@ -3235,6 +3350,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         drain_microphone();
         PortForwardRequest forward_request;
         while (session_->take_port_forward_request(forward_request)) {
+            touch_activity();
             // The transport already checked the session grant; reaching here
             // means the operator enabled port forwarding for this host.
             const Error answered = session_->send_port_forward_result(
@@ -3249,6 +3365,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         PortForwardStop forward_stop;
         while (session_->take_port_forward_stop(forward_stop)) {
+            touch_activity();
             log("port forward: stopped with code " +
                 std::to_string(static_cast<int>(forward_stop.code)) +
                 (forward_stop.reason.empty() ? std::string() : ": " + forward_stop.reason));
@@ -4774,8 +4891,40 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     publish_stats(stats);
     log("file transfer only: no screen stream follows");
 
+    const Clock::duration idle_timeout =
+        config_.auto_disconnect_ms != 0
+            ? std::chrono::duration_cast<Clock::duration>(
+                  std::chrono::milliseconds(config_.auto_disconnect_ms))
+            : std::chrono::duration_cast<Clock::duration>(
+                  std::chrono::minutes(settings_.auto_disconnect_minutes));
+    auto last_activity = Clock::now();
+    // A files-only session has no input or chat; a completed, failed or
+    // cancelled transfer is the visible sign that the viewer is still there.
+    const auto file_activity = [&stats] {
+        return stats.files_received + stats.files_sent + stats.file_bytes_received +
+               stats.file_bytes_sent + stats.file_failures + stats.file_send_failures +
+               stats.file_send_cancels;
+    };
+    auto last_file_activity = file_activity();
+
     while (!stopping_.load()) {
+        if (idle_timeout > Clock::duration::zero() &&
+            Clock::now() - last_activity >= idle_timeout) {
+            ++stats.idle_disconnects;
+            const long long idle_seconds =
+                (std::max)(1LL, config_.auto_disconnect_ms != 0
+                                    ? static_cast<long long>(config_.auto_disconnect_ms) / 1000
+                                    : static_cast<long long>(settings_.auto_disconnect_minutes) * 60);
+            log("idle: no file activity for " + std::to_string(idle_seconds) +
+                " s; closing the file session");
+            return true;
+        }
         poll_files(stats);
+        const uint64_t activity = file_activity();
+        if (activity != last_file_activity) {
+            last_file_activity = activity;
+            last_activity = Clock::now();
+        }
         if (session_->viewer_finished()) {
             return true;
         }

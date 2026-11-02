@@ -63,6 +63,8 @@ type HostAuth struct {
 type SharedViewerHello struct {
 	HostID string `json:"host_id"`
 	Token  string `json:"token"`
+	// Traceparent joins the carrier session span to the viewer's lookup trace.
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 // FrameReader decodes u32le length-prefixed payloads from a byte stream.

@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'server_identity.dart';
 import 'server_settings.dart';
+import 'socks5.dart';
 import 'package:chast_viewer/l10n.dart';
 
 /// One host as reported by `GET /v1/hosts/{id}`.
@@ -79,6 +80,8 @@ class SoftwareInfo {
     this.sha256 = '',
     this.size = 0,
     this.signature = '',
+    this.publisherKeyId = '',
+    this.publisherSignature = '',
   });
 
   final String version;
@@ -90,8 +93,12 @@ class SoftwareInfo {
   final int size;
   final String signature;
 
-  bool get installable =>
-      sha256.isNotEmpty && size > 0 && signature.isNotEmpty;
+  /// Publisher proof forwarded by the server. A build that pins the publisher
+  /// key through CHAST_PUBLISHER_PUBKEY requires both fields.
+  final String publisherKeyId;
+  final String publisherSignature;
+
+  bool get installable => sha256.isNotEmpty && size > 0 && signature.isNotEmpty;
 
   static SoftwareInfo? fromJson(Object? value) {
     if (value is! Map) {
@@ -109,6 +116,8 @@ class SoftwareInfo {
       sha256: value['sha256']?.toString().trim() ?? '',
       size: rawSize is num && rawSize > 0 ? rawSize.toInt() : 0,
       signature: value['signature']?.toString().trim() ?? '',
+      publisherKeyId: value['publisher_key_id']?.toString().trim() ?? '',
+      publisherSignature: value['publisher_sig']?.toString().trim() ?? '',
     );
   }
 }
@@ -425,7 +434,10 @@ class WebAuthnRegisterOptions {
     final String rpId = value['rp_id']?.toString().trim() ?? '';
     final String userId = value['user_id']?.toString().trim() ?? '';
     final String username = value['username']?.toString().trim() ?? '';
-    if (challenge.isEmpty || rpId.isEmpty || userId.isEmpty || username.isEmpty) {
+    if (challenge.isEmpty ||
+        rpId.isEmpty ||
+        userId.isEmpty ||
+        username.isEmpty) {
       return null;
     }
     final int timeout = (value['timeout_ms'] as num?)?.toInt() ?? 0;
@@ -571,14 +583,14 @@ class AddressBookGroup {
   final bool deleted;
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'id': id,
-        'name': name,
-        'parent_id': parentId,
-        'position': position,
-        'updated_at_ms': updatedAtMs,
-        'revision': revision,
-        if (deleted) 'deleted': true,
-      };
+    'id': id,
+    'name': name,
+    'parent_id': parentId,
+    'position': position,
+    'updated_at_ms': updatedAtMs,
+    'revision': revision,
+    if (deleted) 'deleted': true,
+  };
 
   static AddressBookGroup? fromJson(Object? value) {
     if (value is! Map) {
@@ -876,7 +888,12 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded = await _getJson(uri, timeout, key: settings.key);
+    final Object? decoded = await _getJson(
+      settings,
+      uri,
+      timeout,
+      key: settings.key,
+    );
     if (decoded is! Map) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
@@ -935,7 +952,12 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded = await _getJson(uri, timeout, key: settings.key);
+    final Object? decoded = await _getJson(
+      settings,
+      uri,
+      timeout,
+      key: settings.key,
+    );
     final Object? rawHosts = decoded is Map ? decoded['hosts'] : null;
     if (rawHosts is! List) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
@@ -997,6 +1019,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'PATCH',
+      settings,
       uri,
       timeout,
       key: settings.key,
@@ -1005,6 +1028,45 @@ class ServerApi {
     if (decoded is! Map || decoded['id']?.toString() != id) {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
+  }
+
+  /// Queues a cross-subnet Wake-on-LAN request with the connection service.
+  ///
+  /// The caller supplies [mac] because the service never stores link-layer
+  /// addresses. An opted-in host agent on the target's link broadcasts the
+  /// packet at its next registration refresh, so this works across subnets as
+  /// long as at least one relay-enabled agent shares the target's LAN.
+  static Future<void> wake(
+    ServerSettings settings,
+    String token,
+    String hostId,
+    String mac, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String accountToken = _accountToken(settings, token);
+    final String id = hostId.trim();
+    if (id.isEmpty) {
+      throw ServerApiException(tr('设备 ID 为空'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse(
+        '${settings.url}/v1/hosts/${Uri.encodeComponent(id)}/wake',
+      );
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    await _requestJson(
+      'POST',
+      settings,
+      uri,
+      timeout,
+      accountToken: accountToken,
+      body: <String, Object?>{'mac': mac},
+      success: const <int>{HttpStatus.accepted},
+      unauthorized: tr('账号未登录或已过期'),
+      forbidden: tr('目标设备不在当前账号的地址簿中'),
+    );
   }
 
   /// Exchanges a viewer account name and password for a bearer token.
@@ -1056,6 +1118,7 @@ class ServerApi {
     try {
       decoded = await _requestJson(
         'POST',
+        settings,
         uri,
         timeout,
         body: <String, Object?>{
@@ -1118,6 +1181,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'username': name, 'password': password},
@@ -1154,6 +1218,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'username': name, 'password': password},
@@ -1190,6 +1255,7 @@ class ServerApi {
     try {
       decoded = await _requestJson(
         'POST',
+        settings,
         uri,
         timeout,
         body: <String, Object?>{'refresh_token': token},
@@ -1255,6 +1321,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1285,6 +1352,7 @@ class ServerApi {
     try {
       decoded = await _requestJson(
         'POST',
+        settings,
         uri,
         timeout,
         accountToken: accountToken,
@@ -1325,6 +1393,7 @@ class ServerApi {
     try {
       await _requestJson(
         'POST',
+        settings,
         uri,
         timeout,
         accountToken: accountToken,
@@ -1367,6 +1436,7 @@ class ServerApi {
     try {
       await _requestJson(
         'POST',
+        settings,
         uri,
         timeout,
         accountToken: accountToken,
@@ -1411,6 +1481,7 @@ class ServerApi {
     try {
       decoded = await _requestJson(
         'POST',
+        settings,
         uri,
         timeout,
         accountToken: accountToken,
@@ -1460,6 +1531,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1499,6 +1571,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1537,6 +1610,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1570,6 +1644,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1612,6 +1687,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'username': name, 'password': password},
@@ -1660,6 +1736,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'username': name},
@@ -1758,6 +1835,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{
@@ -1793,6 +1871,7 @@ class ServerApi {
     bool success = true,
     String detail = '',
     String auditRef = '',
+    String route = '',
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -1808,6 +1887,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1818,6 +1898,7 @@ class ServerApi {
         'success': success,
         if (detail.trim().isNotEmpty) 'detail': detail.trim(),
         if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
+        if (route.trim().isNotEmpty) 'route': route.trim(),
       },
       success: const <int>{HttpStatus.created},
       unauthorized: tr('账号登录已失效，请重新登录'),
@@ -1837,6 +1918,7 @@ class ServerApi {
     bool success = true,
     String detail = '',
     String auditRef = '',
+    String route = '',
     DateTime? occurredAt,
     Duration timeout = const Duration(seconds: 6),
   }) async {
@@ -1853,6 +1935,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1865,6 +1948,7 @@ class ServerApi {
         'success': success,
         if (detail.trim().isNotEmpty) 'detail': detail.trim(),
         if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
+        if (route.trim().isNotEmpty) 'route': route.trim(),
         if (occurredAt != null)
           'occurred_at_ms': occurredAt.toUtc().millisecondsSinceEpoch,
       },
@@ -1893,6 +1977,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1916,6 +2001,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1959,6 +2045,7 @@ class ServerApi {
     }
     await _requestJson(
       'DELETE',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -1996,6 +2083,7 @@ class ServerApi {
     }
     await _requestJson(
       'PATCH',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2022,6 +2110,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2059,6 +2148,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2098,6 +2188,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2137,6 +2228,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'username': name},
@@ -2173,6 +2265,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'token': value, 'password': password},
@@ -2210,6 +2303,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2249,6 +2343,7 @@ class ServerApi {
     }
     await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{'username': name},
@@ -2290,6 +2385,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       body: <String, Object?>{
@@ -2342,6 +2438,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2361,8 +2458,7 @@ class ServerApi {
       alive.add(peer);
     }
     final List<AddressBookPeer> changes = <AddressBookPeer>[];
-    for (final Object? item
-        in rawChanges is List ? rawChanges : <Object?>[]) {
+    for (final Object? item in rawChanges is List ? rawChanges : <Object?>[]) {
       final AddressBookPeer? peer = AddressBookPeer.fromJson(item);
       if (peer == null) {
         throw ServerApiException(tr('连接服务返回了无效数据'));
@@ -2455,6 +2551,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'PATCH',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2498,6 +2595,7 @@ class ServerApi {
     }
     await _requestJson(
       'DELETE',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2612,6 +2710,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2693,6 +2792,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'PATCH',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2781,6 +2881,7 @@ class ServerApi {
     }
     await _requestJson(
       'DELETE',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2807,6 +2908,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2837,6 +2939,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -2952,6 +3055,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'POST',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -3037,6 +3141,7 @@ class ServerApi {
     }
     await _requestJson(
       'DELETE',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -3063,6 +3168,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -3098,6 +3204,7 @@ class ServerApi {
     }
     final Object? decoded = await _requestJson(
       'GET',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -3135,18 +3242,18 @@ class ServerApi {
         : name.trim();
     final Uri uri;
     try {
-      uri = Uri.parse(
-        '${settings.url}/v1/account/recordings',
-      ).replace(queryParameters: <String, String>{
-        'name': fileName,
-        if (peerId.trim().isNotEmpty) 'peer_id': peerId.trim(),
-        if (startedAtMs > 0) 'started_ms': '$startedAtMs',
-        if (durationMs > 0) 'duration_ms': '$durationMs',
-      });
+      uri = Uri.parse('${settings.url}/v1/account/recordings').replace(
+        queryParameters: <String, String>{
+          'name': fileName,
+          if (peerId.trim().isNotEmpty) 'peer_id': peerId.trim(),
+          if (startedAtMs > 0) 'started_ms': '$startedAtMs',
+          if (durationMs > 0) 'duration_ms': '$durationMs',
+        },
+      );
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    final HttpClient client = _httpClient(settings, timeout);
     try {
       final HttpClientRequest request = await client
           .postUrl(uri)
@@ -3159,11 +3266,13 @@ class ServerApi {
       request.headers.contentType = ContentType('video', 'mp4');
       request.contentLength = total;
       int sent = 0;
-      await request.addStream(file.openRead().map((List<int> chunk) {
-        sent += chunk.length;
-        onProgress?.call(sent, total);
-        return chunk;
-      }));
+      await request.addStream(
+        file.openRead().map((List<int> chunk) {
+          sent += chunk.length;
+          onProgress?.call(sent, total);
+          return chunk;
+        }),
+      );
       final HttpClientResponse response = await request.close().timeout(
         timeout,
       );
@@ -3232,7 +3341,7 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    final HttpClient client = _httpClient(settings, timeout);
     try {
       final HttpClientRequest request = await client
           .getUrl(uri)
@@ -3315,6 +3424,7 @@ class ServerApi {
     }
     await _requestJson(
       'DELETE',
+      settings,
       uri,
       timeout,
       accountToken: accountToken,
@@ -3342,31 +3452,16 @@ class ServerApi {
       case HttpStatus.badRequest:
         return ServerApiException(tr('录制文件无效'), statusCode: status);
       case HttpStatus.unauthorized:
-        return ServerApiException(
-          tr('账号登录已失效，请重新登录'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('账号登录已失效，请重新登录'), statusCode: status);
       case HttpStatus.notFound:
-        return ServerApiException(
-          tr('录制不存在或已被删除'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('录制不存在或已被删除'), statusCode: status);
       case HttpStatus.requestEntityTooLarge:
         if (detail.contains('quota')) {
-          return ServerApiException(
-            tr('录制存储配额已用尽'),
-            statusCode: status,
-          );
+          return ServerApiException(tr('录制存储配额已用尽'), statusCode: status);
         }
-        return ServerApiException(
-          tr('录制文件超过单次上传上限'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('录制文件超过单次上传上限'), statusCode: status);
       case HttpStatus.serviceUnavailable:
-        return ServerApiException(
-          tr('连接服务未启用录制归档'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('连接服务未启用录制归档'), statusCode: status);
       default:
         return ServerApiException(
           tr('连接服务返回 HTTP {p61}', <String, Object?>{'p61': status}),
@@ -3378,11 +3473,16 @@ class ServerApi {
   static String _fileName(String path) {
     final String normalized = path.replaceAll('\\', '/');
     final int slash = normalized.lastIndexOf('/');
-    final String name = slash < 0 ? normalized : normalized.substring(slash + 1);
+    final String name = slash < 0
+        ? normalized
+        : normalized.substring(slash + 1);
     return name.trim().isEmpty ? 'recording.mp4' : name;
   }
 
-  static Future<File> _newRecordingFile(Directory directory, String name) async {
+  static Future<File> _newRecordingFile(
+    Directory directory,
+    String name,
+  ) async {
     String safe = name.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
     if (safe.isEmpty) {
       safe = 'recording.mp4';
@@ -3437,7 +3537,7 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final Object? decoded = await _requestJson('GET', uri, timeout);
+    final Object? decoded = await _requestJson('GET', settings, uri, timeout);
     final Object? raw = decoded is Map ? decoded['public_key'] : null;
     final ServerIdentity? identity = ServerIdentity.parse(
       raw?.toString() ?? '',
@@ -3480,19 +3580,32 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    await _getJson(uri, timeout);
+    await _getJson(settings, uri, timeout);
   }
 
   static Future<Object?> _getJson(
+    ServerSettings settings,
     Uri uri,
     Duration timeout, {
     String key = '',
   }) {
-    return _requestJson('GET', uri, timeout, key: key);
+    return _requestJson('GET', settings, uri, timeout, key: key);
+  }
+
+  static HttpClient _httpClient(ServerSettings settings, Duration timeout) {
+    final HttpClient client;
+    try {
+      client = Socks5Proxy.httpClient(settings.socks5);
+    } on Socks5Exception catch (error) {
+      throw ServerApiException(error.message);
+    }
+    client.connectionTimeout = timeout;
+    return client;
   }
 
   static Future<Object?> _requestJson(
     String method,
+    ServerSettings settings,
     Uri uri,
     Duration timeout, {
     String key = '',
@@ -3510,7 +3623,7 @@ class ServerApi {
     notFound ??= tr('设备未注册或已下线');
     forbidden ??= tr('没有权限执行此操作');
     unavailable ??= tr('连接服务未启用账号存储');
-    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    final HttpClient client = _httpClient(settings, timeout);
     try {
       final HttpClientRequest request = await client
           .openUrl(method, uri)
@@ -3550,7 +3663,9 @@ class ServerApi {
               : response.statusCode == HttpStatus.conflict &&
                     conflict.isNotEmpty
               ? conflict
-              : tr('连接服务返回 HTTP {p61}', <String, Object?>{'p61': response.statusCode}),
+              : tr('连接服务返回 HTTP {p61}', <String, Object?>{
+                  'p61': response.statusCode,
+                }),
           statusCode: response.statusCode,
           code: secondFactor == 'required'
               ? 'totp_required'
@@ -3574,12 +3689,18 @@ class ServerApi {
     } on SocketException catch (error) {
       final String detail = error.message.trim();
       throw ServerApiException(
-        detail.isEmpty ? tr('无法连接连接服务') : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
+        detail.isEmpty
+            ? tr('无法连接连接服务')
+            : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
       );
     } on HttpException catch (error) {
-      throw ServerApiException(tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}));
+      throw ServerApiException(
+        tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}),
+      );
     } catch (error) {
-      throw ServerApiException(tr('连接服务请求失败：{error}', <String, Object?>{'error': error}));
+      throw ServerApiException(
+        tr('连接服务请求失败：{error}', <String, Object?>{'error': error}),
+      );
     } finally {
       client.close(force: true);
     }

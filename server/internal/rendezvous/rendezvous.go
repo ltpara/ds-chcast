@@ -21,6 +21,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -35,6 +36,7 @@ type options struct {
 	readBuffer int
 	rateMax    int
 	serverKey  string
+	tracer     *tracing.Tracer
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -59,6 +61,12 @@ func WithServerKey(key string) Option {
 	return func(o *options) { o.serverKey = key }
 }
 
+// WithTracer records punch coordination spans. Viewer requests carry the trace
+// context of their authenticated lookup, so the punch joins that trace.
+func WithTracer(tracer *tracing.Tracer) Option {
+	return func(o *options) { o.tracer = tracer }
+}
+
 type Server struct {
 	conn       *net.UDPConn
 	reg        *registry.Registry
@@ -70,6 +78,7 @@ type Server struct {
 	limiter    *limiter
 	serverKey  string
 	readBuffer int
+	tracer     *tracing.Tracer
 	done       chan struct{}
 	closeOnce  sync.Once
 }
@@ -104,6 +113,7 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		limiter:    newLimiter(cfg.rateMax, defaultRateSpan),
 		serverKey:  cfg.serverKey,
 		readBuffer: readBuffer,
+		tracer:     cfg.tracer,
 		done:       make(chan struct{}),
 	}, nil
 }
@@ -249,39 +259,60 @@ func (s *Server) relayFor(host registry.Host) string {
 	return s.relayAddr(host.RelayPort)
 }
 
+// handlePunchRequest records one span per punch attempt. The viewer sends the
+// traceparent of its authenticated lookup, so the span lands in the trace that
+// produced the lease.
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
+	var parent tracing.TraceContext
+	if s.tracer != nil {
+		parent, _ = s.tracer.ParseTraceparent(msg.Traceparent)
+	}
+	span := s.tracer.StartSpan("punch.request", parent)
+	errText, candidates := s.coordinatePunch(msg, src)
+	attrs := []tracing.Attr{
+		tracing.String("punch.host_id", msg.HostID),
+		tracing.String("punch.viewer_ip", src.IP.String()),
+		tracing.Int("punch.host_candidates", candidates),
+	}
+	if errText != "" {
+		attrs = append(attrs, tracing.String("error", errText))
+	}
+	s.tracer.EndSpan(span, attrs...)
+}
+
+func (s *Server) coordinatePunch(msg wire.Message, src *net.UDPAddr) (string, int) {
 	reply := wire.Message{Type: wire.TypePunchPeer, Nonce: msg.Nonce}
 	if !s.limiter.allow(src.IP.String()) {
 		reply.Error = "too many punch requests; retry later"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
 		reply.Error = "nonce must be 8..64 characters"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	if !validUpnpPort(msg.UpnpPort) {
 		reply.Error = "upnp_port must be 0..65535"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	if !identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth,
 		msg.Timestamp, time.Now(), punchAuthWindow) {
 		reply.Error = "punch authentication failed"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	host, ok := s.reg.Lookup(msg.HostID)
 	if !ok {
 		reply.Error = "host is not registered"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	if !s.reg.Online(host) {
 		reply.Error = "host is offline"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	var hostAddrs []*net.UDPAddr
 	for _, text := range []string{host.Candidate, host.CandidateV6} {
@@ -296,7 +327,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	if len(hostAddrs) == 0 {
 		reply.Error = "host has no usable address"
 		s.reply(src, reply)
-		return
+		return reply.Error, 0
 	}
 	viewer4, viewer6 := observedCandidate(src)
 	// Record only requests that can actually be coordinated, matching hbbs's
@@ -340,6 +371,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	}
 	reply.ExpiresMS = punchTTL.Milliseconds()
 	s.reply(src, reply)
+	return "", len(hostAddrs)
 }
 
 func (s *Server) reply(to *net.UDPAddr, m wire.Message) {

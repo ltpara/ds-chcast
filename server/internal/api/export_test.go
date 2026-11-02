@@ -110,7 +110,7 @@ func TestCSVExportPagesPastStorePageCaps(t *testing.T) {
 	for i := 0; i < connectionRows; i++ {
 		at := start.Add(time.Duration(i) * time.Minute)
 		if _, err := s.Accounts.RecordConnection(user.ID, "alice", "peer1", "viewer", "",
-			"", at, at.Add(time.Second), true, fmt.Sprintf("c%d", i)); err != nil {
+			"", "", "", at, at.Add(time.Second), true, fmt.Sprintf("c%d", i)); err != nil {
 			t.Fatalf("record connection %d: %v", i, err)
 		}
 	}
@@ -118,14 +118,14 @@ func TestCSVExportPagesPastStorePageCaps(t *testing.T) {
 	if len(rows) != connectionRows+1 {
 		t.Fatalf("connection export rows = %d, want %d", len(rows)-1, connectionRows)
 	}
-	if rows[1][12] != "c449" || rows[len(rows)-1][12] != "c0" {
-		t.Fatalf("connection export order = %q .. %q", rows[1][12], rows[len(rows)-1][12])
+	if rows[1][14] != "c449" || rows[len(rows)-1][14] != "c0" {
+		t.Fatalf("connection export order = %q .. %q", rows[1][14], rows[len(rows)-1][14])
 	}
 
 	const transferRows = 250
 	for i := 0; i < transferRows; i++ {
 		if _, err := s.Accounts.RecordFileTransfer(user.ID, "alice", "peer1", "upload",
-			"dump.bin", "", "", 1, 1, start, true, fmt.Sprintf("f%d", i)); err != nil {
+			"dump.bin", "", "", "", "", 1, 1, start, true, fmt.Sprintf("f%d", i)); err != nil {
 			t.Fatalf("record transfer %d: %v", i, err)
 		}
 	}
@@ -133,8 +133,8 @@ func TestCSVExportPagesPastStorePageCaps(t *testing.T) {
 	if len(rows) != transferRows+1 {
 		t.Fatalf("file export rows = %d, want %d", len(rows)-1, transferRows)
 	}
-	if rows[1][13] != "f249" || rows[len(rows)-1][13] != "f0" {
-		t.Fatalf("file export order = %q .. %q", rows[1][13], rows[len(rows)-1][13])
+	if rows[1][15] != "f249" || rows[len(rows)-1][15] != "f0" {
+		t.Fatalf("file export order = %q .. %q", rows[1][15], rows[len(rows)-1][15])
 	}
 }
 
@@ -192,6 +192,7 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	}
 	if _, err := s.Accounts.RecordConnection(
 		user.ID, "alice", "peer1", "viewer", "198.51.100.7", "",
+		"Testland", "relay",
 		created, ended, true, "viewer side"); err != nil {
 		t.Fatalf("record connection: %v", err)
 	}
@@ -202,6 +203,7 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	}
 	if _, err := s.Accounts.RecordFileTransfer(
 		user.ID, "alice", "peer1", "download", "notes.txt", "198.51.100.7", "",
+		"Testland", "direct",
 		7, 1, created, true, "viewer file"); err != nil {
 		t.Fatalf("record file transfer: %v", err)
 	}
@@ -229,28 +231,30 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	rows = exportCSV(t, s.URL+"/v1/audit/connections?format=csv")
 	if want := []string{"id", "started_at", "ended_at", "duration_ms", "username",
 		"peer_id", "host_id", "audit_ref", "source", "direction",
-		"client_ip", "success", "detail"}; !slices.Equal(rows[0], want) {
+		"client_ip", "location", "route", "success", "detail"}; !slices.Equal(rows[0], want) {
 		t.Fatalf("connection header = %v, want %v", rows[0], want)
 	}
 	if len(rows) != 3 {
 		t.Fatalf("connection rows = %d, want 3\n%v", len(rows), rows)
 	}
-	hostRow := exportRow(t, rows, 12, "host side, \"quoted\"")
+	hostRow := exportRow(t, rows, 14, "host side, \"quoted\"")
 	if hostRow[1] != "2026-10-27T09:03:04.123Z" || hostRow[3] != "90000" ||
 		hostRow[4] != "-" || hostRow[6] != "devbox7" || hostRow[7] != "0011aabb" ||
-		hostRow[8] != "host" || hostRow[9] != "host" || hostRow[11] != "true" {
+		hostRow[8] != "host" || hostRow[9] != "host" ||
+		hostRow[11] != "" || hostRow[12] != "" || hostRow[13] != "true" {
 		t.Fatalf("host connection row = %v", hostRow)
 	}
-	viewerRow := exportRow(t, rows, 12, "viewer side")
+	viewerRow := exportRow(t, rows, 14, "viewer side")
 	if viewerRow[4] != "alice" || viewerRow[5] != "peer1" ||
-		viewerRow[8] != "viewer" || viewerRow[10] != "198.51.100.7" {
+		viewerRow[8] != "viewer" || viewerRow[10] != "198.51.100.7" ||
+		viewerRow[11] != "Testland" || viewerRow[12] != "relay" {
 		t.Fatalf("viewer connection row = %v", viewerRow)
 	}
 
 	rows = exportCSV(t, s.URL+"/v1/audit/file-transfers?format=csv")
 	if want := []string{"id", "occurred_at", "username", "peer_id", "host_id",
 		"audit_ref", "source", "direction", "name", "size", "files",
-		"client_ip", "success", "detail"}; !slices.Equal(rows[0], want) {
+		"client_ip", "location", "route", "success", "detail"}; !slices.Equal(rows[0], want) {
 		t.Fatalf("file header = %v, want %v", rows[0], want)
 	}
 	if len(rows) != 3 {
@@ -259,13 +263,15 @@ func TestOperatorHistoryCSVExport(t *testing.T) {
 	hostFile := exportRow(t, rows, 8, "report, final.csv")
 	if hostFile[1] != "2026-10-27T09:03:04.123Z" || hostFile[2] != "-" ||
 		hostFile[4] != "devbox7" || hostFile[6] != "host" || hostFile[7] != "upload" ||
-		hostFile[9] != "42" || hostFile[10] != "1" {
+		hostFile[9] != "42" || hostFile[10] != "1" ||
+		hostFile[12] != "" || hostFile[13] != "" || hostFile[14] != "true" {
 		t.Fatalf("host file row = %v", hostFile)
 	}
 	viewerFile := exportRow(t, rows, 8, "notes.txt")
 	if viewerFile[2] != "alice" || viewerFile[4] != "" ||
 		viewerFile[6] != "viewer" || viewerFile[7] != "download" ||
-		viewerFile[11] != "198.51.100.7" {
+		viewerFile[11] != "198.51.100.7" ||
+		viewerFile[12] != "Testland" || viewerFile[13] != "direct" {
 		t.Fatalf("viewer file row = %v", viewerFile)
 	}
 

@@ -19,6 +19,7 @@ type fileTransferReportRequest struct {
 	Detail       string `json:"detail"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
 	AuditRef     string `json:"audit_ref,omitempty"`
+	Route        string `json:"route,omitempty"`
 }
 
 type fileTransferView struct {
@@ -33,6 +34,8 @@ type fileTransferView struct {
 	Size         int64  `json:"size"`
 	Files        int    `json:"files"`
 	ClientIP     string `json:"client_ip"`
+	Location     string `json:"location,omitempty"`
+	Route        string `json:"route,omitempty"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
 	Success      bool   `json:"success"`
 	Detail       string `json:"detail"`
@@ -56,6 +59,8 @@ func fileTransferToView(event account.FileEvent) fileTransferView {
 		Size:         event.Size,
 		Files:        event.Files,
 		ClientIP:     event.ClientIP,
+		Location:     event.Location,
+		Route:        event.Route,
 		OccurredAtMS: event.OccurredAt.UnixMilli(),
 		Success:      event.Success,
 		Detail:       event.Detail,
@@ -86,9 +91,11 @@ func (s *server) recordAccountFileTransfer(w http.ResponseWriter, r *http.Reques
 	if req.OccurredAtMS > 0 {
 		occurredAt = time.UnixMilli(req.OccurredAtMS)
 	}
+	ip := s.clientIP(r)
 	event, err := s.cfg.Accounts.RecordFileTransfer(
 		user.ID, user.Username, req.PeerID, req.Direction, req.Name,
-		s.clientIP(r), req.AuditRef, req.Size, files, occurredAt, success, req.Detail,
+		ip, req.AuditRef, s.clientLocation(ip), req.Route,
+		req.Size, files, occurredAt, success, req.Detail,
 	)
 	if err != nil {
 		if errors.Is(err, account.ErrInvalidTransfer) {

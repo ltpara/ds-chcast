@@ -549,6 +549,23 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.file_receive_failures));
         map[key("downloadCancels")] =
             flutter::EncodableValue(static_cast<int64_t>(status.download_cancels));
+        flutter::EncodableList file_audit;
+        file_audit.reserve(status.file_audit.size());
+        for (const chast_viewer::FileAuditEntry& entry : status.file_audit) {
+            flutter::EncodableMap item;
+            item[key("seq")] = flutter::EncodableValue(static_cast<int64_t>(entry.seq));
+            item[key("download")] = flutter::EncodableValue(entry.download);
+            item[key("name")] = flutter::EncodableValue(entry.name);
+            item[key("size")] = flutter::EncodableValue(static_cast<int64_t>(entry.size));
+            item[key("success")] = flutter::EncodableValue(entry.success);
+            item[key("detail")] = flutter::EncodableValue(entry.detail);
+            file_audit.push_back(flutter::EncodableValue(std::move(item)));
+        }
+        map[key("fileAudit")] = flutter::EncodableValue(std::move(file_audit));
+        map[key("fileAuditFirstSeq")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_audit_first_seq));
+        map[key("fileAuditDropped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.file_audit_dropped));
         map[key("downloadCancellable")] =
             flutter::EncodableValue(status.download_cancellable);
         map[key("fileListAnswers")] =
@@ -683,6 +700,13 @@ void ViewerBridge::HandleMethodCall(
         map[key("sasError")] = flutter::EncodableValue(status.sas_error);
         map[key("sasUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.sas_updates));
+        map[key("restartSupported")] =
+            flutter::EncodableValue(status.restart_supported);
+        map[key("restartCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.restart_code));
+        map[key("restartError")] = flutter::EncodableValue(status.restart_error);
+        map[key("restartUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.restart_updates));
         map[key("chatSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.chat_sent));
         map[key("chatReceived")] =
@@ -1318,6 +1342,12 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "sendSas") {
         const bool queued = viewer_ != nullptr && viewer_->SendSas();
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "requestRestart") {
+        const bool queued = viewer_ != nullptr && viewer_->RequestRestart();
         result->Success(flutter::EncodableValue(queued));
         return;
     }

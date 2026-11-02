@@ -4,7 +4,7 @@
 //   chast-quic connect --host 127.0.0.1 --port 4433 [--display N] [--save received.h264] [--record out.mp4] [--input] [--clipboard] [--audio [--audio-stream]] [--play [--adaptive-jitter] [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]] [--audit-ref HEX]
 //   chast-quic verify  --port 45433 --seconds 5 [--display N] [--merged] [--input-real] [--display-mode]
 //                      [--file-upload] [--file-download] [--file-browse] [--port-forward] [--port-forward-denied] [--port-forward-local] [--microphone] [--privacy]
-//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--stream-options] [--encoder auto|vpl|ffmpeg]
+//                      [--terminal] [--terminal-denied] [--camera] [--camera-denied] [--sas] [--restart] [--idle-disconnect] [--stream-options] [--encoder auto|vpl|ffmpeg]
 //                      [--netem [--audio [--audio-stream] [--play [--audio-capture-anchor] [--audio-lead-ms N] [--audio-drift-correction] [--audio-drift-ppm N]]]]] [--record out.mp4]
 //                      [--netem-delay-ms N] [--netem-jitter-ms N] [--netem-loss-percent X] [--netem-rate-kbps N]
 //
@@ -901,6 +901,15 @@ struct Options {
     // the real secure desktop; a second probe checks a host with no callback
     // answers Unsupported instead.
     bool sas = false;
+    // verify only: cover the remote reboot. The host gets an in-memory
+    // restart callback that reports success, so the request/answer channel
+    // runs without ever rebooting this machine; a second probe checks a host
+    // that never granted the permission refuses the request locally.
+    bool restart = false;
+    // verify only: cover idle auto-disconnect. The host closes the session
+    // after a short test timeout once the viewer stops sending input; a second
+    // host without a timeout keeps the same quiet session open.
+    bool idle_disconnect = false;
     // verify only: walk the viewer's picture preferences. A quality/frame-rate
     // change and its restore must be answered with the effective values and
     // followed by a StreamInfo; the other encoder family is requested to prove
@@ -1224,6 +1233,10 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.privacy = true;
             } else if (arg == "--sas") {
                 options.sas = true;
+            } else if (arg == "--restart") {
+                options.restart = true;
+            } else if (arg == "--idle-disconnect") {
+                options.idle_disconnect = true;
             } else if (arg == "--stream-options") {
                 options.stream_options = true;
             } else if (arg == "--send-clipboard" && i + 1 < argc) {
@@ -1500,6 +1513,14 @@ bool parse_args(int argc, char** argv, Options& options) {
         std::fprintf(stderr, "--sas only applies to verify\n");
         return false;
     }
+    if (options.restart && options.mode != "verify") {
+        std::fprintf(stderr, "--restart only applies to verify\n");
+        return false;
+    }
+    if (options.idle_disconnect && options.mode != "verify") {
+        std::fprintf(stderr, "--idle-disconnect only applies to verify\n");
+        return false;
+    }
     if (options.stream_options && options.mode != "verify") {
         std::fprintf(stderr, "--stream-options only applies to verify\n");
         return false;
@@ -1722,6 +1743,8 @@ struct SenderStats {
     // SAS requests the host handled (verify --sas) and the answers it refused.
     uint64_t sas_requests = 0;
     uint64_t sas_failures = 0;
+    uint64_t restart_requests = 0;
+    uint64_t restart_failures = 0;
     // Viewer picture preferences the host handled (verify --stream-options):
     // every request, the ones that changed the running stream, and refusals.
     uint64_t stream_option_requests = 0;
@@ -1991,6 +2014,13 @@ struct ReceiverStats {
     bool sas_ok_seen = false;
     chast::SasCode sas_last_code = chast::SasCode::Ok;
     std::string sas_last_reason;
+    // Restart probe (verify --restart): the host answers through its test
+    // callback, so nothing is actually rebooted.
+    bool restart_probe = false;
+    uint64_t restart_updates = 0;
+    bool restart_ok_seen = false;
+    chast::RestartCode restart_last_code = chast::RestartCode::Ok;
+    std::string restart_last_reason;
     // Stream preference probe (verify --stream-options): every answer, the
     // effective values of the last one, and the StreamInfo the host announced
     // after each applied quality/frame-rate change. The other encoder family
@@ -2234,6 +2264,12 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
         // the request reaches the host and the answer reaches the viewer.
         config.send_sas = [](std::string*) { return true; };
     }
+    if (options.restart) {
+        config.settings.allow_restart = true;
+        // Nothing is rebooted: the callback stands in for the platform call,
+        // so the loopback only proves the request/answer path.
+        config.restart_system = [](std::string*) { return true; };
+    }
     if (options.synthetic_audio) {
         config.audio_capture = [](std::string* capture_error) {
             return make_synthetic_capture(capture_error);
@@ -2466,6 +2502,8 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
     stats.privacy_mode_active = status.stats.privacy_mode_active;
     stats.sas_requests = status.stats.sas_requests;
     stats.sas_failures = status.stats.sas_failures;
+    stats.restart_requests = status.stats.restart_requests;
+    stats.restart_failures = status.stats.restart_failures;
     stats.chat_sent = status.stats.chat_sent;
     stats.chat_received = status.stats.chat_received;
     stats.text_received = status.stats.text_received;
@@ -4713,6 +4751,24 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         }
     };
 
+    auto drain_restart_result = [&] {
+        chast::RestartCode code = chast::RestartCode::Ok;
+        std::string reason;
+        while (session->take_restart_result(code, reason)) {
+            ++stats.restart_updates;
+            stats.restart_last_code = code;
+            stats.restart_last_reason = reason;
+            if (code == chast::RestartCode::Ok) {
+                stats.restart_ok_seen = true;
+            }
+            if (!options.quiet) {
+                std::printf("quic: restart result: code %u%s%s\n",
+                            static_cast<unsigned>(code), reason.empty() ? "" : ": ",
+                            reason.c_str());
+            }
+        }
+    };
+
     auto drain_chat = [&] {
         std::string text;
         while (session->take_chat(text)) {
@@ -5298,6 +5354,11 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     stats.sas_probe = options.mode == "verify" && options.sas;
     bool sas_sent = false;
     const auto sas_at = start + std::chrono::milliseconds(1200);
+    // Restart: same shape as SAS. The loopback host schedules nothing; its
+    // callback answers Ok so the request/answer channel is what gets tested.
+    stats.restart_probe = options.mode == "verify" && options.restart;
+    bool restart_sent = false;
+    const auto restart_at = start + std::chrono::milliseconds(1400);
     // Chat: the host's greeting was queued at the stream announcement; send
     // the reply once the stream is live and drain whatever arrived each pass.
     stats.chat_probe = options.chat_probe != nullptr;
@@ -5715,6 +5776,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         drain_desktop_state();
         drain_privacy_state();
         drain_sas_result();
+        drain_restart_result();
         drain_chat();
         if (!advance_stream_options()) {
             return fail(stats.error);
@@ -5756,6 +5818,13 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
                 return fail("request_sas: " + requested.to_string());
             }
             sas_sent = true;
+        }
+        if (stats.restart_probe && !restart_sent &&
+            std::chrono::steady_clock::now() >= restart_at) {
+            if (chast::Error requested = session->request_restart(); !requested.ok()) {
+                return fail("request_restart: " + requested.to_string());
+            }
+            restart_sent = true;
         }
         if (stats.chat_probe && !chat_sent &&
             std::chrono::steady_clock::now() >= chat_at) {
@@ -5820,6 +5889,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         drain_microphone();
         drain_privacy_state();
         drain_sas_result();
+        drain_restart_result();
         drain_chat();
         if (!advance_stream_options()) {
             return fail(stats.error);
@@ -6007,6 +6077,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     drain_desktop_state();
     drain_privacy_state();
     drain_sas_result();
+    drain_restart_result();
     drain_chat();
     stop_microphone_probe();
     if (stats.file_probe && file_step != FileStep::Done) {
@@ -7575,12 +7646,14 @@ bool wait_host_listening(chast::HostServer& server, std::chrono::milliseconds ti
 }
 
 std::unique_ptr<chast::HostServer> start_probe_host(
-    uint16_t port, const std::function<void(chast::HostSettings&)>& setup, std::string* error) {
+    uint16_t port, const std::function<void(chast::HostSettings&)>& setup, std::string* error,
+    uint32_t auto_disconnect_ms = 0) {
     chast::HostServerConfig host;
     host.settings.bind_address = "127.0.0.1";
     host.settings.port = port;
     host.settings.auth_mode = chast::HostAuthMode::Password;
     host.settings.password_hash = chast::hash_password("open-sesame");
+    host.auto_disconnect_ms = auto_disconnect_ms;
     host.serve_once = true;
     setup(host.settings);
     std::unique_ptr<chast::HostServer> server =
@@ -7878,6 +7951,241 @@ bool sas_unsupported_works(uint16_t port, std::string* detail) {
         *detail = "video did not survive the unsupported SAS answer: " +
                   (received.ok() ? std::string("frame payload did not verify")
                                  : received.to_string());
+        return false;
+    }
+    return true;
+}
+
+// A host that keeps remote restart off must not announce the grant, and the
+// viewer's request must fail locally without reaching the host. The stream
+// must keep running, so a refused reboot is not mistaken for a broken session.
+bool restart_denied_works(uint16_t port, std::string* detail) {
+    std::string error;
+    std::unique_ptr<chast::HostServer> host = start_probe_host(
+        port,
+        [](chast::HostSettings& settings) {
+            settings.allow_input = true;
+            settings.allow_restart = false;
+        },
+        &error);
+    if (!host) {
+        *detail = "restart-disabled host: " + error;
+        return false;
+    }
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 5000;
+    client_config.pinned_fingerprint = host->status().fingerprint;
+    client_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        host->stop();
+        return false;
+    }
+    chast::ServerInfo info;
+    chast::Error connected = client->connect(std::chrono::seconds(10));
+    chast::Error handshaken =
+        connected.ok() ? client->handshake(info, std::chrono::seconds(10),
+                                           chast::kDisplayAuto)
+                       : connected;
+    if (!handshaken.ok()) {
+        *detail = "the viewer did not connect: " + handshaken.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    if (info.restart_enabled) {
+        *detail = "HelloAck granted restart despite the closed setting";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    chast::FrameHeader first_header;
+    std::vector<uint8_t> first_payload;
+    const chast::Error first_frame =
+        client->receive_frame(first_header, first_payload, std::chrono::seconds(10));
+    if (!first_frame.ok() || first_payload.empty()) {
+        *detail = "the probe host did not start streaming: " +
+                  (first_frame.ok() ? std::string("empty frame")
+                                    : first_frame.to_string());
+        client.reset();
+        host->stop();
+        return false;
+    }
+    const chast::Error requested = client->request_restart();
+    if (requested.status() != chast::Status::PermissionDenied) {
+        *detail = "the viewer requested a reboot without permission: " +
+                  requested.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    chast::RestartCode code = chast::RestartCode::Ok;
+    std::string reason;
+    if (client->take_restart_result(code, reason)) {
+        *detail = "a locally refused reboot still produced a host answer";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    chast::FrameHeader header;
+    std::vector<uint8_t> payload;
+    const chast::Error received =
+        client->receive_frame(header, payload, std::chrono::seconds(10));
+    const bool frame_ok =
+        received.ok() && !payload.empty() && payload.size() == header.payload_size &&
+        chast::crc32(payload.data(), payload.size()) == header.payload_crc32;
+    if (!frame_ok) {
+        *detail = "video did not survive the refused reboot: " +
+                  (received.ok() ? std::string("frame payload did not verify")
+                                 : received.to_string());
+        client.reset();
+        host->stop();
+        return false;
+    }
+    const uint64_t requests = host->status().stats.restart_requests;
+    client.reset();
+    host->stop();
+    if (requests != 0) {
+        *detail = "the host counted " + std::to_string(requests) +
+                  " reboot request(s) that never should have arrived";
+        return false;
+    }
+    return true;
+}
+
+// Idle auto-disconnect: a host with a timeout must keep the session while the
+// viewer interacts and close it once the viewer goes quiet. The timeout comes
+// from HostServerConfig::auto_disconnect_ms so the loopback does not wait
+// whole minutes; the timer, the activity rules and the close path are the ones
+// a configured host runs. A second host without a timeout must keep the same
+// quiet session open.
+bool idle_disconnect_works(uint16_t port, std::string* detail) {
+    constexpr uint32_t kIdleMs = 2000;
+    std::string error;
+    std::unique_ptr<chast::HostServer> host = start_probe_host(
+        port, [](chast::HostSettings& settings) { settings.allow_input = true; }, &error,
+        kIdleMs);
+    if (!host) {
+        *detail = "idle host: " + error;
+        return false;
+    }
+    chast::QuicClientConfig client_config;
+    client_config.host = "127.0.0.1";
+    client_config.port = port;
+    client_config.idle_timeout_ms = 5000;
+    client_config.pinned_fingerprint = host->status().fingerprint;
+    client_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> client =
+        chast::QuicSession::create_client(client_config, &error);
+    if (!client) {
+        *detail = "client: " + error;
+        host->stop();
+        return false;
+    }
+    chast::ServerInfo info;
+    chast::Error connected = client->connect(std::chrono::seconds(10));
+    chast::Error handshaken =
+        connected.ok() ? client->handshake(info, std::chrono::seconds(10),
+                                           chast::kDisplayAuto)
+                       : connected;
+    if (!handshaken.ok()) {
+        *detail = "the viewer did not connect: " + handshaken.to_string();
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // Keep interacting across two full timeout windows: each mouse move must
+    // reset the timer, or the host would close the session at kIdleMs.
+    for (int step = 0; step < 5; ++step) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Mouse;
+        event.mouse.action = chast::MouseAction::Move;
+        event.mouse.x = step * 10;
+        event.mouse.y = step * 10;
+        const chast::Error sent = client->send_input(event);
+        if (!sent.ok()) {
+            *detail = "the host closed an active session: " + sent.to_string();
+            client.reset();
+            host->stop();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    if (host->status().state != chast::HostState::Streaming) {
+        *detail = "the host left an interacted session before the viewer went quiet";
+        client.reset();
+        host->stop();
+        return false;
+    }
+    // Quiet again: one more timeout window must end the session by itself.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline &&
+           host->status().state == chast::HostState::Streaming) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const bool stopped = host->status().state != chast::HostState::Streaming;
+    const uint64_t idle_closes = host->status().stats.idle_disconnects;
+    client.reset();
+    host->stop();
+    if (!stopped) {
+        *detail = "the host kept an idle session open past the timeout";
+        return false;
+    }
+    if (idle_closes != 1) {
+        *detail = "the host counted " + std::to_string(idle_closes) +
+                  " idle close(s) for one idle session";
+        return false;
+    }
+
+    // Timeout off: the same quiet session must stay open.
+    const uint16_t off_port = static_cast<uint16_t>(port + 1);
+    std::string off_error;
+    std::unique_ptr<chast::HostServer> off_host = start_probe_host(
+        off_port, [](chast::HostSettings&) {}, &off_error);
+    if (!off_host) {
+        *detail = "timeout-off host: " + off_error;
+        return false;
+    }
+    chast::QuicClientConfig off_config;
+    off_config.host = "127.0.0.1";
+    off_config.port = off_port;
+    off_config.idle_timeout_ms = 5000;
+    off_config.pinned_fingerprint = off_host->status().fingerprint;
+    off_config.password = "open-sesame";
+    std::unique_ptr<chast::QuicSession> off_client =
+        chast::QuicSession::create_client(off_config, &off_error);
+    if (!off_client) {
+        *detail = "timeout-off client: " + off_error;
+        off_host->stop();
+        return false;
+    }
+    chast::ServerInfo off_info;
+    chast::Error off_connected = off_client->connect(std::chrono::seconds(10));
+    chast::Error off_handshaken =
+        off_connected.ok() ? off_client->handshake(off_info, std::chrono::seconds(10),
+                                                   chast::kDisplayAuto)
+                           : off_connected;
+    if (!off_handshaken.ok()) {
+        *detail = "the timeout-off viewer did not connect: " + off_handshaken.to_string();
+        off_client.reset();
+        off_host->stop();
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kIdleMs + 500));
+    const bool still_open = off_host->status().state == chast::HostState::Streaming;
+    const uint64_t off_closes = off_host->status().stats.idle_disconnects;
+    off_client.reset();
+    off_host->stop();
+    if (!still_open) {
+        *detail = "a host without a timeout closed a quiet session";
+        return false;
+    }
+    if (off_closes != 0) {
+        *detail = "a host without a timeout counted an idle close";
         return false;
     }
     return true;
@@ -8705,6 +9013,34 @@ int run_verify(const Options& options) {
         check(passed, "a host without the secure-desktop path reports SAS unsupported");
         if (!passed) {
             std::printf("     SAS gate probe: %s\n", detail.c_str());
+        }
+    }
+    if (local.restart) {
+        check(received.restart_updates >= 1, "the host answered the restart request");
+        check(received.restart_ok_seen, "the host reported the restart as scheduled");
+        check(sent.restart_requests == 1, "the host counted one restart request");
+        check(sent.restart_failures == 0, "the host recorded no restart failure");
+        if (!received.restart_ok_seen) {
+            std::printf("     restart answer: code %u%s%s\n",
+                        static_cast<unsigned>(received.restart_last_code),
+                        received.restart_last_reason.empty() ? "" : ": ",
+                        received.restart_last_reason.c_str());
+        }
+        std::string detail;
+        const bool passed =
+            restart_denied_works(static_cast<uint16_t>(probe_base + 21), &detail);
+        check(passed, "a host that never granted restart refuses the request locally");
+        if (!passed) {
+            std::printf("     restart gate probe: %s\n", detail.c_str());
+        }
+    }
+    if (local.idle_disconnect) {
+        std::string detail;
+        const bool passed =
+            idle_disconnect_works(static_cast<uint16_t>(probe_base + 22), &detail);
+        check(passed, "a host closes an idle session and keeps an interacted one");
+        if (!passed) {
+            std::printf("     idle disconnect probe: %s\n", detail.c_str());
         }
     }
     {
@@ -9567,6 +9903,7 @@ int run_weak_network(const Options& options) {
     local.microphone_recorder.reset();
     local.privacy = false;
     local.sas = false;
+    local.restart = false;
     local.stream_options = false;
     local.reannounce = false;
     local.resolution = 0;

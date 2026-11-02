@@ -11,16 +11,17 @@ import (
 )
 
 type identityEntry struct {
-	ID         string   `json:"id"`
-	Hostname   string   `json:"hostname"`
-	Platform   string   `json:"platform"`
-	Version    string   `json:"version"`
-	Alias      string   `json:"alias"`
-	Tags       []string `json:"tags"`
-	Online     bool     `json:"online"`
-	Relay      string   `json:"relay"`
-	Candidate  string   `json:"candidate"`
-	LastSeenMS int64    `json:"last_seen_ms"`
+	ID             string   `json:"id"`
+	Hostname       string   `json:"hostname"`
+	Platform       string   `json:"platform"`
+	Version        string   `json:"version"`
+	MetadataSigned bool     `json:"metadata_signed"`
+	Alias          string   `json:"alias"`
+	Tags           []string `json:"tags"`
+	Online         bool     `json:"online"`
+	Relay          string   `json:"relay"`
+	Candidate      string   `json:"candidate"`
+	LastSeenMS     int64    `json:"last_seen_ms"`
 }
 
 type identityList struct {

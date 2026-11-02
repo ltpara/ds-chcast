@@ -141,6 +141,14 @@ struct HostServerStats {
     // is answered, so a failed one never ends the session.
     uint64_t sas_requests = 0;
     uint64_t sas_failures = 0;
+    // Restart requests and how many were refused or failed. A successful one
+    // closes the session with the machine, so it never returns to a later
+    // session to be counted twice.
+    uint64_t restart_requests = 0;
+    uint64_t restart_failures = 0;
+    // Sessions the host closed itself after the configured idle timeout ran
+    // out. Zero while auto-disconnect is off or the viewer keeps interacting.
+    uint64_t idle_disconnects = 0;
     // Viewer stream preferences: every request handled, the ones that changed
     // the encoder or its rate, and the refusals (unsupported codec, failed
     // rebuild or a busy cooldown). A request that already matched the stream
@@ -241,6 +249,10 @@ struct HostServerConfig {
     // Stop this many seconds after the first stream was announced; 0 = run
     // until stop().
     double run_seconds = 0.0;
+    // Test hook: overrides settings.auto_disconnect_minutes when non-zero.
+    // A loopback check cannot wait whole minutes, and the session logic must
+    // still be the same one a configured host runs.
+    uint32_t auto_disconnect_ms = 0;
     // Re-announce the stream once, two seconds in. Exercises the viewer's
     // update path; the loopback check turns it on.
     bool reannounce = false;
@@ -322,6 +334,11 @@ struct HostServerConfig {
     // loopback check substitutes a callback so it never touches the real
     // secure desktop; returning false fills the reason and reports Failed.
     std::function<bool(std::string*)> send_sas;
+    // Schedules a restart of this machine. Empty uses the platform shutdown
+    // API with a short delay and a forced reboot; the loopback check
+    // substitutes a callback so an automated run never reboots the operator's
+    // machine. Returning false fills the reason and reports Failed.
+    std::function<bool(std::string*)> restart_system;
 };
 
 class HostServer {

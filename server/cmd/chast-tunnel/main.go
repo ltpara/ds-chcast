@@ -31,7 +31,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: chast-tunnel host|viewer|discover|apply-update [flags]")
+		return fmt.Errorf("usage: chast-tunnel host|viewer|discover|apply-update|confirm-update [flags]")
 	}
 	switch args[0] {
 	case "host":
@@ -42,8 +42,10 @@ func run(args []string) error {
 		return runDiscover(args[1:])
 	case "apply-update":
 		return runApplyUpdate(args[1:])
+	case "confirm-update":
+		return runConfirmUpdate(args[1:])
 	default:
-		return fmt.Errorf("unknown mode %q; use host, viewer, discover or apply-update", args[0])
+		return fmt.Errorf("unknown mode %q; use host, viewer, discover, apply-update or confirm-update", args[0])
 	}
 }
 
@@ -52,6 +54,7 @@ func runHost(args []string) error {
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
 	serverKey := fs.String("server-key", "", "server key required by the API")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
+	publisherPubKey := fs.String("publisher-pubkey", "", "pin the release publisher Ed25519 public key; updates must then carry its signature")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id registered with the service")
 	oldID := fs.String("old-id", "", "previous host id to migrate on the server (used after changing --id)")
@@ -65,11 +68,14 @@ func runHost(args []string) error {
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	autoUpdate := fs.Bool("auto-update", false, "stage and launch the installer advertised by the server; needs --server-pubkey")
 	autoUpdateDir := fs.String("auto-update-dir", "", "directory for the downloaded installer (default: system temp)")
+	wakeRelay := fs.Bool("wake-relay", false, "relay cross-subnet Wake-on-LAN jobs from the server onto this machine's link")
+	wakeTargets := fs.String("wake-targets", "", "comma-separated broadcast destinations for wake relays, e.g. 127.0.0.1:9 for a local diagnostic")
 	lanDiscovery := fs.Bool("lan-discovery", true, "answer LAN discovery pings; exposes id, hostname, username, platform and version on the local link")
 	lanPort := fs.Int("lan-port", lan.DefaultPort, "UDP port for LAN discovery")
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
+	socks5 := fs.String("socks5", "", "route the HTTP API and relay carrier through socks5://[user:pass@]host:port; UDP stays direct")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
@@ -79,6 +85,12 @@ func runHost(args []string) error {
 	tlsConfig, err := netutil.ClientTLSConfig(*tlsCA, *tlsCert, *tlsKey)
 	if err != nil {
 		return err
+	}
+	wakeTargetList := splitCSV(*wakeTargets)
+	for _, target := range wakeTargetList {
+		if _, _, err := net.SplitHostPort(target); err != nil {
+			return fmt.Errorf("invalid --wake-targets %q: %w", target, err)
+		}
 	}
 
 	log := newLogger(*verbose)
@@ -101,24 +113,28 @@ func runHost(args []string) error {
 	}
 
 	h, err := agent.StartHost(ctx, agent.HostConfig{
-		ServerURL:       *server,
-		Servers:         splitCSV(*rendezvousList),
-		ServerKey:       *serverKey,
-		ServerPublicKey: *serverPubKey,
-		ID:              *id,
-		OldID:           *oldID,
-		Key:             *key,
-		Fingerprint:     *fingerprint,
-		LocalAddr:       *local,
-		CarrierAddr:     *carrierAddr,
-		AuditSpool:      *auditSpool,
-		ListenAddr:      *listen,
-		Keepalive:       *keepalive,
-		UPnP:            *upnpEnabled,
-		AutoUpdate:      *autoUpdate,
-		UpdateDir:       *autoUpdateDir,
-		TLS:             tlsConfig,
-		Logger:          log,
+		ServerURL:          *server,
+		Servers:            splitCSV(*rendezvousList),
+		ServerKey:          *serverKey,
+		ServerPublicKey:    *serverPubKey,
+		ID:                 *id,
+		OldID:              *oldID,
+		Key:                *key,
+		Fingerprint:        *fingerprint,
+		LocalAddr:          *local,
+		CarrierAddr:        *carrierAddr,
+		AuditSpool:         *auditSpool,
+		ListenAddr:         *listen,
+		Keepalive:          *keepalive,
+		UPnP:               *upnpEnabled,
+		AutoUpdate:         *autoUpdate,
+		PublisherPublicKey: *publisherPubKey,
+		UpdateDir:          *autoUpdateDir,
+		WakeRelay:          *wakeRelay,
+		WakeTargets:        wakeTargetList,
+		TLS:                tlsConfig,
+		Socks5:             *socks5,
+		Logger:             log,
 		OnInfo: func(info agent.HostInfo) {
 			emitMu.Lock()
 			defer emitMu.Unlock()
@@ -193,6 +209,7 @@ func runViewer(args []string) error {
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
+	socks5 := fs.String("socks5", "", "route the HTTP API and TCP carrier through socks5://[user:pass@]host:port; UDP direct/relay is disabled")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
@@ -226,6 +243,7 @@ func runViewer(args []string) error {
 		DirectTimeout:   *directTimeout,
 		UPnP:            *upnpEnabled,
 		TLS:             tlsConfig,
+		Socks5:          *socks5,
 		Logger:          log,
 		OnPath: func(info agent.PathInfo) {
 			emit(agentEvent{
