@@ -245,14 +245,16 @@ add_library(chast.host STATIC
     src/host/host_server.cc
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
+    src/host/virtual_display.cc
     src/win/privacy.cc
     src/win/sas.cc)
 
 target_include_directories(chast.host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(chast.host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # Media Foundation supplies camera enumeration and capture; mf holds the
-# device-source helpers and mfuuid the format GUIDs.
-target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32 mf mfplat mfreadwrite mfuuid)
+# device-source helpers and mfuuid the format GUIDs. SetupAPI and CfgMgr
+# identify virtual display adapters and their monitor children.
+target_link_libraries(chast.host PUBLIC chast.codec chast.net chast.audio chast.clipboard chast.transfer shell32 ole32 mf mfplat mfreadwrite mfuuid setupapi cfgmgr32 advapi32 wintrust bcrypt)
 
 # Windows integration shared by the tray and the service: firewall/autostart
 # helpers, the Go tunnel child process and SCM control. Kept apart from
@@ -448,6 +450,11 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-login-test tests/host_login_test.cc)
     target_link_libraries(chast-host-login-test PRIVATE chast.host)
 
+    # Virtual display detection, classification and mode choice. The live
+    # probe is read-only and runs without a driver.
+    add_executable(chast-virtual-display-test tests/virtual_display_test.cc)
+    target_link_libraries(chast-virtual-display-test PRIVATE chast.host)
+
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
     add_executable(chast-host-security-test tests/host_security_test.cc)
@@ -532,6 +539,7 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_control PROPERTIES TIMEOUT 180)
     add_test(NAME host_login COMMAND chast-host-login-test)
     set_tests_properties(host_login PROPERTIES TIMEOUT 180)
+    add_test(NAME virtual_display COMMAND chast-virtual-display-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)

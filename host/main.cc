@@ -40,6 +40,7 @@
 #include "chast/host_settings.h"
 #include "chast/identity.h"
 #include "chast/protocol.h"
+#include "chast/virtual_display.h"
 #include "i18n.h"
 #include "platform.h"
 #include "service.h"
@@ -858,6 +859,28 @@ std::wstring tunnel_text() {
         text += tr(L" · 设备 ID ") + widen(settings.tunnel_id);
     }
     return text;
+}
+
+std::wstring virtual_display_text() {
+    const VirtualDisplayProbe probe = probe_virtual_display();
+    const VirtualDisplayStatus status = classify_virtual_display_probe(probe);
+    switch (status.state) {
+        case VirtualDisplayState::Unsupported:
+            return tr(L"虚拟显示器：不支持");
+        case VirtualDisplayState::NotInstalled:
+            return tr(L"虚拟显示器：未安装");
+        case VirtualDisplayState::Installed:
+            return tr(L"虚拟显示器：已安装，未启用");
+        case VirtualDisplayState::Active:
+            return tr(L"虚拟显示器：运行中 ") + std::to_wstring(status.active_monitors) + L"/" +
+                   std::to_wstring(status.max_monitors);
+        case VirtualDisplayState::Error:
+            if (!probe.conflicting_driver.empty()) {
+                return tr(L"虚拟显示器：检测到其他虚拟显示驱动");
+            }
+            return tr(L"虚拟显示器：检测失败");
+    }
+    return tr(L"虚拟显示器：不支持");
 }
 
 std::wstring path_text(const HostStatus& status) {
@@ -1857,6 +1880,9 @@ enum SecurityDialogId {
     kSecAudioRefresh,
     kSecAudioAec,
     kSecAudioGate,
+    kSecVirtualDisplayPolicy,
+    kSecVirtualDisplayCount,
+    kSecVirtualDisplayResolution,
     kSecSave,
     kSecCancel,
 };
@@ -1907,6 +1933,9 @@ struct SecurityDialogState {
     HWND audio_device = nullptr;
     HWND audio_aec = nullptr;
     HWND audio_gate = nullptr;
+    HWND virtual_display_policy = nullptr;
+    HWND virtual_display_count = nullptr;
+    HWND virtual_display_resolution = nullptr;
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
@@ -2220,6 +2249,43 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
                 : 0;
     }
 
+    if (dialog.virtual_display_policy != nullptr) {
+        const LRESULT selected =
+            SendMessageW(dialog.virtual_display_policy, CB_GETCURSEL, 0, 0);
+        updated.virtual_display = selected == 1
+                                      ? VirtualDisplayPolicy::Auto
+                                      : selected == 2 ? VirtualDisplayPolicy::On
+                                                      : VirtualDisplayPolicy::Off;
+    }
+    {
+        const std::string count_text =
+            trim_ascii(narrow(control_text(dialog.virtual_display_count)));
+        const bool digits = !count_text.empty() && count_text.size() <= 1 &&
+                            std::all_of(count_text.begin(), count_text.end(), [](char c) {
+                                return c >= '0' && c <= '9';
+                            });
+        const unsigned long count =
+            digits ? std::strtoul(count_text.c_str(), nullptr, 10) : 0;
+        if (count < 1 || count > kMaxVirtualDisplayMonitors) {
+            return complain(tr(L"虚拟显示器数量必须是 1 到 4 之间的整数。"));
+        }
+        updated.virtual_display_monitors = static_cast<uint32_t>(count);
+    }
+    if (dialog.virtual_display_resolution != nullptr) {
+        wchar_t resolution[64]{};
+        const LRESULT selected =
+            SendMessageW(dialog.virtual_display_resolution, CB_GETCURSEL, 0, 0);
+        if (selected >= 0 &&
+            SendMessageW(dialog.virtual_display_resolution, CB_GETLBTEXT, selected,
+                         reinterpret_cast<LPARAM>(resolution)) != CB_ERR) {
+            std::string normalized;
+            if (!parse_virtual_display_resolution(narrow(resolution), normalized)) {
+                return complain(tr(L"虚拟显示器分辨率必须是 WIDTHxHEIGHT。"));
+            }
+            updated.virtual_display_resolution = normalized;
+        }
+    }
+
     updated.token_auth = is_checked(dialog.token_auth);
     updated.token_mode = is_checked(dialog.one_time) ? HostTokenMode::OneTime
                                                      : HostTokenMode::Reusable;
@@ -2416,7 +2482,7 @@ bool edit_security_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 700 : 620;
     const int page_text_width = dialog_width - 80;
-    RECT frame{0, 0, px(dialog_width), px(658)};
+    RECT frame{0, 0, px(dialog_width), px(772)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -2449,7 +2515,7 @@ bool edit_security_settings(HostSettings& result) {
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12),
-                                 px(dialog_width - 32), px(578), window,
+                                 px(dialog_width - 32), px(692), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
@@ -2729,11 +2795,40 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC",
         tr(L"远程配置需要单独授予权限；关闭某个开关会在本会话立即撤销对应权限，开启则从下次连接生效。"),
         SS_LEFT, 0, 32, 576, page_text_width, 24, 0, nullptr, &dialog.advanced_page);
+    const wchar_t* virtual_display_label = tr(L"虚拟显示器");
+    add(L"STATIC", virtual_display_label, SS_LEFT, 0, 32, 610, text_px(virtual_display_label) + 8,
+        20, 0, nullptr, &dialog.advanced_page);
+    const int virtual_display_left = 32 + text_px(virtual_display_label) + 12;
+    dialog.virtual_display_policy =
+        add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+            WS_EX_CLIENTEDGE, virtual_display_left, 606, 260, 200, kSecVirtualDisplayPolicy,
+            nullptr, &dialog.advanced_page);
+    const wchar_t* virtual_count_label = tr(L"数量（1–4）");
+    const int virtual_count_label_width = text_px(virtual_count_label);
+    add(L"STATIC", virtual_count_label, SS_LEFT, 0, 32, 640, virtual_count_label_width + 8, 20, 0,
+        nullptr, &dialog.advanced_page);
+    dialog.virtual_display_count =
+        add(L"EDIT", L"1", ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE,
+            32 + virtual_count_label_width + 12, 636, 60, 26, kSecVirtualDisplayCount, nullptr,
+            &dialog.advanced_page);
+    const wchar_t* virtual_resolution_label = tr(L"分辨率");
+    const int virtual_resolution_left =
+        std::max(32 + virtual_count_label_width + 12 + 60 + 20, 208);
+    add(L"STATIC", virtual_resolution_label, SS_LEFT, 0, virtual_resolution_left, 640,
+        text_px(virtual_resolution_label) + 8, 20, 0, nullptr, &dialog.advanced_page);
+    dialog.virtual_display_resolution =
+        add(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+            WS_EX_CLIENTEDGE,
+            virtual_resolution_left + text_px(virtual_resolution_label) + 12, 636, 180, 200,
+            kSecVirtualDisplayResolution, nullptr, &dialog.advanced_page);
+    const std::wstring virtual_display_line = virtual_display_text();
+    add(L"STATIC", virtual_display_line.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, 32, 674,
+        page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
     const int sec_cancel_left = dialog_width - 20 - 90;
-    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 606,
+    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 720,
         90, 32, kSecSave, nullptr, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 606, 90, 32,
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 720, 90, 32,
         kSecCancel, nullptr, nullptr);
 
     // ----- initial state -----
@@ -2772,6 +2867,36 @@ bool edit_security_settings(HostSettings& result) {
     dialog.selected_audio_device = settings.audio_device;
     set_check(dialog.audio_aec, settings.audio_aec);
     set_check(dialog.audio_gate, settings.audio_silence_gate_ms != 0);
+    for (const wchar_t* item :
+         {tr(L"关闭"), tr(L"无显示器时自动启用"), tr(L"总是启用")}) {
+        SendMessageW(dialog.virtual_display_policy, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(item));
+    }
+    const int policy_index = settings.virtual_display == VirtualDisplayPolicy::Auto
+                                 ? 1
+                                 : settings.virtual_display == VirtualDisplayPolicy::On ? 2 : 0;
+    SendMessageW(dialog.virtual_display_policy, CB_SETCURSEL, policy_index, 0);
+    set_text(dialog.virtual_display_count,
+             widen(std::to_string(settings.virtual_display_monitors)));
+    int resolution_index = -1;
+    int resolution_count = 0;
+    for (const VirtualDisplayMode& mode : usbmmidd_default_modes()) {
+        const std::wstring item =
+            widen(std::to_string(mode.width) + "x" + std::to_string(mode.height));
+        SendMessageW(dialog.virtual_display_resolution, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(item.c_str()));
+        if (item == widen(settings.virtual_display_resolution)) {
+            resolution_index = resolution_count;
+        }
+        ++resolution_count;
+    }
+    if (resolution_index < 0) {
+        const std::wstring item = widen(settings.virtual_display_resolution);
+        SendMessageW(dialog.virtual_display_resolution, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(item.c_str()));
+        resolution_index = resolution_count;
+    }
+    SendMessageW(dialog.virtual_display_resolution, CB_SETCURSEL, resolution_index, 0);
     refresh_audio_devices(dialog);
 
     if (!settings.totp_secret.empty()) {
@@ -2929,6 +3054,7 @@ void show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kSecurityButton, tr(L"安全设置…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, tunnel_text().c_str());
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, virtual_display_text().c_str());
     AppendMenuW(menu, MF_STRING, kTunnelSettingsButton, tr(L"连接服务设置…"));
     AppendMenuW(menu, MF_STRING, kTunnelRegisterButton, tr(L"重新注册连接服务"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -3621,6 +3747,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             const bool ok = chast::host::set_autostart(enabled, &error);
             LocalFree(argv);
             return ok ? 0 : 1;
+        } else if (arg == L"--vdisplay") {
+            std::vector<std::wstring> vdisplay_args;
+            for (int next = i + 1; next < argc; ++next) {
+                vdisplay_args.emplace_back(argv[next]);
+            }
+            LocalFree(argv);
+            return chast::run_vdisplay_command(vdisplay_args);
         } else if (arg == L"--help" || arg == L"-h") {
             MessageBoxW(nullptr,
                         tr(L"chast 主机\n\n"
@@ -3628,6 +3761,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                         L"--portable          便携模式：设置保存在程序目录下，不写开机启动\n"
                         L"--tray              启动后隐藏窗口\n"
                         L"--autostart on|off  设置开机启动\n"
+                        L"--vdisplay <命令>   虚拟显示器：install --package <目录> [--count 1-4]、uninstall、set-count <0-4>、status（安装/卸载需要管理员）\n"
                         L"--firewall <端口> [隧道端口]  添加防火墙规则（含局域网发现 21129/UDP，需要管理员）"),
                         window_title(), MB_OK | MB_ICONINFORMATION);
             LocalFree(argv);

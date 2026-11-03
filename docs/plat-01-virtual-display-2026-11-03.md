@@ -1,6 +1,7 @@
 # PLAT-01 虚拟显示器：选型与接入设计（usbmmidd_v2）
 
-- 状态：方案已定，未开始实现
+- 状态：PLAT-01a/01c 已落地；PLAT-01b 代码脚手架已完成，
+  真机安装仍被 Amyuni 再分发许可、固定哈希驱动包和测试机阻塞
 - 日期：2026-11-03
 - 关联：`docs/rustdesk-gap-tasks-2026-11-01.md` 的 PLAT-01
 - 目标：让没有接显示器的 Windows 主机也能被 chast 查看器远程操作，并且安装、卸载和签名都可验证。
@@ -257,8 +258,9 @@ chast-host.exe --vdisplay status [--log <文件>]
 - `status` 不需要提权，用于托盘刷新和诊断；
 - 子进程把详细错误写到 `--log` 指定的文件（默认
   `%ProgramData%\chast\vdisplay.log`），托盘读取最后一行展示；
-- 退出码：`0` 成功、`2` 参数错误、`3` 包缺失/哈希不符、`4` 签名不符、
-  `5` 安装失败、`6` 设备未出现、`7` 卸载失败、`8` 平台不支持、`9` 数量越界。
+- 退出码：`0` 成功、`2` 参数错误或缺少管理员权限、`3` 包缺失/哈希不符、
+  `4` 签名不符、`5` 安装失败、`6` 设备未出现、`7` 卸载失败、
+  `8` 平台不支持、`9` 数量越界。
 
 **服务策略**：`chast-service` 以 LocalSystem 运行，可以执行
 `set-count`/启用停用，但**永远不自动安装或卸载驱动**。安装/卸载只发生在
@@ -408,6 +410,94 @@ chast-host.exe --vdisplay status [--log <文件>]
 
 编号说明：roadmap 当前最后一条是 121（P2-113），这些切片落地时按顺序分配
 P2-114 起的编号；在未落地前只使用 PLAT-01a～e，避免占用未来编号。
+
+截至 2026-11-03：PLAT-01a 与 PLAT-01c 已完成；PLAT-01b 的代码脚手架已完成，
+固定哈希驱动包、Amyuni 再分发许可、第三方许可声明与真机 A1 仍阻塞，因此该
+切片不能标记为完成。PLAT-01d 尚未开始。
+
+### 9.1 落地记录
+
+**PLAT-01a 已完成（2026-11-03）**
+
+- `host.ini` 新增 `virtual_display`、`virtual_display_monitors`、
+  `virtual_display_resolution`、`virtual_display_provider`，含范围校验、
+  超限钳制与逐项告警；`tests/host_settings_test.cc` 覆盖往返、默认值与非法值。
+- 新增 `include/chast/virtual_display.h`、`src/host/virtual_display.cc`：
+  provider 接口、x64/Windows 10 1809 平台检查、SetupAPI 检测 usbmmidd 适配器
+  与显示器子设备、WUDF 服务键、VDD/Parsec/RustDesk 冲突检测、状态分类与
+  模式选择；`tests/virtual_display_test.cc` 覆盖分类、模式选择与工厂。
+- 托盘菜单和“安全设置 → 高级”页增加只读状态行（不支持/未安装/已安装/
+  运行中/冲突），中英文文案同步。
+- 验证：`ctest -C Release -R "host_settings|virtual_display|host_i18n"`
+  3/3 通过；`chast-host`、`chast-service` 构建通过。未安装任何驱动，也未改变
+  本机显示拓扑。
+- 未包含：驱动包、提权安装/卸载（PLAT-01b）、启用/停用与 worker 接线
+  （PLAT-01c）。
+
+**PLAT-01c 策略层已完成（2026-11-03）**
+
+- `include/chast/virtual_display.h` 新增 `VirtualDisplayPolicy`（从
+  `host_settings.h` 移入）、`VirtualDisplayAction`、`VirtualDisplayPlan`、
+  `VirtualDisplayPrepareResult`、`plan_virtual_display()` 与
+  `prepare_virtual_display()`。规划是纯函数：`off` 不动作；`auto` 只在没有
+  有面积的活动显示时动作；`on` 总是确保启用；不支持、冲突、未安装、扫描失败
+  分别给出可读原因；数量钳制在 1～4；分辨率从 provider 的模式列表里按
+  “精确 → 宽高比 → 面积”选择。
+- `host/worker.cc` 在加载机器设置之后、创建 `HostServer` 之前调用
+  `prepare_virtual_display()`，写入 `vdisplay:` 日志（状态、活动数量、失败
+  原因）。未安装驱动、检测到冲突或 provider 动作未实现都不会阻止会话启动；
+  `virtual_display_provider=vdd` 会明确记录“本版本未实现”。
+- 托盘“安全设置 → 高级”页新增：策略下拉（关闭/无显示器时自动启用/总是
+  启用）、数量输入（1～4）、分辨率下拉（usbmmidd 默认模式，保留当前自定义
+  值）；保存写回 `host.ini`，中英文案同步。
+- 单测：`tests/virtual_display_test.cc` 用假 provider 覆盖策略决策与编排
+  （off/auto/on、有无活动显示、数量钳制、模式选择、provider 失败、启用后
+  数量为 0），共 66 项通过；`host_settings`、`host_i18n` 同时通过。
+- 全量回归：重新构建全部 Release 目标后 `ctest -C Release` 42/42 通过
+  （639.55 s，2026-11-03 21:03），含此前因旧二进制误报的 `quic_loopback`、
+  `quic_restart`、`quic_idle_disconnect`。
+- 本切片仍未安装驱动、未改变本机显示拓扑。provider 的
+  `set_monitor_count()` / `select_mode()` 仍是占位实现，因此 auto/on 在装有
+  驱动的机器上会记录“not implemented in this build”；A2/A7/A8/A9 需要等
+  PLAT-01b 的 deviceinstaller 与状态文件落地后做真机验收。
+
+**PLAT-01b 代码脚手架已完成（2026-11-03，真机验收仍阻塞）**
+
+- 驱动包契约：默认目录 `<exe>\drivers\usbmmidd_v2`；必需文件为
+  `deviceinstaller64.exe`、`usbmmidd.inf`、`usbmmidd.cat`、
+  `x64/usbmmidd.dll`、`Win32/usbmmidd.dll`、`License.txt` 和
+  `manifest.sha256`。manifest 使用 sha256sum 风格并必须覆盖全部必需文件；
+  逐文件 SHA-256 由 BCrypt 计算；`deviceinstaller64.exe` 通过
+  WinVerifyTrust 校验 Authenticode；可选 `SOURCE.txt` 提供 `VERSION:` 与
+  包级 `SHA256:`。`verify_virtual_display_package()` 返回
+  Ok/Unsupported/Missing/HashMismatch/SignatureMismatch，驱动 catalog 仍交给
+  PnP 在安装时验证。
+- 状态文件：`%ProgramData%\chast\virtual-display.json`，字段为 provider、
+  package_version、package_sha256、installed_at、owned、last_error；自带
+  转义/解析，损坏时按无记录处理。`owned=false` 时卸载只复用、不删除驱动。
+- CLI：`chast-host.exe --vdisplay install --package <目录> [--count 1-4]`、
+  `uninstall`、`set-count <0-4>`、`status [--log <文件>]`；退出码
+  0/2/3/4/5/6/7/8/9 与设计 §5.4 一致。`status` 无需提权；
+  install/uninstall/set-count 检查提升令牌；服务路径永远不会自动安装或卸载。
+- provider 动作已从占位实现替换为 deviceinstaller64 调用：安装后轮询 60 s，
+  `enableidd 1/0` 每次增减一台并轮询 30 s，卸载先 `stop` 再 `remove`；
+  `select_mode()` 用 `ChangeDisplaySettingsExW` 并先确认模式在枚举列表中。
+  worker 使用 `default_virtual_display_package_dir()` 查找安装器。
+- 验证：`chast-host`、`chast-service`、`chast-virtual-display-test`、
+  `chast-host-i18n-test` 构建通过；`ctest -C Release -R
+  "virtual_display|host_i18n|host_settings"` 3/3 通过；
+  `chast-virtual-display-test` 共 106 项通过（新增 manifest/SHA-256/包校验/
+  状态文件 JSON/CLI/时间戳/默认包目录）。实机
+  `chast-host.exe --vdisplay status --log ...` 返回 0 并写入
+  `state=not_installed provider=usbmmidd active=0 max=4`，未知动作返回 2。
+  测试全部使用临时目录：一次早期运行曾因未知动作先于 `--log` 解析而把 usage
+  写进真实 `%ProgramData%`，已改为优先提取 `--log` 并验证不再创建该目录。
+  最终源码重新构建后全量 `ctest -C Release` 42/42 通过（640.11 s，
+  2026-11-03），归属判定为“已存在的第三方驱动只复用、不认领”
+  （`owned=false`），安装被拒或失败时保留原记录与安装时间。
+- 仍未包含/阻塞：没有下载或提交驱动包，`tools/fetch-usbmmidd.ps1` 与第三方
+  许可声明未创建，安装器/打包脚本未接 `--virtual-display`（PLAT-01d），
+  A1～A10 均未执行。修复这两项前置条件后才能把 PLAT-01b 标记为完成。
 
 ## 10. 风险与未决问题
 

@@ -18,8 +18,10 @@
 #include <string_view>
 #include <vector>
 
+#include "chast/capture.h"
 #include "chast/host_server.h"
 #include "chast/identity.h"
+#include "chast/virtual_display.h"
 #include "platform.h"
 #include "service_log.h"
 #include "tunnel.h"
@@ -266,6 +268,45 @@ bool request_session_switch(uint32_t session_id, std::string* error) {
     return true;
 }
 
+void prepare_virtual_display_on_start(const HostSettings& settings) {
+    if (settings.virtual_display == VirtualDisplayPolicy::Off) {
+        return;
+    }
+    if (settings.virtual_display_provider == "vdd") {
+        worker_event("vdisplay.unsupported", {{"provider", "vdd"}});
+        return;
+    }
+    VirtualDisplayProviderKind kind = VirtualDisplayProviderKind::None;
+    if (settings.virtual_display_provider == "usbmmidd") {
+        kind = VirtualDisplayProviderKind::Usbmmidd;
+    } else {
+        kind = detect_virtual_display_provider();
+    }
+    std::unique_ptr<VirtualDisplayProvider> provider;
+    if (kind != VirtualDisplayProviderKind::None) {
+        provider = make_virtual_display_provider(kind, default_virtual_display_package_dir());
+    }
+    if (!provider) {
+        const VirtualDisplayStatus status = classify_virtual_display_probe(probe_virtual_display());
+        worker_event("vdisplay.unavailable", {{"detail", status.detail}});
+        return;
+    }
+    bool active_display = false;
+    for (const DisplayInfo& display : enumerate_displays()) {
+        if (display.width != 0 && display.height != 0) {
+            active_display = true;
+            break;
+        }
+    }
+    const VirtualDisplayPrepareResult result = prepare_virtual_display(
+        settings.virtual_display, settings.virtual_display_monitors,
+        settings.virtual_display_resolution, provider.get(), active_display);
+    worker_event("vdisplay.prepared",
+                 {{"detail", result.detail},
+                  {"state", virtual_display_state_name(result.status.state)},
+                  {"monitors", std::to_string(result.status.active_monitors)}});
+}
+
 bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
                   const std::string& fingerprint, std::atomic<bool>& ended,
                   std::atomic<uint32_t>& exit_code) {
@@ -323,6 +364,7 @@ int run_worker(std::string* error) {
     if (settings.token_auth) {
         worker_event("auth.token_enabled");
     }
+    prepare_virtual_display_on_start(settings);
 
     HANDLE stop = OpenEventW(SYNCHRONIZE, FALSE, kWorkerStopEvent);
     if (stop == nullptr) {
