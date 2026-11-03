@@ -16,6 +16,7 @@
 #include "chast/encoder.h"
 #include "chast/protocol.h"
 #include "chast/security.h"
+#include "chast/virtual_display.h"
 
 namespace chast {
 
@@ -157,6 +158,21 @@ struct HostSettings {
     // kDisplayAuto means the primary display.
     uint16_t display = kDisplayAuto;
 
+    // Virtual display. Off (the default) only reports status; the operator
+    // enables one from the tray. Auto creates one before a session when the
+    // machine has no active display; On always does. A display created this
+    // way stays until the next start or an explicit disable, because removing
+    // it mid-session reflows every window.
+    VirtualDisplayPolicy virtual_display = VirtualDisplayPolicy::Off;
+    // 1..kMaxVirtualDisplayMonitors; larger values are clamped with a warning.
+    uint32_t virtual_display_monitors = 1;
+    // Preferred mode as WIDTHxHEIGHT. The provider picks the closest mode it
+    // supports when the exact one is missing.
+    std::string virtual_display_resolution = "1920x1080";
+    // auto detects an installed provider; "usbmmidd" pins one. "vdd" parses
+    // for forward compatibility but is not implemented yet.
+    std::string virtual_display_provider = "auto";
+
     // Rendezvous service. An empty server_url means standalone operation: the
     // host serves the LAN directly and does not register anywhere.
     bool tunnel = true;
@@ -231,6 +247,12 @@ bool unprotect_totp_secret(const std::string& stored_base64, SecretScope scope,
 // "h264"/"hevc", the spelling used in the settings file.
 const char* codec_setting_name(VideoCodec codec);
 bool parse_codec_setting(const std::string& text, VideoCodec& codec);
+
+// "off"/"auto"/"on", the spelling used in the settings file.
+const char* virtual_display_policy_name(VirtualDisplayPolicy policy);
+bool parse_virtual_display_policy(const std::string& text, VirtualDisplayPolicy& policy);
+// "auto"/"usbmmidd"/"vdd", normalized to lowercase.
+bool parse_virtual_display_provider(const std::string& input, std::string& normalized);
 
 // Service settings. All parsers trim their input and return false when the
 // value is unusable; the caller decides whether to keep a default. An empty

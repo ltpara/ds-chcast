@@ -707,6 +707,41 @@ HostSettingsLoad load_host_settings(const std::string& path) {
                     settings.display = static_cast<uint16_t>(display);
                 }
             }
+        } else if (key == "virtual_display") {
+            if (!parse_virtual_display_policy(value, settings.virtual_display)) {
+                warn(result.warning,
+                     "virtual_display '" + value + "' is not off, auto or on");
+            }
+        } else if (key == "virtual_display_monitors") {
+            uint32_t monitors = 0;
+            if (!parse_u32(value, monitors) || monitors == 0) {
+                warn(result.warning, "virtual_display_monitors '" + value + "' is not 1.." +
+                                         std::to_string(kMaxVirtualDisplayMonitors));
+            } else if (monitors > kMaxVirtualDisplayMonitors) {
+                warn(result.warning, "virtual_display_monitors '" + value + "' exceeds " +
+                                         std::to_string(kMaxVirtualDisplayMonitors) +
+                                         "; clamping");
+                settings.virtual_display_monitors = kMaxVirtualDisplayMonitors;
+            } else {
+                settings.virtual_display_monitors = monitors;
+            }
+        } else if (key == "virtual_display_resolution") {
+            std::string normalized;
+            if (!parse_virtual_display_resolution(value, normalized)) {
+                warn(result.warning, "virtual_display_resolution '" + value +
+                                         "' is not WIDTHxHEIGHT; using " +
+                                         settings.virtual_display_resolution);
+            } else {
+                settings.virtual_display_resolution = normalized;
+            }
+        } else if (key == "virtual_display_provider") {
+            std::string normalized;
+            if (!parse_virtual_display_provider(value, normalized)) {
+                warn(result.warning, "virtual_display_provider '" + value +
+                                         "' is not auto, usbmmidd or vdd");
+            } else {
+                settings.virtual_display_provider = normalized;
+            }
         } else if (key == "tunnel") {
             if (!parse_bool(value, settings.tunnel)) {
                 warn(result.warning, "tunnel '" + value + "' is not a boolean");
@@ -883,6 +918,10 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "display="
          << (settings.display == kDisplayAuto ? "auto" : std::to_string(settings.display))
          << "\n"
+         << "virtual_display=" << virtual_display_policy_name(settings.virtual_display) << "\n"
+         << "virtual_display_monitors=" << settings.virtual_display_monitors << "\n"
+         << "virtual_display_resolution=" << settings.virtual_display_resolution << "\n"
+         << "virtual_display_provider=" << settings.virtual_display_provider << "\n"
          << "# rendezvous service\n"
          << "tunnel=" << (settings.tunnel ? 1 : 0) << "\n"
          << "server_url=" << settings.server_url << "\n"
@@ -1100,6 +1139,64 @@ bool parse_codec_setting(const std::string& text, VideoCodec& codec) {
     }
     if (value == "hevc" || value == "h265") {
         codec = VideoCodec::Hevc;
+        return true;
+    }
+    return false;
+}
+
+const char* virtual_display_policy_name(VirtualDisplayPolicy policy) {
+    switch (policy) {
+        case VirtualDisplayPolicy::Off:
+            return "off";
+        case VirtualDisplayPolicy::Auto:
+            return "auto";
+        case VirtualDisplayPolicy::On:
+            return "on";
+    }
+    return "off";
+}
+
+bool parse_virtual_display_policy(const std::string& text, VirtualDisplayPolicy& policy) {
+    const std::string value = lower(trim(text));
+    if (value == "off") {
+        policy = VirtualDisplayPolicy::Off;
+        return true;
+    }
+    if (value == "auto") {
+        policy = VirtualDisplayPolicy::Auto;
+        return true;
+    }
+    if (value == "on") {
+        policy = VirtualDisplayPolicy::On;
+        return true;
+    }
+    return false;
+}
+
+bool parse_virtual_display_resolution(const std::string& input, std::string& normalized) {
+    const std::string value = lower(trim(input));
+    const size_t separator = value.find('x');
+    if (separator == std::string::npos || separator == 0 || separator + 1 >= value.size() ||
+        value.find('x', separator + 1) != std::string::npos) {
+        return false;
+    }
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!parse_u32(value.substr(0, separator), width) ||
+        !parse_u32(value.substr(separator + 1), height)) {
+        return false;
+    }
+    if (width < 640 || width > 7680 || height < 480 || height > 4320) {
+        return false;
+    }
+    normalized = std::to_string(width) + "x" + std::to_string(height);
+    return true;
+}
+
+bool parse_virtual_display_provider(const std::string& input, std::string& normalized) {
+    const std::string value = lower(trim(input));
+    if (value == "auto" || value == "usbmmidd" || value == "vdd") {
+        normalized = value;
         return true;
     }
     return false;

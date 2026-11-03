@@ -92,6 +92,10 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.access_token == b.access_token && a.codec == b.codec &&
            a.bitrate_kbps == b.bitrate_kbps && a.framerate == b.framerate &&
            a.quality == b.quality && a.autostart == b.autostart && a.display == b.display &&
+           a.virtual_display == b.virtual_display &&
+           a.virtual_display_monitors == b.virtual_display_monitors &&
+           a.virtual_display_resolution == b.virtual_display_resolution &&
+           a.virtual_display_provider == b.virtual_display_provider &&
            a.tunnel == b.tunnel && a.server_url == b.server_url &&
            a.server_key == b.server_key && a.tunnel_id == b.tunnel_id &&
            a.tunnel_old_id == b.tunnel_old_id &&
@@ -150,6 +154,10 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.quality = 0.5f;
     settings.autostart = true;
     settings.display = 1;
+    settings.virtual_display = chast::VirtualDisplayPolicy::Auto;
+    settings.virtual_display_monitors = 2;
+    settings.virtual_display_resolution = "2560x1440";
+    settings.virtual_display_provider = "usbmmidd";
     settings.tunnel = false;
     settings.server_url = "https://rendezvous.example.com/chast";
     settings.server_key = "server secret";
@@ -197,6 +205,12 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
     check(loaded.settings.auto_disconnect_minutes == 0,
           "a fresh host keeps an idle session open");
+    check(loaded.settings.virtual_display == chast::VirtualDisplayPolicy::Off,
+          "a fresh host never creates a virtual display on its own");
+    check(loaded.settings.virtual_display_monitors == 1 &&
+              loaded.settings.virtual_display_resolution == "1920x1080" &&
+              loaded.settings.virtual_display_provider == "auto",
+          "a fresh host has one 1080p virtual display detected automatically");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");
     check(loaded.settings.auth_mode == chast::HostAuthMode::Both,
@@ -240,6 +254,10 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "framerate=0\n"
                "quality=2\n"
                "display=99\n"
+               "virtual_display=perhaps\n"
+               "virtual_display_monitors=0\n"
+               "virtual_display_resolution=1920\n"
+               "virtual_display_provider=nvidia\n"
                "tunnel=perhaps\n"
                "server_url=ftp://example.com\n"
                "server_key=" + std::string(300, 's') + "\n"
@@ -277,6 +295,13 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.framerate == 30, "a zero framerate falls back");
     check(settings.quality == 0.67f, "an out-of-range quality falls back");
     check(settings.display == chast::kDisplayAuto, "an out-of-range display falls back");
+    check(settings.virtual_display == chast::VirtualDisplayPolicy::Off,
+          "an unparsable virtual display policy stays off");
+    check(settings.virtual_display_monitors == 1, "a zero virtual display count falls back");
+    check(settings.virtual_display_resolution == "1920x1080",
+          "a resolution without a height falls back");
+    check(settings.virtual_display_provider == "auto",
+          "an unknown virtual display provider falls back");
     check(settings.tunnel, "an unparsable tunnel toggle keeps the default");
     check(settings.server_url.empty(), "a non-http service URL is dropped");
     check(settings.server_key.empty(), "an oversized server key is dropped");
@@ -291,7 +316,9 @@ void test_invalid_values(const std::filesystem::path& dir) {
                             "record", "auto_disconnect_minutes", "token_mode", "token", "codec",
                             "bitrate_kbps",
                             "framerate",
-                            "quality", "display", "tunnel", "server_url", "server_key",
+                            "quality", "display", "virtual_display", "virtual_display_monitors",
+                            "virtual_display_resolution", "virtual_display_provider", "tunnel",
+                            "server_url", "server_key",
                             "tunnel_id", "tunnel_key", "tunnel_listen", "socks5"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
@@ -485,6 +512,47 @@ void test_codec_names() {
     check(!chast::parse_codec_setting("vp9", codec), "an unknown codec is rejected");
     check(std::string(chast::codec_setting_name(chast::VideoCodec::Hevc)) == "hevc",
           "HEVC is written as hevc");
+}
+
+void test_virtual_display_settings(const std::filesystem::path& dir) {
+    const std::filesystem::path path = dir / "virtual-display.ini";
+    write_text(path,
+               "virtual_display=ON\n"
+               "virtual_display_monitors=9\n"
+               "virtual_display_resolution= 2560X1440 \n"
+               "virtual_display_provider=VDD\n");
+    const chast::HostSettingsLoad loaded = chast::load_host_settings(path.string());
+    check(loaded.settings.virtual_display == chast::VirtualDisplayPolicy::On,
+          "the virtual display policy is case-insensitive");
+    check(loaded.settings.virtual_display_monitors == chast::kMaxVirtualDisplayMonitors,
+          "a count above the driver limit is clamped");
+    check(loaded.warning.find("virtual_display_monitors") != std::string::npos,
+          "the clamp is reported");
+    check(loaded.settings.virtual_display_resolution == "2560x1440",
+          "a resolution is normalized");
+    check(loaded.settings.virtual_display_provider == "vdd",
+          "a known provider is normalized");
+
+    chast::VirtualDisplayPolicy policy = chast::VirtualDisplayPolicy::On;
+    check(chast::parse_virtual_display_policy("auto", policy) &&
+              policy == chast::VirtualDisplayPolicy::Auto,
+          "auto parses as a policy");
+    check(!chast::parse_virtual_display_policy("always", policy),
+          "an unknown policy is rejected");
+    std::string resolution;
+    check(chast::parse_virtual_display_resolution("1920x1080", resolution) &&
+              resolution == "1920x1080",
+          "a 1080p resolution parses");
+    check(!chast::parse_virtual_display_resolution("640x479", resolution),
+          "a resolution below the minimum is rejected");
+    check(!chast::parse_virtual_display_resolution("7680x4320x2", resolution),
+          "a resolution with two separators is rejected");
+    std::string provider;
+    check(chast::parse_virtual_display_provider("usbmmidd", provider) &&
+              provider == "usbmmidd",
+          "the usbmmidd provider parses");
+    check(!chast::parse_virtual_display_provider("parsec", provider),
+          "an unknown provider is rejected");
 }
 
 void test_service_parsers() {
@@ -696,6 +764,7 @@ int main() {
     test_invalid_values(dir);
     test_audio_settings(dir);
     test_idle_timeout_settings(dir);
+    test_virtual_display_settings(dir);
     test_tokens();
     test_security_migration(dir);
     test_totp_storage();
