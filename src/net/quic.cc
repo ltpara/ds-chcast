@@ -72,6 +72,14 @@ constexpr size_t kMaxBufferedFileBytes = 64u * 1024u * 1024u;
 // instead of an overflow that drops the transfer.
 constexpr size_t kFileReceiveHighWaterBytes = 32u * 1024u * 1024u;
 constexpr size_t kFileReceiveLowWaterBytes = 8u * 1024u * 1024u;
+// Media streams get the same backpressure: a consumer that stalls (a paused
+// viewer, a host that stops polling the microphone) leaves further bytes with
+// MsQuic instead of letting the peer grow an in-memory queue without limit.
+// The stream resumes once the queue has drained to half of its high water.
+constexpr size_t kVideoReceiveHighWaterBytes = 32u * 1024u * 1024u;
+constexpr size_t kAudioReceiveHighWaterBytes = 4u * 1024u * 1024u;
+constexpr size_t kMicrophoneReceiveHighWaterBytes = 4u * 1024u * 1024u;
+constexpr size_t kCameraReceiveHighWaterBytes = 16u * 1024u * 1024u;
 constexpr size_t kMaxQueuedOffers = 8;
 // One forwarded connection never buffers more than twice the protocol's high
 // water mark; above the high-water mark the receive stream is paused, so the
@@ -639,8 +647,40 @@ struct QuicSession::Impl {
     bool access_denied_ready = false;
     std::string denial_reason;
     std::optional<AccessDenial> denial_code;
-    std::deque<std::vector<uint8_t>> received;
-    std::deque<std::vector<uint8_t>> audio_received;
+    // A media byte queue with its own byte count. All fields are guarded by
+    // `mutex`: the receive callback fills it, the application drains it, and
+    // `paused` records that the receive stream was disabled at the high-water
+    // mark. The consumer re-enables the stream while still holding the lock,
+    // so it cannot use a handle that SHUTDOWN_COMPLETE already closed.
+    struct MediaQueue {
+        std::deque<std::vector<uint8_t>> chunks;
+        size_t bytes = 0;
+        bool paused = false;
+
+        void push(std::vector<uint8_t> chunk) {
+            bytes += chunk.size();
+            chunks.push_back(std::move(chunk));
+        }
+        void emplace(const uint8_t* begin, const uint8_t* end) {
+            bytes += static_cast<size_t>(end - begin);
+            chunks.emplace_back(begin, end);
+        }
+        bool empty() const { return chunks.empty(); }
+        std::vector<uint8_t> take_front() {
+            std::vector<uint8_t> chunk = std::move(chunks.front());
+            chunks.pop_front();
+            bytes -= chunk.size();
+            return chunk;
+        }
+        void clear() {
+            chunks.clear();
+            bytes = 0;
+            paused = false;
+        }
+    };
+
+    MediaQueue received;
+    MediaQueue audio_received;
     // Client: whole audio packets that arrived as QUIC DATAGRAM frames. They
     // are served before the stream parser so a reordered datagram can never
     // be spliced into a partially received stream packet.
@@ -665,7 +705,7 @@ struct QuicSession::Impl {
     // Microphone uplink (CMIC). `microphone_handles` keeps every CMIC handle
     // this side accepted, including one that was replaced by a newer stream,
     // so late events close the old handle instead of being classified again.
-    std::deque<std::vector<uint8_t>> microphone_received;
+    MediaQueue microphone_received;
     AudioParser microphone_parser;
     AudioInfo microphone_info;
     bool microphone_format_changed = false;
@@ -834,7 +874,7 @@ struct QuicSession::Impl {
     std::deque<uint16_t> camera_starts;
     std::deque<CameraResult> camera_results;
     std::deque<uint16_t> camera_stops;
-    std::deque<std::vector<uint8_t>> camera_received;
+    MediaQueue camera_received;
     FrameParser camera_parser;
     // Unidirectional streams this side opened for clipboard changes; their
     // handles are closed when QUIC reports SHUTDOWN_COMPLETE.
@@ -1124,11 +1164,54 @@ struct QuicSession::Impl {
         return QUIC_STATUS_SUCCESS;
     }
 
-    static void copy_chunks(std::deque<std::vector<uint8_t>>& queue,
-                            const QUIC_STREAM_EVENT& event) {
+    static void copy_chunks(MediaQueue& queue, const QUIC_STREAM_EVENT& event) {
         for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
             const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
-            queue.emplace_back(buffer.Buffer, buffer.Buffer + buffer.Length);
+            queue.emplace(buffer.Buffer, buffer.Buffer + buffer.Length);
+        }
+    }
+
+    // Caller holds `mutex`. Copies a receive event into a media queue unless
+    // the queue is already at its high-water mark. In that case the event is
+    // left with MsQuic (TotalBufferLength = 0 withholds flow-control credit).
+    // Returns true when the caller must disable the stream; it must do so
+    // before releasing the lock so a consumer cannot resume the stream in
+    // between and then have this disable leave it stalled.
+    static bool queue_media_locked(MediaQueue& queue, QUIC_STREAM_EVENT& event,
+                                   size_t high_water) {
+        if (queue.bytes >= high_water) {
+            event.RECEIVE.TotalBufferLength = 0;
+            queue.paused = true;
+            return true;
+        }
+        copy_chunks(queue, event);
+        if (queue.bytes >= high_water) {
+            queue.paused = true;
+            return true;
+        }
+        return false;
+    }
+
+    // Caller holds `mutex`. Re-enables a paused media stream once its queue
+    // has drained to the low-water mark. `stream` is read under the same lock
+    // the SHUTDOWN_COMPLETE callback uses to forget the handle, so a closed
+    // handle is never passed back to MsQuic.
+    void resume_media_locked(HQUIC stream, MediaQueue& queue, size_t high_water) {
+        if (stream && queue.paused && queue.bytes <= high_water / 2) {
+            queue.paused = false;
+            api->StreamReceiveSetEnabled(stream, TRUE);
+        }
+    }
+
+    // Caller holds `mutex`. Aborts handles that were just removed from the
+    // tracking tables while the same lock is held, so a concurrent
+    // SHUTDOWN_COMPLETE cannot close one between the lookup and this call.
+    void abort_streams_locked(const std::vector<HQUIC>& handles,
+                              HQUIC skip = nullptr) {
+        for (HQUIC handle : handles) {
+            if (handle && handle != skip) {
+                api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
         }
     }
 
@@ -1177,7 +1260,7 @@ struct QuicSession::Impl {
             if (std::memcmp(pending->data(), "CFRM", 4) == 0) {
                 HQUIC expected = nullptr;
                 if (role == Role::Client && video.compare_exchange_strong(expected, stream)) {
-                    received.push_back(std::move(*pending));
+                    received.push(std::move(*pending));
                     kind = Kind::Video;
                 } else {
                     kind = Kind::Bad;
@@ -1185,7 +1268,7 @@ struct QuicSession::Impl {
             } else if (std::memcmp(pending->data(), "CAUD", 4) == 0) {
                 HQUIC expected = nullptr;
                 if (role == Role::Client && audio.compare_exchange_strong(expected, stream)) {
-                    audio_received.push_back(std::move(*pending));
+                    audio_received.push(std::move(*pending));
                     kind = Kind::Audio;
                 } else {
                     kind = Kind::Bad;
@@ -1237,8 +1320,8 @@ struct QuicSession::Impl {
                             microphone_parser.reset();
                             microphone_received.clear();
                             if (pending->size() > consumed) {
-                                microphone_received.emplace_back(pending->begin() + consumed,
-                                                                 pending->end());
+                                microphone_received.emplace(pending->data() + consumed,
+                                                            pending->data() + pending->size());
                             }
                             ++microphone_streams_seen;
                             kind = Kind::Microphone;
@@ -1499,8 +1582,9 @@ struct QuicSession::Impl {
                         camera_parser.reset();
                         camera_received.clear();
                         if (pending->size() > kCameraStreamHeaderSize) {
-                            camera_received.emplace_back(
-                                pending->begin() + kCameraStreamHeaderSize, pending->end());
+                            camera_received.emplace(
+                                pending->data() + kCameraStreamHeaderSize,
+                                pending->data() + pending->size());
                         }
                         kind = Kind::Camera;
                     }
@@ -1516,16 +1600,19 @@ struct QuicSession::Impl {
                                    }),
                     unclassified.end());
             }
-        }
-        if (port_forward_pause) {
-            // The host dials before any byte reaches the relay; re-enabled by
-            // accept_port_forward_connection().
-            api->StreamReceiveSetEnabled(port_forward_pause, FALSE);
-        }
-        if (terminal_pause) {
-            // A first packet that already filled the queue; the application
-            // re-enables the stream once it has drained below half.
-            api->StreamReceiveSetEnabled(terminal_pause, FALSE);
+            // Disable under the same lock the consumers take before they
+            // re-enable, so a drain that happens right now cannot be undone
+            // by a late disable that leaves the stream stalled.
+            if (port_forward_pause) {
+                // The host dials before any byte reaches the relay; re-enabled
+                // by accept_port_forward_connection().
+                api->StreamReceiveSetEnabled(port_forward_pause, FALSE);
+            }
+            if (terminal_pause) {
+                // A first packet that already filled the queue; re-enabled by
+                // the application once the queue drained below half.
+                api->StreamReceiveSetEnabled(terminal_pause, FALSE);
+            }
         }
         if (kind == Kind::Reject) {
             api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
@@ -1872,7 +1959,7 @@ struct QuicSession::Impl {
     // Appends data of a stream that was already classified as CCLB or CFIL.
     // Returns false when the handle belongs to neither, so the caller can
     // classify it from its first bytes.
-    bool route_bulk_stream(HQUIC stream, QUIC_STREAM_EVENT& event, HQUIC* pause) {
+    bool route_bulk_stream(HQUIC stream, QUIC_STREAM_EVENT& event) {
         {
             std::lock_guard<std::mutex> lock(mutex);
             for (HQUIC handle : microphone_handles) {
@@ -1920,7 +2007,7 @@ struct QuicSession::Impl {
                          kMaxBufferedFileBytes)) {
                     entry.second.receive_paused = true;
                     event.RECEIVE.TotalBufferLength = 0;
-                    *pause = stream;
+                    api->StreamReceiveSetEnabled(stream, FALSE);
                     return true;
                 }
                 for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
@@ -1946,7 +2033,7 @@ struct QuicSession::Impl {
                     forward->buffered_bytes >= kPortForwardReceiveHighWaterBytes) {
                     forward->receive_paused = true;
                     event.RECEIVE.TotalBufferLength = 0;
-                    *pause = stream;
+                    api->StreamReceiveSetEnabled(stream, FALSE);
                     return true;
                 }
                 for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
@@ -1956,7 +2043,7 @@ struct QuicSession::Impl {
                 }
                 if (forward->buffered_bytes >= kPortForwardReceiveHighWaterBytes) {
                     forward->receive_paused = true;
-                    *pause = stream;
+                    api->StreamReceiveSetEnabled(stream, FALSE);
                 }
                 cv.notify_all();
                 return true;
@@ -1974,7 +2061,7 @@ struct QuicSession::Impl {
                     terminal->buffered_bytes >= kTerminalReceiveHighWaterBytes) {
                     terminal->receive_paused = true;
                     event.RECEIVE.TotalBufferLength = 0;
-                    *pause = stream;
+                    api->StreamReceiveSetEnabled(stream, FALSE);
                     return true;
                 }
                 for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
@@ -1984,7 +2071,7 @@ struct QuicSession::Impl {
                 }
                 if (terminal->buffered_bytes >= kTerminalReceiveHighWaterBytes) {
                     terminal->receive_paused = true;
-                    *pause = stream;
+                    api->StreamReceiveSetEnabled(stream, FALSE);
                 }
                 cv.notify_all();
                 return true;
@@ -2065,25 +2152,34 @@ struct QuicSession::Impl {
                 }
                 break;
             case QUIC_STREAM_EVENT_RECEIVE: {
-                HQUIC pause_stream = nullptr;
                 if (stream == video.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    copy_chunks(received, event);
+                    if (queue_media_locked(received, event, kVideoReceiveHighWaterBytes)) {
+                        api->StreamReceiveSetEnabled(stream, FALSE);
+                    }
                     cv.notify_all();
                 } else if (stream == audio.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    copy_chunks(audio_received, event);
+                    if (queue_media_locked(audio_received, event,
+                                           kAudioReceiveHighWaterBytes)) {
+                        api->StreamReceiveSetEnabled(stream, FALSE);
+                    }
                     cv.notify_all();
                 } else if (stream == microphone.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    copy_chunks(microphone_received, event);
+                    if (queue_media_locked(microphone_received, event,
+                                           kMicrophoneReceiveHighWaterBytes)) {
+                        api->StreamReceiveSetEnabled(stream, FALSE);
+                    }
                     cv.notify_all();
                 } else if (stream == camera.load()) {
                     std::lock_guard<std::mutex> lock(mutex);
                     // After a local stop the rest of the host's in-flight
                     // frames are dropped instead of buffered for nobody.
-                    if (!camera_finished) {
-                        copy_chunks(camera_received, event);
+                    if (!camera_finished &&
+                        queue_media_locked(camera_received, event,
+                                           kCameraReceiveHighWaterBytes)) {
+                        api->StreamReceiveSetEnabled(stream, FALSE);
                     }
                     cv.notify_all();
                 } else if (stream == control.load()) {
@@ -2104,11 +2200,8 @@ struct QuicSession::Impl {
                     for (const auto& message : messages) {
                         handle_control(message.first, message.second);
                     }
-                } else if (!route_bulk_stream(stream, event, &pause_stream)) {
+                } else if (!route_bulk_stream(stream, event)) {
                     classify_media_stream(stream, event);
-                }
-                if (pause_stream) {
-                    api->StreamReceiveSetEnabled(pause_stream, FALSE);
                 }
                 break;
             }
@@ -2272,11 +2365,7 @@ struct QuicSession::Impl {
                     } else if (!bulk) {
                         fatal = true;
                     }
-                }
-                for (HQUIC handle : bulk_aborts) {
-                    if (handle != stream) {
-                        api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-                    }
+                    abort_streams_locked(bulk_aborts, stream);
                 }
                 if (fatal) {
                     note_transport_failure("QUIC peer aborted a stream");
@@ -2308,11 +2397,7 @@ struct QuicSession::Impl {
                         // capture loop sees the same end through camera_open().
                         camera_finished = true;
                     }
-                }
-                for (HQUIC handle : aborts) {
-                    if (handle != stream) {
-                        api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-                    }
+                    abort_streams_locked(aborts, stream);
                 }
                 cv.notify_all();
                 break;
@@ -2730,9 +2815,7 @@ struct QuicSession::Impl {
                             clear_terminals_locked("terminal access was revoked");
                         aborts.insert(aborts.end(), terminals.begin(), terminals.end());
                     }
-                }
-                for (HQUIC handle : aborts) {
-                    api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                    abort_streams_locked(aborts);
                 }
                 cv.notify_all();
                 break;
@@ -3376,9 +3459,7 @@ struct QuicSession::Impl {
                         port_forward_stops.pop_front();
                     }
                     port_forward_stops.push_back(std::move(stop));
-                }
-                for (HQUIC handle : aborts) {
-                    api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                    abort_streams_locked(aborts);
                 }
                 cv.notify_all();
                 break;
@@ -3506,9 +3587,7 @@ struct QuicSession::Impl {
                         terminal_stops.pop_front();
                     }
                     terminal_stops.push_back(std::move(stop));
-                }
-                for (HQUIC handle : aborts) {
-                    api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                    abort_streams_locked(aborts);
                 }
                 cv.notify_all();
                 break;
@@ -4681,15 +4760,13 @@ Error QuicSession::set_permissions(uint16_t permissions) {
         // The uplink is viewer-initiated, so revoking it means aborting the
         // stream: the viewer sees the reset and stops capturing. A new stream
         // after a later grant goes through classification again.
+        std::lock_guard<std::mutex> lock(impl.mutex);
         HQUIC handle = impl.microphone.exchange(nullptr);
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            impl.microphone_finished = true;
-            impl.microphone_received.clear();
-            impl.microphone_parser.reset();
-            impl.microphone_info = AudioInfo{};
-            impl.microphone_format_changed = false;
-        }
+        impl.microphone_finished = true;
+        impl.microphone_received.clear();
+        impl.microphone_parser.reset();
+        impl.microphone_info = AudioInfo{};
+        impl.microphone_format_changed = false;
         if (handle) {
             impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         }
@@ -4706,9 +4783,7 @@ Error QuicSession::set_permissions(uint16_t permissions) {
             impl.clipboard_streams.clear();
             impl.pending_clipboard_bytes = 0;
             impl.clipboard_contents.clear();
-        }
-        for (HQUIC handle : aborts) {
-            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            impl.abort_streams_locked(aborts);
         }
     }
     if ((next & kPermissionFileTransfer) == 0) {
@@ -4729,9 +4804,7 @@ Error QuicSession::set_permissions(uint16_t permissions) {
             impl.file_offers.clear();
             impl.file_chunks.clear();
             impl.buffered_file_bytes = 0;
-        }
-        for (HQUIC handle : aborts) {
-            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            impl.abort_streams_locked(aborts);
         }
         for (const auto& entry : cancelled) {
             FileResult result;
@@ -4747,26 +4820,18 @@ Error QuicSession::set_permissions(uint16_t permissions) {
         // The targets and connections are host authority; drop them before
         // the announcement so a message that races the update cannot reopen
         // anything.
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            aborts = impl.clear_port_forward_locked("port forwarding was revoked");
-        }
-        for (HQUIC handle : aborts) {
-            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-        }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const std::vector<HQUIC> aborts =
+            impl.clear_port_forward_locked("port forwarding was revoked");
+        impl.abort_streams_locked(aborts);
     }
     if ((next & kPermissionTerminal) == 0) {
         // Same for terminals: the console belongs to the host application,
         // which learns about the stop through take_terminal_stop().
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            aborts = impl.clear_terminals_locked("terminal access was revoked");
-        }
-        for (HQUIC handle : aborts) {
-            impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-        }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const std::vector<HQUIC> aborts =
+            impl.clear_terminals_locked("terminal access was revoked");
+        impl.abort_streams_locked(aborts);
     }
     if ((next & kPermissionCamera) == 0) {
         // The host owns the camera; queueing the stop wakes its capture loop
@@ -4784,9 +4849,9 @@ Error QuicSession::set_permissions(uint16_t permissions) {
             impl.camera_finished = true;
             impl.server_camera_id = 0;
             impl.server_pending_camera = 0;
-        }
-        if (stream) {
-            impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            if (stream) {
+                impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            }
         }
     }
     return impl.send_bytes(impl.control.load(), make_permission_update(next),
@@ -5644,16 +5709,19 @@ Error QuicSession::receive_frame(FrameHeader& header, std::vector<uint8_t>& payl
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock<std::mutex> lock(impl.mutex);
     for (;;) {
+        // Parsers are also reset by callbacks and teardown while holding the
+        // lock, so pushing under the lock keeps vector growth from racing a
+        // reset on another thread.
         while (!impl.received.empty()) {
-            std::vector<uint8_t> chunk = std::move(impl.received.front());
-            impl.received.pop_front();
-            lock.unlock();
+            std::vector<uint8_t> chunk = impl.received.take_front();
             std::string error;
-            const bool ok = impl.frame_parser.push(chunk.data(), chunk.size(), &error);
-            lock.lock();
-            if (!ok) {
+            if (!impl.frame_parser.push(chunk.data(), chunk.size(), &error)) {
                 return Error(Status::CaptureFailed, "video stream: " + error);
             }
+        }
+        if (!impl.video_finished && !impl.shutdown_complete) {
+            impl.resume_media_locked(impl.video.load(), impl.received,
+                                     kVideoReceiveHighWaterBytes);
         }
 
         const uint8_t* frame_payload = nullptr;
@@ -5717,15 +5785,15 @@ Error QuicSession::receive_audio(AudioHeader& header, std::vector<uint8_t>& payl
             return Error::success();
         }
         while (!impl.audio_received.empty()) {
-            std::vector<uint8_t> chunk = std::move(impl.audio_received.front());
-            impl.audio_received.pop_front();
-            lock.unlock();
+            std::vector<uint8_t> chunk = impl.audio_received.take_front();
             std::string error;
-            const bool ok = impl.audio_parser.push(chunk.data(), chunk.size(), &error);
-            lock.lock();
-            if (!ok) {
+            if (!impl.audio_parser.push(chunk.data(), chunk.size(), &error)) {
                 return Error(Status::CaptureFailed, "audio stream: " + error);
             }
+        }
+        if (!impl.audio_finished && !impl.shutdown_complete) {
+            impl.resume_media_locked(impl.audio.load(), impl.audio_received,
+                                     kAudioReceiveHighWaterBytes);
         }
 
         const uint8_t* audio_payload = nullptr;
@@ -5794,15 +5862,15 @@ Error QuicSession::receive_microphone(AudioHeader& header, std::vector<uint8_t>&
     std::unique_lock<std::mutex> lock(impl.mutex);
     for (;;) {
         while (!impl.microphone_received.empty()) {
-            std::vector<uint8_t> chunk = std::move(impl.microphone_received.front());
-            impl.microphone_received.pop_front();
-            lock.unlock();
+            std::vector<uint8_t> chunk = impl.microphone_received.take_front();
             std::string error;
-            const bool ok = impl.microphone_parser.push(chunk.data(), chunk.size(), &error);
-            lock.lock();
-            if (!ok) {
+            if (!impl.microphone_parser.push(chunk.data(), chunk.size(), &error)) {
                 return Error(Status::CaptureFailed, "microphone stream: " + error);
             }
+        }
+        if (!impl.microphone_finished && !impl.shutdown_complete) {
+            impl.resume_media_locked(impl.microphone.load(), impl.microphone_received,
+                                     kMicrophoneReceiveHighWaterBytes);
         }
 
         const uint8_t* microphone_payload = nullptr;
@@ -5930,16 +5998,14 @@ Error QuicSession::stop_microphone() {
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "stop_microphone is a client operation");
     }
+    std::lock_guard<std::mutex> lock(impl.mutex);
     HQUIC microphone = impl.microphone.exchange(nullptr);
     if (!microphone) {
         return Error::success();
     }
-    {
-        std::lock_guard<std::mutex> lock(impl.mutex);
-        impl.microphone_received.clear();
-        impl.microphone_parser.reset();
-        impl.microphone_format_changed = false;
-    }
+    impl.microphone_received.clear();
+    impl.microphone_parser.reset();
+    impl.microphone_format_changed = false;
     impl.api->StreamShutdown(microphone, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     return Error::success();
 }
@@ -6274,7 +6340,6 @@ Error QuicSession::send_file_answer(uint32_t transfer_id, FileCode code, uint64_
 
 Error QuicSession::receive_file_chunk(FileChunk& chunk, std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
-    HQUIC resume = nullptr;
     Error result = Error::success();
     {
         std::unique_lock<std::mutex> lock(impl.mutex);
@@ -6288,9 +6353,9 @@ Error QuicSession::receive_file_chunk(FileChunk& chunk, std::chrono::millisecond
             impl.buffered_file_bytes -= chunk.data.size();
             if (impl.buffered_file_bytes <= kFileReceiveLowWaterBytes) {
                 for (auto& entry : impl.received_uploads) {
-                    if (entry.second.receive_paused) {
+                    if (entry.second.receive_paused && entry.second.stream) {
                         entry.second.receive_paused = false;
-                        resume = entry.second.stream;
+                        impl.api->StreamReceiveSetEnabled(entry.second.stream, TRUE);
                         break;
                     }
                 }
@@ -6302,9 +6367,6 @@ Error QuicSession::receive_file_chunk(FileChunk& chunk, std::chrono::millisecond
         } else {
             result = Error(Status::WaitTimeout, "no file data arrived in time");
         }
-    }
-    if (resume) {
-        impl.api->StreamReceiveSetEnabled(resume, TRUE);
     }
     return result;
 }
@@ -6895,7 +6957,6 @@ Error QuicSession::accept_port_forward_connection(PortForwardHandle handle) {
     if (QUIC_FAILED(status)) {
         return quic_error(status, "QUIC StreamOpen(port forward)");
     }
-    HQUIC uplink = nullptr;
     bool gone = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -6905,9 +6966,7 @@ Error QuicSession::accept_port_forward_connection(PortForwardHandle handle) {
         } else {
             entry->downlink = stream;
             entry->accepted = true;
-            // The viewer's bytes waited for the dial; let them through now.
             entry->receive_paused = false;
-            uplink = entry->uplink;
         }
     }
     if (gone) {
@@ -6920,20 +6979,23 @@ Error QuicSession::accept_port_forward_connection(PortForwardHandle handle) {
     }
     Error sent = impl.send_bytes(
         stream, make_port_forward_stream_header(forward_id, connection_id), flags);
-    if (uplink) {
-        impl.api->StreamReceiveSetEnabled(uplink, TRUE);
+    {
+        // The viewer's bytes waited for the dial; let them through now. The
+        // lookup and the API call share the lock, so a handle that a
+        // SHUTDOWN_COMPLETE already forgot is never used.
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        Impl::PortForwardEntry* entry = impl.port_forward_by_handle_locked(handle);
+        if (entry && !entry->failed && entry->downlink == stream && entry->uplink) {
+            impl.api->StreamReceiveSetEnabled(entry->uplink, TRUE);
+        }
     }
     if (!sent.ok()) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            Impl::PortForwardEntry* entry = impl.port_forward_by_handle_locked(handle);
-            if (entry) {
-                impl.fail_port_forward_locked(*entry, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        Impl::PortForwardEntry* entry = impl.port_forward_by_handle_locked(handle);
+        if (entry) {
+            std::vector<HQUIC> aborts;
+            impl.fail_port_forward_locked(*entry, sent.message(), aborts);
+            impl.abort_streams_locked(aborts);
         }
         impl.cv.notify_all();
     }
@@ -6946,7 +7008,6 @@ Error QuicSession::reject_port_forward_connection(PortForwardHandle handle) {
         return Error(Status::InvalidCall,
                      "reject_port_forward_connection is a server operation");
     }
-    HQUIC uplink = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         const auto it = impl.port_forward_connections.find(handle);
@@ -6956,7 +7017,12 @@ Error QuicSession::reject_port_forward_connection(PortForwardHandle handle) {
         if (it->second.accepted) {
             return Error(Status::InvalidCall, "the connection was already accepted");
         }
-        uplink = it->second.uplink;
+        if (it->second.uplink) {
+            // Abort while the entry still owns the handle; SHUTDOWN_COMPLETE
+            // cannot slip in and close it first.
+            impl.api->StreamShutdown(it->second.uplink,
+                                     QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        }
         impl.port_forward_connections.erase(it);
         impl.port_forward_opens.erase(
             std::remove_if(impl.port_forward_opens.begin(), impl.port_forward_opens.end(),
@@ -6964,9 +7030,6 @@ Error QuicSession::reject_port_forward_connection(PortForwardHandle handle) {
                                return open.handle == handle;
                            }),
             impl.port_forward_opens.end());
-    }
-    if (uplink) {
-        impl.api->StreamShutdown(uplink, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     }
     impl.cv.notify_all();
     return Error::success();
@@ -7153,13 +7216,10 @@ Error QuicSession::send_port_forward_stop(uint32_t forward_id, PortForwardCode c
     if (message.empty()) {
         return Error(Status::InvalidCall, "invalid port forward stop code");
     }
-    std::vector<HQUIC> aborts;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
-        aborts = impl.stop_port_forward_target_locked(forward_id);
-    }
-    for (HQUIC handle : aborts) {
-        impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        const std::vector<HQUIC> aborts = impl.stop_port_forward_target_locked(forward_id);
+        impl.abort_streams_locked(aborts);
     }
     impl.cv.notify_all();
     return impl.send_bytes(impl.control.load(), std::move(message),
@@ -7208,18 +7268,12 @@ Error QuicSession::send_port_forward_data(PortForwardHandle handle, const uint8_
     Error sent = impl.send_bytes_until(stream, std::vector<uint8_t>(data, data + size),
                                        QUIC_SEND_FLAG_NONE, deadline);
     if (!sent.ok() && sent.status() != Status::WaitTimeout) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            const auto it = impl.port_forward_connections.find(handle);
-            if (it != impl.port_forward_connections.end()) {
-                impl.fail_port_forward_locked(it->second, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            if (abort != stream) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-            }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it != impl.port_forward_connections.end()) {
+            std::vector<HQUIC> aborts;
+            impl.fail_port_forward_locked(it->second, sent.message(), aborts);
+            impl.abort_streams_locked(aborts, stream);
         }
         impl.cv.notify_all();
     }
@@ -7230,7 +7284,6 @@ Error QuicSession::receive_port_forward_data(PortForwardHandle handle,
                                              std::vector<uint8_t>& data,
                                              std::chrono::milliseconds timeout) {
     Impl& impl = *impl_;
-    HQUIC resume = nullptr;
     Error result = Error::success();
     {
         std::unique_lock<std::mutex> lock(impl.mutex);
@@ -7251,7 +7304,9 @@ Error QuicSession::receive_port_forward_data(PortForwardHandle handle,
                 if (entry.receive_paused &&
                     entry.buffered_bytes <= kPortForwardReceiveHighWaterBytes / 2) {
                     entry.receive_paused = false;
-                    resume = Impl::port_forward_receive_stream(entry);
+                    if (HQUIC stream = Impl::port_forward_receive_stream(entry)) {
+                        impl.api->StreamReceiveSetEnabled(stream, TRUE);
+                    }
                 }
                 break;
             }
@@ -7279,9 +7334,6 @@ Error QuicSession::receive_port_forward_data(PortForwardHandle handle,
             impl.cv.wait_until(lock, deadline);
         }
     }
-    if (resume) {
-        impl.api->StreamReceiveSetEnabled(resume, TRUE);
-    }
     return result;
 }
 
@@ -7308,18 +7360,12 @@ Error QuicSession::finish_port_forward(PortForwardHandle handle) {
     }
     Error sent = impl.send_stream_fin(stream);
     if (!sent.ok()) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            const auto it = impl.port_forward_connections.find(handle);
-            if (it != impl.port_forward_connections.end()) {
-                impl.fail_port_forward_locked(it->second, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            if (abort != stream) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-            }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.port_forward_connections.find(handle);
+        if (it != impl.port_forward_connections.end()) {
+            std::vector<HQUIC> aborts;
+            impl.fail_port_forward_locked(it->second, sent.message(), aborts);
+            impl.abort_streams_locked(aborts, stream);
         }
         impl.cv.notify_all();
     }
@@ -7362,10 +7408,10 @@ void QuicSession::close_port_forward(PortForwardHandle handle) {
                                    return open.handle == handle;
                                }),
                 impl.port_forward_opens.end());
+            impl.abort_streams_locked(streams);
         }
     }
     for (HQUIC stream : streams) {
-        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         impl.api->StreamClose(stream);
     }
     impl.cv.notify_all();
@@ -7564,18 +7610,12 @@ Error QuicSession::send_terminal_input(uint32_t terminal_id, const uint8_t* data
     Error sent = impl.send_bytes_until(stream, std::vector<uint8_t>(data, data + size),
                                        QUIC_SEND_FLAG_NONE, deadline);
     if (!sent.ok() && sent.status() != Status::WaitTimeout) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            const auto it = impl.terminal_entries.find(terminal_id);
-            if (it != impl.terminal_entries.end()) {
-                impl.fail_terminal_locked(it->second, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            if (abort != stream) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-            }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it != impl.terminal_entries.end()) {
+            std::vector<HQUIC> aborts;
+            impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            impl.abort_streams_locked(aborts, stream);
         }
         impl.cv.notify_all();
     }
@@ -7603,18 +7643,12 @@ Error QuicSession::finish_terminal_input(uint32_t terminal_id) {
     }
     Error sent = impl.send_stream_fin(stream);
     if (!sent.ok()) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            const auto it = impl.terminal_entries.find(terminal_id);
-            if (it != impl.terminal_entries.end()) {
-                impl.fail_terminal_locked(it->second, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            if (abort != stream) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-            }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it != impl.terminal_entries.end()) {
+            std::vector<HQUIC> aborts;
+            impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            impl.abort_streams_locked(aborts, stream);
         }
         impl.cv.notify_all();
     }
@@ -7646,7 +7680,6 @@ Error QuicSession::send_terminal_resize(uint32_t terminal_id, uint16_t columns,
 bool QuicSession::take_terminal_output(uint32_t terminal_id, std::vector<uint8_t>& data,
                                        bool& ended) {
     Impl& impl = *impl_;
-    HQUIC resume = nullptr;
     bool popped = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -7665,7 +7698,9 @@ bool QuicSession::take_terminal_output(uint32_t terminal_id, std::vector<uint8_t
             if (entry.receive_paused &&
                 entry.buffered_bytes <= kTerminalReceiveHighWaterBytes / 2) {
                 entry.receive_paused = false;
-                resume = Impl::terminal_receive_stream(entry);
+                if (HQUIC stream = Impl::terminal_receive_stream(entry)) {
+                    impl.api->StreamReceiveSetEnabled(stream, TRUE);
+                }
             }
             popped = true;
         }
@@ -7684,9 +7719,6 @@ bool QuicSession::take_terminal_output(uint32_t terminal_id, std::vector<uint8_t
             }
         }
     }
-    if (resume) {
-        impl.api->StreamReceiveSetEnabled(resume, TRUE);
-    }
     return popped;
 }
 
@@ -7703,7 +7735,6 @@ bool QuicSession::take_terminal_resize(TerminalSize& size) {
 bool QuicSession::take_terminal_input(uint32_t terminal_id, std::vector<uint8_t>& data,
                                       bool& ended) {
     Impl& impl = *impl_;
-    HQUIC resume = nullptr;
     bool popped = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -7722,15 +7753,14 @@ bool QuicSession::take_terminal_input(uint32_t terminal_id, std::vector<uint8_t>
             if (entry.receive_paused &&
                 entry.buffered_bytes <= kTerminalReceiveHighWaterBytes / 2) {
                 entry.receive_paused = false;
-                resume = Impl::terminal_receive_stream(entry);
+                if (HQUIC stream = Impl::terminal_receive_stream(entry)) {
+                    impl.api->StreamReceiveSetEnabled(stream, TRUE);
+                }
             }
             popped = true;
         } else {
             ended = entry.receive_finished || entry.failed;
         }
-    }
-    if (resume) {
-        impl.api->StreamReceiveSetEnabled(resume, TRUE);
     }
     return popped;
 }
@@ -7787,16 +7817,12 @@ Error QuicSession::send_terminal_output(uint32_t terminal_id, const uint8_t* dat
         Error sent = impl.send_bytes(opened, make_terminal_stream_header(terminal_id),
                                      QUIC_SEND_FLAG_START);
         if (!sent.ok()) {
-            std::vector<HQUIC> aborts;
-            {
-                std::lock_guard<std::mutex> lock(impl.mutex);
-                const auto it = impl.terminal_entries.find(terminal_id);
-                if (it != impl.terminal_entries.end()) {
-                    impl.fail_terminal_locked(it->second, sent.message(), aborts);
-                }
-            }
-            for (HQUIC abort : aborts) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            std::lock_guard<std::mutex> lock(impl.mutex);
+            const auto it = impl.terminal_entries.find(terminal_id);
+            if (it != impl.terminal_entries.end()) {
+                std::vector<HQUIC> aborts;
+                impl.fail_terminal_locked(it->second, sent.message(), aborts);
+                impl.abort_streams_locked(aborts);
             }
             impl.cv.notify_all();
             return sent;
@@ -7807,18 +7833,12 @@ Error QuicSession::send_terminal_output(uint32_t terminal_id, const uint8_t* dat
     Error sent = impl.send_bytes_until(stream, std::vector<uint8_t>(data, data + size),
                                        QUIC_SEND_FLAG_NONE, deadline);
     if (!sent.ok() && sent.status() != Status::WaitTimeout) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            const auto it = impl.terminal_entries.find(terminal_id);
-            if (it != impl.terminal_entries.end()) {
-                impl.fail_terminal_locked(it->second, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            if (abort != stream) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-            }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it != impl.terminal_entries.end()) {
+            std::vector<HQUIC> aborts;
+            impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            impl.abort_streams_locked(aborts, stream);
         }
         impl.cv.notify_all();
     }
@@ -7847,18 +7867,12 @@ Error QuicSession::finish_terminal_output(uint32_t terminal_id) {
     }
     Error sent = impl.send_stream_fin(stream);
     if (!sent.ok()) {
-        std::vector<HQUIC> aborts;
-        {
-            std::lock_guard<std::mutex> lock(impl.mutex);
-            const auto it = impl.terminal_entries.find(terminal_id);
-            if (it != impl.terminal_entries.end()) {
-                impl.fail_terminal_locked(it->second, sent.message(), aborts);
-            }
-        }
-        for (HQUIC abort : aborts) {
-            if (abort != stream) {
-                impl.api->StreamShutdown(abort, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-            }
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        const auto it = impl.terminal_entries.find(terminal_id);
+        if (it != impl.terminal_entries.end()) {
+            std::vector<HQUIC> aborts;
+            impl.fail_terminal_locked(it->second, sent.message(), aborts);
+            impl.abort_streams_locked(aborts, stream);
         }
         impl.cv.notify_all();
     }
@@ -7879,16 +7893,13 @@ Error QuicSession::send_terminal_stop(uint32_t terminal_id, TerminalCode code,
     if (message.empty()) {
         return Error(Status::InvalidCall, "invalid terminal stop code");
     }
-    std::vector<HQUIC> aborts;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         // A direction this side already finished cleanly keeps its FIN: a
         // reset would tell the peer the transfer failed and make it drop bytes
         // still queued on its side.
-        aborts = impl.drop_terminal_locked(terminal_id, true);
-    }
-    for (HQUIC handle : aborts) {
-        impl.api->StreamShutdown(handle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        const std::vector<HQUIC> aborts = impl.drop_terminal_locked(terminal_id, true);
+        impl.abort_streams_locked(aborts);
     }
     impl.cv.notify_all();
     return impl.send_bytes(impl.control.load(), std::move(message),
@@ -7911,9 +7922,9 @@ void QuicSession::close_terminal(uint32_t terminal_id) {
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
         streams = impl.drop_terminal_locked(terminal_id);
+        impl.abort_streams_locked(streams);
     }
     for (HQUIC stream : streams) {
-        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         impl.api->StreamClose(stream);
     }
     impl.cv.notify_all();
@@ -8017,8 +8028,8 @@ Error QuicSession::send_camera_result(const CameraResult& result) {
                 impl.camera_finished = true;
                 impl.server_camera_id = 0;
             }
+            impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         }
-        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     }
     impl.cv.notify_all();
     return sent;
@@ -8078,8 +8089,10 @@ Error QuicSession::finish_camera() {
         }
         impl.camera_finished = true;
         impl.server_camera_id = 0;
+        // Shut down under the lock so a teardown that forgets the handle
+        // cannot close it between the load and this call.
+        impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     }
-    impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     impl.cv.notify_all();
     return Error::success();
 }
@@ -8195,15 +8208,15 @@ Error QuicSession::receive_camera_frame(FrameHeader& header, std::vector<uint8_t
     std::unique_lock<std::mutex> lock(impl.mutex);
     for (;;) {
         while (!impl.camera_received.empty()) {
-            std::vector<uint8_t> chunk = std::move(impl.camera_received.front());
-            impl.camera_received.pop_front();
-            lock.unlock();
+            std::vector<uint8_t> chunk = impl.camera_received.take_front();
             std::string error;
-            const bool ok = impl.camera_parser.push(chunk.data(), chunk.size(), &error);
-            lock.lock();
-            if (!ok) {
+            if (!impl.camera_parser.push(chunk.data(), chunk.size(), &error)) {
                 return Error(Status::CaptureFailed, "camera stream: " + error);
             }
+        }
+        if (!impl.camera_finished && !impl.shutdown_complete) {
+            impl.resume_media_locked(impl.camera.load(), impl.camera_received,
+                                     kCameraReceiveHighWaterBytes);
         }
 
         const uint8_t* frame_payload = nullptr;

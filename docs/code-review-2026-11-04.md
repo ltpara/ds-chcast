@@ -13,6 +13,7 @@
 - **未认证 DoS 面较大**：rendezvous 的 keepalive 挑战可被任意覆盖（H1），QUIC 服务端在认证前会无限期占住唯一会话槽（H2）。两者都不需要任何凭据。
 - **远程内存安全无实际缺陷（H4 复核为误报）**：FFmpeg 解码把网络缓冲直接挂到非引用计数的 `AVPacket` 上，但 `avcodec_send_packet` 会先 `av_packet_ref` 复制并补齐 `AV_INPUT_BUFFER_PADDING_SIZE` 字节；已用 guard page 回归测试固化该契约。
 - **账号系统有两处设计缺口（H5/H6，已于 2026-11-05 修复，见各节）**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
+- **媒体接收无界与 QUIC 句柄并发（H3/M1/M2，已于 2026-11-05 修复，见各节）**：四条媒体队列加了字节高水位反压，句柄与 parser 统一到同一把会话锁。
 - **授权撤销在“仅文件”会话中不生效**，且旧掩码会带到下一次会话（H7）。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
@@ -223,6 +224,10 @@ case QUIC_STREAM_EVENT_RECEIVE: {
 - 为四条队列加字节高水位（例如视频 32 MiB、音频/麦克风 4 MiB、摄像头 16 MiB）；
 - 超过高水位时设置 `event.RECEIVE.TotalBufferLength = 0` 并 `StreamReceiveSetEnabled(stream, FALSE)`，在消费函数降到低水位后重新启用（照抄 CFIL 的写法）。
 
+**修复（2026-11-05）**
+
+四条媒体接收队列改为 `Impl::MediaQueue`（数据块 + 字节计数 + `paused`），高水位取视频 32 MiB、音频/麦克风 4 MiB、摄像头 16 MiB。`queue_media_locked()` 在超过高水位时把 `event.RECEIVE.TotalBufferLength` 置 0（字节留在 MsQuic，扣住流控额度），并在同一把 `Impl::mutex` 内调用 `StreamReceiveSetEnabled(stream, FALSE)`；`receive_frame()`、`receive_audio()`、`receive_microphone()`、`receive_camera_frame()` 每次排空后在锁内降到高水位一半时恢复，且只在流未结束、连接未关闭时恢复。暂停与恢复都持同一把锁，避免“消费者先恢复、回调随后禁用”把流永久停住的竞态。构建通过；本机 Smart App Control 禁止执行新链接的测试二进制，`quic_*` 未做运行时验证。
+
 ---
 
 ### H4. FFmpeg 解码直接借用网络缓冲，缺少 `AV_INPUT_BUFFER_PADDING_SIZE`（复核：误报）
@@ -418,6 +423,10 @@ if (resume) {
 
 **修复**：句柄单一所有权或引用计数；所有 `StreamReceiveSetEnabled`/`StreamShutdown` 调用都在持锁状态下完成，并确认 `SHUTDOWN_COMPLETE` 尚未发生。
 
+**修复（2026-11-05）**
+
+`receive_file_chunk()` 的恢复、`accept_port_forward_connection()` 的上行恢复、`receive_port_forward_data()`/`take_terminal_output()`/`take_terminal_input()` 的恢复、`stop_microphone()`、`finish_camera()`、相机拒绝与 `CameraResult` 发送失败路径，以及 `set_permissions()` 的各撤销分支，都改为在持有 `Impl::mutex` 时用查表得到的同一句柄调用 `StreamReceiveSetEnabled`/`StreamShutdown`。所有 `aborts`/`bulk_aborts` 的 `StreamShutdown` 循环统一走 `Impl::abort_streams_locked()` 并在锁内执行；`close_port_forward()`/`close_terminal()` 在锁内 abort、锁外只做 `StreamClose`。暂停侧同样收敛：`route_bulk_stream()` 与流分类在锁内禁用接收，避免消费者在“解锁后、禁用前”排空并恢复后又被迟到禁用停住。构建通过；运行时验证受 Smart App Control 限制。
+
 ---
 
 ### M2. 解析器跨线程竞态（麦克风/摄像头）
@@ -427,6 +436,10 @@ if (resume) {
 应用线程在锁外 `push` 麦克风/摄像头 parser，而 MsQuic 回调线程在持锁时对同一个 parser 调 `reset()`。`std::vector` 的并发 `clear()`/`insert()` 是未定义行为，可能读到已释放缓冲区。
 
 **修复**：parser 纳入同一个 mutex，或用 epoch/代际号让旧数据被丢弃而不是并发 reset。
+
+**修复（2026-11-05）**
+
+`receive_frame()`/`receive_audio()`/`receive_microphone()`/`receive_camera_frame()` 不再在锁外 push；取队列、`parser.push()`、`parser.next()`/`consume()` 全部在 `Impl::mutex` 内完成。`microphone_parser.reset()`（`set_permissions()`、`stop_microphone()`）也随调用点进锁。四个 parser 的所有访问现在由同一把锁串行化，`reset_session_locked()` 的清理不再与消费线程并发。
 
 ---
 
@@ -908,7 +921,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 **第二批（两周内，内存安全与远程 DoS）**
 
 5. H4（复核为误报，无需修改）：`avcodec_send_packet` 会复制非引用计数 packet 并补 padding；`tests/decoder_padding_test.cc` 用 guard page 固定该契约。
-6. H3：四条接收队列加高水位/反压；M1/M2 统一句柄与 parser 同步。
+6. H3：四条接收队列加高水位/反压；M1/M2 统一句柄与 parser 同步（均已完成，见各节修复说明）。
 7. H7：文件会话应用权限撤销并清理跨会话掩码；M3/M4 区分“可恢复拒绝”和“会话致命”。
 8. M7/M8/M9：CF_DIB 长度校验、TOTP 步号去重、隐私遮罩真正可见。
 
