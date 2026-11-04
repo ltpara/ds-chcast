@@ -568,7 +568,12 @@ private:
 
     std::unique_ptr<ActiveUpload> upload_;
     std::string file_receive_directory_;
+    // The id the current session's audit records carry: the viewer's
+    // reference, or one the host generated when the viewer sent none.
+    std::string session_audit_ref_;
+    bool session_audit_ref_absent_ = false;
     std::string file_audit_ref_;
+    bool file_audit_ref_absent_ = false;
     std::ifstream download_stream_;
     double download_tokens_ = 0.0;
     std::chrono::steady_clock::time_point download_token_time_;

@@ -16,6 +16,7 @@
 - **媒体接收无界与 QUIC 句柄并发（H3/M1/M2，已于 2026-11-05 修复，见各节）**：四条媒体队列加了字节高水位反压，句柄与 parser 统一到同一把会话锁。
 - **授权撤销在“仅文件”会话中不生效、旧掩码跨会话泄漏（H7），认证前畸形控制帧可终止整个监听（M3），可恢复拒绝被当成会话致命错误（M4）**（均已于 2026-11-05 修复，见各节）：文件会话每轮应用操作员掩码并在会话边界清理遗留掩码；认证前协议破坏只断开当前连接；权限/配额不足改为仅中止单条流，剪贴板聚合上限改为每次 push 复查。
 - **剪贴板 DIB 越界、TOTP 步内重放、隐私遮罩假成功（M7/M8/M9，已于 2026-11-05 修复，见各节）**：`CF_DIB` 现在按头部推导像素/调色板长度；TOTP 记录并拒绝已用步号（内存级）；隐私遮罩设置分层 alpha、校验桌面归属与覆盖矩形，`OpenDesktopW` 失败即判失败。
+- **审计可被空 ref 抑制、日志可注入、剪贴板下载表跨会话、权限刷新后旧掩码（M10-M13，已于 2026-11-05 修复，见各节）**：无 ref 会话用主机生成 ID 并标记；日志入口转义控制字符；下载表按会话清空且仅在宣布成功后登记；权限更新后本地 `StreamInfo` 同步新掩码。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -580,6 +581,10 @@ if (!settings_.audit_spool.empty() && !audit_ref.empty()) {   // 空 ref => 整�
 
 **修复**：主机侧自行生成会话 ID（时间戳+计数器+随机）作为回退，任何会话都落记录并标记 `viewer_ref_absent`。
 
+**修复（2026-11-05）**
+
+会话开始时若 `session_->audit_ref()` 为空，主机用 `host_audit_ref()` 生成 32 位小写十六进制 ID（时间戳低 32 位 + 进程内计数器 + 8 字节 `secure_random`），会话记录与文件记录共用该 ID；`AuditSessionRecord`/`AuditFileRecord` 新增 `viewer_ref_absent` 并写入 spool 行，会话记录不再因空 ref 被丢弃。服务端把这类行存为 `source=host`、`username="-"`，这就是“没有查看器半边”的标记；Go agent 的 JSON 解码会忽略新增布尔字段（服务端已有 `source` 可区分），因此本批未改 Go。构建通过；本批新构建的测试二进制被 Smart App Control 拦截（exit 126），未运行。
+
 ---
 
 ### M11. 日志注入：viewer 可控字符串带换行写入行式日志
@@ -596,6 +601,10 @@ log(cancel.reason.empty() ? "..." : cancel.reason);
 
 **修复**：`HostServer::log()` 入口统一转义 `0x00-0x1F`、`0x7F`（或 JSON/base64 包装）。
 
+**修复（2026-11-05）**
+
+`HostServer::log()` 现在先经 `log_safe()`：`\n`/`\r`/`\t` 写成可见转义，其余 0x00-0x1F 与 0x7F 写成 `\xNN`，其他字节（含 UTF-8）原样保留。文件路径、`FileCancel.reason`、协议错误等查看器可控文本都只经这一个入口，无法再伪造完整的时间戳日志行。
+
 ---
 
 ### M12. 剪贴板文件下载授权表跨会话残留
@@ -608,6 +617,10 @@ log(cancel.reason.empty() ? "..." : cancel.reason);
 
 **修复**：`begin_file_session()` 内加锁清空 `clipboard_file_entries_`/`clipboard_file_paths_`；索引只在“本会话已向该 viewer 宣布过该列表”时有效（记录会话代号）。
 
+**修复（2026-11-05）**
+
+`begin_file_session()` 在会话开始时持 `clipboard_files_mutex_` 清空 `clipboard_file_entries_`/`clipboard_file_paths_`，`end_file_session()` 再清一次；`poll_clipboard()` 改为在 `send_clipboard_content()` 成功后才登记路径，发送失败的列表不会留下可按索引下载的路径。`.chast-clipboard/<index>` 因此只指向本会话确实向该 viewer 宣布过的列表。
+
 ---
 
 ### M13. 权限变更后重发的 `StreamInfo` 仍携带旧权限位
@@ -619,6 +632,10 @@ log(cancel.reason.empty() ? "..." : cancel.reason);
 viewer 会先后收到 `PermissionUpdate(新掩码)` 与 `StreamInfo(旧掩码)`，依赖后者的客户端会继续按“仍允许”显示开关并继续发送。
 
 **修复**：下发前用 `now_mask` 重新构造 `stream_info`。
+
+**修复（2026-11-05）**
+
+`apply_pending_permissions()` 在 `publish_current()`/`refresh_stream()` 之前用 `now_mask` 重新填充 `input/clipboard/file_transfer/microphone/privacy/port_forward/terminal/record/camera` 与 `audio.enabled`。复核时发现 `QuicSession::refresh_stream()` 本来就会用实时 `session_permissions` 覆盖这些位，因此线上消息并未真正携带旧掩码；但主机侧 `status_.stream` 与本地 `stream_info` 仍是批准时的旧值，后续本地重建会沿用，现一并修正。
 
 ---
 
@@ -959,7 +976,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 **第三批（一个月内，可信度与本地边界）**
 
-9. M10/M11/M12/M13：审计回退 ID、日志转义、剪贴板下载表按会话清理、StreamInfo 用新掩码重建。
+9. M10/M11/M12/M13：审计回退 ID、日志转义、剪贴板下载表按会话清理、StreamInfo 用新掩码重建（均已完成，见各节修复说明）。
 10. M14/M15/M16：剪贴板文本限额统一、`.part` 隔离目录、句柄级 reparse 复核。
 11. M17/M18/M19：更新器句柄锁定、admin console token、CSV 转义。
 12. M24～M29：客户端强制 HTTPS、密钥 DPAPI、首用确认、终端 CSI 上限、录制校验。

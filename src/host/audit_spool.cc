@@ -129,6 +129,7 @@ bool append_audit_session(const std::string& spool_path, const AuditSessionRecor
     }
     std::string line = "{\"kind\":\"session\",\"audit_ref\":";
     append_json_string(line, record.audit_ref);
+    append_bool(line, "viewer_ref_absent", record.viewer_ref_absent);
     append_number(line, "started_at_ms", record.started_at_ms);
     append_number(line, "ended_at_ms", record.ended_at_ms);
     append_bool(line, "success", record.success);
@@ -148,6 +149,7 @@ bool append_audit_file(const std::string& spool_path, const AuditFileRecord& rec
     }
     std::string line = "{\"kind\":\"file\",\"audit_ref\":";
     append_json_string(line, record.audit_ref);
+    append_bool(line, "viewer_ref_absent", record.viewer_ref_absent);
     line += ",\"direction\":";
     append_json_string(line, record.direction);
     line += ",\"name\":";

@@ -26,9 +26,10 @@
 #include "chast/display_mode.h"
 #include "chast/file_transfer.h"
 #include "chast/port_forward_relay.h"
-#include "chast/terminal_relay.h"
 #include "chast/privacy.h"
 #include "chast/sas.h"
+#include "chast/security.h"
+#include "chast/terminal_relay.h"
 
 namespace chast {
 
@@ -44,6 +45,61 @@ constexpr double kDownloadBurst = 256.0 * 1024.0;
 
 std::filesystem::path path_from_utf8(const std::string& utf8) {
     return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
+
+// A viewer may omit its audit reference; the host still records the session,
+// under an id of its own that has the lowercase-hex shape the service accepts.
+// Time, a per-process counter and eight random bytes keep the ids distinct.
+std::string host_audit_ref() {
+    static std::atomic<uint32_t> sequence{0};
+    uint8_t random[8] = {};
+    static_cast<void>(secure_random(random, sizeof(random)));
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    char head[20] = {};
+    std::snprintf(head, sizeof(head), "%08llx%08x",
+                  static_cast<unsigned long long>(now_ms) & 0xFFFFFFFFull,
+                  sequence.fetch_add(1, std::memory_order_relaxed));
+    std::string ref = head;
+    char byte[3] = {};
+    for (const uint8_t value : random) {
+        std::snprintf(byte, sizeof(byte), "%02x", value);
+        ref += byte;
+    }
+    return ref;
+}
+
+// Viewer-controlled names, reasons and protocol errors reach the line log.
+// Escaping control characters keeps an embedded newline from forging a second
+// timestamped record.
+std::string log_safe(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char ch : text) {
+        const auto byte = static_cast<unsigned char>(ch);
+        switch (byte) {
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (byte < 0x20 || byte == 0x7F) {
+                    char escaped[5] = {};
+                    std::snprintf(escaped, sizeof(escaped), "\\x%02x", byte);
+                    out += escaped;
+                } else {
+                    out.push_back(ch);
+                }
+                break;
+        }
+    }
+    return out;
 }
 
 // The viewer downloads a file the host copied to the clipboard through
@@ -907,8 +963,15 @@ void HostServer::run() {
         stats.client_connected = true;
         const std::string peer = session_->client_address();
         // Captured now: wait_for_client() consumed the Hello, and the
-        // reference is cleared when this connection is torn down.
-        const std::string audit_ref = session_->audit_ref();
+        // reference is cleared when this connection is torn down. A viewer
+        // that sent no reference still gets recorded, under a host id that
+        // cannot merge with a viewer report.
+        const std::string viewer_audit_ref = session_->audit_ref();
+        const bool viewer_ref_absent = viewer_audit_ref.empty();
+        const std::string audit_ref =
+            viewer_ref_absent ? host_audit_ref() : viewer_audit_ref;
+        session_audit_ref_ = audit_ref;
+        session_audit_ref_absent_ = viewer_ref_absent;
         const int64_t audit_started_ms = unix_now_ms();
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
@@ -959,11 +1022,13 @@ void HostServer::run() {
         if (!finished.ok() && !peer_left && error.empty() && !stopping_.load()) {
             error = "finish: " + finished.to_string();
         }
-        // Only viewers that sent a reference can be merged with their own
-        // report; a tool or an older viewer leaves no host-side record.
-        if (!settings_.audit_spool.empty() && !audit_ref.empty()) {
+        // Every session leaves a host-side record. A viewer that sent no
+        // reference cannot contribute its own half, so the record is marked
+        // and stands alone.
+        if (!settings_.audit_spool.empty()) {
             AuditSessionRecord record;
             record.audit_ref = audit_ref;
+            record.viewer_ref_absent = viewer_ref_absent;
             record.started_at_ms = audit_started_ms;
             record.ended_at_ms = unix_now_ms();
             record.success = ok && error.empty();
@@ -1435,10 +1500,24 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 return false;
             }
         }
-        // Audio and clipboard availability travel in the stream description.
+        // The stream description carries the capability flags as well, and
+        // describe_stream() copied the approval-time mask into them. Refresh
+        // the local copy with the mask the transport is about to apply.
+        stream_info.input_enabled = (now_mask & kPermissionInput) != 0;
+        stream_info.clipboard_enabled = (now_mask & kPermissionClipboard) != 0;
+        stream_info.file_transfer_enabled =
+            (now_mask & kPermissionFileTransfer) != 0;
+        stream_info.microphone_enabled = (now_mask & kPermissionMicrophone) != 0;
+        stream_info.privacy_mode_enabled =
+            (now_mask & kPermissionPrivacyMode) != 0;
+        stream_info.port_forward_enabled = (now_mask & kPermissionPortForward) != 0;
+        stream_info.terminal_enabled = (now_mask & kPermissionTerminal) != 0;
+        stream_info.record_enabled = (now_mask & kPermissionRecord) != 0;
+        stream_info.camera_enabled = (now_mask & kPermissionCamera) != 0;
         // A viewer that was denied audio at approval has no AAC config yet,
         // so a fresh description is what makes a restore usable.
-        stream_info.audio.enabled = audio_info.enabled;
+        stream_info.audio.enabled =
+            audio_info.enabled && (now_mask & kPermissionAudio) != 0;
         publish_current(stream_info);
         Error refreshed = session_->refresh_stream(stream_info);
         if (!refreshed.ok()) {
@@ -1654,16 +1733,19 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             ClipboardContent files;
             files.seq = clipboard_seq;
             files.formats.push_back(std::move(entry));
-            {
-                std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
-                clipboard_file_entries_ = last_file_entries_;
-                clipboard_file_paths_ = last_file_paths_;
-            }
             Error sent = session_->send_clipboard_content(std::move(files));
             if (!sent.ok()) {
                 ++stats.send_errors;
                 log("clipboard files send failed: " + sent.to_string());
                 return;
+            }
+            // Only a list this viewer actually received may be downloaded by
+            // index; publishing after the send keeps a failed announce from
+            // leaving paths the viewer never saw.
+            {
+                std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
+                clipboard_file_entries_ = last_file_entries_;
+                clipboard_file_paths_ = last_file_paths_;
             }
             ++clipboard_seq;
             ++stats.clipboard_sent;
@@ -3639,12 +3721,20 @@ void HostServer::begin_file_session() {
     file_receive_directory_ = settings_.file_receive_directory.empty()
                                   ? default_receive_directory()
                                   : settings_.file_receive_directory;
-    file_audit_ref_ = session_->audit_ref();
+    file_audit_ref_ = session_audit_ref_;
+    file_audit_ref_absent_ = session_audit_ref_absent_;
     upload_.reset();
     clipboard_incoming_ = ClipboardIncoming{};
     last_file_identity_ = 0;
     last_file_entries_.clear();
     last_file_paths_.clear();
+    {
+        // A clipboard download path belongs to the session that announced
+        // it; a fresh viewer must not reach files an earlier one copied.
+        std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
+        clipboard_file_entries_.clear();
+        clipboard_file_paths_.clear();
+    }
     download_stream_.close();
     download_tokens_ = kDownloadBurst;
     download_token_time_ = Clock::now();
@@ -3698,6 +3788,12 @@ void HostServer::end_file_session() {
     reset_clipboard_incoming(true);
     file_receive_directory_.clear();
     file_audit_ref_.clear();
+    file_audit_ref_absent_ = false;
+    {
+        std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
+        clipboard_file_entries_.clear();
+        clipboard_file_paths_.clear();
+    }
 }
 
 bool HostServer::file_transfer_allowed() const {
@@ -3842,6 +3938,7 @@ void HostServer::audit_upload(const std::string& name, uint64_t bytes, bool succ
     }
     AuditFileRecord record;
     record.audit_ref = file_audit_ref_;
+    record.viewer_ref_absent = file_audit_ref_absent_;
     record.direction = "upload";
     record.name = name;
     record.size = bytes;
@@ -4865,7 +4962,7 @@ bool HostServer::sleep_unless_stopping(std::chrono::milliseconds duration) {
 
 void HostServer::log(const std::string& message) {
     if (config_.log) {
-        config_.log(message);
+        config_.log(log_safe(message));
     }
 }
 
