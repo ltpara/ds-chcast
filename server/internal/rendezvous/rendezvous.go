@@ -28,13 +28,18 @@ const (
 	punchTTL        = 30 * time.Second
 	punchAuthWindow = time.Minute
 	DefaultRateMax  = 30
-	defaultRateSpan = 10 * time.Second
+	// DefaultKeepaliveRateMax admits roughly twelve keepalive messages per
+	// second per source IP: far above the host's own interval while still
+	// capping a flood.
+	DefaultKeepaliveRateMax = 120
+	defaultRateSpan         = 10 * time.Second
 )
 
 type options struct {
-	readBuffer int
-	rateMax    int
-	serverKey  string
+	readBuffer       int
+	rateMax          int
+	keepaliveRateMax int
+	serverKey        string
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -53,6 +58,12 @@ func WithPunchRateMax(max int) Option {
 	return func(o *options) { o.rateMax = max }
 }
 
+// WithKeepaliveRateMax caps keepalive control messages per client IP per ten
+// seconds. A non-positive value disables the limiter.
+func WithKeepaliveRateMax(max int) Option {
+	return func(o *options) { o.keepaliveRateMax = max }
+}
+
 // WithServerKey requires viewers to prove knowledge of the server key before a
 // punch is coordinated. An empty key keeps public rendezvous behavior.
 func WithServerKey(key string) Option {
@@ -60,23 +71,27 @@ func WithServerKey(key string) Option {
 }
 
 type Server struct {
-	conn       *net.UDPConn
-	reg        *registry.Registry
-	relayAddr  func(port int) string
-	identity   *identity.Server
-	punchLog   *punchlog.Log
-	ipChanges  *ipchange.Tracker
-	log        *slog.Logger
-	limiter    *limiter
-	serverKey  string
-	readBuffer int
-	done       chan struct{}
-	closeOnce  sync.Once
+	conn      *net.UDPConn
+	reg       *registry.Registry
+	relayAddr func(port int) string
+	identity  *identity.Server
+	punchLog  *punchlog.Log
+	ipChanges *ipchange.Tracker
+	log       *slog.Logger
+	limiter   *limiter
+	// keepaliveLimiter throttles both keepalive legs per source IP. Without
+	// it an unauthenticated flood could mint challenges as fast as the
+	// registry can sign them.
+	keepaliveLimiter *limiter
+	serverKey        string
+	readBuffer       int
+	done             chan struct{}
+	closeOnce        sync.Once
 }
 
 // New binds the meeting port. bind is an IP:port; port 0 lets the kernel pick.
 func New(bind string, reg *registry.Registry, relayAddr func(port int) string, log *slog.Logger, opts ...Option) (*Server, error) {
-	cfg := options{rateMax: DefaultRateMax}
+	cfg := options{rateMax: DefaultRateMax, keepaliveRateMax: DefaultKeepaliveRateMax}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -97,14 +112,15 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 			"requested", cfg.readBuffer, "error", err)
 	}
 	return &Server{
-		conn:       conn,
-		reg:        reg,
-		relayAddr:  relayAddr,
-		log:        log,
-		limiter:    newLimiter(cfg.rateMax, defaultRateSpan),
-		serverKey:  cfg.serverKey,
-		readBuffer: readBuffer,
-		done:       make(chan struct{}),
+		conn:             conn,
+		reg:              reg,
+		relayAddr:        relayAddr,
+		log:              log,
+		limiter:          newLimiter(cfg.rateMax, defaultRateSpan),
+		keepaliveLimiter: newLimiter(cfg.keepaliveRateMax, defaultRateSpan),
+		serverKey:        cfg.serverKey,
+		readBuffer:       readBuffer,
+		done:             make(chan struct{}),
 	}, nil
 }
 
@@ -171,6 +187,10 @@ func (s *Server) handle(msg wire.Message, src *net.UDPAddr) {
 // one-time nonce before the observed address is allowed to move, so a spoofed
 // source cannot redirect a host's mapping.
 func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
+	if !s.keepaliveLimiter.allow(src.IP.String()) {
+		// Silent drop: any reply would make the port a reflector.
+		return
+	}
 	candidate, candidateV6 := observedCandidate(src)
 	scope := "v4"
 	if candidateV6 != "" {
@@ -191,6 +211,9 @@ func (s *Server) handleKeepalive(msg wire.Message, src *net.UDPAddr) {
 }
 
 func (s *Server) handleKeepaliveAuth(msg wire.Message, src *net.UDPAddr) {
+	if !s.keepaliveLimiter.allow(src.IP.String()) {
+		return
+	}
 	ack := wire.Message{Type: wire.TypeKeepaliveAck}
 	candidate, candidateV6 := observedCandidate(src)
 	if (msg.Candidate != "" && msg.Candidate != candidate) ||
@@ -273,12 +296,9 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		return
 	}
 	host, ok := s.reg.Lookup(msg.HostID)
-	if !ok {
-		reply.Error = "host is not registered"
-		s.reply(src, reply)
-		return
-	}
-	if !s.reg.Online(host) {
+	if !ok || !s.reg.Online(host) {
+		// One message for unknown and offline hosts: distinguishing them
+		// would turn the punch port into a registration oracle.
 		reply.Error = "host is offline"
 		s.reply(src, reply)
 		return

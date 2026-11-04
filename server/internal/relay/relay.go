@@ -28,6 +28,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
+	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -81,9 +82,18 @@ type Manager struct {
 	// relay never forwards a stranger's datagrams to a host.
 	requireViewerToken bool
 
+	// handshakeLimiter bounds relay_hello and relay_viewer control messages
+	// per source IP so the port cannot be used as a reflection amplifier.
+	handshakeLimiter *ratelimit.Limiter
+
 	wantedReadBuffer int
 	readBuffer       int
 }
+
+// DefaultHandshakeRateMax admits roughly twelve control handshakes per second
+// per source IP, which is far more than a host or viewer needs while still
+// capping a flood.
+const DefaultHandshakeRateMax = 120
 
 // Option customizes the relay manager before its ports are bound.
 type Option func(*Manager)
@@ -99,6 +109,14 @@ func WithReadBuffer(size int) Option {
 // default; only tests and embedded single-user relays turn it off.
 func WithViewerTokenRequired(required bool) Option {
 	return func(m *Manager) { m.requireViewerToken = required }
+}
+
+// WithHandshakeRateMax caps relay control handshakes per source IP per ten
+// seconds. A non-positive value admits every handshake.
+func WithHandshakeRateMax(max int) Option {
+	return func(m *Manager) {
+		m.handshakeLimiter = ratelimit.New(float64(max)/10, float64(max))
+	}
 }
 
 // WithBind6 listens on an additional IPv6 address with the same port numbers.
@@ -288,6 +306,8 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 		policy:             policy,
 		bindIP:             ip,
 		requireViewerToken: true,
+		handshakeLimiter: ratelimit.New(
+			float64(DefaultHandshakeRateMax)/10, float64(DefaultHandshakeRateMax)),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -970,6 +990,10 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 	// the set -> port lock order used by allocation.
 	hostID := ""
 	if control != nil {
+		if !p.set.manager.handshakeLimiter.Allow(src.IP.String()) {
+			// Silent drop: a challenge reply would make the port a reflector.
+			return
+		}
 		hostID = p.reservedHost()
 	}
 

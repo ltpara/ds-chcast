@@ -6,7 +6,9 @@ package registry
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -16,6 +18,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -124,13 +127,13 @@ type Registry struct {
 	offlineAfter time.Duration
 	now          func() time.Time
 	store        *Store
-	challenges   map[string]challenge
-}
-
-type challenge struct {
-	nonce   string
-	purpose string
-	expires time.Time
+	// challengeSecret signs stateless challenge nonces. Issuing a challenge
+	// does not store anything, so an unauthenticated flood cannot evict an
+	// outstanding nonce the way a single overwritten slot could.
+	challengeSecret [32]byte
+	// usedChallenges remembers successful proofs until they expire, keeping
+	// nonces one-time without tracking every issued challenge.
+	usedChallenges map[string]time.Time
 }
 
 // New creates a registry without persistence. Tests and embedders that manage
@@ -139,13 +142,17 @@ func New(offlineAfter time.Duration) *Registry {
 	if offlineAfter <= 0 {
 		offlineAfter = 30 * time.Second
 	}
-	return &Registry{
-		hosts:        make(map[string]*Host),
-		identities:   make(map[string]Identity),
-		offlineAfter: offlineAfter,
-		now:          time.Now,
-		challenges:   make(map[string]challenge),
+	r := &Registry{
+		hosts:          make(map[string]*Host),
+		identities:     make(map[string]Identity),
+		offlineAfter:   offlineAfter,
+		now:            time.Now,
+		usedChallenges: make(map[string]time.Time),
 	}
+	if _, err := rand.Read(r.challengeSecret[:]); err != nil {
+		panic("registry: cannot generate the challenge secret: " + err.Error())
+	}
+	return r
 }
 
 // NewPersistent loads the peer database at path. A missing file starts empty;
@@ -605,19 +612,75 @@ func (r *Registry) issueChallenge(id, purpose, scope string) (string, error) {
 	if !ok || r.now().After(host.ExpiresAt) {
 		return "", ErrUnknownHost
 	}
-	nonce, err := newNonce()
-	if err != nil {
-		return "", err
-	}
 	now := r.now()
-	key := challengeKey(id, purpose, scope)
-	for k, c := range r.challenges {
-		if now.After(c.expires) {
-			delete(r.challenges, k)
+	for nonce, expires := range r.usedChallenges {
+		if now.After(expires) {
+			delete(r.usedChallenges, nonce)
 		}
 	}
-	r.challenges[key] = challenge{nonce: nonce, purpose: purpose, expires: now.Add(challengeTTL)}
-	return nonce, nil
+	return r.mintChallenge(id, purpose, scope, now.Add(challengeTTL))
+}
+
+// mintChallenge returns a self-describing nonce bound to the host, purpose and
+// scope. It carries its own expiry, a random salt and an HMAC, so verification
+// needs no per-host pending slot that an unauthenticated request could replace
+// and two issues never collide.
+func (r *Registry) mintChallenge(id, purpose, scope string, expires time.Time) (string, error) {
+	stamp := strconv.FormatInt(expires.UnixMilli(), 10)
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	salt := base64.RawURLEncoding.EncodeToString(raw)
+	mac := hmac.New(sha256.New, r.challengeSecret[:])
+	mac.Write([]byte(id))
+	mac.Write([]byte{0})
+	mac.Write([]byte(purpose))
+	mac.Write([]byte{0})
+	mac.Write([]byte(scope))
+	mac.Write([]byte{0})
+	mac.Write([]byte(stamp))
+	mac.Write([]byte{0})
+	mac.Write([]byte(salt))
+	return stamp + "." + salt + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+// challengeExpiry validates a nonce minted by mintChallenge and returns its
+// expiry. A nonce for another host, purpose or scope fails the HMAC check.
+func (r *Registry) challengeExpiry(id, purpose, scope, nonce string) (time.Time, bool) {
+	parts := strings.Split(nonce, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	stamp, salt, encoded := parts[0], parts[1], parts[2]
+	if len(salt) > 32 || len(encoded) > 64 {
+		return time.Time{}, false
+	}
+	millis, err := strconv.ParseInt(stamp, 10, 64)
+	if err != nil || millis <= 0 {
+		return time.Time{}, false
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(salt); err != nil {
+		return time.Time{}, false
+	}
+	got, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return time.Time{}, false
+	}
+	mac := hmac.New(sha256.New, r.challengeSecret[:])
+	mac.Write([]byte(id))
+	mac.Write([]byte{0})
+	mac.Write([]byte(purpose))
+	mac.Write([]byte{0})
+	mac.Write([]byte(scope))
+	mac.Write([]byte{0})
+	mac.Write([]byte(stamp))
+	mac.Write([]byte{0})
+	mac.Write([]byte(salt))
+	if !hmac.Equal(got, mac.Sum(nil)) {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(millis), true
 }
 
 // VerifyChallenge consumes the nonce and verifies the host signature over the
@@ -627,14 +690,16 @@ func (r *Registry) VerifyChallenge(id, purpose, nonce, message, signature string
 }
 
 func (r *Registry) verifyChallenge(id, purpose, scope, nonce, message, signature string) (Host, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	key := challengeKey(id, purpose, scope)
-	pending, ok := r.challenges[key]
-	if !ok || pending.purpose != purpose || pending.nonce != nonce || r.now().After(pending.expires) {
+	expires, ok := r.challengeExpiry(id, purpose, scope, nonce)
+	now := r.now()
+	if !ok || now.After(expires) {
 		return Host{}, ErrChallenge
 	}
-	delete(r.challenges, key)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, used := r.usedChallenges[nonce]; used {
+		return Host{}, ErrChallenge
+	}
 	record, ok := r.identities[id]
 	if !ok {
 		return Host{}, ErrUnknownHost
@@ -644,9 +709,12 @@ func (r *Registry) verifyChallenge(id, purpose, scope, nonce, message, signature
 		return Host{}, identity.ErrBadSignature
 	}
 	host, ok := r.hosts[id]
-	if !ok || r.now().After(host.ExpiresAt) {
+	if !ok || now.After(host.ExpiresAt) {
 		return Host{}, ErrUnknownHost
 	}
+	// Recording the nonce only after the proof verifies means a bad signature
+	// cannot burn a host's outstanding challenge.
+	r.usedChallenges[nonce] = expires
 	return *host, nil
 }
 
@@ -671,14 +739,6 @@ func (r *Registry) TouchChallenge(id, nonce, candidate, signature, message strin
 	return r.touchLocked(id, candidate, localAddrs, natType, upnpPort)
 }
 
-func challengeKey(id, purpose, scope string) string {
-	key := id + "\x00" + purpose
-	if scope != "" {
-		key += "\x00" + scope
-	}
-	return key
-}
-
 // challengeScope matches the family used by IssueChallengeScoped for a
 // keepalive: the observed candidate is the signed address, so its family is
 // the same one the challenge was issued for.
@@ -687,14 +747,6 @@ func challengeScope(candidate string) string {
 		return "v6"
 	}
 	return "v4"
-}
-
-func newNonce() (string, error) {
-	raw := make([]byte, 16)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func validFingerprint(fp string) error {

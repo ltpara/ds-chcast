@@ -270,6 +270,22 @@ func TestRelayRequiresHello(t *testing.T) {
 	}
 }
 
+func TestRelayHandshakesAreRateLimited(t *testing.T) {
+	_, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithHandshakeRateMax(2))
+	host := listenUDP(t)
+	if ack := relayHandshake(t, host, relayAddr, "devbox", priv); !ack.OK {
+		t.Fatalf("relay handshake: %+v", ack)
+	}
+	// The hello and the proof spent the whole burst, so the next hello must be
+	// dropped silently instead of minting another challenge.
+	host.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeRelayHello, HostID: "devbox"}), relayAddr)
+	host.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 4096)
+	if n, _, err := host.ReadFromUDP(buf); err == nil {
+		t.Fatalf("rate-limited hello got a reply: %s", buf[:n])
+	}
+}
+
 func TestRelayServesBothFamiliesOnOnePort(t *testing.T) {
 	priv := identity.PrivateKeyFromSecret("host-secret")
 	reg := registry.New(time.Minute)

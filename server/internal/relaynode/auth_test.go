@@ -127,6 +127,29 @@ func TestAuthenticatorChallengeIsOneShot(t *testing.T) {
 	}
 }
 
+func TestAuthenticatorChallengeSurvivesInterleavedIssues(t *testing.T) {
+	auth := NewAuthenticator()
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	auth.SetClock(func() time.Time { return now })
+	priv, pub := testKey("host-a")
+	if _, err := auth.Put("devbox", pub, "token", 41000, time.Minute); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	first, err := auth.IssueChallenge("devbox", identity.DomainRelay)
+	if err != nil {
+		t.Fatalf("challenge: %v", err)
+	}
+	for i := 0; i < 64; i++ {
+		if _, err := auth.IssueChallenge("devbox", identity.DomainRelay); err != nil {
+			t.Fatalf("interleaved challenge: %v", err)
+		}
+	}
+	message := identity.RelayMessage("devbox", 41000, "127.0.0.1:5000", first)
+	if !auth.CheckChallenge("devbox", identity.DomainRelay, first, string(message), identity.Sign(priv, message)) {
+		t.Fatal("an unauthorised hello invalidated the host's outstanding challenge")
+	}
+}
+
 func TestAuthenticatorPruneAndRemove(t *testing.T) {
 	auth := NewAuthenticator()
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)

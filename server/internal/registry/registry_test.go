@@ -365,6 +365,31 @@ func TestChallengeIsOneTimeAndBound(t *testing.T) {
 	}
 }
 
+func TestChallengeSurvivesInterleavedIssues(t *testing.T) {
+	reg := New(time.Minute)
+	priv, pub := hostKey("host-secret")
+	if _, err := reg.Register(RegisterRequest{ID: "devbox", PublicKey: pub, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := "198.51.100.7:51234"
+	first, err := reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An unauthenticated flood of keepalives must not displace the nonce the
+	// host is about to answer.
+	for i := 0; i < 64; i++ {
+		if _, err := reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v4"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msg := identity.KeepaliveMessage("devbox", candidate, first)
+	if err := reg.TouchChallenge("devbox", first, candidate,
+		identity.Sign(priv, msg), string(msg), nil, "", 0); err != nil {
+		t.Fatalf("outstanding challenge was displaced: %v", err)
+	}
+}
+
 func TestKeepaliveChallengesPerFamily(t *testing.T) {
 	reg := New(time.Minute)
 	priv, pub := hostKey("host-secret")
@@ -380,6 +405,12 @@ func TestKeepaliveChallengesPerFamily(t *testing.T) {
 	nonce6, err := reg.IssueChallengeScoped("devbox", identity.DomainKeepalive, "v6")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// A nonce minted for one family cannot be spent on the other.
+	wrong := identity.KeepaliveMessage("devbox", v6, nonce4)
+	if err := reg.TouchChallenge("devbox", nonce4, v6,
+		identity.Sign(priv, wrong), string(wrong), nil, "", 0); !errors.Is(err, ErrChallenge) {
+		t.Fatalf("v4 challenge accepted for v6: %v", err)
 	}
 	for _, step := range []struct{ nonce, candidate string }{
 		{nonce6, v6},

@@ -220,8 +220,19 @@ func TestKeepaliveRejectsWrongKeyAndUnknownPunch(t *testing.T) {
 	if ack.OK || ack.Error == "" {
 		t.Fatalf("wrong key accepted: %+v", ack)
 	}
-	// The nonce was consumed by the failed proof, so even a correctly signed
-	// retry of the same challenge must be refused.
+	// A failed proof must not burn the nonce: an observer who saw the
+	// challenge could otherwise deny the host. The right key still completes
+	// it, and only then is the nonce spent.
+	stranger.WriteToUDP(wire.Encode(wire.Message{
+		Type:      wire.TypeKeepaliveAuth,
+		HostID:    "devbox",
+		Nonce:     challenge.Nonce,
+		Candidate: challenge.Candidate,
+		Signature: identity.Sign(priv, message),
+	}), meetAddr)
+	if ack := recv(t, stranger); !ack.OK {
+		t.Fatalf("correct proof after a failed attempt: %+v", ack)
+	}
 	stranger.WriteToUDP(wire.Encode(wire.Message{
 		Type:      wire.TypeKeepaliveAuth,
 		HostID:    "devbox",
@@ -383,6 +394,24 @@ func TestRateLimiter(t *testing.T) {
 		if !disabled.allow("198.51.100.3") {
 			t.Fatal("zero limit still refused a request")
 		}
+	}
+}
+
+func TestKeepaliveIsRateLimited(t *testing.T) {
+	_, _, meetAddr, priv := startMeet(t, WithKeepaliveRateMax(4))
+	host := listenUDP(t)
+	// Every exchange spends two messages (challenge and auth), so two
+	// exchanges exhaust the window.
+	for i := 0; i < 2; i++ {
+		if ack := keepalive(t, host, meetAddr, priv); !ack.OK {
+			t.Fatalf("keepalive %d: %+v", i, ack)
+		}
+	}
+	host.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeKeepalive, HostID: "devbox"}), meetAddr)
+	host.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 2048)
+	if n, _, err := host.ReadFromUDP(buf); err == nil {
+		t.Fatalf("rate-limited keepalive got a reply: %s", buf[:n])
 	}
 }
 

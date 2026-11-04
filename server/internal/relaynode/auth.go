@@ -2,10 +2,14 @@ package relaynode
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,28 +32,29 @@ type lease struct {
 	expires time.Time
 }
 
-type pendingChallenge struct {
-	nonce   string
-	purpose string
-	expires time.Time
-}
-
 // Authenticator holds the leases provisioned by hbbs. A relay node never talks
 // back to hbbs: hbbs hands it the host's public key and carrier token, so the
 // node can verify relay and carrier challenges on its own.
 type Authenticator struct {
-	mu         sync.Mutex
-	leases     map[string]*lease
-	challenges map[string]pendingChallenge
-	now        func() time.Time
+	mu     sync.Mutex
+	leases map[string]*lease
+	// usedChallenges remembers nonces that completed a handshake so a replay
+	// is refused until the minted expiry passes.
+	usedChallenges map[string]time.Time
+	secret         [32]byte
+	now            func() time.Time
 }
 
 func NewAuthenticator() *Authenticator {
-	return &Authenticator{
-		leases:     make(map[string]*lease),
-		challenges: make(map[string]pendingChallenge),
-		now:        time.Now,
+	a := &Authenticator{
+		leases:         make(map[string]*lease),
+		usedChallenges: make(map[string]time.Time),
+		now:            time.Now,
 	}
+	if _, err := rand.Read(a.secret[:]); err != nil {
+		panic("relaynode: cannot generate the challenge secret: " + err.Error())
+	}
+	return a
 }
 
 func (a *Authenticator) SetClock(now func() time.Time) {
@@ -100,11 +105,7 @@ func (a *Authenticator) Put(id, pubText, token string, port int, ttl time.Durati
 		expires: now.Add(ttl),
 	}
 	a.leases[id] = entry
-	for key, pending := range a.challenges {
-		if now.After(pending.expires) {
-			delete(a.challenges, key)
-		}
-	}
+	a.sweepLocked(now)
 	return LeaseInfo{ID: id, PublicKey: pubText, Port: port, ExpiresAt: entry.expires}, nil
 }
 
@@ -113,8 +114,6 @@ func (a *Authenticator) Remove(id string) bool {
 	defer a.mu.Unlock()
 	_, ok := a.leases[id]
 	delete(a.leases, id)
-	delete(a.challenges, challengeKey(id, identity.DomainRelay))
-	delete(a.challenges, challengeKey(id, identity.DomainCarrierHost))
 	return ok
 }
 
@@ -128,16 +127,19 @@ func (a *Authenticator) Prune(now time.Time) []string {
 		if !now.Before(entry.expires) {
 			delete(a.leases, id)
 			expired = append(expired, id)
-			delete(a.challenges, challengeKey(id, identity.DomainRelay))
-			delete(a.challenges, challengeKey(id, identity.DomainCarrierHost))
 		}
 	}
-	for key, pending := range a.challenges {
-		if now.After(pending.expires) {
-			delete(a.challenges, key)
-		}
-	}
+	a.sweepLocked(now)
 	return expired
+}
+
+// sweepLocked drops used-nonce records whose minted lifetime has passed.
+func (a *Authenticator) sweepLocked(now time.Time) {
+	for nonce, expires := range a.usedChallenges {
+		if now.After(expires) {
+			delete(a.usedChallenges, nonce)
+		}
+	}
 }
 
 func (a *Authenticator) Count() int {
@@ -192,6 +194,9 @@ func (a *Authenticator) VerifyCarrier(id, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(entry.token), []byte(token)) == 1
 }
 
+// IssueChallenge returns a self-describing nonce bound to the host and purpose.
+// It carries its own expiry and HMAC, so repeated unauthenticated hello
+// messages cannot replace a host's outstanding challenge.
 func (a *Authenticator) IssueChallenge(id, purpose string) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -199,33 +204,80 @@ func (a *Authenticator) IssueChallenge(id, purpose string) (string, error) {
 	if a.liveLocked(id, now) == nil {
 		return "", ErrUnknownLease
 	}
-	raw := make([]byte, 16)
+	a.sweepLocked(now)
+	return a.mintChallenge(id, purpose, now.Add(challengeTTL)), nil
+}
+
+func (a *Authenticator) mintChallenge(id, purpose string, expires time.Time) string {
+	stamp := strconv.FormatInt(expires.UnixMilli(), 10)
+	raw := make([]byte, 8)
 	if _, err := rand.Read(raw); err != nil {
-		return "", err
+		panic("relaynode: cannot generate a challenge salt: " + err.Error())
 	}
-	nonce := base64.RawURLEncoding.EncodeToString(raw)
-	a.challenges[challengeKey(id, purpose)] = pendingChallenge{
-		nonce:   nonce,
-		purpose: purpose,
-		expires: now.Add(challengeTTL),
+	salt := base64.RawURLEncoding.EncodeToString(raw)
+	mac := hmac.New(sha256.New, a.secret[:])
+	mac.Write([]byte(id))
+	mac.Write([]byte{0})
+	mac.Write([]byte(purpose))
+	mac.Write([]byte{0})
+	mac.Write([]byte(stamp))
+	mac.Write([]byte{0})
+	mac.Write([]byte(salt))
+	return stamp + "." + salt + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (a *Authenticator) challengeExpiry(id, purpose, nonce string) (time.Time, bool) {
+	parts := strings.Split(nonce, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
 	}
-	return nonce, nil
+	stamp, salt, encoded := parts[0], parts[1], parts[2]
+	if len(salt) > 32 || len(encoded) > 64 {
+		return time.Time{}, false
+	}
+	millis, err := strconv.ParseInt(stamp, 10, 64)
+	if err != nil || millis <= 0 {
+		return time.Time{}, false
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(salt); err != nil {
+		return time.Time{}, false
+	}
+	got, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return time.Time{}, false
+	}
+	mac := hmac.New(sha256.New, a.secret[:])
+	mac.Write([]byte(id))
+	mac.Write([]byte{0})
+	mac.Write([]byte(purpose))
+	mac.Write([]byte{0})
+	mac.Write([]byte(stamp))
+	mac.Write([]byte{0})
+	mac.Write([]byte(salt))
+	if !hmac.Equal(got, mac.Sum(nil)) {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(millis), true
 }
 
 func (a *Authenticator) CheckChallenge(id, purpose, nonce, message, signature string) bool {
+	expires, ok := a.challengeExpiry(id, purpose, nonce)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
-	key := challengeKey(id, purpose)
-	pending, ok := a.challenges[key]
-	if !ok || pending.purpose != purpose || pending.nonce != nonce || now.After(pending.expires) {
+	if !ok || now.After(expires) {
 		return false
 	}
-	delete(a.challenges, key)
+	if _, used := a.usedChallenges[nonce]; used {
+		return false
+	}
 	entry := a.liveLocked(id, now)
 	if entry == nil || !identity.Verify(entry.pub, []byte(message), signature) {
 		return false
 	}
+	// Record only after the proof verifies so a bad signature cannot burn the
+	// host's challenge.
+	a.usedChallenges[nonce] = expires
 	return true
 }
 
@@ -236,5 +288,3 @@ func (a *Authenticator) liveLocked(id string, now time.Time) *lease {
 	}
 	return entry
 }
-
-func challengeKey(id, purpose string) string { return id + "\x00" + purpose }

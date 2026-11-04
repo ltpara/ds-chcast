@@ -149,6 +149,7 @@ func run() error {
 		envFile        = flag.String("env-file", ".env", "dotenv file with flag values; empty disables it")
 		rmem           = flag.Int("rmem", 0, "UDP receive buffer in bytes for rendezvous and relay sockets; 0 keeps the system default")
 		punchRateMax   = flag.Int("punch-rate-max", rendezvous.DefaultRateMax, "punch requests per client IP per 10s; 0 disables the limiter")
+		keepaliveRate  = flag.Int("keepalive-rate-max", rendezvous.DefaultKeepaliveRateMax, "keepalive exchanges per client IP per 10s; 0 disables the limiter")
 		testPunch      = flag.String("test-punch", "auto", "startup UDP self-check: auto probes a local endpoint, no disables it, or an explicit host:port")
 		punchLogMax    = flag.Int("punch-log-max", 100000, "retained punch request records; 0 disables the log")
 		regMax         = flag.Int("register-max", 30, "registration attempts per IP per window; 0 disables the rate check")
@@ -382,6 +383,9 @@ func run() error {
 	}
 	if *punchRateMax < 0 {
 		return errors.New("--punch-rate-max must not be negative")
+	}
+	if *keepaliveRate < 0 {
+		return errors.New("--keepalive-rate-max must not be negative")
 	}
 	if *regMax < 0 || *regMaxIDs < 0 {
 		return errors.New("--register-max and --register-max-ids must not be negative")
@@ -640,6 +644,7 @@ func run() error {
 	meet, err := rendezvous.New(*punchListen, reg, relayAddr, log,
 		rendezvous.WithReadBuffer(*rmem),
 		rendezvous.WithPunchRateMax(*punchRateMax),
+		rendezvous.WithKeepaliveRateMax(*keepaliveRate),
 		rendezvous.WithServerKey(*serverKey),
 	)
 	if err != nil {
