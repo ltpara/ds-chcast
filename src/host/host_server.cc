@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -32,6 +33,191 @@
 #include "chast/terminal_relay.h"
 
 namespace chast {
+
+// Defined here, where the audio pipeline types are complete: the header only
+// forward-declares them, so an inline constructor would need their destructors
+// in every translation unit that includes it.
+HostServer::HostServer(HostServerConfig config)
+    : config_(std::move(config)), settings_(config_.settings) {}
+
+// Coordination between a listener and its per-viewer workers. The listener
+// owns the object; workers hold the same shared_ptr. All fields are guarded by
+// `mutex`; `callback_mutex` serializes the user callbacks that persist
+// settings (a viewer thread may otherwise race the parent's).
+struct ViewerRegistry {
+    mutable std::mutex mutex;
+    std::weak_ptr<HostServer> focused;
+    size_t active = 0;
+    // Accepted connections still in their handshake. They already hold the
+    // token they were accepted with, so rotation has to wait for them too.
+    size_t pending = 0;
+    uint64_t admitted = 0;
+    size_t max_viewers = 1;
+    // The desktop viewer allowed to inject input and change host-wide state.
+    HostServer* controller = nullptr;
+    // Viewer audit references held by live sessions. A second connection that
+    // presents the same reference is recorded under a host id instead, so the
+    // service can never merge two concurrent sessions into one row.
+    std::set<std::string> audit_refs;
+    std::mutex callback_mutex;
+
+    // The shared desktop stream. IDXGI allows one duplication per output per
+    // process, so exactly one desktop viewer captures and encodes; the others
+    // receive its frames. `desktop_publisher` is the worker that owns capture,
+    // `desktop_info` is the description it last announced, and the followers
+    // are live workers waiting for the broadcast. `desktop_version` only
+    // grows, so a follower that missed a description change can tell a new
+    // one from the old even after the publisher was replaced.
+    HostServer* desktop_publisher = nullptr;
+    ServerInfo desktop_info;
+    size_t desktop_display_index = 0;
+    std::string desktop_display_name;
+    uint64_t desktop_version = 0;
+    bool desktop_info_ready = false;
+    uint32_t desktop_keyframe_requests = 0;
+    DesktopKind desktop_kind = DesktopKind::Default;
+    std::vector<std::weak_ptr<HostServer>> desktop_followers;
+
+    bool claim_desktop(const std::shared_ptr<HostServer>& viewer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (desktop_publisher != nullptr) {
+            return false;
+        }
+        desktop_publisher = viewer.get();
+        // A new publisher has not announced yet; followers wait for it.
+        desktop_info_ready = false;
+        desktop_info = ServerInfo{};
+        return true;
+    }
+    void release_desktop(HostServer* viewer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (desktop_publisher == viewer) {
+            desktop_publisher = nullptr;
+            desktop_info_ready = false;
+        }
+    }
+    bool is_desktop_publisher(const HostServer* viewer) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return desktop_publisher == viewer;
+    }
+    bool has_desktop_publisher() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return desktop_publisher != nullptr;
+    }
+    void update_desktop_info(const ServerInfo& info, size_t display_index,
+                             const std::string& display_name) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (desktop_publisher == nullptr) {
+            return;
+        }
+        desktop_info = info;
+        desktop_display_index = display_index;
+        desktop_display_name = display_name;
+        ++desktop_version;
+        desktop_info_ready = true;
+    }
+    bool desktop_info_since(uint64_t known_version, ServerInfo& info, size_t& display_index,
+                            std::string& display_name, uint64_t& version) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!desktop_info_ready || desktop_version <= known_version) {
+            return false;
+        }
+        info = desktop_info;
+        display_index = desktop_display_index;
+        display_name = desktop_display_name;
+        version = desktop_version;
+        return true;
+    }
+    void request_desktop_keyframe() {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++desktop_keyframe_requests;
+    }
+    bool take_desktop_keyframe_request() {
+        std::lock_guard<std::mutex> lock(mutex);
+        const bool requested = desktop_keyframe_requests > 0;
+        desktop_keyframe_requests = 0;
+        return requested;
+    }
+    void set_desktop_kind(DesktopKind kind) {
+        std::lock_guard<std::mutex> lock(mutex);
+        desktop_kind = kind;
+    }
+    DesktopKind get_desktop_kind() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return desktop_kind;
+    }
+    void add_desktop_follower(const std::shared_ptr<HostServer>& viewer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = desktop_followers.begin(); it != desktop_followers.end();) {
+            if (it->expired()) {
+                it = desktop_followers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        desktop_followers.push_back(viewer);
+    }
+    void remove_desktop_follower(HostServer* viewer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = desktop_followers.begin(); it != desktop_followers.end();) {
+            const std::shared_ptr<HostServer> live = it->lock();
+            if (!live || live.get() == viewer) {
+                it = desktop_followers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    std::vector<std::shared_ptr<HostServer>> desktop_follower_list() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::shared_ptr<HostServer>> live;
+        for (auto it = desktop_followers.begin(); it != desktop_followers.end();) {
+            std::shared_ptr<HostServer> viewer = it->lock();
+            if (!viewer) {
+                it = desktop_followers.erase(it);
+                continue;
+            }
+            live.push_back(std::move(viewer));
+            ++it;
+        }
+        return live;
+    }
+
+    bool claim_audit_ref(const std::string& ref) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return audit_refs.insert(ref).second;
+    }
+    void release_audit_ref(const std::string& ref) {
+        std::lock_guard<std::mutex> lock(mutex);
+        audit_refs.erase(ref);
+    }
+
+    bool acquire_control(HostServer* viewer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (controller == nullptr) {
+            controller = viewer;
+            return true;
+        }
+        return controller == viewer;
+    }
+    bool holds_control(const HostServer* viewer) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return controller == viewer;
+    }
+    void release_control(HostServer* viewer) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (controller == viewer) {
+            controller = nullptr;
+        }
+    }
+    // Privacy mode changes the operator's physical screens, so it follows the
+    // control lease once more than one viewer is connected. A lone viewer may
+    // always use it when the host grants the permission.
+    bool may_change_host_state(const HostServer* viewer) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return active <= 1 || controller == viewer;
+    }
+};
 
 namespace {
 
@@ -465,8 +651,12 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
     }
     // The policy binds signed Hellos to the certificate just loaded, so it
     // exists only once the session knows its fingerprint.
-    server->security_ = std::make_unique<HostSecurity>(
+    server->security_ = std::make_shared<HostSecurity>(
         server->security_config(server->session_->server_fingerprint()));
+    if (server->settings_.max_viewers > 1) {
+        server->registry_ = std::make_shared<ViewerRegistry>();
+        server->registry_->max_viewers = server->settings_.max_viewers;
+    }
     server->publish_security_status();
     if (server->config_.service_mode && server->settings_.password_hash.empty()) {
         server->log("service mode has no permanent password; every viewer will be refused "
@@ -478,6 +668,11 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
 HostServer::~HostServer() {
     stop();
     carrier_.reset();
+    if (registry_) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        registry_->focused.reset();
+    }
+    viewers_.clear();
     session_.reset();
 }
 
@@ -511,8 +706,46 @@ bool HostServer::running() const {
 }
 
 HostStatus HostServer::status() const {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    HostStatus snapshot = status_;
+    HostStatus snapshot;
+    if (registry_ && !adopted_) {
+        size_t active = 0;
+        uint64_t admitted = 0;
+        std::shared_ptr<HostServer> target;
+        {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            active = registry_->active;
+            admitted = registry_->admitted;
+            target = registry_->focused.lock();
+        }
+        if (target && target.get() != this) {
+            snapshot = target->status();
+            // A worker has no listener state of its own; the identity, token,
+            // policy and carrier belong to the host and stay the parent's.
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            snapshot.fingerprint = status_.fingerprint;
+            snapshot.token = status_.token;
+            snapshot.auth_mode = status_.auth_mode;
+            snapshot.password_configured = status_.password_configured;
+            snapshot.two_factor_enabled = status_.two_factor_enabled;
+            snapshot.temporary_password = status_.temporary_password;
+            snapshot.carrier_listening = status_.carrier_listening;
+            snapshot.carrier_port = status_.carrier_port;
+            snapshot.carrier_error = status_.carrier_error;
+        } else {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            snapshot = status_;
+        }
+        snapshot.active_viewers = active;
+        // `admitted` is the shared count; the focused session reports one
+        // session of its own.
+        snapshot.stats.sessions = admitted;
+        if (active > 0) {
+            snapshot.state = HostState::Streaming;
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        snapshot = status_;
+    }
     if (carrier_) {
         const CarrierServerStats stats = carrier_->stats();
         snapshot.carrier_connections = stats.connections;
@@ -531,6 +764,9 @@ bool HostServer::open_session(std::string* error) {
     quic.bind_address = settings_.bind_address;
     quic.port = settings_.port;
     quic.identity_scope = config_.identity_scope;
+    // Above one, the listener hands every connection to its own session
+    // worker instead of holding a single slot.
+    quic.max_clients = settings_.max_viewers > 1 ? settings_.max_viewers : 1;
     quic.allow_input = settings_.allow_input;
     quic.allow_clipboard = settings_.allow_clipboard;
     quic.allow_file_transfer = settings_.allow_file_transfer;
@@ -660,6 +896,29 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
     const std::string from =
         request.peer_address.empty() ? std::string("an unknown address") : request.peer_address;
     auth.permissions = pending_security_.permissions;
+    approved_permissions_ = 0;
+    lease_stripped_input_ = false;
+    // A refused Hello must not take the control lease with it.
+    if (adopted_ && registry_ && pending_security_.decision != HostSecurity::Decision::Deny) {
+        if (request.mode != SessionMode::Desktop) {
+            // A files-only connection has no input surface. Dropping the bit
+            // here also keeps it from joining the control-lease election.
+            auth.permissions &= ~static_cast<uint16_t>(kPermissionInput);
+        } else if (settings_.allow_input && (auth.permissions & kPermissionInput) != 0) {
+            if (!registry_->acquire_control(this)) {
+                auth.permissions &= ~static_cast<uint16_t>(kPermissionInput);
+                lease_stripped_input_ = true;
+                log("another viewer already holds control; this viewer joins view-only");
+            }
+        }
+        // The lease strip is temporal, not a policy decision: keep the bit so
+        // the transport's ceiling can be raised once control is free. A
+        // files-only or policy-stripped mask stays as it is.
+        approved_permissions_ = auth.permissions;
+        if (lease_stripped_input_) {
+            approved_permissions_ |= kPermissionInput;
+        }
+    }
     switch (pending_security_.decision) {
         case HostSecurity::Decision::Allow:
             auth.action = ClientAuthAction::Allow;
@@ -711,6 +970,10 @@ ClientApproval HostServer::approve_client(const ClientRequest& request) {
     }
     // The trust list and a spent temporary password are committed only now:
     // a refused approval is a denial, not a login.
+    if (adopted_ && registry_) {
+        // The operator's decision also bounds what the lease may grant later.
+        approved_permissions_ &= approval.permissions;
+    }
     commit_security();
     log("the operator approved the viewer from " + from + "; granting " +
         permission_names(request.permissions & approval.permissions));
@@ -808,13 +1071,42 @@ void HostServer::clear_trusted_devices() {
     publish_trusted_devices();
 }
 
+std::shared_ptr<HostServer> HostServer::focused_viewer() const {
+    if (!registry_) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    return registry_->focused.lock();
+}
+
 void HostServer::set_permissions(uint16_t permissions) {
+    if (registry_ && !adopted_) {
+        std::shared_ptr<HostServer> target = focused_viewer();
+        if (!target) {
+            return;
+        }
+        target->set_permissions(permissions);
+        return;
+    }
     std::lock_guard<std::mutex> lock(permission_mutex_);
-    pending_permissions_.store(permissions & kPermissionAll);
+    uint16_t mask = permissions & kPermissionAll;
+    // Input injection has one owner. Granting input to a viewer that does not
+    // hold the lease would put two keyboards on one desktop, so the grant
+    // keeps that viewer view-only until control is free.
+    if (registry_ && adopted_ && (mask & kPermissionInput) != 0 &&
+        !registry_->acquire_control(this)) {
+        mask &= ~static_cast<uint16_t>(kPermissionInput);
+        log("another viewer controls input; this viewer stays view-only");
+    }
+    pending_permissions_.store(mask);
     permission_update_pending_.store(true);
 }
 
 bool HostServer::send_chat(const std::string& text) {
+    if (registry_ && !adopted_) {
+        std::shared_ptr<HostServer> target = focused_viewer();
+        return target ? target->send_chat(text) : false;
+    }
     if (!valid_chat_text(text)) {
         return false;
     }
@@ -833,6 +1125,16 @@ bool HostServer::send_chat(const std::string& text) {
 }
 
 bool HostServer::start_file_download(const std::string& utf8_path, std::string* error) {
+    if (registry_ && !adopted_) {
+        std::shared_ptr<HostServer> target = focused_viewer();
+        if (!target) {
+            if (error != nullptr) {
+                *error = "no viewer is streaming";
+            }
+            return false;
+        }
+        return target->start_file_download(utf8_path, error);
+    }
     const auto fail = [error](const std::string& text) {
         if (error != nullptr) {
             *error = text;
@@ -906,6 +1208,18 @@ void HostServer::publish_download() {
 }
 
 void HostServer::run() {
+    if (adopted_) {
+        run_adopted();
+        return;
+    }
+    if (settings_.max_viewers <= 1) {
+        run_single();
+        return;
+    }
+    run_multi();
+}
+
+void HostServer::run_single() {
     HostServerStats stats;
     uint32_t failures = 0;
     while (!stopping_.load()) {
@@ -976,85 +1290,9 @@ void HostServer::run() {
         }
 
         failures = 0;
-        ++stats.sessions;
-        stats.client_connected = true;
-        const std::string peer = session_->client_address();
-        // Captured now: wait_for_client() consumed the Hello, and the
-        // reference is cleared when this connection is torn down. A viewer
-        // that sent no reference still gets recorded, under a host id that
-        // cannot merge with a viewer report.
-        const std::string viewer_audit_ref = session_->audit_ref();
-        const bool viewer_ref_absent = viewer_audit_ref.empty();
-        const std::string audit_ref =
-            viewer_ref_absent ? host_audit_ref() : viewer_audit_ref;
-        session_audit_ref_ = audit_ref;
-        session_audit_ref_absent_ = viewer_ref_absent;
-        const int64_t audit_started_ms = unix_now_ms();
-        {
-            std::lock_guard<std::mutex> lock(status_mutex_);
-            status_.peer_address = peer;
-            status_.requested_display = session_->requested_display();
-            status_.session_permissions = session_->permissions();
-            status_.display_index = 0;
-            status_.display_name.clear();
-            status_.display_merged = false;
-            status_.stream = ServerInfo{};
-        }
-        publish_stats(stats);
-        publish_state(HostState::Streaming);
-        log(peer.empty() ? "a viewer connected" : "a viewer connected from " + peer);
-
         std::string error;
         bool peer_left = false;
-        const bool files_only = session_->requested_mode() == SessionMode::FileTransfer;
-        const bool ok = files_only ? file_session(stats, &error, &peer_left)
-                                   : stream_session(stats, &error, &peer_left);
-
-        ClientStats peer_stats;
-        bool stats_received = false;
-        const auto finish_timeout = std::chrono::milliseconds(
-            ok ? config_.finish_timeout_ms : std::min<uint32_t>(config_.finish_timeout_ms, 2000));
-        Error finished = session_->finish_server(finish_timeout, peer_stats, stats_received);
-        stats.peer_left = peer_left;
-        stats.stats_received = stats_received;
-        if (stats_received) {
-            stats.peer = peer_stats;
-        }
-        for (const InputEvent& event : session_->take_input_events()) {
-            ++stats.input_events;
-            if (config_.input_event) {
-                config_.input_event(event);
-            }
-        }
-        stats.input_stats = session_->input_stats();
-        stats.input_releases = session_->input_release_requests();
-        publish_stats(stats);
-
-        if (ok && !stopping_.load()) {
-            // A viewer that sends its closing Stats/Bye before the video send
-            // fails left on purpose, even though the send then reports the
-            // peer gone.
-            log(peer_left && !stats_received ? "the viewer disappeared" : "the viewer left");
-        }
-        if (!finished.ok() && !peer_left && error.empty() && !stopping_.load()) {
-            error = "finish: " + finished.to_string();
-        }
-        // Every session leaves a host-side record. A viewer that sent no
-        // reference cannot contribute its own half, so the record is marked
-        // and stands alone.
-        if (!settings_.audit_spool.empty()) {
-            AuditSessionRecord record;
-            record.audit_ref = audit_ref;
-            record.viewer_ref_absent = viewer_ref_absent;
-            record.started_at_ms = audit_started_ms;
-            record.ended_at_ms = unix_now_ms();
-            record.success = ok && error.empty();
-            record.detail = error;
-            std::string audit_error;
-            if (!append_audit_session(settings_.audit_spool, record, &audit_error)) {
-                log("audit: " + audit_error);
-            }
-        }
+        const bool ok = serve_current_session(stats, true, &error, &peer_left);
         if (!ok || !error.empty()) {
             log(error.empty() ? "the session ended" : error);
             publish_state(HostState::Failed, error.empty() ? "the session failed" : error);
@@ -1068,24 +1306,6 @@ void HostServer::run() {
             }
             sleep_unless_stopping(std::chrono::seconds(2));
             continue;
-        }
-
-        // A spent one-time token must not guard the next connection, so it is
-        // replaced while the listener is between viewers.
-        if (settings_.token_mode == HostTokenMode::OneTime && !config_.serve_once) {
-            settings_.access_token = generate_access_token();
-            session_->set_access_token(settings_.access_token);
-            {
-                std::lock_guard<std::mutex> lock(status_mutex_);
-                status_.token = settings_.access_token;
-            }
-            if (config_.token_changed) {
-                config_.token_changed(settings_.access_token);
-            }
-            // The policy holds its own copy of the token, so automation sees
-            // the same rotation the legacy caller does.
-            refresh_security_config();
-            log("the one-time token was spent; a new token is ready");
         }
 
         session_->reset_for_next_client();
@@ -1103,7 +1323,886 @@ void HostServer::run() {
     running_ = false;
 }
 
+bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token,
+                                       std::string* error, bool* peer_left) {
+    *peer_left = false;
+    ++stats.sessions;
+    stats.client_connected = true;
+    const std::string peer = session_->client_address();
+    // Captured now: wait_for_client() consumed the Hello, and the reference is
+    // cleared when this connection is torn down. A viewer that sent no
+    // reference still gets recorded, under a host id that cannot merge with a
+    // viewer report.
+    const std::string viewer_audit_ref = session_->audit_ref();
+    bool viewer_ref_absent = viewer_audit_ref.empty();
+    std::string audit_ref = viewer_ref_absent ? host_audit_ref() : viewer_audit_ref;
+    bool audit_ref_claimed = false;
+    if (registry_ && adopted_ && !viewer_ref_absent) {
+        // Two live sessions that present the same reference would merge into
+        // one row at the service, so the later one stands alone under a host
+        // id instead.
+        if (registry_->claim_audit_ref(audit_ref)) {
+            audit_ref_claimed = true;
+        } else {
+            viewer_ref_absent = true;
+            audit_ref = host_audit_ref();
+        }
+    }
+    session_audit_ref_ = audit_ref;
+    session_audit_ref_absent_ = viewer_ref_absent;
+    const int64_t audit_started_ms = unix_now_ms();
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_.peer_address = peer;
+        status_.requested_display = session_->requested_display();
+        status_.session_permissions = session_->permissions();
+        status_.display_index = 0;
+        status_.display_name.clear();
+        status_.display_merged = false;
+        status_.stream = ServerInfo{};
+    }
+    publish_stats(stats);
+    publish_state(HostState::Streaming);
+    log(peer.empty() ? "a viewer connected" : "a viewer connected from " + peer);
+
+    const bool files_only = session_->requested_mode() == SessionMode::FileTransfer;
+    const bool ok = files_only ? file_session(stats, error, peer_left)
+                               : stream_session(stats, error, peer_left);
+
+    ClientStats peer_stats;
+    bool stats_received = false;
+    const auto finish_timeout = std::chrono::milliseconds(
+        ok ? config_.finish_timeout_ms : std::min<uint32_t>(config_.finish_timeout_ms, 2000));
+    Error finished = session_->finish_server(finish_timeout, peer_stats, stats_received);
+    stats.peer_left = *peer_left;
+    stats.stats_received = stats_received;
+    if (stats_received) {
+        stats.peer = peer_stats;
+    }
+    for (const InputEvent& event : session_->take_input_events()) {
+        ++stats.input_events;
+        if (config_.input_event) {
+            config_.input_event(event);
+        }
+    }
+    stats.input_stats = session_->input_stats();
+    stats.input_releases = session_->input_release_requests();
+    publish_stats(stats);
+
+    if (ok && !stopping_.load()) {
+        // A viewer that sends its closing Stats/Bye before the video send
+        // fails left on purpose, even though the send then reports the peer
+        // gone.
+        log(*peer_left && !stats_received ? "the viewer disappeared" : "the viewer left");
+    }
+    if (!finished.ok() && !*peer_left && error->empty() && !stopping_.load()) {
+        *error = "finish: " + finished.to_string();
+    }
+    // Every session leaves a host-side record. A viewer that sent no reference
+    // cannot contribute its own half, so the record is marked and stands
+    // alone.
+    if (!settings_.audit_spool.empty()) {
+        AuditSessionRecord record;
+        record.audit_ref = audit_ref;
+        record.viewer_ref_absent = viewer_ref_absent;
+        record.started_at_ms = audit_started_ms;
+        record.ended_at_ms = unix_now_ms();
+        record.success = ok && error->empty();
+        record.detail = *error;
+        std::string audit_error;
+        if (!append_audit_session(settings_.audit_spool, record, &audit_error)) {
+            log("audit: " + audit_error);
+        }
+    }
+    if (audit_ref_claimed) {
+        registry_->release_audit_ref(audit_ref);
+    }
+
+    // A spent one-time token must not guard the next connection, so it is
+    // replaced once the last viewer of a sequential host has gone. A worker
+    // leaves this to its listener, which rotates only when no viewer is left.
+    if (rotate_token && ok && error->empty() && !config_.serve_once &&
+        settings_.token_mode == HostTokenMode::OneTime) {
+        settings_.access_token = generate_access_token();
+        session_->set_access_token(settings_.access_token);
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.token = settings_.access_token;
+        }
+        if (config_.token_changed) {
+            config_.token_changed(settings_.access_token);
+        }
+        // The policy holds its own copy of the token, so automation sees the
+        // same rotation the legacy caller does.
+        refresh_security_config();
+        log("the one-time token was spent; a new token is ready");
+    }
+    return ok;
+}
+
+void HostServer::run_multi() {
+    uint32_t failures = 0;
+    const auto first_deadline =
+        config_.first_client_timeout_ms > 0
+            ? Clock::now() + std::chrono::milliseconds(config_.first_client_timeout_ms)
+            : Clock::time_point::max();
+    bool listening_logged = false;
+    bool stop_after_viewer = false;
+    Clock::time_point run_start{};
+
+    while (!stopping_.load()) {
+        reap_viewers();
+        if (config_.serve_once && stop_after_viewer) {
+            if (viewers_.empty()) {
+                break;
+            }
+            // A one-shot host serves the connection it admitted and accepts
+            // nothing more while it runs.
+            sleep_unless_stopping(std::chrono::milliseconds(100));
+            continue;
+        }
+        if (!session_) {
+            std::string error;
+            if (!open_session(&error)) {
+                log("listener failed: " + error);
+                publish_state(HostState::Failed, "QUIC server: " + error);
+                if (config_.serve_once) {
+                    break;
+                }
+                if (config_.max_consecutive_failures != 0 &&
+                    ++failures >= config_.max_consecutive_failures) {
+                    break;
+                }
+                sleep_unless_stopping(std::chrono::seconds(2));
+                continue;
+            }
+            listening_logged = false;
+        }
+        if (!listening_logged) {
+            publish_state(HostState::Listening);
+            log("listening on " + settings_.bind_address + ":" + std::to_string(settings_.port) +
+                " for up to " + std::to_string(settings_.max_viewers) + " viewers");
+            listening_logged = true;
+        }
+
+        std::unique_ptr<QuicSession> connection;
+        Error accepted = session_->accept(connection, std::chrono::milliseconds(200));
+        if (accepted.ok()) {
+            failures = 0;
+            if (run_start == Clock::time_point{}) {
+                run_start = Clock::now();
+            }
+            start_viewer(std::move(connection));
+            if (config_.serve_once) {
+                // One connection: stop accepting, then wait for its worker.
+                stop_after_viewer = true;
+            }
+            continue;
+        }
+        if (accepted.status() != Status::WaitTimeout) {
+            // The listener itself failed. Its configuration has to outlive
+            // every accepted session, so the workers are stopped before the
+            // session is reopened.
+            log("accept failed: " + accepted.to_string());
+            publish_state(HostState::Failed, "QUIC accept: " + accepted.to_string());
+            stop_viewers();
+            session_.reset();
+            listening_logged = false;
+            if (config_.serve_once) {
+                break;
+            }
+            if (config_.max_consecutive_failures != 0 &&
+                ++failures >= config_.max_consecutive_failures) {
+                break;
+            }
+            sleep_unless_stopping(std::chrono::seconds(2));
+            continue;
+        }
+
+        size_t active = 0;
+        uint64_t admitted = 0;
+        {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            active = registry_->active;
+            admitted = registry_->admitted;
+        }
+        if (admitted == 0 && first_deadline != Clock::time_point::max() &&
+            Clock::now() >= first_deadline) {
+            const std::string wait_error =
+                "no client connected in " +
+                std::to_string(config_.first_client_timeout_ms / 1000) + " s";
+            log(wait_error);
+            publish_state(HostState::Failed, wait_error);
+            session_.reset();
+            listening_logged = false;
+            if (config_.serve_once) {
+                break;
+            }
+            if (config_.max_consecutive_failures != 0 &&
+                ++failures >= config_.max_consecutive_failures) {
+                break;
+            }
+            sleep_unless_stopping(std::chrono::seconds(2));
+            continue;
+        }
+        if (active == 0) {
+            publish_state(HostState::Listening);
+        }
+        if (config_.run_seconds > 0.0 && run_start != Clock::time_point{} &&
+            std::chrono::duration<double>(Clock::now() - run_start).count() >=
+                config_.run_seconds) {
+            stopping_ = true;
+            break;
+        }
+    }
+
+    stop_viewers();
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        if (status_.state != HostState::Failed) {
+            status_.state = HostState::Stopped;
+        }
+    }
+    running_ = false;
+}
+
+void HostServer::start_viewer(std::unique_ptr<QuicSession> connection) {
+    auto viewer = std::shared_ptr<HostServer>(new HostServer(config_));
+    viewer->settings_ = settings_;
+    viewer->session_ = std::move(connection);
+    viewer->security_ = security_;
+    viewer->registry_ = registry_;
+    viewer->adopted_ = true;
+    viewer->self_ = viewer;
+    // The listener owns run_seconds, serve_once and token rotation. The
+    // worker only serves its own connection.
+    viewer->config_.run_seconds = 0.0;
+    viewer->config_.serve_once = false;
+    HostServer* raw = viewer.get();
+    viewer->session_->set_server_callbacks(
+        [raw](const ClientRequest& request) { return raw->authenticate_client(request); },
+        [raw](const ClientRequest& request) { return raw->approve_client(request); });
+    {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        ++registry_->pending;
+    }
+    viewers_.push_back(viewer);
+    viewer->start();
+}
+
+void HostServer::reap_viewers() {
+    bool dropped = false;
+    for (auto it = viewers_.begin(); it != viewers_.end();) {
+        if (!(*it)->finished_.load()) {
+            ++it;
+            continue;
+        }
+        dropped = true;
+        (*it)->stop();
+        remember_session((*it)->status());
+        it = viewers_.erase(it);
+    }
+    if (!dropped) {
+        return;
+    }
+    std::shared_ptr<HostServer> next;
+    for (auto& viewer : viewers_) {
+        if (viewer->status().state == HostState::Streaming) {
+            next = viewer;
+        }
+    }
+    size_t active = 0;
+    size_t pending = 0;
+    {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        registry_->focused = next;
+        active = registry_->active;
+        pending = registry_->pending;
+    }
+    if (active == 0) {
+        // A one-shot run reports how its only session ended; every other host
+        // goes back to listening and clears the previous error like the
+        // sequential path does.
+        bool keep_failure = false;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            keep_failure = config_.serve_once && status_.state == HostState::Failed;
+        }
+        if (!keep_failure) {
+            publish_state(HostState::Listening);
+        }
+    }
+    // A one-time token is replaced only when no viewer is left: rotating while
+    // another session is still being admitted would invalidate the token that
+    // viewer is about to present.
+    if (active == 0 && pending == 0 && settings_.token_mode == HostTokenMode::OneTime &&
+        !config_.serve_once) {
+        settings_.access_token = generate_access_token();
+        session_->set_access_token(settings_.access_token);
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.token = settings_.access_token;
+        }
+        if (config_.token_changed) {
+            std::lock_guard<std::mutex> lock(registry_->callback_mutex);
+            config_.token_changed(settings_.access_token);
+        }
+        refresh_security_config();
+        log("the one-time token was spent; a new token is ready");
+    }
+}
+
+void HostServer::stop_viewers() {
+    for (auto& viewer : viewers_) {
+        viewer->stop();
+        remember_session(viewer->status());
+    }
+    viewers_.clear();
+    if (registry_) {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        registry_->focused.reset();
+    }
+}
+
+void HostServer::remember_session(const HostStatus& session) {
+    if (!session.stats.client_connected) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    status_.stats = session.stats;
+    status_.stream = session.stream;
+    status_.display_index = session.display_index;
+    status_.display_name = session.display_name;
+    status_.display_merged = session.display_merged;
+    status_.requested_display = session.requested_display;
+    status_.session_permissions = session.session_permissions;
+    status_.peer_address = session.peer_address;
+    if (session.state == HostState::Failed) {
+        status_.state = session.state;
+        status_.error = session.error;
+    }
+}
+
+void HostServer::run_adopted() {
+    HostServerStats stats;
+    // TLS is already up; only the Hello is still missing. The transport closes
+    // a silent peer after its own hello timeout, so this bound only caps the
+    // wait on a connection that is not even completing that.
+    const auto hello_timeout = std::chrono::milliseconds(
+        config_.first_client_timeout_ms > 0 ? config_.first_client_timeout_ms : 15000);
+    Error waited = session_->wait_for_client(hello_timeout);
+    if (!waited.ok()) {
+        if (!stopping_.load()) {
+            log(waited.status() == Status::WaitTimeout ? "the viewer sent no Hello"
+                                                       : waited.to_string());
+        }
+        registry_->release_control(this);
+        {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            if (registry_->pending > 0) {
+                --registry_->pending;
+            }
+        }
+        {
+            // A publisher may hold a reference to this worker while it
+            // broadcasts; taking the same mutex it uses to reach the session
+            // keeps the handle from being destroyed under a send.
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            session_.reset();
+        }
+        finished_ = true;
+        running_ = false;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->pending > 0) {
+            --registry_->pending;
+        }
+        ++registry_->active;
+        ++registry_->admitted;
+        registry_->focused = self_;
+    }
+    log("a viewer was admitted to a shared host; " + std::to_string([this] {
+            std::lock_guard<std::mutex> lock(registry_->mutex);
+            return registry_->active;
+        }()) +
+        " viewer(s) active");
+
+    std::string error;
+    bool peer_left = false;
+    const bool ok = serve_current_session(stats, false, &error, &peer_left);
+    if (!ok || !error.empty()) {
+        log(error.empty() ? "the session ended" : error);
+        publish_state(HostState::Failed, error.empty() ? "the session failed" : error);
+    }
+
+    registry_->release_control(this);
+    {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->active > 0) {
+            --registry_->active;
+        }
+        std::shared_ptr<HostServer> focused = registry_->focused.lock();
+        if (focused.get() == this) {
+            registry_->focused.reset();
+        }
+    }
+    // Close the connection now instead of in the destructor: the listener can
+    // admit the next viewer without waiting for this worker to be reaped.
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        session_.reset();
+    }
+    finished_ = true;
+    running_ = false;
+}
+
 bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool* peer_left) {
+    *peer_left = false;
+    // A multi-viewer host has one shared desktop stream: the first viewer
+    // captures and encodes, the others follow and receive the same frames.
+    // When the publisher leaves, the follower that wins the free slot builds
+    // its own capture pipeline and continues the stream on its session.
+    bool promoted = false;
+    if (registry_ && adopted_) {
+        std::shared_ptr<HostServer> self = self_.lock();
+        if (!registry_->claim_desktop(self)) {
+            // follow_shared_desktop() claims the publisher role itself when
+            // the old publisher is gone, so a Promote result means this worker
+            // owns the role and needs its own capture pipeline.
+            const SharedFollowResult followed =
+                follow_shared_desktop(stats, error, peer_left, &promoted);
+            if (followed == SharedFollowResult::Ended) {
+                return error->empty();
+            }
+        }
+    }
+    desktop_publisher_ = true;
+    struct PublisherGuard {
+        HostServer* self;
+        ~PublisherGuard() { self->release_desktop_publisher(); }
+    } publisher_guard{this};
+    return stream_desktop(stats, error, peer_left, promoted);
+}
+
+void HostServer::release_desktop_publisher() {
+    if (registry_ && desktop_publisher_) {
+        registry_->release_desktop(this);
+    }
+    desktop_publisher_ = false;
+    desktop_info_ready_ = false;
+}
+
+HostServer::SharedFollowResult HostServer::follow_shared_desktop(
+    HostServerStats& stats, std::string* error, bool* peer_left, bool* announced) {
+    *peer_left = false;
+    *announced = false;
+    std::shared_ptr<HostServer> self = self_.lock();
+    if (!self) {
+        *error = "the viewer worker lost its identity";
+        return SharedFollowResult::Ended;
+    }
+    stats.audio_active = false;
+    stats.privacy_mode_active = false;
+    stats.privacy_mode_changes = 0;
+    stats.sas_requests = 0;
+    stats.sas_failures = 0;
+    stats.resolution_percent = 100;
+    stats.resolution_changes = 0;
+
+    begin_file_session();
+    struct FileSessionEnd {
+        HostServer* self;
+        ~FileSessionEnd() { self->end_file_session(); }
+    } file_session_end{this};
+
+    // The publisher's description is the only stream this session announces.
+    // A follower never captures; when the publisher leaves, the worker that
+    // wins the free role returns Promote and builds its own pipeline.
+    bool live = false;
+    bool follower_registered = false;
+    struct FollowerGuard {
+        HostServer* self;
+        ViewerRegistry* registry;
+        bool* registered;
+        ~FollowerGuard() {
+            if (*registered && registry != nullptr) {
+                registry->remove_desktop_follower(self);
+            }
+        }
+    } follower_guard{this, registry_.get(), &follower_registered};
+
+    clipboard_was_allowed_ = clipboard_allowed();
+    if (clipboard_was_allowed_) {
+        remember_local_clipboard();
+    }
+    clipboard_seq_ = 1;
+    next_clipboard_poll_ = Clock::now() + std::chrono::milliseconds(500);
+
+    auto send_failed = [&](const Error& sent, const std::string& what) -> bool {
+        if (sent.ok()) {
+            return true;
+        }
+        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = what + ": " + sent.to_string();
+        }
+        return false;
+    };
+
+    ServerInfo info;
+    uint64_t known_version = 0;
+
+    // Wait for the publisher's first description. A publisher that fails
+    // before announcing releases the role, which is this worker's turn to
+    // take over instead of waiting forever.
+    while (!stopping_.load()) {
+        ServerInfo next;
+        size_t index = 0;
+        std::string name;
+        uint64_t version = 0;
+        if (registry_->desktop_info_since(known_version, next, index, name, version)) {
+            known_version = version;
+            info = next;
+            if (!live) {
+                Error sent = session_->announce(next);
+                if (!sent.ok()) {
+                    if (sent.status() == Status::Unavailable ||
+                        sent.status() == Status::WaitTimeout) {
+                        *peer_left = true;
+                    } else {
+                        *error = "announce: " + sent.to_string();
+                    }
+                    return SharedFollowResult::Ended;
+                }
+                live = true;
+                *announced = true;
+                publish_stream(next, index, name);
+                // The follower's viewer shows the same desktop banner as the
+                // publisher's, then receives every later change as a broadcast.
+                if (!send_failed(
+                        session_->send_desktop_state(registry_->get_desktop_kind()),
+                        "send_desktop_state")) {
+                    return SharedFollowResult::Ended;
+                }
+                registry_->add_desktop_follower(self);
+                follower_registered = true;
+                registry_->request_desktop_keyframe();
+                // The Hello went out view-only while another viewer held the
+                // control lease. The transport may grant input once the lease
+                // frees, without ever exceeding what the operator approved.
+                if (approved_permissions_ != 0) {
+                    session_->set_permission_ceiling(approved_permissions_);
+                }
+                log("following the shared desktop stream");
+            } else {
+                // The publisher rebuilt its stream (resolution, permissions or
+                // audio) while this worker was still waiting.
+                if (!send_failed(session_->refresh_stream(next), "refresh_stream")) {
+                    return SharedFollowResult::Ended;
+                }
+                ++stats.stream_updates;
+                publish_stream(next, index, name);
+            }
+            stats.target_bitrate = next.bitrate;
+            stats.framerate = next.framerate;
+            stats.audio_active = next.audio.enabled && shared_audio_ready_.load();
+            if (next.source_width != 0) {
+                stats.resolution_percent = static_cast<uint16_t>(
+                    static_cast<uint64_t>(next.width) * 100 / next.source_width);
+            }
+            break;
+        }
+        if (!registry_->has_desktop_publisher() && registry_->claim_desktop(self)) {
+            // Nobody is capturing any more. Whatever this session already
+            // announced stays live; stream_desktop() refreshes it once its
+            // own capture produces a picture.
+            *announced = live;
+            return SharedFollowResult::Promote;
+        }
+        if (session_->viewer_finished()) {
+            return SharedFollowResult::Ended;
+        }
+        if (!session_->peer_alive()) {
+            *peer_left = true;
+            return SharedFollowResult::Ended;
+        }
+        const Error async = session_->async_error();
+        if (!async.ok()) {
+            *error = "transport: " + async.to_string();
+            return SharedFollowResult::Ended;
+        }
+        if (!sleep_unless_stopping(std::chrono::milliseconds(20))) {
+            break;
+        }
+    }
+    if (!live) {
+        return SharedFollowResult::Ended;
+    }
+
+    // Per-viewer control plane. Input, clipboard, chat, files, the
+    // microphone, SAS and the relays run on this viewer's own connection;
+    // only capture, encoding and host-wide display changes belong to the
+    // publisher.
+    auto apply_pending_permissions = [&]() {
+        bool pending = false;
+        uint16_t requested = 0;
+        {
+            std::lock_guard<std::mutex> lock(permission_mutex_);
+            pending = permission_update_pending_.exchange(false);
+            requested = pending_permissions_.load();
+        }
+        if (!pending) {
+            return;
+        }
+        Error applied = session_->set_permissions(requested);
+        if (!applied.ok()) {
+            if (applied.status() != Status::InvalidCall) {
+                log("permission update failed: " + applied.to_string());
+            }
+            return;
+        }
+        const uint16_t now_mask = session_->permissions();
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.session_permissions = now_mask;
+        }
+        if ((now_mask & kPermissionInput) == 0) {
+            registry_->release_control(this);
+        }
+        log("the session permissions are now " + permission_names(now_mask));
+    };
+    auto fold_shared = [&] {
+        stats.encoded = shared_frames_.load();
+        stats.keyframes = shared_keyframes_.load();
+        stats.bytes = shared_bytes_.load();
+        stats.audio_packets = shared_audio_packets_.load();
+        stats.audio_bytes = shared_audio_bytes_.load();
+        stats.audio_dropped = shared_audio_drops_.load();
+        stats.audio_active = info.audio.enabled && shared_audio_ready_.load();
+        stats.cursor_sent = shared_cursor_sent_.load();
+        stats.cursor_dropped = shared_cursor_drops_.load();
+    };
+
+    PortForwardRelay port_forward(*session_);
+    TerminalRelay terminal(*session_);
+    // A follower has no capturer to borrow an adapter from; the camera relay
+    // opens its own device instead.
+    CameraRelay camera(*session_, [] { return LUID{}; },
+                       CameraRelayConfig{settings_.codec, settings_.quality,
+                                         config_.encoder_backend,
+                                         settings_.framerate > 0 ? settings_.framerate : 30u});
+
+    auto last_publish = Clock::now();
+    while (!stopping_.load()) {
+        const auto now = Clock::now();
+        apply_pending_permissions();
+        uint16_t switch_index = kDisplayAuto;
+        if (session_->take_display_switch_request(switch_index)) {
+            ++stats.display_switch_failures;
+            if (!send_failed(
+                    session_->send_display_switch_result(
+                        switch_index, DisplaySwitchCode::Busy,
+                        "the shared desktop is controlled by the viewer that owns the stream"),
+                    "send_display_switch_result")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        uint16_t modes_index = 0;
+        if (session_->take_list_display_modes_request(modes_index)) {
+            DisplayModeList list;
+            list.display = modes_index;
+            list.code = DisplayModeCode::Busy;
+            list.reason =
+                "the shared desktop's modes are controlled by the viewer that owns the stream";
+            if (!send_failed(session_->send_display_modes(list), "send_display_modes")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        uint16_t mode_index = 0;
+        uint16_t mode_width = 0;
+        uint16_t mode_height = 0;
+        uint16_t mode_refresh = 0;
+        if (session_->take_set_display_mode_request(mode_index, mode_width, mode_height,
+                                                    mode_refresh)) {
+            ++stats.display_mode_failures;
+            if (!send_failed(
+                    session_->send_display_mode_result(
+                        mode_index, mode_width, mode_height, mode_refresh,
+                        DisplayModeCode::Busy,
+                        "the shared desktop's modes are controlled by the viewer that owns the stream"),
+                    "send_display_mode_result")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        StreamOptions options;
+        if (session_->take_stream_options_request(options)) {
+            ++stats.stream_option_requests;
+            ++stats.stream_option_failures;
+            StreamOptionsResult result;
+            result.code = StreamOptionsCode::Failed;
+            result.codec = info.codec;
+            result.fps = info.framerate;
+            result.quality = StreamQuality::High;
+            result.reason =
+                "the shared stream's picture settings are controlled by the viewer that owns it";
+            if (!send_failed(session_->send_stream_options_result(result),
+                             "send_stream_options_result")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        bool privacy_requested = false;
+        if (session_->take_privacy_mode_request(privacy_requested)) {
+            ++stats.privacy_mode_changes;
+            if (!send_failed(
+                    session_->send_privacy_mode_state(
+                        false, PrivacyModeCode::Denied,
+                        "privacy mode is controlled by the viewer that owns the shared stream"),
+                    "privacy_mode_state")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        while (session_->take_sas_request()) {
+            if (!send_sas_result(stats, error, peer_left)) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        std::string chat_text;
+        while (session_->take_chat(chat_text)) {
+            ++stats.chat_received;
+            log("chat: received " + std::to_string(chat_text.size()) + " bytes");
+            if (config_.chat_message) {
+                config_.chat_message(chat_text);
+            }
+        }
+        std::string injected_text;
+        while (session_->take_text_input(injected_text)) {
+            ++stats.text_received;
+            log("text input: received " + std::to_string(injected_text.size()) +
+                " bytes");
+            if (config_.text_input) {
+                config_.text_input(injected_text);
+            }
+        }
+        {
+            std::deque<std::string> outbox;
+            {
+                std::lock_guard<std::mutex> lock(chat_mutex_);
+                outbox.swap(pending_chat_);
+            }
+            for (const std::string& text : outbox) {
+                Error sent = session_->send_chat(text);
+                if (!sent.ok()) {
+                    ++stats.send_errors;
+                    log("chat: send failed: " + sent.to_string());
+                    break;
+                }
+                ++stats.chat_sent;
+                log("chat: sent " + std::to_string(text.size()) + " bytes");
+            }
+        }
+        PortForwardRequest forward_request;
+        while (session_->take_port_forward_request(forward_request)) {
+            const Error answered = session_->send_port_forward_result(
+                forward_request.forward_id, PortForwardCode::Ok);
+            if (!answered.ok()) {
+                log("port forward: cannot approve target " + forward_request.host + ":" +
+                    std::to_string(forward_request.port) + ": " + answered.to_string());
+                break;
+            }
+            log("port forward: approved " + forward_request.host + ":" +
+                std::to_string(forward_request.port));
+        }
+        PortForwardStop forward_stop;
+        while (session_->take_port_forward_stop(forward_stop)) {
+            log("port forward: stopped with code " +
+                std::to_string(static_cast<int>(forward_stop.code)) +
+                (forward_stop.reason.empty() ? std::string() : ": " + forward_stop.reason));
+        }
+        for (const std::string& event : port_forward.pump()) {
+            log(event);
+        }
+        for (const std::string& event : terminal.pump()) {
+            log(event);
+        }
+        for (const std::string& event : camera.pump()) {
+            log(event);
+        }
+        drain_peer(stats);
+        poll_clipboard(now, stats);
+        poll_files(stats);
+        drain_microphone(stats);
+        if (session_->take_keyframe_request()) {
+            registry_->request_desktop_keyframe();
+        }
+
+        ServerInfo next;
+        size_t index = 0;
+        std::string name;
+        uint64_t version = 0;
+        if (registry_->desktop_info_since(known_version, next, index, name, version)) {
+            known_version = version;
+            if (!send_failed(session_->refresh_stream(next), "refresh_stream")) {
+                return SharedFollowResult::Ended;
+            }
+            ++stats.stream_updates;
+            info = next;
+            publish_stream(next, index, name);
+            stats.target_bitrate = next.bitrate;
+            stats.framerate = next.framerate;
+            stats.audio_active = next.audio.enabled && shared_audio_ready_.load();
+            if (next.source_width != 0) {
+                stats.resolution_percent = static_cast<uint16_t>(
+                    static_cast<uint64_t>(next.width) * 100 / next.source_width);
+            }
+        }
+
+        if (!registry_->has_desktop_publisher()) {
+            if (registry_->claim_desktop(self)) {
+                if (follower_registered) {
+                    registry_->remove_desktop_follower(this);
+                    follower_registered = false;
+                }
+                shared_send_failed_.store(false);
+                publish_stats(stats);
+                *announced = true;
+                return SharedFollowResult::Promote;
+            }
+            // Another follower took the role; its description arrives above.
+        }
+        if (shared_send_failed_.exchange(false)) {
+            *error = "the shared stream could not be sent to this viewer";
+            return SharedFollowResult::Ended;
+        }
+        if (session_->viewer_finished()) {
+            return SharedFollowResult::Ended;
+        }
+        if (!session_->peer_alive()) {
+            *peer_left = true;
+            return SharedFollowResult::Ended;
+        }
+        const Error async = session_->async_error();
+        if (!async.ok()) {
+            *error = "transport: " + async.to_string();
+            return SharedFollowResult::Ended;
+        }
+        if (now - last_publish >= std::chrono::milliseconds(500)) {
+            last_publish = now;
+            fold_shared();
+            publish_stats(stats);
+        }
+        if (!sleep_unless_stopping(std::chrono::milliseconds(10))) {
+            break;
+        }
+    }
+    return SharedFollowResult::Ended;
+}
+
+bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left,
+                                bool already_announced) {
     *peer_left = false;
     {
         std::lock_guard<std::mutex> lock(chat_mutex_);
@@ -1311,6 +2410,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return send_privacy_state(false, PrivacyModeCode::Denied,
                                       "privacy mode is not permitted by the host");
         }
+        // The overlay covers the operator's physical screens, so with more
+        // than one viewer only the one holding control may raise it.
+        if (registry_ && !registry_->may_change_host_state(this)) {
+            ++stats.privacy_mode_changes;
+            return send_privacy_state(false, PrivacyModeCode::Denied,
+                                      "another viewer controls this host");
+        }
         if (privacy_active) {
             return send_privacy_state(true, PrivacyModeCode::Ok, {});
         }
@@ -1343,61 +2449,18 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // Ctrl+Alt+Del is not a key chord here: Windows only accepts it through
     // SendSAS(), which needs the service worker's LocalSystem token. Every
     // request is answered, and a refusal or platform failure stays local to
-    // this action instead of ending the session.
-    auto send_sas = [&]() -> bool {
-        ++stats.sas_requests;
-        SasCode code = SasCode::Ok;
-        std::string reason;
-        if ((session_->permissions() & kPermissionInput) == 0) {
-            code = SasCode::Denied;
-            reason = "input control is not permitted by the host";
-        } else if (config_.send_sas) {
-            if (!config_.send_sas(&reason)) {
-                code = SasCode::Failed;
-                if (reason.empty()) {
-                    reason = "the SAS callback failed";
-                }
-            }
-        } else if (!config_.service_mode) {
-            code = SasCode::Unsupported;
-            reason = "Ctrl+Alt+Del is only available through the Windows service";
-        } else if (!sas_available()) {
-            code = SasCode::Unsupported;
-            reason = "this Windows installation does not expose SendSAS";
-        } else if (!send_secure_attention(&reason)) {
-            code = SasCode::Failed;
-        }
-        if (code == SasCode::Ok) {
-            // SendSAS is fire-and-forget: Windows reports no result, so this
-            // only records that the request was made.
-            log("Ctrl+Alt+Del requested (Windows does not confirm the secure desktop)");
-        } else {
-            ++stats.sas_failures;
-            log(std::string("Ctrl+Alt+Del refused (") + sas_code_name(code) + "): " +
-                (reason.empty() ? "no reason given" : reason));
-        }
-        Error sent = session_->send_sas_result(code, reason);
-        if (sent.ok()) {
-            return true;
-        }
-        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
-            *peer_left = true;
-        } else {
-            ++stats.send_errors;
-            *error = "sas_result: " + sent.to_string();
-        }
-        return false;
-    };
+    // this action instead of ending the session. The body lives in
+    // send_sas_result() so a follower session serves the request too.
+    auto send_sas = [&]() -> bool { return send_sas_result(stats, error, peer_left); };
     // The endpoint stays open for the whole session even if audio was denied
     // at approval: the operator can grant it back live, and rebuilding WASAPI
     // mid-session would cost a fresh announcement for no benefit. The same
     // endpoint plays the viewer's microphone, so its playback feeds the echo
     // canceller the audio that actually comes out of this machine.
-    std::shared_ptr<AudioReference> audio_reference;
     const bool audio_aec = settings_.allow_audio && settings_.audio_aec;
     if (settings_.allow_audio) {
         if (audio_aec) {
-            audio_reference = std::make_shared<AudioReference>();
+            audio_reference_ = std::make_shared<AudioReference>();
         }
         std::string audio_error;
         if (config_.audio_capture) {
@@ -1405,7 +2468,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         } else {
             LoopbackCaptureConfig audio_config;
             audio_config.device_id = settings_.audio_device;
-            audio_config.reference = audio_reference;
+            audio_config.reference = audio_reference_;
             audio_config.echo_cancellation = audio_aec;
             audio_config.silence_gate_ms = config_.audio_silence_gate_ms;
             audio_capture = create_loopback_capture(audio_config, &audio_error);
@@ -1470,10 +2533,40 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     if (config_.stream_announced) {
         config_.stream_announced(stream_info);
     }
-    Error announced = session_->announce(stream_info);
-    if (!announced.ok()) {
-        *error = "announce: " + announced.to_string();
-        return false;
+    if (already_announced) {
+        // This worker followed the previous publisher, so the transport
+        // already has a stream: replace its description with the one this
+        // capture produces. The old publisher's frames have stopped.
+        Error refreshed = session_->refresh_stream(stream_info);
+        if (!refreshed.ok()) {
+            if (refreshed.status() == Status::Unavailable ||
+                refreshed.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "refresh_stream: " + refreshed.to_string();
+            }
+            return false;
+        }
+        ++stats.stream_updates;
+    } else {
+        Error announced = session_->announce(stream_info);
+        if (!announced.ok()) {
+            *error = "announce: " + announced.to_string();
+            return false;
+        }
+    }
+    if (registry_ && adopted_ && approved_permissions_ != 0) {
+        // A promoted viewer may have joined view-only while the previous
+        // publisher held the control lease; the stream now exists, so the
+        // transport may accept the operator's later input grant.
+        session_->set_permission_ceiling(approved_permissions_);
+    }
+    if (registry_ && desktop_publisher_) {
+        // Followers wait for this first description before announcing their
+        // own sessions; later updates travel through publish_stream().
+        desktop_info_ready_ = true;
+        publish_current(stream_info);
     }
     // A UI request made between sessions is applied once the stream exists:
     // set_permissions() is only valid after the announcement.
@@ -1504,6 +2597,11 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.session_permissions = now_mask;
+        }
+        // A controller whose input was revoked gives the lease up, so a later
+        // grant to another viewer can take it.
+        if (registry_ && adopted_ && (now_mask & kPermissionInput) == 0) {
+            registry_->release_control(this);
         }
         // A revoked permission must take the mask down with it: leaving the
         // operator's screen black after they turned the feature off would be
@@ -1600,208 +2698,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // The operator can revoke the permission mid-session, so the same check
     // runs on every poll; re-enabling starts from a fresh baseline instead of
     // flushing whatever changed while the viewer could not see it.
-    auto clipboard_allowed = [&] {
-        return settings_.allow_clipboard &&
-               (session_->permissions() & kPermissionClipboard) != 0;
-    };
-    bool clipboard_was_allowed = clipboard_allowed();
-    ClipboardContent last_clipboard;
-    uint64_t last_clipboard_hash = 0;
-    // The last file list seen or announced is kept in the member baseline
-    // (last_file_*) because a viewer's clipboard upload completes off the
-    // clipboard poll and has to update the same suppression state.
-    auto read_local_files = [&](std::vector<ClipboardFileEntry>& entries,
-                                std::vector<std::string>& paths) {
-        entries.clear();
-        paths.clear();
-        std::vector<std::string> found;
-        if (!config_.clipboard_read_files(found)) {
-            return false;
-        }
-        std::string collect_error;
-        if (!collect_clipboard_files(found, entries, paths, &collect_error)) {
-            if (!collect_error.empty()) {
-                log("clipboard: " + collect_error);
-            }
-            return false;
-        }
-        return true;
-    };
-    auto remember_local_clipboard = [&] {
-        ClipboardContent current;
-        if (config_.clipboard_read(current)) {
-            last_clipboard_hash = clipboard_content_hash(current);
-            last_clipboard = std::move(current);
-        }
-        last_file_entries_.clear();
-        last_file_paths_.clear();
-        last_file_identity_ =
-            read_local_files(last_file_entries_, last_file_paths_)
-                ? clipboard_file_identity_hash(last_file_entries_)
-                : 0;
-    };
-    if (clipboard_was_allowed) {
+    clipboard_was_allowed_ = clipboard_allowed();
+    if (clipboard_was_allowed_) {
         remember_local_clipboard();
     }
-    uint64_t clipboard_seq = 1;
-    auto next_clipboard_poll = Clock::now() + std::chrono::milliseconds(500);
+    clipboard_seq_ = 1;
+    next_clipboard_poll_ = Clock::now() + std::chrono::milliseconds(500);
 
-    auto apply_peer_clipboard = [&](ClipboardContent content) {
-        if (const ClipboardFormatData* list = content.find(ClipboardFormat::FileList)) {
-            // Protocol v34: the viewer copied files. Only the list crosses the
-            // clipboard stream; the bytes follow as clipboard-marked
-            // FileOffers that stage below a session directory.
-            std::vector<ClipboardFileEntry> entries;
-            std::string list_error;
-            if (!decode_clipboard_file_list(list->data, entries, &list_error)) {
-                log("clipboard: the viewer sent an unusable file list: " + list_error);
-                return;
-            }
-            last_clipboard_hash = clipboard_content_hash(content);
-            last_clipboard = ClipboardContent{};
-            std::string begin_error;
-            if (!begin_clipboard_incoming(entries, stats, &begin_error)) {
-                log("clipboard: cannot stage the viewer's files: " + begin_error);
-            }
-            return;
-        }
-        const uint64_t hash = clipboard_content_hash(content);
-        if (hash == last_clipboard_hash) {
-            return;
-        }
-        std::string content_error;
-        if (!valid_clipboard_content(content, &content_error)) {
-            log("clipboard: the viewer sent unusable content: " + content_error);
-            return;
-        }
-        if (!config_.clipboard_write(content)) {
-            ++stats.clipboard_write_failures;
-            return;
-        }
-        // Remembering what was applied is what stops the next poll from
-        // sending it straight back to the viewer.
-        last_clipboard_hash = hash;
-        last_clipboard = std::move(content);
-        ++stats.clipboard_received;
-    };
-
-    auto drain_peer = [&] {
-        for (const InputEvent& event : session_->take_input_events()) {
-            ++stats.input_events;
-            if (config_.input_event) {
-                config_.input_event(event);
-            }
-        }
-        stats.input_stats = session_->input_stats();
-        stats.input_releases = session_->input_release_requests();
-        if (!clipboard_allowed()) {
-            return;
-        }
-        ClipboardContent content;
-        while (session_->take_clipboard_content(content)) {
-            apply_peer_clipboard(std::move(content));
-        }
-        // A viewer that only speaks the v15 text message still works: treat
-        // its ClipboardUpdate as a text-only item.
-        ClipboardUpdate update;
-        while (session_->take_clipboard_update(update)) {
-            ClipboardContent legacy;
-            legacy.seq = update.seq;
-            ClipboardFormatData text;
-            text.format = ClipboardFormat::Text;
-            text.data.assign(update.text.begin(), update.text.end());
-            legacy.formats.push_back(std::move(text));
-            apply_peer_clipboard(std::move(legacy));
-        }
-    };
-
-    auto poll_clipboard = [&](Clock::time_point now) {
-        const bool allowed = clipboard_allowed();
-        if (!allowed) {
-            clipboard_was_allowed = false;
-            return;
-        }
-        if (!clipboard_was_allowed) {
-            clipboard_was_allowed = true;
-            remember_local_clipboard();
-            next_clipboard_poll = now + std::chrono::milliseconds(500);
-            return;
-        }
-        if (now < next_clipboard_poll) {
-            return;
-        }
-        next_clipboard_poll = now + std::chrono::milliseconds(500);
-        std::vector<ClipboardFileEntry> current_files;
-        std::vector<std::string> current_paths;
-        if (read_local_files(current_files, current_paths)) {
-            const uint64_t identity = clipboard_file_identity_hash(current_files);
-            last_clipboard = ClipboardContent{};
-            last_clipboard_hash = 0;
-            if (identity == 0 || identity == last_file_identity_) {
-                return;
-            }
-            last_file_entries_ = std::move(current_files);
-            last_file_paths_ = std::move(current_paths);
-            last_file_identity_ = identity;
-            ClipboardFormatData entry;
-            entry.format = ClipboardFormat::FileList;
-            entry.data = encode_clipboard_file_list(last_file_entries_);
-            if (entry.data.empty()) {
-                log("clipboard: the local file list is not sendable");
-                return;
-            }
-            ClipboardContent files;
-            files.seq = clipboard_seq;
-            files.formats.push_back(std::move(entry));
-            Error sent = session_->send_clipboard_content(std::move(files));
-            if (!sent.ok()) {
-                ++stats.send_errors;
-                log("clipboard files send failed: " + sent.to_string());
-                return;
-            }
-            // Only a list this viewer actually received may be downloaded by
-            // index; publishing after the send keeps a failed announce from
-            // leaving paths the viewer never saw.
-            {
-                std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
-                clipboard_file_entries_ = last_file_entries_;
-                clipboard_file_paths_ = last_file_paths_;
-            }
-            ++clipboard_seq;
-            ++stats.clipboard_sent;
-            return;
-        }
-        // No files now, so a later text item is a fresh change again.
-        last_file_identity_ = 0;
-        last_file_entries_.clear();
-        last_file_paths_.clear();
-        ClipboardContent current;
-        if (!config_.clipboard_read(current)) {
-            return;
-        }
-        const uint64_t hash = clipboard_content_hash(current);
-        if (hash == last_clipboard_hash) {
-            return;
-        }
-        // Remember content we cannot put on the wire (oversized or
-        // malformed) so every later tick does not retry the same value.
-        last_clipboard = current;
-        last_clipboard_hash = hash;
-        std::string content_error;
-        if (!valid_clipboard_content(current, &content_error)) {
-            log("clipboard: the local item is not sendable: " + content_error);
-            return;
-        }
-        current.seq = clipboard_seq;
-        Error sent = session_->send_clipboard_content(std::move(current));
-        if (!sent.ok()) {
-            ++stats.send_errors;
-            log("clipboard send failed: " + sent.to_string());
-            return;
-        }
-        ++clipboard_seq;
-        ++stats.clipboard_sent;
-    };
 
     // Viewer uploads, browsing, file management and operator downloads.
     // The machinery lives on the host because a file-transfer-only session
@@ -1883,6 +2786,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             }
             ++stats.audio_packets;
             stats.audio_bytes += packet.data.size();
+            broadcast_audio(header, packet.data.data(), packet.data.size());
         }
         const AudioCaptureStats captured = audio_capture->stats();
         stats.audio_dropped = audio_send_drops + captured.dropped;
@@ -1912,168 +2816,8 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
     };
 
-    // Viewer microphone: CMIC carries Opus packets the viewer captured. The
-    // decoder and player follow the stream, not the session: they are created
-    // when the viewer switches the microphone on and released when it goes
-    // off, so an idle session never holds the render endpoint. There is no
-    // echo cancellation; the host simply plays what the viewer sends.
-    std::unique_ptr<IAudioDecoder> microphone_decoder;
-    std::unique_ptr<IAudioPlayer> microphone_player;
-    AudioInfo microphone_info;
-    bool microphone_broken = false;
-    auto stop_microphone = [&](const std::string& reason) {
-        if (audio_reference) {
-            audio_reference->set_active(false);
-        }
-        if (microphone_player) {
-            stats.microphone_underruns = microphone_player->stats().underruns;
-            microphone_player->stop();
-            microphone_player.reset();
-        }
-        microphone_decoder.reset();
-        microphone_info = AudioInfo{};
-        microphone_broken = false;
-        const bool was_active = stats.microphone_active;
-        stats.microphone_active = false;
-        if (was_active && !reason.empty()) {
-            log("microphone stopped: " + reason);
-        }
-    };
-    auto drain_microphone = [&] {
-        stats.microphone_streams = session_->microphone_streams();
-        if (!settings_.allow_microphone || stats.microphone_streams == 0) {
-            return;
-        }
-        if ((session_->permissions() & kPermissionMicrophone) == 0) {
-            if (microphone_decoder || microphone_player) {
-                stop_microphone("the microphone permission was removed");
-            }
-            return;
-        }
-        for (;;) {
-            AudioHeader header;
-            std::vector<uint8_t> payload;
-            AudioInfo info;
-            bool format_changed = false;
-            Error next = session_->receive_microphone(header, payload, info, format_changed,
-                                                      std::chrono::milliseconds(0));
-            if (next.status() == Status::WaitTimeout) {
-                break;
-            }
-            if (next.status() == Status::Unavailable) {
-                // No stream is open or the viewer closed it: the microphone
-                // was switched off, which is not a failure.
-                if (microphone_decoder || microphone_player) {
-                    stop_microphone("the viewer closed the stream");
-                }
-                break;
-            }
-            if (!next.ok()) {
-                ++stats.microphone_errors;
-                log("microphone receive failed: " + next.to_string());
-                stop_microphone("receive failed");
-                break;
-            }
-            if (format_changed) {
-                // A fresh CMIC stream always rebuilds the pipeline, even when
-                // the format happens to match the previous one.
-                if (microphone_decoder || microphone_player) {
-                    stop_microphone({});
-                }
-                microphone_info = info;
-                microphone_broken = false;
-                std::string setup_error;
-                microphone_decoder = create_audio_decoder(info, &setup_error);
-                if (!microphone_decoder) {
-                    ++stats.microphone_errors;
-                    microphone_broken = true;
-                    log("microphone decoder unavailable: " + setup_error);
-                } else {
-                    AudioPlayerConfig player_config;
-                    // The viewer's capture clock is unrelated to the host's;
-                    // anchoring blocks on arrival keeps the 80 ms jitter
-                    // buffer and recovers after a stall without LatencyReply.
-                    player_config.arrival_anchored = true;
-                    // The same output as the system-sound capture: what the
-                    // reference models has to be what the speakers play.
-                    player_config.device_id = settings_.audio_device;
-                    if (config_.microphone_player) {
-                        microphone_player = config_.microphone_player(&setup_error);
-                    } else {
-                        microphone_player = create_audio_player(player_config, &setup_error);
-                    }
-                    if (!microphone_player) {
-                        ++stats.microphone_errors;
-                        microphone_broken = true;
-                        microphone_decoder.reset();
-                        log("microphone playback unavailable: " + setup_error);
-                    } else if (Error started = microphone_player->start(); !started.ok()) {
-                        ++stats.microphone_errors;
-                        microphone_broken = true;
-                        microphone_player.reset();
-                        microphone_decoder.reset();
-                        log("microphone playback failed: " + started.to_string());
-                    } else {
-                        if (audio_reference) {
-                            // Only live playback may train the canceller; the
-                            // pushed blocks are the reference for loopback.
-                            audio_reference->set_active(true);
-                        }
-                        stats.microphone_active = true;
-                        log("microphone: Opus " +
-                            std::to_string(info.sample_rate / 1000u) + " kHz, " +
-                            std::to_string(info.channels) + " ch, " +
-                            std::to_string(info.frame_samples) + " samples/frame" +
-                            (audio_reference ? ", feeding loopback AEC" : ""));
-                    }
-                }
-            }
-            ++stats.microphone_packets;
-            stats.microphone_bytes += payload.size();
-            if (payload.empty() || microphone_broken || !microphone_decoder ||
-                !microphone_player) {
-                continue;
-            }
-            std::vector<DecodedAudio> decoded;
-            Error decode_error =
-                microphone_decoder->decode(header, payload.data(), payload.size(), decoded);
-            if (!decode_error.ok()) {
-                ++stats.microphone_errors;
-                log("microphone decode failed: " + decode_error.to_string());
-                continue;
-            }
-            bool push_failed = false;
-            for (const DecodedAudio& block : decoded) {
-                if (block.channels != 0) {
-                    stats.microphone_frames += block.samples.size() / block.channels;
-                }
-                if (audio_reference && block.channels >= 1 && block.channels <= 2) {
-                    audio_reference->push(block.samples.data(),
-                                          block.samples.size() / block.channels,
-                                          block.channels);
-                }
-                Error pushed = microphone_player->push(block);
-                if (!pushed.ok()) {
-                    ++stats.microphone_errors;
-                    log("microphone playback failed: " + pushed.to_string());
-                    stop_microphone("playback failed");
-                    push_failed = true;
-                    break;
-                }
-            }
-            if (push_failed) {
-                break;
-            }
-            stats.microphone_underruns = microphone_player->stats().underruns;
-            const std::string render_error = microphone_player->error();
-            if (!render_error.empty()) {
-                ++stats.microphone_errors;
-                log("microphone playback lost the render endpoint: " + render_error);
-                stop_microphone("the render endpoint failed");
-                break;
-            }
-        }
-    };
+    // The viewer microphone pipeline lives in the members implemented by
+    // drain_microphone(), so a follower session can serve it too.
 
     // Pointer state. Desktop Duplication keeps the pointer out of the desktop
     // image, so the viewer is told the sprite and where it is; the sprite
@@ -2142,6 +2886,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         }
         cursor_sent = std::move(update);
         cursor_sent_once = true;
+        broadcast_cursor(cursor_sent);
     };
 
     auto process_frame = [&](uint64_t pts_ms, uint64_t capture_ms) -> bool {
@@ -2211,6 +2956,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 }
                 return false;
             }
+            broadcast_video(header, packet.data.data(), packet.data.size());
             if (config_.packet) {
                 config_.packet(header, packet.data.data(), packet.data.size());
             }
@@ -3154,6 +3900,10 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return false;
         }
         reported_desktop = kind;
+        if (registry_ && desktop_publisher_) {
+            registry_->set_desktop_kind(kind);
+            broadcast_desktop_state(kind);
+        }
         return true;
     };
     // Follows the input desktop: a lock screen or UAC prompt moves input to a
@@ -3212,7 +3962,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     };
     if (!sync_desktop(true)) {
         const bool clean = error->empty();
-        drain_peer();
+        drain_peer(stats);
         return clean;
     }
     auto next_desktop_check = Clock::now() + std::chrono::seconds(1);
@@ -3225,7 +3975,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     if (!process_frame(0, capture_clock_ms(Clock::now()))) {
         // A vanished viewer is a normal end, not a failure.
         const bool clean = error->empty();
-        drain_peer();
+        drain_peer(stats);
         return clean;
     }
     publish_cursor();
@@ -3252,14 +4002,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         if (session_->take_display_switch_request(switch_index) &&
             !switch_display(switch_index)) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         uint16_t modes_index = 0;
         if (session_->take_list_display_modes_request(modes_index) &&
             !send_mode_list(modes_index)) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         uint16_t mode_index = 0;
@@ -3270,32 +4020,32 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                                                     mode_refresh) &&
             !change_display_mode(mode_index, mode_width, mode_height, mode_refresh)) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         StreamOptions options;
         if (session_->take_stream_options_request(options) &&
             !apply_stream_options(options)) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         if (!apply_pending_permissions()) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         bool privacy_requested = false;
         if (session_->take_privacy_mode_request(privacy_requested) &&
             !set_privacy_mode(privacy_requested)) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         while (session_->take_sas_request()) {
             if (!send_sas()) {
                 const bool clean = error->empty();
-                drain_peer();
+                drain_peer(stats);
                 return clean;
             }
         }
@@ -3337,12 +4087,12 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             next_desktop_check = now + std::chrono::seconds(1);
             if (!sync_desktop(false)) {
                 const bool clean = error->empty();
-                drain_peer();
+                drain_peer(stats);
                 return clean;
             }
         }
         drain_audio();
-        drain_microphone();
+        drain_microphone(stats);
         PortForwardRequest forward_request;
         while (session_->take_port_forward_request(forward_request)) {
             // The transport already checked the session grant; reaching here
@@ -3372,18 +4122,26 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         for (const std::string& event : camera.pump()) {
             log(event);
         }
-        drain_peer();
-        poll_clipboard(now);
+        drain_peer(stats);
+        poll_clipboard(now, stats);
         poll_files(stats);
         if (now - last_link_sample >= std::chrono::milliseconds(500)) {
             if (!sample_link(now)) {
                 const bool clean = error->empty();
-                drain_peer();
+                drain_peer(stats);
                 return clean;
             }
         }
         if (session_->take_keyframe_request()) {
             force_keyframe = true;
+        }
+        if (registry_ && registry_->take_desktop_keyframe_request()) {
+            // A follower joined or changed its description. Its video stream
+            // starts between key frames, and it may not hold the pointer
+            // sprite yet; the next frame carries both.
+            force_keyframe = true;
+            cursor_sent_once = false;
+            cursor_sent = CursorUpdate{};
         }
         if (config_.keyframe_interval_ms > 0 &&
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keyframe).count() >=
@@ -3402,7 +4160,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     *error = "refresh_stream: " + refreshed.to_string();
                 }
                 const bool clean = error->empty();
-                drain_peer();
+                drain_peer(stats);
                 return clean;
             }
             ++stats.stream_updates;
@@ -3461,7 +4219,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                         break;
                     }
                     drain_audio();
-                    drain_microphone();
+                    drain_microphone(stats);
                 }
                 if (stopped) {
                     break;
@@ -3488,7 +4246,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
         // The endpoint keeps producing while capture waits for the next
         // present; drain here so audio does not wait behind a slow frame.
         drain_audio();
-        drain_microphone();
+        drain_microphone(stats);
         switch (result) {
             case CaptureResult::NoNewFrame:
                 // A failed conversion leaves no NV12 behind. If the desktop
@@ -3499,7 +4257,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     if (!capture_error.ok()) {
                         *error += ": " + capture_error.to_string();
                     }
-                    drain_peer();
+                    drain_peer(stats);
                     return false;
                 }
                 continue;
@@ -3509,7 +4267,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 // attached to the old desktop. Follow first, then rebuild.
                 if (!sync_desktop(false)) {
                     const bool clean = error->empty();
-                    drain_peer();
+                    drain_peer(stats);
                     return clean;
                 }
                 if (desktop_paused || desktop_reinitialized) {
@@ -3518,7 +4276,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 Error err = capturer->reinitialize();
                 if (!err.ok()) {
                     *error = "reinit failed: " + err.to_string();
-                    drain_peer();
+                    drain_peer(stats);
                     return false;
                 }
                 encoder.reset();
@@ -3534,14 +4292,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                 log("capture failed: " + failure);
                 if (!sync_desktop(false)) {
                     const bool clean = error->empty();
-                    drain_peer();
+                    drain_peer(stats);
                     return clean;
                 }
                 if (desktop_paused || desktop_reinitialized) {
                     continue;
                 }
                 *error = "capture failed: " + failure;
-                drain_peer();
+                drain_peer(stats);
                 return false;
             }
             case CaptureResult::Frame:
@@ -3562,7 +4320,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             encoder = create_encoder(rebuilt_adapter.device, encoder_config, error);
             if (!encoder) {
                 *error = "encoder recreation failed: " + *error;
-                drain_peer();
+                drain_peer(stats);
                 return false;
             }
             if (encoder->codec() != encoder_config.codec) {
@@ -3617,7 +4375,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     *error = "refresh_stream: " + refreshed_err.to_string();
                 }
                 const bool clean = error->empty();
-                drain_peer();
+                drain_peer(stats);
                 return clean;
             }
             ++stats.stream_updates;
@@ -3669,7 +4427,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                         *error = "refresh_stream: " + refreshed.to_string();
                     }
                     const bool clean = error->empty();
-                    drain_peer();
+                    drain_peer(stats);
                     return clean;
                 }
                 ++stats.stream_updates;
@@ -3702,7 +4460,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
                     *error = "refresh_stream: " + resized_err.to_string();
                 }
                 const bool clean = error->empty();
-                drain_peer();
+                drain_peer(stats);
                 return clean;
             }
             ++stats.stream_updates;
@@ -3717,14 +4475,14 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
         if (!process_frame(pts_ms, capture_clock_ms(captured_at))) {
             const bool clean = error->empty();
-            drain_peer();
+            drain_peer(stats);
             return clean;
         }
         publish_cursor();
     }
 
     end_file_session();
-    drain_peer();
+    drain_peer(stats);
     return true;
 }
 
@@ -4966,6 +5724,526 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     return error->empty();
 }
 
+// ----- shared desktop broadcasts (publisher side) -----
+
+void HostServer::broadcast_video(const FrameHeader& header, const uint8_t* data, size_t size) {
+    if (!registry_ || !desktop_publisher_) {
+        return;
+    }
+    const std::vector<std::shared_ptr<HostServer>> followers =
+        registry_->desktop_follower_list();
+    for (const std::shared_ptr<HostServer>& follower : followers) {
+        if (follower.get() == this || !data || size == 0) {
+            continue;
+        }
+        Error sent = Error::success();
+        {
+            std::lock_guard<std::mutex> lock(follower->session_mutex_);
+            if (!follower->session_) {
+                continue;
+            }
+            // Never block the capture loop on one viewer: a full queue drops
+            // this frame for that follower, and the next key frame repairs it.
+            sent = follower->session_->send_frame_nowait(header, data, size);
+        }
+        if (sent.ok()) {
+            follower->shared_frames_.fetch_add(1, std::memory_order_relaxed);
+            if (header.keyframe) {
+                follower->shared_keyframes_.fetch_add(1, std::memory_order_relaxed);
+            }
+            follower->shared_bytes_.fetch_add(size, std::memory_order_relaxed);
+        } else if (sent.status() == Status::WaitTimeout) {
+            follower->shared_frame_drops_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
+            follower->shared_send_failed_.store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
+void HostServer::broadcast_audio(const AudioHeader& header, const uint8_t* data, size_t size) {
+    if (!registry_ || !desktop_publisher_) {
+        return;
+    }
+    const std::vector<std::shared_ptr<HostServer>> followers =
+        registry_->desktop_follower_list();
+    for (const std::shared_ptr<HostServer>& follower : followers) {
+        if (follower.get() == this || !data || size == 0) {
+            continue;
+        }
+        Error sent = Error::success();
+        {
+            std::lock_guard<std::mutex> lock(follower->session_mutex_);
+            if (!follower->session_) {
+                continue;
+            }
+            sent = follower->session_->send_audio(header, data, size);
+        }
+        if (sent.ok()) {
+            follower->shared_audio_packets_.fetch_add(1, std::memory_order_relaxed);
+            follower->shared_audio_bytes_.fetch_add(size, std::memory_order_relaxed);
+            follower->shared_audio_ready_.store(true, std::memory_order_relaxed);
+        } else if (sent.status() == Status::WaitTimeout) {
+            follower->shared_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+        } else if (sent.status() != Status::PermissionDenied &&
+                   sent.status() != Status::InvalidCall &&
+                   sent.status() != Status::Unavailable) {
+            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // PermissionDenied and InvalidCall mean this follower has no audio
+        // stream; Unavailable means its session is going away. The follower's
+        // own loop handles all three, and audio is optional per viewer.
+    }
+}
+
+void HostServer::broadcast_cursor(const CursorUpdate& update) {
+    if (!registry_ || !desktop_publisher_) {
+        return;
+    }
+    const std::vector<std::shared_ptr<HostServer>> followers =
+        registry_->desktop_follower_list();
+    for (const std::shared_ptr<HostServer>& follower : followers) {
+        if (follower.get() == this) {
+            continue;
+        }
+        Error sent = Error::success();
+        {
+            std::lock_guard<std::mutex> lock(follower->session_mutex_);
+            if (!follower->session_) {
+                continue;
+            }
+            sent = follower->session_->send_cursor(update);
+        }
+        if (sent.ok()) {
+            follower->shared_cursor_sent_.fetch_add(1, std::memory_order_relaxed);
+        } else if (sent.status() == Status::WaitTimeout) {
+            follower->shared_cursor_drops_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void HostServer::broadcast_desktop_state(DesktopKind kind) {
+    if (!registry_ || !desktop_publisher_) {
+        return;
+    }
+    const std::vector<std::shared_ptr<HostServer>> followers =
+        registry_->desktop_follower_list();
+    for (const std::shared_ptr<HostServer>& follower : followers) {
+        if (follower.get() == this) {
+            continue;
+        }
+        Error sent = Error::success();
+        {
+            std::lock_guard<std::mutex> lock(follower->session_mutex_);
+            if (!follower->session_) {
+                continue;
+            }
+            sent = follower->session_->send_desktop_state(kind);
+        }
+        if (!sent.ok() && sent.status() != Status::Unavailable &&
+            sent.status() != Status::WaitTimeout) {
+            follower->shared_send_errors_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+// ----- per-viewer clipboard and microphone plumbing -----
+
+bool HostServer::clipboard_allowed() const {
+    return settings_.allow_clipboard &&
+           (session_->permissions() & kPermissionClipboard) != 0;
+}
+
+bool HostServer::read_local_clipboard_files(std::vector<ClipboardFileEntry>& entries,
+                                            std::vector<std::string>& paths) {
+    entries.clear();
+    paths.clear();
+    std::vector<std::string> found;
+    if (!config_.clipboard_read_files(found)) {
+        return false;
+    }
+    std::string collect_error;
+    if (!collect_clipboard_files(found, entries, paths, &collect_error)) {
+        if (!collect_error.empty()) {
+            log("clipboard: " + collect_error);
+        }
+        return false;
+    }
+    return true;
+}
+
+void HostServer::remember_local_clipboard() {
+    ClipboardContent current;
+    if (config_.clipboard_read(current)) {
+        last_clipboard_hash_ = clipboard_content_hash(current);
+        last_clipboard_ = std::move(current);
+    }
+    last_file_entries_.clear();
+    last_file_paths_.clear();
+    last_file_identity_ = read_local_clipboard_files(last_file_entries_, last_file_paths_)
+                              ? clipboard_file_identity_hash(last_file_entries_)
+                              : 0;
+}
+
+void HostServer::apply_peer_clipboard(ClipboardContent content, HostServerStats& stats) {
+    if (const ClipboardFormatData* list = content.find(ClipboardFormat::FileList)) {
+        // Protocol v34: the viewer copied files. Only the list crosses the
+        // clipboard stream; the bytes follow as clipboard-marked FileOffers
+        // that stage below a session directory.
+        std::vector<ClipboardFileEntry> entries;
+        std::string list_error;
+        if (!decode_clipboard_file_list(list->data, entries, &list_error)) {
+            log("clipboard: the viewer sent an unusable file list: " + list_error);
+            return;
+        }
+        last_clipboard_hash_ = clipboard_content_hash(content);
+        last_clipboard_ = ClipboardContent{};
+        std::string begin_error;
+        if (!begin_clipboard_incoming(entries, stats, &begin_error)) {
+            log("clipboard: cannot stage the viewer's files: " + begin_error);
+        }
+        return;
+    }
+    const uint64_t hash = clipboard_content_hash(content);
+    if (hash == last_clipboard_hash_) {
+        return;
+    }
+    std::string content_error;
+    if (!valid_clipboard_content(content, &content_error)) {
+        log("clipboard: the viewer sent unusable content: " + content_error);
+        return;
+    }
+    if (!config_.clipboard_write(content)) {
+        ++stats.clipboard_write_failures;
+        return;
+    }
+    // Remembering what was applied stops the next poll from sending it
+    // straight back to the viewer.
+    last_clipboard_hash_ = hash;
+    last_clipboard_ = std::move(content);
+    ++stats.clipboard_received;
+}
+
+void HostServer::drain_peer(HostServerStats& stats) {
+    for (const InputEvent& event : session_->take_input_events()) {
+        ++stats.input_events;
+        if (config_.input_event) {
+            config_.input_event(event);
+        }
+    }
+    stats.input_stats = session_->input_stats();
+    stats.input_releases = session_->input_release_requests();
+    if (!clipboard_allowed()) {
+        return;
+    }
+    ClipboardContent content;
+    while (session_->take_clipboard_content(content)) {
+        apply_peer_clipboard(std::move(content), stats);
+    }
+    // A viewer that only speaks the v15 text message still works: treat its
+    // ClipboardUpdate as a text-only item.
+    ClipboardUpdate update;
+    while (session_->take_clipboard_update(update)) {
+        ClipboardContent legacy;
+        legacy.seq = update.seq;
+        ClipboardFormatData text;
+        text.format = ClipboardFormat::Text;
+        text.data.assign(update.text.begin(), update.text.end());
+        legacy.formats.push_back(std::move(text));
+        apply_peer_clipboard(std::move(legacy), stats);
+    }
+}
+
+void HostServer::poll_clipboard(std::chrono::steady_clock::time_point now,
+                                HostServerStats& stats) {
+    const bool allowed = clipboard_allowed();
+    if (!allowed) {
+        clipboard_was_allowed_ = false;
+        return;
+    }
+    if (!clipboard_was_allowed_) {
+        clipboard_was_allowed_ = true;
+        remember_local_clipboard();
+        next_clipboard_poll_ = now + std::chrono::milliseconds(500);
+        return;
+    }
+    if (now < next_clipboard_poll_) {
+        return;
+    }
+    next_clipboard_poll_ = now + std::chrono::milliseconds(500);
+    std::vector<ClipboardFileEntry> current_files;
+    std::vector<std::string> current_paths;
+    if (read_local_clipboard_files(current_files, current_paths)) {
+        const uint64_t identity = clipboard_file_identity_hash(current_files);
+        last_clipboard_ = ClipboardContent{};
+        last_clipboard_hash_ = 0;
+        if (identity == 0 || identity == last_file_identity_) {
+            return;
+        }
+        last_file_entries_ = std::move(current_files);
+        last_file_paths_ = std::move(current_paths);
+        last_file_identity_ = identity;
+        ClipboardFormatData entry;
+        entry.format = ClipboardFormat::FileList;
+        entry.data = encode_clipboard_file_list(last_file_entries_);
+        if (entry.data.empty()) {
+            log("clipboard: the local file list is not sendable");
+            return;
+        }
+        ClipboardContent files;
+        files.seq = clipboard_seq_;
+        files.formats.push_back(std::move(entry));
+        Error sent = session_->send_clipboard_content(std::move(files));
+        if (!sent.ok()) {
+            ++stats.send_errors;
+            log("clipboard files send failed: " + sent.to_string());
+            return;
+        }
+        // Only a list this viewer actually received may be downloaded by
+        // index; publishing after the send keeps a failed announce from
+        // leaving paths the viewer never saw.
+        {
+            std::lock_guard<std::mutex> lock(clipboard_files_mutex_);
+            clipboard_file_entries_ = last_file_entries_;
+            clipboard_file_paths_ = last_file_paths_;
+        }
+        ++clipboard_seq_;
+        ++stats.clipboard_sent;
+        return;
+    }
+    // No files now, so a later text item is a fresh change again.
+    last_file_identity_ = 0;
+    last_file_entries_.clear();
+    last_file_paths_.clear();
+    ClipboardContent current;
+    if (!config_.clipboard_read(current)) {
+        return;
+    }
+    const uint64_t hash = clipboard_content_hash(current);
+    if (hash == last_clipboard_hash_) {
+        return;
+    }
+    // Remember content we cannot put on the wire (oversized or malformed) so
+    // every later tick does not retry the same value.
+    last_clipboard_ = current;
+    last_clipboard_hash_ = hash;
+    std::string content_error;
+    if (!valid_clipboard_content(current, &content_error)) {
+        log("clipboard: the local item is not sendable: " + content_error);
+        return;
+    }
+    current.seq = clipboard_seq_;
+    Error sent = session_->send_clipboard_content(std::move(current));
+    if (!sent.ok()) {
+        ++stats.send_errors;
+        log("clipboard send failed: " + sent.to_string());
+        return;
+    }
+    ++clipboard_seq_;
+    ++stats.clipboard_sent;
+}
+
+void HostServer::stop_microphone(HostServerStats& stats, const std::string& reason) {
+    if (audio_reference_) {
+        audio_reference_->set_active(false);
+    }
+    if (microphone_player_) {
+        stats.microphone_underruns = microphone_player_->stats().underruns;
+        microphone_player_->stop();
+        microphone_player_.reset();
+    }
+    microphone_decoder_.reset();
+    microphone_info_ = AudioInfo{};
+    microphone_broken_ = false;
+    const bool was_active = stats.microphone_active;
+    stats.microphone_active = false;
+    if (was_active && !reason.empty()) {
+        log("microphone stopped: " + reason);
+    }
+}
+
+void HostServer::drain_microphone(HostServerStats& stats) {
+    stats.microphone_streams = session_->microphone_streams();
+    if (!settings_.allow_microphone || stats.microphone_streams == 0) {
+        return;
+    }
+    if ((session_->permissions() & kPermissionMicrophone) == 0) {
+        if (microphone_decoder_ || microphone_player_) {
+            stop_microphone(stats, "the microphone permission was removed");
+        }
+        return;
+    }
+    for (;;) {
+        AudioHeader header;
+        std::vector<uint8_t> payload;
+        AudioInfo info;
+        bool format_changed = false;
+        Error next = session_->receive_microphone(header, payload, info, format_changed,
+                                                  std::chrono::milliseconds(0));
+        if (next.status() == Status::WaitTimeout) {
+            break;
+        }
+        if (next.status() == Status::Unavailable) {
+            // No stream is open or the viewer closed it: the microphone was
+            // switched off, which is not a failure.
+            if (microphone_decoder_ || microphone_player_) {
+                stop_microphone(stats, "the viewer closed the stream");
+            }
+            break;
+        }
+        if (!next.ok()) {
+            ++stats.microphone_errors;
+            log("microphone receive failed: " + next.to_string());
+            stop_microphone(stats, "receive failed");
+            break;
+        }
+        if (format_changed) {
+            // A fresh CMIC stream always rebuilds the pipeline, even when the
+            // format happens to match the previous one.
+            if (microphone_decoder_ || microphone_player_) {
+                stop_microphone(stats, {});
+            }
+            microphone_info_ = info;
+            microphone_broken_ = false;
+            std::string setup_error;
+            microphone_decoder_ = create_audio_decoder(info, &setup_error);
+            if (!microphone_decoder_) {
+                ++stats.microphone_errors;
+                microphone_broken_ = true;
+                log("microphone decoder unavailable: " + setup_error);
+            } else {
+                AudioPlayerConfig player_config;
+                // The viewer's capture clock is unrelated to the host's;
+                // anchoring blocks on arrival keeps the 80 ms jitter buffer
+                // and recovers after a stall without LatencyReply.
+                player_config.arrival_anchored = true;
+                // The same output as the system-sound capture: what the
+                // reference models has to be what the speakers play.
+                player_config.device_id = settings_.audio_device;
+                if (config_.microphone_player) {
+                    microphone_player_ = config_.microphone_player(&setup_error);
+                } else {
+                    microphone_player_ = create_audio_player(player_config, &setup_error);
+                }
+                if (!microphone_player_) {
+                    ++stats.microphone_errors;
+                    microphone_broken_ = true;
+                    microphone_decoder_.reset();
+                    log("microphone playback unavailable: " + setup_error);
+                } else if (Error started = microphone_player_->start(); !started.ok()) {
+                    ++stats.microphone_errors;
+                    microphone_broken_ = true;
+                    microphone_player_.reset();
+                    microphone_decoder_.reset();
+                    log("microphone playback failed: " + started.to_string());
+                } else {
+                    if (audio_reference_) {
+                        // Only live playback may train the canceller; the
+                        // pushed blocks are the reference for loopback.
+                        audio_reference_->set_active(true);
+                    }
+                    stats.microphone_active = true;
+                    log("microphone: Opus " +
+                        std::to_string(info.sample_rate / 1000u) + " kHz, " +
+                        std::to_string(info.channels) + " ch, " +
+                        std::to_string(info.frame_samples) + " samples/frame" +
+                        (audio_reference_ ? ", feeding loopback AEC" : ""));
+                }
+            }
+        }
+        ++stats.microphone_packets;
+        stats.microphone_bytes += payload.size();
+        if (payload.empty() || microphone_broken_ || !microphone_decoder_ ||
+            !microphone_player_) {
+            continue;
+        }
+        std::vector<DecodedAudio> decoded;
+        Error decode_error =
+            microphone_decoder_->decode(header, payload.data(), payload.size(), decoded);
+        if (!decode_error.ok()) {
+            ++stats.microphone_errors;
+            log("microphone decode failed: " + decode_error.to_string());
+            continue;
+        }
+        bool push_failed = false;
+        for (const DecodedAudio& block : decoded) {
+            if (block.channels != 0) {
+                stats.microphone_frames += block.samples.size() / block.channels;
+            }
+            if (audio_reference_ && block.channels >= 1 && block.channels <= 2) {
+                audio_reference_->push(block.samples.data(),
+                                       block.samples.size() / block.channels, block.channels);
+            }
+            Error pushed = microphone_player_->push(block);
+            if (!pushed.ok()) {
+                ++stats.microphone_errors;
+                log("microphone playback failed: " + pushed.to_string());
+                stop_microphone(stats, "playback failed");
+                push_failed = true;
+                break;
+            }
+        }
+        if (push_failed) {
+            break;
+        }
+        stats.microphone_underruns = microphone_player_->stats().underruns;
+        const std::string render_error = microphone_player_->error();
+        if (!render_error.empty()) {
+            ++stats.microphone_errors;
+            log("microphone playback lost the render endpoint: " + render_error);
+            stop_microphone(stats, "the render endpoint failed");
+            break;
+        }
+    }
+}
+
+bool HostServer::send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left) {
+    ++stats.sas_requests;
+    SasCode code = SasCode::Ok;
+    std::string reason;
+    if ((session_->permissions() & kPermissionInput) == 0) {
+        code = SasCode::Denied;
+        reason = "input control is not permitted by the host";
+    } else if (config_.send_sas) {
+        if (!config_.send_sas(&reason)) {
+            code = SasCode::Failed;
+            if (reason.empty()) {
+                reason = "the SAS callback failed";
+            }
+        }
+    } else if (!config_.service_mode) {
+        code = SasCode::Unsupported;
+        reason = "Ctrl+Alt+Del is only available through the Windows service";
+    } else if (!sas_available()) {
+        code = SasCode::Unsupported;
+        reason = "this Windows installation does not expose SendSAS";
+    } else if (!send_secure_attention(&reason)) {
+        code = SasCode::Failed;
+    }
+    if (code == SasCode::Ok) {
+        // SendSAS is fire-and-forget: Windows reports no result, so this only
+        // records that the request was made.
+        log("Ctrl+Alt+Del requested (Windows does not confirm the secure desktop)");
+    } else {
+        ++stats.sas_failures;
+        log(std::string("Ctrl+Alt+Del refused (") + sas_code_name(code) + "): " +
+            (reason.empty() ? "no reason given" : reason));
+    }
+    Error sent = session_->send_sas_result(code, reason);
+    if (sent.ok()) {
+        return true;
+    }
+    if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+        *peer_left = true;
+    } else {
+        ++stats.send_errors;
+        *error = "sas_result: " + sent.to_string();
+    }
+    return false;
+}
+
 bool HostServer::sleep_unless_stopping(std::chrono::milliseconds duration) {
     const auto end = Clock::now() + duration;
     while (!stopping_.load()) {
@@ -5003,6 +6281,11 @@ void HostServer::publish_stats(const HostServerStats& stats) {
 
 void HostServer::publish_stream(const ServerInfo& info, size_t display_index,
                                 const std::string& display_name) {
+    // The registry lock is taken before the status lock; status() takes them
+    // in the opposite order, so never hold status_mutex_ across this call.
+    if (registry_ && desktop_publisher_ && desktop_info_ready_) {
+        registry_->update_desktop_info(info, display_index, display_name);
+    }
     std::lock_guard<std::mutex> lock(status_mutex_);
     status_.stream = info;
     status_.display_index = display_index;

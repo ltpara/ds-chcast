@@ -72,6 +72,7 @@ bool same_devices(const std::vector<chast::TrustedDevice>& a,
 
 bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
     return a.bind_address == b.bind_address && a.port == b.port && a.carrier == b.carrier &&
+           a.max_viewers == b.max_viewers &&
            a.allow_input == b.allow_input && a.allow_clipboard == b.allow_clipboard &&
            a.allow_file_transfer == b.allow_file_transfer &&
            a.allow_port_forward == b.allow_port_forward &&
@@ -102,6 +103,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.bind_address = "192.168.1.5";
     settings.port = 6100;
     settings.carrier = false;
+    settings.max_viewers = 3;
     settings.allow_input = false;
     settings.allow_clipboard = false;
     settings.allow_file_transfer = false;
@@ -175,6 +177,7 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.audit_spool == (dir / L"absent.audit.jsonl").string(),
           "a missing file still derives the spool next to itself");
     check(loaded.settings.carrier, "a fresh host accepts the TCP/WebSocket fallback");
+    check(loaded.settings.max_viewers == 2, "a fresh host serves two viewers at once");
     check(loaded.settings.allow_input && loaded.settings.require_approval,
           "a fresh host accepts input behind an approval");
     check(loaded.settings.allow_clipboard, "a fresh host syncs the clipboard");
@@ -217,6 +220,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "input=maybe\n"
                "clipboard=perhaps\n"
                "file_transfer=perhaps\n"
+               "max_viewers=9\n"
                "audio=perhaps\n"
                "audio_device=" + std::string(1100, 'd') + "\n"
                "audio_aec=perhaps\n"
@@ -250,6 +254,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.allow_clipboard, "an unparsable clipboard toggle keeps the default");
     check(settings.allow_file_transfer, "an unparsable file toggle keeps the default");
     check(settings.allow_audio, "an unparsable audio toggle keeps the default");
+    check(settings.max_viewers == 2, "an out-of-range viewer cap falls back");
     check(settings.audio_device.empty(), "an oversized output id is dropped");
     check(settings.audio_aec, "an unparsable AEC toggle keeps the default");
     check(settings.audio_silence_gate_ms == 2000,

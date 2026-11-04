@@ -4,15 +4,24 @@
 // per-session handshake, packaged so the command-line tool and the tray
 // application run the same code.
 //
-// One HostServer owns one listener and serves viewers in sequence. A viewer
-// picks a display in Hello; the capturer and encoder are created after the
-// handshake so the announcement describes the output that is actually read.
-// When the viewer leaves, the connection is closed and the listener stays up
-// for the next one. In one-time token mode the token is rotated after every
-// accepted session, so a spent token never guards the next connection.
+// One HostServer owns one listener. With max_viewers == 1 it serves viewers in
+// sequence; above 1 the listener hands every accepted connection to a
+// per-viewer HostServer worker, so a slow, stalled or vanishing viewer cannot
+// hold up the others. Each viewer gets its own handshake, approval,
+// permissions, capturer, encoder, streams and audit record; the policy, the
+// listener, the certificate and the TCP carrier are shared. Only one desktop
+// viewer at a time holds the control lease, so input injection and the
+// host-wide privacy overlay have a single owner.
 //
-// Everything runs on one host thread; callbacks are invoked from it and must
-// return promptly. status() may be read from any thread.
+// A viewer picks a display in Hello; the capturer and encoder are created after
+// the handshake so the announcement describes the output that is actually read.
+// When the viewer leaves, its connection is closed and the listener stays up
+// for the next one. In one-time token mode the token is rotated once the last
+// active viewer has gone.
+//
+// status() may be read from any thread. A multi-viewer host reports the
+// focused (most recently admitted) viewer and the live viewer count; the
+// operator actions below target that focused viewer.
 
 #include <array>
 #include <atomic>
@@ -39,8 +48,11 @@
 
 namespace chast {
 
-class ILoopbackCapture;
+class AudioReference;
+class IAudioDecoder;
 class IAudioPlayer;
+class ILoopbackCapture;
+struct ViewerRegistry;
 
 enum class HostState {
     Stopped,    // not started, or the run ended
@@ -176,6 +188,10 @@ struct HostServerStats {
 
 struct HostStatus {
     HostState state = HostState::Stopped;
+    // Viewers admitted right now. Above one, the fields below describe the
+    // focused viewer (the most recently admitted) and stats.sessions counts
+    // every viewer this host has admitted.
+    size_t active_viewers = 0;
     std::string fingerprint;  // SHA-256 of the certificate this host presents
     std::string token;        // the token CLI/automation has to send
     // The live authentication policy. The tray shows the temporary password
@@ -385,15 +401,82 @@ public:
     bool send_chat(const std::string& text);
 
 private:
-    explicit HostServer(HostServerConfig config)
-        : config_(std::move(config)), settings_(config_.settings) {}
+    explicit HostServer(HostServerConfig config);
 
     void run();
+    // Sequential host: one viewer at a time, with the listener kept across
+    // sessions. Selected when settings_.max_viewers is 1.
+    void run_single();
+    // Concurrent host: the listener accepts up to settings_.max_viewers
+    // connections and each one runs on its own HostServer worker.
+    void run_multi();
+    // Worker entry point for one accepted connection. It waits for the Hello
+    // (the policy runs here), serves the session and reports its own audit
+    // record.
+    void run_adopted();
+    // Shared body of a connected session: publishes the viewer, runs the
+    // streaming or files-only loop, finishes the transport and writes the
+    // audit record. `rotate_token` is false for a viewer worker, whose parent
+    // rotates the one-time token once no viewer is left.
+    bool serve_current_session(HostServerStats& stats, bool rotate_token,
+                               std::string* error, bool* peer_left);
+    // Starts one worker for an accepted connection and makes it the focused
+    // viewer for status() and the operator actions.
+    void start_viewer(std::unique_ptr<QuicSession> connection);
+    // Joins and drops workers that finished. Runs on the parent host thread.
+    void reap_viewers();
+    // Stops and joins every viewer worker. Used when the listener goes away
+    // and by the parent's shutdown path.
+    void stop_viewers();
+    // Copies the last served viewer's snapshot onto the listener, so a caller
+    // that reads status() after wait() still sees the session counters and,
+    // for a one-shot run, why the session ended.
+    void remember_session(const HostStatus& session);
+    // The viewer status(), send_chat() and the operator actions target: the
+    // focused live worker, or null when nobody is streaming.
+    std::shared_ptr<HostServer> focused_viewer() const;
     bool open_session(std::string* error);
     // Serves the connected viewer until the peer leaves, the run ends or an
     // error stops it. Returns false only for a failure, not for a normal
     // disconnect. `peer_left` distinguishes a vanished viewer.
     bool stream_session(HostServerStats& stats, std::string* error, bool* peer_left);
+    // The desktop stream itself. A multi-viewer host elects one publisher:
+    // the first desktop viewer captures and encodes once and later viewers
+    // receive the same frames (a second IDXGIOutputDuplication cannot exist
+    // in one process). `already_announced` means this viewer followed before
+    // and owns a live stream, so the description is refreshed, not announced.
+    bool stream_desktop(HostServerStats& stats, std::string* error, bool* peer_left,
+                        bool already_announced);
+    enum class SharedFollowResult {
+        Ended,    // the viewer left, the run stopped or following failed
+        Promote,  // no publisher is left and this worker took the role over
+    };
+    // Serves a desktop viewer that is not the publisher: waits for the
+    // publisher's stream description, announces (or refreshes) it and runs
+    // this viewer's own control plane. `announced` says whether this session
+    // already has a stream. Returns Promote after claiming the publisher role.
+    SharedFollowResult follow_shared_desktop(HostServerStats& stats, std::string* error,
+                                             bool* peer_left, bool* announced);
+    void release_desktop_publisher();
+    // Fans the publisher's output out to its followers. These run on the
+    // publisher thread and never block, so a slow follower cannot stall the
+    // capture loop. A follower that cannot keep up drops frames.
+    void broadcast_video(const FrameHeader& header, const uint8_t* data, size_t size);
+    void broadcast_audio(const AudioHeader& header, const uint8_t* data, size_t size);
+    void broadcast_cursor(const CursorUpdate& update);
+    void broadcast_desktop_state(DesktopKind kind);
+    // Clipboard and microphone plumbing shared by the publisher and follower
+    // paths; each worker owns its viewer's state.
+    bool clipboard_allowed() const;
+    bool read_local_clipboard_files(std::vector<ClipboardFileEntry>& entries,
+                                    std::vector<std::string>& paths);
+    void remember_local_clipboard();
+    void apply_peer_clipboard(ClipboardContent content, HostServerStats& stats);
+    void drain_peer(HostServerStats& stats);
+    void poll_clipboard(std::chrono::steady_clock::time_point now, HostServerStats& stats);
+    void stop_microphone(HostServerStats& stats, const std::string& reason);
+    void drain_microphone(HostServerStats& stats);
+    bool send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left);
     // Serves a viewer that asked for a file-transfer-only session: no capture,
     // encoder, display or audio exists. The same file machinery as a desktop
     // session runs in a short polling loop until the viewer leaves.
@@ -418,12 +501,20 @@ private:
     HostServerConfig config_;
     HostSettings settings_;
     // The policy outlives listener reopens so lockouts and the temporary
-    // password survive a reconnect; only a new HostServer replaces it.
-    std::unique_ptr<HostSecurity> security_;
+    // password survive a reconnect; a new HostServer replaces it. Viewer
+    // workers share their parent's policy, which is thread-safe.
+    std::shared_ptr<HostSecurity> security_;
     // The Result of the Hello currently being admitted. authenticate_client
     // and approve_client run on the same host thread, so committing after the
     // operator's decision cannot race another handshake.
     HostSecurity::Result pending_security_;
+    // The mask the operator approved before the control lease stripped input.
+    // The transport's permission ceiling is raised back to it once the stream
+    // is announced, so a later lease transfer can grant input without ever
+    // widening what was approved. `lease_stripped_input_` marks the temporal
+    // strip (another viewer held control) as opposed to a policy exclusion.
+    uint16_t approved_permissions_ = 0;
+    bool lease_stripped_input_ = false;
     // A UI request is queued instead of touching the session from that
     // thread; the frame loop applies it. The pair is only meaningful together,
     // so both fields are read and written under permission_mutex_.
@@ -435,8 +526,19 @@ private:
     std::atomic<bool> running_{false};
     bool started_ = false;
 
-    // Owned by the host thread after start(); created in create().
+    // Owned by the host thread after start(); created in create(). A viewer
+    // worker owns the accepted connection instead and leaves this null.
     std::unique_ptr<QuicSession> session_;
+    // Shared coordination between the listener and its viewer workers: the
+    // live count, the focused viewer and the single control lease. Null on a
+    // sequential host.
+    std::shared_ptr<ViewerRegistry> registry_;
+    // Viewer workers only. `self_` lets a worker register itself as focused;
+    // `finished_` tells the parent its thread is about to end.
+    std::weak_ptr<HostServer> self_;
+    bool adopted_ = false;
+    std::atomic<bool> finished_{false};
+    std::vector<std::shared_ptr<HostServer>> viewers_;
     // The fallback listener feeds session_'s UDP port. Created once next to
     // the first session and kept across listener reopens because its target
     // address does not change; stopped before the session is destroyed.
@@ -588,6 +690,45 @@ private:
     // typed while nobody was connected never reaches the next viewer.
     mutable std::mutex chat_mutex_;
     std::deque<std::string> pending_chat_;
+
+    // Multi-viewer desktop sharing. A multi-viewer host elects one publisher
+    // that captures and encodes once; every later desktop viewer follows it.
+    // The role flags belong to this worker's session thread; `session_mutex_`
+    // guards the session handle against a publisher broadcasting into a
+    // follower that is being torn down. The shared_* counters carry the
+    // follower's broadcast traffic back to its own loop.
+    bool desktop_publisher_ = false;
+    bool desktop_info_ready_ = false;
+    std::mutex session_mutex_;
+    std::atomic<uint64_t> shared_frames_{0};
+    std::atomic<uint64_t> shared_keyframes_{0};
+    std::atomic<uint64_t> shared_bytes_{0};
+    std::atomic<uint64_t> shared_frame_drops_{0};
+    std::atomic<uint64_t> shared_send_errors_{0};
+    std::atomic<uint64_t> shared_audio_packets_{0};
+    std::atomic<uint64_t> shared_audio_bytes_{0};
+    std::atomic<uint64_t> shared_audio_drops_{0};
+    std::atomic<uint64_t> shared_cursor_sent_{0};
+    std::atomic<uint64_t> shared_cursor_drops_{0};
+    std::atomic<bool> shared_send_failed_{false};
+    std::atomic<bool> shared_audio_ready_{false};
+
+    // Clipboard baseline and microphone pipeline of this worker's viewer.
+    // They live here instead of in stream_desktop() because the follower path
+    // serves the same per-viewer features without owning capture.
+    bool clipboard_was_allowed_ = false;
+    ClipboardContent last_clipboard_;
+    uint64_t last_clipboard_hash_ = 0;
+    uint64_t clipboard_seq_ = 1;
+    std::chrono::steady_clock::time_point next_clipboard_poll_{};
+    std::unique_ptr<IAudioDecoder> microphone_decoder_;
+    std::unique_ptr<IAudioPlayer> microphone_player_;
+    AudioInfo microphone_info_;
+    bool microphone_broken_ = false;
+    // The publisher's loopback capture feeds the echo canceller; a follower
+    // plays its microphone without one because the reference belongs to the
+    // publisher's audio pipeline.
+    std::shared_ptr<AudioReference> audio_reference_;
 
     mutable std::mutex status_mutex_;
     HostStatus status_;

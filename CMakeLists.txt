@@ -408,6 +408,13 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host)
 
+    # Multi-viewer host over loopback QUIC: concurrent admission, the
+    # connection cap, per-session audit records and the control lease. The
+    # concurrency cases use file-transfer sessions, so no GPU is needed; the
+    # lease case skips itself when no interactive desktop exists.
+    add_executable(chast-host-multi-test tests/host_multi_test.cc)
+    target_link_libraries(chast-host-multi-test PRIVATE chast.host)
+
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
     add_executable(chast-host-security-test tests/host_security_test.cc)
@@ -481,6 +488,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME desktop COMMAND chast-desktop-test)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
+    add_test(NAME host_multi COMMAND chast-host-multi-test)
+    set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)

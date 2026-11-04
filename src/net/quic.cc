@@ -509,6 +509,19 @@ struct QuicSession::Impl {
     HQUIC configuration = nullptr;
     HQUIC listener = nullptr;
     PCCERT_CONTEXT certificate = nullptr;
+    // False for a session accepted by a multi-client listener: its api table
+    // is its own, while the registration, configuration, certificate and
+    // listener belong to the listener and must outlive the connection.
+    bool owns_transport = true;
+    // Multi-client listener state. `accepted` holds connections that finished
+    // the TLS handshake and wait for the application; `live_clients` counts
+    // every accepted session, including one the application already holds, so
+    // the cap is enforced before another handshake begins.
+    std::shared_ptr<std::atomic<size_t>> live_clients;
+    std::mutex accept_mutex;
+    std::condition_variable accept_cv;
+    std::deque<std::unique_ptr<QuicSession>> accepted_sessions;
+    bool listener_closed = false;
     std::atomic<HQUIC> connection{nullptr};
     std::atomic<HQUIC> control{nullptr};
     std::atomic<HQUIC> video{nullptr};
@@ -899,7 +912,12 @@ struct QuicSession::Impl {
     size_t in_flight_bytes = 0;
     size_t in_flight_sends = 0;
 
-    ~Impl() { close(); }
+    ~Impl() {
+        close();
+        if (live_clients) {
+            live_clients->fetch_sub(1);
+        }
+    }
 
     Error fail(Status status, const std::string& message) {
         {
@@ -991,27 +1009,94 @@ struct QuicSession::Impl {
         if (event.Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) {
             return QUIC_STATUS_SUCCESS;
         }
+        HQUIC incoming = event.NEW_CONNECTION.Connection;
+        if (server_config.max_clients > 1) {
+            return on_new_viewer(incoming);
+        }
         HQUIC expected = nullptr;
-        if (!connection.compare_exchange_strong(expected, event.NEW_CONNECTION.Connection)) {
+        if (!connection.compare_exchange_strong(expected, incoming)) {
             // The tool serves one viewer at a time; a second connection is
             // refused before the handshake continues. Shutting it down first
             // tells that client right away instead of leaving it retransmit.
-            api->ConnectionShutdown(event.NEW_CONNECTION.Connection,
-                                    QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-            api->ConnectionClose(event.NEW_CONNECTION.Connection);
+            api->ConnectionShutdown(incoming, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            api->ConnectionClose(incoming);
             return QUIC_STATUS_SUCCESS;
         }
-        api->SetCallbackHandler(event.NEW_CONNECTION.Connection,
+        api->SetCallbackHandler(incoming,
                                 reinterpret_cast<void*>(&Impl::connection_callback), this);
-        const QUIC_STATUS status = api->ConnectionSetConfiguration(
-            event.NEW_CONNECTION.Connection, configuration);
+        const QUIC_STATUS status = api->ConnectionSetConfiguration(incoming, configuration);
         if (QUIC_FAILED(status)) {
             fail(Status::Unavailable,
                  "ConnectionSetConfiguration failed: " + status_hex(status));
-            api->ConnectionClose(event.NEW_CONNECTION.Connection);
+            api->ConnectionClose(incoming);
             connection = nullptr;
             return status;
         }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    // Multi-client listener: builds a server session for the connection the
+    // listener just accepted. Runs on the MsQuic listener callback, so it only
+    // allocates and registers; the Hello, approval and media all happen on the
+    // application thread that calls accept().
+    QUIC_STATUS on_new_viewer(HQUIC incoming) {
+        {
+            std::lock_guard<std::mutex> lock(accept_mutex);
+            if (listener_closed) {
+                api->ConnectionShutdown(incoming, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+                api->ConnectionClose(incoming);
+                return QUIC_STATUS_SUCCESS;
+            }
+        }
+        const size_t live = live_clients->fetch_add(1) + 1;
+        if (live > server_config.max_clients) {
+            live_clients->fetch_sub(1);
+            api->ConnectionShutdown(incoming, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            api->ConnectionClose(incoming);
+            return QUIC_STATUS_SUCCESS;
+        }
+        const auto decline = [&]() {
+            live_clients->fetch_sub(1);
+            api->ConnectionShutdown(incoming, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            api->ConnectionClose(incoming);
+            return QUIC_STATUS_SUCCESS;
+        };
+
+        std::unique_ptr<QuicSession> child(new QuicSession());
+        child->impl_ = std::make_unique<Impl>();
+        Impl& target = *child->impl_;
+        target.role = Role::Server;
+        target.server_config = server_config;
+        // One connection per accepted session: the helper never listens and
+        // never waits for a replacement viewer.
+        target.server_config.max_clients = 1;
+        target.server_config.stop_after_denial = true;
+        target.server_config.access_token = server_config.access_token;
+        target.api = nullptr;
+        if (QUIC_FAILED(MsQuicOpen2(&target.api))) {
+            return decline();
+        }
+        target.owns_transport = false;
+        target.live_clients = live_clients;
+        target.connection = incoming;
+        api->SetCallbackHandler(incoming,
+                                reinterpret_cast<void*>(&Impl::connection_callback), &target);
+        const QUIC_STATUS status = api->ConnectionSetConfiguration(incoming, configuration);
+        if (QUIC_FAILED(status)) {
+            target.connection = nullptr;
+            target.live_clients.reset();
+            return decline();
+        }
+        {
+            std::lock_guard<std::mutex> lock(accept_mutex);
+            if (listener_closed) {
+                target.connection = nullptr;
+                target.live_clients.reset();
+                return decline();
+            }
+            accepted_sessions.push_back(std::move(child));
+        }
+        accept_cv.notify_all();
         return QUIC_STATUS_SUCCESS;
     }
 
@@ -4322,6 +4407,16 @@ struct QuicSession::Impl {
         if (!api) {
             return;
         }
+        // Wake accept() and give queued viewers back to the transport. Their
+        // destructors close the connections below, outside the accept lock.
+        std::deque<std::unique_ptr<QuicSession>> pending;
+        {
+            std::lock_guard<std::mutex> lock(accept_mutex);
+            listener_closed = true;
+            pending.swap(accepted_sessions);
+        }
+        accept_cv.notify_all();
+        pending.clear();
         // Stops the injection thread and lifts anything it was holding, so a
         // disconnect never leaves a key or button down on this machine.
         if (injector) {
@@ -4392,11 +4487,11 @@ struct QuicSession::Impl {
             }
             datagram_sends.clear();
         }
-        if (configuration) {
+        if (configuration && owns_transport) {
             api->ConfigurationClose(configuration);
             configuration = nullptr;
         }
-        if (registration) {
+        if (registration && owns_transport) {
             api->RegistrationClose(registration);
             registration = nullptr;
         }
@@ -4426,6 +4521,9 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
     Impl& impl = *session->impl_;
     impl.role = Impl::Role::Server;
     impl.server_config = config;
+    if (config.max_clients > 1) {
+        impl.live_clients = std::make_shared<std::atomic<size_t>>(0);
+    }
 
     QUIC_STATUS status = MsQuicOpen2(&impl.api);
     if (QUIC_FAILED(status)) {
@@ -4509,13 +4607,53 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
                  std::to_string(config.port) + ": " + status_hex(status);
         return nullptr;
     }
-    if (config.allow_input) {
+    if (config.allow_input && config.max_clients <= 1) {
         impl.injector = InputInjector::create(config.dry_run_input, error);
         if (!impl.injector) {
             return nullptr;
         }
     }
     return session;
+}
+
+Error QuicSession::accept(std::unique_ptr<QuicSession>& client,
+                          std::chrono::milliseconds timeout) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server || impl.server_config.max_clients <= 1) {
+        return Error(Status::InvalidCall,
+                     "accept needs a server created with max_clients above 1");
+    }
+    std::unique_lock<std::mutex> lock(impl.accept_mutex);
+    const bool ready = impl.accept_cv.wait_for(lock, timeout, [&impl] {
+        return !impl.accepted_sessions.empty() || impl.listener_closed;
+    });
+    if (!impl.accepted_sessions.empty()) {
+        client = std::move(impl.accepted_sessions.front());
+        impl.accepted_sessions.pop_front();
+        lock.unlock();
+        if (client->impl_->server_config.allow_input) {
+            std::string error;
+            client->impl_->injector = InputInjector::create(
+                client->impl_->server_config.dry_run_input, &error);
+            if (!client->impl_->injector) {
+                client.reset();
+                return Error(Status::Unavailable, "input injector: " + error);
+            }
+        }
+        return Error::success();
+    }
+    if (!ready) {
+        return Error(Status::WaitTimeout, "no viewer connected in time");
+    }
+    return Error(Status::Unavailable, "the listener is closed");
+}
+
+void QuicSession::set_server_callbacks(
+    std::function<ClientAuthResult(const ClientRequest&)> authenticate,
+    std::function<ClientApproval(const ClientRequest&)> approve_client) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->server_config.authenticate = std::move(authenticate);
+    impl_->server_config.approve_client = std::move(approve_client);
 }
 
 std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& config,
@@ -4648,6 +4786,7 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             impl.hello_ready = false;
             ClientRequest request;
             request.display = impl.requested_display;
+            request.mode = impl.requested_mode;
             request.peer_address = impl.requested_peer;
             request.hello = std::move(impl.pending_hello);
             impl.pending_hello = ClientHello{};
@@ -4935,6 +5074,19 @@ Error QuicSession::set_permissions(uint16_t permissions) {
     }
     return impl.send_bytes(impl.control.load(), make_permission_update(next),
                            QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::set_permission_ceiling(uint16_t permissions) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "set_permission_ceiling is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream was not announced yet");
+    }
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.permission_ceiling = permissions & impl.config_permissions();
+    return Error::success();
 }
 
 bool QuicSession::take_permission_update(uint16_t& permissions) {
@@ -5457,6 +5609,15 @@ uint64_t QuicSession::stream_options_results() const {
 }
 
 Error QuicSession::send_frame(FrameHeader header, const uint8_t* payload, size_t size) {
+    return send_frame_impl(header, payload, size, true);
+}
+
+Error QuicSession::send_frame_nowait(FrameHeader header, const uint8_t* payload, size_t size) {
+    return send_frame_impl(header, payload, size, false);
+}
+
+Error QuicSession::send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size,
+                                   bool wait) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "send_frame is a server operation");
@@ -5477,7 +5638,7 @@ Error QuicSession::send_frame(FrameHeader header, const uint8_t* payload, size_t
     std::vector<uint8_t> bytes(kFrameHeaderSize + size);
     encode_frame_header(header, bytes.data());
     std::memcpy(bytes.data() + kFrameHeaderSize, payload, size);
-    return impl.send_bytes(video, std::move(bytes), QUIC_SEND_FLAG_NONE);
+    return impl.send_bytes_impl(video, std::move(bytes), QUIC_SEND_FLAG_NONE, wait);
 }
 
 bool QuicSession::take_keyframe_request() {

@@ -58,6 +58,11 @@ struct HostSettings {
     // some client networks block; the fallback carries the same QUIC
     // datagrams over a TCP stream without changing the session protocol.
     bool carrier = true;
+    // Viewers served at the same time, 1..8. 1 keeps the sequential host: a
+    // second connection waits until the current viewer leaves. Above 1 every
+    // viewer gets its own handshake, permissions, streams and audit record;
+    // only one of them holds the control lease for input and privacy state.
+    uint32_t max_viewers = 2;
     // The gate belongs to the host, and a remote-desktop host is not useful
     // without it; access control is the token and the approval, not this.
     bool allow_input = true;

@@ -59,6 +59,9 @@ enum class ClientApprovalMethod {
 // password, show a dialog or touch the settings file.
 struct ClientRequest {
     uint16_t display = kDisplayAuto;
+    // What the connection is for. A multi-viewer host uses it to decide which
+    // session may hold the single control lease.
+    SessionMode mode = SessionMode::Desktop;
     // "ip:port" of the connecting peer, empty when the transport would not
     // report it.
     std::string peer_address;
@@ -119,11 +122,21 @@ struct QuicServerConfig {
     uint16_t port = 4433;
     // How long the connection may sit idle before the transport closes it.
     uint32_t idle_timeout_ms = 30000;
+    // How many viewers the listener connects at once. 1 keeps the legacy
+    // single-session slot that wait_for_client() reuses; a value above 1 turns
+    // the server into a listener that hands every accepted connection to the
+    // application through accept(), each as its own QuicSession. The cap is
+    // enforced before TLS completes, so an extra peer is refused immediately.
+    //
+    // Every accepted session runs its own Hello, permissions and streams. The
+    // listener keeps the registration, configuration and certificate alive for
+    // as long as any accepted session exists.
+    uint32_t max_clients = 1;
     // How long a connection may stay open without sending its Hello. A silent
-    // peer would otherwise hold the single session slot forever: the server
-    // keepalive keeps the idle timeout from firing. On expiry the connection
-    // is shut down and the slot is released for the next viewer. 0 disables
-    // the pre-Hello timeout.
+    // peer would otherwise hold a session slot forever: the server keepalive
+    // keeps the idle timeout from firing. On expiry the connection is shut
+    // down and the slot is released for the next viewer. 0 disables the
+    // pre-Hello timeout.
     uint32_t hello_timeout_ms = 10000;
     // Accept InputEvents from the viewer. Off by default: a client that
     // connects to a port bound to loopback is still a client, and the gate
@@ -336,6 +349,20 @@ public:
     // handshake frees its slot the same way. A transport or protocol failure
     // ends the wait early.
     Error wait_for_client(std::chrono::milliseconds timeout);
+    // Multi-client listener (max_clients > 1) only: pops one accepted
+    // connection into `client`. The returned session is in the server role,
+    // has its own MsQuic registration for callbacks, and reports hello errors
+    // through wait_for_client() exactly like a single-client server. Its
+    // configuration and identity belong to the listener, which must outlive
+    // every accepted session. Returns WaitTimeout when no viewer arrived.
+    Error accept(std::unique_ptr<QuicSession>& client, std::chrono::milliseconds timeout);
+    // Replaces the policy hooks of an accepted session before its Hello is
+    // evaluated. The listener's own hooks run on the listener object, so a
+    // host that serves several viewers must point each accepted session at the
+    // state that belongs to that viewer.
+    void set_server_callbacks(
+        std::function<ClientAuthResult(const ClientRequest&)> authenticate,
+        std::function<ClientApproval(const ClientRequest&)> approve_client);
     // The display index the client asked for in Hello, or kDisplayAuto. Valid
     // once wait_for_client() succeeded; the server creates its capturer after
     // that so the request can pick the output.
@@ -372,6 +399,13 @@ public:
     // also lifts anything the injector still holds. Requires an announced
     // stream.
     Error set_permissions(uint16_t permissions);
+    // Server: raises or lowers what a later set_permissions() may grant,
+    // without changing the mask in force. The new ceiling is clamped to what
+    // the configuration allows and never exceeds the mask the operator
+    // approved; the multi-viewer host uses it so a viewer that joined
+    // view-only can receive input once the control lease frees. Requires an
+    // announced stream.
+    Error set_permission_ceiling(uint16_t permissions);
     // Replaces the token the next client has to send. Call between sessions:
     // a token spent by the previous one becomes valid again under its new
     // value, which is how a host rotates a one-time token without rebinding.
@@ -399,6 +433,11 @@ public:
     // when too much unacknowledged data is queued (backpressure), so the
     // caller can keep capturing without unbounded memory growth.
     Error send_frame(FrameHeader header, const uint8_t* payload, size_t size);
+    // The same send without backpressure: WaitTimeout means the queue was full
+    // and the frame was dropped, any other error means the stream is unusable.
+    // A host that shares one encoded stream between viewers uses this so a
+    // slow viewer cannot stall the capture loop.
+    Error send_frame_nowait(FrameHeader header, const uint8_t* payload, size_t size);
     // Sends one audio access unit on the audio stream. Like send_frame it
     // fills in the sequence number, size and CRC. Unlike it, the send never
     // waits: when the shared video/audio queue is full the packet is dropped
@@ -1042,6 +1081,8 @@ public:
 
 private:
     QuicSession() = default;
+
+    Error send_frame_impl(FrameHeader header, const uint8_t* payload, size_t size, bool wait);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

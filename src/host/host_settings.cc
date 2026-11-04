@@ -478,6 +478,15 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.carrier)) {
                 warn(result.warning, "carrier '" + value + "' is not a boolean");
             }
+        } else if (key == "max_viewers") {
+            uint32_t viewers = 0;
+            if (!parse_u32(value, viewers) || viewers == 0 || viewers > 8) {
+                warn(result.warning,
+                     "max_viewers '" + value + "' is not 1..8; using " +
+                         std::to_string(settings.max_viewers));
+            } else {
+                settings.max_viewers = viewers;
+            }
         } else if (key == "input") {
             if (!parse_bool(value, settings.allow_input)) {
                 warn(result.warning, "input '" + value + "' is not a boolean");
@@ -806,6 +815,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "bind=" << settings.bind_address << "\n"
          << "port=" << settings.port << "\n"
          << "carrier=" << (settings.carrier ? 1 : 0) << "\n"
+         << "max_viewers=" << settings.max_viewers << "\n"
          << "# security\n"
          << "auth_mode=" << auth_mode_name(settings.auth_mode) << "\n"
          << "password_hash=" << settings.password_hash << "\n"
