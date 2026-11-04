@@ -1,6 +1,7 @@
 #include "gpu_frame_sink.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -10,6 +11,10 @@ namespace chast_viewer {
 namespace {
 
 constexpr UINT kBlitTimeoutMs = 2000;
+// Poll tightly for a short while before falling back to Sleep(1). The sleep
+// quantum is 15.6 ms unless something in the process asked for a 1 ms timer,
+// and a per-frame wait must not inherit that.
+constexpr UINT kWaitSpinMs = 2;
 constexpr UINT kNominalRate = 60;
 
 constexpr wchar_t kPluginDll[] = L"flutter_gpu_texture_renderer_plugin.dll";
@@ -139,6 +144,13 @@ bool GpuFrameSink::init_device() {
         set_error("D3D11 event query creation failed");
         return false;
     }
+    for (chast::ComPtr<ID3D11Query>& query : slot_done_) {
+        hr = device_->CreateQuery(&query_desc, query.put());
+        if (FAILED(hr)) {
+            set_error("D3D11 slot event query creation failed");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -162,6 +174,19 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
         input.Height == pipeline_input_height_ && width == pipeline_width_ &&
         height == pipeline_height_) {
         return true;
+    }
+
+    // The rebuild replaces the textures the slot queries trail. Let those
+    // queries finish first so re-Ending them is legal and the new textures
+    // cannot be written while the old ones are still in use.
+    for (size_t i = 0; i < slot_done_pending_.size(); ++i) {
+        if (!slot_done_pending_[i]) {
+            continue;
+        }
+        if (!wait_for_query(slot_done_[i].get())) {
+            return false;
+        }
+        slot_done_pending_[i] = false;
     }
 
     // Build everything into locals first: a failed rebuild must leave the
@@ -306,18 +331,27 @@ bool GpuFrameSink::render(Slot& slot, ID3D11Texture2D* nv12, uint32_t subresourc
         set_error(fail_hr("VideoProcessorBlt", hr));
         return false;
     }
-    return wait_for_gpu();
+    // The plugin copies this slot on the same immediate context, so its copy
+    // is ordered after the blit without an event wait here. OnGpuFrame bounds
+    // how far the CPU may run ahead by waiting only when a slot is reused.
+    return true;
 }
 
 bool GpuFrameSink::wait_for_gpu() {
-    // The plugin copies the slot into the texture Flutter samples right after
-    // this returns, on the same immediate context, so the blit has to be
-    // complete before it can read the slot.
+    // The screenshot readback maps the slot right after this returns, so the
+    // copy has to be complete. Frame rendering no longer waits here; the
+    // per-slot queries bound the pipeline instead.
     context_->End(frame_done_.get());
     context_->Flush();
-    const ULONGLONG deadline = GetTickCount64() + kBlitTimeoutMs;
+    return wait_for_query(frame_done_.get());
+}
+
+bool GpuFrameSink::wait_for_query(ID3D11Query* query) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto spin_until = start + std::chrono::milliseconds(kWaitSpinMs);
+    const auto deadline = start + std::chrono::milliseconds(kBlitTimeoutMs);
     for (;;) {
-        const HRESULT hr = context_->GetData(frame_done_.get(), nullptr, 0, 0);
+        const HRESULT hr = context_->GetData(query, nullptr, 0, 0);
         if (hr == S_OK) {
             return true;
         }
@@ -325,11 +359,16 @@ bool GpuFrameSink::wait_for_gpu() {
             set_error(fail_hr("GetData(frame done)", hr));
             return false;
         }
-        if (GetTickCount64() >= deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
             set_error("the display GPU did not finish a frame in time");
             return false;
         }
-        Sleep(1);
+        if (now < spin_until) {
+            SwitchToThread();
+        } else {
+            Sleep(1);
+        }
     }
 }
 
@@ -363,7 +402,20 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
         return false;
     }
 
-    Slot& slot = slots_[next_slot_];
+    const size_t slot_index = next_slot_;
+    // The blit and the plugin's copy both run on this immediate context, so
+    // reusing a slot can never race the previous frame. Waiting for the
+    // slot's older query is backpressure: it caps the pipeline at three
+    // frames instead of stalling on every frame as the old per-frame wait
+    // did. At the capture rate the query has normally completed already.
+    if (slot_done_pending_[slot_index]) {
+        if (!wait_for_query(slot_done_[slot_index].get())) {
+            return false;
+        }
+        slot_done_pending_[slot_index] = false;
+    }
+
+    Slot& slot = slots_[slot_index];
     if (!render(slot, nv12, subresource, width, height, crop_x, crop_y)) {
         return false;
     }
@@ -372,9 +424,14 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
     // context is ordered, so the next pass over this slot cannot overwrite it
     // before the copy has read it.
     set_texture_(output, slot.texture.get());
-    last_slot_ = next_slot_;
+    // The plugin flushes after its copy. Flush again so this event query is
+    // submitted even on a plugin path that returns before copying.
+    context_->End(slot_done_[slot_index].get());
+    context_->Flush();
+    slot_done_pending_[slot_index] = true;
+    last_slot_ = slot_index;
     last_slot_valid_ = true;
-    next_slot_ = (next_slot_ + 1) % kSlotCount;
+    next_slot_ = (slot_index + 1) % kSlotCount;
     return true;
 }
 

@@ -63,6 +63,7 @@ private:
     bool render(Slot& slot, ID3D11Texture2D* nv12, uint32_t subresource, uint32_t width,
                 uint32_t height, uint32_t crop_x, uint32_t crop_y);
     bool wait_for_gpu();
+    bool wait_for_query(ID3D11Query* query);
     void set_error(std::string message);
 
     chast::ComPtr<ID3D11Device> device_;
@@ -72,7 +73,12 @@ private:
     chast::ComPtr<ID3D11VideoContext1> video_context1_;
     chast::ComPtr<ID3D11VideoProcessorEnumerator> enumerator_;
     chast::ComPtr<ID3D11VideoProcessor> processor_;
+    // frame_done_ covers the screenshot path. The per-slot queries bound how
+    // far decode may run ahead: a slot is reused only after the frame that
+    // previously occupied it reached the GPU.
     chast::ComPtr<ID3D11Query> frame_done_;
+    std::array<chast::ComPtr<ID3D11Query>, kSlotCount> slot_done_;
+    std::array<bool, kSlotCount> slot_done_pending_{};
 
     HMODULE plugin_ = nullptr;
     SetTextureFn set_texture_ = nullptr;
