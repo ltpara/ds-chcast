@@ -41,8 +41,12 @@ type Options struct {
 	// is overridable so tests never touch a real chast association.
 	Protocol       bool
 	ProtocolScheme string
-	Quiet          bool
-	Logf           func(format string, args ...any)
+	// VirtualDisplay installs the bundled usbmmidd driver during a machine
+	// install and uninstalls the chast-owned driver before removing the tree.
+	VirtualDisplay      bool
+	VirtualDisplayCount int
+	Quiet               bool
+	Logf                func(format string, args ...any)
 }
 
 func (o Options) logf(format string, args ...any) {

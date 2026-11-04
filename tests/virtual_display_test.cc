@@ -3,6 +3,8 @@
 // driver or real %ProgramData% file is touched.
 
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 
 #include <cstdio>
 #include <filesystem>
@@ -570,6 +572,256 @@ void test_install_record() {
           "the install timestamp is a UTC ISO-8601 second");
 }
 
+std::filesystem::path system_binary(const wchar_t* name) {
+    wchar_t windows[MAX_PATH]{};
+    const UINT size = GetWindowsDirectoryW(windows, MAX_PATH);
+    std::filesystem::path path(std::wstring(windows, size));
+    path /= L"System32";
+    path /= name;
+    return path;
+}
+
+bool build_signed_package(const std::filesystem::path& package) {
+    std::error_code ec;
+    std::filesystem::create_directories(package, ec);
+    // Verify against a system binary that carries an embedded Authenticode
+    // signature; catalog-signed binaries such as cmd.exe are not accepted by
+    // WinVerifyTrust with WTD_CHOICE_FILE.
+    const wchar_t* const candidates[] = {
+        L"MpSigStub.exe",
+        L"appverif.exe",
+        L"vsjitdebugger.exe",
+        L"microsoft.windows.softwarelogo.showdesktop.exe",
+    };
+    bool copied = false;
+    for (const wchar_t* candidate : candidates) {
+        const std::filesystem::path source = system_binary(candidate);
+        std::error_code exists;
+        if (!std::filesystem::exists(source, exists)) {
+            continue;
+        }
+        std::string error;
+        if (!chast::verify_authenticode(source.wstring(), &error)) {
+            continue;
+        }
+        if (CopyFileW(source.c_str(), (package / L"deviceinstaller64.exe").c_str(), TRUE) ==
+            FALSE) {
+            return false;
+        }
+        copied = true;
+        break;
+    }
+    if (!copied) {
+        return false;
+    }
+    const std::vector<std::string> files = {
+        "deviceinstaller64.exe", "usbmmidd.inf",       "usbmmidd.cat",
+        "x64/usbmmidd.dll",      "win32/usbmmidd.dll", "license.txt",
+    };
+    for (const std::string& name : files) {
+        if (name != "deviceinstaller64.exe") {
+            write_bytes(package / std::filesystem::path(name), "content of " + name);
+        }
+    }
+    std::string manifest;
+    for (const std::string& name : files) {
+        std::string digest;
+        std::string error;
+        if (!chast::sha256_file_hex((package / std::filesystem::path(name)).wstring(), &digest,
+                                    &error)) {
+            return false;
+        }
+        manifest += digest + "  " + name + "\n";
+    }
+    write_bytes(package / "manifest.sha256", manifest);
+    return true;
+}
+
+void test_package_guard() {
+    std::string reason;
+    if (!chast::virtual_display_platform_supported(&reason)) {
+        check(!reason.empty(), "the guard test is skipped with a platform reason");
+        return;
+    }
+    TempDir temp;
+    const std::filesystem::path package = temp.path / L"package";
+    if (!build_signed_package(package)) {
+        check(false, "a signed test package can be assembled");
+        return;
+    }
+    chast::VirtualDisplayPackageGuard guard;
+    std::string detail;
+    const chast::VirtualDisplayPackageStatus status = chast::verify_virtual_display_package(
+        package.wstring(), &detail, nullptr, nullptr, &guard);
+    check(status == chast::VirtualDisplayPackageStatus::Ok,
+          "a package with a Microsoft-signed installer verifies");
+    if (status != chast::VirtualDisplayPackageStatus::Ok) {
+        std::printf("     detail: %s\n", detail.c_str());
+        return;
+    }
+    check(guard.active(), "verification holds the package open");
+    const std::filesystem::path installer = package / L"deviceinstaller64.exe";
+    HANDLE write = CreateFileW(installer.c_str(), GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(write == INVALID_HANDLE_VALUE, "a guarded installer cannot be opened for writing");
+    if (write != INVALID_HANDLE_VALUE) {
+        CloseHandle(write);
+    }
+    check(DeleteFileW(installer.c_str()) == FALSE, "a guarded installer cannot be deleted");
+    guard.reset();
+    check(!guard.active(), "resetting the guard releases the package");
+    write = CreateFileW(installer.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(write != INVALID_HANDLE_VALUE, "the installer is writable once the guard is released");
+    if (write != INVALID_HANDLE_VALUE) {
+        CloseHandle(write);
+    }
+}
+
+void test_package_reparse() {
+    std::string reason;
+    if (!chast::virtual_display_platform_supported(&reason)) {
+        check(!reason.empty(), "the reparse test is skipped with a platform reason");
+        return;
+    }
+    TempDir temp;
+    const std::filesystem::path package = temp.path / L"package";
+    if (!build_signed_package(package)) {
+        check(false, "a signed test package can be assembled for the reparse test");
+        return;
+    }
+    const std::filesystem::path link = temp.path / L"package-link";
+    if (CreateSymbolicLinkW(link.c_str(), package.c_str(),
+                            SYMBOLIC_LINK_FLAG_DIRECTORY |
+                                SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == FALSE) {
+        check(true, "directory links are unavailable; the reparse check is skipped");
+        return;
+    }
+    std::string detail;
+    check(chast::verify_virtual_display_package(link.wstring(), &detail) ==
+              chast::VirtualDisplayPackageStatus::UntrustedAcl &&
+              contains(detail, "reparse"),
+          "a package reached through a reparse point is rejected");
+}
+
+class ScopedProgramData {
+  public:
+    explicit ScopedProgramData(const std::filesystem::path& path) {
+        wchar_t buffer[32768]{};
+        const DWORD size = GetEnvironmentVariableW(
+            L"ProgramData", buffer, static_cast<DWORD>(std::size(buffer)));
+        if (size > 0 && size < std::size(buffer)) {
+            previous_.assign(buffer, size);
+        }
+        SetEnvironmentVariableW(L"ProgramData", path.c_str());
+    }
+    ~ScopedProgramData() {
+        SetEnvironmentVariableW(L"ProgramData",
+                                previous_.empty() ? nullptr : previous_.c_str());
+    }
+    ScopedProgramData(const ScopedProgramData&) = delete;
+    ScopedProgramData& operator=(const ScopedProgramData&) = delete;
+
+  private:
+    std::wstring previous_;
+};
+
+bool set_protected_dacl(const std::filesystem::path& path, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor,
+                                                             nullptr) == FALSE) {
+        return false;
+    }
+    BOOL present = FALSE;
+    PACL acl = nullptr;
+    BOOL defaulted = FALSE;
+    const bool ok =
+        GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted) != FALSE &&
+        SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, acl, nullptr) == ERROR_SUCCESS;
+    LocalFree(descriptor);
+    return ok;
+}
+
+bool set_users_write_acl(const std::filesystem::path& path) {
+    return set_protected_dacl(path, L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GW;;;BU)");
+}
+
+bool set_legacy_record_acl(const std::filesystem::path& path) {
+    return set_protected_dacl(path,
+                              L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)(A;;GR;;;BU)");
+}
+
+void test_state_directory_security() {
+    TempDir temp;
+    ScopedProgramData program_data(temp.path);
+    std::string error;
+    if (!chast::harden_virtual_display_state_directory(&error)) {
+        check(!error.empty(), "state-directory hardening explains a failure");
+        return;
+    }
+    check(chast::virtual_display_state_directory_trusted(),
+          "a hardened state directory is trusted");
+    chast::VirtualDisplayInstallRecord record;
+    record.package_version = "2.0.0.1";
+    record.package_sha256 = std::string(64, 'c');
+    record.installed_at = chast::virtual_display_timestamp_utc();
+    record.owned = true;
+    record.last_error.clear();
+    check(chast::write_install_record(record, &error),
+          "the protected install record is written");
+    chast::VirtualDisplayInstallRecord parsed;
+    check(chast::read_install_record(&parsed) &&
+              parsed.package_version == record.package_version && parsed.owned == record.owned,
+          "the protected install record reads back");
+    record.owned = false;
+    check(chast::write_install_record(record, &error) && chast::read_install_record(&parsed) &&
+              !parsed.owned,
+          "a second write replaces the record atomically");
+    size_t leftovers = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path / L"chast", ec)) {
+        if (entry.path().filename().wstring().find(L".tmp-") != std::wstring::npos) {
+            ++leftovers;
+        }
+    }
+    check(leftovers == 0, "no temporary record file is left behind");
+
+    const std::filesystem::path state = temp.path / L"chast" / L"virtual-display.json";
+    DeleteFileW(state.c_str());
+    write_bytes(state, chast::virtual_display_install_json(record));
+    check(set_users_write_acl(state), "a planted record gets a Users-write DACL");
+    check(!chast::read_install_record(&parsed), "the planted record is not trusted");
+    check(chast::harden_virtual_display_state_directory(&error),
+          "hardening succeeds over a planted record");
+    check(GetFileAttributesW(state.c_str()) == INVALID_FILE_ATTRIBUTES,
+          "hardening discards a record that other accounts could change");
+
+    write_bytes(state, chast::virtual_display_install_json(record));
+    check(set_legacy_record_acl(state), "a legacy record gets a CREATOR OWNER ACL");
+    check(!chast::read_install_record(&parsed),
+          "a legacy record is not trusted until it is migrated");
+    check(chast::harden_virtual_display_state_directory(&error),
+          "hardening migrates a legacy record");
+    check(chast::read_install_record(&parsed) && !parsed.owned,
+          "a legacy record written by Administrators survives migration");
+
+    const std::filesystem::path raw = temp.path / L"raw-program-data";
+    std::filesystem::create_directories(raw / L"chast", ec);
+    write_bytes(raw / L"chast" / L"virtual-display.json",
+                chast::virtual_display_install_json(record));
+    ScopedProgramData raw_data(raw);
+    check(!chast::virtual_display_state_directory_trusted(),
+          "a plain ProgramData directory is not trusted");
+    check(!chast::read_install_record(&parsed),
+          "a record in an unprotected directory is ignored");
+    std::string refused;
+    check(!chast::write_install_record(record, &refused),
+          "a record is not written into an unprotected directory");
+}
+
 void test_default_package_dir() {
     const std::wstring dir = chast::default_virtual_display_package_dir();
     const std::wstring suffix = L"\\drivers\\usbmmidd_v2";
@@ -643,7 +895,10 @@ int main() {
     test_manifest_parsing();
     test_sha256();
     test_package_verification();
+    test_package_guard();
+    test_package_reparse();
     test_install_record();
+    test_state_directory_security();
     test_default_package_dir();
     test_vdisplay_cli();
     test_vdisplay_status_command();

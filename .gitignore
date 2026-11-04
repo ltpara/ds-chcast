@@ -7,6 +7,10 @@ Testing/
 *.h265
 *.bmp
 
+# Optional third-party virtual display driver package: fetched locally by
+# tools/fetch-usbmmidd.ps1, never committed.
+drivers/usbmmidd_v2/
+
 # Runtime secrets and machine-local state: a server identity seed is generated
 # on first run, and the viewer writes its settings next to the executable.
 chast-server-identity.key

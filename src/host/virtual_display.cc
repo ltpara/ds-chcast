@@ -4,9 +4,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <aclapi.h>
 #include <bcrypt.h>
 #include <cfgmgr32.h>
 #include <devguid.h>
+#include <sddl.h>
 #include <setupapi.h>
 #include <softpub.h>
 #include <winternl.h>
@@ -27,6 +29,42 @@
 #include <vector>
 
 namespace chast {
+
+// The guard owns every handle verification opened. A package file opened with
+// FILE_SHARE_READ cannot be written, deleted or renamed by anyone else, and
+// the directory handle adds the same protection to the directory itself.
+struct VirtualDisplayPackageGuard::Impl {
+    std::vector<HANDLE> handles;
+
+    ~Impl() { close(); }
+
+    void close() {
+        for (HANDLE handle : handles) {
+            if (handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(handle);
+            }
+        }
+        handles.clear();
+    }
+};
+
+VirtualDisplayPackageGuard::VirtualDisplayPackageGuard() = default;
+VirtualDisplayPackageGuard::~VirtualDisplayPackageGuard() = default;
+VirtualDisplayPackageGuard::VirtualDisplayPackageGuard(VirtualDisplayPackageGuard&&) noexcept =
+    default;
+VirtualDisplayPackageGuard& VirtualDisplayPackageGuard::operator=(
+    VirtualDisplayPackageGuard&&) noexcept = default;
+
+void VirtualDisplayPackageGuard::reset() {
+    if (impl_ != nullptr) {
+        impl_->close();
+        impl_.reset();
+    }
+}
+
+bool VirtualDisplayPackageGuard::active() const {
+    return impl_ != nullptr && !impl_->handles.empty();
+}
 
 namespace {
 
@@ -153,23 +191,19 @@ uint32_t count_usbmmidd_monitors(const std::vector<std::wstring>& adapters) {
     return count;
 }
 
-bool file_exists(const std::wstring& path) {
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES &&
-           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-}
-
-std::string trim_ascii(std::string text) {
-    const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
-    text.erase(text.begin(), std::find_if(text.begin(), text.end(), not_space));
-    text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(), text.end());
-    return text;
-}
-
-bool read_file_bytes(const std::wstring& path, std::string* out, std::string* error) {
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+// Opens the final path component without following a reparse point and
+// refuses anything that is not the expected file or directory type.
+bool open_no_follow(const std::wstring& path, DWORD access, DWORD share, bool directory,
+                    HANDLE* out, std::string* error, bool* reparse = nullptr) {
+    if (reparse != nullptr) {
+        *reparse = false;
+    }
+    DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT;
+    if (directory) {
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    HANDLE file = CreateFileW(path.c_str(), access, share, nullptr, OPEN_EXISTING, flags,
+                              nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         if (error != nullptr) {
             *error = "cannot open " + to_utf8(path) + " (error " +
@@ -177,12 +211,47 @@ bool read_file_bytes(const std::wstring& path, std::string* out, std::string* er
         }
         return false;
     }
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (!GetFileInformationByHandleEx(file, FileAttributeTagInfo, &info, sizeof(info))) {
+        if (error != nullptr) {
+            *error = "cannot inspect " + to_utf8(path) + " (error " +
+                     std::to_string(GetLastError()) + ")";
+        }
+        CloseHandle(file);
+        return false;
+    }
+    const bool is_directory = (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        if (reparse != nullptr) {
+            *reparse = true;
+        }
+        if (error != nullptr) {
+            *error = to_utf8(path) + " is a reparse point";
+        }
+        CloseHandle(file);
+        return false;
+    }
+    if (is_directory != directory) {
+        if (reparse != nullptr) {
+            *reparse = true;
+        }
+        if (error != nullptr) {
+            *error = to_utf8(path) + (directory ? " is not a directory" : " is not a file");
+        }
+        CloseHandle(file);
+        return false;
+    }
+    *out = file;
+    return true;
+}
+
+bool read_handle_bytes(HANDLE file, const std::wstring& label, std::string* out,
+                       std::string* error) {
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 ||
         size.QuadPart > 512ll * 1024 * 1024) {
-        CloseHandle(file);
         if (error != nullptr) {
-            *error = to_utf8(path) + " has an unusable size";
+            *error = to_utf8(label) + " has an unusable size";
         }
         return false;
     }
@@ -193,9 +262,8 @@ bool read_file_bytes(const std::wstring& path, std::string* out, std::string* er
         const DWORD want = static_cast<DWORD>(
             std::min<size_t>(out->size() - offset, static_cast<size_t>(1) << 20));
         if (!ReadFile(file, out->data() + offset, want, &read, nullptr)) {
-            CloseHandle(file);
             if (error != nullptr) {
-                *error = "cannot read " + to_utf8(path) + " (error " +
+                *error = "cannot read " + to_utf8(label) + " (error " +
                          std::to_string(GetLastError()) + ")";
             }
             return false;
@@ -205,9 +273,27 @@ bool read_file_bytes(const std::wstring& path, std::string* out, std::string* er
         }
         offset += read;
     }
-    CloseHandle(file);
     out->resize(offset);
     return true;
+}
+
+std::string trim_ascii(std::string text) {
+    const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
+    text.erase(text.begin(), std::find_if(text.begin(), text.end(), not_space));
+    text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(), text.end());
+    return text;
+}
+
+bool read_file_bytes(const std::wstring& path, std::string* out, std::string* error) {
+    HANDLE file = INVALID_HANDLE_VALUE;
+    if (!open_no_follow(path, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, false, &file,
+                        error)) {
+        return false;
+    }
+    const bool ok = read_handle_bytes(file, path, out, error);
+    CloseHandle(file);
+    return ok;
 }
 
 std::string hex_bytes(const unsigned char* data, size_t size) {
@@ -380,6 +466,222 @@ bool process_elevated() {
     return ok != FALSE && elevation.TokenIsElevated != 0;
 }
 
+constexpr wchar_t kSystemSid[] = L"S-1-5-18";
+constexpr wchar_t kAdministratorsSid[] = L"S-1-5-32-544";
+constexpr wchar_t kTrustedInstallerSid[] =
+    L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+constexpr wchar_t kCreatorOwnerSid[] = L"S-1-3-0";
+
+// Every bit that would let an ACE holder alter, rename or re-own the object.
+constexpr DWORD kWriteAccessMask =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+    FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
+
+enum class AclProfile {
+    // %ProgramData%\chast and its record: SYSTEM or Administrators only.
+    State,
+    // A record left by an older version: an elevated administrator's own SID
+    // is accepted once so the file can be re-owned instead of silently
+    // poisoning the hardened directory.
+    StateMigration,
+    // Driver packages may live under Program Files (TrustedInstaller) or a
+    // caller-supplied directory owned by the elevating user.
+    Package,
+};
+
+bool enable_privilege(const wchar_t* name) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
+    }
+    LUID luid{};
+    bool ok = LookupPrivilegeValueW(nullptr, name, &luid) != FALSE;
+    if (ok) {
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        SetLastError(ERROR_SUCCESS);
+        ok = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr,
+                                   nullptr) != FALSE &&
+             GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(token);
+    return ok;
+}
+
+bool sid_text(PSID sid, std::wstring* out) {
+    LPWSTR text = nullptr;
+    if (!ConvertSidToStringSidW(sid, &text)) {
+        return false;
+    }
+    *out = text;
+    LocalFree(text);
+    return true;
+}
+
+bool current_process_user_sid(std::wstring* out) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    std::vector<unsigned char> buffer(bytes);
+    const bool ok =
+        bytes != 0 &&
+        GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes) != FALSE;
+    CloseHandle(token);
+    if (!ok) {
+        return false;
+    }
+    return sid_text(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, out);
+}
+
+bool acl_trusted(PSID owner, PACL acl, AclProfile profile) {
+    if (owner == nullptr || acl == nullptr) {
+        return false;
+    }
+    std::wstring owner_text;
+    if (!sid_text(owner, &owner_text)) {
+        return false;
+    }
+    std::set<std::wstring> owners = {kSystemSid, kAdministratorsSid};
+    std::set<std::wstring> writers = owners;
+    if (profile == AclProfile::Package) {
+        owners.insert(kTrustedInstallerSid);
+        writers.insert(kTrustedInstallerSid);
+        // CREATOR OWNER resolves to the owner, which the check above limits.
+        writers.insert(kCreatorOwnerSid);
+    }
+    std::wstring user;
+    if (current_process_user_sid(&user) && profile != AclProfile::State) {
+        owners.insert(user);
+        writers.insert(user);
+    }
+    if (profile == AclProfile::StateMigration) {
+        // Records written by the previous version inherited CREATOR OWNER
+        // from %ProgramData%; it resolves to the owner checked above.
+        writers.insert(kCreatorOwnerSid);
+    }
+    if (owners.find(owner_text) == owners.end()) {
+        return false;
+    }
+    ACL_SIZE_INFORMATION size{};
+    if (!GetAclInformation(acl, &size, sizeof(size), AclSizeInformation)) {
+        return false;
+    }
+    for (DWORD index = 0; index < size.AceCount; ++index) {
+        LPVOID raw = nullptr;
+        if (!GetAce(acl, index, &raw) || raw == nullptr) {
+            return false;
+        }
+        const auto* header = static_cast<const ACE_HEADER*>(raw);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            // Object and callback ACEs share the mask offset but carry a
+            // different SID layout; any write grant through them is refused.
+            if ((header->AceType == ACCESS_ALLOWED_OBJECT_ACE_TYPE ||
+                 header->AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE ||
+                 header->AceType == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE) &&
+                (reinterpret_cast<const ACCESS_ALLOWED_ACE*>(raw)->Mask & kWriteAccessMask) !=
+                    0) {
+                return false;
+            }
+            continue;
+        }
+        const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw);
+        if ((ace->Mask & kWriteAccessMask) == 0) {
+            continue;
+        }
+        std::wstring sid;
+        if (!sid_text(const_cast<PSID>(reinterpret_cast<const void*>(&ace->SidStart)), &sid) ||
+            writers.find(sid) == writers.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool handle_acl_trusted(HANDLE file, AclProfile profile, std::string* detail) {
+    PSID owner = nullptr;
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD result =
+        GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        &owner, nullptr, &acl, nullptr, &descriptor);
+    const bool trusted = result == ERROR_SUCCESS && acl_trusted(owner, acl, profile);
+    if (descriptor != nullptr) {
+        LocalFree(descriptor);
+    }
+    if (!trusted && detail != nullptr) {
+        *detail = result == ERROR_SUCCESS
+                      ? "its owner or DACL lets another account change it"
+                      : "its security descriptor could not be read (error " +
+                            std::to_string(result) + ")";
+    }
+    return trusted;
+}
+
+// Applies a protected DACL and, when needed, takes ownership as
+// Administrators. SeRestorePrivilege is required to assign a new owner.
+bool set_handle_security(HANDLE file, bool directory, std::string* error) {
+    if (error != nullptr) {
+        error->clear();
+    }
+    enable_privilege(L"SeRestorePrivilege");
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR current = nullptr;
+    const DWORD read = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner,
+                                       nullptr, nullptr, nullptr, &current);
+    std::wstring owner_text;
+    const bool owner_ok = read == ERROR_SUCCESS && sid_text(owner, &owner_text) &&
+                          (owner_text == kSystemSid || owner_text == kAdministratorsSid);
+    if (current != nullptr) {
+        LocalFree(current);
+    }
+    const wchar_t* sddl =
+        directory ? L"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)"
+                  : L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)";
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &descriptor,
+                                                              nullptr)) {
+        if (error != nullptr) {
+            *error = "the protected DACL could not be built";
+        }
+        return false;
+    }
+    BOOL present = FALSE;
+    PACL acl = nullptr;
+    BOOL defaulted = FALSE;
+    bool ok = GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted) != FALSE &&
+              present != FALSE;
+    unsigned char administrators[SECURITY_MAX_SID_SIZE]{};
+    DWORD administrators_size = static_cast<DWORD>(sizeof(administrators));
+    ok = ok && CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators,
+                                  &administrators_size) != FALSE;
+    if (ok) {
+        SECURITY_INFORMATION info =
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        if (!owner_ok) {
+            info |= OWNER_SECURITY_INFORMATION;
+        }
+        const DWORD result = SetSecurityInfo(
+            file, SE_FILE_OBJECT, info,
+            owner_ok ? nullptr : reinterpret_cast<PSID>(administrators), nullptr, acl, nullptr);
+        if (result != ERROR_SUCCESS) {
+            ok = false;
+            if (error != nullptr) {
+                *error = "the protected owner/DACL could not be applied (error " +
+                         std::to_string(result) + ")";
+            }
+        }
+    } else if (error != nullptr) {
+        *error = "the protected DACL could not be read back";
+    }
+    LocalFree(descriptor);
+    return ok;
+}
+
 bool has_virtual_display_marker(const std::wstring& value) {
     const std::string text = lower_ascii(to_utf8(value));
     return text.find("usbmmid") != std::string::npos ||
@@ -427,19 +729,32 @@ std::wstring virtual_display_state_path() {
     return program_data_dir() + L"\\chast\\virtual-display.json";
 }
 
-std::wstring virtual_display_log_path() {
-    return program_data_dir() + L"\\chast\\vdisplay.log";
+std::wstring virtual_display_state_directory() {
+    return program_data_dir() + L"\\chast";
 }
 
 void append_log(const std::wstring& path, const std::string& line) {
     const size_t slash = path.find_last_of(L"\\/");
     if (slash != std::wstring::npos) {
-        CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
+        const std::wstring parent = path.substr(0, slash);
+        // The state directory is only created by hardening, so a read-only
+        // status command cannot leave an unprotected %ProgramData%\chast.
+        const std::wstring state_dir = virtual_display_state_directory();
+        if (CompareStringOrdinal(parent.c_str(), -1, state_dir.c_str(), -1, TRUE) !=
+            CSTR_EQUAL) {
+            CreateDirectoryW(parent.c_str(), nullptr);
+        }
     }
     HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (!GetFileInformationByHandleEx(file, FileAttributeTagInfo, &info, sizeof(info)) ||
+        (info.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        CloseHandle(file);
         return;
     }
     const std::string text = virtual_display_timestamp_utc() + " " + line + "\n";
@@ -448,78 +763,91 @@ void append_log(const std::wstring& path, const std::string& line) {
     CloseHandle(file);
 }
 
-bool write_text_file(const std::wstring& path, const std::string& text, std::string* error) {
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) {
-        CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
-    }
-    const std::wstring temporary = path + L".tmp";
-    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        if (error != nullptr) {
-            *error = "cannot create " + to_utf8(temporary) + " (error " +
-                     std::to_string(GetLastError()) + ")";
-        }
-        return false;
-    }
-    DWORD written = 0;
-    const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written,
-                              nullptr) &&
-                    written == text.size();
-    CloseHandle(file);
-    if (!ok) {
-        DeleteFileW(temporary.c_str());
-        if (error != nullptr) {
-            *error = "cannot write " + to_utf8(path);
-        }
-        return false;
-    }
-    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        DeleteFileW(temporary.c_str());
-        if (error != nullptr) {
-            *error = "cannot replace " + to_utf8(path) + " (error " +
-                     std::to_string(GetLastError()) + ")";
-        }
-        return false;
-    }
-    return true;
-}
-
-bool read_text_file(const std::wstring& path, std::string* text) {
+// Reads a file under the hardened state directory from a held handle and
+// checks the handle's own owner/DACL, so a swapped path or a planted record
+// is not trusted.
+bool read_state_text(const std::wstring& path, std::string* text) {
+    HANDLE file = INVALID_HANDLE_VALUE;
     std::string error;
-    return read_file_bytes(path, text, &error);
+    if (!open_no_follow(path, GENERIC_READ | READ_CONTROL,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, false, &file,
+                        &error)) {
+        return false;
+    }
+    const bool ok = handle_acl_trusted(file, AclProfile::State, nullptr) &&
+                    read_handle_bytes(file, path, text, &error);
+    CloseHandle(file);
+    return ok;
 }
 
 VirtualDisplayPackageStatus verify_package_files(
     const std::wstring& package_dir, std::string* detail, std::string* package_version,
-    std::string* package_sha256) {
+    std::string* package_sha256, std::vector<HANDLE>* locks) {
     const std::vector<std::string> required = {
         "deviceinstaller64.exe", "usbmmidd.inf",    "usbmmidd.cat", "x64/usbmmidd.dll",
         "win32/usbmmidd.dll",    "license.txt",     "manifest.sha256",
     };
-    for (const std::string& name : required) {
-        if (!file_exists(package_dir + L"\\" + utf8_to_wide(name))) {
-            if (detail != nullptr) {
-                *detail = "the driver package is missing " + name;
-            }
-            return VirtualDisplayPackageStatus::Missing;
+    std::vector<HANDLE> held;
+    const auto fail = [&held](VirtualDisplayPackageStatus status) {
+        for (HANDLE handle : held) {
+            CloseHandle(handle);
         }
+        held.clear();
+        return status;
+    };
+    std::wstring dir = package_dir;
+    while (dir.size() > 3 && (dir.back() == L'\\' || dir.back() == L'/')) {
+        dir.pop_back();
     }
-    std::string manifest_text;
     std::string error;
-    if (!read_file_bytes(package_dir + L"\\manifest.sha256", &manifest_text, &error)) {
+    bool reparse = false;
+    HANDLE directory = INVALID_HANDLE_VALUE;
+    if (!open_no_follow(dir, READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ, true, &directory, &error, &reparse)) {
         if (detail != nullptr) {
             *detail = error;
         }
-        return VirtualDisplayPackageStatus::Missing;
+        return reparse ? VirtualDisplayPackageStatus::UntrustedAcl
+                       : VirtualDisplayPackageStatus::Missing;
+    }
+    held.push_back(directory);
+    std::string acl_detail;
+    if (!handle_acl_trusted(directory, AclProfile::Package, &acl_detail)) {
+        if (detail != nullptr) {
+            *detail = "the driver package directory is not trustworthy: " + acl_detail;
+        }
+        return fail(VirtualDisplayPackageStatus::UntrustedAcl);
+    }
+    const std::wstring manifest_path = dir + L"\\manifest.sha256";
+    HANDLE manifest = INVALID_HANDLE_VALUE;
+    if (!open_no_follow(manifest_path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, false,
+                        &manifest, &error, &reparse)) {
+        if (detail != nullptr) {
+            *detail = error;
+        }
+        return fail(reparse ? VirtualDisplayPackageStatus::UntrustedAcl
+                            : VirtualDisplayPackageStatus::Missing);
+    }
+    held.push_back(manifest);
+    if (!handle_acl_trusted(manifest, AclProfile::Package, &acl_detail)) {
+        if (detail != nullptr) {
+            *detail = "manifest.sha256 is not trustworthy: " + acl_detail;
+        }
+        return fail(VirtualDisplayPackageStatus::UntrustedAcl);
+    }
+    std::string manifest_text;
+    if (!read_handle_bytes(manifest, manifest_path, &manifest_text, &error)) {
+        if (detail != nullptr) {
+            *detail = error;
+        }
+        return fail(VirtualDisplayPackageStatus::Missing);
     }
     std::vector<VirtualDisplayManifestEntry> entries;
     if (!parse_virtual_display_manifest(manifest_text, &entries, &error)) {
         if (detail != nullptr) {
             *detail = "manifest.sha256: " + error;
         }
-        return VirtualDisplayPackageStatus::Missing;
+        return fail(VirtualDisplayPackageStatus::Missing);
     }
     std::set<std::string> listed;
     for (const VirtualDisplayManifestEntry& entry : entries) {
@@ -533,51 +861,82 @@ VirtualDisplayPackageStatus verify_package_files(
             if (detail != nullptr) {
                 *detail = "manifest.sha256 does not list " + name;
             }
-            return VirtualDisplayPackageStatus::Missing;
+            return fail(VirtualDisplayPackageStatus::Missing);
         }
     }
     for (const VirtualDisplayManifestEntry& entry : entries) {
-        const std::wstring path = package_dir + L"\\" + utf8_to_wide(entry.path);
-        std::string digest;
-        if (!sha256_file_hex(path, &digest, &error)) {
+        const std::wstring path = dir + L"\\" + utf8_to_wide(entry.path);
+        HANDLE file = INVALID_HANDLE_VALUE;
+        if (!open_no_follow(path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, false, &file,
+                            &error, &reparse)) {
             if (detail != nullptr) {
                 *detail = error;
             }
-            return VirtualDisplayPackageStatus::Missing;
+            return fail(reparse ? VirtualDisplayPackageStatus::UntrustedAcl
+                                : VirtualDisplayPackageStatus::Missing);
+        }
+        held.push_back(file);
+        if (!handle_acl_trusted(file, AclProfile::Package, &acl_detail)) {
+            if (detail != nullptr) {
+                *detail = entry.path + " is not trustworthy: " + acl_detail;
+            }
+            return fail(VirtualDisplayPackageStatus::UntrustedAcl);
+        }
+        // The handle is read-only and shared only for reading, so the bytes
+        // hashed here cannot change before the elevated installer runs.
+        std::string bytes;
+        std::string digest;
+        if (!read_handle_bytes(file, path, &bytes, &error) ||
+            !sha256_bytes_hex(bytes.data(), bytes.size(), &digest, &error)) {
+            if (detail != nullptr) {
+                *detail = error;
+            }
+            return fail(VirtualDisplayPackageStatus::Missing);
         }
         if (lower_ascii(digest) != lower_ascii(entry.sha256)) {
             if (detail != nullptr) {
                 *detail = entry.path + " does not match its manifest hash";
             }
-            return VirtualDisplayPackageStatus::HashMismatch;
+            return fail(VirtualDisplayPackageStatus::HashMismatch);
         }
     }
-    std::string source_text;
-    if (read_text_file(package_dir + L"\\SOURCE.txt", &source_text)) {
-        size_t start = 0;
-        while (start <= source_text.size()) {
-            const size_t end = source_text.find('\n', start);
-            std::string line = source_text.substr(
-                start, end == std::string::npos ? std::string::npos : end - start);
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            const size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                const std::string key = lower_ascii(trim_ascii(line.substr(0, colon)));
-                const std::string value = trim_ascii(line.substr(colon + 1));
-                if (key == "version" && package_version != nullptr) {
-                    *package_version = value;
-                } else if (key == "sha256" && package_sha256 != nullptr &&
-                           is_hex_sha256(value)) {
-                    *package_sha256 = lower_ascii(value);
+    // SOURCE.txt is informational, so an untrusted or unreadable copy is
+    // simply ignored instead of failing an otherwise valid package.
+    const std::wstring source_path = dir + L"\\SOURCE.txt";
+    HANDLE source = INVALID_HANDLE_VALUE;
+    if (open_no_follow(source_path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, false, &source,
+                       &error, &reparse) &&
+        handle_acl_trusted(source, AclProfile::Package, nullptr)) {
+        std::string source_text;
+        if (read_handle_bytes(source, source_path, &source_text, &error)) {
+            size_t start = 0;
+            while (start <= source_text.size()) {
+                const size_t end = source_text.find('\n', start);
+                std::string line = source_text.substr(
+                    start, end == std::string::npos ? std::string::npos : end - start);
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
                 }
+                const size_t colon = line.find(':');
+                if (colon != std::string::npos) {
+                    const std::string key = lower_ascii(trim_ascii(line.substr(0, colon)));
+                    const std::string value = trim_ascii(line.substr(colon + 1));
+                    if (key == "version" && package_version != nullptr) {
+                        *package_version = value;
+                    } else if (key == "sha256" && package_sha256 != nullptr &&
+                               is_hex_sha256(value)) {
+                        *package_sha256 = lower_ascii(value);
+                    }
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                start = end + 1;
             }
-            if (end == std::string::npos) {
-                break;
-            }
-            start = end + 1;
         }
+    }
+    if (source != INVALID_HANDLE_VALUE) {
+        CloseHandle(source);
     }
     if (package_sha256 != nullptr && package_sha256->empty()) {
         std::string digest;
@@ -585,14 +944,21 @@ VirtualDisplayPackageStatus verify_package_files(
             *package_sha256 = digest;
         }
     }
-    if (!verify_authenticode(package_dir + L"\\deviceinstaller64.exe", &error)) {
+    if (!verify_authenticode(dir + L"\\deviceinstaller64.exe", &error)) {
         if (detail != nullptr) {
             *detail = "deviceinstaller64.exe is not trusted: " + error;
         }
-        return VirtualDisplayPackageStatus::SignatureMismatch;
+        return fail(VirtualDisplayPackageStatus::SignatureMismatch);
     }
     if (detail != nullptr) {
         *detail = "driver package verified (" + std::to_string(entries.size()) + " files)";
+    }
+    if (locks != nullptr) {
+        *locks = std::move(held);
+    } else {
+        for (HANDLE handle : held) {
+            CloseHandle(handle);
+        }
     }
     return VirtualDisplayPackageStatus::Ok;
 }
@@ -644,9 +1010,10 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
     }
 
     bool install(std::string* error) override {
+        VirtualDisplayPackageGuard guard;
         std::string detail;
         const VirtualDisplayPackageStatus check =
-            verify_package_files(package_dir_, &detail, nullptr, nullptr);
+            verify_virtual_display_package(package_dir_, &detail, nullptr, nullptr, &guard);
         if (check != VirtualDisplayPackageStatus::Ok) {
             if (error != nullptr) {
                 *error = detail;
@@ -682,9 +1049,15 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
         if (!probe.adapter_present && !probe.service_registered) {
             return true;
         }
-        if (package_dir_.empty() || !file_exists(installer_path())) {
+        VirtualDisplayPackageGuard guard;
+        std::string detail;
+        const VirtualDisplayPackageStatus check =
+            verify_virtual_display_package(package_dir_, &detail, nullptr, nullptr, &guard);
+        if (check != VirtualDisplayPackageStatus::Ok) {
             if (error != nullptr) {
-                *error = "the usbmmidd package directory is missing; cannot uninstall the driver";
+                *error = "the usbmmidd package directory is missing or untrusted; cannot "
+                         "uninstall the driver: " +
+                         detail;
             }
             return false;
         }
@@ -727,9 +1100,14 @@ class UsbmmiddProvider final : public VirtualDisplayProvider {
         if (probe.active_monitors == count) {
             return true;
         }
-        if (package_dir_.empty() || !file_exists(installer_path())) {
+        VirtualDisplayPackageGuard guard;
+        std::string detail;
+        const VirtualDisplayPackageStatus check =
+            verify_virtual_display_package(package_dir_, &detail, nullptr, nullptr, &guard);
+        if (check != VirtualDisplayPackageStatus::Ok) {
             if (error != nullptr) {
-                *error = "the usbmmidd package directory is required to change the monitor count";
+                *error = "the usbmmidd package is required to change the monitor count: " +
+                         detail;
             }
             return false;
         }
@@ -1262,7 +1640,10 @@ bool verify_authenticode(const std::wstring& path, std::string* error) {
 
 VirtualDisplayPackageStatus verify_virtual_display_package(
     const std::wstring& package_dir, std::string* detail, std::string* package_version,
-    std::string* package_sha256) {
+    std::string* package_sha256, VirtualDisplayPackageGuard* guard) {
+    if (guard != nullptr) {
+        guard->reset();
+    }
     if (package_version != nullptr) {
         package_version->clear();
     }
@@ -1282,7 +1663,15 @@ VirtualDisplayPackageStatus verify_virtual_display_package(
         }
         return VirtualDisplayPackageStatus::Missing;
     }
-    return verify_package_files(package_dir, detail, package_version, package_sha256);
+    std::vector<HANDLE> locks;
+    const VirtualDisplayPackageStatus status =
+        verify_package_files(package_dir, detail, package_version, package_sha256,
+                             guard != nullptr ? &locks : nullptr);
+    if (guard != nullptr && status == VirtualDisplayPackageStatus::Ok) {
+        guard->impl_ = std::make_unique<VirtualDisplayPackageGuard::Impl>();
+        guard->impl_->handles = std::move(locks);
+    }
+    return status;
 }
 
 namespace {
@@ -1479,20 +1868,6 @@ bool json_bool_field(const std::string& text, const std::string& key, bool* out,
     return false;
 }
 
-bool write_install_record(const VirtualDisplayInstallRecord& record, std::string* error) {
-    return write_text_file(virtual_display_state_path(),
-                           virtual_display_install_json(record), error);
-}
-
-bool read_install_record(VirtualDisplayInstallRecord* record) {
-    std::string text;
-    if (!read_text_file(virtual_display_state_path(), &text)) {
-        return false;
-    }
-    std::string error;
-    return parse_virtual_display_install_json(text, record, &error);
-}
-
 bool parse_uint32(const std::wstring& text, uint32_t* value) {
     if (text.empty()) {
         return false;
@@ -1516,6 +1891,207 @@ bool parse_uint32(const std::wstring& text, uint32_t* value) {
 }
 
 }  // namespace
+
+std::wstring virtual_display_log_path() {
+    return program_data_dir() + L"\\chast\\vdisplay.log";
+}
+
+std::string virtual_display_log_tail() {
+    std::string text;
+    if (!virtual_display_state_directory_trusted() ||
+        !read_state_text(virtual_display_log_path(), &text)) {
+        return {};
+    }
+    const size_t end = text.find_last_not_of("\r\n");
+    if (end == std::string::npos) {
+        return {};
+    }
+    const size_t previous = text.find_last_of('\n', end);
+    const size_t start = previous == std::string::npos ? 0 : previous + 1;
+    std::string line = text.substr(start, end - start + 1);
+    constexpr size_t kMaxTail = 400;
+    if (line.size() > kMaxTail) {
+        line = line.substr(line.size() - kMaxTail);
+    }
+    return line;
+}
+
+bool read_install_record(VirtualDisplayInstallRecord* record) {
+    if (!virtual_display_state_directory_trusted()) {
+        return false;
+    }
+    std::string text;
+    if (!read_state_text(virtual_display_state_path(), &text)) {
+        return false;
+    }
+    std::string error;
+    return parse_virtual_display_install_json(text, record, &error);
+}
+
+bool harden_virtual_display_state_directory(std::string* error) {
+    const std::wstring dir = virtual_display_state_directory();
+    if (!CreateDirectoryW(dir.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (error != nullptr) {
+            *error = "cannot create " + to_utf8(dir) + " (error " +
+                     std::to_string(GetLastError()) + ")";
+        }
+        return false;
+    }
+    enable_privilege(L"SeRestorePrivilege");
+    HANDLE directory = INVALID_HANDLE_VALUE;
+    std::string open_error;
+    if (!open_no_follow(dir,
+                        READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_LIST_DIRECTORY |
+                            FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_DELETE, true, &directory, &open_error)) {
+        if (error != nullptr) {
+            *error = open_error;
+        }
+        return false;
+    }
+    // Files created before the directory was protected may have been planted
+    // by another account. Anything whose owner/DACL is not at least
+    // administrator-controlled is removed instead of being silently adopted.
+    for (const std::wstring& path :
+         {virtual_display_state_path(), virtual_display_log_path()}) {
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            DeleteFileW(path.c_str());
+            continue;
+        }
+        HANDLE file = INVALID_HANDLE_VALUE;
+        std::string ignored;
+        if (!open_no_follow(path,
+                            READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE | GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_DELETE, false, &file, &ignored)) {
+            continue;
+        }
+        if (!handle_acl_trusted(file, AclProfile::StateMigration, nullptr)) {
+            FILE_DISPOSITION_INFO disposition{};
+            disposition.DeleteFile = TRUE;
+            SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
+                                       sizeof(disposition));
+        } else {
+            std::string ignored_security;
+            set_handle_security(file, false, &ignored_security);
+        }
+        CloseHandle(file);
+    }
+    std::string acl_error;
+    const bool secured = set_handle_security(directory, true, &acl_error);
+    CloseHandle(directory);
+    if (!secured) {
+        if (error != nullptr) {
+            *error = acl_error;
+        }
+        return false;
+    }
+    if (!virtual_display_state_directory_trusted()) {
+        if (error != nullptr) {
+            *error = "the state directory still grants write access to another account";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool virtual_display_state_directory_trusted() {
+    HANDLE directory = INVALID_HANDLE_VALUE;
+    std::string error;
+    if (!open_no_follow(virtual_display_state_directory(),
+                        READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, true,
+                        &directory, &error)) {
+        return false;
+    }
+    const bool trusted = handle_acl_trusted(directory, AclProfile::State, nullptr);
+    CloseHandle(directory);
+    return trusted;
+}
+
+bool write_install_record(const VirtualDisplayInstallRecord& record, std::string* error) {
+    if (!virtual_display_state_directory_trusted()) {
+        if (error != nullptr) {
+            *error = "the virtual display state directory is not secured";
+        }
+        return false;
+    }
+    const std::wstring path = virtual_display_state_path();
+    std::wstring temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 16 && file == INVALID_HANDLE_VALUE; ++attempt) {
+        unsigned char random[8]{};
+        if (BCryptGenRandom(nullptr, random, sizeof(random),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+            break;
+        }
+        static constexpr wchar_t kHex[] = L"0123456789abcdef";
+        std::wstring suffix = L".tmp-";
+        for (const unsigned char byte : random) {
+            suffix.push_back(kHex[byte >> 4]);
+            suffix.push_back(kHex[byte & 0x0f]);
+        }
+        temporary = path + suffix;
+        file = CreateFileW(temporary.c_str(),
+                           GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                           FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+        if (file == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) {
+            break;
+        }
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        if (error != nullptr) {
+            *error = "cannot create a temporary record next to " + to_utf8(path) + " (error " +
+                     std::to_string(GetLastError()) + ")";
+        }
+        return false;
+    }
+    const std::string text = virtual_display_install_json(record);
+    DWORD written = 0;
+    bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) &&
+              written == text.size() && FlushFileBuffers(file) != FALSE;
+    std::string acl_error;
+    if (ok) {
+        ok = set_handle_security(file, false, &acl_error);
+    }
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFileW(temporary.c_str());
+        if (error != nullptr) {
+            *error = acl_error.empty() ? "cannot write the install record" : acl_error;
+        }
+        return false;
+    }
+    // A reparse point at the record path would redirect the replace; remove
+    // the link itself before moving the protected file into place.
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        DeleteFileW(path.c_str());
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        if (error != nullptr) {
+            *error = "cannot replace " + to_utf8(path) + " (error " +
+                     std::to_string(GetLastError()) + ")";
+        }
+        return false;
+    }
+    std::string check;
+    if (!read_state_text(path, &check)) {
+        if (error != nullptr) {
+            *error = "the install record is not trusted after the replace";
+        }
+        return false;
+    }
+    return true;
+}
 
 std::string virtual_display_install_json(const VirtualDisplayInstallRecord& record) {
     std::string json = "{\n";
@@ -1677,12 +2253,21 @@ int run_vdisplay_command(const std::vector<std::wstring>& args) {
         log("administrator privileges are required for install, uninstall and set-count");
         return kVdisplayExitUsage;
     }
+    // Every record read or write below must happen in a directory that other
+    // accounts cannot change; fail closed if that cannot be guaranteed.
+    std::string state_error;
+    if (!harden_virtual_display_state_directory(&state_error)) {
+        log("cannot secure the state directory: " + state_error);
+        return command.action == VdisplayAction::Uninstall ? kVdisplayExitUninstall
+                                                           : kVdisplayExitInstall;
+    }
     if (command.action == VdisplayAction::Install) {
         std::string detail;
         std::string version;
         std::string package_sha256;
+        VirtualDisplayPackageGuard guard;
         const VirtualDisplayPackageStatus check = verify_virtual_display_package(
-            command.package_dir, &detail, &version, &package_sha256);
+            command.package_dir, &detail, &version, &package_sha256, &guard);
         if (check != VirtualDisplayPackageStatus::Ok) {
             // A rejected package changes nothing, so an existing install
             // record keeps its ownership and only the error is refreshed.

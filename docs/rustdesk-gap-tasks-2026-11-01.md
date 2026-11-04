@@ -42,7 +42,7 @@ P2 = 平台扩展。
 | DEV-09 | P2 | 更多采集/编码后端 | 开发 | 对应硬件 | L |
 | DEV-10 | P2 | 跨子网/中继协助 Wake-on-LAN | 开发 | 无（超出 RustDesk） | M |
 | DEV-11 | P2 | SOCKS5 代理（已完成 2026-11-02） | 开发 | 无 | M |
-| PLAT-01 | P2 | 虚拟显示器（01a/01c 完成，01b 脚手架完成，真机安装阻塞） | 平台 | 驱动再分发许可；无头测试机 | L |
+| PLAT-01 | P2 | 虚拟显示器（01a/01c 完成，01b/01d 代码、本地接线与 ACL/TOCTOU 加固完成，真机安装阻塞） | 平台 | 驱动再分发许可；无头测试机 | L |
 | PLAT-02 | P2 | 远程打印 | 平台 | v4 打印机驱动签名 | L |
 | PLAT-03 | P2 | 非 Windows 平台与打包 | 平台 | CI/平台环境 | XL |
 
@@ -443,9 +443,19 @@ P2 = 平台扩展。
   worker 启动接线、托盘策略/数量/分辨率 UI 与假 provider 单测。PLAT-01b 的
   代码脚手架同日完成：manifest/SHA-256/Authenticode 包校验、状态文件、
   `--vdisplay` 提权 CLI、deviceinstaller64 安装/卸载/数量/模式动作与 106 项
-  单测，最终源码全量 ctest 42/42（640.11 s，2026-11-03）。仍缺固定哈希驱动包、
-  Amyuni 再分发许可、第三方声明、安装器接线与 A1～A10 真机验收，因此
-  PLAT-01b 未完成。后续 PLAT-01b～e 见设计文档 §9。
+  单测，最终源码全量 ctest 42/42（640.11 s，2026-11-03）。PLAT-01d 的本地
+  接线于 2026-11-04 完成：`chast-setup --virtual-display/--virtual-display-count`、
+  安装后提权调用、卸载先驱动后文件、打包脚本按目录捆绑驱动包，以及托盘
+  安装/卸载入口（runas、确认框、失败日志）。同日补上 fail-closed 的
+  `tools/fetch-usbmmidd.ps1` 骨架（固定哈希为空时拒绝下载/解包，配置后校验
+  并生成 `manifest.sha256`/`SOURCE.txt`）与 `THIRD-PARTY-NOTICES.md` 占位。
+  同日完成 ACL 与 TOCTOU 加固：包目录与全部清单文件在哈希/签名校验及
+  deviceinstaller64 运行期间由 `VirtualDisplayPackageGuard` 以只读共享句柄
+  锁定，拒绝 reparse point 与允许非管理主体写入的 ACL；`%ProgramData%\chast`
+  与记录文件使用受保护 DACL、owner 为 BUILTIN\Administrators，记录经临时
+  文件原子替换并读回验证，不可信记录/日志按不存在处理。虚拟显示单测增至
+  130 项。仍缺固定哈希驱动包、Amyuni 再分发许可、许可全文与 A1～A10 真机
+  验收，因此 PLAT-01b/01d 未完成。后续 PLAT-01b～e 见设计文档 §9。
 
 ### PLAT-02 远程打印（P2）
 

@@ -17,7 +17,10 @@ import (
 	"unsafe"
 )
 
-const viewerExe = "chast_viewer.exe"
+const (
+	viewerExe = "chast_viewer.exe"
+	hostExe   = "chast-host.exe"
+)
 
 var (
 	advapi32                = syscall.NewLazyDLL("advapi32.dll")
@@ -94,6 +97,12 @@ func platformInstall(opts Options, payloadBytes int64) error {
 	if err := checkElevation(opts); err != nil {
 		return err
 	}
+	if opts.VirtualDisplay {
+		if err := installVirtualDisplay(opts); err != nil {
+			return err
+		}
+		opts.logf("virtual display driver installed")
+	}
 	if opts.Service {
 		service := filepath.Join(opts.Root, "chast-service.exe")
 		if _, err := os.Stat(service); err != nil {
@@ -135,6 +144,15 @@ func platformUninstall(opts Options) error {
 		opts.logf("removing the chast-host service")
 		if out, err := run(service, "--uninstall"); err != nil {
 			return fmt.Errorf("chast-service --uninstall: %w (%s)", err, firstLine(out))
+		}
+	}
+	// Remove the driver before deleting the tree: --vdisplay uninstall lives
+	// in chast-host.exe, and a failure must keep the installed files so the
+	// operator can retry instead of leaving an orphaned driver behind. The
+	// driver is machine-wide, so only a machine uninstall may touch it.
+	if opts.Machine {
+		if err := uninstallVirtualDisplay(opts); err != nil {
+			return err
 		}
 	}
 	removeShortcut(opts)
@@ -188,11 +206,71 @@ func finishUninstall(root string) error {
 }
 
 func checkElevation(opts Options) error {
+	if opts.Service && !opts.Machine {
+		return errors.New("--service requires --machine")
+	}
+	if opts.VirtualDisplay {
+		if !opts.Machine {
+			return errors.New("--virtual-display requires --machine")
+		}
+		if opts.VirtualDisplayCount < 1 || opts.VirtualDisplayCount > 4 {
+			return errors.New("--virtual-display-count must be from 1 to 4")
+		}
+	}
 	if opts.Machine && !IsElevated() {
 		return errors.New("installing for all users requires an elevated prompt")
 	}
-	if opts.Service && !opts.Machine {
-		return errors.New("--service requires --machine")
+	return nil
+}
+
+// virtualDisplayPackageDir is where the payload carries the fixed-hash
+// usbmmidd package. The installer never downloads a driver itself.
+func virtualDisplayPackageDir(root string) string {
+	return filepath.Join(root, "drivers", "usbmmidd_v2")
+}
+
+func virtualDisplayStatePath() string {
+	return filepath.Join(os.Getenv("ProgramData"), "chast", "virtual-display.json")
+}
+
+func virtualDisplayLogPath() string {
+	return filepath.Join(os.Getenv("ProgramData"), "chast", "vdisplay.log")
+}
+
+func installVirtualDisplay(opts Options) error {
+	host := filepath.Join(opts.Root, hostExe)
+	if _, err := os.Stat(host); err != nil {
+		return fmt.Errorf("--virtual-display needs %s in the payload: %w", hostExe, err)
+	}
+	packageDir := virtualDisplayPackageDir(opts.Root)
+	if info, err := os.Stat(packageDir); err != nil || !info.IsDir() {
+		return fmt.Errorf("--virtual-display needs the driver package at %s (package it with -VirtualDisplayPackageDir)", packageDir)
+	}
+	out, err := run(host, "--vdisplay", "install", "--package", packageDir,
+		"--count", strconv.Itoa(opts.VirtualDisplayCount))
+	if err != nil {
+		return fmt.Errorf("virtual display install failed: %w (%s); see %s", err,
+			firstLine(out), virtualDisplayLogPath())
+	}
+	return nil
+}
+
+func uninstallVirtualDisplay(opts Options) error {
+	if _, err := os.Stat(virtualDisplayStatePath()); err != nil {
+		// No chast-owned record: either the driver was never installed or a
+		// third party owns it, and --vdisplay uninstall would leave it alone.
+		return nil
+	}
+	host := filepath.Join(opts.Root, hostExe)
+	if _, err := os.Stat(host); err != nil {
+		return fmt.Errorf("the virtual display driver is installed but %s is missing; "+
+			"run %s --vdisplay uninstall before removing the install directory: %w",
+			hostExe, host, err)
+	}
+	out, err := run(host, "--vdisplay", "uninstall")
+	if err != nil {
+		return fmt.Errorf("virtual display uninstall failed: %w (%s); see %s. "+
+			"the installed files were kept", err, firstLine(out), virtualDisplayLogPath())
 	}
 	return nil
 }

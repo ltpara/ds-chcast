@@ -7,11 +7,18 @@
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File tools/package-windows.ps1 -Version 0.1.0
+#
+# The optional usbmmidd_v2 driver package (fixed hash, Amyuni redistribution
+# permission required) is bundled only when it is present:
+#   powershell ... -VirtualDisplayPackageDir <path-to-usbmmidd_v2>
+# or when the repository already has drivers\usbmmidd_v2. Without it the
+# installer still builds, but --virtual-display installs are rejected.
 
 param(
     [string]$Version = "0.1.0",
     [string]$Configuration = "Release",
-    [string]$OutDir = "dist"
+    [string]$OutDir = "dist",
+    [string]$VirtualDisplayPackageDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +54,30 @@ Copy-Item -LiteralPath (Join-Path $hostDir "chast-service.exe") -Destination $st
 Get-ChildItem -LiteralPath $stage -Recurse -File |
     Where-Object { $_.Extension -in ".lib", ".pdb", ".exp" } |
     Remove-Item -Force
+
+$driverSource = $VirtualDisplayPackageDir
+if (-not $driverSource) {
+    $defaultDriverSource = Join-Path $root "drivers\usbmmidd_v2"
+    if (Test-Path -LiteralPath $defaultDriverSource -PathType Container) {
+        $driverSource = $defaultDriverSource
+    }
+}
+if ($driverSource) {
+    $driverFiles = @(
+        "deviceinstaller64.exe", "usbmmidd.inf", "usbmmidd.cat",
+        "x64\usbmmidd.dll", "win32\usbmmidd.dll", "License.txt", "manifest.sha256"
+    )
+    foreach ($name in $driverFiles) {
+        Require-File (Join-Path $driverSource $name) "the virtual display package is incomplete"
+    }
+    $driverStage = Join-Path $stage "drivers\usbmmidd_v2"
+    New-Item -ItemType Directory -Path $driverStage -Force | Out-Null
+    Copy-Item -Path (Join-Path $driverSource "*") -Destination $driverStage -Recurse -Force
+    Write-Host "bundled the usbmmidd virtual display driver"
+}
+else {
+    Write-Warning "no usbmmidd_v2 package found; --virtual-display installs will be rejected"
+}
 
 Write-Host "archiving $zip"
 if (Test-Path -LiteralPath $zip) {

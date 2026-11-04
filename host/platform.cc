@@ -174,12 +174,12 @@ void remove_firewall_rules() {
                &ignored);
 }
 
-bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error) {
-    const std::wstring exe = executable_path();
-    std::wstring arguments = L"--firewall " + std::to_wstring(port);
-    if (tunnel_port != 0) {
-        arguments += L" " + std::to_wstring(tunnel_port);
+int run_elevated(const std::wstring& arguments, DWORD timeout_ms, bool* cancelled,
+                 std::string* error) {
+    if (cancelled != nullptr) {
+        *cancelled = false;
     }
+    const std::wstring exe = executable_path();
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
@@ -190,16 +190,43 @@ bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* err
     if (!ShellExecuteExW(&info)) {
         const DWORD code = GetLastError();
         if (code == ERROR_CANCELLED) {
-            *error = "已取消管理员授权，防火墙规则没有改变";
-        } else {
+            if (cancelled != nullptr) {
+                *cancelled = true;
+            }
+            if (error != nullptr) {
+                *error = "已取消管理员授权";
+            }
+        } else if (error != nullptr) {
             *error = "无法请求管理员权限（错误 " + std::to_string(code) + "）";
         }
-        return false;
+        return -1;
     }
-    WaitForSingleObject(info.hProcess, 60000);
+    const DWORD waited = WaitForSingleObject(info.hProcess, timeout_ms == 0 ? 60000 : timeout_ms);
+    if (waited == WAIT_TIMEOUT) {
+        if (error != nullptr) {
+            *error = "等待管理员操作超时";
+        }
+        CloseHandle(info.hProcess);
+        return -1;
+    }
     DWORD code = 1;
     GetExitCodeProcess(info.hProcess, &code);
     CloseHandle(info.hProcess);
+    return static_cast<int>(code);
+}
+
+bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error) {
+    std::wstring arguments = L"--firewall " + std::to_wstring(port);
+    if (tunnel_port != 0) {
+        arguments += L" " + std::to_wstring(tunnel_port);
+    }
+    bool cancelled = false;
+    std::string failure;
+    const int code = run_elevated(arguments, 60000, &cancelled, &failure);
+    if (code < 0) {
+        *error = cancelled ? "已取消管理员授权，防火墙规则没有改变" : failure;
+        return false;
+    }
     if (code != 0) {
         *error = "防火墙规则添加失败（退出码 " + std::to_string(code) + "）";
         return false;

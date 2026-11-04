@@ -167,6 +167,12 @@ std::unique_ptr<VirtualDisplayProvider> make_virtual_display_provider(
 // <executable directory>\drivers\usbmmidd_v2, the layout the installer writes.
 std::wstring default_virtual_display_package_dir();
 
+// %ProgramData%\chast\vdisplay.log, where the elevated CLI records each step.
+std::wstring virtual_display_log_path();
+// Last non-empty line of that log, for the tray's failure message. Empty when
+// the log is missing or blank.
+std::string virtual_display_log_tail();
+
 // ----- driver package and install record (PLAT-01b) -----
 
 enum class VirtualDisplayPackageStatus {
@@ -175,12 +181,46 @@ enum class VirtualDisplayPackageStatus {
     Missing,
     HashMismatch,
     SignatureMismatch,
+    // A path is a reparse point, or its owner/DACL lets an unprivileged
+    // account change the package. Such a package is never trusted.
+    UntrustedAcl,
 };
 
 struct VirtualDisplayManifestEntry {
     std::string sha256;
     // Relative path normalized to '/' separators.
     std::string path;
+};
+
+class VirtualDisplayPackageGuard;
+
+VirtualDisplayPackageStatus verify_virtual_display_package(
+    const std::wstring& package_dir, std::string* detail, std::string* package_version,
+    std::string* package_sha256, VirtualDisplayPackageGuard* guard);
+
+// Holds the verified package files open for reading only, which makes writes,
+// deletes and renames fail until the guard is destroyed or reset. The package
+// directory is held too, so it cannot be renamed while the elevated installer
+// runs. Verification fills the guard; the provider keeps it alive across
+// CreateProcess.
+class VirtualDisplayPackageGuard {
+  public:
+    VirtualDisplayPackageGuard();
+    ~VirtualDisplayPackageGuard();
+    VirtualDisplayPackageGuard(VirtualDisplayPackageGuard&&) noexcept;
+    VirtualDisplayPackageGuard& operator=(VirtualDisplayPackageGuard&&) noexcept;
+    VirtualDisplayPackageGuard(const VirtualDisplayPackageGuard&) = delete;
+    VirtualDisplayPackageGuard& operator=(const VirtualDisplayPackageGuard&) = delete;
+
+    void reset();
+    bool active() const;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    friend VirtualDisplayPackageStatus verify_virtual_display_package(
+        const std::wstring&, std::string*, std::string*, std::string*,
+        VirtualDisplayPackageGuard*);
 };
 
 // Parses a sha256sum-style manifest: "<64 hex>  <relative path>" per line,
@@ -194,12 +234,16 @@ bool sha256_file_hex(const std::wstring& path, std::string* hex, std::string* er
 
 // The package must contain deviceinstaller64.exe, usbmmidd.inf, usbmmidd.cat,
 // x64/usbmmidd.dll, Win32/usbmmidd.dll, License.txt and manifest.sha256.
-// Every manifest entry is hashed, and deviceinstaller64.exe must carry a
-// valid Authenticode signature. The driver catalog is left to Plug and Play,
-// which refuses an invalid driver package during installation.
+// Every manifest entry is hashed from a held handle, every path is opened
+// without following a reparse point, and owners/DACLs must keep other accounts
+// from changing the files. deviceinstaller64.exe must also carry a valid
+// Authenticode signature. The driver catalog is left to Plug and Play, which
+// refuses an invalid driver package during installation. Passing a guard keeps
+// the verified handles open for the following elevated install step.
 VirtualDisplayPackageStatus verify_virtual_display_package(
     const std::wstring& package_dir, std::string* detail,
-    std::string* package_version = nullptr, std::string* package_sha256 = nullptr);
+    std::string* package_version = nullptr, std::string* package_sha256 = nullptr,
+    VirtualDisplayPackageGuard* guard = nullptr);
 
 bool verify_authenticode(const std::wstring& path, std::string* error);
 
@@ -219,6 +263,27 @@ bool parse_virtual_display_install_json(const std::string& text,
                                         VirtualDisplayInstallRecord* record,
                                         std::string* error);
 std::string virtual_display_timestamp_utc();
+
+// Reads the record written by the elevated CLI. False when the state
+// directory is missing or untrusted, the file is unreadable, or the JSON is
+// corrupt; all of those are treated as absent.
+bool read_install_record(VirtualDisplayInstallRecord* record);
+
+// Creates %ProgramData%\chast when needed and replaces its DACL with a
+// protected one: SYSTEM and Administrators have full control, Users may only
+// read. The directory must not be a reparse point. A pre-existing record or
+// log that other accounts could change is discarded rather than trusted.
+// Requires an elevated token (it takes ownership as Administrators).
+bool harden_virtual_display_state_directory(std::string* error);
+
+// True when the state directory exists, is not a reparse point, and only
+// SYSTEM or Administrators can change it.
+bool virtual_display_state_directory_trusted();
+
+// Writes the record through a randomly named temporary file with a protected
+// DACL and an Administrators owner, then atomically replaces the record. The
+// state directory must already be hardened.
+bool write_install_record(const VirtualDisplayInstallRecord& record, std::string* error);
 
 enum class VdisplayAction {
     None,
