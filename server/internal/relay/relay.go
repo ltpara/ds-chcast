@@ -77,8 +77,8 @@ type Manager struct {
 	closed          bool
 
 	// requireViewerToken admits only viewers that first prove the lookup
-	// carrier token over the relay port. It is enabled with the server key so
-	// unauthenticated deployments keep the original first-source behavior.
+	// carrier token over the relay port. It is on by default so an exposed
+	// relay never forwards a stranger's datagrams to a host.
 	requireViewerToken bool
 
 	wantedReadBuffer int
@@ -95,8 +95,8 @@ func WithReadBuffer(size int) Option {
 	return func(m *Manager) { m.wantedReadBuffer = size }
 }
 
-// WithViewerTokenRequired makes every relay viewer prove the per-lease carrier
-// token before its datagrams are forwarded, matching hbbr's key check.
+// WithViewerTokenRequired overrides the viewer token check. It is on by
+// default; only tests and embedded single-user relays turn it off.
 func WithViewerTokenRequired(required bool) Option {
 	return func(m *Manager) { m.requireViewerToken = required }
 }
@@ -282,11 +282,12 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 		return nil, err
 	}
 	m := &Manager{
-		ports:  make(map[int]*portSet),
-		auth:   auth,
-		log:    log,
-		policy: policy,
-		bindIP: ip,
+		ports:              make(map[int]*portSet),
+		auth:               auth,
+		log:                log,
+		policy:             policy,
+		bindIP:             ip,
+		requireViewerToken: true,
 	}
 	for _, opt := range opts {
 		opt(m)

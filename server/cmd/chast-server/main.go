@@ -75,7 +75,8 @@ func run() error {
 		relayNodeCert   = flag.String("relay-node-client-cert", "", "client certificate presented to relay nodes requiring mTLS")
 		relayNodeKeyID  = flag.String("relay-node-client-key", "", "private key for --relay-node-client-cert")
 		relayHealth     = flag.Duration("relay-node-health", 10*time.Second, "how often standalone relay nodes are probed")
-		serverKey       = flag.String("server-key", "", "required for registration unless empty")
+		serverKey       = flag.String("server-key", "", "shared secret required for registration, lookup, management and rendezvous proofs; empty refuses to start")
+		insecureNoKey   = flag.Bool("insecure-no-server-key", false, "run without --server-key; the HTTP API is then limited to a loopback --http-listen and every other listener stays unauthenticated")
 		softwareVer     = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
 		softwareURL     = flag.String("software-url", "", "download URL advertised with --software-version")
 		softwareDir     = flag.String("software-dir", "", "release directory published read-only at /software/{name}; the file named by --software-url is hashed and signed in the notice")
@@ -187,6 +188,11 @@ func run() error {
 	if err := servercfg.Apply(flag.CommandLine, layers...); err != nil {
 		return err
 	}
+	key := strings.TrimSpace(*serverKey)
+	if err := checkServerKey(key, *insecureNoKey, *httpListen); err != nil {
+		return err
+	}
+	*serverKey = key
 	softwareVersion := strings.TrimSpace(*softwareVer)
 	softwareDownload := strings.TrimSpace(*softwareURL)
 	if (softwareVersion == "") != (softwareDownload == "") {
@@ -279,6 +285,9 @@ func run() error {
 		return err
 	}
 	defer logSink.Close()
+	if key == "" {
+		log.Warn("running without a server key: the HTTP API is loopback-only and the other listeners accept unauthenticated hosts", "http_listen", *httpListen)
+	}
 	if softwareName == "" && softwareDownload != "" {
 		if name, _ := software.HostedName(softwareDownload); name != "" {
 			log.Warn("software URL is under /software/ but --software-dir is not set; clients must fetch it elsewhere", "name", name)
@@ -579,7 +588,9 @@ func run() error {
 	}
 	relayManager, err := relay.NewManager(*relayListen, ports, reg, log,
 		relay.WithReadBuffer(*rmem),
-		relay.WithViewerTokenRequired(*serverKey != ""),
+		// Every lease requires the per-lease carrier token; it is issued by
+		// the registry and only handed out through an authenticated lookup.
+		relay.WithViewerTokenRequired(true),
 		relay.WithBind6(*relayV6),
 		relay.WithCarrierBind6(*carrierV6),
 	)
@@ -1067,4 +1078,36 @@ func expireLoop(ctx context.Context, reg *registry.Registry, relayManager *relay
 			}
 		}
 	}
+}
+
+// checkServerKey keeps the default deployment authenticated. An empty key is
+// only accepted with the explicit insecure switch, and that mode must not
+// expose the unauthenticated HTTP API beyond the local machine.
+func checkServerKey(key string, insecure bool, httpListen string) error {
+	if key != "" {
+		if insecure {
+			return errors.New("--insecure-no-server-key cannot be combined with --server-key")
+		}
+		return nil
+	}
+	if !insecure {
+		return errors.New("--server-key is required; pass --insecure-no-server-key only for a loopback development instance")
+	}
+	host, _, err := net.SplitHostPort(httpListen)
+	if err != nil {
+		return fmt.Errorf("--http-listen: %w", err)
+	}
+	if !isLoopbackHost(host) {
+		return fmt.Errorf("--insecure-no-server-key requires a loopback --http-listen, got %q", httpListen)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

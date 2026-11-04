@@ -74,6 +74,7 @@ func TestRefreshSessionSurvivesProcessRestart(t *testing.T) {
 		"--relay-ports", "47000-47002",
 		"--carrier-listen", "",
 		"--env-file", "",
+		"--insecure-no-server-key",
 		"--test-punch", "no",
 		"--api-rate", "0",
 	}

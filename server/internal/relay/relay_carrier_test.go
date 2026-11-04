@@ -113,7 +113,7 @@ func expectClosed(t *testing.T, conn net.Conn) {
 }
 
 func TestCarrierHostLinkRefusesBadCredentials(t *testing.T) {
-	_, _, relayAddr, _ := startRelay(t, "devbox", "host-secret")
+	_, _, relayAddr, _ := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(false))
 
 	conn := dialTCP(t, relayAddr)
 	hello, _ := json.Marshal(carrier.HostHello{HostID: "devbox"})
@@ -172,7 +172,7 @@ func waitForStats(t *testing.T, m *Manager, check func(PortStats) bool) PortStat
 
 func TestCarrierRawViewerPairing(t *testing.T) {
 	const secret = "host-secret-1"
-	m, _, relayAddr, _ := startRelay(t, "devbox", secret)
+	m, _, relayAddr, _ := startRelayWith(t, "devbox", secret, WithViewerTokenRequired(false))
 	host := openHostLink(t, relayAddr, "devbox", secret)
 	viewer, frames, send := openRawViewer(t, relayAddr)
 
@@ -251,7 +251,7 @@ func readWSBinary(t *testing.T, br *bufio.Reader) []byte {
 
 func TestCarrierWebSocketViewerPairing(t *testing.T) {
 	const secret = "host-secret-2"
-	m, _, relayAddr, _ := startRelay(t, "devbox", secret)
+	m, _, relayAddr, _ := startRelayWith(t, "devbox", secret, WithViewerTokenRequired(false))
 	host := openHostLink(t, relayAddr, "devbox", secret)
 	conn := dialTCP(t, relayAddr)
 	if _, err := io.WriteString(conn, wsRequest); err != nil {
@@ -291,7 +291,7 @@ func TestCarrierWebSocketViewerPairing(t *testing.T) {
 
 func TestCarrierBusyRejectsSecondViewer(t *testing.T) {
 	const secret = "host-secret-3"
-	m, _, relayAddr, _ := startRelay(t, "devbox", secret)
+	m, _, relayAddr, _ := startRelayWith(t, "devbox", secret, WithViewerTokenRequired(false))
 	host := openHostLink(t, relayAddr, "devbox", secret)
 	first, _, send := openRawViewer(t, relayAddr)
 	if err := send.WriteFrame([]byte("first")); err != nil {
@@ -315,7 +315,7 @@ func TestCarrierBusyRejectsSecondViewer(t *testing.T) {
 
 func TestCarrierHostLinkDropClosesViewer(t *testing.T) {
 	const secret = "host-secret-4"
-	_, _, relayAddr, _ := startRelay(t, "devbox", secret)
+	_, _, relayAddr, _ := startRelayWith(t, "devbox", secret, WithViewerTokenRequired(false))
 	host := openHostLink(t, relayAddr, "devbox", secret)
 	viewer, _, send := openRawViewer(t, relayAddr)
 	if err := send.WriteFrame([]byte("hello")); err != nil {
@@ -328,14 +328,14 @@ func TestCarrierHostLinkDropClosesViewer(t *testing.T) {
 }
 
 func TestCarrierViewerWithoutHostIsClosed(t *testing.T) {
-	_, _, relayAddr, _ := startRelay(t, "devbox", "host-secret-5")
+	_, _, relayAddr, _ := startRelayWith(t, "devbox", "host-secret-5", WithViewerTokenRequired(false))
 	viewer, _, _ := openRawViewer(t, relayAddr)
 	expectClosed(t, viewer)
 }
 
 func TestCarrierHostLinkKeepalive(t *testing.T) {
 	const secret = "host-secret-6"
-	_, _, relayAddr, _ := startRelay(t, "devbox", secret)
+	_, _, relayAddr, _ := startRelayWith(t, "devbox", secret, WithViewerTokenRequired(false))
 	host := openHostLink(t, relayAddr, "devbox", secret)
 	if err := host.send.WriteFrame(nil); err != nil {
 		t.Fatalf("keepalive: %v", err)

@@ -36,7 +36,7 @@ func blocklistFile(t *testing.T, ips ...string) string {
 }
 
 func TestRelayUDPRateLimitDropsDatagrams(t *testing.T) {
-	m, _, relayAddr, priv := startRelay(t, "devbox", "host-secret-rate")
+	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret-rate", WithViewerTokenRequired(false))
 	if err := m.SetPolicyConfig(PolicyConfig{SingleBandwidthBps: 1024}); err != nil {
 		t.Fatalf("policy: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestRelayUDPRateLimitDropsDatagrams(t *testing.T) {
 }
 
 func TestRelayBlocklistRefusesUDPViewer(t *testing.T) {
-	m, _, relayAddr, priv := startRelay(t, "devbox", "host-secret-block")
+	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret-block", WithViewerTokenRequired(false))
 	if err := m.SetPolicyConfig(PolicyConfig{BlocklistFile: blocklistFile(t, "127.0.0.1")}); err != nil {
 		t.Fatalf("policy: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestRelayBlocklistRefusesUDPViewer(t *testing.T) {
 
 func TestCarrierBlocklistRefusesViewer(t *testing.T) {
 	const secret = "host-secret-carrier-block"
-	m, _, relayAddr, _ := startRelay(t, "devbox", secret)
+	m, _, relayAddr, _ := startRelayWith(t, "devbox", secret, WithViewerTokenRequired(false))
 	if err := m.SetPolicyConfig(PolicyConfig{BlocklistFile: blocklistFile(t, "127.0.0.1")}); err != nil {
 		t.Fatalf("policy: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestSharedCarrierBlocklistRefusesViewer(t *testing.T) {
 }
 
 func TestRelayBlocklistDetachesUDPViewer(t *testing.T) {
-	m, _, relayAddr, priv := startRelay(t, "devbox", "host-secret-detach")
+	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret-detach", WithViewerTokenRequired(false))
 	host := listenUDP(t)
 	viewer := listenUDP(t)
 	if ack := relayHandshake(t, host, relayAddr, "devbox", priv); !ack.OK {

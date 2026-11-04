@@ -96,7 +96,7 @@ func relayHandshake(t *testing.T, conn *net.UDPConn, relayAddr *net.UDPAddr, id 
 }
 
 func TestRelayForwardsBothWays(t *testing.T) {
-	m, _, relayAddr, priv := startRelay(t, "devbox", "host-secret")
+	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(false))
 	host := listenUDP(t)
 	viewer := listenUDP(t)
 
@@ -129,7 +129,7 @@ func TestRelayForwardsBothWays(t *testing.T) {
 // local address replies from that address. Without the rebind the viewer sees
 // the configured bind address and discards the relayed datagrams.
 func TestBindHostKeepsRelaySourceAddress(t *testing.T) {
-	m, _, relayAddr, priv := startRelay(t, "devbox", "host-secret")
+	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(false))
 	assigned := "127.0.0.2"
 	if err := m.BindHost(relayAddr.Port, assigned); err != nil {
 		t.Fatalf("bind host: %v", err)
@@ -160,7 +160,8 @@ func TestBindHostKeepsRelaySourceAddress(t *testing.T) {
 }
 
 func TestRelayRequiresViewerToken(t *testing.T) {
-	_, reg, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(true))
+	// The token check is the manager default; this test pins that behavior.
+	_, reg, relayAddr, priv := startRelay(t, "devbox", "host-secret")
 	record, ok := reg.Lookup("devbox")
 	if !ok || record.CarrierToken == "" {
 		t.Fatal("registry did not issue a carrier token")
@@ -203,7 +204,7 @@ func TestRelayRequiresViewerToken(t *testing.T) {
 }
 
 func TestRelayRefusesSecondViewerAndBadProof(t *testing.T) {
-	_, _, relayAddr, priv := startRelay(t, "devbox", "host-secret")
+	_, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(false))
 	host := listenUDP(t)
 	viewer := listenUDP(t)
 	if ack := relayHandshake(t, host, relayAddr, "devbox", priv); !ack.OK {
@@ -279,7 +280,7 @@ func TestRelayServesBothFamiliesOnOnePort(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog, WithBind6("::1"))
+	m, err := NewManager("127.0.0.1", []int{0}, reg, testLog, WithBind6("::1"), WithViewerTokenRequired(false))
 	if err != nil {
 		t.Skipf("IPv6 loopback unavailable: %v", err)
 	}

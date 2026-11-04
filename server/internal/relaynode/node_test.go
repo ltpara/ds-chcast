@@ -461,6 +461,10 @@ func TestNodeRelaysUDPWithProvisionedLease(t *testing.T) {
 		t.Fatalf("node relay refused the host: %+v", ack)
 	}
 
+	viewer.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeRelayViewer, HostID: "devbox", Token: "carrier"}), relayAddr)
+	if ack, err := wire.Decode(recvUDP(t, viewer)); err != nil || !ack.OK {
+		t.Fatalf("viewer auth: %v %+v", err, ack)
+	}
 	viewer.WriteToUDP([]byte("quic-from-viewer"), relayAddr)
 	if got := string(recvUDP(t, host)); got != "quic-from-viewer" {
 		t.Fatalf("host received %q", got)
