@@ -2240,6 +2240,16 @@ int run_vdisplay_command(const std::vector<std::wstring>& args) {
         log("unsupported: " + platform_reason);
         return kVdisplayExitUnsupported;
     }
+    if (command.action == VdisplayAction::Install) {
+        // The tray hides install on a conflict, but the installer and direct
+        // CLI calls reach this path; never stack a second virtual driver.
+        const VirtualDisplayProbe probe = probe_virtual_display();
+        if (!probe.conflicting_driver.empty()) {
+            log("install refused: another virtual display driver is present: " +
+                probe.conflicting_driver);
+            return kVdisplayExitUnsupported;
+        }
+    }
     if (command.action == VdisplayAction::Status) {
         const VirtualDisplayStatus status =
             classify_virtual_display_probe(probe_virtual_display());

@@ -454,8 +454,11 @@ P2 = 平台扩展。
   锁定，拒绝 reparse point 与允许非管理主体写入的 ACL；`%ProgramData%\chast`
   与记录文件使用受保护 DACL、owner 为 BUILTIN\Administrators，记录经临时
   文件原子替换并读回验证，不可信记录/日志按不存在处理。虚拟显示单测增至
-  130 项。仍缺固定哈希驱动包、Amyuni 再分发许可、许可全文与 A1～A10 真机
-  验收，因此 PLAT-01b/01d 未完成。后续 PLAT-01b～e 见设计文档 §9。
+  130 项。同日补上 A5 的 CLI 冲突拒绝（检测到 VDD/Parsec/RustDesk 时退出 8）
+  与 A6 的托盘会话中卸载拦截，并新增 `docs/plat-01-acceptance-runbook-2026-11-04.md`
+  覆盖 A1～A10 的前置、命令、证据与回滚。仍缺固定哈希驱动包、Amyuni 再分发
+  许可、许可全文与 A1～A10 真机验收，因此 PLAT-01b/01d 未完成。后续
+  PLAT-01b～e 见设计文档 §9。
 
 ### PLAT-02 远程打印（P2）
 
