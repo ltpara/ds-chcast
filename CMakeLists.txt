@@ -452,6 +452,27 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-carrier-test tests/carrier_test.cc)
     target_link_libraries(chast-carrier-test PRIVATE chast.net)
 
+    # FFmpeg's input-buffer contract: a network access unit has no
+    # AV_INPUT_BUFFER_PADDING_SIZE tail, so the decoder must copy it into a
+    # padded packet. The fixture sits flush against a PROTECT_NONE page, which
+    # turns an overread into a crash instead of silent heap damage. The access
+    # unit is deliberately truncated, so a decode error is expected.
+    add_executable(chast-decoder-padding-test tests/decoder_padding_test.cc)
+    target_link_libraries(chast-decoder-padding-test PRIVATE chast.codec)
+
+    # The recording container: the viewer muxes the access units it received
+    # into MP4 without re-encoding. Reopens the files with libavformat and
+    # checks zero-based timing, the key-frame flags and the rollover after a
+    # picture-size change.
+    add_executable(chast-mp4-recorder-test tests/mp4_recorder_test.cc)
+    target_include_directories(chast-mp4-recorder-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+    # The static avformat object files pull its TLS, socket and RTSP helpers
+    # even though this test only uses the MP4 demuxer.
+    target_link_libraries(chast-mp4-recorder-test PRIVATE chast.ffmpeg
+        "${FFMPEG_ROOT}/lib/avformat.lib" secur32 crypt32 ws2_32 bcrypt ncrypt)
+
     enable_testing()
     add_test(NAME cursor COMMAND chast-cursor-test)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
@@ -469,6 +490,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME audio_playout COMMAND chast-audio-playout-test)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
     add_test(NAME carrier COMMAND chast-carrier-test)
+    add_test(NAME decoder_padding COMMAND chast-decoder-padding-test)
+    add_test(NAME mp4_recorder COMMAND chast-mp4-recorder-test)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.

@@ -241,6 +241,7 @@ private:
         segment_codecs_.push_back(codec_);
         header_started_ = true;
         first_pts_ms_ = -1;
+        last_pts_ms_ = -1;
         write_packet(header, data, size);
         return !failed_;
     }
@@ -302,6 +303,16 @@ private:
         const int64_t relative_ms = pts_ms > first_pts_ms_ ? pts_ms - first_pts_ms_ : 0;
         packet_->pts = av_rescale_q(relative_ms, AVRational{1, 1000}, stream_->time_base);
         packet_->dts = packet_->pts;
+        // The muxer infers each sample's duration from the next sample's
+        // timestamp; the final sample keeps the duration it was given, and a
+        // zero one ends the track's edit list before that sample, so players
+        // drop the last picture. The previous spacing is the best estimate
+        // available for the one that has nothing following it.
+        const int64_t spacing_ms =
+            last_pts_ms_ >= 0 && pts_ms > last_pts_ms_ ? pts_ms - last_pts_ms_ : 0;
+        packet_->duration =
+            av_rescale_q(spacing_ms, AVRational{1, 1000}, stream_->time_base);
+        last_pts_ms_ = pts_ms;
         packet_->stream_index = stream_->index;
         packet_->flags = header.keyframe ? AV_PKT_FLAG_KEY : 0;
         if (av_interleaved_write_frame(format_, packet_) < 0) {
@@ -656,6 +667,9 @@ private:
     // Host timestamp of this segment's first picture; subtracted so every
     // segment starts at zero.
     int64_t first_pts_ms_ = -1;
+    // Host timestamp of the previous picture, the spacing estimate for the
+    // sample that ends the segment.
+    int64_t last_pts_ms_ = -1;
     bool header_started_ = false;
     bool failed_ = false;
     std::string error_;

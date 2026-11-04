@@ -11,11 +11,11 @@
 
 - **默认部署不安全**：`chast-server` 默认 `--server-key` 为空、监听 `0.0.0.0:8443`、账号库默认开启。此时管理 API 对全网无鉴权，任何人可以创建管理员账号、重置密码、注册主机；relay 也退化成开放中继。这是本次审核唯一一条“默认配置即可接管”的问题（C1）。
 - **未认证 DoS 面较大**：rendezvous 的 keepalive 挑战可被任意覆盖（H1），QUIC 服务端在认证前会无限期占住唯一会话槽（H2）。两者都不需要任何凭据。
-- **远程内存安全有一处真实缺陷**：FFmpeg 解码直接借用网络缓冲且缺少 64 字节 padding（H4），恶意主机可让观看端越界读堆内存。
+- **远程内存安全无实际缺陷（H4 复核为误报）**：FFmpeg 解码把网络缓冲直接挂到非引用计数的 `AVPacket` 上，但 `avcodec_send_packet` 会先 `av_packet_ref` 复制并补齐 `AV_INPUT_BUFFER_PADDING_SIZE` 字节；已用 guard page 回归测试固化该契约。
 - **账号系统有两处设计缺口**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
 - **授权撤销在“仅文件”会话中不生效**，且旧掩码会带到下一次会话（H7）。
 
-其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2/H4 的投入产出比最高**。
+其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
 ---
 
@@ -225,7 +225,7 @@ case QUIC_STREAM_EVENT_RECEIVE: {
 
 ---
 
-### H4. FFmpeg 解码直接借用网络缓冲，缺少 `AV_INPUT_BUFFER_PADDING_SIZE`，可远程触发越界读
+### H4. FFmpeg 解码直接借用网络缓冲，缺少 `AV_INPUT_BUFFER_PADDING_SIZE`（复核：误报）
 
 **位置**
 - [`src/codec/ffmpeg_decoder.cc:227`](../src/codec/ffmpeg_decoder.cc#L227)
@@ -254,6 +254,19 @@ std::memcpy(packet_->data, data, size);
 ```
 
 或分配 `size + AV_INPUT_BUFFER_PADDING_SIZE`、清零尾部后 `av_packet_from_data`。
+
+**复核（2026-11-05）：不需要修改解码器。**
+
+上述判断对 `avcodec_send_packet` 的数据所有权理解有误。FFmpeg 8.1 的实现（`libavcodec/decode.c`、`libavcodec/packet.c`）是：
+
+```c
+ret = av_packet_ref(avci->buffer_pkt, avpkt);   // avcodec_send_packet 先引用/复制
+// av_packet_ref: 非引用计数 packet（buf == NULL）
+ret = packet_alloc(&dst->buf, src->size);       // size + AV_INPUT_BUFFER_PADDING_SIZE
+memcpy(dst->buf->data, src->data, src->size);   // packet_alloc 已清零 padding 尾部
+```
+
+`packet_` 的 `buf` 在 `av_packet_unref` 后为空，属于“非引用计数 packet”，因此 `avcodec_send_packet` 在进入解码器前就已经复制到带 64 字节零填充的内部缓冲，解码器读不到调用方的网络内存。`tests/decoder_padding_test.cc` 用一个真实 access unit（截断于 slice 中部）紧贴 `PAGE_NOACCESS` 页放置并解码，任何越界读都会立刻崩溃；保留该测试以固定“packet 不得借用未填充调用方内存”的契约（例如将来改用 `av_packet_from_data` 或自建 `buf` 时会失败）。
 
 ---
 
@@ -886,7 +899,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 **第二批（两周内，内存安全与远程 DoS）**
 
-5. H4：FFmpeg packet 复制并补 padding。
+5. H4（复核为误报，无需修改）：`avcodec_send_packet` 会复制非引用计数 packet 并补 padding；`tests/decoder_padding_test.cc` 用 guard page 固定该契约。
 6. H3：四条接收队列加高水位/反压；M1/M2 统一句柄与 parser 同步。
 7. H7：文件会话应用权限撤销并清理跨会话掩码；M3/M4 区分“可恢复拒绝”和“会话致命”。
 8. M7/M8/M9：CF_DIB 长度校验、TOTP 步号去重、隐私遮罩真正可见。
