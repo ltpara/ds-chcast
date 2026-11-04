@@ -1592,10 +1592,12 @@ void main() {
     String? method;
     Uri? requested;
     String? authorization;
+    Object? body;
     server.listen((HttpRequest request) async {
       method = request.method;
       requested = request.uri;
       authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      body = jsonDecode(await utf8.decoder.bind(request).join());
       request.response.headers.contentType = ContentType.json;
       request.response.write(
         jsonEncode(<String, Object?>{
@@ -1609,10 +1611,12 @@ void main() {
     final TwoFactorEnrollment enrollment = await ServerApi.startTwoFactor(
       settings,
       'account-token',
+      password: 'correct horse',
     );
     expect(method, 'POST');
     expect(requested?.path, '/v1/account/2fa/start');
     expect(authorization, 'Bearer account-token');
+    expect(body, <String, Object?>{'password': 'correct horse'});
     expect(enrollment.secret, 'JBSWY3DPEHPK3PXP');
     expect(enrollment.uri, startsWith('otpauth://totp/'));
   });
@@ -1627,7 +1631,11 @@ void main() {
       });
 
       await expectLater(
-        ServerApi.startTwoFactor(settings, 'account-token'),
+        ServerApi.startTwoFactor(
+          settings,
+          'account-token',
+          password: 'correct horse',
+        ),
         throwsA(
           isA<ServerApiException>().having(
             (ServerApiException e) => e.message,
@@ -1653,11 +1661,19 @@ void main() {
       await request.response.close();
     });
 
-    await ServerApi.enableTwoFactor(settings, 'account-token', ' 123456 ');
+    await ServerApi.enableTwoFactor(
+      settings,
+      'account-token',
+      ' 123456 ',
+      password: 'correct horse',
+    );
     expect(method, 'POST');
     expect(requested?.path, '/v1/account/2fa/enable');
     expect(authorization, 'Bearer account-token');
-    expect(body, <String, Object?>{'code': '123456'});
+    expect(body, <String, Object?>{
+      'password': 'correct horse',
+      'code': '123456',
+    });
   });
 
   test(
@@ -1677,17 +1693,27 @@ void main() {
       });
 
       await expectLater(
-        ServerApi.enableTwoFactor(settings, 'account-token', '000000'),
+        ServerApi.enableTwoFactor(
+          settings,
+          'account-token',
+          '000000',
+          password: 'correct horse',
+        ),
         throwsA(
           isA<ServerApiException>().having(
             (ServerApiException e) => e.message,
             'message',
-            '两步验证码不正确',
+            '当前密码或两步验证码不正确',
           ),
         ),
       );
       await expectLater(
-        ServerApi.enableTwoFactor(settings, 'account-token', '000000'),
+        ServerApi.enableTwoFactor(
+          settings,
+          'account-token',
+          '000000',
+          password: 'correct horse',
+        ),
         throwsA(
           isA<ServerApiException>().having(
             (ServerApiException e) => e.message,

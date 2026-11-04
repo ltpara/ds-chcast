@@ -90,6 +90,15 @@ func TestSchemaMigrationAddsAddressBookNesting(t *testing.T) {
 		)`,
 		`INSERT INTO schema_migrations (version, name, applied_at) VALUES
 			(1, 'baseline', 0), (2, 'archive checkpoints', 0)`,
+		`CREATE TABLE refresh_tokens (
+			token_hash  TEXT PRIMARY KEY,
+			user_id     TEXT NOT NULL,
+			session_id  TEXT NOT NULL,
+			created_at  INTEGER NOT NULL,
+			expires_at  INTEGER NOT NULL,
+			rotated_at  INTEGER NOT NULL DEFAULT 0,
+			replaced_by TEXT NOT NULL DEFAULT ''
+		)`,
 		`CREATE TABLE address_book (
 			user_id    TEXT NOT NULL,
 			peer_id    TEXT NOT NULL,
@@ -175,6 +184,15 @@ func TestSchemaMigrationAddsRecordingArchive(t *testing.T) {
 		)`,
 		`INSERT INTO schema_migrations (version, name, applied_at) VALUES
 			(1, 'baseline', 0), (2, 'archive checkpoints', 0), (3, 'address book nesting', 0)`,
+		`CREATE TABLE refresh_tokens (
+			token_hash  TEXT PRIMARY KEY,
+			user_id     TEXT NOT NULL,
+			session_id  TEXT NOT NULL,
+			created_at  INTEGER NOT NULL,
+			expires_at  INTEGER NOT NULL,
+			rotated_at  INTEGER NOT NULL DEFAULT 0,
+			replaced_by TEXT NOT NULL DEFAULT ''
+		)`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			db.Close()

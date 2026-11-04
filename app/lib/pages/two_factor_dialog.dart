@@ -13,13 +13,15 @@ typedef TwoFactorStatusLoader = Future<AccountInfo> Function(
 );
 typedef TwoFactorStarter = Future<TwoFactorEnrollment> Function(
   ServerSettings settings,
-  String token,
-);
+  String token, {
+  required String password,
+});
 typedef TwoFactorEnabler = Future<void> Function(
   ServerSettings settings,
   String token,
-  String code,
-);
+  String code, {
+  required String password,
+});
 typedef TwoFactorDisabler = Future<void> Function(
   ServerSettings settings,
   String token, {
@@ -128,6 +130,11 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
     if (_busy) {
       return;
     }
+    final String password = _password.text;
+    if (password.isEmpty) {
+      setState(() => _error = tr('请输入当前密码'));
+      return;
+    }
     setState(() {
       _busy = true;
       _error = '';
@@ -138,6 +145,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
           await (widget.start ?? ServerApi.startTwoFactor)(
         widget.server,
         widget.account.token,
+        password: password,
       );
       if (!mounted) {
         return;
@@ -168,7 +176,12 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
     if (_busy) {
       return;
     }
+    final String password = _password.text;
     final String code = _code.text.trim();
+    if (password.isEmpty) {
+      setState(() => _error = tr('请输入当前密码'));
+      return;
+    }
     if (code.isEmpty) {
       setState(() => _error = tr('请输入身份验证器中的 6 位验证码'));
       return;
@@ -182,6 +195,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         widget.server,
         widget.account.token,
         code,
+        password: password,
       );
       if (!mounted) {
         return;
@@ -192,6 +206,7 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
         _recoveryCodes = 0;
         _secret = '';
         _uri = '';
+        _password.clear();
         _code.clear();
         _message = tr('两步验证已启用');
       });
@@ -459,6 +474,18 @@ class _TwoFactorDialogState extends State<TwoFactorDialog> {
           style: mutedStyle(context, size: 12),
         ),
         const SizedBox(height: 14),
+        TextField(
+          key: const Key('two-factor-password'),
+          controller: _password,
+          obscureText: true,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            labelText: tr('当前密码'),
+            prefixIcon: Icon(Icons.lock_outline_rounded, size: 18),
+          ),
+        ),
+        const SizedBox(height: 10),
         if (_secret.isEmpty)
           OutlinedButton.icon(
             key: const Key('two-factor-start'),

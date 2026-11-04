@@ -60,8 +60,13 @@ type twoFactorStartResponse struct {
 	OTPAuthURI string `json:"otpauth_uri"`
 }
 
+type twoFactorStartRequest struct {
+	Password string `json:"password"`
+}
+
 type twoFactorCodeRequest struct {
-	Code string `json:"code"`
+	Password string `json:"password"`
+	Code     string `json:"code"`
 }
 
 type twoFactorDisableRequest struct {
@@ -515,8 +520,9 @@ func (s *server) changeAccountPassword(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// startAccountTwoFactor creates a pending TOTP secret. It is not enforced
-// until the caller proves possession with a code from the authenticator.
+// startAccountTwoFactor creates a pending TOTP secret. It requires the
+// account password so a stolen token cannot bind an attacker's authenticator,
+// and it is not enforced until EnableTwoFactor proves possession with a code.
 func (s *server) startAccountTwoFactor(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
@@ -526,7 +532,16 @@ func (s *server) startAccountTwoFactor(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	secret, err := s.cfg.Accounts.StartTwoFactor(user.ID)
+	var req twoFactorStartRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	secret, err := s.cfg.Accounts.StartTwoFactor(user.ID, req.Password)
+	if errors.Is(err, account.ErrInvalidCredentials) {
+		writeError(w, http.StatusForbidden, "current password was not accepted")
+		return
+	}
 	if errors.Is(err, account.ErrTwoFactorEnabled) {
 		writeError(w, http.StatusConflict, "two-factor is already enabled")
 		return
@@ -556,10 +571,16 @@ func (s *server) enableAccountTwoFactor(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	err := s.cfg.Accounts.EnableTwoFactor(user.ID, req.Code)
+	token, _ := bearerToken(r)
+	err := s.cfg.Accounts.EnableTwoFactor(user.ID, token, req.Password, req.Code)
 	if errors.Is(err, account.ErrTwoFactorNotStarted) {
 		s.recordAudit(r, user.Username, account.AuditTwoFactorEnable, "enrollment not started", false)
 		writeError(w, http.StatusBadRequest, "two-factor enrollment has not started")
+		return
+	}
+	if errors.Is(err, account.ErrInvalidCredentials) {
+		s.recordAudit(r, user.Username, account.AuditTwoFactorEnable, "password rejected", false)
+		writeError(w, http.StatusForbidden, "current password was not accepted")
 		return
 	}
 	if errors.Is(err, account.ErrInvalidTwoFactorCode) {
@@ -573,7 +594,7 @@ func (s *server) enableAccountTwoFactor(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "could not enable two-factor")
 		return
 	}
-	s.recordAudit(r, user.Username, account.AuditTwoFactorEnable, "", true)
+	s.recordAudit(r, user.Username, account.AuditTwoFactorEnable, "other sessions revoked", true)
 	s.cfg.Logger.Info("account two-factor enabled", "user", user.Username)
 	w.WriteHeader(http.StatusNoContent)
 }

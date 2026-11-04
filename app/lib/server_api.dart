@@ -1267,11 +1267,13 @@ class ServerApi {
     return info;
   }
 
-  /// Creates a pending authenticator secret. Logins keep working with the
-  /// password alone until [enableTwoFactor] confirms a code from it.
+  /// Creates a pending authenticator secret. The current password is required
+  /// so a stolen token cannot bind another authenticator. Logins keep working
+  /// with the password alone until [enableTwoFactor] confirms a code from it.
   static Future<TwoFactorEnrollment> startTwoFactor(
     ServerSettings settings,
     String token, {
+    required String password,
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -1288,6 +1290,8 @@ class ServerApi {
         uri,
         timeout,
         accountToken: accountToken,
+        body: <String, Object?>{'password': password},
+        forbidden: tr('当前密码不正确'),
         unauthorized: tr('账号登录已失效，请重新登录'),
       );
     } on ServerApiException catch (error) {
@@ -1309,6 +1313,7 @@ class ServerApi {
     ServerSettings settings,
     String token,
     String code, {
+    required String password,
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -1328,10 +1333,10 @@ class ServerApi {
         uri,
         timeout,
         accountToken: accountToken,
-        body: <String, Object?>{'code': otp},
+        body: <String, Object?>{'password': password, 'code': otp},
         success: const <int>{HttpStatus.ok, HttpStatus.noContent},
         unauthorized: tr('账号登录已失效，请重新登录'),
-        forbidden: tr('两步验证码不正确'),
+        forbidden: tr('当前密码或两步验证码不正确'),
       );
     } on ServerApiException catch (error) {
       if (error.statusCode == HttpStatus.badRequest) {

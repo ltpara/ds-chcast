@@ -307,7 +307,7 @@ func TestAdminAccountPasswordAndTwoFactorReset(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
 	s.Accounts.SetClock(func() time.Time { return now })
-	secret, err := s.Accounts.StartTwoFactor(bob.ID)
+	secret, err := s.Accounts.StartTwoFactor(bob.ID, "battery staple")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestAdminAccountPasswordAndTwoFactorReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp code: %v", err)
 	}
-	if err := s.Accounts.EnableTwoFactor(bob.ID, code); err != nil {
+	if err := s.Accounts.EnableTwoFactor(bob.ID, "", "battery staple", code); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	admin := login(t, s.URL, "alice", "correct horse").Token

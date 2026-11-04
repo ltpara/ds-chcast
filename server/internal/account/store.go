@@ -39,7 +39,8 @@ const (
 	// RefreshReuseGrace keeps a just-rotated refresh token usable while its
 	// replacement is still unused. A viewer that lost the rotation response
 	// retries with the old token on its next tick; without the window that
-	// retry would look like a replay and revoke the whole session.
+	// retry would look like a replay and revoke the whole session. Only one
+	// such retry is allowed per session.
 	RefreshReuseGrace = 2 * time.Minute
 
 	maxName           = 128
@@ -1164,54 +1165,81 @@ func (s *Store) TwoFactorEnabled(userID string) (bool, error) {
 	return enabled, nil
 }
 
-// StartTwoFactor creates a pending secret. It is not required at login until
-// EnableTwoFactor accepts a code from it. An account that already enabled 2FA
-// must disable it (password plus a current code) or be reset by an operator,
-// so a stolen token cannot silently replace the authenticator.
-func (s *Store) StartTwoFactor(userID string) (string, error) {
+// StartTwoFactor creates a pending secret after verifying the account
+// password, so a stolen access token cannot bind an attacker's authenticator.
+// It is not required at login until EnableTwoFactor accepts a code from it. An
+// account that already enabled 2FA must disable it (password plus a current
+// code) or be reset by an operator.
+func (s *Store) StartTwoFactor(userID, password string) (string, error) {
 	secret, err := newTOTPSecret()
 	if err != nil {
 		return "", err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	var enabled bool
-	err = s.db.QueryRow(`SELECT totp_enabled FROM users WHERE id = ?`, userID).Scan(&enabled)
+	var (
+		hash    string
+		enabled bool
+	)
+	err = s.db.QueryRow(`SELECT password_hash, totp_enabled FROM users WHERE id = ?`, userID).
+		Scan(&hash, &enabled)
+	s.mu.Unlock()
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrUnknownUser
 	}
 	if err != nil {
 		return "", fmt.Errorf("account store %s: start two-factor: %w", s.path, err)
 	}
+	ok, err := verifyPassword(hash, password)
+	if err != nil || !ok {
+		return "", ErrInvalidCredentials
+	}
 	if enabled {
 		return "", ErrTwoFactorEnabled
 	}
-	if _, err := s.db.Exec(
-		`UPDATE users SET totp_secret = ?, totp_enabled = 0, totp_last_step = 0 WHERE id = ?`,
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		`UPDATE users SET totp_secret = ?, totp_enabled = 0, totp_last_step = 0
+		 WHERE id = ? AND totp_enabled = 0`,
 		secret, userID,
-	); err != nil {
+	)
+	if err != nil {
 		return "", fmt.Errorf("account store %s: save two-factor secret: %w", s.path, err)
+	}
+	if rows, err := res.RowsAffected(); err != nil {
+		return "", err
+	} else if rows == 0 {
+		// A concurrent enable won the race; the caller must disable first.
+		return "", ErrTwoFactorEnabled
 	}
 	return secret, nil
 }
 
-// EnableTwoFactor confirms a pending secret with a code from the caller's
-// authenticator. The matched step is recorded so the enrollment code cannot
-// also be used for the next login.
-func (s *Store) EnableTwoFactor(userID, code string) error {
+// EnableTwoFactor confirms a pending secret with the account password and a
+// code from the caller's authenticator, then revokes every other session so a
+// token stolen before enrollment cannot keep using the account. The matched
+// step is recorded so the enrollment code cannot also be used for the next
+// login.
+func (s *Store) EnableTwoFactor(userID, currentToken, password, code string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	var (
+		hash    string
 		secret  string
 		enabled bool
 	)
-	err := s.db.QueryRow(`SELECT totp_secret, totp_enabled FROM users WHERE id = ?`, userID).
-		Scan(&secret, &enabled)
+	err := s.db.QueryRow(
+		`SELECT password_hash, totp_secret, totp_enabled FROM users WHERE id = ?`, userID,
+	).Scan(&hash, &secret, &enabled)
+	s.mu.Unlock()
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrUnknownUser
 	}
 	if err != nil {
 		return fmt.Errorf("account store %s: read two-factor secret: %w", s.path, err)
+	}
+	ok, err := verifyPassword(hash, password)
+	if err != nil || !ok {
+		return ErrInvalidCredentials
 	}
 	if secret == "" {
 		return ErrTwoFactorNotStarted
@@ -1223,11 +1251,44 @@ func (s *Store) EnableTwoFactor(userID, code string) error {
 	if !matched {
 		return ErrInvalidTwoFactorCode
 	}
-	if _, err := s.db.Exec(
-		`UPDATE users SET totp_enabled = 1, totp_last_step = ? WHERE id = ?`,
-		step, userID,
-	); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("account store %s: begin enable two-factor: %w", s.path, err)
+	}
+	defer tx.Rollback()
+	// The secret must still be the one the code was verified against; a
+	// concurrent restart of the enrollment would otherwise enable a secret
+	// this caller never saw.
+	res, err := tx.Exec(
+		`UPDATE users SET totp_enabled = 1, totp_last_step = ? WHERE id = ? AND totp_secret = ?`,
+		step, userID, secret,
+	)
+	if err != nil {
 		return fmt.Errorf("account store %s: enable two-factor: %w", s.path, err)
+	}
+	if rows, err := res.RowsAffected(); err != nil {
+		return err
+	} else if rows == 0 {
+		return ErrTwoFactorNotStarted
+	}
+	current := tokenHash(strings.TrimSpace(currentToken))
+	if _, err := tx.Exec(
+		`DELETE FROM refresh_tokens WHERE user_id = ?
+		 AND session_id IN (SELECT session_id FROM user_tokens WHERE user_id = ? AND token_hash <> ?)`,
+		userID, userID, current,
+	); err != nil {
+		return fmt.Errorf("account store %s: revoke other refresh tokens: %w", s.path, err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM user_tokens WHERE user_id = ? AND token_hash <> ?`,
+		userID, current,
+	); err != nil {
+		return fmt.Errorf("account store %s: revoke other sessions: %w", s.path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("account store %s: commit enable two-factor: %w", s.path, err)
 	}
 	return nil
 }
@@ -1477,8 +1538,11 @@ func (s *Store) Authenticate(token string) (User, error) {
 // revokes the whole session, except for one bounded case: a retry within
 // RefreshReuseGrace whose replacement token is still unused. That is the
 // viewer that lost the rotation response, and retiring the undelivered
-// replacement keeps the session alive. Once the replacement has been used,
-// the presented token can only be a copy, so the session is revoked.
+// replacement keeps the session alive. The retry is recorded on the retired
+// row, so a session only ever tolerates one: a second replayed token means
+// two clients hold copies of the chain, and both are cut off. Once the
+// replacement has been used, the presented token can only be a copy, so the
+// session is revoked.
 func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, string, time.Time, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
@@ -1498,12 +1562,13 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 		sessionID string
 		expires   int64
 		rotated   int64
+		replayed  int64
 	)
 	err = tx.QueryRow(
-		`SELECT user_id, session_id, expires_at, rotated_at
+		`SELECT user_id, session_id, expires_at, rotated_at, replayed_at
 		 FROM refresh_tokens WHERE token_hash = ?`,
 		tokenHash(refreshToken),
-	).Scan(&userID, &sessionID, &expires, &rotated)
+	).Scan(&userID, &sessionID, &expires, &rotated, &replayed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, "", time.Time{}, "", time.Time{}, ErrInvalidToken
 	}
@@ -1514,7 +1579,7 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 	retire := tokenHash(refreshToken)
 	if rotated != 0 {
 		grace := s.refreshGrace.Milliseconds()
-		if unixMillis(now)-rotated > grace {
+		if replayed != 0 || unixMillis(now)-rotated > grace {
 			if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
 				return User{}, "", time.Time{}, "", time.Time{}, err
 			}
@@ -1530,7 +1595,7 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 		)
 		err = tx.QueryRow(
 			`SELECT token_hash, created_at FROM refresh_tokens
-			 WHERE user_id = ? AND session_id = ? AND rotated_at = 0`,
+			 WHERE user_id = ? AND session_id = ? AND rotated_at = 0 AND replayed_at = 0`,
 			userID, sessionID,
 		).Scan(&replacement, &replacementCreated)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1540,7 +1605,16 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 			return User{}, "", time.Time{}, "", time.Time{},
 				fmt.Errorf("account store %s: refresh replacement lookup: %w", s.path, err)
 		}
-		if replacementCreated != rotated {
+		var replays int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM refresh_tokens
+			 WHERE user_id = ? AND session_id = ? AND replayed_at <> 0`,
+			userID, sessionID,
+		).Scan(&replays); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{},
+				fmt.Errorf("account store %s: count refresh replays: %w", s.path, err)
+		}
+		if replacementCreated != rotated || replays > 0 {
 			if err := revokeSessionLocked(tx, userID, sessionID); err != nil {
 				return User{}, "", time.Time{}, "", time.Time{}, err
 			}
@@ -1549,6 +1623,13 @@ func (s *Store) RefreshSession(refreshToken string) (User, string, time.Time, st
 					fmt.Errorf("account store %s: commit refresh replay: %w", s.path, err)
 			}
 			return User{}, "", time.Time{}, "", time.Time{}, ErrRefreshReused
+		}
+		if _, err := tx.Exec(
+			`UPDATE refresh_tokens SET replayed_at = ? WHERE token_hash = ?`,
+			unixMillis(now), tokenHash(refreshToken),
+		); err != nil {
+			return User{}, "", time.Time{}, "", time.Time{},
+				fmt.Errorf("account store %s: record refresh replay: %w", s.path, err)
 		}
 		retire = replacement
 	}

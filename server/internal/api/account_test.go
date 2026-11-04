@@ -1483,6 +1483,7 @@ func TestAccountTwoFactorLogin(t *testing.T) {
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	s.Accounts.SetClock(func() time.Time { return now })
 	first := login(t, s.URL, "alice", "correct horse")
+	stale := login(t, s.URL, "alice", "correct horse")
 
 	readInfo := func(token string) accountInfoReply {
 		t.Helper()
@@ -1500,7 +1501,12 @@ func TestAccountTwoFactorLogin(t *testing.T) {
 		t.Fatal("new account reports two-factor enabled")
 	}
 
-	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start", "", first.Token)
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start",
+		`{"password":"wrong horse"}`, first.Token); status != http.StatusForbidden {
+		t.Fatalf("start with wrong password: %d %s", status, body)
+	}
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start",
+		`{"password":"correct horse"}`, first.Token)
 	if status != http.StatusOK {
 		t.Fatalf("start two-factor: %d %s", status, data)
 	}
@@ -1517,10 +1523,14 @@ func TestAccountTwoFactorLogin(t *testing.T) {
 		t.Fatalf("generate code: %v", err)
 	}
 	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/enable",
-		`{"code":"000000"}`, first.Token); status != http.StatusForbidden {
+		`{"password":"correct horse","code":"000000"}`, first.Token); status != http.StatusForbidden {
 		t.Fatalf("enable with wrong code: %d %s", status, body)
 	}
-	enableBody, err := json.Marshal(map[string]string{"code": code})
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/enable",
+		`{"password":"wrong horse","code":"`+code+`"}`, first.Token); status != http.StatusForbidden {
+		t.Fatalf("enable with wrong password: %d %s", status, body)
+	}
+	enableBody, err := json.Marshal(map[string]string{"password": "correct horse", "code": code})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1531,7 +1541,21 @@ func TestAccountTwoFactorLogin(t *testing.T) {
 	if info := readInfo(first.Token); !info.TwoFactor || info.User.Username != "alice" {
 		t.Fatalf("account info after enable = %+v", info)
 	}
-	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start", "", first.Token); status != http.StatusConflict {
+	// Enabling the second factor revokes sessions that predate it, while the
+	// enrolling session stays signed in.
+	if status, body := request(t, http.MethodGet, s.URL+"/v1/account", "", stale.Token); status != http.StatusUnauthorized {
+		t.Fatalf("pre-enrollment session survived: %d %s", status, body)
+	}
+	refreshBody, err := json.Marshal(map[string]string{"refresh_token": stale.RefreshToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/refresh",
+		string(refreshBody), ""); status != http.StatusUnauthorized {
+		t.Fatalf("pre-enrollment refresh token survived: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start",
+		`{"password":"correct horse"}`, first.Token); status != http.StatusConflict {
 		t.Fatalf("restart enabled two-factor: %d %s", status, body)
 	}
 
@@ -1632,7 +1656,8 @@ func TestAccountRecoveryCodes(t *testing.T) {
 	s.Accounts.SetClock(func() time.Time { return now })
 	first := login(t, s.URL, "alice", "correct horse")
 
-	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start", "", first.Token)
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start",
+		`{"password":"correct horse"}`, first.Token)
 	if status != http.StatusOK {
 		t.Fatalf("start two-factor: %d %s", status, data)
 	}
@@ -1644,7 +1669,7 @@ func TestAccountRecoveryCodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enableBody, err := json.Marshal(map[string]string{"code": code})
+	enableBody, err := json.Marshal(map[string]string{"password": "correct horse", "code": code})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1983,7 +2008,8 @@ func TestAccountMutationAudit(t *testing.T) {
 		t.Fatalf("change password: %d %s", status, body)
 	}
 
-	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start", "", main.Token)
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start",
+		`{"password":"new correct horse"}`, main.Token)
 	if status != http.StatusOK {
 		t.Fatalf("start two-factor: %d %s", status, data)
 	}
@@ -1995,13 +2021,17 @@ func TestAccountMutationAudit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate code: %v", err)
 	}
-	enableBody, err := json.Marshal(map[string]string{"code": code})
+	enableBody, err := json.Marshal(map[string]string{"password": "new correct horse", "code": code})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/enable",
-		`{"code":"000000"}`, main.Token); status != http.StatusForbidden {
+		`{"password":"new correct horse","code":"000000"}`, main.Token); status != http.StatusForbidden {
 		t.Fatalf("enable with wrong code: %d %s", status, body)
+	}
+	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/enable",
+		`{"password":"wrong horse","code":"`+code+`"}`, main.Token); status != http.StatusForbidden {
+		t.Fatalf("enable with wrong password: %d %s", status, body)
 	}
 	if status, body := request(t, http.MethodPost, s.URL+"/v1/account/2fa/enable",
 		string(enableBody), main.Token); status != http.StatusNoContent {
@@ -2085,7 +2115,8 @@ func TestAccountMutationAudit(t *testing.T) {
 	wantEvent(account.AuditPasswordChange, "weak password", false)
 	wantEvent(account.AuditPasswordChange, "other sessions revoked", true)
 	wantEvent(account.AuditTwoFactorEnable, "invalid code", false)
-	wantEvent(account.AuditTwoFactorEnable, "", true)
+	wantEvent(account.AuditTwoFactorEnable, "password rejected", false)
+	wantEvent(account.AuditTwoFactorEnable, "other sessions revoked", true)
 	wantEvent(account.AuditTwoFactorDisable, "invalid credentials or code", false)
 	wantEvent(account.AuditTwoFactorDisable, "", true)
 	wantEvent(account.AuditTwoFactorDisable, "not enabled", false)

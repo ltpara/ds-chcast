@@ -234,8 +234,8 @@ wss 握手、双向帧与统计核对（根路径与前缀改写两种挂载）�
 | `POST` | `/v1/account/recover/complete` | 无 | 提交 `token` 与 `password`；令牌一次性、默认 30 分钟（`--recovery-ttl`）有效，成功返回 `{"username":...}` 并吊销该账号全部访问/刷新令牌；弱密码 400 且不消耗令牌，未知、过期、已用或被替换的令牌均为 400 |
 | `POST` | `/v1/account/recover/sms` | 无（仅用户名与 HTTP 限流） | 提交 `username`；与邮件找回一样只有 202 `{"status":"accepted"}`，未知账号、未设手机与网关失败都不泄露；同一客户端 IP+用户名每分钟最多一条；未配置短信网关或账号存储返回 503；成功发送写入 `account_recover` 审计 |
 | `POST` | `/v1/account/recover/sms/complete` | 无 | 提交 `username`、8 位 `code`（可含空格/短横线）与 `password`；验证码一次性、默认 10 分钟（`--sms-ttl`，最长 1h）有效，5 次错误后作废，成功返回 `{"username":...}` 并吊销全部访问/刷新令牌；弱密码 400 且不消耗验证码，未知、过期、已用或错误验证码均为 400 |
-| `POST` | `/v1/account/2fa/start` | Bearer account token | 生成待确认的 TOTP 密钥，返回 `secret`（base32、无填充）与 `otpauth_uri`；已启用时返回 409 |
-| `POST` | `/v1/account/2fa/enable` | Bearer account token | 提交身份验证器的 6 位 `code` 激活待确认密钥，返回 204；未生成密钥为 400、验证码不匹配为 403 |
+| `POST` | `/v1/account/2fa/start` | Bearer account token | 提交当前 `password` 生成待确认的 TOTP 密钥，返回 `secret`（base32、无填充）与 `otpauth_uri`；密码错误 403、已启用时返回 409 |
+| `POST` | `/v1/account/2fa/enable` | Bearer account token | 提交当前 `password` 与身份验证器的 6 位 `code` 激活待确认密钥，返回 204；成功后在同一事务中撤销该账号其他会话（当前会话保留）；未生成密钥为 400、密码或验证码不匹配为 403 |
 | `POST` | `/v1/account/2fa/disable` | Bearer account token | 提交 `password` 与 `code` 关闭两步验证，返回 204；凭据或验证码错误均为 403，未启用为 400；关闭会同时清除全部恢复码 |
 | `POST` | `/v1/account/2fa/recovery` | Bearer account token | 提交 `password` 与当前 `code`，重新生成 10 个一次性恢复码并返回 `{"codes":[...]}`（仅此一次）；凭据或验证码错误为 403，未启用为 400；旧恢复码全部失效 |
 | `POST` | `/v1/account/webauthn/register/begin` | Bearer account token + `password` | 校验密码后签发 5 分钟注册挑战，返回 `challenge`、`rp_id`、`user_id`、`username`、`display_name`、`timeout_ms` 与现有凭据排除列表 `exclude_credentials`；密码错误 403，未配置 WebAuthn 503 |
@@ -374,7 +374,13 @@ Authorization: Bearer <account token>
 
 POST /v1/account/2fa/start
 Authorization: Bearer <account token>
+{"password":"<password>"}
 → 200 {"secret":"JBSWY3DPEHPK3PXP...","otpauth_uri":"otpauth://totp/chast:alice?..."}
+
+POST /v1/account/2fa/enable
+Authorization: Bearer <account token>
+{"password":"<password>","code":"123456"}
+→ 204
 
 POST /v1/account/2fa/recovery
 Authorization: Bearer <account token>
@@ -635,11 +641,13 @@ SHA-256）以及设置会话令牌时的 `X-Amz-Security-Token`，签名覆盖�
 secret key 与会话令牌都走命令行参数，会出现在进程列表里，应借助服务管理器
 或受限账户隔离。
 
-账号可启用 TOTP 两步验证：`POST /v1/account/2fa/start` 生成 20 字节随机密钥
-（base32、无填充），返回一次性的 `secret` 与
+账号可启用 TOTP 两步验证：`POST /v1/account/2fa/start` 校验当前密码后生成
+20 字节随机密钥（base32、无填充），返回一次性的 `secret` 与
 `otpauth://totp/chast:<username>?...` URI；确认前登录仍只需密码。
-`POST /v1/account/2fa/enable` 用身份验证器当前的 6 位验证码激活，算法为
-RFC 6238 HMAC-SHA1、30 秒步长、允许前后各 1 步偏差。启用与登录都会记录已
+`POST /v1/account/2fa/enable` 校验当前密码并用身份验证器当前的 6 位验证码
+激活，算法为 RFC 6238 HMAC-SHA1、30 秒步长、允许前后各 1 步偏差。两个接口
+都要求密码，避免仅凭窃取的帐户令牌把攻击者的身份验证器绑定到受害账号；
+enable 成功时在同一事务中撤销该账号其他会话，只保留发起请求的当前会话。启用与登录都会记录已
 消费的时间步，因此启用用的验证码不能立刻用于登录，登录用过的验证码也不能
 重放；关闭需要当前密码和一个当前有效的验证码，成功后清除密钥。缺少验证码
 不计入登录失败锁定，错误或重放的验证码计入。忘记验证器时由管理台

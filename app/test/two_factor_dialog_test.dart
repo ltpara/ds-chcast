@@ -53,15 +53,24 @@ void main() {
           expect(token, 'account-token');
           return const AccountInfo(username: 'alice');
         },
-        start: (ServerSettings server, String token) async {
-          calls.add('start|$token');
+        start: (
+          ServerSettings server,
+          String token, {
+          required String password,
+        }) async {
+          calls.add('start|$token|$password');
           return const TwoFactorEnrollment(
             secret: 'JBSWY3DPEHPK3PXP',
             uri: 'otpauth://totp/chast:alice?secret=JBSWY3DPEHPK3PXP',
           );
         },
-        enable: (ServerSettings server, String token, String code) async {
-          calls.add('enable|$token|$code');
+        enable: (
+          ServerSettings server,
+          String token,
+          String code, {
+          required String password,
+        }) async {
+          calls.add('enable|$token|$code|$password');
         },
       ),
     );
@@ -74,6 +83,15 @@ void main() {
 
     await tester.tap(find.byKey(const Key('two-factor-start')));
     await tester.pumpAndSettle();
+    expect(find.text('请输入当前密码'), findsOneWidget);
+    expect(calls, isEmpty);
+
+    await tester.enterText(
+      find.byKey(const Key('two-factor-password')),
+      'secret123',
+    );
+    await tester.tap(find.byKey(const Key('two-factor-start')));
+    await tester.pumpAndSettle();
     expect(find.text('JBSWY3DPEHPK3PXP'), findsOneWidget);
     expect(find.textContaining('otpauth://totp/'), findsOneWidget);
 
@@ -82,8 +100,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(calls, <String>[
-      'start|account-token',
-      'enable|account-token|123456',
+      'start|account-token|secret123',
+      'enable|account-token|123456|secret123',
     ]);
     expect(
       tester.widget<Text>(find.byKey(const Key('two-factor-status'))).data,
@@ -163,18 +181,31 @@ void main() {
         loadInfo: (ServerSettings server, String token) async {
           return const AccountInfo(username: 'alice');
         },
-        start: (ServerSettings server, String token) async {
+        start: (
+          ServerSettings server,
+          String token, {
+          required String password,
+        }) async {
           return const TwoFactorEnrollment(
             secret: 'JBSWY3DPEHPK3PXP',
             uri: 'otpauth://totp/chast:alice?secret=JBSWY3DPEHPK3PXP',
           );
         },
-        enable: (ServerSettings server, String token, String code) async {
+        enable: (
+          ServerSettings server,
+          String token,
+          String code, {
+          required String password,
+        }) async {
           throw const ServerApiException('两步验证码不正确');
         },
       ),
     );
 
+    await tester.enterText(
+      find.byKey(const Key('two-factor-password')),
+      'secret123',
+    );
     await tester.tap(find.byKey(const Key('two-factor-start')));
     await tester.pumpAndSettle();
     await tester.enterText(find.byKey(const Key('two-factor-code')), '000000');

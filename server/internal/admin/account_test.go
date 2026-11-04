@@ -147,7 +147,7 @@ func TestAccountConsoleCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find alice: %v", err)
 	}
-	secret, err := s.Accounts.StartTwoFactor(alice.ID)
+	secret, err := s.Accounts.StartTwoFactor(alice.ID, "newsecret123")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestAccountConsoleCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate two-factor code: %v", err)
 	}
-	if err := s.Accounts.EnableTwoFactor(alice.ID, code); err != nil {
+	if err := s.Accounts.EnableTwoFactor(alice.ID, "", "newsecret123", code); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	if out = send(t, c.Addr(), "user 2fa alice off"); !strings.Contains(out, "alice two-factor disabled") {

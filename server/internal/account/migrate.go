@@ -11,13 +11,24 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 4
+const accountSchemaVersion = 5
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
 	{Version: 2, Name: "archive checkpoints", Apply: applyArchiveCheckpoints},
 	{Version: 3, Name: "address book nesting", Apply: applyAddressBookNesting},
 	{Version: 4, Name: "recording archive", Apply: applyRecordingArchive},
+	{Version: 5, Name: "refresh replay marker", Apply: applyRefreshReplayMarker},
+}
+
+// applyRefreshReplayMarker records that a retired refresh token was presented
+// again. The grace window tolerates one such retry per session; a second one
+// means two clients hold copies of the same token chain.
+func applyRefreshReplayMarker(db *sql.DB) error {
+	if err := ensureColumn(db, "refresh_tokens", "replayed_at", "replayed_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate refresh_tokens.replayed_at: %w", err)
+	}
+	return nil
 }
 
 // applyRecordingArchive adds the metadata side of uploaded viewer recordings.

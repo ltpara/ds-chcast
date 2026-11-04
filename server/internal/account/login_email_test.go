@@ -31,7 +31,7 @@ func TestLoginEmailCodeRequirements(t *testing.T) {
 	if _, _, _, err := store.CreateLoginEmailCode("alice", "correct horse", time.Minute); !errors.Is(err, ErrTwoFactorNotEnabled) {
 		t.Fatalf("without two-factor = %v", err)
 	}
-	user := enableLoginTwoFactor(t, store, "alice", "")
+	user := enableLoginTwoFactor(t, store, "alice", "correct horse", "")
 	if _, _, _, err := store.CreateLoginEmailCode("alice", "correct horse", time.Minute); !errors.Is(err, ErrNoRecoveryEmail) {
 		t.Fatalf("without email = %v", err)
 	}
@@ -52,7 +52,7 @@ func TestLoginEmailCodeRequirements(t *testing.T) {
 	if _, err := store.CreateUser("bob", "battery staple"); err != nil {
 		t.Fatalf("create bob: %v", err)
 	}
-	bob := enableLoginTwoFactor(t, store, "bob", "")
+	bob := enableLoginTwoFactor(t, store, "bob", "battery staple", "")
 	if _, err := store.SetEmail("bob", "bob@example.com"); err != nil {
 		t.Fatalf("set bob email: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestLoginEmailCodeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("set email: %v", err)
 	}
-	secret, err := store.StartTwoFactor(user.ID)
+	secret, err := store.StartTwoFactor(user.ID, "correct horse")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestLoginEmailCodeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, enableCode); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", enableCode); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 
@@ -240,7 +240,7 @@ func TestLoginEmailCodeLifecycle(t *testing.T) {
 	if got := countLoginEmailCodes(t, store, user.ID); got != 0 {
 		t.Fatalf("code survived two-factor reset: %d", got)
 	}
-	secret, err = store.StartTwoFactor(user.ID)
+	secret, err = store.StartTwoFactor(user.ID, "battery staple")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestLoginEmailCodeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, totp); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "battery staple", totp); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	if _, _, _, _, _, err := store.LoginWithRefreshFactors(

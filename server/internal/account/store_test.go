@@ -269,6 +269,33 @@ func TestRefreshReuseGrace(t *testing.T) {
 		t.Fatalf("replay did not revoke the recovered token: %v", err)
 	}
 
+	// Two clients alternating the two newest tokens must not keep each other
+	// alive: the first retry is tolerated, the next replay ends the session.
+	_, _, _, chain, _, err := store.LoginWithRefresh("alice", "correct horse", "", "", "", "")
+	if err != nil {
+		t.Fatalf("third login: %v", err)
+	}
+	now = now.Add(time.Second)
+	_, _, _, replacement, _, err := store.RefreshSession(chain)
+	if err != nil {
+		t.Fatalf("rotate chain: %v", err)
+	}
+	now = now.Add(time.Second)
+	_, attackerAccess, _, attackerToken, _, err := store.RefreshSession(chain)
+	if err != nil {
+		t.Fatalf("first in-window retry: %v", err)
+	}
+	now = now.Add(time.Second)
+	if _, _, _, _, _, err := store.RefreshSession(replacement); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("second in-window replay = %v, want ErrRefreshReused", err)
+	}
+	if _, err := store.Authenticate(attackerAccess); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("session survived the second replay: %v", err)
+	}
+	if _, _, _, _, _, err := store.RefreshSession(attackerToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token from the retry after revocation = %v", err)
+	}
+
 	// A retired token whose replacement was already used is a replay even
 	// inside the window.
 	_, _, _, fresh, _, err := store.LoginWithRefresh("alice", "correct horse", "", "", "", "")
@@ -1865,10 +1892,10 @@ func TestTwoFactorLoginLifecycle(t *testing.T) {
 	if enabled, err := store.TwoFactorEnabled(user.ID); err != nil || enabled {
 		t.Fatalf("new account two-factor = %v, %v", enabled, err)
 	}
-	if _, err := store.StartTwoFactor("missing"); !errors.Is(err, ErrUnknownUser) {
+	if _, err := store.StartTwoFactor("missing", "correct horse"); !errors.Is(err, ErrUnknownUser) {
 		t.Fatalf("start for unknown user = %v", err)
 	}
-	secret, err := store.StartTwoFactor(user.ID)
+	secret, err := store.StartTwoFactor(user.ID, "correct horse")
 	if err != nil || secret == "" {
 		t.Fatalf("start two-factor = %q, %v", secret, err)
 	}
@@ -1883,16 +1910,16 @@ func TestTwoFactorLoginLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, "000000"); !errors.Is(err, ErrInvalidTwoFactorCode) {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", "000000"); !errors.Is(err, ErrInvalidTwoFactorCode) {
 		t.Fatalf("enable with wrong code = %v", err)
 	}
-	if err := store.EnableTwoFactor(user.ID, code); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", code); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	if enabled, err := store.TwoFactorEnabled(user.ID); err != nil || !enabled {
 		t.Fatalf("enabled state = %v, %v", enabled, err)
 	}
-	if _, err := store.StartTwoFactor(user.ID); !errors.Is(err, ErrTwoFactorEnabled) {
+	if _, err := store.StartTwoFactor(user.ID, "correct horse"); !errors.Is(err, ErrTwoFactorEnabled) {
 		t.Fatalf("restart while enabled = %v", err)
 	}
 
@@ -1946,7 +1973,7 @@ func TestTwoFactorLoginLifecycle(t *testing.T) {
 	}
 
 	// Re-enroll, then let an operator reset a lost authenticator.
-	secret, err = store.StartTwoFactor(user.ID)
+	secret, err = store.StartTwoFactor(user.ID, "correct horse")
 	if err != nil {
 		t.Fatalf("restart two-factor: %v", err)
 	}
@@ -1954,7 +1981,7 @@ func TestTwoFactorLoginLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, code); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", code); err != nil {
 		t.Fatalf("re-enable two-factor: %v", err)
 	}
 	if err := store.ResetTwoFactor("nobody"); !errors.Is(err, ErrUnknownUser) {
@@ -1979,7 +2006,7 @@ func TestRecoveryCodesLifecycle(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	store.SetClock(func() time.Time { return now })
-	secret, err := store.StartTwoFactor(user.ID)
+	secret, err := store.StartTwoFactor(user.ID, "correct horse")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -1987,7 +2014,7 @@ func TestRecoveryCodesLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, code); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", code); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 
@@ -2084,7 +2111,7 @@ func TestTwoFactorSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	secret, err := store.StartTwoFactor(user.ID)
+	secret, err := store.StartTwoFactor(user.ID, "correct horse")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -2092,7 +2119,7 @@ func TestTwoFactorSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, code); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", code); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	codes, err := store.GenerateRecoveryCodes(user.ID, "correct horse", code)

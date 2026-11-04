@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func enableLoginTwoFactor(t *testing.T, store *Store, username, phone string) User {
+func enableLoginTwoFactor(t *testing.T, store *Store, username, password, phone string) User {
 	t.Helper()
 	user, err := store.FindUser(username)
 	if err != nil {
@@ -18,7 +18,7 @@ func enableLoginTwoFactor(t *testing.T, store *Store, username, phone string) Us
 			t.Fatalf("set phone: %v", err)
 		}
 	}
-	secret, err := store.StartTwoFactor(user.ID)
+	secret, err := store.StartTwoFactor(user.ID, password)
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -26,7 +26,7 @@ func enableLoginTwoFactor(t *testing.T, store *Store, username, phone string) Us
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, code); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", password, code); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	return user
@@ -57,7 +57,7 @@ func TestLoginSMSCodeRequirements(t *testing.T) {
 	if _, _, _, err := store.CreateLoginSMSCode("alice", "correct horse", time.Minute); !errors.Is(err, ErrTwoFactorNotEnabled) {
 		t.Fatalf("without two-factor = %v", err)
 	}
-	user := enableLoginTwoFactor(t, store, "alice", "")
+	user := enableLoginTwoFactor(t, store, "alice", "correct horse", "")
 	if _, _, _, err := store.CreateLoginSMSCode("alice", "correct horse", time.Minute); !errors.Is(err, ErrNoRecoveryPhone) {
 		t.Fatalf("without phone = %v", err)
 	}
@@ -78,7 +78,7 @@ func TestLoginSMSCodeRequirements(t *testing.T) {
 	if _, err := store.CreateUser("bob", "battery staple"); err != nil {
 		t.Fatalf("create bob: %v", err)
 	}
-	bob := enableLoginTwoFactor(t, store, "bob", "15550100002")
+	bob := enableLoginTwoFactor(t, store, "bob", "battery staple", "15550100002")
 	if _, err := store.SetBanned("bob", true); err != nil {
 		t.Fatalf("ban bob: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestLoginSMSCodeLifecycle(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
 	store.SetClock(func() time.Time { return now })
-	user := enableLoginTwoFactor(t, store, "alice", "15550100001")
+	user := enableLoginTwoFactor(t, store, "alice", "correct horse", "15550100001")
 
 	code, _, _, err := store.CreateLoginSMSCode("alice", "correct horse", 10*time.Minute)
 	if err != nil {
@@ -199,7 +199,7 @@ func TestLoginSMSCodeLifecycle(t *testing.T) {
 	if got := countLoginSMSCodes(t, store, user.ID); got != 0 {
 		t.Fatalf("code survived two-factor reset: %d", got)
 	}
-	secret, err := store.StartTwoFactor(user.ID)
+	secret, err := store.StartTwoFactor(user.ID, "correct horse")
 	if err != nil {
 		t.Fatalf("start two-factor: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestLoginSMSCodeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.EnableTwoFactor(user.ID, totp); err != nil {
+	if err := store.EnableTwoFactor(user.ID, "", "correct horse", totp); err != nil {
 		t.Fatalf("enable two-factor: %v", err)
 	}
 	if _, _, _, _, _, err := store.LoginWithRefreshSMS(

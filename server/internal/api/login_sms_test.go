@@ -13,7 +13,11 @@ import (
 func enableAccountTwoFactor(t *testing.T, s *testutil.Server, username, password string, at time.Time) string {
 	t.Helper()
 	token := login(t, s.URL, username, password).Token
-	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start", "", token)
+	startBody, err := json.Marshal(map[string]string{"password": password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, data := request(t, http.MethodPost, s.URL+"/v1/account/2fa/start", string(startBody), token)
 	if status != http.StatusOK {
 		t.Fatalf("start two-factor for %s: %d %s", username, status, data)
 	}
@@ -25,7 +29,7 @@ func enableAccountTwoFactor(t *testing.T, s *testutil.Server, username, password
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(map[string]string{"code": code})
+	body, err := json.Marshal(map[string]string{"password": password, "code": code})
 	if err != nil {
 		t.Fatal(err)
 	}

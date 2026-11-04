@@ -12,7 +12,7 @@
 - **默认部署不安全**：`chast-server` 默认 `--server-key` 为空、监听 `0.0.0.0:8443`、账号库默认开启。此时管理 API 对全网无鉴权，任何人可以创建管理员账号、重置密码、注册主机；relay 也退化成开放中继。这是本次审核唯一一条“默认配置即可接管”的问题（C1）。
 - **未认证 DoS 面较大**：rendezvous 的 keepalive 挑战可被任意覆盖（H1），QUIC 服务端在认证前会无限期占住唯一会话槽（H2）。两者都不需要任何凭据。
 - **远程内存安全无实际缺陷（H4 复核为误报）**：FFmpeg 解码把网络缓冲直接挂到非引用计数的 `AVPacket` 上，但 `avcodec_send_packet` 会先 `av_packet_ref` 复制并补齐 `AV_INPUT_BUFFER_PADDING_SIZE` 字节；已用 guard page 回归测试固化该契约。
-- **账号系统有两处设计缺口**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
+- **账号系统有两处设计缺口（H5/H6，已于 2026-11-05 修复，见各节）**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
 - **授权撤销在“仅文件”会话中不生效**，且旧掩码会带到下一次会话（H7）。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
@@ -299,6 +299,10 @@ err := s.cfg.Accounts.EnableTwoFactor(user.ID, req.Code)   // 只校验新 secre
 - `enable` 成功后吊销该账号其他会话并写审计；
 - 提供基于恢复码/运维的自助解绑路径。
 
+**修复（2026-11-05）**
+
+`StartTwoFactor`/`EnableTwoFactor` 在 store 层校验当前密码；`enable` 在同一事务内启用 2FA 并删除除调用者外的全部 access/refresh 会话，HTTP 层补充 `password rejected` 审计（成功审计改为 `other sessions revoked`）。恢复码登录与 `user 2fa <名> off` 保持为解绑路径。查看器启用对话框同步要求输入当前密码。API/store/Flutter 测试已覆盖错误密码与旧会话吊销。
+
 ---
 
 ### H6. `RefreshReuseGrace` 让刷新令牌重放检测失效，被盗 refresh token 可与正常客户端长期共存
@@ -332,6 +336,10 @@ if rotated != 0 {
 - 宽限只允许“替代者未被使用且未被轮换”，并在同一事务里记录 `replayed_at`；
 - 同一会话出现第二次并发刷新直接 `revokeSessionLocked`；
 - 更稳妥的做法是 token family + 使用即失效，不设宽限，客户端用幂等重试处理网络失败。
+
+**修复（2026-11-05）**
+
+`refresh_tokens` 增加 `replayed_at`（迁移 v5）。宽限分支要求被重放 token 从未被重放、替代者仍 `rotated_at = 0 AND replayed_at = 0`，并在同一事务内写入 `replayed_at`；同一会话只要已有一条重放记录，后续任何宽限重放都会 `revokeSessionLocked`。因此“丢失响应的第一次重试”仍然可用，而攻击者与受害者交替提交新旧 token 会在第二次重放时整会话失效。`TestRefreshReuseGrace` 增加了交替重放回归用例。
 
 ---
 
@@ -895,7 +903,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 1. C1：空 `--server-key` 拒绝启动 / 强制回环；relay 始终要求 per-lease token。
 2. H1：把 keepalive/relay/carrier 挑战改成无状态 HMAC 或多槽位，并加 per-IP 限流。
 3. H2：给“已连接未 Hello”加独立超时。
-4. H5：2FA start/enable 要求密码；H6：收紧 refresh 宽限。
+4. H5：2FA start/enable 要求密码；H6：收紧 refresh 宽限（均已完成，见各节修复说明）。
 
 **第二批（两周内，内存安全与远程 DoS）**
 
