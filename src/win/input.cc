@@ -188,10 +188,6 @@ DWORD mouse_flag(MouseAction action, uint16_t buttons) {
     }
 }
 
-DWORD x_button(uint16_t buttons) {
-    return (buttons & kMouseBack) ? XBUTTON1 : XBUTTON2;
-}
-
 uint16_t modifier_usage(uint16_t bit) {
     switch (bit) {
         case kModifierLeftCtrl: return 0xE0;
@@ -567,20 +563,54 @@ void InputInjector::apply_mouse(const MouseEvent& event) {
             break;
         case MouseAction::ButtonDown:
         case MouseAction::ButtonUp: {
-            if ((event.buttons & 0x1Fu) == 0) {
+            const uint16_t pressed = static_cast<uint16_t>(event.buttons & 0x1Fu);
+            if (pressed == 0) {
                 break;
             }
-            input.mi.dwFlags = mouse_flag(event.action, event.buttons);
-            if (event.buttons & (kMouseBack | kMouseForward)) {
-                input.mi.mouseData = x_button(event.buttons);
+            const bool down = event.action == MouseAction::ButtonDown;
+            UINT applied = 0;
+            UINT failed = 0;
+            const auto send_button = [&](DWORD flags, DWORD data) {
+                INPUT button{};
+                button.type = INPUT_MOUSE;
+                button.mi.dwFlags = flags;
+                button.mi.mouseData = data;
+                if (send(button) == 1) {
+                    ++applied;
+                } else {
+                    ++failed;
+                }
+            };
+            // One INPUT carries one flag, so a mask with several bits needs
+            // one call per bit. This matters for Back+Forward: sending a
+            // single XBUTTON left the other button down until release_all().
+            const uint16_t primary =
+                static_cast<uint16_t>(pressed & ~(kMouseBack | kMouseForward));
+            if (primary != 0) {
+                send_button(mouse_flag(event.action, primary), 0);
+                if (down) {
+                    held_buttons_ |= primary;
+                } else {
+                    held_buttons_ &= static_cast<uint16_t>(~primary);
+                }
             }
-            if (event.action == MouseAction::ButtonDown) {
-                held_buttons_ |= static_cast<uint16_t>(event.buttons & 0x1Fu);
-            } else {
-                held_buttons_ &= static_cast<uint16_t>(~(event.buttons & 0x1Fu));
+            for (const uint16_t bit :
+                 {static_cast<uint16_t>(kMouseBack), static_cast<uint16_t>(kMouseForward)}) {
+                if ((pressed & bit) == 0) {
+                    continue;
+                }
+                send_button(down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP,
+                            bit == kMouseBack ? XBUTTON1 : XBUTTON2);
+                if (down) {
+                    held_buttons_ |= bit;
+                } else {
+                    held_buttons_ &= static_cast<uint16_t>(~bit);
+                }
             }
-            posted = true;
-            break;
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.applied += applied;
+            stats_.failed += failed;
+            return;
         }
         case MouseAction::Wheel:
             input.mi.mouseData = static_cast<DWORD>(event.y);

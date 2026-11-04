@@ -1129,12 +1129,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       );
     }
     // Every Ctrl+Alt+Del request gets one answer. A refusal or unsupported
-    // host explains itself; success confirms the sequence was injected.
+    // host explains itself; success only means SendSAS was invoked, because
+    // Windows never reports whether the secure desktop actually appeared.
     if (!nowOver && status.sasUpdates > _status.sasUpdates) {
       final String reason = status.sasError;
       final String text;
       if (status.sasCode == ViewerSasCode.ok.code) {
-        text = tr('Ctrl+Alt+Del 已发送到主机');
+        text = tr('已请求主机发送 Ctrl+Alt+Del（Windows 不回报是否成功）');
       } else {
         final String detail = reason.isEmpty
             ? _sasCodeText(status.sasCode)

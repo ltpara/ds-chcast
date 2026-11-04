@@ -520,6 +520,28 @@ void test_password_and_permissions() {
           "the decision enum is usable");
 }
 
+void test_password_rehash() {
+    chast::HostSecurity::Config config;
+    config.mode = chast::HostAuthMode::Password;
+    const std::vector<uint8_t> salt(16, 0x42);
+    config.password_hash = chast::hash_password_with_salt(test_password(), salt, 1);
+    check(chast::password_hash_needs_rehash(config.password_hash),
+          "the fixture starts on an old iteration count");
+    chast::HostSecurity security(config);
+    chast::ClientHello hello = hello_with(test_password());
+    auto result = security.evaluate(hello, "127.0.0.1:9100", 1000);
+    check(result.decision == Decision::Allow, "the old hash still verifies");
+    check(security.password_hash().rfind("pbkdf2-sha256$600000$", 0) == 0,
+          "a successful login upgrades the hash to the current cost");
+    check(chast::verify_password(test_password(), security.password_hash()),
+          "the upgraded hash still verifies the password");
+
+    chast::ClientHello wrong = hello_with("not-the-password");
+    result = security.evaluate(wrong, "127.0.0.1:9100", 1001);
+    check(result.decision == Decision::Deny,
+          "the upgraded hash rejects a wrong password");
+}
+
 void test_file_transfer_mode() {
     chast::HostSecurity::Config config;
     config.mode = chast::HostAuthMode::Click;
@@ -606,6 +628,7 @@ int main() {
     test_lockout();
     test_service_mode();
     test_password_and_permissions();
+    test_password_rehash();
     test_file_transfer_mode();
     test_signature_message();
     if (failures != 0) {

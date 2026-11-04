@@ -422,6 +422,8 @@ bool write_clipboard_files(const std::vector<std::string>& paths, std::string* e
         }
         return false;
     }
+    // GlobalAlloc leaves stale bytes in the header; pt/fNC must be zero.
+    *drop = DROPFILES{};
     drop->pFiles = sizeof(DROPFILES);
     drop->fWide = TRUE;
     std::memcpy(reinterpret_cast<uint8_t*>(drop) + sizeof(DROPFILES), list.data(),

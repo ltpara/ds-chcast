@@ -12,3 +12,14 @@ Testing/
 chast-server-identity.key
 chast-server-state.db
 ds-chcastbuildpf-gui.ini
+
+# Certificates, private keys, logs and audit spools produced by local runs.
+# These are runtime material; a development tree must never publish them.
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+*.log
+*.jsonl

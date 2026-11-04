@@ -65,6 +65,21 @@ void save_trusted_devices(const std::vector<TrustedDevice>& devices) {
     }
 }
 
+void save_password_hash(const std::string& hash) {
+    std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
+    if (g_worker->settings.password_hash == hash) {
+        return;
+    }
+    g_worker->settings.password_hash = hash;
+    if (g_worker->settings_path.empty()) {
+        return;
+    }
+    std::string error;
+    if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
+        worker_log("cannot save the upgraded password hash: " + error);
+    }
+}
+
 void clear_migrated_identity(const std::string& old_id) {
     std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
     if (g_worker->settings.tunnel_old_id != old_id) {
@@ -193,6 +208,7 @@ int run_worker(std::string* error) {
     config.log = worker_log;
     config.token_changed = save_rotated_token;
     config.trusted_devices_changed = save_trusted_devices;
+    config.password_hash_changed = save_password_hash;
 
     std::string create_error;
     std::unique_ptr<HostServer> server = HostServer::create(std::move(config), &create_error);

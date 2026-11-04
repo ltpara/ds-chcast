@@ -120,13 +120,21 @@ void test_password_hashing() {
     const std::string first = chast::hash_password("correct horse");
     const std::string second = chast::hash_password("correct horse");
     check(!first.empty() &&
-              first.rfind("pbkdf2-sha256$210000$", 0) == 0,
+              first.rfind("pbkdf2-sha256$600000$", 0) == 0,
           "hash_password uses the default iteration count");
     check(first != second, "hash_password salts each hash");
     check(chast::verify_password("correct horse", first),
           "hash_password round-trips");
     check(!chast::verify_password("wrong horse", first),
           "hash_password rejects the wrong password");
+    check(chast::password_hash_needs_rehash(one),
+          "an older iteration count asks for a rehash");
+    check(!chast::password_hash_needs_rehash(first),
+          "a current hash needs no rehash");
+    check(!chast::password_hash_needs_rehash(""),
+          "an empty encoding needs no rehash");
+    check(!chast::password_hash_needs_rehash("bcrypt$1$73616c74$00"),
+          "an unknown scheme needs no rehash");
 }
 
 void test_totp() {

@@ -303,8 +303,6 @@ Error MfxDecoder::start_on(const ImplCandidate& candidate, const uint8_t* data, 
         return mfx_error(sts, "MFXCreateSession");
     }
     legacy_ = candidate.api_major < 2;
-    std::fprintf(stderr, "decoder: %s api %u.%u legacy=%d gpu=%d\n", candidate.name.c_str(),
-                 candidate.api_major, candidate.api_minor, legacy_ ? 1 : 0, gpu_ ? 1 : 0);
 
     if (gpu_) {
         sts = MFXVideoCORE_SetHandle(session_, MFX_HANDLE_D3D11_DEVICE,
@@ -448,10 +446,6 @@ mfxStatus MFX_CDECL MfxDecoder::alloc_frames(mfxHDL pthis, mfxFrameAllocRequest*
     if (!pthis || !request || !response) {
         return MFX_ERR_NULL_PTR;
     }
-    std::fprintf(stderr,
-                 "decoder: alloc type=0x%x fourcc=0x%x %ux%u min=%u suggested=%u\n",
-                 request->Type, request->Info.FourCC, request->Info.Width,
-                 request->Info.Height, request->NumFrameMin, request->NumFrameSuggested);
     response->mids = nullptr;
     response->NumFrameActual = 0;
     if ((request->Type & MFX_MEMTYPE_VIDEO_MEMORY_DECODER_TARGET) == 0 ||
@@ -476,7 +470,6 @@ mfxStatus MFX_CDECL MfxDecoder::alloc_frames(mfxHDL pthis, mfxFrameAllocRequest*
         }
         mids[i] = texture;
     }
-    std::fprintf(stderr, "decoder: alloc: %u textures\n", count);
     response->mids = mids;
     response->NumFrameActual = count;
     return MFX_ERR_NONE;

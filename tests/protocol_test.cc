@@ -176,6 +176,18 @@ void test_hello() {
     std::vector<uint8_t> unknown_capability = payload_of(chast::make_hello(sent));
     unknown_capability.back() = 0x80;
     rejects_hello(unknown_capability, "Hello with an unknown client capability is rejected");
+
+    chast::ClientHello long_name = sent;
+    long_name.device_name.assign(chast::kMaxDeviceNameLength - 1, 'a');
+    long_name.device_name += "\xC3\xA9";  // two bytes straddling the limit
+    check(parses_hello(payload_of(chast::make_hello(long_name)), got) &&
+              got.device_name == std::string(chast::kMaxDeviceNameLength - 1, 'a'),
+          "Hello truncates an over-long device name on the UTF-8 boundary");
+    chast::ClientHello invalid_name = sent;
+    invalid_name.device_name = "bad\xFFname";
+    check(parses_hello(payload_of(chast::make_hello(invalid_name)), got) &&
+              got.device_name.empty(),
+          "Hello drops a device name that is not UTF-8 instead of emitting it");
 }
 
 void test_access_denied() {
@@ -211,6 +223,17 @@ void test_access_denied() {
 
     check(!chast::parse_access_denied(std::vector<uint8_t>(2), code, reason, &error),
           "short AccessDenied is rejected");
+
+    std::vector<uint8_t> invalid_reason =
+        payload_of(chast::make_access_denied(chast::AccessDenial::Declined, "ab"));
+    invalid_reason.back() = 0xFF;
+    check(!chast::parse_access_denied(invalid_reason, code, reason, &error),
+          "AccessDenied with a non-UTF-8 reason is rejected");
+    check(chast::parse_access_denied(
+              payload_of(chast::make_access_denied(chast::AccessDenial::Declined, "bad\xFF")),
+              code, reason, &error) &&
+              reason.empty(),
+          "the AccessDenied maker drops a reason that is not UTF-8");
 }
 
 void test_hello_ack() {
@@ -314,6 +337,15 @@ void test_hello_ack() {
                                  &error) &&
               !datagram_got.audio_datagram,
           "HelloAck leaves datagram audio off when it is not announced");
+
+    std::vector<uint8_t> nonzero_reserved = payload_of(chast::make_hello_ack(sent));
+    nonzero_reserved[1] = 1;  // codec(1), then the reserved byte
+    check(!chast::parse_hello_ack(nonzero_reserved, got, &error),
+          "HelloAck with a non-zero reserved byte is rejected");
+    std::vector<uint8_t> trailing_ack = payload_of(chast::make_hello_ack(sent));
+    trailing_ack.push_back(0);
+    check(!chast::parse_hello_ack(trailing_ack, got, &error),
+          "HelloAck with trailing bytes is rejected");
 
     chast::ServerInfo opus = sent;
     opus.audio.codec = chast::AudioCodec::Opus;
@@ -1140,6 +1172,15 @@ void test_frame_header() {
     old_version[5] = 0;
     check(!chast::decode_frame_header(old_version.data(), old_version.size(), got, &error),
           "FrameHeader from another protocol version is rejected");
+    std::vector<uint8_t> unknown_flags(bytes, bytes + sizeof(bytes));
+    unknown_flags[6] = 0x04;  // magic(4), version(2), then the flag word
+    check(!chast::decode_frame_header(unknown_flags.data(), unknown_flags.size(), got, &error),
+          "FrameHeader with unknown flags is rejected");
+    std::vector<uint8_t> nonzero_reserved(bytes, bytes + sizeof(bytes));
+    nonzero_reserved.back() = 1;
+    check(!chast::decode_frame_header(nonzero_reserved.data(), nonzero_reserved.size(), got,
+                                      &error),
+          "FrameHeader with a non-zero reserved byte is rejected");
     check(!chast::decode_frame_header(bytes, chast::kFrameHeaderSize - 1, got, &error),
           "a short FrameHeader is rejected");
 }
@@ -2192,6 +2233,27 @@ void test_input_events() {
     std::vector<uint8_t> unknown_modifiers = body;
     unknown_modifiers[15] = 0x80;
     rejects(unknown_modifiers, "unknown input state bits are rejected");
+    std::vector<uint8_t> trailing_event = body;
+    trailing_event.push_back(0);
+    rejects(trailing_event, "InputEvent with trailing bytes is rejected");
+
+    chast::ClientStats stats;
+    stats.received = 10;
+    stats.decoded = 9;
+    stats.crc_errors = 1;
+    stats.decode_errors = 2;
+    stats.digest = 0x0123456789ABCDEFull;
+    stats.elapsed_ms = 3000;
+    std::vector<uint8_t> stats_payload = payload_of(chast::make_stats(stats));
+    chast::ClientStats got_stats;
+    check(chast::parse_stats(stats_payload, got_stats, &error) &&
+              got_stats.received == 10 && got_stats.decoded == 9 &&
+              got_stats.crc_errors == 1 && got_stats.decode_errors == 2 &&
+              got_stats.digest == stats.digest && got_stats.elapsed_ms == 3000,
+          "Stats round-trips its counters");
+    stats_payload.push_back(0);
+    check(!chast::parse_stats(stats_payload, got_stats, &error),
+          "Stats with trailing bytes is rejected");
 }
 
 // The injector's whole path except SendInput itself, which is what the dry
@@ -2634,6 +2696,55 @@ void test_file_transfer() {
     std::vector<uint8_t> cancel_io = payload_of(chast::make_file_cancel(cancel));
     check(!chast::parse_file_cancel(cancel_io, got_cancel, &error),
           "FileCancel with a non-cancel code is rejected");
+
+    chast::FileOffer zero_offer = offer;
+    zero_offer.transfer_id = 0;
+    check(chast::make_file_offer(zero_offer).empty(),
+          "the FileOffer maker refuses a zero transfer id");
+    chast::FileOffer empty_named = offer;
+    empty_named.name.clear();
+    check(chast::make_file_offer(empty_named).empty(),
+          "the FileOffer maker refuses an empty name");
+    chast::FileOffer invalid_named = offer;
+    invalid_named.name = "bad\xFFname";
+    check(chast::make_file_offer(invalid_named).empty(),
+          "the FileOffer maker refuses a non-UTF-8 name");
+
+    std::vector<uint8_t> zero_offer_wire = payload_of(chast::make_file_offer(offer));
+    std::fill(zero_offer_wire.begin(), zero_offer_wire.begin() + 4, 0);
+    rejects_offer(std::move(zero_offer_wire), "FileOffer with a zero transfer id is rejected");
+
+    chast::FileAnswer zero_answer;
+    zero_answer.transfer_id = 0;
+    zero_answer.code = chast::FileCode::Ok;
+    check(chast::make_file_answer(zero_answer).empty(),
+          "the FileAnswer maker refuses a zero transfer id");
+    std::vector<uint8_t> zero_answer_wire =
+        payload_of(chast::make_file_answer(answer));
+    std::fill(zero_answer_wire.begin(), zero_answer_wire.begin() + 4, 0);
+    check(!chast::parse_file_answer(zero_answer_wire, got_answer, &error),
+          "FileAnswer with a zero transfer id is rejected");
+
+    chast::FileResult zero_result;
+    zero_result.transfer_id = 0;
+    zero_result.code = chast::FileCode::Cancelled;
+    check(chast::make_file_result(zero_result).empty(),
+          "the FileResult maker refuses a zero transfer id");
+    result.code = chast::FileCode::DigestMismatch;
+    std::vector<uint8_t> zero_result_wire = payload_of(chast::make_file_result(result));
+    std::fill(zero_result_wire.begin(), zero_result_wire.begin() + 4, 0);
+    check(!chast::parse_file_result(zero_result_wire, got_result, &error),
+          "FileResult with a zero transfer id is rejected");
+
+    chast::FileCancel zero_cancel;
+    zero_cancel.transfer_id = 0;
+    check(chast::make_file_cancel(zero_cancel).empty(),
+          "the FileCancel maker refuses a zero transfer id");
+    cancel.code = chast::FileCode::Cancelled;
+    std::vector<uint8_t> zero_cancel_wire = payload_of(chast::make_file_cancel(cancel));
+    std::fill(zero_cancel_wire.begin(), zero_cancel_wire.begin() + 4, 0);
+    check(!chast::parse_file_cancel(zero_cancel_wire, got_cancel, &error),
+          "FileCancel with a zero transfer id is rejected");
 
     chast::FileStreamHeader header;
     header.transfer_id = 7;

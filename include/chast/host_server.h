@@ -280,6 +280,10 @@ struct HostServerConfig {
     // device reconnected, or the operator revoked one. Called on the host
     // thread; the receiver saves the list so it survives a restart.
     std::function<void(const std::vector<TrustedDevice>&)> trusted_devices_changed;
+    // A successful password login replaced an older PBKDF2 hash with one at
+    // the current cost. Called on the host thread; the receiver saves the new
+    // encoding so the upgrade survives a restart.
+    std::function<void(const std::string&)> password_hash_changed;
     // Called after HelloAck with the description that went out.
     std::function<void(const ServerInfo&)> stream_announced;
     // Called for every encoded access unit that was handed to the transport,

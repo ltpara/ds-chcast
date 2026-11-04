@@ -42,7 +42,9 @@ struct AuditFileRecord {
 
 // Appends one line. Opens and closes the file per record so the agent can
 // delete it between writes; missing directories are the caller's problem (the
-// default spool sits next to host.ini, which already exists).
+// default spool sits next to host.ini, which already exists). The spool
+// rotates to "<path>.1" past 5 MiB so a host without an agent cannot grow it
+// without bound; only one backup is kept.
 bool append_audit_session(const std::string& spool_path, const AuditSessionRecord& record,
                           std::string* error = nullptr);
 bool append_audit_file(const std::string& spool_path, const AuditFileRecord& record,

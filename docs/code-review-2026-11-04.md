@@ -20,6 +20,7 @@
 - **剪贴板文本限额不一致、`.part` 与用户文件同名、接收 reparse 检查 TOCTOU（M14-M16，已于 2026-11-05 修复，见各节）**：文本改按 4 MiB 校验且全部句柄就绪后才清空剪贴板；中间态移入 `<root>\.chast-partial\<hash>.part`；中间文件与 sidecar 以 `FILE_FLAG_OPEN_REPARSE_POINT` 打开并做句柄级复核。
 - **更新器校验后按路径执行、管理控制台无认证、CSV 公式注入（M17-M19，已于 2026-11-05 修复，见各节）**：暂存文件在启动安装器前重算 SHA-256 与长度，默认暂存目录移到可执行文件旁的 `updates`；管理控制台要求首行 `auth <token>`（缺省随机生成并记录日志，常量时间比较）；CSV 导出对以 `= + - @ \t \r` 开头的单元格（单独的 `-` 占位除外）前置 `'`。
 - **客户端通道明文、首次信任与终端/下载防护（M24-M29，已于 2026-11-05 修复，见各节）**：连接服务除回环外强制 HTTPS；服务密钥与账号 token 一样走 DPAPI，并经 stdin 传给 `chast-tunnel`；直连首次连接弹出主机证书指纹确认，保存失败会明确标注“本次未固定”；账号 token 保护失败时不再写明文；终端 CSI 解析有长度与工作量上限；WebAuthn 的 rpId/origin 绑定到所配置的服务器；录制下载边写边校验大小与 SHA-256。
+- **低危健壮性与一致性（L1-L16，已于 2026-11-05 清理，见第 4 节）**：协议解析与构造双端校验、鼠标 X 键按位释放、审计 spool 5 MiB 轮转、PBKDF2 提到 600k 并在登录后自动 rehash、宽窄字符串转换越界、Windows 保留文件名清洗与 `.gitignore` 补齐。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -45,7 +46,7 @@
 | Critical | 1 | 默认部署下未认证即可接管管理面/中继 |
 | High | 7 | 远程 DoS、远程越界读、账号接管、授权撤销失效 |
 | Medium | 17 | 内存安全竞态、审计/日志可信度、本地提权面、客户端密钥暴露 |
-| Low | 12 | 健壮性、一致性、清理项 |
+| Low | 16 | 健壮性、一致性、清理项 |
 
 > 说明：本报告按“可利用性 + 影响面”定级。需要本机低权限用户配合的（TOCTOU、命令行读取密钥）定为 Medium；需要已认证 viewer 配合但能打挂宿主进程的定为 High。
 
@@ -991,6 +992,19 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 | L15 | [`app/lib/server_api.dart:3385`](../app/lib/server_api.dart#L3385) | 录制文件名清洗未处理 Windows 保留名/trailing dot | 复用主机侧 `sanitize_wide` 规则 |
 | L16 | [`.gitignore`](../.gitignore) | 未忽略 PEM、日志、`server_identity_audit.jsonl` 等本地产物 | 补规则，避免误提交密钥/日志 |
 
+**修复（2026-11-05）**
+
+- L1/L2/L5-L7：`parse_hello_ack` 校验保留字节并要求读到尾部；`decode_frame_header` 拒绝未知 flag 位并读取最后一个保留字节；`make_hello` 按 UTF-8 边界截断设备名；`make_access_denied` 复用 `truncate_utf8_reason`，`parse_access_denied` 拒绝非 UTF-8 reason；`parse_stats`/`parse_input_event` 追加 `at_end()`。
+- L3/L4：`make_file_offer` 对空名、非法 UTF-8 名、超限大小直接返回 `{}`；FileOffer/FileAnswer/FileResult/FileCancel 的构造与解析两侧都拒绝 `transfer_id == 0`。
+- L8/L9：`DROPFILES` 写入前整体清零；鼠标按键按位注入，Back+Forward 合并的 `buttons` 现在会各发一个 XBUTTON DOWN/UP 并分别计数。
+- L10：`SendSAS` 无法回报结果，查看器 Ok 文案改为“已请求主机发送 Ctrl+Alt+Del（Windows 不回报是否成功）”，主机日志同样只记录请求。
+- L11：审计 spool 超过 5 MiB 时轮转为 `<path>.1`（只保留一个备份），并用互斥量串行化大小检查与追加。
+- L12：VPL 解码器删除会话建立/表面池分配的 `fprintf`，仅保留错误路径输出。
+- L13：PBKDF2 默认迭代 210k → 600k；新增 `password_hash_needs_rehash`，成功登录时用明文把旧哈希升级到当前强度，并通过 `password_hash_changed` 回调持久化（tray 与 service worker 都已接）。
+- L14：`wasapi_common.h` 的 `narrow()` 及 `camera.cc` 的 `utf8()`/`wide()` 改为按转换所需长度分配、转换后 `pop_back()`，不再写入 `std::string` 终止符槽位。
+- L15：录制下载名清洗补齐 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9/CONIN$/CONOUT$）、尾随点与空格处理，并新增回归测试。
+- L16：`.gitignore` 增加 `*.pem`、`*.key`、`*.crt`、`*.cer`、`*.pfx`、`*.p12`、`*.log`、`*.jsonl`。
+
 ---
 
 ## 5. 已核实、未发现问题的部分
@@ -1044,7 +1058,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 **第四批（持续）**
 
-13. 低危表逐项清理；补恶意输入测试；统一日志/审计格式；CI 加 `govulncheck` 与依赖扫描。
+13. 低危表 L1-L16 已清理（见第 4 节修复说明）；恶意输入测试已随协议修复补齐一部分，统一日志/审计格式与 CI `govulncheck`/依赖扫描仍待办。
 
 ---
 

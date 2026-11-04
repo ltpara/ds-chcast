@@ -658,6 +658,24 @@ bool verify_password(const std::string& password, const std::string& encoded) {
     return equal;
 }
 
+bool password_hash_needs_rehash(const std::string& encoded) {
+    constexpr std::string_view kPrefix = "pbkdf2-sha256$";
+    if (encoded.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return false;
+    }
+    const size_t begin = kPrefix.size();
+    const size_t end = encoded.find('$', begin);
+    if (end == std::string::npos) {
+        return false;
+    }
+    uint32_t iterations = 0;
+    const auto parsed = std::from_chars(encoded.data() + begin, encoded.data() + end, iterations);
+    if (parsed.ec != std::errc() || parsed.ptr != encoded.data() + end || iterations == 0) {
+        return false;
+    }
+    return iterations < kPasswordHashIterations;
+}
+
 // ----- TOTP -----
 
 std::string generate_totp_secret() {

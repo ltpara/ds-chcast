@@ -70,6 +70,7 @@ constexpr UINT kTunnelExitMessage = WM_APP + 5;
 constexpr UINT kSecurityMessage = WM_APP + 6;
 constexpr UINT kSecurityPageMessage = WM_APP + 7;
 constexpr UINT kChatMessage = WM_APP + 8;
+constexpr UINT kPasswordHashMessage = WM_APP + 9;
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -281,6 +282,13 @@ void server_token_changed(const std::string& token) {
 void server_trusted_devices_changed(const std::vector<TrustedDevice>& devices) {
     auto* copy = new std::vector<TrustedDevice>(devices);
     if (!PostMessageW(g_app->window, kSecurityMessage, 0, reinterpret_cast<LPARAM>(copy))) {
+        delete copy;
+    }
+}
+
+void server_password_hash_changed(const std::string& hash) {
+    auto* copy = new std::string(hash);
+    if (!PostMessageW(g_app->window, kPasswordHashMessage, 0, reinterpret_cast<LPARAM>(copy))) {
         delete copy;
     }
 }
@@ -702,6 +710,7 @@ void start_server() {
     config.log = server_log;
     config.token_changed = server_token_changed;
     config.trusted_devices_changed = server_trusted_devices_changed;
+    config.password_hash_changed = server_password_hash_changed;
     config.chat_message = server_chat;
     std::string error;
     g_app->server = HostServer::create(std::move(config), &error);
@@ -3155,6 +3164,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             delete devices;
             save_settings();
             refresh_ui();
+            return 0;
+        }
+        case kPasswordHashMessage: {
+            auto* hash = reinterpret_cast<std::string*>(lparam);
+            g_app->settings.password_hash = *hash;
+            delete hash;
+            save_settings();
             return 0;
         }
         case kChatMessage: {

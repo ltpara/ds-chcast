@@ -586,6 +586,23 @@ void test_audit_spool(const std::filesystem::path& dir) {
               R"({"kind":"file","audit_ref":"00112233aabbccdd","direction":"upload","name":"报告\nb.txt","size":42,"occurred_at_ms":1700000004000,"success":true,"detail":""})",
           "the file line escapes the name and carries the size");
 
+    // A spool nobody consumes must stay bounded: an append past the cap
+    // rotates the full file to .1 and starts a fresh active file.
+    const std::string rotating = (folder / L"rotating.jsonl").string();
+    chast::AuditSessionRecord large = session;
+    large.detail.assign(5 * 1024 * 1024, 'x');
+    check(chast::append_audit_session(rotating, large, &error),
+          "a record larger than the cap is appended");
+    check(chast::append_audit_session(rotating, session, &error),
+          "the next append rotates the spool");
+    check(std::filesystem::exists(folder / L"rotating.jsonl.1"),
+          "the full spool is kept as .1");
+    std::ifstream rotated(folder / L"rotating.jsonl", std::ios::binary);
+    std::string rotated_line;
+    check(static_cast<bool>(std::getline(rotated, rotated_line)) &&
+              rotated_line.rfind("{\"kind\":\"session\"", 0) == 0,
+          "the fresh spool starts with the new record");
+
     chast::AuditSessionRecord missing;
     check(!chast::append_audit_session(spool, missing, &error),
           "a record without a viewer reference is refused");

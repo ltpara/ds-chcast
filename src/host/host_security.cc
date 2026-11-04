@@ -397,6 +397,15 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     bool permanent_ok = false;
     if (hash_present && hash_usable) {
         permanent_ok = verify_password(hello.password, config_.password_hash);
+        // The plaintext is only available here, so this is the one moment an
+        // older, cheaper hash can be upgraded. HostServer persists the new
+        // encoding after the login commits.
+        if (permanent_ok && password_hash_needs_rehash(config_.password_hash)) {
+            std::string rehashed = hash_password(hello.password);
+            if (!rehashed.empty()) {
+                config_.password_hash = std::move(rehashed);
+            }
+        }
     }
     bool temporary_ok = false;
     if (!temporary_password_.empty() &&

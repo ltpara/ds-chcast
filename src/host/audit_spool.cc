@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <mutex>
 
 namespace chast {
 
@@ -75,6 +76,41 @@ void append_bool(std::string& out, const char* key, bool value) {
     out += value ? "true" : "false";
 }
 
+constexpr ULONGLONG kMaxSpoolBytes = 5ull * 1024 * 1024;
+
+// Two host threads can append (session end and file uploads); serializing the
+// size check and the append keeps rotation from splitting a record.
+std::mutex& spool_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+bool rotate_spool_if_needed(const std::wstring& path, const std::string& spool_path,
+                            std::string* error) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+        return true;  // no file yet; the append below creates it
+    }
+    const ULONGLONG size =
+        (static_cast<ULONGLONG>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+    if (size < kMaxSpoolBytes) {
+        return true;
+    }
+    // Keep exactly one rotated spool. When no agent consumes the file (for
+    // example tunnel=false) this caps the disk cost at about twice the limit;
+    // the agent keeps forwarding from the fresh active file afterwards.
+    const std::wstring backup = path + L".1";
+    if (!MoveFileExW(path.c_str(), backup.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (error != nullptr) {
+            *error = "cannot rotate audit spool " + spool_path + " (Windows error " +
+                     std::to_string(GetLastError()) + ")";
+        }
+        return false;
+    }
+    return true;
+}
+
 bool append_line(const std::string& spool_path, const std::string& line, std::string* error) {
     if (spool_path.empty()) {
         if (error != nullptr) {
@@ -92,6 +128,10 @@ bool append_line(const std::string& spool_path, const std::string& line, std::st
     // Deliberately no FILE_SHARE_DELETE: the agent removes the spool after
     // storing every line, and a delete in the middle of this append would
     // throw the new record away. The agent retries on the next tick.
+    std::lock_guard<std::mutex> lock(spool_mutex());
+    if (!rotate_spool_if_needed(path, spool_path, error)) {
+        return false;
+    }
     HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);

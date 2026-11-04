@@ -3437,14 +3437,34 @@ class ServerApi {
     return name.trim().isEmpty ? 'recording.mp4' : name;
   }
 
-  static Future<File> _newRecordingFile(Directory directory, String name) async {
-    String safe = name.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
+  static final RegExp _invalidFileChars = RegExp(r'[\\/:*?"<>|\x00-\x1f]');
+  // Windows treats these names as devices even with an extension, and drops
+  // trailing dots, so a name straight from the server could land somewhere
+  // other than the intended file.
+  static final RegExp _windowsReservedName = RegExp(
+    r'^(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])$',
+    caseSensitive: false,
+  );
+
+  static String _safeRecordingName(String name) {
+    String safe = name.replaceAll(_invalidFileChars, '_').trim();
+    safe = safe.replaceFirst(RegExp(r'[. ]+$'), '');
     if (safe.isEmpty) {
-      safe = 'recording.mp4';
+      return 'recording.mp4';
+    }
+    final int dot = safe.indexOf('.');
+    final String stem = dot > 0 ? safe.substring(0, dot) : safe;
+    if (_windowsReservedName.hasMatch(stem)) {
+      safe = '_$safe';
     }
     if (!safe.toLowerCase().endsWith('.mp4')) {
       safe = '$safe.mp4';
     }
+    return safe;
+  }
+
+  static Future<File> _newRecordingFile(Directory directory, String name) async {
+    final String safe = _safeRecordingName(name);
     final String separator = Platform.pathSeparator;
     File file = File('${directory.path}$separator$safe');
     if (!await file.exists()) {

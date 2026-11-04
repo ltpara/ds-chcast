@@ -237,6 +237,9 @@ void set_error(std::string* error, const std::string& message) {
     }
 }
 
+// Defined further down with the other text helpers; the early makers need it.
+std::string truncate_utf8_reason(const std::string& reason, size_t limit);
+
 }  // namespace
 
 uint32_t crc32(const uint8_t* data, size_t size) {
@@ -300,6 +303,10 @@ bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
         set_error(error, "unsupported frame protocol version " + std::to_string(version));
         return false;
     }
+    if ((flags & ~0x3u) != 0) {
+        set_error(error, "frame header carries unknown flags");
+        return false;
+    }
     if (!codec_from_wire(codec, header.codec)) {
         set_error(error, "unknown frame codec " + std::to_string(codec));
         return false;
@@ -323,6 +330,11 @@ bool decode_frame_header(const uint8_t* data, size_t size, FrameHeader& header,
             return false;
         }
         header.capture_ms |= static_cast<uint64_t>(byte) << (8 * i);
+    }
+    uint8_t reserved = 0;
+    if (!reader.u8(reserved) || reserved != 0) {
+        set_error(error, "frame header has a malformed reserved byte");
+        return false;
     }
     return true;
 }
@@ -526,9 +538,9 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     const size_t key_size = hello.device_key.size() > kMaxDeviceKeyLength
                                 ? kMaxDeviceKeyLength
                                 : hello.device_key.size();
-    const size_t name_size = hello.device_name.size() > kMaxDeviceNameLength
-                                 ? kMaxDeviceNameLength
-                                 : hello.device_name.size();
+    const std::string device_name =
+        truncate_utf8_reason(hello.device_name, kMaxDeviceNameLength);
+    const size_t name_size = device_name.size();
     const size_t signature_size = hello.signature.size() > kMaxSignatureLength
                                       ? kMaxSignatureLength
                                       : hello.signature.size();
@@ -558,7 +570,7 @@ std::vector<uint8_t> make_hello(const ClientHello& hello) {
     put_u8(cursor, hello.device_platform);
     put_u16(cursor, static_cast<uint16_t>(name_size));
     if (name_size > 0) {
-        std::memcpy(cursor, hello.device_name.data(), name_size);
+        std::memcpy(cursor, device_name.data(), name_size);
         cursor += name_size;
     }
     std::memcpy(cursor, hello.nonce.data(), kHelloNonceBytes);
@@ -725,13 +737,14 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
 }
 
 std::vector<uint8_t> make_access_denied(AccessDenial code, const std::string& reason) {
-    const size_t reason_size =
-        reason.size() > kMaxAccessDenialReason ? kMaxAccessDenialReason : reason.size();
-    std::vector<uint8_t> payload(3 + reason_size);
+    const std::string text = truncate_utf8_reason(reason, kMaxAccessDenialReason);
+    std::vector<uint8_t> payload(3 + text.size());
     uint8_t* cursor = payload.data();
     put_u8(cursor, static_cast<uint8_t>(code));
-    put_u16(cursor, static_cast<uint16_t>(reason_size));
-    std::memcpy(cursor, reason.data(), reason_size);
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
     return make_control(ControlType::AccessDenied, payload);
 }
 
@@ -755,6 +768,10 @@ bool parse_access_denied(const std::vector<uint8_t>& payload, AccessDenial& code
     }
     if (!reader.string(reason, reason_size)) {
         set_error(error, "truncated AccessDenied reason");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "AccessDenied reason is not valid UTF-8");
         return false;
     }
     code = static_cast<AccessDenial>(raw_code);
@@ -892,6 +909,10 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         !reader.u32(origin_x) || !reader.u32(origin_y) || !reader.u16(flags) ||
         !reader.u16(name_size)) {
         set_error(error, "truncated HelloAck");
+        return false;
+    }
+    if (reserved != 0) {
+        set_error(error, "HelloAck carries a non-zero reserved byte");
         return false;
     }
     info.origin_x = static_cast<int32_t>(origin_x);
@@ -1115,6 +1136,10 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.terminal_enabled = (permissions & kPermissionTerminal) != 0;
     info.record_enabled = (permissions & kPermissionRecord) != 0;
     info.camera_enabled = (permissions & kPermissionCamera) != 0;
+    if (!reader.at_end()) {
+        set_error(error, "HelloAck carries trailing bytes");
+        return false;
+    }
     return true;
 }
 
@@ -1134,8 +1159,9 @@ bool parse_stats(const std::vector<uint8_t>& payload, ClientStats& stats, std::s
     Reader reader(payload.data(), payload.size());
     if (!reader.u64(stats.received) || !reader.u64(stats.decoded) ||
         !reader.u64(stats.crc_errors) || !reader.u64(stats.decode_errors) ||
-        !reader.u64(stats.digest) || !reader.u64(stats.elapsed_ms)) {
-        set_error(error, "truncated Stats");
+        !reader.u64(stats.digest) || !reader.u64(stats.elapsed_ms) ||
+        !reader.at_end()) {
+        set_error(error, "malformed Stats");
         return false;
     }
     return true;
@@ -1233,7 +1259,7 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
             event.mouse.buttons = buttons;
             event.mouse.x = static_cast<int32_t>(x);
             event.mouse.y = static_cast<int32_t>(y);
-            return true;
+            break;
         case static_cast<uint8_t>(InputKind::Key):
             if (action > static_cast<uint8_t>(KeyAction::Up)) {
                 set_error(error, "InputEvent names unknown key action " + std::to_string(action));
@@ -1246,11 +1272,16 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
             event.kind = InputKind::Key;
             event.key.action = static_cast<KeyAction>(action);
             event.key.hid_usage = hid_usage;
-            return true;
+            break;
         default:
             set_error(error, "InputEvent names unknown kind " + std::to_string(kind));
             return false;
     }
+    if (!reader.at_end()) {
+        set_error(error, "InputEvent carries trailing bytes");
+        return false;
+    }
+    return true;
 }
 
 bool valid_clipboard_text(const std::string& text) {
@@ -2761,6 +2792,12 @@ std::string make_offer_relative_path(const std::string& top, const std::string& 
 }
 
 std::vector<uint8_t> make_file_offer(const FileOffer& offer) {
+    if (offer.transfer_id == 0 || offer.name.empty() || !valid_utf8(offer.name) ||
+        offer.size > kMaxFileTransferBytes) {
+        // The parser refuses these, so sending them would only stall the
+        // transfer until the peer's timeout.
+        return {};
+    }
     const std::string name = truncate_utf8_reason(offer.name, kMaxFileNameBytes);
     std::string relative = offer.relative_path;
     if (relative.size() > kMaxFileRelativePathBytes) {
@@ -2801,6 +2838,10 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
         set_error(error, "FileOffer carries unknown flags");
         return false;
     }
+    if (offer.transfer_id == 0) {
+        set_error(error, "FileOffer carries no transfer id");
+        return false;
+    }
     offer.resume = (flags & kFileOfferFlagResume) != 0;
     offer.clipboard = (flags & kFileOfferFlagClipboard) != 0;
     if (offer.size > kMaxFileTransferBytes) {
@@ -2837,6 +2878,9 @@ bool parse_file_offer(const std::vector<uint8_t>& payload, FileOffer& offer, std
 }
 
 std::vector<uint8_t> make_file_answer(const FileAnswer& answer) {
+    if (answer.transfer_id == 0) {
+        return {};
+    }
     const std::string text = truncate_utf8_reason(answer.reason, kMaxFileReasonBytes);
     std::vector<uint8_t> payload(4 + 1 + 8 + 2 + text.size());
     uint8_t* cursor = payload.data();
@@ -2864,6 +2908,10 @@ bool parse_file_answer(const std::vector<uint8_t>& payload, FileAnswer& answer,
     if (!parse_file_code(raw_code, answer.code, error)) {
         return false;
     }
+    if (answer.transfer_id == 0) {
+        set_error(error, "FileAnswer carries no transfer id");
+        return false;
+    }
     if (answer.code != FileCode::Ok) {
         if (answer.resume_offset != 0) {
             set_error(error, "a refused FileAnswer carries a resume offset");
@@ -2877,6 +2925,9 @@ bool parse_file_answer(const std::vector<uint8_t>& payload, FileAnswer& answer,
 }
 
 std::vector<uint8_t> make_file_result(const FileResult& result) {
+    if (result.transfer_id == 0) {
+        return {};
+    }
     const std::string text = truncate_utf8_reason(result.reason, kMaxFileReasonBytes);
     std::vector<uint8_t> payload(4 + 1 + 8 + 2 + text.size());
     uint8_t* cursor = payload.data();
@@ -2904,6 +2955,10 @@ bool parse_file_result(const std::vector<uint8_t>& payload, FileResult& result,
     if (!parse_file_code(raw_code, result.code, error)) {
         return false;
     }
+    if (result.transfer_id == 0) {
+        set_error(error, "FileResult carries no transfer id");
+        return false;
+    }
     if (result.code != FileCode::Ok && result.code != FileCode::DigestMismatch &&
         result.code != FileCode::IoError && result.code != FileCode::Cancelled) {
         set_error(error, "FileResult carries a code it cannot report");
@@ -2917,6 +2972,9 @@ bool parse_file_result(const std::vector<uint8_t>& payload, FileResult& result,
 }
 
 std::vector<uint8_t> make_file_cancel(const FileCancel& cancel) {
+    if (cancel.transfer_id == 0) {
+        return {};
+    }
     const std::string text = truncate_utf8_reason(cancel.reason, kMaxFileReasonBytes);
     std::vector<uint8_t> payload(4 + 1 + 2 + text.size());
     uint8_t* cursor = payload.data();
@@ -2941,6 +2999,10 @@ bool parse_file_cancel(const std::vector<uint8_t>& payload, FileCancel& cancel,
         return false;
     }
     if (!parse_file_code(raw_code, cancel.code, error)) {
+        return false;
+    }
+    if (cancel.transfer_id == 0) {
+        set_error(error, "FileCancel carries no transfer id");
         return false;
     }
     if (cancel.code != FileCode::Cancelled) {

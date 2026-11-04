@@ -221,8 +221,14 @@ inline std::string narrow_utf8(const wchar_t* text) {
     if (size <= 1) {
         return {};
     }
-    std::string narrow(static_cast<size_t>(size - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow.data(), size, nullptr, nullptr);
+    std::string narrow(static_cast<size_t>(size), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, text, -1, narrow.data(), size, nullptr, nullptr) == 0) {
+        return {};
+    }
+    // The conversion writes the string plus its NUL terminator; drop the
+    // terminator instead of handing WideCharToMultiByte one byte past the
+    // string's storage.
+    narrow.pop_back();
     return narrow;
 }
 

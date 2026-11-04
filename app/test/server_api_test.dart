@@ -3103,6 +3103,30 @@ void main() {
     expect(await second.readAsBytes(), <int>[0, 1, 2, 3, 4]);
   });
 
+  test('downloadRecording avoids Windows device names and trailing dots', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-download-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType('video', 'mp4');
+      request.response.add(<int>[0, 1, 2, 3, 4]);
+      await request.response.close();
+    });
+    final String digest = sha256.convert(<int>[0, 1, 2, 3, 4]).toString();
+    Future<File> download(String id, String name) => ServerApi.downloadRecording(
+      settings,
+      'account-token',
+      RemoteRecording(id: id, name: name, size: 5, sha256: digest),
+      directory: dir,
+    );
+
+    final File device = await download('d' * 32, 'CON.mp4');
+    final File dotted = await download('e' * 32, 'notes...');
+    expect(device.path, endsWith('_CON.mp4'));
+    expect(dotted.path, endsWith('notes.mp4'));
+  });
+
   test('downloadRecording deletes a body that fails its digest', () async {
     final Directory dir = await Directory.systemTemp.createTemp(
       'chast-download-',

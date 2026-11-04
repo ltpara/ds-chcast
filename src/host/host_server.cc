@@ -722,6 +722,16 @@ void HostServer::commit_security() {
         return;
     }
     security_->note_connected(pending_security_, unix_now());
+    // The login may have rehashed an older password encoding at the current
+    // cost; persist it while the plaintext was available.
+    const std::string hash = security_->password_hash();
+    if (!hash.empty() && hash != settings_.password_hash) {
+        settings_.password_hash = hash;
+        log("the permanent password hash was upgraded to the current cost");
+        if (config_.password_hash_changed) {
+            config_.password_hash_changed(hash);
+        }
+    }
     publish_trusted_devices();
     publish_security_status();
 }
@@ -1358,7 +1368,9 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             code = SasCode::Failed;
         }
         if (code == SasCode::Ok) {
-            log("Ctrl+Alt+Del sent to the secure desktop");
+            // SendSAS is fire-and-forget: Windows reports no result, so this
+            // only records that the request was made.
+            log("Ctrl+Alt+Del requested (Windows does not confirm the secure desktop)");
         } else {
             ++stats.sas_failures;
             log(std::string("Ctrl+Alt+Del refused (") + sas_code_name(code) + "): " +

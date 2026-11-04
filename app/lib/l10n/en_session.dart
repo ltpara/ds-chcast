@@ -2,7 +2,8 @@
 const Map<String, String> kEnglishSession = <String, String>{
   ' · 异常 {anomalies}': ' · {anomalies} anomalies',
   '6 位验证码': '6-digit code',
-  'Ctrl+Alt+Del 已发送到主机': 'Ctrl+Alt+Del sent to host',
+  '已请求主机发送 Ctrl+Alt+Del（Windows 不回报是否成功）':
+      'Ctrl+Alt+Del requested on the host (Windows does not report whether it succeeded)',
   'Ctrl+Alt+Del 未发送：{detail}': 'Ctrl+Alt+Del not sent: {detail}',
   'Ctrl+Alt+Del 未能排队：远程键鼠尚未就绪':
       'Ctrl+Alt+Del could not be queued: remote input is not ready',

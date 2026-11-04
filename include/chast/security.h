@@ -68,7 +68,7 @@ bool sha256(const uint8_t* data, size_t size, std::array<uint8_t, 32>& digest);
 
 // ----- password hashing -----
 
-inline constexpr uint32_t kPasswordHashIterations = 210000;
+inline constexpr uint32_t kPasswordHashIterations = 600000;
 inline constexpr size_t kPasswordSaltBytes = 16;
 inline constexpr size_t kPasswordHashBytes = 32;
 
@@ -78,6 +78,9 @@ std::string hash_password_with_salt(const std::string& password,
                                     const std::vector<uint8_t>& salt,
                                     uint32_t iterations = kPasswordHashIterations);
 bool verify_password(const std::string& password, const std::string& encoded);
+// True when `encoded` is a well-formed hash below the current iteration
+// count, so a successful login should replace it with a fresh hash.
+bool password_hash_needs_rehash(const std::string& encoded);
 
 // ----- TOTP -----
 
