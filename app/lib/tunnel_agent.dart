@@ -162,6 +162,7 @@ class TunnelAgent {
     required TunnelMode mode,
     String key = '',
     String serverPublicKey = '',
+    String proxy = '',
   }) {
     return <String>[
       'viewer',
@@ -173,9 +174,11 @@ class TunnelAgent {
       '$loopback:0',
       '--mode',
       mode.name,
-      // The key travels over stdin, never argv: any process of this user,
-      // EDR and audit logs can read a child's command line.
+      // The key and the proxy URL (which may carry credentials) travel over
+      // stdin, never argv: any process of this user, EDR and audit logs can
+      // read a child's command line.
       if (key.isNotEmpty) '--server-key-stdin',
+      if (proxy.isNotEmpty) '--proxy-stdin',
       if (serverPublicKey.isNotEmpty) ...<String>[
         '--server-pubkey',
         serverPublicKey,
@@ -204,6 +207,7 @@ class TunnelAgent {
           mode: server.mode,
           key: server.key,
           serverPublicKey: serverPublicKey,
+          proxy: server.proxy,
         );
     final Process process;
     try {
@@ -213,9 +217,15 @@ class TunnelAgent {
         tr('无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。', <String, Object?>{'exe': exe, 'p2': error.message}),
       );
     }
-    if (server.key.isNotEmpty) {
+    if (server.key.isNotEmpty || server.proxy.isNotEmpty) {
       try {
-        process.stdin.write('${server.key}\n');
+        // Order matches the helper: server key first, then the proxy URL.
+        if (server.key.isNotEmpty) {
+          process.stdin.write('${server.key}\n');
+        }
+        if (server.proxy.isNotEmpty) {
+          process.stdin.write('${server.proxy}\n');
+        }
         await process.stdin.close();
       } catch (_) {
         // The child exited before reading; its exit status carries the error.

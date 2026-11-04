@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 
 import 'server_identity.dart';
 import 'server_settings.dart';
+import 'tunnel_proxy.dart';
 import 'package:chast_viewer/l10n.dart';
 
 /// One host as reported by `GET /v1/hosts/{id}`.
@@ -873,6 +874,13 @@ class ServerApi {
 
   /// Server-side limit for `GET /v1/hosts?ids=...`.
   static const int maxBatchIds = 200;
+
+  /// Outbound proxy for every viewer HTTP call, including the mandatory
+  /// server identity check and account/address-book routes. The home page
+  /// sets it from the saved connection settings; when it is empty,
+  /// `CHAST_PROXY` applies. A configured-but-invalid value throws instead of
+  /// silently falling back to a direct connection.
+  static String proxy = '';
 
   static Future<HostInfo> lookup(
     ServerSettings settings,
@@ -3167,7 +3175,7 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    final HttpClient client = await _newClient(timeout);
     try {
       final HttpClientRequest request = await client
           .postUrl(uri)
@@ -3253,7 +3261,7 @@ class ServerApi {
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
-    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    final HttpClient client = await _newClient(timeout);
     try {
       final HttpClientRequest request = await client
           .getUrl(uri)
@@ -3585,7 +3593,7 @@ class ServerApi {
     notFound ??= tr('设备未注册或已下线');
     forbidden ??= tr('没有权限执行此操作');
     unavailable ??= tr('连接服务未启用账号存储');
-    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    final HttpClient client = await _newClient(timeout);
     try {
       final HttpClientRequest request = await client
           .openUrl(method, uri)
@@ -3658,5 +3666,28 @@ class ServerApi {
     } finally {
       client.close(force: true);
     }
+  }
+
+  /// Creates a client that routes through [ServerProxyBridge] whenever a
+  /// proxy applies. The bridge is started before the client exists, so a
+  /// failed helper leaves no direct-capable client behind.
+  static Future<HttpClient> _newClient(Duration timeout) async {
+    ServerProxyBridge? bridge;
+    try {
+      final String effective = effectiveProxyUrl(proxy);
+      if (effective.isNotEmpty) {
+        bridge = await ServerProxyBridge.ensure(effective);
+      }
+    } on ServerProxyException catch (error) {
+      throw ServerApiException(error.message);
+    } on FormatException catch (error) {
+      throw ServerApiException(error.message);
+    }
+    final HttpClient client = HttpClient()..connectionTimeout = timeout;
+    if (bridge != null) {
+      final String address = bridge.address;
+      client.findProxy = (Uri uri) => 'PROXY $address';
+    }
+    return client;
   }
 }

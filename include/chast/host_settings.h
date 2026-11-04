@@ -161,6 +161,10 @@ struct HostSettings {
     // after the registration reply confirms the move.
     std::string tunnel_old_id;
     std::string tunnel_key;
+    // Outbound proxy for the rendezvous API and the relay's TCP carrier.
+    // Accepted schemes: http, https, socks5 and socks5h with an explicit
+    // port. UDP direct/relay paths are unaffected.
+    std::string proxy;
     // Public-facing UDP socket of chast-tunnel host. It must differ from the
     // QUIC port above because both are UDP listeners.
     std::string tunnel_listen = "0.0.0.0:14434";
@@ -223,6 +227,7 @@ bool parse_codec_setting(const std::string& text, VideoCodec& codec);
 // value is unusable; the caller decides whether to keep a default. An empty
 // server URL is valid and means "not configured".
 bool parse_server_url(const std::string& input, std::string& normalized);
+bool parse_proxy_url(const std::string& input, std::string& normalized);
 bool valid_server_key(const std::string& key);
 bool parse_tunnel_id(const std::string& input, std::string& normalized);
 bool valid_tunnel_key(const std::string& key);

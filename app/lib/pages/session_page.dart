@@ -532,7 +532,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       url: widget.target.server,
       mode: widget.target.mode,
       key: widget.target.serverKey,
+      proxy: widget.settings.proxy,
     );
+    // Server identity, audit reports and recording uploads use the same
+    // outbound path as the tunnel agent; an invalid value fails those calls
+    // instead of letting them dial directly.
+    ServerApi.proxy = widget.settings.proxy;
     _tunnelStarting ??= () async {
       final String serverKey = await _confirmedServerKey(settings);
       return TunnelAgent.start(
@@ -664,7 +669,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       final int carrierPort;
       final String carrierHostId;
       final String carrierToken;
-      if (tunnel != null && tunnel.carrierPort != 0) {
+      final bool proxied;
+      try {
+        proxied = effectiveProxyUrl(widget.settings.proxy).isNotEmpty;
+      } on FormatException catch (error) {
+        throw TunnelException(error.message);
+      }
+      if (tunnel != null && proxied) {
+        // The agent already carries every datagram through the proxy. A
+        // direct carrier dial from the engine would bypass it, so leave the
+        // external carrier empty; the engine then only retries loopback.
+        carrierHost = '';
+        carrierPort = 0;
+        carrierHostId = '';
+        carrierToken = '';
+      } else if (tunnel != null && tunnel.carrierPort != 0) {
         carrierHost = tunnel.carrierHost;
         carrierPort = tunnel.carrierPort;
         carrierHostId = widget.target.hostId;

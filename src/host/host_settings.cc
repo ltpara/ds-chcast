@@ -240,6 +240,82 @@ bool parse_server_url(const std::string& input, std::string& normalized) {
     return true;
 }
 
+bool parse_proxy_url(const std::string& input, std::string& normalized) {
+    std::string text = trim(input);
+    if (text.empty()) {
+        normalized.clear();
+        return true;
+    }
+    if (text.size() > 512) {
+        return false;
+    }
+    for (unsigned char c : text) {
+        if (c < 0x21 || c > 0x7E || c == '"' || c == '\\' || c == '<' || c == '>') {
+            return false;
+        }
+    }
+    if (text.find('?') != std::string::npos || text.find('#') != std::string::npos) {
+        return false;
+    }
+    const size_t separator = text.find("://");
+    if (separator == std::string::npos || separator == 0) {
+        return false;
+    }
+    const std::string scheme = lower(text.substr(0, separator));
+    if (scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks5h") {
+        return false;
+    }
+    std::string rest = text.substr(separator + 3);
+    while (!rest.empty() && rest.back() == '/') {
+        rest.pop_back();
+    }
+    if (rest.empty() || rest.find('/') != std::string::npos) {
+        return false;
+    }
+    // Strip optional user:password@ before validating host:port.
+    const size_t at = rest.rfind('@');
+    if (at != std::string::npos) {
+        if (at == 0) {
+            return false;
+        }
+        rest = rest.substr(at + 1);
+    }
+    const size_t colon = rest.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= rest.size()) {
+        return false;
+    }
+    const std::string host = rest.substr(0, colon);
+    const std::string port_text = rest.substr(colon + 1);
+    if (host.empty() || host.size() > 255) {
+        return false;
+    }
+    if (host.front() == '[') {
+        if (host.size() < 3 || host.back() != ']') {
+            return false;
+        }
+    } else if (host.find('[') != std::string::npos || host.find(']') != std::string::npos) {
+        return false;
+    }
+    if (port_text.empty() || port_text.size() > 5) {
+        return false;
+    }
+    uint32_t port = 0;
+    for (char c : port_text) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        port = port * 10 + static_cast<uint32_t>(c - '0');
+    }
+    if (port < 1 || port > 65535) {
+        return false;
+    }
+    normalized = scheme + "://" + text.substr(separator + 3);
+    while (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    return true;
+}
+
 bool valid_server_key(const std::string& key) {
     return key.empty() || printable_secret(key, 0, 256);
 }
@@ -613,6 +689,15 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             } else {
                 settings.server_key = value;
             }
+        } else if (key == "proxy") {
+            std::string normalized;
+            if (!parse_proxy_url(value, normalized)) {
+                // Do not echo the value: proxy URLs may embed credentials.
+                warn(result.warning,
+                     "proxy is not an http(s) or socks5 URL with an explicit port; ignoring it");
+            } else {
+                settings.proxy = normalized;
+            }
         } else if (key == "tunnel_id") {
             if (value.empty()) {
                 settings.tunnel_id.clear();
@@ -761,6 +846,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "tunnel=" << (settings.tunnel ? 1 : 0) << "\n"
          << "server_url=" << settings.server_url << "\n"
          << "server_key=" << settings.server_key << "\n"
+         << "proxy=" << settings.proxy << "\n"
          << "tunnel_id=" << settings.tunnel_id << "\n"
          << "tunnel_old_id=" << settings.tunnel_old_id << "\n"
          << "tunnel_key=" << settings.tunnel_key << "\n"

@@ -123,4 +123,10 @@ const Map<String, String> kEnglishCore = <String, String>{
   '录制下载数据超过记录的大小': 'Recording download exceeds the recorded size',
   '录制下载不完整：应有 {expected} 字节，实际收到 {actual} 字节': 'Recording download is incomplete: expected {expected} bytes, received {actual}',
   '录制内容校验失败，文件已删除': 'Recording verification failed; the file was deleted',
+  '出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口': 'Invalid outbound proxy; use http://, https://, socks5:// or socks5h:// with an explicit port',
+  '出站代理地址为空': 'The outbound proxy address is empty',
+  '无法启动代理桥接（{exe}）：{p2}': 'Cannot start the proxy bridge ({exe}): {p2}',
+  '代理桥接启动失败（退出码 {code}）{p7}': 'The proxy bridge failed to start (exit code {code}) {p7}',
+  '代理桥接在 {p3} 秒内没有就绪{p4}': 'The proxy bridge was not ready within {p3} seconds{p4}',
+  '代理桥接返回了无效监听地址：{p5}': 'The proxy bridge returned an invalid listen address: {p5}',
 };

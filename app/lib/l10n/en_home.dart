@@ -290,4 +290,9 @@ const Map<String, String> kEnglishHome = <String, String>{
   '读取云端录制失败：{error}': 'Could not load cloud recordings: {error}',
   '读取录制文件失败：{error}': 'Could not read the recording file: {error}',
   '保存录制文件失败：{error}': 'Could not save the recording file: {error}',
+  '出站代理（可选）': 'Outbound proxy (optional)',
+  '显示代理': 'Show proxy',
+  '隐藏代理': 'Hide proxy',
+  '代理地址无效：示例 socks5://127.0.0.1:10808': 'Invalid proxy address; for example socks5://127.0.0.1:10808',
+  '支持 http://、https://、socks5:// 和 socks5h://（需带端口，可含用户名密码）。配置代理后会话强制走服务器 TCP 中继：UDP 直连、UDP 中继和打洞无法穿过代理；服务端没有中继能力时会明确报错而不是绕过代理直连。': 'Supports http://, https://, socks5:// and socks5h:// (explicit port, optional user and password). With a proxy the session is forced onto the server TCP carrier: direct UDP, UDP relay and punching cannot traverse a proxy, and a server without a carrier fails with a clear error instead of bypassing the proxy.',
 };

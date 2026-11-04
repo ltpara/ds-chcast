@@ -229,6 +229,9 @@ std::wstring tunnel_command_line(const std::wstring& executable, const HostSetti
     if (!settings.server_key.empty()) {
         add(L"--server-key", widen(settings.server_key));
     }
+    if (!settings.proxy.empty()) {
+        add(L"--proxy", widen(settings.proxy));
+    }
     if (!settings.audit_spool.empty()) {
         // The agent signs and forwards the host's inbound audit records from
         // this spool; the path is shared with the host process, not a secret.
@@ -265,6 +268,9 @@ bool validate_tunnel_settings(const HostSettings& settings, std::string* error) 
     }
     if (!valid_server_key(settings.server_key)) {
         return fail("服务器密钥需要最多 256 个可打印字符，且不能包含引号或反斜杠");
+    }
+    if (!parse_proxy_url(settings.proxy, normalized)) {
+        return fail("出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口");
     }
     if (!parse_tunnel_listen(settings.tunnel_listen, normalized)) {
         return fail("隧道监听地址无效，需要 host:port");

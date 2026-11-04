@@ -1260,6 +1260,7 @@ enum TunnelDialogId {
     kDialogId,
     kDialogKey,
     kDialogListen,
+    kDialogProxy,
     kDialogEnabled,
 };
 
@@ -1270,6 +1271,7 @@ struct TunnelDialogState {
     HWND id = nullptr;
     HWND key = nullptr;
     HWND listen = nullptr;
+    HWND proxy = nullptr;
     HWND enabled = nullptr;
     bool done = false;
     bool accepted = false;
@@ -1529,6 +1531,17 @@ bool collect_tunnel_settings(TunnelDialogState& dialog, HostSettings& updated, s
         }
         updated.tunnel_listen = normalized;
     }
+
+    const std::string proxy = trim_ascii(narrow(control_text(dialog.proxy)));
+    if (proxy.empty()) {
+        updated.proxy.clear();
+    } else {
+        if (!parse_proxy_url(proxy, normalized)) {
+            error = "出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口";
+            return false;
+        }
+        updated.proxy = normalized;
+    }
     return validate_tunnel_settings(updated, &error);
 }
 
@@ -1606,7 +1619,7 @@ bool edit_tunnel_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 660 : 540;
     const int tunnel_content = dialog_width - 40;
-    RECT frame{0, 0, px(dialog_width), px(470)};
+    RECT frame{0, 0, px(dialog_width), px(530)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -1659,13 +1672,17 @@ bool edit_tunnel_settings(HostSettings& result) {
         tr(L"\n隧道端口必须不同，例如 0.0.0.0:14434");
     add(L"STATIC", port_hint.c_str(), SS_LEFT, 0, 276, 316, dialog_width - 20 - 276, 40, 0,
         nullptr);
+    add(L"STATIC", tr(L"出站代理（可选，http://、https://、socks5:// 或 socks5h://，含端口）"),
+        SS_LEFT, 0, 20, 356, tunnel_content, 20, 0, nullptr);
+    dialog.proxy = add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 20, 378,
+                       tunnel_content, 26, kDialogProxy, nullptr);
     const wchar_t* enable_text = tr(L"启用连接服务（注册到会合服务器）");
-    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 366,
+    dialog.enabled = add(L"BUTTON", enable_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 20, 414,
                          std::max(400, check_px(enable_text)), 24, kDialogEnabled, nullptr);
     const int tunnel_cancel_left = dialog_width - 20 - 100;
     add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left - 10 - 100,
-        408, 100, 32, IDOK, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 408, 100, 32,
+        456, 100, 32, IDOK, nullptr);
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, tunnel_cancel_left, 456, 100, 32,
         IDCANCEL, nullptr);
 
     set_text(dialog.url, widen(g_app->settings.server_url));
@@ -1673,6 +1690,7 @@ bool edit_tunnel_settings(HostSettings& result) {
     set_text(dialog.id, widen(g_app->settings.tunnel_id));
     set_text(dialog.key, widen(g_app->settings.tunnel_key));
     set_text(dialog.listen, widen(g_app->settings.tunnel_listen));
+    set_text(dialog.proxy, widen(g_app->settings.proxy));
     set_check(dialog.enabled, g_app->settings.tunnel);
 
     EnableWindow(g_app->window, FALSE);

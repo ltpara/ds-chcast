@@ -90,7 +90,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.bitrate_kbps == b.bitrate_kbps && a.framerate == b.framerate &&
            a.quality == b.quality && a.autostart == b.autostart && a.display == b.display &&
            a.tunnel == b.tunnel && a.server_url == b.server_url &&
-           a.server_key == b.server_key && a.tunnel_id == b.tunnel_id &&
+           a.server_key == b.server_key && a.proxy == b.proxy && a.tunnel_id == b.tunnel_id &&
            a.tunnel_old_id == b.tunnel_old_id &&
            a.tunnel_key == b.tunnel_key && a.tunnel_listen == b.tunnel_listen &&
            a.audit_spool == b.audit_spool;
@@ -148,6 +148,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.tunnel = false;
     settings.server_url = "https://rendezvous.example.com/chast";
     settings.server_key = "server secret";
+    settings.proxy = "socks5://127.0.0.1:10808";
     settings.tunnel_id = "devbox.office";
     settings.tunnel_old_id = "devbox.home";
     settings.tunnel_key = "host secret 123";
@@ -234,6 +235,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                "tunnel=perhaps\n"
                "server_url=ftp://example.com\n"
                "server_key=" + std::string(300, 's') + "\n"
+               "proxy=ftp://example.com:21\n"
                "tunnel_id=bad id\n"
                "tunnel_key=short\n"
                "tunnel_listen=127.0.0.1:0\n"
@@ -268,6 +270,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
     check(settings.tunnel, "an unparsable tunnel toggle keeps the default");
     check(settings.server_url.empty(), "a non-http service URL is dropped");
     check(settings.server_key.empty(), "an oversized server key is dropped");
+    check(settings.proxy.empty(), "a non-proxy URL is dropped");
     check(settings.tunnel_id.empty(), "an invalid device id is dropped");
     check(settings.tunnel_key.empty(), "a short device key is dropped");
     check(settings.tunnel_listen == "0.0.0.0:14434", "an invalid tunnel listen falls back");
@@ -279,7 +282,7 @@ void test_invalid_values(const std::filesystem::path& dir) {
                             "bitrate_kbps",
                             "framerate",
                             "quality", "display", "tunnel", "server_url", "server_key",
-                            "tunnel_id", "tunnel_key", "tunnel_listen"}) {
+                            "proxy", "tunnel_id", "tunnel_key", "tunnel_listen"}) {
         check(loaded.warning.find(key) != std::string::npos,
               (std::string("the warning names ") + key).c_str());
     }
@@ -448,6 +451,24 @@ void test_service_parsers() {
     check(!chast::parse_server_url("http://", out), "a URL without a host is rejected");
     check(!chast::parse_server_url("http://example.com/a b", out), "a space is rejected");
 
+    check(chast::parse_proxy_url("", out) && out.empty(), "an empty proxy disables the setting");
+    check(chast::parse_proxy_url("SOCKS5://127.0.0.1:10808/ ", out) &&
+              out == "socks5://127.0.0.1:10808",
+          "a socks5 proxy is normalized");
+    check(chast::parse_proxy_url("http://user:pass@proxy.example:8080", out) &&
+              out == "http://user:pass@proxy.example:8080",
+          "proxy credentials survive parsing");
+    check(chast::parse_proxy_url("https://[::1]:8443", out) &&
+              out == "https://[::1]:8443",
+          "an IPv6 proxy keeps its brackets");
+    check(!chast::parse_proxy_url("127.0.0.1:10808", out),
+          "a proxy needs an explicit scheme");
+    check(!chast::parse_proxy_url("ftp://127.0.0.1:21", out), "an unknown proxy scheme is rejected");
+    check(!chast::parse_proxy_url("socks5://127.0.0.1", out), "a proxy needs a port");
+    check(!chast::parse_proxy_url("socks5://127.0.0.1:0", out), "a zero proxy port is rejected");
+    check(!chast::parse_proxy_url("socks5://127.0.0.1:1080/path", out),
+          "a proxy path is rejected");
+
     check(chast::valid_server_key("") && chast::valid_server_key("dev secret"),
           "optional server keys accept printable text");
     check(!chast::valid_server_key(std::string(300, 's')), "an oversized server key is rejected");
@@ -580,10 +601,10 @@ void test_audit_spool(const std::filesystem::path& dir) {
     check(static_cast<bool>(std::getline(in, first)) && static_cast<bool>(std::getline(in, second)),
           "both spool lines are readable");
     check(first ==
-              R"({"kind":"session","audit_ref":"00112233aabbccdd","started_at_ms":1700000000000,"ended_at_ms":1700000005000,"success":false,"detail":"the \"viewer\" left"})",
+              R"({"kind":"session","audit_ref":"00112233aabbccdd","viewer_ref_absent":false,"started_at_ms":1700000000000,"ended_at_ms":1700000005000,"success":false,"detail":"the \"viewer\" left"})",
           "the session line matches the agent's JSON shape");
     check(second ==
-              R"({"kind":"file","audit_ref":"00112233aabbccdd","direction":"upload","name":"报告\nb.txt","size":42,"occurred_at_ms":1700000004000,"success":true,"detail":""})",
+              R"({"kind":"file","audit_ref":"00112233aabbccdd","viewer_ref_absent":false,"direction":"upload","name":"报告\nb.txt","size":42,"occurred_at_ms":1700000004000,"success":true,"detail":""})",
           "the file line escapes the name and carries the size");
 
     // A spool nobody consumes must stay bounded: an append past the cap

@@ -32,6 +32,48 @@ void main() {
     expect(normalizeServerUrl('https://user:pass@chast.example'), isEmpty);
   });
 
+  test('proxy URLs require an explicit supported scheme and port', () {
+    expect(normalizeProxyUrl(''), isEmpty);
+    expect(
+      normalizeProxyUrl('socks5://127.0.0.1:10808'),
+      'socks5://127.0.0.1:10808',
+    );
+    expect(
+      normalizeProxyUrl('SOCKS5H://user:pass@proxy.example:1080/'),
+      'socks5h://user:pass@proxy.example:1080',
+    );
+    expect(
+      normalizeProxyUrl('http://proxy.example:8080'),
+      'http://proxy.example:8080',
+    );
+    expect(
+      normalizeProxyUrl('https://proxy.example:8443'),
+      'https://proxy.example:8443',
+    );
+    expect(normalizeProxyUrl('socks5://[::1]:1080'), 'socks5://[::1]:1080');
+
+    expect(normalizeProxyUrl('127.0.0.1:10808'), isEmpty);
+    expect(normalizeProxyUrl('ftp://proxy.example:21'), isEmpty);
+    expect(normalizeProxyUrl('socks5://proxy.example'), isEmpty);
+    expect(normalizeProxyUrl('socks5://proxy.example:0'), isEmpty);
+    expect(normalizeProxyUrl('socks5://proxy.example:70000'), isEmpty);
+    expect(normalizeProxyUrl('socks5://proxy.example:1080/path'), isEmpty);
+    expect(normalizeProxyUrl('socks5://proxy.example:1080?x=1'), isEmpty);
+    expect(normalizeProxyUrl('socks5://proxy.example:1080#frag'), isEmpty);
+  });
+
+  test('an invalid configured proxy fails closed', () {
+    expect(
+      effectiveProxyUrl('socks5://127.0.0.1:10808'),
+      'socks5://127.0.0.1:10808',
+    );
+    expect(
+      () => effectiveProxyUrl('ftp://proxy.example:21'),
+      throwsFormatException,
+    );
+    expect(effectiveProxyUrl(''), isEmpty);
+  });
+
   test('unknown modes fall back to auto', () {
     expect(TunnelModeName.parse('relay'), TunnelMode.relay);
     expect(TunnelModeName.parse('direct'), TunnelMode.direct);
@@ -51,12 +93,14 @@ void main() {
       url: 'https://chast.example/',
       mode: TunnelMode.relay,
       key: 'dev-secret',
+      proxy: 'socks5://127.0.0.1:10808',
       uploadRecordings: true,
     ));
     final ServerSettings loaded = await store.load();
     expect(loaded.url, 'https://chast.example');
     expect(loaded.mode, TunnelMode.relay);
     expect(loaded.key, 'dev-secret');
+    expect(loaded.proxy, 'socks5://127.0.0.1:10808');
     expect(loaded.uploadRecordings, isTrue);
     expect(loaded.configured, isTrue);
   });
@@ -87,6 +131,50 @@ void main() {
     expect(loaded.mode, TunnelMode.relay);
     expect(loaded.key, 'dev-secret');
     expect(loaded.uploadRecordings, isTrue);
+  });
+
+  test('proxy credentials are protected at rest', () async {
+    final Directory dir = await Directory.systemTemp.createTemp('chast-settings-');
+    addTearDown(() => dir.delete(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}server.json');
+    final ServerSettingsStore store = ServerSettingsStore(
+      file: file,
+      protectSecret: (String plaintext) async => _protect(plaintext),
+      unprotectSecret: (String blob) async => _unprotect(blob),
+    );
+
+    await store.save(const ServerSettings(
+      url: 'https://chast.example',
+      proxy: 'socks5://alice:hunter2@127.0.0.1:10808',
+    ));
+
+    final String text = await file.readAsString();
+    expect(text, contains('"protected"'));
+    expect(text, isNot(contains('hunter2')));
+
+    final ServerSettings loaded = await store.load();
+    expect(loaded.proxy, 'socks5://alice:hunter2@127.0.0.1:10808');
+  });
+
+  test('a proxy-only legacy file is migrated too', () async {
+    final Directory dir = await Directory.systemTemp.createTemp('chast-settings-');
+    addTearDown(() => dir.delete(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}server.json');
+    await file.writeAsString(jsonEncode(<String, Object?>{
+      'url': 'https://chast.example',
+      'proxy': 'socks5://alice:hunter2@127.0.0.1:10808',
+    }));
+
+    final ServerSettings loaded = await ServerSettingsStore(
+      file: file,
+      protectSecret: (String plaintext) async => _protect(plaintext),
+      unprotectSecret: (String blob) async => _unprotect(blob),
+    ).load();
+
+    expect(loaded.proxy, 'socks5://alice:hunter2@127.0.0.1:10808');
+    final String text = await file.readAsString();
+    expect(text, contains('"protected"'));
+    expect(text, isNot(contains('hunter2')));
   });
 
   test('a legacy plaintext key is migrated to a protected envelope', () async {
@@ -125,12 +213,16 @@ void main() {
     await store.save(const ServerSettings(
       url: 'https://chast.example',
       key: 'dev-secret',
+      proxy: 'socks5://alice:hunter2@127.0.0.1:10808',
     ));
 
-    expect(await file.readAsString(), isNot(contains('dev-secret')));
+    final String text = await file.readAsString();
+    expect(text, isNot(contains('dev-secret')));
+    expect(text, isNot(contains('hunter2')));
     final ServerSettings loaded = await store.load();
     expect(loaded.url, 'https://chast.example');
     expect(loaded.key, isEmpty);
+    expect(loaded.proxy, isEmpty);
   });
 
   test('a corrupt file loads as unconfigured', () async {

@@ -125,6 +125,7 @@ chast::HostSettings valid_settings() {
 void test_command_line() {
     chast::HostSettings settings = valid_settings();
     settings.server_key = "server secret";
+    settings.proxy = "socks5://127.0.0.1:10808";
     settings.tunnel_old_id = "devbox.home";
     const std::wstring command = chast::host::tunnel_command_line(
         L"C:\\Program Files\\chast\\chast-tunnel.exe", settings, 4433, "AA:BB:CC");
@@ -143,13 +144,17 @@ void test_command_line() {
     check(contains(command, L"--listen 0.0.0.0:14434"), "the tunnel listener is passed");
     check(contains(command, L"--server-key \"server secret\""),
           "a server key with spaces is quoted");
+    check(contains(command, L"--proxy socks5://127.0.0.1:10808"),
+          "the outbound proxy is passed");
     check(contains(command, L"--fingerprint AA:BB:CC"), "the certificate fingerprint is passed");
 
     settings.server_key.clear();
+    settings.proxy.clear();
     const std::wstring without_optional =
         chast::host::tunnel_command_line(L"chast-tunnel.exe", settings, 4433, "");
     check(!contains(without_optional, L"--server-key"),
           "an empty server key leaves out the flag");
+    check(!contains(without_optional, L"--proxy"), "an empty proxy leaves out the flag");
     check(!contains(without_optional, L"--fingerprint"),
           "an empty fingerprint leaves out the flag");
     check(!contains(without_optional, L"--audit-spool"),
@@ -209,6 +214,19 @@ void test_validation() {
     check(!chast::host::validate_tunnel_settings(settings, &error) &&
               error.find("服务器密钥") != std::string::npos,
           "an oversized server key is rejected");
+
+    settings = valid_settings();
+    settings.proxy = "127.0.0.1:10808";
+    error.clear();
+    check(!chast::host::validate_tunnel_settings(settings, &error) &&
+              error.find("代理") != std::string::npos,
+          "a proxy without a scheme is rejected");
+
+    settings = valid_settings();
+    settings.proxy = "socks5://127.0.0.1:10808";
+    error.clear();
+    check(chast::host::validate_tunnel_settings(settings, &error) && error.empty(),
+          "a socks5 proxy validates");
 
     settings = valid_settings();
     settings.tunnel_listen = "127.0.0.1:0";

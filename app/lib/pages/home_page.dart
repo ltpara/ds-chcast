@@ -424,6 +424,9 @@ class _HomePageState extends State<HomePage> {
         account != null && account.groups.isNotEmpty
         ? account.groups
         : const <AddressBookGroup>[];
+    // Every API call below must use the same outbound path as the tunnel
+    // agent; set it before the first presence refresh.
+    ServerApi.proxy = server.proxy;
     setState(() {
       _devices = devices;
       _server = server;
@@ -1670,6 +1673,7 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     await _serverStore.save(settings);
+    ServerApi.proxy = settings.proxy;
     if (!mounted) {
       return;
     }
@@ -5779,9 +5783,11 @@ class _ServerDialog extends StatefulWidget {
 class _ServerDialogState extends State<_ServerDialog> {
   late final TextEditingController _url;
   late final TextEditingController _key;
+  late final TextEditingController _proxy;
   late TunnelMode _mode;
   bool _testing = false;
   bool _showKey = false;
+  bool _showProxy = false;
   String _status = '';
   bool _statusOk = false;
   ServerIdentityPin? _pin;
@@ -5791,6 +5797,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     super.initState();
     _url = TextEditingController(text: widget.initial.url);
     _key = TextEditingController(text: widget.initial.key);
+    _proxy = TextEditingController(text: widget.initial.proxy);
     _mode = widget.initial.mode;
     _url.addListener(_loadPin);
     unawaited(_loadPin());
@@ -5801,6 +5808,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     _url.removeListener(_loadPin);
     _url.dispose();
     _key.dispose();
+    _proxy.dispose();
     super.dispose();
   }
 
@@ -5828,11 +5836,24 @@ class _ServerDialogState extends State<_ServerDialog> {
       });
       return;
     }
+    final String proxyText = _proxy.text.trim();
+    final String proxy = normalizeProxyUrl(proxyText);
+    if (proxyText.isNotEmpty && proxy.isEmpty) {
+      setState(() {
+        _status = tr('代理地址无效：示例 socks5://127.0.0.1:10808');
+        _statusOk = false;
+      });
+      return;
+    }
     setState(() {
       _testing = true;
       _status = tr('正在检查…');
       _statusOk = false;
     });
+    // The check uses the same global outbound path as every other API call;
+    // restore the saved value so canceling the dialog changes nothing.
+    final String previousProxy = ServerApi.proxy;
+    ServerApi.proxy = proxy;
     try {
       await ServerApi.check(
         ServerSettings(url: url, mode: _mode, key: _key.text.trim()),
@@ -5851,6 +5872,7 @@ class _ServerDialogState extends State<_ServerDialog> {
         });
       }
     } finally {
+      ServerApi.proxy = previousProxy;
       if (mounted) {
         setState(() => _testing = false);
       }
@@ -5867,9 +5889,23 @@ class _ServerDialogState extends State<_ServerDialog> {
       });
       return;
     }
-    Navigator.of(
-      context,
-    ).pop(ServerSettings(url: url, mode: _mode, key: _key.text.trim()));
+    final String proxyText = _proxy.text.trim();
+    final String proxy = normalizeProxyUrl(proxyText);
+    if (proxyText.isNotEmpty && proxy.isEmpty) {
+      setState(() {
+        _status = tr('代理地址无效：示例 socks5://127.0.0.1:10808');
+        _statusOk = false;
+      });
+      return;
+    }
+    Navigator.of(context).pop(
+      ServerSettings(
+        url: url,
+        mode: _mode,
+        key: _key.text.trim(),
+        proxy: proxy,
+      ),
+    );
   }
 
   @override
@@ -5880,121 +5916,150 @@ class _ServerDialogState extends State<_ServerDialog> {
       title: Text(tr('连接服务')),
       content: SizedBox(
         width: 420,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            TextField(
-              controller: _url,
-              autofocus: true,
-              decoration: InputDecoration(
-                labelText: tr('服务地址'),
-                hintText: 'https://chast.example:8443',
-              ),
-              onSubmitted: (_) => _save(),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _key,
-              obscureText: !_showKey,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: InputDecoration(
-                labelText: tr('服务端密钥（可选）'),
-                hintText: tr('与 --server-key 相同'),
-                suffixIcon: IconButton(
-                  tooltip: _showKey ? tr('隐藏密钥') : tr('显示密钥'),
-                  icon: Icon(
-                    _showKey ? Icons.visibility_off : Icons.visibility,
-                  ),
-                  onPressed: () => setState(() => _showKey = !_showKey),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              TextField(
+                controller: _url,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: tr('服务地址'),
+                  hintText: 'https://chast.example:8443',
                 ),
+                onSubmitted: (_) => _save(),
               ),
-              onSubmitted: (_) => _save(),
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<TunnelMode>(
-              initialValue: _mode,
-              decoration: InputDecoration(labelText: tr('路径策略')),
-              items: <DropdownMenuItem<TunnelMode>>[
-                for (final TunnelMode mode in TunnelMode.values)
-                  DropdownMenuItem<TunnelMode>(
-                    value: mode,
-                    child: Text(mode.label),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _key,
+                obscureText: !_showKey,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: tr('服务端密钥（可选）'),
+                  hintText: tr('与 --server-key 相同'),
+                  suffixIcon: IconButton(
+                    tooltip: _showKey ? tr('隐藏密钥') : tr('显示密钥'),
+                    icon: Icon(
+                      _showKey ? Icons.visibility_off : Icons.visibility,
+                    ),
+                    onPressed: () => setState(() => _showKey = !_showKey),
                   ),
-              ],
-              onChanged: (TunnelMode? value) {
-                if (value != null) {
-                  setState(() => _mode = value);
-                }
-              },
-            ),
-            const SizedBox(height: 10),
-            Row(
-              children: <Widget>[
-                TextButton(
-                  onPressed: _testing ? null : _test,
-                  child: Text(_testing ? tr('检查中…') : tr('测试连接')),
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    _status,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: _status.isEmpty
-                          ? Colors.grey
-                          : (_statusOk
-                                ? const Color(0xFF4CAF50)
-                                : Theme.of(context).colorScheme.error),
+                onSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                key: const Key('server-proxy'),
+                controller: _proxy,
+                obscureText: !_showProxy,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: tr('出站代理（可选）'),
+                  hintText: 'socks5://127.0.0.1:10808',
+                  suffixIcon: IconButton(
+                    tooltip: _showProxy ? tr('隐藏代理') : tr('显示代理'),
+                    icon: Icon(
+                      _showProxy ? Icons.visibility_off : Icons.visibility,
+                    ),
+                    onPressed: () => setState(() => _showProxy = !_showProxy),
+                  ),
+                ),
+                onSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                tr(
+                  '支持 http://、https://、socks5:// 和 socks5h://（需带端口，可含用户名密码）。配置代理后会话强制走服务器 TCP 中继：UDP 直连、UDP 中继和打洞无法穿过代理；服务端没有中继能力时会明确报错而不是绕过代理直连。',
+                ),
+                style: mutedStyle(context, size: 10.5),
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<TunnelMode>(
+                initialValue: _mode,
+                decoration: InputDecoration(labelText: tr('路径策略')),
+                items: <DropdownMenuItem<TunnelMode>>[
+                  for (final TunnelMode mode in TunnelMode.values)
+                    DropdownMenuItem<TunnelMode>(
+                      value: mode,
+                      child: Text(mode.label),
+                    ),
+                ],
+                onChanged: (TunnelMode? value) {
+                  if (value != null) {
+                    setState(() => _mode = value);
+                  }
+                },
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: <Widget>[
+                  TextButton(
+                    onPressed: _testing ? null : _test,
+                    child: Text(_testing ? tr('检查中…') : tr('测试连接')),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _status,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: _status.isEmpty
+                            ? Colors.grey
+                            : (_statusOk
+                                  ? const Color(0xFF4CAF50)
+                                  : Theme.of(context).colorScheme.error),
+                      ),
                     ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: <Widget>[
-                Icon(
-                  _pin == null
-                      ? Icons.verified_user_outlined
-                      : Icons.verified_user,
-                  size: 15,
-                  color: _pin == null
-                      ? mutedStyle(context).color
-                      : const Color(0xFF4CAF50),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    _pin == null
-                        ? tr('服务器身份尚未固定：首次连接时会展示指纹')
-                        : tr('服务器身份 {p28}（已固定）', <String, Object?>{
-                            'p28': shortenServerFingerprint(
-                              _pin!.identity.fingerprint,
-                            ),
-                          }),
-                    overflow: TextOverflow.ellipsis,
-                    style: mutedStyle(context, size: 11),
-                  ),
-                ),
-                if (_pin != null)
-                  TextButton(
-                    key: const Key('server-identity-forget'),
-                    onPressed: _forgetPin,
-                    child: Text(tr('清除固定')),
-                  ),
-              ],
-            ),
-            Text(
-              tr(
-                '服务端配置 --server-key 后，查看者解析设备 ID 和打洞也要带同一密钥；留空表示服务端未启用密钥。留空服务地址即可关闭设备 ID 解析。',
+                ],
               ),
-              style: mutedStyle(context, size: 10.5),
-            ),
-          ],
+              const SizedBox(height: 8),
+              Row(
+                children: <Widget>[
+                  Icon(
+                    _pin == null
+                        ? Icons.verified_user_outlined
+                        : Icons.verified_user,
+                    size: 15,
+                    color: _pin == null
+                        ? mutedStyle(context).color
+                        : const Color(0xFF4CAF50),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _pin == null
+                          ? tr('服务器身份尚未固定：首次连接时会展示指纹')
+                          : tr('服务器身份 {p28}（已固定）', <String, Object?>{
+                              'p28': shortenServerFingerprint(
+                                _pin!.identity.fingerprint,
+                              ),
+                            }),
+                      overflow: TextOverflow.ellipsis,
+                      style: mutedStyle(context, size: 11),
+                    ),
+                  ),
+                  if (_pin != null)
+                    TextButton(
+                      key: const Key('server-identity-forget'),
+                      onPressed: _forgetPin,
+                      child: Text(tr('清除固定')),
+                    ),
+                ],
+              ),
+              Text(
+                tr(
+                  '服务端配置 --server-key 后，查看者解析设备 ID 和打洞也要带同一密钥；留空表示服务端未启用密钥。留空服务地址即可关闭设备 ID 解析。',
+                ),
+                style: mutedStyle(context, size: 10.5),
+              ),
+            ],
+          ),
         ),
       ),
       actions: <Widget>[

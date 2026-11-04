@@ -193,12 +193,85 @@ void main() {
           .having((TunnelException e) => e.message, 'message', contains('无效监听地址'))),
     );
   }, skip: !Platform.isWindows);
+
+  test('the proxy URL is requested over stdin, never argv', () {
+    final List<String> withProxy = TunnelAgent.arguments(
+      server: 'https://chast.example',
+      hostId: 'devbox',
+      mode: TunnelMode.auto,
+      key: 'dev-secret',
+      proxy: 'socks5://alice:hunter2@127.0.0.1:10808',
+    );
+    expect(withProxy, contains('--server-key-stdin'));
+    expect(withProxy, contains('--proxy-stdin'));
+    expect(withProxy.join(' '), isNot(contains('hunter2')));
+
+    final List<String> proxyOnly = TunnelAgent.arguments(
+      server: 'https://chast.example',
+      hostId: 'devbox',
+      mode: TunnelMode.auto,
+      proxy: 'socks5://127.0.0.1:10808',
+    );
+    expect(proxyOnly, <String>[
+      'viewer',
+      '--server',
+      'https://chast.example',
+      '--id',
+      'devbox',
+      '--listen',
+      '127.0.0.1:0',
+      '--mode',
+      'auto',
+      '--proxy-stdin',
+    ]);
+  });
+
+  test(
+    'the key and proxy reach the child in that order over stdin',
+    () async {
+      final File script = await _ps1(
+        '\$key = [Console]::In.ReadLine()\r\n'
+        '\$proxy = [Console]::In.ReadLine()\r\n'
+        '[Console]::Out.WriteLine(\'{"event":"ready","listen":"127.0.0.1:45678","remote":"\' + \$key + \',\' + \$proxy + \'"}\')\r\n',
+      );
+      final TunnelAgent agent = await TunnelAgent.start(
+        server: const ServerSettings(
+          url: 'http://127.0.0.1:1',
+          key: 'dev-secret',
+          proxy: 'socks5://127.0.0.1:10808',
+        ),
+        hostId: 'devbox',
+        executable: 'powershell',
+        argumentOverride: <String>[
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script.path,
+        ],
+        timeout: const Duration(seconds: 20),
+      );
+      addTearDown(agent.stop);
+
+      expect(agent.remote, 'dev-secret,socks5://127.0.0.1:10808');
+    },
+    skip: !Platform.isWindows,
+  );
 }
 
 Future<File> _bat(String contents) async {
   final Directory dir = await Directory.systemTemp.createTemp('chast-tunnel-');
   addTearDown(() => dir.delete(recursive: true));
   final File script = File('${dir.path}${Platform.pathSeparator}agent.bat');
+  await script.writeAsString(contents);
+  return script;
+}
+
+Future<File> _ps1(String contents) async {
+  final Directory dir = await Directory.systemTemp.createTemp('chast-tunnel-');
+  addTearDown(() => dir.delete(recursive: true));
+  final File script = File('${dir.path}${Platform.pathSeparator}agent.ps1');
   await script.writeAsString(contents);
   return script;
 }

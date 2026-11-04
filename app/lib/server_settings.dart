@@ -103,11 +103,65 @@ bool _isLoopbackHost(String host) {
   return address != null && address.isLoopback;
 }
 
+/// Canonical outbound proxy URL, or an empty string when [input] is empty or
+/// invalid. Accepted schemes: http, https, socks5 and socks5h, each with an
+/// explicit port. Credentials may be embedded in the userinfo part.
+String normalizeProxyUrl(String input) {
+  final String text = input.trim();
+  if (text.isEmpty || text.length > 512 || !text.contains('://')) {
+    return '';
+  }
+  final Uri? uri = Uri.tryParse(text);
+  if (uri == null) {
+    return '';
+  }
+  final String scheme = uri.scheme.toLowerCase();
+  if (scheme != 'http' &&
+      scheme != 'https' &&
+      scheme != 'socks5' &&
+      scheme != 'socks5h') {
+    return '';
+  }
+  if (uri.host.isEmpty || !uri.hasPort) {
+    return '';
+  }
+  if (uri.port < 1 || uri.port > 65535) {
+    return '';
+  }
+  if (uri.path.isNotEmpty && uri.path != '/') {
+    return '';
+  }
+  if (uri.hasQuery || uri.hasFragment) {
+    return '';
+  }
+  return uri.replace(scheme: scheme, path: '').toString();
+}
+
+/// The proxy that actually applies: the configured value when present,
+/// otherwise `CHAST_PROXY`. An invalid value throws instead of returning
+/// empty, so a misconfigured proxy fails closed rather than dialing directly.
+String effectiveProxyUrl(String configured) {
+  final String text = configured.trim().isNotEmpty
+      ? configured.trim()
+      : (Platform.environment['CHAST_PROXY']?.trim() ?? '');
+  if (text.isEmpty) {
+    return '';
+  }
+  final String normalized = normalizeProxyUrl(text);
+  if (normalized.isEmpty) {
+    throw FormatException(
+      tr('出站代理地址无效，需要 http://、https://、socks5:// 或 socks5h:// 且包含端口'),
+    );
+  }
+  return normalized;
+}
+
 class ServerSettings {
   const ServerSettings({
     this.url = '',
     this.mode = TunnelMode.auto,
     this.key = '',
+    this.proxy = '',
     this.uploadRecordings = false,
   });
 
@@ -119,6 +173,10 @@ class ServerSettings {
   /// prove its punch requests, so it belongs with the service, not a device.
   final String key;
 
+  /// Outbound http(s)/socks5 proxy for the control plane and the TCP carrier.
+  /// UDP paths are not proxied; the agent forces the carrier when this is set.
+  final String proxy;
+
   /// Uploads a finished viewer recording to the signed-in account's archive.
   /// The server decides whether an archive exists; this only records intent.
   final bool uploadRecordings;
@@ -129,12 +187,14 @@ class ServerSettings {
     String? url,
     TunnelMode? mode,
     String? key,
+    String? proxy,
     bool? uploadRecordings,
   }) {
     return ServerSettings(
       url: url ?? this.url,
       mode: mode ?? this.mode,
       key: key ?? this.key,
+      proxy: proxy ?? this.proxy,
       uploadRecordings: uploadRecordings ?? this.uploadRecordings,
     );
   }
@@ -143,6 +203,7 @@ class ServerSettings {
         'url': url,
         'mode': mode.name,
         'key': key,
+        'proxy': proxy,
         'upload_recordings': uploadRecordings,
       };
 
@@ -155,6 +216,9 @@ class ServerSettings {
       url: url,
       mode: TunnelModeName.parse(value['mode']),
       key: value['key']?.toString().trim() ?? '',
+      // Keep an invalid stored value instead of dropping it: it must fail
+      // loudly when used, never silently turn into a direct connection.
+      proxy: value['proxy']?.toString().trim() ?? '',
       uploadRecordings: value['upload_recordings'] == true,
     );
   }
@@ -207,8 +271,9 @@ class ServerSettingsStore {
         );
       }
       final ServerSettings settings = ServerSettings.fromJson(decoded);
-      if (settings.key.isNotEmpty && _protector != null) {
-        // Replace a legacy plaintext key with its protected envelope.
+      if ((settings.key.isNotEmpty || settings.proxy.isNotEmpty) &&
+          _protector != null) {
+        // Replace a legacy plaintext secret with its protected envelope.
         await save(settings);
       }
       return settings;
@@ -224,14 +289,23 @@ class ServerSettingsStore {
     }
     String text = jsonEncode(settings.toJson());
     final ServerKeyProtector? protect = _protector;
-    if (protect != null && settings.key.isNotEmpty) {
+    if (protect != null &&
+        (settings.key.isNotEmpty || settings.proxy.isNotEmpty)) {
       try {
         final String blob = await protect(text);
         text = jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
       } catch (_) {
-        // Never fall back to writing the key in the clear: keep the
-        // non-secret fields on disk and leave the key for this run only.
-        text = jsonEncode(settings.copyWith(key: '').toJson());
+        // Never fall back to writing secrets in the clear: keep the
+        // non-secret fields on disk and leave them for this run only.
+        final bool proxyHasCredentials = settings.proxy.contains('@');
+        text = jsonEncode(
+          settings
+              .copyWith(
+                key: '',
+                proxy: proxyHasCredentials ? '' : settings.proxy,
+              )
+              .toJson(),
+        );
       }
     }
     try {
