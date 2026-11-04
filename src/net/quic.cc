@@ -520,6 +520,10 @@ struct QuicSession::Impl {
     mutable std::mutex mutex;
     std::condition_variable cv;
     bool connected = false;
+    std::chrono::steady_clock::time_point connected_at{};
+    // The pre-Hello timeout only guards the handshake. Once a client was
+    // admitted, a later wait_for_client() must not tear down the live session.
+    bool client_accepted = false;
     bool shutdown_complete = false;
     bool peer_closed = false;
     bool hello_ready = false;
@@ -953,6 +957,7 @@ struct QuicSession::Impl {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     connected = true;
+                    connected_at = std::chrono::steady_clock::now();
                 }
                 cv.notify_all();
                 break;
@@ -3967,6 +3972,8 @@ struct QuicSession::Impl {
         {
             std::lock_guard<std::mutex> lock(mutex);
             connected = false;
+            connected_at = {};
+            client_accepted = false;
             shutdown_complete = false;
             peer_closed = false;
             video_finished = false;
@@ -4444,10 +4451,36 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
     const uint16_t ceiling = impl.config_permissions();
     for (;;) {
         std::unique_lock<std::mutex> lock(impl.mutex);
-        const bool woken = impl.cv.wait_until(lock, deadline, [&impl] {
-            return impl.hello_ready || impl.transport_failed ||
-                   impl.shutdown_complete || impl.peer_closed;
-        });
+        auto until = deadline;
+        if (!impl.client_accepted && !impl.hello_ready && impl.connected &&
+            impl.server_config.hello_timeout_ms > 0) {
+            const auto hello_deadline =
+                impl.connected_at +
+                std::chrono::milliseconds(impl.server_config.hello_timeout_ms);
+            if (std::chrono::steady_clock::now() >= hello_deadline) {
+                lock.unlock();
+                // A peer that connected but never sent its Hello must not hold
+                // the single session slot forever (the keepalive defeats the
+                // idle timeout). Close it and keep listening for a real client.
+                impl.reset_connection();
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return Error(Status::WaitTimeout, "client connected but sent no Hello");
+                }
+                continue;
+            }
+            if (hello_deadline < until) {
+                until = hello_deadline;
+            }
+        }
+        // A notification delivered while this thread was refusing or
+        // resetting the previous client is not repeated, so a state left
+        // pending by it (the next viewer's Hello) must be seen here rather
+        // than slept through until the deadline. CONNECTED still wakes the
+        // wait so the pre-Hello deadline is re-evaluated without a Hello.
+        if (!impl.hello_ready && !impl.transport_failed && !impl.peer_closed &&
+            !impl.shutdown_complete) {
+            impl.cv.wait_until(lock, until);
+        }
         if (impl.transport_failed) {
             return Error(impl.transport_status, impl.transport_message);
         }
@@ -4504,6 +4537,12 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
                 if (!impl.server_config.approve_client) {
                     refuse(AccessDenial::Declined,
                            "the host requires approval but cannot ask for it");
+                } else if (!impl.peer_alive()) {
+                    // The Hello can reach this loop after the viewer's
+                    // handshake timeout expired. Do not ask an operator about
+                    // a viewer that already gave up.
+                    refuse(AccessDenial::AuthTimeout,
+                           "the viewer stopped waiting for approval");
                 } else {
                     const ClientApproval approval = impl.server_config.approve_client(request);
                     if (!approval.allow) {
@@ -4531,6 +4570,10 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
                 if (!impl.server_config.authenticate) {
                     impl.consume_token();
                 }
+                {
+                    std::lock_guard<std::mutex> guard(impl.mutex);
+                    impl.client_accepted = true;
+                }
                 return Error::success();
             }
             if (impl.server_config.stop_after_denial) {
@@ -4541,7 +4584,7 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             }
             continue;
         }
-        if (woken) {
+        if (impl.peer_closed || impl.shutdown_complete) {
             // A connection that came and went without a usable Hello (aborted
             // TLS, no Hello, wrong protocol version) frees the slot; the
             // listener stays available for the next client.
@@ -4552,7 +4595,12 @@ Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
             }
             continue;
         }
-        return Error(Status::WaitTimeout, "no client connected in time");
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Error(Status::WaitTimeout, "no client connected in time");
+        }
+        // A spurious wakeup or the end of the pre-Hello slice: the next
+        // iteration either re-waits or enforces the pre-Hello timeout.
+        continue;
     }
 }
 

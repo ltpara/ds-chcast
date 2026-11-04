@@ -6694,6 +6694,70 @@ ProbeClient probe_handshake(uint16_t port, const std::string& pin, const std::st
     return result;
 }
 
+// A peer that connects but never sends its Hello must not hold the single
+// session slot: the server closes it after hello_timeout_ms and serves the
+// next viewer.
+bool pre_hello_timeout_works(uint16_t port, std::string* detail) {
+    chast::QuicServerConfig server_config;
+    server_config.bind_address = "127.0.0.1";
+    server_config.port = port;
+    server_config.idle_timeout_ms = 5000;
+    server_config.hello_timeout_ms = 400;
+    std::string error;
+    std::unique_ptr<chast::QuicSession> server =
+        chast::QuicSession::create_server(server_config, &error);
+    if (!server) {
+        *detail = "server: " + error;
+        return false;
+    }
+    const std::string pin = server->server_fingerprint();
+    chast::Error waited = chast::Error::success();
+    std::thread waiting([&] {
+        waited = server->wait_for_client(std::chrono::seconds(4));
+        if (waited.ok()) {
+            chast::ServerInfo info;
+            info.width = 640;
+            info.height = 480;
+            info.source_width = 640;
+            info.source_height = 480;
+            info.framerate = 30;
+            waited = server->announce(info);
+        }
+    });
+
+    chast::QuicClientConfig silent_config;
+    silent_config.host = "127.0.0.1";
+    silent_config.port = port;
+    silent_config.idle_timeout_ms = 5000;
+    silent_config.pinned_fingerprint = pin;
+    std::unique_ptr<chast::QuicSession> silent =
+        chast::QuicSession::create_client(silent_config, &error);
+    if (!silent) {
+        waiting.join();
+        *detail = "client: " + error;
+        return false;
+    }
+    const chast::Error connected = silent->connect(std::chrono::seconds(2));
+    if (!connected.ok()) {
+        waiting.join();
+        *detail = "silent client connect: " + connected.to_string();
+        return false;
+    }
+    // Long enough for the 400 ms deadline plus the shutdown handshake.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    const ProbeClient second = probe_handshake(port, pin, "", std::chrono::seconds(2));
+    waiting.join();
+    if (!waited.ok()) {
+        *detail = "wait: " + waited.to_string();
+        return false;
+    }
+    if (!second.ok) {
+        *detail = "second viewer: " + second.error;
+        return false;
+    }
+    return true;
+}
+
 // Token and approval, on their own server so the main loopback stays a plain
 // accepted session: a wrong token is refused with a reason, then an operator
 // who declines the first viewer and accepts the second gets exactly that.
@@ -8634,6 +8698,15 @@ int run_verify(const Options& options) {
         check(passed, "wrong, spent and declined viewers are refused and told why");
         if (!passed) {
             std::printf("     access control probe: %s\n", detail.c_str());
+        }
+    }
+    {
+        std::string detail;
+        const bool passed =
+            pre_hello_timeout_works(static_cast<uint16_t>(probe_base + 7), &detail);
+        check(passed, "a viewer that never sends Hello cannot keep the session slot");
+        if (!passed) {
+            std::printf("     pre-Hello timeout probe: %s\n", detail.c_str());
         }
     }
     {

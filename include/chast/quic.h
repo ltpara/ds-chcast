@@ -119,6 +119,12 @@ struct QuicServerConfig {
     uint16_t port = 4433;
     // How long the connection may sit idle before the transport closes it.
     uint32_t idle_timeout_ms = 30000;
+    // How long a connection may stay open without sending its Hello. A silent
+    // peer would otherwise hold the single session slot forever: the server
+    // keepalive keeps the idle timeout from firing. On expiry the connection
+    // is shut down and the slot is released for the next viewer. 0 disables
+    // the pre-Hello timeout.
+    uint32_t hello_timeout_ms = 10000;
     // Accept InputEvents from the viewer. Off by default: a client that
     // connects to a port bound to loopback is still a client, and the gate
     // belongs to the server, not to the binding.
