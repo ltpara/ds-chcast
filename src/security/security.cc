@@ -700,7 +700,7 @@ uint32_t totp_code(const std::vector<uint8_t>& key, uint64_t unix_seconds,
 }
 
 bool verify_totp(const std::string& base32_secret, const std::string& code,
-                 uint64_t unix_seconds, int window) {
+                 uint64_t unix_seconds, int window, uint64_t* matched_step) {
     std::vector<uint8_t> key;
     if (!parse_totp_secret(base32_secret, key)) {
         return false;
@@ -731,6 +731,9 @@ bool verify_totp(const std::string& base32_secret, const std::string& code,
         char text[8];
         std::snprintf(text, sizeof(text), "%06u", expected);
         if (constant_time_equal(digits.data(), text, 6)) {
+            if (matched_step) {
+                *matched_step = static_cast<uint64_t>(moment) / static_cast<uint64_t>(kStep);
+            }
             return true;
         }
     }

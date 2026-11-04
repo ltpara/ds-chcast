@@ -198,6 +198,18 @@ void test_two_factor() {
     result = security.evaluate(hello, "127.0.0.1:3000", now);
     check(result.decision == Decision::Allow, "the current TOTP code allows the connection");
 
+    // RFC 6238: a time step authenticates at most once, so a captured code
+    // cannot be replayed inside its +/- window.
+    result = security.evaluate(hello, "127.0.0.1:3000", now);
+    check(result.decision == Decision::Deny && result.denial == AccessDenial::WrongTwoFactor,
+          "a consumed TOTP step cannot be replayed");
+    check(security.last_totp_step() == static_cast<uint64_t>(now) / 30,
+          "the accepted TOTP step is remembered");
+
+    hello.totp = totp_now(config.totp_secret, now + 30);
+    result = security.evaluate(hello, "127.0.0.1:3000", now + 30);
+    check(result.decision == Decision::Allow, "the next TOTP step is still accepted");
+
     hello.totp = totp_now(config.totp_secret, now + 300);
     result = security.evaluate(hello, "127.0.0.1:3000", now);
     check(result.decision == Decision::Deny && result.denial == AccessDenial::WrongTwoFactor,

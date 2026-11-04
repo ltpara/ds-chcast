@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <thread>
 
@@ -56,6 +57,22 @@ std::string win32_error(DWORD code) {
     return out;
 }
 
+// The overlay only protects displays the user is looking at, which live on
+// the interactive window station's Default desktop. A mask created on another
+// desktop would report success while hiding nothing.
+bool on_default_desktop() {
+    const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+    if (desktop == nullptr) {
+        return false;
+    }
+    wchar_t name[64] = {};
+    DWORD needed = 0;
+    if (!GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &needed)) {
+        return false;
+    }
+    return _wcsicmp(name, L"Default") == 0;
+}
+
 }  // namespace
 
 struct PrivacyOverlay::Impl {
@@ -66,7 +83,7 @@ struct PrivacyOverlay::Impl {
     std::atomic<bool> enabled{false};
 
     void run();
-    void cover(HWND hwnd);
+    bool cover(HWND hwnd);
     void set_enabled(HWND hwnd, bool on, bool* ok);
 
     static LRESULT window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
@@ -95,18 +112,26 @@ bool privacy_mode_supported() {
     return info.dwBuildNumber >= 19041;
 }
 
-void PrivacyOverlay::Impl::cover(HWND hwnd) {
+bool PrivacyOverlay::Impl::cover(HWND hwnd) {
     const int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (width <= 0 || height <= 0) {
-        return;
+    // The metrics read 0 when the thread cannot see the interactive desktop,
+    // and no virtual screen reaches these bounds; refusing them keeps an
+    // invalid rectangle from leaving a partially covered screen that claims
+    // to be private.
+    constexpr int kMaxVirtualExtent = 32768;
+    constexpr int kMaxVirtualOffset = 65536;
+    if (width <= 0 || height <= 0 || width > kMaxVirtualExtent ||
+        height > kMaxVirtualExtent || x < -kMaxVirtualOffset ||
+        x > kMaxVirtualOffset || y < -kMaxVirtualOffset || y > kMaxVirtualOffset) {
+        return false;
     }
     // HWND_TOPMOST on every tick keeps the mask above windows that are
     // created topmost later; SWP_NOACTIVATE keeps focus where it was.
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    return SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW) != FALSE;
 }
 
 void PrivacyOverlay::Impl::set_enabled(HWND hwnd, bool on, bool* ok) {
@@ -118,8 +143,12 @@ void PrivacyOverlay::Impl::set_enabled(HWND hwnd, bool on, bool* ok) {
         enabled = false;
         return;
     }
-    cover(hwnd);
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    if (!on_default_desktop() || !cover(hwnd)) {
+        if (ok != nullptr) {
+            *ok = false;
+        }
+        return;
+    }
     if (!IsWindowVisible(hwnd)) {
         if (ok != nullptr) {
             *ok = false;
@@ -131,9 +160,18 @@ void PrivacyOverlay::Impl::set_enabled(HWND hwnd, bool on, bool* ok) {
 
 void PrivacyOverlay::Impl::run() {
     HDESK desktop = OpenDesktopW(L"Default", 0, FALSE, kDefaultDesktopAccess);
-    if (desktop != nullptr) {
-        SetThreadDesktop(desktop);
-        CloseDesktop(desktop);
+    if (desktop == nullptr) {
+        create_error = "OpenDesktopW(Default): " + win32_error(GetLastError());
+        SetEvent(ready);
+        return;
+    }
+    const BOOL attached = SetThreadDesktop(desktop);
+    const DWORD attach_error = attached ? ERROR_SUCCESS : GetLastError();
+    CloseDesktop(desktop);
+    if (attached == FALSE) {
+        create_error = "SetThreadDesktop(Default): " + win32_error(attach_error);
+        SetEvent(ready);
+        return;
     }
 
     WNDCLASSEXW wc{};
@@ -157,6 +195,15 @@ void PrivacyOverlay::Impl::run() {
         wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, this);
     if (window == nullptr) {
         create_error = "CreateWindowExW: " + win32_error(GetLastError());
+        SetEvent(ready);
+        return;
+    }
+    // A layered window without an alpha is never composited, so the black
+    // background would stay invisible while IsWindowVisible reports true.
+    if (!SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA)) {
+        create_error = "SetLayeredWindowAttributes: " + win32_error(GetLastError());
+        DestroyWindow(window);
+        window = nullptr;
         SetEvent(ready);
         return;
     }
@@ -199,8 +246,11 @@ LRESULT CALLBACK PrivacyOverlay::Impl::window_proc(HWND hwnd, UINT message, WPAR
         case WM_DISPLAYCHANGE:
         case WM_SETTINGCHANGE:
         case WM_TIMER:
-            if (impl != nullptr && impl->enabled.load()) {
-                impl->cover(hwnd);
+            if (impl != nullptr && impl->enabled.load() && !impl->cover(hwnd)) {
+                // A partial mask would claim privacy the window cannot
+                // provide, so drop it instead of leaving it half covering.
+                ShowWindow(hwnd, SW_HIDE);
+                impl->enabled = false;
             }
             return 0;
         case WM_CLOSE:

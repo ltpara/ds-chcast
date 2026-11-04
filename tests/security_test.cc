@@ -143,7 +143,9 @@ void test_totp() {
     check(chast::totp_code(key, 20000000000ull) == 353130,
           "TOTP vector at 20000000000");
 
-    check(chast::verify_totp(secret, "287082", 59), "verify accepts the current code");
+    uint64_t matched_step = 0;
+    check(chast::verify_totp(secret, "287082", 59, 0, &matched_step) && matched_step == 1,
+          "verify reports the matching RFC 6238 time step");
     check(chast::verify_totp(secret, " 287 082 ", 59),
           "verify tolerates spaces in the code");
     check(!chast::verify_totp(secret, "287083", 59), "verify rejects a wrong code");

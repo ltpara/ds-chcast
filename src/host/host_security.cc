@@ -451,21 +451,30 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
             result.permissions =
                 config_.default_permissions & requested;
             return result;
-        } else if (!verify_totp(config_.totp_secret, hello.totp, now_unix, 1)) {
-            result = deny(AccessDenial::WrongTwoFactor);
-            result.peer_address = peer_address;
-            result.peer_ip = address_key(peer_address, result.peer_ip);
-            result.permissions =
-                config_.default_permissions & requested;
-            fail_locked(key, now_unix);
-            if (!config_.service_mode && !temporary_password_.empty()) {
-                ++temporary_failures_;
-                if (temporary_failures_ >= kTempPasswordFailureLimit) {
-                    temporary_password_ = random_digits(6);
-                    temporary_failures_ = 0;
+        } else {
+            uint64_t step = 0;
+            // A well-formed code from an earlier step is a replay: RFC 6238
+            // requires each time step to be accepted at most once.
+            const bool fresh =
+                verify_totp(config_.totp_secret, hello.totp, now_unix, 1, &step) &&
+                step > last_totp_step_;
+            if (!fresh) {
+                result = deny(AccessDenial::WrongTwoFactor);
+                result.peer_address = peer_address;
+                result.peer_ip = address_key(peer_address, result.peer_ip);
+                result.permissions =
+                    config_.default_permissions & requested;
+                fail_locked(key, now_unix);
+                if (!config_.service_mode && !temporary_password_.empty()) {
+                    ++temporary_failures_;
+                    if (temporary_failures_ >= kTempPasswordFailureLimit) {
+                        temporary_password_ = random_digits(6);
+                        temporary_failures_ = 0;
+                    }
                 }
+                return result;
             }
-            return result;
+            last_totp_step_ = step;
         }
     } else if (trusted_active && signature_valid) {
         result.via_trusted_device = true;
@@ -604,6 +613,11 @@ bool HostSecurity::two_factor_enabled() const {
 std::string HostSecurity::totp_secret() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_.totp_secret;
+}
+
+uint64_t HostSecurity::last_totp_step() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_totp_step_;
 }
 
 bool HostSecurity::has_temporary_password() const {

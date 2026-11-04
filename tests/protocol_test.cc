@@ -3074,6 +3074,35 @@ void test_clipboard_container() {
     check(chast::encode_clipboard_stream(bad_dib).empty(),
           "the encoder refuses a DIB with no picture size");
 
+    auto rejects_dib = [&](std::vector<uint8_t> bytes, const char* what) {
+        chast::ClipboardContent candidate;
+        chast::ClipboardFormatData entry;
+        entry.format = chast::ClipboardFormat::Dib;
+        entry.data = std::move(bytes);
+        candidate.formats.push_back(std::move(entry));
+        check(!chast::valid_clipboard_content(candidate, &error), what);
+    };
+    std::vector<uint8_t> truncated = dib.data;
+    truncated.pop_back();
+    rejects_dib(std::move(truncated),
+                "a DIB shorter than the pixels its header promises is rejected");
+    std::vector<uint8_t> widened = dib.data;
+    widened[4] = 0x88;
+    widened[5] = 0x13;  // width 5000, still inside the 8192 cap
+    rejects_dib(std::move(widened),
+                "a DIB whose width outruns its pixel data is rejected");
+    std::vector<uint8_t> odd_bits = dib.data;
+    odd_bits[14] = 7;
+    rejects_dib(std::move(odd_bits), "a DIB with an unusable bit count is rejected");
+    std::vector<uint8_t> oversized = dib.data;
+    oversized[4] = 0x01;
+    oversized[5] = 0x20;  // width 8193
+    rejects_dib(std::move(oversized), "a DIB wider than the dimension cap is rejected");
+    std::vector<uint8_t> no_palette = dib.data;
+    no_palette[14] = 8;
+    rejects_dib(std::move(no_palette),
+                "a DIB whose color table is missing is rejected");
+
     // A rich item's text rides the CCLB stream, not the legacy control
     // message, so it must not inherit that message's 256 KiB limit.
     check(chast::kMaxClipboardTextBytes > chast::kMaxClipboardBytes,

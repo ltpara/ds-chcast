@@ -139,6 +139,10 @@ public:
     void clear_totp_secret();
     bool two_factor_enabled() const;
     std::string totp_secret() const;
+    // Highest RFC 6238 step accepted so far. Every later login must use a
+    // strictly newer step, so a captured code cannot be replayed inside its
+    // +/- window.
+    uint64_t last_totp_step() const;
 
     // ----- temporary password -----
 
@@ -186,6 +190,9 @@ private:
     bool whitelist_configured_ = false;
     bool whitelist_valid_ = false;
     bool totp_valid_ = false;
+    // Monotonic within the lifetime of this policy object, including across
+    // set_config() calls; replacing the secret does not rewind it.
+    uint64_t last_totp_step_ = 0;
     std::map<std::string, AddressFailures> failures_;
     std::vector<std::pair<std::array<uint8_t, kHelloNonceBytes>, int64_t>> nonces_;
 };

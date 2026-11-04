@@ -87,12 +87,20 @@ uint64_t read_u64(const uint8_t* data) {
     return value;
 }
 
+// Paste targets trust the DIB header and allocate/read according to it, so a
+// header that promises more pixels than the blob carries turns into an
+// out-of-bounds read on the host. Derive the exact palette and pixel byte
+// counts from the header instead of only checking that the header itself fits.
 bool valid_dib(const std::vector<uint8_t>& data, std::string* error) {
-    if (data.size() < 12) {
+    constexpr uint64_t kMaxDimension = 8192;
+    const auto fail = [error](const char* message) {
         if (error) {
-            *error = "DIB clipboard data is too short";
+            *error = message;
         }
         return false;
+    };
+    if (data.size() < 12) {
+        return fail("DIB clipboard data is too short");
     }
     const uint32_t header_size = read_u32(data.data());
     switch (header_size) {
@@ -105,31 +113,105 @@ bool valid_dib(const std::vector<uint8_t>& data, std::string* error) {
         case 124:  // BITMAPV5HEADER
             break;
         default:
-            if (error) {
-                *error = "DIB clipboard data has an unknown header size";
-            }
-            return false;
+            return fail("DIB clipboard data has an unknown header size");
     }
     if (data.size() < header_size) {
-        if (error) {
-            *error = "DIB clipboard data is shorter than its header";
-        }
-        return false;
+        return fail("DIB clipboard data is shorter than its header");
     }
-    int64_t width = 0;
-    int64_t height = 0;
+
+    uint64_t width = 0;
+    uint64_t height = 0;
+    uint32_t planes = 1;
+    uint32_t bit_count = 0;
+    uint32_t compression = 0;  // BI_RGB; the core header has no such field
+    uint32_t size_image = 0;
+    uint32_t colors_used = 0;
+    uint64_t palette_entry_bytes = 4;
     if (header_size == 12) {
-        width = static_cast<int64_t>(data[4] | (data[5] << 8));
-        height = static_cast<int64_t>(data[6] | (data[7] << 8));
+        width = data[4] | (data[5] << 8);
+        height = data[6] | (data[7] << 8);
+        planes = data[8] | (data[9] << 8);
+        bit_count = data[10] | (data[11] << 8);
+        palette_entry_bytes = 3;  // RGBTRIPLE
     } else {
-        width = static_cast<int32_t>(read_u32(data.data() + 4));
-        height = static_cast<int32_t>(read_u32(data.data() + 8));
+        width = read_u32(data.data() + 4);
+        const int32_t signed_height = static_cast<int32_t>(read_u32(data.data() + 8));
+        height = signed_height < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(signed_height))
+                                   : static_cast<uint64_t>(signed_height);
+        planes = data[12] | (data[13] << 8);
+        bit_count = data[14] | (data[15] << 8);
+        compression = read_u32(data.data() + 16);
+        size_image = read_u32(data.data() + 20);
+        colors_used = read_u32(data.data() + 32);
     }
-    if (width <= 0 || height == 0 || width > 32768 || height > 32768 || height < -32768) {
-        if (error) {
-            *error = "DIB clipboard data has an unusable size";
+
+    if (width == 0 || width > kMaxDimension || height == 0 || height > kMaxDimension ||
+        planes != 1) {
+        return fail("DIB clipboard data has an unusable size");
+    }
+    const bool plain_bit_count = bit_count == 1 || bit_count == 4 || bit_count == 8 ||
+                                 bit_count == 16 || bit_count == 24 || bit_count == 32;
+    switch (compression) {
+        case 0:  // BI_RGB
+            if (!plain_bit_count) {
+                return fail("DIB clipboard data has an unusable bit count");
+            }
+            break;
+        case 1:  // BI_RLE8
+            if (bit_count != 8) {
+                return fail("DIB clipboard data has an unusable bit count");
+            }
+            break;
+        case 2:  // BI_RLE4
+            if (bit_count != 4) {
+                return fail("DIB clipboard data has an unusable bit count");
+            }
+            break;
+        case 3:  // BI_BITFIELDS
+            if (bit_count != 16 && bit_count != 32) {
+                return fail("DIB clipboard data has an unusable bit count");
+            }
+            break;
+        case 4:  // BI_JPEG
+        case 5:  // BI_PNG
+            break;
+        default:
+            return fail("DIB clipboard data uses an unsupported compression");
+    }
+
+    // The 40-byte header stores the three channel masks after the header; the
+    // V2 and later headers carry them inside the header itself. The OS/2 2.x
+    // header also has no mask fields, so it keeps the trailing layout.
+    uint64_t mask_bytes = 0;
+    if (compression == 3 && (header_size == 40 || header_size == 64)) {
+        mask_bytes = 12;
+    }
+    uint64_t palette_bytes = 0;
+    if (compression == 0 || compression == 1 || compression == 2 || compression == 3) {
+        uint64_t entries = colors_used;
+        if (entries == 0 && bit_count <= 8 && bit_count > 0) {
+            entries = uint64_t{1} << bit_count;
         }
-        return false;
+        if (entries > 256) {
+            return fail("DIB clipboard data has an unusable color table");
+        }
+        palette_bytes = entries * palette_entry_bytes;
+    }
+    const uint64_t pixel_offset = uint64_t{header_size} + mask_bytes + palette_bytes;
+    if (pixel_offset > data.size()) {
+        return fail("DIB clipboard data is shorter than its color table");
+    }
+
+    if (compression == 0 || compression == 3) {
+        const uint64_t stride = ((width * bit_count + 31) / 32) * 4;
+        const uint64_t pixels = stride * height;
+        if (pixels == 0 || pixel_offset + pixels > data.size()) {
+            return fail("DIB clipboard data is shorter than its pixel data");
+        }
+    } else if (size_image == 0 || size_image > data.size() - pixel_offset) {
+        // RLE and JPEG/PNG payloads are stored as-is; biSizeImage is the only
+        // trustworthy bound, so a missing or oversized value is refused.
+        return fail("DIB clipboard data is shorter than its compressed payload");
     }
     return true;
 }

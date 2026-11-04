@@ -15,6 +15,7 @@
 - **账号系统有两处设计缺口（H5/H6，已于 2026-11-05 修复，见各节）**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
 - **媒体接收无界与 QUIC 句柄并发（H3/M1/M2，已于 2026-11-05 修复，见各节）**：四条媒体队列加了字节高水位反压，句柄与 parser 统一到同一把会话锁。
 - **授权撤销在“仅文件”会话中不生效、旧掩码跨会话泄漏（H7），认证前畸形控制帧可终止整个监听（M3），可恢复拒绝被当成会话致命错误（M4）**（均已于 2026-11-05 修复，见各节）：文件会话每轮应用操作员掩码并在会话边界清理遗留掩码；认证前协议破坏只断开当前连接；权限/配额不足改为仅中止单条流，剪贴板聚合上限改为每次 push 复查。
+- **剪贴板 DIB 越界、TOTP 步内重放、隐私遮罩假成功（M7/M8/M9，已于 2026-11-05 修复，见各节）**：`CF_DIB` 现在按头部推导像素/调色板长度；TOTP 记录并拒绝已用步号（内存级）；隐私遮罩设置分层 alpha、校验桌面归属与覆盖矩形，`OpenDesktopW` 失败即判失败。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -516,6 +517,10 @@ if (width <= 0 || height == 0 || width > 32768 || height > 32768 || height < -32
 
 **修复**：按 `stride = ((width*bitcount+31)/32)*4`、`pixel = stride*abs(height)`、调色板大小校验 `data.size()`；`BI_BITFIELDS/BI_JPEG/BI_PNG` 分别处理；宽高上限压到 8192。
 
+**修复（2026-11-05）**
+
+`valid_dib()` 现在完全按头部推导布局：接受 12/40/52/56/64/108/124 字节头；宽高非零且不超过 8192、`biPlanes == 1`；压缩方式约束位深（BI_RGB 1/4/8/16/24/32，BI_RLE8 8，BI_RLE4 4，BI_BITFIELDS 16/32，BI_JPEG/BI_PNG 不限）；调色板条目数取 `biClrUsed` 或 `1<<biBitCount`（上限 256，core 头每项 3 字节、info 头 4 字节），BI_BITFIELDS 的 40/64 字节头再计 12 字节通道掩码；BI_RGB/BI_BITFIELDS 用 `stride*height` 校验 `pixel_offset` 之后的剩余字节，RLE/JPEG/PNG 要求 `biSizeImage` 非零且不越过缓冲区。`tests/protocol_test.cc` 新增截断像素、宽度超出数据、7bpp、8193 宽度、8bpp 缺调色板五个拒绝用例，与既有合法 DIB 往返用例一起由 `chast-protocol-test` 运行通过。
+
 ---
 
 ### M8. TOTP 在 ±1 步窗口内可重放
@@ -533,6 +538,10 @@ for (int offset = -span; offset <= span; ++offset) {
 
 **修复**：`verify_totp` 返回命中的步号；`HostSecurity` 持久化 `last_accepted_step`，接受后拒绝 `step <= last`。
 
+**修复（2026-11-05）**
+
+`verify_totp()` 增加可选 `matched_step` 出参，命中时返回该时间步；`HostSecurity` 新增受 `mutex_` 保护的 `last_totp_step_`，只有 `step > last_totp_step_` 才接受并推进。记录跨 `set_config()` 保留（替换密钥不会把已用步号倒回），但**仅存于内存**：重启后从当前时间步重新开始，同一窗口内的重放在重启后可再次通过。持久化需要新的设置字段与兼容迁移，而单次重启窗口的暴露面远小于原先的无限重放，故本轮采用内存方案。`tests/host_security_test.cc` 覆盖当前码接受、同码重放拒绝、步号记录、下一步接受；`tests/security_test.cc` 校验 `matched_step` 返回值。两个测试均运行通过。
+
 ---
 
 ### M9. 隐私遮罩“假成功”：分层窗口从未设置分层属性
@@ -549,6 +558,13 @@ if (!IsWindowVisible(hwnd)) { if (ok) *ok = false; return; }
 全文件没有 `SetLayeredWindowAttributes`/`UpdateLayeredWindow`。未设置属性的分层窗口不会被绘制（透明度视为 0），但 `WS_VISIBLE` 仍为真，`IsWindowVisible()` 照样返回 TRUE。于是 `enable()` 返回成功、host 回 `PrivacyModeCode::Ok`，而屏幕实际没有被遮挡。
 
 **修复**：创建后立即 `SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)`（或去掉 `WS_EX_LAYERED`）；增加覆盖矩形与桌面归属校验；`OpenDesktopW(L"Default")` 失败要直接判失败。
+
+**修复（2026-11-05）**
+
+- 窗口创建成功后立即 `SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)`，失败按创建失败处理（写 `create_error`、销毁窗口、置位 ready），不再出现“分层但永不绘制、`IsWindowVisible` 却为真”的假成功。
+- `cover()` 改为返回 `bool`：虚拟屏幕宽高必须为正且不超过 32768、原点绝对值不超过 65536（指标读取失败时返回 0），`SetWindowPos` 失败也返回 false。`enable()` 只有在桌面归属、覆盖矩形、`IsWindowVisible` 都通过后才置 `enabled`；会话中 `WM_DISPLAYCHANGE`/`WM_SETTINGCHANGE`/定时器发现覆盖失败时隐藏窗口并清除 `enabled`，避免留下“遮住一半却声称隐私”的状态。
+- 线程启动时 `OpenDesktopW(L"Default")` 或 `SetThreadDesktop` 失败直接判创建失败（此前忽略返回值）；`set_enabled()` 显示前用 `GetUserObjectInformationW(UOI_NAME)` 校验当前线程桌面确为 `Default`，在其他桌面上不再谎报成功。
+- 构建通过；运行时验证需要真实交互桌面且会实际黑屏，未在本机执行。
 
 ---
 
@@ -939,7 +955,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 5. H4（复核为误报，无需修改）：`avcodec_send_packet` 会复制非引用计数 packet 并补 padding；`tests/decoder_padding_test.cc` 用 guard page 固定该契约。
 6. H3：四条接收队列加高水位/反压；M1/M2 统一句柄与 parser 同步（均已完成，见各节修复说明）。
 7. H7：文件会话应用权限撤销并清理跨会话掩码；M3/M4 区分“可恢复拒绝”和“会话致命”（均已完成，见各节修复说明）。
-8. M7/M8/M9：CF_DIB 长度校验、TOTP 步号去重、隐私遮罩真正可见。
+8. M7/M8/M9：CF_DIB 长度校验、TOTP 步号去重、隐私遮罩真正可见（均已完成，见各节修复说明）。
 
 **第三批（一个月内，可信度与本地边界）**
 

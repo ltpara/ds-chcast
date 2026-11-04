@@ -89,9 +89,12 @@ bool parse_totp_secret(const std::string& base32, std::vector<uint8_t>& key);
 uint32_t totp_code(const std::vector<uint8_t>& key, uint64_t unix_seconds,
                    uint32_t step_seconds = 30, uint32_t digits = 6);
 // Accepts the code at `unix_seconds` and +/- `window` steps. The comparison
-// is constant time.
+// is constant time. When `matched_step` is not null it receives the RFC 6238
+// time step that matched, so a stateful caller can refuse a second use of the
+// same or an older step.
 bool verify_totp(const std::string& base32_secret, const std::string& code,
-                 uint64_t unix_seconds, int window = 1);
+                 uint64_t unix_seconds, int window = 1,
+                 uint64_t* matched_step = nullptr);
 std::string totp_uri(const std::string& secret_base32, const std::string& issuer,
                      const std::string& account);
 
