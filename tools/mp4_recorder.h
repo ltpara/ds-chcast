@@ -30,6 +30,7 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
+#include <libavutil/mathematics.h>
 }
 
 #include "annexb.h"
@@ -239,6 +240,7 @@ private:
         segments_.push_back(path);
         segment_codecs_.push_back(codec_);
         header_started_ = true;
+        first_pts_ms_ = -1;
         write_packet(header, data, size);
         return !failed_;
     }
@@ -289,7 +291,16 @@ private:
             return;
         }
         std::memcpy(packet_->data, sample.data(), sample.size());
-        packet_->pts = static_cast<int64_t>(header.pts_ms);
+        // The host timestamps pictures from the start of its session, but a
+        // file should start at zero. The muxer may also pick its own track
+        // timescale in write_header (mov uses 1/16000 here), so convert from
+        // milliseconds into whatever time base the stream now carries.
+        const int64_t pts_ms = static_cast<int64_t>(header.pts_ms);
+        if (first_pts_ms_ < 0) {
+            first_pts_ms_ = pts_ms;
+        }
+        const int64_t relative_ms = pts_ms > first_pts_ms_ ? pts_ms - first_pts_ms_ : 0;
+        packet_->pts = av_rescale_q(relative_ms, AVRational{1, 1000}, stream_->time_base);
         packet_->dts = packet_->pts;
         packet_->stream_index = stream_->index;
         packet_->flags = header.keyframe ? AV_PKT_FLAG_KEY : 0;
@@ -642,6 +653,9 @@ private:
     AVFormatContext* format_ = nullptr;
     AVStream* stream_ = nullptr;
     AVPacket* packet_ = nullptr;
+    // Host timestamp of this segment's first picture; subtracted so every
+    // segment starts at zero.
+    int64_t first_pts_ms_ = -1;
     bool header_started_ = false;
     bool failed_ = false;
     std::string error_;

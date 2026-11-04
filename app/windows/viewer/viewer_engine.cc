@@ -1040,7 +1040,10 @@ bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
         std::lock_guard<std::mutex> lock(record_mutex_);
         record_dir_ = std::move(directory);
     }
-    record_wanted_.store(enabled, std::memory_order_relaxed);
+    const bool was_wanted = record_wanted_.exchange(enabled, std::memory_order_relaxed);
+    if (enabled && !was_wanted) {
+        keyframe_wanted_.store(true, std::memory_order_relaxed);
+    }
     return true;
 }
 
@@ -6189,6 +6192,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         file_active || audio_announced || microphone_enabled ||
                         microphone_wanted_.load(std::memory_order_relaxed) ||
                         port_forward != nullptr || terminal_active || camera_active;
+                    if (keyframe_wanted_.exchange(false, std::memory_order_relaxed)) {
+                        request_keyframe();
+                    }
                     chast::Error received_frame = chast::Error::success();
                     if (files_only) {
                         // No media stream to wait on: the loop polls on short

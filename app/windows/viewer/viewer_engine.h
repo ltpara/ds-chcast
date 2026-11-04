@@ -908,6 +908,10 @@ private:
     // owns the muxer; `record_dir_` is read when a recording starts, so a new
     // folder applies to the next file instead of interrupting one in flight.
     std::atomic<bool> record_wanted_{false};
+    // The muxer can only open its first segment on a key frame, and an idle
+    // host sends one only when asked; enabling recording sets this flag so the
+    // session thread requests an IDR instead of waiting for the next GOP.
+    std::atomic<bool> keyframe_wanted_{false};
     mutable std::mutex record_mutex_;
     std::string record_dir_;
 

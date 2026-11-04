@@ -1957,7 +1957,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         status.displayModeLists > _modesRequestedLists) {
       _modesRefreshPending = false;
     }
-    if (status.displayModesDisplay == streamed && !_modesRefreshPending) {
+    // The display fields start at display 0 with an empty list, which would
+    // otherwise look like a loaded answer for the common single-display case.
+    if (status.displayModesDisplay == streamed &&
+        status.displayModeLists > 0 &&
+        !_modesRefreshPending) {
       return;
     }
     final DateTime now = DateTime.now();
