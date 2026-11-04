@@ -96,6 +96,8 @@ struct HostServerStats {
     // out (local changes). Both stay zero when clipboard sync is disabled.
     uint64_t clipboard_sent = 0;
     uint64_t clipboard_received = 0;
+    // Viewer items the local clipboard refused; the previous content stays.
+    uint64_t clipboard_write_failures = 0;
     // Chat lines sent to the viewer and received from it. Both directions are
     // ungated by permissions; an admitted session is the authorization.
     uint64_t chat_sent = 0;

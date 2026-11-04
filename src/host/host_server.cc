@@ -428,12 +428,6 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
             return read_clipboard(content, &ignored);
         };
     }
-    if (!config.clipboard_write) {
-        config.clipboard_write = [](const ClipboardContent& content) {
-            std::string ignored;
-            return write_clipboard(content, &ignored);
-        };
-    }
     if (!config.clipboard_read_files) {
         config.clipboard_read_files = [](std::vector<std::string>& paths) {
             std::string ignored;
@@ -447,6 +441,19 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
         };
     }
     std::unique_ptr<HostServer> server(new HostServer(std::move(config)));
+    if (!server->config_.clipboard_write) {
+        // The default writer reports why the viewer's item was refused; the
+        // clipboard backend now leaves the previous content in place on failure.
+        HostServer* self = server.get();
+        server->config_.clipboard_write = [self](const ClipboardContent& content) {
+            std::string write_error;
+            if (write_clipboard(content, &write_error)) {
+                return true;
+            }
+            self->log("clipboard: cannot apply the viewer's content: " + write_error);
+            return false;
+        };
+    }
     if (server->settings_.access_token.empty()) {
         server->settings_.access_token = generate_access_token();
         if (server->config_.token_changed) {
@@ -1656,6 +1663,7 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
             return;
         }
         if (!config_.clipboard_write(content)) {
+            ++stats.clipboard_write_failures;
             return;
         }
         // Remembering what was applied is what stops the next poll from

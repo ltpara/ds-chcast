@@ -146,47 +146,43 @@ UINT win32_format(ClipboardFormat format) {
     return 0;
 }
 
-bool set_global(UINT format, const std::vector<uint8_t>& data, bool terminate) {
-    if (format == 0) {
-        return false;
-    }
-    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, data.size() + (terminate ? 1 : 0));
+// Builds the handle a format is published with, without touching the
+// clipboard: write_clipboard() prepares the whole item first so a failure
+// cannot leave the previous owner's content cleared and nothing in its place.
+HGLOBAL make_global(const std::vector<uint8_t>& data) {
+    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, data.size());
     if (!handle) {
-        return false;
+        return nullptr;
     }
     auto* target = static_cast<uint8_t*>(GlobalLock(handle));
     if (!target) {
         GlobalFree(handle);
-        return false;
+        return nullptr;
     }
     if (!data.empty()) {
         std::memcpy(target, data.data(), data.size());
     }
-    if (terminate) {
-        target[data.size()] = 0;
-    }
     GlobalUnlock(handle);
-    if (!SetClipboardData(format, handle)) {
-        GlobalFree(handle);
-        return false;
-    }
-    return true;
+    return handle;
 }
 
-bool set_text(const std::vector<uint8_t>& data) {
+HGLOBAL make_text(const std::vector<uint8_t>& data) {
     const std::string text(data.begin(), data.end());
-    if (!valid_clipboard_text(text) || text.size() > static_cast<size_t>(INT_MAX)) {
-        return false;
+    // The rich path carries text up to the stream's budget; the legacy
+    // 256 KiB control-message limit (valid_clipboard_text) does not apply.
+    if (text.empty() || text.size() > kMaxClipboardTextBytes ||
+        text.size() > static_cast<size_t>(INT_MAX) || !valid_utf8(text)) {
+        return nullptr;
     }
     const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
                                            static_cast<int>(text.size()), nullptr, 0);
     if (length <= 0) {
-        return false;
+        return nullptr;
     }
     const size_t bytes = (static_cast<size_t>(length) + 1) * sizeof(wchar_t);
     HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
     if (!handle) {
-        return false;
+        return nullptr;
     }
     auto* target = static_cast<wchar_t*>(GlobalLock(handle));
     if (!target ||
@@ -194,15 +190,11 @@ bool set_text(const std::vector<uint8_t>& data) {
                             static_cast<int>(text.size()), target, length) != length) {
         GlobalUnlock(handle);
         GlobalFree(handle);
-        return false;
+        return nullptr;
     }
     target[length] = L'\0';
     GlobalUnlock(handle);
-    if (!SetClipboardData(CF_UNICODETEXT, handle)) {
-        GlobalFree(handle);
-        return false;
-    }
-    return true;
+    return handle;
 }
 
 }  // namespace
@@ -250,29 +242,74 @@ bool write_clipboard(const ClipboardContent& content, std::string* error) {
     if (!valid_clipboard_content(content, error)) {
         return false;
     }
+    struct Staged {
+        UINT format = 0;
+        HGLOBAL handle = nullptr;
+    };
+    std::vector<Staged> staged;
+    staged.reserve(content.formats.size());
+    // Prepare every handle before EmptyClipboard(). A preparation failure must
+    // leave the clipboard alone; once it is emptied nothing may fail.
+    // Text goes in last: a paste target that knows none of the richer
+    // formats should still find the plain fallback.
+    for (auto it = content.formats.rbegin(); it != content.formats.rend(); ++it) {
+        const UINT format = win32_format(it->format);
+        HGLOBAL handle = nullptr;
+        if (format == CF_UNICODETEXT) {
+            handle = make_text(it->data);
+        } else if (format != 0) {
+            handle = make_global(it->data);
+        }
+        if (handle == nullptr) {
+            continue;
+        }
+        staged.push_back({format, handle});
+    }
+    auto release = [&staged] {
+        for (const Staged& item : staged) {
+            if (item.handle != nullptr) {
+                GlobalFree(item.handle);
+            }
+        }
+        staged.clear();
+    };
+    if (staged.empty()) {
+        if (error) {
+            *error = "the clipboard item could not be prepared";
+        }
+        return false;
+    }
     if (!open_clipboard()) {
+        release();
         if (error) {
             *error = "the clipboard is held by another process";
         }
         return false;
     }
-    bool any = false;
-    if (EmptyClipboard()) {
-        // Text goes in last: a paste target that knows none of the richer
-        // formats should still find the plain fallback.
-        for (auto it = content.formats.rbegin(); it != content.formats.rend(); ++it) {
-            if (it->format == ClipboardFormat::Text) {
-                any = set_text(it->data) || any;
-            } else {
-                any = set_global(win32_format(it->format), it->data, false) || any;
-            }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        release();
+        if (error) {
+            *error = "the clipboard could not be cleared";
+        }
+        return false;
+    }
+    size_t written = 0;
+    for (Staged& item : staged) {
+        if (SetClipboardData(item.format, item.handle)) {
+            item.handle = nullptr;  // the clipboard owns it now
+            ++written;
         }
     }
     CloseClipboard();
-    if (!any && error) {
-        *error = "the clipboard refused every format";
+    release();
+    if (written == 0) {
+        if (error) {
+            *error = "the clipboard refused every format";
+        }
+        return false;
     }
-    return any;
+    return true;
 }
 
 bool read_clipboard_files(std::vector<std::string>& paths, std::string* error) {

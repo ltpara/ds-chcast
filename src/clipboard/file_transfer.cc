@@ -23,6 +23,9 @@ constexpr uint8_t kSidecarVersion = 1;
 constexpr char kSidecarMagic[9] = {'C', 'H', 'A', 'S', 'P', 'A', 'R', 'T', '1'};
 constexpr size_t kSidecarBytes = sizeof(kSidecarMagic) + 1 + 8 + 32;
 constexpr size_t kIoChunk = 1024u * 1024u;
+// Intermediates live in a reserved directory with hashed names, so they can
+// never collide with a user file such as "backup.zip.part".
+constexpr wchar_t kPartialDirectory[] = L".chast-partial";
 
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) {
@@ -104,10 +107,66 @@ bool path_exists(const std::wstring& path) {
     return GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND;
 }
 
-bool is_reparse_point(const std::wstring& path) {
-    const DWORD attributes = GetFileAttributesW(long_path(path).c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES &&
-           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+// Path-based checks race with a swap; after opening with
+// FILE_FLAG_OPEN_REPARSE_POINT the attributes of the object actually held
+// decide whether the handle is a plain file or directory.
+bool plain_handle(HANDLE handle, bool directory) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    return GetFileInformationByHandle(handle, &info) != FALSE &&
+           (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+           ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) == directory;
+}
+
+bool ensure_partial_directory(const std::wstring& parent, std::wstring& directory,
+                              std::string* error) {
+    directory = join(parent, kPartialDirectory);
+    if (!CreateDirectoryW(long_path(directory).c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (error) {
+            *error = "cannot create the partial directory (error " +
+                     std::to_string(GetLastError()) + ")";
+        }
+        return false;
+    }
+    HANDLE handle = CreateFileW(long_path(directory).c_str(), FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        if (error) {
+            *error = "the partial path is not a directory";
+        }
+        return false;
+    }
+    const bool plain = plain_handle(handle, true);
+    CloseHandle(handle);
+    if (!plain) {
+        if (error) {
+            *error = "the partial path is a reparse point";
+        }
+        return false;
+    }
+    return true;
+}
+
+std::wstring partial_file_name(const std::wstring& final_name) {
+    const std::string text = wide_to_utf8(final_name);
+    Sha256 hash;
+    std::array<uint8_t, 32> digest{};
+    if (text.empty() || !hash.ready() ||
+        !hash.update(text.data(), text.size()) || !hash.finish(digest)) {
+        return {};
+    }
+    static const wchar_t kHex[] = L"0123456789abcdef";
+    std::wstring name;
+    name.reserve(32 + 5);
+    for (size_t i = 0; i < 16; ++i) {
+        name.push_back(kHex[digest[i] >> 4]);
+        name.push_back(kHex[digest[i] & 0x0F]);
+    }
+    name += L".part";
+    return name;
 }
 
 bool ensure_directory(const std::wstring& path, std::string* error) {
@@ -297,8 +356,13 @@ struct Sidecar {
 
 bool read_sidecar(const std::wstring& path, Sidecar& sidecar) {
     HANDLE file = CreateFileW(long_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                              OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    if (!plain_handle(file, false)) {
+        CloseHandle(file);
         return false;
     }
     std::array<uint8_t, kSidecarBytes> bytes{};
@@ -324,8 +388,13 @@ bool read_sidecar(const std::wstring& path, Sidecar& sidecar) {
 bool write_sidecar(const std::wstring& path, uint64_t size,
                    const std::array<uint8_t, 32>& digest) {
     HANDLE file = CreateFileW(long_path(path).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                              CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    if (!plain_handle(file, false)) {
+        CloseHandle(file);
         return false;
     }
     std::array<uint8_t, kSidecarBytes> bytes{};
@@ -380,6 +449,11 @@ bool sanitize_received_directory(const std::string& utf8_path, std::string& sani
         }
         part = sanitize_wide(std::move(part));
         if (part.empty() || part == L"." || part == L"..") {
+            return false;
+        }
+        // The reserved name holds half-received files; a transfer must not
+        // place its own directories or files there.
+        if (_wcsicmp(part.c_str(), kPartialDirectory) == 0) {
             return false;
         }
         parts.push_back(std::move(part));
@@ -580,6 +654,10 @@ FileCode resolve_receive_path(const std::string& root, const std::string& relati
             const std::wstring wide_part = utf8_to_wide(relative.substr(start, length));
             if (wide_part.empty()) {
                 error = "a path component is not usable";
+                return FileCode::Refused;
+            }
+            if (_wcsicmp(wide_part.c_str(), kPartialDirectory) == 0) {
+                error = "the path is reserved for partial transfers";
                 return FileCode::Refused;
             }
             current = join(current, wide_part);
@@ -875,6 +953,10 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
     if (!ensure_directory(directory, error)) {
         return nullptr;
     }
+    std::wstring partial_directory;
+    if (!ensure_partial_directory(directory, partial_directory, error)) {
+        return nullptr;
+    }
     std::string relative;
     if (!sanitize_received_directory(options.relative_path, relative)) {
         if (error) {
@@ -896,15 +978,15 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
         return nullptr;
     }
     impl.final_path = join(final_directory, impl.final_name);
-    impl.part_path = impl.final_path + L".part";
-    impl.sidecar_path = impl.part_path + L".chast";
-
-    if (is_reparse_point(impl.part_path) || is_reparse_point(impl.sidecar_path)) {
+    const std::wstring part_name = partial_file_name(impl.final_name);
+    if (part_name.empty()) {
         if (error) {
-            *error = "the receive path is a reparse point";
+            *error = "cannot name the partial file";
         }
         return nullptr;
     }
+    impl.part_path = join(partial_directory, part_name);
+    impl.sidecar_path = impl.part_path + L".chast";
 
     uint64_t resume = 0;
     bool resume_ok = false;
@@ -915,11 +997,13 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
             HANDLE existing = CreateFileW(long_path(impl.part_path).c_str(),
                                           GENERIC_READ | GENERIC_WRITE,
                                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+                                              FILE_FLAG_OPEN_REPARSE_POINT,
                                           nullptr);
             if (existing != INVALID_HANDLE_VALUE) {
                 LARGE_INTEGER size{};
-                if (GetFileSizeEx(existing, &size) && size.QuadPart >= 0 &&
+                if (plain_handle(existing, false) && GetFileSizeEx(existing, &size) &&
+                    size.QuadPart >= 0 &&
                     static_cast<uint64_t>(size.QuadPart) <= options.size) {
                     impl.file = existing;
                     resume = static_cast<uint64_t>(size.QuadPart);
@@ -964,15 +1048,23 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
         end.QuadPart = static_cast<LONGLONG>(resume);
         SetFilePointerEx(impl.file, end, nullptr, FILE_BEGIN);
     } else {
-        DeleteFileW(long_path(impl.part_path).c_str());
-        DeleteFileW(long_path(impl.sidecar_path).c_str());
         impl.file = CreateFileW(long_path(impl.part_path).c_str(), GENERIC_READ | GENERIC_WRITE,
                                 FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+                                    FILE_FLAG_OPEN_REPARSE_POINT,
+                                nullptr);
         if (impl.file == INVALID_HANDLE_VALUE) {
             if (error) {
                 *error = "cannot create the partial file (error " +
                          std::to_string(GetLastError()) + ")";
+            }
+            return nullptr;
+        }
+        if (!plain_handle(impl.file, false)) {
+            CloseHandle(impl.file);
+            impl.file = INVALID_HANDLE_VALUE;
+            if (error) {
+                *error = "the partial file is a reparse point";
             }
             return nullptr;
         }

@@ -17,6 +17,7 @@
 - **授权撤销在“仅文件”会话中不生效、旧掩码跨会话泄漏（H7），认证前畸形控制帧可终止整个监听（M3），可恢复拒绝被当成会话致命错误（M4）**（均已于 2026-11-05 修复，见各节）：文件会话每轮应用操作员掩码并在会话边界清理遗留掩码；认证前协议破坏只断开当前连接；权限/配额不足改为仅中止单条流，剪贴板聚合上限改为每次 push 复查。
 - **剪贴板 DIB 越界、TOTP 步内重放、隐私遮罩假成功（M7/M8/M9，已于 2026-11-05 修复，见各节）**：`CF_DIB` 现在按头部推导像素/调色板长度；TOTP 记录并拒绝已用步号（内存级）；隐私遮罩设置分层 alpha、校验桌面归属与覆盖矩形，`OpenDesktopW` 失败即判失败。
 - **审计可被空 ref 抑制、日志可注入、剪贴板下载表跨会话、权限刷新后旧掩码（M10-M13，已于 2026-11-05 修复，见各节）**：无 ref 会话用主机生成 ID 并标记；日志入口转义控制字符；下载表按会话清空且仅在宣布成功后登记；权限更新后本地 `StreamInfo` 同步新掩码。
+- **剪贴板文本限额不一致、`.part` 与用户文件同名、接收 reparse 检查 TOCTOU（M14-M16，已于 2026-11-05 修复，见各节）**：文本改按 4 MiB 校验且全部句柄就绪后才清空剪贴板；中间态移入 `<root>\.chast-partial\<hash>.part`；中间文件与 sidecar 以 `FILE_FLAG_OPEN_REPARSE_POINT` 打开并做句柄级复核。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -647,6 +648,10 @@ viewer 会先后收到 `PermissionUpdate(新掩码)` 与 `StreamInfo(旧掩码)`
 
 **修复**：`set_text()` 使用与流一致的 4 MiB 限额；先分配好全部 HGLOBAL、全部成功后再 `EmptyClipboard()`；失败要计数并记日志。
 
+**修复（2026-11-05）**
+
+`set_text()` 改为 `make_text()`，直接按 `kMaxClipboardTextBytes`（4 MiB）与 UTF-8 校验，不再经过 256 KiB 的 `valid_clipboard_text()`。`write_clipboard()` 先为所有格式分配 HGLOBAL（文本转 UTF-16，其余按字节复制），全部就绪后才 `EmptyClipboard()` 并逐个 `SetClipboardData()`；任一准备步骤失败都直接返回，旧剪贴板内容保持不动。主机侧默认 `clipboard_write` 改在 `HostServer::create()` 里安装，失败时把 `write_clipboard()` 的具体原因写日志；`HostServerStats` 新增 `clipboard_write_failures` 计数（`apply_peer_clipboard()` 递增）。
+
 ---
 
 ### M15. `.part`/`.part.chast` 命名空间与用户文件名重叠，可删除接收目录已有文件
@@ -663,6 +668,10 @@ DeleteFileW(long_path(impl.part_path).c_str());      // 无条件删除
 `unique_name()` 只保证最终名不冲突，`part_path` 可能正好是目录里已有的普通文件（用户自己的 `backup.zip.part`，或上次传输完成的 `x.part`），非续传或 sidecar 不匹配时会被直接删除。攻击者先传 `x.part`、再传 `x` 就能删掉自己先前的文件，也能定向删除主机用户任何以 `.part`/`.part.chast` 结尾的文件。
 
 **修复**：把中间态放进与用户命名空间不相交的位置（如 `<root>\.chast-partial\<digest16>`，文件名用哈希而不是对端名字）；确实要复用同目录时，先读 sidecar 确认归属，不匹配就拒绝而不是删除。
+
+**修复（2026-11-05）**
+
+中间态移到接收根目录下的保留目录 `<root>\.chast-partial\`，文件名取最终名 SHA-256 的前 16 字节（32 个 hex 字符）加 `.part`，sidecar 为同名加 `.chast`。保留目录在 `unique_name()` 之前创建，因此最终名不会选中它；`sanitize_received_directory()` 与 `resolve_receive_path()` 拒绝任何层级名为 `.chast-partial` 的路径，避免传输目录树或文件浏览写进中间态。`tests/file_transfer_test.cc` 新增“用户已有 `backup.zip.part` 不被删除”的回归。升级前留在旧位置的 `<name>.part` 不再被续传识别，可手工清理。
 
 ---
 
@@ -682,6 +691,10 @@ impl.file = CreateFileW(long_path(impl.part_path).c_str(), GENERIC_READ | GENERI
 **影响**：接收目录（默认 `%USERPROFILE%\Downloads\chast`）可被同用户/低权限进程写入时，在检查与打开之间把 `<name>.part` 换成指向受害者文件的符号链接。若 host 以 SYSTEM/服务模式接收而目录落在用户可写位置，就是“普通用户 → 高完整性进程任意文件写/截断”的本机提权面（需要创建符号链接权限，所以定为 Medium）。
 
 **修复**：用 `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS` 打开后 `GetFileInformationByHandle` 复核 `FILE_ATTRIBUTE_REPARSE_POINT`；或用随机局部名 + 句柄相对创建；接收目录显式设 DACL。
+
+**修复（2026-11-05）**
+
+保留目录本身以 `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` 打开并经 `GetFileInformationByHandle()` 复核；中间文件与 sidecar 的 `CreateFileW`/`OPEN_EXISTING` 同样带 `FILE_FLAG_OPEN_REPARSE_POINT`，句柄属性含 `FILE_ATTRIBUTE_REPARSE_POINT` 即拒绝。非续传的 `CREATE_ALWAYS` 也作用在链接对象而非目标上，路径在检查与打开之间被换成符号链接时不会截断受害者文件。测试新增“保留目录是目录符号链接时拒绝接收”，无法创建链接的环境自动跳过。接收目录 DACL 未改，留待部署侧按最小权限设置。
 
 ---
 
@@ -977,7 +990,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 **第三批（一个月内，可信度与本地边界）**
 
 9. M10/M11/M12/M13：审计回退 ID、日志转义、剪贴板下载表按会话清理、StreamInfo 用新掩码重建（均已完成，见各节修复说明）。
-10. M14/M15/M16：剪贴板文本限额统一、`.part` 隔离目录、句柄级 reparse 复核。
+10. M14/M15/M16：剪贴板文本限额统一、`.part` 隔离目录、句柄级 reparse 复核（均已完成，见各节修复说明）。
 11. M17/M18/M19：更新器句柄锁定、admin console token、CSV 转义。
 12. M24～M29：客户端强制 HTTPS、密钥 DPAPI、首用确认、终端 CSI 上限、录制校验。
 

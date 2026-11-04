@@ -35,6 +35,22 @@ std::string read_file(const std::filesystem::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
+size_t partial_count(const std::filesystem::path& root, const std::wstring& extension) {
+    std::error_code ignored;
+    const std::filesystem::path directory = root / ".chast-partial";
+    if (!std::filesystem::is_directory(directory, ignored)) {
+        return 0;
+    }
+    size_t count = 0;
+    for (std::filesystem::directory_iterator it(directory, ignored), end;
+         it != end && !ignored; it.increment(ignored)) {
+        if (it->path().extension() == extension) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void test_sanitize() {
     check(chast::sanitize_received_name("report.pdf") == "report.pdf",
           "a plain name is kept");
@@ -95,9 +111,10 @@ void test_receiver(const std::filesystem::path& directory) {
         check(receiver->write(reinterpret_cast<const uint8_t*>(content.data()), 3, &error),
               "the first half is written");
         receiver->abort(true);
-        check(std::filesystem::exists(directory / "resume.bin.part") &&
-                  std::filesystem::exists(directory / "resume.bin.part.chast"),
-              "abort(true) keeps the part file and its sidecar");
+        check(!std::filesystem::exists(directory / "resume.bin.part") &&
+                  partial_count(directory, L".part") == 1 &&
+                  partial_count(directory, L".chast") == 1,
+              "abort(true) keeps the part file and its sidecar in the reserved directory");
     }
 
     options.allow_resume = true;
@@ -112,7 +129,8 @@ void test_receiver(const std::filesystem::path& directory) {
               "the completed file passes its digest and is renamed");
         check(read_file(final_path) == content, "the final file holds every byte");
         check(!std::filesystem::exists(directory / "resume.bin.part") &&
-                  !std::filesystem::exists(directory / "resume.bin.part.chast"),
+                  partial_count(directory, L".part") == 0 &&
+                  partial_count(directory, L".chast") == 0,
               "the part file and sidecar are gone after the rename");
         uint64_t size = 0;
         std::array<uint8_t, 32> digest{};
@@ -135,7 +153,8 @@ void test_receiver(const std::filesystem::path& directory) {
         check(!receiver->finish(final_path, &error),
               "a digest mismatch fails the transfer");
         check(!std::filesystem::exists(directory / "wrong.bin.part") &&
-                  !std::filesystem::exists(directory / "wrong.bin.part.chast"),
+                  partial_count(directory, L".part") == 0 &&
+                  partial_count(directory, L".chast") == 0,
               "a digest mismatch removes the part file and sidecar");
     }
 }
@@ -160,6 +179,9 @@ void test_sanitize_directory() {
           "an empty component is rejected");
     check(!chast::sanitize_received_directory("a\\b", path),
           "a backslash is rejected");
+    check(!chast::sanitize_received_directory(".chast-partial", path) &&
+              !chast::sanitize_received_directory("Trip/.chast-partial", path),
+          "the reserved partial directory is rejected at any depth");
     std::string deep;
     for (size_t i = 0; i <= chast::kMaxReceivePathDepth; ++i) {
         if (!deep.empty()) {
@@ -259,6 +281,70 @@ void test_nested_receiver(const std::filesystem::path& directory) {
     offset = 0;
     receiver = chast::FileReceiver::create(crossing, &offset, &error);
     check(receiver == nullptr, "a directory component that is a file is refused");
+}
+
+void test_part_isolation(const std::filesystem::path& directory) {
+    const std::filesystem::path root = directory / "part-isolation";
+    std::error_code ignored;
+    std::filesystem::create_directories(root, ignored);
+    const std::filesystem::path user_part = root / "backup.zip.part";
+    {
+        std::ofstream output(user_part, std::ios::binary);
+        output << "user data";
+    }
+
+    const std::string content = "payload";
+    chast::FileReceiveOptions options;
+    options.directory = root.string();
+    options.name = "backup.zip";
+    options.size = content.size();
+    options.sha256 = digest_of(content);
+    options.allow_resume = false;
+    uint64_t offset = 0;
+    std::string error;
+    std::unique_ptr<chast::FileReceiver> receiver =
+        chast::FileReceiver::create(options, &offset, &error);
+    check(receiver != nullptr, "a transfer starts beside a user file named <target>.part");
+    if (receiver) {
+        check(receiver->write(reinterpret_cast<const uint8_t*>(content.data()),
+                              content.size(), &error),
+              "the isolated transfer accepts its bytes");
+        std::string final_path;
+        check(receiver->finish(final_path, &error) &&
+                  std::filesystem::path(final_path) == root / "backup.zip",
+              "the transfer lands under its own name");
+    }
+    check(read_file(user_part) == "user data",
+          "the user's <target>.part file survives untouched");
+}
+
+void test_partial_reparse(const std::filesystem::path& directory) {
+    const std::filesystem::path root = directory / "reparse-root";
+    const std::filesystem::path target = directory / "reparse-target";
+    std::error_code ignored;
+    std::filesystem::create_directories(root, ignored);
+    std::filesystem::create_directories(target, ignored);
+    const std::filesystem::path link = root / ".chast-partial";
+    constexpr DWORD kAllowUnprivilegedCreate = 0x2;
+    if (!CreateSymbolicLinkW(link.c_str(), target.c_str(),
+                             SYMBOLIC_LINK_FLAG_DIRECTORY | kAllowUnprivilegedCreate)) {
+        std::printf("skip partial reparse checks: cannot create a link here\n");
+        return;
+    }
+
+    chast::FileReceiveOptions options;
+    options.directory = root.string();
+    options.name = "x.bin";
+    options.size = 1;
+    options.sha256 = digest_of("a");
+    options.allow_resume = false;
+    uint64_t offset = 0;
+    std::string error;
+    std::unique_ptr<chast::FileReceiver> receiver =
+        chast::FileReceiver::create(options, &offset, &error);
+    check(receiver == nullptr,
+          "a reserved partial path that is a reparse point is refused");
+    std::filesystem::remove(link, ignored);
 }
 
 void test_browser(const std::filesystem::path& directory) {
@@ -405,6 +491,8 @@ int main() {
         test_sha256_file(directory);
         test_receiver(directory);
         test_nested_receiver(directory);
+        test_part_isolation(directory);
+        test_partial_reparse(directory);
         test_browser(directory);
     } else {
         std::printf("FAIL could not create a temp directory\n");
