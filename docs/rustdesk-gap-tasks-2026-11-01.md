@@ -361,7 +361,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | ID | 优先级 | 缺口 | RustDesk 证据 | chast 现状 |
 | --- | --- | --- | --- | --- |
 | DEV-11 | P1 | 多查看者并发（同一主机同时多个受控会话） | `src/server.rs:466`/`:488` 以连接表维护多个连接，视频服务按订阅者分发 | `include/chast/quic.h:5` 服务端只接受一个客户端，`src/host/host_server.cc:547` 结束当前会话后才接待下一个查看器 |
-| DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 无出站代理配置；直连会合/中继/载体 |
+| DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 已实现（2026-11-05）：会合控制面、TCP 载体与共享载体支持 http/https/socks5/socks5h，代理下强制 TCP 载体，详见同日小节 |
 | DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 只有主机系统声→查看器与查看器麦克风→主机播放（`include/chast/audio.h:3-5`），没有主机麦克风上行，也没有通话请求/接听流程 |
 | DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
 | DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 可发送 Ctrl+Alt+Del（`include/chast/sas.h`），但不能在锁屏/登录界面输入凭据或自动登录 |
@@ -388,6 +388,35 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
    排序；其中 DEV-15/DEV-16 涉及凭据与会话边界，需先复审安全模型。
 3. **DEV-21～DEV-27**：体验与部署增强。DEV-23 只在有对应硬件且能保持
    零拷贝时启动，不引入 CPU fallback；DEV-24/25 可随 UI 批次完成。
+
+### DEV-12 出站 SOCKS5/HTTP(S) 代理（2026-11-05 完成）
+
+查看器与主机的会合控制面、中继 TCP 载体和共享载体都可以走一个显式配置的
+出站代理，支持 `http://`、`https://`、`socks5://`、`socks5h://`（必须带
+端口，可带用户名密码）。实现分三层：
+
+- Go 侧新增 `server/internal/netproxy`：手写 SOCKS5（RFC 1928/1929）与
+  HTTP CONNECT 拨号（HTTPS 代理单独 TLS 握手），并提供 `chast-tunnel proxy`
+  回环 HTTP 正向代理桥，供不支持 SOCKS5 的 Dart `HttpClient` 使用。
+- 主机 agent：`--proxy`/`CHAST_PROXY` 覆盖控制面、更新下载和中继载体；
+  `host.ini` 的 `proxy=` 与托盘对话框可持久化。查看器 agent 额外支持
+  `--proxy-stdin`，代理 URL 不进入 argv。
+- 查看器：`server.json` 的 `proxy` 在密钥或代理非空时整体走 DPAPI 保护，
+  代理凭据不会明文落盘；服务器身份校验、账号/地址簿、录制上传下载全部经
+  同一个出站路径；设置页新增“出站代理（可选）”与显示/隐藏按钮。
+
+边界：UDP 直连、UDP 中继和打洞无法穿过 HTTP(S)/SOCKS5 代理（未实现
+SOCKS5 UDP ASSOCIATE），因此配置代理后查看器强制走服务器 TCP 载体；
+`--mode direct` 直接报错，服务端没有载体时也明确报错，不会静默绕过代理
+直连。主机入站 UDP 监听不变；C++ 媒体链路未改动，零拷贝路径不受影响。
+主机侧代理 URL 由 `host.ini` 读出后经 argv 传给 agent（无 stdin 通道），
+带凭据时本机进程列表可见；查看器侧已经走 stdin。无效代理值一律失败关闭
+（存储值保留并在使用时报错，不回落为直连）。主机名由代理侧解析。
+
+验证：`flutter analyze --no-pub` 无问题；`flutter test --no-pub` 540 项
+通过；`flutter build windows --release --no-pub` 成功；`go vet ./...`、
+`go test ./...` 通过（新增 netproxy 单测与 host+viewer 代理回环测试）；
+`chast-host-settings-test.exe`、`chast-host-tunnel-test.exe` 通过。
 
 ### 已核对但不算缺口的项
 

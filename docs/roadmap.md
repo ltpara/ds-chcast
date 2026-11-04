@@ -2933,6 +2933,18 @@
      摄像头/终端面板、单目标端口转发等不是缺口；白板仅在 RustDesk CLI 内部
      工具中出现，不计入。验证：仅源码对照与文档登记，无代码改动，未跑构建
      与测试。边界：本轮不改变 ENV/DEV/PLAT-01～03 的既有处置与状态。
+124. **P1 · DEV-12 出站 SOCKS5/HTTP(S) 代理（2026-11-05 完成）**：新增
+     `server/internal/netproxy`（HTTP/HTTPS CONNECT、SOCKS5 握手、回环桥接
+     `chast-tunnel proxy`）；主机与查看器 agent 的会合控制面、中继 TCP 载体
+     和共享载体均可走代理，`CHAST_PROXY`/`--proxy`/`--proxy-stdin` 与
+     `host.ini proxy=`/托盘对话框/查看器设置页均可配置。配置代理后查看器强制
+     TCP 载体，UDP 直连/中继/打洞不经代理；`--mode direct` 或无载体明确报错，
+     不静默直连。Dart `server.json` 对代理凭据做 DPAPI 保护，无效值失败关闭。
+     验证：`flutter analyze` 无问题、`flutter test` 540 项、Windows release
+     构建成功、`go vet`/`go test` 通过、C++ 设置与隧道测试通过。边界：无
+     SOCKS5 UDP ASSOCIATE，主机入站 UDP 与零拷贝媒体链路不变；主机侧代理
+     凭据经 argv 传给 agent。详见 `docs/status-2026-10-25.md` 的同日小节与
+     `docs/rustdesk-gap-tasks-2026-11-01.md`。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
