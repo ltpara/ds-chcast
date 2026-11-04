@@ -2990,6 +2990,8 @@ void show_window() {
     SetForegroundWindow(g_app->window);
 }
 
+bool session_is_live();
+
 void show_tray_menu() {
     POINT point{};
     GetCursorPos(&point);
@@ -3076,7 +3078,11 @@ void show_tray_menu() {
     } else if (vdisplay_status.state == VirtualDisplayState::Installed ||
                vdisplay_status.state == VirtualDisplayState::Active) {
         VirtualDisplayInstallRecord record;
-        if (read_install_record(&record) && record.owned) {
+        const bool owned = read_install_record(&record) && record.owned;
+        if (owned && session_is_live()) {
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+                        tr(L"卸载虚拟显示器（请先结束会话）"));
+        } else if (owned) {
             AppendMenuW(menu, MF_STRING, kVdisplayUninstallButton, tr(L"卸载虚拟显示器…"));
         } else {
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
@@ -3585,6 +3591,11 @@ void handle_command(int id) {
             break;
         }
         case kVdisplayUninstallButton: {
+            if (session_is_live()) {
+                MessageBoxW(g_app->window, tr(L"请先结束远程会话，再卸载虚拟显示器。"),
+                            window_title(), MB_ICONINFORMATION | MB_OK);
+                break;
+            }
             if (MessageBoxW(g_app->window,
                             tr(L"卸载虚拟显示器会移除 chast 安装的驱动。请先结束远程会话。继续吗？"),
                             window_title(),

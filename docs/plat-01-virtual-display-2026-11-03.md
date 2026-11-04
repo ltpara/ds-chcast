@@ -404,6 +404,9 @@ BUILTIN\Administrators。读取方先检查目录/文件 ACL，不可信时按�
 | A9 | 不支持的分辨率 | 选择 2560×1440（若不在列表） | 选择最接近模式并记录日志，不崩溃 |
 | A10 | 安全模式 | 执行 `--vdisplay uninstall` | 驱动移除，系统恢复正常显示 |
 
+逐项的前置条件、命令、期望输出、证据路径与回滚步骤见
+`docs/plat-01-acceptance-runbook-2026-11-04.md`。
+
 ### 8.3 证据归档
 
 每项完成后在 `docs/status-2026-10-25.md` 增加小节，至少包含：
@@ -639,6 +642,22 @@ PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动
   迁移时被识别一次，迁移后立即替换为受保护 DACL。
 - 仍未完成：固定哈希驱动包、Amyuni 再分发许可、许可全文、A1～A10 真机
   验收。本次加固不改变这些外部阻塞。
+
+**PLAT-01 验收前差距修复与手册（2026-11-04）**
+
+- A5：`--vdisplay install` 在平台检查后先探测冲突驱动；检测到 VDD/Parsec/
+  RustDesk 标记时记录 `install refused: another virtual display driver is
+  present: <id>` 并退出 8。托盘原本已灰显安装项，本次让安装器和直接 CLI
+  调用同样不叠加驱动。
+- A6：托盘菜单在 `HostServer` 处于 `Streaming` 时把卸载项改为灰显的
+  “卸载虚拟显示器（请先结束会话）”，处理函数再次检查并只弹提示；结束会话后
+  恢复可卸载。服务安装器的卸载会先停服务；直接 CLI 卸载仍不感知会话，
+  见手册 G3。
+- 新增实机验收手册 `docs/plat-01-acceptance-runbook-2026-11-04.md`，覆盖
+  A1–A10 的前置、命令、期望输出、证据路径、回滚与已知差距。
+- 验证：Release 构建 `chast-host` 与 `chast-virtual-display-test` 通过；
+  定向 ctest `virtual_display|host_i18n|host_settings` 3/3；虚拟显示单测
+  仍为 130 项通过。未安装驱动、未改变本机拓扑，A1–A10 仍未执行。
 
 ## 10. 风险与未决问题
 
