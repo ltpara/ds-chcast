@@ -350,6 +350,62 @@ M24–M29 把用户态连接服务收紧为回环外强制 HTTPS、密钥走 DPA
 每项完成后更新上表状态、`roadmap.md` 与 `docs/status-2026-10-25.md` 并附
 证据位置；ENV 项必须以真机日志/截图/指标关闭。
 
+## 2026-11-05 RustDesk 1.5.1 复核（新增缺口）
+
+复核基线：RustDesk `55786aa`（1.5.1，2026-11-03），含
+`libs/base/protos/message.proto`。本轮把 RustDesk 当前源码与本项目逐项对照，
+新增以下未出现在 ENV/DEV/PLAT-01～03 清单中的能力缺口，登记为
+DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PLAT 的处置；
+编号接在 DEV-10 之后，便于沿用“完成定义”归档。
+
+| ID | 优先级 | 缺口 | RustDesk 证据 | chast 现状 |
+| --- | --- | --- | --- | --- |
+| DEV-11 | P1 | 多查看者并发（同一主机同时多个受控会话） | `src/server.rs:466`/`:488` 以连接表维护多个连接，视频服务按订阅者分发 | `include/chast/quic.h:5` 服务端只接受一个客户端，`src/host/host_server.cc:547` 结束当前会话后才接待下一个查看器 |
+| DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 无出站代理配置；直连会合/中继/载体 |
+| DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 只有主机系统声→查看器与查看器麦克风→主机播放（`include/chast/audio.h:3-5`），没有主机麦克风上行，也没有通话请求/接听流程 |
+| DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
+| DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 可发送 Ctrl+Alt+Del（`include/chast/sas.h`），但不能在锁屏/登录界面输入凭据或自动登录 |
+| DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 固定控制当前控制台会话，无可选会话列表 |
+| DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 只有隐私遮罩（黑屏）；不能重启主机、屏蔽本地键鼠或发送 Win+L |
+| DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | `SessionMode` 只有 Desktop/FileTransfer（`include/chast/protocol.h:1025`）；终端/摄像头/端口转发都依附桌面会话 |
+| DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 终端随会话结束销毁，单会话最多 2 个（`protocol.h:1254`/`:1263`） |
+| DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 协议支持多个 `forward_id`（上限 8），但查看器只管理一个活动目标（`app/lib/pages/session_page.dart:1602-1755`） |
+| DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 账号体系有密码/TOTP/短信/邮件/WebAuthn，没有 OIDC 联邦登录 |
+| DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | `InputKind` 只有 Mouse/Key（`protocol.h:319`），触摸板/手写笔按鼠标模拟 |
+| DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 只有 H.264/HEVC 的 NV12 4:2:0 硬件编码（`include/chast/encoder.h:42-44`）；受零拷贝约束，只能增加直接写 GPU 缓冲的硬件后端 |
+| DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 支持切换单个/全部显示器与多屏坐标映射（`frameToDesktop`），但没有按显示器开窗、跟随/光标缩放，也不能改主机显示分辨率（只有采集缩放百分比） |
+| DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 有 TLS TCP 共享载体，没有 WebSocket 选项，无法直接挂在仅支持 WS 的反代/CDN 后 |
+| DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 主机设置只在本机/服务端管理；无“会话结束后锁定主机”选项 |
+| DEV-27 | P3 | RDP 快捷方式与便携模式 | `flutter/lib/common/widgets/peer_card.dart:735-769`、`src/server/portable_service.rs` | 无 RDP 快捷入口（可手工用端口转发替代）；只有安装器，没有便携服务模式 |
+
+### 排期建议
+
+1. **DEV-11、DEV-12**：多查看者与出站代理属于部署/协作面 P1。DEV-11 改动
+   `QuicSession` 单客户端假设、`HostServer` 单 `session_` 以及逐会话审批/
+   权限/隐私/审计，工作量最大；DEV-12 独立且风险低，可先做。
+2. **DEV-13～DEV-20**：远程支持常用能力，按“语音通话 → 主机控制 → 独立
+   会话类型/持久终端 → 多端口转发 → OS 登录/Windows 会话 → Switch Sides”
+   排序；其中 DEV-15/DEV-16 涉及凭据与会话边界，需先复审安全模型。
+3. **DEV-21～DEV-27**：体验与部署增强。DEV-23 只在有对应硬件且能保持
+   零拷贝时启动，不引入 CPU fallback；DEV-24/25 可随 UI 批次完成。
+
+### 已核对但不算缺口的项
+
+- Ctrl+Alt+Del：已由 `SendSAS` 实现（`include/chast/sas.h`），不是缺口。
+- 受信设备免二次验证：主机侧 `TrustStore` 已支持，查看器可勾选“信任此
+  设备，下次跳过两步验证”（`app/lib/pages/session_page.dart:4494`），不是
+  缺口。
+- 剪贴板：已支持文本/HTML/RTF/DIB 与文件剪贴板（`protocol.h:408-452`），
+  覆盖 RustDesk 的 `MultiClipboards`。
+- 隐私模式、摄像头面板、终端面板、单目标端口转发、文件传输会话、查看器
+  录制、地址簿分组/ACL、同网段 Wake-on-LAN、局域网发现、直连 IP、TLS/mTLS/
+  ACME、2FA/WebAuthn/找回、管理台角色、审计导出/归档、i18n、安装器、
+  IPv6/打洞/中继/共享载体、UPnP 均已实现，见 `docs/status-2026-10-25.md`。
+- 白板（`src/whiteboard`）只在 RustDesk CLI/内部工具中出现，未进入 Flutter
+  产品面，不计为对齐缺口；`PluginRequest` 属插件机制，也不是产品功能缺口。
+- 虚拟显示器、远程打印、非 Windows/Web/移动客户端仍由 PLAT-01～03 跟踪，
+  本表不重复登记。
+
 ## 完成定义
 
 每个任务完成时必须同时满足：
