@@ -37,8 +37,12 @@ type Options struct {
 	Service  bool
 	Shortcut bool
 	Register bool
-	Quiet    bool
-	Logf     func(format string, args ...any)
+	// VirtualDisplay installs the bundled usbmmidd driver during a machine
+	// install and uninstalls the chast-owned driver before removing the tree.
+	VirtualDisplay      bool
+	VirtualDisplayCount int
+	Quiet               bool
+	Logf                func(format string, args ...any)
 }
 
 func (o Options) logf(format string, args ...any) {

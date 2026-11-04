@@ -31,6 +31,12 @@ int apply_firewall_rule(uint16_t port, uint16_t tunnel_port);
 // service uninstaller, which cannot leave a stale allowance behind.
 void remove_firewall_rules();
 
+// Relaunches this executable elevated with the given arguments and waits for
+// it. Returns the child exit code, or -1 when the user cancels or the process
+// cannot be started; *cancelled distinguishes a UAC refusal.
+int run_elevated(const std::wstring& arguments, DWORD timeout_ms, bool* cancelled,
+                 std::string* error);
+
 // Relaunches this executable with --firewall <port> [<tunnel_port>] through
 // the UAC prompt and waits for it. False when the user cancels or netsh fails.
 bool request_firewall_rule(uint16_t port, uint16_t tunnel_port, std::string* error);

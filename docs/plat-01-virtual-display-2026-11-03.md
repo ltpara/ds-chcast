@@ -1,6 +1,6 @@
 # PLAT-01 虚拟显示器：选型与接入设计（usbmmidd_v2）
 
-- 状态：PLAT-01a/01c 已落地；PLAT-01b 代码脚手架已完成，
+- 状态：PLAT-01a/01c 已落地；PLAT-01b/01d 的代码与本地接线已完成，
   真机安装仍被 Amyuni 再分发许可、固定哈希驱动包和测试机阻塞
 - 日期：2026-11-03
 - 关联：`docs/rustdesk-gap-tasks-2026-11-01.md` 的 PLAT-01
@@ -285,16 +285,28 @@ chast-host.exe --vdisplay status [--log <文件>]
 `owned` 用于区分“本产品安装的驱动”和“用户或其他软件已装的 usbmmidd”：
 `owned=false` 时只复用，不卸载。状态文件损坏时按“未安装”处理并记录日志。
 
+目录和文件都带受保护 DACL：目录为
+`D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)`（Users 只读），
+记录文件为 `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)`，owner 为
+BUILTIN\Administrators。读取方先检查目录/文件 ACL，不可信时按“无记录”处理；
+写入使用同目录临时文件 + `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` 原子
+替换，见 §7。
+
 ## 6. 打包与分发
 
-- **不把第三方二进制提交进 git**。新增 `tools/fetch-usbmmidd.ps1`：
-  - 从 `https://www.amyuni.com/downloads/usbmmidd_v2.zip` 下载；
-  - 校验上面的固定 SHA-256；
+- **不把第三方二进制提交进 git**。`tools/fetch-usbmmidd.ps1` 负责获取和校验：
+  - 固定哈希常量 `$pinnedZipSha256` 当前为空；未配置时脚本只打印本地 zip 的
+    SHA-256 并退出码 2，不下载、不解包任何内容（fail-closed）；
+  - 配置后从 `https://www.amyuni.com/downloads/usbmmidd_v2.zip` 下载，或使用
+    `-SourceZip <文件>` 指定的本地包，并校验固定 SHA-256；
   - 解包到 `build/deps/usbmmidd_v2`，保留原始 `License.txt` 和
-    `idd_instructions.txt`。
-- `tools/package-windows.ps1` 增加 `-VirtualDisplay` 开关：
-  - 检查 `build/deps/usbmmidd_v2` 存在且哈希正确；
-  - 复制到暂存树的 `drivers\usbmmidd_v2\`；
+    `idd_instructions.txt`，生成 sha256sum 风格的 `manifest.sha256` 与
+    `SOURCE.txt`（URL、日期、包哈希、驱动版本）；
+  - 已存在且校验通过的目标目录不重复解包；加 `-Force` 才替换。
+- `tools/package-windows.ps1` 增加 `-VirtualDisplayPackageDir <目录>`：
+  - 省略时回退到仓库的 `drivers\usbmmidd_v2`，两者都不存在则只告警，
+    安装包仍可生成，但 `--virtual-display` 会被安装器拒绝；
+  - 检查必需文件齐全后复制到暂存树的 `drivers\usbmmidd_v2\`；
   - 发布前把 `dist/chast-<ver>-setup.exe` 的哈希写入发布记录。
 - 安装后的目录布局：
 
@@ -310,10 +322,11 @@ chast-host.exe --vdisplay status [--log <文件>]
   SOURCE.txt          # 下载 URL、日期、SHA-256、“未修改”
 ```
 
-- **许可**：在仓库的第三方声明文件中加入 Amyuni 版权与许可全文链接/副本；
-  安装目录保留未修改的 `License.txt`。发布前必须确认再分发和广告提示条款；
-  若不允许随产品分发，退化为“用户主动下载 + 哈希校验 + 明确确认”的引导安装，
-  不在安装包里携带二进制。
+- **许可**：仓库根目录的 `THIRD-PARTY-NOTICES.md` 已加入 Amyuni 版权、包哈希
+  和分发状态占位；安装目录保留未修改的 `License.txt`。发布前必须确认再分发
+  和广告提示条款；若不允许随产品分发，退化为“用户主动下载 + 哈希校验 +
+  明确确认”的引导安装，不在安装包里携带二进制。许可全文/官方链接待 Amyuni
+  确认后补入。
 - **安装器**：`chast-setup --machine --service --virtual-display` 在复制完负载后，
   以已提升的权限调用 `<安装根>\chast-host.exe --vdisplay install ...`；
   失败则整个安装失败并给出日志路径。卸载时先调用 `--vdisplay uninstall`，
@@ -348,7 +361,16 @@ chast-host.exe --vdisplay status [--log <文件>]
 - 服务不得安装驱动，只能启停已经安装的驱动；
 - 不修改主显示器、DPI 和用户现有显示排列；
 - 不下载并执行任何非固定哈希的驱动包；
-- 安装前检查系统架构、Windows 版本和已有虚拟显示驱动。
+- 安装前检查系统架构、Windows 版本和已有虚拟显示驱动；
+- 包目录、manifest、全部清单文件和 `SOURCE.txt` 在哈希/签名校验与
+  `deviceinstaller64` 运行期间以只读共享句柄持续锁定，持有
+  `VirtualDisplayPackageGuard` 时写入、删除、改名和目录改名都会失败，避免
+  校验后替换（TOCTOU）；任何 reparse point、错误对象类型或允许非
+  SYSTEM/Administrators/TrustedInstaller/当前用户写入的 ACL 都拒绝安装；
+- `%ProgramData%\chast` 与 `virtual-display.json` 使用受保护 DACL
+  （SYSTEM/Administrators 完全控制、Users 只读，owner 为
+  BUILTIN\Administrators）；记录经临时文件原子替换并读回验证，ACL 不可信时
+  按无记录处理，日志文件拒绝 reparse point。
 
 ## 8. 测试与验收
 
@@ -360,6 +382,10 @@ chast-host.exe --vdisplay status [--log <文件>]
 - provider 选择：仅 usbmmidd 可用、VDD 未实现、检测到冲突、ARM64；
 - 状态机：未安装 → 已安装 → 运行中 → 停用 → 卸载；
 - 哈希校验： fixture 正确/篡改/缺失；
+- 包 ACL/TOCTOU：签名包校验后句柄保持锁定（写入/删除失败，`reset()` 后
+  恢复）、目录 reparse point 拒绝、manifest 路径逃逸拒绝；
+- 状态目录：受保护 DACL 信任、记录原子替换与读回、无临时文件残留、
+  Users 可写记录被丢弃、CREATOR OWNER 旧记录迁移后保留、裸目录拒绝写入；
 - 提权参数构造：带空格的安装路径、数量边界、动作白名单；
 - 状态文件 `owned=false` 时不得卸载。
 
@@ -411,9 +437,10 @@ chast-host.exe --vdisplay status [--log <文件>]
 编号说明：roadmap 当前最后一条是 121（P2-113），这些切片落地时按顺序分配
 P2-114 起的编号；在未落地前只使用 PLAT-01a～e，避免占用未来编号。
 
-截至 2026-11-03：PLAT-01a 与 PLAT-01c 已完成；PLAT-01b 的代码脚手架已完成，
-固定哈希驱动包、Amyuni 再分发许可、第三方许可声明与真机 A1 仍阻塞，因此该
-切片不能标记为完成。PLAT-01d 尚未开始。
+截至 2026-11-04：PLAT-01a、PLAT-01c 已完成；PLAT-01b 的代码脚手架、
+`tools/fetch-usbmmidd.ps1` 骨架与 `THIRD-PARTY-NOTICES.md` 占位，以及
+PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动包、Amyuni 再
+分发许可、许可全文与真机 A1/A2 仍阻塞，因此 PLAT-01b/01d 不能标记为完成。
 
 ### 9.1 落地记录
 
@@ -498,6 +525,120 @@ P2-114 起的编号；在未落地前只使用 PLAT-01a～e，避免占用未来
 - 仍未包含/阻塞：没有下载或提交驱动包，`tools/fetch-usbmmidd.ps1` 与第三方
   许可声明未创建，安装器/打包脚本未接 `--virtual-display`（PLAT-01d），
   A1～A10 均未执行。修复这两项前置条件后才能把 PLAT-01b 标记为完成。
+
+**PLAT-01d 本地接线已完成（2026-11-04，真机验收仍阻塞）**
+
+- 安装器：`chast-setup` 新增 `--virtual-display` 与
+  `--virtual-display-count 1-4`，两者都要求 `--machine`；`checkElevation()`
+  在提权检查前先做参数校验。`platformInstall()` 在解包负载之后、注册服务之前
+  调用 `<根>\chast-host.exe --vdisplay install --package <根>\drivers\usbmmidd_v2
+  --count N`，失败即终止安装并给出 `%ProgramData%\chast\vdisplay.log` 路径；
+  驱动包缺失时明确提示用 `-VirtualDisplayPackageDir` 打包，不会自行下载。
+- 卸载：仅 `--machine` 卸载会驱动 `--vdisplay uninstall`，且只在
+  `%ProgramData%\chast\virtual-display.json` 存在时执行；卸载顺序是先驱动、
+  后文件，驱动卸载失败会保留整个安装树以便重试。`owned=false` 的记录由 CLI
+  复用语义保证不会被移除。
+- 打包：`tools/package-windows.ps1` 新增 `-VirtualDisplayPackageDir`，省略时
+  回退到仓库 `drivers\usbmmidd_v2`；包内必需文件齐全才复制到暂存树的
+  `drivers\usbmmidd_v2\`，否则告警并继续生成不含驱动的安装包。
+- 托盘：菜单新增“安装虚拟显示器…/卸载虚拟显示器…”入口。安装仅在
+  `NotInstalled` 且默认包目录存在时可用，冲突驱动和缺失驱动包分别显示灰显
+  说明；卸载仅在记录 `owned=true` 时可用，第三方安装只提示不认领。两个动作
+  都先弹确认框，再以 `runas` 调起隐藏 CLI（安装 180 s、卸载 120 s 超时），
+  失败对话框包含退出码、错误、日志最后一行和日志路径。`host/platform.cc`
+  的提权逻辑抽成 `run_elevated()`，防火墙路径复用同一实现。
+- 验证：全量 Release 构建（所有目标）退出码 0；`ctest -C Release -R
+  "virtual_display|host_i18n|host_settings"` 3/3；`go test -count=1
+  ./internal/setup` 通过（新增 5 个用例：选项校验、路径、缺 host/缺包拒绝、
+  无记录跳过卸载、缺 host 时保留文件）；`package-windows.ps1` 解析通过；
+  实机 `chast-host.exe --vdisplay status --log build/vdisplay-smoke.log`
+  退出 0 且未创建 `%ProgramData%\chast`；`chast-setup --virtual-display`
+  与 `--virtual-display-count 5` 均按预期在参数阶段被拒绝。
+- 回归：同一构建的串行 ctest 分两段完成 42/42（1–24 于 2026-11-03、
+  25–42 于 2026-11-04，18/18）。2026-11-04 重跑第一段时出现两次桌面像素类
+  偶发：`quic_terminal` 一次、`quic_loopback` 的
+  “captured picture was not the black overlay” 隐私亮度断言一次，两者单独
+  重跑均通过；该断言比较运行期间桌面亮度变化，与本次托盘/安装器改动无关。
+- 仍未包含/阻塞：没有下载、提交或安装驱动包；`tools/fetch-usbmmidd.ps1` 与
+  `THIRD-PARTY-NOTICES.md` 占位见下一条，固定哈希、Amyuni 再分发确认、
+  A1～A10 真机验收仍未完成。真机 `--virtual-display` 安装需要先提供固定
+  哈希包。
+
+**PLAT-01b 获取脚本与第三方声明占位（2026-11-04，固定哈希与许可仍阻塞）**
+
+- `tools/fetch-usbmmidd.ps1`：fail-closed 获取脚本。`$pinnedZipSha256` 为空时
+  只打印 `-SourceZip` 指向的本地包哈希并退出码 2，不发起下载；配置后从
+  固定的 Amyuni URL 下载或读取 `-SourceZip`，校验包级 SHA-256，解包到
+  `build/deps/usbmmidd_v2`，检查必需文件与唯一包根目录，生成 sha256sum
+  风格的 `manifest.sha256` 和 `SOURCE.txt`（URL、日期、包哈希、INF
+  `DriverVer`），并对 `deviceinstaller64.exe` 打印 Authenticode 状态与签名
+  主体。目标目录已存在时先按 manifest 校验，通过则直接成功，否则要求
+  `-Force`。退出码 2/3/4 分别表示未配置固定哈希、包哈希不符、包内容不完整。
+- `THIRD-PARTY-NOTICES.md`：仓库根目录的第三方声明占位，记录 Amyuni 版权、
+  产品页、版本 2.0.0.1、2026-11-03 复核的包 SHA-256、WHQL 签名链、不提交
+  二进制、默认不捆绑、再分发与广告提示条款待确认、分发时保留 `License.txt`
+  与 `SOURCE.txt` 等约束；许可全文/官方链接待 Amyuni 确认后补入。
+- 验证：PowerShell 解析通过；无固定哈希直接运行退出码 2，未发起网络请求、
+  未创建 `build/deps/usbmmidd_v2`。用临时合成包（占位文件 + 伪造 INF
+  `DriverVer`）在 `build/` 下验证完整路径：生成 6 条 sha256sum 清单与
+  `SOURCE.txt`（`VERSION: 2.0.0.1`）、重复运行直接判定“已存在且校验通过”、
+  篡改文件后退出码 4、`-Force` 重新解包恢复、包哈希不符退出码 3 且不创建
+  目标目录、解包临时目录被清理。`git diff --check` 干净。未下载、解包或
+  安装任何真实驱动。
+- 仍未完成：固定哈希（需人工复核官方包）、Amyuni 再分发/广告条款确认、
+  许可全文、`drivers\usbmmidd_v2` 的实际打包与 A1～A10 真机验收。
+
+**PLAT-01b ACL 与 TOCTOU 加固已完成（2026-11-04，真机验收仍阻塞）**
+
+- 包信任与锁定：`verify_virtual_display_package()` 用
+  `GENERIC_READ|READ_CONTROL` + `FILE_SHARE_READ` 打开包目录、manifest、
+  全部 manifest 条目和可选 `SOURCE.txt`，拒绝 reparse point、错误对象类型
+  与不可信 ACL；SHA-256 从已锁定的句柄读取，Authenticode 也在锁定期间校验。
+  新增 `VirtualDisplayPackageGuard`，在 `deviceinstaller64.exe` 运行期间保持
+  这些句柄；守卫存活时写入、删除、改名文件或改名包目录都会失败，释放后才
+  恢复。
+- ACL 信任配置：`State`（owner 与可写主体只允许 SYSTEM/Administrators，
+  Users 只读）、`StateMigration`（额外允许当前提权用户和 CREATOR OWNER，
+  后者会解析为已校验的 owner，用于给旧记录重新加 ACL）、`Package`
+  （SYSTEM/Administrators/TrustedInstaller/当前用户，CREATOR OWNER 作为写
+  主体）；任何允许其他 SID 写入的 allow ACE、以及带写位的 object/callback
+  ACE 都判为不可信。
+- 状态目录：`harden_virtual_display_state_directory()` 创建目录并写入
+  `D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GR;;;BU)`，设置保护 DACL，
+  启用 `SeRestorePrivilege` 把 owner 改为 BUILTIN\Administrators；不可信的
+  旧 `virtual-display.json`/`vdisplay.log` 直接删除，可信旧文件重新加 ACL。
+  install/uninstall/set-count 在动作前调用；`status` 仍无需提权，也不会
+  创建 `%ProgramData%\chast`。
+- 记录写入：`write_install_record()` 在可信目录内用 `BCryptGenRandom` 生成
+  `.tmp-<hex>` 名、`CREATE_NEW` 打开、写入并 `FlushFileBuffers`、给临时文件
+  加 `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)`，再用
+  `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` 原子替换，最后按 `State`
+  配置读回校验。读取侧 `read_install_record()`、`virtual_display_log_tail()`
+  和 `read_state_text()` 先验证目录/文件 ACL，不可信时按“无记录/无日志”
+  处理；`append_log()` 只创建显式 `--log` 的自定义父目录，日志文件拒绝
+  reparse point 和目录。
+- 测试：`chast-virtual-display-test` 增至 130 项，新增包守卫（锁定期间写入/
+  删除失败、`reset()` 后恢复）、目录 reparse 拒绝、状态目录信任、记录写入/
+  读回/原子替换、无 `.tmp-` 残留、Users 可写记录被丢弃、带 CREATOR
+  OWNER 写 ACE 的旧记录经迁移后保留、裸 ProgramData 目录既不信任记录也
+  拒绝写入。签名用例改用带内嵌 Authenticode 签名的系统
+  二进制（`MpSigStub.exe`/`appverif.exe`/`vsjitdebugger.exe`/ShowDesktop，
+  按顺序取第一个可验证者）；catalog 签名的 `cmd.exe` 会被 WinVerifyTrust
+  `WTD_CHOICE_FILE` 拒绝，不再使用。
+- 验证：全量 Release 构建（所有目标）退出码 0；最终源码全量 `ctest -C
+  Release` 42/42 通过（621.55 s，2026-11-04），定向
+  `virtual_display|host_i18n|host_settings` 3/3；把 `ProgramData` 重定向到
+  `build/programdata-smoke` 后，`--vdisplay status` 退出 0 且只写显式日志
+  文件，`--vdisplay set-count 0` 先把目录加硬（`icacls` 显示 SYSTEM/
+  Administrators 完全控制、Users 只读继承）再因驱动未安装退出 5，未生成
+  记录文件；真实 `%ProgramData%\chast` 未被创建。`git diff --check` 干净。
+- 已知边界：如果非管理账户把 `%ProgramData%\chast` 预先创建为 reparse
+  point，或用拒绝管理员的 DACL 保护该目录，加固会失败关闭（不跟随链接），
+  安装/卸载被拒绝，需要管理员手动处理；普通目录会被接管并重新加 ACL。
+  这是可用性影响，不构成提权。旧的、继承 CREATOR OWNER 的记录只允许在
+  迁移时被识别一次，迁移后立即替换为受保护 DACL。
+- 仍未完成：固定哈希驱动包、Amyuni 再分发许可、许可全文、A1～A10 真机
+  验收。本次加固不改变这些外部阻塞。
 
 ## 10. 风险与未决问题
 

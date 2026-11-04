@@ -110,6 +110,8 @@ enum ControlId {
     kAutostartCheck,
     kSecurityButton,
     kFirewallButton,
+    kVdisplayInstallButton,
+    kVdisplayUninstallButton,
     kOpenConfigButton,
     kToggleButton,
     kTunnelSettingsButton,
@@ -861,8 +863,7 @@ std::wstring tunnel_text() {
     return text;
 }
 
-std::wstring virtual_display_text() {
-    const VirtualDisplayProbe probe = probe_virtual_display();
+std::wstring virtual_display_text(const VirtualDisplayProbe& probe) {
     const VirtualDisplayStatus status = classify_virtual_display_probe(probe);
     switch (status.state) {
         case VirtualDisplayState::Unsupported:
@@ -881,6 +882,11 @@ std::wstring virtual_display_text() {
             return tr(L"虚拟显示器：检测失败");
     }
     return tr(L"虚拟显示器：不支持");
+}
+
+bool path_is_directory(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 std::wstring path_text(const HostStatus& status) {
@@ -2821,7 +2827,8 @@ bool edit_security_settings(HostSettings& result) {
             WS_EX_CLIENTEDGE,
             virtual_resolution_left + text_px(virtual_resolution_label) + 12, 636, 180, 200,
             kSecVirtualDisplayResolution, nullptr, &dialog.advanced_page);
-    const std::wstring virtual_display_line = virtual_display_text();
+    const std::wstring virtual_display_line =
+        virtual_display_text(probe_virtual_display());
     add(L"STATIC", virtual_display_line.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, 32, 674,
         page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
@@ -3054,7 +3061,28 @@ void show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kSecurityButton, tr(L"安全设置…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, tunnel_text().c_str());
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, virtual_display_text().c_str());
+    const VirtualDisplayProbe vdisplay_probe = probe_virtual_display();
+    const VirtualDisplayStatus vdisplay_status =
+        classify_virtual_display_probe(vdisplay_probe);
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, virtual_display_text(vdisplay_probe).c_str());
+    if (!vdisplay_probe.conflicting_driver.empty()) {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+                    tr(L"安装虚拟显示器（检测到驱动冲突）"));
+    } else if (vdisplay_status.state == VirtualDisplayState::NotInstalled) {
+        const bool have_package = path_is_directory(default_virtual_display_package_dir());
+        AppendMenuW(menu, MF_STRING | (have_package ? 0 : MF_GRAYED), kVdisplayInstallButton,
+                    have_package ? tr(L"安装虚拟显示器…")
+                                 : tr(L"安装虚拟显示器（缺少驱动包）"));
+    } else if (vdisplay_status.state == VirtualDisplayState::Installed ||
+               vdisplay_status.state == VirtualDisplayState::Active) {
+        VirtualDisplayInstallRecord record;
+        if (read_install_record(&record) && record.owned) {
+            AppendMenuW(menu, MF_STRING, kVdisplayUninstallButton, tr(L"卸载虚拟显示器…"));
+        } else {
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+                        tr(L"虚拟显示器由其他程序安装，chast 不会卸载。"));
+        }
+    }
     AppendMenuW(menu, MF_STRING, kTunnelSettingsButton, tr(L"连接服务设置…"));
     AppendMenuW(menu, MF_STRING, kTunnelRegisterButton, tr(L"重新注册连接服务"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -3510,6 +3538,88 @@ void handle_command(int id) {
                 append_log_line(tr(L"防火墙：") + widen(error));
             }
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            break;
+        }
+        case kVdisplayInstallButton: {
+            if (MessageBoxW(g_app->window,
+                            tr(L"安装虚拟显示器会改变本机的显示拓扑，并需要管理员权限。继续吗？"),
+                            window_title(),
+                            MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+                break;
+            }
+            append_log_line(tr(L"正在请求管理员权限以安装虚拟显示器…"));
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            const std::wstring arguments =
+                L"--vdisplay install --package \"" + default_virtual_display_package_dir() +
+                L"\" --count " + std::to_wstring(g_app->settings.virtual_display_monitors);
+            bool cancelled = false;
+            std::string error;
+            const int code = chast::host::run_elevated(arguments, 180000, &cancelled, &error);
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            std::wstring message;
+            if (code == 0) {
+                const VirtualDisplayStatus status =
+                    classify_virtual_display_probe(probe_virtual_display());
+                message = tr(L"虚拟显示器已安装，当前启用 ") +
+                          std::to_wstring(status.active_monitors) +
+                          tr(L" 台活动显示器。");
+                append_log_line(tr(L"虚拟显示器安装完成"));
+            } else if (cancelled) {
+                message = tr(L"已取消管理员授权。");
+            } else {
+                message = tr(L"虚拟显示器安装失败");
+                if (code > 0) {
+                    message += L" (" + std::to_wstring(code) + L")";
+                }
+                if (!error.empty()) {
+                    message += L"\n\n" + widen(error);
+                }
+                const std::string tail = virtual_display_log_tail();
+                if (!tail.empty()) {
+                    message += L"\n\n" + widen(tail);
+                }
+                message += std::wstring(L"\n\n") + tr(L"日志：") + virtual_display_log_path();
+            }
+            MessageBoxW(g_app->window, message.c_str(), window_title(),
+                        MB_ICONINFORMATION | MB_OK);
+            break;
+        }
+        case kVdisplayUninstallButton: {
+            if (MessageBoxW(g_app->window,
+                            tr(L"卸载虚拟显示器会移除 chast 安装的驱动。请先结束远程会话。继续吗？"),
+                            window_title(),
+                            MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+                break;
+            }
+            append_log_line(tr(L"正在请求管理员权限以卸载虚拟显示器…"));
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            bool cancelled = false;
+            std::string error;
+            const int code =
+                chast::host::run_elevated(L"--vdisplay uninstall", 120000, &cancelled, &error);
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            std::wstring message;
+            if (code == 0) {
+                message = tr(L"虚拟显示器已卸载。");
+                append_log_line(message);
+            } else if (cancelled) {
+                message = tr(L"已取消管理员授权。");
+            } else {
+                message = tr(L"虚拟显示器卸载失败");
+                if (code > 0) {
+                    message += L" (" + std::to_wstring(code) + L")";
+                }
+                if (!error.empty()) {
+                    message += L"\n\n" + widen(error);
+                }
+                const std::string tail = virtual_display_log_tail();
+                if (!tail.empty()) {
+                    message += L"\n\n" + widen(tail);
+                }
+                message += std::wstring(L"\n\n") + tr(L"日志：") + virtual_display_log_path();
+            }
+            MessageBoxW(g_app->window, message.c_str(), window_title(),
+                        MB_ICONINFORMATION | MB_OK);
             break;
         }
         case kTunnelSettingsButton: {

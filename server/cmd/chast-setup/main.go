@@ -33,18 +33,22 @@ func run() error {
 		uninstall   = flag.Bool("uninstall", false, "remove the installed files and registration")
 		list        = flag.Bool("list", false, "list the payload entries and exit")
 		quiet       = flag.Bool("quiet", false, "suppress progress output")
+		vdisplay    = flag.Bool("virtual-display", false, "install the bundled usbmmidd driver (requires --machine)")
+		vdisplayN   = flag.Int("virtual-display-count", 1, "virtual monitors to enable during install (1-4)")
 	)
 	flag.Parse()
 
 	install := setup.Options{
-		Root:     *root,
-		AppID:    *appID,
-		Version:  *appVersion,
-		Machine:  *machine,
-		Service:  *service,
-		Shortcut: *shortcut,
-		Register: *register,
-		Quiet:    *quiet,
+		Root:                *root,
+		AppID:               *appID,
+		Version:             *appVersion,
+		Machine:             *machine,
+		Service:             *service,
+		Shortcut:            *shortcut,
+		Register:            *register,
+		VirtualDisplay:      *vdisplay,
+		VirtualDisplayCount: *vdisplayN,
+		Quiet:               *quiet,
 	}
 	install.Logf = func(format string, args ...any) {
 		if !*quiet {
@@ -56,6 +60,12 @@ func run() error {
 	}
 	if *service && !*machine {
 		return fmt.Errorf("--service requires --machine")
+	}
+	if *vdisplay && !*machine {
+		return fmt.Errorf("--virtual-display requires --machine")
+	}
+	if *vdisplay && (*vdisplayN < 1 || *vdisplayN > 4) {
+		return fmt.Errorf("--virtual-display-count must be from 1 to 4")
 	}
 
 	if *uninstall {
