@@ -137,6 +137,7 @@ func run() error {
 		geoIPFile       = flag.String("geoip-file", "", "CIDR-to-location table used to label login IPs; empty records IPs only")
 		relayOnly       = flag.Bool("relay-only", false, "hide direct candidates and force viewers onto the relay or carrier")
 		adminListen     = flag.String("admin-listen", "127.0.0.1:8446", "loopback-only plain-text admin console; empty disables it")
+		adminToken      = flag.String("admin-token", "", "secret the admin console requires; empty generates and logs one at startup")
 
 		relaySingle    = flag.Float64("relay-single-bandwidth", 128, "per-session relay bandwidth in Mbit/s; 0 disables the limit")
 		relayTotal     = flag.Float64("relay-total-bandwidth", 1024, "total relay bandwidth in Mbit/s; 0 disables the limit")
@@ -881,6 +882,7 @@ func run() error {
 			SMSTTL:      *smsTTL,
 			Archive:     archiveConsole,
 			Logger:      log,
+			Token:       *adminToken,
 		})
 		if err != nil {
 			return err

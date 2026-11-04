@@ -34,6 +34,7 @@ type serverProcess struct {
 	cmd   *exec.Cmd
 	base  string
 	admin string
+	token string
 	log   bytes.Buffer
 	done  bool
 }
@@ -113,15 +114,18 @@ func startServer(t *testing.T, bin string, args []string) *serverProcess {
 	t.Helper()
 	httpPort := freeTCPPort(t)
 	adminPort := freeTCPPort(t)
+	const adminToken = "restart-test-token"
 	full := append([]string{
 		"--http-listen", fmt.Sprintf("127.0.0.1:%d", httpPort),
 		"--admin-listen", fmt.Sprintf("127.0.0.1:%d", adminPort),
+		"--admin-token", adminToken,
 	}, args...)
 	cmd := exec.Command(bin, full...)
 	s := &serverProcess{
 		cmd:   cmd,
 		base:  fmt.Sprintf("http://127.0.0.1:%d", httpPort),
 		admin: fmt.Sprintf("127.0.0.1:%d", adminPort),
+		token: adminToken,
 	}
 	cmd.Stdout, cmd.Stderr = &s.log, &s.log
 	if err := cmd.Start(); err != nil {
@@ -173,7 +177,7 @@ func adminCommand(t *testing.T, s *serverProcess, line string) string {
 		t.Fatalf("admin dial: %v\n%s", err, s.logText())
 	}
 	defer conn.Close()
-	if _, err := io.WriteString(conn, line+"\n"); err != nil {
+	if _, err := io.WriteString(conn, "auth "+s.token+"\n"+line+"\n"); err != nil {
 		t.Fatalf("admin write: %v\n%s", err, s.logText())
 	}
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {

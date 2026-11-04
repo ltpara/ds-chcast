@@ -241,6 +241,32 @@ func TestFetchHonoursContext(t *testing.T) {
 	}
 }
 
+func TestVerifyFileRechecksStagedBytes(t *testing.T) {
+	body := []byte("installer payload")
+	digest := digestOf(body)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chast-2.1.0.exe")
+	if err := os.WriteFile(path, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyFile(path, digest, int64(len(body))); err != nil {
+		t.Fatalf("VerifyFile on matching bytes: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("swapped installer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyFile(path, digest, int64(len(body))); err == nil ||
+		!strings.Contains(err.Error(), "digest") {
+		t.Fatalf("VerifyFile after a swap = %v, want a digest error", err)
+	}
+	if err := VerifyFile(filepath.Join(dir, "missing.exe"), digest, int64(len(body))); err == nil {
+		t.Fatal("VerifyFile accepted a missing file")
+	}
+	if err := VerifyFile(path, "", int64(len(body))); err == nil {
+		t.Fatal("VerifyFile accepted an empty digest")
+	}
+}
+
 func TestLaunchMissingFileFails(t *testing.T) {
 	if err := Launch(filepath.Join(t.TempDir(), "missing.exe")); err == nil {
 		t.Fatal("Launch started a file that does not exist")

@@ -1,10 +1,14 @@
 // Package admin serves the hbbs-style plain-text control console. It binds a
-// loopback TCP address, reads one command line per connection and writes a
-// plain-text reply. No data-plane work ever depends on this package.
+// loopback TCP address, requires an authentication line, reads one command line
+// per connection and writes a plain-text reply. No data-plane work ever depends
+// on this package.
 package admin
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -97,6 +101,9 @@ type Config struct {
 	// PolicyOnly trims the help text to the relay console used by chast-relay.
 	PolicyOnly bool
 	Logger     *slog.Logger
+	// Token authenticates every connection. Empty makes New generate one and
+	// log it once at startup.
+	Token string
 }
 
 type Console struct {
@@ -114,6 +121,14 @@ func New(cfg Config) (*Console, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	if cfg.Token == "" {
+		var raw [16]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return nil, fmt.Errorf("admin token: %w", err)
+		}
+		cfg.Token = hex.EncodeToString(raw[:])
+		cfg.Logger.Info("admin console token generated", "token", cfg.Token)
+	}
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("admin listen %q: %w", cfg.Listen, err)
@@ -127,6 +142,9 @@ func New(cfg Config) (*Console, error) {
 }
 
 func (c *Console) Addr() string { return c.listener.Addr().String() }
+
+// Token is the secret every console connection must present.
+func (c *Console) Token() string { return c.cfg.Token }
 
 func (c *Console) Serve() {
 	for {
@@ -172,12 +190,34 @@ func (c *Console) handle(conn net.Conn) {
 	if err != nil && line == "" {
 		return
 	}
+	if !c.authorized(strings.TrimSpace(line)) {
+		c.cfg.Logger.Warn("admin connection unauthorized", "remote", conn.RemoteAddr())
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		_, _ = io.WriteString(conn, "unauthorized\n")
+		return
+	}
+	conn.SetReadDeadline(time.Now().Add(readTimeout))
+	line, err = reader.ReadString('\n')
+	if err != nil && line == "" {
+		return
+	}
 	reply := c.execute(strings.TrimSpace(line))
 	if reply == "" {
 		return
 	}
 	conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	_, _ = io.WriteString(conn, reply)
+}
+
+// authorized checks the fixed-width authentication preamble. The token is
+// compared in constant time even though the console only listens on loopback,
+// because any local account can reach the port.
+func (c *Console) authorized(line string) bool {
+	const prefix = "auth "
+	if !strings.HasPrefix(line, prefix) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(line[len(prefix):]), []byte(c.cfg.Token)) == 1
 }
 
 func (c *Console) execute(line string) string {

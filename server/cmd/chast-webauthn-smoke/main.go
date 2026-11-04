@@ -100,7 +100,7 @@ func (c *apiClient) call(method, path, token string, body any) (int, []byte, err
 	return reply.StatusCode, data, nil
 }
 
-func adminCommand(addr, command string) (string, error) {
+func adminCommand(addr, token, command string) (string, error) {
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
 		return "", err
@@ -108,6 +108,9 @@ func adminCommand(addr, command string) (string, error) {
 	defer conn.Close()
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return "", err
+	}
+	if token != "" {
+		command = "auth " + token + "\n" + command
 	}
 	if _, err := io.WriteString(conn, command+"\n"); err != nil {
 		return "", err
@@ -141,6 +144,7 @@ func encode(data []byte) string {
 func main() {
 	serverURL := flag.String("server", "http://127.0.0.1:18443", "chast-server HTTP API base URL")
 	adminAddr := flag.String("admin", "127.0.0.1:18446", "chast-server admin console address")
+	adminToken := flag.String("admin-token", "", "admin console secret printed at server startup")
 	rpID := flag.String("rp-id", "127.0.0.1", "relying party id the server was started with")
 	origin := flag.String("origin", "", "origin the server was started with; defaults to --server")
 	username := flag.String("username", "webauthn-smoke", "account used for the smoke run")
@@ -149,13 +153,13 @@ func main() {
 	wait := flag.Duration("wait", 10*time.Second, "how long to wait for the admin console")
 	flag.Parse()
 
-	if err := run(*serverURL, *adminAddr, *rpID, *origin, *username, *password, *keep, *wait); err != nil {
+	if err := run(*serverURL, *adminAddr, *adminToken, *rpID, *origin, *username, *password, *keep, *wait); err != nil {
 		fmt.Fprintln(os.Stderr, "webauthn smoke:", err)
 		os.Exit(1)
 	}
 }
 
-func run(serverURL, adminAddr, rpID, origin, username, password string, keep bool, wait time.Duration) error {
+func run(serverURL, adminAddr, adminToken, rpID, origin, username, password string, keep bool, wait time.Duration) error {
 	serverURL = strings.TrimRight(serverURL, "/")
 	if origin == "" {
 		origin = serverURL
@@ -163,10 +167,10 @@ func run(serverURL, adminAddr, rpID, origin, username, password string, keep boo
 	if err := waitForAdmin(adminAddr, wait); err != nil {
 		return err
 	}
-	if _, err := adminCommand(adminAddr, "user del "+username); err == nil {
+	if _, err := adminCommand(adminAddr, adminToken, "user del "+username); err == nil {
 		fmt.Printf("[ok] removed any previous %s account\n", username)
 	}
-	out, err := adminCommand(adminAddr, "user add "+username+" "+password)
+	out, err := adminCommand(adminAddr, adminToken, "user add "+username+" "+password)
 	if err != nil {
 		return fmt.Errorf("create account: %w", err)
 	}
@@ -175,7 +179,7 @@ func run(serverURL, adminAddr, rpID, origin, username, password string, keep boo
 	}
 	if !keep {
 		defer func() {
-			if cleaned, err := adminCommand(adminAddr, "user del "+username); err == nil {
+			if cleaned, err := adminCommand(adminAddr, adminToken, "user del "+username); err == nil {
 				fmt.Printf("[ok] cleaned up account (%s)\n", strings.TrimSpace(cleaned))
 			}
 		}()
@@ -474,7 +478,7 @@ func run(serverURL, adminAddr, rpID, origin, username, password string, keep boo
 	report.check("passwordless begin without keys is answered like an enabled account",
 		status == http.StatusAccepted && strings.Contains(string(data), "accepted"), string(data))
 
-	audit, err := adminCommand(adminAddr, "audit 50")
+	audit, err := adminCommand(adminAddr, adminToken, "audit 50")
 	if err != nil {
 		return fmt.Errorf("audit: %w", err)
 	}

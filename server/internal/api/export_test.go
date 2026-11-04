@@ -138,6 +138,48 @@ func TestCSVExportPagesPastStorePageCaps(t *testing.T) {
 	}
 }
 
+func TestCSVExportEscapesFormulas(t *testing.T) {
+	s := testutil.Start(t)
+	triggers := []string{`=HYPERLINK("http://evil")`, "+SUM(A1)", "-2+3", "@cmd"}
+	for _, value := range triggers {
+		if err := s.Accounts.AppendAudit(account.AuditEvent{
+			Username: "alice", Action: "formula_probe", Detail: value,
+			Location: value, Success: true,
+		}); err != nil {
+			t.Fatalf("append audit %q: %v", value, err)
+		}
+	}
+	if err := s.Accounts.AppendAudit(account.AuditEvent{
+		Username: "alice", Action: "formula_probe", Detail: "plain text", Success: true,
+	}); err != nil {
+		t.Fatalf("append plain audit: %v", err)
+	}
+
+	rows := exportCSV(t, s.URL+"/v1/audit?format=csv&action=formula_probe")
+	if len(rows) != len(triggers)+2 {
+		t.Fatalf("formula rows = %d, want %d", len(rows)-1, len(triggers)+1)
+	}
+	seen := 0
+	for _, row := range rows[1:] {
+		if row[4] == "plain text" {
+			if row[6] != "" {
+				t.Fatalf("plain row location = %q", row[6])
+			}
+			continue
+		}
+		if !strings.HasPrefix(row[4], "'") || !strings.HasPrefix(row[6], "'") {
+			t.Fatalf("formula row not escaped: %q", row)
+		}
+		if row[4] != row[6] || row[4][1:] == "" {
+			t.Fatalf("formula row detail/location = %q / %q", row[4], row[6])
+		}
+		seen++
+	}
+	if seen != len(triggers) {
+		t.Fatalf("escaped rows = %d, want %d", seen, len(triggers))
+	}
+}
+
 func TestCSVExportFlushesThroughInstrumentation(t *testing.T) {
 	s := testutil.Start(t)
 	req, err := http.NewRequest(http.MethodGet, s.URL+"/v1/audit?format=csv", nil)

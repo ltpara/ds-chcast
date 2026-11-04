@@ -595,7 +595,9 @@ server-key）或管理台 `connections [count]` 查看全部账号并可按用�
 500 行，连接与文件传输每批 200 行（与存储层单页上限一致）。表头在首页查询
 成功后才发送，没有匹配行时返回仅含表头的 CSV；写出中途失败只记服务器日志
 并关闭连接，客户端看到的是被截断的下载。时间列是 UTC RFC3339Nano，
-`detail` 等含逗号、引号或换行的字段按 RFC 4180 转义。`format` 只接受空值、
+`detail` 等含逗号、引号或换行的字段按 RFC 4180 转义；以 `=`、`+`、`-`、
+`@`、制表符或回车开头的单元格额外加前导 `'`（单独一格 `-` 占位除外），
+防止表格软件把远端可控的用户名、文件名或详情当成公式执行。`format` 只接受空值、
 `json` 或 `csv`，其他值返回 400；不带 `format` 仍是原来的分页 JSON。
 
 需要长期留存时，可用 `--audit-archive-dir` 把三类历史外置为 JSONL：每隔
@@ -915,18 +917,20 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `/software/` 下但未设置目录时启动只警告，由其他主机负责下载。
 - `chast-tunnel host --auto-update` 让主机代理自动应用上述通告：必须同时
   给出 `--server-pubkey`，否则启动直接失败；收到带摘要与签名的通告后先按
-  签名校验版本/URL/摘要/大小，再下载到 `--auto-update-dir`（默认系统临时
-  目录），边下载边核对 SHA-256 与长度，一致才改名为最终文件并以分离进程
-  启动安装器，每个版本最多尝试一次。未固定公钥、签名不符、超限、下载失败
-  或启动失败都只记日志（`software update rejected`/`download failed`/
+  签名校验版本/URL/摘要/大小，再下载到 `--auto-update-dir`（默认可执行文件
+  旁的 `updates` 目录，继承安装目录 ACL），边下载边核对 SHA-256 与长度，
+  一致才改名为最终文件；启动安装器前再按路径重算一次摘要，文件若在下载后
+  被替换就拒绝执行。安装器以分离进程启动，每个版本最多尝试一次。未固定
+  公钥、签名不符、超限、下载失败、摘要复核失败或启动失败都只记日志
+  （`software update rejected`/`download failed`/`no longer matches`/
   `launch failed`），不执行任何下载文件，也不影响注册与远程会话。
 - 查看器在已固定服务器身份（`ServerIdentityStore`）时，把更新对话框的
   “下载并安装”交给同目录的 `chast-tunnel apply-update`：helper 用 pin 验签、
-  流式下载核对 SHA-256 与长度、等待查看器 PID 退出、把当前 exe 改名为
-  `*.old-<纳秒>` 备份、换入新文件并启动，成功后删除备份；新文件无法启动
-  时还原并重启旧文件。`apply-update` 拒绝替换正在运行的自身；缺 pin、签名
-  不符与被篡改的大小都在下载前拒绝。未固定身份或通告不带签名时只显示横幅
-  与“复制下载地址”。
+  流式下载核对 SHA-256 与长度、安装前再按路径复核一次摘要、等待查看器 PID
+  退出、把当前 exe 改名为 `*.old-<纳秒>` 备份、换入新文件并启动，成功后删除
+  备份；新文件无法启动时还原并重启旧文件。`apply-update` 拒绝替换正在运行
+  的自身；缺 pin、签名不符与被篡改的大小都在下载前拒绝。未固定身份或通告
+  不带签名时只显示横幅与“复制下载地址”。
 - `--api-rate`（默认 50 请求/秒）与 `--api-burst`（默认 100）是所有 HTTP
   路径共用的按 IP 令牌桶，`--api-rate 0` 关闭。超限返回 `429` 和
   `Retry-After: 1`，计入 `chast_http_rate_limited_total`。默认按 TCP 对端
@@ -1093,7 +1097,9 @@ chast-relay --http-listen 0.0.0.0:8447 --relay-listen 0.0.0.0 \
 - 节点同样接受全部中继策略参数与名单文件，策略在节点本地执行，不改变控制面
   或数据面协议。`--admin-listen`（默认 `127.0.0.1:8449`，空值禁用）提供与
   hbbs 相同的一行命令控制台（`stats`、`hosts` 摘要、`sb/tb/ls/dt/t`、
-  `ba/br/b`、`Ba/Br/B`、`u`），只绑定回环。
+  `ba/br/b`、`Ba/Br/B`、`u`），只绑定回环。控制台要求首行
+  `auth <token>`：`--admin-token` 可显式指定，缺省时启动随机生成并记录
+  `admin console token generated` 日志；令牌错误或缺失只回 `unauthorized`。
 
 - `--key` 必填，与 hbbs 的 `--relay-node-key` 相同；控制面 `/v1/leases`、
   `/v1/leases/{id}`、`/v1/stats` 都要求 Bearer key，`/healthz` 公开。
@@ -1161,8 +1167,11 @@ chast-server ... --admin-listen 127.0.0.1:8446 \
 ```
 
 - `--admin-listen`（默认 `127.0.0.1:8446`，空值禁用）只接受回环绑定，启动
-  时校验监听地址，连接来源不是回环直接关闭。协议与 hbbs 一致：一行明文
-  命令（≤1 KiB），处理完写回纯文本并关闭。默认命令如下：
+  时校验监听地址，连接来源不是回环直接关闭。`--admin-token` 指定控制台
+  令牌，缺省时启动随机生成（16 字节）并打印 `admin console token generated`
+  日志。协议与 hbbs 相近但先认证：首行 `auth <token>`（常量时间比较），
+  通过后再发一行明文命令（≤1 KiB），处理完写回纯文本并关闭；令牌缺失或
+  错误只回 `unauthorized`。默认命令如下：
 
   | 命令 | 说明 |
   | --- | --- |

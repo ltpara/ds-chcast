@@ -91,11 +91,11 @@ func TestConsoleRelayNodes(t *testing.T) {
 		RelayPool:  pool,
 	})
 
-	stats := send(t, c.Addr(), "stats")
+	stats := send(t, c, "stats")
 	if !strings.Contains(stats, "relay_nodes=1 healthy=1") {
 		t.Fatalf("stats output:\n%s", stats)
 	}
-	hosts := send(t, c.Addr(), "hosts")
+	hosts := send(t, c, "hosts")
 	for _, want := range []string{
 		"devbox online=true",
 		"relay_host=relay-a.example",
@@ -106,13 +106,13 @@ func TestConsoleRelayNodes(t *testing.T) {
 			t.Fatalf("hosts output missing %q:\n%s", want, hosts)
 		}
 	}
-	rs := send(t, c.Addr(), "rs")
+	rs := send(t, c, "rs")
 	for _, want := range []string{"relay_nodes=1 healthy=1", "node=" + node.URL + " status=up", "127.0.0.1"} {
 		if !strings.Contains(rs, want) {
 			t.Fatalf("rs output missing %q:\n%s", want, rs)
 		}
 	}
-	if got := send(t, c.Addr(), "tg 203.0.113.1"); !strings.Contains(got, "next="+node.URL) {
+	if got := send(t, c, "tg 203.0.113.1"); !strings.Contains(got, "next="+node.URL) {
 		t.Fatalf("tg with a healthy node: %q", got)
 	}
 
@@ -120,11 +120,11 @@ func TestConsoleRelayNodes(t *testing.T) {
 	waitPool(t, pool, "node failure", func(status relaypool.Status) bool {
 		return status.Healthy == 0
 	})
-	rs = send(t, c.Addr(), "rs")
+	rs = send(t, c, "rs")
 	if !strings.Contains(rs, "status=down") {
 		t.Fatalf("rs after failure:\n%s", rs)
 	}
-	if got := send(t, c.Addr(), "tg 203.0.113.1"); !strings.Contains(got, "next=127.0.0.1") {
+	if got := send(t, c, "tg 203.0.113.1"); !strings.Contains(got, "next=127.0.0.1") {
 		t.Fatalf("tg fallback: %q", got)
 	}
 }

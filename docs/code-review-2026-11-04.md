@@ -18,6 +18,7 @@
 - **剪贴板 DIB 越界、TOTP 步内重放、隐私遮罩假成功（M7/M8/M9，已于 2026-11-05 修复，见各节）**：`CF_DIB` 现在按头部推导像素/调色板长度；TOTP 记录并拒绝已用步号（内存级）；隐私遮罩设置分层 alpha、校验桌面归属与覆盖矩形，`OpenDesktopW` 失败即判失败。
 - **审计可被空 ref 抑制、日志可注入、剪贴板下载表跨会话、权限刷新后旧掩码（M10-M13，已于 2026-11-05 修复，见各节）**：无 ref 会话用主机生成 ID 并标记；日志入口转义控制字符；下载表按会话清空且仅在宣布成功后登记；权限更新后本地 `StreamInfo` 同步新掩码。
 - **剪贴板文本限额不一致、`.part` 与用户文件同名、接收 reparse 检查 TOCTOU（M14-M16，已于 2026-11-05 修复，见各节）**：文本改按 4 MiB 校验且全部句柄就绪后才清空剪贴板；中间态移入 `<root>\.chast-partial\<hash>.part`；中间文件与 sidecar 以 `FILE_FLAG_OPEN_REPARSE_POINT` 打开并做句柄级复核。
+- **更新器校验后按路径执行、管理控制台无认证、CSV 公式注入（M17-M19，已于 2026-11-05 修复，见各节）**：暂存文件在启动安装器前重算 SHA-256 与长度，默认暂存目录移到可执行文件旁的 `updates`；管理控制台要求首行 `auth <token>`（缺省随机生成并记录日志，常量时间比较）；CSV 导出对以 `= + - @ \t \r` 开头的单元格（单独的 `-` 占位除外）前置 `'`。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -713,6 +714,10 @@ return final, nil
 
 **修复**：校验与执行之间保持独占文件句柄（`FILE_SHARE_NONE` + `FILE_FLAG_DELETE_ON_CLOSE`），或 `Launch` 前重算 SHA-256；默认暂存目录移到安装目录并收紧 ACL。
 
+**修复（2026-11-05）**
+
+采用“执行前重算摘要”，并同时移动默认暂存目录。新增 `updater.VerifyFile(path, sha256, size)`：要求通告带摘要、期望长度为 `(0, MaxSize]`，打开文件后确认是普通文件、长度一致，再流式重算 SHA-256（多读 1 字节以发现超长文件），不一致即拒绝。`agent` 在 `updater.Launch(path)` 之前、`chast-tunnel apply-update` 在 `updater.Install` 之前都调用它，失败分别记 `software update staged file no longer matches` 与 `staged release changed after the download`，不执行任何已下载文件。默认暂存目录从 `%TEMP%` 改为可执行文件旁的 `updates` 子目录（`defaultStagingDir()`，取不到可执行路径才退回系统临时目录），该目录继承安装目录的 ACL，低权限用户不能替换文件；`--auto-update-dir` 与 `apply-update --dir` 的说明同步更新。句柄锁定方案未采用：安装器需要以独立进程启动，跨进程持有独占句柄会让部分安装器无法读取文件；重算摘要把替换窗口压缩到校验与启动之间，暂存目录的 ACL 又阻止低权限用户写入，两者共同覆盖原风险。新增 `TestVerifyFileRechecksStagedBytes` 覆盖一致、字节被换、文件缺失与空摘要四种情况。
+
 ---
 
 ### M18. 本地管理控制台只校验回环地址，没有任何认证
@@ -729,6 +734,10 @@ reply := c.execute(strings.TrimSpace(line))   // 无口令、无 token
 
 **修复**：启动时生成一次性 token 打印到日志/stderr 并要求首行携带；或改用 Windows named pipe + ACL 限定。
 
+**修复（2026-11-05）**
+
+采用启动令牌方案。`admin.Config` 新增 `Token`；`New` 在为空时生成 16 字节随机令牌（`crypto/rand`）并记录一次 `admin console token generated` 日志，`Console.Token()` 供测试与嵌入方读取。连接仍先做回环来源校验，随后要求首行 `auth <token>`：缺失或错误只回 `unauthorized` 并记 `admin connection unauthorized`，比较用 `crypto/subtle.ConstantTimeCompare`，通过后重置读超时再读一行命令。`chast-server` 与 `chast-relay` 新增 `--admin-token`（缺省生成并记录），帮助文本与 README 已同步；`chast-webauthn-smoke` 新增 `--admin-token` 并在每次控制台调用前发送认证行；实进程重启测试改为显式传入令牌。所有 `internal/admin` 测试经 `send(t, console, command)` 自动认证，并新增 `TestRequiresToken`（缺失、错误、正确与生成令牌四种路径）。named pipe 方案未采用，以便继续支持跨平台的回环调试与现有测试方式。
+
 ---
 
 ### M19. CSV 导出公式注入（审计/连接/文件传输）
@@ -738,6 +747,10 @@ reply := c.execute(strings.TrimSpace(line))   // 无口令、无 token
 `encoding/csv` 不会中和以 `= + - @ \t \r` 开头的单元格。用户名、`peer_id`、`detail`、`name` 都可由攻击者控制（失败登录也会写 `audit_events`），运维用 Excel 打开导出文件即可能触发公式（数据外带/钓鱼）。
 
 **修复**：导出前统一 `csvSafe()`：对危险首字符前置 `'`。
+
+**修复（2026-11-05）**
+
+`csvExport.write` 对每一行逐单元格调用 `csvSafe()`：首字符为 `= + - @ \t \r` 时前置 `'`，Excel/LibreOffice 会按文本处理；空串与“无值”占位符 `-` 保持原样（`-` 单独一格不构成公式，且现有导出用它表示缺失用户名）。规则作用于所有列，新增字段自动覆盖，不再依赖逐列记得调用。新增 `TestCSVExportEscapesFormulas`（经真实审计导出验证 `=`/`+`/`-`/`@` 与普通文本）和 `TestCSVSafe`（含制表符、回车与空串边界）。
 
 ---
 
@@ -991,7 +1004,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 9. M10/M11/M12/M13：审计回退 ID、日志转义、剪贴板下载表按会话清理、StreamInfo 用新掩码重建（均已完成，见各节修复说明）。
 10. M14/M15/M16：剪贴板文本限额统一、`.part` 隔离目录、句柄级 reparse 复核（均已完成，见各节修复说明）。
-11. M17/M18/M19：更新器句柄锁定、admin console token、CSV 转义。
+11. M17/M18/M19：更新器句柄锁定、admin console token、CSV 转义（均已完成，见各节修复说明）。
 12. M24～M29：客户端强制 HTTPS、密钥 DPAPI、首用确认、终端 CSI 上限、录制校验。
 
 **第四批（持续）**

@@ -64,7 +64,7 @@ func runHost(args []string) error {
 	keepalive := fs.Duration("keepalive", 10*time.Second, "rendezvous keepalive interval")
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	autoUpdate := fs.Bool("auto-update", false, "stage and launch the installer advertised by the server; needs --server-pubkey")
-	autoUpdateDir := fs.String("auto-update-dir", "", "directory for the downloaded installer (default: system temp)")
+	autoUpdateDir := fs.String("auto-update-dir", "", "directory for the downloaded installer (default: updates beside the executable)")
 	lanDiscovery := fs.Bool("lan-discovery", true, "answer LAN discovery pings; exposes id, hostname, username, platform and version on the local link")
 	lanPort := fs.Int("lan-port", lan.DefaultPort, "UDP port for LAN discovery")
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")

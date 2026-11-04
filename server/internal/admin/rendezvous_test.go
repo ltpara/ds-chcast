@@ -20,17 +20,17 @@ func TestConsoleRendezvousServers(t *testing.T) {
 		Rendezvous: push,
 	})
 
-	help := send(t, c.Addr(), "h")
+	help := send(t, c, "h")
 	if !strings.Contains(help, "rendezvous-servers(rv)") {
 		t.Fatalf("help missing rendezvous-servers:\n%s", help)
 	}
 
-	out := send(t, c.Addr(), "rv")
+	out := send(t, c, "rv")
 	if !strings.Contains(out, "serial=1") || !strings.Contains(out, "https://one.example") {
 		t.Fatalf("rv = %q", out)
 	}
 
-	out = send(t, c.Addr(), "rv https://two.example,https://three.example")
+	out = send(t, c, "rv https://two.example,https://three.example")
 	if !strings.Contains(out, "serial=2") {
 		t.Fatalf("rv set = %q", out)
 	}
@@ -39,7 +39,7 @@ func TestConsoleRendezvousServers(t *testing.T) {
 		t.Fatalf("config after set = %d/%v", serial, servers)
 	}
 
-	out = send(t, c.Addr(), "rv serial 5 https://four.example")
+	out = send(t, c, "rv serial 5 https://four.example")
 	if !strings.Contains(out, "serial=5") {
 		t.Fatalf("rv serial = %q", out)
 	}
@@ -47,16 +47,16 @@ func TestConsoleRendezvousServers(t *testing.T) {
 		t.Fatalf("config after serial = %d/%v", serial, servers)
 	}
 
-	out = send(t, c.Addr(), "rv serial 4 https://five.example")
+	out = send(t, c, "rv serial 4 https://five.example")
 	if !strings.Contains(out, "must be greater") {
 		t.Fatalf("stale serial accepted: %q", out)
 	}
-	out = send(t, c.Addr(), "rv bogus-url")
+	out = send(t, c, "rv bogus-url")
 	if !strings.Contains(out, "rendezvous-servers:") {
 		t.Fatalf("invalid url accepted: %q", out)
 	}
 
-	out = send(t, c.Addr(), "rv clear")
+	out = send(t, c, "rv clear")
 	if !strings.Contains(out, "serial=6 cleared") {
 		t.Fatalf("rv clear = %q", out)
 	}
@@ -65,7 +65,7 @@ func TestConsoleRendezvousServers(t *testing.T) {
 	}
 
 	without := startConsole(t, Config{Registry: s.Registry, Relay: s.Relay})
-	if out := send(t, without.Addr(), "rv"); !strings.Contains(out, "not enabled") {
+	if out := send(t, without, "rv"); !strings.Contains(out, "not enabled") {
 		t.Fatalf("rv without config = %q", out)
 	}
 }

@@ -84,7 +84,7 @@ func Fetch(ctx context.Context, client *http.Client, n Notice, dir string) (stri
 		return "", err
 	}
 	if strings.TrimSpace(dir) == "" {
-		dir = os.TempDir()
+		dir = defaultStagingDir()
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -145,6 +145,56 @@ func Fetch(ctx context.Context, client *http.Client, n Notice, dir string) (stri
 		}
 	}
 	return final, nil
+}
+
+// VerifyFile re-checks a staged release on disk immediately before it is
+// launched or swapped into place. Fetch already hashed the stream it wrote,
+// but the path could have been replaced since; a service running from a
+// protected install directory must never execute a file another local user
+// planted there.
+func VerifyFile(path, expectedSHA256 string, expectedSize int64) error {
+	if expectedSHA256 == "" {
+		return errors.New("the update carries no digest")
+	}
+	if expectedSize <= 0 || expectedSize > MaxSize {
+		return fmt.Errorf("release size %d is outside 1..%d", expectedSize, int64(MaxSize))
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("staged release: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("staged release: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("the staged release is not a regular file")
+	}
+	if info.Size() != expectedSize {
+		return fmt.Errorf("staged size %d does not match the advertised %d", info.Size(), expectedSize)
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, io.LimitReader(file, expectedSize+1)); err != nil {
+		return fmt.Errorf("read the staged release: %w", err)
+	}
+	got := hex.EncodeToString(digest.Sum(nil))
+	if !strings.EqualFold(got, expectedSHA256) {
+		return fmt.Errorf("staged digest %s does not match the advertised %s", got, expectedSHA256)
+	}
+	return nil
+}
+
+// defaultStagingDir keeps the release beside the running executable rather
+// than in the shared temp directory. A service installed under Program Files
+// is writable only by administrators, while %TEMP% is writable by the local
+// user the service must not trust.
+func defaultStagingDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return os.TempDir()
+	}
+	return filepath.Join(filepath.Dir(exe), "updates")
 }
 
 // downloadName derives the staged file name from the download URL. Only a

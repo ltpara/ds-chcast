@@ -27,7 +27,7 @@ func runApplyUpdate(args []string) error {
 	serverPubKey := fs.String("server-pubkey", "", "pinned server Ed25519 public key; required")
 	target := fs.String("target", "", "binary to replace, e.g. chast_viewer.exe")
 	launch := fs.String("launch", "", "binary to start after the swap; defaults to --target")
-	staging := fs.String("dir", "", "staging directory (default: system temp)")
+	staging := fs.String("dir", "", "staging directory (default: updates beside this helper)")
 	waitPID := fs.Int("wait-pid", 0, "wait for this process to exit before swapping")
 	waitTimeout := fs.Duration("wait-timeout", 90*time.Second, "how long to wait for --wait-pid")
 	retireTimeout := fs.Duration("retire-timeout", 20*time.Second, "how long to retry removing the previous binary")
@@ -77,6 +77,9 @@ func runApplyUpdate(args []string) error {
 		return err
 	}
 	logf("staged %s", staged)
+	if err := updater.VerifyFile(staged, notice.SHA256, notice.Size); err != nil {
+		return fmt.Errorf("staged release changed after the download: %w", err)
+	}
 	backup, err := updater.Install(staged, *target)
 	if err != nil {
 		return err

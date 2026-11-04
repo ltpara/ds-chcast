@@ -77,7 +77,11 @@ func (e *csvExport) write(rows [][]string) bool {
 		return false
 	}
 	for _, row := range rows {
-		if err := e.cw.Write(row); err != nil {
+		safe := make([]string, len(row))
+		for i, cell := range row {
+			safe[i] = csvSafe(cell)
+		}
+		if err := e.cw.Write(safe); err != nil {
 			e.s.cfg.Logger.Error(e.label+" export write", "error", err)
 			return false
 		}
@@ -89,6 +93,22 @@ func (e *csvExport) write(rows [][]string) bool {
 	}
 	e.flush()
 	return true
+}
+
+// csvSafe defuses spreadsheet formula injection: a leading apostrophe makes
+// Excel and LibreOffice treat the cell as literal text. Usernames, peer ids,
+// file names and detail fields all reach this from remote clients. The lone
+// "-" placeholder for absent values is left alone because it cannot carry a
+// formula.
+func csvSafe(cell string) string {
+	if cell == "" || cell == "-" {
+		return cell
+	}
+	switch cell[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + cell
+	}
+	return cell
 }
 
 func (e *csvExport) flush() {

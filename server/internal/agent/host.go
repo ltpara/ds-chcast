@@ -70,8 +70,8 @@ type HostConfig struct {
 	// It requires ServerPublicKey: without a pin the notice cannot be
 	// verified, so the agent refuses to run a downloaded binary.
 	AutoUpdate bool
-	// UpdateDir is where the installer is staged. Empty uses the system temp
-	// directory.
+	// UpdateDir is where the installer is staged. Empty uses an "updates"
+	// directory beside the agent executable, which inherits its ACL.
 	UpdateDir string
 	// OnInfo receives registration and viewer-path changes, starting with the
 	// relay assigned by the server. It is called from the read or refresh
@@ -565,6 +565,11 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 		}
 		h.log.Info("software update staged", "version", notice.Version,
 			"path", path, "size", notice.Size, "sha256", notice.SHA256)
+		if err := updater.VerifyFile(path, notice.SHA256, notice.Size); err != nil {
+			h.log.Error("software update staged file no longer matches", "version", notice.Version,
+				"path", path, "error", err)
+			return
+		}
 		if err := updater.Launch(path); err != nil {
 			h.log.Error("software update launch failed", "version", notice.Version,
 				"path", path, "error", err)
