@@ -360,7 +360,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 
 | ID | 优先级 | 缺口 | RustDesk 证据 | chast 现状 |
 | --- | --- | --- | --- | --- |
-| DEV-11 | P1 | 多查看者并发（同一主机同时多个受控会话） | `src/server.rs:466`/`:488` 以连接表维护多个连接，视频服务按订阅者分发 | `include/chast/quic.h:5` 服务端只接受一个客户端，`src/host/host_server.cc:547` 结束当前会话后才接待下一个查看器 |
+| DEV-11 | P1 | 多查看者并发（同一主机同时多个受控会话） | `src/server.rs:466`/`:488` 以连接表维护多个连接，视频服务按订阅者分发 | 已实现（2026-11-05）：`max_viewers`（1..8，默认 2）并发接纳，每个查看者独立会话/审批/权限/审计，共享桌面流与控制租约，详见同日小节 |
 | DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 已实现（2026-11-05）：会合控制面、TCP 载体与共享载体支持 http/https/socks5/socks5h，代理下强制 TCP 载体，详见同日小节 |
 | DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 只有主机系统声→查看器与查看器麦克风→主机播放（`include/chast/audio.h:3-5`），没有主机麦克风上行，也没有通话请求/接听流程 |
 | DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
@@ -388,6 +388,47 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
    排序；其中 DEV-15/DEV-16 涉及凭据与会话边界，需先复审安全模型。
 3. **DEV-21～DEV-27**：体验与部署增强。DEV-23 只在有对应硬件且能保持
    零拷贝时启动，不引入 CPU fallback；DEV-24/25 可随 UI 批次完成。
+
+### DEV-11 多查看者并发会话（2026-11-05 完成）
+
+同一主机可以同时服务多个查看者（`host.ini` 的 `max_viewers=1..8`，默认 2；
+`1` 保留原有串行语义）。传输层 `QuicServerConfig::max_clients` 在 TLS 完成
+前执行上限，超出的连接立即拒绝；每个通过上限的连接由 `accept()` 交给一个
+独立的 `HostServer` 工作线程，各自拥有 Hello、审批、权限、流和审计记录，
+共享安全策略、证书注册、监听器和 TCP 载体。
+
+桌面视频按“发布者/跟随者”共享。DXGI 对同一输出只允许一个
+`IDXOutputDuplication`，因此最先进入的桌面查看者成为发布者，负责采集、编码、
+系统音频、光标和隐私遮罩，并把已编码访问单元、音频包、光标更新与桌面状态
+广播给跟随者；广播使用 `send_frame_nowait()`，队列满时丢弃该查看者的这一帧，
+慢查看者不会拖住采集循环。跟随者在自己的连接上运行控制面（输入、剪贴板、
+聊天、文件、终端/端口转发/摄像头中继、麦克风、SAS），收到新的
+`StreamInfo` 时用 `refresh_stream()` 更新描述。发布者离开后，一个跟随者赢得
+`claim_desktop()` 并重建采集/编码/音频，以 `refresh_stream()` 接续已经宣告
+的流；注册表版本号单调递增且不因接管重置，跟随者不会把旧描述当成新流。
+
+输入仍只有一个控制租约：后来的桌面查看者以只读加入，租约在离开或输入被
+撤销时释放。新增 `QuicSession::set_permission_ceiling()` 在流宣告后把
+“后续可授予”的上限恢复到审批时的掩码（仍受配置硬门限裁剪），但不改变
+当前掩码，因此只读查看者可以在租约释放后由操作员授予输入，而不会扩大
+审批范围。隐私遮罩、显示切换/模式、流参数等主机级操作归发布者所有；跟随者
+的请求以 Busy/Denied 明确拒绝，关键帧请求转发给发布者。
+
+设置与审计：`HostSettings::max_viewers` 持久化到 `host.ini`，越界值回落
+默认并告警；每个查看者按自己的 viewer ref 记录审计，重复引用由既有的
+host-generated 回退 ID 区分。
+
+验证：新增 `chast-host-multi-test.exe`（`ctest -R host_multi`，超时 180 s），
+覆盖两个查看者并发、超限拒绝、重复审计引用、控制租约的授予/拒绝/释放与
+发布者离开后的接管（含共享帧接收和租约恢复）。同轮
+`chast-protocol-test`、`chast-host-settings-test`、`chast-carrier-test`、
+`chast-host-tunnel-test` 通过。
+
+边界：并发上限 8；同一时刻只有一个发布者，所有桌面查看者共享同一显示器与
+编码器，因此跟随者不能单独切换显示器/分辨率/编码参数（请求会被告知由发布
+者控制）；隐私遮罩仍是主机级状态。文件传输专用会话不参与桌面共享。媒体
+路径仍沿用原有 GPU 零拷贝链路，未增加 CPU 转换或 CPU 编码 fallback；共享
+只改变“已编码输出交给谁”，不改变采集/编码/渲染路径。
 
 ### DEV-12 出站 SOCKS5/HTTP(S) 代理（2026-11-05 完成）
 

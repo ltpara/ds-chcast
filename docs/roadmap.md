@@ -2945,6 +2945,22 @@
      SOCKS5 UDP ASSOCIATE，主机入站 UDP 与零拷贝媒体链路不变；主机侧代理
      凭据经 argv 传给 agent。详见 `docs/status-2026-10-25.md` 的同日小节与
      `docs/rustdesk-gap-tasks-2026-11-01.md`。
+125. **P1 · DEV-11 多查看者并发会话（2026-11-05 完成）**：`HostSettings`
+     新增 `max_viewers=1..8`（默认 2，`host.ini` 持久化）；传输层
+     `QuicServerConfig::max_clients` 在 TLS 前执行上限，`accept()` 把每个
+     连接交给独立的 `HostServer` 工作线程，各自拥有 Hello/审批/权限/流/审计，
+     共享安全策略、证书、监听器和 TCP 载体。桌面流采用发布者/跟随者：
+     首个桌面查看者采集、编码并广播已编码访问单元、音频、光标和桌面状态
+     （`send_frame_nowait()`，慢查看者丢帧而不阻塞采集）；跟随者在自己的
+     连接上运行输入/剪贴板/聊天/文件/终端/端口转发/摄像头/麦克风/SAS 控制面。
+     发布者离开后一个跟随者接管并 `refresh_stream()` 接续已宣告的流。输入
+     仍单租约，新增 `QuicSession::set_permission_ceiling()` 使只读查看者在
+     租约释放后可被授予输入而不扩大审批范围。验证：新增
+     `chast-host-multi-test`（并发、超限、重复审计引用、租约与接管），
+     protocol/settings/carrier/tunnel 测试通过。边界：最多 8 个查看者，
+     同一时刻一个发布者，跟随者不能单独切换显示器/分辨率/编码参数；媒体
+     路径保持 GPU 零拷贝，无 CPU fallback。详见
+     `docs/rustdesk-gap-tasks-2026-11-01.md` 的同日小节。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
