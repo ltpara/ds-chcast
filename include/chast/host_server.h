@@ -419,7 +419,9 @@ private:
     // operator's decision cannot race another handshake.
     HostSecurity::Result pending_security_;
     // A UI request is queued instead of touching the session from that
-    // thread; the frame loop applies it.
+    // thread; the frame loop applies it. The pair is only meaningful together,
+    // so both fields are read and written under permission_mutex_.
+    std::mutex permission_mutex_;
     std::atomic<bool> permission_update_pending_{false};
     std::atomic<uint16_t> pending_permissions_{0};
     std::thread thread_;

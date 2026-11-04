@@ -736,6 +736,7 @@ void HostServer::clear_trusted_devices() {
 }
 
 void HostServer::set_permissions(uint16_t permissions) {
+    std::lock_guard<std::mutex> lock(permission_mutex_);
     pending_permissions_.store(permissions & kPermissionAll);
     permission_update_pending_.store(true);
 }
@@ -1394,10 +1395,17 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
     // set_permissions() is only valid after the announcement.
     uint16_t announced_permissions = granted_permissions;
     auto apply_pending_permissions = [&]() -> bool {
-        if (!permission_update_pending_.exchange(false)) {
+        bool pending = false;
+        uint16_t requested = 0;
+        {
+            std::lock_guard<std::mutex> lock(permission_mutex_);
+            pending = permission_update_pending_.exchange(false);
+            requested = pending_permissions_.load();
+        }
+        if (!pending) {
             return true;
         }
-        Error applied = session_->set_permissions(pending_permissions_.load());
+        Error applied = session_->set_permissions(requested);
         if (!applied.ok()) {
             if (applied.status() != Status::InvalidCall) {
                 log("permission update failed: " + applied.to_string());
@@ -3621,6 +3629,13 @@ bool HostServer::stream_session(HostServerStats& stats, std::string* error, bool
 // ----- file transfer shared by both session kinds -----
 
 void HostServer::begin_file_session() {
+    {
+        // A request aimed at the previous session must not leak into this
+        // one: the mask was computed by the approval of this connection.
+        std::lock_guard<std::mutex> lock(permission_mutex_);
+        pending_permissions_.store(0);
+        permission_update_pending_.store(false);
+    }
     file_receive_directory_ = settings_.file_receive_directory.empty()
                                   ? default_receive_directory()
                                   : settings_.file_receive_directory;
@@ -3636,6 +3651,13 @@ void HostServer::begin_file_session() {
 }
 
 void HostServer::end_file_session() {
+    {
+        // Nothing may apply this mask after the session it belonged to ended;
+        // the next connection starts from its own approved mask.
+        std::lock_guard<std::mutex> lock(permission_mutex_);
+        pending_permissions_.store(0);
+        permission_update_pending_.store(false);
+    }
     if (upload_) {
         log("file: " + upload_->receiver->name() +
             " is incomplete; its .part file is kept for a resume");
@@ -4774,7 +4796,39 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     publish_stats(stats);
     log("file transfer only: no screen stream follows");
 
+    // A files-only session has no frame loop, so the queued operator mask is
+    // applied here instead. Revoking file transfer/clipboard reaches the
+    // transport (in-flight uploads are aborted) and the gates below, which
+    // read session_->permissions() on every poll.
+    auto apply_pending_permissions = [&]() {
+        bool pending = false;
+        uint16_t requested = 0;
+        {
+            std::lock_guard<std::mutex> lock(permission_mutex_);
+            pending = permission_update_pending_.exchange(false);
+            requested = pending_permissions_.load();
+        }
+        if (!pending) {
+            return;
+        }
+        Error applied = session_->set_permissions(requested);
+        if (!applied.ok()) {
+            if (applied.status() != Status::InvalidCall) {
+                log("permission update failed: " + applied.to_string());
+            }
+            return;
+        }
+        const uint16_t now_mask = session_->permissions();
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.session_permissions = now_mask;
+        }
+        log("the session permissions are now " + permission_names(now_mask));
+    };
+    apply_pending_permissions();
+
     while (!stopping_.load()) {
+        apply_pending_permissions();
         poll_files(stats);
         if (session_->viewer_finished()) {
             return true;

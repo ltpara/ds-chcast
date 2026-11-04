@@ -920,6 +920,30 @@ struct QuicSession::Impl {
         fail(Status::Unavailable, message);
     }
 
+    // A malformed control message always ends its connection, but before the
+    // handshake completed it must not also end the listener: anyone who
+    // finishes TLS can send garbage, and letting that tear down the host's
+    // single session slot turns it into a remotely triggerable outage. Only a
+    // violation by an established session escalates to transport_failed.
+    void control_protocol_failure(const std::string& message) {
+        bool pre_auth = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            // A client has no listener to protect, so its handshake keeps the
+            // descriptive protocol error; only the server's pre-approval
+            // window is downgraded to "drop this connection".
+            pre_auth = role == Role::Server && !client_accepted;
+        }
+        if (!pre_auth) {
+            note_transport_failure(message);
+            return;
+        }
+        if (HQUIC handle = connection.load()) {
+            api->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        }
+        cv.notify_all();
+    }
+
     Error recorded_error() const {
         std::lock_guard<std::mutex> lock(mutex);
         if (!transport_failed) {
@@ -1236,6 +1260,7 @@ struct QuicSession::Impl {
         Kind kind = Kind::Wait;
         HQUIC port_forward_pause = nullptr;
         HQUIC terminal_pause = nullptr;
+        std::optional<FileResult> file_rejection;
         {
             std::lock_guard<std::mutex> lock(mutex);
             std::vector<uint8_t>* pending = nullptr;
@@ -1332,9 +1357,16 @@ struct QuicSession::Impl {
                 const bool allowed =
                     role != Role::Server ||
                     (session_permissions.load() & kPermissionClipboard) != 0;
-                if (!allowed || clipboard_streams.size() >= kMaxClipboardStreams ||
-                    pending_clipboard_bytes + pending->size() > kMaxPendingClipboardBytes) {
-                    kind = Kind::Bad;
+                if (!allowed) {
+                    // A revoked permission is recoverable: refuse this push,
+                    // keep the session.
+                    kind = Kind::Reject;
+                } else if (clipboard_streams.size() >= kMaxClipboardStreams ||
+                           pending_clipboard_bytes + pending->size() >
+                               kMaxPendingClipboardBytes) {
+                    // Quota exhaustion is recoverable too; the next item can
+                    // succeed once the peer's earlier pushes finish.
+                    kind = Kind::Reject;
                 } else {
                     ClipboardStream entry;
                     entry.stream = stream;
@@ -1348,36 +1380,54 @@ struct QuicSession::Impl {
                 // session carries file transfers at all.
                 const bool allowed =
                     (session_permissions.load() & kPermissionFileTransfer) != 0;
+                FileStreamHeader header;
+                std::string error;
+                const bool header_ready = pending->size() >= kFileStreamHeaderSize;
+                // The first receive usually carries the header and the first
+                // chunk together; decode only the fixed prefix.
+                const bool header_ok =
+                    header_ready &&
+                    decode_file_stream_header(pending->data(), kFileStreamHeaderSize,
+                                              header, &error);
                 if (!allowed) {
-                    kind = Kind::Bad;
-                } else if (pending->size() < kFileStreamHeaderSize) {
+                    // Revoking file transfer must not end a live session that
+                    // still has a CFIL stream in flight. When the header is
+                    // already here, the upload is failed explicitly.
+                    if (header_ok) {
+                        file_rejection = FileResult{header.transfer_id, FileCode::Refused, 0,
+                                                    "file transfer is disabled"};
+                    }
+                    kind = Kind::Reject;
+                } else if (!header_ready) {
                     // The fixed prefix has not arrived yet.
                     return;
+                } else if (!header_ok) {
+                    kind = Kind::Bad;
+                } else if (received_uploads.count(header.transfer_id) != 0 ||
+                           received_uploads.size() >= kMaxIncomingUploads ||
+                           header.offset > kMaxFileTransferBytes) {
+                    // Duplicate, too many concurrent uploads, or an
+                    // out-of-range resume point: refuse this stream only.
+                    const bool out_of_range = header.offset > kMaxFileTransferBytes;
+                    file_rejection = FileResult{
+                        header.transfer_id, out_of_range ? FileCode::Refused : FileCode::Busy,
+                        0,
+                        out_of_range ? "the resume offset is outside the transfer limit"
+                                     : "the host is not accepting another upload"};
+                    kind = Kind::Reject;
                 } else {
-                    FileStreamHeader header;
-                    std::string error;
-                    // The first receive usually carries the header and the
-                    // first chunk together; decode only the fixed prefix.
-                    if (!decode_file_stream_header(pending->data(), kFileStreamHeaderSize,
-                                                   header, &error) ||
-                        received_uploads.count(header.transfer_id) != 0 ||
-                        received_uploads.size() >= kMaxIncomingUploads ||
-                        header.offset > kMaxFileTransferBytes) {
-                        kind = Kind::Bad;
-                    } else {
-                        ReceivedUpload upload;
-                        upload.stream = stream;
-                        upload.start_offset = header.offset;
-                        const auto inserted =
-                            received_uploads.emplace(header.transfer_id, std::move(upload));
-                        if (pending->size() > kFileStreamHeaderSize) {
-                            push_file_chunk_locked(
-                                inserted.first->second, inserted.first->first,
-                                pending->data() + kFileStreamHeaderSize,
-                                pending->size() - kFileStreamHeaderSize, header.offset);
-                        }
-                        kind = Kind::File;
+                    ReceivedUpload upload;
+                    upload.stream = stream;
+                    upload.start_offset = header.offset;
+                    const auto inserted =
+                        received_uploads.emplace(header.transfer_id, std::move(upload));
+                    if (pending->size() > kFileStreamHeaderSize) {
+                        push_file_chunk_locked(
+                            inserted.first->second, inserted.first->first,
+                            pending->data() + kFileStreamHeaderSize,
+                            pending->size() - kFileStreamHeaderSize, header.offset);
                     }
+                    kind = Kind::File;
                 }
             } else if (std::memcmp(pending->data(), kPortForwardStreamMagic, 4) == 0) {
                 // One unidirectional stream per direction per TCP connection.
@@ -1616,6 +1666,17 @@ struct QuicSession::Impl {
         }
         if (kind == Kind::Reject) {
             api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+            if (file_rejection) {
+                // The viewer matches the result to its upload and fails the
+                // attempt explicitly instead of seeing only a stream abort.
+                // The control handle is used under the same lock that guards
+                // its lifetime.
+                std::lock_guard<std::mutex> lock(mutex);
+                if (HQUIC handle = control.load()) {
+                    try_send_bytes(handle, make_file_result(*file_rejection),
+                                   QUIC_SEND_FLAG_NONE);
+                }
+            }
         } else if (kind == Kind::Bad) {
             note_transport_failure("the peer opened an unusable stream");
         }
@@ -1978,8 +2039,14 @@ struct QuicSession::Impl {
                     for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
                         const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
                         // Dropping one oversized blob must not end the session:
-                        // abort this stream only and keep the last item.
-                        if (entry.bytes.size() + buffer.Length > kMaxClipboardStreamBytes) {
+                        // abort this stream only and keep the last item. The
+                        // aggregate limit is checked on every push because the
+                        // classification-time check sees only the first chunk
+                        // and kMaxClipboardStreams concurrent streams can
+                        // otherwise exceed it many times over.
+                        if (entry.bytes.size() + buffer.Length > kMaxClipboardStreamBytes ||
+                            pending_clipboard_bytes + buffer.Length >
+                                kMaxPendingClipboardBytes) {
                             pending_clipboard_bytes -= entry.bytes.size();
                             entry.bytes.clear();
                             entry.finished = true;
@@ -2186,15 +2253,23 @@ struct QuicSession::Impl {
                     std::vector<std::pair<ControlType, std::vector<uint8_t>>> messages;
                     std::string error;
                     bool ok = true;
-                    for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
-                        const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
-                        if (!control_parser.push(buffer.Buffer, buffer.Length, messages, &error)) {
-                            ok = false;
-                            break;
+                    {
+                        // reset_session_locked() clears the parser under this
+                        // lock while a reconnect is being prepared; the stream
+                        // callback must not push framing state into it at the
+                        // same time.
+                        std::lock_guard<std::mutex> lock(mutex);
+                        for (uint32_t i = 0; i < event.RECEIVE.BufferCount; ++i) {
+                            const QUIC_BUFFER& buffer = event.RECEIVE.Buffers[i];
+                            if (!control_parser.push(buffer.Buffer, buffer.Length, messages,
+                                                     &error)) {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
                     if (!ok) {
-                        note_transport_failure("control stream: " + error);
+                        control_protocol_failure("control stream: " + error);
                         break;
                     }
                     for (const auto& message : messages) {
@@ -2288,6 +2363,7 @@ struct QuicSession::Impl {
             }
             case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
                 bool fatal = false;
+                bool control_abort = false;
                 std::vector<HQUIC> bulk_aborts;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
@@ -2361,13 +2437,15 @@ struct QuicSession::Impl {
                         // camera, not the desktop session.
                         camera_finished = true;
                     } else if (stream == control.load()) {
-                        fatal = true;
+                        control_abort = true;
                     } else if (!bulk) {
                         fatal = true;
                     }
                     abort_streams_locked(bulk_aborts, stream);
                 }
-                if (fatal) {
+                if (control_abort) {
+                    control_protocol_failure("QUIC peer aborted the control stream");
+                } else if (fatal) {
                     note_transport_failure("QUIC peer aborted a stream");
                 }
                 cv.notify_all();
@@ -2541,7 +2619,7 @@ struct QuicSession::Impl {
                 }
                 ClientHello hello;
                 if (!parse_hello(payload, hello, &error)) {
-                    note_transport_failure("Hello: " + error);
+                    control_protocol_failure("Hello: " + error);
                     break;
                 }
                 {
@@ -2565,7 +2643,7 @@ struct QuicSession::Impl {
                 AccessDenial code = AccessDenial::InvalidToken;
                 std::string reason;
                 if (!parse_access_denied(payload, code, reason, &error)) {
-                    note_transport_failure("AccessDenied: " + error);
+                    control_protocol_failure("AccessDenied: " + error);
                     break;
                 }
                 {
@@ -2583,7 +2661,7 @@ struct QuicSession::Impl {
                 }
                 ServerInfo info;
                 if (!parse_hello_ack(payload, info, &error)) {
-                    note_transport_failure("HelloAck: " + error);
+                    control_protocol_failure("HelloAck: " + error);
                     break;
                 }
                 {
@@ -2603,7 +2681,7 @@ struct QuicSession::Impl {
                 // stream; this only replaces the description.
                 ServerInfo info;
                 if (!parse_hello_ack(payload, info, &error)) {
-                    note_transport_failure("StreamInfo: " + error);
+                    control_protocol_failure("StreamInfo: " + error);
                     break;
                 }
                 {
@@ -2627,7 +2705,7 @@ struct QuicSession::Impl {
             case ControlType::Stats: {
                 ClientStats stats;
                 if (!parse_stats(payload, stats, &error)) {
-                    note_transport_failure("Stats: " + error);
+                    control_protocol_failure("Stats: " + error);
                     break;
                 }
                 {
@@ -2660,7 +2738,7 @@ struct QuicSession::Impl {
                     // Same policy as a malformed Stats or Hello: the peer is
                     // not speaking the protocol, so the session ends rather
                     // than dropping events silently.
-                    note_transport_failure("InputEvent: " + error);
+                    control_protocol_failure("InputEvent: " + error);
                     break;
                 }
                 {
@@ -2687,7 +2765,7 @@ struct QuicSession::Impl {
                 }
                 std::string text;
                 if (!parse_text_input(payload, text, &error)) {
-                    note_transport_failure("TextInput: " + error);
+                    control_protocol_failure("TextInput: " + error);
                     break;
                 }
                 if (injector) {
@@ -2726,7 +2804,7 @@ struct QuicSession::Impl {
                 }
                 uint64_t client_us = 0;
                 if (!parse_latency_probe(payload, client_us, &error)) {
-                    note_transport_failure("LatencyProbe: " + error);
+                    control_protocol_failure("LatencyProbe: " + error);
                     break;
                 }
                 const uint64_t recv_us = steady_us();
@@ -2746,7 +2824,7 @@ struct QuicSession::Impl {
                 uint64_t host_send_us = 0;
                 if (!parse_latency_reply(payload, client_us, host_recv_us, host_send_us,
                                          &error)) {
-                    note_transport_failure("LatencyReply: " + error);
+                    control_protocol_failure("LatencyReply: " + error);
                     break;
                 }
                 const uint64_t received_us = steady_us();
@@ -2784,7 +2862,7 @@ struct QuicSession::Impl {
                 }
                 uint16_t permissions = 0;
                 if (!parse_permission_update(payload, permissions, &error)) {
-                    note_transport_failure("PermissionUpdate: " + error);
+                    control_protocol_failure("PermissionUpdate: " + error);
                     break;
                 }
                 std::vector<HQUIC> aborts;
@@ -2830,7 +2908,7 @@ struct QuicSession::Impl {
                 }
                 uint16_t index = kDisplayAuto;
                 if (!parse_switch_display(payload, index, &error)) {
-                    note_transport_failure("SwitchDisplay: " + error);
+                    control_protocol_failure("SwitchDisplay: " + error);
                     break;
                 }
                 {
@@ -2849,7 +2927,7 @@ struct QuicSession::Impl {
                 DisplaySwitchCode code = DisplaySwitchCode::Failed;
                 std::string reason;
                 if (!parse_display_switch_result(payload, index, code, reason, &error)) {
-                    note_transport_failure("DisplaySwitchResult: " + error);
+                    control_protocol_failure("DisplaySwitchResult: " + error);
                     break;
                 }
                 {
@@ -2869,7 +2947,7 @@ struct QuicSession::Impl {
                 }
                 uint16_t index = 0;
                 if (!parse_list_display_modes(payload, index, &error)) {
-                    note_transport_failure("ListDisplayModes: " + error);
+                    control_protocol_failure("ListDisplayModes: " + error);
                     break;
                 }
                 {
@@ -2886,7 +2964,7 @@ struct QuicSession::Impl {
                 }
                 DisplayModeList list;
                 if (!parse_display_modes(payload, list, &error)) {
-                    note_transport_failure("DisplayModes: " + error);
+                    control_protocol_failure("DisplayModes: " + error);
                     break;
                 }
                 {
@@ -2911,7 +2989,7 @@ struct QuicSession::Impl {
                 uint16_t refresh_hz = 0;
                 if (!parse_set_display_mode(payload, index, width, height, refresh_hz,
                                             &error)) {
-                    note_transport_failure("SetDisplayMode: " + error);
+                    control_protocol_failure("SetDisplayMode: " + error);
                     break;
                 }
                 {
@@ -2937,7 +3015,7 @@ struct QuicSession::Impl {
                 std::string reason;
                 if (!parse_display_mode_result(payload, index, width, height, refresh_hz,
                                                code, reason, &error)) {
-                    note_transport_failure("DisplayModeResult: " + error);
+                    control_protocol_failure("DisplayModeResult: " + error);
                     break;
                 }
                 {
@@ -2964,7 +3042,7 @@ struct QuicSession::Impl {
                 }
                 bool enabled = false;
                 if (!parse_set_privacy_mode(payload, enabled, &error)) {
-                    note_transport_failure("SetPrivacyMode: " + error);
+                    control_protocol_failure("SetPrivacyMode: " + error);
                     break;
                 }
                 {
@@ -2984,7 +3062,7 @@ struct QuicSession::Impl {
                 PrivacyModeCode code = PrivacyModeCode::Failed;
                 std::string reason;
                 if (!parse_privacy_mode_state(payload, enabled, code, reason, &error)) {
-                    note_transport_failure("PrivacyModeState: " + error);
+                    control_protocol_failure("PrivacyModeState: " + error);
                     break;
                 }
                 {
@@ -3004,7 +3082,7 @@ struct QuicSession::Impl {
                 }
                 DesktopKind kind = DesktopKind::Default;
                 if (!parse_desktop_state(payload, kind, &error)) {
-                    note_transport_failure("DesktopState: " + error);
+                    control_protocol_failure("DesktopState: " + error);
                     break;
                 }
                 {
@@ -3021,7 +3099,7 @@ struct QuicSession::Impl {
                     break;
                 }
                 if (!parse_send_sas(payload, &error)) {
-                    note_transport_failure("SendSas: " + error);
+                    control_protocol_failure("SendSas: " + error);
                     break;
                 }
                 // Deliberately not gated on the permission mask here: the
@@ -3042,7 +3120,7 @@ struct QuicSession::Impl {
                 SasCode code = SasCode::Failed;
                 std::string reason;
                 if (!parse_sas_result(payload, code, reason, &error)) {
-                    note_transport_failure("SasResult: " + error);
+                    control_protocol_failure("SasResult: " + error);
                     break;
                 }
                 {
@@ -3064,7 +3142,7 @@ struct QuicSession::Impl {
                 // desktop, unlike a display switch.
                 StreamOptions options;
                 if (!parse_set_stream_options(payload, options, &error)) {
-                    note_transport_failure("SetStreamOptions: " + error);
+                    control_protocol_failure("SetStreamOptions: " + error);
                     break;
                 }
                 {
@@ -3082,7 +3160,7 @@ struct QuicSession::Impl {
                 }
                 StreamOptionsResult result;
                 if (!parse_stream_options_result(payload, result, &error)) {
-                    note_transport_failure("StreamOptionsResult: " + error);
+                    control_protocol_failure("StreamOptionsResult: " + error);
                     break;
                 }
                 {
@@ -3103,7 +3181,7 @@ struct QuicSession::Impl {
                 }
                 ClipboardUpdate update;
                 if (!parse_clipboard_update(payload, update, &error)) {
-                    note_transport_failure("ClipboardUpdate: " + error);
+                    control_protocol_failure("ClipboardUpdate: " + error);
                     break;
                 }
                 {
@@ -3120,7 +3198,7 @@ struct QuicSession::Impl {
             case ControlType::ChatMessage: {
                 std::string text;
                 if (!parse_chat_message(payload, text, &error)) {
-                    note_transport_failure("ChatMessage: " + error);
+                    control_protocol_failure("ChatMessage: " + error);
                     break;
                 }
                 {
@@ -3157,7 +3235,7 @@ struct QuicSession::Impl {
                 }
                 FileOffer offer;
                 if (!parse_file_offer(payload, offer, &error)) {
-                    note_transport_failure("FileOffer: " + error);
+                    control_protocol_failure("FileOffer: " + error);
                     break;
                 }
                 {
@@ -3177,7 +3255,7 @@ struct QuicSession::Impl {
             case ControlType::FileAnswer: {
                 FileAnswer answer;
                 if (!parse_file_answer(payload, answer, &error)) {
-                    note_transport_failure("FileAnswer: " + error);
+                    control_protocol_failure("FileAnswer: " + error);
                     break;
                 }
                 bool bad_offset = false;
@@ -3199,7 +3277,7 @@ struct QuicSession::Impl {
                     }
                 }
                 if (bad_offset) {
-                    note_transport_failure("FileAnswer: resume offset past the file size");
+                    control_protocol_failure("FileAnswer: resume offset past the file size");
                 }
                 cv.notify_all();
                 break;
@@ -3207,7 +3285,7 @@ struct QuicSession::Impl {
             case ControlType::FileResult: {
                 FileResult result;
                 if (!parse_file_result(payload, result, &error)) {
-                    note_transport_failure("FileResult: " + error);
+                    control_protocol_failure("FileResult: " + error);
                     break;
                 }
                 {
@@ -3233,7 +3311,7 @@ struct QuicSession::Impl {
             case ControlType::FileCancel: {
                 FileCancel cancel;
                 if (!parse_file_cancel(payload, cancel, &error)) {
-                    note_transport_failure("FileCancel: " + error);
+                    control_protocol_failure("FileCancel: " + error);
                     break;
                 }
                 {
@@ -3263,7 +3341,7 @@ struct QuicSession::Impl {
                 uint32_t request_id = 0;
                 std::string directory;
                 if (!parse_file_list_request(payload, request_id, directory, &error)) {
-                    note_transport_failure("FileListRequest: " + error);
+                    control_protocol_failure("FileListRequest: " + error);
                     break;
                 }
                 {
@@ -3282,7 +3360,7 @@ struct QuicSession::Impl {
                 }
                 FileListResult result;
                 if (!parse_file_list_result(payload, result, &error)) {
-                    note_transport_failure("FileListResult: " + error);
+                    control_protocol_failure("FileListResult: " + error);
                     break;
                 }
                 {
@@ -3302,7 +3380,7 @@ struct QuicSession::Impl {
                 uint32_t request_id = 0;
                 std::string path;
                 if (!parse_file_download_request(payload, request_id, path, &error)) {
-                    note_transport_failure("FileDownloadRequest: " + error);
+                    control_protocol_failure("FileDownloadRequest: " + error);
                     break;
                 }
                 {
@@ -3321,7 +3399,7 @@ struct QuicSession::Impl {
                 }
                 FileDownloadResult result;
                 if (!parse_file_download_result(payload, result, &error)) {
-                    note_transport_failure("FileDownloadResult: " + error);
+                    control_protocol_failure("FileDownloadResult: " + error);
                     break;
                 }
                 {
@@ -3341,7 +3419,7 @@ struct QuicSession::Impl {
                 FileOpRequestData request;
                 if (!parse_file_op_request(payload, request.request_id, request.op,
                                            request.path, request.new_name, &error)) {
-                    note_transport_failure("FileOpRequest: " + error);
+                    control_protocol_failure("FileOpRequest: " + error);
                     break;
                 }
                 {
@@ -3360,7 +3438,7 @@ struct QuicSession::Impl {
                 }
                 FileOpResult result;
                 if (!parse_file_op_result(payload, result, &error)) {
-                    note_transport_failure("FileOpResult: " + error);
+                    control_protocol_failure("FileOpResult: " + error);
                     break;
                 }
                 {
@@ -3379,7 +3457,7 @@ struct QuicSession::Impl {
                 }
                 PortForwardRequest request;
                 if (!parse_port_forward_request(payload, request, &error)) {
-                    note_transport_failure("PortForwardRequest: " + error);
+                    control_protocol_failure("PortForwardRequest: " + error);
                     break;
                 }
                 PortForwardResult refusal;
@@ -3424,7 +3502,7 @@ struct QuicSession::Impl {
                 }
                 PortForwardResult result;
                 if (!parse_port_forward_result(payload, result, &error)) {
-                    note_transport_failure("PortForwardResult: " + error);
+                    control_protocol_failure("PortForwardResult: " + error);
                     break;
                 }
                 bool queued = false;
@@ -3448,7 +3526,7 @@ struct QuicSession::Impl {
             case ControlType::PortForwardStop: {
                 PortForwardStop stop;
                 if (!parse_port_forward_stop(payload, stop, &error)) {
-                    note_transport_failure("PortForwardStop: " + error);
+                    control_protocol_failure("PortForwardStop: " + error);
                     break;
                 }
                 std::vector<HQUIC> aborts;
@@ -3470,7 +3548,7 @@ struct QuicSession::Impl {
                 }
                 TerminalRequest request;
                 if (!parse_terminal_request(payload, request, &error)) {
-                    note_transport_failure("TerminalRequest: " + error);
+                    control_protocol_failure("TerminalRequest: " + error);
                     break;
                 }
                 TerminalResult refusal;
@@ -3516,7 +3594,7 @@ struct QuicSession::Impl {
                 }
                 TerminalResult result;
                 if (!parse_terminal_result(payload, result, &error)) {
-                    note_transport_failure("TerminalResult: " + error);
+                    control_protocol_failure("TerminalResult: " + error);
                     break;
                 }
                 bool queued = false;
@@ -3554,7 +3632,7 @@ struct QuicSession::Impl {
             case ControlType::TerminalStop: {
                 TerminalStop stop;
                 if (!parse_terminal_stop(payload, stop, &error)) {
-                    note_transport_failure("TerminalStop: " + error);
+                    control_protocol_failure("TerminalStop: " + error);
                     break;
                 }
                 std::vector<HQUIC> aborts;
@@ -3598,7 +3676,7 @@ struct QuicSession::Impl {
                 }
                 TerminalSize size;
                 if (!parse_terminal_resize(payload, size, &error)) {
-                    note_transport_failure("TerminalResize: " + error);
+                    control_protocol_failure("TerminalResize: " + error);
                     break;
                 }
                 {
@@ -3620,7 +3698,7 @@ struct QuicSession::Impl {
                     break;
                 }
                 if (!parse_camera_list_request(payload, &error)) {
-                    note_transport_failure("ListCameras: " + error);
+                    control_protocol_failure("ListCameras: " + error);
                     break;
                 }
                 {
@@ -3638,7 +3716,7 @@ struct QuicSession::Impl {
                 }
                 CameraList list;
                 if (!parse_camera_list(payload, list, &error)) {
-                    note_transport_failure("CameraList: " + error);
+                    control_protocol_failure("CameraList: " + error);
                     break;
                 }
                 {
@@ -3660,7 +3738,7 @@ struct QuicSession::Impl {
                 }
                 uint16_t camera_id = 0;
                 if (!parse_camera_start(payload, camera_id, &error)) {
-                    note_transport_failure("StartCamera: " + error);
+                    control_protocol_failure("StartCamera: " + error);
                     break;
                 }
                 CameraResult refusal;
@@ -3703,7 +3781,7 @@ struct QuicSession::Impl {
                 }
                 CameraResult result;
                 if (!parse_camera_result(payload, result, &error)) {
-                    note_transport_failure("CameraResult: " + error);
+                    control_protocol_failure("CameraResult: " + error);
                     break;
                 }
                 bool queued = false;
@@ -3738,10 +3816,9 @@ struct QuicSession::Impl {
                 }
                 uint16_t camera_id = 0;
                 if (!parse_camera_stop(payload, camera_id, &error)) {
-                    note_transport_failure("StopCamera: " + error);
+                    control_protocol_failure("StopCamera: " + error);
                     break;
                 }
-                HQUIC stream = nullptr;
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     while (camera_stops.size() >= 4) {
@@ -3756,15 +3833,17 @@ struct QuicSession::Impl {
                     // A stale stop for an earlier camera must not end the one
                     // that replaced it; the id check is the guard.
                     if (camera_id == server_camera_id && !camera_finished) {
-                        stream = camera.load();
                         camera_finished = true;
                         server_camera_id = 0;
+                        // The host application still pops the id and stops its
+                        // capture; the FIN tells the viewer no more frames
+                        // follow. The shutdown runs under the lock because the
+                        // handle is released by SHUTDOWN_COMPLETE, which takes
+                        // the same lock.
+                        if (HQUIC stream = camera.load()) {
+                            api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+                        }
                     }
-                }
-                if (stream) {
-                    // The host application still pops the id and stops its
-                    // capture; the FIN tells the viewer no more frames follow.
-                    api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
                 }
                 cv.notify_all();
                 break;

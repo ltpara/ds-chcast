@@ -14,7 +14,7 @@
 - **远程内存安全无实际缺陷（H4 复核为误报）**：FFmpeg 解码把网络缓冲直接挂到非引用计数的 `AVPacket` 上，但 `avcodec_send_packet` 会先 `av_packet_ref` 复制并补齐 `AV_INPUT_BUFFER_PADDING_SIZE` 字节；已用 guard page 回归测试固化该契约。
 - **账号系统有两处设计缺口（H5/H6，已于 2026-11-05 修复，见各节）**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
 - **媒体接收无界与 QUIC 句柄并发（H3/M1/M2，已于 2026-11-05 修复，见各节）**：四条媒体队列加了字节高水位反压，句柄与 parser 统一到同一把会话锁。
-- **授权撤销在“仅文件”会话中不生效**，且旧掩码会带到下一次会话（H7）。
+- **授权撤销在“仅文件”会话中不生效、旧掩码跨会话泄漏（H7），认证前畸形控制帧可终止整个监听（M3），可恢复拒绝被当成会话致命错误（M4）**（均已于 2026-11-05 修复，见各节）：文件会话每轮应用操作员掩码并在会话边界清理遗留掩码；认证前协议破坏只断开当前连接；权限/配额不足改为仅中止单条流，剪贴板聚合上限改为每次 push 复查。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -395,6 +395,10 @@ viewer 以 `SessionMode::FileTransfer` 连接后，操作员在托盘关闭“�
 - `end_file_session()`/`begin_file_session()` 清空 `permission_update_pending_` 与 `pending_permissions_`；
 - 权限检查不要依赖启动快照，统一走 `session_->permissions() & settings 当前值`。
 
+**修复（2026-11-05）**
+
+`file_session()` 在 announcement 之后、以及主循环每轮 `poll_files()` 之前调用 `apply_pending_permissions()`：在 `permission_mutex_` 下取走 pending 标志与掩码，调用 `session_->set_permissions()`，并把 `session_->permissions()` 回写到 `status_.session_permissions`。`begin_file_session()`/`end_file_session()` 在锁内清空两个字段，上一次会话遗留的掩码不会被应用到新连接。`set_permissions()` 改为在同一把锁下写入标志与掩码，避免读到“新掩码 + 旧标志”的半更新状态。`file_transfer_allowed()`/`clipboard_transfer_allowed()` 继续读取实时的 `session_->permissions()`，撤权后 `poll_files()` 的 FileOffer/FileListRequest/FileDownloadRequest 与上传接受随之关闭，传输层 `set_permissions()` 同时中止在途上传。构建通过；文件会话的托盘撤权路径未运行验证（Smart App Control 阻止新构建的 C++ 测试二进制，见 H3 节说明）。
+
 ---
 
 ## 3. 中危问题
@@ -451,6 +455,10 @@ if (resume) {
 
 **修复**：认证完成前，控制流/Hello 解析失败只作废“这一条连接”，不设置 `transport_failed`；只有认证后的协议破坏才升级为会话致命。
 
+**修复（2026-11-05）**
+
+新增 `Impl::control_protocol_failure()`：控制流分帧或控制报文解码失败时，若本端是服务端且 `client_accepted` 仍为 false（Hello 尚未被批准），只对当前连接调用 `ConnectionShutdown()`，不设置 `transport_failed`；`wait_for_client()` 随后经 `shutdown_complete` → `reset_connection()` 继续监听。认证后的协议破坏、以及客户端侧（没有监听器需要保护）仍调用 `note_transport_failure()` 保留明确错误。`handle_control()` 内约 50 处解码失败、控制流分帧失败、以及认证前“对端 abort 控制流”都走这一分类。控制流 parser 的 `push()` 同时移入 `Impl::mutex`，与 `reset_session_locked()` 的 `control_parser.reset()` 串行化，补上了 M2 的同类竞态。构建通过；`quic_*` 测试未运行（Smart App Control 阻止新构建二进制，见 H3 节说明）。
+
 ---
 
 ### M4. 可恢复的拒绝被当成会话致命错误
@@ -462,6 +470,14 @@ CFIL 无权限、CCLB 无权限、第 9 个并发上传等“可恢复拒绝”�
 另外 `kMaxPendingClipboardBytes = 96 MiB` 只在流分类时检查一次，8 条 40 MiB 的流可以同时通过，聚合上限形同虚设。
 
 **修复**：权限/配额不足一律走 `Reject` 并回明确错误；聚合字节检查移到每次 push。
+
+**修复（2026-11-05）**
+
+- `classify_media_stream()` 中 CFIL 的无权限、重复 transfer_id、超过 `kMaxIncomingUploads`、起始偏移超限，以及 CCLB 的无权限、超过 `kMaxClipboardStreams`/`kMaxPendingClipboardBytes`，全部改走 `Kind::Reject`：只 abort 这一条流，会话继续。CFIL 在已解析出 transfer_id 时还在控制流回一条 `FileResult`（`Refused`/`Busy` + 原因），viewer 的上传状态据此显式失败；控制句柄在同一把 `Impl::mutex` 内使用，不引入新的 use-after-close。
+- `route_bulk_stream()` 对 CCLB 的每次 push 都检查 `pending_clipboard_bytes + buffer.Length > kMaxPendingClipboardBytes`，超限就丢弃当前 blob 并 abort 该流；分类时的检查只覆盖首包，8 条并发流原可绕开聚合上限。
+- 真正的协议破坏（magic/头部解码失败、未知 magic）仍保留 `Kind::Bad` → `note_transport_failure()`。
+
+构建通过；`quic_*` 测试未运行（Smart App Control 限制）。
 
 ---
 
@@ -922,7 +938,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 5. H4（复核为误报，无需修改）：`avcodec_send_packet` 会复制非引用计数 packet 并补 padding；`tests/decoder_padding_test.cc` 用 guard page 固定该契约。
 6. H3：四条接收队列加高水位/反压；M1/M2 统一句柄与 parser 同步（均已完成，见各节修复说明）。
-7. H7：文件会话应用权限撤销并清理跨会话掩码；M3/M4 区分“可恢复拒绝”和“会话致命”。
+7. H7：文件会话应用权限撤销并清理跨会话掩码；M3/M4 区分“可恢复拒绝”和“会话致命”（均已完成，见各节修复说明）。
 8. M7/M8/M9：CF_DIB 长度校验、TOTP 步号去重、隐私遮罩真正可见。
 
 **第三批（一个月内，可信度与本地边界）**
