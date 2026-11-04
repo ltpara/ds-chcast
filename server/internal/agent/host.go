@@ -24,6 +24,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 	"github.com/ltpara/ds-chcast/server/internal/updater"
 	"github.com/ltpara/ds-chcast/server/internal/upnp"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
@@ -38,6 +39,9 @@ type HostConfig struct {
 	// TLS configures HTTPS to the rendezvous API: a private CA bundle, a
 	// client certificate for mTLS, or both. Nil uses the system roots.
 	TLS *tls.Config
+	// Proxy routes the HTTP control plane, update download and the relay
+	// carrier link through an outbound proxy. Inbound UDP paths are unchanged.
+	Proxy *netproxy.Proxy
 	// ServerPublicKey pins the rendezvous server identity. When set, the
 	// registration reply must contain a valid server-signed host binding.
 	ServerPublicKey string
@@ -225,7 +229,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		cfg:            cfg,
 		conn:           conn,
 		localOut:       localOut,
-		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS),
+		api:            newAPIClient(servers.Current(), cfg.ServerKey, cfg.TLS, cfg.Proxy),
 		servers:        servers,
 		log:            cfg.Logger.With("agent", "host", "id", cfg.ID),
 		local:          local,
@@ -553,8 +557,8 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 			return
 		}
 		client := &http.Client{Timeout: 15 * time.Minute}
-		if h.cfg.TLS != nil {
-			client.Transport = &http.Transport{TLSClientConfig: h.cfg.TLS.Clone()}
+		if h.cfg.TLS != nil || h.cfg.Proxy != nil {
+			client.Transport = h.cfg.Proxy.HTTPTransport(h.cfg.TLS)
 		}
 		ctx, cancel := context.WithTimeout(h.ctx, 15*time.Minute)
 		defer cancel()
@@ -1023,7 +1027,9 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	localFrames := carrier.NewFrameReader(bufio.NewReader(local))
 	localSend := carrier.NewFrameWriter(local)
 
-	conn, err := net.DialTimeout("tcp", relayAddr, carrierDial)
+	dialCtx, dialCancel := context.WithTimeout(h.ctx, carrierDial)
+	conn, err := h.cfg.Proxy.DialContext(dialCtx, "tcp", relayAddr)
+	dialCancel()
 	if err != nil {
 		return false, fmt.Errorf("relay carrier %s: %w", relayAddr, err)
 	}

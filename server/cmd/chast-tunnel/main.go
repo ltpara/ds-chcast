@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/agent"
 	"github.com/ltpara/ds-chcast/server/internal/lan"
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
 )
 
@@ -32,19 +34,21 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: chast-tunnel host|viewer|discover|apply-update [flags]")
+		return fmt.Errorf("usage: chast-tunnel host|viewer|proxy|discover|apply-update [flags]")
 	}
 	switch args[0] {
 	case "host":
 		return runHost(args[1:])
 	case "viewer":
 		return runViewer(args[1:])
+	case "proxy":
+		return runProxy(args[1:])
 	case "discover":
 		return runDiscover(args[1:])
 	case "apply-update":
 		return runApplyUpdate(args[1:])
 	default:
-		return fmt.Errorf("unknown mode %q; use host, viewer, discover or apply-update", args[0])
+		return fmt.Errorf("unknown mode %q; use host, viewer, proxy, discover or apply-update", args[0])
 	}
 }
 
@@ -71,9 +75,14 @@ func runHost(args []string) error {
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
+	proxyURL := fs.String("proxy", "", "outbound http://, https://, socks5:// or socks5h:// proxy for the API and TCP carrier (falls back to CHAST_PROXY)")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
+	proxy, err := resolveProxy(*proxyURL)
+	if err != nil {
+		return err
+	}
 	if *lanPort < 1 || *lanPort > 65535 {
 		return fmt.Errorf("invalid --lan-port %d", *lanPort)
 	}
@@ -106,6 +115,7 @@ func runHost(args []string) error {
 		Servers:         splitCSV(*rendezvousList),
 		ServerKey:       *serverKey,
 		ServerPublicKey: *serverPubKey,
+		Proxy:           proxy,
 		ID:              *id,
 		OldID:           *oldID,
 		Key:             *key,
@@ -195,11 +205,18 @@ func runViewer(args []string) error {
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
 	tlsCert := fs.String("tls-client-cert", "", "client certificate presented when the rendezvous server requires mTLS")
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
+	proxyURL := fs.String("proxy", "", "outbound http://, https://, socks5:// or socks5h:// proxy (visible in the process command line; prefer --proxy-stdin)")
+	proxyStdin := fs.Bool("proxy-stdin", false, "read the proxy URL from stdin after the server key; overrides --proxy")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
 
+	// Stdin order matches the embedding client: server key first, then proxy.
+	var stdin *bufio.Reader
+	if *serverKeyStdin || *proxyStdin {
+		stdin = bufio.NewReader(os.Stdin)
+	}
 	if *serverKeyStdin {
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, err := stdin.ReadString('\n')
 		key := strings.TrimRight(line, "\r\n")
 		if key == "" {
 			if err != nil {
@@ -208,6 +225,21 @@ func runViewer(args []string) error {
 			return fmt.Errorf("read server key from stdin: empty key")
 		}
 		*serverKey = key
+	}
+	if *proxyStdin {
+		line, err := stdin.ReadString('\n')
+		value := strings.TrimRight(line, "\r\n")
+		if value == "" {
+			if err != nil {
+				return fmt.Errorf("read proxy from stdin: %w", err)
+			}
+			return fmt.Errorf("read proxy from stdin: empty proxy")
+		}
+		*proxyURL = value
+	}
+	proxy, err := resolveProxy(*proxyURL)
+	if err != nil {
+		return err
 	}
 
 	tlsConfig, err := netutil.ClientTLSConfig(*tlsCA, *tlsCert, *tlsKey)
@@ -234,6 +266,7 @@ func runViewer(args []string) error {
 		Servers:         splitCSV(*rendezvousList),
 		ServerKey:       *serverKey,
 		ServerPublicKey: *serverPubKey,
+		Proxy:           proxy,
 		HostID:          *id,
 		ListenAddr:      *listen,
 		Mode:            *mode,
@@ -276,6 +309,91 @@ func runViewer(args []string) error {
 	log.Info("viewer agent online", "host", *id)
 	<-ctx.Done()
 	return nil
+}
+
+// resolveProxy parses the flag value, then CHAST_PROXY. An empty result means
+// direct connections, preserving the behavior of existing deployments.
+func resolveProxy(raw string) (*netproxy.Proxy, error) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		text = strings.TrimSpace(os.Getenv("CHAST_PROXY"))
+	}
+	if text == "" {
+		return nil, nil
+	}
+	proxy, err := netproxy.Parse(text)
+	if err != nil {
+		return nil, fmt.Errorf("--proxy: %w", err)
+	}
+	return proxy, nil
+}
+
+// runProxy serves a loopback HTTP forward proxy for clients that cannot speak
+// SOCKS5 themselves, such as the Flutter viewer's Dart HTTP stack.
+func runProxy(args []string) error {
+	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+	upstreamURL := fs.String("proxy", "", "upstream http://, https://, socks5:// or socks5h:// proxy (falls back to CHAST_PROXY)")
+	upstreamStdin := fs.Bool("proxy-stdin", false, "read the upstream proxy URL from stdin; overrides --proxy")
+	listen := fs.String("listen", "127.0.0.1:0", "loopback TCP address for the local proxy bridge")
+	verbose := fs.Bool("verbose", false, "debug logging")
+	fs.Parse(args)
+
+	if *upstreamStdin {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		value := strings.TrimRight(line, "\r\n")
+		if value == "" {
+			if err != nil {
+				return fmt.Errorf("read proxy from stdin: %w", err)
+			}
+			return fmt.Errorf("read proxy from stdin: empty proxy")
+		}
+		*upstreamURL = value
+	}
+	upstream, err := resolveProxy(*upstreamURL)
+	if err != nil {
+		return err
+	}
+	if upstream == nil {
+		return fmt.Errorf("proxy mode needs --proxy or CHAST_PROXY")
+	}
+	listenAddr, err := net.ResolveTCPAddr("tcp", *listen)
+	if err != nil {
+		return fmt.Errorf("--listen %q: %w", *listen, err)
+	}
+	if listenAddr.IP == nil || !listenAddr.IP.IsLoopback() {
+		// An all-interface forward proxy would let every network peer borrow
+		// the configured upstream credentials.
+		return fmt.Errorf("--listen must be a loopback address")
+	}
+	listener, err := net.ListenTCP("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", *listen, err)
+	}
+	defer listener.Close()
+
+	log := newLogger(*verbose)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+	_ = json.NewEncoder(os.Stdout).Encode(agentEvent{
+		Event:  "ready",
+		Listen: listener.Addr().String(),
+	})
+	log.Info("proxy bridge listening", "listen", listener.Addr().String(), "upstream", upstream.Redacted())
+	if *upstreamStdin {
+		// The embedding viewer keeps this pipe open for its lifetime. EOF
+		// means it exited without stopping us; the bridge must not linger
+		// holding the configured upstream and its credentials.
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			stop()
+			listener.Close()
+		}()
+	}
+	return netproxy.Serve(ctx, listener, upstream, log)
 }
 
 func runDiscover(args []string) error {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/netproxy"
 )
 
 // Version is reported to the server as peer metadata and can be overridden at
@@ -47,10 +48,10 @@ type apiClient struct {
 	http      *http.Client
 }
 
-func newAPIClient(base, serverKey string, tlsConfig *tls.Config) *apiClient {
+func newAPIClient(base, serverKey string, tlsConfig *tls.Config, proxy *netproxy.Proxy) *apiClient {
 	client := &http.Client{Timeout: 5 * time.Second}
-	if tlsConfig != nil {
-		client.Transport = &http.Transport{TLSClientConfig: tlsConfig.Clone()}
+	if tlsConfig != nil || proxy != nil {
+		client.Transport = proxy.HTTPTransport(tlsConfig)
 	}
 	return &apiClient{
 		base:      strings.TrimRight(base, "/"),

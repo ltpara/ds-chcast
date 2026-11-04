@@ -254,7 +254,7 @@ func TestCarrierKeepsHostOnlineWithoutRendezvous(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	api := newAPIClient(s.URL, testutil.ServerKey, nil)
+	api := newAPIClient(s.URL, testutil.ServerKey, nil, nil)
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
 	host, err := api.lookup(lookupCtx, "devbox")
 	lookupCancel()
