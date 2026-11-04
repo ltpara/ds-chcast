@@ -87,8 +87,7 @@ void main() {
         '127.0.0.1:0',
         '--mode',
         'relay',
-        '--server-key',
-        'dev-secret',
+        '--server-key-stdin',
       ],
     );
     expect(
@@ -109,13 +108,33 @@ void main() {
         '127.0.0.1:0',
         '--mode',
         'relay',
-        '--server-key',
-        'dev-secret',
+        '--server-key-stdin',
         '--server-pubkey',
         'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
       ],
     );
   });
+
+  test('the server key reaches the child over stdin, not argv', () async {
+    final File script = await _bat(
+      '@set /p KEY=\r\n'
+      '@echo {"event":"ready","listen":"127.0.0.1:45678","path":"direct",'
+      '"remote":"%KEY%"}\r\n',
+    );
+    final TunnelAgent agent = await TunnelAgent.start(
+      server: const ServerSettings(
+        url: 'http://127.0.0.1:1',
+        key: 'dev-secret',
+      ),
+      hostId: 'devbox',
+      executable: 'cmd',
+      argumentOverride: <String>['/c', script.path],
+      timeout: const Duration(seconds: 10),
+    );
+    addTearDown(agent.stop);
+
+    expect(agent.remote, 'dev-secret');
+  }, skip: !Platform.isWindows);
 
   test('a missing executable is reported as a tunnel failure', () async {
     await expectLater(

@@ -282,7 +282,8 @@ void main() {
     expect(await withoutProtector.load(), isNull);
   });
 
-  test('a failing protector still persists the session plainly', () async {
+  test('a failing protector skips persistence instead of writing plainly',
+      () async {
     final AccountSessionStore store = AccountSessionStore(
       file: file,
       protectSecret: (String _) async => throw StateError('dpapi'),
@@ -293,8 +294,7 @@ void main() {
       token: 'token-value',
       expiresAt: DateTime.utc(2027),
     ));
-    expect(await file.readAsString(), contains('token-value'));
-    expect((await AccountSessionStore(file: file).load())?.token,
-        'token-value');
+    expect(await file.exists(), isFalse);
+    expect(await AccountSessionStore(file: file).load(), isNull);
   });
 }

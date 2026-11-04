@@ -171,6 +171,27 @@ void main() {
       grid.write('\x1b(0abc');
       expect(grid.lineText(0), 'abc');
     });
+
+    test('a CSI parameter body over the limit is discarded', () {
+      final TerminalGrid grid = TerminalGrid(columns: 10, rows: 2);
+      grid.write('\x1b[${'1' * 40};31mX');
+      expect(grid.lineText(0), 'X');
+      expect(grid.lines[0][0].fg, kTerminalDefaultColor);
+    });
+
+    test('huge operation counts are clipped to the screen', () {
+      final TerminalGrid grid = TerminalGrid(columns: 8, rows: 3);
+      grid.write('top\r\nmid\r\nbot');
+      final int scrollbackBefore = grid.scrollback.length;
+      grid.write('\x1b[9999S\x1b[9999T');
+      expect(grid.scrollback.length - scrollbackBefore, lessThanOrEqualTo(3));
+      grid.write('\x1b[1;1H\x1b[9999@\x1b[9999P');
+      expect(grid.lines[0].length, 8);
+      grid.write('\x1b[9999L\x1b[9999M');
+      expect(grid.lines.length, 3);
+      grid.write('\x1b[9999I\x1b[9999Z');
+      expect(grid.cursorColumn, 0);
+    });
   });
 
   group('TerminalUtf8Decoder', () {

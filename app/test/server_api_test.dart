@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:chast_viewer/server_api.dart';
@@ -3079,6 +3080,7 @@ void main() {
       id: 'c' * 32,
       name: r'..\会话/录制 2026.mp4',
       size: 5,
+      sha256: sha256.convert(<int>[0, 1, 2, 3, 4]).toString(),
     );
 
     final File first = await ServerApi.downloadRecording(
@@ -3099,6 +3101,63 @@ void main() {
     expect(second.path, endsWith('会话_录制 2026 (1).mp4'));
     expect(await first.readAsBytes(), <int>[0, 1, 2, 3, 4]);
     expect(await second.readAsBytes(), <int>[0, 1, 2, 3, 4]);
+  });
+
+  test('downloadRecording deletes a body that fails its digest', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-download-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType('video', 'mp4');
+      request.response.add(<int>[9, 9, 9, 9, 9]);
+      await request.response.close();
+    });
+    final RemoteRecording recording = RemoteRecording(
+      id: 'c' * 32,
+      name: 'recording.mp4',
+      size: 5,
+      sha256: sha256.convert(<int>[0, 1, 2, 3, 4]).toString(),
+    );
+
+    await expectLater(
+      ServerApi.downloadRecording(
+        settings,
+        'account-token',
+        recording,
+        directory: dir,
+      ),
+      throwsA(isA<ServerApiException>()),
+    );
+    expect(dir.listSync(), isEmpty);
+  });
+
+  test('downloadRecording deletes a body with the wrong size', () async {
+    final Directory dir = await Directory.systemTemp.createTemp(
+      'chast-download-',
+    );
+    addTearDown(() => dir.delete(recursive: true));
+    server.listen((HttpRequest request) async {
+      request.response.headers.contentType = ContentType('video', 'mp4');
+      request.response.add(<int>[0, 1, 2, 3]);
+      await request.response.close();
+    });
+    final RemoteRecording recording = RemoteRecording(
+      id: 'c' * 32,
+      name: 'recording.mp4',
+      size: 5,
+    );
+
+    await expectLater(
+      ServerApi.downloadRecording(
+        settings,
+        'account-token',
+        recording,
+        directory: dir,
+      ),
+      throwsA(isA<ServerApiException>()),
+    );
+    expect(dir.listSync(), isEmpty);
   });
 
   test('deleteRecording accepts 204 and reports a missing recording', () async {

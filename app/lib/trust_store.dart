@@ -69,7 +69,9 @@ class TrustStore {
   }
 
   /// Stores [fingerprint] for [target]; an invalid fingerprint is ignored.
-  /// Returns the canonical value that was stored, or an empty string.
+  /// Returns the canonical value once it is on disk, or an empty string when
+  /// the store could not be written; callers must not treat the value as
+  /// pinned in that case.
   Future<String> trust(String target, String fingerprint) async {
     final String canonical = normalizeFingerprint(fingerprint);
     if (target.isEmpty || canonical.isEmpty) {
@@ -77,8 +79,7 @@ class TrustStore {
     }
     final Map<String, String> entries = await load();
     entries[target] = canonical;
-    await _save(entries);
-    return canonical;
+    return await _save(entries) ? canonical : '';
   }
 
   Future<void> forget(String target) async {
@@ -88,17 +89,44 @@ class TrustStore {
     }
   }
 
-  Future<void> _save(Map<String, String> entries) async {
+  /// Writes through a temp file and an atomic rename so a crash or a full disk
+  /// cannot leave a truncated pin list. Returns false when nothing could be
+  /// persisted.
+  Future<bool> _save(Map<String, String> entries) async {
     final File? file = _file();
     if (file == null) {
-      return;
+      return false;
     }
+    final File temp = File('${file.path}.$pid.tmp');
     try {
       await file.parent.create(recursive: true);
-      await file.writeAsString(jsonEncode(entries));
+      if (await file.exists() && !await _isJsonMap(file)) {
+        // Keep an unreadable file under a side name instead of destroying the
+        // only copy of the pins it may still hold.
+        await file.rename(
+          '${file.path}.corrupt-${DateTime.now().millisecondsSinceEpoch}',
+        );
+      }
+      await temp.writeAsString(jsonEncode(entries), flush: true);
+      await temp.rename(file.path);
+      return true;
     } catch (_) {
-      // Losing the pin only costs a future confirmation; it must not block
-      // the session.
+      try {
+        if (await temp.exists()) {
+          await temp.delete();
+        }
+      } catch (_) {
+        // A leftover temp file only wastes space; the next save replaces it.
+      }
+      return false;
+    }
+  }
+
+  Future<bool> _isJsonMap(File file) async {
+    try {
+      return jsonDecode(await file.readAsString()) is Map;
+    } catch (_) {
+      return false;
     }
   }
 }

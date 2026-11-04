@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
+
 import 'server_identity.dart';
 import 'server_settings.dart';
 import 'package:chast_viewer/l10n.dart';
@@ -847,6 +849,20 @@ class DevicePresence {
   final String error;
 
   bool get online => state == HostPresence.online;
+}
+
+/// Collects the single digest produced by a chunked hash conversion without
+/// buffering the bytes that produced it.
+class _DigestSink implements Sink<Digest> {
+  Digest? value;
+
+  @override
+  void add(Digest data) {
+    value = data;
+  }
+
+  @override
+  void close() {}
 }
 
 /// Lookup-only client for the HTTP service. When the server runs with a key,
@@ -3256,15 +3272,50 @@ class ServerApi {
             .timeout(timeout);
         throw _recordingFailure(response.statusCode, text);
       }
+      final int contentLength = response.contentLength;
+      if (recording.size > 0 &&
+          contentLength >= 0 &&
+          contentLength != recording.size) {
+        throw ServerApiException(
+          tr('录制大小与服务器记录不一致：应有 {expected} 字节，响应为 {actual} 字节', <String, Object?>{
+            'expected': recording.size,
+            'actual': contentLength,
+          }),
+        );
+      }
       await directory.create(recursive: true);
       final File target = await _newRecordingFile(directory, recording.name);
       final IOSink sink = target.openWrite();
+      final _DigestSink digestSink = _DigestSink();
+      final ByteConversionSink hasher = sha256.startChunkedConversion(digestSink);
+      int received = 0;
       try {
         await for (final List<int> chunk in response.timeout(timeout)) {
+          received += chunk.length;
+          if (recording.size > 0 && received > recording.size) {
+            throw ServerApiException(tr('录制下载数据超过记录的大小'));
+          }
+          hasher.add(chunk);
           sink.add(chunk);
         }
         await sink.flush();
         await sink.close();
+        hasher.close();
+        if (recording.size > 0 && received != recording.size) {
+          throw ServerApiException(
+            tr('录制下载不完整：应有 {expected} 字节，实际收到 {actual} 字节', <String, Object?>{
+              'expected': recording.size,
+              'actual': received,
+            }),
+          );
+        }
+        final String expected = recording.sha256.trim().toLowerCase();
+        if (expected.isNotEmpty &&
+            (digestSink.value == null ||
+                digestSink.value.toString() != expected)) {
+          throw ServerApiException(tr('录制内容校验失败，文件已删除'));
+        }
+        return target;
       } catch (_) {
         await sink.close();
         try {
@@ -3274,7 +3325,6 @@ class ServerApi {
         }
         rethrow;
       }
-      return target;
     } on ServerApiException {
       rethrow;
     } on TimeoutException {

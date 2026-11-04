@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -182,7 +183,8 @@ func runHost(args []string) error {
 func runViewer(args []string) error {
 	fs := flag.NewFlagSet("viewer", flag.ExitOnError)
 	server := fs.String("server", "", "HTTP API base, e.g. http://127.0.0.1:8443")
-	serverKey := fs.String("server-key", "", "server key required by the API")
+	serverKey := fs.String("server-key", "", "server key required by the API (visible in the process command line; prefer --server-key-stdin)")
+	serverKeyStdin := fs.Bool("server-key-stdin", false, "read the server key from the first line of stdin; overrides --server-key")
 	serverPubKey := fs.String("server-pubkey", "", "pin the server Ed25519 public key returned by /v1/server")
 	rendezvousList := fs.String("rendezvous-servers", "", "extra rendezvous HTTP API bases tried on failure; the server's pushed list replaces them")
 	id := fs.String("id", "", "host id to reach")
@@ -195,6 +197,18 @@ func runViewer(args []string) error {
 	tlsKey := fs.String("tls-client-key", "", "private key for --tls-client-cert")
 	verbose := fs.Bool("verbose", false, "debug logging")
 	fs.Parse(args)
+
+	if *serverKeyStdin {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		key := strings.TrimRight(line, "\r\n")
+		if key == "" {
+			if err != nil {
+				return fmt.Errorf("read server key from stdin: %w", err)
+			}
+			return fmt.Errorf("read server key from stdin: empty key")
+		}
+		*serverKey = key
+	}
 
 	tlsConfig, err := netutil.ClientTLSConfig(*tlsCA, *tlsCert, *tlsKey)
 	if err != nil {

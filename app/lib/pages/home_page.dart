@@ -230,7 +230,11 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _deviceStore = widget.deviceStore ?? DeviceStore();
-    _serverStore = widget.serverStore ?? ServerSettingsStore();
+    _serverStore = widget.serverStore ??
+        ServerSettingsStore(
+          protectSecret: ViewerBridge.protectSecret,
+          unprotectSecret: ViewerBridge.unprotectSecret,
+        );
     _trustStore = widget.trustStore ?? TrustStore();
     _identityStore = widget.identityStore ?? ServerIdentityStore();
     _accountStore =
@@ -5858,7 +5862,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     final String url = normalizeServerUrl(text);
     if (text.isNotEmpty && url.isEmpty) {
       setState(() {
-        _status = tr('地址无效：示例 http://192.168.1.10:8443');
+        _status = tr('地址无效：示例 https://chast.example:8443（本机可用 http://127.0.0.1:8443）');
         _statusOk = false;
       });
       return;
@@ -5885,7 +5889,7 @@ class _ServerDialogState extends State<_ServerDialog> {
               autofocus: true,
               decoration: InputDecoration(
                 labelText: tr('服务地址'),
-                hintText: 'http://127.0.0.1:8443',
+                hintText: 'https://chast.example:8443',
               ),
               onSubmitted: (_) => _save(),
             ),

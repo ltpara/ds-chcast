@@ -165,7 +165,8 @@ typedef SecretUnprotector = Future<String> Function(String protectedBase64);
 /// `ViewerBridge.protectSecret` so the bearer and refresh tokens never touch
 /// the disk in the clear. Without one (standalone `dart run` tools) the file
 /// keeps the legacy plaintext shape, and a plaintext file is re-encrypted the
-/// first time it is loaded with a protector.
+/// first time it is loaded with a protector. When protection fails the save
+/// is skipped rather than downgraded to plaintext.
 ///
 /// A session is only used when its [AccountSession.server] matches the
 /// configured connection service; switching services does not silently reuse
@@ -235,8 +236,9 @@ class AccountSessionStore {
         text =
             jsonEncode(<String, Object?>{'version': 1, 'protected': blob});
       } catch (_) {
-        // Losing the session costs a login; refusing to persist it costs the
-        // same. Keep the legacy shape rather than failing the sign-in.
+        // Never write the access and refresh tokens in the clear: losing the
+        // remembered session only costs one sign-in.
+        return;
       }
     }
     try {

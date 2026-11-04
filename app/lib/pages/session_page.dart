@@ -191,8 +191,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _cursorBusy = false;
   bool _cursorDirty = false;
   // The identity this page pins for the current connection. Empty only until
-  // the first contact, whose certificate is then remembered by the store.
+  // the first contact, whose certificate is then confirmed and remembered.
   String _pinnedFingerprint = '';
+  // First-use confirmation runs once per connection attempt that has no
+  // stored pin. `_fingerprintUnpersisted` stays set when the user accepted a
+  // fingerprint but the trust store could not save it, so the UI can say the
+  // connection is not actually pinned.
+  bool _fingerprintPrompted = false;
+  bool _fingerprintUnpersisted = false;
   // Interactive authentication. The password is loaded from this account's
   // DPAPI store once, then kept for reconnects; the code is cleared whenever
   // the password changes because the host checks them in that order.
@@ -616,12 +622,20 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     _textureId = id;
-    final String pin = await _trustStore.fingerprintFor(widget.target.trustKey);
+    final String storedPin =
+        await _trustStore.fingerprintFor(widget.target.trustKey);
     if (!mounted) {
       await _stopSession();
       return;
     }
+    // An accepted fingerprint that could not be persisted still pins this
+    // process's later reconnects, so it is not silently downgraded to an
+    // unverified handshake.
+    final String pin = storedPin.isNotEmpty
+        ? storedPin
+        : (_fingerprintUnpersisted ? _pinnedFingerprint : '');
     _pinnedFingerprint = pin;
+    _fingerprintPrompted = pin.isNotEmpty;
     if (!_credentialsLoaded) {
       _credentialsLoaded = true;
       try {
@@ -781,13 +795,16 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _applyStatus(ViewerStatus status) {
-    // First contact: remember the identity the server just proved it holds,
-    // so every later connection to this endpoint is pinned to it.
-    if (_pinnedFingerprint.isEmpty && status.serverFingerprint.isNotEmpty) {
+    // First contact: the native side connected without a pin so it could
+    // report the certificate. Ask before remembering it; every later
+    // connection is verified against the accepted value.
+    if (_startError == null &&
+        _pinnedFingerprint.isEmpty &&
+        status.serverFingerprint.isNotEmpty &&
+        !_fingerprintPrompted) {
+      _fingerprintPrompted = true;
       _pinnedFingerprint = status.serverFingerprint;
-      unawaited(
-        _trustStore.trust(widget.target.trustKey, status.serverFingerprint),
-      );
+      unawaited(_confirmFirstFingerprint(status.serverFingerprint));
     }
     _trackRecording(status);
     final int previousPermissions = _status.permissions;
@@ -2101,16 +2118,76 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _status.serverFingerprint.isNotEmpty &&
       _status.serverFingerprint != _pinnedFingerprint;
 
+  /// TOFU for the host certificate. The native side has already completed the
+  /// unpinned handshake, so the user sees the fingerprint before it is
+  /// remembered; rejecting ends the session instead of leaving it unverified.
+  Future<void> _confirmFirstFingerprint(String fingerprint) async {
+    final bool accepted =
+        await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (BuildContext context) => _HostFingerprintDialog(
+            host: widget.target.label,
+            fingerprint: fingerprint,
+          ),
+        ) ??
+        false;
+    if (!mounted) {
+      return;
+    }
+    if (!accepted) {
+      await _stopSession();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pinnedFingerprint = '';
+        _fingerprintPrompted = false;
+        _fingerprintUnpersisted = false;
+        _startError = tr('未确认主机证书指纹，已终止连接');
+      });
+      return;
+    }
+    final String saved =
+        await _trustStore.trust(widget.target.trustKey, fingerprint);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _pinnedFingerprint = fingerprint;
+      _fingerprintUnpersisted = saved.isEmpty;
+    });
+    if (saved.isEmpty) {
+      _showFingerprintWarning();
+    }
+  }
+
+  void _showFingerprintWarning() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(tr('无法保存主机指纹，本次连接不会固定证书；下次连接需要重新确认。')),
+        duration: const Duration(seconds: 6),
+      ),
+    );
+  }
+
   Future<void> _trustNewIdentity() async {
     final String fresh = _status.serverFingerprint;
     if (fresh.isEmpty || _reconnecting) {
       return;
     }
-    await _trustStore.trust(widget.target.trustKey, fresh);
+    final String saved =
+        await _trustStore.trust(widget.target.trustKey, fresh);
     if (!mounted) {
       return;
     }
-    _pinnedFingerprint = fresh;
+    setState(() {
+      _pinnedFingerprint = fresh;
+      _fingerprintUnpersisted = saved.isEmpty;
+    });
+    if (saved.isEmpty) {
+      _showFingerprintWarning();
+    }
     await _reconnect();
   }
 
@@ -3315,6 +3392,47 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
+                if (hasFrame && !showOverlay && _fingerprintUnpersisted)
+                  Positioned(
+                    top: 96,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: IgnorePointer(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 7,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.68),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: Colors.orangeAccent.withValues(alpha: 0.45),
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              const Icon(
+                                Icons.shield_outlined,
+                                size: 14,
+                                color: Colors.orangeAccent,
+                              ),
+                              const SizedBox(width: 7),
+                              Text(
+                                tr('主机指纹未能保存，本次连接未固定证书'),
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
                 if (hasFrame && !showOverlay && _statsVisible)
                   Positioned(
                     top: 10,
@@ -4124,6 +4242,40 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   ),
                 ),
               ],
+              if (_fingerprintUnpersisted) ...<Widget>[
+                const SizedBox(height: 14),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFB74D).withValues(alpha: 0.08),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: const Color(0xFFFFB74D).withValues(alpha: 0.32),
+                    ),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      const Icon(
+                        Icons.shield_outlined,
+                        size: 14,
+                        color: Color(0xFFFFB74D),
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          tr('这次连接没有固定主机证书：指纹无法保存到本地，下次连接会重新确认。'),
+                          style: const TextStyle(
+                            color: Colors.white54,
+                            fontSize: 11,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (_status.received > 0) ...<Widget>[
                 const SizedBox(height: 12),
                 Container(height: 1, color: Colors.white12),
@@ -4478,6 +4630,62 @@ class _ServerIdentityDialog extends StatelessWidget {
           key: const Key('server-identity-accept'),
           onPressed: () => Navigator.of(context).pop(true),
           child: Text(changed ? tr('信任新身份') : tr('信任并连接')),
+        ),
+      ],
+    );
+  }
+}
+
+/// First-use confirmation for the host's QUIC certificate. The fingerprint is
+/// the only value a user can compare with the host operator, so it is shown in
+/// full; rejecting stops the session instead of continuing unverified.
+class _HostFingerprintDialog extends StatelessWidget {
+  const _HostFingerprintDialog({required this.host, required this.fingerprint});
+
+  final String host;
+  final String fingerprint;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    const TextStyle mono = TextStyle(
+      fontFamily: 'Consolas',
+      fontSize: 13,
+      letterSpacing: 0.8,
+      height: 1.5,
+    );
+    return AlertDialog(
+      title: Text(tr('确认主机证书')),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              tr('首次连接到 {host}。请与主机管理员核对证书指纹：', <String, Object?>{
+                'host': host,
+              }),
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 8),
+            SelectableText(formatServerFingerprint(fingerprint), style: mono),
+            const SizedBox(height: 12),
+            Text(
+              tr('确认后会记住该指纹；以后证书变化会被拒绝，直到你再次确认。'),
+              style: theme.textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: Text(tr('取消连接')),
+        ),
+        FilledButton(
+          key: const Key('host-fingerprint-accept'),
+          onPressed: () => Navigator.of(context).pop(true),
+          child: Text(tr('信任并连接')),
         ),
       ],
     );

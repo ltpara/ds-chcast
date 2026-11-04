@@ -59,6 +59,37 @@ void main() {
     expect(await store.load(), isEmpty);
   });
 
+  test('a corrupt trust file is kept aside before it is replaced', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('chast-trust-');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}trust.json');
+    await file.writeAsString('not json');
+    final TrustStore store = TrustStore(file: file);
+
+    expect(await store.trust('host:1', hex), hex);
+
+    final List<String> names = dir
+        .listSync()
+        .map((FileSystemEntity entity) => entity.path)
+        .map((String path) => path.split(Platform.pathSeparator).last)
+        .toList();
+    expect(names.where((String name) => name.startsWith('trust.json.corrupt-')),
+        hasLength(1));
+    expect(await store.fingerprintFor('host:1'), hex);
+  });
+
+  test('trust reports a failed write instead of pretending to pin', () async {
+    final Directory dir = Directory.systemTemp.createTempSync('chast-trust-');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final File file = File('${dir.path}${Platform.pathSeparator}trust.json');
+    // A directory at the target path makes the final rename fail.
+    await Directory(file.path).create();
+    final TrustStore store = TrustStore(file: file);
+
+    expect(await store.trust('host:1', hex), isEmpty);
+    expect(await store.fingerprintFor('host:1'), '');
+  });
+
   test('parses the presented fingerprint from the native status', () {
     final ViewerStatus status = ViewerStatus.fromMap(<Object?, Object?>{
       'state': 'streaming',

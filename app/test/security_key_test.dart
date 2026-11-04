@@ -136,6 +136,53 @@ void main() {
     );
   });
 
+  test('the WebAuthn origin is bound to the configured server host', () {
+    expect(
+      webAuthnOriginFor(
+        const ServerSettings(url: 'https://chast.example:8443'),
+        'chast.example',
+      ),
+      'https://chast.example:8443',
+    );
+    expect(
+      webAuthnOriginFor(
+        const ServerSettings(url: 'https://rp.chast.example'),
+        'chast.example',
+      ),
+      'https://rp.chast.example',
+    );
+    expect(
+      webAuthnOriginFor(
+        const ServerSettings(url: 'http://127.0.0.1:8443'),
+        '127.0.0.1',
+      ),
+      'http://127.0.0.1:8443',
+    );
+    for (final String rpId in <String>[
+      'evil.example',
+      'chast.example.evil',
+      'https://chast.example',
+      'chast.example:8443',
+      '',
+    ]) {
+      expect(
+        () => webAuthnOriginFor(
+          const ServerSettings(url: 'https://chast.example'),
+          rpId,
+        ),
+        throwsA(isA<SecurityKeyException>()),
+        reason: rpId,
+      );
+    }
+    expect(
+      () => webAuthnOriginFor(
+        const ServerSettings(url: 'http://127.0.0.1:8443'),
+        'localhost',
+      ),
+      throwsA(isA<SecurityKeyException>()),
+    );
+  });
+
   test('loginWithSecurityKey starts, asserts and finishes the login', () async {
     late HttpServer server;
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -153,7 +200,7 @@ void main() {
       if (request.uri.path.endsWith('/begin')) {
         request.response.write(jsonEncode(<String, Object?>{
           'challenge': 'Y2hhbGxlbmdl',
-          'rp_id': 'chast.example.com',
+          'rp_id': '127.0.0.1',
           'username': 'alice',
           'timeout_ms': 60000,
           'credentials': <Object?>[
@@ -197,6 +244,10 @@ void main() {
       (assertion.arguments as Map<Object?, Object?>)['challenge'],
       'Y2hhbGxlbmdl',
     );
+    expect(
+      (assertion.arguments as Map<Object?, Object?>)['origin'],
+      'http://127.0.0.1:${server.port}',
+    );
     expect(paths, <String>[
       '/v1/account/login/webauthn/begin',
       '/v1/account/login/webauthn/finish',
@@ -228,7 +279,7 @@ void main() {
       if (request.uri.path.endsWith('/begin')) {
         request.response.write(jsonEncode(<String, Object?>{
           'challenge': 'Y2hhbGxlbmdl',
-          'rp_id': 'chast.example.com',
+          'rp_id': '127.0.0.1',
           'username': 'alice',
           'timeout_ms': 60000,
           'credentials': <Object?>[
@@ -266,6 +317,10 @@ void main() {
       'securityKeyAvailable',
       'securityKeyGetAssertion',
     ]);
+    expect(
+      (calls.last.arguments as Map<Object?, Object?>)['origin'],
+      'http://127.0.0.1:${server.port}',
+    );
     expect(paths, <String>[
       '/v1/account/login/webauthn/passwordless/begin',
       '/v1/account/login/webauthn/passwordless/finish',
@@ -274,6 +329,47 @@ void main() {
     expect((bodies.last as Map<Object?, Object?>)['device_name'], '开发机');
     expect(result.token, 'acct-token');
     expect(result.username, 'alice');
+  });
+
+  test('a server cannot choose a WebAuthn RP outside the configured host',
+      () async {
+    late HttpServer server;
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    final ServerSettings settings = ServerSettings(
+      url: 'http://127.0.0.1:${server.port}',
+    );
+    server.listen((HttpRequest request) async {
+      await request.drain<void>();
+      request.response.headers.contentType = ContentType.json;
+      if (request.uri.path.endsWith('/begin')) {
+        request.response.write(jsonEncode(<String, Object?>{
+          'challenge': 'Y2hhbGxlbmdl',
+          'rp_id': 'evil.example',
+          'username': 'alice',
+          'timeout_ms': 60000,
+          'credentials': <Object?>[
+            <String, Object?>{'id': 'Y3JlZA', 'name': '此电脑'},
+          ],
+        }));
+      }
+      await request.response.close();
+    });
+    mock((MethodCall call) async => true);
+
+    await expectLater(
+      loginWithSecurityKeyOnly(settings, username: 'alice'),
+      throwsA(
+        isA<SecurityKeyException>().having(
+          (SecurityKeyException error) => error.code,
+          'code',
+          'bad_args',
+        ),
+      ),
+    );
+    expect(calls.map((MethodCall call) => call.method), <String>[
+      'securityKeyAvailable',
+    ]);
   });
 
   test('loginWithSecurityKeyOnly reports an account without keys', () async {

@@ -19,6 +19,7 @@
 - **审计可被空 ref 抑制、日志可注入、剪贴板下载表跨会话、权限刷新后旧掩码（M10-M13，已于 2026-11-05 修复，见各节）**：无 ref 会话用主机生成 ID 并标记；日志入口转义控制字符；下载表按会话清空且仅在宣布成功后登记；权限更新后本地 `StreamInfo` 同步新掩码。
 - **剪贴板文本限额不一致、`.part` 与用户文件同名、接收 reparse 检查 TOCTOU（M14-M16，已于 2026-11-05 修复，见各节）**：文本改按 4 MiB 校验且全部句柄就绪后才清空剪贴板；中间态移入 `<root>\.chast-partial\<hash>.part`；中间文件与 sidecar 以 `FILE_FLAG_OPEN_REPARSE_POINT` 打开并做句柄级复核。
 - **更新器校验后按路径执行、管理控制台无认证、CSV 公式注入（M17-M19，已于 2026-11-05 修复，见各节）**：暂存文件在启动安装器前重算 SHA-256 与长度，默认暂存目录移到可执行文件旁的 `updates`；管理控制台要求首行 `auth <token>`（缺省随机生成并记录日志，常量时间比较）；CSV 导出对以 `= + - @ \t \r` 开头的单元格（单独的 `-` 占位除外）前置 `'`。
+- **客户端通道明文、首次信任与终端/下载防护（M24-M29，已于 2026-11-05 修复，见各节）**：连接服务除回环外强制 HTTPS；服务密钥与账号 token 一样走 DPAPI，并经 stdin 传给 `chast-tunnel`；直连首次连接弹出主机证书指纹确认，保存失败会明确标注“本次未固定”；账号 token 保护失败时不再写明文；终端 CSI 解析有长度与工作量上限；WebAuthn 的 rpId/origin 绑定到所配置的服务器；录制下载边写边校验大小与 SHA-256。
 
 其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
 
@@ -834,6 +835,14 @@ if (key.isNotEmpty) ...<String>['--server-key', key],
 
 **修复**：除 loopback 外强制 `https`（或对 API 做 SPKI pin）；服务密钥与账号 token 一样走 DPAPI；密钥改走 stdin/受 ACL 保护的配置文件；拒绝带 `userInfo` 的 URL。
 
+**修复（2026-11-05）**
+
+`normalizeServerUrl` 改为 HTTPS 优先：不带 scheme 的输入默认补 `https://`，仅回环主机（`localhost`、`127.0.0.0/8`、`::1`）补 `http://`；非回环的 `http://` 直接判为无效，带 `userInfo`、query 或 fragment 的 URL 一律拒绝。UI 的错误提示与 hint 改为 `https://chast.example:8443`，并在错误里注明本机可用 HTTP。
+
+服务密钥与账号 token 统一走 DPAPI。`ServerSettingsStore` 新增可注入的 `protectSecret`/`unprotectSecret`（生产环境接 `ViewerBridge.protectSecret`），密钥非空时把整个配置 payload 加密成 `{"version":1,"protected":"..."}` 信封；保护失败时只写不含密钥的非敏感字段，绝不静默落明文。加载旧的明文配置会在密钥非空时立即重写为加密信封；遇到加密信封但没有 unprotector 时按“未配置”处理，避免把解密失败当成空密钥继续使用。
+
+子进程密钥改走 stdin：`TunnelAgent` 不再把密钥放进 argv，而是加 `--server-key-stdin` 并在启动后通过管道写入第一行；`chast-tunnel` 在解析参数后从 stdin 读取并去掉 CRLF，空密钥或读失败直接报错退出。原 `--server-key` 仅保留给手工调试，帮助文本已注明其会出现在进程命令行。测试覆盖 URL 策略、DPAPI 落盘、旧配置迁移、保护失败不写密钥、损坏文件容忍，以及 Windows 下 stdin 传密钥的完整子进程路径。
+
 ---
 
 ### M25. 直连首次连接无条件 `allowUnverified`，pin 写入失败被吞掉
@@ -854,6 +863,14 @@ if (_pinnedFingerprint.isEmpty && status.serverFingerprint.isNotEmpty) {
 首次连接被 MITM → 攻击者证书被永久 pin；`trust.json` 写失败（磁盘满/ACL）时内存里看起来已固定，下次启动又变回未验证，静默重复 TOFU。更糟的是 `load()` 对损坏/不可解析的 `trust.json` 直接返回空 map（[`trust_store.dart:62`](../app/lib/trust_store.dart#L62)），一次截断写入就会丢掉全部 pin，所有主机重新回到“首次信任”。这里与服务端身份确认（[`session_page.dart:554`](../app/lib/pages/session_page.dart#L554) 有确认对话框）不对称：主机证书首用没有任何确认。
 
 **修复**：首次连接也弹一次指纹确认；`trust()` 返回空串时提示“无法保存指纹，本次不固定”，并在 UI 上标注未验证；`_save()` 改为临时文件 + 原子 rename，解析失败时保留旧文件而不是清空。
+
+**修复（2026-11-05）**
+
+首次直连不再静默信任。握手拿到服务器指纹后，若本地没有 pin，会话页弹出“确认主机证书”对话框，展示完整 SHA-256 指纹并提示与主机管理员核对：拒绝会终止连接并显示“未确认主机证书指纹，已终止连接”；接受才写入 `TrustStore` 并固定本次会话。已固定的正常连接不弹窗。
+
+`TrustStore.trust()` 现在返回实际保存的规范化 pin，保存失败返回空串。会话保留内存 pin 使本次连接仍受固定保护，但界面持续显示“主机指纹未能保存，本次连接未固定证书”的角标（有画面时）与断线提示，并在下一次重连时重新走确认流程。
+
+`_save()` 改为写临时文件（按 pid 命名）后原子 rename，任何一步失败都删除临时文件并返回 `false`；加载到损坏的 `trust.json` 时先备份为 `trust.json.corrupt-<时间戳>` 再重建，不再静默丢掉全部主机 pin。新增损坏文件备份与写入失败（目标路径是目录）两组测试。
 
 ---
 
@@ -876,6 +893,10 @@ DPAPI/原生桥任一失败（CryptoAPI 策略、漫游配置文件、profile �
 
 **修复**：保护失败即放弃持久化（宁可不记住登录），或至少写可见告警；不要静默降级。
 
+**修复（2026-11-05）**
+
+`AccountStore.save` 在 DPAPI 保护失败时直接 `return`，不再回退写明文 payload；类注释同步改为“要么加密、要么不记”。代价仅是下次需要重新登录，不影响当前会话。测试改为断言保护失败后文件不存在且 `load()` 返回 null。
+
 ---
 
 ### M27. 终端 CSI 解析没有长度/工作量上限
@@ -896,6 +917,12 @@ for (int i = 0; i < count; i++) { line.insert(...); line.removeLast(); }  // 最
 
 **修复**：`_csiBody` 加 32 字节上限（超限丢弃该序列），`count` 按 `min(count, rows/columns)` 裁剪，对单次 dispatch 的工作量设预算。
 
+**修复（2026-11-05）**
+
+CSI 参数缓冲上限 32 字节：超限后置 `_csiOverflow` 并清空缓冲，后续参数字节只丢弃，遇到终止符时整条序列不派发并回到 ground；`ESC`、`CAN`、`SUB` 与 `reset` 都会清除溢出标记，不会把状态泄漏到下一条序列。
+
+所有带计数的操作按当前上下文裁剪：`ICH`/`DCH` 裁到 `columns - cursorColumn`，`IL`/`DL` 裁到 `scrollBottom - cursorRow + 1`，`SU`/`SD` 裁到 `scrollBottom - scrollTop`，`CHT`/`CBT` 裁到 `columns`。新增过长的 CSI 序列被整体丢弃、以及 `ESC[9999S ESC[9999T` 只产生有限行变化的回归测试。
+
 ---
 
 ### M28. WebAuthn 的 rpId/origin 完全由服务器决定，未与所连服务绑定
@@ -912,6 +939,10 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 **修复**：校验 `rp_id` 必须是所配置服务器 URL 的 host（或运维白名单），origin 用实际 `settings.url` 的 scheme+host 计算。
 
+**修复（2026-11-05）**
+
+新增 `webAuthnOriginFor(server, rpId)`：origin 一律由 `server.url` 的 `Uri.origin` 计算，不再用服务器给的值拼接。`rpId` 必须与配置的 host 匹配——IP 字面量与 `localhost` 要求完全相等，域名允许等于 host 或是 host 的后缀（含前导点边界）；空值、带 `:`/`/`/空格的取值、以及不匹配的域名都会抛 `SecurityKeyException`（`bad_args`），不会触达原生认证器。注册（`makeCredential`）与两种登录（`getAssertion`）全部走该函数。测试覆盖域名、子域、IP 与四种拒绝路径，并断言 rpId 不匹配时除 `securityKeyAvailable` 外没有任何原生调用。
+
 ---
 
 ### M29. 云端录制下载不校验 SHA-256/大小，内容直接写入本地并被“打开”
@@ -921,6 +952,10 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 下载循环只把字节写进 `%USERPROFILE%\Videos\chast-recordings\*.mp4`，`recording.sha256` 从未参与比较，也没有大小上限；UI 随后提供“打开/在资源管理器中显示”。服务端被入侵或被 HTTP 中间人替换响应体时，任意字节会落成 `.mp4` 并被用户打开。
 
 **修复**：边写边算 SHA-256 并与 `recording.sha256` 比对，不符即删文件报错；下载前用 `size` 做上限校验。
+
+**修复（2026-11-05）**
+
+下载改为流式校验：响应 200 后先检查 `content-length` 是否等于 `recording.size`，不符立即失败；写入过程中累计字节数，一旦超过记录大小立即中止。文件内容经 `sha256.startChunkedConversion` 边写边算，流结束后校验“实际字节数 == 记录大小”，再与服务端记录的 `sha256` 比对（服务端未给摘要时只校验大小）。任一步失败都会取消流、删除目标文件并抛 `ServerApiException`，不会留下可被“打开”的半成品。新增摘要不符与大小不符两组测试，断言下载目录最终为空。
 
 ---
 
@@ -1005,7 +1040,7 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 9. M10/M11/M12/M13：审计回退 ID、日志转义、剪贴板下载表按会话清理、StreamInfo 用新掩码重建（均已完成，见各节修复说明）。
 10. M14/M15/M16：剪贴板文本限额统一、`.part` 隔离目录、句柄级 reparse 复核（均已完成，见各节修复说明）。
 11. M17/M18/M19：更新器句柄锁定、admin console token、CSV 转义（均已完成，见各节修复说明）。
-12. M24～M29：客户端强制 HTTPS、密钥 DPAPI、首用确认、终端 CSI 上限、录制校验。
+12. M24～M29：客户端强制 HTTPS、密钥 DPAPI、首用确认、终端 CSI 上限、录制校验（均已完成，见各节修复说明）。
 
 **第四批（持续）**
 

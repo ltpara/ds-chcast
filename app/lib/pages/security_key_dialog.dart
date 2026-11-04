@@ -234,6 +234,7 @@ class _SecurityKeyDialogState extends State<SecurityKeyDialog> {
   }) {
     return _key.makeCredential(
       rpId: rpId,
+      origin: webAuthnOriginFor(widget.server, rpId),
       userId: userId,
       username: username,
       displayName: displayName,

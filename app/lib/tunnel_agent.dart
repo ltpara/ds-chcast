@@ -173,7 +173,9 @@ class TunnelAgent {
       '$loopback:0',
       '--mode',
       mode.name,
-      if (key.isNotEmpty) ...<String>['--server-key', key],
+      // The key travels over stdin, never argv: any process of this user,
+      // EDR and audit logs can read a child's command line.
+      if (key.isNotEmpty) '--server-key-stdin',
       if (serverPublicKey.isNotEmpty) ...<String>[
         '--server-pubkey',
         serverPublicKey,
@@ -210,6 +212,14 @@ class TunnelAgent {
       throw TunnelException(
         tr('无法启动隧道代理（{exe}）：{p2}\n请确认 chast-tunnel.exe 与会话程序位于同一目录。', <String, Object?>{'exe': exe, 'p2': error.message}),
       );
+    }
+    if (server.key.isNotEmpty) {
+      try {
+        process.stdin.write('${server.key}\n');
+        await process.stdin.close();
+      } catch (_) {
+        // The child exited before reading; its exit status carries the error.
+      }
     }
     final TunnelAgent agent = TunnelAgent._(process, exe);
     agent._ready = Completer<void>();

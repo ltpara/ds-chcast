@@ -211,7 +211,13 @@ class TerminalGrid {
 
   _State _state = _State.ground;
   final StringBuffer _csiBody = StringBuffer();
+  bool _csiOverflow = false;
   final StringBuffer _oscBody = StringBuffer();
+
+  /// Longest parameter body accepted for one CSI sequence. Real sequences are
+  /// a handful of digits; anything longer is dropped instead of growing the
+  /// buffer with hostile output.
+  static const int _csiBodyLimit = 32;
 
   /// True while the last printed character sits in the final column and the
   /// next printable character starts a new line.
@@ -246,6 +252,7 @@ class TerminalGrid {
     title = '';
     _state = _State.ground;
     _csiBody.clear();
+    _csiOverflow = false;
     _oscBody.clear();
   }
 
@@ -463,7 +470,8 @@ class TerminalGrid {
 
   void _tab(int count) {
     _wrapPending = false;
-    for (int i = 0; i < count; i++) {
+    final int bounded = count.clamp(0, _columns);
+    for (int i = 0; i < bounded; i++) {
       final int next = (cursorColumn ~/ 8 + 1) * 8;
       cursorColumn = next < _columns ? next : _columns - 1;
     }
@@ -471,6 +479,7 @@ class TerminalGrid {
 
   void _beginCsi() {
     _csiBody.clear();
+    _csiOverflow = false;
     _state = _State.csi;
   }
 
@@ -526,15 +535,26 @@ class TerminalGrid {
 
   void _csi(int rune) {
     if (rune >= 0x40 && rune <= 0x7E) {
-      _dispatchCsi(rune);
+      if (!_csiOverflow) {
+        _dispatchCsi(rune);
+      }
+      _csiOverflow = false;
       _state = _State.ground;
       return;
     }
     if (rune >= 0x20 && rune <= 0x3F) {
-      _csiBody.writeCharCode(rune);
+      if (_csiBody.length >= _csiBodyLimit) {
+        _csiOverflow = true;
+        _csiBody.clear();
+        return;
+      }
+      if (!_csiOverflow) {
+        _csiBody.writeCharCode(rune);
+      }
       return;
     }
     // A control character interrupts and cancels the sequence.
+    _csiOverflow = false;
     _state = _State.ground;
   }
 
@@ -680,7 +700,8 @@ class TerminalGrid {
 
   void _backTab(int count) {
     _wrapPending = false;
-    for (int i = 0; i < count; i++) {
+    final int bounded = count.clamp(0, _columns);
+    for (int i = 0; i < bounded; i++) {
       int next = ((cursorColumn - 1) ~/ 8) * 8;
       if (next < 0) {
         next = 0;
@@ -712,7 +733,8 @@ class TerminalGrid {
       return;
     }
     final bool whole = top == 0 && bottom == _rows - 1;
-    for (int i = 0; i < count; i++) {
+    final int bounded = count.clamp(0, bottom - top);
+    for (int i = 0; i < bounded; i++) {
       final List<TerminalCell> removed = _lines.removeAt(top);
       if (whole && !_altActive) {
         _pushScrollback(removed);
@@ -727,7 +749,8 @@ class TerminalGrid {
     if (top >= bottom) {
       return;
     }
-    for (int i = 0; i < count; i++) {
+    final int bounded = count.clamp(0, bottom - top);
+    for (int i = 0; i < bounded; i++) {
       _lines.removeAt(bottom);
       _lines.insert(top, _blankLine());
     }
@@ -795,16 +818,18 @@ class TerminalGrid {
   }
 
   void _insertChars(int count) {
+    final int bounded = count.clamp(0, _columns - cursorColumn);
     final List<TerminalCell> line = _lines[cursorRow];
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < bounded; i++) {
       line.insert(cursorColumn, TerminalCell());
       line.removeLast();
     }
   }
 
   void _deleteChars(int count) {
+    final int bounded = count.clamp(0, _columns - cursorColumn);
     final List<TerminalCell> line = _lines[cursorRow];
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < bounded; i++) {
       if (cursorColumn < line.length) {
         line.removeAt(cursorColumn);
         line.add(TerminalCell());
@@ -821,7 +846,8 @@ class TerminalGrid {
     if (cursorRow < scrollTop || cursorRow > scrollBottom) {
       return;
     }
-    for (int i = 0; i < count; i++) {
+    final int bounded = count.clamp(0, scrollBottom - cursorRow + 1);
+    for (int i = 0; i < bounded; i++) {
       _lines.removeAt(scrollBottom);
       _lines.insert(cursorRow, _blankLine());
     }
@@ -831,7 +857,8 @@ class TerminalGrid {
     if (cursorRow < scrollTop || cursorRow > scrollBottom) {
       return;
     }
-    for (int i = 0; i < count; i++) {
+    final int bounded = count.clamp(0, scrollBottom - cursorRow + 1);
+    for (int i = 0; i < bounded; i++) {
       _lines.removeAt(cursorRow);
       _lines.insert(scrollBottom, _blankLine());
     }

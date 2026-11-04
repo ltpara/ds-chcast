@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 
 import 'server_api.dart';
@@ -44,6 +46,36 @@ class SecurityKeyAssertion {
   final String clientDataJSON;
   final String authenticatorData;
   final String signature;
+}
+
+/// The WebAuthn origin for [server], after checking that the server-provided
+/// [rpId] belongs to the configured host. A domain RP may be the host itself
+/// or a parent domain; an IP or localhost must match exactly. Anything else
+/// would let a substituted server make this authenticator sign for another
+/// relying party.
+String webAuthnOriginFor(ServerSettings server, String rpId) {
+  final Uri? uri = Uri.tryParse(server.url);
+  final String host = _withoutTrailingDot(uri?.host.toLowerCase() ?? '');
+  final String id = _withoutTrailingDot(rpId.trim().toLowerCase());
+  final bool shaped =
+      id.isNotEmpty && !id.contains(':') && !id.contains('/') && !id.contains(' ');
+  final bool ip = InternetAddress.tryParse(host) != null;
+  final bool matches =
+      shaped &&
+      (ip || id == 'localhost'
+          ? id == host
+          : id == host || host.endsWith('.$id'));
+  if (host.isEmpty || !matches) {
+    throw SecurityKeyException(
+      tr('服务器要求的安全密钥域名与连接服务不一致：{rpId}', <String, Object?>{'rpId': rpId}),
+      code: 'bad_args',
+    );
+  }
+  return uri!.origin;
+}
+
+String _withoutTrailingDot(String value) {
+  return value.endsWith('.') ? value.substring(0, value.length - 1) : value;
 }
 
 /// Talks to the native `chast/viewer` bridge, which calls Windows Hello
@@ -178,6 +210,7 @@ Future<AccountLoginResult> loginWithSecurityKey(
   }
   final SecurityKeyAssertion assertion = await key.getAssertion(
     rpId: options.rpId,
+    origin: webAuthnOriginFor(server, options.rpId),
     challenge: options.challenge,
     allowCredentials: <String>[
       for (final WebAuthnCredential credential in options.credentials) credential.id,
@@ -215,6 +248,7 @@ Future<AccountLoginResult> loginWithSecurityKeyOnly(
   }
   final SecurityKeyAssertion assertion = await key.getAssertion(
     rpId: options.rpId,
+    origin: webAuthnOriginFor(server, options.rpId),
     challenge: options.challenge,
     allowCredentials: <String>[
       for (final WebAuthnCredential credential in options.credentials) credential.id,
