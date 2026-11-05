@@ -331,7 +331,7 @@ func (s *Store) FinishWebAuthnRegistration(userID string, expectedChallenge []by
 		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
 		cred.ID, userID, cred.PublicKey, cred.Alg, cred.SignCount, name, created,
 	); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "PRIMARY KEY") {
+		if isUniqueViolation(err) {
 			return WebAuthnCredential{}, ErrWebAuthnCredentialExists
 		}
 		return WebAuthnCredential{}, fmt.Errorf("account store %s: save security key: %w", s.path, err)

@@ -96,7 +96,7 @@ func (s *Store) SetPhone(username, phone string) (User, error) {
 	defer tx.Rollback()
 	res, err := tx.Exec(`UPDATE users SET phone = ? WHERE username = ?`, phone, username)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueViolation(err) {
 			return User{}, ErrPhoneTaken
 		}
 		return User{}, fmt.Errorf("account store %s: set phone: %w", s.path, err)

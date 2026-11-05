@@ -64,7 +64,7 @@ func (s *Store) SetEmail(username, email string) (User, error) {
 	defer tx.Rollback()
 	res, err := tx.Exec(`UPDATE users SET email = ? WHERE username = ?`, email, username)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueViolation(err) {
 			return User{}, ErrEmailTaken
 		}
 		return User{}, fmt.Errorf("account store %s: set email: %w", s.path, err)

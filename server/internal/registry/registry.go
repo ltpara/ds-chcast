@@ -178,8 +178,24 @@ func NewPersistent(offlineAfter time.Duration, path string) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
+	return loadPersistent(r, store)
+}
+
+// NewPersistentPostgres is NewPersistent backed by PostgreSQL instead of a
+// SQLite file. Legacy JSON state is not imported in this mode.
+func NewPersistentPostgres(offlineAfter time.Duration, dsn string) (*Registry, error) {
+	r := New(offlineAfter)
+	store, err := NewStorePostgres(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return loadPersistent(r, store)
+}
+
+func loadPersistent(r *Registry, store *Store) (*Registry, error) {
 	ids, err := store.Load()
 	if err != nil {
+		store.Close()
 		return nil, err
 	}
 	for _, id := range ids {

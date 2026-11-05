@@ -115,6 +115,19 @@ const (
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$`)
 
+// isUniqueViolation matches SQLite's "UNIQUE constraint failed" and
+// PostgreSQL's "duplicate key value violates unique constraint" errors without
+// depending on a driver-specific error type.
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE") ||
+		strings.Contains(msg, "duplicate key value violates unique constraint") ||
+		strings.Contains(msg, "PRIMARY KEY")
+}
+
 type User struct {
 	ID        string    `json:"id"`
 	Username  string    `json:"username"`
@@ -245,16 +258,26 @@ type SharedBook struct {
 
 // Store keeps accounts in the same SQLite file as the peer registry. A single
 // connection serialises writes and the WAL journal lets registry traffic keep
-// reading while a login or address-book write is in flight.
+// reading while a login or address-book write is in flight. PostgreSQL is an
+// alternative backend for deployments that need more than one server process;
+// the SQL is shared and the driver rewrites placeholders and SQLite idioms.
 type Store struct {
 	path         string
 	db           *sql.DB
+	dialect      dialect
 	mu           sync.Mutex
 	now          func() time.Time
 	tokenTTL     time.Duration
 	accessTTL    time.Duration
 	refreshGrace time.Duration
 }
+
+type dialect int
+
+const (
+	dialectSQLite dialect = iota
+	dialectPostgres
+)
 
 func Open(path string) (*Store, error) {
 	if path == "" {
@@ -290,6 +313,37 @@ func Open(path string) (*Store, error) {
 	return &Store{
 		path:         path,
 		db:           db,
+		dialect:      dialectSQLite,
+		now:          time.Now,
+		tokenTTL:     TokenTTL,
+		accessTTL:    AccessTokenTTL,
+		refreshGrace: RefreshReuseGrace,
+	}, nil
+}
+
+// OpenPostgres opens the account store in a PostgreSQL database. The pool is
+// not capped at one connection; row-level serialisation is left to the
+// database instead of the SQLite write lock.
+func OpenPostgres(dsn string) (*Store, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, errors.New("account PostgreSQL DSN is empty")
+	}
+	db, err := dbmetric.OpenPostgres("account", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open account store: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connect account store: %w", err)
+	}
+	if _, err := schemamig.RunPostgres(db, "schema_migrations", accountPostgresMigrations); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("account store: %w", err)
+	}
+	return &Store{
+		path:         "postgres",
+		db:           db,
+		dialect:      dialectPostgres,
 		now:          time.Now,
 		tokenTTL:     TokenTTL,
 		accessTTL:    AccessTokenTTL,
@@ -602,7 +656,7 @@ func (s *Store) createUser(username, password, email, phone, role string) (User,
 		`INSERT INTO users (id, username, password_hash, created_at, role, email, phone) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		id, username, hash, unixMillis(created), role, email, phone,
 	); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueViolation(err) {
 			if strings.Contains(err.Error(), "phone") {
 				return User{}, ErrPhoneTaken
 			}
@@ -2039,14 +2093,14 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 			peer      Peer
 			tags      string
 			updatedAt int64
-			deleted   int
+			deleted   bool
 		)
 		if err := rows.Scan(&peer.ID, &peer.Name, &tags, &peer.GroupID, &peer.Position, &updatedAt, &peer.Revision, &deleted); err != nil {
 			return Snapshot{}, err
 		}
 		peer.Tags = decodeTags(tags)
 		peer.UpdatedAt = timeFromMillis(updatedAt)
-		peer.Deleted = deleted != 0
+		peer.Deleted = deleted
 		changes = append(changes, peer)
 	}
 	if err := rows.Err(); err != nil {
@@ -2067,13 +2121,13 @@ func (s *Store) Snapshot(userID string, since int64) (Snapshot, error) {
 		var (
 			group     Group
 			updatedAt int64
-			deleted   int
+			deleted   bool
 		)
 		if err := groupRows.Scan(&group.ID, &group.Name, &group.ParentID, &group.Position, &updatedAt, &group.Revision, &deleted); err != nil {
 			return Snapshot{}, err
 		}
 		group.UpdatedAt = timeFromMillis(updatedAt)
-		group.Deleted = deleted != 0
+		group.Deleted = deleted
 		groupChanges = append(groupChanges, group)
 	}
 	if err := groupRows.Err(); err != nil {
@@ -2214,11 +2268,11 @@ func (s *Store) updatePeerLocked(userID, peerID string, name *string, tags *[]st
 	now := s.now().UTC()
 	if _, err := tx.Exec(
 		`INSERT INTO address_book (user_id, peer_id, name, tags, group_id, position, updated_at, revision, deleted)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false)
 		 ON CONFLICT(user_id, peer_id) DO UPDATE SET
 			name = excluded.name, tags = excluded.tags, group_id = excluded.group_id,
 			position = excluded.position, updated_at = excluded.updated_at,
-			revision = excluded.revision, deleted = 0`,
+			revision = excluded.revision, deleted = false`,
 		userID, peerID, updatedName, encodeTags(updatedTags), updatedGroup, updatedPosition,
 		unixMillis(now), revision,
 	); err != nil {
@@ -2369,7 +2423,7 @@ func (s *Store) UpdateGroupAt(userID, groupID string, name *string, parentID *st
 	var (
 		storedName, storedParent        string
 		storedPosition, currentRevision int64
-		deleted                         int
+		deleted                         bool
 	)
 	err = tx.QueryRow(
 		`SELECT name, parent_id, position, revision, deleted FROM address_book_groups
@@ -2380,10 +2434,10 @@ func (s *Store) UpdateGroupAt(userID, groupID string, name *string, parentID *st
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return Group{}, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
 	}
-	if ifRevision > 0 && (!exists || deleted != 0 || currentRevision != ifRevision) {
+	if ifRevision > 0 && (!exists || deleted || currentRevision != ifRevision) {
 		return Group{}, ErrGroupConflict
 	}
-	creating := !exists || deleted != 0
+	creating := !exists || deleted
 	if creating && name == nil {
 		return Group{}, ErrInvalidGroupName
 	}
@@ -2435,11 +2489,11 @@ func (s *Store) UpdateGroupAt(userID, groupID string, name *string, parentID *st
 	if _, err := tx.Exec(
 		`INSERT INTO address_book_groups
 			(user_id, group_id, name, parent_id, position, updated_at, revision, deleted)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, false)
 		 ON CONFLICT(user_id, group_id) DO UPDATE SET
 			name = excluded.name, parent_id = excluded.parent_id,
 			position = excluded.position, updated_at = excluded.updated_at,
-			revision = excluded.revision, deleted = 0`,
+			revision = excluded.revision, deleted = false`,
 		userID, groupID, storedName, storedParent, storedPosition, unixMillis(now), revision,
 	); err != nil {
 		return Group{}, fmt.Errorf("account store %s: write address book group: %w", s.path, err)
@@ -2472,13 +2526,13 @@ func groupParentDepthLocked(tx *sql.Tx, userID, parentID, groupID string) (int, 
 			return 0, ErrGroupDepth
 		}
 		var next string
-		var deleted int
+		var deleted bool
 		err := tx.QueryRow(
 			`SELECT parent_id, deleted FROM address_book_groups
 			 WHERE user_id = ? AND group_id = ?`,
 			userID, current,
 		).Scan(&next, &deleted)
-		if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted != 0) {
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted) {
 			return 0, ErrUnknownGroup
 		}
 		if err != nil {
@@ -2556,7 +2610,7 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 	}
 	defer tx.Rollback()
 	var (
-		deleted  int
+		deleted  bool
 		live     int64
 		parentID string
 	)
@@ -2565,7 +2619,7 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 		 WHERE user_id = ? AND group_id = ?`,
 		userID, groupID,
 	).Scan(&deleted, &live, &parentID)
-	if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted != 0) {
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && deleted) {
 		return false, nil
 	}
 	if err != nil {
@@ -2674,7 +2728,7 @@ func (s *Store) DeleteGroupAt(userID, groupID string, ifRevision int64) (bool, e
 }
 
 func liveGroupLocked(tx *sql.Tx, userID, groupID string) (bool, error) {
-	var deleted int
+	var deleted bool
 	err := tx.QueryRow(
 		`SELECT deleted FROM address_book_groups WHERE user_id = ? AND group_id = ?`,
 		userID, groupID,
@@ -2685,7 +2739,7 @@ func liveGroupLocked(tx *sql.Tx, userID, groupID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return deleted == 0, nil
+	return !deleted, nil
 }
 
 // DeletePeer writes a tombstone instead of dropping the row. false means
@@ -2706,7 +2760,7 @@ func (s *Store) deletePeerLocked(userID, peerID string, ifRevision int64) (bool,
 	}
 	defer tx.Rollback()
 	var (
-		deleted         int
+		deleted         bool
 		currentRevision int64
 	)
 	err = tx.QueryRow(
@@ -2722,7 +2776,7 @@ func (s *Store) deletePeerLocked(userID, peerID string, ifRevision int64) (bool,
 	if err != nil {
 		return false, fmt.Errorf("account store %s: read address book entry: %w", s.path, err)
 	}
-	if deleted != 0 {
+	if deleted {
 		if ifRevision > 0 {
 			return false, ErrPeerConflict
 		}
@@ -2824,7 +2878,7 @@ func (s *Store) shareBookLocked(ownerID, granteeUsername, permission, groupID st
 }
 
 func (s *Store) groupLiveLocked(userID, groupID string) (bool, error) {
-	var deleted int
+	var deleted bool
 	err := s.db.QueryRow(
 		`SELECT deleted FROM address_book_groups WHERE user_id = ? AND group_id = ?`,
 		userID, groupID,
@@ -2835,7 +2889,7 @@ func (s *Store) groupLiveLocked(userID, groupID string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("account store %s: read address book group: %w", s.path, err)
 	}
-	return deleted == 0, nil
+	return !deleted, nil
 }
 
 // UnshareBook revokes every grant between the pair, matching the original

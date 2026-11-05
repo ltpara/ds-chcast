@@ -1,10 +1,11 @@
-// Package schemamig applies ordered, forward-only schema migrations to a
-// SQLite-backed store. Each store keeps its own bookkeeping table, so the
-// account store and the peer registry can share one database file without
+// Package schemamig applies ordered, forward-only schema migrations to the
+// account and peer databases. Each store keeps its own bookkeeping table, so
+// the account store and the peer registry can share one database without
 // sharing version numbers.
 package schemamig
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -36,6 +37,26 @@ func (e *TooNewError) Error() string {
 		e.Found, e.Supported)
 }
 
+// RunPostgres is Run for a PostgreSQL pool. A session advisory lock serialises
+// instances that start against the same database at once: CREATE TABLE IF NOT
+// EXISTS can still fail when two sessions create the same table concurrently.
+func RunPostgres(db *sql.DB, table string, migrations []Migration) (int, error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("schemamig: migration lock: %w", err)
+	}
+	defer conn.Close()
+	const lockKey = int64(0x4d6967726174696f) // "Migratio", the first eight bytes
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
+		return 0, fmt.Errorf("schemamig: migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(ctx, `SELECT pg_advisory_unlock($1)`, lockKey)
+	}()
+	return Run(db, table, migrations)
+}
+
 // Run creates the bookkeeping table when it is missing, refuses databases
 // newer than the last migration, and applies pending migrations in order. The
 // returned version is the one recorded after the run.
@@ -59,7 +80,7 @@ func Run(db *sql.DB, table string, migrations []Migration) (int, error) {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS ` + table + ` (
 		version    INTEGER PRIMARY KEY,
 		name       TEXT NOT NULL DEFAULT '',
-		applied_at INTEGER NOT NULL
+		applied_at BIGINT NOT NULL
 	)`); err != nil {
 		return 0, fmt.Errorf("schemamig: create %s: %w", table, err)
 	}
@@ -76,7 +97,8 @@ func Run(db *sql.DB, table string, migrations []Migration) (int, error) {
 				migration.Version, migration.Name, err)
 		}
 		if _, err := db.Exec(
-			`INSERT OR IGNORE INTO `+table+` (version, name, applied_at) VALUES (?, ?, ?)`,
+			`INSERT INTO `+table+` (version, name, applied_at) VALUES (?, ?, ?)
+			 ON CONFLICT(version) DO NOTHING`,
 			migration.Version, migration.Name, time.Now().UTC().UnixMilli(),
 		); err != nil {
 			return current, fmt.Errorf("schemamig: record migration %d: %w", migration.Version, err)

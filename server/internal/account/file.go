@@ -152,21 +152,19 @@ func (s *Store) RecordHostFileTransfer(
 func (s *Store) insertFileEventLocked(event FileEvent, userID string) (FileEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
+	var id int64
+	err := s.db.QueryRow(
 		`INSERT INTO file_events
 			(user_id, username, peer_id, direction, name, size, files,
 			 client_ip, occurred_at, success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 RETURNING id`,
 		userID, event.Username, event.PeerID, event.Direction, event.Name,
 		event.Size, event.Files, event.ClientIP, unixMillis(event.OccurredAt),
 		event.Success, event.Detail, event.HostID, event.AuditRef, event.Source,
-	)
+	).Scan(&id)
 	if err != nil {
 		return FileEvent{}, fmt.Errorf("account store %s: record file transfer: %w", s.path, err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return FileEvent{}, fmt.Errorf("account store %s: record file transfer id: %w", s.path, err)
 	}
 	if _, err := s.db.Exec(
 		`DELETE FROM file_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - ? FROM file_events)`,

@@ -127,6 +127,7 @@ func run() error {
 		hostTTL          = flag.Duration("host-ttl", 60*time.Second, "how long a registration survives without renewal")
 		offline          = flag.Duration("offline-after", 30*time.Second, "keepalive silence that makes a host offline")
 		stateFile        = flag.String("state", "chast-server-state.db", "persistent SQLite peer database; a legacy .json next to it is imported once; empty disables persistence")
+		postgresDSN      = flag.String("postgres-dsn", "", "PostgreSQL DSN for accounts, address books and peer state; overrides --state; empty keeps SQLite")
 		identityFile     = flag.String("identity", "chast-server-identity.key", "Ed25519 server identity seed; created on first run, empty for ephemeral")
 		tlsCert          = flag.String("tls-cert", "", "PEM certificate for the HTTP API; requires --tls-key")
 		tlsKey           = flag.String("tls-key", "", "PEM private key for the HTTP API; requires --tls-cert")
@@ -610,19 +611,32 @@ func run() error {
 		log.Info("software update publisher signature verified", "key_id", keyID)
 	}
 
-	reg, err := registry.NewPersistent(*offline, *stateFile)
+	var reg *registry.Registry
+	if *postgresDSN != "" {
+		reg, err = registry.NewPersistentPostgres(*offline, *postgresDSN)
+	} else {
+		reg, err = registry.NewPersistent(*offline, *stateFile)
+	}
 	if err != nil {
 		return err
 	}
 	defer reg.Close()
 	var accounts *account.Store
-	if *stateFile != "" {
+	switch {
+	case *postgresDSN != "":
+		accounts, err = account.OpenPostgres(*postgresDSN)
+		if err != nil {
+			return fmt.Errorf("accounts: %w", err)
+		}
+		defer accounts.Close()
+		log.Info("accounts and peer state stored in PostgreSQL")
+	case *stateFile != "":
 		accounts, err = account.Open(*stateFile)
 		if err != nil {
 			return fmt.Errorf("accounts: %w", err)
 		}
 		defer accounts.Close()
-	} else {
+	default:
 		log.Warn("persistent state disabled; viewer accounts and address books are unavailable")
 	}
 	var geoLocator *geoip.Locator

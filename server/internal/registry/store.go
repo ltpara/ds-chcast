@@ -67,6 +67,28 @@ func NewStore(path string) (*Store, error) {
 	return &Store{path: path, db: db}, nil
 }
 
+// NewStorePostgres opens the peer database in PostgreSQL. PostgreSQL support
+// starts at the current schema, so the baseline migration creates every table
+// and no SQLite upgrade helpers run.
+func NewStorePostgres(dsn string) (*Store, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, errors.New("registry PostgreSQL DSN is empty")
+	}
+	db, err := dbmetric.OpenPostgres("registry", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open state: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connect state: %w", err)
+	}
+	if _, err := schemamig.RunPostgres(db, "registry_schema_migrations", registryPostgresMigrations); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("state: %w", err)
+	}
+	return &Store{path: "postgres", db: db}, nil
+}
+
 // enableWAL retries while another instance is switching a fresh database to
 // WAL; SQLite returns SQLITE_BUSY for the mode change without invoking the
 // busy handler, so a simultaneous cold start needs an explicit wait.

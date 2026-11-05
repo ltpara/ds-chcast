@@ -98,7 +98,7 @@ func (s *Store) LoginOIDC(
 		 VALUES (?, ?, ?, ?, ?, ?, '')`,
 		id, username, hash, unixMillis(now), role, email,
 	); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueViolation(err) {
 			if strings.Contains(err.Error(), "email") {
 				return User{}, "", time.Time{}, "", time.Time{}, ErrEmailTaken
 			}

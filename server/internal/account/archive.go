@@ -56,7 +56,8 @@ func (s *Store) AdvanceArchiveCheckpoint(stream string, lastID int64) error {
 	if _, err := s.db.Exec(
 		`INSERT INTO archive_checkpoints (stream, last_id, updated_at) VALUES (?, ?, ?)
 		 ON CONFLICT(stream) DO UPDATE SET
-			last_id = MAX(archive_checkpoints.last_id, excluded.last_id),
+			last_id = CASE WHEN excluded.last_id > archive_checkpoints.last_id
+				THEN excluded.last_id ELSE archive_checkpoints.last_id END,
 			updated_at = excluded.updated_at`,
 		stream, lastID, unixMillis(s.now().UTC()),
 	); err != nil {

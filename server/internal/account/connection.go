@@ -258,21 +258,19 @@ func mergeConnectionDetail(existing, incoming string) string {
 }
 
 func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (ConnectionEvent, error) {
-	result, err := s.db.Exec(
+	var id int64
+	err := s.db.QueryRow(
 		`INSERT INTO connection_events
 			(user_id, username, peer_id, direction, client_ip, started_at, ended_at,
 			 success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 RETURNING id`,
 		userID, event.Username, event.PeerID, event.Direction, event.ClientIP,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
 		event.Detail, event.HostID, event.AuditRef, event.Source,
-	)
+	).Scan(&id)
 	if err != nil {
 		return ConnectionEvent{}, fmt.Errorf("account store %s: record connection: %w", s.path, err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return ConnectionEvent{}, fmt.Errorf("account store %s: record connection id: %w", s.path, err)
 	}
 	if _, err := s.db.Exec(
 		`DELETE FROM connection_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - ? FROM connection_events)`,

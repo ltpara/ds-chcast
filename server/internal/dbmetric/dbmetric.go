@@ -2,7 +2,9 @@
 // exports the numbers in Prometheus text format together with the pool's wait
 // statistics. The wait counters are the queue-depth signal for SQLite: while
 // the store is limited to one connection, every concurrent writer waits in
-// database/sql, and that queue is otherwise invisible.
+// database/sql, and that queue is otherwise invisible. For PostgreSQL the same
+// numbers show pool saturation, and the wrapper also rewrites SQLite-flavoured
+// SQL for the pgx driver.
 package dbmetric
 
 import (
@@ -99,6 +101,7 @@ type connector struct {
 	base     driver.Driver
 	dsn      string
 	registry *Registry
+	rewrite  func(string) string
 }
 
 func (c *connector) Connect(context.Context) (driver.Conn, error) {
@@ -106,7 +109,7 @@ func (c *connector) Connect(context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &conn{base: base, registry: c.registry}, nil
+	return &conn{base: base, registry: c.registry, rewrite: c.rewrite}, nil
 }
 
 func (c *connector) Driver() driver.Driver { return c.base }
@@ -114,15 +117,50 @@ func (c *connector) Driver() driver.Driver { return c.base }
 type conn struct {
 	base     driver.Conn
 	registry *Registry
+	rewrite  func(string) string
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
-	base, err := c.base.Prepare(query)
+	base, err := c.base.Prepare(c.statement(query))
 	if err != nil {
 		c.registry.observe(operation(query), 0, err)
 		return nil, err
 	}
 	return &stmt{base: base, registry: c.registry, op: operation(query)}, nil
+}
+
+// statement applies the dialect rewrite, if any, before the query reaches the
+// underlying driver.
+func (c *conn) statement(query string) string {
+	if c.rewrite == nil {
+		return query
+	}
+	return c.rewrite(query)
+}
+
+// ExecContext and QueryContext bypass database/sql's prepare-and-execute
+// fallback. pgx's stdlib driver keeps Conn.Prepare for compatibility but its
+// statements refuse Exec, so the direct paths are the supported ones.
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	execer, ok := c.base.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	start := time.Now()
+	result, err := execer.ExecContext(ctx, c.statement(query), args)
+	c.registry.observe(operation(query), time.Since(start), err)
+	return result, err
+}
+
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	queryer, ok := c.base.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	start := time.Now()
+	rows, err := queryer.QueryContext(ctx, c.statement(query), args)
+	c.registry.observe(operation(query), time.Since(start), err)
+	return rows, err
 }
 
 func (c *conn) Close() error { return c.base.Close() }

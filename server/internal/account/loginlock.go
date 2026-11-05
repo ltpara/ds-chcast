@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
@@ -85,8 +86,20 @@ func (s *Store) UpdateLoginLock(key string, update func(authlimit.Record, bool) 
 		return authlimit.Record{}, fmt.Errorf("account store %s: update login lock: %w", s.path, err)
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+	begin := "BEGIN IMMEDIATE"
+	if s.dialect == dialectPostgres {
+		begin = "BEGIN"
+	}
+	if _, err := conn.ExecContext(ctx, begin); err != nil {
 		return authlimit.Record{}, fmt.Errorf("account store %s: update login lock: %w", s.path, err)
+	}
+	if s.dialect == dialectPostgres {
+		// SQLite's IMMEDIATE lock has no read-committed equivalent; a
+		// transaction-scoped advisory lock serialises the same key.
+		if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_xact_lock(?)`, advisoryKey(key)); err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			return authlimit.Record{}, fmt.Errorf("account store %s: lock login key: %w", s.path, err)
+		}
 	}
 	committed := false
 	defer func() {
@@ -157,6 +170,12 @@ func (s *Store) ClearLoginLocks(username string) (int64, error) {
 		return 0, fmt.Errorf("account store %s: clear login locks: %w", s.path, err)
 	}
 	return cleared, nil
+}
+
+func advisoryKey(key string) int64 {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(key))
+	return int64(hash.Sum64())
 }
 
 func zeroMillis(t time.Time) int64 {
