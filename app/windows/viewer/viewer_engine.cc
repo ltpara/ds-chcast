@@ -570,10 +570,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         std::lock_guard<std::mutex> lock(camera_mutex_);
         pending_camera_.clear();
     }
-    // Microphone capture is a per-session privacy decision: every session
-    // starts with the uplink off, while the chosen device is remembered.
+    // Microphone capture and recording are per-session privacy decisions:
+    // every session starts with both off, while the chosen devices and
+    // directory are remembered.
     microphone_wanted_.store(false, std::memory_order_relaxed);
     voice_wanted_.store(false, std::memory_order_relaxed);
+    record_wanted_.store(false, std::memory_order_relaxed);
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
@@ -1544,6 +1546,15 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
     if (!running_.load(std::memory_order_acquire)) {
         return false;
     }
+    {
+        std::lock_guard<std::mutex> lock(terminal_mutex_);
+        // The previous console's bytes must be on the panel before its phase
+        // can mean anything for a new one. Checked before the phase moves so a
+        // rejected open cannot leave kRequesting behind and lock out retries.
+        if (!terminal_output_ended_) {
+            return false;
+        }
+    }
     uint8_t flags = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1576,11 +1587,6 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
         }
     }
     std::lock_guard<std::mutex> lock(terminal_mutex_);
-    // The previous console's bytes must be on the panel before its phase can
-    // mean anything for a new one.
-    if (!terminal_output_ended_) {
-        return false;
-    }
     // Leftovers from the previous console would be printed as if they
     // belonged to this one.
     terminal_output_.clear();

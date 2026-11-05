@@ -422,8 +422,17 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
     // The plugin copies the slot into the single texture it registered with
     // Flutter and marks that frame available. GPU work on one immediate
     // context is ordered, so the next pass over this slot cannot overwrite it
-    // before the copy has read it.
-    set_texture_(output, slot.texture.get());
+    // before the copy has read it. The call stays under mutex_ and re-reads
+    // output_: SetOutput(nullptr) is issued right before Dart unregisters the
+    // texture, so it must not return while a plugin call on the old output is
+    // still in flight, and a detach during the blit drops this frame instead.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (output_ == nullptr) {
+            return false;
+        }
+        set_texture_(output_, slot.texture.get());
+    }
     // The plugin flushes after its copy. Flush again so this event query is
     // submitted even on a plugin path that returns before copying.
     context_->End(slot_done_[slot_index].get());

@@ -435,10 +435,6 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         EnsureIdentity();
-        if (output > 0) {
-            texture_sink_->SetOutput(
-                reinterpret_cast<void*>(static_cast<intptr_t>(output)));
-        }
         if (!viewer_->Start(host, static_cast<uint16_t>(port),
                             static_cast<uint16_t>(display), std::move(fingerprint),
                             allow_unverified, std::move(access_token),
@@ -447,9 +443,15 @@ void ViewerBridge::HandleMethodCall(
                             static_cast<uint16_t>(carrier_port),
                             std::move(carrier_host_id), std::move(carrier_token),
                             file_transfer_only, session_mode)) {
-            texture_sink_->SetOutput(nullptr);
             result->Error("busy", "a session is already running");
             return;
+        }
+        // Attach only after the engine accepted the session: a rejected start
+        // must leave the running session's output untouched. The handshake
+        // takes longer than this call, so no frame is drawn before the attach.
+        if (output > 0) {
+            texture_sink_->SetOutput(
+                reinterpret_cast<void*>(static_cast<intptr_t>(output)));
         }
         result->Success(flutter::EncodableValue(true));
         return;
