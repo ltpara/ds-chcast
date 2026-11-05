@@ -371,7 +371,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 已实现（2026-11-05）：协议 v42 的 `TerminalRequest` 增加 persist/attach 标志与 `service_id`，主机进程级注册表保留最多 100 个服务，空闲 1 小时回收并回放 1 MiB 输出；`terminal_persist=` 默认关闭，详见同日小节 |
 | DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 已实现（2026-11-05）：查看器引擎维护规则表，每条规则独立 `forward_id`、本地监听端口、目标与计数，最多 8 条并行；面板列出规则并可逐条停止，详见同日小节 |
 | DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 已实现（2026-11-05）：服务端完成授权码 + PKCE 的 OIDC 登录（JWKS 验签、按 issuer 隔离的身份链接、可选自动建号），查看器用系统浏览器完成认证并轮询取回与密码登录相同的会话，详见同日小节 |
-| DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | `InputKind` 只有 Mouse/Key（`protocol.h:319`），触摸板/手写笔按鼠标模拟 |
+| DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | 已实现（2026-11-05）：协议 v43 的 `InputEvent` 增加 Touch/Pen，主机用 Windows 触摸注入与合成笔注入（不可用时降级为鼠标拖动），查看器映射多触点、压感、倾斜与橡皮/桶形键，详见同日小节 |
 | DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 只有 H.264/HEVC 的 NV12 4:2:0 硬件编码（`include/chast/encoder.h:42-44`）；受零拷贝约束，只能增加直接写 GPU 缓冲的硬件后端 |
 | DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 支持切换单个/全部显示器与多屏坐标映射（`frameToDesktop`），但没有按显示器开窗、跟随/光标缩放，也不能改主机显示分辨率（只有采集缩放百分比） |
 | DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 有 TLS TCP 共享载体，没有 WebSocket 选项，无法直接挂在仅支持 WS 的反代/CDN 后 |
@@ -591,6 +591,48 @@ service ID 一致性、Ok 携带服务 ID、错误结果禁止携带、HelloAck 
 边界：一个服务器只接一个 IdP；不实现 RP 发起的登出（会话仍由现有访问/
 刷新令牌与封禁控制）；自动建号默认开启但只接受已验证邮箱；OIDC 登录绕过
 本地 TOTP（强认证由 IdP 负责）；内存中的待处理登录在服务端重启后丢失。
+
+### DEV-22 触摸/笔输入（2026-11-05 完成）
+
+协议 v43 给 `InputEvent` 增加 Touch/Pen 两种输入，负载从 16 字节固定为
+24 字节（在 kind/action/buttons/x/y/hid_usage/modifiers 之后追加
+pressure/contact/flags/tilt_x/tilt_y）；旧的 16 字节事件一律拒绝，主机与
+查看器必须同版本。
+
+- **协议**（`include/chast/protocol.h`、`src/net/protocol.cc`）：
+  `InputKind::Touch=3`/`Pen=4`；`TouchEvent{action,contact,x,y,pressure}`、
+  `PenEvent{action,x,y,pressure,flags,tilt_x,tilt_y}`，动作共用
+  `TouchAction{Down,Move,Up,Cancel}`，触点上限 `kMaxTouchContacts=10`。
+  解析按 kind 校验：鼠标/键盘的扩展字段必须为零；触摸压力 0..1024、
+  contact<10；笔 flags≤0x07、压力≤1024、倾斜 -90..90；多余字节拒绝。
+- **主机注入**（`src/win/input.cc`）：`InitializeTouchInjection` 启用 10 点
+  触摸，每帧携带全部活动触点（未变化的触点保持 INCONTACT），Up 沿用最后
+  一次 Update 的坐标，取消发送 UP|CANCELED；合成笔用
+  `CreateSyntheticPointerDevice(PT_PEN)` + `InjectSyntheticPointerInput`
+  （Win10 1809+，运行时 GetProcAddress 加载，缺席不影响启动），坐标换算到
+  虚拟屏左上角，倾斜直接映射为 Windows 每轴角度，压力/倾斜仅在非零时置位
+  PEN_MASK，橡皮/翻转/桶形按钮映射 penFlags。注入不可用（旧系统、无触摸
+  设备）时首个触点降级为左键拖动，其余触点忽略；`release_all` 取消全部
+  触点与笔。注入仍支持 dry-run，测试不移动真实指针。
+- **查看器**（`app/lib/remote_pointer.dart`、`widgets/remote_view.dart`、
+  `pages/session_page.dart`、原生 `viewer_bridge.cc`）：触摸/手写笔指针
+  不再落入鼠标路径；`RemoteContactTracker` 按指针分配并回收稳定触点槽，
+  槽满时丢弃新触点；压力映射 0..1024（范围无效视为未上报），Flutter 的
+  tilt/orientation 换算为 Windows 每轴角度，invertedStylus 映射翻转+橡皮，
+  笔上主按钮映射桶形键；失去控制/焦点或重连时先逐触点 Cancel 再清空槽。
+  原生桥按 kind 校验动作、槽位、压力、倾斜与互斥字段。
+- **工具**：`tools/quic.cc` 的输入回放脚本加入双指触摸与带桶形键/倾斜的
+  笔划，`same_event` 与 `--dump-input` 覆盖新字段；`--input` 验证仍使用
+  dry-run 注入器。
+- **零拷贝**：仅新增输入控制面，采集、编码、解码与渲染路径未改动。
+
+验证：C++ Release 全量构建通过；`flutter analyze` 无问题；`flutter test`
+579 项通过（新增触点槽分配/回收、压力与倾斜映射、笔标志用例）；Windows
+release 构建成功。本机没有触摸屏/手写笔，且 Device Guard 阻止运行新生成
+的无签名二进制，真实触摸/笔手势需实机验收。
+
+边界：查看器只转发 Flutter 提供的 pointer 事件，不做手势识别；触摸 hover
+不转发；多个手写笔同时书写时只跟踪第一支，第二支按下会替换当前笔。
 
 ### DEV-20 多条端口转发规则并行（2026-11-05 完成）
 

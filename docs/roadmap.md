@@ -3079,6 +3079,22 @@
      574 项 `flutter test` 与 Windows release 构建通过（C++ 桥接为编译
      验证）。边界：单 IdP、不做 RP 发起的登出、OIDC 绕过本地 TOTP、真实
      IdP 与浏览器交互需实机验收；媒体链路未改动。
+134. **P2 · DEV-22 触摸/笔输入（2026-11-05 完成）**：协议 v43 给
+     `InputEvent` 增加 Touch/Pen，负载固定为 24 字节（新增
+     pressure/contact/flags/tilt_x/tilt_y），旧 16 字节事件拒绝。主机用
+     `InitializeTouchInjection` 注入最多 10 个触点（每帧携带全部活动触点，
+     Up 沿用最后 Update 坐标，取消用 UP|CANCELED），用运行时加载的
+     `CreateSyntheticPointerDevice(PT_PEN)`/`InjectSyntheticPointerInput`
+     注入合成笔（Win10 1809+），压力/倾斜按需置位 PEN_MASK，橡皮/翻转/
+     桶形键映射 penFlags；注入不可用时首个触点降级为左键拖动。查看器把
+     touch/stylus/invertedStylus 指针从鼠标路径分流，
+     `RemoteContactTracker` 分配并回收触点槽，压力归一化到 0..1024，
+     tilt/orientation 换算成 Windows 每轴角度，失焦或重连先 Cancel 再
+     清槽；原生桥按 kind 校验互斥字段。`tools/quic.cc` 回放脚本与
+     `--dump-input` 覆盖新事件。C++ Release 全量构建、`flutter analyze`、
+     579 项 `flutter test` 与 Windows release 构建通过（C++ 与注入路径为
+     编译验证）。边界：不做手势识别、不转发触摸 hover、只跟踪一支笔；
+     真实触摸屏/手写笔需实机验收；媒体链路未改动。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
