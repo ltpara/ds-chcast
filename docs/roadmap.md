@@ -3095,6 +3095,21 @@
      579 项 `flutter test` 与 Windows release 构建通过（C++ 与注入路径为
      编译验证）。边界：不做手势识别、不转发触摸 hover、只跟踪一支笔；
      真实触摸屏/手写笔需实机验收；媒体链路未改动。
+135. **P2 · DEV-24 多显示器跟随 / 远程分辨率（2026-11-05 完成）**：复核确认
+     远程分辨率（`ListDisplayModes`/`SetDisplayMode`）与光标随画面缩放此前
+     已具备；“按显示器独立开窗”在 RustDesk 1.5.1 只写配置、没有消费方，
+     不按多窗口架构实现。协议 v44 新增 `SetDisplayFollow(63)` /
+     `DisplayFollowState(64)`：1 字节掩码（bit0 光标、bit1 窗口）、结果码
+     （Ok/Failed/Unsupported）与 UTF-8 原因。主机每 200 ms 采样，窗口跟随
+     优先（前景窗口监视器与 DXGI 输出矩形按交集面积取最大），否则光标命中
+     输出矩形；目标稳定 400 ms、自动切换间隔 ≥1 s 且沿用既有 1 s 冷却后
+     调用 `switch_display`，重建与拒绝语义与手动切换一致。合并流回
+     Unsupported，未授权回 Failed，撤权时主机清除并主动通知。查看器显示器
+     菜单新增两个勾选项，开启后回到“服务端默认”，手动切换显示前自动关闭
+     跟随。`protocol_test` 新增 `test_display_follow`，`flutter test` 582 项
+     通过，`flutter analyze` 无问题，Windows release 构建通过。边界：单机
+     没有真实多屏，命中与去抖需双屏实机验收；媒体链路保持零拷贝，无 CPU
+     fallback。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

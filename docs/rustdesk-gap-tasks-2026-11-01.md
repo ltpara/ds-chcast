@@ -373,7 +373,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 已实现（2026-11-05）：服务端完成授权码 + PKCE 的 OIDC 登录（JWKS 验签、按 issuer 隔离的身份链接、可选自动建号），查看器用系统浏览器完成认证并轮询取回与密码登录相同的会话，详见同日小节 |
 | DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | 已实现（2026-11-05）：协议 v43 的 `InputEvent` 增加 Touch/Pen，主机用 Windows 触摸注入与合成笔注入（不可用时降级为鼠标拖动），查看器映射多触点、压感、倾斜与橡皮/桶形键，详见同日小节 |
 | DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 只有 H.264/HEVC 的 NV12 4:2:0 硬件编码（`include/chast/encoder.h:42-44`）；受零拷贝约束，只能增加直接写 GPU 缓冲的硬件后端 |
-| DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 支持切换单个/全部显示器与多屏坐标映射（`frameToDesktop`），但没有按显示器开窗、跟随/光标缩放，也不能改主机显示分辨率（只有采集缩放百分比） |
+| DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 已实现（2026-11-05）：协议 v44 的 `SetDisplayFollow/DisplayFollowState` 让主机跟随远程光标或前台窗口自动切换输出；远程分辨率与光标缩放此前已具备；RustDesk 1.5.1 的“按显示器独立开窗”只存配置、无消费方，暂不按多窗口架构实现，详见同日小节 |
 | DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 有 TLS TCP 共享载体，没有 WebSocket 选项，无法直接挂在仅支持 WS 的反代/CDN 后 |
 | DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 主机设置只在本机/服务端管理；无“会话结束后锁定主机”选项 |
 | DEV-27 | P3 | RDP 快捷方式与便携模式 | `flutter/lib/common/widgets/peer_card.dart:735-769`、`src/server/portable_service.rs` | 无 RDP 快捷入口（可手工用端口转发替代）；只有安装器，没有便携服务模式 |
@@ -831,6 +831,50 @@ Windows release 构建结果见 `docs/status-2026-10-25.md`。
 当前连接并由查看器重连；测试环境没有第二个已登录会话，WTS 枚举与真实
 会话交接待双机/多会话验收；媒体链路保持零拷贝，无 CPU fallback。
 DEV-14（Switch Sides）仍因需要反向角色交接暂缓。
+
+### DEV-24 多显示器跟随与远程分辨率（2026-11-05 完成）
+
+复核先把四项需求分开：修改主机显示分辨率与光标缩放此前已经具备——
+主机侧 `ListDisplayModes/SetDisplayMode` 枚举并切换 DXGI 输出模式，查看器
+分辨率菜单按流输出查询；光标由主机按 `_cursorScale = _viewScale × DPR`
+随画面缩放绘制，无需新增开关。“按显示器独立开窗”在 RustDesk 1.5.1 中
+`displays_as_individual_windows` 仅写入配置，没有消费方，产品面并未真正
+提供，因此本轮不引入多窗口架构，只补齐真实缺口：跟随远程光标与跟随远程
+前台窗口。
+
+协议从 v43 提升到 v44，在可靠控制流上新增 `SetDisplayFollow(63)` /
+`DisplayFollowState(64)`。请求负载为 1 字节掩码（bit0 光标、bit1 窗口，
+未知位拒绝）；状态负载为掩码、结果码（Ok/Failed/Unsupported）、u16 长度
+与 UTF-8 原因，结果码非 Ok 时掩码必须为 0，原因按字符边界截断到 256 字节。
+传输层要求输入权限（与切换显示一致），服务端角色接收请求、客户端角色接收
+状态。
+
+- **主机跟随**：会话线程每 200 ms 采样一次。窗口跟随优先于光标跟随：
+  `GetForegroundWindow` → `MonitorFromWindow` → 显示器工作区与 DXGI 输出
+  矩形按交集面积取最大；光标跟随用 `GetCursorPos` 命中输出矩形。目标必须
+  稳定 400 ms，距上次自动切换至少 1 s，并且仍受既有 1 s 切换冷却约束；
+  这些都通过后直接调用既有 `switch_display`，重建采集/编码、发布
+  `StreamInfo`、回 `DisplaySwitchResult` 的语义与手动切换完全一致。
+- **拒绝路径**：合并流已同时显示全部输出，开启跟随回 `Unsupported`；无
+  输入权限回 `Failed`；会话中途撤权时主机清除已生效掩码并主动发一条
+  `Failed`（“input control was disabled”），查看器据此熄灭勾选。单显示器
+  时主机仍接受请求但目标恒为当前输出，不产生切换。
+- **查看器**：`SetDisplayFollow(cursor, window)` 进入单槽“最新覆盖”队列，
+  状态新增 `displayFollowFlags/Code/Error/Results`。显示器菜单底部新增
+  “跟随远程光标 / 跟随远程窗口”两个勾选项；少于两块屏、无输入权限或合并
+  流时置灰。开启任一项会把本地选择切回“服务端默认”，让活动标记跟随
+  `streamedDisplayIndex`；手动选择显示器前先关闭跟随，避免主机下一轮又把
+  输出切走；拒绝原因以 SnackBar 呈现。
+
+验证：`protocol_test` 新增 `test_display_follow`（两向编解码往返、未知
+标志/未知结果码/尾随字节/超长原因拒绝、非 Ok 携带掩码拒绝、原因按字符
+边界截断）；`flutter test` 新增跟随状态解析用例与显示器菜单用例（勾选
+标记、点击回调、合并流置灰），全量 582 项通过；`flutter analyze` 无问题；
+Windows release 构建通过。
+
+边界：本机没有真实多显示器环境，光标/窗口命中所依赖的 DXGI 输出矩形与
+虚拟桌面坐标只做了编译与单元验证，需双屏真机验收切换与去抖效果；跟随只
+改变采集输出，媒体链路保持零拷贝，无 CPU fallback。
 
 ### 已核对但不算缺口的项
 
