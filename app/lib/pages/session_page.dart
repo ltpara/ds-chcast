@@ -192,6 +192,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   double _wheelY = 0;
   double _wheelX = 0;
   int _heldButtons = 0;
+  // Physical button -> host button at press time. Release must lift the same
+  // host button even if "swap left and right" is toggled while it is held.
+  final Map<int, int> _remoteButtons = <int, int>{};
   MouseMapping _mouse = const MouseMapping();
   final LinkedHashSet<int> _heldKeys = LinkedHashSet<int>();
   // Touch contacts on the host, keyed by the pointer that owns each slot.
@@ -3377,10 +3380,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ViewerMouse.forward,
     ]) {
       if (_heldButtons & bit != 0) {
-        _sendMouse(ViewerMouse.buttonUp, buttons: _mouse.buttons(bit));
+        _sendMouse(
+          ViewerMouse.buttonUp,
+          buttons: _remoteButtons[bit] ?? _mouse.buttons(bit),
+        );
       }
     }
     _heldButtons = 0;
+    _remoteButtons.clear();
     _cancelRemotePointers();
     // Even if an Up above was lost, or the host saw a press this page never
     // recorded, this lifts whatever it still holds.
@@ -4165,13 +4172,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   void _onPointerButton(Offset frame, int button, bool down) {
     if (down) {
       _heldButtons |= button;
+      final int remote = _mouse.buttons(button);
+      _remoteButtons[button] = remote;
+      _sendMouse(ViewerMouse.buttonDown, buttons: remote);
     } else {
       _heldButtons &= ~button;
+      final int remote = _remoteButtons.remove(button) ?? _mouse.buttons(button);
+      _sendMouse(ViewerMouse.buttonUp, buttons: remote);
     }
-    _sendMouse(
-      down ? ViewerMouse.buttonDown : ViewerMouse.buttonUp,
-      buttons: _mouse.buttons(button),
-    );
   }
 
   void _onPointerScroll(Offset frame, Offset delta) {
