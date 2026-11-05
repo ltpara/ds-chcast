@@ -99,8 +99,10 @@ private:
     std::shared_ptr<chast::DeviceIdentity> identity_;
     bool identity_loaded_ = false;
     // One Windows Hello prompt at a time: webauthn.dll would otherwise stack
-    // verification windows from concurrent Dart calls.
-    std::atomic<bool> security_key_busy_{false};
+    // verification windows from concurrent Dart calls. Shared with the worker
+    // so a prompt that outlives the bridge still clears the flag.
+    std::shared_ptr<std::atomic<bool>> security_key_busy_ =
+        std::make_shared<std::atomic<bool>>(false);
     bool fullscreen_ = false;
     LONG_PTR saved_style_ = 0;
     WINDOWPLACEMENT saved_placement_{};

@@ -67,6 +67,12 @@ public:
         return false;
     }
     virtual std::string error() const = 0;
+    // True when error() names a lost device rather than a frame the sink can
+    // retry. Only such sinks can be rebuilt by Reset().
+    virtual bool fatal() const { return false; }
+    // Drops and re-creates the device-backed pipeline. Returns false with
+    // error() set when the device cannot be initialized again.
+    virtual bool Reset() { return false; }
 };
 
 enum class ViewerState {
@@ -1276,6 +1282,8 @@ private:
         std::string destination;
         std::deque<std::string> directories;
         std::deque<std::pair<std::string, std::string>> files;
+        // Entries announced for the root being walked; caps the walk.
+        uint64_t walk_entries = 0;
         uint32_t listing_id = 0;
         std::string listing_path;
         uint32_t download_id = 0;

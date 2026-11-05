@@ -41,6 +41,15 @@ constexpr auto kMediaPoll = std::chrono::milliseconds(10);
 constexpr auto kFrameStall = std::chrono::seconds(20);
 constexpr auto kKeyframeRetry = std::chrono::seconds(1);
 constexpr auto kProbeInterval = std::chrono::seconds(1);
+// Matches GpuFrameSink's cap. Checking the announced size here fails the
+// session with a clear reason before a decoder and shared textures exist;
+// the sink repeats the check for every decoded frame.
+constexpr uint32_t kMaxFrameSide = 8192;
+constexpr uint64_t kMaxFramePixels = 7680ull * 4320ull;
+// Consecutive sink refusals tolerated before the display stream ends. One
+// mode change or TDR recovery can fail a handful of frames; a permanently
+// broken pipeline must not look like a frozen desktop forever.
+constexpr uint64_t kMaxSinkFailureStreak = 300;
 constexpr auto kClipboardPollInterval = std::chrono::milliseconds(500);
 // Virtual browse path that the host serves announced clipboard files from;
 // the digits after the prefix index the FileList the host sent.
@@ -809,11 +818,17 @@ constexpr size_t kMaxPendingBrowse = 8;
 // cap keeps a select-all over a huge share from turning into a multi-minute
 // queue the operator cannot see the end of.
 constexpr size_t kMaxBatchDownloadRoots = 512;
+// A host controls every listing, so the walk itself is bounded: a tree that
+// keeps answering with the maximum number of entries must not grow the
+// directory and file queues without limit.
+constexpr uint64_t kMaxFolderWalkEntries = 200000;
+constexpr size_t kMaxFolderWalkDepth = 64;
 
 }  // namespace
 
 bool ViewerEngine::RequestFileList(std::string directory) {
-    if (!running_.load(std::memory_order_acquire)) {
+    if (!running_.load(std::memory_order_acquire) ||
+        (!directory.empty() && !chast::valid_file_browser_path(directory))) {
         return false;
     }
     {
@@ -836,7 +851,8 @@ bool ViewerEngine::RequestFileList(std::string directory) {
 }
 
 bool ViewerEngine::RequestFileDownload(std::string path) {
-    if (!running_.load(std::memory_order_acquire) || path.empty()) {
+    if (!running_.load(std::memory_order_acquire) || path.empty() ||
+        !chast::valid_file_browser_path(path)) {
         return false;
     }
     {
@@ -2020,6 +2036,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     bool control_only = false;
     bool logged_frame = false;
     bool logged_drop = false;
+    // Frames the display sink refused since the last success, and how many
+    // times the sink device has been rebuilt in this session.
+    uint64_t sink_failures = 0;
+    int display_rebuilds = 0;
     uint64_t init_errors = 0;
     std::string failure;
     // Scratch buffer for native constructors that report through a string.
@@ -2785,16 +2805,22 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             std::unique_ptr<chast::IVideoDecoder> decoder;
             if (!control_only) {
                 decoder_config.codec = info.codec;
-                if (sink_ == nullptr || sink_->device() == nullptr) {
+                const bool picture_fits =
+                    info.width <= kMaxFrameSide && info.height <= kMaxFrameSide &&
+                    static_cast<uint64_t>(info.width) * info.height <= kMaxFramePixels;
+                if (!picture_fits) {
+                    fail("display: the host announced a picture larger than this viewer "
+                         "accepts");
+                } else if (sink_ == nullptr || sink_->device() == nullptr) {
                     fail("display: " +
                          (sink_ != nullptr ? sink_->error()
                                            : std::string("the frame sink is not available")));
+                } else {
+                    // Decode straight into a D3D11 texture and hand each
+                    // picture to the sink while the decoder still owns the
+                    // surface: the image never reaches system memory.
+                    decoder_config.d3d11_device = sink_->device();
                 }
-                // Decode straight into a D3D11 texture and hand each picture
-                // to the sink while the decoder still owns the surface: the
-                // image never reaches system memory.
-                decoder_config.d3d11_device =
-                    sink_ != nullptr ? sink_->device() : nullptr;
                 decoder_config.gpu_handler =
                     [&](const chast::GpuFrame& frame) -> chast::Error {
                     ++decoded;
@@ -2806,6 +2832,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                           frame.pts_ms)) {
                         ++published;
                         ++window_frames;
+                        sink_failures = 0;
                         if (!logged_frame) {
                             logged_frame = true;
                             std::fprintf(stderr, "viewer: first GPU frame %ux%u\n",
@@ -2817,17 +2844,39 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         return chast::Error(chast::Status::Unsupported,
                                             "display: the frame sink is not available");
                     }
-                    if (!sink_->error().empty()) {
+                    const std::string sink_error = sink_->error();
+                    if (sink_->fatal()) {
+                        return chast::Error(chast::Status::DeviceRemoved,
+                                            "display: " + sink_error);
+                    }
+                    if (sink_error.empty()) {
+                        // No Flutter texture is attached (for example while
+                        // the UI is tearing the page down); nothing was
+                        // rendered, so this is not a sink failure.
+                        if (!logged_drop) {
+                            logged_drop = true;
+                            std::fprintf(stderr,
+                                         "viewer: the display has no GPU output; dropping "
+                                         "frames\n");
+                        }
+                        return chast::Error::success();
+                    }
+                    // A transient driver failure (mode change, TDR recovery,
+                    // a stalled blit) drops this frame; the sink clears the
+                    // reason at the start of the next one.
+                    ++sink_failures;
+                    if (sink_failures >= kMaxSinkFailureStreak) {
+                        sink_failures = 0;
                         return chast::Error(chast::Status::CaptureFailed,
-                                            "display: " + sink_->error());
+                                            "display: " + sink_error);
                     }
                     if (!logged_drop) {
                         logged_drop = true;
                         std::fprintf(stderr,
-                                     "viewer: the display has no GPU output; dropping frames\n");
+                                     "viewer: the display sink dropped a frame (%s); "
+                                     "retrying\n",
+                                     sink_error.c_str());
                     }
-                    // The plugin texture is gone (for example while the UI is
-                    // tearing the page down); dropping keeps the decoder running.
                     return chast::Error::success();
                 };
                 decoder = decoder_config.d3d11_device != nullptr
@@ -4321,26 +4370,44 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         clipboard_files.next < clipboard_files.entries.size()) {
                         // CF_HDROP lists what the operator sees: a flat file
                         // by itself, a copied folder once for all of its files.
+                        // The folder comes from where the file actually landed
+                        // inside the staging root, not from the host's
+                        // rel_path; the spelling only decides flat vs. tree.
                         const std::string& rel =
                             clipboard_files.entries[clipboard_files.next].rel_path;
-                        const size_t slash = rel.find('/');
-                        if (slash == std::string::npos) {
+                        const std::filesystem::path staging =
+                            path_from_utf8(clipboard_files.directory);
+                        const std::filesystem::path relative =
+                            path_from_utf8(final_path).lexically_relative(staging);
+                        bool inside = !relative.empty();
+                        for (const std::filesystem::path& part : relative) {
+                            if (part == "..") {
+                                inside = false;
+                                break;
+                            }
+                        }
+                        if (!inside) {
+                            clip_files_fail(
+                                "the received file landed outside the clipboard staging "
+                                "folder");
+                        } else if (rel.find('/') == std::string::npos) {
                             clipboard_files.paths.push_back(final_path);
                         } else {
-                            const std::string top_path = utf8_from_path(
-                                path_from_utf8(clipboard_files.directory) /
-                                path_from_utf8(rel.substr(0, slash)));
+                            const std::string top_path =
+                                utf8_from_path(staging / *relative.begin());
                             if (std::find(clipboard_files.paths.begin(),
                                           clipboard_files.paths.end(),
                                           top_path) == clipboard_files.paths.end()) {
                                 clipboard_files.paths.push_back(top_path);
                             }
                         }
-                        ++clipboard_files.next;
-                        clipboard_files.stage = ClipboardFiles::Stage::kRequesting;
-                        clipboard_files.request_id = 0;
-                        clipboard_files.transfer_id = 0;
-                        clipboard_files.retry_after = Clock::now();
+                        if (clipboard_files.stage == ClipboardFiles::Stage::kReceiving) {
+                            ++clipboard_files.next;
+                            clipboard_files.stage = ClipboardFiles::Stage::kRequesting;
+                            clipboard_files.request_id = 0;
+                            clipboard_files.transfer_id = 0;
+                            clipboard_files.retry_after = Clock::now();
+                        }
                     }
                     ++files_received;
                     chast::Error sent =
@@ -4479,7 +4546,25 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         for (const chast::FileListEntry& entry : list.entries) {
                                             const std::string child =
                                                 listed + "/" + entry.name;
+                                            if (++folder_.walk_entries >
+                                                kMaxFolderWalkEntries) {
+                                                walk_error =
+                                                    "the folder has too many entries to "
+                                                    "download";
+                                                break;
+                                            }
                                             if (entry.directory) {
+                                                const size_t depth = static_cast<size_t>(
+                                                    std::count(child.begin(), child.end(), '/'));
+                                                const size_t root_depth = static_cast<size_t>(
+                                                    std::count(folder_.root.begin(),
+                                                               folder_.root.end(), '/'));
+                                                if (depth - root_depth > kMaxFolderWalkDepth) {
+                                                    walk_error =
+                                                        "the folder is nested too deeply to "
+                                                        "download";
+                                                    break;
+                                                }
                                                 folder_.directories.push_back(child);
                                             } else {
                                                 std::string local = folder_.name;
@@ -4675,6 +4760,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     walk.download_directory.clear();
                     walk.transfer_id = 0;
                     walk.current.clear();
+                    walk.walk_entries = 0;
                     walk.retry_after = now;
                     walk.transfer_deadline = now;
                     if (root.directory) {
@@ -6312,6 +6398,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 uint64_t camera_frames = 0;
                 uint64_t camera_gaps = 0;
                 uint64_t camera_decode_errors = 0;
+                uint64_t camera_sink_failures = 0;
                 uint64_t camera_next_seq = 0;
                 bool camera_seq_valid = false;
                 std::vector<chast::DecodedFrame> camera_decoded;
@@ -6337,6 +6424,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     camera_stopping = false;
                     camera_decoder.reset();
                     camera_seq_valid = false;
+                    camera_sink_failures = 0;
                     camera_decoded.clear();
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.camera_decoder.clear();
@@ -6561,6 +6649,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         frame.texture, frame.subresource, frame.width,
                                         frame.height, frame.crop_x, frame.crop_y,
                                         frame.pts_ms)) {
+                                    camera_sink_failures = 0;
                                     return chast::Error::success();
                                 }
                                 if (camera_sink_ == nullptr) {
@@ -6568,13 +6657,22 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         chast::Status::Unsupported,
                                         "camera: the frame sink is not available");
                                 }
-                                if (!camera_sink_->error().empty()) {
-                                    return chast::Error(
-                                        chast::Status::CaptureFailed,
-                                        "camera: " + camera_sink_->error());
+                                const std::string sink_error = camera_sink_->error();
+                                if (camera_sink_->fatal()) {
+                                    return chast::Error(chast::Status::DeviceRemoved,
+                                                        "camera: " + sink_error);
                                 }
-                                // No texture is attached yet; dropping keeps
-                                // the decoder running.
+                                if (sink_error.empty()) {
+                                    // No texture is attached yet; dropping
+                                    // keeps the decoder running.
+                                    return chast::Error::success();
+                                }
+                                ++camera_sink_failures;
+                                if (camera_sink_failures >= kMaxSinkFailureStreak) {
+                                    camera_sink_failures = 0;
+                                    return chast::Error(chast::Status::CaptureFailed,
+                                                        "camera: " + sink_error);
+                                }
                                 return chast::Error::success();
                             };
                             std::string decoder_error;
@@ -6613,12 +6711,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             header.keyframe, camera_decoded);
                         if (!decode_error.ok()) {
                             if (camera_sink_ != nullptr &&
-                                !camera_sink_->error().empty()) {
-                                const std::string sink_error = camera_sink_->error();
+                                decode_error.message().rfind("camera: ", 0) == 0) {
                                 session->request_camera_stop();
                                 reset_camera();
                                 set_camera_phase(CameraPhase::kFailed, 0, {},
-                                                 "display: " + sink_error);
+                                                 decode_error.message());
                                 break;
                             }
                             if (camera_decode_errors < 3) {
@@ -7085,6 +7182,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     bool applied = false;
                     while (session->take_stream_update(update)) {
                         applied = true;
+                        if (!update.control_only && !update.files_only &&
+                            (update.width > kMaxFrameSide ||
+                             update.height > kMaxFrameSide ||
+                             static_cast<uint64_t>(update.width) * update.height >
+                                 kMaxFramePixels)) {
+                            fail("display: the host announced a picture larger than this "
+                                 "viewer accepts");
+                            return false;
+                        }
                         const bool needs_decoder = update.codec != info.codec ||
                                                    update.width != info.width ||
                                                    update.height != info.height;
@@ -7434,8 +7540,45 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     chast::Error decode_error = decoder->decode(
                         payload.data(), payload.size(), header.pts_ms, header.keyframe, frames);
                     if (!decode_error.ok()) {
-                        if (sink_ != nullptr && !sink_->error().empty()) {
+                        const bool display_failure =
+                            sink_ != nullptr &&
+                            decode_error.message().rfind("display: ", 0) == 0;
+                        if (display_failure && sink_->fatal() && display_rebuilds < 1) {
+                            // A reset or removed adapter took the device under
+                            // the sink. Rebuild both the sink device and the
+                            // decoder once; the Flutter texture was registered
+                            // on Flutter's own device, so it survives.
+                            ++display_rebuilds;
+                            std::fprintf(stderr,
+                                         "viewer: display device lost (%s); rebuilding\n",
+                                         sink_->error().c_str());
+                            if (sink_->Reset()) {
+                                decoder.reset();
+                                decoder_config.d3d11_device = sink_->device();
+                                std::string rebuild_error;
+                                decoder =
+                                    chast::create_decoder(decoder_config, &rebuild_error);
+                                if (decoder) {
+                                    {
+                                        std::lock_guard<std::mutex> lock(mutex_);
+                                        status_.decoder = decoder->implementation();
+                                    }
+                                    std::fprintf(stderr, "viewer: decoder %s\n",
+                                                 decoder->implementation().c_str());
+                                    sync_status(false);
+                                    request_keyframe();
+                                    continue;
+                                }
+                                fail("display: the decoder could not be rebuilt after "
+                                     "the display device was lost: " +
+                                     rebuild_error);
+                                break;
+                            }
                             fail("display: " + sink_->error());
+                            break;
+                        }
+                        if (display_failure) {
+                            fail(decode_error.message());
                             break;
                         }
                         if (!decoder->initialized()) {

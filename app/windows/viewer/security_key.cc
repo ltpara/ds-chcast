@@ -177,6 +177,83 @@ std::string error_name(HRESULT result) {
     return utf8_from_wide(WebAuthNGetErrorName(result));
 }
 
+std::string ascii_lower(std::string text) {
+    for (char& raw : text) {
+        if (raw >= 'A' && raw <= 'Z') {
+            raw = static_cast<char>(raw - 'A' + 'a');
+        }
+    }
+    return text;
+}
+
+// Relying-party ids are host names; keeping the charset strict also stops a
+// caller from smuggling a scheme or port into what Windows Hello sees.
+bool valid_rp_id(const std::string& id) {
+    if (id.empty() || id.size() > 253 || id.front() == '.' || id.back() == '.') {
+        return false;
+    }
+    bool previous_dot = false;
+    for (const char raw : id) {
+        const auto value = static_cast<unsigned char>(raw);
+        if (value == '.') {
+            if (previous_dot) {
+                return false;
+            }
+            previous_dot = true;
+            continue;
+        }
+        previous_dot = false;
+        const bool alpha = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z');
+        const bool digit = value >= '0' && value <= '9';
+        if (!alpha && !digit && value != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The origin's host must be the relying party or one of its subdomains.
+// Dart derives the origin from the configured server; repeating the check
+// here keeps a compromised renderer from asking Windows Hello to sign client
+// data for another site.
+bool origin_matches_rp_id(const std::string& origin, const std::string& rp_id) {
+    constexpr char kScheme[] = "https://";
+    constexpr size_t kSchemeLength = sizeof(kScheme) - 1;
+    if (origin.size() <= kSchemeLength ||
+        ascii_lower(origin.substr(0, kSchemeLength)) != kScheme) {
+        return false;
+    }
+    const size_t end = origin.find_first_of(":/?#", kSchemeLength);
+    std::string host = origin.substr(
+        kSchemeLength,
+        end == std::string::npos ? std::string::npos : end - kSchemeLength);
+    if (host.empty() || host.find('@') != std::string::npos) {
+        return false;
+    }
+    host = ascii_lower(host);
+    const std::string id = ascii_lower(rp_id);
+    if (host == id) {
+        return true;
+    }
+    return host.size() > id.size() &&
+           host.compare(host.size() - id.size(), id.size(), id) == 0 &&
+           host[host.size() - id.size() - 1] == '.';
+}
+
+// clientDataJSON carries the challenge verbatim, and WebAuthn expects it in
+// base64url. Windows Hello would otherwise sign an arbitrary string.
+bool valid_challenge(const std::string& challenge) {
+    if (challenge.empty() || challenge.size() > 128) {
+        return false;
+    }
+    for (const char raw : challenge) {
+        if (base64_url_value(raw) < 0 && raw != '=') {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string failed_code(HRESULT result, const char* action, std::string* error) {
     const std::string name = error_name(result);
     std::string code = "failed";
@@ -280,7 +357,8 @@ SecurityKeyCredential MakeSecurityKeyCredential(HWND window, const SecurityKeyOp
     const std::wstring rp_id = wide_from_utf8(options.rp_id);
     const std::wstring username_wide = wide_from_utf8(username);
     const std::wstring display_wide = wide_from_utf8(display_name.empty() ? username : display_name);
-    if (rp_id.empty() || username_wide.empty() || display_wide.empty()) {
+    if (rp_id.empty() || !valid_rp_id(options.rp_id) || username_wide.empty() ||
+        display_wide.empty()) {
         *error_code = "bad_args";
         *error = "relying party id and user name must be valid UTF-8";
         return result;
@@ -288,6 +366,12 @@ SecurityKeyCredential MakeSecurityKeyCredential(HWND window, const SecurityKeyOp
 
     const std::string origin =
         options.origin.empty() ? "https://" + options.rp_id : options.origin;
+    if (!valid_challenge(options.challenge) ||
+        !origin_matches_rp_id(origin, options.rp_id)) {
+        *error_code = "bad_args";
+        *error = "the challenge or origin does not match the relying party";
+        return result;
+    }
     const std::string client_json = client_data_json("webauthn.create", options.challenge, origin);
     WEBAUTHN_CLIENT_DATA client{};
     make_client_data(client_json, &client);
@@ -374,7 +458,7 @@ SecurityKeyAssertion GetSecurityKeyAssertion(HWND window, const SecurityKeyOptio
         return result;
     }
     const std::wstring rp_id = wide_from_utf8(options.rp_id);
-    if (rp_id.empty()) {
+    if (rp_id.empty() || !valid_rp_id(options.rp_id)) {
         *error_code = "bad_args";
         *error = "relying party id must be a valid host name";
         return result;
@@ -382,6 +466,12 @@ SecurityKeyAssertion GetSecurityKeyAssertion(HWND window, const SecurityKeyOptio
 
     const std::string origin =
         options.origin.empty() ? "https://" + options.rp_id : options.origin;
+    if (!valid_challenge(options.challenge) ||
+        !origin_matches_rp_id(origin, options.rp_id)) {
+        *error_code = "bad_args";
+        *error = "the challenge or origin does not match the relying party";
+        return result;
+    }
     const std::string client_json = client_data_json("webauthn.get", options.challenge, origin);
     WEBAUTHN_CLIENT_DATA client{};
     make_client_data(client_json, &client);

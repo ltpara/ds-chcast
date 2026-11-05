@@ -44,14 +44,28 @@ constexpr char kAccountSecretEntropy[] = "chast.account.v1";
 constexpr size_t kMaxProtectPlaintext = 64 * 1024;
 constexpr size_t kMaxProtectedText = 128 * 1024;
 
-// A finished Windows Hello ceremony waiting for the platform thread.
+// A finished Windows Hello ceremony waiting for the platform thread. Both the
+// worker and the platform handler hold it through a shared_ptr, and `answered`
+// keeps a race between them (or with Shutdown) from replying twice.
 struct SecurityKeyCompletion {
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
     flutter::EncodableMap value;
     std::string error_code;
     std::string error;
     bool ok = false;
+    std::atomic<bool> answered{false};
 };
+
+void complete_security_key(const std::shared_ptr<SecurityKeyCompletion>& completion) {
+    if (completion == nullptr || completion->answered.exchange(true)) {
+        return;
+    }
+    if (completion->ok) {
+        completion->result->Success(flutter::EncodableValue(completion->value));
+    } else {
+        completion->result->Error(completion->error_code, completion->error);
+    }
+}
 
 const char* state_name(ViewerState state) {
     switch (state) {
@@ -255,6 +269,9 @@ void ViewerBridge::Shutdown() {
         return;
     }
     shutting_down_ = true;
+    // A prompt still open will find its completion message dropped and reset
+    // the flag itself; clearing it here covers the window already being gone.
+    security_key_busy_->store(false);
     SetKeyCapture(false);
     ClearCursor();
     if (view_ != nullptr) {
@@ -2009,16 +2026,20 @@ void ViewerBridge::StartSecurityKey(
     }
 
     bool idle = false;
-    if (!security_key_busy_.compare_exchange_strong(idle, true)) {
+    if (!security_key_busy_->compare_exchange_strong(idle, true)) {
         result->Error("busy", "another Windows Hello prompt is still open");
         return;
     }
 
-    auto* completion = new SecurityKeyCompletion();
+    auto completion = std::make_shared<SecurityKeyCompletion>();
     completion->result = std::move(result);
+    // The worker may outlive the bridge (a Hello prompt blocks until the user
+    // answers), so it holds the shared flag rather than a ViewerBridge pointer.
+    auto busy = security_key_busy_;
     const HWND window = window_;
-    std::thread([window, completion, make_credential, options = std::move(options),
-                 user_id = std::move(user_id), username = std::move(username),
+    std::thread([window, busy, completion, make_credential,
+                 options = std::move(options), user_id = std::move(user_id),
+                 username = std::move(username),
                  display_name = std::move(display_name)]() {
         const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         std::string error;
@@ -2057,10 +2078,16 @@ void ViewerBridge::StartSecurityKey(
         if (SUCCEEDED(com)) {
             CoUninitialize();
         }
+        // The handler owns the shared_ptr through a heap copy; a failed post
+        // means it will never run, so answer here and clear the flag instead
+        // of leaving the bridge permanently busy.
+        auto* posted = new std::shared_ptr<SecurityKeyCompletion>(completion);
         if (window == nullptr ||
             !PostMessageW(window, kSecurityKeyDoneMessage, 0,
-                          reinterpret_cast<LPARAM>(completion))) {
-            delete completion;
+                          reinterpret_cast<LPARAM>(posted))) {
+            delete posted;
+            busy->store(false);
+            complete_security_key(completion);
         }
     }).detach();
 }
@@ -2070,16 +2097,15 @@ LRESULT CALLBACK ViewerBridge::WindowSubclassProc(HWND window, UINT message, WPA
                                                   DWORD_PTR ref_data) {
     if (message == kSecurityKeyDoneMessage) {
         auto* bridge = reinterpret_cast<ViewerBridge*>(ref_data);
-        auto* completion = reinterpret_cast<SecurityKeyCompletion*>(lparam);
-        if (bridge != nullptr && completion != nullptr) {
-            bridge->security_key_busy_ = false;
-            if (completion->ok) {
-                completion->result->Success(flutter::EncodableValue(completion->value));
-            } else {
-                completion->result->Error(completion->error_code, completion->error);
+        auto* posted = reinterpret_cast<std::shared_ptr<SecurityKeyCompletion>*>(lparam);
+        if (posted != nullptr) {
+            const std::shared_ptr<SecurityKeyCompletion> completion = std::move(*posted);
+            delete posted;
+            if (bridge != nullptr) {
+                bridge->security_key_busy_->store(false);
             }
+            complete_security_key(completion);
         }
-        delete completion;
         return 0;
     }
     return DefSubclassProc(window, message, wparam, lparam);

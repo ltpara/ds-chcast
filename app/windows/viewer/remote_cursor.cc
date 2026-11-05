@@ -128,17 +128,18 @@ bool RemoteCursor::Register(uint64_t shape_id, int width, int height, int hotspo
 }
 
 void RemoteCursor::evict_locked() {
-    while (!order_.empty()) {
-        const uint64_t id = order_.front();
-        order_.pop_front();
-        const auto found = shapes_.find(id);
-        if (found == shapes_.end()) {
+    // Never free the sprite the OS is showing: cursor_override_ would stay
+    // set while cursor() returned nullptr, leaving the window without a
+    // pointer. The cache may briefly hold one extra shape instead.
+    for (auto it = order_.begin(); it != order_.end(); ++it) {
+        const uint64_t id = *it;
+        if (id == active_shape_) {
             continue;
         }
-        if (id == active_shape_) {
-            // The sprite the OS is showing is about to be freed; drop the
-            // override rather than leave the cursor pointing at a dead handle.
-            Deactivate();
+        order_.erase(it);
+        const auto found = shapes_.find(id);
+        if (found == shapes_.end()) {
+            return;
         }
         release_shape(found->second);
         shapes_.erase(found);

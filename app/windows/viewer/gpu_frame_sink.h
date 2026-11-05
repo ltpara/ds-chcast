@@ -38,6 +38,15 @@ public:
 
     bool ready() const noexcept { return ready_; }
     ID3D11Device* device() override;
+    // True once an error named the device itself (removed or reset). Frames
+    // cannot be recovered on that device; the session rebuilds the decoder
+    // after Reset().
+    bool fatal() const;
+    // Re-creates the D3D11 device and drops the video processor pipeline so
+    // the next frame builds fresh textures. Only safe on the session thread,
+    // where no frame is in flight. The Flutter texture registered with the
+    // plugin belongs to Flutter, not to this device, so it survives.
+    bool Reset();
     bool OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint32_t width,
                     uint32_t height, uint32_t crop_x, uint32_t crop_y,
                     uint64_t pts_ms) override;
@@ -64,7 +73,9 @@ private:
                 uint32_t height, uint32_t crop_x, uint32_t crop_y);
     bool wait_for_gpu();
     bool wait_for_query(ID3D11Query* query);
-    void set_error(std::string message);
+    void drop_pipeline();
+    void clear_transient_error();
+    void set_error(std::string message, bool device_gone = false);
 
     chast::ComPtr<ID3D11Device> device_;
     chast::ComPtr<ID3D11DeviceContext> context_;
@@ -104,6 +115,7 @@ private:
     bool pipeline_ready_ = false;
 
     bool ready_ = false;
+    bool error_fatal_ = false;
     std::string error_;
 };
 

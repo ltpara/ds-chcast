@@ -19,6 +19,16 @@ constexpr UINT kNominalRate = 60;
 
 constexpr wchar_t kPluginDll[] = L"flutter_gpu_texture_renderer_plugin.dll";
 
+// A remote desktop picture never legitimately needs more than 8K. The cap
+// keeps a hostile or broken host from sizing three shared slots and the
+// readback into multiple GiB, and keeps every RECT below LONG_MAX.
+constexpr uint32_t kMaxFrameSide = 8192;
+constexpr uint64_t kMaxFramePixels = 7680ull * 4320ull;
+
+bool device_lost(HRESULT hr) {
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
+}
+
 std::string fail_hr(const char* what, HRESULT hr) {
     char buffer[160];
     std::snprintf(buffer, sizeof(buffer), "%s failed (0x%08lx)", what,
@@ -76,7 +86,11 @@ bool GpuFrameSink::init_device() {
                                          reinterpret_cast<void**>(factory.put())))) {
             for (UINT index = 0;; ++index) {
                 IDXGIAdapter1* candidate = nullptr;
-                if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) {
+                const HRESULT enumerated = factory->EnumAdapters1(index, &candidate);
+                if (enumerated == DXGI_ERROR_NOT_FOUND) {
+                    break;
+                }
+                if (FAILED(enumerated) || candidate == nullptr) {
                     break;
                 }
                 DXGI_ADAPTER_DESC1 desc{};
@@ -117,7 +131,8 @@ bool GpuFrameSink::init_device() {
     }
     if (FAILED(hr) || !device_ || !context_) {
         set_error(adapter ? "D3D11 device creation on Flutter's adapter failed"
-                          : "D3D11 device creation failed");
+                          : "D3D11 device creation failed",
+                  device_lost(hr));
         return false;
     }
 
@@ -141,13 +156,13 @@ bool GpuFrameSink::init_device() {
     query_desc.Query = D3D11_QUERY_EVENT;
     hr = device_->CreateQuery(&query_desc, frame_done_.put());
     if (FAILED(hr)) {
-        set_error("D3D11 event query creation failed");
+        set_error("D3D11 event query creation failed", device_lost(hr));
         return false;
     }
     for (chast::ComPtr<ID3D11Query>& query : slot_done_) {
         hr = device_->CreateQuery(&query_desc, query.put());
         if (FAILED(hr)) {
-            set_error("D3D11 slot event query creation failed");
+            set_error("D3D11 slot event query creation failed", device_lost(hr));
             return false;
         }
     }
@@ -166,6 +181,59 @@ ID3D11Device* GpuFrameSink::device() {
 std::string GpuFrameSink::error() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return error_;
+}
+
+bool GpuFrameSink::fatal() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return error_fatal_;
+}
+
+void GpuFrameSink::clear_transient_error() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!error_fatal_) {
+        error_.clear();
+    }
+}
+
+void GpuFrameSink::drop_pipeline() {
+    slots_ = {};
+    slot_done_pending_ = {};
+    next_slot_ = 0;
+    last_slot_ = 0;
+    last_slot_valid_ = false;
+    readback_.reset();
+    enumerator_.reset();
+    processor_.reset();
+    pipeline_input_width_ = 0;
+    pipeline_input_height_ = 0;
+    pipeline_width_ = 0;
+    pipeline_height_ = 0;
+    pipeline_ready_ = false;
+}
+
+bool GpuFrameSink::Reset() {
+    drop_pipeline();
+    frame_done_.reset();
+    video_context1_.reset();
+    video_context_.reset();
+    video_device_.reset();
+    context_.reset();
+    device_.reset();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error_.clear();
+        error_fatal_ = false;
+    }
+    ready_ = init_device();
+    if (!ready_) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (error_.empty()) {
+            error_ = "the display GPU could not be re-initialized";
+        }
+        error_fatal_ = true;
+        return false;
+    }
+    return true;
 }
 
 bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t width,
@@ -205,7 +273,7 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
     chast::ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
     HRESULT hr = video_device_->CreateVideoProcessorEnumerator(&content, enumerator.put());
     if (FAILED(hr) || !enumerator) {
-        set_error(fail_hr("CreateVideoProcessorEnumerator", hr));
+        set_error(fail_hr("CreateVideoProcessorEnumerator", hr), device_lost(hr));
         return false;
     }
 
@@ -223,7 +291,7 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
     chast::ComPtr<ID3D11VideoProcessor> processor;
     hr = video_device_->CreateVideoProcessor(enumerator.get(), 0, processor.put());
     if (FAILED(hr) || !processor) {
-        set_error(fail_hr("CreateVideoProcessor", hr));
+        set_error(fail_hr("CreateVideoProcessor", hr), device_lost(hr));
         return false;
     }
 
@@ -264,7 +332,7 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
         texture_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
         hr = device_->CreateTexture2D(&texture_desc, nullptr, slot.texture.put());
         if (FAILED(hr) || !slot.texture) {
-            set_error(fail_hr("CreateTexture2D(display)", hr));
+            set_error(fail_hr("CreateTexture2D(display)", hr), device_lost(hr));
             return false;
         }
 
@@ -274,7 +342,7 @@ bool GpuFrameSink::ensure_pipeline(const D3D11_TEXTURE2D_DESC& input, uint32_t w
         hr = video_device_->CreateVideoProcessorOutputView(
             slot.texture.get(), enumerator.get(), &view_desc, slot.output_view.put());
         if (FAILED(hr) || !slot.output_view) {
-            set_error(fail_hr("CreateVideoProcessorOutputView", hr));
+            set_error(fail_hr("CreateVideoProcessorOutputView", hr), device_lost(hr));
             return false;
         }
     }
@@ -305,7 +373,7 @@ bool GpuFrameSink::render(Slot& slot, ID3D11Texture2D* nv12, uint32_t subresourc
     HRESULT hr = video_device_->CreateVideoProcessorInputView(
         nv12, enumerator_.get(), &view_desc, input_view.put());
     if (FAILED(hr) || !input_view) {
-        set_error(fail_hr("CreateVideoProcessorInputView", hr));
+        set_error(fail_hr("CreateVideoProcessorInputView", hr), device_lost(hr));
         return false;
     }
 
@@ -328,7 +396,7 @@ bool GpuFrameSink::render(Slot& slot, ID3D11Texture2D* nv12, uint32_t subresourc
     hr = video_context_->VideoProcessorBlt(processor_.get(), slot.output_view.get(), 0, 1,
                                            &stream);
     if (FAILED(hr)) {
-        set_error(fail_hr("VideoProcessorBlt", hr));
+        set_error(fail_hr("VideoProcessorBlt", hr), device_lost(hr));
         return false;
     }
     // The plugin copies this slot on the same immediate context, so its copy
@@ -356,7 +424,7 @@ bool GpuFrameSink::wait_for_query(ID3D11Query* query) {
             return true;
         }
         if (hr != S_FALSE) {
-            set_error(fail_hr("GetData(frame done)", hr));
+            set_error(fail_hr("GetData(frame done)", hr), device_lost(hr));
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -379,8 +447,21 @@ bool GpuFrameSink::OnGpuFrame(ID3D11Texture2D* nv12, uint32_t subresource, uint3
     if (!ready_ || nv12 == nullptr || width == 0 || height == 0) {
         return false;
     }
+    // Each frame starts a new error generation so a transient failure does
+    // not stick after the driver recovers. Device-lost errors stay.
+    clear_transient_error();
+    if (width > kMaxFrameSide || height > kMaxFrameSide ||
+        static_cast<uint64_t>(width) * height > kMaxFramePixels) {
+        set_error("the remote picture is larger than this viewer accepts");
+        return false;
+    }
     D3D11_TEXTURE2D_DESC desc{};
     nv12->GetDesc(&desc);
+    if (desc.Width > kMaxFrameSide || desc.Height > kMaxFrameSide ||
+        static_cast<uint64_t>(desc.Width) * desc.Height > kMaxFramePixels) {
+        set_error("the decoder surface is larger than this viewer accepts");
+        return false;
+    }
     if (desc.Format != DXGI_FORMAT_NV12) {
         set_error("the decoder surface is not NV12");
         return false;
@@ -455,6 +536,7 @@ bool GpuFrameSink::CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width,
     if (!ready_ || !device_ || !context_) {
         return fail("the display sink is not ready");
     }
+    clear_transient_error();
     if (!last_slot_valid_ || !slots_[last_slot_].texture) {
         return fail("no remote picture has been rendered yet");
     }
@@ -509,9 +591,14 @@ bool GpuFrameSink::CaptureBgra(std::vector<uint8_t>& bgra, uint32_t& width,
     return true;
 }
 
-void GpuFrameSink::set_error(std::string message) {
+void GpuFrameSink::set_error(std::string message, bool device_gone) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (error_.empty()) {
+    if (device_gone) {
+        // A device-lost reason is the one that matters even if a transient
+        // failure was recorded first.
+        error_ = std::move(message);
+        error_fatal_ = true;
+    } else if (error_.empty()) {
         error_ = std::move(message);
     }
 }
