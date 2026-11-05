@@ -3357,6 +3357,28 @@
      `LocalSystem` 服务，便携形态按 DEV-27 不做共享内存回传，远程触发
      UAC 还会新增提权通道并要求传输主机凭据。验证：`flutter analyze`、
      `flutter test` 全量 603 项、Windows release 构建均通过。
+154. **工程化收尾：协议 fuzz、JSONL 服务日志、依赖扫描（2026-11-06 完成）**：
+     新增 `tests/protocol_fuzz_test.cc`，对 69 个解析入口（全部控制消息
+     `parse_*`、`decode_frame_header`/`decode_audio_header` 及
+     `ControlParser`/`FrameParser`/`AudioParser` 重组器）以合法 maker
+     输出为种子做确定性变异（xorshift64star，截断/翻转/置位/删除/插入/
+     复制/随机尾），并固定覆盖 0～1 MiB 的边界长度；MSVC 无 libFuzzer
+     运行时，故用可复现的变异循环替代覆盖率引导，失败只打印目标名。
+     CTest `protocol_fuzz` 通过（0.38 s）。服务与工作进程日志改为 JSONL：
+     每行 `{"ts":"…Z","event":"…","fields":{…}}`，UTC 毫秒时间戳，值统一
+     为字符串，控制字符/引号转义、非法 UTF-8 替换为 U+FFFD，5 MiB 轮转
+     到 `.old`，加锁追加；`service.cc`/`worker.cc` 的生命周期、会话切换、
+     隧道与设置事件全部改为带字段的事件名，自由文本经 `log_line` 记为
+     `event=message` 的 `text` 字段。新增 `service_log` 测试（31 项断言）
+     覆盖形状、时间戳、转义、UTF-8、轮转与 8 线程并发追加。依赖侧：
+     `go.mod` 固定 `toolchain go1.27.3`，升级 pgx 5.9.2、x/net 0.62.0、
+     x/crypto 修复版与 x/text 0.43.0，`govulncheck ./...` 从 15 条可达
+     漏洞降为 0（模块级也为 0）；新增 `.github/dependabot.yml`
+     （gomod/pub/github-actions 周更）与 `security` 工作流（go vet/test/
+     govulncheck、flutter analyze/test）。验证：全量 Release 构建通过，
+     串行 `ctest` 47/47（654.19 s），`flutter analyze` 无问题、
+     `flutter test` 603 项、Windows release 构建通过；边界：C++ 依赖
+     （vcpkg/oneVPL/FFmpeg）仍由人工跟进版本，Dependabot 不覆盖。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
