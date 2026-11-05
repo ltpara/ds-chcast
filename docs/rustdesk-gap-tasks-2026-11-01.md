@@ -304,14 +304,50 @@ P2 = 平台扩展。
   `server/internal/webadmin/assets/app.js`、
   `server/internal/webadmin/assets/style.css`。
 
-### DEV-05 连接审计 GeoIP 与路由关联（P1）
+### DEV-05 连接审计 GeoIP 与路由关联（P1，2026-11-05 完成）
 
 - 目标：连接与文件传输审计带登录地点/路由，且能按 `audit_ref` 关联。
-- 实施：复用 `internal/geoip` 为连接审计补地点；记录 punch/relay
-  路由；查看器文件传输由轮询聚合改为逐文件/逐批可核对。
-- 验收：审计查询能显示地点与路由；同一会话的连接/文件记录可关联；
-  未配置 GeoIP 时只记录 IP。
-- 测试：GeoIP 单测、审计合并单测与回环。
+- 实施：SQLite 迁移到 v8（PostgreSQL 基线同步），`connection_events` 与
+  `file_events` 增加 `location`/`route` 列。账号连接接口复用
+  `s.clientLocation(ip)` 写入登录地点，文件传输接口按来源地址同样写入；
+  `RecordConnection` 接受路由并使用 `direct`/`punch`/`relay`/`carrier`
+  白名单，未知值存空；按 `audit_ref` 合并主机与查看器记录时保留任一侧的
+  非空地点与路由。未配置 `--geoip-file` 时地点为空，只记录 IP。新增
+  `POST /v1/account/file-transfers/batch`：一次 1..200 个文件、每文件一行
+  （`files=1`），整批共享 `peer_id`、`audit_ref`、`route` 与来源地点，任
+  一条非法则整批拒绝；旧单条接口保留给主机审计。运营者审计、CSV 导出与
+  Web 管理台显示地点、路由与截断的关联引用。
+  查看器原生会话线程把所有普通上传/下载结果（成功、失败、取消、拒绝、
+  会话结束）逐文件排入 `CompletedFile` 队列，剪贴板暂存不计（与主机
+  `audit_upload` 跳过剪贴板一致）；bridge 新增 `takeCompletedFiles`，Dart
+  在每轮状态轮询后与会话停止/重连时取走队列，按 200 条分批上报。连接与
+  文件记录使用同一路由：不经过连接服务为 `direct`，服务端协助直连
+  （agent 的 `direct`）为 `punch`，中继与共享承载照实记录；路径未定前
+  不猜路由。
+- 验收：审计查询显示地点、路由与关联列；同一会话的连接与文件记录共享
+  `audit_ref`；未配置 GeoIP 时只记录 IP。回环（隔离 `state.db`，
+  `127.0.0.0/8 → Local lab`，真实 `chast-server` + 查看器
+  `account_sync_smoke.dart`）：探针全过；`GET /v1/account/connections`
+  返回 `location=Local lab, route=punch, audit_ref=abcd1234`，同一引用的
+  两条文件记录均 `files=1`、`direction=download`，地点与路由相同。
+- 测试：`internal/geoip` 覆盖最长前缀/BOM/IPv4-mapped/坏行；
+  `internal/account` 覆盖连接地点/路由合并、未知路由、文件批量逐行落库
+  与整批校验/上限、迁移 v8；`internal/api` 新增 `audit_route_test.go`
+  覆盖连接与批量的地点/路由/关联、未知路由降级、无 GeoIP 只记 IP；
+  Web 管理台新增的三列由既有静态资源随服务端下发（无浏览器断言）；Flutter
+  `server_api_test.dart` 覆盖连接 `route` 字段、批量 `items` 形状与空批
+  不请求；`go vet ./...`、`go test ./... -count=1`、`flutter analyze` 与
+  `flutter build windows --release` 通过。
+- 文件：`server/internal/account/connection.go`、
+  `server/internal/account/file.go`、`server/internal/account/migrate.go`、
+  `server/internal/account/migrate_postgres.go`、
+  `server/internal/api/connection.go`、`server/internal/api/file.go`、
+  `server/internal/api/export.go`、`server/internal/api/api.go`、
+  `server/internal/webadmin/assets/app.js`、
+  `app/lib/server_api.dart`、`app/lib/pages/session_page.dart`、
+  `app/lib/viewer_bridge.dart`、`app/windows/viewer/viewer_engine.h`、
+  `app/windows/viewer/viewer_engine.cc`、
+  `app/windows/viewer/viewer_bridge.cc`、`app/tool/account_sync_smoke.dart`。
 
 ### DEV-06 归档集中去重与迟到合并（P1）
 

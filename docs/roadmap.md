@@ -3308,6 +3308,25 @@
      `group device quota reached: limit 1`；`internal/api` 与
      `internal/webadmin` 全通过，`internal/account` 测试二进制本轮再次被
      Application Control 拦截（存储代码此后未改动）。
+151. **P1 · DEV-05 连接审计地点与路由关联（2026-11-05 完成）**：
+     账号库迁移到 v8（PostgreSQL 基线同步），`connection_events` 与
+     `file_events` 增加 `location`/`route`；连接接口按 `--geoip-file` 写
+     登录地点，路由白名单 `direct/punch/relay/carrier`，未知值存空，按
+     `audit_ref` 合并时保留任一侧的非空地点与路由。新增
+     `POST /v1/account/file-transfers/batch`（1..200 文件、每文件一行、
+     任一条非法则整批拒绝）承载查看器逐文件审计，旧单条接口保留给主机；
+     运营者审计、CSV 导出与 Web 管理台显示地点、路由与关联引用。查看器
+     原生会话线程把普通上传/下载结果（成功/失败/取消/拒绝/会话结束）
+     逐文件入队，剪贴板暂存不计；bridge 的 `takeCompletedFiles` 由 Dart
+     每轮轮询与会话停止/重连后取走，按 200 条分批上报，连接与文件共用
+     `audit_ref` 和路由（本地直连 `direct`、服务端协助直连 `punch`、
+     `relay`/`carrier` 照实，路径未定前不猜）。验证：`go vet ./...`、
+     `go test ./... -count=1`、Flutter `analyze`、`server_api_test.dart` 与
+     `flutter build windows --release` 通过；隔离 `state.db` +
+     `127.0.0.0/8 → Local lab` 的真实服务端回环中，
+     `account_sync_smoke.dart` 全过，连接与两条文件记录共享
+     `audit_ref=abcd1234`、地点 `Local lab`、路由 `punch`；未配置 GeoIP
+     的接口测试确认只记录 IP。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
