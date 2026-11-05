@@ -3054,6 +3054,17 @@
      全量 C++ 构建、`flutter analyze`、562 项 `flutter test` 与 Windows
      release 构建通过（C++ 为编译验证）。边界：断线重连与空闲回收需
      双机验收；关闭开关不追溯已分离服务；媒体链路未改动。
+132. **P2 · DEV-20 多条端口转发规则并行（2026-11-05 完成）**：协议保持
+     v42，主机早已按 `forward_id` 支持 8 条目标；本轮把查看器从单目标
+     改为规则表：`StartPortForward` 返回规则 ID，每条规则独立
+     `PortForwardClient`/`forward_id`/监听端口/目标/计数，命令队列保持
+     start/stop 顺序，绑定失败或超限保留带错误的规则，撤权时全部停止。
+     `ViewerStatus.portForwardRules` 替换原单目标字段，`stopPortForward`
+     带 `ruleId`；对话框与独立会话卡片改为规则列表（逐条停止、添加规则），
+     工具栏在任一规则生效时高亮。全量 C++ 构建、`flutter analyze`、565 项
+     `flutter test` 与 Windows release 构建通过（C++ 为编译验证）。边界：
+     真实 TCP 目标需双机验收；规则随会话结束销毁，不跨重连保留；媒体
+     链路未改动。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

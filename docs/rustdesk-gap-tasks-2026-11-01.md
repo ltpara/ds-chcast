@@ -369,7 +369,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
 | DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | 已实现（2026-11-05）：协议 v41 的 `SessionMode` 增加 Terminal/Camera/PortForward 与 `kServerInfoControlOnly`；主机为控制型会话单独派发 relay，不建立采集/编码；查看器对端菜单可直接发起三种独立会话，详见同日小节 |
 | DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 已实现（2026-11-05）：协议 v42 的 `TerminalRequest` 增加 persist/attach 标志与 `service_id`，主机进程级注册表保留最多 100 个服务，空闲 1 小时回收并回放 1 MiB 输出；`terminal_persist=` 默认关闭，详见同日小节 |
-| DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 协议支持多个 `forward_id`（上限 8），但查看器只管理一个活动目标（`app/lib/pages/session_page.dart:1602-1755`） |
+| DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 已实现（2026-11-05）：查看器引擎维护规则表，每条规则独立 `forward_id`、本地监听端口、目标与计数，最多 8 条并行；面板列出规则并可逐条停止，详见同日小节 |
 | DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 账号体系有密码/TOTP/短信/邮件/WebAuthn，没有 OIDC 联邦登录 |
 | DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | `InputKind` 只有 Mouse/Key（`protocol.h:319`），触摸板/手写笔按鼠标模拟 |
 | DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 只有 H.264/HEVC 的 NV12 4:2:0 硬件编码（`include/chast/encoder.h:42-44`）；受零拷贝约束，只能增加直接写 GPU 缓冲的硬件后端 |
@@ -542,6 +542,37 @@ service ID 一致性、Ok 携带服务 ID、错误结果禁止携带、HelloAck 
 
 边界：持久控制台的断线重连与空闲回收需双机验收；关闭 `terminal_persist`
 不追溯已分离的服务；持久 shell 以主机账户继续运行，默认不开启。
+
+### DEV-20 多条端口转发规则并行（2026-11-05 完成）
+
+协议保持 v42：`PortForwardRequest/Result/Stop` 与 CPFW 流头一直按
+`forward_id` 多路复用，主机侧 `kMaxPortForwardTargets=8` 也按目标表实现；
+缺口只在查看器一次只维护一个活动目标。
+
+- **查看器引擎**：`StartPortForward` 每次分配单调规则 ID 并返回（0 表示未
+  入队），命令队列保持 start/stop 顺序；会话线程维护规则表，每条规则一个
+  `PortForwardClient`、独立 `forward_id`、本地监听端口、目标与连接/失败/
+  收发计数。规则按 `pump()` 驱动，最多 8 条并行；超出上限或绑定失败时保留
+  一条带错误的规则供操作者查看和移除。主机撤权时一次性停止全部规则并在
+  每条上写明原因。所有规则随会话结束销毁，监听端口不跨重连保留。
+- **协议客户端**：`PortForwardClient::start` 接受显式 `forward_id`（拒绝 0），
+  并暴露 `forward_id()`；命令行端口转发探针固定使用 1。
+- **桥与界面**：`ViewerStatus` 用 `portForwardRules` 列表替代原单目标字段，
+  `startPortForward` 返回规则 ID，`stopPortForward` 需要 `ruleId`。端口
+  转发对话框改为规则管理面板：列出每条规则的 `127.0.0.1:本地 → 目标`、
+  状态与计数，可逐条停止，并在下方添加新规则；独立端口转发会话的状态卡片
+  同样列出规则并提供“添加规则”；工具栏的端口转发按钮在任一规则生效时
+  高亮。
+- **零拷贝**：只改变查看器侧的规则管理与控制面，媒体链路未改动。
+
+验证：全量 C++ Release 构建成功（`PortForwardClient` 签名变更同步到 CLI
+探针）。本机 Device Guard 阻止运行新生成的无签名二进制，C++ 侧为编译验证。
+`flutter analyze` 无问题；`flutter test` 565 项通过（新增规则列表解析用例）；
+Windows release 构建成功。
+
+边界：真实 TCP 目标与多规则并发需双机验收；规则属于当前会话，断线重连后
+需重新添加（与终端持久化不同）；同一目标可以出现在多条规则中，由操作者
+自行避免重复。
 
 ### DEV-18 独立终端 / 摄像头 / TCP 隧道会话（2026-11-05 完成）
 
