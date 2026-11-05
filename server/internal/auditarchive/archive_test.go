@@ -73,11 +73,13 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 		}
 	}
 	if _, err := store.RecordConnection(alice.ID, "alice", "devbox", "viewer",
-		"198.51.100.4", "", start, start.Add(90*time.Second), true, "viewer side"); err != nil {
+		"198.51.100.4", "Testland", "punch", "",
+		start, start.Add(90*time.Second), true, "viewer side"); err != nil {
 		t.Fatalf("record connection: %v", err)
 	}
 	if _, err := store.RecordFileTransfer(alice.ID, "alice", "devbox", "upload",
-		"notes.txt", "198.51.100.4", "", 7, 1, start, true, "viewer file"); err != nil {
+		"notes.txt", "198.51.100.4", "Testland", "punch", "",
+		7, 1, start, true, "viewer file"); err != nil {
 		t.Fatalf("record transfer: %v", err)
 	}
 
@@ -151,7 +153,8 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 		t.Fatalf("append logout: %v", err)
 	}
 	if _, err := store.RecordFileTransfer(alice.ID, "alice", "devbox", "download",
-		"dump.bin", "198.51.100.4", "", 9, 1, start, true, "second file"); err != nil {
+		"dump.bin", "198.51.100.4", "Testland", "punch", "",
+		9, 1, start, true, "second file"); err != nil {
 		t.Fatalf("record second transfer: %v", err)
 	}
 	result, err = archiver.Run()

@@ -2212,6 +2212,8 @@ type connectionReply struct {
 	AuditRef    string `json:"audit_ref"`
 	Source      string `json:"source"`
 	ClientIP    string `json:"client_ip"`
+	Location    string `json:"location"`
+	Route       string `json:"route"`
 	StartedAtMS int64  `json:"started_at_ms"`
 	EndedAtMS   int64  `json:"ended_at_ms"`
 	DurationMS  int64  `json:"duration_ms"`
@@ -2371,6 +2373,8 @@ type fileTransferReply struct {
 	Size         int64  `json:"size"`
 	Files        int    `json:"files"`
 	ClientIP     string `json:"client_ip"`
+	Location     string `json:"location"`
+	Route        string `json:"route"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
 	Success      bool   `json:"success"`
 	Detail       string `json:"detail"`

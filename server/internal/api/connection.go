@@ -18,6 +18,7 @@ type connectionReportRequest struct {
 	Success     *bool  `json:"success"`
 	Detail      string `json:"detail"`
 	AuditRef    string `json:"audit_ref,omitempty"`
+	Route       string `json:"route,omitempty"`
 }
 
 type connectionView struct {
@@ -29,6 +30,8 @@ type connectionView struct {
 	AuditRef    string `json:"audit_ref,omitempty"`
 	Source      string `json:"source,omitempty"`
 	ClientIP    string `json:"client_ip"`
+	Location    string `json:"location,omitempty"`
+	Route       string `json:"route,omitempty"`
 	StartedAtMS int64  `json:"started_at_ms"`
 	EndedAtMS   int64  `json:"ended_at_ms"`
 	DurationMS  int64  `json:"duration_ms"`
@@ -51,6 +54,8 @@ func connectionToView(event account.ConnectionEvent) connectionView {
 		AuditRef:    event.AuditRef,
 		Source:      event.Source,
 		ClientIP:    event.ClientIP,
+		Location:    event.Location,
+		Route:       event.Route,
 		StartedAtMS: event.StartedAt.UnixMilli(),
 		EndedAtMS:   event.EndedAt.UnixMilli(),
 		DurationMS:  event.Duration().Milliseconds(),
@@ -119,9 +124,10 @@ func (s *server) recordAccountConnection(w http.ResponseWriter, r *http.Request)
 	if req.EndedAtMS > 0 {
 		endedAt = time.UnixMilli(req.EndedAtMS)
 	}
+	ip := s.clientIP(r)
 	event, err := s.cfg.Accounts.RecordConnection(
-		user.ID, user.Username, req.PeerID, req.Direction, s.clientIP(r),
-		req.AuditRef, startedAt, endedAt, success, req.Detail,
+		user.ID, user.Username, req.PeerID, req.Direction, ip, s.clientLocation(ip),
+		req.Route, req.AuditRef, startedAt, endedAt, success, req.Detail,
 	)
 	if err != nil {
 		if errors.Is(err, account.ErrInvalidConnection) {

@@ -182,7 +182,7 @@ func TestAccountGroupEventFilters(t *testing.T) {
 	now := time.Now().UTC()
 	for _, tc := range []struct{ user User }{{alice}, {bob}, {carol}} {
 		if _, err := store.RecordConnection(tc.user.ID, tc.user.Username,
-			"peer-"+tc.user.Username, "viewer", "127.0.0.1", "",
+			"peer-"+tc.user.Username, "viewer", "127.0.0.1", "", "", "",
 			now.Add(-time.Minute), now, true, "report"); err != nil {
 			t.Fatalf("record connection for %s: %v", tc.user.Username, err)
 		}
@@ -198,7 +198,7 @@ func TestAccountGroupEventFilters(t *testing.T) {
 	}
 	for _, user := range []User{bob, carol} {
 		if _, err := store.RecordFileTransfer(user.ID, user.Username, "peer",
-			"upload", "a.txt", "127.0.0.1", "", 10, 1, now, true, ""); err != nil {
+			"upload", "a.txt", "127.0.0.1", "", "", "", 10, 1, now, true, ""); err != nil {
 			t.Fatalf("record transfer for %s: %v", user.Username, err)
 		}
 	}

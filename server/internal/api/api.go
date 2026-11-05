@@ -294,6 +294,7 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("DELETE /v1/recordings/{id}", s.consoleDeleteRecording)
 	mux.HandleFunc("GET /v1/audit/file-transfers", s.auditFileTransfers)
 	mux.HandleFunc("POST /v1/account/file-transfers", s.recordAccountFileTransfer)
+	mux.HandleFunc("POST /v1/account/file-transfers/batch", s.recordAccountFileTransferBatch)
 	mux.HandleFunc("GET /v1/account/file-transfers", s.accountFileTransfers)
 	mux.HandleFunc("POST /v1/hosts/{id}/audit", s.recordHostAudit)
 	mux.HandleFunc("GET /v1/accounts", s.adminAccounts)

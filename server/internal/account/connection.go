@@ -13,16 +13,45 @@ import (
 var ErrInvalidConnection = errors.New("invalid connection record")
 
 const (
-	connectionRetention = 10000
-	maxConnectionPeer   = 128
-	maxConnectionDetail = 256
-	maxConnectionIP     = 64
-	maxConnectionSpan   = 30 * 24 * time.Hour
-	maxAuditRef         = 64
-	connectionViewer    = "viewer"
-	connectionHost      = "host"
-	connectionBoth      = "both"
+	connectionRetention   = 10000
+	maxConnectionPeer     = 128
+	maxConnectionDetail   = 256
+	maxConnectionIP       = 64
+	maxConnectionLocation = 64
+	maxConnectionRoute    = 32
+	maxConnectionSpan     = 30 * 24 * time.Hour
+	maxAuditRef           = 64
+	connectionViewer      = "viewer"
+	connectionHost        = "host"
+	connectionBoth        = "both"
 )
+
+// Route values describe how the viewer's media reached the host. "direct"
+// means no rendezvous server was involved, "punch" is a server-assisted
+// direct path, "relay" is the per-host relay and "carrier" the server's
+// shared TCP/WebSocket carrier. Unknown values are stored as empty rather
+// than rejecting the report.
+const (
+	RouteDirect  = "direct"
+	RoutePunch   = "punch"
+	RouteRelay   = "relay"
+	RouteCarrier = "carrier"
+)
+
+func normalizeRoute(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case RouteDirect:
+		return RouteDirect
+	case RoutePunch:
+		return RoutePunch
+	case RouteRelay:
+		return RouteRelay
+	case RouteCarrier:
+		return RouteCarrier
+	default:
+		return ""
+	}
+}
 
 // ConnectionEvent is one remote session. Viewer reports carry the account;
 // host reports carry the host id and an audit reference shared by both sides,
@@ -36,6 +65,8 @@ type ConnectionEvent struct {
 	AuditRef  string
 	Source    string
 	ClientIP  string
+	Location  string
+	Route     string
 	StartedAt time.Time
 	EndedAt   time.Time
 	Success   bool
@@ -78,7 +109,7 @@ func normalizeAuditRef(raw string) (string, error) {
 }
 
 func (s *Store) RecordConnection(
-	userID, username, peerID, direction, clientIP, auditRef string,
+	userID, username, peerID, direction, clientIP, location, route, auditRef string,
 	startedAt, endedAt time.Time,
 	success bool,
 	detail string,
@@ -103,6 +134,8 @@ func (s *Store) RecordConnection(
 		username = "-"
 	}
 	clientIP = normalizeText(clientIP, maxConnectionIP)
+	location = normalizeText(location, maxConnectionLocation)
+	route = normalizeRoute(route)
 	detail = normalizeText(detail, maxConnectionDetail)
 	ref, err := normalizeAuditRef(auditRef)
 	if err != nil {
@@ -128,6 +161,12 @@ func (s *Store) RecordConnection(
 			merged.PeerID = peerID
 			merged.Direction = connectionViewer
 			merged.ClientIP = clientIP
+			if location != "" {
+				merged.Location = location
+			}
+			if route != "" {
+				merged.Route = route
+			}
 			merged.StartedAt = earliest(existing.StartedAt, startedAt)
 			merged.EndedAt = latest(existing.EndedAt, endedAt)
 			merged.Success = existing.Success && success
@@ -146,6 +185,8 @@ func (s *Store) RecordConnection(
 		AuditRef:  ref,
 		Source:    connectionViewer,
 		ClientIP:  clientIP,
+		Location:  location,
+		Route:     route,
 		StartedAt: startedAt,
 		EndedAt:   endedAt,
 		Success:   success,
@@ -261,11 +302,12 @@ func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (Co
 	var id int64
 	err := s.db.QueryRow(
 		`INSERT INTO connection_events
-			(user_id, username, peer_id, direction, client_ip, started_at, ended_at,
-			 success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(user_id, username, peer_id, direction, client_ip, location, route,
+			 started_at, ended_at, success, detail, host_id, audit_ref, source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
 		userID, event.Username, event.PeerID, event.Direction, event.ClientIP,
+		event.Location, event.Route,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
 		event.Detail, event.HostID, event.AuditRef, event.Source,
 	).Scan(&id)
@@ -287,17 +329,18 @@ func (s *Store) insertConnectionLocked(event ConnectionEvent, userID string) (Co
 // account a viewer report may already have supplied.
 func (s *Store) updateConnectionLocked(event ConnectionEvent, userID string) error {
 	query := `UPDATE connection_events SET username=?, peer_id=?, direction=?,
-			client_ip=?, started_at=?, ended_at=?, success=?, detail=?,
+			client_ip=?, location=?, route=?, started_at=?, ended_at=?, success=?, detail=?,
 			host_id=?, audit_ref=?, source=? WHERE id=?`
 	args := []any{
 		event.Username, event.PeerID, event.Direction, event.ClientIP,
+		event.Location, event.Route,
 		unixMillis(event.StartedAt), unixMillis(event.EndedAt), event.Success,
 		event.Detail, event.HostID, event.AuditRef, event.Source, event.ID,
 	}
 	if userID != "" {
 		query = `UPDATE connection_events SET user_id=?, username=?, peer_id=?,
-			direction=?, client_ip=?, started_at=?, ended_at=?, success=?, detail=?,
-			host_id=?, audit_ref=?, source=? WHERE id=?`
+			direction=?, client_ip=?, location=?, route=?, started_at=?, ended_at=?,
+			success=?, detail=?, host_id=?, audit_ref=?, source=? WHERE id=?`
 		args = append([]any{userID}, args...)
 	}
 	if _, err := s.db.Exec(query, args...); err != nil {
@@ -309,7 +352,7 @@ func (s *Store) updateConnectionLocked(event ConnectionEvent, userID string) err
 func (s *Store) connectionByRefLocked(ref string) (ConnectionEvent, bool, error) {
 	row := s.db.QueryRow(
 		`SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source
+			success, detail, host_id, audit_ref, source, location, route
 		 FROM connection_events WHERE audit_ref = ? ORDER BY id LIMIT 1`, ref)
 	event, err := scanConnection(row)
 	if err == errNoRows {
@@ -378,7 +421,7 @@ func (s *Store) connectionEvents(where string, args []any, beforeID int64, limit
 		args = append(args, beforeID)
 	}
 	query := `SELECT id, username, peer_id, direction, client_ip, started_at, ended_at,
-			success, detail, host_id, audit_ref, source
+			success, detail, host_id, audit_ref, source, location, route
 		 FROM connection_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
@@ -417,7 +460,7 @@ func scanConnection(row rowScanner) (ConnectionEvent, error) {
 	if err := row.Scan(&event.ID, &event.Username, &event.PeerID,
 		&event.Direction, &event.ClientIP, &started, &ended,
 		&event.Success, &event.Detail, &event.HostID, &event.AuditRef,
-		&event.Source); err != nil {
+		&event.Source, &event.Location, &event.Route); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConnectionEvent{}, errNoRows
 		}

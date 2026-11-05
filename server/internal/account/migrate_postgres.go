@@ -192,7 +192,9 @@ func applyAccountPostgresBaseline(db *sql.DB) error {
 			detail     TEXT NOT NULL DEFAULT '',
 			host_id    TEXT NOT NULL DEFAULT '',
 			audit_ref  TEXT NOT NULL DEFAULT '',
-			source     TEXT NOT NULL DEFAULT 'viewer'
+			source     TEXT NOT NULL DEFAULT 'viewer',
+			location   TEXT NOT NULL DEFAULT '',
+			route      TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS connection_events_started
 			ON connection_events(started_at)`,
@@ -213,7 +215,9 @@ func applyAccountPostgresBaseline(db *sql.DB) error {
 			detail      TEXT NOT NULL DEFAULT '',
 			host_id     TEXT NOT NULL DEFAULT '',
 			audit_ref   TEXT NOT NULL DEFAULT '',
-			source      TEXT NOT NULL DEFAULT 'viewer'
+			source      TEXT NOT NULL DEFAULT 'viewer',
+			location    TEXT NOT NULL DEFAULT '',
+			route       TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS file_events_occurred
 			ON file_events(occurred_at)`,
@@ -283,6 +287,14 @@ func applyAccountPostgresBaseline(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS account_group_devices_peer
 			ON account_group_devices(peer_id)`,
+		`ALTER TABLE connection_events ADD COLUMN IF NOT EXISTS
+			location TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE connection_events ADD COLUMN IF NOT EXISTS
+			route TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE file_events ADD COLUMN IF NOT EXISTS
+			location TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE file_events ADD COLUMN IF NOT EXISTS
+			route TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

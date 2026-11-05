@@ -19,6 +19,26 @@ type fileTransferReportRequest struct {
 	Detail       string `json:"detail"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
 	AuditRef     string `json:"audit_ref,omitempty"`
+	Route        string `json:"route,omitempty"`
+}
+
+// fileTransferBatchItem is one finished file in a detailed viewer report.
+// The viewer's engine queues each completed upload or download instead of
+// collapsing a poll window into one row with the last file's name.
+type fileTransferBatchItem struct {
+	Direction    string `json:"direction"`
+	Name         string `json:"name"`
+	Size         int64  `json:"size"`
+	Success      *bool  `json:"success"`
+	Detail       string `json:"detail"`
+	OccurredAtMS int64  `json:"occurred_at_ms"`
+}
+
+type fileTransferBatchRequest struct {
+	PeerID   string                  `json:"peer_id"`
+	AuditRef string                  `json:"audit_ref,omitempty"`
+	Route    string                  `json:"route,omitempty"`
+	Items    []fileTransferBatchItem `json:"items"`
 }
 
 type fileTransferView struct {
@@ -33,6 +53,8 @@ type fileTransferView struct {
 	Size         int64  `json:"size"`
 	Files        int    `json:"files"`
 	ClientIP     string `json:"client_ip"`
+	Location     string `json:"location,omitempty"`
+	Route        string `json:"route,omitempty"`
 	OccurredAtMS int64  `json:"occurred_at_ms"`
 	Success      bool   `json:"success"`
 	Detail       string `json:"detail"`
@@ -56,6 +78,8 @@ func fileTransferToView(event account.FileEvent) fileTransferView {
 		Size:         event.Size,
 		Files:        event.Files,
 		ClientIP:     event.ClientIP,
+		Location:     event.Location,
+		Route:        event.Route,
 		OccurredAtMS: event.OccurredAt.UnixMilli(),
 		Success:      event.Success,
 		Detail:       event.Detail,
@@ -86,9 +110,11 @@ func (s *server) recordAccountFileTransfer(w http.ResponseWriter, r *http.Reques
 	if req.OccurredAtMS > 0 {
 		occurredAt = time.UnixMilli(req.OccurredAtMS)
 	}
+	ip := s.clientIP(r)
 	event, err := s.cfg.Accounts.RecordFileTransfer(
 		user.ID, user.Username, req.PeerID, req.Direction, req.Name,
-		s.clientIP(r), req.AuditRef, req.Size, files, occurredAt, success, req.Detail,
+		ip, s.clientLocation(ip), req.Route, req.AuditRef,
+		req.Size, files, occurredAt, success, req.Detail,
 	)
 	if err != nil {
 		if errors.Is(err, account.ErrInvalidTransfer) {
@@ -100,6 +126,63 @@ func (s *server) recordAccountFileTransfer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusCreated, fileTransferToView(event))
+}
+
+// recordAccountFileTransferBatch accepts one poll's finished files, one row
+// each. The account and client address come from the request, never from the
+// body; a shared route and audit reference link the batch to its session.
+func (s *server) recordAccountFileTransferBatch(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.accountUser(w, r)
+	if !ok {
+		return
+	}
+	var req fileTransferBatchRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.Items) == 0 || len(req.Items) > 200 {
+		writeError(w, http.StatusBadRequest, "items must contain between 1 and 200 files")
+		return
+	}
+	reports := make([]account.FileTransferReport, 0, len(req.Items))
+	for _, item := range req.Items {
+		success := true
+		if item.Success != nil {
+			success = *item.Success
+		}
+		var occurredAt time.Time
+		if item.OccurredAtMS > 0 {
+			occurredAt = time.UnixMilli(item.OccurredAtMS)
+		}
+		reports = append(reports, account.FileTransferReport{
+			Direction:  item.Direction,
+			Name:       item.Name,
+			Size:       item.Size,
+			Success:    success,
+			Detail:     item.Detail,
+			OccurredAt: occurredAt,
+		})
+	}
+	ip := s.clientIP(r)
+	events, err := s.cfg.Accounts.RecordFileTransfers(
+		user.ID, user.Username, req.PeerID, ip, s.clientLocation(ip),
+		req.Route, req.AuditRef, reports,
+	)
+	if err != nil {
+		if errors.Is(err, account.ErrInvalidTransfer) {
+			writeError(w, http.StatusBadRequest, "file transfer report is invalid")
+			return
+		}
+		s.cfg.Logger.Error("account file transfer batch", "error", err)
+		writeError(w, http.StatusInternalServerError, "could not store the file transfer report")
+		return
+	}
+	out := make([]fileTransferView, 0, len(events))
+	for _, event := range events {
+		out = append(out, fileTransferToView(event))
+	}
+	writeJSON(w, http.StatusCreated, fileTransfersResponse{Transfers: out})
 }
 
 func (s *server) accountFileTransfers(w http.ResponseWriter, r *http.Request) {

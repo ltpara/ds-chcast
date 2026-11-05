@@ -643,6 +643,8 @@ type connectionLine struct {
 	Source     string `json:"source"`
 	Direction  string `json:"direction"`
 	ClientIP   string `json:"client_ip"`
+	Location   string `json:"location"`
+	Route      string `json:"route"`
 	Success    bool   `json:"success"`
 	Detail     string `json:"detail"`
 }
@@ -661,6 +663,8 @@ type transferLine struct {
 	Size       int64  `json:"size"`
 	Files      int    `json:"files"`
 	ClientIP   string `json:"client_ip"`
+	Location   string `json:"location"`
+	Route      string `json:"route"`
 	Success    bool   `json:"success"`
 	Detail     string `json:"detail"`
 }
@@ -711,6 +715,8 @@ func (a *Archiver) readConnections(afterID int64, limit int) ([]record, error) {
 			Source:     event.Source,
 			Direction:  event.Direction,
 			ClientIP:   event.ClientIP,
+			Location:   event.Location,
+			Route:      event.Route,
 			Success:    event.Success,
 			Detail:     event.Detail,
 		})
@@ -743,6 +749,8 @@ func (a *Archiver) readFileTransfers(afterID int64, limit int) ([]record, error)
 			Size:       event.Size,
 			Files:      event.Files,
 			ClientIP:   event.ClientIP,
+			Location:   event.Location,
+			Route:      event.Route,
 			Success:    event.Success,
 			Detail:     event.Detail,
 		})

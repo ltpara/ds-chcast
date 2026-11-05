@@ -11,21 +11,24 @@ import (
 var ErrInvalidTransfer = errors.New("invalid file transfer record")
 
 const (
-	transferRetention = 10000
-	maxTransferPeer   = 128
-	maxTransferName   = 256
-	maxTransferDetail = 256
-	maxTransferIP     = 64
-	maxTransferFiles  = 1000
-	maxTransferSize   = 1 << 50
-	transferUpload    = "upload"
-	transferDownload  = "download"
+	transferRetention   = 10000
+	maxTransferPeer     = 128
+	maxTransferName     = 256
+	maxTransferDetail   = 256
+	maxTransferIP       = 64
+	maxTransferLocation = 64
+	maxTransferFiles    = 1000
+	maxTransferBatch    = 200
+	maxTransferSize     = 1 << 50
+	transferUpload      = "upload"
+	transferDownload    = "download"
 )
 
 // FileEvent is one viewer- or host-reported upload or download. A viewer
 // report covers every file that finished between two polls, so Files can
 // exceed one while Name and Size describe the last file in that window. Host
-// reports describe one finished file and share the session AuditRef.
+// reports describe one finished file and share the session AuditRef. The
+// viewer's detailed path reports one row per file with Files set to one.
 type FileEvent struct {
 	ID         int64
 	Username   string
@@ -38,54 +41,126 @@ type FileEvent struct {
 	Size       int64
 	Files      int
 	ClientIP   string
+	Location   string
+	Route      string
 	OccurredAt time.Time
 	Success    bool
 	Detail     string
 }
 
+// FileTransferReport is one finished file in a detailed viewer batch.
+type FileTransferReport struct {
+	Direction  string
+	Name       string
+	Size       int64
+	Success    bool
+	Detail     string
+	OccurredAt time.Time
+}
+
 func (s *Store) RecordFileTransfer(
-	userID, username, peerID, direction, name, clientIP, auditRef string,
+	userID, username, peerID, direction, name, clientIP, location, route, auditRef string,
 	size int64,
 	files int,
 	occurredAt time.Time,
 	success bool,
 	detail string,
 ) (FileEvent, error) {
+	event, userID, err := s.normalizeFileTransfer(userID, username, peerID, direction,
+		name, clientIP, location, route, auditRef, size, files, occurredAt, success, detail)
+	if err != nil {
+		return FileEvent{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.insertFileEventRowLocked(&event, userID); err != nil {
+		return FileEvent{}, err
+	}
+	if err := s.trimFileEventsLocked(); err != nil {
+		return FileEvent{}, err
+	}
+	return event, nil
+}
+
+// RecordFileTransfers stores one viewer poll as one row per finished file.
+// Every entry is validated before the first insert, so a bad entry rejects the
+// whole batch without writing anything.
+func (s *Store) RecordFileTransfers(
+	userID, username, peerID, clientIP, location, route, auditRef string,
+	reports []FileTransferReport,
+) ([]FileEvent, error) {
+	if len(reports) == 0 || len(reports) > maxTransferBatch {
+		return nil, fmt.Errorf("%w: batch of %d files", ErrInvalidTransfer, len(reports))
+	}
+	events := make([]FileEvent, 0, len(reports))
+	for _, report := range reports {
+		event, normalizedUserID, err := s.normalizeFileTransfer(userID, username, peerID,
+			report.Direction, report.Name, clientIP, location, route, auditRef,
+			report.Size, 1, report.OccurredAt, report.Success, report.Detail)
+		if err != nil {
+			return nil, err
+		}
+		userID = normalizedUserID
+		events = append(events, event)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range events {
+		if err := s.insertFileEventRowLocked(&events[i], userID); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.trimFileEventsLocked(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func (s *Store) normalizeFileTransfer(
+	userID, username, peerID, direction, name, clientIP, location, route, auditRef string,
+	size int64,
+	files int,
+	occurredAt time.Time,
+	success bool,
+	detail string,
+) (FileEvent, string, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
-		return FileEvent{}, fmt.Errorf("%w: user is empty", ErrInvalidTransfer)
+		return FileEvent{}, "", fmt.Errorf("%w: user is empty", ErrInvalidTransfer)
 	}
 	peerID = normalizeText(peerID, maxTransferPeer)
 	if peerID == "" {
-		return FileEvent{}, fmt.Errorf("%w: peer id is empty", ErrInvalidTransfer)
+		return FileEvent{}, "", fmt.Errorf("%w: peer id is empty", ErrInvalidTransfer)
 	}
 	direction = strings.TrimSpace(direction)
 	if direction != transferUpload && direction != transferDownload {
-		return FileEvent{}, fmt.Errorf("%w: direction %q", ErrInvalidTransfer, direction)
+		return FileEvent{}, "", fmt.Errorf("%w: direction %q", ErrInvalidTransfer, direction)
 	}
 	name = normalizeText(name, maxTransferName)
 	ref, err := normalizeAuditRef(auditRef)
 	if err != nil {
-		return FileEvent{}, fmt.Errorf("%w: %v", ErrInvalidTransfer, err)
+		return FileEvent{}, "", fmt.Errorf("%w: %v", ErrInvalidTransfer, err)
 	}
 	if size < 0 || size > maxTransferSize {
-		return FileEvent{}, fmt.Errorf("%w: size %d", ErrInvalidTransfer, size)
+		return FileEvent{}, "", fmt.Errorf("%w: size %d", ErrInvalidTransfer, size)
 	}
 	if files < 1 || files > maxTransferFiles {
-		return FileEvent{}, fmt.Errorf("%w: files %d", ErrInvalidTransfer, files)
+		return FileEvent{}, "", fmt.Errorf("%w: files %d", ErrInvalidTransfer, files)
 	}
 	username = strings.TrimSpace(username)
 	if username == "" {
 		username = "-"
 	}
 	clientIP = normalizeText(clientIP, maxTransferIP)
+	location = normalizeText(location, maxTransferLocation)
+	route = normalizeRoute(route)
 	detail = normalizeText(detail, maxTransferDetail)
 	if occurredAt.IsZero() {
 		occurredAt = s.now()
 	}
 	occurredAt = occurredAt.UTC()
 
-	event := FileEvent{
+	return FileEvent{
 		Username:   username,
 		PeerID:     peerID,
 		Direction:  direction,
@@ -95,11 +170,12 @@ func (s *Store) RecordFileTransfer(
 		Size:       size,
 		Files:      files,
 		ClientIP:   clientIP,
+		Location:   location,
+		Route:      route,
 		OccurredAt: occurredAt,
 		Success:    success,
 		Detail:     detail,
-	}
-	return s.insertFileEventLocked(event, userID)
+	}, userID, nil
 }
 
 // RecordHostFileTransfer stores one finished file seen by the host. The host
@@ -146,34 +222,46 @@ func (s *Store) RecordHostFileTransfer(
 		Success:    success,
 		Detail:     detail,
 	}
-	return s.insertFileEventLocked(event, "")
-}
-
-func (s *Store) insertFileEventLocked(event FileEvent, userID string) (FileEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.insertFileEventRowLocked(&event, ""); err != nil {
+		return FileEvent{}, err
+	}
+	if err := s.trimFileEventsLocked(); err != nil {
+		return FileEvent{}, err
+	}
+	return event, nil
+}
+
+func (s *Store) insertFileEventRowLocked(event *FileEvent, userID string) error {
 	var id int64
 	err := s.db.QueryRow(
 		`INSERT INTO file_events
 			(user_id, username, peer_id, direction, name, size, files,
-			 client_ip, occurred_at, success, detail, host_id, audit_ref, source)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 client_ip, location, route, occurred_at, success, detail,
+			 host_id, audit_ref, source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING id`,
 		userID, event.Username, event.PeerID, event.Direction, event.Name,
-		event.Size, event.Files, event.ClientIP, unixMillis(event.OccurredAt),
+		event.Size, event.Files, event.ClientIP, event.Location, event.Route,
+		unixMillis(event.OccurredAt),
 		event.Success, event.Detail, event.HostID, event.AuditRef, event.Source,
 	).Scan(&id)
 	if err != nil {
-		return FileEvent{}, fmt.Errorf("account store %s: record file transfer: %w", s.path, err)
+		return fmt.Errorf("account store %s: record file transfer: %w", s.path, err)
 	}
+	event.ID = id
+	return nil
+}
+
+func (s *Store) trimFileEventsLocked() error {
 	if _, err := s.db.Exec(
 		`DELETE FROM file_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - ? FROM file_events)`,
 		transferRetention,
 	); err != nil {
-		return FileEvent{}, fmt.Errorf("account store %s: trim file transfers: %w", s.path, err)
+		return fmt.Errorf("account store %s: trim file transfers: %w", s.path, err)
 	}
-	event.ID = id
-	return event, nil
+	return nil
 }
 
 // FileTransfers lists one account's reports, newest first.
@@ -232,7 +320,8 @@ func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) 
 		args = append(args, beforeID)
 	}
 	query := `SELECT id, username, peer_id, direction, name, size, files,
-			client_ip, occurred_at, success, detail, host_id, audit_ref, source
+			client_ip, occurred_at, success, detail, host_id, audit_ref, source,
+			location, route
 		 FROM file_events WHERE ` + where + ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
 	s.mu.Lock()
@@ -251,7 +340,8 @@ func (s *Store) fileEvents(where string, args []any, beforeID int64, limit int) 
 		if err := rows.Scan(&event.ID, &event.Username, &event.PeerID,
 			&event.Direction, &event.Name, &event.Size, &event.Files,
 			&event.ClientIP, &occurred, &event.Success, &event.Detail,
-			&event.HostID, &event.AuditRef, &event.Source); err != nil {
+			&event.HostID, &event.AuditRef, &event.Source,
+			&event.Location, &event.Route); err != nil {
 			return nil, fmt.Errorf("account store %s: scan file transfer: %w", s.path, err)
 		}
 		event.OccurredAt = timeFromMillis(occurred)

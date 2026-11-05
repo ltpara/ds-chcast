@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 7
+const accountSchemaVersion = 8
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -21,6 +21,29 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 5, Name: "refresh replay marker", Apply: applyRefreshReplayMarker},
 	{Version: 6, Name: "oidc identities", Apply: applyOIDCIdentities},
 	{Version: 7, Name: "account groups", Apply: applyAccountGroups},
+	{Version: 8, Name: "audit location and route", Apply: applyAuditLocationRoute},
+}
+
+// applyAuditLocationRoute records where a session signed in and which path it
+// took (direct, punched, relay or shared carrier). Both columns default to the
+// empty string so databases without a GeoIP table keep recording only the
+// client address.
+func applyAuditLocationRoute(db *sql.DB) error {
+	for _, column := range []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{"connection_events", "location", "location TEXT NOT NULL DEFAULT ''"},
+		{"connection_events", "route", "route TEXT NOT NULL DEFAULT ''"},
+		{"file_events", "location", "location TEXT NOT NULL DEFAULT ''"},
+		{"file_events", "route", "route TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureColumn(db, column.table, column.name, column.ddl); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return nil
 }
 
 // applyAccountGroups adds operator-managed groups that scope console access

@@ -183,11 +183,11 @@ func TestAccountGroupHTTP(t *testing.T) {
 	// Both scoped history endpoints read only the group's accounts and devices.
 	now := time.Now().UTC()
 	if _, err := s.Accounts.RecordConnection(bob.ID, bob.Username, "peer-bob",
-		"viewer", "127.0.0.1", "", now.Add(-time.Minute), now, true, ""); err != nil {
+		"viewer", "127.0.0.1", "", "", "", now.Add(-time.Minute), now, true, ""); err != nil {
 		t.Fatalf("record bob connection: %v", err)
 	}
 	if _, err := s.Accounts.RecordConnection(alice.ID, alice.Username, "peer-alice",
-		"viewer", "127.0.0.1", "", now.Add(-time.Minute), now, true, ""); err != nil {
+		"viewer", "127.0.0.1", "", "", "", now.Add(-time.Minute), now, true, ""); err != nil {
 		t.Fatalf("record alice connection: %v", err)
 	}
 	if _, err := s.Accounts.RecordHostConnection("devbox", "",

@@ -71,6 +71,27 @@
     return ok ? pill('成功', 'ok') : pill('失败', 'bad');
   }
 
+  const ROUTE_LABELS = {
+    direct: '直连',
+    punch: '打洞',
+    relay: '中继',
+    carrier: '共享承载',
+  };
+
+  function routeCell(value) {
+    if (!value) return '—';
+    const node = el('span', '', ROUTE_LABELS[value] || value);
+    node.title = value;
+    return node;
+  }
+
+  function refCell(value) {
+    if (!value) return '—';
+    const node = el('span', 'mono', value.length > 18 ? value.slice(0, 18) + '…' : value);
+    node.title = value;
+    return node;
+  }
+
   function fmtBytes(value) {
     const n = Number(value);
     if (value === undefined || value === null || !Number.isFinite(n)) return '—';
@@ -1359,7 +1380,7 @@
       filterKey: 'action',
       filterPlaceholder: '动作（可选，如 login）',
       hasHost: false,
-      columns: ['时间', '用户', '动作', '详情', '客户端 IP', '结果'],
+      columns: ['时间', '用户', '动作', '详情', '客户端 IP', '地点', '结果'],
       row(event) {
         return [
           fmtTime(event.created_at_ms),
@@ -1367,6 +1388,7 @@
           event.action,
           event.detail || '—',
           event.client_ip || '—',
+          event.location || '—',
           pillBool(event.success),
         ];
       },
@@ -1376,7 +1398,8 @@
       filterKey: 'username',
       filterPlaceholder: '用户名（可选）',
       hasHost: true,
-      columns: ['开始', '用户', '对端', '方向', '来源', '客户端 IP', '时长', '结果', '详情'],
+      columns: ['开始', '用户', '对端', '方向', '来源', '客户端 IP', '地点', '路由',
+        '关联', '时长', '结果', '详情'],
       row(event) {
         return [
           fmtTime(event.started_at_ms),
@@ -1385,6 +1408,9 @@
           event.direction || '—',
           event.source || '—',
           event.client_ip || '—',
+          event.location || '—',
+          routeCell(event.route),
+          refCell(event.audit_ref),
           fmtDurationMS(event.duration_ms),
           pillBool(event.success),
           event.detail || '—',
@@ -1396,7 +1422,8 @@
       filterKey: 'username',
       filterPlaceholder: '用户名（可选）',
       hasHost: true,
-      columns: ['时间', '用户', '对端', '方向', '文件', '大小', '客户端 IP', '结果', '详情'],
+      columns: ['时间', '用户', '对端', '方向', '文件', '大小', '客户端 IP', '地点',
+        '路由', '关联', '结果', '详情'],
       row(event) {
         const size = fmtBytes(event.size) + (event.files > 1 ? '（' + event.files + ' 个）' : '');
         return [
@@ -1407,6 +1434,9 @@
           event.name || '—',
           size,
           event.client_ip || '—',
+          event.location || '—',
+          routeCell(event.route),
+          refCell(event.audit_ref),
           pillBool(event.success),
           event.detail || '—',
         ];

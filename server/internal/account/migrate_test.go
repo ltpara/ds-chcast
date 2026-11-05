@@ -13,6 +13,107 @@ func TestSchemaVersionMatchesMigrations(t *testing.T) {
 	}
 }
 
+// seedAuditEventTables recreates the pre-v8 history tables so migrations that
+// only add columns can run against a database seeded without a full baseline.
+func seedAuditEventTables(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`CREATE TABLE connection_events (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id    TEXT NOT NULL,
+			username   TEXT NOT NULL,
+			peer_id    TEXT NOT NULL,
+			direction  TEXT NOT NULL DEFAULT 'viewer',
+			client_ip  TEXT NOT NULL DEFAULT '',
+			started_at INTEGER NOT NULL,
+			ended_at   INTEGER NOT NULL,
+			success    INTEGER NOT NULL DEFAULT 1,
+			detail     TEXT NOT NULL DEFAULT '',
+			host_id    TEXT NOT NULL DEFAULT '',
+			audit_ref  TEXT NOT NULL DEFAULT '',
+			source     TEXT NOT NULL DEFAULT 'viewer'
+		)`,
+		`CREATE TABLE file_events (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id     TEXT NOT NULL,
+			username    TEXT NOT NULL,
+			peer_id     TEXT NOT NULL,
+			direction   TEXT NOT NULL,
+			name        TEXT NOT NULL DEFAULT '',
+			size        INTEGER NOT NULL DEFAULT 0,
+			files       INTEGER NOT NULL DEFAULT 1,
+			client_ip   TEXT NOT NULL DEFAULT '',
+			occurred_at INTEGER NOT NULL,
+			success     INTEGER NOT NULL DEFAULT 1,
+			detail      TEXT NOT NULL DEFAULT '',
+			host_id     TEXT NOT NULL DEFAULT '',
+			audit_ref   TEXT NOT NULL DEFAULT '',
+			source      TEXT NOT NULL DEFAULT 'viewer'
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatalf("seed audit event tables: %v", err)
+		}
+	}
+}
+
+func TestSchemaMigrationAddsAuditLocationRoute(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (
+		version    INTEGER PRIMARY KEY,
+		name       TEXT NOT NULL DEFAULT '',
+		applied_at INTEGER NOT NULL
+	)`); err != nil {
+		db.Close()
+		t.Fatalf("seed migrations: %v", err)
+	}
+	for version := 1; version <= 7; version++ {
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, 'legacy', 0)`,
+			version,
+		); err != nil {
+			db.Close()
+			t.Fatalf("seed migration %d: %v", version, err)
+		}
+	}
+	seedAuditEventTables(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	for _, column := range []struct {
+		table string
+		name  string
+	}{
+		{"connection_events", "location"},
+		{"connection_events", "route"},
+		{"file_events", "location"},
+		{"file_events", "route"},
+	} {
+		found, err := columnExists(store.db, column.table, column.name)
+		if err != nil || !found {
+			t.Fatalf("column %s.%s missing after migration: %v", column.table, column.name, err)
+		}
+	}
+	var version int
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != accountSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, accountSchemaVersion)
+	}
+}
+
 func TestSchemaMigrationRecordsBaselineOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	store, err := Open(path)
@@ -127,6 +228,7 @@ func TestSchemaMigrationAddsAddressBookNesting(t *testing.T) {
 			t.Fatalf("seed pre-v3 database: %v", err)
 		}
 	}
+	seedAuditEventTables(t, db)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close raw database: %v", err)
 	}
@@ -199,6 +301,7 @@ func TestSchemaMigrationAddsRecordingArchive(t *testing.T) {
 			t.Fatalf("seed pre-v4 database: %v", err)
 		}
 	}
+	seedAuditEventTables(t, db)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close raw database: %v", err)
 	}

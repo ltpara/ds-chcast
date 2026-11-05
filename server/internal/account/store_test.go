@@ -2249,7 +2249,7 @@ func TestConnectionReportsMergeByAuditRef(t *testing.T) {
 
 	report := func() (ConnectionEvent, error) {
 		return store.RecordConnection(alice.ID, "alice", "viewerbox", connectionViewer,
-			"127.0.0.1", ref, at, at.Add(2*time.Minute), true, "")
+			"127.0.0.1", "Testland", RoutePunch, ref, at, at.Add(2*time.Minute), true, "")
 	}
 	merged, err := report()
 	if err != nil {
@@ -2262,6 +2262,9 @@ func TestConnectionReportsMergeByAuditRef(t *testing.T) {
 	}
 	if !merged.EndedAt.Equal(at.Add(2 * time.Minute)) {
 		t.Fatalf("merged window = %v", merged)
+	}
+	if merged.Location != "Testland" || merged.Route != RoutePunch {
+		t.Fatalf("merged context = %+v", merged)
 	}
 
 	// A retry from either side must not pretend the other one reported twice.
