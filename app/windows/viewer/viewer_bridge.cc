@@ -854,24 +854,29 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.stream_option_results));
         map[key("portForwardEnabled")] =
             flutter::EncodableValue(status.port_forward_enabled);
-        map[key("portForwardActive")] =
-            flutter::EncodableValue(status.port_forward_active);
-        map[key("portForwardLocalPort")] =
-            flutter::EncodableValue(static_cast<int32_t>(status.port_forward_local_port));
-        map[key("portForwardRemoteHost")] =
-            flutter::EncodableValue(status.port_forward_remote_host);
-        map[key("portForwardRemotePort")] =
-            flutter::EncodableValue(static_cast<int32_t>(status.port_forward_remote_port));
-        map[key("portForwardConnections")] =
-            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_connections));
-        map[key("portForwardFailures")] =
-            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_failures));
-        map[key("portForwardBytesUp")] =
-            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_bytes_up));
-        map[key("portForwardBytesDown")] =
-            flutter::EncodableValue(static_cast<int64_t>(status.port_forward_bytes_down));
-        map[key("portForwardError")] =
-            flutter::EncodableValue(status.port_forward_error);
+        flutter::EncodableList forward_rules;
+        for (const ViewerPortForwardRule& rule : status.port_forward_rules) {
+            flutter::EncodableMap entry;
+            entry[key("ruleId")] =
+                flutter::EncodableValue(static_cast<int32_t>(rule.rule_id));
+            entry[key("active")] = flutter::EncodableValue(rule.active);
+            entry[key("localPort")] =
+                flutter::EncodableValue(static_cast<int32_t>(rule.local_port));
+            entry[key("remoteHost")] = flutter::EncodableValue(rule.remote_host);
+            entry[key("remotePort")] =
+                flutter::EncodableValue(static_cast<int32_t>(rule.remote_port));
+            entry[key("connections")] =
+                flutter::EncodableValue(static_cast<int64_t>(rule.connections));
+            entry[key("failures")] =
+                flutter::EncodableValue(static_cast<int64_t>(rule.failures));
+            entry[key("bytesUp")] =
+                flutter::EncodableValue(static_cast<int64_t>(rule.bytes_up));
+            entry[key("bytesDown")] =
+                flutter::EncodableValue(static_cast<int64_t>(rule.bytes_down));
+            entry[key("error")] = flutter::EncodableValue(rule.error);
+            forward_rules.push_back(flutter::EncodableValue(entry));
+        }
+        map[key("portForwardRules")] = flutter::EncodableValue(forward_rules);
         flutter::EncodableList modes;
         for (const chast::DisplayModeInfo& mode : status.display_modes) {
             flutter::EncodableMap entry;
@@ -1659,17 +1664,26 @@ void ViewerBridge::HandleMethodCall(
                           "remotePort 1..65535 and remoteHost");
             return;
         }
-        const bool queued =
-            viewer_ != nullptr &&
-            viewer_->StartPortForward(static_cast<uint16_t>(local_port), remote_host,
-                                      static_cast<uint16_t>(remote_port));
-        result->Success(flutter::EncodableValue(queued));
+        const uint32_t rule_id =
+            viewer_ != nullptr
+                ? viewer_->StartPortForward(static_cast<uint16_t>(local_port),
+                                            remote_host,
+                                            static_cast<uint16_t>(remote_port))
+                : 0;
+        result->Success(flutter::EncodableValue(static_cast<int64_t>(rule_id)));
         return;
     }
 
     if (method == "stopPortForward") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t rule_id = 0;
+        if (args == nullptr || !map_int(*args, "ruleId", &rule_id) || rule_id <= 0 ||
+            rule_id > 0xFFFFFFFFll) {
+            result->Error("bad_args", "stopPortForward wants a positive ruleId");
+            return;
+        }
         if (viewer_ != nullptr) {
-            viewer_->StopPortForward();
+            viewer_->StopPortForward(static_cast<uint32_t>(rule_id));
         }
         result->Success();
         return;

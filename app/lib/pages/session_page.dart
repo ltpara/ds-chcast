@@ -147,6 +147,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // The last port-forward failure already shown, so a stable error text does
   // not pop a snack bar on every poll. Cleared when the engine clears it.
   String _portForwardErrorSeen = '';
+  // Mirrors the engine's rule list so the open port-forward dialog updates
+  // while it is up; the page itself rebuilds from _status.
+  final ValueNotifier<List<ViewerPortForwardRule>> _portForwardRules =
+      ValueNotifier<List<ViewerPortForwardRule>>(
+        const <ViewerPortForwardRule>[],
+      );
   String? _startError;
   int _textureId = -1;
   Future<void>? _teardown;
@@ -291,6 +297,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _terminalFocus.removeListener(_onTerminalFocusChanged);
     _terminalFocus.dispose();
     _focus.dispose();
+    _portForwardRules.dispose();
     _setKeyCapture(false);
     _clearCursor();
     final DateTime? auditStartedAt = _auditStartedAt;
@@ -853,6 +860,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(_confirmFirstFingerprint(status.serverFingerprint));
     }
     _trackRecording(status);
+    _syncPortForwardRules(status.portForwardRules);
     // Track a persistent console's service id while it is alive. An ending or
     // refusal leaves nothing to attach to, and a poll from a fresh engine
     // (id still 0) must not erase what the page remembers for a reconnect.
@@ -1317,14 +1325,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       );
     }
     if (!nowOver) {
-      if (status.portForwardError.isEmpty) {
+      final String forwardError = status.portForwardRules
+          .map((ViewerPortForwardRule rule) => rule.error)
+          .firstWhere((String text) => text.isNotEmpty, orElse: () => '');
+      if (forwardError.isEmpty) {
         _portForwardErrorSeen = '';
-      } else if (status.portForwardError != _portForwardErrorSeen) {
-        _portForwardErrorSeen = status.portForwardError;
+      } else if (forwardError != _portForwardErrorSeen) {
+        _portForwardErrorSeen = forwardError;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              tr('端口转发：{p4}', <String, Object?>{'p4': status.portForwardError}),
+              tr('端口转发：{p4}', <String, Object?>{'p4': forwardError}),
             ),
             duration: const Duration(seconds: 5),
           ),
@@ -2044,55 +2055,117 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     return tr('主机拒绝了该操作');
   }
 
-  /// Opens the port-forward dialog. The listener binds 127.0.0.1 on the
-  /// viewer and the host relays each accepted TCP connection to the target;
-  /// the fields start from what the engine is running, so the dialog doubles
-  /// as the stop/replace sheet.
+  /// Keeps the open dialog's rule list in step with the engine. The value is
+  /// replaced only when something actually changed, so polls do not rebuild
+  /// the dialog on every tick.
+  void _syncPortForwardRules(List<ViewerPortForwardRule> rules) {
+    final List<ViewerPortForwardRule> previous = _portForwardRules.value;
+    bool changed = previous.length != rules.length;
+    if (!changed) {
+      for (int i = 0; i < rules.length; ++i) {
+        final ViewerPortForwardRule a = previous[i];
+        final ViewerPortForwardRule b = rules[i];
+        if (a.ruleId != b.ruleId ||
+            a.active != b.active ||
+            a.localPort != b.localPort ||
+            a.remoteHost != b.remoteHost ||
+            a.remotePort != b.remotePort ||
+            a.connections != b.connections ||
+            a.failures != b.failures ||
+            a.bytesUp != b.bytesUp ||
+            a.bytesDown != b.bytesDown ||
+            a.error != b.error) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (changed) {
+      _portForwardRules.value = rules;
+    }
+  }
+
+  /// Opens the port-forward sheet. Each rule owns a 127.0.0.1 listener on the
+  /// viewer and one host target, so rules run side by side; the sheet lists
+  /// the running rules with their counters and appends a new one.
   Future<void> _openPortForwardDialog() async {
     if (!_status.acceptsPortForward) {
       return;
     }
     final TextEditingController localController = TextEditingController(
-      text: '${_status.portForwardLocalPort}',
+      text: '0',
     );
     final TextEditingController hostController = TextEditingController(
-      text: _status.portForwardRemoteHost.isEmpty
-          ? '127.0.0.1'
-          : _status.portForwardRemoteHost,
+      text: '127.0.0.1',
     );
-    final TextEditingController remoteController = TextEditingController(
-      text: _status.portForwardRemotePort == 0
-          ? ''
-          : '${_status.portForwardRemotePort}',
-    );
+    final TextEditingController remoteController = TextEditingController();
     String? error;
-    final String? action = await showDialog<String>(
+    bool adding = false;
+    await showDialog<void>(
       context: context,
       builder: (BuildContext dialogContext) {
         return StatefulBuilder(
           builder: (BuildContext context, StateSetter setDialogState) {
-            void start() {
+            Future<void> add() async {
               final int? local = int.tryParse(localController.text.trim());
               final int? remote = int.tryParse(remoteController.text.trim());
               final String host = hostController.text.trim();
               if (local == null || local < 0 || local > 65535) {
-                setDialogState(() => error = tr('本地端口须为 0–65535（0 表示自动分配）'));
+                setDialogState(
+                  () => error = tr('本地端口须为 0–65535（0 表示自动分配）'),
+                );
                 return;
               }
               if (host.isEmpty ||
                   remote == null ||
                   remote < 1 ||
                   remote > 65535) {
-                setDialogState(() => error = tr('请填写目标主机和 1–65535 的目标端口'));
+                setDialogState(
+                  () => error = tr('请填写目标主机和 1–65535 的目标端口'),
+                );
                 return;
               }
-              Navigator.of(dialogContext).pop('start');
+              setDialogState(() {
+                error = null;
+                adding = true;
+              });
+              try {
+                final int ruleId = await ViewerBridge.startPortForward(
+                  localPort: local,
+                  remoteHost: host,
+                  remotePort: remote,
+                );
+                if (!dialogContext.mounted) {
+                  return;
+                }
+                if (ruleId == 0) {
+                  setDialogState(() {
+                    error = tr('无法开始端口转发：主机未开放该权限');
+                    adding = false;
+                  });
+                  return;
+                }
+                remoteController.clear();
+                setDialogState(() => adding = false);
+              } on PlatformException catch (failure) {
+                if (!dialogContext.mounted) {
+                  return;
+                }
+                setDialogState(() {
+                  error = failure.message ?? tr('端口转发操作失败');
+                  adding = false;
+                });
+              } on MissingPluginException {
+                if (dialogContext.mounted) {
+                  setDialogState(() => adding = false);
+                }
+              }
             }
 
             return AlertDialog(
               title: Text(tr('端口转发')),
               content: SizedBox(
-                width: 380,
+                width: 420,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -2101,9 +2174,50 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       tr(
                         '本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。本地端口填 0 由系统分配。',
                       ),
-                      style: TextStyle(fontSize: 12, height: 1.4),
+                      style: const TextStyle(fontSize: 12, height: 1.4),
                     ),
                     const SizedBox(height: 12),
+                    ValueListenableBuilder<List<ViewerPortForwardRule>>(
+                      valueListenable: _portForwardRules,
+                      builder:
+                          (
+                            BuildContext context,
+                            List<ViewerPortForwardRule> rules,
+                            Widget? child,
+                          ) {
+                            if (rules.isEmpty) {
+                              return Text(
+                                tr('尚无规则，填写下面的目标后开始转发。'),
+                                style: const TextStyle(
+                                  fontSize: 11.5,
+                                  color: Colors.white54,
+                                ),
+                              );
+                            }
+                            return ConstrainedBox(
+                              constraints: const BoxConstraints(maxHeight: 220),
+                              child: SingleChildScrollView(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: <Widget>[
+                                    for (final ViewerPortForwardRule rule
+                                        in rules)
+                                      _buildPortForwardRuleRow(rule),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                    ),
+                    const SizedBox(height: 14),
+                    Text(
+                      tr('添加规则'),
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
                     TextField(
                       controller: localController,
                       keyboardType: TextInputType.number,
@@ -2129,24 +2243,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         isDense: true,
                       ),
                     ),
-                    if (_status.portForwardActive) ...<Widget>[
-                      const SizedBox(height: 14),
-                      Text(
-                        tr(
-                          '正在转发 127.0.0.1:{p7} → {p8}:{p9}\n连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}',
-                          <String, Object?>{
-                            'p7': _status.portForwardLocalPort,
-                            'p8': _status.portForwardRemoteHost,
-                            'p9': _status.portForwardRemotePort,
-                            'p10': _status.portForwardConnections,
-                            'p11': _status.portForwardFailures,
-                            'p12': _formatBytes(_status.portForwardBytesUp),
-                            'p13': _formatBytes(_status.portForwardBytesDown),
-                          },
-                        ),
-                        style: const TextStyle(fontSize: 11.5, height: 1.5),
+                    const SizedBox(height: 8),
+                    Text(
+                      tr('最多同时运行 8 条规则。'),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.white38,
                       ),
-                    ],
+                    ),
                     if (error != null) ...<Widget>[
                       const SizedBox(height: 10),
                       Text(
@@ -2161,20 +2265,13 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 ),
               ),
               actions: <Widget>[
-                if (_status.portForwardActive)
-                  TextButton(
-                    onPressed: () => Navigator.of(dialogContext).pop('stop'),
-                    child: Text(tr('停止转发')),
-                  ),
                 TextButton(
                   onPressed: () => Navigator.of(dialogContext).pop(),
                   child: Text(tr('取消')),
                 ),
                 FilledButton(
-                  onPressed: start,
-                  child: Text(
-                    _status.portForwardActive ? tr('更换目标') : tr('开始转发'),
-                  ),
+                  onPressed: adding ? null : () => unawaited(add()),
+                  child: Text(tr('添加规则')),
                 ),
               ],
             );
@@ -2182,37 +2279,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         );
       },
     );
-    final int? local = int.tryParse(localController.text.trim());
-    final int? remote = int.tryParse(remoteController.text.trim());
-    final String host = hostController.text.trim();
     localController.dispose();
     hostController.dispose();
     remoteController.dispose();
-    if (!mounted) {
-      return;
-    }
+  }
+
+  Future<void> _stopPortForwardRule(int ruleId) async {
     try {
-      if (action == 'stop') {
-        await ViewerBridge.stopPortForward();
-        return;
-      }
-      if (action != 'start' || local == null || remote == null) {
-        return;
-      }
-      final bool queued = await ViewerBridge.startPortForward(
-        localPort: local,
-        remoteHost: host,
-        remotePort: remote,
-      );
-      if (!mounted || queued) {
-        return;
-      }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(tr('无法开始端口转发：主机未开放该权限')),
-          duration: Duration(seconds: 4),
-        ),
-      );
+      await ViewerBridge.stopPortForward(ruleId: ruleId);
     } on PlatformException catch (failure) {
       if (!mounted) {
         return;
@@ -2223,6 +2297,74 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     } on MissingPluginException {
       // The native viewer is going away.
     }
+  }
+
+  /// One rule row: the listener, the target, its state and counters, and the
+  /// button that stops just this rule.
+  Widget _buildPortForwardRuleRow(ViewerPortForwardRule rule) {
+    final String state = rule.active
+        ? tr('转发中')
+        : (rule.error.isNotEmpty ? rule.error : tr('等待主机确认'));
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 8, 6, 8),
+      decoration: BoxDecoration(
+        color: Colors.white10,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  tr('127.0.0.1:{p7} → {p8}:{p9}', <String, Object?>{
+                    'p7': rule.localPort,
+                    'p8': rule.remoteHost,
+                    'p9': rule.remotePort,
+                  }),
+                  style: const TextStyle(color: Colors.white, fontSize: 12.5),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  state,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: rule.error.isNotEmpty
+                        ? Theme.of(context).colorScheme.error
+                        : Colors.white54,
+                  ),
+                ),
+                if (rule.active) ...<Widget>[
+                  const SizedBox(height: 2),
+                  Text(
+                    tr(
+                      '连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}',
+                      <String, Object?>{
+                        'p10': rule.connections,
+                        'p11': rule.failures,
+                        'p12': _formatBytes(rule.bytesUp),
+                        'p13': _formatBytes(rule.bytesDown),
+                      },
+                    ),
+                    style: const TextStyle(
+                      fontSize: 10.5,
+                      color: Colors.white38,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.link_off_rounded, size: 18),
+            tooltip: tr('停止规则'),
+            onPressed: () => unawaited(_stopPortForwardRule(rule.ruleId)),
+          ),
+        ],
+      ),
+    );
   }
 
   /// The host's PrivacyModeCode (chast::PrivacyModeCode) in the page's words.
@@ -3808,7 +3950,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onHostAction: (ViewerHostAction action) =>
                             unawaited(_onHostAction(action)),
                         portForwardAvailable: _status.acceptsPortForward,
-                        portForwardActive: _status.portForwardActive,
+                        portForwardActive: _status.portForwardRules.any(
+                          (ViewerPortForwardRule rule) => rule.active,
+                        ),
                         onOpenPortForward: () =>
                             unawaited(_openPortForwardDialog()),
                         displays: _status.displays,
@@ -4478,7 +4622,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Widget _buildPortForwardCard() {
     final ViewerStatus status = _status;
-    if (!status.portForwardActive) {
+    final List<ViewerPortForwardRule> rules = status.portForwardRules;
+    if (rules.isEmpty) {
       return _buildControlNote(
         icon: Icons.alt_route_rounded,
         title: tr('端口转发'),
@@ -4520,42 +4665,26 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             ],
           ),
           const SizedBox(height: 12),
-          Text(
-            tr(
-              '正在转发 127.0.0.1:{p7} → {p8}:{p9}\n连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}',
-              <String, Object?>{
-                'p7': status.portForwardLocalPort,
-                'p8': status.portForwardRemoteHost,
-                'p9': status.portForwardRemotePort,
-                'p10': status.portForwardConnections,
-                'p11': status.portForwardFailures,
-                'p12': _formatBytes(status.portForwardBytesUp),
-                'p13': _formatBytes(status.portForwardBytesDown),
-              },
-            ),
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11.5,
-              height: 1.5,
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 260),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  for (final ViewerPortForwardRule rule in rules)
+                    _buildPortForwardRuleRow(rule),
+                ],
+              ),
             ),
           ),
-          const SizedBox(height: 16),
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: OutlinedButton(
-                  onPressed: () => unawaited(_openPortForwardDialog()),
-                  child: Text(tr('更换目标')),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: FilledButton(
-                  onPressed: () => unawaited(ViewerBridge.stopPortForward()),
-                  child: Text(tr('停止转发')),
-                ),
-              ),
-            ],
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: () => unawaited(_openPortForwardDialog()),
+              icon: const Icon(Icons.add_link_rounded, size: 18),
+              label: Text(tr('添加规则')),
+            ),
           ),
         ],
       ),

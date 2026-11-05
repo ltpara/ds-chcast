@@ -86,6 +86,16 @@ const Map<String, String> kEnglishSession = <String, String>{
   '无法发送文件：{reason}': 'Cannot send file: {reason}',
   '无法开始端口转发：主机未开放该权限':
       'Cannot start port forwarding: the host has not enabled this permission',
+  '127.0.0.1:{p7} → {p8}:{p9}': '127.0.0.1:{p7} → {p8}:{p9}',
+  '添加规则': 'Add rule',
+  '尚无规则，填写下面的目标后开始转发。':
+      'No rules yet; enter a target below to start forwarding.',
+  '最多同时运行 8 条规则。': 'Up to eight rules run at the same time.',
+  '停止规则': 'Stop rule',
+  '转发中': 'Forwarding',
+  '等待主机确认': 'Waiting for the host',
+  '连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}':
+      'Connections {p10} · failed {p11} · up {p12} · down {p13}',
   '无法读取服务器身份：{p2}': 'Cannot read the server identity: {p2}',
   '无法通过连接服务打开设备：{p1}':
       'Cannot open the device through the connection service: {p1}',

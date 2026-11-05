@@ -26,9 +26,10 @@ public:
     // Binds the listener (127.0.0.1:local_port, 0 picks a free port) and
     // reports the bound port. The request for the remote target goes out on
     // the first pump(); connections are only accepted once the host answered
-    // Ok, so a refused target leaves nothing relayed.
-    Error start(const std::string& remote_host, uint16_t remote_port,
-                uint16_t local_port, uint16_t* bound_port);
+    // Ok, so a refused target leaves nothing relayed. forward_id names the
+    // target on the wire and must be unique among the session's targets.
+    Error start(uint32_t forward_id, const std::string& remote_host,
+                uint16_t remote_port, uint16_t local_port, uint16_t* bound_port);
     // Closes the listener and every connection, and tells the host to drop
     // the target. Safe to call when nothing is running.
     void stop();
@@ -37,6 +38,7 @@ public:
     std::vector<std::string> pump();
 
     bool running() const;
+    uint32_t forward_id() const;
     std::string remote_host() const;
     uint16_t remote_port() const;
     uint16_t local_port() const;

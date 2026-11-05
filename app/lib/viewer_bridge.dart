@@ -253,6 +253,55 @@ class ViewerDisplayMode {
   }
 }
 
+/// One viewer-side port-forward rule: the local listener and the host target
+/// it relays to. Up to eight rules run in the same session; [active] is true
+/// once the host accepted the target, and [error] explains a refusal or a
+/// failed listener until the rule is removed.
+class ViewerPortForwardRule {
+  const ViewerPortForwardRule({
+    required this.ruleId,
+    this.active = false,
+    this.localPort = 0,
+    this.remoteHost = '',
+    this.remotePort = 0,
+    this.connections = 0,
+    this.failures = 0,
+    this.bytesUp = 0,
+    this.bytesDown = 0,
+    this.error = '',
+  });
+
+  final int ruleId;
+  final bool active;
+  final int localPort;
+  final String remoteHost;
+  final int remotePort;
+  final int connections;
+  final int failures;
+  final int bytesUp;
+  final int bytesDown;
+  final String error;
+
+  static ViewerPortForwardRule? fromMap(Map<Object?, Object?> map) {
+    final int ruleId = (map['ruleId'] as num?)?.toInt() ?? 0;
+    if (ruleId <= 0) {
+      return null;
+    }
+    return ViewerPortForwardRule(
+      ruleId: ruleId,
+      active: map['active'] == true,
+      localPort: (map['localPort'] as num?)?.toInt() ?? 0,
+      remoteHost: map['remoteHost']?.toString() ?? '',
+      remotePort: (map['remotePort'] as num?)?.toInt() ?? 0,
+      connections: (map['connections'] as num?)?.toInt() ?? 0,
+      failures: (map['failures'] as num?)?.toInt() ?? 0,
+      bytesUp: (map['bytesUp'] as num?)?.toInt() ?? 0,
+      bytesDown: (map['bytesDown'] as num?)?.toInt() ?? 0,
+      error: map['error']?.toString() ?? '',
+    );
+  }
+}
+
 /// One Windows session the host can hand the stream to (protocol v40).
 /// [id] is the WTS session id the switch request sends back; only active
 /// sessions with a logged-on user are listed, and [current] marks the session
@@ -545,15 +594,7 @@ class ViewerStatus {
     this.streamOptionError = '',
     this.streamOptionResults = 0,
     this.portForwardEnabled = false,
-    this.portForwardActive = false,
-    this.portForwardLocalPort = 0,
-    this.portForwardRemoteHost = '',
-    this.portForwardRemotePort = 0,
-    this.portForwardConnections = 0,
-    this.portForwardFailures = 0,
-    this.portForwardBytesUp = 0,
-    this.portForwardBytesDown = 0,
-    this.portForwardError = '',
+    this.portForwardRules = const <ViewerPortForwardRule>[],
     this.terminalSupported = false,
     this.terminalPersistSupported = false,
     this.terminalServiceId = 0,
@@ -1038,22 +1079,13 @@ class ViewerStatus {
   final int streamOptionResults;
 
   /// Viewer-side port forwarding. [portForwardEnabled] mirrors the host's
-  /// permission; [portForwardActive] means the local listener on
-  /// 127.0.0.1:[portForwardLocalPort] is up and the host accepted the target
-  /// [portForwardRemoteHost]:[portForwardRemotePort]. While a request is in
-  /// flight the port is already bound but the flag stays false;
-  /// [portForwardError] explains a refusal. The byte counters cover the whole
-  /// session, including targets that were replaced.
+  /// permission; every entry in [portForwardRules] owns a local listener on
+  /// 127.0.0.1 and one host target. A rule is active once the host accepted
+  /// its target; while the request is in flight the listener is already bound
+  /// but [ViewerPortForwardRule.active] stays false. The counters are per
+  /// rule, and a refused rule stays listed with its error.
   final bool portForwardEnabled;
-  final bool portForwardActive;
-  final int portForwardLocalPort;
-  final String portForwardRemoteHost;
-  final int portForwardRemotePort;
-  final int portForwardConnections;
-  final int portForwardFailures;
-  final int portForwardBytesUp;
-  final int portForwardBytesDown;
-  final String portForwardError;
+  final List<ViewerPortForwardRule> portForwardRules;
 
   /// Remote terminal. [terminalSupported] mirrors the host's permission;
   /// [terminalPersistSupported] says the host keeps consoles across
@@ -1267,6 +1299,19 @@ class ViewerStatus {
           final ViewerDisplayMode? mode = ViewerDisplayMode.fromMap(entry);
           if (mode != null) {
             displayModes.add(mode);
+          }
+        }
+      }
+    }
+    final List<ViewerPortForwardRule> forwardRules = <ViewerPortForwardRule>[];
+    final Object? rawForwardRules = map['portForwardRules'];
+    if (rawForwardRules is List) {
+      for (final Object? entry in rawForwardRules) {
+        if (entry is Map) {
+          final ViewerPortForwardRule? rule =
+              ViewerPortForwardRule.fromMap(entry);
+          if (rule != null) {
+            forwardRules.add(rule);
           }
         }
       }
@@ -1488,15 +1533,7 @@ class ViewerStatus {
       streamOptionError: asString(map['streamOptionError']),
       streamOptionResults: asInt(map['streamOptionResults']),
       portForwardEnabled: map['portForwardEnabled'] == true,
-      portForwardActive: map['portForwardActive'] == true,
-      portForwardLocalPort: asInt(map['portForwardLocalPort']),
-      portForwardRemoteHost: asString(map['portForwardRemoteHost']),
-      portForwardRemotePort: asInt(map['portForwardRemotePort']),
-      portForwardConnections: asInt(map['portForwardConnections']),
-      portForwardFailures: asInt(map['portForwardFailures']),
-      portForwardBytesUp: asInt(map['portForwardBytesUp']),
-      portForwardBytesDown: asInt(map['portForwardBytesDown']),
-      portForwardError: asString(map['portForwardError']),
+      portForwardRules: List<ViewerPortForwardRule>.unmodifiable(forwardRules),
       terminalSupported: map['terminalSupported'] == true,
       terminalPersistSupported: map['terminalPersistSupported'] == true,
       terminalServiceId: asInt(map['terminalServiceId']),
@@ -2002,17 +2039,17 @@ class ViewerBridge {
 
   /// Binds a viewer-side port-forward listener on 127.0.0.1:[localPort]
   /// (0 picks a free port) and asks the host to relay it to
-  /// [remoteHost]:[remotePort]. False means the request was not queued: no
-  /// streaming session, or the host did not grant
-  /// [ViewerPermission.portForward]. The bound port and the host's answer
-  /// arrive through [ViewerStatus.portForwardLocalPort] and
-  /// [ViewerStatus.portForwardError].
-  static Future<bool> startPortForward({
+  /// [remoteHost]:[remotePort]. Returns the rule id that names it in
+  /// [ViewerStatus.portForwardRules], or 0 when the request was not queued:
+  /// no streaming session, or the host did not grant
+  /// [ViewerPermission.portForward]. Rules run in parallel, up to the host's
+  /// eight-target budget.
+  static Future<int> startPortForward({
     required int localPort,
     required String remoteHost,
     required int remotePort,
   }) async {
-    final bool? queued = await _channel.invokeMethod<bool>(
+    final int? ruleId = await _channel.invokeMethod<int>(
       'startPortForward',
       <String, Object>{
         'localPort': localPort,
@@ -2020,13 +2057,15 @@ class ViewerBridge {
         'remotePort': remotePort,
       },
     );
-    return queued ?? false;
+    return ruleId ?? 0;
   }
 
-  /// Closes the listener and every relayed connection, and tells the host to
-  /// drop the target. Safe when nothing is running.
-  static Future<void> stopPortForward() {
-    return _channel.invokeMethod<void>('stopPortForward');
+  /// Stops one rule's listener and every relayed connection, and tells the
+  /// host to drop the target. Safe when the id is unknown.
+  static Future<void> stopPortForward({required int ruleId}) {
+    return _channel.invokeMethod<void>('stopPortForward', <String, Object>{
+      'ruleId': ruleId,
+    });
   }
 
   /// While remote control is on, an active local IME must not turn physical

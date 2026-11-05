@@ -193,7 +193,7 @@ struct PortForwardClient::Impl {
     uint16_t remote_port = 0;
     uint16_t local_port = 0;
     SOCKET listener = INVALID_SOCKET;
-    uint32_t forward_id = 1;
+    uint32_t forward_id = 0;
     uint32_t next_connection_id = 1;
     std::vector<Conn> live;
     uint64_t accepted = 0;
@@ -218,11 +218,15 @@ PortForwardClient::~PortForwardClient() {
     }
 }
 
-Error PortForwardClient::start(const std::string& remote_host, uint16_t remote_port,
-                               uint16_t local_port, uint16_t* bound_port) {
+Error PortForwardClient::start(uint32_t forward_id, const std::string& remote_host,
+                               uint16_t remote_port, uint16_t local_port,
+                               uint16_t* bound_port) {
     Impl& impl = *impl_;
     if (impl.step != Impl::Step::Idle && impl.step != Impl::Step::Closed) {
         return Error(Status::InvalidCall, "a port forward is already running");
+    }
+    if (forward_id == 0) {
+        return Error(Status::InvalidCall, "the forward id must not be zero");
     }
     if (!impl.wsa) {
         WSADATA data{};
@@ -262,6 +266,7 @@ Error PortForwardClient::start(const std::string& remote_host, uint16_t remote_p
         closesocket(listener);
         return Error(Status::Unavailable, "cannot read the listener's port");
     }
+    impl.forward_id = forward_id;
     impl.host = remote_host;
     impl.remote_port = remote_port;
     impl.local_port = ntohs(address.sin_port);
@@ -391,6 +396,8 @@ bool PortForwardClient::running() const {
     return impl.step == Impl::Step::Request || impl.step == Impl::Step::WaitResult ||
            impl.step == Impl::Step::Accept;
 }
+
+uint32_t PortForwardClient::forward_id() const { return impl_->forward_id; }
 
 std::string PortForwardClient::remote_host() const { return impl_->host; }
 

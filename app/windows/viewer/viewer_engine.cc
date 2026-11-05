@@ -500,11 +500,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_session_list_ = false;
         pending_session_select_.reset();
     }
-    // Port forwarding belongs to one session too; the listener lives on the
-    // session thread and goes away with it.
+    // Port forwarding belongs to one session too; the listeners live on the
+    // session thread and go away with it.
     {
         std::lock_guard<std::mutex> lock(port_forward_mutex_);
-        pending_port_forward_.reset();
+        pending_port_forward_.clear();
+        next_port_forward_id_ = 1;
     }
     // Chat belongs to one viewer session in both directions.
     {
@@ -1711,34 +1712,44 @@ void ViewerEngine::StopCamera() {
     pending_camera_.push_back(std::move(command));
 }
 
-bool ViewerEngine::StartPortForward(uint16_t local_port,
-                                    const std::string& remote_host,
-                                    uint16_t remote_port) {
+uint32_t ViewerEngine::StartPortForward(uint16_t local_port,
+                                        const std::string& remote_host,
+                                        uint16_t remote_port) {
     if (!running_.load(std::memory_order_acquire) || remote_host.empty() ||
         remote_port == 0) {
-        return false;
+        return 0;
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (status_.state != ViewerState::kStreaming ||
             (status_.permissions & chast::kPermissionPortForward) == 0) {
-            return false;
+            return 0;
         }
     }
     PortForwardCommand command;
+    command.kind = PortForwardCommand::Kind::Start;
     command.local_port = local_port;
     command.remote_host = remote_host;
     command.remote_port = remote_port;
     std::lock_guard<std::mutex> lock(port_forward_mutex_);
-    pending_port_forward_ = std::move(command);
-    return true;
+    command.rule_id = next_port_forward_id_++;
+    if (next_port_forward_id_ == 0) {
+        next_port_forward_id_ = 1;
+    }
+    const uint32_t rule_id = command.rule_id;
+    pending_port_forward_.push_back(std::move(command));
+    return rule_id;
 }
 
-void ViewerEngine::StopPortForward() {
+void ViewerEngine::StopPortForward(uint32_t rule_id) {
+    if (rule_id == 0) {
+        return;
+    }
     PortForwardCommand command;
-    command.stop = true;
+    command.kind = PortForwardCommand::Kind::Stop;
+    command.rule_id = rule_id;
     std::lock_guard<std::mutex> lock(port_forward_mutex_);
-    pending_port_forward_ = std::move(command);
+    pending_port_forward_.push_back(std::move(command));
 }
 
 ViewerStatus ViewerEngine::Snapshot() const {
@@ -2209,9 +2220,6 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     // has been destroyed.
     std::unique_ptr<chast::CarrierBridge> carrier_bridge;
     std::unique_ptr<chast::QuicSession> session;
-    // Declared after the session so its destructor (which tells the host to
-    // drop the target) runs while the connection still exists.
-    std::unique_ptr<chast::PortForwardClient> port_forward;
 
     // Stops the uplink: the capture thread first (it owns the endpoint), then
     // the CMIC stream, so the host sees the switch go off. `switch_off`
@@ -6458,132 +6466,169 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
-                // Port forwarding. The operator's target crosses the mutex;
-                // the listener and every relay are driven here by pump(). The
-                // counters add up across targets, so the status stays
-                // session-wide even when a target is replaced.
-                uint64_t forward_connections_done = 0;
-                uint64_t forward_failures_done = 0;
-                uint64_t forward_bytes_up_done = 0;
-                uint64_t forward_bytes_down_done = 0;
-                std::string last_forward_error;
+                // Port forwarding. Every rule owns one listener and one host
+                // target; commands cross the mutex in order and the rules are
+                // driven here by pump(). Up to kMaxPortForwardTargets run at
+                // once, and a rule that failed to start stays listed with its
+                // error until the operator removes it.
+                struct ActiveForward {
+                    uint32_t rule_id = 0;
+                    uint16_t local_port = 0;
+                    std::string remote_host;
+                    uint16_t remote_port = 0;
+                    std::unique_ptr<chast::PortForwardClient> client;
+                    bool active = false;
+                    uint64_t connections = 0;
+                    uint64_t failures = 0;
+                    uint64_t bytes_up = 0;
+                    uint64_t bytes_down = 0;
+                    std::string error;
+                };
+                std::vector<ActiveForward> forwards;
 
-                auto drop_port_forward = [&] {
-                    if (!port_forward) {
-                        return;
+                auto publish_forwards = [&] {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.port_forward_rules.clear();
+                    status_.port_forward_rules.reserve(forwards.size());
+                    for (const ActiveForward& forward : forwards) {
+                        ViewerPortForwardRule rule;
+                        rule.rule_id = forward.rule_id;
+                        rule.active = forward.active;
+                        rule.local_port = forward.local_port;
+                        rule.remote_host = forward.remote_host;
+                        rule.remote_port = forward.remote_port;
+                        rule.connections = forward.connections;
+                        rule.failures = forward.failures;
+                        rule.bytes_up = forward.bytes_up;
+                        rule.bytes_down = forward.bytes_down;
+                        rule.error = forward.error;
+                        status_.port_forward_rules.push_back(std::move(rule));
                     }
-                    forward_connections_done += port_forward->connections();
-                    forward_failures_done += port_forward->failures();
-                    forward_bytes_up_done += port_forward->bytes_up();
-                    forward_bytes_down_done += port_forward->bytes_down();
-                    port_forward->stop();
-                    port_forward.reset();
+                };
+
+                auto stop_forward = [&](size_t index) {
+                    ActiveForward& forward = forwards[index];
+                    if (forward.client) {
+                        forward.client->stop();
+                        forward.client.reset();
+                    }
+                    std::fprintf(stderr, "viewer: port forward rule %u stopped\n",
+                                 static_cast<unsigned>(forward.rule_id));
+                    forwards.erase(forwards.begin() +
+                                   static_cast<std::ptrdiff_t>(index));
                 };
 
                 auto drain_port_forward = [&] {
-                    std::optional<PortForwardCommand> command;
+                    std::deque<PortForwardCommand> commands;
                     {
                         std::lock_guard<std::mutex> lock(port_forward_mutex_);
-                        command.swap(pending_port_forward_);
+                        commands.swap(pending_port_forward_);
                     }
-                    if (!command) {
+                    if (commands.empty()) {
                         return;
                     }
-                    drop_port_forward();
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.port_forward_active = false;
-                        status_.port_forward_local_port = 0;
-                        status_.port_forward_remote_host.clear();
-                        status_.port_forward_remote_port = 0;
-                        status_.port_forward_error.clear();
-                        status_.port_forward_connections = forward_connections_done;
-                        status_.port_forward_failures = forward_failures_done;
-                        status_.port_forward_bytes_up = forward_bytes_up_done;
-                        status_.port_forward_bytes_down = forward_bytes_down_done;
-                    }
-                    last_forward_error.clear();
-                    if (command->stop) {
-                        return;
-                    }
-                    if ((session->permissions() & chast::kPermissionPortForward) == 0) {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.port_forward_error =
-                            "the host did not grant port forwarding";
-                        return;
-                    }
-                    auto client = std::make_unique<chast::PortForwardClient>(*session);
-                    uint16_t bound = 0;
-                    const chast::Error started = client->start(
-                        command->remote_host, command->remote_port, command->local_port,
-                        &bound);
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.port_forward_remote_host = command->remote_host;
-                        status_.port_forward_remote_port = command->remote_port;
-                        if (started.ok()) {
-                            status_.port_forward_local_port = bound;
-                        } else {
-                            status_.port_forward_local_port = 0;
-                            status_.port_forward_error =
-                                "listener: " + started.to_string();
+                    for (const PortForwardCommand& command : commands) {
+                        if (command.kind == PortForwardCommand::Kind::Stop) {
+                            for (size_t i = 0; i < forwards.size(); ++i) {
+                                if (forwards[i].rule_id == command.rule_id) {
+                                    stop_forward(i);
+                                    break;
+                                }
+                            }
+                            continue;
                         }
+                        ActiveForward forward;
+                        forward.rule_id = command.rule_id;
+                        forward.local_port = command.local_port;
+                        forward.remote_host = command.remote_host;
+                        forward.remote_port = command.remote_port;
+                        const auto live_forwards = std::count_if(
+                            forwards.begin(), forwards.end(),
+                            [](const ActiveForward& entry) {
+                                return entry.active ||
+                                       (entry.client != nullptr &&
+                                        entry.client->running());
+                            });
+                        if ((session->permissions() & chast::kPermissionPortForward) == 0) {
+                            forward.error = "the host did not grant port forwarding";
+                            forwards.push_back(std::move(forward));
+                            continue;
+                        }
+                        if (live_forwards >=
+                            static_cast<std::ptrdiff_t>(
+                                chast::kMaxPortForwardTargets)) {
+                            forward.error = "at most " +
+                                            std::to_string(chast::kMaxPortForwardTargets) +
+                                            " port forwards run at once";
+                            forwards.push_back(std::move(forward));
+                            continue;
+                        }
+                        forward.client = std::make_unique<chast::PortForwardClient>(*session);
+                        uint16_t bound = 0;
+                        const chast::Error started = forward.client->start(
+                            forward.rule_id, command.remote_host, command.remote_port,
+                            command.local_port, &bound);
+                        if (!started.ok()) {
+                            forward.client.reset();
+                            forward.local_port = 0;
+                            forward.error = "listener: " + started.to_string();
+                            std::fprintf(stderr, "viewer: port forward: %s\n",
+                                         started.to_string().c_str());
+                            forwards.push_back(std::move(forward));
+                            continue;
+                        }
+                        forward.local_port = bound;
+                        std::fprintf(stderr,
+                                     "viewer: port forward rule %u listening on "
+                                     "127.0.0.1:%u -> %s:%u\n",
+                                     static_cast<unsigned>(forward.rule_id),
+                                     static_cast<unsigned>(bound),
+                                     command.remote_host.c_str(),
+                                     static_cast<unsigned>(command.remote_port));
+                        forwards.push_back(std::move(forward));
                     }
-                    if (!started.ok()) {
-                        std::fprintf(stderr, "viewer: port forward: %s\n",
-                                     started.to_string().c_str());
-                        return;
-                    }
-                    std::fprintf(stderr,
-                                 "viewer: port forward listening on 127.0.0.1:%u -> %s:%u\n",
-                                 static_cast<unsigned>(bound), command->remote_host.c_str(),
-                                 static_cast<unsigned>(command->remote_port));
-                    port_forward = std::move(client);
+                    publish_forwards();
                 };
 
                 auto poll_port_forward = [&] {
-                    if (!port_forward) {
+                    if (forwards.empty()) {
                         return;
                     }
-                    if ((session->permissions() & chast::kPermissionPortForward) == 0) {
-                        // A revocation closes the local port immediately; the
-                        // transport aborts whatever was still in flight.
-                        drop_port_forward();
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.port_forward_active = false;
-                        status_.port_forward_error =
-                            "the host revoked port forwarding";
-                        status_.port_forward_connections = forward_connections_done;
-                        status_.port_forward_failures = forward_failures_done;
-                        status_.port_forward_bytes_up = forward_bytes_up_done;
-                        status_.port_forward_bytes_down = forward_bytes_down_done;
-                        return;
-                    }
-                    for (const std::string& event : port_forward->pump()) {
-                        std::fprintf(stderr, "viewer: %s\n", event.c_str());
-                    }
-                    const bool active = port_forward->running();
-                    const std::string error = port_forward->error();
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        status_.port_forward_active = active;
-                        status_.port_forward_connections =
-                            forward_connections_done + port_forward->connections();
-                        status_.port_forward_failures =
-                            forward_failures_done + port_forward->failures();
-                        status_.port_forward_bytes_up =
-                            forward_bytes_up_done + port_forward->bytes_up();
-                        status_.port_forward_bytes_down =
-                            forward_bytes_down_done + port_forward->bytes_down();
-                        status_.port_forward_error = error;
-                    }
-                    if (error != last_forward_error) {
-                        if (!error.empty()) {
-                            std::fprintf(stderr, "viewer: port forward: %s\n",
-                                         error.c_str());
+                    const bool allowed =
+                        (session->permissions() & chast::kPermissionPortForward) != 0;
+                    for (ActiveForward& forward : forwards) {
+                        if (!forward.client) {
+                            continue;
                         }
-                        last_forward_error = error;
+                        if (!allowed) {
+                            // A revocation closes every local port at once; the
+                            // transport aborts whatever was still in flight.
+                            forward.client->stop();
+                            forward.client.reset();
+                            forward.active = false;
+                            forward.error = "the host revoked port forwarding";
+                            continue;
+                        }
+                        for (const std::string& event : forward.client->pump()) {
+                            std::fprintf(stderr, "viewer: %s\n", event.c_str());
+                        }
+                        forward.active = forward.client->running();
+                        forward.connections = forward.client->connections();
+                        forward.failures = forward.client->failures();
+                        forward.bytes_up = forward.client->bytes_up();
+                        forward.bytes_down = forward.client->bytes_down();
+                        const std::string error = forward.client->error();
+                        if (error != forward.error) {
+                            forward.error = error;
+                            if (!error.empty()) {
+                                std::fprintf(stderr,
+                                             "viewer: port forward rule %u: %s\n",
+                                             static_cast<unsigned>(forward.rule_id),
+                                             error.c_str());
+                            }
+                        }
                     }
+                    publish_forwards();
                 };
 
                 // Adopts the desktop the host is capturing. Secure is the lock
@@ -6969,7 +7014,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         file_active || audio_announced || microphone_enabled ||
                         microphone_wanted_.load(std::memory_order_relaxed) ||
                         voice_wanted_.load(std::memory_order_relaxed) || voice_active ||
-                        voice_pending || port_forward != nullptr || terminal_active ||
+                        voice_pending || !forwards.empty() || terminal_active ||
                         camera_active;
                     if (keyframe_wanted_.exchange(false, std::memory_order_relaxed)) {
                         request_keyframe();

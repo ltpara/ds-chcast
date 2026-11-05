@@ -4292,7 +4292,7 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
         local_forward = std::make_unique<chast::PortForwardClient>(*session);
         uint16_t bound = 0;
         const chast::Error started = local_forward->start(
-            options.forward_host, options.forward_port, 0, &bound);
+            1, options.forward_host, options.forward_port, 0, &bound);
         if (!started.ok()) {
             return fail("start_port_forward: " + started.to_string());
         }

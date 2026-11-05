@@ -130,6 +130,23 @@ enum class CameraPhase {
     kFailed = 6,
 };
 
+// One viewer-side port-forward rule: the local listener and the host target it
+// is relayed to. A rule is active once the host accepted the target; a refused
+// or failed one stays in the list with `error` set until the operator removes
+// it, so a rejection is visible instead of silently disappearing.
+struct ViewerPortForwardRule {
+    uint32_t rule_id = 0;
+    bool active = false;
+    uint16_t local_port = 0;
+    std::string remote_host;
+    uint16_t remote_port = 0;
+    uint64_t connections = 0;
+    uint64_t failures = 0;
+    uint64_t bytes_up = 0;
+    uint64_t bytes_down = 0;
+    std::string error;
+};
+
 struct ViewerStatus {
     ViewerState state = ViewerState::kIdle;
     std::string error;
@@ -508,22 +525,14 @@ struct ViewerStatus {
     std::string stream_option_error;
     uint64_t stream_option_results = 0;
     // Viewer-side port forwarding. `port_forward_enabled` mirrors the host's
-    // announced permission; `port_forward_active` means the local listener is
-    // up and the host accepted the target. While a request is in flight the
-    // listener is already bound (so the UI can show the port) but the flag
-    // stays false; a refusal closes the listener and explains itself in
-    // `port_forward_error`. The byte counters cover the whole session and all
-    // relayed connections.
+    // announced permission; every rule in `port_forward_rules` owns a local
+    // listener on 127.0.0.1 and one host target. Up to
+    // chast::kMaxPortForwardTargets rules run in parallel. A rule is active
+    // once the host accepted its target; while the request is in flight the
+    // listener is already bound (so the UI can show the port) but `active`
+    // stays false. The counters are per rule.
     bool port_forward_enabled = false;
-    bool port_forward_active = false;
-    uint16_t port_forward_local_port = 0;
-    std::string port_forward_remote_host;
-    uint16_t port_forward_remote_port = 0;
-    uint64_t port_forward_connections = 0;
-    uint64_t port_forward_failures = 0;
-    uint64_t port_forward_bytes_up = 0;
-    uint64_t port_forward_bytes_down = 0;
-    std::string port_forward_error;
+    std::vector<ViewerPortForwardRule> port_forward_rules;
     // Remote terminal (protocol v27). The viewer drives at most one console.
     // `terminal_supported` mirrors the host's announced permission;
     // `terminal_phase` is a TerminalPhase value; `terminal_code` and
@@ -785,17 +794,18 @@ public:
 
     // Binds a viewer-side port-forward listener on 127.0.0.1:local_port (0
     // picks a free port) and asks the host to relay it to
-    // remote_host:remote_port. Returns false when no session is streaming, the
-    // host did not grant kPermissionPortForward, or the arguments are invalid
-    // (an empty host or a zero remote port). The listener is applied by the
-    // session thread within one poll; the bound port, the host's answer and the
-    // counters arrive through ViewerStatus::port_forward_*. One target per
-    // viewer: starting again replaces the running listener.
-    bool StartPortForward(uint16_t local_port, const std::string& remote_host,
-                          uint16_t remote_port);
-    // Stops the listener and every relayed connection, and tells the host to
-    // drop the target. Safe to call when nothing is running.
-    void StopPortForward();
+    // remote_host:remote_port. Returns the rule id (nonzero) that names the
+    // rule in ViewerStatus::port_forward_rules, or 0 when no session is
+    // streaming, the host did not grant kPermissionPortForward, or the
+    // arguments are invalid (an empty host or a zero remote port). The
+    // listener is applied by the session thread within one poll. Up to
+    // chast::kMaxPortForwardTargets rules run at once; starting more leaves
+    // each extra rule in the list with an error.
+    uint32_t StartPortForward(uint16_t local_port, const std::string& remote_host,
+                              uint16_t remote_port);
+    // Stops one rule's listener and every relayed connection, and tells the
+    // host to drop the target. Safe when the id is unknown or already stopped.
+    void StopPortForward(uint32_t rule_id);
 
     // Copies the newest pointer state the host sent, once per received update.
     // The sprite is only attached to the update that introduced a shape, so a
@@ -1044,18 +1054,20 @@ private:
     bool pending_session_list_ = false;
     std::optional<uint32_t> pending_session_select_;
 
-    // The port-forward target crosses to the session thread here. One slot is
-    // enough: the operator picks a target, and a newer pick replaces an
-    // unsent one. `stop` is a command of its own so it cannot be dropped by a
-    // later start.
+    // Port-forward commands cross to the session thread here. The queue keeps
+    // order between starts and stops, so a stop cannot overtake the start it
+    // refers to. Ids are allocated under this mutex when a start is queued.
     struct PortForwardCommand {
-        bool stop = false;
+        enum class Kind { Start, Stop };
+        Kind kind = Kind::Start;
+        uint32_t rule_id = 0;
         uint16_t local_port = 0;
         std::string remote_host;
         uint16_t remote_port = 0;
     };
     mutable std::mutex port_forward_mutex_;
-    std::optional<PortForwardCommand> pending_port_forward_;
+    std::deque<PortForwardCommand> pending_port_forward_;
+    uint32_t next_port_forward_id_ = 1;
 
     // Chat crosses in both directions. The outgoing queue is bounded and
     // cleared when a session starts; the session thread appends host lines for
