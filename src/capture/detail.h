@@ -266,6 +266,9 @@ struct CaptureDevice {
     ComPtr<ID3D11DeviceContext> context;
     UINT vendor_id = 0;
 };
+std::unique_ptr<IDxgiCapturer> create_shared_capturer_on_device(const DisplayInfo& display,
+    const CaptureConfig& config, ID3D11Device* device, ID3D11DeviceContext* context,
+    UINT vendor_id, std::string* error);
 
 // Creates the D3D11 device for an adapter by LUID, with the flags Desktop
 // Duplication and the NV12 video processor need.

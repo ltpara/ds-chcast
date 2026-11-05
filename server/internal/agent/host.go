@@ -120,7 +120,8 @@ type HostInfo struct {
 }
 
 type HostAgent struct {
-	cfg HostConfig
+	routes localRoutes
+	cfg    HostConfig
 	// conn carries rendezvous, relay and viewer traffic; localOut exists only
 	// when the local control address needs the other address family.
 	conn         *net.UDPConn
@@ -385,6 +386,7 @@ func (h *HostAgent) reportInfo() {
 }
 
 func (h *HostAgent) Close() {
+	h.routes.close()
 	h.cancel()
 	h.conn.Close()
 	if h.localOut != nil {
@@ -771,14 +773,26 @@ func (h *HostAgent) readLoop() {
 			continue
 		}
 		h.noteViewer(src)
-		h.mu.Lock()
-		h.remote = cloneAddr(src)
-		h.mu.Unlock()
-		if h.localOut != nil {
-			h.localOut.WriteToUDP(data, h.local)
-		} else {
-			h.conn.WriteToUDP(data, h.local)
+		route := src.String()
+		id, payload, multiplex := carrier.DecodeMux(data)
+		if multiplex {
+			if !h.relayAllowed(src) {
+				continue
+			}
+			route += "/" + strconv.FormatUint(id, 10)
+			data = payload
 		}
+		peer := cloneAddr(src)
+		_ = h.routes.forward(route, h.local, data, func(reply []byte) error {
+			if multiplex {
+				reply = carrier.EncodeMux(id, reply)
+			}
+			if len(reply) == 0 {
+				return nil
+			}
+			_, err := h.conn.WriteToUDP(reply, peer)
+			return err
+		})
 	}
 }
 
@@ -899,10 +913,15 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 			msg.Candidate == "" || msg.Nonce == "" {
 			return
 		}
-		signature := identity.Sign(h.priv, identity.RelayMessage(h.cfg.ID, src.Port, msg.Candidate, msg.Nonce))
+		candidate := msg.Candidate
+		if msg.Multiplex {
+			candidate += "\nMUX1"
+		}
+		signature := identity.Sign(h.priv, identity.RelayMessage(h.cfg.ID, src.Port, candidate, msg.Nonce))
 		h.noteObserved(false, msg.Candidate)
 		h.conn.WriteToUDP(wire.Encode(wire.Message{
 			Type:      wire.TypeRelayAuth,
+			Multiplex: msg.Multiplex,
 			HostID:    h.cfg.ID,
 			Nonce:     msg.Nonce,
 			Candidate: msg.Candidate,
@@ -967,7 +986,7 @@ func (h *HostAgent) relayHelloLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	send := func() {
-		raw := wire.Encode(wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID})
+		raw := wire.Encode(wire.Message{Type: wire.TypeRelayHello, HostID: h.cfg.ID, Multiplex: true})
 		// Every advertised endpoint is a way into the same lease. A dual-stack
 		// host authenticates on each family so a viewer can pick either one.
 		for _, relay := range h.relayEndpoints() {
@@ -1104,7 +1123,7 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	hello, err := json.Marshal(carrier.HostHello{HostID: h.cfg.ID})
+	hello, err := json.Marshal(carrier.HostHello{HostID: h.cfg.ID, Multiplex: true})
 	if err != nil {
 		return false, err
 	}
@@ -1124,10 +1143,15 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	if err := json.Unmarshal([]byte(challengeText), &challenge); err != nil || challenge.Nonce == "" {
 		return false, fmt.Errorf("relay carrier sent a malformed challenge")
 	}
+	capability := ""
+	if challenge.Multiplex {
+		capability = "MUX1"
+	}
 	auth, err := json.Marshal(carrier.HostAuth{
+		Multiplex: challenge.Multiplex,
 		HostID:    h.cfg.ID,
 		Nonce:     challenge.Nonce,
-		Signature: identity.Sign(h.priv, identity.CarrierHostMessage(h.cfg.ID, "", challenge.Nonce)),
+		Signature: identity.Sign(h.priv, identity.CarrierHostMessage(h.cfg.ID, capability, challenge.Nonce)),
 	})
 	if err != nil {
 		return false, err
@@ -1151,6 +1175,10 @@ func (h *HostAgent) runCarrierLink(relayAddr string) (bool, error) {
 	relaySend := carrier.NewFrameWriter(conn)
 
 	h.carrierOnce.Do(func() { close(h.carrierReady) })
+	if challenge.Multiplex {
+		local.Close()
+		return true, h.runMuxCarrier(conn, relayFrames, relaySend, relayAddr)
+	}
 	h.log.Info("carrier link established", "relay", relayAddr, "local", h.carrier.String())
 	defer h.log.Info("carrier link closed", "relay", relayAddr)
 

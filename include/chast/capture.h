@@ -207,7 +207,7 @@ enum class CaptureResult {
 // The D3D11 device a capturer runs on, exported so an encoder can pick the
 // right device: import the frame's shared handle into `device` to stay
 // on-GPU, and choose a hardware encoder for `vendor_id` (1 = AMD, 0x10DE =
-// NVIDIA, 0x8086 = Intel) or fall back to the software one.
+// NVIDIA, 0x8086 = Intel). Unsupported hardware fails explicitly.
 struct AdapterDevice {
     ID3D11Device* device = nullptr;  // capturer-owned, valid for its lifetime
     UINT vendor_id = 0;
@@ -269,6 +269,13 @@ std::unique_ptr<IDxgiCapturer> create_capturer(size_t display_index, const Captu
 std::unique_ptr<IDxgiCapturer> create_capturer(const DisplayInfo& display,
                                                const CaptureConfig& config,
                                                std::string* error = nullptr);
+
+// Concurrent viewers share one desktop duplication per output. Each reader
+// owns GPU textures and an independent NV12 scaler; no pixels enter sysmem.
+std::unique_ptr<IDxgiCapturer> create_shared_capturer(size_t display_index,
+    const CaptureConfig& config, std::string* error = nullptr);
+std::unique_ptr<IDxgiCapturer> create_shared_capturer(const DisplayInfo& display,
+    const CaptureConfig& config, std::string* error = nullptr);
 
 // Creates a capturer that lays every display out in virtual-desktop order and
 // publishes the union as one picture. All displays must be on the same

@@ -12,6 +12,8 @@ import (
 // account that asked for it.
 var ErrUnknownRecording = errors.New("unknown recording")
 
+var ErrRecordingQuota = errors.New("account recording quota is exhausted")
+
 var recordingIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 // Recording is the metadata of one uploaded viewer recording. The MP4 itself
@@ -36,6 +38,16 @@ type Recording struct {
 // AddRecording stores metadata after the archive has written the file. The
 // caller supplies the digest so both sides describe the same bytes.
 func (s *Store) AddRecording(rec Recording) (Recording, error) {
+	return s.AddRecordingWithQuota(rec, 0)
+}
+
+// AddRecordingWithQuota checks account usage and inserts in one SQLite write
+// statement, including when multiple stores share the same database.
+// Zero quota means unlimited.
+func (s *Store) AddRecordingWithQuota(rec Recording, quota int64) (Recording, error) {
+	if quota < 0 {
+		return Recording{}, fmt.Errorf("recording quota must not be negative")
+	}
 	if !recordingIDPattern.MatchString(rec.ID) {
 		return Recording{}, fmt.Errorf("account store %s: recording id is invalid", s.path)
 	}
@@ -58,15 +70,22 @@ func (s *Store) AddRecording(rec Recording) (Recording, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(
+	result, err := s.db.Exec(
 		`INSERT INTO recordings (id, user_id, name, peer_id, size, sha256,
 			duration_ms, started_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		 WHERE ? = 0 OR COALESCE((SELECT SUM(size) FROM recordings WHERE user_id = ?), 0) <= ? - ?`,
 		rec.ID, rec.UserID, rec.Name, strings.TrimSpace(rec.PeerID), rec.Size,
 		rec.SHA256, rec.DurationMS, rec.StartedAtMS, rec.CreatedAtMS,
+		quota, rec.UserID, quota, rec.Size,
 	)
 	if err != nil {
 		return Recording{}, fmt.Errorf("account store %s: add recording: %w", s.path, err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return Recording{}, fmt.Errorf("account store %s: recording insert result: %w", s.path, err)
+	} else if rows == 0 {
+		return Recording{}, ErrRecordingQuota
 	}
 	return rec, nil
 }
@@ -183,7 +202,6 @@ func (s *Store) RecordingTotals(username string) (int64, int, error) {
 	}
 	return bytes, files, nil
 }
-
 
 func (s *Store) recordingLocked(userID, id string) (Recording, error) {
 	row := s.db.QueryRow(

@@ -41,6 +41,7 @@ Require-File (Join-Path $viewerDir "chast_viewer.exe") "build the viewer with: c
 Require-File (Join-Path $viewerDir "chast-tunnel.exe") "the viewer build ships the bundled tunnel agent"
 Require-File (Join-Path $hostDir "chast-host.exe") "build the host with: cmake --build build --config $Configuration --target chast-host"
 Require-File (Join-Path $hostDir "chast-service.exe") "build the service with: cmake --build build --config $Configuration --target chast-service"
+Require-File (Join-Path $hostDir "chast-display-guard.exe") "build the display recovery helper with: cmake --build build --config $Configuration --target chast-display-guard"
 Require-File (Join-Path $viewerDir "data\app.so") "the viewer release tree is incomplete"
 
 Write-Host "staging chast $Version"
@@ -51,6 +52,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -Path (Join-Path $viewerDir "*") -Destination $stage -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $hostDir "chast-host.exe") -Destination $stage -Force
 Copy-Item -LiteralPath (Join-Path $hostDir "chast-service.exe") -Destination $stage -Force
+Copy-Item -LiteralPath (Join-Path $hostDir "chast-display-guard.exe") -Destination $stage -Force
 Get-ChildItem -LiteralPath $stage -Recurse -File |
     Where-Object { $_.Extension -in ".lib", ".pdb", ".exp" } |
     Remove-Item -Force

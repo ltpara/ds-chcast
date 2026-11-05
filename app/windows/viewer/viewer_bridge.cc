@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -29,12 +30,24 @@
 
 namespace chast_viewer {
 
+// The worker owns ceremony data; the platform thread exclusively owns the
+// Flutter reply. Shutdown abandons that reply before its engine is destroyed.
+struct SecurityKeyCompletion {
+    std::mutex mutex;
+    bool abandoned = false;
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
+    flutter::EncodableMap value;
+    std::string error_code;
+    std::string error;
+    bool ok = false;
+};
+
 namespace {
 
 constexpr UINT_PTR kViewSubclassId = 1;
 constexpr UINT_PTR kWindowSubclassId = 2;
 // Posted by a security-key worker thread once Windows Hello returns. The
-// LPARAM owns a SecurityKeyCompletion that only the platform thread may answer.
+// LPARAM identifies the bridge-owned completion; it does not own memory.
 constexpr UINT kSecurityKeyDoneMessage = WM_APP + 0x51;
 // The Dart side uses a server URL or host:port as the password-store key.
 constexpr size_t kMaxTrustKeyLength = 512;
@@ -44,14 +57,12 @@ constexpr char kAccountSecretEntropy[] = "chast.account.v1";
 constexpr size_t kMaxProtectPlaintext = 64 * 1024;
 constexpr size_t kMaxProtectedText = 128 * 1024;
 
-// A finished Windows Hello ceremony waiting for the platform thread.
-struct SecurityKeyCompletion {
-    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
-    flutter::EncodableMap value;
-    std::string error_code;
-    std::string error;
-    bool ok = false;
-};
+bool cursor_over_view(HWND view) {
+    POINT position{};
+    if (!view || !IsWindow(view) || !GetCursorPos(&position)) return false;
+    const HWND hovered = WindowFromPoint(position);
+    return hovered == view || IsChild(view, hovered);
+}
 
 const char* state_name(ViewerState state) {
     switch (state) {
@@ -255,6 +266,17 @@ void ViewerBridge::Shutdown() {
         return;
     }
     shutting_down_ = true;
+    if (security_key_pending_) {
+        auto completion = std::move(security_key_pending_);
+        std::lock_guard<std::mutex> lock(completion->mutex);
+        completion->abandoned = true;
+        completion->result.reset();
+        // Posting and abandonment share the mutex, so no late result can be
+        // queued after this drain, including after Windows reuses the HWND.
+        MSG message{};
+        while (PeekMessageW(&message, window_, kSecurityKeyDoneMessage,
+                            kSecurityKeyDoneMessage, PM_REMOVE)) {}
+    }
     SetKeyCapture(false);
     ClearCursor();
     if (view_ != nullptr) {
@@ -314,6 +336,28 @@ void ViewerBridge::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
     const std::string& method = call.method_name();
+
+    if (method == "openSessionWindow") {
+        const auto* payload = std::get_if<std::string>(call.arguments());
+        if (!payload || !open_session_window || !open_session_window(*payload)) {
+            result->Error("window_open_failed", "Could not open a session window (limit 16)");
+        } else {
+            result->Success(flutter::EncodableValue(true));
+        }
+        return;
+    }
+    if (method == "setWindowCloseHandler") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        window_close_handler_ = enabled && *enabled;
+        result->Success();
+        return;
+    }
+    if (method == "closeSessionWindow") {
+        window_close_handler_ = false;
+        result->Success();
+        PostMessageW(window_, WM_CLOSE, 0, 0);
+        return;
+    }
 
     if (method == "start") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
@@ -684,6 +728,22 @@ void ViewerBridge::HandleMethodCall(
         map[key("microphoneRecovering")] =
             flutter::EncodableValue(status.microphone_recovering);
         map[key("microphoneError")] = flutter::EncodableValue(status.microphone_error);
+        map[key("displayControlSupported")] = flutter::EncodableValue(status.display_control.supported);
+        map[key("displayControlManaged")] = flutter::EncodableValue(status.display_control.managed);
+        map[key("displayControlCount")] = flutter::EncodableValue(static_cast<int>(status.display_control.count));
+        map[key("displayControlPrivacy")] = flutter::EncodableValue(static_cast<int>(status.display_control.privacy));
+        map[key("displayControlCode")] = flutter::EncodableValue(static_cast<int>(status.display_control.code));
+        map[key("displayControlError")] = flutter::EncodableValue(status.display_control.reason);
+        map[key("displayControlUpdates")] = flutter::EncodableValue(static_cast<int64_t>(status.display_control_updates));
+        flutter::EncodableList controlled_outputs;
+        for (const auto& output : status.display_control.outputs) {
+            controlled_outputs.emplace_back(flutter::EncodableMap{
+                {key("id"), flutter::EncodableValue(static_cast<int64_t>(output.id))},
+                {key("active"), flutter::EncodableValue(output.active)},
+            });
+        }
+        map[key("displayControlOutputs")] = flutter::EncodableValue(std::move(controlled_outputs));
+        map[key("displayControlBusy")] = flutter::EncodableValue(status.display_control_busy);
         map[key("privacySupported")] = flutter::EncodableValue(status.privacy_supported);
         map[key("privacyEnabled")] = flutter::EncodableValue(status.privacy_enabled);
         map[key("privacyCode")] =
@@ -691,6 +751,20 @@ void ViewerBridge::HandleMethodCall(
         map[key("privacyError")] = flutter::EncodableValue(status.privacy_error);
         map[key("privacyUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.privacy_updates));
+        map[key("blockInputSupported")] = flutter::EncodableValue(status.block_input_supported);
+        map[key("blockInputEnabled")] = flutter::EncodableValue(status.block_input_enabled);
+        map[key("blockInputCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.block_input_code));
+        map[key("blockInputError")] = flutter::EncodableValue(status.block_input_error);
+        map[key("blockInputUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.block_input_updates));
+        map[key("lockAfterSessionSupported")] = flutter::EncodableValue(status.lock_after_session_supported);
+        map[key("lockAfterSessionEnabled")] = flutter::EncodableValue(status.lock_after_session_enabled);
+        map[key("lockAfterSessionCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.lock_after_session_code));
+        map[key("lockAfterSessionError")] = flutter::EncodableValue(status.lock_after_session_error);
+        map[key("lockAfterSessionUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.lock_after_session_updates));
         map[key("desktop")] =
             flutter::EncodableValue(static_cast<int32_t>(status.desktop));
         map[key("desktopUpdates")] =
@@ -730,6 +804,20 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.terminal_bytes));
         map[key("terminalUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.terminal_updates));
+        flutter::EncodableList terminals;
+        for (const auto& terminal : status.terminals) {
+            flutter::EncodableMap item;
+            item[key("phase")] = flutter::EncodableValue(static_cast<int32_t>(terminal.phase));
+            item[key("code")] = flutter::EncodableValue(terminal.code);
+            item[key("reason")] = flutter::EncodableValue(terminal.reason);
+            item[key("error")] = flutter::EncodableValue(terminal.error);
+            item[key("columns")] = flutter::EncodableValue(static_cast<int32_t>(terminal.columns));
+            item[key("rows")] = flutter::EncodableValue(static_cast<int32_t>(terminal.rows));
+            item[key("bytes")] = flutter::EncodableValue(static_cast<int64_t>(terminal.bytes));
+            item[key("updates")] = flutter::EncodableValue(static_cast<int64_t>(terminal.updates));
+            terminals.emplace_back(std::move(item));
+        }
+        map[key("terminals")] = flutter::EncodableValue(std::move(terminals));
         map[key("cameraSupported")] =
             flutter::EncodableValue(status.camera_supported);
         map[key("cameraPhase")] =
@@ -1329,6 +1417,21 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "controlDisplays") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t action = -1, value = -1, target = 0;
+        if (args && args->contains(key("target")) && !map_int(*args, "target", &target)) target = -1;
+        if (!args || !map_int(*args, "action", &action) || !map_int(*args, "value", &value) ||
+            action < 0 || action > 4 || value < 0 || value > 4 || target < 0 || target > UINT32_MAX) {
+            result->Error("bad_args", "controlDisplays wants a valid action and value");
+            return;
+        }
+        const bool queued = viewer_ && viewer_->ControlDisplays(
+            static_cast<chast::DisplayControlAction>(action), static_cast<uint8_t>(value), static_cast<uint32_t>(target));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
     if (method == "setPrivacyMode") {
         const auto* enabled = std::get_if<bool>(call.arguments());
         if (enabled == nullptr) {
@@ -1336,6 +1439,28 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         const bool applied = viewer_ != nullptr && viewer_->SetPrivacyMode(*enabled);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "setBlockInput") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setBlockInput wants a bool");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SetBlockInput(*enabled);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "setLockAfterSession") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setLockAfterSession wants a bool");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SetLockAfterSession(*enabled);
         result->Success(flutter::EncodableValue(applied));
         return;
     }
@@ -1385,73 +1510,66 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
-    if (method == "openTerminal") {
+    if (method == "openTerminal" || method == "resizeTerminal" ||
+        method == "sendTerminalInput" || method == "closeTerminal" ||
+        method == "takeTerminalOutput") {
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
-        int64_t columns = 0;
-        int64_t rows = 0;
-        if (args == nullptr || !map_int(*args, "columns", &columns) ||
-            !map_int(*args, "rows", &rows) || columns <= 0 || columns > 500 ||
-            rows <= 0 || rows > 200) {
-            result->Error("bad_args", "openTerminal wants columns 1..500 and rows 1..200");
+        int64_t terminal_id = 1;
+        if (args != nullptr && args->count(key("terminalId")) != 0 &&
+            !map_int(*args, "terminalId", &terminal_id)) {
+            result->Error("bad_args", "terminalId must be an integer");
             return;
         }
-        const bool opened =
-            viewer_ != nullptr && viewer_->OpenTerminal(
-                                      static_cast<uint16_t>(columns),
-                                      static_cast<uint16_t>(rows));
-        result->Success(flutter::EncodableValue(opened));
-        return;
-    }
-
-    if (method == "sendTerminalInput") {
-        const auto* text = std::get_if<std::string>(call.arguments());
-        if (text == nullptr) {
-            result->Error("bad_args", "sendTerminalInput wants the input text");
+        if (terminal_id < 1 || terminal_id > static_cast<int64_t>(chast::kMaxTerminals)) {
+            result->Error("bad_args", "terminalId is out of range");
             return;
         }
-        const bool queued = viewer_ != nullptr && viewer_->SendTerminalInput(*text);
-        result->Success(flutter::EncodableValue(queued));
-        return;
-    }
-
-    if (method == "resizeTerminal") {
-        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
-        int64_t columns = 0;
-        int64_t rows = 0;
-        if (args == nullptr || !map_int(*args, "columns", &columns) ||
-            !map_int(*args, "rows", &rows) || columns <= 0 || columns > 500 ||
-            rows <= 0 || rows > 200) {
-            result->Error("bad_args", "resizeTerminal wants columns 1..500 and rows 1..200");
+        const auto id = static_cast<uint32_t>(terminal_id);
+        if (method == "openTerminal" || method == "resizeTerminal") {
+            int64_t columns = 0;
+            int64_t rows = 0;
+            if (args == nullptr || !map_int(*args, "columns", &columns) ||
+                !map_int(*args, "rows", &rows) || columns <= 0 || columns > 500 ||
+                rows <= 0 || rows > 200) {
+                result->Error("bad_args", "terminal size wants columns 1..500 and rows 1..200");
+                return;
+            }
+            const bool queued = viewer_ != nullptr &&
+                (method == "openTerminal"
+                    ? viewer_->OpenTerminal(static_cast<uint16_t>(columns),
+                                            static_cast<uint16_t>(rows), id)
+                    : viewer_->ResizeTerminal(static_cast<uint16_t>(columns),
+                                              static_cast<uint16_t>(rows), id));
+            result->Success(flutter::EncodableValue(queued));
             return;
         }
-        const bool queued =
-            viewer_ != nullptr && viewer_->ResizeTerminal(
-                                      static_cast<uint16_t>(columns),
-                                      static_cast<uint16_t>(rows));
-        result->Success(flutter::EncodableValue(queued));
-        return;
-    }
-
-    if (method == "closeTerminal") {
-        if (viewer_ != nullptr) {
-            viewer_->CloseTerminal();
+        if (method == "sendTerminalInput") {
+            const std::string* text = nullptr;
+            if (args != nullptr) {
+                const auto it = args->find(key("text"));
+                if (it != args->end()) text = std::get_if<std::string>(&it->second);
+            } else {
+                text = std::get_if<std::string>(call.arguments());
+            }
+            if (text == nullptr) {
+                result->Error("bad_args", "sendTerminalInput wants the input text");
+                return;
+            }
+            result->Success(flutter::EncodableValue(
+                viewer_ != nullptr && viewer_->SendTerminalInput(*text, id)));
+            return;
         }
-        result->Success();
-        return;
-    }
-
-    if (method == "takeTerminalOutput") {
-        // Bytes, not text: a UTF-8 sequence may be split across chunks, so
-        // decoding belongs to the panel that reassembles the console picture.
+        if (method == "closeTerminal") {
+            if (viewer_ != nullptr) viewer_->CloseTerminal(id);
+            result->Success();
+            return;
+        }
         std::vector<uint8_t> data;
-        bool ended = false;
-        if (viewer_ != nullptr) {
-            viewer_->TakeTerminalOutput(data, ended);
-        }
+        bool ended = viewer_ == nullptr;
+        if (viewer_ != nullptr) viewer_->TakeTerminalOutput(data, ended, id);
         flutter::EncodableMap reply;
-        reply[flutter::EncodableValue("data")] =
-            flutter::EncodableValue(std::move(data));
-        reply[flutter::EncodableValue("ended")] = flutter::EncodableValue(ended);
+        reply[key("data")] = flutter::EncodableValue(std::move(data));
+        reply[key("ended")] = flutter::EncodableValue(ended);
         result->Success(flutter::EncodableValue(std::move(reply)));
         return;
     }
@@ -1777,8 +1895,9 @@ void ViewerBridge::StartSecurityKey(
         return;
     }
 
-    auto* completion = new SecurityKeyCompletion();
+    auto completion = std::make_shared<SecurityKeyCompletion>();
     completion->result = std::move(result);
+    security_key_pending_ = completion;
     const HWND window = window_;
     std::thread([window, completion, make_credential, options = std::move(options),
                  user_id = std::move(user_id), username = std::move(username),
@@ -1820,10 +1939,10 @@ void ViewerBridge::StartSecurityKey(
         if (SUCCEEDED(com)) {
             CoUninitialize();
         }
-        if (window == nullptr ||
-            !PostMessageW(window, kSecurityKeyDoneMessage, 0,
-                          reinterpret_cast<LPARAM>(completion))) {
-            delete completion;
+        std::lock_guard<std::mutex> lock(completion->mutex);
+        if (!completion->abandoned && window != nullptr) {
+            PostMessageW(window, kSecurityKeyDoneMessage, 0,
+                         reinterpret_cast<LPARAM>(completion.get()));
         }
     }).detach();
 }
@@ -1831,18 +1950,28 @@ void ViewerBridge::StartSecurityKey(
 LRESULT CALLBACK ViewerBridge::WindowSubclassProc(HWND window, UINT message, WPARAM wparam,
                                                   LPARAM lparam, UINT_PTR id,
                                                   DWORD_PTR ref_data) {
+    auto* bridge = reinterpret_cast<ViewerBridge*>(ref_data);
+    if (message == WM_CLOSE && bridge && bridge->window_close_handler_ && !bridge->shutting_down_) {
+        if (!bridge->window_close_requested_) {
+            bridge->window_close_requested_ = true;
+            bridge->channel_->InvokeMethod("windowCloseRequested", nullptr);
+        }
+        return 0;
+    }
     if (message == kSecurityKeyDoneMessage) {
-        auto* bridge = reinterpret_cast<ViewerBridge*>(ref_data);
-        auto* completion = reinterpret_cast<SecurityKeyCompletion*>(lparam);
-        if (bridge != nullptr && completion != nullptr) {
+        const auto completion = bridge ? bridge->security_key_pending_ : nullptr;
+        if (completion && completion.get() == reinterpret_cast<SecurityKeyCompletion*>(lparam)) {
+            std::lock_guard<std::mutex> lock(completion->mutex);
+            if (completion->abandoned || !completion->result) return 0;
             bridge->security_key_busy_ = false;
             if (completion->ok) {
                 completion->result->Success(flutter::EncodableValue(completion->value));
             } else {
                 completion->result->Error(completion->error_code, completion->error);
             }
+            completion->result.reset();
+            bridge->security_key_pending_.reset();
         }
-        delete completion;
         return 0;
     }
     return DefSubclassProc(window, message, wparam, lparam);
@@ -1909,8 +2038,22 @@ void ViewerBridge::SendInput(
         }
         event.key.action = static_cast<chast::KeyAction>(action);
         event.key.hid_usage = static_cast<uint16_t>(usage);
+    } else if (kind == 3) {
+        event.kind = chast::InputKind::Gesture;
+        if (action < 0 || action > 1 || buttons != 0 ||
+            x < -chast::kMaxGestureDelta || x > chast::kMaxGestureDelta ||
+            y < -chast::kMaxGestureDelta || y > chast::kMaxGestureDelta) {
+            result->Error("bad_args", "gesture event out of range");
+            return;
+        }
+        event.gesture = {static_cast<chast::GestureAction>(action),
+                         static_cast<int32_t>(x), static_cast<int32_t>(y)};
+        if (!chast::valid_gesture_event(event.gesture)) {
+            result->Error("bad_args", "gesture wants a nonzero pan or vertical zoom delta");
+            return;
+        }
     } else {
-        result->Error("bad_args", "input kind must be 1 (mouse) or 2 (key)");
+        result->Error("bad_args", "input kind must be mouse, key or gesture");
         return;
     }
 
@@ -2045,7 +2188,7 @@ void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
         if (cursor_override_) {
             cursor_override_ = false;
             remote_cursor_.Deactivate();
-            if (view_ != nullptr && IsWindow(view_)) {
+            if (cursor_over_view(view_)) {
                 ::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
             }
         }
@@ -2071,7 +2214,7 @@ void ViewerBridge::ApplyCursor(const flutter::EncodableMap& args) {
     cursor_shape_ = last_cursor_.shape_id;
     cursor_scale_ = scale;
     cursor_override_ = true;
-    if (view_ != nullptr && IsWindow(view_)) {
+    if (cursor_over_view(view_)) {
         ::SetCursor(remote_cursor_.cursor());
     }
 }
@@ -2081,7 +2224,7 @@ void ViewerBridge::ClearCursor() {
     have_cursor_ = false;
     cursor_shape_ = 0;
     remote_cursor_.Clear();
-    if (view_ != nullptr && IsWindow(view_)) {
+    if (cursor_over_view(view_)) {
         ::SetCursor(::LoadCursor(nullptr, IDC_ARROW));
     }
 }

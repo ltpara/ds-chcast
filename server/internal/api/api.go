@@ -1005,6 +1005,8 @@ type statusRecorder struct {
 	wroteHeader bool
 }
 
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (r *statusRecorder) WriteHeader(status int) {
 	if r.wroteHeader {
 		return
@@ -1518,8 +1520,13 @@ func boolFloat(v bool) float64 {
 }
 
 func (s *server) authorized(r *http.Request) bool {
+	return s.cfg.ServerKey == "" || s.serverKeyAuthorized(r)
+}
+
+// Open registration does not grant operator privileges.
+func (s *server) serverKeyAuthorized(r *http.Request) bool {
 	if s.cfg.ServerKey == "" {
-		return true
+		return false
 	}
 	header := r.Header.Get("Authorization")
 	const prefix = "Bearer "

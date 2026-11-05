@@ -21,11 +21,14 @@
 #include <windows.h>
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 
@@ -49,6 +52,7 @@ struct InputStats {
     uint64_t failed = 0;    // SendInput reported zero inserted events
     uint64_t dropped = 0;   // queue was full
     uint64_t lock_toggles = 0;  // Caps/Num/Scroll taps that matched the client
+    uint64_t shared_suppressed = 0; // another viewer still owns this key/button
 };
 
 class InputInjector {
@@ -81,6 +85,11 @@ public:
     // moves cannot be applied after the viewer has given up control.
     void release_held();
 
+    // Runs BlockInput on the same thread as SendInput. Disabling also runs
+    // during stop(), so a disconnected viewer cannot leave the machine blocked.
+    bool block_local_input(bool enabled, std::string* error);
+    bool local_input_blocked() const { return local_input_blocked_.load(); }
+
     // Releases every key and button this injector is holding down, then stops
     // the thread. Called on teardown so a disconnect cannot leave a modifier
     // stuck on the host.
@@ -109,6 +118,8 @@ private:
     void apply_key(const KeyEvent& event);
     void release_all();
     UINT send(const INPUT& input);
+    void forget_shared_input();
+    std::map<uint32_t, std::wstring> shared_input_;
     // Moves the injection thread onto the desktop that currently receives
     // input, at most every 250 ms or immediately after SendInput rejected an
     // event. An actual switch forgets held keys and buttons: they do not
@@ -119,6 +130,8 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     struct Pending {
+        std::shared_ptr<std::promise<DWORD>> block_result;
+        bool block_enabled = false;
         bool release = false;
         bool has_text = false;
         InputEvent event;
@@ -126,6 +139,8 @@ private:
     };
     std::deque<Pending> queue_;
     bool stopping_ = false;
+    std::atomic<bool> local_input_blocked_{false};  // written by injection thread
+    bool unblock_on_desktop_change_ = false;  // owned by injection thread
     std::thread thread_;
 
     // Owned by the injection thread.

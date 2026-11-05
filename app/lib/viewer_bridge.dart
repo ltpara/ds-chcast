@@ -27,6 +27,44 @@ enum ViewerTerminalPhase {
   }
 }
 
+const int kViewerMaxTerminals = 2;
+
+class ViewerTerminalStatus {
+  const ViewerTerminalStatus({
+    this.phase = ViewerTerminalPhase.closed,
+    this.code = 0,
+    this.reason = '',
+    this.error = '',
+    this.columns = 0,
+    this.rows = 0,
+    this.bytes = 0,
+    this.updates = 0,
+  });
+
+  final ViewerTerminalPhase phase;
+  final int code;
+  final String reason;
+  final String error;
+  final int columns;
+  final int rows;
+  final int bytes;
+  final int updates;
+
+  factory ViewerTerminalStatus.fromMap(Map<Object?, Object?> map) {
+    int number(String name) => (map[name] as num?)?.toInt() ?? 0;
+    return ViewerTerminalStatus(
+      phase: ViewerTerminalPhase.fromCode(number('phase')),
+      code: number('code'),
+      reason: map['reason'] as String? ?? '',
+      error: map['error'] as String? ?? '',
+      columns: number('columns'),
+      rows: number('rows'),
+      bytes: number('bytes'),
+      updates: number('updates'),
+    );
+  }
+}
+
 /// One piece of console output. [ended] marks the last piece the console ever
 /// produced; the panel keeps the bytes and then shows the ending.
 class ViewerTerminalOutput {
@@ -195,7 +233,9 @@ class ViewerDisplay {
   /// "\\.\DISPLAY1" as "DISPLAY1" for the picker.
   String get label {
     final int slash = name.lastIndexOf('\\');
-    return slash >= 0 && slash + 1 < name.length ? name.substring(slash + 1) : name;
+    return slash >= 0 && slash + 1 < name.length
+        ? name.substring(slash + 1)
+        : name;
   }
 
   static ViewerDisplay? fromMap(Map<Object?, Object?> map, int index) {
@@ -348,9 +388,26 @@ class ViewerFileAuditEntry {
       return const <ViewerFileAuditEntry>[];
     }
     return <ViewerFileAuditEntry>[
-      for (final Object? item in value)
-        if (item is Map<Object?, Object?>) ViewerFileAuditEntry.fromMap(item),
-    ].where((ViewerFileAuditEntry entry) => entry.seq > 0).toList(growable: false);
+          for (final Object? item in value)
+            if (item is Map<Object?, Object?>)
+              ViewerFileAuditEntry.fromMap(item),
+        ]
+        .where((ViewerFileAuditEntry entry) => entry.seq > 0)
+        .toList(growable: false);
+  }
+}
+
+class ViewerControlledDisplay {
+  const ViewerControlledDisplay({required this.id, required this.active});
+  final int id;
+  final bool active;
+  static List<ViewerControlledDisplay> fromList(Object? value) {
+    if (value is! List) return const <ViewerControlledDisplay>[];
+    return <ViewerControlledDisplay>[
+      for (final item in value)
+        if (item is Map && item['id'] is int && (item['id'] as int) > 0)
+          ViewerControlledDisplay(id: item['id'] as int, active: item['active'] == true),
+    ];
   }
 }
 
@@ -505,6 +562,26 @@ class ViewerStatus {
     this.privacyCode = 0,
     this.privacyError = '',
     this.privacyUpdates = 0,
+    this.displayControlSupported = false,
+    this.displayControlManaged = false,
+    this.displayControlCount = 0,
+    this.displayControlPrivacy = 0,
+    this.displayControlCode = 0,
+    this.displayControlError = '',
+    this.displayControlUpdates = 0,
+    this.displayControlBusy = false,
+    this.displayControlOutputs = const <ViewerControlledDisplay>[],
+
+    this.blockInputSupported = false,
+    this.lockAfterSessionSupported = false,
+    this.blockInputEnabled = false,
+    this.lockAfterSessionEnabled = false,
+    this.blockInputCode = 0,
+    this.lockAfterSessionCode = 0,
+    this.blockInputError = '',
+    this.lockAfterSessionError = '',
+    this.blockInputUpdates = 0,
+    this.lockAfterSessionUpdates = 0,
     this.desktop = ViewerDesktopKind.defaultDesktop,
     this.desktopUpdates = 0,
     this.sasCode = 0,
@@ -552,6 +629,7 @@ class ViewerStatus {
     this.terminalRows = 0,
     this.terminalBytes = 0,
     this.terminalUpdates = 0,
+    this.terminals = const <ViewerTerminalStatus>[],
     this.cameraSupported = false,
     this.cameraPhase = ViewerCameraPhase.idle,
     this.cameraCode = 0,
@@ -774,9 +852,11 @@ class ViewerStatus {
   final int folderDownloadFilesTotal;
   final int folderDownloadFilesDone;
   final String folderDownloadCurrent;
+
   /// The selected entries the running walk was asked for: 1 is the folder
   /// row's recursive download, higher counts are a batch.
   final int folderDownloadRoots;
+
   /// Whether the walk came from the multi-select bar. A batch can hold one
   /// file, which [folderDownloadRoots] alone cannot tell from a folder row.
   final bool folderDownloadBatch;
@@ -892,6 +972,26 @@ class ViewerStatus {
   final int privacyCode;
   final String privacyError;
   final int privacyUpdates;
+  final bool displayControlSupported;
+  final bool displayControlManaged;
+  final int displayControlCount;
+  final int displayControlPrivacy;
+  final int displayControlCode;
+  final String displayControlError;
+  final int displayControlUpdates;
+  final bool displayControlBusy;
+  final List<ViewerControlledDisplay> displayControlOutputs;
+
+  final bool blockInputSupported;
+  final bool lockAfterSessionSupported;
+  final bool blockInputEnabled;
+  final bool lockAfterSessionEnabled;
+  final int blockInputCode;
+  final int lockAfterSessionCode;
+  final String blockInputError;
+  final String lockAfterSessionError;
+  final int blockInputUpdates;
+  final int lockAfterSessionUpdates;
 
   /// Which desktop the host's video is capturing: the user desktop, a secure
   /// desktop (lock screen, UAC, credential prompt) or none. The picture pauses
@@ -994,7 +1094,8 @@ class ViewerStatus {
   final int portForwardBytesDown;
   final String portForwardError;
 
-  /// Remote terminal. [terminalSupported] mirrors the host's permission;
+  /// Remote terminal slot 1 (legacy scalar fields). [terminals] describes
+  /// every slot. [terminalSupported] mirrors the host's permission;
   /// [terminalPhase] is the console's state, [terminalCode] and
   /// [terminalReason] carry the host's TerminalCode and wording for a refusal
   /// or an ending, and [terminalError] explains a local failure such as a send
@@ -1012,6 +1113,22 @@ class ViewerStatus {
   final int terminalRows;
   final int terminalBytes;
   final int terminalUpdates;
+  final List<ViewerTerminalStatus> terminals;
+
+  ViewerTerminalStatus terminal(int id) {
+    if (id >= 1 && id <= terminals.length) return terminals[id - 1];
+    if (id != 1) return const ViewerTerminalStatus();
+    return ViewerTerminalStatus(
+      phase: terminalPhase,
+      code: terminalCode,
+      reason: terminalReason,
+      error: terminalError,
+      columns: terminalColumns,
+      rows: terminalRows,
+      bytes: terminalBytes,
+      updates: terminalUpdates,
+    );
+  }
 
   /// Camera sharing (protocol v29). [cameraSupported] mirrors the host's
   /// permission; the viewer watches at most one camera. [cameraPhase] is its
@@ -1043,7 +1160,9 @@ class ViewerStatus {
   bool get acceptsCamera => isLive && cameraSupported;
   bool get isLive => state == ViewerState.streaming;
   bool get isOver =>
-      state == ViewerState.ended || state == ViewerState.failed || error.isNotEmpty;
+      state == ViewerState.ended ||
+      state == ViewerState.failed ||
+      error.isNotEmpty;
   // Pointer and keyboard events can only reach the host while the stream is
   // live and the server announced its input gate as open.
   bool get acceptsInput => inputEnabled && isLive;
@@ -1150,9 +1269,12 @@ class ViewerStatus {
     final int height = asInt(map['height']);
     // Maps from before the source size existed only carry the encoded size,
     // which was also the desktop size then.
-    final int sourceWidth = asInt(map['sourceWidth']) > 0 ? asInt(map['sourceWidth']) : width;
-    final int sourceHeight =
-        asInt(map['sourceHeight']) > 0 ? asInt(map['sourceHeight']) : height;
+    final int sourceWidth = asInt(map['sourceWidth']) > 0
+        ? asInt(map['sourceWidth'])
+        : width;
+    final int sourceHeight = asInt(map['sourceHeight']) > 0
+        ? asInt(map['sourceHeight'])
+        : height;
     final List<ViewerDisplay> displays = <ViewerDisplay>[];
     final Object? rawDisplays = map['displays'];
     if (rawDisplays is List) {
@@ -1342,6 +1464,26 @@ class ViewerStatus {
       privacyCode: asInt(map['privacyCode']),
       privacyError: asString(map['privacyError']),
       privacyUpdates: asInt(map['privacyUpdates']),
+      displayControlSupported: map['displayControlSupported'] == true,
+      displayControlManaged: map['displayControlManaged'] == true,
+      displayControlCount: asInt(map['displayControlCount']),
+      displayControlPrivacy: asInt(map['displayControlPrivacy']),
+      displayControlCode: asInt(map['displayControlCode']),
+      displayControlError: asString(map['displayControlError']),
+      displayControlUpdates: asInt(map['displayControlUpdates']),
+      displayControlBusy: map['displayControlBusy'] == true,
+      displayControlOutputs: ViewerControlledDisplay.fromList(map['displayControlOutputs']),
+
+      blockInputSupported: map['blockInputSupported'] == true,
+      lockAfterSessionSupported: map['lockAfterSessionSupported'] == true,
+      blockInputEnabled: map['blockInputEnabled'] == true,
+      lockAfterSessionEnabled: map['lockAfterSessionEnabled'] == true,
+      blockInputCode: asInt(map['blockInputCode']),
+      lockAfterSessionCode: asInt(map['lockAfterSessionCode']),
+      blockInputError: asString(map['blockInputError']),
+      lockAfterSessionError: asString(map['lockAfterSessionError']),
+      blockInputUpdates: asInt(map['blockInputUpdates']),
+      lockAfterSessionUpdates: asInt(map['lockAfterSessionUpdates']),
       desktop: ViewerDesktopKind.fromCode(asInt(map['desktop'])),
       desktopUpdates: asInt(map['desktopUpdates']),
       sasCode: asInt(map['sasCode']),
@@ -1381,8 +1523,7 @@ class ViewerStatus {
       portForwardBytesDown: asInt(map['portForwardBytesDown']),
       portForwardError: asString(map['portForwardError']),
       terminalSupported: map['terminalSupported'] == true,
-      terminalPhase:
-          ViewerTerminalPhase.fromCode(asInt(map['terminalPhase'])),
+      terminalPhase: ViewerTerminalPhase.fromCode(asInt(map['terminalPhase'])),
       terminalCode: asInt(map['terminalCode']),
       terminalReason: asString(map['terminalReason']),
       terminalError: asString(map['terminalError']),
@@ -1390,6 +1531,11 @@ class ViewerStatus {
       terminalRows: asInt(map['terminalRows']),
       terminalBytes: asInt(map['terminalBytes']),
       terminalUpdates: asInt(map['terminalUpdates']),
+      terminals: <ViewerTerminalStatus>[
+        for (final Object? item
+            in (map['terminals'] as List<Object?>? ?? const <Object?>[]))
+          if (item is Map<Object?, Object?>) ViewerTerminalStatus.fromMap(item),
+      ],
       cameraSupported: map['cameraSupported'] == true,
       cameraPhase: ViewerCameraPhase.fromCode(asInt(map['cameraPhase'])),
       cameraCode: asInt(map['cameraCode']),
@@ -1474,27 +1620,24 @@ class ViewerBridge {
     String carrierToken = '',
     bool fileTransferOnly = false,
   }) async {
-    await _channel.invokeMethod<void>(
-      'start',
-      <String, Object>{
-        'host': host,
-        'port': port,
-        'gpuOutput': gpuOutput,
-        'display': display,
-        'fingerprint': fingerprint,
-        'allowUnverified': allowUnverified,
-        'accessToken': accessToken,
-        'password': password,
-        'totp': totp,
-        'trustDevice': trustDevice,
-        'transport': transport,
-        'carrierHost': carrierHost,
-        'carrierPort': carrierPort,
-        'carrierHostId': carrierHostId,
-        'carrierToken': carrierToken,
-        'fileTransferOnly': fileTransferOnly,
-      },
-    );
+    await _channel.invokeMethod<void>('start', <String, Object>{
+      'host': host,
+      'port': port,
+      'gpuOutput': gpuOutput,
+      'display': display,
+      'fingerprint': fingerprint,
+      'allowUnverified': allowUnverified,
+      'accessToken': accessToken,
+      'password': password,
+      'totp': totp,
+      'trustDevice': trustDevice,
+      'transport': transport,
+      'carrierHost': carrierHost,
+      'carrierPort': carrierPort,
+      'carrierHostId': carrierHostId,
+      'carrierToken': carrierToken,
+      'fileTransferOnly': fileTransferOnly,
+    });
   }
 
   /// Reads the password saved for [trustKey] from this Windows account's
@@ -1515,8 +1658,10 @@ class ViewerBridge {
   /// Encrypts [plaintext] with DPAPI under the current Windows user and
   /// returns the base64 blob. Throws [PlatformException] when DPAPI fails.
   static Future<String> protectSecret(String plaintext) async {
-    final String? blob =
-        await _channel.invokeMethod<String>('protectSecret', plaintext);
+    final String? blob = await _channel.invokeMethod<String>(
+      'protectSecret',
+      plaintext,
+    );
     if (blob == null || blob.isEmpty) {
       throw PlatformException(
         code: 'dpapi',
@@ -1529,8 +1674,10 @@ class ViewerBridge {
   /// Decrypts a [protectSecret] blob. Throws [PlatformException] when the
   /// blob does not belong to this Windows account or was corrupted.
   static Future<String> unprotectSecret(String blob) async {
-    final String? plaintext =
-        await _channel.invokeMethod<String>('unprotectSecret', blob);
+    final String? plaintext = await _channel.invokeMethod<String>(
+      'unprotectSecret',
+      blob,
+    );
     if (plaintext == null) {
       throw PlatformException(
         code: 'dpapi',
@@ -1551,7 +1698,10 @@ class ViewerBridge {
   }
 
   static Future<bool> setFullscreen(bool enable) async {
-    final bool? actual = await _channel.invokeMethod<bool>('setFullscreen', enable);
+    final bool? actual = await _channel.invokeMethod<bool>(
+      'setFullscreen',
+      enable,
+    );
     return actual ?? false;
   }
 
@@ -1568,15 +1718,37 @@ class ViewerBridge {
     int y = 0,
     int modifiers = 0,
   }) async {
-    final bool? queued = await _channel.invokeMethod<bool>('sendInput', <String, Object>{
-      'kind': 1,
-      'action': action,
-      'buttons': buttons,
-      'x': x,
-      'y': y,
-      'modifiers': modifiers,
-    });
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'sendInput',
+      <String, Object>{
+        'kind': 1,
+        'action': action,
+        'buttons': buttons,
+        'x': x,
+        'y': y,
+        'modifiers': modifiers,
+      },
+    );
     return queued ?? false;
+  }
+
+  /// Sends a pan or a complete zoom chord, gated by remote input permission.
+  /// Deltas are wheel units (120 per notch), limited to ten notches per event.
+  static Future<bool> sendGesture({
+    required bool zoom,
+    int x = 0,
+    int y = 0,
+    int modifiers = 0,
+  }) async {
+    return await _channel.invokeMethod<bool>('sendInput', <String, Object>{
+          'kind': 3,
+          'action': zoom ? 1 : 0,
+          'buttons': 0,
+          'x': x,
+          'y': y,
+          'modifiers': modifiers,
+        }) ??
+        false;
   }
 
   /// Sends one key transition by USB HID usage id (usage page 0x07), which is
@@ -1588,15 +1760,16 @@ class ViewerBridge {
     required bool down,
     int modifiers = 0,
   }) async {
-    final bool? queued = await _channel.invokeMethod<bool>('sendInput', <String, Object>{
-      'kind': 2,
-      'action': down ? 0 : 1,
-      'buttons': 0,
-      'x': 0,
-      'y': 0,
-      'hidUsage': usage,
-      'modifiers': modifiers,
-    });
+    final bool? queued = await _channel
+        .invokeMethod<bool>('sendInput', <String, Object>{
+          'kind': 2,
+          'action': down ? 0 : 1,
+          'buttons': 0,
+          'x': 0,
+          'y': 0,
+          'hidUsage': usage,
+          'modifiers': modifiers,
+        });
     return queued ?? false;
   }
 
@@ -1614,7 +1787,10 @@ class ViewerBridge {
   /// an index outside the announced list); the host's answer then arrives in
   /// [ViewerStatus.displaySwitches] / [ViewerStatus.displaySwitchError].
   static Future<bool> switchDisplay(int display) async {
-    final bool? queued = await _channel.invokeMethod<bool>('switchDisplay', display);
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'switchDisplay',
+      display,
+    );
     return queued ?? false;
   }
 
@@ -1623,8 +1799,10 @@ class ViewerBridge {
   /// answer replaces [ViewerStatus.displayModes] and is counted by
   /// [ViewerStatus.displayModeLists]. Listing needs no input permission.
   static Future<bool> requestDisplayModes(int display) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('requestDisplayModes', display);
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'requestDisplayModes',
+      display,
+    );
     return queued ?? false;
   }
 
@@ -1666,11 +1844,7 @@ class ViewerBridge {
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>(
       'setStreamOptions',
-      <String, Object>{
-        'codec': codec,
-        'maxFps': maxFps,
-        'quality': quality,
-      },
+      <String, Object>{'codec': codec, 'maxFps': maxFps, 'quality': quality},
     );
     return queued ?? false;
   }
@@ -1719,19 +1893,24 @@ class ViewerBridge {
     return _channel.invokeMethod<String>('takeChat');
   }
 
-  /// Opens the session's one remote console at [columns] x [rows] characters
-  /// (1..500 by 1..200). False means it was not queued: no streaming session,
+  /// Opens the selected remote console at [columns] x [rows] characters
+  /// (1..500 by 1..200), in slot [terminalId] (1..[kViewerMaxTerminals]).
+  /// False means it was not queued: no streaming session,
   /// the host did not grant [ViewerPermission.terminal], a console is already
   /// open, or the previous one's output has not been drained yet. The host's
-  /// answer arrives through [ViewerStatus.terminalPhase],
-  /// [ViewerStatus.terminalCode] and [ViewerStatus.terminalReason].
+  /// answer arrives through [ViewerStatus.terminal].
   static Future<bool> openTerminal({
     required int columns,
     required int rows,
+    int terminalId = 1,
   }) async {
     final bool? opened = await _channel.invokeMethod<bool>(
       'openTerminal',
-      <String, Object>{'columns': columns, 'rows': rows},
+      <String, Object>{
+        'columns': columns,
+        'rows': rows,
+        'terminalId': terminalId,
+      },
     );
     return opened ?? false;
   }
@@ -1739,9 +1918,14 @@ class ViewerBridge {
   /// Queues raw console input. Printable text is UTF-8; control keys travel as
   /// single bytes (for example `\x03` for Ctrl+C). False means no console is
   /// open or the engine's 256 KiB input queue is full.
-  static Future<bool> sendTerminalInput(String input) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('sendTerminalInput', input);
+  static Future<bool> sendTerminalInput(
+    String input, {
+    int terminalId = 1,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'sendTerminalInput',
+      <String, Object>{'terminalId': terminalId, 'text': input},
+    );
     return queued ?? false;
   }
 
@@ -1752,27 +1936,39 @@ class ViewerBridge {
   static Future<bool> resizeTerminal({
     required int columns,
     required int rows,
+    int terminalId = 1,
   }) async {
     final bool? queued = await _channel.invokeMethod<bool>(
       'resizeTerminal',
-      <String, Object>{'columns': columns, 'rows': rows},
+      <String, Object>{
+        'columns': columns,
+        'rows': rows,
+        'terminalId': terminalId,
+      },
     );
     return queued ?? false;
   }
 
-  /// Ends the console. The host closes the shell; output already in flight is
-  /// still returned by [takeTerminalOutput] until it reports `ended`.
-  static Future<void> closeTerminal() {
-    return _channel.invokeMethod<void>('closeTerminal');
+  /// Ends this console. Output already buffered by the viewer can still be
+  /// drained through [takeTerminalOutput] until it reports `ended`.
+  static Future<void> closeTerminal({int terminalId = 1}) {
+    return _channel.invokeMethod<void>('closeTerminal', <String, Object>{
+      'terminalId': terminalId,
+    });
   }
 
   /// Pops the oldest console output. Returns null when nothing is waiting and
   /// the console has not ended; otherwise the bytes and whether that was the
   /// last piece. A UTF-8 sequence may be split across pieces, so the panel
   /// decodes only after it has reassembled them.
-  static Future<ViewerTerminalOutput?> takeTerminalOutput() async {
-    final Map<Object?, Object?>? reply =
-        await _channel.invokeMethod<Map<Object?, Object?>>('takeTerminalOutput');
+  static Future<ViewerTerminalOutput?> takeTerminalOutput({
+    int terminalId = 1,
+  }) async {
+    final Map<Object?, Object?>? reply = await _channel
+        .invokeMethod<Map<Object?, Object?>>(
+          'takeTerminalOutput',
+          <String, Object>{'terminalId': terminalId},
+        );
     if (reply == null) {
       return null;
     }
@@ -1790,8 +1986,10 @@ class ViewerBridge {
   /// camera panel registered. 0 detaches, so decoded pictures are dropped
   /// until a new output is attached.
   static Future<bool> setCameraOutput(int output) async {
-    final bool? attached =
-        await _channel.invokeMethod<bool>('setCameraOutput', output);
+    final bool? attached = await _channel.invokeMethod<bool>(
+      'setCameraOutput',
+      output,
+    );
     return attached ?? false;
   }
 
@@ -1801,8 +1999,7 @@ class ViewerBridge {
   /// arrives through [ViewerStatus.cameraPhase], [ViewerStatus.cameraCode],
   /// [ViewerStatus.cameraReason] and [ViewerStatus.cameras].
   static Future<bool> requestCameraList() async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('requestCameraList');
+    final bool? queued = await _channel.invokeMethod<bool>('requestCameraList');
     return queued ?? false;
   }
 
@@ -1858,7 +2055,10 @@ class ViewerBridge {
   /// keys into VK_PROCESSKEY (the engine drops those before Dart sees them).
   /// Turning this off restores the IME for local text fields.
   static Future<bool> setKeyCapture(bool enable) async {
-    final bool? active = await _channel.invokeMethod<bool>('setKeyCapture', enable);
+    final bool? active = await _channel.invokeMethod<bool>(
+      'setKeyCapture',
+      enable,
+    );
     return active ?? false;
   }
 
@@ -1917,8 +2117,9 @@ class ViewerBridge {
   /// the shared [directory] being browsed ('' is the shared root). Returns how
   /// many roots were queued, or null when the dialog was cancelled.
   static Future<int?> sendFileTo(String directory) {
-    return _channel.invokeMethod<int>(
-        'sendFileTo', <String, Object?>{'directory': directory});
+    return _channel.invokeMethod<int>('sendFileTo', <String, Object?>{
+      'directory': directory,
+    });
   }
 
   /// Queues already-known [paths] for upload into the shared [directory] being
@@ -1938,8 +2139,10 @@ class ViewerBridge {
   /// answer arrives through [ViewerStatus.fileListAnswers] and
   /// [takeFileList].
   static Future<bool> requestFileList(String directory) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('requestFileList', directory);
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'requestFileList',
+      directory,
+    );
     return queued ?? false;
   }
 
@@ -1950,8 +2153,10 @@ class ViewerBridge {
   /// download: [ViewerStatus.downloadPhase] and [ViewerStatus.downloadName]
   /// follow it into the viewer's Downloads\chast folder.
   static Future<bool> requestFileDownload(String path) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('requestFileDownload', path);
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'requestFileDownload',
+      path,
+    );
     return queued ?? false;
   }
 
@@ -1966,12 +2171,14 @@ class ViewerBridge {
     String path, {
     String newName = '',
   }) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('fileOperation', <String, Object?>{
-      'operation': operation.wireValue,
-      'path': path,
-      'newName': newName,
-    });
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'fileOperation',
+      <String, Object?>{
+        'operation': operation.wireValue,
+        'path': path,
+        'newName': newName,
+      },
+    );
     return queued ?? false;
   }
 
@@ -1981,8 +2188,10 @@ class ViewerBridge {
   /// not started (see [requestFileList], or one is already running). Progress
   /// and the outcome arrive through the `folderDownload*` status fields.
   static Future<bool> downloadFolder(String path) async {
-    final bool? queued =
-        await _channel.invokeMethod<bool>('downloadFolder', path);
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'downloadFolder',
+      path,
+    );
     return queued ?? false;
   }
 
@@ -2000,10 +2209,12 @@ class ViewerBridge {
     final bool? queued = await _channel.invokeMethod<bool>(
       'downloadEntries',
       entries
-          .map((ViewerFileSelection entry) => <String, Object?>{
-                'path': entry.path,
-                'directory': entry.directory,
-              })
+          .map(
+            (ViewerFileSelection entry) => <String, Object?>{
+              'path': entry.path,
+              'directory': entry.directory,
+            },
+          )
           .toList(),
     );
     return queued ?? false;
@@ -2032,8 +2243,8 @@ class ViewerBridge {
   /// Pops the newest directory listing the host sent. Returns null when none
   /// is waiting; a listing for an older request is superseded by a newer one.
   static Future<ViewerFileListing?> takeFileList() async {
-    final Map<Object?, Object?>? map =
-        await _channel.invokeMethod<Map<Object?, Object?>>('takeFileList');
+    final Map<Object?, Object?>? map = await _channel
+        .invokeMethod<Map<Object?, Object?>>('takeFileList');
     if (map == null) {
       return null;
     }
@@ -2042,8 +2253,9 @@ class ViewerBridge {
     if (raw is List) {
       for (final Object? item in raw) {
         if (item is Map) {
-          final ViewerFileEntry? entry =
-              ViewerFileEntry.fromMap(Map<Object?, Object?>.from(item));
+          final ViewerFileEntry? entry = ViewerFileEntry.fromMap(
+            Map<Object?, Object?>.from(item),
+          );
           if (entry != null) {
             entries.add(entry);
           }
@@ -2063,11 +2275,34 @@ class ViewerBridge {
   /// page listens at a time; passing null detaches it.
   static void setDropHandler(void Function(List<String> paths)? handler) {
     _dropHandler = handler;
-    if (handler == null) {
+    _installMethodHandler();
+  }
+
+  static Future<void> setWindowCloseHandler(
+    Future<void> Function()? handler,
+  ) async {
+    _windowCloseHandler = handler;
+    _installMethodHandler();
+    try {
+      await _channel.invokeMethod<void>(
+        'setWindowCloseHandler',
+        handler != null,
+      );
+    } on MissingPluginException {
+      // Widget tests and non-Windows embedders do not have native windows.
+    }
+  }
+
+  static void _installMethodHandler() {
+    if (_dropHandler == null && _windowCloseHandler == null) {
       _channel.setMethodCallHandler(null);
       return;
     }
     _channel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'windowCloseRequested') {
+        await _windowCloseHandler?.call();
+        return;
+      }
       if (call.method == 'droppedFiles' && call.arguments is List) {
         final List<String> paths = (call.arguments as List)
             .whereType<String>()
@@ -2081,6 +2316,7 @@ class ViewerBridge {
   }
 
   static void Function(List<String> paths)? _dropHandler;
+  static Future<void> Function()? _windowCloseHandler;
 
   /// Picks up whatever pointer state the host sent and installs it as this
   /// window's cursor while [enabled]. [scale] is the size the video is drawn
@@ -2115,7 +2351,10 @@ class ViewerBridge {
   /// running while muted. Returns false when no audio pipeline is running, so
   /// the caller knows the tap had no effect.
   static Future<bool> setAudioMuted(bool mute) async {
-    final bool? muted = await _channel.invokeMethod<bool>('setAudioMuted', mute);
+    final bool? muted = await _channel.invokeMethod<bool>(
+      'setAudioMuted',
+      mute,
+    );
     return muted ?? false;
   }
 
@@ -2124,7 +2363,10 @@ class ViewerBridge {
   /// Returns false when the host did not grant the microphone, so the caller
   /// can explain the tap.
   static Future<bool> setMicrophone(bool enabled) async {
-    final bool? applied = await _channel.invokeMethod<bool>('setMicrophone', enabled);
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'setMicrophone',
+      enabled,
+    );
     return applied ?? false;
   }
 
@@ -2132,29 +2374,58 @@ class ViewerBridge {
   /// answer arrives through [ViewerStatus.privacyEnabled]; returns false when
   /// the host did not grant the privacy bit.
   static Future<bool> setPrivacyMode(bool enabled) async {
-    final bool? applied =
-        await _channel.invokeMethod<bool>('setPrivacyMode', enabled);
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'setPrivacyMode',
+      enabled,
+    );
+    return applied ?? false;
+  }
+
+  static Future<bool> setBlockInput(bool enabled) async {
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'setBlockInput',
+      enabled,
+    );
+    return applied ?? false;
+  }
+
+  static Future<bool> controlDisplays(int action, int value, {int target = 0}) async =>
+      await _channel.invokeMethod<bool>('controlDisplays', <String, int>{
+        'action': action, 'value': value, if (target != 0) 'target': target,
+      }) ?? false;
+
+  static Future<bool> setLockAfterSession(bool enabled) async {
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'setLockAfterSession',
+      enabled,
+    );
     return applied ?? false;
   }
 
   /// Pins the capture endpoint; an empty id follows the default
   /// communications device. An open uplink is reopened on the new device.
   static Future<bool> selectMicrophone(String deviceId) async {
-    final bool? applied =
-        await _channel.invokeMethod<bool>('selectMicrophone', deviceId);
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'selectMicrophone',
+      deviceId,
+    );
     return applied ?? false;
   }
 
   /// Lists the machine's active capture endpoints, default first.
   static Future<List<ViewerMicrophoneDevice>> listMicrophones() async {
-    final Object? result = await _channel.invokeMethod<Object?>('listMicrophones');
+    final Object? result = await _channel.invokeMethod<Object?>(
+      'listMicrophones',
+    );
     if (result is! List) {
       return const <ViewerMicrophoneDevice>[];
     }
     final List<ViewerMicrophoneDevice> devices = <ViewerMicrophoneDevice>[];
     for (final Object? entry in result) {
       if (entry is Map) {
-        final ViewerMicrophoneDevice? device = ViewerMicrophoneDevice.fromMap(entry);
+        final ViewerMicrophoneDevice? device = ViewerMicrophoneDevice.fromMap(
+          entry,
+        );
         if (device != null) {
           devices.add(device);
         }
@@ -2166,8 +2437,10 @@ class ViewerBridge {
   /// Pins the playback endpoint; an empty id follows the Windows default
   /// output. A live player is rebuilt with the same decoder and clock offset.
   static Future<bool> selectAudioOutput(String deviceId) async {
-    final bool? applied =
-        await _channel.invokeMethod<bool>('selectAudioOutput', deviceId);
+    final bool? applied = await _channel.invokeMethod<bool>(
+      'selectAudioOutput',
+      deviceId,
+    );
     return applied ?? false;
   }
 
@@ -2186,7 +2459,9 @@ class ViewerBridge {
 
   /// Lists the machine's active playback endpoints, default first.
   static Future<List<ViewerAudioOutput>> listAudioOutputs() async {
-    final Object? result = await _channel.invokeMethod<Object?>('listAudioOutputs');
+    final Object? result = await _channel.invokeMethod<Object?>(
+      'listAudioOutputs',
+    );
     if (result is! List) {
       return const <ViewerAudioOutput>[];
     }
@@ -2299,6 +2574,7 @@ abstract final class ViewerPermission {
   static const int fileTransfer = 0x0008;
   static const int microphone = 0x0010;
   static const int privacyMode = 0x0020;
+  static const int blockInput = 0x4000;
   static const int portForward = 0x0080;
   static const int terminal = 0x0100;
   // The host's consent to a local recording of the received stream; advisory,

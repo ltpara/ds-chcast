@@ -308,6 +308,8 @@ type recorder struct {
 	wroteHeader bool
 }
 
+func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (r *recorder) WriteHeader(status int) {
 	if r.wroteHeader {
 		return

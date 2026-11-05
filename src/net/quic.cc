@@ -118,6 +118,9 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.privacy_mode_enabled) {
         mask |= kPermissionPrivacyMode;
     }
+    if (info.block_input_enabled) {
+        mask |= kPermissionBlockInput;
+    }
     if (info.port_forward_enabled) {
         mask |= kPermissionPortForward;
     }
@@ -480,7 +483,7 @@ PCCERT_CONTEXT open_or_create_identity(IdentityScope scope, std::string* error) 
 
 }  // namespace
 
-struct QuicSession::Impl {
+struct QuicSession::Impl : std::enable_shared_from_this<QuicSession::Impl> {
     enum class Role { Server, Client };
 
     struct PendingSend {
@@ -503,6 +506,13 @@ struct QuicSession::Impl {
     HQUIC registration = nullptr;
     HQUIC configuration = nullptr;
     HQUIC listener = nullptr;
+    // Accepted connections borrow the listener's registration/configuration.
+    // Keeping their owner alive avoids closing registration under a session.
+    std::shared_ptr<Impl> listener_owner;
+    std::mutex accept_mutex;
+    std::condition_variable accept_cv;
+    std::deque<std::unique_ptr<QuicSession>> accepted_peers;
+    std::atomic<uint16_t> live_connections{0};
     PCCERT_CONTEXT certificate = nullptr;
     std::atomic<HQUIC> connection{nullptr};
     std::atomic<HQUIC> control{nullptr};
@@ -601,6 +611,24 @@ struct QuicSession::Impl {
     PrivacyModeCode privacy_mode_code = PrivacyModeCode::Ok;
     std::string privacy_mode_reason;
     uint64_t privacy_mode_states_seen = 0;
+    bool block_input_request_ready = false;
+    bool block_input_requested = false;
+    uint64_t block_input_requests_seen = 0;
+    bool block_input_state_ready = false;
+    bool block_input_enabled = false;
+    BlockInputCode block_input_code = BlockInputCode::Ok;
+    std::string block_input_reason;
+    uint64_t block_input_states_seen = 0;
+    std::optional<DisplayControlRequest> display_control_request;
+    std::optional<DisplayControlState> display_control_state;
+    bool lock_after_session_request_ready = false;
+    bool lock_after_session_requested = false;
+    uint64_t lock_after_session_requests_seen = 0;
+    bool lock_after_session_state_ready = false;
+    bool lock_after_session_enabled = false;
+    LockAfterSessionCode lock_after_session_code = LockAfterSessionCode::Ok;
+    std::string lock_after_session_reason;
+    uint64_t lock_after_session_states_seen = 0;
     // Client: the newest desktop kind the host announced.
     bool desktop_state_ready = false;
     DesktopKind desktop_kind = DesktopKind::Default;
@@ -932,15 +960,40 @@ struct QuicSession::Impl {
         if (event.Type != QUIC_LISTENER_EVENT_NEW_CONNECTION) {
             return QUIC_STATUS_SUCCESS;
         }
+        if (server_config.max_connections > 1) {
+            std::lock_guard<std::mutex> guard(accept_mutex);
+            if (live_connections.load() >= server_config.max_connections) {
+                return QUIC_STATUS_CONNECTION_REFUSED;
+            }
+            auto child = std::unique_ptr<QuicSession>(new QuicSession());
+            child->impl_ = std::make_shared<Impl>();
+            auto& peer = *child->impl_;
+            peer.role = Role::Server;
+            {
+                std::lock_guard<std::mutex> config_guard(mutex);
+                peer.server_config = server_config;
+            }
+            peer.server_config.max_connections = 1;
+            peer.server_config.stop_after_denial = true;
+            peer.api = api;
+            peer.configuration = configuration;
+            peer.identity_fingerprint = identity_fingerprint;
+            peer.listener_owner = shared_from_this();
+            ++live_connections;
+            peer.connection = event.NEW_CONNECTION.Connection;
+            api->SetCallbackHandler(event.NEW_CONNECTION.Connection,
+                reinterpret_cast<void*>(&Impl::connection_callback), &peer);
+            accepted_peers.push_back(std::move(child));
+            accept_cv.notify_one();
+            // Configuration and injector creation run on the accept thread.
+            return QUIC_STATUS_SUCCESS;
+        }
         HQUIC expected = nullptr;
         if (!connection.compare_exchange_strong(expected, event.NEW_CONNECTION.Connection)) {
             // The tool serves one viewer at a time; a second connection is
             // refused before the handshake continues. Shutting it down first
             // tells that client right away instead of leaving it retransmit.
-            api->ConnectionShutdown(event.NEW_CONNECTION.Connection,
-                                    QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-            api->ConnectionClose(event.NEW_CONNECTION.Connection);
-            return QUIC_STATUS_SUCCESS;
+            return QUIC_STATUS_CONNECTION_REFUSED;
         }
         api->SetCallbackHandler(event.NEW_CONNECTION.Connection,
                                 reinterpret_cast<void*>(&Impl::connection_callback), this);
@@ -2919,6 +2972,116 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::SetBlockInput: {
+                if (role != Role::Server) {
+                    break;
+                }
+                bool enabled = false;
+                if (!parse_set_block_input(payload, enabled, &error)) {
+                    note_transport_failure("SetBlockInput: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!hello_complete) break;
+                    block_input_requested = enabled;
+                    block_input_request_ready = true;
+                    ++block_input_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::BlockInputState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                bool enabled = false;
+                BlockInputCode code = BlockInputCode::Failed;
+                std::string reason;
+                if (!parse_block_input_state(payload, enabled, code, reason, &error)) {
+                    note_transport_failure("BlockInputState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    block_input_enabled = enabled;
+                    block_input_code = code;
+                    block_input_reason = std::move(reason);
+                    block_input_state_ready = true;
+                    ++block_input_states_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayControl: {
+                if (role != Role::Server) break;
+                DisplayControlRequest request;
+                if (!parse_display_control(payload, request, &error)) {
+                    note_transport_failure("DisplayControl: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_control_request = request;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayControlState: {
+                if (role != Role::Client) break;
+                DisplayControlState state;
+                if (!parse_display_control_state(payload, state, &error)) {
+                    note_transport_failure("DisplayControlState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_control_state = std::move(state);
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SetLockAfterSession: {
+                if (role != Role::Server) {
+                    break;
+                }
+                bool enabled = false;
+                if (!parse_set_lock_after_session(payload, enabled, &error)) {
+                    note_transport_failure("SetLockAfterSession: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!hello_complete) break;
+                    lock_after_session_requested = enabled;
+                    lock_after_session_request_ready = true;
+                    ++lock_after_session_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::LockAfterSessionState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                bool enabled = false;
+                LockAfterSessionCode code = LockAfterSessionCode::Failed;
+                std::string reason;
+                if (!parse_lock_after_session_state(payload, enabled, code, reason, &error)) {
+                    note_transport_failure("LockAfterSessionState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    lock_after_session_enabled = enabled;
+                    lock_after_session_code = code;
+                    lock_after_session_reason = std::move(reason);
+                    lock_after_session_state_ready = true;
+                    ++lock_after_session_states_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::DesktopState: {
                 if (role != Role::Client) {
                     break;
@@ -4063,6 +4226,24 @@ struct QuicSession::Impl {
             privacy_mode_code = PrivacyModeCode::Ok;
             privacy_mode_reason.clear();
             privacy_mode_states_seen = 0;
+            block_input_request_ready = false;
+            block_input_requested = false;
+            block_input_requests_seen = 0;
+            block_input_state_ready = false;
+            block_input_enabled = false;
+            block_input_code = BlockInputCode::Ok;
+            block_input_reason.clear();
+            block_input_states_seen = 0;
+            display_control_request.reset();
+            display_control_state.reset();
+            lock_after_session_request_ready = false;
+            lock_after_session_requested = false;
+            lock_after_session_requests_seen = 0;
+            lock_after_session_state_ready = false;
+            lock_after_session_enabled = false;
+            lock_after_session_code = LockAfterSessionCode::Ok;
+            lock_after_session_reason.clear();
+            lock_after_session_states_seen = 0;
             desktop_state_ready = false;
             desktop_kind = DesktopKind::Default;
             desktop_states_seen = 0;
@@ -4162,6 +4343,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_privacy_mode) {
             mask |= kPermissionPrivacyMode;
+        }
+        if (server_config.allow_block_input && server_config.allow_input) {
+            mask |= kPermissionBlockInput;
         }
         if (server_config.allow_port_forward) {
             mask |= kPermissionPortForward;
@@ -4283,6 +4467,11 @@ struct QuicSession::Impl {
             }
             datagram_sends.clear();
         }
+        if (listener_owner) {
+            --listener_owner->live_connections;
+            api = nullptr;
+            return;
+        }
         if (configuration) {
             api->ConfigurationClose(configuration);
             configuration = nullptr;
@@ -4308,12 +4497,24 @@ struct QuicSession::Impl {
     }
 };
 
-QuicSession::~QuicSession() = default;
+QuicSession::~QuicSession() {
+    if (impl_ && impl_->listener && impl_->server_config.max_connections > 1) {
+        // Wait out listener callbacks before dropping pending peers. Accepted
+        // sessions may outlive this handle and retain the transport resources.
+        impl_->api->ListenerClose(impl_->listener);
+        impl_->listener = nullptr;
+        std::deque<std::unique_ptr<QuicSession>> pending;
+        {
+            std::lock_guard<std::mutex> guard(impl_->accept_mutex);
+            pending.swap(impl_->accepted_peers);
+        }
+    }
+}
 
 std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& config,
                                                         std::string* error) {
     auto session = std::unique_ptr<QuicSession>(new QuicSession());
-    session->impl_ = std::make_unique<Impl>();
+    session->impl_ = std::make_shared<Impl>();
     Impl& impl = *session->impl_;
     impl.role = Impl::Role::Server;
     impl.server_config = config;
@@ -4400,7 +4601,7 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
                  std::to_string(config.port) + ": " + status_hex(status);
         return nullptr;
     }
-    if (config.allow_input) {
+    if (config.allow_input && config.max_connections <= 1) {
         impl.injector = InputInjector::create(config.dry_run_input, error);
         if (!impl.injector) {
             return nullptr;
@@ -4412,7 +4613,7 @@ std::unique_ptr<QuicSession> QuicSession::create_server(const QuicServerConfig& 
 std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& config,
                                                         std::string* error) {
     auto session = std::unique_ptr<QuicSession>(new QuicSession());
-    session->impl_ = std::make_unique<Impl>();
+    session->impl_ = std::make_shared<Impl>();
     Impl& impl = *session->impl_;
     impl.role = Impl::Role::Client;
     impl.client_config = config;
@@ -4492,6 +4693,35 @@ std::unique_ptr<QuicSession> QuicSession::create_client(const QuicClientConfig& 
     }
     impl.connection = connection;
     return session;
+}
+
+std::unique_ptr<QuicSession> QuicSession::accept_client(
+    std::chrono::milliseconds timeout, std::string* error) {
+    auto& listener = *impl_;
+    std::unique_ptr<QuicSession> child;
+    {
+        std::unique_lock<std::mutex> lock(listener.accept_mutex);
+        if (!listener.accept_cv.wait_for(lock, timeout,
+                                        [&] { return !listener.accepted_peers.empty(); })) {
+            if (error) error->clear();
+            return nullptr;
+        }
+        child = std::move(listener.accepted_peers.front());
+        listener.accepted_peers.pop_front();
+    }
+    auto& peer = *child->impl_;
+    if (peer.server_config.allow_input) {
+        peer.injector = InputInjector::create(peer.server_config.dry_run_input, error);
+        if (!peer.injector) return nullptr;
+    }
+    const QUIC_STATUS status = peer.api->ConnectionSetConfiguration(
+        peer.connection.load(), peer.configuration);
+    if (QUIC_FAILED(status)) {
+        if (error) *error = "ConnectionSetConfiguration failed: " + status_hex(status);
+        return nullptr;
+    }
+    if (error) error->clear();
+    return child;
 }
 
 Error QuicSession::wait_for_client(std::chrono::milliseconds timeout) {
@@ -4682,6 +4912,10 @@ Error QuicSession::set_permissions(uint16_t permissions) {
         // viewer fails, the host is still the one enforcing the reduction.
         impl.session_permissions = next;
     }
+    if ((next & (kPermissionInput | kPermissionBlockInput)) !=
+                    (kPermissionInput | kPermissionBlockInput) && impl.injector) {
+        impl.injector->block_local_input(false, nullptr);
+    }
     if ((next & kPermissionInput) == 0 && impl.injector) {
         impl.injector->release_held();
     }
@@ -4823,6 +5057,7 @@ void QuicSession::set_access_token(std::string token) {
 }
 
 void QuicSession::reset_for_next_client() {
+    if (impl_->injector) impl_->injector->block_local_input(false, nullptr);
     impl_->reset_connection();
 }
 
@@ -4855,6 +5090,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.camera_enabled = (granted & kPermissionCamera) != 0;
     ack.record_enabled = (granted & kPermissionRecord) != 0;
     ack.restart_enabled = (granted & kPermissionRestart) != 0;
+    ack.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -4984,6 +5220,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.camera_enabled = (granted & kPermissionCamera) != 0;
     update.record_enabled = (granted & kPermissionRecord) != 0;
     update.restart_enabled = (granted & kPermissionRestart) != 0;
+    update.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -5153,6 +5390,29 @@ Error QuicSession::send_privacy_mode_state(bool enabled, PrivacyModeCode code,
                            QUIC_SEND_FLAG_NONE);
 }
 
+bool QuicSession::take_block_input_request(bool& enabled) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->block_input_request_ready) {
+        return false;
+    }
+    impl_->block_input_request_ready = false;
+    enabled = impl_->block_input_requested;
+    return true;
+}
+
+Error QuicSession::send_block_input_state(bool enabled, BlockInputCode code,
+                                           const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_block_input_state is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_block_input_state(enabled, code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
 Error QuicSession::send_desktop_state(DesktopKind kind) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Server) {
@@ -5194,6 +5454,168 @@ bool QuicSession::take_privacy_mode_state(bool& enabled, PrivacyModeCode& code,
     reason = impl_->privacy_mode_reason;
     impl_->privacy_mode_state_ready = false;
     return true;
+}
+
+Error QuicSession::set_block_input(bool enabled) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "set_block_input is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if (enabled && (impl.session_permissions.load() & (kPermissionBlockInput | kPermissionInput)) !=
+                           (kPermissionBlockInput | kPermissionInput)) {
+            return Error(Status::PermissionDenied, "block input is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_set_block_input(enabled),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_block_input_state(bool& enabled, BlockInputCode& code,
+                                          std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->block_input_state_ready) {
+        return false;
+    }
+    enabled = impl_->block_input_enabled;
+    code = impl_->block_input_code;
+    reason = impl_->block_input_reason;
+    impl_->block_input_state_ready = false;
+    return true;
+}
+
+bool QuicSession::take_display_control_request(DisplayControlRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_control_request) return false;
+    request = *impl_->display_control_request;
+    impl_->display_control_request.reset();
+    return true;
+}
+
+Error QuicSession::send_display_control_state(const DisplayControlState& state) {
+    if (impl_->role != Impl::Role::Server || !impl_->announced)
+        return Error(Status::InvalidCall, "display state requires an open server session");
+    const auto bytes = make_display_control_state(state);
+    if (bytes.empty()) return Error(Status::InvalidCall, "invalid display state");
+    return impl_->send_bytes(impl_->control.load(), bytes, QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_display_control(const DisplayControlRequest& request) {
+    if (impl_->role != Impl::Role::Client)
+        return Error(Status::InvalidCall, "display control is a client operation");
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->hello_complete) return Error(Status::InvalidCall, "handshake is incomplete");
+        if (impl_->client_config.session_mode != SessionMode::Desktop)
+            return Error(Status::PermissionDenied, "display control requires a desktop session");
+        const auto need = (request.action == DisplayControlAction::SetCount || request.action == DisplayControlAction::ToggleOutput)
+            ? kPermissionPrivacyMode | kPermissionInput : kPermissionPrivacyMode;
+        if (request.action != DisplayControlAction::Query && request.action != DisplayControlAction::Restore &&
+            (impl_->session_permissions.load() & need) != need)
+            return Error(Status::PermissionDenied, "display control is not permitted");
+    }
+    const auto bytes = make_display_control(request);
+    if (bytes.empty()) return Error(Status::InvalidCall, "invalid display request");
+    return impl_->send_bytes(impl_->control.load(), bytes, QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_control_state(DisplayControlState& state) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_control_state) return false;
+    state = std::move(*impl_->display_control_state);
+    impl_->display_control_state.reset();
+    return true;
+}
+
+bool QuicSession::take_lock_after_session_request(bool& enabled) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->lock_after_session_request_ready) {
+        return false;
+    }
+    impl_->lock_after_session_request_ready = false;
+    enabled = impl_->lock_after_session_requested;
+    return true;
+}
+
+Error QuicSession::send_lock_after_session_state(bool enabled, LockAfterSessionCode code,
+                                           const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_lock_after_session_state is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_lock_after_session_state(enabled, code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::set_lock_after_session(bool enabled) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "set_lock_after_session is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.client_config.session_mode != SessionMode::Desktop) {
+            return Error(Status::PermissionDenied, "locking after a session requires a desktop connection");
+        }
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if (enabled && (impl.session_permissions.load() & kPermissionInput) == 0) {
+            return Error(Status::PermissionDenied, "lock after session is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_set_lock_after_session(enabled),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_lock_after_session_state(bool& enabled, LockAfterSessionCode& code,
+                                          std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->lock_after_session_state_ready) {
+        return false;
+    }
+    enabled = impl_->lock_after_session_enabled;
+    code = impl_->lock_after_session_code;
+    reason = impl_->lock_after_session_reason;
+    impl_->lock_after_session_state_ready = false;
+    return true;
+}
+
+bool QuicSession::apply_block_input(bool enabled, std::string* error) {
+    if (impl_->role != Impl::Role::Server) {
+        if (error) *error = "blocking input is a server operation";
+        return false;
+    }
+    if (!impl_->injector) {
+        if (error) *error = "the input injector is unavailable";
+        return false;
+    }
+    if (enabled && (permissions() & (kPermissionBlockInput | kPermissionInput)) !=
+                       (kPermissionBlockInput | kPermissionInput)) {
+        if (error) *error = "blocking local input is not permitted";
+        return false;
+    }
+    if (!impl_->injector->block_local_input(enabled, error)) return false;
+    // The input thread may have been busy while a different caller revoked
+    // permission. Do not leave a late enable behind that caller's release.
+    if (enabled && (permissions() & (kPermissionBlockInput | kPermissionInput)) !=
+                       (kPermissionBlockInput | kPermissionInput)) {
+        impl_->injector->block_local_input(false, nullptr);
+        if (error) *error = "blocking local input was revoked";
+        return false;
+    }
+    return true;
+}
+
+bool QuicSession::local_input_blocked() const {
+    return impl_->injector && impl_->injector->local_input_blocked();
 }
 
 bool QuicSession::take_desktop_state(DesktopKind& kind) {
@@ -5569,6 +5991,7 @@ Error QuicSession::finish_server(std::chrono::milliseconds timeout, ClientStats&
     if (impl.role != Impl::Role::Server) {
         return Error(Status::InvalidCall, "finish_server is a server operation");
     }
+    if (impl.injector) impl.injector->block_local_input(false, nullptr);
     if (HQUIC video = impl.video.load()) {
         impl.api->StreamShutdown(video, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
     }

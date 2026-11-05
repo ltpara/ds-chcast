@@ -5,6 +5,7 @@
 #include <wtsapi32.h>
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -27,7 +28,7 @@ HANDLE g_session_wake = nullptr;
 HANDLE g_worker_stop = nullptr;
 HANDLE g_job = nullptr;
 HANDLE g_worker_process = nullptr;
-DWORD g_worker_session = 0;
+std::atomic<DWORD> g_worker_session{0xFFFFFFFF};
 std::string g_log_path;
 
 bool is_elevated() {
@@ -177,18 +178,6 @@ DWORD find_process_in_session(const wchar_t* executable, DWORD session) {
     return found;
 }
 
-bool session_has_user(DWORD session) {
-    LPWSTR name = nullptr;
-    DWORD bytes = 0;
-    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &name,
-                                     &bytes)) {
-        return false;
-    }
-    const bool has_user = name != nullptr && name[0] != L'\0';
-    WTSFreeMemory(name);
-    return has_user;
-}
-
 std::wstring worker_command_line() {
     return L"\"" + executable_path() + L"\" --worker";
 }
@@ -241,12 +230,16 @@ bool start_worker(DWORD session, std::string* error) {
     startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
     PROCESS_INFORMATION info{};
     const std::wstring executable = executable_path();
+    // Publish before creation so a concurrent logoff also stops a worker
+    // that has not opened its stop event yet.
+    g_worker_session = session;
     const BOOL started = CreateProcessAsUserW(
         primary, executable.c_str(), buffer.data(), nullptr, nullptr, FALSE,
         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info);
     const DWORD code = GetLastError();
     CloseHandle(primary);
     if (!started) {
+        g_worker_session = 0xFFFFFFFF;
         *error = "无法在会话 " + std::to_string(session) + " 启动工作进程（错误 " +
                  std::to_string(code) + "）";
         return false;
@@ -257,7 +250,6 @@ bool start_worker(DWORD session, std::string* error) {
     }
     CloseHandle(info.hThread);
     g_worker_process = info.hProcess;
-    g_worker_session = session;
     log_line(g_log_path, "worker started: pid=" + std::to_string(info.dwProcessId) +
                              " session=" + std::to_string(session));
     return true;
@@ -282,15 +274,13 @@ void stop_worker() {
                              " code=" + std::to_string(exit_code));
     CloseHandle(g_worker_process);
     g_worker_process = nullptr;
-    g_worker_session = 0;
+    g_worker_session = 0xFFFFFFFF;
     if (g_worker_stop != nullptr) {
         ResetEvent(g_worker_stop);
     }
 }
 
 DWORD WINAPI service_handler(DWORD control, DWORD event_type, void* event_data, void* context) {
-    (void)event_type;
-    (void)event_data;
     (void)context;
     switch (control) {
         case SERVICE_CONTROL_STOP:
@@ -303,6 +293,15 @@ DWORD WINAPI service_handler(DWORD control, DWORD event_type, void* event_data, 
             }
             return NO_ERROR;
         case SERVICE_CONTROL_SESSIONCHANGE:
+            if (event_type == WTS_SESSION_LOGOFF && event_data != nullptr) {
+                const auto* notification = static_cast<const WTSSESSION_NOTIFICATION*>(event_data);
+                if (notification->dwSessionId == g_worker_session.load() &&
+                    g_worker_stop != nullptr) {
+                    // End the old user's connections and shells before a
+                    // fresh worker exposes the pre-login desktop.
+                    SetEvent(g_worker_stop);
+                }
+            }
             if (g_session_wake != nullptr) {
                 SetEvent(g_session_wake);
             }
@@ -354,7 +353,10 @@ void service_main(DWORD argc, LPWSTR* argv) {
     g_job = CreateJobObjectW(nullptr, nullptr);
     if (g_job != nullptr) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // The display recovery helper explicitly breaks away so it can turn
+        // physical monitors back on after either the worker or service dies.
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                                                  JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         if (!SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &limits,
                                      sizeof(limits))) {
             log_line(g_log_path, "cannot configure the service job: " +
@@ -383,11 +385,12 @@ void service_main(DWORD argc, LPWSTR* argv) {
             break;
         }
         const DWORD session = WTSGetActiveConsoleSessionId();
-        const bool logged_in = session != 0xFFFFFFFF && session_has_user(session);
+        const bool console_available = session != 0xFFFFFFFF;
 
         if (g_worker_process != nullptr) {
-            if (!logged_in || session != g_worker_session) {
-                log_line(g_log_path, "session changed; stopping the worker");
+            if (!console_available || session != g_worker_session.load() ||
+                WaitForSingleObject(g_worker_stop, 0) == WAIT_OBJECT_0) {
+                log_line(g_log_path, "session changed or logged off; stopping the worker");
                 stop_worker();
                 retry_at = std::chrono::steady_clock::now();
             } else if (WaitForSingleObject(g_worker_process, 0) == WAIT_OBJECT_0) {
@@ -396,13 +399,13 @@ void service_main(DWORD argc, LPWSTR* argv) {
                 log_line(g_log_path, "worker ended: code=" + std::to_string(exit_code));
                 CloseHandle(g_worker_process);
                 g_worker_process = nullptr;
-                g_worker_session = 0;
+                g_worker_session = 0xFFFFFFFF;
                 retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(3);
             }
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (g_worker_process == nullptr && logged_in && now >= retry_at) {
+        if (g_worker_process == nullptr && console_available && now >= retry_at) {
             std::string error;
             if (!start_worker(session, &error)) {
                 log_line(g_log_path, error);

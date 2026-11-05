@@ -33,6 +33,7 @@ void main() {
     required List<ViewerDisplay> announced,
     required int active,
     required ValueChanged<int> onSelect,
+    ValueChanged<int>? onOpenWindow,
     List<ViewerDisplayMode> modes = const <ViewerDisplayMode>[],
     bool modeChangeAvailable = true,
     ValueChanged<ViewerDisplayMode>? onSelectMode,
@@ -56,6 +57,18 @@ void main() {
     ValueChanged<RemoteSpecialAction>? onSpecialAction,
     VoidCallback? onSendText,
     bool terminalAvailable = false,
+    bool blockInputAvailable = false,
+    bool blockInputEnabled = false,
+    VoidCallback? onToggleBlockInput,
+    bool lockAfterSessionAvailable = false,
+    bool lockAfterSessionEnabled = false,
+    VoidCallback? onToggleLockAfterSession,
+    bool displayControlSupported = false,
+    bool displayControlManaged = false,
+    bool privacyAvailable = true,
+    void Function(int, int)? onControlDisplays,
+    List<ViewerControlledDisplay> displayControlOutputs = const <ViewerControlledDisplay>[],
+    void Function(int, bool)? onToggleVirtualDisplay,
     bool terminalOpen = false,
     VoidCallback? onToggleTerminal,
     bool streamOptionsAvailable = true,
@@ -95,11 +108,24 @@ void main() {
               () async => const <ViewerMicrophoneDevice>[],
           onSelectMicrophone: onSelectMicrophone ?? (_) async {},
           onSetAudioProcessing: onSetAudioProcessing ?? (_, _) async {},
-          privacyAvailable: true,
+          displayControlAvailable: true,
+          displayControlSupported: displayControlSupported,
+          displayControlManaged: displayControlManaged,
+          onControlDisplays: onControlDisplays,
+          displayControlOutputs: displayControlOutputs,
+          onToggleVirtualDisplay: onToggleVirtualDisplay,
+          privacyAvailable: privacyAvailable,
           privacyEnabled: false,
+          blockInputAvailable: blockInputAvailable,
+          blockInputEnabled: blockInputEnabled,
+          onToggleBlockInput: onToggleBlockInput,
+          lockAfterSessionAvailable: lockAfterSessionAvailable,
+          lockAfterSessionEnabled: lockAfterSessionEnabled,
+          onToggleLockAfterSession: onToggleLockAfterSession,
           displays: announced,
           activeDisplay: active,
           onSelectDisplay: onSelect,
+          onOpenDisplayWindow: onOpenWindow,
           modes: modes,
           modeChangeAvailable: modeChangeAvailable,
           onSelectMode: onSelectMode ?? (_) {},
@@ -144,6 +170,88 @@ void main() {
     );
   }
 
+  testWidgets('targeted menu sends captured identity and desired state after reordering', (tester) async {
+    tester.view.physicalSize = const Size(1800, 1400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final List<Object> calls = <Object>[];
+    await tester.pumpWidget(toolbar(announced: displays, active: 0, onSelect: (_) {},
+      displayControlSupported: true,
+      displayControlOutputs: const <ViewerControlledDisplay>[
+        ViewerControlledDisplay(id: 31, active: true), ViewerControlledDisplay(id: 7, active: false),
+      ], onToggleVirtualDisplay: (id, enabled) => calls.add(<Object>[id, enabled])));
+    await tester.tap(find.byTooltip('虚拟显示器与隐私设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('虚拟屏 31'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('虚拟显示器与隐私设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('虚拟屏 7'));
+    await tester.pumpAndSettle();
+    expect(calls, <Object>[<Object>[31, false], <Object>[7, true]]);
+  });
+
+  testWidgets('display menu gates mutation but preserves recovery after revocation', (tester) async {
+    tester.view.physicalSize = const Size(1800, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final List<int> actions = <int>[];
+    await tester.pumpWidget(toolbar(announced: displays, active: 0, onSelect: (_) {},
+      displayControlSupported: true, displayControlManaged: true, privacyAvailable: false,
+      onControlDisplays: (action, value) => actions.add(action)));
+    await tester.tap(find.byTooltip('虚拟显示器与隐私设置'));
+    await tester.pumpAndSettle();
+    final CheckedPopupMenuItem<int> create = tester.widget(find.widgetWithText(CheckedPopupMenuItem<int>, '启用 1 个虚拟屏'));
+    expect(create.enabled, isFalse);
+    await tester.tap(find.text('恢复原显示布局'));
+    await tester.pumpAndSettle();
+    expect(actions, <int>[2]);
+  });
+
+  testWidgets('input blocking needs consent but restoring stays available', (tester) async {
+    int toggles = 0;
+    Widget build({bool available = false, bool enabled = false}) => toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (_) {},
+      blockInputAvailable: available,
+      blockInputEnabled: enabled,
+      onToggleBlockInput: () => ++toggles,
+    );
+    await tester.pumpWidget(build());
+    await tester.tap(find.byTooltip('禁用主机本地键鼠'));
+    expect(toggles, 0);
+    await tester.pumpWidget(build(available: true));
+    await tester.tap(find.byTooltip('禁用主机本地键鼠'));
+    expect(toggles, 1);
+    await tester.pumpWidget(build(enabled: true));
+    await tester.tap(find.byTooltip('恢复主机本地键鼠'));
+    expect(toggles, 2);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('lock after session requires permission and remains cancellable', (tester) async {
+    int toggles = 0;
+    Widget build({bool allowed = false, bool enabled = false}) => toolbar(
+      announced: displays, active: 0, onSelect: (_) {},
+      lockAfterSessionAvailable: allowed,
+      lockAfterSessionEnabled: enabled,
+      onToggleLockAfterSession: () => ++toggles,
+    );
+    await tester.pumpWidget(build());
+    await tester.tap(find.byTooltip('会话结束后锁屏（最后一个桌面会话退出时）'));
+    expect(toggles, 0);
+    await tester.pumpWidget(build(allowed: true));
+    await tester.tap(find.byTooltip('会话结束后锁屏（最后一个桌面会话退出时）'));
+    expect(toggles, 1);
+    await tester.pumpWidget(build(enabled: true));
+    await tester.tap(find.byTooltip('取消会话结束后锁屏'));
+    expect(toggles, 2);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('lists every announced display and reports the pick', (WidgetTester tester) async {
     int? picked;
     await tester.pumpWidget(toolbar(
@@ -163,6 +271,22 @@ void main() {
     await tester.tap(find.text('DISPLAY2'));
     await tester.pumpAndSettle();
     expect(picked, 1);
+  });
+
+  testWidgets('opening a monitor window leaves the current selection intact', (tester) async {
+    int? selected;
+    int? opened;
+    await tester.pumpWidget(toolbar(
+      announced: displays, active: 0,
+      onSelect: (int index) => selected = index,
+      onOpenWindow: (int index) => opened = index,
+    ));
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('在新窗口打开显示器 2'));
+    await tester.pumpAndSettle();
+    expect(opened, 1);
+    expect(selected, isNull);
   });
 
   testWidgets('the default entry asks the server to choose', (WidgetTester tester) async {

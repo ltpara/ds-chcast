@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -39,29 +40,31 @@ class TrustStore {
   }
 
   Future<Map<String, String>> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return <String, String>{};
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map) {
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
         return <String, String>{};
       }
-      final Map<String, String> entries = <String, String>{};
-      decoded.forEach((Object? key, Object? value) {
-        if (key is! String || value is! String) {
-          return;
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is! Map) {
+          return <String, String>{};
         }
-        final String fingerprint = normalizeFingerprint(value);
-        if (key.isNotEmpty && fingerprint.isNotEmpty) {
-          entries[key] = fingerprint;
-        }
-      });
-      return entries;
-    } catch (_) {
-      return <String, String>{};
-    }
+        final Map<String, String> entries = <String, String>{};
+        decoded.forEach((Object? key, Object? value) {
+          if (key is! String || value is! String) {
+            return;
+          }
+          final String fingerprint = normalizeFingerprint(value);
+          if (key.isNotEmpty && fingerprint.isNotEmpty) {
+            entries[key] = fingerprint;
+          }
+        });
+        return entries;
+      } catch (_) {
+        return <String, String>{};
+      }
+    });
   }
 
   Future<String> fingerprintFor(String target) async {
@@ -71,21 +74,25 @@ class TrustStore {
   /// Stores [fingerprint] for [target]; an invalid fingerprint is ignored.
   /// Returns the canonical value that was stored, or an empty string.
   Future<String> trust(String target, String fingerprint) async {
-    final String canonical = normalizeFingerprint(fingerprint);
-    if (target.isEmpty || canonical.isEmpty) {
-      return '';
-    }
-    final Map<String, String> entries = await load();
-    entries[target] = canonical;
-    await _save(entries);
-    return canonical;
+    return withStoreLock(_file(), () async {
+      final String canonical = normalizeFingerprint(fingerprint);
+      if (target.isEmpty || canonical.isEmpty) {
+        return '';
+      }
+      final Map<String, String> entries = await load();
+      entries[target] = canonical;
+      await _save(entries);
+      return canonical;
+    });
   }
 
   Future<void> forget(String target) async {
-    final Map<String, String> entries = await load();
-    if (entries.remove(target) != null) {
-      await _save(entries);
-    }
+    return withStoreLock(_file(), () async {
+      final Map<String, String> entries = await load();
+      if (entries.remove(target) != null) {
+        await _save(entries);
+      }
+    });
   }
 
   Future<void> _save(Map<String, String> entries) async {

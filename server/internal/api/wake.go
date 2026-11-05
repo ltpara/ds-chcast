@@ -82,7 +82,7 @@ func (s *server) wakeHost(w http.ResponseWriter, r *http.Request) {
 // neither a key nor accounts stays open, matching registration and lookup,
 // with the per-target cooldown and per-IP HTTP limiter as the guard rails.
 func (s *server) wakeActor(w http.ResponseWriter, r *http.Request, target string) (string, bool) {
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		return "server-key", true
 	}
 	if s.cfg.Accounts != nil {
@@ -102,7 +102,11 @@ func (s *server) wakeActor(w http.ResponseWriter, r *http.Request, target string
 		}
 		return user.Username, true
 	}
-	return "anonymous", true
+	if s.cfg.ServerKey == "" {
+		return "anonymous", true
+	}
+	writeError(w, http.StatusUnauthorized, "server key required")
+	return "", false
 }
 
 func (s *server) wakeAllowed(user account.User, target string) bool {

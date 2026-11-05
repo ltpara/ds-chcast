@@ -24,13 +24,16 @@
 - 仓库不提交第三方二进制。`tools/fetch-usbmmidd.ps1` 在 `$pinnedZipSha256`
   配置后下载并校验安装包，解包到 `build/deps/usbmmidd_v2`（`build/` 已被
   `.gitignore` 忽略），并生成 `manifest.sha256` 与 `SOURCE.txt`。
-- 固定哈希尚未配置，脚本当前会拒绝下载和解包，只打印本地 zip 的 SHA-256
-  供复核。
+- 2026-11-05 再次从官方地址获取相同 ZIP，已固定 ZIP 及必需文件的 SHA-256，
+  允许主动获取用于本机安装和验证。此操作不代表批准发布包再分发。
+- 官方 `deviceinstaller64.exe` 没有 Authenticode 签名。主机仅对完整匹配内置
+  六个文件哈希的 2.0.0.1 包允许这个辅助程序，同时仍验证 CAT、x64/Win32 DLL
+  的 Authenticode、文件 ACL 与只读锁。修改 manifest 或 SOURCE 不能授权新文件。
 - `tools/package-windows.ps1 -VirtualDisplayPackageDir <目录>` 或仓库
   `drivers\usbmmidd_v2` 存在时才把驱动打进安装包；默认安装包不含该驱动。
 - 再分发许可与广告提示条款尚未获得 Amyuni 确认。确认前发布包不应包含该
   驱动二进制，只保留“用户主动获取 + 哈希校验 + 明确确认”的引导安装。
 - 分发该驱动时必须原样保留 `License.txt`，并在安装目录附带 `SOURCE.txt`
   （下载 URL、日期、SHA-256）。
-- 待办：Amyuni 确认后再在本文件追加许可全文或官方许可链接，并同时配置
-  `tools/fetch-usbmmidd.ps1` 的 `$pinnedZipSha256`。
+- 待办：发布包再分发前确认 Amyuni 许可及广告提示条款；固定哈希只用于验证
+  已审阅文件，不替代这项确认。原许可随本机驱动包保留。

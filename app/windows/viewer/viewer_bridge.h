@@ -7,6 +7,7 @@
 #include <flutter/method_channel.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -20,6 +21,7 @@ class FlutterEngine;
 namespace chast_viewer {
 
 class GpuFrameSink;
+struct SecurityKeyCompletion;
 
 // Owns the viewer session and exposes it to Dart over a MethodChannel. One
 // instance lives for the lifetime of the runner window. Dart registers the
@@ -38,6 +40,7 @@ public:
     // Must run on the platform thread before the Flutter controller is
     // destroyed.
     void Shutdown();
+    std::function<bool(const std::string&)> open_session_window;
 
 private:
     void HandleMethodCall(
@@ -78,6 +81,8 @@ private:
 
     flutter::FlutterEngine* engine_ = nullptr;
     HWND window_ = nullptr;
+    bool window_close_handler_ = false;
+    bool window_close_requested_ = false;
     HWND view_ = nullptr;
     std::atomic<bool> key_capture_{false};
     HIMC saved_himc_ = nullptr;
@@ -101,6 +106,7 @@ private:
     // One Windows Hello prompt at a time: webauthn.dll would otherwise stack
     // verification windows from concurrent Dart calls.
     std::atomic<bool> security_key_busy_{false};
+    std::shared_ptr<SecurityKeyCompletion> security_key_pending_;
     bool fullscreen_ = false;
     LONG_PTR saved_style_ = 0;
     WINDOWPLACEMENT saved_placement_{};

@@ -33,7 +33,7 @@ func rolePermission(role string) (consolePermission, bool) {
 // it needs. Operators sign in with a normal account token; role changes take
 // effect on the next request because Authenticate re-reads the user row.
 func (s *server) consoleActor(w http.ResponseWriter, r *http.Request, need consolePermission) (account.User, string, bool) {
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		return account.User{}, "server-key", true
 	}
 	if s.cfg.Accounts == nil {

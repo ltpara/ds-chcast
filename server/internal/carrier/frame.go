@@ -42,16 +42,19 @@ var ErrFrameTooLarge = errors.New("carrier frame is larger than 65535 bytes")
 
 // HostHello is the JSON line a host agent sends after MagicHost.
 type HostHello struct {
-	HostID string `json:"host_id"`
+	Multiplex bool   `json:"multiplex,omitempty"`
+	HostID    string `json:"host_id"`
 }
 
 // HostChallenge is the relay's JSON line starting with MagicChallenge.
 type HostChallenge struct {
-	Nonce string `json:"nonce"`
+	Multiplex bool   `json:"multiplex,omitempty"`
+	Nonce     string `json:"nonce"`
 }
 
 // HostAuth is the host agent's JSON line starting with MagicAuth.
 type HostAuth struct {
+	Multiplex bool   `json:"multiplex,omitempty"`
 	HostID    string `json:"host_id"`
 	Nonce     string `json:"nonce"`
 	Signature string `json:"signature"`

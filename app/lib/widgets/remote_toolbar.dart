@@ -52,12 +52,28 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSetAudioProcessing,
     required this.privacyAvailable,
     required this.privacyEnabled,
+    this.blockInputAvailable = false,
+    this.lockAfterSessionAvailable = false,
+    this.blockInputEnabled = false,
+    this.lockAfterSessionEnabled = false,
+    this.onToggleBlockInput,
+    this.onToggleLockAfterSession,
+    this.displayControlAvailable = false,
+    this.displayControlSupported = false,
+    this.displayControlManaged = false,
+    this.displayControlBusy = false,
+    this.displayControlCount = 0,
+    this.displayControlPrivacy = 0,
+    this.onControlDisplays,
+    this.displayControlOutputs = const <ViewerControlledDisplay>[],
+    this.onToggleVirtualDisplay,
     required this.portForwardAvailable,
     required this.portForwardActive,
     required this.onOpenPortForward,
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
+    this.onOpenDisplayWindow,
     required this.modes,
     required this.modeChangeAvailable,
     required this.onSelectMode,
@@ -135,6 +151,12 @@ class RemoteToolbar extends StatelessWidget {
   final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
+  final bool blockInputAvailable;
+  final bool lockAfterSessionAvailable;
+  final bool blockInputEnabled;
+  final bool lockAfterSessionEnabled;
+  final VoidCallback? onToggleBlockInput;
+  final VoidCallback? onToggleLockAfterSession;
 
   /// A viewer-side port-forward listener is running and the host accepted
   /// the target; the button stays enabled either way so the dialog can stop
@@ -145,6 +167,7 @@ class RemoteToolbar extends StatelessWidget {
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
+  final ValueChanged<int>? onOpenDisplayWindow;
   final List<ViewerDisplayMode> modes;
   final bool modeChangeAvailable;
   final ValueChanged<ViewerDisplayMode> onSelectMode;
@@ -190,6 +213,16 @@ class RemoteToolbar extends StatelessWidget {
   final VoidCallback onToggleAudio;
   final VoidCallback onToggleMicrophone;
   final VoidCallback onTogglePrivacy;
+  final bool displayControlAvailable;
+  final bool displayControlSupported;
+  final bool displayControlManaged;
+  final bool displayControlBusy;
+  final int displayControlCount;
+  final int displayControlPrivacy;
+  final void Function(int action, int value)? onControlDisplays;
+  final List<ViewerControlledDisplay> displayControlOutputs;
+  final void Function(int target, bool enabled)? onToggleVirtualDisplay;
+
 
   /// Viewer-side recording. Recording is local to this viewer: nothing is sent
   /// to the host and nothing is uploaded. The switch is optional so tests and
@@ -431,7 +464,9 @@ class RemoteToolbar extends StatelessWidget {
           borderRadius: BorderRadius.circular(4),
           border: Border.all(color: Colors.white24),
         ),
-        child: Row(
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
           mainAxisSize: MainAxisSize.min,
           children: <Widget>[
             _BarButton(
@@ -446,6 +481,7 @@ class RemoteToolbar extends StatelessWidget {
               displays: displays,
               active: activeDisplay,
               onSelected: onSelectDisplay,
+              onOpenWindow: onOpenDisplayWindow,
             ),
             if (activeDisplay != kViewerDisplayAll)
               _ResolutionButton(
@@ -588,6 +624,71 @@ class RemoteToolbar extends StatelessWidget {
                   unawaited(_openMicrophoneMenu(context)),
             ),
             _BarButton(
+              icon: blockInputEnabled ? Icons.lock_rounded : Icons.keyboard_outlined,
+              tooltip: blockInputEnabled
+                  ? tr('恢复主机本地键鼠')
+                  : tr('禁用主机本地键鼠'),
+              disabled: !blockInputAvailable && !blockInputEnabled,
+              active: blockInputEnabled,
+              onTap: () => onToggleBlockInput?.call(),
+            ),
+            _BarButton(
+              icon: lockAfterSessionEnabled ? Icons.lock_clock : Icons.lock_clock_outlined,
+              tooltip: lockAfterSessionEnabled
+                  ? tr('取消会话结束后锁屏')
+                  : tr('会话结束后锁屏（最后一个桌面会话退出时）'),
+              disabled: !lockAfterSessionAvailable && !lockAfterSessionEnabled,
+              active: lockAfterSessionEnabled,
+              onTap: () => onToggleLockAfterSession?.call(),
+            ),
+            PopupMenuButton<int>(
+              tooltip: tr('虚拟显示器与隐私设置'),
+              enabled: displayControlAvailable && !displayControlBusy,
+              icon: Icon(Icons.settings_display_outlined,
+                  size: 18, color: displayControlAvailable ? Colors.white70 : Colors.white24),
+              onSelected: (int choice) {
+                if (choice >= 100) {
+                  onToggleVirtualDisplay?.call((choice - 100) ~/ 2, (choice - 100).isOdd);
+                } else if (choice == 20) {
+                  onControlDisplays?.call(2, 0);
+                } else if (choice == 21) {
+                  onControlDisplays?.call(0, 0);
+                } else if (choice >= 10) {
+                  onControlDisplays?.call(3, choice - 10);
+                } else {
+                  onControlDisplays?.call(1, choice);
+                }
+              },
+              itemBuilder: (_) => <PopupMenuEntry<int>>[
+                PopupMenuItem<int>(enabled: false,
+                  child: Text(tr('临时虚拟屏，断线后恢复原布局'))),
+                for (int count = 0; count <= 4; ++count)
+                  CheckedPopupMenuItem<int>(
+                    value: count, checked: displayControlCount == count,
+                    enabled: displayControlSupported && inputAvailable && privacyAvailable && !privacyEnabled,
+                    child: Text(tr('启用 {p1} 个虚拟屏', <String, Object?>{'p1': count})),
+                  ),
+                if (displayControlOutputs.isNotEmpty) const PopupMenuDivider(),
+                for (final output in displayControlOutputs)
+                  CheckedPopupMenuItem<int>(
+                    value: 100 + output.id * 2 + (output.active ? 0 : 1),
+                    checked: output.active,
+                    enabled: displayControlSupported && inputAvailable && privacyAvailable && !privacyEnabled,
+                    child: Text(tr('虚拟屏 {p1}', <String, Object?>{'p1': output.id})),
+                  ),
+                PopupMenuItem<int>(value: 20, enabled: displayControlManaged,
+                  child: Text(tr('恢复原显示布局'))),
+                const PopupMenuDivider(),
+                CheckedPopupMenuItem<int>(value: 10, checked: displayControlPrivacy == 0,
+                  enabled: privacyAvailable && !privacyEnabled && !displayControlManaged,
+                  child: Text(tr('隐私方式：遮罩'))),
+                CheckedPopupMenuItem<int>(value: 11, checked: displayControlPrivacy == 1,
+                  enabled: privacyAvailable && displayControlSupported && !privacyEnabled && !displayControlManaged,
+                  child: Text(tr('隐私方式：虚拟屏'))),
+                PopupMenuItem<int>(value: 21, child: Text(tr('刷新显示状态'))),
+              ],
+            ),
+            _BarButton(
               icon: privacyEnabled
                   ? Icons.shield_rounded
                   : Icons.shield_outlined,
@@ -652,6 +753,7 @@ class RemoteToolbar extends StatelessWidget {
               onTap: onClose,
             ),
           ],
+          ),
         ),
       ),
     );
@@ -931,11 +1033,13 @@ class _DisplayButton extends StatelessWidget {
     required this.displays,
     required this.active,
     required this.onSelected,
+    this.onOpenWindow,
   });
 
   final List<ViewerDisplay> displays;
   final int active;
   final ValueChanged<int> onSelected;
+  final ValueChanged<int>? onOpenWindow;
 
   @override
   Widget build(BuildContext context) {
@@ -952,7 +1056,13 @@ class _DisplayButton extends StatelessWidget {
         elevation: 8,
         padding: EdgeInsets.zero,
         constraints: const BoxConstraints(minWidth: 210, maxWidth: 300),
-        onSelected: onSelected,
+        onSelected: (int value) {
+          if (value < 0) {
+            onOpenWindow?.call(-value - 1);
+          } else {
+            onSelected(value);
+          }
+        },
         itemBuilder: (BuildContext context) {
           return <PopupMenuEntry<int>>[
             _displayItem(kViewerDisplayAuto, tr('服务端默认'), tr('由服务端选择输出'),
@@ -966,6 +1076,15 @@ class _DisplayButton extends StatelessWidget {
                 _detail(display),
                 Icons.monitor_rounded,
               ),
+            if (onOpenWindow != null) ...<PopupMenuEntry<int>>[
+              const PopupMenuDivider(),
+              for (final ViewerDisplay display in displays)
+                PopupMenuItem<int>(
+                  value: -display.index - 1,
+                  child: Text(tr('在新窗口打开显示器 {p1}',
+                      <String, Object?>{'p1': display.index + 1})),
+                ),
+            ],
           ];
         },
         child: SizedBox(

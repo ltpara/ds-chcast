@@ -9,9 +9,7 @@
 #
 # The package is never committed: the output lives under build/ (gitignored).
 #
-# Fail-closed: a reviewed SHA-256 must be pinned below before this script will
-# download or extract anything. While the pin is empty the script only prints
-# the hash of a local zip, if one was supplied, and exits with code 2.
+# Fail-closed: the ZIP and every required payload must match reviewed hashes.
 
 param(
     [string]$SourceZip = "",
@@ -23,16 +21,23 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $downloadUrl = "https://www.amyuni.com/downloads/usbmmidd_v2.zip"
 
-# SHA-256 of the official usbmmidd_v2.zip. Leave empty until the package has
-# been reviewed (signature chain, file list, Amyuni redistribution terms) and
-# update this value together with THIRD-PARTY-NOTICES.md.
-$pinnedZipSha256 = ""
+# Official 2.0.0.1 package reviewed on 2026-11-05. This pin authorizes
+# fetching for local use; it does not authorize bundling a release.
+$pinnedZipSha256 = "629b51e9944762bae73948171c65d09a79595cf4c771a82ebc003fbba5b24f51"
 
 $requiredFiles = @(
     "deviceinstaller64.exe", "usbmmidd.inf", "usbmmidd.cat",
     "x64\usbmmidd.dll", "win32\usbmmidd.dll", "License.txt"
 )
 $expectedSigner = "Microsoft Windows Hardware Compatibility Publisher"
+$pinnedFiles = @{
+    "deviceinstaller64.exe" = "e9baa02cdae921acf0aae4d8e8c29a4cdf4057ab61f9c60862b7cc439e2753f7"
+    "usbmmidd.inf" = "a8750ca15a86742f3012886c9932bb974158cd2d9779cf891c730d976a47726a"
+    "usbmmidd.cat" = "470149c4cf9970ba59070aa7c9409c9f63a15727de99bab53e7e51f55310779f"
+    "x64\usbmmidd.dll" = "dc135d675127113915a7e5aa9fe57c84edad6be41d0890b265ef124ab26ea9e3"
+    "win32\usbmmidd.dll" = "07ceebaecf203fef39117576d8b49d803c0fb1f6c7aa5175a6ebab110d54fed2"
+    "License.txt" = "44c73fc4110979899dbb5054662de581f7d4350939f19bb2d50574f613314ba2"
+}
 
 if (-not $Destination) {
     $Destination = Join-Path $root "build\deps\usbmmidd_v2"
@@ -55,6 +60,9 @@ function Get-Sha256([string]$Path) {
 function Test-Package([string]$Root, [switch]$VerifyManifest) {
     foreach ($name in $requiredFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $Root $name) -PathType Leaf)) {
+            return $false
+        }
+        if ((Get-Sha256 (Join-Path $Root $name)) -ne $pinnedFiles[$name]) {
             return $false
         }
     }
@@ -157,18 +165,15 @@ if ($packageCandidates.Count -ne 1) {
 }
 $packageRoot = $packageCandidates[0]
 
-$installer = Join-Path $packageRoot "deviceinstaller64.exe"
-$signature = Get-AuthenticodeSignature -LiteralPath $installer
-if ($signature.Status -eq "Valid") {
-    Write-Host "deviceinstaller64.exe signer: $($signature.SignerCertificate.Subject)"
-    if ($signature.SignerCertificate.Subject -notlike "*$expectedSigner*") {
-        Write-Warning "the signer is not $expectedSigner; chast-host will reject this package"
+foreach ($name in @("usbmmidd.cat", "x64\usbmmidd.dll", "win32\usbmmidd.dll")) {
+    $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $packageRoot $name)
+    if ($signature.Status -ne "Valid" -or
+        $signature.SignerCertificate.Subject -notlike "*$expectedSigner*") {
+        Fail 4 "the driver signature is not trusted: $name ($($signature.Status))"
     }
+    Write-Host "$name signer: $($signature.SignerCertificate.Subject)"
 }
-else {
-    Write-Warning ("deviceinstaller64.exe signature status is $($signature.Status); " +
-        "chast-host will reject this package unless WinVerifyTrust accepts it")
-}
+Write-Host "The vendor helper is unsigned; it is authorized by the reviewed package hash."
 
 New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 Copy-Item -Path (Join-Path $packageRoot "*") -Destination $Destination -Recurse -Force

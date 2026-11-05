@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -34,6 +35,8 @@
 #include "chast/error.h"
 #include "chast/file_transfer.h"
 #include "chast/host_server.h"
+#include "chast/display_privacy.h"
+#include "../src/win/display_topology.h"
 #include "chast/host_settings.h"
 #include "chast/protocol.h"
 #include "chast/security.h"
@@ -1308,6 +1311,112 @@ bool run_terminal(chast_viewer::ViewerEngine& engine, std::chrono::milliseconds 
     return true;
 }
 
+// Independent tabs must preserve their process environment and route bytes
+// only to their own console, including after closing and reusing a slot.
+bool run_terminal_tabs(chast_viewer::ViewerEngine& engine, chast::HostServer& host,
+                       std::string* error) {
+    using Phase = chast_viewer::TerminalPhase;
+    auto wait_for = [&](const std::function<bool()>& ready, const char* failure) {
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        do {
+            if (ready()) return true;
+            if (engine.Snapshot().state != chast_viewer::ViewerState::kStreaming) break;
+            std::this_thread::sleep_for(5ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        *error = failure;
+        return false;
+    };
+    std::array<std::string, 2> transcripts;
+    std::array<bool, 2> output_ended{};
+    auto drain = [&] {
+        for (uint32_t id = 1; id <= 2; ++id) {
+            std::vector<uint8_t> data;
+            bool ended = false;
+            while (engine.TakeTerminalOutput(data, ended, id)) {
+                transcripts[id - 1].append(reinterpret_cast<const char*>(data.data()), data.size());
+            }
+            output_ended[id - 1] = ended;
+        }
+    };
+    const uint16_t permissions = engine.Snapshot().permissions;
+    if (!engine.OpenTerminal(80, 24, 1) || !engine.OpenTerminal(90, 28, 2) ||
+        engine.OpenTerminal(80, 24, 3)) {
+        *error = "terminal slot bounds or simultaneous opens failed";
+        return false;
+    }
+    if (!wait_for([&] {
+        const auto status = engine.Snapshot();
+        return status.terminals[0].phase == Phase::kOpen &&
+               status.terminals[1].phase == Phase::kOpen;
+    }, "both terminal tabs did not open")) return false;
+    if (!engine.SendTerminalInput("set CHAST_TAB=FIRST_TAB_ONLY\r\necho %CHAST_TAB%\r\n", 1) ||
+        !engine.SendTerminalInput("set CHAST_TAB=SECOND_TAB_ONLY\r\necho %CHAST_TAB%\r\n", 2) ||
+        !engine.ResizeTerminal(110, 32, 2)) {
+        *error = "terminal tab input or resize refused";
+        return false;
+    }
+    if (!wait_for([&] {
+        drain();
+        const auto status = engine.Snapshot();
+        return transcripts[0].find("FIRST_TAB_ONLY") != std::string::npos &&
+               transcripts[1].find("SECOND_TAB_ONLY") != std::string::npos &&
+               status.terminals[1].columns == 110 && status.terminals[1].rows == 32;
+    }, "terminal tabs did not return their markers/resize")) return false;
+    if (transcripts[0].find("SECOND_TAB_ONLY") != std::string::npos ||
+        transcripts[1].find("FIRST_TAB_ONLY") != std::string::npos ||
+        engine.Snapshot().terminals[0].columns != 80) {
+        *error = "terminal output or resize crossed between tabs";
+        return false;
+    }
+    engine.CloseTerminal(1);
+    if (!wait_for([&] {
+        std::vector<uint8_t> data;
+        bool ended = false;
+        while (engine.TakeTerminalOutput(data, ended, 1)) {}
+        return ended;
+    }, "first tab did not close")) return false;
+    // Confirm the second shell retained its environment after the first closed.
+    transcripts[1].clear();
+    if (!engine.SendTerminalInput("echo %CHAST_TAB%\r\n", 2) ||
+        !wait_for([&] {
+            drain();
+            return transcripts[1].find("SECOND_TAB_ONLY") != std::string::npos;
+        }, "closing one tab terminated the other")) return false;
+    if (!engine.OpenTerminal(70, 20, 1) ||
+        !wait_for([&] { return engine.Snapshot().terminals[0].phase == Phase::kOpen; },
+                  "closed terminal slot did not reopen")) return false;
+    transcripts[0].clear();
+    if (!engine.SendTerminalInput("echo FRESH_TAB_ONLY\r\n", 1) ||
+        !wait_for([&] {
+            drain();
+            return transcripts[0].find("FRESH_TAB_ONLY") != std::string::npos;
+        }, "reopened terminal did not return its own output")) return false;
+    if (transcripts[0].find("FIRST_TAB_ONLY") != std::string::npos) {
+        *error = "reopened terminal inherited the old terminal output";
+        return false;
+    }
+    host.set_permissions(static_cast<uint16_t>(permissions & ~chast::kPermissionTerminal));
+    if (!wait_for([&] {
+        drain();
+        const auto status = engine.Snapshot();
+        const auto stopped = [](Phase phase) {
+            return phase == Phase::kEnded || phase == Phase::kFailed;
+        };
+        // Stream abort and PermissionUpdate use independent QUIC paths. The
+        // host's ending may be observed before the explicit revocation; both
+        // are valid provided every stream ends and the permission is gone.
+        return stopped(status.terminals[0].phase) && stopped(status.terminals[1].phase) &&
+               output_ended[0] && output_ended[1] &&
+               (status.permissions & chast::kPermissionTerminal) == 0;
+    }, "revocation did not close both terminal tabs")) return false;
+    if (engine.SendTerminalInput("echo denied\r\n", 2) || engine.OpenTerminal(80, 24, 1)) {
+        *error = "revoked terminal accepted input or reopen";
+        return false;
+    }
+    host.set_permissions(permissions);
+    return true;
+}
+
 // Parses the signature and the IHDR every PNG begins with, so a screenshot is
 // checked for being a real picture of the streamed size and not just a file
 // with a plausible name.
@@ -1463,9 +1572,193 @@ bool check_no_files(const fs::path& directory, std::string* error) {
     return true;
 }
 
+// --display-control is non-disruptive; --display-control-live additionally
+// creates temporary extended desktops on an explicitly prepared machine.
+int run_display_control_probe(bool live) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    using namespace chast;
+    using A = DisplayControlAction;
+    using C = DisplayControlCode;
+    int failures = 0;
+    auto check = [&](bool ok, const char* message) {
+        std::printf("%s %s\n", ok ? "ok  " : "FAIL", message);
+        if (!ok) ++failures;
+        return ok;
+    };
+    std::function<bool()> disconnected = [] { return false; };
+    const auto until = [&](const std::function<bool()>& predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + 40s;
+        do {
+            if (predicate()) return true;
+            if (disconnected()) return false;
+            std::this_thread::sleep_for(20ms);
+        }
+        while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+    std::string error;
+    display_topology::Snapshot original;
+    if (!check(display_topology::query(original, QDC_ONLY_ACTIVE_PATHS, &error), "save original desktop topology")) return 1;
+    const auto restored = [&] {
+        display_topology::Snapshot now;
+        if (!display_topology::query(now, QDC_ONLY_ACTIVE_PATHS, &error) || now.paths.size() != original.paths.size()) return false;
+        for (const auto& a : original.paths) {
+            bool found = false;
+            for (const auto& b : now.paths) {
+                if (a.targetInfo.id != b.targetInfo.id || a.targetInfo.adapterId.LowPart != b.targetInfo.adapterId.LowPart ||
+                    a.targetInfo.adapterId.HighPart != b.targetInfo.adapterId.HighPart) continue;
+                const auto& x = original.modes[a.sourceInfo.modeInfoIdx].sourceMode;
+                const auto& y = now.modes[b.sourceInfo.modeInfoIdx].sourceMode;
+                found = x.width == y.width && x.height == y.height && x.position.x == y.position.x &&
+                        x.position.y == y.position.y && a.targetInfo.rotation == b.targetInfo.rotation;
+            }
+            if (!found) return false;
+        }
+        return true;
+    };
+    ProbeSink sink;
+    if (!check(sink.create(&error), "create hardware viewer sink")) return 1;
+    std::atomic<int> locks{0};
+    HostServerConfig cfg;
+    cfg.max_sessions = 1;  // also covers the standalone lock-after-session path
+    cfg.settings.bind_address = "127.0.0.1";
+    cfg.settings.port = pick_free_port();
+    cfg.settings.carrier = false;
+    cfg.settings.auth_mode = HostAuthMode::Password;
+    cfg.settings.password_hash = hash_password(kPassword);
+    cfg.settings.allow_input = true;
+    cfg.settings.allow_privacy_mode = true;
+    cfg.settings.allow_audio = false;
+    cfg.dry_run_input = true;
+    cfg.finish_timeout_ms = 100;
+    cfg.lock_workstation = [&](std::string*) { ++locks; return true; };
+    cfg.log = [](const std::string& message) { std::fprintf(stderr, "host: %s\n", message.c_str()); };
+    auto host = HostServer::create(cfg, &error);
+    if (!check(host != nullptr, "create authenticated host")) return 1;
+    host->start();
+    chast_viewer::ViewerEngine engine(&sink);
+    if (!check(engine.Start("127.0.0.1", cfg.settings.port, kDisplayAuto, {}, true, {}, kPassword), "start real ViewerEngine")) return 1;
+    if (!check(wait_streaming(engine, 30s, &error), "hardware desktop stream starts")) {
+        std::fprintf(stderr, "%s\n", error.c_str()); engine.Stop(); host->stop(); return 1;
+    }
+    disconnected = [&] {
+        const auto state = engine.Snapshot().state;
+        return state == chast_viewer::ViewerState::kFailed || state == chast_viewer::ViewerState::kEnded;
+    };
+    check(until([&] { return engine.Snapshot().display_control_updates > 0; }), "automatic display capabilities arrive");
+    auto command = [&](A action, uint8_t value, C expected = C::Ok, uint32_t target = 0) {
+        const auto before = engine.Snapshot().display_control_updates;
+        if (!check(engine.ControlDisplays(action, value, target), "display command queued by ViewerEngine")) return false;
+        if (!check(until([&] { return engine.Snapshot().display_control_updates > before; }), "host display result reaches ViewerEngine")) return false;
+        const auto answer = engine.Snapshot().display_control;
+        if (answer.code != expected) std::fprintf(stderr, "display result: %s\n", answer.reason.c_str());
+        return check(answer.code == expected, "display result matches expected outcome");
+    };
+    command(A::SelectPrivacy, 0);
+    check(engine.Snapshot().display_control.privacy == PrivacyImplementation::Overlay, "overlay selection acknowledged");
+    if (engine.Snapshot().display_control.supported) {
+        command(A::SelectPrivacy, 1);
+        check(engine.Snapshot().display_control.privacy == PrivacyImplementation::VirtualDisplay, "virtual privacy selection acknowledged");
+        command(A::SelectPrivacy, 0);
+    }
+    host->set_permissions(kPermissionAll & ~kPermissionPrivacyMode);
+    check(until([&] { return !(engine.Snapshot().permissions & kPermissionPrivacyMode); }), "privacy revocation reaches viewer");
+    check(!engine.ControlDisplays(A::SelectPrivacy, 0) && !engine.ControlDisplays(A::SetCount, 1), "revoked viewer cannot mutate topology or privacy choice");
+    command(A::Restore, 0);
+    command(A::Query, 0);
+    host->set_permissions(kPermissionAll & ~kPermissionInput);
+    check(until([&] { return !(engine.Snapshot().permissions & kPermissionInput) && (engine.Snapshot().permissions & kPermissionPrivacyMode); }), "input revoked independently");
+    check(!engine.ControlDisplays(A::SetCount, 1), "virtual display changes also require input permission");
+    command(A::SelectPrivacy, 0);
+    host->set_permissions(kPermissionAll);
+    check(wait_permission(engine, kPermissionInput, 5s), "input permission restored");
+    if (live && check(attached_virtual_display_count() == 0, "live acceptance starts with no active virtual outputs")) {
+        for (uint8_t count : std::array<uint8_t, 5>{1, 2, 4, 1, 0}) {
+            if (!command(A::SetCount, count)) break;
+            check(engine.Snapshot().display_control.managed && engine.Snapshot().display_control.count == count &&
+                  attached_virtual_display_count() == count, "host result agrees with actual virtual output count");
+            const auto before = engine.Snapshot().received;
+            check(until([&] { return engine.Snapshot().received > before + 2; }), "GPU video continues after topology change");
+        }
+        command(A::SetCount, 4);
+        const auto outputs = engine.Snapshot().display_control.outputs;
+        if (check(outputs.size() == 4, "four stable output identities announced")) {
+            const uint32_t middle = outputs[1].id;
+            command(A::ToggleOutput, 0, C::Ok, middle);
+            const auto disabled = engine.Snapshot().display_control.outputs;
+            check(disabled.size() == outputs.size() && attached_virtual_display_count() == 3 &&
+                  std::all_of(disabled.begin(), disabled.end(), [&](const auto& output) {
+                      return output.active == (output.id != middle) && std::any_of(outputs.begin(), outputs.end(),
+                          [&](const auto& old) { return old.id == output.id; });
+                  }), "disabling a middle identity leaves all other outputs active with stable IDs");
+            command(A::ToggleOutput, 0, C::Ok, middle);
+            check(attached_virtual_display_count() == 3, "repeated targeted disable is idempotent");
+            command(A::ToggleOutput, 1, C::Ok, middle);
+            const auto enabled = engine.Snapshot().display_control.outputs;
+            check(attached_virtual_display_count() == 4 && std::all_of(enabled.begin(), enabled.end(),
+                  [](const auto& output) { return output.active; }), "same identity reactivates after Windows reorders outputs");
+            command(A::ToggleOutput, 0, C::Denied, UINT32_MAX);
+            check(attached_virtual_display_count() == 4 && engine.Snapshot().display_control.managed,
+                  "unknown identity cannot change another output or abandon the current layout");
+            const auto before = engine.Snapshot().received;
+            check(until([&] { return engine.Snapshot().received > before + 2; }), "GPU stream survives targeted output changes");
+            std::vector<VirtualDisplayOutput> physical_ids;
+            if (check(enumerate_virtual_display_outputs(physical_ids, &error) && !physical_ids.empty(),
+                      "enumerate a virtual screen to capture before removing it")) {
+                const auto device = virtual_display_device_name(physical_ids.front().identity);
+                const auto snapshot = engine.Snapshot();
+                uint16_t index = kDisplayAuto;
+                for (size_t i = 0; i < snapshot.displays.size(); ++i) {
+                    if (snapshot.displays[i].name == utf8(fs::path(device))) index = static_cast<uint16_t>(i);
+                }
+                check(index != kDisplayAuto && engine.SwitchDisplay(index) &&
+                      until([&] { return engine.Snapshot().display_switches > snapshot.display_switches; }),
+                      "viewer switches to an active virtual screen");
+                for (const auto& output : enabled) command(A::ToggleOutput, 0, C::Ok, output.id);
+                const auto decoded_before = engine.Snapshot().received;
+                check(attached_virtual_display_count() == 0 &&
+                      until([&] { return engine.Snapshot().received > decoded_before + 2; }),
+                      "removing the captured virtual screen selects a surviving desktop and keeps GPU video");
+            }
+        }
+        command(A::SelectPrivacy, 1, C::Busy);
+        command(A::Restore, 0);
+        check(until(restored), "explicit restore restores original modes and positions");
+        command(A::SelectPrivacy, 1);
+        check(engine.SetPrivacyMode(true), "enable remotely selected virtual privacy");
+        check(until([&] { return engine.Snapshot().privacy_enabled; }), "virtual privacy activates through ViewerEngine");
+        display_topology::Snapshot private_layout;
+        check(display_topology::query(private_layout, QDC_ONLY_ACTIVE_PATHS, &error) &&
+              private_layout.paths.size() == 1 && attached_virtual_display_count() == 1,
+              "selected virtual privacy leaves only one virtual output active");
+        command(A::SetCount, 2, C::Busy);
+        check(engine.SetPrivacyMode(false), "disable selected virtual privacy");
+        check(until([&] { return !engine.Snapshot().privacy_enabled && restored(); }), "privacy off restores physical displays");
+        command(A::SelectPrivacy, 0);
+        command(A::SetCount, 1);
+        host->set_permissions(kPermissionAll & ~kPermissionPrivacyMode);
+        check(until([&] { return !engine.Snapshot().display_control.managed && restored(); }), "permission revocation restores original layout");
+        host->set_permissions(kPermissionAll);
+        check(wait_permission(engine, kPermissionPrivacyMode, 5s), "privacy permission restored");
+        command(A::SetCount, 1);
+    }
+    check(engine.SetLockAfterSession(true), "real ViewerEngine queues lock after session");
+    check(until([&] { return engine.Snapshot().lock_after_session_enabled; }), "host acknowledges lock intent through ViewerEngine");
+    disconnected = [] { return false; };
+    engine.Stop();
+    check(until([&] { return locks == 1; }), "standalone host executes lock callback exactly once");
+    host->stop();
+    check(until(restored), "disconnect restores original desktop topology");
+    return failures ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && (std::string(argv[1]) == "--display-control" || std::string(argv[1]) == "--display-control-live")) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        return run_display_control_probe(std::string(argv[1]) == "--display-control-live");
+    }
     bool files_only = false;
     bool file_transfer_denied = false;
     bool clipboard_scenario = false;
@@ -1970,12 +2263,14 @@ int main(int argc, char** argv) {
                                         "(folder expanded, nested directories created)\n",
                                         static_cast<unsigned long long>(uploaded));
                                     uint64_t terminal_bytes = 0;
-                                    if (!run_terminal(*engine, 15s, &terminal_bytes, &error)) {
+                                    if (!run_terminal(*engine, 15s, &terminal_bytes, &error) ||
+                                        !run_terminal_tabs(*engine, *host, &error)) {
                                         // error already set
                                     } else {
                                         std::printf(
                                             "viewer-probe: terminal 80x24 -> marker echoed, "
-                                            "resized to 100x30, closed (%llu bytes)\n",
+                                            "resized to 100x30, closed (%llu bytes); two tabs "
+                                            "isolated, closed/reopened and revoked\n",
                                             static_cast<unsigned long long>(terminal_bytes));
                                         std::string first_shot;
                                         std::string second_shot;

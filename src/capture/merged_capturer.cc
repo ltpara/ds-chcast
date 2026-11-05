@@ -276,7 +276,7 @@ Error MergedCapturer::build_children() {
     for (const DisplayInfo& member : displays_) {
         std::string child_error;
         std::unique_ptr<IDxgiCapturer> capturer =
-            detail::create_capturer_on_device(member, child_config, device_.get(), context_.get(),
+            detail::create_shared_capturer_on_device(member, child_config, device_.get(), context_.get(),
                                               vendor_id_, &child_error);
         if (!capturer) {
             return Error(Status::CaptureFailed, "cannot capture " +

@@ -140,6 +140,48 @@ void test_receiver(const std::filesystem::path& directory) {
     }
 }
 
+void test_concurrent_receivers(const std::filesystem::path& directory) {
+    const std::string content = "independent-transfers";
+    chast::FileReceiveOptions options;
+    options.directory = directory.string();
+    options.name = "concurrent.bin";
+    options.size = content.size();
+    options.sha256 = digest_of(content);
+    options.allow_resume = true;
+    uint64_t offset = 0;
+    std::string error;
+    auto first = chast::FileReceiver::create(options, &offset, &error);
+    check(first != nullptr, "first viewer reserves the destination");
+    if (!first) return;
+    check(first->write(reinterpret_cast<const uint8_t*>(content.data()), 5, &error),
+          "first viewer writes a partial file");
+    auto conflicting = options;
+    conflicting.sha256.fill(0x42);
+    auto second = chast::FileReceiver::create(conflicting, &offset, &error);
+    check(!second && std::filesystem::exists(directory / "concurrent.bin.part.chast"),
+          "conflicting viewer cannot remove the active receiver's sidecar");
+    first->abort(true);
+    second = chast::FileReceiver::create(options, &offset, &error);
+    check(second && offset == 5, "another viewer resumes after the owner releases the destination");
+    if (!second) return;
+    first->abort(false);
+    check(std::filesystem::exists(directory / "concurrent.bin.part.chast"),
+          "a stale receiver cannot delete a new owner's partial transfer");
+    check(second->write(reinterpret_cast<const uint8_t*>(content.data()) + 5,
+                        content.size() - 5, &error), "resumed receiver writes the remainder");
+    std::string path;
+    check(second->finish(path, &error) && read_file(path) == content,
+          "the competing offer did not corrupt the completed file");
+    check(!std::filesystem::exists(directory / "concurrent.bin.part.chast.lock"),
+          "finish releases the reservation before receiver destruction");
+    options.name = "unfinished.bin";
+    auto incomplete = chast::FileReceiver::create(options, &offset, &error);
+    if (!incomplete) { check(false, "incomplete receiver starts"); return; }
+    check(!incomplete->finish(path, &error) &&
+          !std::filesystem::exists(directory / "unfinished.bin.part.chast.lock"),
+          "a failed finish also releases the reservation");
+}
+
 void test_sanitize_directory() {
     std::string path;
     check(chast::sanitize_received_directory("", path) && path.empty(),
@@ -404,6 +446,7 @@ int main() {
     if (!directory.empty()) {
         test_sha256_file(directory);
         test_receiver(directory);
+        test_concurrent_receivers(directory);
         test_nested_receiver(directory);
         test_browser(directory);
     } else {

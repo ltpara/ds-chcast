@@ -9703,6 +9703,11 @@ int run_verify(const Options& options) {
               "the announced audio format is Opus 48 kHz stereo, 960-sample frames");
         check(!sent.audio_info.extradata.empty(), "the server announced the Opus config");
         check(sent.audio_packets > 0 && sent.audio_bytes > 0, "the server sent audio packets");
+        if (sent.audio_errors || sent.audio_dropped) {
+            std::printf("     host audio: errors=%llu dropped=%llu\n",
+                        static_cast<unsigned long long>(sent.audio_errors),
+                        static_cast<unsigned long long>(sent.audio_dropped));
+        }
         if (local.display_mode) {
             // Rebuilding capture and the encoder holds the host loop for a
             // moment; the capture queue is sized for a few hundred

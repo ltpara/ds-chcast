@@ -127,6 +127,17 @@ enum class TerminalPhase {
     kFailed = 4,
 };
 
+struct ViewerTerminalStatus {
+    TerminalPhase phase = TerminalPhase::kClosed;
+    int code = 0;
+    std::string reason;
+    std::string error;
+    uint16_t columns = 0;
+    uint16_t rows = 0;
+    uint64_t bytes = 0;
+    uint64_t updates = 0;
+};
+
 // One camera the viewer is watching. Listing covers the round trip of a list
 // request, Starting covers StartCamera until the host's answer, and Streaming
 // means the CCAM stream is open. Stopped is terminal: the viewer asked to
@@ -405,11 +416,24 @@ struct ViewerStatus {
     // session starts off. A refusal or a host-initiated disable explains itself
     // in `privacy_error`; `privacy_updates` lets the UI pair an answer with the
     // poll that saw it.
+    chast::DisplayControlState display_control;
+    uint64_t display_control_updates = 0;
+    bool display_control_busy = false;
     bool privacy_supported = false;
     bool privacy_enabled = false;
     int privacy_code = 0;
     std::string privacy_error;
     uint64_t privacy_updates = 0;
+    bool block_input_supported = false;
+    bool lock_after_session_supported = false;
+    bool block_input_enabled = false;
+    bool lock_after_session_enabled = false;
+    int block_input_code = 0;
+    int lock_after_session_code = 0;
+    std::string block_input_error;
+    std::string lock_after_session_error;
+    uint64_t block_input_updates = 0;
+    uint64_t lock_after_session_updates = 0;
     // Which desktop the host's video is capturing. Secure means the lock
     // screen, UAC or a credential prompt is up; the picture pauses while the
     // host cannot follow it and resumes when the user desktop returns.
@@ -497,7 +521,8 @@ struct ViewerStatus {
     uint64_t port_forward_bytes_up = 0;
     uint64_t port_forward_bytes_down = 0;
     std::string port_forward_error;
-    // Remote terminal (protocol v27). The viewer drives at most one console.
+    // Remote terminals (protocol v27). Legacy scalar fields describe slot 1;
+    // terminals contains the independently tracked slots in slot order.
     // `terminal_supported` mirrors the host's announced permission;
     // `terminal_phase` is a TerminalPhase value; `terminal_code` and
     // `terminal_reason` are the host's TerminalCode and wording for a refusal
@@ -517,6 +542,7 @@ struct ViewerStatus {
     uint16_t terminal_rows = 0;
     uint64_t terminal_bytes = 0;
     uint64_t terminal_updates = 0;
+    std::array<ViewerTerminalStatus, chast::kMaxTerminals> terminals;
 
     // Camera sharing (protocol v29). `camera_supported` mirrors the host's
     // announced permission; the viewer watches at most one camera at a time.
@@ -818,7 +844,10 @@ public:
     // display. Returns false when no session is streaming or the host did not
     // grant kPermissionPrivacyMode. Only the newest request is kept; the answer
     // arrives through ViewerStatus::privacy_enabled/privacy_code/privacy_error.
+    bool ControlDisplays(chast::DisplayControlAction action, uint8_t value, uint32_t target = 0);
     bool SetPrivacyMode(bool enabled);
+    bool SetBlockInput(bool enabled);
+    bool SetLockAfterSession(bool enabled);
     // Queues one Ctrl+Alt+Del request. Returns false when no session is
     // streaming or the host did not grant input control. The answer arrives
     // through ViewerStatus::sas_code/sas_error/sas_updates; a newer request
@@ -841,28 +870,29 @@ public:
     // when the host did not grant input control, or when the queue is full.
     bool SendText(const std::string& text);
 
-    // Opens the session's remote console at the given character size. Returns
+    // Opens a console in slot 1..kMaxTerminals at the given character size. Returns
     // false when no session is streaming, the host did not grant
     // kPermissionTerminal, the size is outside 1..500 x 1..200, or a console
-    // is already open (or being requested). The round trip and the host's
-    // answer arrive through terminal_phase/terminal_code/terminal_reason.
-    bool OpenTerminal(uint16_t columns, uint16_t rows);
+    // is already open (or being requested) in that slot. The round trip and
+    // host's answer arrive through ViewerStatus::terminals[terminal_id - 1].
+    bool OpenTerminal(uint16_t columns, uint16_t rows, uint32_t terminal_id = 1);
     // Queues raw console input: printable text as UTF-8 and control sequences
     // as bytes (for example "\x03" for Ctrl+C). Returns false when no console
     // is open or the queue's 256 KiB bound is reached.
-    bool SendTerminalInput(const std::string& bytes);
+    bool SendTerminalInput(const std::string& bytes, uint32_t terminal_id = 1);
     // Queues a console resize. Returns false when no console is open or the
     // size is out of range. The host applies it best effort; the acknowledged
-    // size shows up in terminal_columns/terminal_rows.
-    bool ResizeTerminal(uint16_t columns, uint16_t rows);
-    // Ends the console. The host closes the shell; output that was already in
-    // flight is still queued for TakeTerminalOutput() until it reports ended.
-    void CloseTerminal();
+    // size shows up in the selected slot's columns/rows.
+    bool ResizeTerminal(uint16_t columns, uint16_t rows, uint32_t terminal_id = 1);
+    // Ends the selected console. Output already buffered by the viewer can
+    // still be drained, then TakeTerminalOutput() reports ended.
+    void CloseTerminal(uint32_t terminal_id = 1);
     // Pops the oldest console output. `ended` reports that the console is over
     // and this was its last buffered piece; the phase in the status stays
     // terminal until the panel takes the bytes. Returns false when nothing is
     // waiting, with `ended` still telling whether the console finished.
-    bool TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended);
+    bool TakeTerminalOutput(std::vector<uint8_t>& data, bool& ended,
+                            uint32_t terminal_id = 1);
 
     // Asks the host to enumerate its cameras. Returns false when no session is
     // streaming, the host did not grant kPermissionCamera, or a camera is
@@ -955,7 +985,10 @@ private:
     // Newest privacy request, for the same reason as the display switch: the
     // operator wants the state they picked last, not a replay of every toggle.
     mutable std::mutex privacy_mutex_;
+    std::optional<chast::DisplayControlRequest> pending_display_control_;
     std::optional<bool> pending_privacy_;
+    std::optional<bool> pending_block_input_;
+    std::optional<bool> pending_lock_after_session_;
     // SAS is an action, not a state: one pending request is enough, and a
     // second tap replaces an unsent one instead of queueing a burst.
     std::atomic<bool> pending_sas_{false};
@@ -985,7 +1018,7 @@ private:
     // input, so it is queued only while the host grants input control.
     std::deque<std::string> pending_text_;
 
-    // One remote console crosses in both directions. Commands keep their
+    // Each remote console has bounded input/output queues. Commands keep their
     // order: typing, resizes and the close must reach the host in the order
     // they happened. Input is bounded by the same high water the host applies
     // to the uplink; output is handed to the UI in pieces, and the session
@@ -1000,16 +1033,23 @@ private:
             kClose,
         };
         Kind kind = Kind::kOpen;
+        uint32_t slot = 0;
+        uint64_t generation = 0;
         std::string bytes;
         uint16_t columns = 0;
         uint16_t rows = 0;
     };
+    struct TerminalChannel {
+        uint64_t generation = 0;
+        ViewerTerminalStatus status;
+        std::deque<std::vector<uint8_t>> output;
+        size_t output_bytes = 0;
+        size_t pending_bytes = 0;
+        bool ended = true;
+    };
     mutable std::mutex terminal_mutex_;
     std::deque<TerminalCommand> pending_terminal_;
-    size_t pending_terminal_bytes_ = 0;
-    std::deque<std::vector<uint8_t>> terminal_output_;
-    size_t terminal_output_bytes_ = 0;
-    bool terminal_output_ended_ = true;
+    std::array<TerminalChannel, chast::kMaxTerminals> terminals_;
 
     // Camera requests cross here in order: a stop that follows a start must
     // reach the host after it, and a list answer is only useful to the panel

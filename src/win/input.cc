@@ -18,6 +18,14 @@ namespace chast {
 
 namespace {
 
+// The desktop has one keyboard and mouse, even when several authenticated
+// viewers inject into it. An Up only reaches Windows when its last owner
+// releases it. The desktop name keeps secure-desktop transitions separate.
+std::mutex shared_input_mutex;
+std::map<std::pair<std::wstring, uint32_t>, size_t> shared_input_refs;
+// A synthesized chord must finish before another session's input is applied.
+std::mutex shared_event_mutex;
+
 struct ScanMapping {
     uint16_t usage;
     uint16_t scan;
@@ -262,6 +270,56 @@ std::unique_ptr<InputInjector> InputInjector::create(bool dry_run, std::string* 
 }
 
 UINT InputInjector::send(const INPUT& input) {
+    uint32_t code = 0;
+    bool up = false;
+    if (input.type == INPUT_KEYBOARD) {
+        code = 0x10000u | input.ki.wScan | (static_cast<uint32_t>(input.ki.wVk) << 8) |
+               ((input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) ? 0x20000u : 0) |
+               ((input.ki.dwFlags & KEYEVENTF_UNICODE) ? 0x40000u : 0);
+        up = (input.ki.dwFlags & KEYEVENTF_KEYUP) != 0;
+    } else if (input.type == INPUT_MOUSE) {
+        const DWORD flags = input.mi.dwFlags;
+        if (flags & (MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP)) code = 1;
+        if (flags & (MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_RIGHTUP)) code = 2;
+        if (flags & (MOUSEEVENTF_MIDDLEDOWN | MOUSEEVENTF_MIDDLEUP)) code = 3;
+        if (flags & (MOUSEEVENTF_XDOWN | MOUSEEVENTF_XUP)) code = 3 + input.mi.mouseData;
+        up = (flags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP |
+                       MOUSEEVENTF_MIDDLEUP | MOUSEEVENTF_XUP)) != 0;
+    }
+    std::unique_lock<std::mutex> shared_lock(shared_input_mutex, std::defer_lock);
+    bool new_owner = false;
+    std::pair<std::wstring, uint32_t> key;
+    if (code) {
+        shared_lock.lock();
+        auto own = shared_input_.find(code);
+        if (up) {
+            if (own == shared_input_.end()) return 1;
+            key = {own->second, code};
+            shared_input_.erase(own);
+            auto found = shared_input_refs.find(key);
+            if (found != shared_input_refs.end()) {
+                if (--found->second > 0) {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    ++stats_.shared_suppressed;
+                    return 1;
+                }
+                shared_input_refs.erase(found);
+            }
+        } else if (own == shared_input_.end()) {
+            wchar_t name[256]{};
+            DWORD needed = 0;
+            GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME,
+                                      name, sizeof(name), &needed);
+            key = {std::wstring(dry_run_ ? L"test:" : L"live:") + name, code};
+            shared_input_[code] = key.first;
+            new_owner = true;
+            if (++shared_input_refs[key] > 1) {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                ++stats_.shared_suppressed;
+                return 1;
+            }
+        }
+    }
     // A dry run stops at the OS boundary: everything above it (mapping,
     // coordinate conversion, held-key tracking) runs exactly as it does for a
     // real event, so a loopback check covers all of our code and none of the
@@ -271,11 +329,25 @@ UINT InputInjector::send(const INPUT& input) {
     }
     const UINT inserted = SendInput(1, const_cast<INPUT*>(&input), sizeof(input));
     if (inserted == 0) {
+        if (new_owner) {
+            shared_input_.erase(code);
+            shared_input_refs.erase(key);
+        }
         // The desktop can change between the check in run() and this call;
         // SendInput then drops the event. Look again before the next one.
         desktop_check_due_ = true;
     }
     return inserted;
+}
+
+void InputInjector::forget_shared_input() {
+    std::lock_guard<std::mutex> lock(shared_input_mutex);
+    for (const auto& own : shared_input_) {
+        auto found = shared_input_refs.find({own.second, own.first});
+        if (found != shared_input_refs.end() && --found->second == 0)
+            shared_input_refs.erase(found);
+    }
+    shared_input_.clear();
 }
 
 void InputInjector::follow_input_desktop_if_due() {
@@ -286,6 +358,15 @@ void InputInjector::follow_input_desktop_if_due() {
     }
     desktop_check_due_ = false;
     last_desktop_follow_ = now;
+    if (local_input_blocked_ && !dry_run_ && !on_input_desktop()) {
+        // A secure-attention/desktop transition is a local escape. Do not
+        // silently re-block when the operator returns to Default.
+        unblock_on_desktop_change_ = true;
+    }
+    if (unblock_on_desktop_change_ && BlockInput(FALSE)) {
+        local_input_blocked_ = false;
+        unblock_on_desktop_change_ = false;
+    }
     std::string error;
     bool switched = false;
     if (!follow_input_desktop(&error, &switched)) {
@@ -294,6 +375,7 @@ void InputInjector::follow_input_desktop_if_due() {
         return;
     }
     if (switched) {
+        forget_shared_input();
         // Keys and buttons belong to the desktop they were pressed on. The
         // new one starts with everything up, so forget the old state and let
         // the peer's next modifier bitmap press what is still held.
@@ -305,6 +387,7 @@ void InputInjector::follow_input_desktop_if_due() {
 
 InputInjector::~InputInjector() {
     stop();
+    forget_shared_input();
 }
 
 void InputInjector::submit(const InputEvent& event) {
@@ -379,6 +462,28 @@ void InputInjector::stop() {
     }
 }
 
+bool InputInjector::block_local_input(bool enabled, std::string* error) {
+    auto result = std::make_shared<std::promise<DWORD>>();
+    auto completion = result->get_future();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) {
+            if (error) *error = "the input thread is stopping";
+            return false;
+        }
+        Pending pending;
+        pending.block_result = result;
+        pending.block_enabled = enabled;
+        queue_.push_back(std::move(pending));
+    }
+    cv_.notify_one();
+    const DWORD code = completion.get();
+    if (code != ERROR_SUCCESS && error) {
+        *error = "BlockInput failed: " + std::to_string(code);
+    }
+    return code == ERROR_SUCCESS;
+}
+
 InputStats InputInjector::stats() const {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     return stats_;
@@ -387,16 +492,42 @@ InputStats InputInjector::stats() const {
 void InputInjector::run() {
     std::unique_lock<std::mutex> lock(mutex_);
     for (;;) {
-        cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+        const auto ready = [this] { return stopping_ || !queue_.empty(); };
+        if (local_input_blocked_) {
+            cv_.wait_for(lock, std::chrono::milliseconds(250), ready);
+        } else {
+            cv_.wait(lock, ready);
+        }
         std::deque<Pending> batch;
         batch.swap(queue_);
+        if (batch.empty() && local_input_blocked_) {
+            lock.unlock();
+            follow_input_desktop_if_due();
+            lock.lock();
+        }
         if (!batch.empty()) {
             // Apply outside the lock: SendInput can take milliseconds when
             // the desktop is busy, and submit() must stay non-blocking.
             lock.unlock();
             for (const Pending& pending : batch) {
                 follow_input_desktop_if_due();
-                if (pending.release) {
+                if (pending.block_result) {
+                    DWORD code = ERROR_SUCCESS;
+                    if (pending.block_enabled != local_input_blocked_) {
+                        SetLastError(ERROR_SUCCESS);
+                        if (dry_run_ || BlockInput(pending.block_enabled ? TRUE : FALSE)) {
+                            local_input_blocked_ = pending.block_enabled;
+                            unblock_on_desktop_change_ = false;
+                        } else {
+                            code = GetLastError();
+                            if (code == ERROR_SUCCESS) code = ERROR_ACCESS_DENIED;
+                            // A failed release remains visible and is retried
+                            // while idle until it succeeds or this thread exits.
+                            if (!pending.block_enabled) unblock_on_desktop_change_ = true;
+                        }
+                    }
+                    pending.block_result->set_value(code);
+                } else if (pending.release) {
                     release_all();
                 } else if (pending.has_text) {
                     apply_text(pending.text);
@@ -412,9 +543,21 @@ void InputInjector::run() {
     }
     lock.unlock();
     release_all();
+    if (local_input_blocked_ && !dry_run_) {
+        BlockInput(FALSE);
+    }
+    local_input_blocked_ = false;
 }
 
 void InputInjector::apply(const InputEvent& event) {
+    std::lock_guard<std::mutex> event_lock(shared_event_mutex);
+    if ((event.kind != InputKind::Mouse && event.kind != InputKind::Key &&
+         event.kind != InputKind::Gesture) ||
+        (event.kind == InputKind::Gesture && !valid_gesture_event(event.gesture))) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.rejected;
+        return;
+    }
     uint16_t locks = static_cast<uint16_t>(event.modifiers & kLockStateMask);
     if (event.kind == InputKind::Key) {
         // A lock key toggles the host by itself; reconciling that same bit
@@ -439,6 +582,17 @@ void InputInjector::apply(const InputEvent& event) {
     sync_modifiers(reported);
     if (event.kind == InputKind::Mouse) {
         apply_mouse(event.mouse);
+    } else if (event.kind == InputKind::Gesture) {
+        if (event.gesture.action == GestureAction::Zoom) {
+            const uint16_t control = (reported & (kModifierLeftCtrl | kModifierRightCtrl))
+                ? 0 : kModifierLeftCtrl;
+            sync_modifiers(static_cast<uint16_t>(reported | control));
+            apply_mouse({MouseAction::Wheel, 0, 0, event.gesture.y});
+            sync_modifiers(reported);
+        } else {
+            if (event.gesture.x) apply_mouse({MouseAction::WheelHorizontal, 0, event.gesture.x, 0});
+            if (event.gesture.y) apply_mouse({MouseAction::Wheel, 0, 0, event.gesture.y});
+        }
     } else {
         apply_key(event.key);
     }
@@ -538,6 +692,16 @@ void InputInjector::sync_modifiers(uint16_t reported) {
 }
 
 void InputInjector::apply_mouse(const MouseEvent& event) {
+    if ((event.action == MouseAction::ButtonDown || event.action == MouseAction::ButtonUp) &&
+        (event.buttons & (event.buttons - 1)) != 0) {
+        for (uint16_t bit = 1; bit <= kMouseForward; bit <<= 1) {
+            if (!(event.buttons & bit)) continue;
+            MouseEvent single = event;
+            single.buttons = bit;
+            apply_mouse(single);
+        }
+        return;
+    }
     INPUT input{};
     input.type = INPUT_MOUSE;
     bool posted = false;
@@ -699,6 +863,9 @@ void InputInjector::apply_text(const std::string& text) {
     size_t failed = 0;
     size_t i = 0;
     while (i < text.size()) {
+        // Serialize one character at a time, so a long paste cannot starve
+        // another viewer, while its down/up sequence remains indivisible.
+        std::lock_guard<std::mutex> event_lock(shared_event_mutex);
         const unsigned char lead = static_cast<unsigned char>(text[i]);
         uint32_t code_point = 0;
         size_t length = 1;
@@ -744,6 +911,7 @@ void InputInjector::apply_text(const std::string& text) {
 }
 
 void InputInjector::release_all() {
+    std::lock_guard<std::mutex> event_lock(shared_event_mutex);
     // Buttons first: releasing a key mid-drag would still leave the drag on.
     uint16_t buttons = held_buttons_;
     held_buttons_ = 0;

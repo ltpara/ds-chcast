@@ -16,6 +16,7 @@ import '../security_key.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
+import '../session_window.dart';
 import '../socks5.dart';
 import '../target.dart';
 import '../theme.dart';
@@ -771,7 +772,22 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) {
       return;
     }
-    await Navigator.of(context).push<void>(
+    bool openedWindow;
+    try {
+      openedWindow = await SessionWindowRequest(target: target,
+        account: _account, settings: _server, filesOnly: fileTransferOnly).open();
+    } on PlatformException {
+      if (mounted) {
+        setState(() {
+          _opening = false;
+          _error = tr('无法打开会话窗口');
+        });
+      }
+      return;
+    }
+    if (!mounted) return;
+    if (!openedWindow) {
+      await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
         builder: (BuildContext context) {
           return SessionPage(
@@ -783,7 +799,8 @@ class _HomePageState extends State<HomePage> {
           );
         },
       ),
-    );
+      );
+    }
     if (!mounted) {
       return;
     }

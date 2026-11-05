@@ -43,6 +43,7 @@ class TerminalPanel extends StatefulWidget {
   const TerminalPanel({
     super.key,
     required this.status,
+    this.terminalId = 1,
     required this.focusNode,
     required this.onOpen,
     required this.onTakeOutput,
@@ -55,6 +56,7 @@ class TerminalPanel extends StatefulWidget {
   });
 
   final ViewerStatus status;
+  final int terminalId;
   final FocusNode focusNode;
   final Future<bool> Function(int columns, int rows) onOpen;
   final Future<ViewerTerminalOutput?> Function() onTakeOutput;
@@ -83,6 +85,8 @@ class _TerminalPanelState extends State<TerminalPanel> {
   final ScrollController _scroll = ScrollController();
   final TextEditingController _search = TextEditingController();
   final FocusNode _searchFocus = FocusNode();
+
+  ViewerTerminalStatus get _terminal => widget.status.terminal(widget.terminalId);
 
   Timer? _poll;
   Timer? _resizeDebounce;
@@ -404,8 +408,8 @@ class _TerminalPanelState extends State<TerminalPanel> {
   bool get _canType =>
       !_ended &&
       !_openFailed &&
-      (widget.status.terminalPhase == ViewerTerminalPhase.open ||
-          widget.status.terminalPhase == ViewerTerminalPhase.requesting);
+      (_terminal.phase == ViewerTerminalPhase.open ||
+          _terminal.phase == ViewerTerminalPhase.requesting);
 
   void _scheduleScrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -612,7 +616,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
   @override
   Widget build(BuildContext context) {
     final bool busy =
-        widget.status.terminalPhase == ViewerTerminalPhase.requesting;
+        _terminal.phase == ViewerTerminalPhase.requesting;
     return Focus(
       focusNode: widget.focusNode,
       onKeyEvent: _onKey,
@@ -775,7 +779,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
   }
 
   String _phaseLabel() {
-    switch (widget.status.terminalPhase) {
+    switch (_terminal.phase) {
       case ViewerTerminalPhase.requesting:
         return tr('申请中…');
       case ViewerTerminalPhase.open:
@@ -964,24 +968,24 @@ class _TerminalPanelState extends State<TerminalPanel> {
     if (_openFailed) {
       return tr('无法打开终端：主机未授权、已有控制台，或上一个控制台尚未收尾');
     }
-    if (_ended) {
-      final String reason = widget.status.terminalReason;
+    if (_ended && _terminal.phase != ViewerTerminalPhase.failed) {
+      final String reason = _terminal.reason;
       return reason.isEmpty
           ? tr('主机已结束该控制台')
           : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
     }
-    switch (widget.status.terminalPhase) {
+    switch (_terminal.phase) {
       case ViewerTerminalPhase.requesting:
         return '';
       case ViewerTerminalPhase.ended:
-        final String reason = widget.status.terminalReason;
+        final String reason = _terminal.reason;
         return reason.isEmpty
             ? tr('主机已结束该控制台')
             : tr('主机已结束该控制台：{reason}', <String, Object?>{'reason': reason});
       case ViewerTerminalPhase.failed:
-        final String detail = widget.status.terminalError.isNotEmpty
-            ? widget.status.terminalError
-            : widget.status.terminalReason;
+        final String detail = _terminal.error.isNotEmpty
+            ? _terminal.error
+            : _terminal.reason;
         return detail.isEmpty ? tr('终端不可用（主机拒绝或权限已撤销）') : detail;
       default:
         return '';
@@ -1028,7 +1032,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
             ),
           ),
           Text(
-            tr('{p3} 字节', <String, Object?>{'p3': widget.status.terminalBytes}),
+            tr('{p3} 字节', <String, Object?>{'p3': _terminal.bytes}),
             style: const TextStyle(fontSize: 10, color: Colors.white24),
           ),
         ],

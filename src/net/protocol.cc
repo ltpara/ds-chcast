@@ -803,6 +803,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.record_enabled ? kServerInfoRecordEnabled : 0) |
                         (info.camera_enabled ? kServerInfoCameraEnabled : 0) |
                         (info.restart_enabled ? kServerInfoRestartEnabled : 0) |
+                        (info.block_input_enabled ? kServerInfoBlockInputEnabled : 0) |
                         (info.merged ? kServerInfoMergedLayout : 0) |
                         (info.files_only ? kServerInfoFileTransferOnly : 0) |
                         (info.audio_datagram && info.audio.enabled ? kServerInfoAudioDatagram : 0)));
@@ -868,6 +869,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     }
     if (info.restart_enabled) {
         permissions |= kPermissionRestart;
+    }
+    if (info.block_input_enabled) {
+        permissions |= kPermissionBlockInput;
     }
     put_u16(cursor, permissions);
     return payload;
@@ -1120,6 +1124,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.record_enabled = (permissions & kPermissionRecord) != 0;
     info.camera_enabled = (permissions & kPermissionCamera) != 0;
     info.restart_enabled = (permissions & kPermissionRestart) != 0;
+    info.block_input_enabled = (permissions & kPermissionBlockInput) != 0;
     return true;
 }
 
@@ -1188,22 +1193,36 @@ bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_u
     return true;
 }
 
+bool valid_gesture_event(const GestureEvent& event) {
+    if (event.x < -kMaxGestureDelta || event.x > kMaxGestureDelta ||
+        event.y < -kMaxGestureDelta || event.y > kMaxGestureDelta ||
+        (event.x == 0 && event.y == 0)) return false;
+    return event.action == GestureAction::Pan ||
+           (event.action == GestureAction::Zoom && event.x == 0);
+}
+
 std::vector<uint8_t> make_input_event(const InputEvent& event) {
     std::vector<uint8_t> payload(16);
     uint8_t* cursor = payload.data();
     put_u8(cursor, static_cast<uint8_t>(event.kind));
     const bool mouse = event.kind == InputKind::Mouse;
+    const bool gesture = event.kind == InputKind::Gesture;
     put_u8(cursor, mouse ? static_cast<uint8_t>(event.mouse.action)
-                         : static_cast<uint8_t>(event.key.action));
+                  : gesture ? static_cast<uint8_t>(event.gesture.action)
+                            : static_cast<uint8_t>(event.key.action));
     put_u16(cursor, mouse ? event.mouse.buttons : 0);
-    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.x : 0));
-    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.y : 0));
-    put_u16(cursor, mouse ? 0 : event.key.hid_usage);
+    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.x : gesture ? event.gesture.x : 0));
+    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.y : gesture ? event.gesture.y : 0));
+    put_u16(cursor, event.kind == InputKind::Key ? event.key.hid_usage : 0);
     put_u16(cursor, static_cast<uint16_t>(event.modifiers & kInputStateMask));
     return make_control(ControlType::InputEvent, payload);
 }
 
 bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, std::string* error) {
+    if (payload.size() != 16) {
+        set_error(error, "InputEvent must contain exactly 16 bytes");
+        return false;
+    }
     Reader reader(payload.data(), payload.size());
     uint8_t kind = 0;
     uint8_t action = 0;
@@ -1223,6 +1242,17 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
     }
     event.modifiers = modifiers;
     switch (kind) {
+        case static_cast<uint8_t>(InputKind::Gesture): {
+            GestureEvent gesture{static_cast<GestureAction>(action),
+                                 static_cast<int32_t>(x), static_cast<int32_t>(y)};
+            if (buttons != 0 || hid_usage != 0 || !valid_gesture_event(gesture)) {
+                set_error(error, "InputEvent carries an invalid gesture");
+                return false;
+            }
+            event.kind = InputKind::Gesture;
+            event.gesture = gesture;
+            return true;
+        }
         case static_cast<uint8_t>(InputKind::Mouse):
             if (action > static_cast<uint8_t>(MouseAction::WheelHorizontal)) {
                 set_error(error, "InputEvent names unknown mouse action " +
@@ -2511,6 +2541,218 @@ bool parse_privacy_mode_state(const std::vector<uint8_t>& payload, bool& enabled
     }
     enabled = raw_enabled != 0;
     code = static_cast<PrivacyModeCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_set_block_input(bool enabled) {
+    std::vector<uint8_t> payload(1);
+    payload[0] = enabled ? 1 : 0;
+    return make_control(ControlType::SetBlockInput, payload);
+}
+
+bool parse_set_block_input(const std::vector<uint8_t>& payload, bool& enabled,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw = 0;
+    if (!reader.u8(raw) || !reader.at_end() || raw > 1) {
+        set_error(error, "malformed SetBlockInput");
+        return false;
+    }
+    enabled = raw != 0;
+    return true;
+}
+
+std::vector<uint8_t> make_block_input_state(bool enabled, BlockInputCode code,
+                                             const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxPrivacyModeReason);
+    std::vector<uint8_t> payload(4 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, enabled ? 1 : 0);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::BlockInputState, payload);
+}
+
+bool parse_block_input_state(const std::vector<uint8_t>& payload, bool& enabled,
+                              BlockInputCode& code, std::string& reason,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_enabled = 0;
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_enabled) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed BlockInputState");
+        return false;
+    }
+    if (raw_enabled > 1) {
+        set_error(error, "BlockInputState carries an invalid enabled flag");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(BlockInputCode::Failed)) {
+        set_error(error, "unknown block input code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxPrivacyModeReason) {
+        set_error(error, "BlockInputState reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "BlockInputState carries a malformed reason");
+        return false;
+    }
+    enabled = raw_enabled != 0;
+    code = static_cast<BlockInputCode>(raw_code);
+    return true;
+}
+
+std::vector<uint8_t> make_display_control(const DisplayControlRequest& request) {
+    std::vector<uint8_t> payload(6);
+    auto* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(request.action));
+    put_u8(cursor, request.value);
+    put_u32(cursor, request.target);
+    DisplayControlRequest checked;
+    if (!parse_display_control(payload, checked)) return {};
+    return make_control(ControlType::DisplayControl, payload);
+}
+
+bool parse_display_control(const std::vector<uint8_t>& payload, DisplayControlRequest& request,
+                           std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t action = 0, value = 0;
+    uint32_t target = 0;
+    if (!reader.u8(action) || !reader.u8(value) || !reader.u32(target) || !reader.at_end() || action > 4 ||
+        (action == 1 ? value > 4 : action >= 3 ? value > 1 : value != 0) ||
+        (action == 4 ? target == 0 : target != 0)) {
+        set_error(error, "malformed DisplayControl");
+        return false;
+    }
+    request = {static_cast<DisplayControlAction>(action), value, target};
+    return true;
+}
+
+std::vector<uint8_t> make_display_control_state(const DisplayControlState& state) {
+    if (state.count > 4 || state.outputs.size() > 4 || static_cast<uint8_t>(state.privacy) > 1 ||
+        static_cast<uint8_t>(state.code) > 4) return {};
+    const auto reason = truncate_utf8_reason(state.reason, kMaxPrivacyModeReason);
+    std::vector<uint8_t> payload(8 + reason.size() + state.outputs.size() * 5);
+    auto* cursor = payload.data();
+    put_u8(cursor, state.supported ? 1 : 0);
+    put_u8(cursor, state.managed ? 1 : 0);
+    put_u8(cursor, state.count);
+    put_u8(cursor, static_cast<uint8_t>(state.privacy));
+    put_u8(cursor, static_cast<uint8_t>(state.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) std::memcpy(cursor, reason.data(), reason.size());
+    cursor += reason.size();
+    put_u8(cursor, static_cast<uint8_t>(state.outputs.size()));
+    std::vector<uint32_t> ids;
+    for (const auto& output : state.outputs) {
+        if (!output.id || std::find(ids.begin(), ids.end(), output.id) != ids.end()) return {};
+        ids.push_back(output.id);
+        put_u32(cursor, output.id);
+        put_u8(cursor, output.active ? 1 : 0);
+    }
+    return make_control(ControlType::DisplayControlState, payload);
+}
+
+bool parse_display_control_state(const std::vector<uint8_t>& payload, DisplayControlState& state,
+                                 std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t supported = 0, managed = 0, count = 0, privacy = 0, code = 0, entries = 0;
+    uint16_t size = 0;
+    std::string reason;
+    if (!reader.u8(supported) || !reader.u8(managed) || !reader.u8(count) ||
+        !reader.u8(privacy) || !reader.u8(code) || !reader.u16(size) ||
+        !reader.string(reason, size) || !reader.u8(entries) || supported > 1 || managed > 1 ||
+        count > 4 || entries > 4 || privacy > 1 || code > 4 || size > kMaxPrivacyModeReason ||
+        (!reason.empty() && !valid_utf8(reason))) {
+        set_error(error, "malformed DisplayControlState");
+        return false;
+    }
+    std::vector<ControlledDisplay> outputs;
+    for (uint8_t i = 0; i < entries; ++i) {
+        uint32_t id = 0;
+        uint8_t active = 0;
+        if (!reader.u32(id) || !reader.u8(active) || !id || active > 1 ||
+            std::any_of(outputs.begin(), outputs.end(), [&](const auto& item) { return item.id == id; })) {
+            set_error(error, "invalid or duplicate virtual display identity");
+            return false;
+        }
+        outputs.push_back({id, active != 0});
+    }
+    if (!reader.at_end()) { set_error(error, "trailing display state data"); return false; }
+    state = {supported != 0, managed != 0, count, static_cast<PrivacyImplementation>(privacy),
+             static_cast<DisplayControlCode>(code), std::move(reason), std::move(outputs)};
+    return true;
+}
+
+std::vector<uint8_t> make_set_lock_after_session(bool enabled) {
+    std::vector<uint8_t> payload(1);
+    payload[0] = enabled ? 1 : 0;
+    return make_control(ControlType::SetLockAfterSession, payload);
+}
+
+bool parse_set_lock_after_session(const std::vector<uint8_t>& payload, bool& enabled,
+                            std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw = 0;
+    if (!reader.u8(raw) || !reader.at_end() || raw > 1) {
+        set_error(error, "malformed SetLockAfterSession");
+        return false;
+    }
+    enabled = raw != 0;
+    return true;
+}
+
+std::vector<uint8_t> make_lock_after_session_state(bool enabled, LockAfterSessionCode code,
+                                             const std::string& reason) {
+    const std::string text = truncate_utf8_reason(reason, kMaxPrivacyModeReason);
+    std::vector<uint8_t> payload(4 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, enabled ? 1 : 0);
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::LockAfterSessionState, payload);
+}
+
+bool parse_lock_after_session_state(const std::vector<uint8_t>& payload, bool& enabled,
+                              LockAfterSessionCode& code, std::string& reason,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_enabled = 0;
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_enabled) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed LockAfterSessionState");
+        return false;
+    }
+    if (raw_enabled > 1) {
+        set_error(error, "LockAfterSessionState carries an invalid enabled flag");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(LockAfterSessionCode::Failed)) {
+        set_error(error, "unknown lock after session code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxPrivacyModeReason) {
+        set_error(error, "LockAfterSessionState reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "LockAfterSessionState carries a malformed reason");
+        return false;
+    }
+    enabled = raw_enabled != 0;
+    code = static_cast<LockAfterSessionCode>(raw_code);
     return true;
 }
 

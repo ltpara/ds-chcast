@@ -64,6 +64,7 @@ add_library(chast.dxgi STATIC
     src/capture/nv12_pass.cc
     src/capture/cursor.cc
     src/capture/dxgi_capturer.cc
+    src/capture/shared_capturer.cc
     src/capture/merged_capturer.cc)
 
 target_include_directories(chast.dxgi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -243,10 +244,12 @@ add_library(chast.host STATIC
     src/host/host_security.cc
     src/host/host_settings.cc
     src/host/host_server.cc
+    src/host/display_privacy.cc
     src/host/port_forward_relay.cc
     src/host/terminal_relay.cc
     src/host/virtual_display.cc
     src/win/privacy.cc
+    src/win/display_privacy.cc
     src/win/restart.cc
     src/win/sas.cc)
 
@@ -277,6 +280,17 @@ target_link_libraries(chast.host.tray PUBLIC chast.host shell32 advapi32 wtsapi3
 # when the test tools are switched off.
 add_executable(chast-host WIN32 host/main.cc)
 target_link_libraries(chast-host PRIVATE chast.host.tray comctl32 comdlg32)
+
+# Crash-safe physical-display restoration helper. It receives only inherited
+# kernel handles from the host and has no network or user configuration path.
+add_executable(chast-display-guard host/display_guard_main.cc)
+target_include_directories(chast-display-guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(chast-display-guard PRIVATE chast.host)
+add_custom_command(TARGET chast-display-guard POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:chast-display-guard> $<TARGET_FILE_DIR:chast-host>
+    VERBATIM)
 add_custom_command(TARGET chast-host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:msquic> $<TARGET_FILE_DIR:chast-host>
@@ -307,6 +321,8 @@ endif()
 # executable: the service launches itself with --worker, so an upgrade only has
 # to replace one file.
 add_executable(chast-service host/service_main.cc host/worker.cc)
+add_dependencies(chast-host chast-display-guard)
+add_dependencies(chast-service chast-display-guard)
 target_link_libraries(chast-service PRIVATE chast.host.tray)
 add_custom_command(TARGET chast-service POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -411,10 +427,25 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host)
 
+    add_executable(chast-block-input-test tests/block_input_test.cc)
+    target_link_libraries(chast-block-input-test PRIVATE chast.host)
+    add_executable(chast-lock-after-session-test tests/lock_after_session_test.cc)
+    target_link_libraries(chast-lock-after-session-test PRIVATE chast.host)
+    add_executable(chast-multi-session-test tests/multi_session_test.cc)
+    target_link_libraries(chast-multi-session-test PRIVATE chast.host)
+
     # Virtual display detection, classification and mode choice. The live
     # probe is read-only and runs without a driver.
     add_executable(chast-virtual-display-test tests/virtual_display_test.cc)
     target_link_libraries(chast-virtual-display-test PRIVATE chast.host)
+    add_executable(chast-display-privacy-test tests/display_privacy_test.cc)
+    target_include_directories(chast-display-privacy-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-display-privacy-test PRIVATE chast.host)
+    # Opt-in only: real driver/GPU/topology and abrupt worker/job termination.
+    add_executable(chast-display-privacy-live tests/display_privacy_live.cc)
+    target_include_directories(chast-display-privacy-live PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(chast-display-privacy-live PRIVATE chast.host)
+    add_dependencies(chast-display-privacy-live chast-display-guard)
 
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
@@ -469,6 +500,8 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
     add_test(NAME virtual_display COMMAND chast-virtual-display-test)
+    add_test(NAME display_privacy COMMAND chast-display-privacy-test)
+    add_test(NAME lock_after_session COMMAND chast-lock-after-session-test)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)
@@ -478,6 +511,10 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME audio_playout COMMAND chast-audio-playout-test)
     add_test(NAME file_transfer COMMAND chast-file-transfer-test)
     add_test(NAME carrier COMMAND chast-carrier-test)
+    add_test(NAME block_input COMMAND chast-block-input-test)
+    set_tests_properties(block_input PROPERTIES TIMEOUT 120)
+    add_test(NAME multi_session COMMAND chast-multi-session-test)
+    set_tests_properties(multi_session PROPERTIES TIMEOUT 120)
 
     # Localhost loopback: needs an interactive desktop like the other capture
     # tools, so it is not part of the pure-logic set.
@@ -550,6 +587,8 @@ if(CHAST_BUILD_TESTS)
     # 80x24, echo a typed marker, accept a resize to 100x30 and close cleanly.
     # Downloads land in the user's Downloads\chast under unique names and are
     # removed again.
+    add_test(NAME viewer_display_control COMMAND chast-viewer-probe --display-control)
+    set_tests_properties(viewer_display_control PROPERTIES TIMEOUT 180)
     add_test(NAME viewer_folder_download COMMAND chast-viewer-probe)
     set_tests_properties(viewer_folder_download PROPERTIES TIMEOUT 180)
     # Protocol v32: a files-only request must reach streaming with no picture

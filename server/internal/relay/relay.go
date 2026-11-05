@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -159,9 +160,14 @@ type portSet struct {
 }
 
 type port struct {
-	set    *portSet
-	number int
-	family string
+	multiplex bool
+	muxPeers  map[string]*udpPeer
+	muxIDs    map[uint64]*udpPeer
+	muxAuth   map[string]udpAuthorization
+	nextMuxID uint64
+	set       *portSet
+	number    int
+	family    string
 
 	mu         sync.Mutex
 	conn       *net.UDPConn
@@ -199,6 +205,7 @@ type port struct {
 }
 
 type hostLink struct {
+	mux  *muxCarrier
 	conn net.Conn
 	send *carrier.FrameWriter
 }
@@ -858,19 +865,20 @@ func (m *Manager) SharedCarrierStats() (SharedCarrierStats, bool) {
 }
 
 type PortStats struct {
-	Port        int    `json:"port"`
-	HostID      string `json:"host_id,omitempty"`
-	HostOnline  bool   `json:"host_online"`
-	Viewer      string `json:"viewer,omitempty"`
-	ToHost      uint64 `json:"to_host_bytes"`
-	ToViewer    uint64 `json:"to_viewer_bytes"`
-	Busy        uint64 `json:"busy"`
-	Dropped     uint64 `json:"dropped"`
-	TCPToHost   uint64 `json:"tcp_to_host_bytes"`
-	TCPToViewer uint64 `json:"tcp_to_viewer_bytes"`
-	TCPViewers  uint64 `json:"tcp_viewers"`
-	TCPBusy     uint64 `json:"tcp_busy"`
-	Blocked     uint64 `json:"blocked_sessions"`
+	Port        int      `json:"port"`
+	HostID      string   `json:"host_id,omitempty"`
+	HostOnline  bool     `json:"host_online"`
+	Viewer      string   `json:"viewer,omitempty"`
+	Viewers     []string `json:"viewers,omitempty"`
+	ToHost      uint64   `json:"to_host_bytes"`
+	ToViewer    uint64   `json:"to_viewer_bytes"`
+	Busy        uint64   `json:"busy"`
+	Dropped     uint64   `json:"dropped"`
+	TCPToHost   uint64   `json:"tcp_to_host_bytes"`
+	TCPToViewer uint64   `json:"tcp_to_viewer_bytes"`
+	TCPViewers  uint64   `json:"tcp_viewers"`
+	TCPBusy     uint64   `json:"tcp_busy"`
+	Blocked     uint64   `json:"blocked_sessions"`
 }
 
 type Stats struct {
@@ -921,9 +929,21 @@ func (m *Manager) Stats() Stats {
 					ps.Viewer = p.viewerAddr.String()
 				}
 			}
+			for _, peer := range p.muxPeers {
+				if now.Sub(peer.seen) <= viewerIdle {
+					ps.Viewers = append(ps.Viewers, peer.address.String())
+				}
+			}
+			if p.hostLink != nil && p.hostLink.mux != nil {
+				ps.Viewers = append(ps.Viewers, p.hostLink.mux.addresses()...)
+			}
 			p.mu.Unlock()
 		}
 		set.mu.Unlock()
+		sort.Strings(ps.Viewers)
+		if ps.Viewer == "" && len(ps.Viewers) > 0 {
+			ps.Viewer = ps.Viewers[0]
+		}
 		out.Ports = append(out.Ports, ps)
 	}
 	if m.shared != nil {
@@ -978,6 +998,9 @@ func (p *port) detachUDPViewerLocked() {
 // The trace parent is kept so a viewer that reconnects without another
 // relay_viewer stays in the same trace.
 func (p *port) endUDPSpanLocked(reason string) {
+	if reason == "reallocated" || reason == "released" || reason == "shutdown" || reason == "host_moved" {
+		p.clearMuxLocked()
+	}
 	if p.udpSpan == nil {
 		return
 	}
@@ -1022,6 +1045,10 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 	}
 
 	fromHost := p.hostAddr != nil && sameAddr(p.hostAddr, src)
+	if p.multiplex {
+		p.handleMux(conn, data, src, now, fromHost)
+		return
+	}
 	if fromHost {
 		p.hostSeen = now
 		if p.viewerAddr == nil || now.Sub(p.viewerSeen) > viewerIdle || p.udpSession == nil {
@@ -1116,6 +1143,7 @@ func (p *port) handleHello(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr
 	}
 	p.reply(conn, src, wire.Message{
 		Type:      wire.TypeRelayChallenge,
+		Multiplex: msg.Multiplex,
 		HostID:    msg.HostID,
 		Nonce:     nonce,
 		Candidate: src.String(),
@@ -1135,7 +1163,11 @@ func (p *port) handleAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr,
 		p.reply(conn, src, ack)
 		return
 	}
-	message := identity.RelayMessage(msg.HostID, p.number, candidate, msg.Nonce)
+	signedCandidate := candidate
+	if msg.Multiplex {
+		signedCandidate += "\nMUX1"
+	}
+	message := identity.RelayMessage(msg.HostID, p.number, signedCandidate, msg.Nonce)
 	if p.set.manager.auth == nil ||
 		!p.set.manager.auth.CheckChallenge(msg.HostID, identity.DomainRelay, msg.Nonce, string(message), msg.Signature) ||
 		!p.set.manager.auth.VerifyHost(msg.HostID, p.number) {
@@ -1155,6 +1187,10 @@ func (p *port) handleAuth(conn *net.UDPConn, msg wire.Message, src *net.UDPAddr,
 		}
 	}
 	p.hostAddr = cloneAddr(src)
+	if p.multiplex != msg.Multiplex {
+		p.clearMuxLocked()
+	}
+	p.multiplex = msg.Multiplex
 	p.hostSeen = now
 	ack.OK = true
 	p.reply(conn, src, ack)
@@ -1182,6 +1218,24 @@ func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UD
 	case p.set.manager.auth == nil || !p.set.manager.auth.VerifyCarrier(msg.HostID, msg.Token):
 		ack.Error = "viewer token was not accepted"
 	default:
+		if p.multiplex {
+			if p.muxAuth == nil {
+				p.muxAuth = make(map[string]udpAuthorization)
+			}
+			now := time.Now()
+			for key, seen := range p.muxAuth {
+				if now.Sub(seen.seen) > viewerIdle {
+					delete(p.muxAuth, key)
+				}
+			}
+			if len(p.muxAuth) >= carrier.MaxMuxPeers && p.muxAuth[src.String()].seen.IsZero() {
+				ack.Error = "too many authenticated viewers"
+				break
+			}
+			p.muxAuth[src.String()] = udpAuthorization{seen: now, parent: parent}
+			ack.OK = true
+			break
+		}
 		if p.viewerAuthAddr == nil || !sameAddr(p.viewerAuthAddr, src) {
 			if p.viewerAddr != nil && !sameAddr(p.viewerAddr, src) {
 				p.detachUDPViewerLocked()
@@ -1335,7 +1389,7 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 		p.refuseConn(conn, "host has no live registration")
 		return
 	}
-	challenge, err := json.Marshal(carrier.HostChallenge{Nonce: nonce})
+	challenge, err := json.Marshal(carrier.HostChallenge{Nonce: nonce, Multiplex: hello.Multiplex})
 	if err != nil {
 		p.refuseConn(conn, "could not issue a challenge")
 		return
@@ -1359,7 +1413,11 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 		p.refuseConn(conn, "malformed host proof")
 		return
 	}
-	message := identity.CarrierHostMessage(hello.HostID, "", auth.Nonce)
+	capability := ""
+	if hello.Multiplex {
+		capability = "MUX1"
+	}
+	message := identity.CarrierHostMessage(hello.HostID, capability, auth.Nonce)
 	if auth.HostID != hello.HostID || auth.Nonce != nonce ||
 		!p.set.manager.auth.CheckChallenge(hello.HostID, identity.DomainCarrierHost, auth.Nonce, string(message), auth.Signature) {
 		p.refuseConn(conn, "host proof was not accepted")
@@ -1372,6 +1430,18 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 	_ = conn.SetDeadline(time.Time{})
 
 	link := &hostLink{conn: conn, send: carrier.NewFrameWriter(conn)}
+	if hello.Multiplex {
+		link.mux = newMuxCarrier(p.set.manager.policy, fmt.Sprintf("carrier:%d/%s", p.number, p.family), link.sendFrame, func(toHost bool, n int) {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if toHost {
+				p.tcpToHost += uint64(n)
+			} else {
+				p.tcpToViewer += uint64(n)
+			}
+		})
+		defer link.mux.close()
+	}
 	p.set.mu.Lock()
 	if p.set.hostID != reserved {
 		p.set.mu.Unlock()
@@ -1415,6 +1485,10 @@ func (p *port) serveHost(conn net.Conn, br *bufio.Reader) {
 			if err := link.sendFrame(nil); err != nil {
 				break
 			}
+			continue
+		}
+		if link.mux != nil {
+			link.mux.receive(payload)
 			continue
 		}
 		if viewer == nil {
@@ -1506,6 +1580,13 @@ func (p *port) serveViewer(v *carrierViewer, traceparent string) {
 		closeReason = "no_host"
 		p.mu.Unlock()
 		v.close()
+		return
+	}
+	if p.hostLink.mux != nil {
+		mux := p.hostLink.mux
+		p.tcpViewers++
+		p.mu.Unlock()
+		mux.serve(v)
 		return
 	}
 	if p.viewer != nil {

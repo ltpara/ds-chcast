@@ -12,10 +12,14 @@ enum ViewFit { adaptive, original }
 /// added. The host may encode a smaller picture than the desktop, so these are
 /// source pixels, not texture pixels; the session page adds the origin last.
 typedef FramePointerHandler = void Function(Offset position, int buttons);
-typedef FrameButtonHandler = void Function(Offset position, int button, bool down);
+typedef FrameButtonHandler =
+    void Function(Offset position, int button, bool down);
 typedef FrameScrollHandler = void Function(Offset position, Offset delta);
+typedef FrameGestureHandler =
+    void Function(Offset position, bool zoom, int deltaX, int deltaY);
 
-const int _mouseButtonMask = ViewerMouse.left |
+const int _mouseButtonMask =
+    ViewerMouse.left |
     ViewerMouse.right |
     ViewerMouse.middle |
     ViewerMouse.back |
@@ -43,10 +47,14 @@ const List<int> _mouseButtons = <int>[
 }) {
   final int w = width > 0 ? width : 1;
   final int h = height > 0 ? height : 1;
-  final int x =
-      (originX + frame.dx).round().clamp(originX, originX + w - 1).toInt();
-  final int y =
-      (originY + frame.dy).round().clamp(originY, originY + h - 1).toInt();
+  final int x = (originX + frame.dx)
+      .round()
+      .clamp(originX, originX + w - 1)
+      .toInt();
+  final int y = (originY + frame.dy)
+      .round()
+      .clamp(originY, originY + h - 1)
+      .toInt();
   return (x, y);
 }
 
@@ -66,6 +74,7 @@ class RemoteView extends StatefulWidget {
     this.onMove,
     this.onButton,
     this.onScroll,
+    this.onGesture,
     this.onFocusRequested,
   });
 
@@ -101,6 +110,7 @@ class RemoteView extends StatefulWidget {
   final FramePointerHandler? onMove;
   final FrameButtonHandler? onButton;
   final FrameScrollHandler? onScroll;
+  final FrameGestureHandler? onGesture;
   final VoidCallback? onFocusRequested;
 
   @override
@@ -117,6 +127,20 @@ class _RemoteViewState extends State<RemoteView> {
   int _buttons = 0;
   Offset _lastFrame = Offset.zero;
   double? _reportedScale;
+  final Map<int, Offset> _touches = <int, Offset>{};
+  bool _touchGesture = false;
+  bool _touchDragging = false;
+  Offset _touchPress = Offset.zero;
+  Offset _touchCenter = Offset.zero;
+  double _touchSpan = 0;
+  int _touchGeneration = 0;
+  bool _touchUpdateScheduled = false;
+  int? _panZoomPointer;
+  double _panZoomScale = 1;
+  double _gestureX = 0;
+  double _gestureY = 0;
+  double _gestureZoom = 0;
+  bool _zooming = false;
 
   @override
   void dispose() {
@@ -152,6 +176,13 @@ class _RemoteViewState extends State<RemoteView> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.captureInput && !widget.captureInput) {
       _releaseButtons();
+      _touches.clear();
+      _touchGesture = false;
+      _touchDragging = false;
+      ++_touchGeneration;
+      _touchUpdateScheduled = false;
+      _panZoomPointer = null;
+      _resetGesture();
     }
   }
 
@@ -161,10 +192,12 @@ class _RemoteViewState extends State<RemoteView> {
     }
     final int width = widget._pointerWidth;
     final int height = widget._pointerHeight;
-    final double x =
-        (local.dx * width / box.width).clamp(0.0, width - 1.0).toDouble();
-    final double y =
-        (local.dy * height / box.height).clamp(0.0, height - 1.0).toDouble();
+    final double x = (local.dx * width / box.width)
+        .clamp(0.0, width - 1.0)
+        .toDouble();
+    final double y = (local.dy * height / box.height)
+        .clamp(0.0, height - 1.0)
+        .toDouble();
     return Offset(x, y);
   }
 
@@ -200,11 +233,138 @@ class _RemoteViewState extends State<RemoteView> {
     }
   }
 
+  void _resetGesture() {
+    _gestureX = _gestureY = _gestureZoom = 0;
+    _panZoomScale = 1;
+    _zooming = false;
+  }
+
+  void _gesture(Offset position, Offset pan, double scale) {
+    if (!pan.dx.isFinite || !pan.dy.isFinite || !scale.isFinite || scale <= 0) {
+      return;
+    }
+    _gestureZoom += math.log(scale.clamp(0.25, 4)) / math.log(1.1) * 120;
+    // Ignore small span noise during a two-finger pan.
+    if (_gestureZoom.abs() >= 60) _zooming = true;
+    if (_zooming) {
+      // Accumulate small pinch updates: roughly ten percent is one zoom step.
+      // Once a gesture becomes a pinch, centroid drift must not also scroll.
+      final int steps = (_gestureZoom / 120).truncate();
+      if (steps != 0) {
+        _gestureZoom -= steps * 120;
+        widget.onGesture?.call(position, true, 0, steps.clamp(-10, 10) * 120);
+      }
+      return;
+    }
+    // Direct manipulation follows the fingers, the opposite of scrollDelta.
+    _gestureX -= pan.dx * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
+    _gestureY += pan.dy * kViewerWheelDelta / kViewerScrollPixelsPerNotch;
+    final int x = _gestureX.truncate();
+    final int y = _gestureY.truncate();
+    _gestureX -= x;
+    _gestureY -= y;
+    if (x != 0 || y != 0) {
+      widget.onGesture?.call(
+        position,
+        false,
+        x.clamp(-1200, 1200),
+        y.clamp(-1200, 1200),
+      );
+    }
+  }
+
+  void _measureTouches() {
+    final List<Offset> points = _touches.values.take(2).toList();
+    if (points.length < 2) return;
+    _touchCenter = (points[0] + points[1]) / 2;
+    _touchSpan = (points[1] - points[0]).distance;
+  }
+
+  void _touchDown(PointerDownEvent event, Size box) {
+    widget.onFocusRequested?.call();
+    _touches[event.pointer] = event.localPosition;
+    if (_touches.length == 1 && !_touchGesture) {
+      _touchPress = event.localPosition;
+      _touchDragging = false;
+    } else {
+      _releaseButtons();
+      _touchGesture = true;
+      _touchDragging = false;
+      ++_touchGeneration;
+      _touchUpdateScheduled = false;
+      _resetGesture();
+      _measureTouches();
+    }
+  }
+
+  void _touchMove(PointerMoveEvent event, Size box) {
+    // Ignore a contact that began while control was disabled.
+    if (!_touches.containsKey(event.pointer)) return;
+    _touches[event.pointer] = event.localPosition;
+    if (_touchGesture) {
+      if (_touches.length < 2 || _touchUpdateScheduled) return;
+      _touchUpdateScheduled = true;
+      final int generation = _touchGeneration;
+      // Coalesce both contacts: updating one finger first must not turn a
+      // simultaneous translation into a transient pinch.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || generation != _touchGeneration) return;
+        _touchUpdateScheduled = false;
+        if (!widget.captureInput || _touches.length < 2) return;
+        final Offset oldCenter = _touchCenter;
+        final double oldSpan = _touchSpan;
+        _measureTouches();
+        _gesture(
+          _toFrame(_touchCenter, box),
+          _touchCenter - oldCenter,
+          oldSpan > 1 ? _touchSpan / oldSpan : 1,
+        );
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    } else {
+      final Offset position = _toFrame(event.localPosition, box);
+      if (!_touchDragging) {
+        if ((event.localPosition - _touchPress).distance < kTouchSlop) return;
+        _touchDragging = true;
+        _syncButtons(ViewerMouse.left, _toFrame(_touchPress, box));
+      }
+      _syncButtons(ViewerMouse.left, position);
+      widget.onMove?.call(position, ViewerMouse.left);
+    }
+  }
+
+  void _touchEnd(
+    int pointer,
+    Offset localPosition,
+    Size box, {
+    bool cancelled = false,
+  }) {
+    if (_touches.remove(pointer) == null) return;
+    if (!_touchGesture) {
+      final Offset position = _toFrame(localPosition, box);
+      if (!_touchDragging && !cancelled) {
+        _syncButtons(ViewerMouse.left, position);
+      }
+      _syncButtons(0, position);
+    }
+    ++_touchGeneration;
+    _touchUpdateScheduled = false;
+    if (_touches.isEmpty) {
+      _touchGesture = false;
+      _resetGesture();
+    } else {
+      // The final finger of a two-finger gesture must not become a click/drag.
+      _measureTouches();
+    }
+  }
+
   Widget _layer(Size box) {
     _reportScale(box);
     final Widget texture = Texture(
       textureId: widget.textureId,
-      filterQuality: widget.fit == ViewFit.original ? FilterQuality.none : FilterQuality.low,
+      filterQuality: widget.fit == ViewFit.original
+          ? FilterQuality.none
+          : FilterQuality.low,
     );
     if (!widget.captureInput) {
       return texture;
@@ -215,12 +375,25 @@ class _RemoteViewState extends State<RemoteView> {
       child: Listener(
         behavior: HitTestBehavior.opaque,
         onPointerDown: (PointerDownEvent event) {
+          if (event.kind == PointerDeviceKind.touch) {
+            _touchDown(event, box);
+            return;
+          }
           widget.onFocusRequested?.call();
           _syncButtons(event.buttons, _toFrame(event.localPosition, box));
         },
-        onPointerUp: (PointerUpEvent event) =>
-            _syncButtons(event.buttons, _toFrame(event.localPosition, box)),
+        onPointerUp: (PointerUpEvent event) {
+          if (event.kind == PointerDeviceKind.touch) {
+            _touchEnd(event.pointer, event.localPosition, box);
+          } else {
+            _syncButtons(event.buttons, _toFrame(event.localPosition, box));
+          }
+        },
         onPointerMove: (PointerMoveEvent event) {
+          if (event.kind == PointerDeviceKind.touch) {
+            _touchMove(event, box);
+            return;
+          }
           final Offset position = _toFrame(event.localPosition, box);
           _syncButtons(event.buttons, position);
           widget.onMove?.call(position, event.buttons);
@@ -230,11 +403,43 @@ class _RemoteViewState extends State<RemoteView> {
           _syncButtons(event.buttons, position);
           widget.onHover?.call(position, event.buttons);
         },
-        onPointerCancel: (PointerCancelEvent event) =>
-            _syncButtons(0, _toFrame(event.localPosition, box)),
+        onPointerCancel: (PointerCancelEvent event) {
+          if (event.kind == PointerDeviceKind.touch) {
+            _touchEnd(event.pointer, event.localPosition, box, cancelled: true);
+          } else {
+            _syncButtons(0, _toFrame(event.localPosition, box));
+          }
+        },
+        onPointerPanZoomStart: (PointerPanZoomStartEvent event) {
+          widget.onFocusRequested?.call();
+          _releaseButtons();
+          _panZoomPointer = event.pointer;
+          _resetGesture();
+        },
+        onPointerPanZoomUpdate: (PointerPanZoomUpdateEvent event) {
+          if (_panZoomPointer != event.pointer ||
+              !event.scale.isFinite ||
+              event.scale <= 0) {
+            return;
+          }
+          _gesture(
+            _toFrame(event.localPosition, box),
+            event.localPanDelta,
+            event.scale / _panZoomScale,
+          );
+          _panZoomScale = event.scale;
+        },
+        onPointerPanZoomEnd: (PointerPanZoomEndEvent event) {
+          if (_panZoomPointer != event.pointer) return;
+          _panZoomPointer = null;
+          _resetGesture();
+        },
         onPointerSignal: (PointerSignalEvent event) {
           if (event is PointerScrollEvent) {
-            widget.onScroll?.call(_toFrame(event.localPosition, box), event.scrollDelta);
+            widget.onScroll?.call(
+              _toFrame(event.localPosition, box),
+              event.scrollDelta,
+            );
           }
         },
         child: texture,
@@ -247,14 +452,18 @@ class _RemoteViewState extends State<RemoteView> {
     if (widget.videoWidth <= 0 || widget.videoHeight <= 0) {
       return const SizedBox.shrink();
     }
-    final Size videoSize =
-        Size(widget.videoWidth.toDouble(), widget.videoHeight.toDouble());
+    final Size videoSize = Size(
+      widget.videoWidth.toDouble(),
+      widget.videoHeight.toDouble(),
+    );
 
     if (widget.fit == ViewFit.adaptive) {
       return LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
           Size available = constraints.biggest;
-          if (!available.isFinite || available.width <= 0 || available.height <= 0) {
+          if (!available.isFinite ||
+              available.width <= 0 ||
+              available.height <= 0) {
             available = videoSize;
           }
           final double scale = math.min(

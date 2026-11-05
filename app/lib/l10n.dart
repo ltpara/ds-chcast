@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -49,16 +50,18 @@ class AppLanguage {
       return;
     }
     try {
-      if (!file.existsSync()) {
-        return;
-      }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        final Object? language = decoded['language'];
-        if (language == kLanguageEnglish) {
-          current.value = kLanguageEnglish;
+      withStoreLockSync(file, () {
+        if (!file.existsSync()) {
+          return;
         }
-      }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          final Object? language = decoded['language'];
+          if (language == kLanguageEnglish) {
+            current.value = kLanguageEnglish;
+          }
+        }
+      });
     } catch (_) {
       // A corrupt settings file must not stop the viewer from starting.
     }
@@ -71,12 +74,18 @@ class AppLanguage {
     }
     // Other preferences (the picture choices) share this file, so a language
     // change merges instead of replacing the whole map.
-    final Map<String, Object?> payload = _readMap()..['language'] = code;
     try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // Language is a preference; failing to persist it is not fatal.
+      withStoreLockSync(file, () {
+        final Map<String, Object?> payload = _readMap()..['language'] = code;
+        try {
+          file.parent.createSync(recursive: true);
+          file.writeAsStringSync(jsonEncode(payload));
+        } catch (_) {
+          // Language is a preference; failing to persist it is not fatal.
+        }
+      });
+    } on FileSystemException {
+      // Preferences are best effort when the directory cannot be locked.
     }
   }
 
@@ -86,13 +95,16 @@ class AppLanguage {
       return <String, Object?>{};
     }
     try {
-      if (!file.existsSync()) {
+      return withStoreLockSync(file, () {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
         return <String, Object?>{};
-      }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
+      });
     } catch (_) {
       // A corrupt settings file must not stop the viewer from starting.
     }

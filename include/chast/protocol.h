@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 36.
+// The chast wire protocol, version 40.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 37;
+inline constexpr uint16_t kProtocolVersion = 42;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -313,6 +313,14 @@ enum class ControlType : uint16_t {
     // reason length (u16), UTF-8 reason. See RestartCode. Ok means the
     // restart was scheduled; the machine reboots after a few seconds.
     RestartResult = 53,
+    SetBlockInput = 54,
+    BlockInputState = 55,
+    // Per-session opt-in. Requires input permission. When multiple desktop
+    // viewers coexist, locking is deferred until the last one leaves.
+    SetLockAfterSession = 56,
+    LockAfterSessionState = 57,
+    DisplayControl = 58,
+    DisplayControlState = 59,
 };
 
 // ----- input -----
@@ -329,6 +337,7 @@ enum class ControlType : uint16_t {
 enum class InputKind : uint8_t {
     Mouse = 1,
     Key = 2,
+    Gesture = 3,
 };
 
 enum class MouseAction : uint8_t {
@@ -374,6 +383,20 @@ struct KeyEvent {
     uint16_t hid_usage = 0;
 };
 
+// Gestures carry bounded wheel deltas (120 units per notch). Each Zoom is a
+// complete Ctrl+wheel operation: no modifier survives an interrupted gesture.
+enum class GestureAction : uint8_t {
+    Pan = 0,
+    Zoom = 1,
+};
+inline constexpr int32_t kMaxGestureDelta = 1200;
+struct GestureEvent {
+    GestureAction action = GestureAction::Pan;
+    int32_t x = 0;  // positive scrolls right; zero for Zoom
+    int32_t y = 0;  // positive scrolls up / zooms in
+};
+bool valid_gesture_event(const GestureEvent& event);
+
 // Bit positions in InputEvent::modifiers. Bits 0..7 are the modifier keys on
 // HID usage page 0x07 (0xE0..0xE7) in that order; every event, pointer or
 // keyboard, carries the set the client saw held at that moment. The injector
@@ -410,6 +433,7 @@ struct InputEvent {
     InputKind kind = InputKind::Mouse;
     MouseEvent mouse;
     KeyEvent key;
+    GestureEvent gesture;
     // Modifier keys held and lock keys on, when the event happened; see
     // ModifierBit and LockStateBit.
     uint16_t modifiers = 0;
@@ -750,9 +774,10 @@ bool decode_microphone_stream_header(const uint8_t* data, size_t size, AudioInfo
 // microphone stream; bit 5 that SetPrivacyMode is accepted; bit 7 that the
 // viewer may ask for TCP port forwarding; bit 8 that remote terminals are
 // accepted; bit 9 that the host consents to viewer-side recording; bit 10 that
-// cameras may be listed and started; bit 11 that RestartRequest is accepted.
+// cameras may be listed and started; bit 11 that RestartRequest is accepted;
+// bit 14 that the viewer may request local keyboard/mouse blocking.
 // Bit 6 is not a permission: it says the picture is a merged layout of every
-// attached output, with origin/source covering their union. Bits 13 and 14
+// attached output, with origin/source covering their union. Bits 12 and 13
 // are session-shape markers that are not permissions either.
 inline constexpr uint16_t kServerInfoInputEnabled = 0x0001;
 inline constexpr uint16_t kServerInfoClipboardEnabled = 0x0002;
@@ -768,6 +793,7 @@ inline constexpr uint16_t kServerInfoCameraEnabled = 0x0400;
 // The viewer may send RestartRequest. Aligned with kPermissionRestart so the
 // flag word and the appended mask stay comparable bit for bit.
 inline constexpr uint16_t kServerInfoRestartEnabled = 0x0800;
+inline constexpr uint16_t kServerInfoBlockInputEnabled = 0x4000;
 // This session carries files only: no video or audio stream follows, and the
 // picture and source sizes in the message are zero. The viewer never creates
 // a decoder for such a session. v37 moved this bit from 0x0800, which now
@@ -790,7 +816,8 @@ inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
                                                        kServerInfoTerminalEnabled |
                                                        kServerInfoRecordEnabled |
                                                        kServerInfoCameraEnabled |
-                                                       kServerInfoRestartEnabled;
+                                                       kServerInfoRestartEnabled |
+                                                       kServerInfoBlockInputEnabled;
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoMergedLayout |
                                                   kServerInfoFileTransferOnly |
@@ -807,7 +834,8 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // for the viewer to keep a local recording of the received stream (the host
 // cannot enforce it, so it is an advisory permission like RustDesk's
 // "enable-record-session"); camera gates ListCameras, StartCamera and CCAM
-// streams; restart gates RestartRequest and reboots the host.
+// streams; restart gates RestartRequest and reboots the host. Block-input
+// also requires the input permission and gates SetBlockInput(true).
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -826,13 +854,14 @@ enum PermissionBit : uint16_t {
     // Reboot the host machine. Off unless the operator opts in, because it
     // interrupts whoever is sitting at the machine.
     kPermissionRestart = 0x0800,
+    kPermissionBlockInput = 0x4000,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
                                            kPermissionMicrophone | kPermissionPrivacyMode |
                                            kPermissionPortForward | kPermissionTerminal |
                                            kPermissionRecord | kPermissionCamera |
-                                           kPermissionRestart;
+                                           kPermissionRestart | kPermissionBlockInput;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -977,6 +1006,7 @@ struct ServerInfo {
     // mask; each request is still checked against the host's settings and its
     // platform's privileges when it arrives.
     bool restart_enabled = false;
+    bool block_input_enabled = false;
     // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
     // audio stream. Set only alongside audio.enabled.
     bool audio_datagram = false;
@@ -1498,6 +1528,57 @@ bool parse_send_sas(const std::vector<uint8_t>& payload, std::string* error);
 std::vector<uint8_t> make_sas_result(SasCode code, const std::string& reason);
 bool parse_sas_result(const std::vector<uint8_t>& payload, SasCode& code,
                       std::string& reason, std::string* error);
+
+// BlockInput is independent of the screen privacy overlay. A failure may
+// still report enabled=true when releasing an existing block failed.
+enum class BlockInputCode : uint8_t { Ok, Denied, Unsupported, Failed };
+std::vector<uint8_t> make_set_block_input(bool enabled);
+bool parse_set_block_input(const std::vector<uint8_t>& payload, bool& enabled,
+                           std::string* error);
+std::vector<uint8_t> make_block_input_state(bool enabled, BlockInputCode code,
+                                           const std::string& reason);
+bool parse_block_input_state(const std::vector<uint8_t>& payload, bool& enabled,
+                             BlockInputCode& code, std::string& reason,
+                             std::string* error);
+
+// Session-scoped topology management. Restore is allowed after revocation.
+enum class DisplayControlAction : uint8_t { Query, SetCount, Restore, SelectPrivacy, ToggleOutput };
+enum class PrivacyImplementation : uint8_t { Overlay, VirtualDisplay };
+enum class DisplayControlCode : uint8_t { Ok, Denied, Unsupported, Busy, Failed };
+struct DisplayControlRequest {
+    DisplayControlAction action = DisplayControlAction::Query;
+    uint8_t value = 0;
+    uint32_t target = 0; // host-issued session identity, never a display-list index
+};
+struct ControlledDisplay {
+    uint32_t id = 0;
+    bool active = false;
+};
+struct DisplayControlState {
+    bool supported = false;
+    bool managed = false;
+    uint8_t count = 0;  // attached desktop outputs, not allocated PnP monitors
+    PrivacyImplementation privacy = PrivacyImplementation::Overlay;
+    DisplayControlCode code = DisplayControlCode::Ok;
+    std::string reason;
+    std::vector<ControlledDisplay> outputs;
+};
+std::vector<uint8_t> make_display_control(const DisplayControlRequest& request);
+bool parse_display_control(const std::vector<uint8_t>& payload, DisplayControlRequest& request,
+                           std::string* error = nullptr);
+std::vector<uint8_t> make_display_control_state(const DisplayControlState& state);
+bool parse_display_control_state(const std::vector<uint8_t>& payload, DisplayControlState& state,
+                                 std::string* error = nullptr);
+
+enum class LockAfterSessionCode : uint8_t { Ok, Denied, Unsupported, Failed };
+std::vector<uint8_t> make_set_lock_after_session(bool enabled);
+bool parse_set_lock_after_session(const std::vector<uint8_t>& payload, bool& enabled,
+                           std::string* error);
+std::vector<uint8_t> make_lock_after_session_state(bool enabled, LockAfterSessionCode code,
+                                           const std::string& reason);
+bool parse_lock_after_session_state(const std::vector<uint8_t>& payload, bool& enabled,
+                             LockAfterSessionCode& code, std::string& reason,
+                             std::string* error);
 
 // ----- remote restart -----
 //

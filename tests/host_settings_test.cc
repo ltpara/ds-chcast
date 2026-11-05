@@ -435,6 +435,17 @@ void test_security_migration(const std::filesystem::path& dir) {
           "a mask written before the record bit keeps the consent default");
     check(!loaded.settings.allow_restart,
           "a mask written before the restart bit keeps the off default");
+    check(!loaded.settings.allow_block_input, "local input blocking defaults to off");
+    const std::filesystem::path with_block_input = dir / "block-input.ini";
+    write_text(with_block_input, "permissions=37\nblock_input=1\n");
+    loaded = chast::load_host_settings(with_block_input.string());
+    check(loaded.settings.allow_block_input,
+          "explicit local input consent survives an older permissions mask");
+    std::string block_error;
+    check(chast::save_host_settings(with_block_input.string(), loaded.settings, &block_error),
+          "save local input consent");
+    check(chast::load_host_settings(with_block_input.string()).settings.allow_block_input,
+          "local input consent survives a settings round trip");
 
     const std::filesystem::path with_restart = dir / "with-restart.ini";
     write_text(with_restart, "permissions=37\nrestart=1\n");
@@ -515,6 +526,20 @@ void test_codec_names() {
 }
 
 void test_virtual_display_settings(const std::filesystem::path& dir) {
+    const auto privacy_path = dir / "privacy-method.ini";
+    write_text(privacy_path, "privacy_mode_impl=VIRTUAL_DISPLAY\n");
+    auto privacy = chast::load_host_settings(privacy_path.string());
+    check(privacy.settings.privacy_mode_impl == "virtual_display", "virtual display privacy parses explicitly");
+    std::string privacy_error;
+    check(chast::save_host_settings(privacy_path.string(), privacy.settings, &privacy_error) &&
+          chast::load_host_settings(privacy_path.string()).settings.privacy_mode_impl == "virtual_display",
+          "virtual display privacy survives settings round trip");
+    write_text(privacy_path, "privacy_mode_impl=typo\n");
+    privacy = chast::load_host_settings(privacy_path.string());
+    check(privacy.settings.privacy_mode_impl == "invalid" &&
+          privacy.warning.find("privacy_mode_impl") != std::string::npos,
+          "unknown privacy method fails closed instead of selecting overlay");
+    check(chast::HostSettings{}.privacy_mode_impl == "overlay", "existing installations retain overlay by default");
     const std::filesystem::path path = dir / "virtual-display.ini";
     write_text(path,
                "virtual_display=ON\n"

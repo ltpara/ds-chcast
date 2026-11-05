@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -67,17 +68,18 @@ class ServerIdentityPin {
   final DateTime pinnedAt;
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'public_key': identity.publicKey,
-        'fingerprint': identity.fingerprint,
-        'pinned_at_ms': pinnedAt.toUtc().millisecondsSinceEpoch,
-      };
+    'public_key': identity.publicKey,
+    'fingerprint': identity.fingerprint,
+    'pinned_at_ms': pinnedAt.toUtc().millisecondsSinceEpoch,
+  };
 
   static ServerIdentityPin? fromJson(Object? value) {
     if (value is! Map) {
       return null;
     }
-    final ServerIdentity? identity =
-        ServerIdentity.parse(value['public_key']?.toString() ?? '');
+    final ServerIdentity? identity = ServerIdentity.parse(
+      value['public_key']?.toString() ?? '',
+    );
     if (identity == null) {
       return null;
     }
@@ -101,8 +103,8 @@ class ServerIdentityPin {
 /// capped.
 class ServerIdentityStore {
   ServerIdentityStore({File? file, File? auditFile})
-      : _injected = file,
-        _auditInjected = auditFile;
+    : _injected = file,
+      _auditInjected = auditFile;
 
   final File? _injected;
   final File? _auditInjected;
@@ -130,30 +132,33 @@ class ServerIdentityStore {
   }
 
   Future<Map<String, ServerIdentityPin>> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return <String, ServerIdentityPin>{};
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map) {
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
         return <String, ServerIdentityPin>{};
       }
-      final Map<String, ServerIdentityPin> pins = <String, ServerIdentityPin>{};
-      decoded.forEach((Object? key, Object? value) {
-        if (key is! String) {
-          return;
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is! Map) {
+          return <String, ServerIdentityPin>{};
         }
-        final String url = normalizeServerUrl(key);
-        final ServerIdentityPin? pin = ServerIdentityPin.fromJson(value);
-        if (url.isNotEmpty && pin != null) {
-          pins[url] = pin;
-        }
-      });
-      return pins;
-    } catch (_) {
-      return <String, ServerIdentityPin>{};
-    }
+        final Map<String, ServerIdentityPin> pins =
+            <String, ServerIdentityPin>{};
+        decoded.forEach((Object? key, Object? value) {
+          if (key is! String) {
+            return;
+          }
+          final String url = normalizeServerUrl(key);
+          final ServerIdentityPin? pin = ServerIdentityPin.fromJson(value);
+          if (url.isNotEmpty && pin != null) {
+            pins[url] = pin;
+          }
+        });
+        return pins;
+      } catch (_) {
+        return <String, ServerIdentityPin>{};
+      }
+    });
   }
 
   Future<ServerIdentityPin?> pinFor(String serverUrl) async {
@@ -171,43 +176,47 @@ class ServerIdentityStore {
     ServerIdentity identity, {
     ServerIdentityPin? previous,
   }) async {
-    final String url = normalizeServerUrl(serverUrl);
-    if (url.isEmpty) {
-      return ServerIdentityPin(identity: identity, pinnedAt: DateTime.now());
-    }
-    final ServerIdentityPin record = ServerIdentityPin(
-      identity: identity,
-      pinnedAt: DateTime.now().toUtc(),
-    );
-    final Map<String, ServerIdentityPin> pins = await load();
-    pins[url] = record;
-    await _save(pins);
-    await _audit(
-      server: url,
-      action: previous == null ? 'tofu' : 'rotate',
-      identity: identity,
-      previousFingerprint: previous?.identity.fingerprint ?? '',
-    );
-    return record;
+    return withStoreLock(_file(), () async {
+      final String url = normalizeServerUrl(serverUrl);
+      if (url.isEmpty) {
+        return ServerIdentityPin(identity: identity, pinnedAt: DateTime.now());
+      }
+      final ServerIdentityPin record = ServerIdentityPin(
+        identity: identity,
+        pinnedAt: DateTime.now().toUtc(),
+      );
+      final Map<String, ServerIdentityPin> pins = await load();
+      pins[url] = record;
+      await _save(pins);
+      await _audit(
+        server: url,
+        action: previous == null ? 'tofu' : 'rotate',
+        identity: identity,
+        previousFingerprint: previous?.identity.fingerprint ?? '',
+      );
+      return record;
+    });
   }
 
   /// Removes the pin so the next connection asks again unconditionally.
   Future<void> forget(String serverUrl) async {
-    final String url = normalizeServerUrl(serverUrl);
-    if (url.isEmpty) {
-      return;
-    }
-    final Map<String, ServerIdentityPin> pins = await load();
-    final ServerIdentityPin? previous = pins.remove(url);
-    if (previous == null) {
-      return;
-    }
-    await _save(pins);
-    await _audit(
-      server: url,
-      action: 'forget',
-      previousFingerprint: previous.identity.fingerprint,
-    );
+    return withStoreLock(_file(), () async {
+      final String url = normalizeServerUrl(serverUrl);
+      if (url.isEmpty) {
+        return;
+      }
+      final Map<String, ServerIdentityPin> pins = await load();
+      final ServerIdentityPin? previous = pins.remove(url);
+      if (previous == null) {
+        return;
+      }
+      await _save(pins);
+      await _audit(
+        server: url,
+        action: 'forget',
+        previousFingerprint: previous.identity.fingerprint,
+      );
+    });
   }
 
   Future<void> _save(Map<String, ServerIdentityPin> pins) async {
@@ -217,10 +226,12 @@ class ServerIdentityStore {
     }
     try {
       await file.parent.create(recursive: true);
-      await file.writeAsString(jsonEncode(<String, Object?>{
-        for (final MapEntry<String, ServerIdentityPin> entry in pins.entries)
-          entry.key: entry.value.toJson(),
-      }));
+      await file.writeAsString(
+        jsonEncode(<String, Object?>{
+          for (final MapEntry<String, ServerIdentityPin> entry in pins.entries)
+            entry.key: entry.value.toJson(),
+        }),
+      );
     } catch (_) {
       // Losing the pin only costs a future confirmation; it must not block
       // the connection.

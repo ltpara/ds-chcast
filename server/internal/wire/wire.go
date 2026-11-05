@@ -34,6 +34,7 @@ const (
 const MaxControlSize = 2048
 
 type Message struct {
+	Multiplex   bool     `json:"multiplex,omitempty"`
 	Type        string   `json:"type"`
 	HostID      string   `json:"host_id,omitempty"`
 	Nonce       string   `json:"nonce,omitempty"`

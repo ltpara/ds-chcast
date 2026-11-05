@@ -117,10 +117,14 @@ struct HostSettings {
     // monitor, so a person sitting at the machine cannot see the desktop until
     // the session ends or the operator revokes the permission.
     bool allow_privacy_mode = false;
+    // Explicit operator choice: overlay (default) or virtual_display. The
+    // latter requires a GPU-capturable usbmmidd output and recovery helper.
+    std::string privacy_mode_impl = "overlay";
     // Let the viewer reboot this machine. Off by default: a restart
     // interrupts whoever is sitting at the machine and closes every session,
     // so it is an explicit decision in the same spirit as the terminal.
     bool allow_restart = false;
+    bool allow_block_input = false;
     // Close the session after this many minutes without viewer activity
     // (input, chat or clipboard). 0 keeps it open until one side leaves and is
     // the default: a forgotten viewer should not hold the screen forever, but

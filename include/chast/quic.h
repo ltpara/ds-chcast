@@ -117,6 +117,9 @@ enum class IdentityScope {
 struct QuicServerConfig {
     std::string bind_address = "127.0.0.1";
     uint16_t port = 4433;
+    // Above one, the listener returns independent connections through
+    // accept_client(). Includes handshakes waiting for authentication.
+    uint16_t max_connections = 1;
     // How long the connection may sit idle before the transport closes it.
     uint32_t idle_timeout_ms = 30000;
     // Accept InputEvents from the viewer. Off by default: a client that
@@ -167,6 +170,7 @@ struct QuicServerConfig {
     // interrupts whoever is sitting at the machine, so the host opts in
     // explicitly. announce() clears restart_enabled when false.
     bool allow_restart = false;
+    bool allow_block_input = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -334,6 +338,10 @@ public:
     // handshake frees its slot the same way. A transport or protocol failure
     // ends the wait early.
     Error wait_for_client(std::chrono::milliseconds timeout);
+    // Multi-connection listeners only. The returned session still needs
+    // wait_for_client() to authenticate it before any application work.
+    std::unique_ptr<QuicSession> accept_client(std::chrono::milliseconds timeout,
+                                              std::string* error);
     // The display index the client asked for in Hello, or kDisplayAuto. Valid
     // once wait_for_client() succeeded; the server creates its capturer after
     // that so the request can pick the output.
@@ -457,6 +465,20 @@ public:
     // that toggles twice wants the final state. The host answers each taken
     // request with send_privacy_mode_state(). Requires the privacy-mode
     // permission; a request without it is dropped by the transport.
+    bool take_block_input_request(bool& enabled);
+    Error send_block_input_state(bool enabled, BlockInputCode code, const std::string& reason);
+    Error set_block_input(bool enabled);
+    bool take_block_input_state(bool& enabled, BlockInputCode& code, std::string& reason);
+    bool take_display_control_request(DisplayControlRequest& request);
+    Error send_display_control_state(const DisplayControlState& state);
+    Error request_display_control(const DisplayControlRequest& request);
+    bool take_display_control_state(DisplayControlState& state);
+    bool take_lock_after_session_request(bool& enabled);
+    Error send_lock_after_session_state(bool enabled, LockAfterSessionCode code, const std::string& reason);
+    Error set_lock_after_session(bool enabled);
+    bool take_lock_after_session_state(bool& enabled, LockAfterSessionCode& code, std::string& reason);
+    bool apply_block_input(bool enabled, std::string* error);
+    bool local_input_blocked() const;
     bool take_privacy_mode_request(bool& enabled);
     // Answers a privacy-mode request or announces a state the host changed on
     // its own (permission revoked, desktop switch). `enabled` is the resulting
@@ -1063,7 +1085,7 @@ private:
     QuicSession() = default;
 
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace chast

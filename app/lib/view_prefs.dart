@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -89,23 +90,29 @@ class ViewPreferences {
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap()
-      ..[_fitKey] = prefs.fit == 1 ? 1 : 0
-      ..[_statsKey] = prefs.stats
-      ..[_fileSortKey] = prefs.fileSort >= 0 && prefs.fileSort <= 2
-          ? prefs.fileSort
-          : 0
-      ..[_fileSortAscendingKey] = prefs.fileSortAscending
-      ..[_browserDirectoryKey] = normalizeDirectory(prefs.browserDirectory)
-      ..[_terminalFontSizeKey] =
-          prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
-          ? prefs.terminalFontSize
-          : 13;
     try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // A view preference; failing to persist it is not fatal.
+      withStoreLockSync(file, () {
+        final Map<String, Object?> payload = _readMap()
+          ..[_fitKey] = prefs.fit == 1 ? 1 : 0
+          ..[_statsKey] = prefs.stats
+          ..[_fileSortKey] = prefs.fileSort >= 0 && prefs.fileSort <= 2
+              ? prefs.fileSort
+              : 0
+          ..[_fileSortAscendingKey] = prefs.fileSortAscending
+          ..[_browserDirectoryKey] = normalizeDirectory(prefs.browserDirectory)
+          ..[_terminalFontSizeKey] =
+              prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
+              ? prefs.terminalFontSize
+              : 13;
+        try {
+          file.parent.createSync(recursive: true);
+          file.writeAsStringSync(jsonEncode(payload));
+        } catch (_) {
+          // A view preference; failing to persist it is not fatal.
+        }
+      });
+    } on FileSystemException {
+      // Preferences are best effort when the directory cannot be locked.
     }
   }
 
@@ -115,13 +122,16 @@ class ViewPreferences {
       return <String, Object?>{};
     }
     try {
-      if (!file.existsSync()) {
+      return withStoreLockSync(file, () {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
         return <String, Object?>{};
-      }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
+      });
     } catch (_) {
       // A corrupt settings file must not stop the viewer from starting.
     }

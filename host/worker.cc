@@ -110,44 +110,6 @@ void log_tunnel_event(const TunnelEvent& event) {
     }
 }
 
-void prepare_virtual_display_on_start(const HostSettings& settings) {
-    if (settings.virtual_display == VirtualDisplayPolicy::Off) {
-        return;
-    }
-    if (settings.virtual_display_provider == "vdd") {
-        worker_log("vdisplay: the vdd provider is not implemented in this build");
-        return;
-    }
-    VirtualDisplayProviderKind kind = VirtualDisplayProviderKind::None;
-    if (settings.virtual_display_provider == "usbmmidd") {
-        kind = VirtualDisplayProviderKind::Usbmmidd;
-    } else {
-        kind = detect_virtual_display_provider();
-    }
-    std::unique_ptr<VirtualDisplayProvider> provider;
-    if (kind != VirtualDisplayProviderKind::None) {
-        provider = make_virtual_display_provider(kind, default_virtual_display_package_dir());
-    }
-    if (!provider) {
-        const VirtualDisplayStatus status = classify_virtual_display_probe(probe_virtual_display());
-        worker_log("vdisplay: " + status.detail);
-        return;
-    }
-    bool active_display = false;
-    for (const DisplayInfo& display : enumerate_displays()) {
-        if (display.width != 0 && display.height != 0) {
-            active_display = true;
-            break;
-        }
-    }
-    const VirtualDisplayPrepareResult result = prepare_virtual_display(
-        settings.virtual_display, settings.virtual_display_monitors,
-        settings.virtual_display_resolution, provider.get(), active_display);
-    worker_log("vdisplay: " + result.detail + " [state=" +
-               virtual_display_state_name(result.status.state) + ", monitors=" +
-               std::to_string(result.status.active_monitors) + "]");
-}
-
 bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
                   const std::string& fingerprint, std::atomic<bool>& ended,
                   std::atomic<uint32_t>& exit_code) {
@@ -204,7 +166,6 @@ int run_worker(std::string* error) {
     if (settings.token_auth) {
         worker_log("access-token authentication is enabled for automation");
     }
-    prepare_virtual_display_on_start(settings);
 
     HANDLE stop = OpenEventW(SYNCHRONIZE, FALSE, kWorkerStopEvent);
     if (stop == nullptr) {
@@ -221,6 +182,7 @@ int run_worker(std::string* error) {
     }
 
     HostServerConfig config;
+    config.max_sessions = 8;
     config.settings = settings;
     config.audio_silence_gate_ms = settings.audio_silence_gate_ms;
     config.identity_scope = IdentityScope::LocalMachine;

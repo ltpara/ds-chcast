@@ -40,7 +40,7 @@ func (s *server) accessGroupActor(w http.ResponseWriter, r *http.Request, groupI
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
 		return account.User{}, "", false
 	}
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		return account.User{}, "server-key", true
 	}
 	token, ok := bearerToken(r)
@@ -151,7 +151,7 @@ func (s *server) listAccessGroups(w http.ResponseWriter, r *http.Request) {
 		groups []account.AccessGroup
 		err    error
 	)
-	if s.authorized(r) {
+	if s.serverKeyAuthorized(r) {
 		groups, err = s.cfg.Accounts.ListAccessGroups()
 	} else {
 		user, ok := s.accountUser(w, r)

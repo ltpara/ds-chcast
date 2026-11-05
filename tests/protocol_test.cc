@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -2223,11 +2224,39 @@ void test_input_events() {
     check(got.key.hid_usage == 0xE6, "key event keeps the HID usage");
     check(got.modifiers == chast::kModifierRightAlt, "key event keeps the modifier bitmap");
 
+    chast::InputEvent gesture;
+    gesture.kind = chast::InputKind::Gesture;
+    gesture.gesture = {chast::GestureAction::Pan, -37, 120};
+    gesture.modifiers = chast::kModifierRightShift;
+    check(chast::parse_input_event(payload_of(chast::make_input_event(gesture)), got, &error) &&
+          got.kind == chast::InputKind::Gesture && got.gesture.action == chast::GestureAction::Pan &&
+          got.gesture.x == -37 && got.gesture.y == 120 && got.modifiers == gesture.modifiers,
+          "pan preserves two signed axes and physical modifiers");
+    gesture.gesture = {chast::GestureAction::Zoom, 0, -240};
+    check(chast::parse_input_event(payload_of(chast::make_input_event(gesture)), got, &error) &&
+          got.gesture.action == chast::GestureAction::Zoom && got.gesture.y == -240,
+          "zoom round-trips independently of mouse button state");
+
     auto rejects = [&](std::vector<uint8_t> payload, const char* what) {
         chast::InputEvent dropped;
         check(!chast::parse_input_event(payload, dropped, &error), what);
     };
     rejects(std::vector<uint8_t>(8), "short InputEvent is rejected");
+    rejects(std::vector<uint8_t>(17), "trailing InputEvent bytes are rejected");
+    auto bad_gesture = payload_of(chast::make_input_event(gesture));
+    bad_gesture[2] = 1;
+    rejects(bad_gesture, "gesture cannot smuggle mouse buttons");
+    bad_gesture = payload_of(chast::make_input_event(gesture));
+    bad_gesture[12] = 1;
+    rejects(bad_gesture, "gesture cannot smuggle a HID key");
+    gesture.gesture.x = 1;
+    rejects(payload_of(chast::make_input_event(gesture)), "zoom has no horizontal delta");
+    gesture.gesture = {chast::GestureAction::Pan, 0, chast::kMaxGestureDelta + 1};
+    rejects(payload_of(chast::make_input_event(gesture)), "gesture amplification is bounded");
+    gesture.gesture = {chast::GestureAction::Pan, 0, 0};
+    rejects(payload_of(chast::make_input_event(gesture)), "empty gesture is rejected");
+    gesture.gesture = {static_cast<chast::GestureAction>(2), 0, 120};
+    rejects(payload_of(chast::make_input_event(gesture)), "unknown gesture action is rejected");
 
     const std::vector<uint8_t> body = payload_of(chast::make_input_event(mouse));
     std::vector<uint8_t> unknown_kind = body;
@@ -2263,6 +2292,78 @@ void test_injector_dry_run() {
         event.modifiers = modifiers;
         return event;
     };
+
+    // One viewer releasing Ctrl must not lift it while another viewer holds it.
+    {
+        auto first = chast::InputInjector::create(true, &error);
+        auto second = chast::InputInjector::create(true, &error);
+        check(first && second, "two independent input injectors start");
+        if (first && second) {
+            auto wait = [](const std::function<bool()>& ready) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (!ready() && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                return ready();
+            };
+            first->submit(key(0xE0, chast::KeyAction::Down, chast::kModifierLeftCtrl));
+            check(wait([&]{ return first->stats().applied == 1; }), "first viewer presses Ctrl");
+            second->submit(key(0xE0, chast::KeyAction::Down, chast::kModifierLeftCtrl));
+            check(wait([&]{ return second->stats().applied == 1; }) &&
+                  second->stats().shared_suppressed == 1,
+                  "second viewer owns Ctrl without injecting a second physical down");
+            first->release_held();
+            check(wait([&]{ return first->stats().applied == 2; }) &&
+                  first->stats().shared_suppressed == 1,
+                  "revoking first viewer input preserves the other viewer's held Ctrl");
+            second->release_held();
+            check(wait([&]{ return second->stats().applied == 2; }) &&
+                  second->stats().shared_suppressed == 1,
+                  "the final owner injects the physical key release");
+        }
+    }
+
+    // A pinch must release its synthetic Ctrl immediately, even without an
+    // end event; another viewer's physical Ctrl must remain held.
+    {
+        auto gesture_input = chast::InputInjector::create(true, &error);
+        auto other = chast::InputInjector::create(true, &error);
+        if (gesture_input && other) {
+            chast::InputEvent zoom;
+            zoom.kind = chast::InputKind::Gesture;
+            zoom.gesture = {chast::GestureAction::Zoom, 0, 120};
+            gesture_input->submit(zoom);
+            gesture_input->stop();
+            check(gesture_input->stats().applied == 3,
+                  "pinch injects Ctrl down, wheel and immediate Ctrl up with no cleanup key");
+            other->submit(key(0xE0, chast::KeyAction::Down, chast::kModifierLeftCtrl));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (other->stats().applied == 0 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            gesture_input = chast::InputInjector::create(true, &error);
+            if (gesture_input) {
+                gesture_input->submit(zoom);
+                gesture_input->stop();
+                check(gesture_input->stats().applied == 3 &&
+                      gesture_input->stats().shared_suppressed == 2,
+                      "pinch preserves another session's held Ctrl");
+                other->stop();
+                check(other->stats().applied == 2 && other->stats().shared_suppressed == 0,
+                      "physical Ctrl still belongs to its viewer after the pinch");
+            }
+        }
+        auto input = chast::InputInjector::create(true, &error);
+        if (input) {
+            chast::InputEvent pan;
+            pan.kind = chast::InputKind::Gesture;
+            pan.gesture = {chast::GestureAction::Pan, -80, 50};
+            input->submit(pan);
+            pan.gesture.y = chast::kMaxGestureDelta + 1;
+            input->submit(pan);
+            input->stop();
+            check(input->stats().applied == 2 && input->stats().rejected == 1,
+                  "pan injects both axes; malformed gesture never reaches the OS");
+        }
+    }
 
     // A coherent chord needs exactly one injection per event.
     {
@@ -3164,6 +3265,104 @@ int main(int argc, char** argv) {
     test_restart();
     test_stream_options();
     test_privacy_mode();
+    {
+        chast::DisplayControlRequest request;
+        for (const auto action : {chast::DisplayControlAction::Query, chast::DisplayControlAction::SetCount,
+                                 chast::DisplayControlAction::Restore, chast::DisplayControlAction::SelectPrivacy}) {
+            const uint8_t value = action == chast::DisplayControlAction::SetCount ? 4 : 0;
+            check(chast::parse_display_control(payload_of(chast::make_display_control({action, value})), request)
+                  && request.action == action && request.value == value, "display control request round-trips");
+        }
+        for (const std::vector<uint8_t> invalid : {std::vector<uint8_t>{}, {4, 0}, {1, 5}, {3, 2}, {0, 1}, {2, 1}, {1}, {1, 1, 0}})
+            check(!chast::parse_display_control(invalid, request), "invalid display action/value/length rejected");
+        chast::DisplayControlState state{true, true, 4, chast::PrivacyImplementation::VirtualDisplay,
+                                       chast::DisplayControlCode::Failed, "GPU preflight failed"}, decoded;
+        state.outputs = {{31, true}, {7, false}};
+        check(chast::parse_display_control(payload_of(chast::make_display_control(
+                  {chast::DisplayControlAction::ToggleOutput, 0, 31})), request) &&
+              request.target == 31 && request.value == 0, "targeted display request carries stable identity");
+        check(chast::make_display_control({chast::DisplayControlAction::ToggleOutput, 1, 0}).empty() &&
+              chast::make_display_control({chast::DisplayControlAction::SetCount, 1, 31}).empty(),
+              "target is required only for a targeted action");
+        for (const std::vector<uint8_t> invalid : {std::vector<uint8_t>{5,0,0,0,0,0}, {1,5,0,0,0,0},
+                 {3,2,0,0,0,0}, {0,1,0,0,0,0}, {2,1,0,0,0,0}, {4,2,1,0,0,0}})
+            check(!chast::parse_display_control(invalid, request), "invalid six-byte display request rejected");
+        const auto payload = payload_of(chast::make_display_control_state(state));
+        check(chast::parse_display_control_state(payload, decoded) && decoded.supported && decoded.managed &&
+              decoded.count == 4 && decoded.privacy == state.privacy && decoded.code == state.code &&
+              decoded.reason == state.reason, "display result preserves actual layout and failure");
+        check(decoded.outputs.size() == 2 && decoded.outputs[0].id == 31 && decoded.outputs[0].active &&
+              decoded.outputs[1].id == 7 && !decoded.outputs[1].active, "display identity list survives reordering");
+        auto duplicate = state;
+        duplicate.outputs[1].id = 31;
+        check(chast::make_display_control_state(duplicate).empty(), "encoder rejects duplicate output identities");
+        auto bad_output = payload;
+        const size_t entry = 8 + state.reason.size();
+        std::copy(bad_output.begin() + entry, bad_output.begin() + entry + 4, bad_output.begin() + entry + 5);
+        check(!chast::parse_display_control_state(bad_output, decoded), "decoder rejects duplicate output identities");
+        bad_output = payload; bad_output[entry + 4] = 2;
+        check(!chast::parse_display_control_state(bad_output, decoded), "decoder rejects invalid output activation flag");
+        for (size_t field = 0; field < 5; ++field) {
+            auto invalid = payload; invalid[field] = 255;
+            check(!chast::parse_display_control_state(invalid, decoded), "invalid display state field rejected");
+        }
+        auto invalid = payload; invalid.push_back(0);
+        check(!chast::parse_display_control_state(invalid, decoded), "trailing display state data rejected");
+        invalid = payload; invalid[7] = 255;
+        check(!chast::parse_display_control_state(invalid, decoded), "malformed display UTF-8 rejected");
+    }
+    {
+        bool enabled = false;
+        std::string reason, error;
+        chast::LockAfterSessionCode code = chast::LockAfterSessionCode::Ok;
+        check(chast::parse_set_lock_after_session(payload_of(chast::make_set_lock_after_session(true)),
+              enabled, &error) && enabled, "lock after session request round-trips");
+        check(!chast::parse_set_lock_after_session({2}, enabled, &error) &&
+              !chast::parse_set_lock_after_session({1, 0}, enabled, &error) &&
+              !chast::parse_set_lock_after_session({}, enabled, &error),
+              "invalid lock flags and trailing request data are rejected");
+        const auto state = payload_of(chast::make_lock_after_session_state(false,
+            chast::LockAfterSessionCode::Denied, "input permission required"));
+        check(chast::parse_lock_after_session_state(state, enabled, code, reason, &error) &&
+              !enabled && code == chast::LockAfterSessionCode::Denied && reason == "input permission required",
+              "lock refusal preserves state and reason");
+        auto invalid = state;
+        invalid[0] = 2;
+        check(!chast::parse_lock_after_session_state(invalid, enabled, code, reason, &error), "invalid lock state flag rejected");
+        invalid = state; invalid[1] = 255;
+        check(!chast::parse_lock_after_session_state(invalid, enabled, code, reason, &error), "unknown lock result rejected");
+        invalid = state; invalid.push_back(0);
+        check(!chast::parse_lock_after_session_state(invalid, enabled, code, reason, &error), "trailing lock result data rejected");
+    }
+    {
+        bool enabled = false;
+        std::string reason, error;
+        chast::BlockInputCode code = chast::BlockInputCode::Ok;
+        check(chast::parse_set_block_input(payload_of(chast::make_set_block_input(true)),
+                                           enabled, &error) && enabled,
+              "local input block request round-trips");
+        check(!chast::parse_set_block_input({2}, enabled, &error) &&
+                  !chast::parse_set_block_input({1, 0}, enabled, &error),
+              "malformed local input block requests are rejected");
+        check(chast::parse_block_input_state(payload_of(chast::make_block_input_state(
+                  true, chast::BlockInputCode::Failed, "release failed")),
+                  enabled, code, reason, &error) && enabled &&
+                  code == chast::BlockInputCode::Failed && reason == "release failed",
+              "failed unblock preserves the actual blocked state");
+        auto injector = chast::InputInjector::create(true, &error);
+        check(injector != nullptr, "create dry-run input injector for local blocking");
+        if (injector) {
+            check(injector->block_local_input(true, &error) && injector->local_input_blocked(),
+                  "input thread acknowledges enabling local block");
+            check(injector->block_local_input(false, &error) && !injector->local_input_blocked(),
+                  "input thread acknowledges releasing local block");
+            check(injector->block_local_input(true, &error), "enable before teardown");
+            injector->stop();
+            check(!injector->local_input_blocked(), "teardown releases local block");
+            check(!injector->block_local_input(true, &error),
+                  "stopped injector cannot enable a local block");
+        }
+    }
     test_display_switch();
     test_display_modes();
     test_file_transfer();

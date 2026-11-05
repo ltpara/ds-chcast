@@ -503,6 +503,10 @@ bool sha256_file(const std::string& utf8_path, uint64_t& size,
 }
 
 struct FileReceiver::Impl {
+    HANDLE reservation = INVALID_HANDLE_VALUE;
+    ~Impl() {
+        if (reservation != INVALID_HANDLE_VALUE) CloseHandle(reservation);
+    }
     std::wstring directory;
     std::wstring final_name;
     std::wstring final_path;
@@ -898,6 +902,20 @@ std::unique_ptr<FileReceiver> FileReceiver::create(const FileReceiveOptions& opt
     impl.final_path = join(final_directory, impl.final_name);
     impl.part_path = impl.final_path + L".part";
     impl.sidecar_path = impl.part_path + L".chast";
+    // Hold the destination across resume validation, data writes and rename.
+    // A competing session must never remove an active transfer's sidecar.
+    const auto reservation_path = impl.sidecar_path + L".lock";
+    if (is_reparse_point(reservation_path)) {
+        if (error) *error = "the receive reservation is a reparse point";
+        return nullptr;
+    }
+    impl.reservation = CreateFileW(long_path(reservation_path).c_str(), GENERIC_WRITE,
+        0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE |
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (impl.reservation == INVALID_HANDLE_VALUE) {
+        if (error) *error = "another transfer owns the receive destination";
+        return nullptr;
+    }
 
     if (is_reparse_point(impl.part_path) || is_reparse_point(impl.sidecar_path)) {
         if (error) {
@@ -1050,6 +1068,15 @@ bool FileReceiver::write(const uint8_t* data, size_t size, std::string* error) {
 
 bool FileReceiver::finish(std::string& final_path, std::string* error) {
     Impl& impl = *impl_;
+    struct ReleaseReservation {
+        HANDLE& handle;
+        ~ReleaseReservation() {
+            if (handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(handle);
+                handle = INVALID_HANDLE_VALUE;
+            }
+        }
+    } reservation{impl.reservation};
     final_path.clear();
     if (impl.file == INVALID_HANDLE_VALUE) {
         if (error) {
@@ -1116,9 +1143,13 @@ void FileReceiver::abort(bool keep_partial) {
         CloseHandle(impl.file);
         impl.file = INVALID_HANDLE_VALUE;
     }
-    if (!keep_partial) {
+    if (!keep_partial && impl.reservation != INVALID_HANDLE_VALUE) {
         DeleteFileW(long_path(impl.part_path).c_str());
         DeleteFileW(long_path(impl.sidecar_path).c_str());
+    }
+    if (impl.reservation != INVALID_HANDLE_VALUE) {
+        CloseHandle(impl.reservation);
+        impl.reservation = INVALID_HANDLE_VALUE;
     }
 }
 

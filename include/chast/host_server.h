@@ -4,15 +4,16 @@
 // per-session handshake, packaged so the command-line tool and the tray
 // application run the same code.
 //
-// One HostServer owns one listener and serves viewers in sequence. A viewer
+// One HostServer owns one listener and admits up to max_sessions viewers. A viewer
 // picks a display in Hello; the capturer and encoder are created after the
 // handshake so the announcement describes the output that is actually read.
 // When the viewer leaves, the connection is closed and the listener stays up
 // for the next one. In one-time token mode the token is rotated after every
 // accepted session, so a spent token never guards the next connection.
 //
-// Everything runs on one host thread; callbacks are invoked from it and must
-// return promptly. status() may be read from any thread.
+// Authentication and approval run on the listener thread; admitted sessions
+// have separate workers. Media callbacks may run concurrently and must return
+// promptly. status() and the per-session operator methods are thread-safe.
 
 #include <array>
 #include <atomic>
@@ -181,6 +182,8 @@ struct HostServerStats {
 };
 
 struct HostStatus {
+    uint64_t session_id = 0;
+    uint32_t active_sessions = 0;
     HostState state = HostState::Stopped;
     std::string fingerprint;  // SHA-256 of the certificate this host presents
     std::string token;        // the token CLI/automation has to send
@@ -225,6 +228,9 @@ struct HostStatus {
 
 struct HostServerConfig {
     HostSettings settings;
+    // Includes viewers still authenticating. Each admitted viewer owns its
+    // capture, encoder, transfers and terminal state. serve_once keeps one.
+    uint16_t max_sessions = 1;
     // The tray keeps its identity in the user's store; the Windows service
     // worker uses the machine store so the fingerprint survives logins.
     IdentityScope identity_scope = IdentityScope::CurrentUser;
@@ -313,6 +319,7 @@ struct HostServerConfig {
     // Called on the host thread for every ChatMessage the viewer sent. The
     // operator UI appends it to the chat window; the message is not echoed.
     std::function<void(const std::string&)> chat_message;
+    std::function<void(uint64_t, const std::string&)> session_chat_message;
     // Called on the host thread for every composed text block the injector
     // accepted (protocol v36). The text has already been queued for Unicode
     // injection; the hook is for diagnostics and the loopback check.
@@ -339,6 +346,10 @@ struct HostServerConfig {
     // substitutes a callback so an automated run never reboots the operator's
     // machine. Returning false fills the reason and reports Failed.
     std::function<bool(std::string*)> restart_system;
+    // Requests a workstation lock after the last desktop viewer leaves.
+    // Empty calls LockWorkStation. Tests substitute this callback so they do
+    // not lock the operator out. Runs under desktop coordination; no reentry.
+    std::function<bool(std::string*)> lock_workstation;
 };
 
 class HostServer {
@@ -362,6 +373,12 @@ public:
     bool running() const;
 
     HostStatus status() const;
+    std::vector<HostStatus> sessions() const;
+    bool disconnect_session(uint64_t session_id);
+    bool set_session_permissions(uint64_t session_id, uint16_t permissions);
+    bool send_session_chat(uint64_t session_id, const std::string& text);
+    bool start_session_file_download(uint64_t session_id, const std::string& path,
+                                     std::string* error);
     // The token CLI/automation needs right now. Rotates after a one-time
     // session.
     std::string token() const;
@@ -400,6 +417,7 @@ private:
         : config_(std::move(config)), settings_(config_.settings) {}
 
     void run();
+    void run_listener();
     bool open_session(std::string* error);
     // Serves the connected viewer until the peer leaves, the run ends or an
     // error stops it. Returns false only for a failure, not for a normal
@@ -443,6 +461,29 @@ private:
     std::atomic<bool> stopping_{false};
     std::atomic<bool> running_{false};
     bool started_ = false;
+    bool admitted_ = false;
+    uint64_t session_id_ = 0;
+    uint64_t next_session_id_ = 1;
+    mutable std::mutex sessions_mutex_;
+    std::vector<std::unique_ptr<HostServer>> sessions_;
+    uint64_t completed_sessions_ = 0;
+    std::atomic<uint16_t> global_permissions_{kPermissionAll};
+    // Parent-owned under sessions_mutex_: independent operator restrictions
+    // survive unrelated global gate changes.
+    uint16_t session_permission_limit_ = kPermissionAll;
+    // Protected by desktop_->mutex, including synchronous operator revocation.
+    bool lock_after_session_ = false;
+    bool lock_after_session_revoked_ = false;
+    uint16_t lock_permission_limit_ = kPermissionAll;
+    struct DesktopCoordination {
+        std::mutex mutex;
+        size_t users = 0;
+        uint64_t exclusive_owner = 0;
+        uint64_t mode_owner = 0;
+        uint64_t topology_owner = 0;
+        bool lock_pending = false;
+    };
+    std::shared_ptr<DesktopCoordination> desktop_ = std::make_shared<DesktopCoordination>();
 
     // Owned by the host thread after start(); created in create().
     std::unique_ptr<QuicSession> session_;

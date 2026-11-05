@@ -543,6 +543,19 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_privacy_mode)) {
                 warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
             }
+        } else if (key == "privacy_mode_impl") {
+            const auto impl = lower(value);
+            if (impl == "overlay" || impl == "virtual_display") {
+                settings.privacy_mode_impl = impl;
+            } else {
+                // A typo must not silently select a different privacy policy.
+                settings.privacy_mode_impl = "invalid";
+                warn(result.warning, "privacy_mode_impl must be overlay or virtual_display");
+            }
+        } else if (key == "block_input") {
+            if (!parse_bool(value, settings.allow_block_input)) {
+                warn(result.warning, "block_input '" + value + "' is not a boolean");
+            }
         } else if (key == "restart") {
             if (!parse_bool(value, settings.allow_restart)) {
                 warn(result.warning, "restart '" + value + "' is not a boolean");
@@ -874,6 +887,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_camera ? kPermissionCamera : 0) |
         (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0) |
         (settings.allow_restart ? kPermissionRestart : 0) |
+        (settings.allow_block_input ? kPermissionBlockInput : 0) |
         (settings.allow_record ? kPermissionRecord : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
@@ -904,7 +918,9 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "audio_silence_gate_ms=" << settings.audio_silence_gate_ms << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
+         << "privacy_mode_impl=" << settings.privacy_mode_impl << "\n"
          << "restart=" << (settings.allow_restart ? 1 : 0) << "\n"
+         << "block_input=" << (settings.allow_block_input ? 1 : 0) << "\n"
          << "auto_disconnect_minutes=" << settings.auto_disconnect_minutes << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="

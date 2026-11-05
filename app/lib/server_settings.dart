@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'package:chast_viewer/l10n.dart';
@@ -130,12 +131,12 @@ class ServerSettings {
   }
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'url': url,
-        'mode': mode.name,
-        'key': key,
-        'socks5': socks5,
-        'upload_recordings': uploadRecordings,
-      };
+    'url': url,
+    'mode': mode.name,
+    'key': key,
+    'socks5': socks5,
+    'upload_recordings': uploadRecordings,
+  };
 
   static ServerSettings fromJson(Object? value) {
     if (value is! Map) {
@@ -146,8 +147,7 @@ class ServerSettings {
       url: url,
       mode: TunnelModeName.parse(value['mode']),
       key: value['key']?.toString().trim() ?? '',
-      socks5:
-          Socks5Proxy.normalize(value['socks5']?.toString() ?? '') ?? '',
+      socks5: Socks5Proxy.normalize(value['socks5']?.toString() ?? '') ?? '',
       uploadRecordings: value['upload_recordings'] == true,
     );
   }
@@ -170,28 +170,32 @@ class ServerSettingsStore {
   }
 
   Future<ServerSettings> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return const ServerSettings();
-    }
-    try {
-      return ServerSettings.fromJson(jsonDecode(await file.readAsString()));
-    } catch (_) {
-      return const ServerSettings();
-    }
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
+        return const ServerSettings();
+      }
+      try {
+        return ServerSettings.fromJson(jsonDecode(await file.readAsString()));
+      } catch (_) {
+        return const ServerSettings();
+      }
+    });
   }
 
   Future<void> save(ServerSettings settings) async {
-    final File? file = _file();
-    if (file == null) {
-      return;
-    }
-    try {
-      await file.parent.create(recursive: true);
-      await file.writeAsString(jsonEncode(settings.toJson()));
-    } catch (_) {
-      // The address book still works against per-device servers; a lost
-      // default only costs retyping the URL next time.
-    }
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null) {
+        return;
+      }
+      try {
+        await file.parent.create(recursive: true);
+        await file.writeAsString(jsonEncode(settings.toJson()));
+      } catch (_) {
+        // The address book still works against per-device servers; a lost
+        // default only costs retyping the URL next time.
+      }
+    });
   }
 }

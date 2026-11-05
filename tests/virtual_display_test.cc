@@ -750,6 +750,25 @@ bool set_users_write_acl(const std::filesystem::path& path) {
 }
 
 bool set_legacy_record_acl(const std::filesystem::path& path) {
+    // SetSecurityInfo may resolve CREATOR OWNER to the current file owner.
+    // Explicitly emulate an old file owned by the installing user's SID,
+    // rather than inheriting Administrators ownership from our hardened dir.
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    std::vector<unsigned char> buffer(bytes);
+    const bool got_user = bytes != 0 &&
+        GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes) != FALSE;
+    CloseHandle(token);
+    if (!got_user || SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+            reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, nullptr, nullptr,
+            nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
     return set_protected_dacl(path,
                               L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)(A;;GR;;;BU)");
 }
@@ -830,6 +849,53 @@ void test_default_package_dir() {
           "the default package directory is drivers\\usbmmidd_v2 next to the executable");
 }
 
+void test_install_activation_record() {
+    TempDir temp;
+    ScopedProgramData program_data(temp.path);
+    std::string error;
+    if (!chast::harden_virtual_display_state_directory(&error)) {
+        check(!error.empty(), "install-record test explains unavailable hardening");
+        return;
+    }
+    FakeProvider provider;
+    provider.current = installed_status(0);
+    provider.count_result = false;
+    chast::VirtualDisplayInstallRecord record;
+    record.owned = true;
+    record.installed_at = chast::virtual_display_timestamp_utc();
+    check(chast::finish_virtual_display_install(provider, record, 1, &error) ==
+              chast::kVdisplayExitNoDevice,
+          "activation failure returns the no-device exit code");
+    chast::VirtualDisplayInstallRecord saved;
+    check(chast::read_install_record(&saved) && saved.owned &&
+              contains(saved.last_error, "deviceinstaller refused"),
+          "activation failure retains ownership and its error for uninstall");
+    provider.count_result = true;
+    check(chast::finish_virtual_display_install(provider, saved, 1, &error) ==
+              chast::kVdisplayExitOk && chast::read_install_record(&saved) &&
+              saved.owned && saved.last_error.empty(),
+          "activation retry preserves ownership and clears the error");
+    record.owned = false;
+    provider.count_result = false;
+    check(chast::finish_virtual_display_install(provider, record, 1, &error) ==
+              chast::kVdisplayExitNoDevice && chast::read_install_record(&saved) &&
+              !saved.owned,
+          "failed activation never claims a third-party driver");
+    // Deny replacement by keeping the existing record open without delete
+    // sharing. No real driver is touched by this fake provider.
+    const auto state = temp.path / L"chast" / L"virtual-display.json";
+    HANDLE locked = CreateFileW(state.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(locked != INVALID_HANDLE_VALUE, "the ownership record can be locked");
+    if (locked != INVALID_HANDLE_VALUE) {
+        const int previous_calls = provider.count_calls;
+        check(chast::finish_virtual_display_install(provider, record, 1, &error) ==
+                  chast::kVdisplayExitInstall && provider.count_calls == previous_calls,
+              "a record write failure prevents activation and reports failure");
+        CloseHandle(locked);
+    }
+}
+
 void test_vdisplay_cli() {
     chast::VdisplayCommand command = chast::parse_vdisplay_command(
         {L"install", L"--package", L"C:\\chast\\drivers\\usbmmidd_v2", L"--count", L"3"});
@@ -884,8 +950,45 @@ void test_vdisplay_status_command() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Optional real vendor fixture; no driver is installed or executed.
+    if (argc == 3 && std::string(argv[1]) == "--reviewed-package") {
+        const std::filesystem::path source(argv[2]);
+        std::string detail;
+        chast::VirtualDisplayPackageGuard guard;
+        check(chast::verify_virtual_display_package(source.wstring(), &detail, nullptr, nullptr, &guard)
+              == chast::VirtualDisplayPackageStatus::Ok && guard.active(),
+              "reviewed unsigned helper and signed driver payload verify under the file guard");
+        guard.reset();
+        TempDir temp;
+        const auto copy = temp.path / "package";
+        std::filesystem::copy(source, copy, std::filesystem::copy_options::recursive);
+        check(set_protected_dacl(copy, L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"),
+              "temporary package ACL is protected");
+        const auto original_manifest = read_all(copy / "manifest.sha256");
+        std::vector<chast::VirtualDisplayManifestEntry> entries;
+        check(chast::parse_virtual_display_manifest(original_manifest, &entries, &detail), "vendor manifest parses");
+        for (const char* name : {"deviceinstaller64.exe", "usbmmidd.inf", "usbmmidd.cat", "x64/usbmmidd.dll"}) {
+            const auto file = copy / name;
+            const auto original = read_all(file);
+            write_bytes(file, original + "tampered");
+            check(chast::verify_virtual_display_package(copy.wstring(), &detail) == chast::VirtualDisplayPackageStatus::HashMismatch,
+                  "modified vendor payload is rejected");
+            std::string manifest;
+            for (const auto& entry : entries) {
+                std::string hash;
+                chast::sha256_file_hex((copy / entry.path).wstring(), &hash, &detail);
+                manifest += hash + "  " + entry.path + "\n";
+            }
+            write_bytes(copy / "manifest.sha256", manifest);
+            check(chast::verify_virtual_display_package(copy.wstring(), &detail) == chast::VirtualDisplayPackageStatus::SignatureMismatch,
+                  "rewriting the manifest cannot authorize an altered unsigned vendor package");
+            write_bytes(file, original);
+            write_bytes(copy / "manifest.sha256", original_manifest);
+        }
+        return failures ? 1 : 0;
+    }
     test_platform();
     test_classification();
     test_mode_selection();
@@ -899,6 +1002,7 @@ int main() {
     test_package_reparse();
     test_install_record();
     test_state_directory_security();
+    test_install_activation_record();
     test_default_package_dir();
     test_vdisplay_cli();
     test_vdisplay_status_command();

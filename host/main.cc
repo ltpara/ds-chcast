@@ -95,6 +95,7 @@ enum ControlId {
     kRecordCheck,
     kCameraCheck,
     kRestartCheck,
+    kBlockInputCheck,
     kSendFileButton,
     kAudioCheck,
     kMicrophoneCheck,
@@ -105,6 +106,8 @@ enum ControlId {
     kFirewallButton,
     kVdisplayInstallButton,
     kVdisplayUninstallButton,
+    kVdisplayEnableButton,
+    kVdisplayDisableButton,
     kOpenConfigButton,
     kToggleButton,
     kTunnelSettingsButton,
@@ -166,6 +169,7 @@ struct HostApp {
     bool startup_created = false;
     std::string startup_save_error;
     std::unique_ptr<HostServer> server;
+    uint64_t selected_session = 0;
     TunnelProcess tunnel;
     std::mutex tunnel_mutex;
     std::deque<TunnelEvent> tunnel_events;
@@ -180,6 +184,7 @@ struct HostApp {
     HWND chat_history = nullptr;
     HWND chat_input = nullptr;
     bool chat_live = false;
+    uint64_t chat_target = 0;
     std::deque<std::wstring> chat_lines;
 };
 
@@ -337,6 +342,7 @@ struct ApprovalDialogState {
     HWND privacy = nullptr;
     HWND record = nullptr;
     HWND restart = nullptr;
+    HWND block_input = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
@@ -375,6 +381,7 @@ void finish_approval(ApprovalDialogState& dialog, bool allowed) {
         narrow(dialog.privacy, kPermissionPrivacyMode);
         narrow(dialog.record, kPermissionRecord);
         narrow(dialog.restart, kPermissionRestart);
+        narrow(dialog.block_input, kPermissionBlockInput);
         dialog.result = mask;
     }
     if (dialog.window != nullptr) {
@@ -489,7 +496,9 @@ ClientApproval server_approve(const ClientRequest& request) {
     const wchar_t* privacy_text = tr(L"隐私模式（黑屏）");
     const wchar_t* record_text = tr(L"查看者录制会话");
     const wchar_t* restart_text = tr(L"远程重启");
-    const int column1 = std::max(130, std::max(check_px(input_text), check_px(file_text)));
+    const wchar_t* block_input_text = tr(L"禁用本地键鼠");
+    const int column1 = std::max(130, std::max(check_px(block_input_text),
+                                              std::max(check_px(input_text), check_px(file_text))));
     const int column2 = std::max(130, std::max(check_px(clipboard_text), check_px(microphone_text)));
     const int column3 =
         std::max(130, std::max(check_px(audio_text),
@@ -585,11 +594,14 @@ ClientApproval server_approve(const ClientRequest& request) {
     dialog.restart = permission_check(restart_text, kPermissionRestart, third, column3, 216,
                                       kApprovalRestart);
 
+    dialog.block_input = permission_check(block_input_text, kPermissionBlockInput,
+                                           20, column1, 268, kBlockInputCheck);
+
     const int deny_left = dialog_width - 20 - 90;
     const int allow_left = deny_left - 10 - 90;
-    add(L"BUTTON", tr(L"允许"), BS_DEFPUSHBUTTON | WS_TABSTOP, allow_left, 278, 90, 32,
+    add(L"BUTTON", tr(L"允许"), BS_DEFPUSHBUTTON | WS_TABSTOP, allow_left, 300, 90, 32,
         kApprovalAllow, nullptr);
-    add(L"BUTTON", tr(L"拒绝"), BS_PUSHBUTTON | WS_TABSTOP, deny_left, 278, 90, 32, kApprovalDeny,
+    add(L"BUTTON", tr(L"拒绝"), BS_PUSHBUTTON | WS_TABSTOP, deny_left, 300, 90, 32, kApprovalDeny,
         nullptr);
 
     SetTimer(window, 1, 200, nullptr);
@@ -699,6 +711,7 @@ void start_server() {
         return;
     }
     HostServerConfig config;
+    config.max_sessions = 8;
     config.settings = g_app->settings;
     config.audio_silence_gate_ms = g_app->settings.audio_silence_gate_ms;
     config.serve_once = false;
@@ -710,6 +723,9 @@ void start_server() {
     config.token_changed = server_token_changed;
     config.trusted_devices_changed = server_trusted_devices_changed;
     config.chat_message = server_chat;
+    config.session_chat_message = [](uint64_t id, const std::string& text) {
+        server_chat("[" + std::to_string(id) + "] " + text);
+    };
     std::string error;
     g_app->server = HostServer::create(std::move(config), &error);
     if (!g_app->server) {
@@ -898,6 +914,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionCamera) != 0) {
         add(tr(L"摄像头"));
     }
+    if ((mask & kPermissionBlockInput) != 0) {
+        add(tr(L"禁用本地键鼠"));
+    }
     if ((mask & kPermissionRestart) != 0) {
         add(tr(L"远程重启"));
     }
@@ -918,6 +937,7 @@ uint16_t current_gate_mask() {
                                  (g_app->settings.allow_terminal ? kPermissionTerminal : 0) |
                                  (g_app->settings.allow_record ? kPermissionRecord : 0) |
                                  (g_app->settings.allow_camera ? kPermissionCamera : 0) |
+                                 (g_app->settings.allow_block_input ? kPermissionBlockInput : 0) |
                                  (g_app->settings.allow_restart ? kPermissionRestart : 0));
 }
 
@@ -945,6 +965,41 @@ std::wstring session_permission_text(const HostStatus& status) {
     return text;
 }
 
+// Keep credentials and listener status from the parent, while displaying the
+// explicitly selected viewer's media and permissions.
+void select_status(HostStatus& status, const std::vector<HostStatus>& peers) {
+    if (peers.empty()) {
+        g_app->selected_session = 0;
+        status.session_id = 0;
+        return;
+    }
+    if (!g_app->selected_session && peers.size() == 1) {
+        g_app->selected_session = peers.front().session_id;
+    }
+    for (const auto& peer : peers) {
+        if (peer.session_id != g_app->selected_session) continue;
+        status.session_id = peer.session_id;
+        status.peer_address = peer.peer_address;
+        status.session_permissions = peer.session_permissions;
+        status.stream = peer.stream;
+        const auto total = status.stats.sessions;
+        status.stats = peer.stats;
+        status.stats.sessions = total;
+        status.display_name = peer.display_name;
+        status.display_index = peer.display_index;
+        status.download_active = peer.download_active;
+        status.download_name = peer.download_name;
+        status.download_size = peer.download_size;
+        status.download_sent = peer.download_sent;
+        status.download_error = peer.download_error;
+        return;
+    }
+    status.peer_address.clear();
+    status.session_id = 0;
+    status.session_permissions = 0;
+    status.stream = {};
+}
+
 // Reads the live state and updates every label. Called on a timer, so it only
 // writes text that changed: rewriting an edit would clear a selection the
 // operator is about to copy.
@@ -952,11 +1007,12 @@ void refresh_ui() {
     HostStatus status;
     if (g_app->server) {
         status = g_app->server->status();
+        select_status(status, g_app->server->sessions());
     }
     const bool running = g_app->server && g_app->server->running();
 
-    // Chat history belongs to one viewer: clear it when a session starts so a
-    // later viewer never sees the previous conversation.
+    // Host chat history labels each peer. Clear the previous connection group's
+    // history when the next group starts.
     const bool streaming = g_app->server != nullptr && status.state == HostState::Streaming;
     if (streaming != g_app->chat_live) {
         g_app->chat_live = streaming;
@@ -968,11 +1024,25 @@ void refresh_ui() {
         }
     }
 
+    if (g_app->chat_target != status.session_id) {
+        g_app->chat_target = status.session_id;
+        if (g_app->chat_input) SetWindowTextW(g_app->chat_input, L"");
+    }
+    if (g_app->chat_window) {
+        const std::wstring title = std::wstring(tr(L"chast 会话聊天")) + L" · " +
+            (status.session_id ? L"#" + std::to_wstring(status.session_id)
+                               : std::wstring(tr(L"请从托盘选择查看者")));
+        set_text(g_app->chat_window, title);
+        EnableWindow(g_app->chat_input, status.session_id != 0);
+    }
+
     set_text(g_app->state_label, tr(L"状态：") + (g_app->server ? state_text(status.state, status)
                                                            : std::wstring(tr(L"已停止"))));
     set_text(g_app->peer_label,
-             tr(L"查看器：") + (status.peer_address.empty() ? std::wstring(L"—")
-                                                       : widen(status.peer_address)));
+             tr(L"查看器：") + std::to_wstring(status.active_sessions) + L" · " +
+             (status.active_sessions == 0 ? L"—"
+              : status.peer_address.empty() ? std::wstring(tr(L"请从托盘选择查看者"))
+                 : L"#" + std::to_wstring(status.session_id) + L" " + widen(status.peer_address)));
     if (status.stream.width > 0) {
         std::wstring stream = tr(L"画面：") + widen(status.display_name) + L" · " +
                               std::to_wstring(status.stream.width) + L"×" +
@@ -1368,16 +1438,21 @@ void send_chat_from_input() {
         append_chat_line(tr(L"系统：共享没有运行，消息未发送"));
         return;
     }
+    if (!g_app->selected_session) {
+        append_chat_line(tr(L"请从托盘选择查看者"));
+        return;
+    }
     const std::string text = trim_ascii(narrow(control_text(g_app->chat_input)));
     if (!valid_chat_text(text)) {
         append_chat_line(tr(L"系统：消息不能为空，最长 4096 字节"));
         return;
     }
-    if (!g_app->server->send_chat(text)) {
+    const bool sent = g_app->server->send_session_chat(g_app->selected_session, text);
+    if (!sent) {
         append_chat_line(tr(L"系统：没有正在连接的查看者，或待发队列已满"));
         return;
     }
-    append_chat_line(tr(L"[主机] ") + widen(text));
+    append_chat_line(std::wstring(tr(L"[主机] ")) + L"[" + std::to_wstring(g_app->selected_session) + L"] " + widen(text));
     SetWindowTextW(g_app->chat_input, L"");
     SetFocus(g_app->chat_input);
 }
@@ -1785,6 +1860,7 @@ enum SecurityDialogId {
     kSecAllowRecord,
     kSecAllowCamera,
     kSecAllowRestart,
+    kSecAllowBlockInput,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1799,6 +1875,7 @@ enum SecurityDialogId {
     kSecVirtualDisplayPolicy,
     kSecVirtualDisplayCount,
     kSecVirtualDisplayResolution,
+    kSecPrivacyImplementation,
     kSecSave,
     kSecCancel,
 };
@@ -1833,6 +1910,7 @@ struct SecurityDialogState {
     HWND allow_record = nullptr;
     HWND allow_camera = nullptr;
     HWND allow_restart = nullptr;
+    HWND allow_block_input = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -1847,6 +1925,7 @@ struct SecurityDialogState {
     HWND virtual_display_policy = nullptr;
     HWND virtual_display_count = nullptr;
     HWND virtual_display_resolution = nullptr;
+    HWND privacy_implementation = nullptr;
     // Parallel to the combo box: index 0 is the system default.
     std::vector<std::string> audio_device_ids;
     std::string selected_audio_device;
@@ -2064,9 +2143,12 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_record = is_checked(dialog.allow_record);
     updated.allow_camera = is_checked(dialog.allow_camera);
     updated.allow_restart = is_checked(dialog.allow_restart);
+    updated.allow_block_input = is_checked(dialog.allow_block_input);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
+    updated.privacy_mode_impl = SendMessageW(dialog.privacy_implementation, CB_GETCURSEL, 0, 0) == 1
+                                   ? "virtual_display" : "overlay";
     updated.allow_permission_change = is_checked(dialog.allow_change);
     updated.file_receive_directory = dialog.receive_directory;
 
@@ -2401,7 +2483,7 @@ bool edit_security_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 700 : 620;
     const int page_text_width = dialog_width - 80;
-    RECT frame{0, 0, px(dialog_width), px(668)};
+    RECT frame{0, 0, px(dialog_width), px(696)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -2434,7 +2516,7 @@ bool edit_security_settings(HostSettings& result) {
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12),
-                                 px(dialog_width - 32), px(588), window,
+                                 px(dialog_width - 32), px(620), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
@@ -2618,6 +2700,8 @@ bool edit_security_settings(HostSettings& result) {
         camera_left, 520, page_right - camera_left, 20, 0, nullptr, &dialog.access_page);
 
     const wchar_t* allow_restart_text = tr(L"允许远程重启");
+    dialog.allow_block_input = page_check(tr(L"允许查看器禁用本地键鼠"),
+                                           32, 572, kSecAllowBlockInput);
     dialog.allow_restart = page_check(allow_restart_text, 32, 544, kSecAllowRestart);
     const int restart_left = 32 + std::max(120, check_px(allow_restart_text)) + 10;
     add(L"STATIC", tr(L"允许查看器重启本机；重启会中断当前会话和本机上的工作。"), SS_LEFT, 0,
@@ -2714,15 +2798,27 @@ bool edit_security_settings(HostSettings& result) {
         virtual_display_text(probe_virtual_display());
     add(L"STATIC", virtual_display_line.c_str(), SS_LEFT | SS_ENDELLIPSIS, 0, 32, 568,
         page_text_width, 20, 0, nullptr, &dialog.advanced_page);
+    add(L"STATIC", tr(L"隐私方式"), SS_LEFT, 0, 32, 594, 100, 20, 0, nullptr,
+        &dialog.advanced_page);
+    dialog.privacy_implementation = add(L"COMBOBOX", L"",
+        CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP, WS_EX_CLIENTEDGE,
+        140, 590, page_text_width - 108, 150, kSecPrivacyImplementation, nullptr,
+        &dialog.advanced_page);
+    SendMessageW(dialog.privacy_implementation, CB_ADDSTRING, 0,
+        reinterpret_cast<LPARAM>(tr(L"黑色遮罩")));
+    SendMessageW(dialog.privacy_implementation, CB_ADDSTRING, 0,
+        reinterpret_cast<LPARAM>(tr(L"虚拟屏（关闭物理显示器）")));
 
     const int sec_cancel_left = dialog_width - 20 - 90;
-    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 616,
+    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 644,
         90, 32, kSecSave, nullptr, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 616, 90, 32,
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 644, 90, 32,
         kSecCancel, nullptr, nullptr);
 
     // ----- initial state -----
     const HostSettings& settings = g_app->settings;
+    SendMessageW(dialog.privacy_implementation, CB_SETCURSEL,
+                 settings.privacy_mode_impl == "virtual_display" ? 1 : 0, 0);
     SendMessageW(settings.auth_mode == HostAuthMode::Click ? dialog.mode_click
                                                            : settings.auth_mode ==
                                                                      HostAuthMode::Password
@@ -2738,6 +2834,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_record, settings.allow_record);
     set_check(dialog.allow_camera, settings.allow_camera);
     set_check(dialog.allow_restart, settings.allow_restart);
+    set_check(dialog.allow_block_input, settings.allow_block_input);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2886,6 +2983,33 @@ void show_tray_menu() {
         return;
     }
     AppendMenuW(menu, MF_STRING, kMenuShow, tr(L"显示 chast 主机"));
+    const auto peers = g_app->server ? g_app->server->sessions() : std::vector<HostStatus>{};
+    select_status(status, peers);
+    constexpr uint16_t session_bits[] = {kPermissionInput, kPermissionClipboard,
+        kPermissionFileTransfer, kPermissionAudio, kPermissionMicrophone,
+        kPermissionPortForward, kPermissionTerminal, kPermissionRecord,
+        kPermissionCamera, kPermissionPrivacyMode, kPermissionBlockInput,
+        kPermissionRestart};
+    if (!peers.empty()) {
+        HMENU viewers = CreatePopupMenu();
+        for (size_t i = 0; i < peers.size(); ++i) {
+            HMENU actions = CreatePopupMenu();
+            AppendMenuW(actions, MF_STRING |
+                (g_app->selected_session == peers[i].session_id ? MF_CHECKED : 0),
+                6000 + i * 16, tr(L"选择此会话（聊天和文件）"));
+            AppendMenuW(actions, MF_STRING, 6001 + i * 16, tr(L"断开此会话"));
+            AppendMenuW(actions, MF_SEPARATOR, 0, nullptr);
+            for (size_t bit = 0; bit < std::size(session_bits); ++bit) {
+                AppendMenuW(actions, MF_STRING |
+                    ((peers[i].session_permissions & session_bits[bit]) ? MF_CHECKED : 0),
+                    6002 + i * 16 + bit, permission_label(session_bits[bit]).c_str());
+            }
+            const std::wstring label = L"#" + std::to_wstring(peers[i].session_id) +
+                L" " + widen(peers[i].peer_address);
+            AppendMenuW(viewers, MF_POPUP, reinterpret_cast<UINT_PTR>(actions), label.c_str());
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(viewers), tr(L"连接中的查看者"));
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2904,13 +3028,15 @@ void show_tray_menu() {
                 kRecordCheck, tr(L"允许查看者录制会话"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_camera ? MF_CHECKED : 0),
                 kCameraCheck, tr(L"允许查看器串流本机摄像头"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_block_input ? MF_CHECKED : 0),
+                kBlockInputCheck, tr(L"允许查看器禁用本地键鼠"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_restart ? MF_CHECKED : 0),
                 kRestartCheck, tr(L"允许查看器重启本机"));
     const bool can_send = running && status.state == HostState::Streaming &&
                           (status.session_permissions & kPermissionFileTransfer) != 0;
     AppendMenuW(menu, MF_STRING | (can_send ? 0 : MF_GRAYED), kSendFileButton,
                 tr(L"发送文件到查看器…"));
-    const bool can_chat = running && status.state == HostState::Streaming;
+    const bool can_chat = running && status.state == HostState::Streaming && status.session_id != 0;
     AppendMenuW(menu, MF_STRING | (can_chat ? 0 : MF_GRAYED), kChatButton,
                 tr(L"与查看者聊天…"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_audio ? MF_CHECKED : 0), kAudioCheck,
@@ -2943,6 +3069,11 @@ void show_tray_menu() {
                vdisplay_status.state == VirtualDisplayState::Active) {
         VirtualDisplayInstallRecord record;
         const bool owned = read_install_record(&record) && record.owned;
+        const bool display_busy = session_is_live() || virtual_display_privacy_busy();
+        AppendMenuW(menu, MF_STRING | (display_busy ? MF_GRAYED : 0),
+                    kVdisplayEnableButton, tr(L"启用虚拟显示器（按配置数量）"));
+        AppendMenuW(menu, MF_STRING | (display_busy ? MF_GRAYED : 0),
+                    kVdisplayDisableButton, tr(L"停用虚拟显示器"));
         if (owned && session_is_live()) {
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
                         tr(L"卸载虚拟显示器（请先结束会话）"));
@@ -2962,9 +3093,24 @@ void show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kQuitButton, tr(L"退出"));
 
     SetForegroundWindow(g_app->window);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, point.x, point.y, 0,
-                   g_app->window, nullptr);
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON |
+        TPM_BOTTOMALIGN | TPM_LEFTALIGN, point.x, point.y, 0, g_app->window, nullptr);
     DestroyMenu(menu);
+    if (command >= 6000 && command < 6000 + peers.size() * 16 && g_app->server) {
+        const auto& peer = peers[(command - 6000) / 16];
+        const auto action = (command - 6000) % 16;
+        if (action == 0) {
+            g_app->selected_session = peer.session_id;
+        } else if (action == 1) {
+            g_app->server->disconnect_session(peer.session_id);
+        } else if (action - 2 < std::size(session_bits)) {
+            g_app->server->set_session_permissions(peer.session_id,
+                peer.session_permissions ^ session_bits[action - 2]);
+        }
+        refresh_ui();
+    } else if (command) {
+        SendMessageW(g_app->window, WM_COMMAND, command, 0);
+    }
     PostMessageW(g_app->window, WM_NULL, 0, 0);
 }
 
@@ -3080,7 +3226,10 @@ void handle_command(int id) {
                 break;
             }
             std::string error;
-            if (!g_app->server->start_file_download(narrow(path), &error)) {
+            const bool queued = g_app->selected_session
+                ? g_app->server->start_session_file_download(g_app->selected_session, narrow(path), &error)
+                : g_app->server->start_file_download(narrow(path), &error);
+            if (!queued) {
                 append_log_line(tr(L"无法发送文件：") + widen(error));
             } else {
                 append_log_line(tr(L"已排队发送：") + std::wstring(path));
@@ -3170,6 +3319,15 @@ void handle_command(int id) {
                 restart_server();
                 append_log_line(g_app->settings.allow_camera ? tr(L"摄像头已开启")
                                                              : tr(L"摄像头已关闭"));
+            }
+            break;
+        case kBlockInputCheck:
+            g_app->settings.allow_block_input = !g_app->settings.allow_block_input;
+            save_settings();
+            if (session_is_live()) {
+                g_app->server->set_permissions(current_gate_mask());
+            } else {
+                restart_server();
             }
             break;
         case kRestartCheck:
@@ -3346,6 +3504,25 @@ void handle_command(int id) {
             }
             MessageBoxW(g_app->window, message.c_str(), window_title(),
                         MB_ICONINFORMATION | MB_OK);
+            break;
+        }
+        case kVdisplayEnableButton:
+        case kVdisplayDisableButton: {
+            if (session_is_live() || virtual_display_privacy_busy()) {
+                MessageBoxW(g_app->window, tr(L"请先结束会话并等待显示恢复完成。"),
+                            window_title(), MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            const bool enable = id == kVdisplayEnableButton;
+            const std::wstring arguments = L"--vdisplay set-count " +
+                std::to_wstring(enable ? g_app->settings.virtual_display_monitors : 0);
+            bool cancelled = false;
+            std::string error;
+            const int code = chast::host::run_elevated(arguments, 180000, &cancelled, &error);
+            std::wstring message = code == 0 ? tr(L"虚拟显示器状态已更新。")
+                                            : tr(L"虚拟显示器操作未完成。");
+            if (code != 0) message += L"\n" + widen(error) + L"\n" + widen(virtual_display_log_tail());
+            MessageBoxW(g_app->window, message.c_str(), window_title(), MB_OK | MB_ICONINFORMATION);
             break;
         }
         case kVdisplayUninstallButton: {

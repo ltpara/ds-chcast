@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -305,185 +306,203 @@ class DeviceStore {
   }
 
   Future<List<Device>> load() async {
-    final File? file = _file();
-    if (file == null || !await file.exists()) {
-      return <Device>[];
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! List) {
+    return withStoreLock(_file(), () async {
+      final File? file = _file();
+      if (file == null || !await file.exists()) {
         return <Device>[];
       }
-      final List<Device> devices = <Device>[
-        for (final Object? item in decoded)
-          if (Device.fromJson(item) case final Device device) device,
-      ];
-      devices.sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
-      return devices;
-    } catch (_) {
-      return <Device>[];
-    }
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is! List) {
+          return <Device>[];
+        }
+        final List<Device> devices = <Device>[
+          for (final Object? item in decoded)
+            if (Device.fromJson(item) case final Device device) device,
+        ];
+        devices.sort((Device a, Device b) => b.sortTime.compareTo(a.sortTime));
+        return devices;
+      } catch (_) {
+        return <Device>[];
+      }
+    });
   }
 
   /// Inserts or updates [device] and marks it used now. A saved entry keeps
   /// its saved flag and name when an ad-hoc connection touches it.
   Future<List<Device>> touch(Device device) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere(
-      (Device item) => item.key == device.key,
-    );
-    final DateTime now = DateTime.now();
-    if (index >= 0) {
-      final Device old = devices[index];
-      final List<String> tags = device.tags.isEmpty ? old.tags : device.tags;
-      devices[index] = Device(
-        id: device.id,
-        name: device.name.isEmpty ? old.name : device.name,
-        server: device.server,
-        tags: tags,
-        groupId: old.groupId,
-        tagsCleared: tags.isEmpty ? old.tagsCleared : false,
-        groupCleared: old.groupCleared,
-        saved: old.saved || device.saved,
-        favorite: old.favorite,
-        mac: device.mac.isNotEmpty ? device.mac : old.mac,
-        revision: old.revision,
-        lastUsed: now,
-        addedAt: old.addedAt,
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere(
+        (Device item) => item.key == device.key,
       );
-    } else {
-      devices.add(
-        Device(
+      final DateTime now = DateTime.now();
+      if (index >= 0) {
+        final Device old = devices[index];
+        final List<String> tags = device.tags.isEmpty ? old.tags : device.tags;
+        devices[index] = Device(
           id: device.id,
-          name: device.name,
+          name: device.name.isEmpty ? old.name : device.name,
           server: device.server,
-          tags: Device.cleanTags(device.tags),
-          saved: false,
-          favorite: device.favorite,
-          mac: device.mac,
+          tags: tags,
+          groupId: old.groupId,
+          tagsCleared: tags.isEmpty ? old.tagsCleared : false,
+          groupCleared: old.groupCleared,
+          saved: old.saved || device.saved,
+          favorite: old.favorite,
+          mac: device.mac.isNotEmpty ? device.mac : old.mac,
+          revision: old.revision,
           lastUsed: now,
-          addedAt: now,
-        ),
-      );
-    }
-    return _save(devices);
+          addedAt: old.addedAt,
+        );
+      } else {
+        devices.add(
+          Device(
+            id: device.id,
+            name: device.name,
+            server: device.server,
+            tags: Device.cleanTags(device.tags),
+            saved: false,
+            favorite: device.favorite,
+            mac: device.mac,
+            lastUsed: now,
+            addedAt: now,
+          ),
+        );
+      }
+      return _save(devices);
+    });
   }
 
   /// Adds or updates an address-book entry without marking it as recently
   /// used; a newly saved host has never been connected from this app.
   Future<List<Device>> save(Device device) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere(
-      (Device item) => item.key == device.key,
-    );
-    final DateTime now = DateTime.now();
-    if (index >= 0) {
-      final Device old = devices[index];
-      final List<String> tags = device.tags.isEmpty
-          ? old.tags
-          : Device.cleanTags(device.tags);
-      final String groupId = old.groupId.isEmpty
-          ? device.groupId.trim()
-          : old.groupId;
-      devices[index] = Device(
-        id: device.id,
-        name: device.name.isEmpty ? old.name : device.name,
-        server: device.server,
-        tags: tags,
-        groupId: groupId,
-        tagsCleared: tags.isEmpty ? old.tagsCleared : false,
-        groupCleared: groupId.isEmpty ? old.groupCleared : false,
-        saved: true,
-        favorite: old.favorite,
-        mac: device.mac.isNotEmpty ? device.mac : old.mac,
-        revision: old.revision,
-        lastUsed: old.lastUsed,
-        addedAt: old.addedAt,
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere(
+        (Device item) => item.key == device.key,
       );
-    } else {
-      devices.add(
-        Device(
+      final DateTime now = DateTime.now();
+      if (index >= 0) {
+        final Device old = devices[index];
+        final List<String> tags = device.tags.isEmpty
+            ? old.tags
+            : Device.cleanTags(device.tags);
+        final String groupId = old.groupId.isEmpty
+            ? device.groupId.trim()
+            : old.groupId;
+        devices[index] = Device(
           id: device.id,
-          name: device.name,
+          name: device.name.isEmpty ? old.name : device.name,
           server: device.server,
-          tags: Device.cleanTags(device.tags),
-          groupId: device.groupId.trim(),
+          tags: tags,
+          groupId: groupId,
+          tagsCleared: tags.isEmpty ? old.tagsCleared : false,
+          groupCleared: groupId.isEmpty ? old.groupCleared : false,
           saved: true,
-          favorite: device.favorite,
-          mac: device.mac,
-          revision: device.revision,
-          addedAt: now,
-        ),
-      );
-    }
-    return _save(devices);
+          favorite: old.favorite,
+          mac: device.mac.isNotEmpty ? device.mac : old.mac,
+          revision: old.revision,
+          lastUsed: old.lastUsed,
+          addedAt: old.addedAt,
+        );
+      } else {
+        devices.add(
+          Device(
+            id: device.id,
+            name: device.name,
+            server: device.server,
+            tags: Device.cleanTags(device.tags),
+            groupId: device.groupId.trim(),
+            saved: true,
+            favorite: device.favorite,
+            mac: device.mac,
+            revision: device.revision,
+            addedAt: now,
+          ),
+        );
+      }
+      return _save(devices);
+    });
   }
 
   Future<List<Device>> promote(String key) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      devices[index] = devices[index].copyWith(saved: true);
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        devices[index] = devices[index].copyWith(saved: true);
+      }
+      return _save(devices);
+    });
   }
 
   Future<List<Device>> rename(String key, String name) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      devices[index] = devices[index].copyWith(name: name.trim());
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        devices[index] = devices[index].copyWith(name: name.trim());
+      }
+      return _save(devices);
+    });
   }
 
   /// Stores a Wake-on-LAN address locally; an invalid value clears it.
   Future<List<Device>> updateMac(String key, String mac) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      devices[index] = devices[index].copyWith(mac: normalizeMac(mac) ?? '');
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        devices[index] = devices[index].copyWith(mac: normalizeMac(mac) ?? '');
+      }
+      return _save(devices);
+    });
   }
 
   /// Toggles this viewer's favorite marker. The flag never leaves this
   /// machine; the account address book has no favorite field.
   Future<List<Device>> setFavorite(String key, bool favorite) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      devices[index] = devices[index].copyWith(favorite: favorite);
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        devices[index] = devices[index].copyWith(favorite: favorite);
+      }
+      return _save(devices);
+    });
   }
 
   Future<List<Device>> updateTags(String key, List<String> tags) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      final List<String> clean = Device.cleanTags(tags);
-      devices[index] = devices[index].copyWith(
-        tags: clean,
-        tagsCleared: clean.isEmpty,
-      );
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        final List<String> clean = Device.cleanTags(tags);
+        devices[index] = devices[index].copyWith(
+          tags: clean,
+          tagsCleared: clean.isEmpty,
+        );
+      }
+      return _save(devices);
+    });
   }
 
   /// Moves one saved entry into [groupId]; an empty id removes it from its
   /// group. Group names are resolved from the server, so only the id is kept.
   Future<List<Device>> updateGroup(String key, String groupId) async {
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      final String value = groupId.trim();
-      devices[index] = devices[index].copyWith(
-        groupId: value,
-        groupCleared: value.isEmpty,
-      );
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        final String value = groupId.trim();
+        devices[index] = devices[index].copyWith(
+          groupId: value,
+          groupCleared: value.isEmpty,
+        );
+      }
+      return _save(devices);
+    });
   }
 
   /// Records that a clear intent reached the server, so the next sync does not
@@ -493,18 +512,20 @@ class DeviceStore {
     bool tags = false,
     bool group = false,
   }) async {
-    if (!tags && !group) {
-      return load();
-    }
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      devices[index] = devices[index].copyWith(
-        tagsCleared: tags ? false : null,
-        groupCleared: group ? false : null,
-      );
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      if (!tags && !group) {
+        return load();
+      }
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        devices[index] = devices[index].copyWith(
+          tagsCleared: tags ? false : null,
+          groupCleared: group ? false : null,
+        );
+      }
+      return _save(devices);
+    });
   }
 
   /// Records the revision (and optional sort position) returned by a
@@ -515,82 +536,96 @@ class DeviceStore {
     int revision, {
     int? position,
   }) async {
-    if (revision <= 0) {
-      return load();
-    }
-    final List<Device> devices = await load();
-    final int index = devices.indexWhere((Device item) => item.key == key);
-    if (index >= 0) {
-      devices[index] = devices[index].copyWith(
-        revision: revision,
-        position: position,
-      );
-    }
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      if (revision <= 0) {
+        return load();
+      }
+      final List<Device> devices = await load();
+      final int index = devices.indexWhere((Device item) => item.key == key);
+      if (index >= 0) {
+        devices[index] = devices[index].copyWith(
+          revision: revision,
+          position: position,
+        );
+      }
+      return _save(devices);
+    });
   }
 
   Future<List<Device>> remove(String key) async {
-    final List<Device> devices = await load();
-    devices.removeWhere((Device item) => item.key == key);
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      devices.removeWhere((Device item) => item.key == key);
+      return _save(devices);
+    });
   }
 
   /// Removes ad-hoc entries but keeps the address book.
   Future<List<Device>> clearRecent() async {
-    final List<Device> devices = await load();
-    devices.removeWhere((Device item) => !item.saved);
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      devices.removeWhere((Device item) => !item.saved);
+      return _save(devices);
+    });
   }
 
   /// Removes one ad-hoc entry; a saved address-book row with the same key stays.
   Future<List<Device>> removeRecent(String key) async {
-    final List<Device> devices = await load();
-    devices.removeWhere((Device item) => !item.saved && item.key == key);
-    return _save(devices);
+    return withStoreLock(_file(), () async {
+      final List<Device> devices = await load();
+      devices.removeWhere((Device item) => !item.saved && item.key == key);
+      return _save(devices);
+    });
   }
 
   /// Replaces the whole store; account sync builds the merged list itself.
   Future<List<Device>> replaceAll(List<Device> devices) {
-    return _save(List<Device>.of(devices));
+    return withStoreLock(_file(), () => _save(List<Device>.of(devices)));
   }
 
   Future<List<PendingDeletion>> loadPendingDeletions() async {
-    final File? file = _deletionsFile();
-    if (file == null || !await file.exists()) {
-      return <PendingDeletion>[];
-    }
-    try {
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! List) {
+    return withStoreLock(_deletionsFile(), () async {
+      final File? file = _deletionsFile();
+      if (file == null || !await file.exists()) {
         return <PendingDeletion>[];
       }
-      final List<PendingDeletion> deletions = <PendingDeletion>[
-        for (final Object? item in decoded)
-          if (PendingDeletion.fromJson(item) case final PendingDeletion item)
-            item,
-      ];
-      deletions.sort(
-        (PendingDeletion a, PendingDeletion b) =>
-            a.deletedAt.compareTo(b.deletedAt),
-      );
-      return deletions;
-    } catch (_) {
-      return <PendingDeletion>[];
-    }
+      try {
+        final Object? decoded = jsonDecode(await file.readAsString());
+        if (decoded is! List) {
+          return <PendingDeletion>[];
+        }
+        final List<PendingDeletion> deletions = <PendingDeletion>[
+          for (final Object? item in decoded)
+            if (PendingDeletion.fromJson(item) case final PendingDeletion item)
+              item,
+        ];
+        deletions.sort(
+          (PendingDeletion a, PendingDeletion b) =>
+              a.deletedAt.compareTo(b.deletedAt),
+        );
+        return deletions;
+      } catch (_) {
+        return <PendingDeletion>[];
+      }
+    });
   }
 
   Future<List<PendingDeletion>> queueDeletion(PendingDeletion deletion) async {
-    final List<PendingDeletion> deletions = await loadPendingDeletions();
-    if (deletions.every((PendingDeletion item) => item.key != deletion.key)) {
-      deletions.add(deletion);
-    }
-    return _savePendingDeletions(deletions);
+    return withStoreLock(_deletionsFile(), () async {
+      final List<PendingDeletion> deletions = await loadPendingDeletions();
+      if (deletions.every((PendingDeletion item) => item.key != deletion.key)) {
+        deletions.add(deletion);
+      }
+      return _savePendingDeletions(deletions);
+    });
   }
 
   Future<List<PendingDeletion>> removePendingDeletion(String key) async {
-    final List<PendingDeletion> deletions = await loadPendingDeletions();
-    deletions.removeWhere((PendingDeletion item) => item.key == key);
-    return _savePendingDeletions(deletions);
+    return withStoreLock(_deletionsFile(), () async {
+      final List<PendingDeletion> deletions = await loadPendingDeletions();
+      deletions.removeWhere((PendingDeletion item) => item.key == key);
+      return _savePendingDeletions(deletions);
+    });
   }
 
   Future<List<PendingDeletion>> _savePendingDeletions(

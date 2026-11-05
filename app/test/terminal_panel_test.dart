@@ -7,6 +7,30 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  testWidgets('keeps the refusal reason after output has ended', (tester) async {
+    final FocusNode focus = FocusNode();
+    addTearDown(focus.dispose);
+    bool delivered = false;
+    await tester.pumpWidget(_host(
+      focus: focus,
+      status: const ViewerStatus(
+        terminalSupported: true,
+        terminalPhase: ViewerTerminalPhase.failed,
+        terminalError: 'the host revoked terminal access',
+      ),
+      onTakeOutput: () async {
+        if (delivered) return null;
+        delivered = true;
+        return ViewerTerminalOutput(data: Uint8List(0), ended: true);
+      },
+    ));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 60));
+    expect(find.text('the host revoked terminal access'), findsOneWidget);
+    expect(find.text('主机已结束该控制台'), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('opens at the layout size and renders console output', (
     WidgetTester tester,
   ) async {

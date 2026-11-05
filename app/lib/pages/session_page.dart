@@ -10,6 +10,7 @@ import '../account_store.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
+import '../session_window.dart';
 import '../stream_prefs.dart';
 import '../target.dart';
 import '../theme.dart';
@@ -26,7 +27,7 @@ import '../widgets/remote_toolbar.dart';
 import '../widgets/send_text_dialog.dart';
 import '../widgets/remote_view.dart';
 import '../widgets/stats_overlay.dart';
-import '../widgets/terminal_panel.dart';
+import '../widgets/terminal_tabs.dart';
 import 'package:chast_viewer/l10n.dart';
 
 class SessionPage extends StatefulWidget {
@@ -37,9 +38,13 @@ class SessionPage extends StatefulWidget {
     this.settings = const ServerSettings(),
     this.identityStore,
     this.fileTransferOnly = false,
+    this.windowSession = false,
+    this.initialDisplay = 65535,
   });
 
   final ConnectTarget target;
+  final bool windowSession;
+  final int initialDisplay;
 
   /// Ask the host for a session without a screen stream (protocol v32): the
   /// page shows only the shared-folder browser. The host refuses the Hello
@@ -237,10 +242,14 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _display = widget.initialDisplay;
     WidgetsBinding.instance.addObserver(this);
     _chatInputFocus.addListener(_onChatFocusChanged);
     _terminalFocus.addListener(_onTerminalFocusChanged);
     ViewerBridge.setDropHandler(_sendDroppedFiles);
+    if (widget.windowSession) {
+      unawaited(ViewerBridge.setWindowCloseHandler(_closeNativeWindow));
+    }
     final StreamPreferences prefs = StreamPreferences.load();
     _streamCodec = _streamCodecFor(prefs.codec);
     _streamQuality = _streamQualityFor(prefs.quality);
@@ -262,6 +271,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _closing = true;
     ViewerBridge.setDropHandler(null);
+    if (widget.windowSession) {
+      unawaited(ViewerBridge.setWindowCloseHandler(null));
+    }
     _pollTimer?.cancel();
     _hideTimer?.cancel();
     _autoTimer?.cancel();
@@ -1101,6 +1113,28 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     // Every privacy answer is one event. A refusal or a host-initiated
     // disable explains itself; a success just confirms the new state.
+    if (!nowOver && status.blockInputUpdates > _status.blockInputUpdates) {
+      final String text = status.blockInputCode == 0
+          ? (status.blockInputEnabled ? tr('主机本地键鼠已禁用') : tr('主机本地键鼠已恢复'))
+          : '${tr('无法切换主机本地键鼠')}：${status.blockInputError}';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
+    }
+    if (!nowOver && status.displayControlUpdates > _status.displayControlUpdates &&
+        status.displayControlCode != 0) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(
+        '${tr('显示设置未应用')}：${status.displayControlError}',
+      )));
+    }
+    if (!nowOver && status.lockAfterSessionUpdates > _status.lockAfterSessionUpdates) {
+      final String text = status.lockAfterSessionCode == 0
+          ? (status.lockAfterSessionEnabled ? tr('已启用会话结束后锁屏') : tr('已取消会话结束后锁屏'))
+          : '${tr('无法设置会话结束后锁屏')}：${status.lockAfterSessionError}';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
+    }
     if (!nowOver && status.privacyUpdates > _status.privacyUpdates) {
       final String reason = status.privacyError;
       final String text;
@@ -1573,6 +1607,63 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _toggleBlockInput() async {
+    try {
+      final bool queued = await ViewerBridge.setBlockInput(
+        !_status.blockInputEnabled,
+      );
+      if (!mounted || queued) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(tr('无法切换主机本地键鼠'))));
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? tr('无法切换主机本地键鼠'))),
+      );
+    } on MissingPluginException {
+      // The native window has closed.
+    }
+  }
+
+  Future<void> _toggleLockAfterSession() async {
+    try {
+      final bool queued = await ViewerBridge.setLockAfterSession(
+        !_status.lockAfterSessionEnabled,
+      );
+      if (!mounted || queued) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(tr('无法设置会话结束后锁屏'))));
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? tr('无法设置会话结束后锁屏'))),
+      );
+    } on MissingPluginException {
+      // The native window has closed.
+    }
+  }
+
+  Future<void> _controlDisplays(int action, int value, {int target = 0}) async {
+    try {
+      final bool queued = await ViewerBridge.controlDisplays(action, value, target: target);
+      if (mounted && !queued) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(tr('显示设置未应用'))),
+        );
+      }
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message ?? tr('显示设置未应用'))),
+        );
+      }
+    } on MissingPluginException {
+      // The native window has closed.
+    }
+  }
+
   Future<void> _togglePrivacy() async {
     if (!_status.acceptsPrivacy) {
       return;
@@ -1930,6 +2021,23 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     return _status.streamedDisplayIndex ?? kViewerDisplayAuto;
   }
 
+  Future<void> _openDisplayWindow(int display) async {
+    try {
+      final bool opened = await SessionWindowRequest(
+        target: widget.target,
+        account: widget.account,
+        settings: widget.settings,
+        display: display,
+      ).open();
+      if (opened || !mounted) return;
+    } on PlatformException {
+      if (!mounted) return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(tr('无法打开会话窗口'))));
+  }
+
   Future<void> _switchDisplay(int display) async {
     if (_reconnecting) {
       return;
@@ -2156,6 +2264,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if ((mask & ViewerPermission.privacyMode) != 0) {
         parts.add(tr('隐私模式'));
       }
+      if ((mask & ViewerPermission.blockInput) != 0) {
+        parts.add(tr('禁用本地键鼠'));
+      }
       if ((mask & ViewerPermission.record) != 0) {
         parts.add(tr('录制'));
       }
@@ -2365,12 +2476,28 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
 
   Future<void> _shutdownOnce() async {
     _closing = true;
-    await _starting;
-    _teardown = null;
-    await _stopSession();
-    await _tunnel?.stop();
-    _tunnel = null;
-    _tunnelStarting = null;
+    try {
+      await _starting;
+      _teardown = null;
+      await _stopSession();
+    } finally {
+      await _tunnel?.stop();
+      _tunnel = null;
+      _tunnelStarting = null;
+    }
+  }
+
+  Future<void> _closeNativeWindow() async {
+    _autoTimer?.cancel();
+    _pollTimer?.cancel();
+    _hideTimer?.cancel();
+    _setKeyCapture(false);
+    _clearCursor();
+    try {
+      await _shutdown();
+    } finally {
+      await SessionWindowRequest.close();
+    }
   }
 
   Future<void> _leave() async {
@@ -2391,7 +2518,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!mounted) {
       return;
     }
-    Navigator.of(context).pop();
+    if (widget.windowSession) {
+      await SessionWindowRequest.close();
+    } else {
+      Navigator.of(context).pop();
+    }
   }
 
   void _cleanupAfterPop() {
@@ -2593,8 +2724,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_terminalFocus.hasFocus) {
       _terminalFocus.unfocus();
     }
-    // The panel's dispose asks the engine to close the console, so the host
-    // shell ends with the overlay.
+    // Disposing the tab group closes every console owned by this overlay.
     setState(() => _terminalOpen = false);
     _setKeyCapture(_inputActive && !_chatTyping);
     if (_inputActive) {
@@ -3094,6 +3224,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _onPointerButton(Offset frame, int button, bool down) {
+    // Touch presses have no preceding hover event. Position the remote
+    // pointer before applying the button at the touched desktop coordinate.
+    final (int x, int y) = _desktopPoint(frame);
+    _sendMouse(ViewerMouse.move, buttons: _heldButtons, x: x, y: y);
     if (down) {
       _heldButtons |= button;
     } else {
@@ -3126,6 +3260,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelX -= stepsX * kViewerScrollPixelsPerNotch;
       _sendMouse(ViewerMouse.wheelHorizontal, x: stepsX * kViewerWheelDelta);
     }
+  }
+
+  void _onGesture(Offset frame, bool zoom, int deltaX, int deltaY) {
+    if (!_inputActive) return;
+    final (int x, int y) = _desktopPoint(frame);
+    _sendMouse(ViewerMouse.move, buttons: _heldButtons, x: x, y: y);
+    unawaited(
+      _guardSend(
+        ViewerBridge.sendGesture(
+          zoom: zoom,
+          x: deltaX,
+          y: deltaY,
+          modifiers: _inputState(),
+        ),
+      ),
+    );
   }
 
   /// Path selected by the embedded agent, empty for a direct connection that
@@ -3244,6 +3394,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onMove: _inputActive ? _onPointerMove : null,
                       onButton: _inputActive ? _onPointerButton : null,
                       onScroll: _inputActive ? _onPointerScroll : null,
+                      onGesture: _inputActive ? _onGesture : null,
                       onFocusRequested: _focus.requestFocus,
                     ),
                   )
@@ -3286,8 +3437,28 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onLoadMicrophones: _loadMicrophones,
                         onSelectMicrophone: _selectMicrophone,
                         onSetAudioProcessing: _setAudioProcessing,
+                        displayControlAvailable: _status.isLive && !_status.filesOnly,
+                        displayControlSupported: _status.displayControlSupported,
+                        displayControlManaged: _status.displayControlManaged,
+                        displayControlBusy: _status.displayControlBusy,
+                        displayControlCount: _status.displayControlCount,
+                        displayControlPrivacy: _status.displayControlPrivacy,
+                        onControlDisplays: _controlDisplays,
+                        displayControlOutputs: _status.displayControlOutputs,
+                        onToggleVirtualDisplay: (int target, bool enabled) =>
+                            _controlDisplays(4, enabled ? 1 : 0, target: target),
                         privacyAvailable: _status.acceptsPrivacy,
                         privacyEnabled: _status.privacyEnabled,
+                        blockInputAvailable:
+                            _status.isLive && _status.blockInputSupported,
+                        blockInputEnabled: _status.blockInputEnabled,
+                        onToggleBlockInput: () =>
+                            unawaited(_toggleBlockInput()),
+                        lockAfterSessionAvailable:
+                            _status.isLive && _status.lockAfterSessionSupported,
+                        lockAfterSessionEnabled: _status.lockAfterSessionEnabled,
+                        onToggleLockAfterSession: () =>
+                            unawaited(_toggleLockAfterSession()),
                         portForwardAvailable: _status.acceptsPortForward,
                         portForwardActive: _status.portForwardActive,
                         onOpenPortForward: () =>
@@ -3296,6 +3467,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         activeDisplay: _activeDisplay,
                         onSelectDisplay: (int index) =>
                             unawaited(_switchDisplay(index)),
+                        onOpenDisplayWindow: _status.isLive
+                            ? (int index) =>
+                                  unawaited(_openDisplayWindow(index))
+                            : null,
                         modes:
                             _status.displayModesDisplay ==
                                     _status.streamedDisplayIndex &&
@@ -3520,22 +3695,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         child: FractionallySizedBox(
                           widthFactor: 0.7,
                           heightFactor: 0.7,
-                          child: TerminalPanel(
+                          child: TerminalTabs(
                             status: _status,
                             focusNode: _terminalFocus,
-                            onOpen: (int columns, int rows) =>
-                                ViewerBridge.openTerminal(
-                                  columns: columns,
-                                  rows: rows,
-                                ),
-                            onTakeOutput: ViewerBridge.takeTerminalOutput,
-                            onSendInput: ViewerBridge.sendTerminalInput,
-                            onResize: (int columns, int rows) =>
-                                ViewerBridge.resizeTerminal(
-                                  columns: columns,
-                                  rows: rows,
-                                ),
-                            onClose: ViewerBridge.closeTerminal,
                             onDismiss: _closeTerminalPanel,
                             initialFontSize: _terminalFontSize,
                             onFontSizeChanged: _rememberTerminalFontSize,

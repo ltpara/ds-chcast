@@ -7,7 +7,22 @@ namespace chast::host {
 
 const std::map<std::wstring, std::wstring>& english_strings() {
     static const std::map<std::wstring, std::wstring> table = {
+        {L"隐私方式", L"Privacy method"},
+        {L"启用虚拟显示器（按配置数量）", L"Enable virtual displays (configured count)"},
+        {L"停用虚拟显示器", L"Disable virtual displays"},
+        {L"请先结束会话并等待显示恢复完成。", L"End the session and wait for display recovery first."},
+        {L"虚拟显示器状态已更新。", L"Virtual display status updated."},
+        {L"虚拟显示器操作未完成。", L"The virtual display operation did not complete."},
+        {L"黑色遮罩", L"Black overlay"},
+        {L"虚拟屏（关闭物理显示器）", L"Virtual display (disable physical monitors)"},
+        {L"选择此会话（聊天和文件）", L"Select for chat and files"},
+        {L"切换远程输入权限", L"Toggle input permission"},
+        {L"断开此会话", L"Disconnect this viewer"},
+        {L"连接中的查看者", L"Connected viewers"},
+        {L"请从托盘选择查看者", L"Select a viewer from the tray"},
         {L"chast 主机", L"chast host"},
+        {L"禁用本地键鼠", L"Block local input"},
+        {L"允许查看器禁用本地键鼠", L"Allow blocking local input"},
         {L"未知系统", L"Unknown system"},
         {L"点击批准模式：每次连接都需要确认", L"Click-to-approve: every connection needs confirmation"},
         {L"查看器没有提供密码，请求当面批准", L"The viewer offered no password and asked for in-person approval"},

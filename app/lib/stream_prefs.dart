@@ -1,3 +1,4 @@
+import 'store_lock.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -8,11 +9,7 @@ import 'package:flutter/foundation.dart';
 /// `code` fields of [ViewerStreamCodec] and [ViewerStreamQuality]; the frame
 /// cap is one of 0 (uncapped), 15, 30 and 60.
 class StreamPreferences {
-  const StreamPreferences({
-    this.codec = 0,
-    this.quality = 0,
-    this.maxFps = 0,
-  });
+  const StreamPreferences({this.codec = 0, this.quality = 0, this.maxFps = 0});
 
   final int codec;
   final int quality;
@@ -46,15 +43,21 @@ class StreamPreferences {
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap()
-      ..[_codecKey] = _choice(prefs.codec)
-      ..[_qualityKey] = _choice(prefs.quality)
-      ..[_maxFpsKey] = _fps(prefs.maxFps);
     try {
-      file.parent.createSync(recursive: true);
-      file.writeAsStringSync(jsonEncode(payload));
-    } catch (_) {
-      // A picture preference; failing to persist it is not fatal.
+      withStoreLockSync(file, () {
+        final Map<String, Object?> payload = _readMap()
+          ..[_codecKey] = _choice(prefs.codec)
+          ..[_qualityKey] = _choice(prefs.quality)
+          ..[_maxFpsKey] = _fps(prefs.maxFps);
+        try {
+          file.parent.createSync(recursive: true);
+          file.writeAsStringSync(jsonEncode(payload));
+        } catch (_) {
+          // A picture preference; failing to persist it is not fatal.
+        }
+      });
+    } on FileSystemException {
+      // Preferences are best effort when the directory cannot be locked.
     }
   }
 
@@ -78,13 +81,16 @@ class StreamPreferences {
       return <String, Object?>{};
     }
     try {
-      if (!file.existsSync()) {
+      return withStoreLockSync(file, () {
+        if (!file.existsSync()) {
+          return <String, Object?>{};
+        }
+        final Object? decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map<String, Object?>) {
+          return Map<String, Object?>.of(decoded);
+        }
         return <String, Object?>{};
-      }
-      final Object? decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is Map<String, Object?>) {
-        return Map<String, Object?>.of(decoded);
-      }
+      });
     } catch (_) {
       // A corrupt settings file must not stop the viewer from starting.
     }
