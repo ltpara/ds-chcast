@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "chast/host_server.h"
@@ -40,6 +41,10 @@ void worker_log(const std::string& message) {
     log_line(g_worker->log_path, message);
 }
 
+void worker_event(std::string_view event, std::initializer_list<LogField> fields = {}) {
+    log_event(g_worker->log_path, event, fields);
+}
+
 void save_rotated_token(const std::string& token) {
     std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
     if (g_worker->settings.access_token == token) {
@@ -51,7 +56,7 @@ void save_rotated_token(const std::string& token) {
     }
     std::string error;
     if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
-        worker_log("cannot save the new access token: " + error);
+        worker_event("settings.token_save_failed", {{"error", error}});
     }
 }
 
@@ -63,7 +68,7 @@ void save_trusted_devices(const std::vector<TrustedDevice>& devices) {
     }
     std::string error;
     if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
-        worker_log("cannot save the trusted-device list: " + error);
+        worker_event("settings.trusted_devices_save_failed", {{"error", error}});
     }
 }
 
@@ -78,7 +83,7 @@ void save_password_hash(const std::string& hash) {
     }
     std::string error;
     if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
-        worker_log("cannot save the upgraded password hash: " + error);
+        worker_event("settings.password_hash_save_failed", {{"error", error}});
     }
 }
 
@@ -107,7 +112,7 @@ void save_remote_settings(const HostSettings& update) {
     }
     std::string error;
     if (!save_host_settings(g_worker->settings_path, settings, &error)) {
-        worker_log("cannot save the remote settings change: " + error);
+        worker_event("settings.remote_save_failed", {{"error", error}});
     }
 }
 
@@ -122,35 +127,26 @@ void clear_migrated_identity(const std::string& old_id) {
     }
     std::string error;
     if (!save_host_settings(g_worker->settings_path, g_worker->settings, &error)) {
-        worker_log("cannot clear the migrated device id: " + error);
+        worker_event("settings.migrated_id_clear_failed", {{"error", error}});
     }
 }
 
 void log_tunnel_event(const TunnelEvent& event) {
     if (event.event == "ready") {
-        std::string line = "tunnel online";
-        if (!event.host.empty()) {
-            line += " id=" + event.host;
-        }
-        if (!event.listen.empty()) {
-            line += " listen=" + event.listen;
-        }
-        if (!event.relay.empty()) {
-            line += " relay=" + event.relay;
-        }
         if (!event.migrated_from.empty()) {
-            line += " migrated_from=" + event.migrated_from;
             clear_migrated_identity(event.migrated_from);
         }
-        worker_log(line);
+        worker_event("tunnel.online",
+                     {{"host", event.host},
+                      {"listen", event.listen},
+                      {"relay", event.relay},
+                      {"migrated_from", event.migrated_from}});
     } else if (event.event == "viewer") {
-        std::string line = "viewer via " + (event.path.empty() ? "unknown" : event.path);
-        if (!event.remote.empty()) {
-            line += " remote=" + event.remote;
-        }
-        worker_log(line);
+        worker_event("tunnel.viewer",
+                     {{"path", event.path.empty() ? "unknown" : event.path},
+                      {"remote", event.remote}});
     } else if (event.event == "relay") {
-        worker_log("tunnel relay address " + event.relay);
+        worker_event("tunnel.relay", {{"relay", event.relay}});
     }
 }
 
@@ -266,7 +262,7 @@ bool request_session_switch(uint32_t session_id, std::string* error) {
         *error = "the service could not be signalled for the session switch";
         return false;
     }
-    worker_log("session switch requested: session " + std::to_string(session_id));
+    worker_event("session.switch_requested", {{"session", std::to_string(session_id)}});
     return true;
 }
 
@@ -277,16 +273,18 @@ bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
     exit_code = 0;
     std::string error;
     if (!tunnel.start(settings, settings.port, fingerprint, log_tunnel_event,
-                      [](const std::string& line) { worker_log("tunnel: " + line); },
+                      [](const std::string& line) {
+                          worker_event("tunnel.output", {{"text", line}});
+                      },
                       [&ended, &exit_code](uint32_t code) {
                           exit_code = code;
                           ended = true;
                       },
                       &error)) {
-        worker_log("cannot start the tunnel: " + error);
+        worker_event("tunnel.start_failed", {{"error", error}});
         return false;
     }
-    worker_log("tunnel starting for device " + settings.tunnel_id);
+    worker_event("tunnel.starting", {{"device", settings.tunnel_id}});
     return true;
 }
 
@@ -298,45 +296,44 @@ int run_worker(std::string* error) {
     context.log_path = service_log_path("worker.log");
     DWORD session = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &session);
-    worker_log("worker starting: pid=" + std::to_string(GetCurrentProcessId()) +
-               " session=" + std::to_string(session));
+    worker_event("worker.start",
+                 {{"pid", std::to_string(GetCurrentProcessId())},
+                  {"session", std::to_string(session)}});
 
     HostSettings settings;
     std::string settings_warning;
     std::string settings_error;
     if (!load_machine_settings(settings, &context.settings_path, &settings_warning,
                                &settings_error)) {
-        worker_log("machine settings: " + settings_error);
+        worker_event("settings.error", {{"error", settings_error}});
     } else {
-        worker_log("settings: " + context.settings_path);
+        worker_event("settings.loaded", {{"path", context.settings_path}});
     }
     if (!settings_warning.empty()) {
-        worker_log("settings warning: " + settings_warning);
+        worker_event("settings.warning", {{"text", settings_warning}});
     }
     context.settings = settings;
 
     if (settings.password_hash.empty()) {
-        worker_log("service mode has no permanent password; every viewer will be refused "
-                   "until one is set");
+        worker_event("auth.password_missing");
     }
     if (settings.auth_mode != HostAuthMode::Password) {
-        worker_log("service mode ignores click approval and the temporary password; "
-                   "a permanent password is required");
+        worker_event("auth.click_approval_ignored");
     }
     if (settings.token_auth) {
-        worker_log("access-token authentication is enabled for automation");
+        worker_event("auth.token_enabled");
     }
 
     HANDLE stop = OpenEventW(SYNCHRONIZE, FALSE, kWorkerStopEvent);
     if (stop == nullptr) {
         stop = CreateEventW(nullptr, TRUE, FALSE, kWorkerStopEvent);
         if (stop != nullptr) {
-            worker_log("stop event was missing; created it for a manual run");
+            worker_event("events.stop_created");
         }
     }
     if (stop == nullptr) {
         *error = "无法打开停止事件（错误 " + std::to_string(GetLastError()) + "）";
-        worker_log(*error);
+        worker_event("worker.fatal", {{"error", *error}});
         g_worker = nullptr;
         return 1;
     }
@@ -369,15 +366,14 @@ int run_worker(std::string* error) {
         config.list_sessions = list_active_sessions;
         config.select_session = request_session_switch;
     } else if (settings.allow_session_select) {
-        worker_log("session_select is enabled but no service switch channel is present; "
-                   "the permission is withheld");
+        worker_event("session.select_withheld");
     }
 
     std::string create_error;
     std::unique_ptr<HostServer> server = HostServer::create(std::move(config), &create_error);
     if (!server) {
         *error = create_error;
-        worker_log("cannot open the listener: " + create_error);
+        worker_event("listener.failed", {{"error", create_error}});
         CloseHandle(stop);
         g_worker = nullptr;
         return 1;
@@ -385,17 +381,18 @@ int run_worker(std::string* error) {
     server->start();
     const HostStatus status = server->status();
     if (!status.fingerprint.empty()) {
-        worker_log("identity SHA256 " + format_fingerprint(status.fingerprint));
+        worker_event("identity.fingerprint",
+                     {{"sha256", format_fingerprint(status.fingerprint)}});
     }
 
     bool tunnel_wanted = false;
     if (settings.tunnel) {
         if (settings.server_url.empty()) {
-            worker_log("connection service is enabled but server_url is empty; staying local");
+            worker_event("tunnel.local_only");
         } else if (std::string tunnel_error; validate_tunnel_settings(settings, &tunnel_error)) {
             tunnel_wanted = true;
         } else {
-            worker_log("connection service settings rejected: " + tunnel_error);
+            worker_event("tunnel.settings_rejected", {{"error", tunnel_error}});
         }
     }
 
@@ -414,13 +411,13 @@ int run_worker(std::string* error) {
             break;
         }
         if (!server->running()) {
-            worker_log("the host server stopped; leaving the session");
+            worker_event("server.stopped");
             break;
         }
         const auto now = std::chrono::steady_clock::now();
         if (tunnel_ended.exchange(false)) {
-            worker_log("tunnel process exited: code=" +
-                       std::to_string(tunnel_exit_code.load()));
+            worker_event("tunnel.exited",
+                         {{"code", std::to_string(tunnel_exit_code.load())}});
             tunnel_needs_start = true;
             next_tunnel = now + std::chrono::seconds(5);
         }
@@ -434,11 +431,11 @@ int run_worker(std::string* error) {
         }
     }
 
-    worker_log("worker stopping");
+    worker_event("worker.stopping");
     tunnel.stop();
     server->stop();
     CloseHandle(stop);
-    worker_log("worker stopped");
+    worker_event("worker.stopped");
     g_worker = nullptr;
     return 0;
 }

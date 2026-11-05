@@ -394,6 +394,13 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-protocol-test tests/protocol_test.cc)
     target_link_libraries(chast-protocol-test PRIVATE chast.net)
 
+    # Deterministic mutation coverage for every control parser, the stream
+    # header decoders and the three reassembly parsers. Seeds are real maker
+    # output; truncation, bit flips, insertions and random 1 MiB payloads must
+    # only ever make a parser reject, never crash or over-allocate.
+    add_executable(chast-protocol-fuzz-test tests/protocol_fuzz_test.cc)
+    target_link_libraries(chast-protocol-fuzz-test PRIVATE chast.net)
+
     # The input-desktop tracker against the live session. Needs an interactive
     # desktop; the secure-desktop path cannot be produced from a test.
     add_executable(chast-desktop-test tests/desktop_test.cc)
@@ -407,6 +414,11 @@ if(CHAST_BUILD_TESTS)
     # Settings file round-trip: no GPU, no network, no certificate store.
     add_executable(chast-host-settings-test tests/host_settings_test.cc)
     target_link_libraries(chast-host-settings-test PRIVATE chast.host)
+
+    # JSONL records for the service and worker: timestamp shape, escaping,
+    # invalid-UTF-8 replacement, rotation and concurrent appends.
+    add_executable(chast-service-log-test tests/service_log_test.cc)
+    target_link_libraries(chast-service-log-test PRIVATE chast.host.tray)
 
     # Multi-viewer host over loopback QUIC: concurrent admission, the
     # connection cap, per-session audit records and the control lease. The
@@ -506,9 +518,12 @@ if(CHAST_BUILD_TESTS)
     add_test(NAME png_writer COMMAND chast-png-writer-test)
     add_test(NAME remote_cursor COMMAND chast-remote-cursor-test)
     add_test(NAME protocol COMMAND chast-protocol-test)
+    add_test(NAME protocol_fuzz COMMAND chast-protocol-fuzz-test)
+    set_tests_properties(protocol_fuzz PROPERTIES TIMEOUT 300)
     add_test(NAME desktop COMMAND chast-desktop-test)
     add_test(NAME security COMMAND chast-security-test)
     add_test(NAME host_settings COMMAND chast-host-settings-test)
+    add_test(NAME service_log COMMAND chast-service-log-test)
     add_test(NAME host_multi COMMAND chast-host-multi-test)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_voice COMMAND chast-host-voice-test)

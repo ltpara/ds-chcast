@@ -315,14 +315,15 @@ bool start_worker(DWORD session, std::string* error) {
         return false;
     }
     if (g_job != nullptr && !AssignProcessToJobObject(g_job, info.hProcess)) {
-        log_line(g_log_path, "cannot assign the worker to the service job: " +
-                                 std::to_string(GetLastError()));
+        log_event(g_log_path, "worker.job_assign_failed",
+                  {{"error", std::to_string(GetLastError())}});
     }
     CloseHandle(info.hThread);
     g_worker_process = info.hProcess;
     g_worker_session = session;
-    log_line(g_log_path, "worker started: pid=" + std::to_string(info.dwProcessId) +
-                             " session=" + std::to_string(session));
+    log_event(g_log_path, "worker.start",
+              {{"pid", std::to_string(info.dwProcessId)},
+               {"session", std::to_string(session)}});
     return true;
 }
 
@@ -335,14 +336,15 @@ void stop_worker() {
     }
     const DWORD waited = WaitForSingleObject(g_worker_process, 20000);
     if (waited == WAIT_TIMEOUT) {
-        log_line(g_log_path, "worker did not stop in 20 s; terminating");
+        log_event(g_log_path, "worker.stalled");
         TerminateProcess(g_worker_process, 1);
         WaitForSingleObject(g_worker_process, 2000);
     }
     DWORD exit_code = 0;
     GetExitCodeProcess(g_worker_process, &exit_code);
-    log_line(g_log_path, "worker exited: pid=" + std::to_string(GetProcessId(g_worker_process)) +
-                             " code=" + std::to_string(exit_code));
+    log_event(g_log_path, "worker.exit",
+              {{"pid", std::to_string(GetProcessId(g_worker_process))},
+               {"code", std::to_string(exit_code)}});
     CloseHandle(g_worker_process);
     g_worker_process = nullptr;
     g_worker_session = 0;
@@ -391,25 +393,28 @@ void service_main(DWORD argc, LPWSTR* argv) {
     g_status.dwCheckPoint = 0;
     report_status(SERVICE_START_PENDING, NO_ERROR, 30000);
     g_log_path = service_log_path("service.log");
-    log_line(g_log_path, "service starting");
+    log_event(g_log_path, "service.start");
 
     HostSettings settings;
     std::string settings_path;
     std::string settings_warning;
     std::string settings_error;
     if (!load_machine_settings(settings, &settings_path, &settings_warning, &settings_error)) {
-        log_line(g_log_path, "machine settings: " + settings_error);
+        log_event(g_log_path, "settings.error", {{"error", settings_error}});
     } else {
-        log_line(g_log_path, "settings: " + settings_path + " port=" +
-                                 std::to_string(settings.port));
+        log_event(g_log_path, "settings.loaded",
+                  {{"path", settings_path}, {"port", std::to_string(settings.port)}});
     }
     if (!settings_warning.empty()) {
-        log_line(g_log_path, "settings warning: " + settings_warning);
+        log_event(g_log_path, "settings.warning", {{"text", settings_warning}});
     }
 
     const int firewall = apply_firewall_rule(settings.port, tunnel_port_of(settings));
-    log_line(g_log_path, firewall == 0 ? "firewall rules applied"
-                                       : "firewall rules failed: " + std::to_string(firewall));
+    if (firewall == 0) {
+        log_event(g_log_path, "firewall.applied");
+    } else {
+        log_event(g_log_path, "firewall.failed", {{"error", std::to_string(firewall)}});
+    }
 
     g_service_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_session_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -424,26 +429,28 @@ void service_main(DWORD argc, LPWSTR* argv) {
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &limits,
                                      sizeof(limits))) {
-            log_line(g_log_path, "cannot configure the service job: " +
-                                     std::to_string(GetLastError()));
+            log_event(g_log_path, "job.configure_failed",
+                      {{"error", std::to_string(GetLastError())}});
         }
     } else {
-        log_line(g_log_path, "cannot create the service job: " + std::to_string(GetLastError()));
+        log_event(g_log_path, "job.create_failed",
+                  {{"error", std::to_string(GetLastError())}});
     }
     if (g_service_stop == nullptr || g_session_wake == nullptr || g_worker_stop == nullptr ||
         g_worker_switch == nullptr) {
-        log_line(g_log_path, "cannot create service events: " + std::to_string(GetLastError()));
+        log_event(g_log_path, "events.create_failed",
+                  {{"error", std::to_string(GetLastError())}});
         report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
         return;
     }
     const bool debug_privilege = enable_privilege(L"SeDebugPrivilege");
     (void)enable_privilege(L"SeAssignPrimaryTokenPrivilege");
     (void)enable_privilege(L"SeIncreaseQuotaPrivilege");
-    log_line(g_log_path, debug_privilege ? "SeDebugPrivilege enabled"
-                                         : "SeDebugPrivilege could not be enabled");
+    log_event(g_log_path, "privilege.debug",
+              {{"enabled", debug_privilege ? "true" : "false"}});
 
     report_status(SERVICE_RUNNING);
-    log_line(g_log_path, "service running");
+    log_event(g_log_path, "service.running");
 
     auto retry_at = std::chrono::steady_clock::now();
     for (;;) {
@@ -454,16 +461,15 @@ void service_main(DWORD argc, LPWSTR* argv) {
         DWORD requested_session = 0;
         if (take_session_switch_request(requested_session)) {
             if (requested_session == g_worker_session) {
-                log_line(g_log_path, "session switch ignored: the worker already runs in session " +
-                                         std::to_string(requested_session));
+                log_event(g_log_path, "session.switch_ignored",
+                          {{"session", std::to_string(requested_session)}});
             } else if (!session_is_active(requested_session) ||
                        !session_has_user(requested_session)) {
-                log_line(g_log_path, "session switch refused: session " +
-                                         std::to_string(requested_session) +
-                                         " is not active");
+                log_event(g_log_path, "session.switch_refused",
+                          {{"session", std::to_string(requested_session)}});
             } else {
-                log_line(g_log_path, "session switch requested: session " +
-                                         std::to_string(requested_session));
+                log_event(g_log_path, "session.switch_requested",
+                          {{"session", std::to_string(requested_session)}});
                 g_selected_session = requested_session;
                 if (g_worker_process != nullptr) {
                     stop_worker();
@@ -483,22 +489,25 @@ void service_main(DWORD argc, LPWSTR* argv) {
                 session = g_selected_session;
                 logged_in = true;
             } else {
-                log_line(g_log_path, "selected session " +
-                                         std::to_string(g_selected_session) +
-                                         " is no longer active; following the console session");
+                log_event(g_log_path, "session.selected_lost",
+                          {{"session", std::to_string(g_selected_session)}});
                 g_selected_session = 0;
             }
         }
 
         if (g_worker_process != nullptr) {
             if (!logged_in || session != g_worker_session) {
-                log_line(g_log_path, "session changed; stopping the worker");
+                log_event(g_log_path, "session.changed",
+                          {{"from", std::to_string(g_worker_session)},
+                           {"to", std::to_string(session)}});
                 stop_worker();
                 retry_at = std::chrono::steady_clock::now();
             } else if (WaitForSingleObject(g_worker_process, 0) == WAIT_OBJECT_0) {
                 DWORD exit_code = 0;
                 GetExitCodeProcess(g_worker_process, &exit_code);
-                log_line(g_log_path, "worker ended: code=" + std::to_string(exit_code));
+                log_event(g_log_path, "worker.exit",
+                          {{"pid", std::to_string(GetProcessId(g_worker_process))},
+                           {"code", std::to_string(exit_code)}});
                 CloseHandle(g_worker_process);
                 g_worker_process = nullptr;
                 g_worker_session = 0;
@@ -510,7 +519,7 @@ void service_main(DWORD argc, LPWSTR* argv) {
             std::chrono::steady_clock::now() >= retry_at) {
             std::string error;
             if (!start_worker(session, &error)) {
-                log_line(g_log_path, error);
+                log_event(g_log_path, "worker.start_failed", {{"error", error}});
                 retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             }
         }
@@ -532,7 +541,7 @@ void service_main(DWORD argc, LPWSTR* argv) {
     g_session_wake = nullptr;
     g_worker_stop = nullptr;
     g_worker_switch = nullptr;
-    log_line(g_log_path, "service stopped");
+    log_event(g_log_path, "service.stop");
     report_status(SERVICE_STOPPED);
 }
 
