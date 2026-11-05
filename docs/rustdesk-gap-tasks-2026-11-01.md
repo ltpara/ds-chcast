@@ -376,7 +376,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 已实现（2026-11-05）：协议 v44 的 `SetDisplayFollow/DisplayFollowState` 让主机跟随远程光标或前台窗口自动切换输出；远程分辨率与光标缩放此前已具备；RustDesk 1.5.1 的“按显示器独立开窗”只存配置、无消费方，暂不按多窗口架构实现，详见同日小节 |
 | DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 已实现（2026-11-05）：主机/中继的载体端口本就同时接受裸 TCP 与 WebSocket，本轮补上查看器“使用 WebSocket”开关（`server.json` 的 `use_websocket`），开启后引擎固定走 WS 载体，详见同日小节 |
 | DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 已实现（2026-11-05）：协议 v46 的 `RemoteConfigRequest/State` 在会话内读取并修改主机暴露的 14 项策略开关，权限位 0x8000 由 `allow_remote_config` 控制；`lock_after_session_end` 在会话收尾时锁定主机，详见同日小节 |
-| DEV-27 | P3 | RDP 快捷方式与便携模式 | `flutter/lib/common/widgets/peer_card.dart:735-769`、`src/server/portable_service.rs` | 无 RDP 快捷入口（可手工用端口转发替代）；只有安装器，没有便携服务模式 |
+| DEV-27 | P3 | RDP 快捷方式与便携模式 | `flutter/lib/common/widgets/peer_card.dart:735-769`、`src/server/portable_service.rs` | 已实现（2026-11-05）：设备菜单新增 RDP 入口，经端口转发把查看器随机端口连到主机 127.0.0.1 并启动 mstsc（凭据由 mstsc 询问）；主机新增 `--portable`，设置/身份/审计留在程序目录，不写开机启动；RustDesk 式共享内存便携服务因违背零拷贝不实现，详见同日小节 |
 
 ### 排期建议
 
@@ -986,6 +986,38 @@ RustDesk 的“远程配置”允许已连接的查看者读取并修改主机�
 边界：本机单机验证，没有第二台真实主机做端到端远程配置验收；开关
 语义仍以 `REMOTE_CONFIG` 暴露的范围为准，未暴露的策略（如安装、网络
 适配器）不在远程修改之列。
+
+### DEV-27 RDP 快捷方式与便携模式（2026-11-05 完成）
+
+RustDesk 在设备菜单里直接提供 RDP：查看者经端口转发连到主机的 3389，
+再用本机 mstsc 打开；便携版不安装，需要时临时拉起一个提权辅助进程共享
+画面。chast 此前只能手工配置端口转发，主机也只能以安装后的服务形态运行。
+
+- **RDP 快捷方式（查看器）**：设备卡片与最近连接的菜单新增“RDP”。选择
+  后弹出端口对话框（默认 3389），随后用 `port_forward` 模式连接主机，
+  会话转 live 时自动建立一条“本机随机端口 → 主机 `127.0.0.1:<RDP 端口>`”
+  的转发规则，待引擎发布实际监听端口后启动
+  `mstsc /v:127.0.0.1:<端口>`。规则和状态卡片沿用现有端口转发面板，
+  关闭会话即断开转发。协议与主机不变：RDP 只是查看器侧的端口转发预设。
+- **凭据**：与 RustDesk 不同，查看器不调用 `cmdkey`、不保存 RDP 用户名
+  或密码，也不把密码放进任何命令行；mstsc 自己弹出登录框，凭据只留在
+  Windows 的 RDP 客户端内。
+- **便携模式（主机）**：`chast-host.exe --portable` 把设置写到
+  `<程序目录>\chast-portable\host.ini`（权限、令牌、设备身份和审计
+  spool 都随之落在该目录），复制文件夹即可带走完整身份；显式
+  `--config` 仍然优先。便携模式强制关闭开机启动并禁用两个开关入口，
+  避免把指向旧路径的登录项留给下一台机器。
+- **不做 RustDesk 式“便携服务”**：它的做法是在提权辅助进程里采集，再用
+  共享内存把帧复制给主进程，这与项目“只支持零拷贝、不考虑 CPU
+  fallback”的约束冲突。便携模式直接以托盘进程跑完整采集→编码流水线，
+  纹理仍直接进入硬件编码器；代价是登录取屏、安全桌面采集与 Windows
+  会话切换这些依赖安装服务的功能在便携模式下不可用。
+
+验证：`flutter analyze` 无问题；`flutter test` 全量 587 项通过（新增
+RDP 参数用例、设备菜单端口对话框用例）；Windows release 构建通过；
+主机侧 Release 构建通过，`chast-host-settings-test` 新增便携路径用例
+并通过。边界：本机没有第二台可 RDP 的 Windows 主机，mstsc 端到端与
+便携模式实际启动未运行验证；便携模式不改变媒体链路，保持零拷贝。
 
 ### 已核对但不算缺口的项
 

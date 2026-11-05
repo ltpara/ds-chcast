@@ -3150,6 +3150,21 @@
      应答用例）、`host-settings-test`、`chast-viewer-probe` 编译、
      `flutter analyze`、584 项 `flutter test` 与 Windows release 构建通过。
      边界：单机验证，无第二台真实主机做端到端验收。
+139. **P3 · DEV-27 RDP 快捷方式与便携模式（2026-11-05 完成）**：查看器设备
+     卡片与最近连接的菜单新增“RDP”，弹出端口对话框（默认 3389）后以
+     `port_forward` 模式连接主机；会话转 live 时自动建立一条“本机随机端口
+     → 主机 `127.0.0.1:<RDP 端口>`”的转发规则，待引擎发布实际监听端口后
+     启动 `mstsc /v:127.0.0.1:<端口>`。协议与主机不变，RDP 只是查看器侧
+     预设；与 RustDesk 不同，不调用 `cmdkey`、不保存或传递 RDP 凭据。
+     主机新增 `--portable`：设置、身份与审计 spool 写到
+     `<程序目录>\chast-portable\host.ini`，显式 `--config` 优先，强制关闭
+     并禁用开机启动。不做 RustDesk 式共享内存“便携服务”，因为它会在辅助
+     进程采集后复制帧，违反零拷贝约束；便携模式直接以托盘进程跑完整
+     采集→编码流水线。验证：`flutter analyze`、587 项 `flutter test`、
+     Windows release 构建、主机侧 Release 构建与 `chast-host-settings-test`
+     新增便携路径用例通过。边界：本机无第二台可 RDP 的 Windows 主机，
+     mstsc 端到端与便携模式实际启动未运行验证；便携模式不支持登录取屏、
+     安全桌面采集与会话切换；媒体链路保持零拷贝。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
