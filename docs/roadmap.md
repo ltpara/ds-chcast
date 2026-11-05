@@ -3272,6 +3272,25 @@
      依赖。验证：tracing/relay/api/account/registry 测试通过；
      `dbmetric` 专用测试二进制在本机被 Application Control 拦截，其驱动
      路径由 account 存储测试与 API 指标断言覆盖。
+149. **P1 · DEV-03 PostgreSQL 后端（2026-11-05 完成）**：
+     新增 `--postgres-dsn`（`CHAST_POSTGRES_DSN`），非空时账号、令牌、
+     地址簿、审计/连接/文件历史、登录限速、录制元数据、归档检查点与对等
+     记录改存 PostgreSQL，`--state` 被忽略。为避免改写数百处调用点，方言
+     适配放在 `internal/dbmetric` 驱动层：pgx v5 stdlib 连接器把 `?` 改写
+     为 `$n`、去掉 `COLLATE NOCASE`、把布尔列与 `0/1` 的比较改写为
+     `false/true`，并以 `ExecerContext`/`QueryerContext` 直连绕过 pgx 已
+     弃用的 `Stmt.Exec`；PostgreSQL 基线用 BOOLEAN/BIGINT/BYTEA/BIGSERIAL，
+     非确定性 ICU 排序规则 `chast_nocase` 复现 SQLite 的大小写不敏感唯一
+     约束与比较，录制表补 `rowid BIGSERIAL` 保留运营分页游标；`RETURNING
+     id`、`ON CONFLICT DO NOTHING`、`CASE WHEN` 与 `isUniqueViolation` 统一
+     两边语义，登录限速在 PG 上以 `pg_advisory_xact_lock` 串行。迁移沿用
+     `schemamig`（账号 v6、对等 v1），PG 基线在会话 advisory lock 下创建，
+     连接池不再限制单连接。验证：便携 PostgreSQL 16.2 空集群上
+     `CHAST_TEST_POSTGRES_DSN` 门控的账号/对等测试通过，两个 Store 实例
+     并发递增同一登录键 80 次无丢失；服务端以 PG 启动后 `/healthz` 200、
+     日志确认 PostgreSQL 存储、`/metrics` 输出 `chast_db_*`；SQLite 回归
+     保持全绿（仅 Application Control 拦截的 `internal/tracing` 测试
+     二进制未运行）。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

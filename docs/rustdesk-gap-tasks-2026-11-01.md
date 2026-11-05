@@ -217,15 +217,50 @@ P2 = 平台扩展。
   `server/cmd/chast-relay/main.go`、`server/internal/account/store.go`、
   `server/internal/registry/store.go`、`server/README.md`。
 
-### DEV-03 PostgreSQL 后端（P1）
+### DEV-03 PostgreSQL 后端（P1，2026-11-05 完成）
 
 - 目标：在不破坏 SQLite 默认部署的前提下支持 PostgreSQL。
-- 实施：抽出账号/地址簿/审计存储接口；用 `pgx` 实现；
-  复用 `schemamig` 的版本化迁移并保证 SQLite/PG 语义一致；
-  增加 `CHAST_TEST_POSTGRES_DSN` 门控的集成测试。
-- 验收：同一套 API 在两者上通过；迁移从旧版本升级成功；
-  单连接限制解除后可并发；部署文档给出连接串与迁移命令。
-- 测试：`go test ./...` 全绿；PG 集成测试在可用实例上通过。
+- 实施：没有抽出新的存储接口层，而是在 `database/sql` 驱动层做方言适配，
+  让现有 `account.Store`/`registry.Store` 与全部调用点保持不变：
+  `internal/dbmetric` 新增 pgx v5 stdlib 连接器，`RewritePostgres` 把 `?`
+  改写为 `$n`（跳过字符串、引号标识符与注释）、去掉 `COLLATE NOCASE`、把
+  `banned|deleted|success|totp_enabled = 0/1` 改写为布尔字面量；连接器实现
+  `ExecerContext`/`QueryerContext` 直连，绕开 pgx 已弃用的
+  `Stmt.Exec`。PostgreSQL 基线 schema 使用 BOOLEAN、BIGINT、BYTEA、
+  BIGSERIAL，并以非确定性 ICU 排序规则 `chast_nocase`
+  （`und-u-ks-level2`）复现 SQLite 的用户名/邮箱大小写不敏感比较与唯一
+  索引；录制元数据增加 `rowid BIGSERIAL` 以保留运营分页游标。双方言统一的
+  写法包括 `INSERT ... RETURNING id`、`ON CONFLICT ... DO NOTHING`、
+  `CASE WHEN` 合并归档检查点、`isUniqueViolation` 识别两边的唯一键错误；
+  登录限速在 PG 上用 `BEGIN` + `pg_advisory_xact_lock` 按登录键串行，
+  SQLite 继续 `BEGIN IMMEDIATE`。`--postgres-dsn`（`CHAST_POSTGRES_DSN`）
+  非空时账号与对等记录共用一个数据库并忽略 `--state`；两边启动迁移复用
+  `schemamig`，PG 版本号与 SQLite 对齐（当前账号 v6、对等 v1），基线在
+  advisory lock 下创建，池不再限制单连接。PostgreSQL 支持从当前 schema
+  开始，不支持 SQLite 文件在线搬迁；后续迁移需同时追加到两份列表。
+  部署、备份与测试说明写入 `server/README.md` 的“PostgreSQL 后端”。
+- 验收：同一套存储/HTTP API 在 SQLite 与 PostgreSQL 上通过；全新
+  PostgreSQL 集群从空库迁移成功；两个 Store 实例并发更新同一登录键
+  80 次无丢失；服务端以 PG DSN 启动后 `/healthz` 200、日志确认
+  “accounts and peer state stored in PostgreSQL”、`/metrics` 输出
+  `chast_db_*`；SQLite 回归保持全绿。
+- 测试：新增 `internal/account/postgres_test.go`（账号、大小写不敏感登录、
+  地址簿、连接/文件审计与归档读取、录制元数据与分页、登录限速、注销）与
+  `TestPostgresConcurrentLoginLocks`、`internal/registry/postgres_test.go`、
+  `internal/dbmetric/postgres_test.go`，均由 `CHAST_TEST_POSTGRES_DSN`
+  门控。本机用便携 PostgreSQL 16.2 空集群验证两份门控测试与并发用例；
+  `go test ./...` 带 DSN 运行时仅 `internal/tracing` 测试二进制被
+  Application Control 拦截（环境限制），其余包全通过。
+- 文件：`server/internal/account/postgres_test.go`、
+  `server/internal/account/migrate_postgres.go`、
+  `server/internal/account/store.go`、`server/internal/account/loginlock.go`、
+  `server/internal/account/connection.go`、`server/internal/account/file.go`、
+  `server/internal/account/email.go`、`server/internal/account/phone.go`、
+  `server/internal/account/oidc.go`、`server/internal/account/webauthn.go`、
+  `server/internal/account/archive.go`、`server/internal/dbmetric/`、
+  `server/internal/schemamig/schemamig.go`、
+  `server/internal/registry/`、`server/cmd/chast-server/main.go`、
+  `server/go.mod`、`server/README.md`。
 
 ### DEV-04 账号按组授权与配额（P1）
 
@@ -406,7 +441,7 @@ WebSocket、便携模式、RDP）补一轮。
 | DEV-01 | 已完成（2026-11-05） | 发布者签名（服务器/主机/查看器三层校验）、`chast-publish` 签名工具、查看器健康标记回滚与安装器服务恢复均已实现并验证，详见同日小节。 |
 | DEV-07 | 已完成（2026-11-05） | 主机用绑定私钥签名元数据，服务器验签后仅在规范化未改动时落库并回显；默认兼容旧主机，`--require-host-metadata-signature` 可强制；管理 CLI/Web 台显示签名状态，详见同日小节。 |
 | DEV-02 | 已完成（2026-11-05） | punch 与 relay 会话 span 按主机 ID 归并同一 trace，SQLite 经驱动包装记录查询耗时/错误/慢查询与连接池等待，hbbs 与 relay 的 `/metrics` 暴露队列与数据面指标；QUIC 由 C++ 主机终止，无 Go 侧握手/流 span。 |
-| DEV-03 | 采纳，P1 | 需 PostgreSQL 实例；先抽存储接口并保持 SQLite 默认部署与现有回归全绿。 |
+| DEV-03 | 已完成（2026-11-05） | `--postgres-dsn`/`CHAST_POSTGRES_DSN` 让账号、地址簿、审计/连接/文件历史、录制元数据与对等记录改存 PostgreSQL；驱动层方言改写保持调用点不变，ICU 排序规则复现 SQLite NOCASE，并发由 advisory lock 串行；空库迁移、并发与启动验证通过。 |
 | DEV-04 | 采纳，P1 | 账号仍只有逐设备标签，无按组授权与配额；与地址簿分组 ACL 解耦。 |
 | DEV-05 | 采纳，P1 | GeoIP 目前只用于登录审计；连接/文件审计缺地点、路由与逐文件关联。 |
 | DEV-06 | 采纳，P1 | 已有按日轮转与远端投递，缺集中去重与迟到合并。 |

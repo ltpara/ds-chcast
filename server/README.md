@@ -9,7 +9,7 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | RustDesk | 本服务 | 说明 |
 | --- | --- | --- |
 | `RegisterPk` 首次登记 ID 公钥 | `POST /v1/hosts` + Ed25519 注册签名 | 公钥与 ID 永久绑定，续约必须用同一私钥签名 |
-| `Peer` 记录持久化 | SQLite `chast-server-state.db`（`peers` 表）+ 服务器签名 `binding` | 离线仍可查询身份、主机名/平台/版本与最近在线时间；旧 JSON 状态自动一次性导入；状态库带前向版本化迁移（P2-21） |
+| `Peer` 记录持久化 | SQLite `chast-server-state.db`（`peers` 表）或 `--postgres-dsn` 指定的 PostgreSQL + 服务器签名 `binding` | 离线仍可查询身份、主机名/平台/版本与最近在线时间；旧 JSON 状态自动一次性导入；状态库带前向版本化迁移（P2-21）；PostgreSQL 后端与账号/审计共用同一 DSN |
 | 地址簿批量在线查询 | `GET /v1/hosts?ids=<id,...>` | 一次最多 200 个 ID、自动去重；未知 ID 列入 `missing`，整批查询不因个别失效条目失败 |
 | 对等记录别名与标签 | `PATCH /v1/identities/{id}` + 管理台 `alias`/`tags` | 运营者维护的展示名称与标签持久化到 SQLite，主机续约不会覆盖；单机与批量查询随记录返回，查看器地址簿在配置 server-key 后可从设备菜单直接编辑 |
 | 用户账号与账号地址簿 | `POST /v1/account/login` 等 + 管理台 `user`/`ab`/`audit` | PBKDF2-SHA256 密码换取 30 min 访问令牌与 720 h 刷新令牌（库中只存令牌哈希），刷新即轮换、重放即撤销整个会话；可选 TOTP 两步验证与一次性恢复码、设备会话改名/撤销与持久化账号安全审计；每个用户拥有独立的名称/标签地址簿，账号令牌与运营者 server-key 互不通用；查看器侧栏可登录并自动续期同步该地址簿，设备菜单可编辑账号标签；可选找回邮箱与一次性密码重置令牌（库中只存 SHA-256、默认 30 min、单账号仅一个有效令牌、成功即吊销全部会话）与可选找回手机与 8 位短信验证码（只存 SHA-256、默认 10 min、单账号单活、5 次错误即作废、成功后同样吊销全部会话），找回请求固定返回 202 以防账号枚举 |
@@ -751,13 +751,16 @@ Flutter 客户端都从同一份连接服务配置读取该密钥，打洞证明
   ID 绑定与最近一次元数据（租约与中继端口不持久化，主机重新注册时再分配）。
   同一文件还保存查看者账号、登录令牌与每用户地址簿；`--state ""` 关闭持久化时
   这些路由返回 503，`/v1/server` 的 `accounts` 为 `false`。
+  `--postgres-dsn`（或 `CHAST_POSTGRES_DSN`）非空时，账号、地址簿、审计与对等
+  记录改用 PostgreSQL 并忽略 `--state`，详见下文“PostgreSQL 后端”。
   升级前遗留的 JSON 状态会被一次性导入：同路径的旧 JSON 改写为
   `<state>.legacy` 后原地建库；`<state>.db` 不存在而同目录有同名 `.json`
   时导入并把它改名为 `.json.imported`。WAL 旁文件 `.db-wal`/`.db-shm` 属于
   状态的一部分；备份时应停服，或用 SQLite 的在线备份接口，不要只复制主文件。
   状态库带前向版本化迁移：账号与对等记录分别在 `schema_migrations`/
   `registry_schema_migrations` 记录版本，启动只执行未应用的步骤；账号库当前
-  为 v3（v3 增加分组 `parent_id`/`position` 与条目 `position`）；没有版本表
+  为 v6（v3 增加分组 `parent_id`/`position` 与条目 `position`，v4 增加录制
+  元数据，v5 增加刷新令牌重放标记，v6 增加 OIDC 身份关联）；没有版本表
   的旧库会自动补跑基线并补记 v1，版本高于当前二进制时服务端拒绝启动并提示
   升级（`schema version N is newer than this binary supports (M)`）。升级前
   应停止旧实例；只支持前向迁移，降级需从备份恢复。
@@ -1047,7 +1050,10 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `chast_db_query_duration_seconds_max{op}`。单连接池的排队情况由
   `chast_db_pool_wait_total{db}`、`chast_db_pool_wait_seconds_total{db}`、
   `chast_db_pool_in_use{db}` 与 `chast_db_pool_open_connections{db}` 反映，
-  等待数持续上升即 SQLite 写队列积压。
+  等待数持续上升即 SQLite 写队列积压。PostgreSQL 后端复用同一组指标，此时
+  `db="account"`/`db="registry"` 的等待与 `in_use` 反映连接池饱和而非
+  SQLite 写锁；包装层同时把 SQLite 风格的 `?` 占位符、`COLLATE NOCASE` 与
+  布尔字面量改写为 pgx 可执行的语句，对调用方透明。
 - `GET /metrics` 输出 Prometheus 文本格式，配置 `--server-key` 后需要 Bearer
   认证。API 请求延迟以 `chast_http_request_duration_seconds` 直方图暴露，
   按端点分标签，分桶 0.001–10 秒加 `+Inf`，同时给出 `_sum`/`_count`。采集器示例：
@@ -1096,6 +1102,46 @@ scrape_configs:
   探测。自检会注册一个临时 ID，每秒重发一次签名 keepalive，12 s 内无应答则
   打印目标与最后错误并退出，成功时日志记录 RTT。探测目标不是 `chast-relay`：
   节点没有会合端口，其 UDP 中继端口需要有效租约才应答。
+
+### PostgreSQL 后端
+
+状态需要离开单机 SQLite 时，给 `chast-server` 传 `--postgres-dsn`（或设置
+`CHAST_POSTGRES_DSN`）。非空 DSN 同时接管账号、令牌、地址簿、审计/连接/文件
+历史、登录限速、录制元数据、归档检查点与对等记录，`--state` 被忽略；
+`--state ""` 的“无持久化”语义不再适用。
+
+```sh
+chast-server --postgres-dsn "postgres://chast:secret@db.example.com:5432/chast?sslmode=require" \
+  --server-key "$CHAST_SERVER_KEY" --identity /var/lib/chast/identity.key \
+  --audit-archive-dir /var/lib/chast/archive
+```
+
+- 驱动为 pgx v5；目标库需支持 ICU（官方发行版默认支持）。首次启动会创建
+  非确定性排序规则 `chast_nocase`（`provider = icu, locale = 'und-u-ks-level2',
+  deterministic = false`），用于复现 SQLite `COLLATE NOCASE` 的用户名/邮箱
+  大小写不敏感比较与唯一索引；`CREATE COLLATION` 需要超级用户或该库的
+  `CREATE` 权限，权限不足时启动失败并在日志给出原因。
+- 无需单独的迁移命令：启动时账号库与对等库分别以 `schema_migrations` /
+  `registry_schema_migrations` 记录版本，只执行未应用步骤；多个实例同时冷
+  启动时用 PostgreSQL 会话级 advisory lock 串行化建表。PostgreSQL 支持从
+  当前 schema 开始（账号基线 v6、对等基线 v1），不支持从 SQLite 文件在线
+  搬迁；迁移只前向追加，新增迁移必须同时补到 SQLite 与 PostgreSQL 两份列表。
+  版本高于二进制支持范围时拒绝启动。
+- 连接池不再限制为单连接，并发由数据库行锁与每登录键的
+  `pg_advisory_xact_lock` 串行化；`/metrics` 的 `chast_db_pool_*` 指标可用于
+  判断池容量。
+- 备份用 `pg_dump`/`pg_restore`。录制 MP4、审计 JSONL 归档、ACME 缓存与
+  `--identity` 仍在本机目录，不随数据库迁移；恢复时数据库与这些目录要一起
+  备份。
+- 集成测试由 `CHAST_TEST_POSTGRES_DSN` 门控：
+
+```sh
+CHAST_TEST_POSTGRES_DSN="postgres://postgres@127.0.0.1:5432/chast_test?sslmode=disable" \
+  go test ./internal/account ./internal/registry
+```
+
+  测试会在目标库建表并写入临时账号/主机，结束后清理自己创建的行；请使用
+  专用测试库，不要指向生产库。
 
 ### 独立中继节点（chast-relay）
 
