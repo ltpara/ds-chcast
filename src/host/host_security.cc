@@ -70,6 +70,40 @@ bool has_prefix(const std::string& text, std::string_view prefix) {
     return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
 }
 
+// A control-only session may request nothing beyond the one permission its
+// mode serves: the host announces no picture, input or other control for it.
+uint16_t mode_permissions(SessionMode mode) {
+    switch (mode) {
+        case SessionMode::FileTransfer:
+            return kPermissionFileTransfer;
+        case SessionMode::Terminal:
+            return kPermissionTerminal;
+        case SessionMode::Camera:
+            return kPermissionCamera;
+        case SessionMode::PortForward:
+            return kPermissionPortForward;
+        case SessionMode::Desktop:
+            break;
+    }
+    return kPermissionAll;
+}
+
+std::string mode_disabled_reason(SessionMode mode) {
+    switch (mode) {
+        case SessionMode::FileTransfer:
+            return "file transfer is disabled on this host";
+        case SessionMode::Terminal:
+            return "remote terminal is disabled on this host";
+        case SessionMode::Camera:
+            return "camera streaming is disabled on this host";
+        case SessionMode::PortForward:
+            return "port forwarding is disabled on this host";
+        case SessionMode::Desktop:
+            break;
+    }
+    return {};
+}
+
 bool device_expired(const TrustedDevice& device, int64_t now_unix) {
     const int64_t last = device.last_seen_unix_seconds != 0 ? device.last_seen_unix_seconds
                                                             : device.added_unix_seconds;
@@ -231,13 +265,12 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
     result.device_name = hello.device_name;
     result.device_platform = hello.device_platform;
     result.device_key = hello.device_key;
-    // A file-transfer-only session may request nothing but file transfer: the
-    // host will announce no picture, input or other control for it. Clamping
-    // the request here keeps every later decision and the approval window on
-    // the same mask.
+    // A control-only session may request nothing but the permission its mode
+    // serves: the host will announce no picture, input or other control for
+    // it. Clamping the request here keeps every later decision and the
+    // approval window on the same mask.
     const uint16_t requested =
-        hello.requested_permissions &
-        (hello.mode == SessionMode::FileTransfer ? kPermissionFileTransfer : kPermissionAll);
+        hello.requested_permissions & mode_permissions(hello.mode);
     result.permissions = config_.default_permissions & requested;
 
     if (whitelist_configured_) {
@@ -275,12 +308,12 @@ HostSecurity::Result HostSecurity::evaluate(const ClientHello& hello,
         }
     }
 
-    // A files-only session has nothing to serve when the host does not allow
-    // file transfer; refusing here is clearer than an empty session that
-    // refuses every request.
-    if (hello.mode == SessionMode::FileTransfer &&
-        (config_.default_permissions & kPermissionFileTransfer) == 0) {
-        result = deny(AccessDenial::Declined, "file transfer is disabled on this host");
+    // A control-only session has nothing to serve when the host does not
+    // allow its one feature; refusing here is clearer than an empty session
+    // that refuses every request.
+    if (hello.mode != SessionMode::Desktop &&
+        (config_.default_permissions & mode_permissions(hello.mode)) == 0) {
+        result = deny(AccessDenial::Declined, mode_disabled_reason(hello.mode));
         result.peer_address = peer_address;
         result.peer_ip = address_key(peer_address, result.peer_ip);
         return result;

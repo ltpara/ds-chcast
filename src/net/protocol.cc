@@ -696,8 +696,7 @@ bool parse_hello(const std::vector<uint8_t>& payload, ClientHello& hello,
         set_error(error, "Hello carries no session mode");
         return false;
     }
-    if (mode != static_cast<uint8_t>(SessionMode::Desktop) &&
-        mode != static_cast<uint8_t>(SessionMode::FileTransfer)) {
+    if (mode > static_cast<uint8_t>(SessionMode::PortForward)) {
         set_error(error, "Hello asks for session mode " + std::to_string(mode));
         return false;
     }
@@ -793,8 +792,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     // 24 fixed bytes, the encoder name, the display count, the displays, the
     // 16-byte audio description and its AudioSpecificConfig, the captured
     // desktop size (the encoded size in the fixed block may be scaled down),
-    // then the v13 permission mask.
-    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4 + 2;
+    // the v13 permission mask, then the v41 session mode.
+    size_t size = 24 + info.encoder.size() + 2 + 16 + extradata_size + 4 + 2 + 1;
     for (size_t i = 0; i < display_count; ++i) {
         size += kDisplayFixedSize + info.displays[i].name.size();
     }
@@ -821,7 +820,8 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.camera_enabled ? kServerInfoCameraEnabled : 0) |
                         (info.merged ? kServerInfoMergedLayout : 0) |
                         (info.files_only ? kServerInfoFileTransferOnly : 0) |
-                        (info.audio_datagram && info.audio.enabled ? kServerInfoAudioDatagram : 0)));
+                        (info.audio_datagram && info.audio.enabled ? kServerInfoAudioDatagram : 0) |
+                        (info.control_only ? kServerInfoControlOnly : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -895,6 +895,7 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
         permissions |= kPermissionSessionSelect;
     }
     put_u16(cursor, permissions);
+    put_u8(cursor, static_cast<uint8_t>(info.mode));
     return payload;
 }
 
@@ -937,6 +938,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.clipboard_enabled = (flags & kServerInfoClipboardEnabled) != 0;
     info.merged = (flags & kServerInfoMergedLayout) != 0;
     info.files_only = (flags & kServerInfoFileTransferOnly) != 0;
+    info.control_only = (flags & kServerInfoControlOnly) != 0;
     const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
     info.audio_datagram = (flags & kServerInfoAudioDatagram) != 0;
     if (info.audio_datagram && !audio_flag) {
@@ -947,19 +949,19 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck names unknown codec " + std::to_string(codec));
         return false;
     }
-    if (info.files_only && info.merged) {
-        set_error(error, "HelloAck is files-only and merged at once");
+    if ((info.files_only || info.control_only) && info.merged) {
+        set_error(error, "HelloAck is control-only and merged at once");
         return false;
     }
-    if (info.files_only && audio_flag) {
-        set_error(error, "HelloAck announces audio in a files-only session");
+    if ((info.files_only || info.control_only) && audio_flag) {
+        set_error(error, "HelloAck announces audio in a control-only session");
         return false;
     }
-    if (info.files_only && (info.width != 0 || info.height != 0)) {
-        set_error(error, "HelloAck has a picture in a files-only session");
+    if ((info.files_only || info.control_only) && (info.width != 0 || info.height != 0)) {
+        set_error(error, "HelloAck has a picture in a control-only session");
         return false;
     }
-    if (!info.files_only && (info.width == 0 || info.height == 0)) {
+    if (!info.files_only && !info.control_only && (info.width == 0 || info.height == 0)) {
         set_error(error, "HelloAck has an empty picture");
         return false;
     }
@@ -1088,12 +1090,12 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         return false;
     }
     if (info.source_width == 0 || info.source_height == 0) {
-        if (!info.files_only) {
+        if (!info.files_only && !info.control_only) {
             set_error(error, "HelloAck has an empty source picture");
             return false;
         }
-    } else if (info.files_only) {
-        set_error(error, "HelloAck has a source picture in a files-only session");
+    } else if (info.files_only || info.control_only) {
+        set_error(error, "HelloAck has a source picture in a control-only session");
         return false;
     }
     uint16_t permissions = 0;
@@ -1103,6 +1105,27 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     }
     if ((permissions & ~kPermissionAll) != 0) {
         set_error(error, "HelloAck grants unknown permissions");
+        return false;
+    }
+    uint8_t mode = 0;
+    if (!reader.u8(mode)) {
+        set_error(error, "HelloAck carries no session mode");
+        return false;
+    }
+    if (mode > static_cast<uint8_t>(SessionMode::PortForward)) {
+        set_error(error, "HelloAck names session mode " + std::to_string(mode));
+        return false;
+    }
+    info.mode = static_cast<SessionMode>(mode);
+    const bool control_mode = info.mode == SessionMode::Terminal ||
+                              info.mode == SessionMode::Camera ||
+                              info.mode == SessionMode::PortForward;
+    if (info.files_only != (info.mode == SessionMode::FileTransfer)) {
+        set_error(error, "HelloAck session mode disagrees with its file-transfer flag");
+        return false;
+    }
+    if (info.control_only != control_mode) {
+        set_error(error, "HelloAck session mode disagrees with its control-only flag");
         return false;
     }
     // Restart, block input, OS login and session select have no flag of their
@@ -1119,6 +1142,19 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     if (info.files_only && (permissions & ~kPermissionFileTransfer) != 0) {
         set_error(error, "HelloAck grants more than file transfer in a files-only session");
         return false;
+    }
+    if (control_mode) {
+        const uint16_t mode_permission =
+            info.mode == SessionMode::Terminal
+                ? kPermissionTerminal
+                : info.mode == SessionMode::Camera ? kPermissionCamera
+                                                   : kPermissionPortForward;
+        if ((permissions & ~mode_permission) != 0 ||
+            (permissions & mode_permission) == 0) {
+            set_error(error,
+                      "HelloAck grants a permission the control-only session cannot use");
+            return false;
+        }
     }
     if (info.merged) {
         if (info.displays.empty()) {

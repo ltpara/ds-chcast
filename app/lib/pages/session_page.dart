@@ -37,6 +37,7 @@ class SessionPage extends StatefulWidget {
     this.settings = const ServerSettings(),
     this.identityStore,
     this.fileTransferOnly = false,
+    this.sessionMode = 'desktop',
   });
 
   final ConnectTarget target;
@@ -46,6 +47,12 @@ class SessionPage extends StatefulWidget {
   /// when it does not allow file transfer, and the page reports that refusal
   /// like any other.
   final bool fileTransferOnly;
+
+  /// The connection type requested from the host (protocol v41): 'desktop',
+  /// 'file_transfer', 'terminal', 'camera' or 'port_forward'. The standalone
+  /// modes carry no screen stream and show their own panel instead of the
+  /// remote-screen stack.
+  final String sessionMode;
 
   /// The signed-in account, if any. It is used to report a finished remote
   /// session and, when enabled, to upload finished recordings.
@@ -115,6 +122,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _cameraOpen = false;
   bool _cameraOpening = false;
   int _cameraTextureId = -1;
+  // A standalone camera session opens the panel and starts a camera on its
+  // own: there is no remote picture to click through first.
+  bool _cameraAutoStarted = false;
+  // The standalone port-forward session raises its setup dialog once when the
+  // session turns live; closing it leaves the status card behind.
+  bool _portForwardPrompted = false;
   // Host shared-folder browser. Modeless like chat; it never takes the
   // keyboard, so remote input keeps flowing while it is open.
   bool _fileBrowserOpen = false;
@@ -706,7 +719,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         host: tunnel?.host ?? widget.target.host,
         port: tunnel?.port ?? widget.target.port,
         gpuOutput: output,
-        display: widget.fileTransferOnly ? kViewerDisplayAuto : _display,
+        display: widget.fileTransferOnly || widget.sessionMode != 'desktop'
+            ? kViewerDisplayAuto
+            : _display,
         fingerprint: pin,
         allowUnverified: pin.isEmpty,
         accessToken: widget.target.token,
@@ -718,6 +733,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         carrierHostId: carrierHostId,
         carrierToken: carrierToken,
         fileTransferOnly: widget.fileTransferOnly,
+        sessionMode: widget.sessionMode,
       );
       // The native session starts with clipboard sync on; reapply this page's
       // switch before the first poll can show it as enabled.
@@ -959,6 +975,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _status = status;
       _fullscreen = status.fullscreen;
     });
+    _maybeOpenControlPanel(status);
     if (streamSettled) {
       _saveStreamPreferences();
     }
@@ -3039,6 +3056,47 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _setKeyCapture(_inputActive && !focused && !_chatTyping);
   }
 
+  /// A standalone session has no remote screen to click through, so the page
+  /// opens the mode's panel as soon as the session turns live. Runs after
+  /// every status poll; each action fires at most once.
+  void _maybeOpenControlPanel(ViewerStatus status) {
+    final String mode = widget.sessionMode != 'desktop'
+        ? widget.sessionMode
+        : status.sessionMode;
+    if (!status.isLive || status.isOver) {
+      return;
+    }
+    if (mode == 'camera') {
+      if (!_cameraOpen && !_cameraOpening && status.acceptsCamera) {
+        unawaited(_openCameraPanel());
+      }
+      if (_cameraOpen &&
+          !_cameraAutoStarted &&
+          status.cameras.isNotEmpty &&
+          (status.cameraPhase == ViewerCameraPhase.idle ||
+              status.cameraPhase == ViewerCameraPhase.listed)) {
+        _cameraAutoStarted = true;
+        ViewerCamera camera = status.cameras.first;
+        for (final ViewerCamera candidate in status.cameras) {
+          if (candidate.isDefault) {
+            camera = candidate;
+            break;
+          }
+        }
+        unawaited(_startCamera(camera.id));
+      }
+    } else if (mode == 'port_forward' &&
+        !_portForwardPrompted &&
+        status.acceptsPortForward) {
+      _portForwardPrompted = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_status.isOver) {
+          unawaited(_openPortForwardDialog());
+        }
+      });
+    }
+  }
+
   void _toggleTerminal() {
     if (_terminalOpen) {
       _closeTerminalPanel();
@@ -3616,6 +3674,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // never applies.
     if (widget.fileTransferOnly || _status.filesOnly) {
       return _buildFilesOnly();
+    }
+    // Terminal, camera and port-forward sessions carry no screen stream: the
+    // page is the mode's panel with a small header. The widget field drives
+    // the layout before the HelloAck; the status echo confirms it afterwards.
+    final String controlMode = widget.sessionMode != 'desktop'
+        ? widget.sessionMode
+        : _status.sessionMode;
+    if (_status.controlOnly || controlMode != 'desktop') {
+      return _buildControlOnly(controlMode);
     }
     final bool hasFrame = _status.hasFrame;
     final bool showOverlay = _startError != null || _status.isOver;
@@ -4209,6 +4276,298 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                   child: _buildFileProgress(),
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The whole page for a standalone session (protocol v41): a small header
+  /// naming the connection type and the mode's own panel in the body. The
+  /// page never shows the remote-screen stack; the close button leaves the
+  /// session.
+  Widget _buildControlOnly(String mode) {
+    final bool showOverlay = _startError != null || _status.isOver;
+    final bool live = _status.isLive;
+    final (IconData icon, String title) = switch (mode) {
+      'terminal' => (Icons.terminal_rounded, tr('远程终端')),
+      'camera' => (Icons.videocam_rounded, tr('主机摄像头')),
+      'port_forward' => (Icons.alt_route_rounded, tr('端口转发')),
+      _ => (Icons.cable_rounded, tr('远程会话')),
+    };
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (bool didPop, Object? result) {
+        if (didPop) {
+          _cleanupAfterPop();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Column(
+          children: <Widget>[
+            Container(
+              height: 44,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              color: const Color(0xFF1A1B20),
+              child: Row(
+                children: <Widget>[
+                  Icon(icon, size: 16, color: kAccentBright),
+                  const SizedBox(width: 8),
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      widget.target.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white54,
+                        fontSize: 11.5,
+                      ),
+                    ),
+                  ),
+                  if (live)
+                    Text(
+                      _status.transportLabel,
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 11,
+                      ),
+                    ),
+                  const SizedBox(width: 8),
+                  SizedBox(
+                    width: 30,
+                    height: 30,
+                    child: IconButton(
+                      tooltip: tr('关闭'),
+                      padding: EdgeInsets.zero,
+                      icon: const Icon(
+                        Icons.close_rounded,
+                        size: 17,
+                        color: Colors.white70,
+                      ),
+                      onPressed: _leave,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Colors.white12),
+            Expanded(
+              child: Container(
+                color: Colors.black,
+                child: _autoPolicy.waiting && showOverlay
+                    ? _buildAutoReconnect(false)
+                    : showOverlay
+                    ? _buildDisconnected(false)
+                    : !live
+                    ? _buildWaiting()
+                    : _buildControlBody(mode),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildControlBody(String mode) {
+    switch (mode) {
+      case 'terminal':
+        return Padding(
+          padding: const EdgeInsets.all(12),
+          child: TerminalPanel(
+            status: _status,
+            focusNode: _terminalFocus,
+            onOpen: (int columns, int rows) =>
+                ViewerBridge.openTerminal(columns: columns, rows: rows),
+            onTakeOutput: ViewerBridge.takeTerminalOutput,
+            onSendInput: ViewerBridge.sendTerminalInput,
+            onResize: (int columns, int rows) =>
+                ViewerBridge.resizeTerminal(columns: columns, rows: rows),
+            onClose: ViewerBridge.closeTerminal,
+            onDismiss: _leave,
+            initialFontSize: _terminalFontSize,
+            onFontSizeChanged: _rememberTerminalFontSize,
+          ),
+        );
+      case 'camera':
+        if (!_cameraOpen) {
+          return _cameraOpening
+              ? _buildControlNote(
+                  icon: Icons.videocam_rounded,
+                  title: tr('正在打开摄像头…'),
+                  detail: tr('面板准备好后会自动列出主机上的摄像头。'),
+                )
+              : _buildControlNote(
+                  icon: Icons.videocam_rounded,
+                  title: tr('主机摄像头'),
+                  detail: tr('连接已建立，可以打开主机摄像头。'),
+                  actionLabel: tr('打开摄像头'),
+                  onAction: () => unawaited(_openCameraPanel()),
+                );
+        }
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: SizedBox(
+              width: 560,
+              child: CameraPanel(
+                status: _status,
+                textureId: _cameraTextureId,
+                onRefresh: () =>
+                    unawaited(_guardSend(ViewerBridge.requestCameraList())),
+                onStart: (int cameraId) => unawaited(_startCamera(cameraId)),
+                onStop: () => unawaited(_stopCamera()),
+                onDismiss: _leave,
+              ),
+            ),
+          ),
+        );
+      case 'port_forward':
+        return Center(child: _buildPortForwardCard());
+      default:
+        return _buildWaiting();
+    }
+  }
+
+  Widget _buildPortForwardCard() {
+    final ViewerStatus status = _status;
+    if (!status.portForwardActive) {
+      return _buildControlNote(
+        icon: Icons.alt_route_rounded,
+        title: tr('端口转发'),
+        detail: tr(
+          '本机在 127.0.0.1 上监听，主机把每个连入的 TCP 连接转发到目标地址。本地端口填 0 由系统分配。',
+        ),
+        actionLabel: tr('配置端口转发'),
+        onAction: () => unawaited(_openPortForwardDialog()),
+      );
+    }
+    return Container(
+      width: 420,
+      padding: const EdgeInsets.fromLTRB(26, 24, 26, 20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1C1D22),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              const Icon(
+                Icons.alt_route_rounded,
+                size: 18,
+                color: kAccentBright,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                tr('端口转发'),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            tr(
+              '正在转发 127.0.0.1:{p7} → {p8}:{p9}\n连接 {p10} · 失败 {p11} · 上行 {p12} · 下行 {p13}',
+              <String, Object?>{
+                'p7': status.portForwardLocalPort,
+                'p8': status.portForwardRemoteHost,
+                'p9': status.portForwardRemotePort,
+                'p10': status.portForwardConnections,
+                'p11': status.portForwardFailures,
+                'p12': _formatBytes(status.portForwardBytesUp),
+                'p13': _formatBytes(status.portForwardBytesDown),
+              },
+            ),
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11.5,
+              height: 1.5,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () => unawaited(_openPortForwardDialog()),
+                  child: Text(tr('更换目标')),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton(
+                  onPressed: () => unawaited(ViewerBridge.stopPortForward()),
+                  child: Text(tr('停止转发')),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildControlNote({
+    required IconData icon,
+    required String title,
+    required String detail,
+    String? actionLabel,
+    VoidCallback? onAction,
+  }) {
+    return Center(
+      child: Container(
+        width: 380,
+        padding: const EdgeInsets.fromLTRB(26, 26, 26, 22),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1C1D22),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(icon, size: 30, color: Colors.white54),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              detail,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 12,
+                height: 1.45,
+              ),
+            ),
+            if (actionLabel != null && onAction != null) ...<Widget>[
+              const SizedBox(height: 16),
+              FilledButton(onPressed: onAction, child: Text(actionLabel)),
+            ],
           ],
         ),
       ),

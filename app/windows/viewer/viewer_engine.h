@@ -191,6 +191,11 @@ struct ViewerStatus {
     // input or pointer stream exists, and the file browser is the session.
     // `state` still reaches kStreaming once the host accepted the Hello.
     bool files_only = false;
+    // v41: the session has no screen stream at all (files_only included) and
+    // `session_mode` names what it serves: "desktop", "file_transfer",
+    // "terminal", "camera" or "port_forward".
+    bool control_only = false;
+    std::string session_mode = "desktop";
     // The permission mask the host last announced (chast::PermissionBit) and
     // how many masks have been applied, including the one from HelloAck. The
     // UI compares the mask to explain a live revocation.
@@ -618,7 +623,9 @@ public:
     // `file_transfer_only` asks the host for a session without a screen
     // stream (protocol v32). The host answers through
     // ViewerStatus::files_only; a host that lacks file transfer refuses the
-    // Hello, so `display` and the sink are not used.
+    // Hello, so `display` and the sink are not used. `session_mode` (v41)
+    // selects Terminal, Camera or PortForward instead; it takes precedence
+    // over the bool, and those sessions also need neither display nor sink.
     bool Start(const std::string& host, uint16_t port, uint16_t display,
                std::string pinned_fingerprint = {},
                bool allow_unverified = false,
@@ -629,7 +636,8 @@ public:
                ViewerTransport transport = ViewerTransport::kAuto,
                std::string carrier_host = {}, uint16_t carrier_port = 0,
                std::string carrier_host_id = {}, std::string carrier_token = {},
-               bool file_transfer_only = false);
+               bool file_transfer_only = false,
+               chast::SessionMode session_mode = chast::SessionMode::Desktop);
     // Requests the session to end and waits for the worker to tear down the
     // QUIC connection. Safe to call when no session is running.
     void Stop();
@@ -938,7 +946,8 @@ private:
              bool trust_device, ViewerTransport transport,
              std::string carrier_host, uint16_t carrier_port,
              std::string carrier_host_id, std::string carrier_token,
-             std::string audit_ref, bool file_transfer_only);
+             std::string audit_ref, bool file_transfer_only,
+             chast::SessionMode session_mode);
     void SetState(ViewerState state, std::string error = {});
     // Expands dropped folders and hashes queued uploads on its own thread, so
     // a multi-gigabyte read never stalls the session's receive loop.

@@ -337,9 +337,31 @@ void ViewerBridge::HandleMethodCall(
         if (args != nullptr) {
             map_bool(*args, "fileTransferOnly", &file_transfer_only);
         }
-        // A files-only session has no picture, so it needs neither the GPU
+        chast::SessionMode session_mode = chast::SessionMode::Desktop;
+        if (args != nullptr) {
+            std::string mode_text;
+            if (map_string(*args, "sessionMode", &mode_text) && !mode_text.empty()) {
+                if (mode_text == "desktop") {
+                    session_mode = chast::SessionMode::Desktop;
+                } else if (mode_text == "file_transfer") {
+                    session_mode = chast::SessionMode::FileTransfer;
+                } else if (mode_text == "terminal") {
+                    session_mode = chast::SessionMode::Terminal;
+                } else if (mode_text == "camera") {
+                    session_mode = chast::SessionMode::Camera;
+                } else if (mode_text == "port_forward") {
+                    session_mode = chast::SessionMode::PortForward;
+                } else {
+                    result->Error("bad_args", "sessionMode must be desktop, file_transfer, terminal, camera or port_forward");
+                    return;
+                }
+            }
+        }
+        const bool control_only = file_transfer_only ||
+                                  session_mode != chast::SessionMode::Desktop;
+        // A control-only session has no picture, so it needs neither the GPU
         // sink nor a texture; a desktop session still does.
-        if (!file_transfer_only &&
+        if (!control_only &&
             (texture_sink_ == nullptr || !texture_sink_->ready())) {
             result->Error("no_gpu", texture_sink_ != nullptr
                                         ? texture_sink_->error()
@@ -348,9 +370,9 @@ void ViewerBridge::HandleMethodCall(
         }
         if (args == nullptr || !map_string(*args, "host", &host) ||
             !map_int(*args, "port", &port) ||
-            (!file_transfer_only && !map_int(*args, "gpuOutput", &output)) ||
+            (!control_only && !map_int(*args, "gpuOutput", &output)) ||
             host.empty() || port <= 0 || port > 65535 || output < 0 ||
-            (!file_transfer_only && output == 0)) {
+            (!control_only && output == 0)) {
             result->Error("bad_args",
                           "start wants a host, a port in 1..65535 and a GPU texture output");
             return;
@@ -424,7 +446,7 @@ void ViewerBridge::HandleMethodCall(
                             trust_device, transport, std::move(carrier_host),
                             static_cast<uint16_t>(carrier_port),
                             std::move(carrier_host_id), std::move(carrier_token),
-                            file_transfer_only)) {
+                            file_transfer_only, session_mode)) {
             texture_sink_->SetOutput(nullptr);
             result->Error("busy", "a session is already running");
             return;
@@ -491,6 +513,8 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(static_cast<int64_t>(status.elapsed_ms));
         map[key("videoFinished")] = flutter::EncodableValue(status.video_finished);
         map[key("filesOnly")] = flutter::EncodableValue(status.files_only);
+        map[key("controlOnly")] = flutter::EncodableValue(status.control_only);
+        map[key("sessionMode")] = flutter::EncodableValue(status.session_mode);
         map[key("fullscreen")] = flutter::EncodableValue(fullscreen_);
         map[key("inputEnabled")] = flutter::EncodableValue(status.input_enabled);
         map[key("permissions")] =

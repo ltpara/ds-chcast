@@ -95,6 +95,12 @@ void test_hello() {
     check(parses_hello(payload_of(chast::make_hello(sent)), got) &&
               got.mode == chast::SessionMode::FileTransfer,
           "Hello round-trips the v32 file-transfer session mode");
+    for (chast::SessionMode mode : {chast::SessionMode::Terminal, chast::SessionMode::Camera,
+                                    chast::SessionMode::PortForward}) {
+        sent.mode = mode;
+        check(parses_hello(payload_of(chast::make_hello(sent)), got) && got.mode == mode,
+              "Hello round-trips the v41 terminal, camera and port-forward modes");
+    }
     sent.mode = chast::SessionMode::Desktop;
 
     sent.capabilities = chast::kClientCapabilityAudioDatagram;
@@ -489,6 +495,7 @@ void test_hello_ack() {
 void test_files_only_hello_ack() {
     chast::ServerInfo sent;
     sent.files_only = true;
+    sent.mode = chast::SessionMode::FileTransfer;
     sent.file_transfer_enabled = true;
     sent.encoder = "none";
     chast::ServerInfo got;
@@ -530,6 +537,87 @@ void test_files_only_hello_ack() {
     audio.audio.extradata = {0x11, 0x90};
     rejects_ack(audio, "a files-only HelloAck that announces audio is rejected");
     rejects_ack(chast::ServerInfo{}, "a HelloAck without a picture and without the flag is rejected");
+}
+
+void test_control_only_hello_ack() {
+    auto control_info = [](chast::SessionMode mode) {
+        chast::ServerInfo info;
+        info.control_only = true;
+        info.mode = mode;
+        info.encoder = "none";
+        if (mode == chast::SessionMode::Terminal) {
+            info.terminal_enabled = true;
+        } else if (mode == chast::SessionMode::Camera) {
+            info.camera_enabled = true;
+        } else {
+            info.port_forward_enabled = true;
+        }
+        return info;
+    };
+
+    for (chast::SessionMode mode : {chast::SessionMode::Terminal, chast::SessionMode::Camera,
+                                    chast::SessionMode::PortForward}) {
+        chast::ServerInfo got;
+        std::string error;
+        const bool parsed =
+            chast::parse_hello_ack(payload_of(chast::make_hello_ack(control_info(mode))), got,
+                                   &error);
+        check(parsed, "a control-only HelloAck round-trips");
+        if (!parsed) {
+            std::printf("     %s\n", error.c_str());
+            continue;
+        }
+        check(got.control_only, "HelloAck keeps the control-only flag");
+        check(got.mode == mode, "HelloAck keeps the v41 control session mode");
+        check(!got.files_only && !got.merged,
+              "a control-only HelloAck is neither files-only nor merged");
+        check(got.width == 0 && got.height == 0 && got.source_width == 0 &&
+                  got.source_height == 0,
+              "a control-only HelloAck carries no picture size");
+        check(!got.audio.enabled && got.displays.empty(),
+              "a control-only HelloAck carries no media");
+        check(mode == chast::SessionMode::Terminal
+                  ? got.terminal_enabled
+                  : mode == chast::SessionMode::Camera ? got.camera_enabled
+                                                       : got.port_forward_enabled,
+              "a control-only HelloAck grants its own permission only");
+    }
+
+    auto rejects_ack = [](const chast::ServerInfo& info, const char* what) {
+        chast::ServerInfo dropped;
+        std::string error;
+        check(!chast::parse_hello_ack(payload_of(chast::make_hello_ack(info)), dropped,
+                                      &error),
+              what);
+    };
+    chast::ServerInfo missing_flag = control_info(chast::SessionMode::Terminal);
+    missing_flag.control_only = false;
+    rejects_ack(missing_flag, "a terminal HelloAck without the control-only flag is rejected");
+    chast::ServerInfo wrong_flag = control_info(chast::SessionMode::FileTransfer);
+    wrong_flag.files_only = true;
+    wrong_flag.file_transfer_enabled = true;
+    rejects_ack(wrong_flag, "a file-transfer HelloAck with the control-only flag is rejected");
+    chast::ServerInfo extra = control_info(chast::SessionMode::Terminal);
+    extra.camera_enabled = true;
+    rejects_ack(extra, "a terminal HelloAck that grants another permission is rejected");
+    chast::ServerInfo empty = control_info(chast::SessionMode::Terminal);
+    empty.terminal_enabled = false;
+    rejects_ack(empty, "a terminal HelloAck without its permission is rejected");
+    chast::ServerInfo picture = control_info(chast::SessionMode::Camera);
+    picture.width = 640;
+    picture.height = 480;
+    rejects_ack(picture, "a camera HelloAck with a picture is rejected");
+    chast::ServerInfo merged = control_info(chast::SessionMode::PortForward);
+    merged.merged = true;
+    rejects_ack(merged, "a port-forward HelloAck that claims a merged layout is rejected");
+
+    std::vector<uint8_t> payload =
+        payload_of(chast::make_hello_ack(control_info(chast::SessionMode::Terminal)));
+    payload.back() = 5;
+    chast::ServerInfo dropped;
+    std::string error;
+    check(!chast::parse_hello_ack(payload, dropped, &error),
+          "a HelloAck with an unknown session mode is rejected");
 }
 
 void test_merged_hello_ack() {
@@ -3793,6 +3881,7 @@ int main(int argc, char** argv) {
     test_access_denied();
     test_hello_ack();
     test_files_only_hello_ack();
+    test_control_only_hello_ack();
     test_merged_hello_ack();
     test_permission_update();
     test_sas();

@@ -528,4 +528,11 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The host does not support switching Windows sessions',
   '主机无法切换会话': 'The host could not switch sessions',
   '主机拒绝了会话切换': 'The host refused the session switch',
+  '远程会话': 'Remote session',
+  '配置端口转发': 'Set up port forwarding',
+  '打开摄像头': 'Open camera',
+  '连接已建立，可以打开主机摄像头。':
+      'The session is live; you can open the host camera.',
+  '面板准备好后会自动列出主机上的摄像头。':
+      'The host cameras are listed as soon as the panel is ready.',
 };

@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 40.
+// The chast wire protocol, version 41.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 40;
+inline constexpr uint16_t kProtocolVersion = 41;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -830,6 +830,11 @@ inline constexpr uint16_t kServerInfoFileTransferOnly = 0x0800;
 // audio stream. The viewer serves these packets before the stream parser; a
 // lost datagram is a short gap, not a retransmission that stalls playback.
 inline constexpr uint16_t kServerInfoAudioDatagram = 0x1000;
+// v41: the session carries no desktop picture or audio. The mode byte appended
+// to HelloAck/StreamInfo says what the session is for (Terminal, Camera or
+// PortForward); FileTransfer keeps using the older FileTransferOnly flag. The
+// viewer never creates a decoder for such a session.
+inline constexpr uint16_t kServerInfoControlOnly = 0x2000;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
 // this mask rather than with every known flag. Restart and block input have no
@@ -848,7 +853,8 @@ inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
 inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoMergedLayout |
                                                   kServerInfoFileTransferOnly |
-                                                  kServerInfoAudioDatagram;
+                                                  kServerInfoAudioDatagram |
+                                                  kServerInfoControlOnly;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
@@ -902,6 +908,23 @@ inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboa
                                            kPermissionRecord | kPermissionCamera |
                                            kPermissionRestart | kPermissionBlockInput |
                                            kPermissionOsLogin | kPermissionSessionSelect;
+
+// What the viewer wants to do on this connection. Desktop is the full remote
+// desktop. The other modes ask for a control-only session that never starts a
+// capturer or encoder: FileTransfer browses the shared directories and moves
+// files, Terminal opens shells, Camera streams one camera, and PortForward
+// relays TCP targets. The host may refuse the mode; its answer in HelloAck is
+// authoritative.
+enum class SessionMode : uint8_t {
+    Desktop = 0,
+    FileTransfer = 1,
+    // v41: shells only (kPermissionTerminal).
+    Terminal = 2,
+    // v41: one camera stream only (kPermissionCamera).
+    Camera = 3,
+    // v41: viewer-registered TCP targets only (kPermissionPortForward).
+    PortForward = 4,
+};
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -1021,6 +1044,11 @@ struct ServerInfo {
     // the viewer must not expect frames. Only `file_transfer_enabled` can be
     // set alongside it.
     bool files_only = false;
+    // v41: the session is control-only (kServerInfoControlOnly) and `mode`
+    // says what it serves. FileTransfer keeps using files_only, so a viewer
+    // that only understands v40 still lands in the file browser.
+    bool control_only = false;
+    SessionMode mode = SessionMode::Desktop;
     // The viewer may open a microphone stream. This is the permission bit's
     // decoded form; it is not a separate wire field.
     bool microphone_enabled = false;
@@ -1121,15 +1149,6 @@ inline constexpr size_t kMaxAuditRefLength = 64;
 inline constexpr size_t kMaxSignatureLength = 128;
 inline constexpr size_t kHelloNonceBytes = 16;
 
-// What the viewer wants to do on this connection. Desktop is the full remote
-// desktop; FileTransfer asks for a control-only session that browses the
-// shared directories and moves files without capturing or encoding anything.
-// The host may refuse the mode; its answer in HelloAck is authoritative.
-enum class SessionMode : uint8_t {
-    Desktop = 0,
-    FileTransfer = 1,
-};
-
 // auth_flags bits.
 inline constexpr uint8_t kAuthFlagTrustDevice = 0x01;  // add this key to the trust list
 inline constexpr uint8_t kAuthFlagSigned = 0x02;       // signature is present
@@ -1167,7 +1186,8 @@ struct ClientHello {
     // Empty for CLI tools that do not report audit.
     std::string audit_ref;
     // v32: desktop by default; FileTransfer asks the host for a control-only
-    // file session. The host answers with ServerInfo::files_only.
+    // file session. v41 adds Terminal, Camera and PortForward. The host
+    // answers with ServerInfo::mode (FileTransfer also sets files_only).
     SessionMode mode = SessionMode::Desktop;
     // v35: bits from the kClientCapability* set. Default empty; the transport
     // fills it from its configuration so a client can opt out of datagram

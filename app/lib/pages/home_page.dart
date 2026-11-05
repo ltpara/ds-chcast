@@ -660,7 +660,11 @@ class _HomePageState extends State<HomePage> {
     return text.startsWith('[') || text.contains(':');
   }
 
-  Future<void> _connect(String input, {bool fileTransferOnly = false}) async {
+  Future<void> _connect(
+    String input, {
+    bool fileTransferOnly = false,
+    String sessionMode = 'desktop',
+  }) async {
     if (_opening) {
       return;
     }
@@ -687,12 +691,17 @@ class _HomePageState extends State<HomePage> {
       setState(() => _error = tr('格式无效：请输入设备 ID 或 主机:端口'));
       return;
     }
-    await _open(target, fileTransferOnly: fileTransferOnly);
+    await _open(
+      target,
+      fileTransferOnly: fileTransferOnly,
+      sessionMode: sessionMode,
+    );
   }
 
   Future<void> _connectDevice(
     Device device, {
     bool fileTransferOnly = false,
+    String sessionMode = 'desktop',
   }) async {
     if (_opening) {
       return;
@@ -724,12 +733,17 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     _address.text = target.label;
-    await _open(target, fileTransferOnly: fileTransferOnly);
+    await _open(
+      target,
+      fileTransferOnly: fileTransferOnly,
+      sessionMode: sessionMode,
+    );
   }
 
   Future<void> _open(
     ConnectTarget target, {
     bool fileTransferOnly = false,
+    String sessionMode = 'desktop',
   }) async {
     if (_opening) {
       return;
@@ -754,6 +768,7 @@ class _HomePageState extends State<HomePage> {
             settings: _server,
             identityStore: _identityStore,
             fileTransferOnly: fileTransferOnly,
+            sessionMode: sessionMode,
           );
         },
       ),
@@ -2406,6 +2421,14 @@ class _HomePageState extends State<HomePage> {
                           onTap: () => _connectDevice(device),
                           onFilesOnly: () =>
                               _connectDevice(device, fileTransferOnly: true),
+                          onTerminal: () =>
+                              _connectDevice(device, sessionMode: 'terminal'),
+                          onCamera: () =>
+                              _connectDevice(device, sessionMode: 'camera'),
+                          onPortForward: () => _connectDevice(
+                            device,
+                            sessionMode: 'port_forward',
+                          ),
                           onRename: () => _renameDevice(device),
                           onSave: () => _promote(device),
                           onRemove: () => _removeRecent(device),
@@ -2852,6 +2875,9 @@ class _HomePageState extends State<HomePage> {
       draggable: draggable && accountReady,
       onTap: () => _connectDevice(device),
       onFilesOnly: () => _connectDevice(device, fileTransferOnly: true),
+      onTerminal: () => _connectDevice(device, sessionMode: 'terminal'),
+      onCamera: () => _connectDevice(device, sessionMode: 'camera'),
+      onPortForward: () => _connectDevice(device, sessionMode: 'port_forward'),
       onRename: () => _renameDevice(device),
       onWake: () => _wakeDevice(device),
       onLabels: device.viaServer ? () => _editLabels(device) : null,
@@ -4042,6 +4068,9 @@ class _DeviceCard extends StatelessWidget {
     required this.pinned,
     required this.onTap,
     required this.onFilesOnly,
+    required this.onTerminal,
+    required this.onCamera,
+    required this.onPortForward,
     required this.onRename,
     required this.onWake,
     required this.onDelete,
@@ -4059,6 +4088,9 @@ class _DeviceCard extends StatelessWidget {
   final bool draggable;
   final VoidCallback onTap;
   final VoidCallback onFilesOnly;
+  final VoidCallback onTerminal;
+  final VoidCallback onCamera;
+  final VoidCallback onPortForward;
   final VoidCallback onRename;
   final VoidCallback onWake;
   final VoidCallback onDelete;
@@ -4208,6 +4240,12 @@ class _DeviceCard extends StatelessWidget {
                   onSelected: (String value) {
                     if (value == 'files') {
                       onFilesOnly();
+                    } else if (value == 'terminal') {
+                      onTerminal();
+                    } else if (value == 'camera') {
+                      onCamera();
+                    } else if (value == 'port-forward') {
+                      onPortForward();
                     } else if (value == 'copy-id') {
                       unawaited(_copyId(context));
                     } else if (value == 'copy-server') {
@@ -4235,6 +4273,18 @@ class _DeviceCard extends StatelessWidget {
                         PopupMenuItem<String>(
                           value: 'files',
                           child: Text(tr('仅文件传输')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'terminal',
+                          child: Text(tr('远程终端')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'camera',
+                          child: Text(tr('主机摄像头')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'port-forward',
+                          child: Text(tr('端口转发')),
                         ),
                         PopupMenuItem<String>(
                           value: 'copy-id',
@@ -4356,6 +4406,9 @@ class _RecentCard extends StatelessWidget {
     required this.presence,
     required this.onTap,
     required this.onFilesOnly,
+    required this.onTerminal,
+    required this.onCamera,
+    required this.onPortForward,
     required this.onRename,
     required this.onSave,
     required this.onRemove,
@@ -4365,6 +4418,9 @@ class _RecentCard extends StatelessWidget {
   final DevicePresence presence;
   final VoidCallback onTap;
   final VoidCallback onFilesOnly;
+  final VoidCallback onTerminal;
+  final VoidCallback onCamera;
+  final VoidCallback onPortForward;
   final VoidCallback onRename;
   final VoidCallback onSave;
   final VoidCallback onRemove;
@@ -4383,6 +4439,9 @@ class _RecentCard extends StatelessWidget {
       ),
       items: <PopupMenuEntry<String>>[
         PopupMenuItem<String>(value: 'files', child: Text(tr('仅文件传输'))),
+        PopupMenuItem<String>(value: 'terminal', child: Text(tr('远程终端'))),
+        PopupMenuItem<String>(value: 'camera', child: Text(tr('主机摄像头'))),
+        PopupMenuItem<String>(value: 'port-forward', child: Text(tr('端口转发'))),
         PopupMenuItem<String>(value: 'copy-id', child: Text(tr('复制 ID'))),
         PopupMenuItem<String>(value: 'rename', child: Text(tr('重命名'))),
         PopupMenuItem<String>(value: 'save', child: Text(tr('保存到我的设备'))),
@@ -4394,6 +4453,12 @@ class _RecentCard extends StatelessWidget {
     }
     if (value == 'files') {
       onFilesOnly();
+    } else if (value == 'terminal') {
+      onTerminal();
+    } else if (value == 'camera') {
+      onCamera();
+    } else if (value == 'port-forward') {
+      onPortForward();
     } else if (value == 'copy-id') {
       await _copyDeviceId(context, device.id);
     } else if (value == 'rename') {

@@ -1536,9 +1536,12 @@ bool HostServer::serve_current_session(HostServerStats& stats, bool rotate_token
     publish_state(HostState::Streaming);
     log(peer.empty() ? "a viewer connected" : "a viewer connected from " + peer);
 
-    const bool files_only = session_->requested_mode() == SessionMode::FileTransfer;
-    const bool ok = files_only ? file_session(stats, error, peer_left)
-                               : stream_session(stats, error, peer_left);
+    const SessionMode mode = session_->requested_mode();
+    const bool ok = mode == SessionMode::FileTransfer
+                        ? file_session(stats, error, peer_left)
+                        : mode == SessionMode::Desktop
+                              ? stream_session(stats, error, peer_left)
+                              : control_session(mode, stats, error, peer_left);
 
     ClientStats peer_stats;
     bool stats_received = false;
@@ -5938,6 +5941,7 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
     // permission, and the announcement repeats that mask as the gates.
     ServerInfo info;
     info.files_only = true;
+    info.mode = SessionMode::FileTransfer;
     publish_stream(info, 0, std::string());
     if (config_.stream_announced) {
         config_.stream_announced(info);
@@ -6083,6 +6087,212 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
             return false;
         }
         if (!sleep_unless_stopping(std::chrono::milliseconds(20))) {
+            break;
+        }
+    }
+    return error->empty();
+}
+
+bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
+                                 std::string* error, bool* peer_left) {
+    *peer_left = false;
+    // No capturer, encoder or media stream: announce() derives the one granted
+    // permission from the session mask and opens no video stream for a
+    // control-only description.
+    ServerInfo info;
+    info.control_only = true;
+    info.mode = mode;
+    publish_stream(info, 0, std::string());
+    if (config_.stream_announced) {
+        config_.stream_announced(info);
+    }
+    Error announced = session_->announce(info);
+    if (!announced.ok()) {
+        *error = "announce: " + announced.to_string();
+        return false;
+    }
+    publish_stats(stats);
+    const char* label = mode == SessionMode::Terminal
+                            ? "terminal"
+                            : mode == SessionMode::Camera ? "camera" : "port forward";
+    log(std::string(label) + " only: no screen stream follows");
+
+    // As in the file session, there is no frame loop to notice an operator
+    // change, so the queued mask is applied here. Revoking the mode's
+    // permission closes its streams in the transport; the relays below stop
+    // serving new requests.
+    auto apply_pending_permissions = [&]() {
+        bool pending = false;
+        uint16_t requested = 0;
+        {
+            std::lock_guard<std::mutex> lock(permission_mutex_);
+            pending = permission_update_pending_.exchange(false);
+            requested = pending_permissions_.load();
+        }
+        if (!pending) {
+            return;
+        }
+        Error applied = session_->set_permissions(requested);
+        if (!applied.ok()) {
+            if (applied.status() != Status::InvalidCall) {
+                log("permission update failed: " + applied.to_string());
+            }
+            return;
+        }
+        const uint16_t now_mask = session_->permissions();
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.session_permissions = now_mask;
+        }
+        log("the session permissions are now " + permission_names(now_mask));
+    };
+    apply_pending_permissions();
+
+    // The relays own every socket and shell they open; their destructors run
+    // on every exit path below.
+    PortForwardRelay port_forward(*session_);
+    TerminalRelay terminal(*session_);
+    // A control-only session has no capturer to borrow an adapter from; the
+    // camera relay opens its own device instead.
+    CameraRelay camera(*session_, [] { return LUID{}; },
+                       CameraRelayConfig{settings_.codec, settings_.quality,
+                                         config_.encoder_backend,
+                                         settings_.framerate > 0 ? settings_.framerate : 30u});
+
+    while (!stopping_.load()) {
+        apply_pending_permissions();
+        // Desktop-only controls have no surface here. Answering keeps a viewer
+        // that races a permission change from waiting for a reply that will
+        // never come.
+        HostControlRequest host_action;
+        while (session_->take_host_action_request(host_action)) {
+            ++stats.host_actions;
+            ++stats.host_action_failures;
+            HostControlResult denied;
+            denied.action = host_action.action;
+            denied.code = HostActionCode::Denied;
+            denied.reason = "host actions are not available in a control-only session";
+            const Error sent = session_->send_host_action_result(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "host_action_result: " + sent.to_string();
+                return false;
+            }
+            log("host action refused: a control-only session cannot control the host");
+        }
+        std::string login_password;
+        while (session_->take_os_login_request(login_password)) {
+            ++stats.os_login_requests;
+            ++stats.os_login_failures;
+            std::fill(login_password.begin(), login_password.end(), '\0');
+            login_password.clear();
+            const Error sent = session_->send_os_login_result(
+                OsLoginCode::Unsupported,
+                "OS login is not available in a control-only session");
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "os_login_result: " + sent.to_string();
+                return false;
+            }
+            log("OS login refused: a control-only session cannot type at the logon screen");
+        }
+        while (session_->take_session_list_request()) {
+            ++stats.session_list_requests;
+            SessionListResult denied;
+            denied.code = SessionListCode::Unsupported;
+            denied.reason = "session select is not available in a control-only session";
+            const Error sent = session_->send_session_list_result(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "session_list_result: " + sent.to_string();
+                return false;
+            }
+            log("session list refused: a control-only session cannot switch sessions");
+        }
+        uint32_t select_id = 0;
+        while (session_->take_session_select_request(select_id)) {
+            ++stats.session_select_requests;
+            SessionSelectResult denied;
+            denied.session_id = select_id;
+            denied.code = SessionSelectCode::Unsupported;
+            denied.reason = "session select is not available in a control-only session";
+            const Error sent = session_->send_session_select_result(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "session_select_result: " + sent.to_string();
+                return false;
+            }
+            log("session select refused: a control-only session cannot switch sessions");
+        }
+        PortForwardRequest forward_request;
+        while (session_->take_port_forward_request(forward_request)) {
+            // The transport already checked the session grant; reaching here
+            // means the operator enabled port forwarding for this host.
+            const Error answered = session_->send_port_forward_result(
+                forward_request.forward_id, PortForwardCode::Ok);
+            if (!answered.ok()) {
+                if (answered.status() == Status::Unavailable ||
+                    answered.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "port_forward_result: " + answered.to_string();
+                return false;
+            }
+            log("port forward: approved " + forward_request.host + ":" +
+                std::to_string(forward_request.port));
+        }
+        PortForwardStop forward_stop;
+        while (session_->take_port_forward_stop(forward_stop)) {
+            log("port forward: stopped with code " +
+                std::to_string(static_cast<int>(forward_stop.code)) +
+                (forward_stop.reason.empty() ? std::string()
+                                             : ": " + forward_stop.reason));
+        }
+        for (const std::string& event : port_forward.pump()) {
+            log(event);
+        }
+        for (const std::string& event : terminal.pump()) {
+            log(event);
+        }
+        for (const std::string& event : camera.pump()) {
+            log(event);
+        }
+        if (session_->viewer_finished()) {
+            return true;
+        }
+        if (!session_->peer_alive()) {
+            *peer_left = true;
+            return true;
+        }
+        const Error async = session_->async_error();
+        if (!async.ok()) {
+            *error = "transport: " + async.to_string();
+            return false;
+        }
+        const auto idle = std::chrono::milliseconds(camera.streaming() ? 10 : 20);
+        if (!sleep_unless_stopping(idle)) {
             break;
         }
     }

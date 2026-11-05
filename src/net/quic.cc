@@ -5585,8 +5585,8 @@ Error QuicSession::announce(const ServerInfo& info) {
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
     }
-    if (ack.files_only) {
-        // There is no picture and no media stream in a files-only session.
+    if (ack.files_only || ack.control_only) {
+        // There is no picture and no media stream in a control-only session.
         // Normalize the message here so a caller that reused a desktop
         // description cannot announce a stream the viewer would wait for.
         ack.audio.enabled = false;
@@ -5602,7 +5602,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     // Open both media streams before the HelloAck so the announcement never
     // describes a stream that failed to open. The client classifies them by
     // packet magic, so their order here does not matter.
-    if (!ack.files_only) {
+    if (!ack.files_only && !ack.control_only) {
         HQUIC video = nullptr;
         QUIC_STATUS status = impl.api->StreamOpen(
             impl.connection.load(), QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,

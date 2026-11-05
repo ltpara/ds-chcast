@@ -134,6 +134,22 @@ constexpr uint32_t kViewerTerminalId = 1;
 // otherwise build an unbounded queue on the session thread.
 constexpr size_t kMaxQueuedUploads = 10000;
 
+const char* session_mode_name(chast::SessionMode mode) {
+    switch (mode) {
+        case chast::SessionMode::Desktop:
+            return "desktop";
+        case chast::SessionMode::FileTransfer:
+            return "file_transfer";
+        case chast::SessionMode::Terminal:
+            return "terminal";
+        case chast::SessionMode::Camera:
+            return "camera";
+        case chast::SessionMode::PortForward:
+            return "port_forward";
+    }
+    return "desktop";
+}
+
 std::string codec_name(chast::VideoCodec codec) {
     return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
 }
@@ -367,7 +383,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                          bool trust_device, ViewerTransport transport,
                          std::string carrier_host, uint16_t carrier_port,
                          std::string carrier_host_id, std::string carrier_token,
-                         bool file_transfer_only) {
+                         bool file_transfer_only, chast::SessionMode session_mode) {
     if (running_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -414,6 +430,11 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         status_.host = host;
         status_.port = port;
         status_.state = ViewerState::kConnecting;
+        status_.session_mode = session_mode_name(
+            session_mode != chast::SessionMode::Desktop
+                ? session_mode
+                : file_transfer_only ? chast::SessionMode::FileTransfer
+                                     : chast::SessionMode::Desktop);
         status_.transport = transport == ViewerTransport::kTcp
                                 ? "tcp"
                                 : transport == ViewerTransport::kWebSocket ? "ws" : "quic";
@@ -523,7 +544,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
                           std::move(totp), trust_device, transport,
                           std::move(carrier_host), carrier_port,
                           std::move(carrier_host_id), std::move(carrier_token),
-                          std::move(audit_ref), file_transfer_only);
+                          std::move(audit_ref), file_transfer_only, session_mode);
     return true;
 }
 
@@ -1146,7 +1167,7 @@ bool ViewerEngine::SetRecording(bool enabled, std::string directory) {
 bool ViewerEngine::SaveScreenshot(std::string directory) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (status_.state != ViewerState::kStreaming || status_.files_only) {
+        if (status_.state != ViewerState::kStreaming || status_.control_only) {
             return false;
         }
     }
@@ -1728,7 +1749,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                        std::string totp, bool trust_device, ViewerTransport transport,
                        std::string carrier_host, uint16_t carrier_port,
                        std::string carrier_host_id, std::string carrier_token,
-                       std::string audit_ref, bool file_transfer_only) {
+                       std::string audit_ref, bool file_transfer_only,
+                       chast::SessionMode session_mode) {
     const auto started = Clock::now();
     auto last_frame = started;
     auto last_keyframe_request = started - kKeyframeRetry;
@@ -1866,9 +1888,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint32_t display_source_height = 0;
     bool video_finished = false;
     bool handshaken = false;
-    // Set from HelloAck: the host serves file transfer only, so the session
-    // runs without decoder, sink or media waits.
+    // Set from HelloAck: the host serves no screen stream, so the session
+    // runs without decoder, sink or media waits. `files_only` is the file
+    // browser case; `control_only` covers the v41 terminal, camera and
+    // port-forward modes too.
     bool files_only = false;
+    bool control_only = false;
     bool logged_frame = false;
     bool logged_drop = false;
     uint64_t init_errors = 0;
@@ -2295,9 +2320,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
         client_config.device_identity = device_identity_.get();
         client_config.trust_device = trust_device;
         client_config.audit_ref = audit_ref;
-        client_config.session_mode = file_transfer_only
-                                         ? chast::SessionMode::FileTransfer
-                                         : chast::SessionMode::Desktop;
+        client_config.session_mode =
+            session_mode != chast::SessionMode::Desktop
+                ? session_mode
+                : file_transfer_only ? chast::SessionMode::FileTransfer
+                                     : chast::SessionMode::Desktop;
         std::string create_error;
         session = chast::QuicSession::create_client(client_config, &create_error);
         if (!session) {
@@ -2358,10 +2385,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             fail("handshake: " + handshake.to_string());
         } else {
             handshaken = true;
-            // The host decides: it answers a files-only request with an empty
-            // screen description and the flag, and the UI leaves the picture
-            // view for the file browser.
+            // The host decides: it answers a control-only request with an
+            // empty screen description and the flag, and the UI leaves the
+            // picture view for the matching panel.
             files_only = info.files_only;
+            control_only = info.files_only || info.control_only;
             display_width = info.width;
             display_height = info.height;
             display_source_width = info.source_width;
@@ -2369,6 +2397,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 status_.files_only = files_only;
+                status_.control_only = control_only;
+                status_.session_mode = session_mode_name(info.mode);
                 status_.codec = info.codec;
                 status_.width = info.width;
                 status_.height = info.height;
@@ -2618,7 +2648,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             // its picture size or codec.
             chast::DecoderConfig decoder_config;
             std::unique_ptr<chast::IVideoDecoder> decoder;
-            if (!files_only) {
+            if (!control_only) {
                 decoder_config.codec = info.codec;
                 if (sink_ == nullptr || sink_->device() == nullptr) {
                     fail("display: " +
@@ -2672,7 +2702,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     fail("decoder (" + codec_name(info.codec) + "): " + error);
                 }
             }
-            if (files_only || decoder) {
+            if (control_only || decoder) {
                 if (decoder) {
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
@@ -2682,7 +2712,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                  decoder->implementation().c_str());
                 } else {
                     std::fprintf(stderr,
-                                 "viewer: file transfer only; no screen stream follows\n");
+                                 "viewer: control-only session; no screen stream follows\n");
                 }
                 SetState(ViewerState::kStreaming);
 
@@ -6881,7 +6911,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         request_keyframe();
                     }
                     chast::Error received_frame = chast::Error::success();
-                    if (files_only) {
+                    if (control_only) {
                         // No media stream to wait on: the loop polls on short
                         // sleeps so file requests keep flowing, and the
                         // transport tells when the viewer left.
@@ -6940,11 +6970,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             video_finished = true;
                             break;
                         }
-                        if (!files_only && now - last_frame >= kFrameStall) {
+                        if (!control_only && now - last_frame >= kFrameStall) {
                             fail("no frames arrived for 20 s");
                             break;
                         }
-                        if (!files_only && sink_ != nullptr && !sink_->error().empty()) {
+                        if (!control_only && sink_ != nullptr && !sink_->error().empty()) {
                             fail("display: " + sink_->error());
                             break;
                         }

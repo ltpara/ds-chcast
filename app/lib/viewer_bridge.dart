@@ -379,6 +379,8 @@ class ViewerStatus {
     this.elapsedMs = 0,
     this.videoFinished = false,
     this.filesOnly = false,
+    this.controlOnly = false,
+    this.sessionMode = 'desktop',
     this.fullscreen = false,
     this.inputEnabled = false,
     this.permissions = 0,
@@ -651,6 +653,16 @@ class ViewerStatus {
   /// file browser instead of the remote screen. The state still reaches
   /// [ViewerState.streaming] once the host accepted the Hello.
   final bool filesOnly;
+
+  /// True when the host answered a terminal, camera or port-forward request:
+  /// the session has no picture and no remote-screen stack. The state still
+  /// reaches [ViewerState.streaming] once the host accepted the Hello.
+  final bool controlOnly;
+
+  /// What the host agreed to serve: `desktop`, `file_transfer`, `terminal`,
+  /// `camera` or `port_forward` (protocol v41). Anything but `desktop` has no
+  /// screen stream, so the page shows the matching panel instead of a picture.
+  final String sessionMode;
   final bool fullscreen;
   final bool inputEnabled;
 
@@ -1301,6 +1313,10 @@ class ViewerStatus {
       elapsedMs: asInt(map['elapsedMs']),
       videoFinished: map['videoFinished'] == true,
       filesOnly: map['filesOnly'] == true,
+      controlOnly: map['controlOnly'] == true,
+      sessionMode: asString(map['sessionMode']).isEmpty
+          ? 'desktop'
+          : asString(map['sessionMode']),
       fullscreen: map['fullscreen'] == true,
       inputEnabled: map['inputEnabled'] == true,
       permissions: asInt(map['permissions']),
@@ -1549,7 +1565,9 @@ class ViewerBridge {
   ///
   /// [fileTransferOnly] asks the host for a session without a screen stream
   /// (protocol v32); [gpuOutput] is then unused and may be 0. A host that does
-  /// not allow file transfer refuses the Hello.
+  /// not allow file transfer refuses the Hello. [sessionMode] (v41) selects
+  /// `terminal`, `camera` or `port_forward` instead; those also need no
+  /// [gpuOutput].
   static Future<void> start({
     required String host,
     required int port,
@@ -1567,6 +1585,7 @@ class ViewerBridge {
     String carrierHostId = '',
     String carrierToken = '',
     bool fileTransferOnly = false,
+    String sessionMode = 'desktop',
   }) async {
     await _channel.invokeMethod<void>(
       'start',
@@ -1587,6 +1606,7 @@ class ViewerBridge {
         'carrierHostId': carrierHostId,
         'carrierToken': carrierToken,
         'fileTransferOnly': fileTransferOnly,
+        'sessionMode': sessionMode,
       },
     );
   }

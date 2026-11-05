@@ -509,6 +509,10 @@ private:
     // error stops it. Returns false only for a failure, not for a normal
     // disconnect. `peer_left` distinguishes a vanished viewer.
     bool stream_session(HostServerStats& stats, std::string* error, bool* peer_left);
+    // Serves a terminal, camera or port-forward-only session: no capturer or
+    // encoder is started, and only that feature's control plane runs.
+    bool control_session(SessionMode mode, HostServerStats& stats, std::string* error,
+                         bool* peer_left);
     // The desktop stream itself. A multi-viewer host elects one publisher:
     // the first desktop viewer captures and encodes once and later viewers
     // receive the same frames (a second IDXGIOutputDuplication cannot exist
