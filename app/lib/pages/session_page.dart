@@ -1586,6 +1586,34 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _toggleVoiceCall() async {
+    if (!_status.acceptsVoiceCall) {
+      return;
+    }
+    final bool turnOn = !_status.voiceEnabled;
+    try {
+      final bool applied = await ViewerBridge.setVoiceCall(turnOn);
+      if (!mounted || applied) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('主机未授权麦克风，无法开启')),
+          duration: Duration(seconds: 4),
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法切换语音通话'))));
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
   Future<void> _togglePrivacy() async {
     if (!_status.acceptsPrivacy) {
       return;
@@ -3300,6 +3328,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onLoadMicrophones: _loadMicrophones,
                         onSelectMicrophone: _selectMicrophone,
                         onSetAudioProcessing: _setAudioProcessing,
+                        voiceAvailable: _status.acceptsVoiceCall,
+                        voiceEnabled: _status.voiceEnabled,
+                        voicePending: _status.voicePending,
+                        onToggleVoiceCall: () => unawaited(_toggleVoiceCall()),
                         privacyAvailable: _status.acceptsPrivacy,
                         privacyEnabled: _status.privacyEnabled,
                         portForwardAvailable: _status.acceptsPortForward,

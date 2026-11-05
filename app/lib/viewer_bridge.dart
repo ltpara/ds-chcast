@@ -453,6 +453,13 @@ class ViewerStatus {
     this.microphoneRecoveries = 0,
     this.microphoneRecovering = false,
     this.microphoneError = '',
+    this.voiceAuthorized = false,
+    this.voiceEnabled = false,
+    this.voicePending = false,
+    this.voicePackets = 0,
+    this.voiceDropped = 0,
+    this.voiceErrors = 0,
+    this.voiceError = '',
     this.privacySupported = false,
     this.privacyEnabled = false,
     this.privacyCode = 0,
@@ -820,6 +827,18 @@ class ViewerStatus {
   final bool microphoneRecovering;
   final String microphoneError;
 
+  /// Voice call with the host microphone. [voiceAuthorized] mirrors the host
+  /// permission; [voiceEnabled] means the call is up and the host's Opus
+  /// packets are being played; [voicePending] covers the request round trip.
+  /// A refusal or a host-initiated close explains itself in [voiceError].
+  final bool voiceAuthorized;
+  final bool voiceEnabled;
+  final bool voicePending;
+  final int voicePackets;
+  final int voiceDropped;
+  final int voiceErrors;
+  final String voiceError;
+
   /// Privacy mode hides the host's own screen while the stream continues.
   /// [privacySupported] mirrors the host's permission; [privacyEnabled] is the
   /// overlay state from the host's most recent answer, and every session starts
@@ -1001,6 +1020,10 @@ class ViewerStatus {
   bool get acceptsAudio => audioEnabled && isLive;
   // The microphone button needs a live session and the host's microphone bit.
   bool get acceptsMicrophone =>
+      isLive && (permissions & ViewerPermission.microphone) != 0;
+  // The voice-call button shares the microphone bit: an admitted session with
+  // that grant may play the host's microphone.
+  bool get acceptsVoiceCall =>
       isLive && (permissions & ViewerPermission.microphone) != 0;
   // The privacy button needs a live session and the host's privacy bit.
   bool get acceptsPrivacy =>
@@ -1261,6 +1284,13 @@ class ViewerStatus {
       microphoneRecoveries: asInt(map['microphoneRecoveries']),
       microphoneRecovering: map['microphoneRecovering'] == true,
       microphoneError: asString(map['microphoneError']),
+      voiceAuthorized: map['voiceAuthorized'] == true,
+      voiceEnabled: map['voiceEnabled'] == true,
+      voicePending: map['voicePending'] == true,
+      voicePackets: asInt(map['voicePackets']),
+      voiceDropped: asInt(map['voiceDropped']),
+      voiceErrors: asInt(map['voiceErrors']),
+      voiceError: asString(map['voiceError']),
       privacySupported: map['privacySupported'] == true,
       privacyEnabled: map['privacyEnabled'] == true,
       privacyCode: asInt(map['privacyCode']),
@@ -2035,6 +2065,15 @@ class ViewerBridge {
   /// can explain the tap.
   static Future<bool> setMicrophone(bool enabled) async {
     final bool? applied = await _channel.invokeMethod<bool>('setMicrophone', enabled);
+    return applied ?? false;
+  }
+
+  /// Starts or ends a voice call that plays the host's microphone. The
+  /// answer, packets and a host-initiated close arrive through
+  /// [ViewerStatus.voiceEnabled] / [ViewerStatus.voiceError]. Returns false
+  /// when the host did not grant the microphone.
+  static Future<bool> setVoiceCall(bool enabled) async {
+    final bool? applied = await _channel.invokeMethod<bool>('setVoiceCall', enabled);
     return applied ?? false;
   }
 

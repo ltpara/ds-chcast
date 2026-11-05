@@ -377,6 +377,11 @@ bool check_clipboard_files(const std::vector<std::string>& paths,
     std::error_code ec;
     size_t top_level = 0;
     for (fs::directory_iterator it(first.parent_path(), ec), end; it != end; it.increment(ec)) {
+        // The receiver keeps a reserved directory for resumable partial
+        // downloads next to the delivered items; it is not a clipboard item.
+        if (utf8(it->path().filename()) == ".chast-partial") {
+            continue;
+        }
         ++top_level;
     }
     if (ec || top_level != 3) {
@@ -463,6 +468,9 @@ bool check_host_clipboard_files(const std::vector<std::string>& paths,
     }
     size_t top_level = 0;
     for (fs::directory_iterator it(root, ec), end; it != end; it.increment(ec)) {
+        if (utf8(it->path().filename()) == ".chast-partial") {
+            continue;
+        }
         ++top_level;
     }
     if (ec || top_level != 3) {

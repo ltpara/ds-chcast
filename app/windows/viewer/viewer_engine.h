@@ -377,6 +377,19 @@ struct ViewerStatus {
     uint64_t microphone_recoveries = 0;
     bool microphone_recovering = false;
     std::string microphone_error;
+    // Voice call (protocol v37): `voice_authorized` mirrors the host
+    // microphone permission, `voice_enabled` means the call is up and the
+    // host's Opus packets are being played, `voice_pending` covers the
+    // request/answer round trip. `voice_error` explains a refusal or a
+    // host-initiated close. Uplink and downlink are independent: this call
+    // never changes the system audio path.
+    bool voice_authorized = false;
+    bool voice_enabled = false;
+    bool voice_pending = false;
+    uint64_t voice_packets = 0;
+    uint64_t voice_dropped = 0;
+    uint64_t voice_errors = 0;
+    std::string voice_error;
     // Privacy mode hides the host's own screen while the stream continues.
     // `privacy_supported` mirrors the host's permission; `privacy_enabled` is
     // the overlay state from the most recent PrivacyModeState, and every
@@ -766,6 +779,11 @@ public:
     // running or the host did not grant kPermissionMicrophone (a revocation
     // also clears the switch and reports why in microphone_error).
     bool SetMicrophone(bool enabled);
+    // Starts or ends a voice call with the host microphone. The answer, the
+    // decoded Opus packets and a host-initiated close arrive through
+    // ViewerStatus::voice_*. Returns false when no session is running or the
+    // host did not grant kPermissionMicrophone.
+    bool SetVoiceCall(bool enabled);
     // Pins the capture endpoint. Empty follows the default communications
     // device. An open capture is reopened on the new id within one poll; the
     // choice is kept for later switches. Returns false when no session is
@@ -896,6 +914,7 @@ private:
     // the capture thread and the CMIC stream. Every session starts off, and a
     // missing permission clears the flag rather than leaving it queued.
     std::atomic<bool> microphone_wanted_{false};
+    std::atomic<bool> voice_wanted_{false};
     mutable std::mutex microphone_mutex_;
     std::string microphone_device_id_;
     // The playback choice survives reconnects, like the microphone device.

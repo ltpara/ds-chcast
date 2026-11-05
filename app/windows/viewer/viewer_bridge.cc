@@ -667,6 +667,16 @@ void ViewerBridge::HandleMethodCall(
         map[key("microphoneRecovering")] =
             flutter::EncodableValue(status.microphone_recovering);
         map[key("microphoneError")] = flutter::EncodableValue(status.microphone_error);
+        map[key("voiceAuthorized")] = flutter::EncodableValue(status.voice_authorized);
+        map[key("voiceEnabled")] = flutter::EncodableValue(status.voice_enabled);
+        map[key("voicePending")] = flutter::EncodableValue(status.voice_pending);
+        map[key("voicePackets")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.voice_packets));
+        map[key("voiceDropped")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.voice_dropped));
+        map[key("voiceErrors")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.voice_errors));
+        map[key("voiceError")] = flutter::EncodableValue(status.voice_error);
         map[key("privacySupported")] = flutter::EncodableValue(status.privacy_supported);
         map[key("privacyEnabled")] = flutter::EncodableValue(status.privacy_enabled);
         map[key("privacyCode")] =
@@ -1264,6 +1274,17 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         const bool applied = viewer_ != nullptr && viewer_->SetMicrophone(*enabled);
+        result->Success(flutter::EncodableValue(applied));
+        return;
+    }
+
+    if (method == "setVoiceCall") {
+        const auto* enabled = std::get_if<bool>(call.arguments());
+        if (enabled == nullptr) {
+            result->Error("bad_args", "setVoiceCall wants a bool");
+            return;
+        }
+        const bool applied = viewer_ != nullptr && viewer_->SetVoiceCall(*enabled);
         result->Success(flutter::EncodableValue(applied));
         return;
     }

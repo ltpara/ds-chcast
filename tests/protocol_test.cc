@@ -2020,6 +2020,121 @@ void test_camera() {
           "a truncated CCAM header is rejected");
 }
 
+void test_voice_call() {
+    std::string error;
+    chast::VoiceCallRequest request;
+    request.request_id = 42;
+    const std::vector<uint8_t> encoded_request = chast::make_voice_call_request(request);
+    check(!encoded_request.empty() &&
+              encoded_request[6] == static_cast<uint8_t>(chast::ControlType::VoiceCallRequest),
+          "VoiceCallRequest names its control type");
+    chast::VoiceCallRequest request_out;
+    check(chast::parse_voice_call_request(payload_of(encoded_request), request_out, &error) &&
+              request_out.request_id == 42 && request_out.connect,
+          "VoiceCallRequest round-trips a start");
+    request.connect = false;
+    check(chast::parse_voice_call_request(
+              payload_of(chast::make_voice_call_request(request)), request_out, &error) &&
+              !request_out.connect,
+          "VoiceCallRequest round-trips a stop");
+    request.request_id = 0;
+    check(chast::make_voice_call_request(request).empty(),
+          "VoiceCallRequest with request id 0 is not encoded");
+    std::vector<uint8_t> bad_flags = payload_of(encoded_request);
+    bad_flags[0] = 0x80;
+    check(!chast::parse_voice_call_request(bad_flags, request_out, &error),
+          "VoiceCallRequest with unknown flags is rejected");
+
+    chast::AudioInfo info;
+    info.enabled = true;
+    info.codec = chast::AudioCodec::Opus;
+    info.sample_rate = 48000;
+    info.channels = 1;
+    info.frame_samples = chast::kOpusFrameSamples;
+    info.extradata.assign(19, 0);
+    std::memcpy(info.extradata.data(), "OpusHead", 8);
+    info.extradata[8] = 1;
+    info.extradata[9] = 1;
+    info.extradata[10] = 0x38;
+    info.extradata[11] = 0x01;
+    info.extradata[14] = 0x80;
+    info.extradata[15] = 0xBB;
+
+    chast::VoiceCallResponse response;
+    response.request_id = 42;
+    response.audio = info;
+    chast::VoiceCallResponse response_out;
+    check(chast::parse_voice_call_response(
+              payload_of(chast::make_voice_call_response(response)), response_out, &error) &&
+              response_out.request_id == 42 && response_out.code == chast::VoiceCallCode::Ok &&
+              response_out.audio.enabled &&
+              response_out.audio.codec == chast::AudioCodec::Opus &&
+              response_out.audio.sample_rate == 48000 && response_out.audio.channels == 1 &&
+              response_out.audio.frame_samples == chast::kOpusFrameSamples &&
+              response_out.audio.extradata == info.extradata,
+          "VoiceCallResponse round-trips the accepted microphone format");
+
+    chast::VoiceCallResponse refused;
+    refused.request_id = 42;
+    refused.code = chast::VoiceCallCode::Refused;
+    refused.reason = "the operator did not grant the microphone";
+    check(chast::parse_voice_call_response(
+              payload_of(chast::make_voice_call_response(refused)), response_out, &error) &&
+              response_out.code == chast::VoiceCallCode::Refused &&
+              response_out.reason == refused.reason && !response_out.audio.enabled,
+          "VoiceCallResponse round-trips a refusal");
+    chast::VoiceCallResponse no_format;
+    no_format.request_id = 42;
+    check(chast::make_voice_call_response(no_format).empty(),
+          "an Ok VoiceCallResponse needs a microphone format");
+    std::vector<uint8_t> bad_code =
+        payload_of(chast::make_voice_call_response(refused));
+    bad_code[8] = 9;
+    check(!chast::parse_voice_call_response(bad_code, response_out, &error),
+          "VoiceCallResponse with an unknown code is rejected");
+    std::vector<uint8_t> bad_rate =
+        payload_of(chast::make_voice_call_response(response));
+    bad_rate[13] = 0x00;
+    check(!chast::parse_voice_call_response(bad_rate, response_out, &error),
+          "VoiceCallResponse with a non-voice sample rate is rejected");
+
+    chast::AudioHeader header;
+    header.seq = 7;
+    header.pts_ms = 900;
+    header.capture_ms = 1234;
+    header.sample_rate = 48000;
+    header.frame_samples = chast::kOpusFrameSamples;
+    header.channels = 1;
+    header.codec = chast::AudioCodec::Opus;
+    const std::vector<uint8_t> opus(60, 0xA5);
+    const std::vector<uint8_t> wire =
+        chast::make_voice_audio(header, opus.data(), opus.size());
+    check(!wire.empty() &&
+              wire[6] == static_cast<uint8_t>(chast::ControlType::VoiceAudio),
+          "VoiceAudio names its control type");
+    chast::AudioHeader header_out;
+    const uint8_t* audio = nullptr;
+    size_t audio_size = 0;
+    check(chast::parse_voice_audio(payload_of(wire), header_out, &audio, audio_size, &error) &&
+              header_out.seq == 7 && header_out.pts_ms == 900 &&
+              header_out.capture_ms == 1234 &&
+              header_out.payload_size == opus.size() && audio_size == opus.size() &&
+              std::memcmp(audio, opus.data(), opus.size()) == 0,
+          "VoiceAudio round-trips a header and its Opus packet");
+    std::vector<uint8_t> tampered = payload_of(wire);
+    tampered.back() ^= 0x01;
+    check(!chast::parse_voice_audio(tampered, header_out, &audio, audio_size, &error),
+          "VoiceAudio with a broken payload CRC is rejected");
+    check(chast::make_voice_audio(header, nullptr, 12).empty(),
+          "VoiceAudio without a payload is not encoded");
+    header.codec = chast::AudioCodec::AAC;
+    check(chast::make_voice_audio(header, opus.data(), opus.size()).empty(),
+          "VoiceAudio only encodes Opus");
+    check(!chast::parse_voice_audio(std::vector<uint8_t>(chast::kAudioHeaderSize, 0),
+                                    header_out, &audio, audio_size, &error),
+          "VoiceAudio without a packet is rejected");
+}
+
 void test_cursor_update() {
     std::string error;
     chast::CursorUpdate update;
@@ -3274,6 +3389,7 @@ int main(int argc, char** argv) {
     test_port_forward();
     test_terminal();
     test_camera();
+    test_voice_call();
     test_cursor_update();
     test_stream_info();
     test_input_events();

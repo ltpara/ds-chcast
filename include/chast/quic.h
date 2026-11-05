@@ -741,6 +741,48 @@ public:
     // Total ChatMessages received since the connection started.
     uint64_t chats_received() const;
 
+    // ----- voice call (protocol v37, both roles) -----
+    //
+    // A voice call streams the host's microphone to the viewer. It is started
+    // by the viewer, answered by the host, and then carries encoded Opus units
+    // as VoiceAudio control messages. Both directions are gated by
+    // kPermissionMicrophone; a revocation ends the call and drops queued
+    // audio. The system-audio and viewer-microphone paths are unaffected.
+
+    // Server: pops one request. `connect` true asks to start a call; false
+    // tells the host to stop the one it runs. The transport already refuses a
+    // start without the microphone permission and answers a duplicate start,
+    // so every request the host sees can be acted on.
+    bool take_voice_call_request(VoiceCallRequest& request);
+    // Server: answers a start request. Ok opens the call and makes
+    // send_voice_audio() valid; the response carries the microphone format
+    // the host actually opened. A response for an id that is not waiting is
+    // refused, and a revocation turns an Ok answer into Refused.
+    Error send_voice_call_response(const VoiceCallResponse& response);
+    // Server: sends one encoded microphone unit. InvalidCall when no call is
+    // open or the header is not a voice header; PermissionDenied once the
+    // microphone permission was revoked. The sequence number is assigned here.
+    Error send_voice_audio(const AudioHeader& header, const uint8_t* payload, size_t size);
+    // Server: closes the call from the host side. Idempotent.
+    Error send_voice_call_close();
+    // True while this side considers the call open.
+    bool voice_call_active() const;
+
+    // Client: asks the host to start a call. Requires the completed handshake
+    // and kPermissionMicrophone; a pending or running call returns InvalidCall.
+    Error request_voice_call();
+    // Client: stops a pending or running call. The host closes its capture.
+    Error request_voice_call_stop();
+    // Client: pops the oldest answer. A later answer supersedes none: each
+    // request id is answered once.
+    bool take_voice_call_response(VoiceCallResponse& response);
+    // Client: true once when the host closed the call on its own (permission
+    // revoked, device failed, operator stopped it). Cleared by the call.
+    bool take_voice_call_closed();
+    // Client: pops one microphone unit. The header is validated and the
+    // payload copied. Empty when no audio is queued.
+    bool take_voice_audio(AudioHeader& header, std::vector<uint8_t>& payload);
+
     // ----- composed text input (viewer -> host, protocol v36) -----
     //
     // The viewer's own input method composes the text and sends the result;

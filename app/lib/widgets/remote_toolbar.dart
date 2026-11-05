@@ -44,6 +44,10 @@ class RemoteToolbar extends StatelessWidget {
     required this.microphoneAvailable,
     required this.microphoneEnabled,
     required this.microphoneDevice,
+    required this.voiceAvailable,
+    required this.voiceEnabled,
+    required this.voicePending,
+    required this.onToggleVoiceCall,
     required this.audioAec,
     required this.audioNoiseSuppression,
     required this.onLoadMicrophones,
@@ -126,6 +130,10 @@ class RemoteToolbar extends StatelessWidget {
   /// The pinned capture endpoint id; empty follows the default communications
   /// device (the menu marks that entry).
   final String microphoneDevice;
+  final bool voiceAvailable;
+  final bool voiceEnabled;
+  final bool voicePending;
+  final VoidCallback onToggleVoiceCall;
   final bool audioAec;
   final bool audioNoiseSuppression;
   final Future<List<ViewerMicrophoneDevice>> Function() onLoadMicrophones;
@@ -424,226 +432,244 @@ class RemoteToolbar extends StatelessWidget {
           borderRadius: BorderRadius.circular(4),
           border: Border.all(color: Colors.white24),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            _BarButton(
-              icon: pinned ? Icons.push_pin_rounded : Icons.push_pin_outlined,
-              tooltip: pinned ? tr('取消固定') : tr('固定工具栏'),
-              active: pinned,
-              onTap: onTogglePin,
-            ),
-            _FitButton(fit: fit, onChanged: onFitChanged),
-            const _BarSeparator(),
-            _DisplayButton(
-              displays: displays,
-              active: activeDisplay,
-              onSelected: onSelectDisplay,
-            ),
-            if (activeDisplay != kViewerDisplayAll)
-              _ResolutionButton(
-                modes: modes,
-                available: modeChangeAvailable,
-                onSelected: onSelectMode,
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              _BarButton(
+                icon: pinned ? Icons.push_pin_rounded : Icons.push_pin_outlined,
+                tooltip: pinned ? tr('取消固定') : tr('固定工具栏'),
+                active: pinned,
+                onTap: onTogglePin,
               ),
-            _StreamOptionsButton(
-              available: streamOptionsAvailable,
-              codec: streamCodec,
-              quality: streamQuality,
-              maxFps: streamMaxFps,
-              onSelectCodec: onSelectStreamCodec,
-              onSelectQuality: onSelectStreamQuality,
-              onSelectFps: onSelectStreamFps,
-            ),
-            _BarButton(
-              icon: Icons.keyboard_alt_outlined,
-              tooltip: !inputAvailable
-                  ? tr('服务端未开放输入')
-                  : controlEnabled
-                      ? tr('关闭远程键鼠')
-                      : tr('开启远程键鼠'),
-              disabled: !inputAvailable,
-              active: controlEnabled,
-              onTap: onToggleControl,
-            ),
-            _SpecialKeysButton(
-              available: specialKeysAvailable,
-              onSelected: onSpecialAction,
-            ),
-            _BarButton(
-              icon: Icons.text_fields_rounded,
-              tooltip: specialKeysAvailable
-                  ? tr('发送文本')
-                  : tr('需要远程键鼠控制'),
-              disabled: !specialKeysAvailable,
-              onTap: onSendText,
-            ),
-            _BarButton(
-              icon: Icons.photo_camera_rounded,
-              tooltip: !screenshotAvailable
-                  ? tr('会话建立后可截图')
-                  : tr('截图（保存为本地 PNG）'),
-              disabled: !screenshotAvailable,
-              onTap: () => onScreenshot?.call(),
-            ),
-            _BarButton(
-              icon: clipboardEnabled
-                  ? Icons.content_paste_go_rounded
-                  : Icons.content_paste_off_rounded,
-              tooltip: !clipboardAvailable
-                  ? tr('服务端未开放剪贴板')
-                  : clipboardEnabled
-                      ? tr('暂停剪贴板同步')
-                      : tr('恢复剪贴板同步'),
-              disabled: !clipboardAvailable,
-              active: clipboardAvailable && clipboardEnabled,
-              onTap: onToggleClipboard,
-            ),
-            _BarButton(
-              icon: Icons.upload_file_rounded,
-              tooltip: !fileAvailable
-                  ? tr('服务端未开放文件传输')
-                  : fileActive
-                      ? tr('文件正在发送')
-                      : tr('发送文件到主机'),
-              disabled: !fileAvailable || fileActive,
-              active: fileActive,
-              onTap: onSendFile,
-            ),
-            _BarButton(
-              icon: fileBrowseOpen
-                  ? Icons.folder_open_rounded
-                  : Icons.folder_outlined,
-              tooltip: !fileAvailable
-                  ? tr('服务端未开放文件传输')
-                  : fileBrowseOpen
-                      ? tr('关闭主机文件浏览')
-                      : tr('浏览主机共享文件夹'),
-              disabled: !fileAvailable,
-              active: fileBrowseOpen,
-              onTap: onToggleFileBrowse,
-            ),
-            _BarButton(
-              icon: chatOpen ? Icons.forum_rounded : Icons.forum_outlined,
-              tooltip: chatOpen ? tr('关闭会话聊天') : tr('会话聊天'),
-              active: chatOpen,
-              onTap: onToggleChat,
-            ),
-            _BarButton(
-              icon: Icons.terminal_rounded,
-              tooltip: !terminalAvailable
-                  ? tr('服务端未开放远程终端')
-                  : terminalOpen
-                      ? tr('关闭远程终端')
-                      : tr('远程终端'),
-              disabled: !terminalAvailable,
-              active: terminalOpen,
-              onTap: onToggleTerminal,
-            ),
-            _BarButton(
-              icon: cameraOpen
-                  ? Icons.videocam_rounded
-                  : Icons.videocam_outlined,
-              tooltip: !cameraAvailable
-                  ? tr('服务端未开放摄像头')
-                  : cameraOpen
-                      ? tr('关闭远程摄像头')
-                      : tr('查看主机摄像头'),
-              disabled: !cameraAvailable,
-              active: cameraOpen,
-              onTap: onToggleCamera,
-            ),
-            _BarButton(
-              icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
-              tooltip: !audioAvailable
-                  ? tr('服务端未启用声音')
-                  : audioMuted
-                      ? tr('取消静音（长按选择输出设备）')
-                      : tr('静音（长按选择输出设备）'),
-              disabled: !audioAvailable,
-              active: audioAvailable && !audioMuted,
-              onTap: onToggleAudio,
-              onLongPress: (BuildContext context) =>
-                  unawaited(_openAudioOutputMenu(context)),
-            ),
-            _BarButton(
-              icon: microphoneEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
-              tooltip: !microphoneAvailable
-                  ? tr('服务端未开放麦克风')
-                  : microphoneEnabled
-                      ? tr('关闭麦克风（长按选择设备）')
-                      : tr('开启麦克风（长按选择设备）'),
-              disabled: !microphoneAvailable,
-              active: microphoneEnabled,
-              onTap: onToggleMicrophone,
-              onLongPress: (BuildContext context) =>
-                  unawaited(_openMicrophoneMenu(context)),
-            ),
-            _BarButton(
-              icon: privacyEnabled
-                  ? Icons.shield_rounded
-                  : Icons.shield_outlined,
-              tooltip: !privacyAvailable
-                  ? tr('服务端未开放隐私模式')
-                  : privacyEnabled
-                      ? tr('关闭隐私模式（恢复主机本地画面）')
-                      : tr('开启隐私模式（遮挡主机本地画面）'),
-              disabled: !privacyAvailable,
-              active: privacyEnabled,
-              onTap: onTogglePrivacy,
-            ),
-            _BarButton(
-              icon: recording
-                  ? Icons.stop_circle_rounded
-                  : Icons.fiber_manual_record_rounded,
-              tooltip: !recordingAvailable
-                  ? (recordingDenied ? tr('主机未开放录制') : tr('会话建立后可录制到本地'))
-                  : recording
-                      ? tr('停止录制（保存为本地 MP4）')
-                      : tr('录制到本地（保存为 MP4）'),
-              disabled: !recordingAvailable,
-              active: recording,
-              onTap: () => onToggleRecording?.call(),
-            ),
-            _BarButton(
-              icon: portForwardActive
-                  ? Icons.alt_route_rounded
-                  : Icons.alt_route,
-              tooltip: !portForwardAvailable
-                  ? tr('服务端未开放端口转发')
-                  : portForwardActive
-                      ? tr('端口转发进行中（点击查看或停止）')
-                      : tr('端口转发'),
-              disabled: !portForwardAvailable,
-              active: portForwardActive,
-              onTap: onOpenPortForward,
-            ),
-            _BarButton(
-              icon: Icons.speed_rounded,
-              tooltip: tr('显示或隐藏统计'),
-              active: statsVisible,
-              onTap: onToggleStats,
-            ),
-            const _BarSeparator(),
-            _BarButton(
-              icon: fullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
-              tooltip: fullscreen ? tr('退出全屏') : tr('全屏'),
-              active: fullscreen,
-              onTap: onToggleFullscreen,
-            ),
-            _BarButton(
-              icon: Icons.expand_less_rounded,
-              tooltip: tr('收起工具栏'),
-              onTap: onCollapse,
-            ),
-            const SizedBox(width: 2),
-            _BarButton(
-              icon: Icons.close_rounded,
-              tooltip: tr('断开连接'),
-              danger: true,
-              onTap: onClose,
-            ),
-          ],
+              _FitButton(fit: fit, onChanged: onFitChanged),
+              const _BarSeparator(),
+              _DisplayButton(
+                displays: displays,
+                active: activeDisplay,
+                onSelected: onSelectDisplay,
+              ),
+              if (activeDisplay != kViewerDisplayAll)
+                _ResolutionButton(
+                  modes: modes,
+                  available: modeChangeAvailable,
+                  onSelected: onSelectMode,
+                ),
+              _StreamOptionsButton(
+                available: streamOptionsAvailable,
+                codec: streamCodec,
+                quality: streamQuality,
+                maxFps: streamMaxFps,
+                onSelectCodec: onSelectStreamCodec,
+                onSelectQuality: onSelectStreamQuality,
+                onSelectFps: onSelectStreamFps,
+              ),
+              _BarButton(
+                icon: Icons.keyboard_alt_outlined,
+                tooltip: !inputAvailable
+                    ? tr('服务端未开放输入')
+                    : controlEnabled
+                        ? tr('关闭远程键鼠')
+                        : tr('开启远程键鼠'),
+                disabled: !inputAvailable,
+                active: controlEnabled,
+                onTap: onToggleControl,
+              ),
+              _SpecialKeysButton(
+                available: specialKeysAvailable,
+                onSelected: onSpecialAction,
+              ),
+              _BarButton(
+                icon: Icons.text_fields_rounded,
+                tooltip: specialKeysAvailable
+                    ? tr('发送文本')
+                    : tr('需要远程键鼠控制'),
+                disabled: !specialKeysAvailable,
+                onTap: onSendText,
+              ),
+              _BarButton(
+                icon: Icons.photo_camera_rounded,
+                tooltip: !screenshotAvailable
+                    ? tr('会话建立后可截图')
+                    : tr('截图（保存为本地 PNG）'),
+                disabled: !screenshotAvailable,
+                onTap: () => onScreenshot?.call(),
+              ),
+              _BarButton(
+                icon: clipboardEnabled
+                    ? Icons.content_paste_go_rounded
+                    : Icons.content_paste_off_rounded,
+                tooltip: !clipboardAvailable
+                    ? tr('服务端未开放剪贴板')
+                    : clipboardEnabled
+                        ? tr('暂停剪贴板同步')
+                        : tr('恢复剪贴板同步'),
+                disabled: !clipboardAvailable,
+                active: clipboardAvailable && clipboardEnabled,
+                onTap: onToggleClipboard,
+              ),
+              _BarButton(
+                icon: Icons.upload_file_rounded,
+                tooltip: !fileAvailable
+                    ? tr('服务端未开放文件传输')
+                    : fileActive
+                        ? tr('文件正在发送')
+                        : tr('发送文件到主机'),
+                disabled: !fileAvailable || fileActive,
+                active: fileActive,
+                onTap: onSendFile,
+              ),
+              _BarButton(
+                icon: fileBrowseOpen
+                    ? Icons.folder_open_rounded
+                    : Icons.folder_outlined,
+                tooltip: !fileAvailable
+                    ? tr('服务端未开放文件传输')
+                    : fileBrowseOpen
+                        ? tr('关闭主机文件浏览')
+                        : tr('浏览主机共享文件夹'),
+                disabled: !fileAvailable,
+                active: fileBrowseOpen,
+                onTap: onToggleFileBrowse,
+              ),
+              _BarButton(
+                icon: chatOpen ? Icons.forum_rounded : Icons.forum_outlined,
+                tooltip: chatOpen ? tr('关闭会话聊天') : tr('会话聊天'),
+                active: chatOpen,
+                onTap: onToggleChat,
+              ),
+              _BarButton(
+                icon: Icons.terminal_rounded,
+                tooltip: !terminalAvailable
+                    ? tr('服务端未开放远程终端')
+                    : terminalOpen
+                        ? tr('关闭远程终端')
+                        : tr('远程终端'),
+                disabled: !terminalAvailable,
+                active: terminalOpen,
+                onTap: onToggleTerminal,
+              ),
+              _BarButton(
+                icon: cameraOpen
+                    ? Icons.videocam_rounded
+                    : Icons.videocam_outlined,
+                tooltip: !cameraAvailable
+                    ? tr('服务端未开放摄像头')
+                    : cameraOpen
+                        ? tr('关闭远程摄像头')
+                        : tr('查看主机摄像头'),
+                disabled: !cameraAvailable,
+                active: cameraOpen,
+                onTap: onToggleCamera,
+              ),
+              _BarButton(
+                icon: audioMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
+                tooltip: !audioAvailable
+                    ? tr('服务端未启用声音')
+                    : audioMuted
+                        ? tr('取消静音（长按选择输出设备）')
+                        : tr('静音（长按选择输出设备）'),
+                disabled: !audioAvailable,
+                active: audioAvailable && !audioMuted,
+                onTap: onToggleAudio,
+                onLongPress: (BuildContext context) =>
+                    unawaited(_openAudioOutputMenu(context)),
+              ),
+              _BarButton(
+                icon: microphoneEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
+                tooltip: !microphoneAvailable
+                    ? tr('服务端未开放麦克风')
+                    : microphoneEnabled
+                        ? tr('关闭麦克风（长按选择设备）')
+                        : tr('开启麦克风（长按选择设备）'),
+                disabled: !microphoneAvailable,
+                active: microphoneEnabled,
+                onTap: onToggleMicrophone,
+                onLongPress: (BuildContext context) =>
+                    unawaited(_openMicrophoneMenu(context)),
+              ),
+              _BarButton(
+                icon: voiceEnabled
+                    ? Icons.phone_in_talk_rounded
+                    : Icons.phone_outlined,
+                tooltip: !voiceAvailable
+                    ? tr('服务端未开放语音通话')
+                    : voicePending
+                        ? tr('正在接通主机麦克风…')
+                        : voiceEnabled
+                            ? tr('结束语音通话')
+                            : tr('收听主机麦克风'),
+                disabled: !voiceAvailable || voicePending,
+                active: voiceEnabled,
+                onTap: onToggleVoiceCall,
+              ),
+              _BarButton(
+                icon: privacyEnabled
+                    ? Icons.shield_rounded
+                    : Icons.shield_outlined,
+                tooltip: !privacyAvailable
+                    ? tr('服务端未开放隐私模式')
+                    : privacyEnabled
+                        ? tr('关闭隐私模式（恢复主机本地画面）')
+                        : tr('开启隐私模式（遮挡主机本地画面）'),
+                disabled: !privacyAvailable,
+                active: privacyEnabled,
+                onTap: onTogglePrivacy,
+              ),
+              _BarButton(
+                icon: recording
+                    ? Icons.stop_circle_rounded
+                    : Icons.fiber_manual_record_rounded,
+                tooltip: !recordingAvailable
+                    ? (recordingDenied ? tr('主机未开放录制') : tr('会话建立后可录制到本地'))
+                    : recording
+                        ? tr('停止录制（保存为本地 MP4）')
+                        : tr('录制到本地（保存为 MP4）'),
+                disabled: !recordingAvailable,
+                active: recording,
+                onTap: () => onToggleRecording?.call(),
+              ),
+              _BarButton(
+                icon: portForwardActive
+                    ? Icons.alt_route_rounded
+                    : Icons.alt_route,
+                tooltip: !portForwardAvailable
+                    ? tr('服务端未开放端口转发')
+                    : portForwardActive
+                        ? tr('端口转发进行中（点击查看或停止）')
+                        : tr('端口转发'),
+                disabled: !portForwardAvailable,
+                active: portForwardActive,
+                onTap: onOpenPortForward,
+              ),
+              _BarButton(
+                icon: Icons.speed_rounded,
+                tooltip: tr('显示或隐藏统计'),
+                active: statsVisible,
+                onTap: onToggleStats,
+              ),
+              const _BarSeparator(),
+              _BarButton(
+                icon: fullscreen ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded,
+                tooltip: fullscreen ? tr('退出全屏') : tr('全屏'),
+                active: fullscreen,
+                onTap: onToggleFullscreen,
+              ),
+              _BarButton(
+                icon: Icons.expand_less_rounded,
+                tooltip: tr('收起工具栏'),
+                onTap: onCollapse,
+              ),
+              const SizedBox(width: 2),
+              _BarButton(
+                icon: Icons.close_rounded,
+                tooltip: tr('断开连接'),
+                danger: true,
+                onTap: onClose,
+              ),
+            ],
+          ),
         ),
       ),
     );

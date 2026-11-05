@@ -2177,6 +2177,8 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
         poll_clipboard(now, stats);
         poll_files(stats);
         drain_microphone(stats);
+        handle_voice_call_requests(stats);
+        drain_voice_call(stats);
         if (session_->take_keyframe_request()) {
             registry_->request_desktop_keyframe();
         }
@@ -4135,6 +4137,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         }
         drain_audio();
         drain_microphone(stats);
+        handle_voice_call_requests(stats);
+        drain_voice_call(stats);
         PortForwardRequest forward_request;
         while (session_->take_port_forward_request(forward_request)) {
             // The transport already checked the session grant; reaching here
@@ -4262,6 +4266,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                     }
                     drain_audio();
                     drain_microphone(stats);
+                    handle_voice_call_requests(stats);
+                    drain_voice_call(stats);
                 }
                 if (stopped) {
                     break;
@@ -4289,6 +4295,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // present; drain here so audio does not wait behind a slow frame.
         drain_audio();
         drain_microphone(stats);
+        handle_voice_call_requests(stats);
+        drain_voice_call(stats);
         switch (result) {
             case CaptureResult::NoNewFrame:
                 // A failed conversion leaves no NV12 behind. If the desktop
@@ -6239,6 +6247,166 @@ void HostServer::drain_microphone(HostServerStats& stats) {
             break;
         }
     }
+}
+
+void HostServer::stop_voice_call(HostServerStats& stats, const std::string& reason,
+                                 bool notify) {
+    if (voice_capture_) {
+        voice_capture_->stop();
+        voice_capture_.reset();
+    }
+    voice_info_ = AudioInfo{};
+    voice_next_seq_ = 0;
+    voice_request_id_ = 0;
+    const bool was_active = stats.voice_call_active;
+    stats.voice_call_active = false;
+    if (was_active) {
+        ++stats.voice_call_completed;
+        if (!reason.empty()) {
+            log("voice call stopped: " + reason);
+        }
+    }
+    if (notify) {
+        const Error closed = session_->send_voice_call_close();
+        if (!closed.ok()) {
+            ++stats.voice_call_errors;
+            log("voice call close failed: " + closed.to_string());
+        }
+    }
+}
+
+void HostServer::handle_voice_call_requests(HostServerStats& stats) {
+    VoiceCallRequest request;
+    while (session_->take_voice_call_request(request)) {
+        if (!request.connect) {
+            // The transport cleared the call when it queued this stop, so no
+            // second close goes back to the viewer.
+            stop_voice_call(stats, "the viewer ended the call", false);
+            continue;
+        }
+        ++stats.voice_call_requests;
+        if (voice_capture_) {
+            VoiceCallResponse busy;
+            busy.request_id = request.request_id;
+            busy.code = VoiceCallCode::Busy;
+            busy.reason = "a voice call is already running";
+            const Error sent = session_->send_voice_call_response(busy);
+            if (!sent.ok()) {
+                ++stats.voice_call_errors;
+                log("voice call: cannot refuse an overlapping call: " + sent.to_string());
+            }
+            continue;
+        }
+        const bool allowed = settings_.allow_microphone &&
+                             (session_->permissions() & kPermissionMicrophone) != 0;
+        std::string setup_error;
+        std::unique_ptr<IMicrophoneCapture> capture;
+        if (allowed) {
+            capture = config_.voice_capture
+                          ? config_.voice_capture(&setup_error)
+                          : create_microphone_capture(MicrophoneCaptureConfig{}, &setup_error);
+            if (capture) {
+                capture->start();
+                if (capture->failed()) {
+                    setup_error = capture->error();
+                    capture->stop();
+                    capture.reset();
+                }
+            }
+        } else {
+            setup_error = "the microphone is not enabled for this session";
+        }
+        if (!capture) {
+            VoiceCallResponse failed;
+            failed.request_id = request.request_id;
+            failed.code = allowed ? VoiceCallCode::Failed : VoiceCallCode::Refused;
+            failed.reason =
+                setup_error.empty() ? "no microphone is available" : setup_error;
+            ++stats.voice_call_errors;
+            const Error sent = session_->send_voice_call_response(failed);
+            if (!sent.ok()) {
+                log("voice call: cannot answer the request: " + sent.to_string());
+            }
+            log("voice call: request failed: " + failed.reason);
+            continue;
+        }
+        VoiceCallResponse accepted;
+        accepted.request_id = request.request_id;
+        accepted.code = VoiceCallCode::Ok;
+        accepted.audio = capture->info();
+        const Error sent = session_->send_voice_call_response(accepted);
+        if (!sent.ok()) {
+            ++stats.voice_call_errors;
+            capture->stop();
+            log("voice call: cannot accept the call: " + sent.to_string());
+            continue;
+        }
+        if ((session_->permissions() & kPermissionMicrophone) == 0) {
+            // The transport downgrades an Ok answer to Refused when the
+            // permission disappears while the request is in flight.
+            capture->stop();
+            continue;
+        }
+        voice_capture_ = std::move(capture);
+        voice_info_ = voice_capture_->info();
+        voice_next_seq_ = 0;
+        voice_request_id_ = request.request_id;
+        voice_send_drops_ = 0;
+        ++stats.voice_call_accepted;
+        stats.voice_call_active = true;
+        log("voice call: host microphone sending Opus " +
+            std::to_string(voice_info_.sample_rate / 1000u) + " kHz, " +
+            std::to_string(voice_info_.channels) + " ch");
+    }
+    if (voice_capture_ && (!settings_.allow_microphone ||
+                           (session_->permissions() & kPermissionMicrophone) == 0)) {
+        stop_voice_call(stats, "the microphone permission was removed", true);
+    }
+}
+
+void HostServer::drain_voice_call(HostServerStats& stats) {
+    if (!voice_capture_) {
+        return;
+    }
+    if (voice_capture_->failed()) {
+        ++stats.voice_call_errors;
+        const std::string reason = voice_capture_->error();
+        stop_voice_call(stats,
+                        "capture: " + (reason.empty() ? std::string("the device failed")
+                                                      : reason),
+                        true);
+        return;
+    }
+    EncodedAudio packet;
+    while (voice_capture_->take_packet(packet)) {
+        AudioHeader header;
+        header.codec = voice_info_.codec;
+        header.sample_rate = voice_info_.sample_rate;
+        header.channels = voice_info_.channels;
+        header.frame_samples = voice_info_.frame_samples;
+        header.pts_ms = packet.capture_ms;
+        header.capture_ms = packet.capture_ms;
+        const Error sent = session_->send_voice_audio(header, packet.data.data(),
+                                                      packet.data.size());
+        if (sent.status() == Status::WaitTimeout) {
+            ++voice_send_drops_;
+            continue;
+        }
+        if (!sent.ok()) {
+            ++stats.voice_call_errors;
+            const bool revoked = sent.status() == Status::PermissionDenied;
+            const std::string reason = sent.to_string();
+            stop_voice_call(stats,
+                            revoked ? "the microphone permission was removed"
+                                    : "send failed: " + reason,
+                            !revoked);
+            return;
+        }
+        ++stats.voice_call_packets;
+        stats.voice_call_bytes += packet.data.size();
+    }
+    const AudioCaptureStats captured = voice_capture_->stats();
+    stats.voice_call_dropped = voice_send_drops_ + captured.dropped;
 }
 
 bool HostServer::send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left) {

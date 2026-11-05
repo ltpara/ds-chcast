@@ -419,6 +419,7 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     // Microphone capture is a per-session privacy decision: every session
     // starts with the uplink off, while the chosen device is remembered.
     microphone_wanted_.store(false, std::memory_order_relaxed);
+    voice_wanted_.store(false, std::memory_order_relaxed);
     stop_requested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     thread_ = std::thread(&ViewerEngine::Run, this, host, port, display,
@@ -1126,6 +1127,17 @@ bool ViewerEngine::SetMicrophone(bool enabled) {
     return true;
 }
 
+bool ViewerEngine::SetVoiceCall(bool enabled) {
+    if (enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_.voice_authorized) {
+            return false;
+        }
+    }
+    voice_wanted_.store(enabled, std::memory_order_relaxed);
+    return true;
+}
+
 bool ViewerEngine::SelectMicrophone(std::string device_id) {
     if (!running_.load(std::memory_order_acquire)) {
         return false;
@@ -1599,6 +1611,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t microphone_recoveries = 0;
     bool microphone_recovering = false;
     std::string microphone_error;
+    std::unique_ptr<chast::IAudioDecoder> voice_decoder;
+    std::unique_ptr<chast::IAudioPlayer> voice_player;
+    chast::AudioInfo voice_info;
+    bool voice_authorized = false;
+    bool voice_active = false;
+    bool voice_pending = false;
+    uint64_t voice_packets = 0;
+    uint64_t voice_dropped = 0;
+    uint64_t voice_errors = 0;
+    std::string voice_error;
     bool privacy_supported = false;
     bool privacy_enabled = false;
     int privacy_code = 0;
@@ -1854,6 +1876,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.microphone_recoveries = microphone_recoveries;
             status_.microphone_recovering = microphone_recovering;
             status_.microphone_error = microphone_error;
+            if (voice_player) {
+                voice_dropped = voice_player->stats().dropped;
+            }
+            status_.voice_enabled = voice_active;
+            status_.voice_pending = voice_pending;
+            status_.voice_packets = voice_packets;
+            status_.voice_dropped = voice_dropped;
+            status_.voice_errors = voice_errors;
+            status_.voice_error = voice_error;
             status_.recording = recorder != nullptr;
             if (recorder) {
                 status_.record_samples = recorder->samples();
@@ -1952,6 +1983,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             microphone_error = reason;
             std::fprintf(stderr, "viewer: microphone stopped: %s\n", reason.c_str());
         }
+    };
+
+    // Releases the voice-call playback pipeline. The transport-side call is
+    // stopped by drain_voice; this only covers the local decoder and player.
+    auto stop_voice = [&] {
+        if (voice_player) {
+            voice_player->stop();
+            voice_player.reset();
+        }
+        voice_decoder.reset();
+        voice_info = chast::AudioInfo{};
+        voice_active = false;
+        voice_pending = false;
     };
 
     const bool automatic = transport == ViewerTransport::kAuto;
@@ -2282,6 +2326,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 }
                 clipboard_enabled = clipboard;
                 microphone_authorized = microphone;
+                voice_authorized = microphone;
                 privacy_supported = privacy;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -2290,6 +2335,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.input_enabled = input;
                     status_.clipboard_enabled = clipboard;
                     status_.microphone_authorized = microphone;
+                    status_.voice_authorized = microphone;
                     status_.privacy_supported = privacy;
                     status_.port_forward_enabled = forward_allowed;
                     status_.terminal_supported = terminal_allowed;
@@ -2299,6 +2345,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // releases the microphone at once and tells the UI why.
                 if (!microphone && (microphone_capture || microphone_stream_open)) {
                     stop_microphone("the host revoked the microphone", true);
+                }
+                if (!microphone && (voice_active || voice_pending)) {
+                    stop_voice();
+                    voice_wanted_.store(false, std::memory_order_relaxed);
+                    voice_error = "the host revoked the microphone";
                 }
             };
             apply_permissions(session->permissions());
@@ -5061,6 +5112,151 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Voice call. The request round trip and the host's answer are
+                // taken here; a host-initiated close (permission revocation or
+                // capture failure) clears the switch and explains itself.
+                auto drain_voice = [&] {
+                    const bool wanted = voice_wanted_.load(std::memory_order_relaxed);
+                    if (!wanted && (voice_active || voice_pending)) {
+                        session->request_voice_call_stop();
+                        stop_voice();
+                        voice_error.clear();
+                        std::fprintf(stderr, "viewer: voice call stopped\n");
+                        return;
+                    }
+                    if (!wanted || voice_active || voice_pending) {
+                        return;
+                    }
+                    if (!voice_authorized) {
+                        voice_error = "the host did not grant the microphone";
+                        voice_wanted_.store(false, std::memory_order_relaxed);
+                        return;
+                    }
+                    chast::Error requested = session->request_voice_call();
+                    if (!requested.ok()) {
+                        ++voice_errors;
+                        voice_error = "request: " + requested.to_string();
+                        voice_wanted_.store(false, std::memory_order_relaxed);
+                        std::fprintf(stderr, "viewer: voice call request: %s\n",
+                                     requested.to_string().c_str());
+                        return;
+                    }
+                    voice_pending = true;
+                    voice_error.clear();
+                };
+                auto receive_voice = [&] {
+                    chast::VoiceCallResponse response;
+                    while (session->take_voice_call_response(response)) {
+                        voice_pending = false;
+                        if (response.code != chast::VoiceCallCode::Ok) {
+                            stop_voice();
+                            voice_wanted_.store(false, std::memory_order_relaxed);
+                            voice_error = response.reason.empty()
+                                              ? std::string("the host refused the voice call")
+                                              : response.reason;
+                            ++voice_errors;
+                            std::fprintf(stderr, "viewer: voice call refused: %s\n",
+                                         voice_error.c_str());
+                            continue;
+                        }
+                        std::string setup_error;
+                        voice_decoder =
+                            chast::create_audio_decoder(response.audio, &setup_error);
+                        if (!voice_decoder) {
+                            ++voice_errors;
+                            voice_error = "decoder: " + setup_error;
+                            voice_wanted_.store(false, std::memory_order_relaxed);
+                            voice_pending = false;
+                            session->request_voice_call_stop();
+                            std::fprintf(stderr, "viewer: voice decoder: %s\n",
+                                         setup_error.c_str());
+                            continue;
+                        }
+                        chast::AudioPlayerConfig player_config;
+                        // The host's capture clock is unrelated to this
+                        // machine's; anchoring playback on arrival keeps the
+                        // 80 ms jitter buffer and recovers after a stall.
+                        player_config.arrival_anchored = true;
+                        player_config.device_id = audio_device;
+                        voice_player = chast::create_audio_player(player_config, &setup_error);
+                        if (!voice_player) {
+                            ++voice_errors;
+                            voice_error = "playback: " + setup_error;
+                            voice_wanted_.store(false, std::memory_order_relaxed);
+                            voice_decoder.reset();
+                            session->request_voice_call_stop();
+                            std::fprintf(stderr, "viewer: voice playback: %s\n",
+                                         setup_error.c_str());
+                            continue;
+                        }
+                        if (chast::Error started = voice_player->start(); !started.ok()) {
+                            ++voice_errors;
+                            voice_error = "playback: " + started.to_string();
+                            voice_wanted_.store(false, std::memory_order_relaxed);
+                            voice_player.reset();
+                            voice_decoder.reset();
+                            session->request_voice_call_stop();
+                            std::fprintf(stderr, "viewer: voice playback: %s\n",
+                                         started.to_string().c_str());
+                            continue;
+                        }
+                        voice_info = response.audio;
+                        voice_active = true;
+                        voice_error.clear();
+                        std::fprintf(stderr, "viewer: voice call up, Opus %u Hz %u ch\n",
+                                     voice_info.sample_rate, voice_info.channels);
+                    }
+                    if (session->take_voice_call_closed() &&
+                        (voice_active || voice_pending)) {
+                        stop_voice();
+                        voice_wanted_.store(false, std::memory_order_relaxed);
+                        voice_error = "the host ended the voice call";
+                        std::fprintf(stderr, "viewer: voice call closed by the host\n");
+                    }
+                    chast::AudioHeader header;
+                    std::vector<uint8_t> payload;
+                    while (voice_active && session->take_voice_audio(header, payload)) {
+                        if (!voice_decoder || !voice_player) {
+                            break;
+                        }
+                        std::vector<chast::DecodedAudio> blocks;
+                        chast::Error decoded = voice_decoder->decode(
+                            header, payload.data(), payload.size(), blocks);
+                        if (!decoded.ok()) {
+                            ++voice_errors;
+                            if (voice_errors <= 3) {
+                                std::fprintf(stderr, "viewer: voice decode: %s\n",
+                                             decoded.to_string().c_str());
+                            }
+                            continue;
+                        }
+                        bool push_failed = false;
+                        for (const chast::DecodedAudio& block : blocks) {
+                            chast::Error pushed = voice_player->push(block);
+                            if (!pushed.ok()) {
+                                ++voice_errors;
+                                push_failed = true;
+                                break;
+                            }
+                        }
+                        if (push_failed) {
+                            break;
+                        }
+                        ++voice_packets;
+                        const std::string render_error = voice_player->error();
+                        if (!render_error.empty()) {
+                            ++voice_errors;
+                            voice_error = "playback: " + render_error;
+                            stop_voice();
+                            voice_wanted_.store(false, std::memory_order_relaxed);
+                            std::fprintf(stderr, "viewer: voice playback lost the "
+                                                 "endpoint: %s\n",
+                                         render_error.c_str());
+                            break;
+                        }
+                    }
+                };
+
                 // Remote terminal. The panel drives one console through the
                 // command queue; this thread owns the session, so request,
                 // input, resize and the stop all leave from here in order.
@@ -6175,6 +6371,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_cursor();
                     drain_audio();
                     drain_microphone();
+                    drain_voice();
+                    receive_voice();
                     chast::FrameHeader header;
                     std::vector<uint8_t> payload;
                     FileUpload::Stage upload_stage = FileUpload::Stage::kDone;
@@ -6191,7 +6389,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                         chast::kPermissionClipboard)) != 0 ||
                         file_active || audio_announced || microphone_enabled ||
                         microphone_wanted_.load(std::memory_order_relaxed) ||
-                        port_forward != nullptr || terminal_active || camera_active;
+                        voice_wanted_.load(std::memory_order_relaxed) || voice_active ||
+                        voice_pending || port_forward != nullptr || terminal_active ||
+                        camera_active;
                     if (keyframe_wanted_.exchange(false, std::memory_order_relaxed)) {
                         request_keyframe();
                     }
@@ -6216,6 +6416,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     // the wait ends.
                     drain_audio();
                     drain_microphone();
+                    drain_voice();
+                    receive_voice();
                     receive_permissions();
                     drain_privacy();
                     receive_privacy();

@@ -52,6 +52,7 @@ class AudioReference;
 class IAudioDecoder;
 class IAudioPlayer;
 class ILoopbackCapture;
+class IMicrophoneCapture;
 struct ViewerRegistry;
 
 enum class HostState {
@@ -175,6 +176,18 @@ struct HostServerStats {
     // Streams opened over the session, including reconnects after the viewer
     // toggled the microphone off and on.
     uint64_t microphone_streams = 0;
+    // Voice call (protocol v37): the host microphone uplink the viewer asked
+    // for. requests counts every start request seen, accepted the calls that
+    // answered Ok, completed the calls that stopped for any reason after being
+    // accepted, and packets/bytes the Opus packets handed to the transport.
+    bool voice_call_active = false;
+    uint64_t voice_call_requests = 0;
+    uint64_t voice_call_accepted = 0;
+    uint64_t voice_call_completed = 0;
+    uint64_t voice_call_packets = 0;
+    uint64_t voice_call_bytes = 0;
+    uint64_t voice_call_dropped = 0;
+    uint64_t voice_call_errors = 0;
     // Pointer traffic. cursor_sent counts the CursorUpdates handed to the
     // transport; cursor_shapes is how many of them carried a sprite and
     // cursor_bytes their total sprite size. cursor_dropped counts updates the
@@ -339,6 +352,12 @@ struct HostServerConfig {
     // the loopback check substitutes a sink that only counts frames so it does
     // not make noise. Created lazily, the first time a viewer opens CMIC.
     std::function<std::unique_ptr<IAudioPlayer>(std::string*)> microphone_player;
+    // Creates the host microphone a viewer's voice call sends (protocol v37).
+    // Empty opens the default communications capture device; the loopback
+    // check substitutes a synthetic packet source. Called only while
+    // settings.allow_microphone is set; returning nullptr (with `error`)
+    // answers the call with Failed.
+    std::function<std::unique_ptr<IMicrophoneCapture>(std::string*)> voice_capture;
     // Injects Ctrl+Alt+Del. Empty uses the platform SendSAS in service mode and
     // answers Unsupported otherwise (the tray host cannot call it). The
     // loopback check substitutes a callback so it never touches the real
@@ -479,6 +498,14 @@ private:
     void poll_clipboard(std::chrono::steady_clock::time_point now, HostServerStats& stats);
     void stop_microphone(HostServerStats& stats, const std::string& reason);
     void drain_microphone(HostServerStats& stats);
+    // Host microphone uplink of a voice call. handle_voice_call_requests()
+    // answers the viewer's control messages and owns the capture lifetime;
+    // drain_voice_call() forwards encoded packets. Both run per worker, so a
+    // follower session can serve its own call without owning the desktop.
+    void handle_voice_call_requests(HostServerStats& stats);
+    void drain_voice_call(HostServerStats& stats);
+    void stop_voice_call(HostServerStats& stats, const std::string& reason,
+                         bool notify);
     bool send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left);
     // Serves a viewer that asked for a file-transfer-only session: no capture,
     // encoder, display or audio exists. The same file machinery as a desktop
@@ -732,6 +759,14 @@ private:
     // plays its microphone without one because the reference belongs to the
     // publisher's audio pipeline.
     std::shared_ptr<AudioReference> audio_reference_;
+
+    // Voice call of this worker's viewer. The capture is created when the
+    // viewer asks and stopped on close, permission loss or capture failure.
+    std::unique_ptr<IMicrophoneCapture> voice_capture_;
+    AudioInfo voice_info_;
+    uint64_t voice_next_seq_ = 0;
+    uint64_t voice_request_id_ = 0;
+    uint64_t voice_send_drops_ = 0;
 
     mutable std::mutex status_mutex_;
     HostStatus status_;

@@ -2067,6 +2067,204 @@ bool decode_camera_stream_header(const uint8_t* data, size_t size,
     return true;
 }
 
+namespace {
+
+bool valid_voice_code(VoiceCallCode code) {
+    return code == VoiceCallCode::Ok || code == VoiceCallCode::Refused ||
+           code == VoiceCallCode::Busy || code == VoiceCallCode::Failed;
+}
+
+std::string truncate_voice_reason(const std::string& reason) {
+    if (reason.size() <= kMaxVoiceCallReasonBytes) {
+        return valid_utf8(reason) ? reason : std::string();
+    }
+    size_t cut = kMaxVoiceCallReasonBytes;
+    while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0u) == 0x80u) {
+        --cut;
+    }
+    std::string text = reason.substr(0, cut);
+    return valid_utf8(text) ? text : std::string();
+}
+
+// The host microphone is always 48 kHz Opus in 20 ms frames, one or two
+// channels. Anything else would describe a stream the viewer cannot decode
+// with the microphone decoder.
+bool valid_voice_info(const AudioInfo& info) {
+    return info.codec == AudioCodec::Opus && info.sample_rate == 48000 &&
+           (info.channels == 1 || info.channels == 2) &&
+           info.frame_samples == kOpusFrameSamples && !info.extradata.empty() &&
+           info.extradata.size() <= kMaxAudioExtradata;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_voice_call_request(const VoiceCallRequest& request) {
+    if (request.request_id == 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(1 + 8);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, request.connect ? 1 : 0);
+    put_u64(cursor, request.request_id);
+    return make_control(ControlType::VoiceCallRequest, payload);
+}
+
+bool parse_voice_call_request(const std::vector<uint8_t>& payload,
+                              VoiceCallRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t flags = 0;
+    if (!reader.u8(flags) || !reader.u64(request.request_id) || !reader.at_end()) {
+        set_error(error, "malformed VoiceCallRequest");
+        return false;
+    }
+    if ((flags & ~0x1u) != 0) {
+        set_error(error, "VoiceCallRequest carries unknown flags");
+        return false;
+    }
+    if (request.request_id == 0) {
+        set_error(error, "VoiceCallRequest carries request id 0");
+        return false;
+    }
+    request.connect = (flags & 0x1u) != 0;
+    return true;
+}
+
+std::vector<uint8_t> make_voice_call_response(const VoiceCallResponse& response) {
+    if (response.request_id == 0 || !valid_voice_code(response.code)) {
+        return {};
+    }
+    const bool ok = response.code == VoiceCallCode::Ok;
+    if (ok && !valid_voice_info(response.audio)) {
+        return {};
+    }
+    const std::string reason = truncate_voice_reason(response.reason);
+    size_t size = 8 + 1 + 2 + reason.size();
+    if (ok) {
+        size += 1 + 4 + 2 + 2 + 2 + response.audio.extradata.size();
+    }
+    std::vector<uint8_t> payload(size);
+    uint8_t* cursor = payload.data();
+    put_u64(cursor, response.request_id);
+    put_u8(cursor, static_cast<uint8_t>(response.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+        cursor += reason.size();
+    }
+    if (ok) {
+        put_u8(cursor, audio_codec_wire(response.audio.codec));
+        put_u32(cursor, response.audio.sample_rate);
+        put_u16(cursor, response.audio.channels);
+        put_u16(cursor, response.audio.frame_samples);
+        put_u16(cursor, static_cast<uint16_t>(response.audio.extradata.size()));
+        std::memcpy(cursor, response.audio.extradata.data(), response.audio.extradata.size());
+    }
+    return make_control(ControlType::VoiceCallResponse, payload);
+}
+
+bool parse_voice_call_response(const std::vector<uint8_t>& payload,
+                               VoiceCallResponse& response, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u64(response.request_id) || !reader.u8(raw_code) ||
+        !reader.u16(reason_size)) {
+        set_error(error, "truncated VoiceCallResponse");
+        return false;
+    }
+    response.code = static_cast<VoiceCallCode>(raw_code);
+    if (!valid_voice_code(response.code)) {
+        set_error(error, "VoiceCallResponse carries an unknown code");
+        return false;
+    }
+    if (response.request_id == 0) {
+        set_error(error, "VoiceCallResponse carries request id 0");
+        return false;
+    }
+    if (reason_size > kMaxVoiceCallReasonBytes ||
+        !reader.string(response.reason, reason_size)) {
+        set_error(error, "VoiceCallResponse carries a malformed reason");
+        return false;
+    }
+    if (!response.reason.empty() && !valid_utf8(response.reason)) {
+        set_error(error, "VoiceCallResponse reason is not valid UTF-8");
+        return false;
+    }
+    response.audio = AudioInfo{};
+    if (response.code == VoiceCallCode::Ok) {
+        uint8_t codec = 0;
+        uint16_t extradata_size = 0;
+        if (!reader.u8(codec) || !reader.u32(response.audio.sample_rate) ||
+            !reader.u16(response.audio.channels) ||
+            !reader.u16(response.audio.frame_samples) ||
+            !reader.u16(extradata_size)) {
+            set_error(error, "truncated VoiceCallResponse format");
+            return false;
+        }
+        if (!audio_codec_from_wire(codec, response.audio.codec) ||
+            extradata_size == 0 || extradata_size > kMaxAudioExtradata ||
+            !reader.bytes(response.audio.extradata, extradata_size)) {
+            set_error(error, "VoiceCallResponse carries a malformed format");
+            return false;
+        }
+        response.audio.enabled = true;
+        response.audio.bitrate = 0;
+        if (!valid_voice_info(response.audio)) {
+            set_error(error, "VoiceCallResponse format is not a voice stream");
+            return false;
+        }
+    }
+    if (!reader.at_end()) {
+        set_error(error, "VoiceCallResponse carries trailing bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_voice_audio(const AudioHeader& header,
+                                      const uint8_t* payload, size_t size) {
+    if (!payload || size == 0 || size > kMaxAudioPayload ||
+        header.codec != AudioCodec::Opus || !valid_audio_rate(header.sample_rate) ||
+        (header.channels != 1 && header.channels != 2) ||
+        header.frame_samples == 0 || header.frame_samples > 8192) {
+        return {};
+    }
+    AudioHeader wire = header;
+    wire.payload_size = static_cast<uint32_t>(size);
+    wire.payload_crc32 = crc32(payload, size);
+    std::vector<uint8_t> message(kAudioHeaderSize + size);
+    encode_audio_header(wire, message.data());
+    std::memcpy(message.data() + kAudioHeaderSize, payload, size);
+    return make_control(ControlType::VoiceAudio, message);
+}
+
+bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
+                       const uint8_t** audio, size_t& audio_size, std::string* error) {
+    if (payload.size() <= kAudioHeaderSize) {
+        set_error(error, "VoiceAudio carries no encoded packet");
+        return false;
+    }
+    if (!decode_audio_header(payload.data(), kAudioHeaderSize, header, error)) {
+        return false;
+    }
+    if (header.codec != AudioCodec::Opus) {
+        set_error(error, "VoiceAudio is not Opus");
+        return false;
+    }
+    audio_size = payload.size() - kAudioHeaderSize;
+    if (header.payload_size != audio_size) {
+        set_error(error, "VoiceAudio length does not match its header");
+        return false;
+    }
+    const uint8_t* data = payload.data() + kAudioHeaderSize;
+    if (header.payload_crc32 != crc32(data, audio_size)) {
+        set_error(error, "VoiceAudio payload CRC does not match");
+        return false;
+    }
+    *audio = data;
+    return true;
+}
+
 // CursorUpdate: flags u8, reserved u8, x/y u32, hotspot u16 x2, shape id u64,
 // width/height u16 x2, then width*height*4 premultiplied BGRA bytes or none.
 constexpr size_t kCursorFixedSize = 1 + 1 + 4 + 4 + 2 + 2 + 8 + 2 + 2;

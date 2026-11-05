@@ -80,6 +80,11 @@ constexpr size_t kVideoReceiveHighWaterBytes = 32u * 1024u * 1024u;
 constexpr size_t kAudioReceiveHighWaterBytes = 4u * 1024u * 1024u;
 constexpr size_t kMicrophoneReceiveHighWaterBytes = 4u * 1024u * 1024u;
 constexpr size_t kCameraReceiveHighWaterBytes = 16u * 1024u * 1024u;
+// Voice call audio rides the control stream. The queue holds about five
+// seconds; past that the oldest packet is dropped, because late voice is
+// worse than a short gap.
+constexpr size_t kMaxVoiceAudioPackets = 256;
+constexpr size_t kMaxVoiceAudioBytes = 1024u * 1024u;
 constexpr size_t kMaxQueuedOffers = 8;
 // One forwarded connection never buffers more than twice the protocol's high
 // water mark; above the high-water mark the receive stream is paused, so the
@@ -797,6 +802,23 @@ struct QuicSession::Impl {
     // this queue is for observation; the injector consumes them itself.
     std::deque<std::string> texts;
     uint64_t texts_seen = 0;
+    // Voice call (protocol v37). The host microphone packets ride the control
+    // stream; the queues stay small because stale voice is useless. The
+    // server keeps at most one pending start, the client one outstanding
+    // request id.
+    bool server_voice_active = false;
+    bool client_voice_active = false;
+    bool client_voice_requested = false;
+    uint64_t client_voice_request_id = 0;
+    uint64_t server_voice_pending = 0;
+    uint64_t next_voice_request_id = 0;
+    uint64_t next_voice_seq = 0;
+    bool voice_closed_notice = false;
+    uint64_t voice_audio_seen = 0;
+    std::deque<VoiceCallRequest> voice_requests;
+    std::deque<VoiceCallResponse> voice_responses;
+    std::deque<std::vector<uint8_t>> voice_audio;
+    size_t buffered_voice_bytes = 0;
     std::deque<FileOffer> file_offers;
     uint64_t file_offers_seen = 0;
     std::deque<FileChunk> file_chunks;
@@ -2978,6 +3000,17 @@ struct QuicSession::Impl {
                             clear_terminals_locked("terminal access was revoked");
                         aborts.insert(aborts.end(), terminals.begin(), terminals.end());
                     }
+                    if ((permissions & kPermissionMicrophone) == 0 &&
+                        (client_voice_active || client_voice_requested)) {
+                        // The host stops the capture on its side; the viewer
+                        // stops expecting audio and reports the close once.
+                        client_voice_active = false;
+                        client_voice_requested = false;
+                        client_voice_request_id = 0;
+                        voice_closed_notice = true;
+                        voice_audio.clear();
+                        buffered_voice_bytes = 0;
+                    }
                     abort_streams_locked(aborts);
                 }
                 cv.notify_all();
@@ -3293,6 +3326,147 @@ struct QuicSession::Impl {
                     }
                     chats.push_back(std::move(text));
                     ++chats_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::VoiceCallRequest: {
+                VoiceCallRequest request;
+                if (!parse_voice_call_request(payload, request, &error)) {
+                    control_protocol_failure("VoiceCallRequest: " + error);
+                    break;
+                }
+                if (role == Role::Server) {
+                    // A start without the microphone permission is answered
+                    // with a refusal rather than queued, so the viewer's call
+                    // button never spins. A second start while one is pending
+                    // or running is answered Busy for the same reason.
+                    VoiceCallResponse refusal;
+                    refusal.request_id = request.request_id;
+                    bool refuse = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        if (!request.connect) {
+                            // A stop cancels this connection's call even if the
+                            // start has not been answered yet; drop the queued
+                            // start so the host does not open the microphone
+                            // for a call the viewer already ended.
+                            if (server_voice_pending != 0) {
+                                for (auto it = voice_requests.begin();
+                                     it != voice_requests.end();) {
+                                    if (it->connect &&
+                                        it->request_id == server_voice_pending) {
+                                        it = voice_requests.erase(it);
+                                    } else {
+                                        ++it;
+                                    }
+                                }
+                                server_voice_pending = 0;
+                            }
+                            server_voice_active = false;
+                            if (voice_requests.size() >= 4) {
+                                voice_requests.pop_front();
+                            }
+                            voice_requests.push_back(request);
+                        } else if ((session_permissions.load() & kPermissionMicrophone) ==
+                                   0) {
+                            refusal.code = VoiceCallCode::Refused;
+                            refusal.reason = "microphone access is not granted";
+                            refuse = true;
+                        } else if (server_voice_pending != 0 || server_voice_active) {
+                            refusal.code = VoiceCallCode::Busy;
+                            refusal.reason = "a voice call is already running";
+                            refuse = true;
+                        } else {
+                            server_voice_pending = request.request_id;
+                            voice_requests.push_back(request);
+                        }
+                    }
+                    if (refuse) {
+                        try_send_bytes(control.load(), make_voice_call_response(refusal),
+                                       QUIC_SEND_FLAG_NONE);
+                    }
+                } else {
+                    // Hosts only send the stop form; a start from the host is
+                    // not this protocol's direction.
+                    if (request.connect) {
+                        break;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        client_voice_active = false;
+                        client_voice_requested = false;
+                        client_voice_request_id = 0;
+                        voice_closed_notice = true;
+                        voice_audio.clear();
+                        buffered_voice_bytes = 0;
+                    }
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::VoiceCallResponse: {
+                if (role != Role::Client) {
+                    break;
+                }
+                VoiceCallResponse response;
+                if (!parse_voice_call_response(payload, response, &error)) {
+                    control_protocol_failure("VoiceCallResponse: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // An answer for a call the viewer already stopped is
+                    // stale, not an error: the stop and the answer cross.
+                    if (response.request_id != client_voice_request_id) {
+                        break;
+                    }
+                    client_voice_requested = false;
+                    client_voice_request_id = 0;
+                    if (response.code == VoiceCallCode::Ok) {
+                        client_voice_active = true;
+                    } else {
+                        client_voice_active = false;
+                        voice_audio.clear();
+                        buffered_voice_bytes = 0;
+                    }
+                    while (voice_responses.size() >= 4) {
+                        voice_responses.pop_front();
+                    }
+                    voice_responses.push_back(std::move(response));
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::VoiceAudio: {
+                if (role != Role::Client) {
+                    break;
+                }
+                AudioHeader header;
+                const uint8_t* frame = nullptr;
+                size_t audio_size = 0;
+                if (!parse_voice_audio(payload, header, &frame, audio_size, &error)) {
+                    control_protocol_failure("VoiceAudio: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!client_voice_active ||
+                        (session_permissions.load() & kPermissionMicrophone) == 0) {
+                        break;
+                    }
+                    while (!voice_audio.empty() &&
+                           (voice_audio.size() >= kMaxVoiceAudioPackets ||
+                            buffered_voice_bytes + payload.size() > kMaxVoiceAudioBytes)) {
+                        buffered_voice_bytes -= voice_audio.front().size();
+                        voice_audio.pop_front();
+                    }
+                    if (payload.size() > kMaxVoiceAudioBytes) {
+                        break;
+                    }
+                    voice_audio.push_back(payload);
+                    buffered_voice_bytes += payload.size();
+                    ++voice_audio_seen;
                 }
                 cv.notify_all();
                 break;
@@ -4323,6 +4497,19 @@ struct QuicSession::Impl {
             camera_stops.clear();
             camera_received.clear();
             camera_parser.reset();
+            server_voice_active = false;
+            client_voice_active = false;
+            client_voice_requested = false;
+            client_voice_request_id = 0;
+            server_voice_pending = 0;
+            next_voice_request_id = 0;
+            next_voice_seq = 0;
+            voice_closed_notice = false;
+            voice_audio_seen = 0;
+            voice_requests.clear();
+            voice_responses.clear();
+            voice_audio.clear();
+            buffered_voice_bytes = 0;
             unclassified.clear();
             transport_failed = false;
             transport_status = Status::Ok;
@@ -5070,6 +5257,23 @@ Error QuicSession::set_permissions(uint16_t permissions) {
             if (stream) {
                 impl.api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
             }
+        }
+    }
+    if ((next & kPermissionMicrophone) == 0) {
+        // The host owns the microphone; a queued stop wakes its relay, which
+        // stops the capture and closes the call for the viewer.
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.server_voice_active || impl.server_voice_pending != 0) {
+            impl.server_voice_active = false;
+            impl.server_voice_pending = 0;
+            VoiceCallRequest stop;
+            stop.connect = false;
+            stop.request_id = ++impl.next_voice_request_id;
+            if (impl.voice_requests.size() >= 4) {
+                impl.voice_requests.pop_front();
+            }
+            impl.voice_requests.push_back(stop);
+            impl.cv.notify_all();
         }
     }
     return impl.send_bytes(impl.control.load(), make_permission_update(next),
@@ -6495,6 +6699,208 @@ bool QuicSession::take_chat(std::string& text) {
 uint64_t QuicSession::chats_received() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->chats_seen;
+}
+
+bool QuicSession::take_voice_call_request(VoiceCallRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->voice_requests.empty()) {
+        return false;
+    }
+    request = impl_->voice_requests.front();
+    impl_->voice_requests.pop_front();
+    return true;
+}
+
+Error QuicSession::send_voice_call_response(const VoiceCallResponse& response) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_voice_call_response is a server operation");
+    }
+    VoiceCallResponse answer = response;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if (answer.request_id == 0 || answer.request_id != impl.server_voice_pending) {
+            return Error(Status::InvalidCall, "no voice call request is waiting");
+        }
+        impl.server_voice_pending = 0;
+        if (answer.code == VoiceCallCode::Ok) {
+            if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+                answer.code = VoiceCallCode::Refused;
+                answer.reason = "microphone access was revoked";
+                answer.audio = AudioInfo{};
+            } else {
+                impl.next_voice_seq = 0;
+            }
+        }
+        if (make_voice_call_response(answer).empty()) {
+            return Error(Status::InvalidCall, "invalid voice call response");
+        }
+        impl.server_voice_active = answer.code == VoiceCallCode::Ok;
+    }
+    Error sent = impl.send_bytes(impl.control.load(), make_voice_call_response(answer),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.server_voice_active = false;
+    }
+    return sent;
+}
+
+Error QuicSession::send_voice_audio(const AudioHeader& header, const uint8_t* payload,
+                                    size_t size) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_voice_audio is a server operation");
+    }
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+            return Error(Status::PermissionDenied, "microphone access was revoked");
+        }
+        if (!impl.server_voice_active) {
+            return Error(Status::Unavailable, "no voice call is running");
+        }
+        seq = impl.next_voice_seq++;
+    }
+    AudioHeader wire = header;
+    wire.seq = seq;
+    std::vector<uint8_t> message = make_voice_audio(wire, payload, size);
+    if (message.empty()) {
+        return Error(Status::InvalidCall, "invalid voice audio packet");
+    }
+    return impl.send_bytes(impl.control.load(), std::move(message), QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::send_voice_call_close() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_voice_call_close is a server operation");
+    }
+    VoiceCallRequest request;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.announced) {
+            return Error(Status::InvalidCall, "the stream is not open");
+        }
+        if (!impl.server_voice_active && impl.server_voice_pending == 0) {
+            return Error::success();
+        }
+        impl.server_voice_active = false;
+        impl.server_voice_pending = 0;
+        request.request_id = ++impl.next_voice_request_id;
+        request.connect = false;
+    }
+    return impl.send_bytes(impl.control.load(), make_voice_call_request(request),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::voice_call_active() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->role == Impl::Role::Server ? impl_->server_voice_active
+                                             : impl_->client_voice_active;
+}
+
+Error QuicSession::request_voice_call() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_voice_call is a client operation");
+    }
+    VoiceCallRequest request;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionMicrophone) == 0) {
+            return Error(Status::PermissionDenied, "the host did not grant the microphone");
+        }
+        if (impl.client_voice_active || impl.client_voice_requested) {
+            return Error(Status::InvalidCall, "a voice call is already running");
+        }
+        request.request_id = ++impl.next_voice_request_id;
+        request.connect = true;
+        impl.client_voice_requested = true;
+        impl.client_voice_request_id = request.request_id;
+        impl.voice_closed_notice = false;
+    }
+    Error sent = impl.send_bytes(impl.control.load(), make_voice_call_request(request),
+                                 QUIC_SEND_FLAG_NONE);
+    if (!sent.ok()) {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (impl.client_voice_request_id == request.request_id) {
+            impl.client_voice_requested = false;
+            impl.client_voice_request_id = 0;
+        }
+    }
+    return sent;
+}
+
+Error QuicSession::request_voice_call_stop() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_voice_call_stop is a client operation");
+    }
+    VoiceCallRequest request;
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if (!impl.client_voice_active && !impl.client_voice_requested) {
+            return Error::success();
+        }
+        impl.client_voice_active = false;
+        impl.client_voice_requested = false;
+        impl.client_voice_request_id = 0;
+        impl.voice_audio.clear();
+        impl.buffered_voice_bytes = 0;
+        request.request_id = ++impl.next_voice_request_id;
+        request.connect = false;
+    }
+    return impl.send_bytes(impl.control.load(), make_voice_call_request(request),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_voice_call_response(VoiceCallResponse& response) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->voice_responses.empty()) {
+        return false;
+    }
+    response = std::move(impl_->voice_responses.front());
+    impl_->voice_responses.pop_front();
+    return true;
+}
+
+bool QuicSession::take_voice_call_closed() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const bool closed = impl_->voice_closed_notice;
+    impl_->voice_closed_notice = false;
+    return closed;
+}
+
+bool QuicSession::take_voice_audio(AudioHeader& header, std::vector<uint8_t>& payload) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    while (!impl_->voice_audio.empty()) {
+        std::vector<uint8_t> raw = std::move(impl_->voice_audio.front());
+        impl_->voice_audio.pop_front();
+        impl_->buffered_voice_bytes -= raw.size();
+        const uint8_t* audio = nullptr;
+        size_t audio_size = 0;
+        std::string error;
+        if (!parse_voice_audio(raw, header, &audio, audio_size, &error)) {
+            continue;
+        }
+        payload.assign(audio, audio + audio_size);
+        return true;
+    }
+    return false;
 }
 
 Error QuicSession::send_text_input(const std::string& text) {

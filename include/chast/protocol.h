@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 36;
+inline constexpr uint16_t kProtocolVersion = 37;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -303,6 +303,25 @@ enum class ControlType : uint16_t {
     // each code point to KEYEVENTF_UNICODE, with '\n' and '\t' as Return and
     // Tab. Requires the input permission like InputEvent. Protocol v36.
     TextInput = 51,
+    // Viewer -> host: start or stop a voice call, which streams the host's
+    // microphone to the viewer's speakers. Payload: flags (u8, bit 0 =
+    // connect) and request id (u64). Starting requires kPermissionMicrophone;
+    // the host answers with VoiceCallResponse. A request with bit 0 clear
+    // stops a running call; the host may send the same message to close one
+    // from its side. Protocol v37.
+    VoiceCallRequest = 52,
+    // Host -> viewer: the answer to a start request. Payload: request id
+    // (u64), code (u8, see VoiceCallCode), reason length (u16), UTF-8 reason,
+    // and, when Ok, the microphone format: codec (u8), sample rate (u32),
+    // channels (u16), frame samples (u16), extradata length (u16) and the
+    // extradata. Ok means VoiceAudio messages follow; every other code leaves
+    // the call closed.
+    VoiceCallResponse = 53,
+    // Host -> viewer: one encoded microphone access unit. Payload:
+    // AudioHeader (48 bytes) followed by the Opus packet. Only sent while a
+    // call is open; the viewer drops it otherwise. The control stream is
+    // ordered, so packets arrive in capture order. Protocol v37.
+    VoiceAudio = 54,
 };
 
 // ----- input -----
@@ -1393,6 +1412,56 @@ bool parse_camera_stop(const std::vector<uint8_t>& payload, uint16_t& camera_id,
 std::vector<uint8_t> make_camera_stream_header(uint16_t camera_id);
 bool decode_camera_stream_header(const uint8_t* data, size_t size,
                                  CameraStreamHeader& header, std::string* error);
+
+// ----- voice call (protocol v37) -----
+//
+// A voice call streams the host's microphone to the viewer. It leaves the
+// two established audio directions alone: system sound keeps travelling on
+// `CAUD` (or datagrams) and the viewer's microphone keeps travelling on
+// `CMIC`. The call is negotiated with VoiceCallRequest/Response and the
+// encoded microphone units ride on the ordered control stream as VoiceAudio,
+// the same model RustDesk uses for its AudioFrame voice path. The host's
+// microphone is gated by kPermissionMicrophone, which an operator grants at
+// connection approval like the viewer's microphone.
+inline constexpr size_t kMaxVoiceCallReasonBytes = 256;
+
+enum class VoiceCallCode : uint8_t {
+    Ok = 0,
+    Refused = 1,  // microphone access is not granted for this session
+    Busy = 2,     // a call is already running
+    Failed = 3,   // the host microphone or its encoder could not start
+};
+
+struct VoiceCallRequest {
+    uint64_t request_id = 0;
+    bool connect = true;
+};
+
+struct VoiceCallResponse {
+    uint64_t request_id = 0;
+    VoiceCallCode code = VoiceCallCode::Ok;
+    std::string reason;
+    // The host microphone format when code is Ok; empty otherwise. Only Opus
+    // is accepted, at 48 kHz with one or two channels and 20 ms frames.
+    AudioInfo audio;
+};
+
+// The makers reject a zero request id, unknown codes and an Ok response
+// without a usable microphone format; the parsers reject the same cases plus
+// trailing bytes. A non-Ok response carries no format.
+std::vector<uint8_t> make_voice_call_request(const VoiceCallRequest& request);
+bool parse_voice_call_request(const std::vector<uint8_t>& payload,
+                              VoiceCallRequest& request, std::string* error);
+std::vector<uint8_t> make_voice_call_response(const VoiceCallResponse& response);
+bool parse_voice_call_response(const std::vector<uint8_t>& payload,
+                               VoiceCallResponse& response, std::string* error);
+// AudioHeader + Opus payload. The maker fills in size and CRC and refuses an
+// empty or oversized packet; the parser re-checks both and requires a
+// protocol-valid Opus header.
+std::vector<uint8_t> make_voice_audio(const AudioHeader& header,
+                                      const uint8_t* payload, size_t size);
+bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
+                       const uint8_t** audio, size_t& audio_size, std::string* error);
 
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that
