@@ -899,7 +899,7 @@ func run() error {
 			if result.Audit+result.Connections+result.FileTransfers > 0 {
 				log.Info("audit archive wrote rows", "audit", result.Audit,
 					"connections", result.Connections, "transfers", result.FileTransfers,
-					"files", result.Files)
+					"files", result.Files, "merged", result.Merged)
 			}
 			if len(result.Compressed)+len(result.Pruned) > 0 {
 				log.Info("audit archive compacted", "compressed", len(result.Compressed),

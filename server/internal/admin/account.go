@@ -452,9 +452,9 @@ func (c *Console) archiveText(args []string) string {
 		if err != nil {
 			return fmt.Sprintf("audit archive failed: %v\n", err)
 		}
-		out := fmt.Sprintf("archived: audit=%d connections=%d transfers=%d files=%d compressed=%d pruned=%d delivered=%d\n",
+		out := fmt.Sprintf("archived: audit=%d connections=%d transfers=%d files=%d merged=%d compressed=%d pruned=%d delivered=%d\n",
 			result.Audit, result.Connections, result.FileTransfers, len(result.Files),
-			len(result.Compressed), len(result.Pruned), len(result.Delivered))
+			len(result.Merged), len(result.Compressed), len(result.Pruned), len(result.Delivered))
 		if result.DeliveryError != "" {
 			out += fmt.Sprintf("delivery pending: %s\n", result.DeliveryError)
 		}

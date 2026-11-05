@@ -162,7 +162,7 @@ func TestRemoteDeliveryUploadsClosedFilesOnce(t *testing.T) {
 	}
 	if audit.method != http.MethodPut || audit.auth != "Bearer s3cret" ||
 		audit.contentType != "application/x-ndjson" ||
-		audit.idempotency != "audit-20261028.jsonl" ||
+		audit.idempotency != "20261028-"+sha256Hex([]byte(auditBody)) ||
 		audit.digest != sha256Hex([]byte(auditBody)) || string(audit.body) != auditBody {
 		t.Fatalf("audit upload = %+v", audit)
 	}
@@ -190,6 +190,15 @@ func TestRemoteDeliveryUploadsClosedFilesOnce(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name+deliveredSuffix)); err == nil {
 			t.Fatalf("%s was marked delivered", name)
 		}
+	}
+	ledger := readLines(t, filepath.Join(dir, deliveredLedgerName))
+	if len(ledger) != 2 {
+		t.Fatalf("ledger = %v", ledger)
+	}
+	if ledger[0]["day"] != "20261028" || ledger[0]["file"] != "audit-20261028.jsonl" ||
+		ledger[0]["sha256"] != sha256Hex([]byte(auditBody)) || ledger[0]["url"] == "" ||
+		ledger[1]["file"] != "connections-20261028.jsonl.gz" {
+		t.Fatalf("ledger entries = %v", ledger)
 	}
 
 	result, err = archiver.Run()
@@ -361,5 +370,193 @@ func TestRemoteDeliveryDoesNotFollowRedirects(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "audit-20261028.jsonl"+deliveredSuffix)); !os.IsNotExist(err) {
 		t.Fatalf("redirected file got a marker (err=%v)", err)
+	}
+}
+
+// A central receiver stores one object per Idempotency-Key, so an upload that
+// is repeated after the sender lost its delivery state still lands once.
+type dedupeSink struct {
+	mu     sync.Mutex
+	stored map[string][]byte
+	puts   int
+}
+
+func (s *dedupeSink) handler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	key := r.Header.Get("Idempotency-Key")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.puts++
+	if key == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if _, ok := s.stored[key]; !ok {
+		s.stored[key] = body
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *dedupeSink) snapshot() (int, map[string][]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]byte, len(s.stored))
+	for key, body := range s.stored {
+		out[key] = body
+	}
+	return s.puts, out
+}
+
+func TestRemoteDeliveryLedgerSuppressesUploadAfterMarkerLoss(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	const body = "{\"stream\":\"audit\",\"id\":1}\n"
+	path := filepath.Join(dir, "audit-20261028.jsonl")
+	writeFile(t, path, body)
+
+	recorder := &uploadRecorder{uploads: map[string]receivedUpload{}}
+	server := httptest.NewServer(http.HandlerFunc(recorder.handler))
+	defer server.Close()
+	archiver, err := New(dir, store, nil, Options{RemoteURL: server.URL})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	now := time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC)
+	archiver.now = func() time.Time { return now }
+	if _, err := archiver.Run(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if _, attempts := recorder.snapshot(); attempts != 1 {
+		t.Fatalf("first delivery attempts = %d", attempts)
+	}
+
+	// The sink accepted the file but the local marker is gone. The ledger
+	// still names the exact bytes, so the next pass restores the marker
+	// instead of uploading again.
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	result, err := archiver.Run()
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if len(result.Delivered) != 0 || result.DeliveryError != "" {
+		t.Fatalf("second run = %+v", result)
+	}
+	if _, attempts := recorder.snapshot(); attempts != 1 {
+		t.Fatalf("ledger did not suppress the retry: %d attempts", attempts)
+	}
+	if _, err := os.Stat(path + deliveredSuffix); err != nil {
+		t.Fatalf("marker was not restored: %v", err)
+	}
+}
+
+func TestRemoteDeliveryRedeliversRewrittenDayFile(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	const first = "{\"stream\":\"audit\",\"id\":1}\n"
+	const rewritten = "{\"stream\":\"audit\",\"id\":1}\n{\"stream\":\"audit\",\"id\":9}\n"
+	path := filepath.Join(dir, "audit-20261028.jsonl")
+	writeFile(t, path, first)
+
+	recorder := &uploadRecorder{uploads: map[string]receivedUpload{}}
+	server := httptest.NewServer(http.HandlerFunc(recorder.handler))
+	defer server.Close()
+	archiver, err := New(dir, store, nil, Options{RemoteURL: server.URL})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	now := time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC)
+	archiver.now = func() time.Time { return now }
+	if _, err := archiver.Run(); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// A late merge rewrites the closed day file and drops its marker; the new
+	// content hash is not in the ledger, so the new version is delivered once.
+	writeFile(t, path, rewritten)
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	result, err := archiver.Run()
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if len(result.Delivered) != 1 || result.DeliveryError != "" {
+		t.Fatalf("second run = %+v", result)
+	}
+	uploads, attempts := recorder.snapshot()
+	if attempts != 2 {
+		t.Fatalf("attempts = %d", attempts)
+	}
+	if got := uploads["audit-20261028.jsonl"].body; string(got) != rewritten {
+		t.Fatalf("rewritten upload = %q", got)
+	}
+	ledger := readLines(t, filepath.Join(dir, deliveredLedgerName))
+	if len(ledger) != 2 || ledger[0]["sha256"] == ledger[1]["sha256"] ||
+		ledger[1]["sha256"] != sha256Hex([]byte(rewritten)) {
+		t.Fatalf("ledger = %v", ledger)
+	}
+	// And the new version is not delivered again.
+	if _, err := archiver.Run(); err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if _, attempts := recorder.snapshot(); attempts != 2 {
+		t.Fatalf("third run uploaded again: %d attempts", attempts)
+	}
+}
+
+func TestRemoteDeliveryRepeatedAfterLostStateStoresOnce(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	const body = "{\"stream\":\"audit\",\"id\":1}\n"
+	path := filepath.Join(dir, "audit-20261028.jsonl")
+	writeFile(t, path, body)
+
+	sink := &dedupeSink{stored: map[string][]byte{}}
+	server := httptest.NewServer(http.HandlerFunc(sink.handler))
+	defer server.Close()
+	opts := Options{RemoteURL: server.URL}
+	now := time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC)
+
+	first, err := New(dir, store, nil, opts)
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	first.now = func() time.Time { return now }
+	if _, err := first.Run(); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Both local records are lost (a crash before they were durable). The
+	// retry carries the same day+content Idempotency-Key, so the sink keeps a
+	// single object even though it received two PUTs.
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, deliveredLedgerName)); err != nil {
+		t.Fatalf("remove ledger: %v", err)
+	}
+	second, err := New(dir, store, nil, opts)
+	if err != nil {
+		t.Fatalf("second archiver: %v", err)
+	}
+	second.now = func() time.Time { return now }
+	result, err := second.Run()
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if len(result.Delivered) != 1 || result.DeliveryError != "" {
+		t.Fatalf("second run = %+v", result)
+	}
+	puts, stored := sink.snapshot()
+	if puts != 2 || len(stored) != 1 {
+		t.Fatalf("sink puts=%d stored=%d", puts, len(stored))
+	}
+	for key, got := range stored {
+		want := "20261028-" + sha256Hex([]byte(body))
+		if key != want || string(got) != body {
+			t.Fatalf("stored key=%q body=%q", key, got)
+		}
 	}
 }

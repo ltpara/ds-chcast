@@ -338,3 +338,69 @@ func TestS3VirtualHostedDelivery(t *testing.T) {
 		t.Fatalf("marker URL = %q", marker.URL)
 	}
 }
+
+func TestS3DeliveryLedgerAndRewrite(t *testing.T) {
+	store := openStore(t)
+	dir := t.TempDir()
+	const first = "{\"stream\":\"audit\",\"id\":1}\n"
+	const rewritten = "{\"stream\":\"audit\",\"id\":1}\n{\"stream\":\"audit\",\"id\":5}\n"
+	path := filepath.Join(dir, "audit-20261028.jsonl")
+	writeFile(t, path, first)
+
+	recorder := &s3Recorder{}
+	server := httptest.NewServer(http.HandlerFunc(recorder.handler))
+	defer server.Close()
+	archiver, err := New(dir, store, nil, Options{S3: &S3Options{
+		Endpoint:  server.URL,
+		Region:    "us-east-1",
+		Bucket:    "audit-bucket",
+		AccessKey: "AKIDEXAMPLE",
+		SecretKey: "secret",
+	}})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	now := time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC)
+	archiver.now = func() time.Time { return now }
+	if _, err := archiver.Run(); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// The marker is lost but the ledger names the exact bytes: no second PUT.
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	if result, err := archiver.Run(); err != nil || len(result.Delivered) != 0 {
+		t.Fatalf("second run = %+v, %v", result, err)
+	}
+	recorder.mu.Lock()
+	uploads := append([]s3Upload(nil), recorder.uploads...)
+	recorder.uploads = nil
+	recorder.mu.Unlock()
+	if len(uploads) != 1 {
+		t.Fatalf("ledger did not suppress the S3 retry: %d uploads", len(uploads))
+	}
+
+	// A late merge changes the object; the new hash is delivered once.
+	writeFile(t, path, rewritten)
+	if err := os.Remove(path + deliveredSuffix); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	result, err := archiver.Run()
+	if err != nil {
+		t.Fatalf("third run: %v", err)
+	}
+	if len(result.Delivered) != 1 || result.DeliveryError != "" {
+		t.Fatalf("third run = %+v", result)
+	}
+	recorder.mu.Lock()
+	uploads = append([]s3Upload(nil), recorder.uploads...)
+	recorder.mu.Unlock()
+	if len(uploads) != 1 || string(uploads[0].body) != rewritten {
+		t.Fatalf("rewritten upload = %+v", uploads)
+	}
+	ledger := readLines(t, filepath.Join(dir, deliveredLedgerName))
+	if len(ledger) != 2 || ledger[0]["sha256"] == ledger[1]["sha256"] {
+		t.Fatalf("ledger = %v", ledger)
+	}
+}

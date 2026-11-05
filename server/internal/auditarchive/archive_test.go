@@ -168,22 +168,169 @@ func TestRunWritesJSONLAndResumes(t *testing.T) {
 		t.Fatalf("transfers after append = %v", lines)
 	}
 
-	// The next UTC day starts a new file while the checkpoint carries over.
+	// A row dated on an earlier day is merged into that closed file instead of
+	// today's target, and the file it replaces is reported as merged.
 	archiver.now = func() time.Time { return start.Add(24 * time.Hour) }
 	if err := store.AppendAudit(account.AuditEvent{
 		Username: "alice", Action: account.AuditLogin, Detail: "next day", CreatedAt: start, Success: true,
 	}); err != nil {
 		t.Fatalf("append next day: %v", err)
 	}
-	if _, err = archiver.Run(); err != nil {
+	result, err = archiver.Run()
+	if err != nil {
 		t.Fatalf("next day run: %v", err)
 	}
-	nextDay := readLines(t, filepath.Join(dir, "audit-20261029.jsonl"))
-	if len(nextDay) != 1 || nextDay[0]["detail"] != "next day" {
-		t.Fatalf("next day lines = %v", nextDay)
+	if len(result.Files) != 0 || len(result.Merged) != 1 || result.Merged[0] != auditPath {
+		t.Fatalf("late run files=%v merged=%v", result.Files, result.Merged)
 	}
-	if lines := readLines(t, auditPath); len(lines) != 3 {
-		t.Fatalf("previous day file changed: %d lines", len(lines))
+	if _, err := os.Stat(filepath.Join(dir, "audit-20261029.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("a late row created today's file (err=%v)", err)
+	}
+	lines := readLines(t, auditPath)
+	if len(lines) != 4 || lines[3]["detail"] != "next day" {
+		t.Fatalf("late merge = %v", lines)
+	}
+}
+
+func TestRunMergesLateHostAuditIntoItsOwnDay(t *testing.T) {
+	store := openStore(t)
+	alice, err := store.CreateUser("alice", "correct horse")
+	if err != nil {
+		t.Fatalf("create alice: %v", err)
+	}
+	day28 := time.Date(2026, 10, 28, 9, 30, 0, 0, time.UTC)
+	if _, err := store.RecordConnection(alice.ID, "alice", "devbox", "viewer",
+		"198.51.100.4", "Testland", "punch", "abcd1234",
+		day28, day28.Add(time.Minute), true, "viewer side"); err != nil {
+		t.Fatalf("record viewer connection: %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "archive")
+	archiver, err := New(dir, store, nil, Options{})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	archiver.now = func() time.Time { return day28 }
+	if _, err := archiver.Run(); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// A host that was offline spools its reports and forwards them a day late.
+	// The session ended after midnight, the file finished two days earlier.
+	if _, err := store.RecordHostConnection("host-a", "",
+		time.Date(2026, 10, 27, 23, 50, 0, 0, time.UTC),
+		time.Date(2026, 10, 28, 0, 10, 0, 0, time.UTC), true, "late session"); err != nil {
+		t.Fatalf("record late connection: %v", err)
+	}
+	if _, err := store.RecordHostFileTransfer("host-a", "", "upload", "late.txt", 5,
+		time.Date(2026, 10, 26, 23, 30, 0, 0, time.UTC), true, "late file"); err != nil {
+		t.Fatalf("record late transfer: %v", err)
+	}
+	archiver.now = func() time.Time { return day28.Add(24 * time.Hour) }
+	result, err := archiver.Run()
+	if err != nil {
+		t.Fatalf("late run: %v", err)
+	}
+	if result.Connections != 1 || result.FileTransfers != 1 || len(result.Files) != 0 {
+		t.Fatalf("late run = %+v", result)
+	}
+	if len(result.Merged) != 2 {
+		t.Fatalf("merged = %v", result.Merged)
+	}
+
+	connectionLines := readLines(t, filepath.Join(dir, "connections-20261028.jsonl"))
+	if len(connectionLines) != 2 || connectionLines[1]["detail"] != "late session" ||
+		connectionLines[1]["direction"] != "host" {
+		t.Fatalf("connection day file = %v", connectionLines)
+	}
+	transferLines := readLines(t, filepath.Join(dir, "file-transfers-20261026.jsonl"))
+	if len(transferLines) != 1 || transferLines[0]["name"] != "late.txt" {
+		t.Fatalf("transfer day file = %v", transferLines)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "connections-20261029.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("a late session created today's file (err=%v)", err)
+	}
+}
+
+func TestMergeClosedDayRewritesGzipAndSkipsReplayedRows(t *testing.T) {
+	store := openStore(t)
+	dir := filepath.Join(t.TempDir(), "archive")
+	archiver, err := New(dir, store, nil, Options{})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	gzPath := filepath.Join(dir, "connections-20261028.jsonl.gz")
+	if err := writeGzipAtomic(gzPath, []byte("{\"stream\":\"connections\",\"id\":7}\n")); err != nil {
+		t.Fatalf("seed gzip: %v", err)
+	}
+	// A marker from the previous delivery must not survive a content change.
+	writeFile(t, gzPath+deliveredSuffix, `{"file":"connections-20261028.jsonl.gz"}`)
+
+	records := []record{
+		{id: 7, line: []byte(`{"stream":"connections","id":7}`)},
+		{id: 8, line: []byte(`{"stream":"connections","id":8}`)},
+	}
+	target, err := archiver.mergeClosedDay("connections", "20261028", records)
+	if err != nil || target != gzPath {
+		t.Fatalf("merge = %q, %v", target, err)
+	}
+	// Replaying the same page after a crash before the checkpoint must not
+	// duplicate lines.
+	if _, err := archiver.mergeClosedDay("connections", "20261028", records); err != nil {
+		t.Fatalf("replayed merge: %v", err)
+	}
+	body := readGzipText(t, gzPath)
+	if want := "{\"stream\":\"connections\",\"id\":7}\n{\"stream\":\"connections\",\"id\":8}\n"; body != want {
+		t.Fatalf("merged gzip = %q, want %q", body, want)
+	}
+	if _, err := os.Stat(gzPath + deliveredSuffix); !os.IsNotExist(err) {
+		t.Fatalf("a rewritten file kept its delivered marker (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "connections-20261028.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("a plain file was left behind (err=%v)", err)
+	}
+}
+
+func TestLateRecordsClampToRetentionAndToday(t *testing.T) {
+	store := openStore(t)
+	dir := filepath.Join(t.TempDir(), "archive")
+	archiver, err := New(dir, store, nil, Options{RetentionDays: 3})
+	if err != nil {
+		t.Fatalf("new archiver: %v", err)
+	}
+	now := time.Date(2026, 10, 29, 8, 0, 0, 0, time.UTC)
+	archiver.now = func() time.Time { return now }
+	if err := store.AppendAudit(account.AuditEvent{
+		Username: "alice", Action: account.AuditLogin, Detail: "too old",
+		CreatedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC), Success: true,
+	}); err != nil {
+		t.Fatalf("append old audit: %v", err)
+	}
+	if err := store.AppendAudit(account.AuditEvent{
+		Username: "alice", Action: account.AuditLogin, Detail: "from the future",
+		CreatedAt: now.Add(48 * time.Hour), Success: true,
+	}); err != nil {
+		t.Fatalf("append future audit: %v", err)
+	}
+	result, err := archiver.Run()
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(result.Merged) != 1 {
+		t.Fatalf("merged = %v", result.Merged)
+	}
+	old := readLines(t, filepath.Join(dir, "audit-20261026.jsonl"))
+	if len(old) != 1 || old[0]["detail"] != "too old" {
+		t.Fatalf("clamped file = %v", old)
+	}
+	for _, absent := range []string{"audit-20261001.jsonl", "audit-20261031.jsonl"} {
+		if _, err := os.Stat(filepath.Join(dir, absent)); !os.IsNotExist(err) {
+			t.Fatalf("%s was created (err=%v)", absent, err)
+		}
+	}
+	today := readLines(t, filepath.Join(dir, "audit-20261029.jsonl"))
+	if len(today) != 1 || today[0]["detail"] != "from the future" {
+		t.Fatalf("today file = %v", today)
 	}
 }
 
