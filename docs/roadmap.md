@@ -3041,6 +3041,19 @@
      通过（本机 Device Guard 阻止运行新二进制，C++ 为编译验证）。边界：
      真实 shell/摄像头/TCP 目标待双机验收；控制型会话不参与多查看者
      注册；桌面与摄像头媒体链路保持零拷贝。
+131. **P2 · DEV-19 终端持久化服务（2026-11-05 完成）**：协议 v42 给
+     `TerminalRequest` 增加 persist/attach 标志与服务 ID，`TerminalResult`
+     回传服务 ID 并新增 `NotFound`；`ServerInfo` 增加
+     `kServerInfoTerminalPersist`(0x4000)。主机用进程级注册表保存最多
+     100 个共享控制台，分离期间继续写入 1 MiB scrollback，attach 时先回放
+     再送实时输出；60 秒扫描回收空闲 1 小时或已退出的服务，Job Object
+     保证主机退出时终止全部子进程。`host.ini` 的 `terminal_persist=`
+     与安全设置“断线后保留”默认关闭；查看器每次打开分配新终端 ID，
+     页面记住服务 ID 并在重连后自动 attach，面板显示 `#id`，关闭按钮
+     结束服务而 dispose 不发送 close。protocol/host_settings 用例、
+     全量 C++ 构建、`flutter analyze`、562 项 `flutter test` 与 Windows
+     release 构建通过（C++ 为编译验证）。边界：断线重连与空闲回收需
+     双机验收；关闭开关不追溯已分离服务；媒体链路未改动。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

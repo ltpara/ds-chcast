@@ -368,7 +368,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 已实现（2026-11-05）：协议 v40 的 `SessionListRequest/Result`、`SessionSelectRequest/Result` 由服务模式主机列出并切换 WTS 会话；权限位 0x4000 与 `allow_session_select` 默认关闭；查看器工具栏会话选择器在切换后自动重连，详见同日小节 |
 | DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
 | DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | 已实现（2026-11-05）：协议 v41 的 `SessionMode` 增加 Terminal/Camera/PortForward 与 `kServerInfoControlOnly`；主机为控制型会话单独派发 relay，不建立采集/编码；查看器对端菜单可直接发起三种独立会话，详见同日小节 |
-| DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 终端随会话结束销毁，单会话最多 2 个（`protocol.h:1254`/`:1263`） |
+| DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 已实现（2026-11-05）：协议 v42 的 `TerminalRequest` 增加 persist/attach 标志与 `service_id`，主机进程级注册表保留最多 100 个服务，空闲 1 小时回收并回放 1 MiB 输出；`terminal_persist=` 默认关闭，详见同日小节 |
 | DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 协议支持多个 `forward_id`（上限 8），但查看器只管理一个活动目标（`app/lib/pages/session_page.dart:1602-1755`） |
 | DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 账号体系有密码/TOTP/短信/邮件/WebAuthn，没有 OIDC 联邦登录 |
 | DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | `InputKind` 只有 Mouse/Key（`protocol.h:319`），触摸板/手写笔按鼠标模拟 |
@@ -499,6 +499,49 @@ analyze` 无问题；`flutter test` 540 项通过；Windows release 构建成功
 全量 `ctest` 43/43 通过（644.27 s）。
 边界：真实麦克风与音箱待双机验收；每连接一通通话；语音与系统声音共用
 可靠控制流的拥塞控制；视频零拷贝链路未改动，无 CPU fallback。
+
+### DEV-19 终端持久化服务（2026-11-05 完成）
+
+协议从 v41 提升到 v42。`TerminalRequest` 在 id/尺寸之后增加 `flags`(u8) 与
+`service_id`(u32)，载荷 13 字节：`kTerminalRequestPersist`(0x01) 要求主机
+在会话结束后保留控制台，`kTerminalRequestAttach`(0x02) 按服务 ID 重连；
+两者互斥，attach 必须带非零服务 ID，非 attach 必须为 0。`TerminalResult`
+增加 `service_id`(u32)，只有 Ok 可以携带；新增
+`TerminalCode::NotFound=5`。`ServerInfo` 增加
+`kServerInfoTerminalPersist`(0x4000)，仅在授予终端权限时有效，announce/
+refresh 时裁剪。
+
+- **主机注册表**：`TerminalRelay` 进程级泄露单例保存最多
+  `kMaxTerminalServices=100` 个共享控制台；会话级 `terminal_id` 用于 CTTY
+  流，服务级 `service_id` 跨会话不变。attach 时改写为新会话的终端 ID，
+  先把 1 MiB scrollback 复制进 replay 队列再送实时输出，避免重复或丢失；
+  锁序固定为注册表 → 控制台。单会话仍最多 2 个控制台。
+- **生命周期**：查看器下行 FIN 对持久控制台只解除绑定（detached），不关闭
+  stdin；会话控制台保持原有 EOF 语义。分离期间读取线程继续把输出写入
+  scrollback（1 MiB 环形裁剪）且不阻塞。60 秒扫描回收空闲 ≥1 小时、已退出、
+  正在关闭或读端结束的服务；Job Object 以
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 保证主机进程退出时子进程一并终止。
+  显式关闭（查看器 stop / shell 退出）仍立即移除服务。
+- **主机设置与界面**：`host.ini` 新增 `terminal_persist=`，默认关闭；
+  安全设置“远程终端”旁新增“断线后保留”复选框；关闭开关只影响新会话，
+  已分离的服务保留到 attach 被拒或空闲超时（最长 1 小时）。
+- **查看器**：状态新增 `terminal_persist_supported`/`terminal_service_id`；
+  `OpenTerminal(columns, rows, service_id)` 自动选择 persist/attach；会话
+  循环每次打开分配新的单调终端 ID，输入/缩放/停止/输出都使用该 ID；
+  页面记住服务 ID，重连后重建面板并以 attach 打开；面板标题显示 `#id`，
+  关闭按钮仍等价于结束服务，dispose 不再发送 close。
+- **零拷贝**：仅改变终端控制/流生命周期，媒体采集、编码、解码与渲染路径
+  未改动。
+
+验证：`chast-protocol-test` 新增 v42 用例（persist/attach 往返、互斥与
+service ID 一致性、Ok 携带服务 ID、错误结果禁止携带、HelloAck 保留持久化
+标志）；`chast-host-settings-test` 覆盖 `terminal_persist=` 往返与默认值；
+全量 C++ Release 构建成功。本机 Device Guard 阻止运行新生成的无签名
+二进制（既有环境限制），C++ 侧为编译验证。`flutter analyze` 无问题；
+`flutter test` 562 项通过；Windows release 构建成功。
+
+边界：持久控制台的断线重连与空闲回收需双机验收；关闭 `terminal_persist`
+不追溯已分离的服务；持久 shell 以主机账户继续运行，默认不开启。
 
 ### DEV-18 独立终端 / 摄像头 / TCP 隧道会话（2026-11-05 完成）
 
