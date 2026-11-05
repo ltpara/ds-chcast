@@ -99,6 +99,9 @@ var (
 	ErrPhoneTaken        = errors.New("phone number is already in use")
 	ErrNoRecoveryPhone   = errors.New("account has no recovery phone")
 	ErrInvalidResetCode  = errors.New("password reset code is invalid or expired")
+
+	ErrOIDCAccountNotFound = errors.New("no account is linked to this identity provider subject")
+	ErrInvalidOIDCIdentity = errors.New("identity provider issuer and subject are required")
 )
 
 // Shared address-book permissions, weakest first. Read may list the book,

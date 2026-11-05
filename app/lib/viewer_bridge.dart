@@ -1700,6 +1700,12 @@ class ViewerBridge {
     return plaintext;
   }
 
+  /// Opens an http(s) URL in the user's default browser. Used by the SSO
+  /// login flow; the native side rejects other schemes.
+  static Future<void> openExternalUrl(String url) {
+    return _channel.invokeMethod<void>('openExternalUrl', url);
+  }
+
   static Future<void> stop() => _channel.invokeMethod<void>('stop');
 
   static Future<ViewerStatus> status() async {

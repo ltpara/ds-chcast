@@ -31,6 +31,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/oidc"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
 	"github.com/ltpara/ds-chcast/server/internal/recordings"
@@ -133,6 +134,8 @@ type Config struct {
 	// values a client may report in clientDataJSON.
 	WebAuthnRPID    string
 	WebAuthnOrigins []string
+	// OIDC enables viewer single sign-on. Nil leaves the OIDC routes at 503.
+	OIDC *oidc.Provider
 	// Mailer delivers password-reset messages. Nil disables self-service
 	// recovery, while other account routes keep working.
 	Mailer Mailer
@@ -167,6 +170,9 @@ type server struct {
 
 	recoveryMu   sync.Mutex
 	recoveryLast map[string]time.Time
+
+	oidcMu      sync.Mutex
+	oidcPending map[string]*oidcLoginState
 }
 
 // httpDurationBuckets are the Prometheus histogram bounds in seconds. The
@@ -191,6 +197,7 @@ func New(cfg Config) http.Handler {
 	s := &server{
 		cfg:             cfg,
 		started:         time.Now(),
+		oidcPending:     make(map[string]*oidcLoginState),
 		requests:        make(map[string]uint64),
 		durationSum:     make(map[string]float64),
 		durationCount:   make(map[string]uint64),
@@ -214,6 +221,10 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/account/login/webauthn/passwordless/finish", s.finishWebAuthnPasswordlessLogin)
 	mux.HandleFunc("POST /v1/account/webauthn/register/begin", s.beginWebAuthnRegistration)
 	mux.HandleFunc("POST /v1/account/webauthn/register/finish", s.finishWebAuthnRegistration)
+	mux.HandleFunc("GET /v1/account/oidc", s.oidcStatus)
+	mux.HandleFunc("POST /v1/account/oidc/begin", s.oidcBegin)
+	mux.HandleFunc("GET /v1/account/oidc/callback", s.oidcCallback)
+	mux.HandleFunc("POST /v1/account/oidc/poll", s.oidcPoll)
 	mux.HandleFunc("GET /v1/account/webauthn/credentials", s.listWebAuthnCredentials)
 	mux.HandleFunc("POST /v1/account/webauthn/credentials/remove", s.removeWebAuthnCredential)
 	mux.HandleFunc("POST /v1/account/refresh", s.refresh)

@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 5
+const accountSchemaVersion = 6
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -19,6 +19,28 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 3, Name: "address book nesting", Apply: applyAddressBookNesting},
 	{Version: 4, Name: "recording archive", Apply: applyRecordingArchive},
 	{Version: 5, Name: "refresh replay marker", Apply: applyRefreshReplayMarker},
+	{Version: 6, Name: "oidc identities", Apply: applyOIDCIdentities},
+}
+
+// applyOIDCIdentities links an external OpenID Connect subject to one local
+// account. The issuer is part of the key so two providers may reuse subject
+// values without colliding.
+func applyOIDCIdentities(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS oidc_identities (
+			issuer     TEXT NOT NULL,
+			subject    TEXT NOT NULL,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (issuer, subject)
+		)`,
+		`CREATE INDEX IF NOT EXISTS oidc_identities_user ON oidc_identities(user_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create oidc identity link: %w", err)
+		}
+	}
+	return nil
 }
 
 // applyRefreshReplayMarker records that a retired refresh token was presented

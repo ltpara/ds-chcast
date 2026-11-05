@@ -1838,6 +1838,39 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "openExternalUrl") {
+        const auto* url = std::get_if<std::string>(call.arguments());
+        if (url == nullptr || url->empty() || url->size() > 4096) {
+            result->Error("bad_args", "the URL has an unsupported size");
+            return;
+        }
+        const std::string& text = *url;
+        const bool web = text.rfind("https://", 0) == 0 || text.rfind("http://", 0) == 0;
+        if (!web) {
+            result->Error("bad_args", "only http and https URLs can be opened");
+            return;
+        }
+        const int wide_length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                                    text.data(),
+                                                    static_cast<int>(text.size()),
+                                                    nullptr, 0);
+        if (wide_length <= 0) {
+            result->Error("bad_args", "the URL is not valid UTF-8");
+            return;
+        }
+        std::wstring wide(static_cast<size_t>(wide_length), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                            static_cast<int>(text.size()), wide.data(), wide_length);
+        const HINSTANCE launched = ShellExecuteW(nullptr, L"open", wide.c_str(),
+                                                 nullptr, nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(launched) <= 32) {
+            result->Error("open_failed", "Windows could not open the default browser");
+            return;
+        }
+        result->Success();
+        return;
+    }
+
     if (method == "securityKeyAvailable") {
         result->Success(flutter::EncodableValue(QuerySecurityKeyAvailability().available));
         return;

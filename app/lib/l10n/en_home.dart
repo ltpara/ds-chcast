@@ -293,6 +293,20 @@ const Map<String, String> kEnglishHome = <String, String>{
   '出站代理（可选）': 'Outbound proxy (optional)',
   '显示代理': 'Show proxy',
   '隐藏代理': 'Hide proxy',
-  '代理地址无效：示例 socks5://127.0.0.1:10808': 'Invalid proxy address; for example socks5://127.0.0.1:10808',
-  '支持 http://、https://、socks5:// 和 socks5h://（需带端口，可含用户名密码）。配置代理后会话强制走服务器 TCP 中继：UDP 直连、UDP 中继和打洞无法穿过代理；服务端没有中继能力时会明确报错而不是绕过代理直连。': 'Supports http://, https://, socks5:// and socks5h:// (explicit port, optional user and password). With a proxy the session is forced onto the server TCP carrier: direct UDP, UDP relay and punching cannot traverse a proxy, and a server without a carrier fails with a clear error instead of bypassing the proxy.',
+  '代理地址无效：示例 socks5://127.0.0.1:10808':
+      'Invalid proxy address; for example socks5://127.0.0.1:10808',
+  '支持 http://、https://、socks5:// 和 socks5h://（需带端口，可含用户名密码）。配置代理后会话强制走服务器 TCP 中继：UDP 直连、UDP 中继和打洞无法穿过代理；服务端没有中继能力时会明确报错而不是绕过代理直连。':
+      'Supports http://, https://, socks5:// and socks5h:// (explicit port, optional user and password). With a proxy the session is forced onto the server TCP carrier: direct UDP, UDP relay and punching cannot traverse a proxy, and a server without a carrier fails with a clear error instead of bypassing the proxy.',
+  '连接服务未启用单点登录': 'The connection service does not offer single sign-on',
+  '单点登录状态无效': 'Invalid single sign-on state',
+  '单点登录失败，请重试': 'Single sign-on failed; try again',
+  '单点登录已过期，请重试': 'Single sign-on expired; try again',
+  '单点登录超时，请重试': 'Single sign-on timed out; try again',
+  '单点登录失败：{error}': 'Single sign-on failed: {error}',
+  '该身份未关联账号，请联系管理员':
+      'No account is linked to this identity; contact the administrator',
+  '无法打开浏览器：{error}': 'Could not open the browser: {error}',
+  '使用单点登录': 'Sign in with single sign-on',
+  '单点登录：{provider}': 'Single sign-on: {provider}',
+  '请在浏览器中完成登录，然后返回这里。': 'Finish signing in in your browser, then return here.',
 };

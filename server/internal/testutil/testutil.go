@@ -21,6 +21,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
+	"github.com/ltpara/ds-chcast/server/internal/oidc"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
 	"github.com/ltpara/ds-chcast/server/internal/recordings"
@@ -89,6 +90,8 @@ type Options struct {
 	// WebAuthnRPID and WebAuthnOrigins enable the security-key routes.
 	WebAuthnRPID    string
 	WebAuthnOrigins []string
+	// OIDC enables viewer single sign-on routes. Nil leaves them at 503.
+	OIDC *oidc.Provider
 	// GeoIP labels login addresses in audit events and session lists.
 	GeoIP *geoip.Locator
 	// RelayExtra advertises additional relay hosts (for example the IPv6
@@ -294,6 +297,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		SMSTTL:            opts.SMSTTL,
 		WebAuthnRPID:      opts.WebAuthnRPID,
 		WebAuthnOrigins:   opts.WebAuthnOrigins,
+		OIDC:              opts.OIDC,
 		Tracer:            opts.Tracer,
 	})
 	hs := httptest.NewServer(handler)

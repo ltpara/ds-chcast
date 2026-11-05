@@ -77,6 +77,9 @@ typedef AccountPasswordlessSecurityKeyLogin =
       ServerSettings server, {
       required String username,
     });
+typedef AccountOidcInfo = Future<OidcLoginInfo> Function(ServerSettings server);
+typedef AccountOidcLogin =
+    Future<AccountLoginResult> Function(ServerSettings server);
 typedef AccountRefresh =
     Future<AccountLoginResult> Function(
       ServerSettings server,
@@ -129,6 +132,8 @@ class HomePage extends StatefulWidget {
     this.accountLoginEmail,
     this.accountSecurityKeyLogin,
     this.accountPasswordlessSecurityKeyLogin,
+    this.accountOidcInfo,
+    this.accountOidcLogin,
     this.accountRefresh,
     this.accountLogout,
     this.addressBookFetcher,
@@ -157,6 +162,8 @@ class HomePage extends StatefulWidget {
   final AccountSecurityKeyLogin? accountSecurityKeyLogin;
   final AccountPasswordlessSecurityKeyLogin?
   accountPasswordlessSecurityKeyLogin;
+  final AccountOidcInfo? accountOidcInfo;
+  final AccountOidcLogin? accountOidcLogin;
   final AccountRefresh? accountRefresh;
   final AccountLogout? accountLogout;
   final AddressBookFetcher? addressBookFetcher;
@@ -192,6 +199,8 @@ class _HomePageState extends State<HomePage> {
   late final LoginEmailRequester _requestLoginEmail;
   late final AccountSecurityKeyLogin _loginWithSecurityKey;
   late final AccountPasswordlessSecurityKeyLogin _loginWithSecurityKeyOnly;
+  late final AccountOidcInfo _oidcInfo;
+  late final AccountOidcLogin _loginOidc;
   late final AccountRefresh _refreshAccount;
   late final AccountLogout _logoutAccount;
   late final AddressBookFetcher _fetchAddressBook;
@@ -230,7 +239,8 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _deviceStore = widget.deviceStore ?? DeviceStore();
-    _serverStore = widget.serverStore ??
+    _serverStore =
+        widget.serverStore ??
         ServerSettingsStore(
           protectSecret: ViewerBridge.protectSecret,
           unprotectSecret: ViewerBridge.unprotectSecret,
@@ -321,6 +331,14 @@ class _HomePageState extends State<HomePage> {
               username: username,
               deviceName: _hostname,
             );
+    _oidcInfo = widget.accountOidcInfo ?? ServerApi.oidcInfo;
+    _loginOidc =
+        widget.accountOidcLogin ??
+        (ServerSettings server) => ServerApi.loginOidc(
+          server,
+          deviceName: _hostname,
+          openUrl: ViewerBridge.openExternalUrl,
+        );
     _logoutAccount =
         widget.accountLogout ??
         (ServerSettings server, String token) =>
@@ -1199,6 +1217,8 @@ class _HomePageState extends State<HomePage> {
           requestLoginEmail: _requestLoginEmail,
           securityKeyLogin: _loginWithSecurityKey,
           securityKeyPasswordlessLogin: _loginWithSecurityKeyOnly,
+          oidcInfo: _oidcInfo,
+          oidcLogin: _loginOidc,
           syncing: _syncing,
           groups: _groups,
           uploadRecordings: _server.uploadRecordings,
@@ -4957,6 +4977,8 @@ class _AccountDialog extends StatefulWidget {
     required this.requestLoginEmail,
     required this.securityKeyLogin,
     required this.securityKeyPasswordlessLogin,
+    required this.oidcInfo,
+    required this.oidcLogin,
     required this.syncing,
     this.groups = const <AddressBookGroup>[],
     this.uploadRecordings = false,
@@ -4970,6 +4992,8 @@ class _AccountDialog extends StatefulWidget {
   final LoginEmailRequester requestLoginEmail;
   final AccountSecurityKeyLogin securityKeyLogin;
   final AccountPasswordlessSecurityKeyLogin securityKeyPasswordlessLogin;
+  final AccountOidcInfo oidcInfo;
+  final AccountOidcLogin oidcLogin;
   final bool syncing;
   final List<AddressBookGroup> groups;
   final bool uploadRecordings;
@@ -4993,6 +5017,8 @@ class _AccountDialogState extends State<_AccountDialog> {
   bool _useEmail = false;
   bool _sendingSms = false;
   bool _sendingEmail = false;
+  bool _oidcAvailable = false;
+  String _oidcName = '';
   late bool _uploadRecordings;
   String _error = '';
   String _notice = '';
@@ -5001,6 +5027,24 @@ class _AccountDialogState extends State<_AccountDialog> {
   void initState() {
     super.initState();
     _uploadRecordings = widget.uploadRecordings;
+    _loadOidcInfo();
+  }
+
+  Future<void> _loadOidcInfo() async {
+    if (!widget.server.configured) {
+      return;
+    }
+    try {
+      final OidcLoginInfo info = await widget.oidcInfo(widget.server);
+      if (mounted) {
+        setState(() {
+          _oidcAvailable = info.enabled;
+          _oidcName = info.name;
+        });
+      }
+    } catch (_) {
+      // An older server without the route simply hides the SSO button.
+    }
   }
 
   @override
@@ -5093,6 +5137,34 @@ class _AccountDialogState extends State<_AccountDialog> {
         ),
       ),
     );
+  }
+
+  Future<void> _submitOidc() async {
+    setState(() {
+      _busy = true;
+      _error = '';
+      _notice = tr('请在浏览器中完成登录，然后返回这里。');
+    });
+    try {
+      final AccountLoginResult result = await widget.oidcLogin(widget.server);
+      _finishLogin('', result);
+    } on ServerApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _notice = '';
+          _error = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _notice = '';
+          _error = tr('单点登录失败：{error}', <String, Object?>{'error': error});
+        });
+      }
+    }
   }
 
   Future<void> _submitSecurityKey() async {
@@ -5528,6 +5600,21 @@ class _AccountDialogState extends State<_AccountDialog> {
           ),
           onSubmitted: (_) => _submit(),
         ),
+        if (_oidcAvailable) ...<Widget>[
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            key: const Key('account-oidc-login'),
+            onPressed: _busy ? null : _submitOidc,
+            icon: const Icon(Icons.open_in_new_rounded, size: 17),
+            label: Text(
+              _oidcName.isEmpty
+                  ? tr('使用单点登录')
+                  : tr('单点登录：{provider}', <String, Object?>{
+                      'provider': _oidcName,
+                    }),
+            ),
+          ),
+        ],
         Align(
           alignment: Alignment.centerLeft,
           child: Wrap(
@@ -5949,7 +6036,9 @@ class _ServerDialogState extends State<_ServerDialog> {
     final String url = normalizeServerUrl(text);
     if (text.isNotEmpty && url.isEmpty) {
       setState(() {
-        _status = tr('地址无效：示例 https://chast.example:8443（本机可用 http://127.0.0.1:8443）');
+        _status = tr(
+          '地址无效：示例 https://chast.example:8443（本机可用 http://127.0.0.1:8443）',
+        );
         _statusOk = false;
       });
       return;

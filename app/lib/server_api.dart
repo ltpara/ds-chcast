@@ -93,8 +93,7 @@ class SoftwareInfo {
   final int size;
   final String signature;
 
-  bool get installable =>
-      sha256.isNotEmpty && size > 0 && signature.isNotEmpty;
+  bool get installable => sha256.isNotEmpty && size > 0 && signature.isNotEmpty;
 
   static SoftwareInfo? fromJson(Object? value) {
     if (value is! Map) {
@@ -140,6 +139,36 @@ class AccountLoginResult {
   /// long-lived access tokens only; such a session simply ends at [expiresInMs].
   final String refreshToken;
   final int refreshExpiresInMs;
+}
+
+/// Whether a server offers browser single sign-on and what to call it.
+class OidcLoginInfo {
+  const OidcLoginInfo({
+    this.enabled = false,
+    this.name = '',
+    this.autoCreate = false,
+  });
+
+  final bool enabled;
+  final String name;
+
+  /// True when an unknown identity may create an account on first sign-in.
+  final bool autoCreate;
+}
+
+/// One started browser sign-in attempt, identified by [state]. [authUrl] is
+/// the provider page the viewer opens; the session itself is collected with
+/// [ServerApi.oidcPoll].
+class OidcLoginSession {
+  const OidcLoginSession({
+    required this.authUrl,
+    required this.state,
+    required this.expiresInMs,
+  });
+
+  final String authUrl;
+  final String state;
+  final int expiresInMs;
 }
 
 /// One server-side login session of the signed-in account. [id] is an opaque
@@ -428,7 +457,10 @@ class WebAuthnRegisterOptions {
     final String rpId = value['rp_id']?.toString().trim() ?? '';
     final String userId = value['user_id']?.toString().trim() ?? '';
     final String username = value['username']?.toString().trim() ?? '';
-    if (challenge.isEmpty || rpId.isEmpty || userId.isEmpty || username.isEmpty) {
+    if (challenge.isEmpty ||
+        rpId.isEmpty ||
+        userId.isEmpty ||
+        username.isEmpty) {
       return null;
     }
     final int timeout = (value['timeout_ms'] as num?)?.toInt() ?? 0;
@@ -574,14 +606,14 @@ class AddressBookGroup {
   final bool deleted;
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'id': id,
-        'name': name,
-        'parent_id': parentId,
-        'position': position,
-        'updated_at_ms': updatedAtMs,
-        'revision': revision,
-        if (deleted) 'deleted': true,
-      };
+    'id': id,
+    'name': name,
+    'parent_id': parentId,
+    'position': position,
+    'updated_at_ms': updatedAtMs,
+    'revision': revision,
+    if (deleted) 'deleted': true,
+  };
 
   static AddressBookGroup? fromJson(Object? value) {
     if (value is! Map) {
@@ -1233,6 +1265,217 @@ class ServerApi {
       throw ServerApiException(tr('连接服务返回了无效数据'));
     }
     return result;
+  }
+
+  /// Describes this server's single sign-on setup. Servers without OIDC, and
+  /// older servers without the route at all, report [OidcLoginInfo.disabled].
+  static Future<OidcLoginInfo> oidcInfo(
+    ServerSettings settings, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    if (!settings.configured) {
+      throw ServerApiException(tr('未配置连接服务'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/oidc');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded;
+    try {
+      decoded = await _requestJson('GET', uri, timeout);
+    } on ServerApiException catch (error) {
+      if (error.statusCode == HttpStatus.notFound) {
+        return const OidcLoginInfo();
+      }
+      rethrow;
+    }
+    if (decoded is! Map) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    return OidcLoginInfo(
+      enabled: decoded['enabled'] == true,
+      name: decoded['name']?.toString().trim() ?? '',
+      autoCreate: decoded['auto_create'] == true,
+    );
+  }
+
+  /// Starts a browser sign-in attempt and returns the provider URL to open.
+  /// The attempt stays pending on the server until the provider redirects the
+  /// browser back; [oidcPoll] then collects the issued session.
+  static Future<OidcLoginSession> oidcBegin(
+    ServerSettings settings, {
+    String deviceId = '',
+    String deviceName = '',
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    if (!settings.configured) {
+      throw ServerApiException(tr('未配置连接服务'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/oidc/begin');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded = await _requestJson(
+      'POST',
+      uri,
+      timeout,
+      body: <String, Object?>{
+        'device_id': deviceId.trim(),
+        'device_name': deviceName.trim(),
+      },
+      unavailable: tr('连接服务未启用单点登录'),
+    );
+    if (decoded is! Map) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    final String authUrl = decoded['auth_url']?.toString().trim() ?? '';
+    final String state = decoded['state']?.toString().trim() ?? '';
+    final Object? rawExpires = decoded['expires_in_ms'];
+    final Uri? target = Uri.tryParse(authUrl);
+    if (authUrl.isEmpty ||
+        state.isEmpty ||
+        target == null ||
+        (target.scheme != 'http' && target.scheme != 'https') ||
+        target.host.isEmpty) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    return OidcLoginSession(
+      authUrl: authUrl,
+      state: state,
+      expiresInMs: rawExpires is num && rawExpires > 0 ? rawExpires.toInt() : 0,
+    );
+  }
+
+  /// Polls one browser sign-in attempt. A pending attempt returns null; a
+  /// completed one returns the account session the browser callback created.
+  /// Tokens never travel through the browser, so this is the only way the
+  /// viewer learns about them.
+  static Future<AccountLoginResult?> oidcPoll(
+    ServerSettings settings,
+    String state, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final String key = state.trim();
+    if (key.isEmpty) {
+      throw ServerApiException(tr('单点登录状态无效'));
+    }
+    if (!settings.configured) {
+      throw ServerApiException(tr('未配置连接服务'));
+    }
+    final Uri uri;
+    try {
+      uri = Uri.parse('${settings.url}/v1/account/oidc/poll');
+    } on FormatException {
+      throw ServerApiException(tr('连接服务地址无效'));
+    }
+    final Object? decoded;
+    try {
+      decoded = await _requestJson(
+        'POST',
+        uri,
+        timeout,
+        body: <String, Object?>{'state': key},
+        success: const <int>{HttpStatus.ok, HttpStatus.accepted},
+        unauthorized: tr('单点登录失败，请重试'),
+        notFound: tr('单点登录已过期，请重试'),
+        unavailable: tr('连接服务未启用单点登录'),
+      );
+    } on ServerApiException catch (error) {
+      throw _oidcPollException(error);
+    }
+    if (decoded == null) {
+      return null;
+    }
+    if (decoded is! Map) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    if (decoded['token'] == null) {
+      return null;
+    }
+    final AccountLoginResult? result = _parseLoginReply(decoded);
+    if (result == null) {
+      throw ServerApiException(tr('连接服务返回了无效数据'));
+    }
+    return result;
+  }
+
+  static ServerApiException _oidcPollException(ServerApiException error) {
+    switch (error.code) {
+      case 'account_banned':
+        return ServerApiException(
+          tr('账号已被封禁'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      case 'no_account':
+        return ServerApiException(
+          tr('该身份未关联账号，请联系管理员'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      case 'oidc_expired':
+        return ServerApiException(
+          tr('单点登录已过期，请重试'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+      case 'oidc_failed':
+        return ServerApiException(
+          tr('单点登录失败，请重试'),
+          statusCode: error.statusCode,
+          code: error.code,
+        );
+    }
+    return error;
+  }
+
+  /// Runs a full browser single sign-on: starts an attempt, opens the
+  /// provider URL in the user's browser and polls until the callback has
+  /// produced an account session or [timeout] expires. Transient network
+  /// failures while polling are retried; terminal answers are not.
+  static Future<AccountLoginResult> loginOidc(
+    ServerSettings settings, {
+    String deviceId = '',
+    String deviceName = '',
+    required Future<void> Function(String url) openUrl,
+    Duration interval = const Duration(seconds: 2),
+    Duration timeout = const Duration(minutes: 5),
+  }) async {
+    final OidcLoginSession session = await oidcBegin(
+      settings,
+      deviceId: deviceId,
+      deviceName: deviceName,
+    );
+    try {
+      await openUrl(session.authUrl);
+    } catch (error) {
+      throw ServerApiException(
+        tr('无法打开浏览器：{error}', <String, Object?>{'error': error}),
+      );
+    }
+    final DateTime deadline = DateTime.now().add(timeout);
+    do {
+      final AccountLoginResult? result;
+      try {
+        result = await oidcPoll(settings, session.state);
+      } on ServerApiException catch (error) {
+        if (error.statusCode == null) {
+          // Timeout or socket failure: the browser step may still finish.
+          await Future<void>.delayed(interval);
+          continue;
+        }
+        rethrow;
+      }
+      if (result != null) {
+        return result;
+      }
+      await Future<void>.delayed(interval);
+    } while (DateTime.now().isBefore(deadline));
+    throw ServerApiException(tr('单点登录超时，请重试'));
   }
 
   static AccountLoginResult? _parseLoginReply(Object? decoded) {
@@ -2390,8 +2633,7 @@ class ServerApi {
       alive.add(peer);
     }
     final List<AddressBookPeer> changes = <AddressBookPeer>[];
-    for (final Object? item
-        in rawChanges is List ? rawChanges : <Object?>[]) {
+    for (final Object? item in rawChanges is List ? rawChanges : <Object?>[]) {
       final AddressBookPeer? peer = AddressBookPeer.fromJson(item);
       if (peer == null) {
         throw ServerApiException(tr('连接服务返回了无效数据'));
@@ -3164,14 +3406,14 @@ class ServerApi {
         : name.trim();
     final Uri uri;
     try {
-      uri = Uri.parse(
-        '${settings.url}/v1/account/recordings',
-      ).replace(queryParameters: <String, String>{
-        'name': fileName,
-        if (peerId.trim().isNotEmpty) 'peer_id': peerId.trim(),
-        if (startedAtMs > 0) 'started_ms': '$startedAtMs',
-        if (durationMs > 0) 'duration_ms': '$durationMs',
-      });
+      uri = Uri.parse('${settings.url}/v1/account/recordings').replace(
+        queryParameters: <String, String>{
+          'name': fileName,
+          if (peerId.trim().isNotEmpty) 'peer_id': peerId.trim(),
+          if (startedAtMs > 0) 'started_ms': '$startedAtMs',
+          if (durationMs > 0) 'duration_ms': '$durationMs',
+        },
+      );
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
@@ -3188,11 +3430,13 @@ class ServerApi {
       request.headers.contentType = ContentType('video', 'mp4');
       request.contentLength = total;
       int sent = 0;
-      await request.addStream(file.openRead().map((List<int> chunk) {
-        sent += chunk.length;
-        onProgress?.call(sent, total);
-        return chunk;
-      }));
+      await request.addStream(
+        file.openRead().map((List<int> chunk) {
+          sent += chunk.length;
+          onProgress?.call(sent, total);
+          return chunk;
+        }),
+      );
       final HttpClientResponse response = await request.close().timeout(
         timeout,
       );
@@ -3285,17 +3529,22 @@ class ServerApi {
           contentLength >= 0 &&
           contentLength != recording.size) {
         throw ServerApiException(
-          tr('录制大小与服务器记录不一致：应有 {expected} 字节，响应为 {actual} 字节', <String, Object?>{
-            'expected': recording.size,
-            'actual': contentLength,
-          }),
+          tr(
+            '录制大小与服务器记录不一致：应有 {expected} 字节，响应为 {actual} 字节',
+            <String, Object?>{
+              'expected': recording.size,
+              'actual': contentLength,
+            },
+          ),
         );
       }
       await directory.create(recursive: true);
       final File target = await _newRecordingFile(directory, recording.name);
       final IOSink sink = target.openWrite();
       final _DigestSink digestSink = _DigestSink();
-      final ByteConversionSink hasher = sha256.startChunkedConversion(digestSink);
+      final ByteConversionSink hasher = sha256.startChunkedConversion(
+        digestSink,
+      );
       int received = 0;
       try {
         await for (final List<int> chunk in response.timeout(timeout)) {
@@ -3405,31 +3654,16 @@ class ServerApi {
       case HttpStatus.badRequest:
         return ServerApiException(tr('录制文件无效'), statusCode: status);
       case HttpStatus.unauthorized:
-        return ServerApiException(
-          tr('账号登录已失效，请重新登录'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('账号登录已失效，请重新登录'), statusCode: status);
       case HttpStatus.notFound:
-        return ServerApiException(
-          tr('录制不存在或已被删除'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('录制不存在或已被删除'), statusCode: status);
       case HttpStatus.requestEntityTooLarge:
         if (detail.contains('quota')) {
-          return ServerApiException(
-            tr('录制存储配额已用尽'),
-            statusCode: status,
-          );
+          return ServerApiException(tr('录制存储配额已用尽'), statusCode: status);
         }
-        return ServerApiException(
-          tr('录制文件超过单次上传上限'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('录制文件超过单次上传上限'), statusCode: status);
       case HttpStatus.serviceUnavailable:
-        return ServerApiException(
-          tr('连接服务未启用录制归档'),
-          statusCode: status,
-        );
+        return ServerApiException(tr('连接服务未启用录制归档'), statusCode: status);
       default:
         return ServerApiException(
           tr('连接服务返回 HTTP {p61}', <String, Object?>{'p61': status}),
@@ -3441,7 +3675,9 @@ class ServerApi {
   static String _fileName(String path) {
     final String normalized = path.replaceAll('\\', '/');
     final int slash = normalized.lastIndexOf('/');
-    final String name = slash < 0 ? normalized : normalized.substring(slash + 1);
+    final String name = slash < 0
+        ? normalized
+        : normalized.substring(slash + 1);
     return name.trim().isEmpty ? 'recording.mp4' : name;
   }
 
@@ -3471,7 +3707,10 @@ class ServerApi {
     return safe;
   }
 
-  static Future<File> _newRecordingFile(Directory directory, String name) async {
+  static Future<File> _newRecordingFile(
+    Directory directory,
+    String name,
+  ) async {
     final String safe = _safeRecordingName(name);
     final String separator = Platform.pathSeparator;
     File file = File('${directory.path}$separator$safe');
@@ -3616,6 +3855,23 @@ class ServerApi {
           .timeout(timeout);
       if (!success.contains(response.statusCode)) {
         final String? secondFactor = response.headers.value('x-chast-2fa');
+        String code = secondFactor == 'required'
+            ? 'totp_required'
+            : secondFactor == 'invalid'
+            ? 'totp_invalid'
+            : '';
+        if (code.isEmpty) {
+          // Routes such as OIDC polling answer with a JSON code; surfacing it
+          // lets callers translate terminal failures individually.
+          try {
+            final Object? errorBody = jsonDecode(text);
+            if (errorBody is Map && errorBody['code'] is String) {
+              code = (errorBody['code'] as String).trim();
+            }
+          } on FormatException {
+            // The body is not JSON; the status text alone must do.
+          }
+        }
         throw ServerApiException(
           response.statusCode == HttpStatus.notFound
               ? notFound
@@ -3633,13 +3889,11 @@ class ServerApi {
               : response.statusCode == HttpStatus.conflict &&
                     conflict.isNotEmpty
               ? conflict
-              : tr('连接服务返回 HTTP {p61}', <String, Object?>{'p61': response.statusCode}),
+              : tr('连接服务返回 HTTP {p61}', <String, Object?>{
+                  'p61': response.statusCode,
+                }),
           statusCode: response.statusCode,
-          code: secondFactor == 'required'
-              ? 'totp_required'
-              : secondFactor == 'invalid'
-              ? 'totp_invalid'
-              : '',
+          code: code,
         );
       }
       if (text.trim().isEmpty) {
@@ -3657,12 +3911,18 @@ class ServerApi {
     } on SocketException catch (error) {
       final String detail = error.message.trim();
       throw ServerApiException(
-        detail.isEmpty ? tr('无法连接连接服务') : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
+        detail.isEmpty
+            ? tr('无法连接连接服务')
+            : tr('无法连接连接服务：{detail}', <String, Object?>{'detail': detail}),
       );
     } on HttpException catch (error) {
-      throw ServerApiException(tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}));
+      throw ServerApiException(
+        tr('连接服务请求失败：{p62}', <String, Object?>{'p62': error.message}),
+      );
     } catch (error) {
-      throw ServerApiException(tr('连接服务请求失败：{error}', <String, Object?>{'error': error}));
+      throw ServerApiException(
+        tr('连接服务请求失败：{error}', <String, Object?>{'error': error}),
+      );
     } finally {
       client.close(force: true);
     }
