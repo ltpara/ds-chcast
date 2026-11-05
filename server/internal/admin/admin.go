@@ -466,8 +466,12 @@ func (c *Console) peersText(count int) string {
 		if tags == "" {
 			tags = "-"
 		}
-		fmt.Fprintf(&b, "%s online=%t hostname=%s platform=%s version=%s alias=%s tags=%s last_seen=%s\n",
-			peer.ID, online, hostname, platform, version, alias, tags, lastSeen)
+		metadata := "unsigned"
+		if peer.MetadataSignature != "" {
+			metadata = "signed"
+		}
+		fmt.Fprintf(&b, "%s online=%t hostname=%s platform=%s version=%s metadata=%s alias=%s tags=%s last_seen=%s\n",
+			peer.ID, online, hostname, platform, version, metadata, alias, tags, lastSeen)
 	}
 	return b.String()
 }

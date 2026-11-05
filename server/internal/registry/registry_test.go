@@ -104,6 +104,80 @@ func TestRegisterLookupAndPersistence(t *testing.T) {
 	}
 }
 
+func TestMetadataSignaturePersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	reg, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(4000, 0)
+	reg.SetClock(func() time.Time { return now })
+	_, pub := hostKey("host-secret")
+	req := RegisterRequest{
+		ID:                "devbox",
+		PublicKey:         pub,
+		Hostname:          "Dev Box",
+		Platform:          "windows/amd64",
+		Version:           "1.2.3",
+		MetadataSignature: "c2lnbmF0dXJl",
+		TTL:               time.Minute,
+	}
+	if _, err := reg.Register(req); err != nil {
+		t.Fatal(err)
+	}
+	if record, ok := reg.Identity("devbox"); !ok || record.MetadataSignature != "c2lnbmF0dXJl" {
+		t.Fatalf("stored metadata signature = %+v %v", record, ok)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewPersistent(time.Minute, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reopened.SetClock(func() time.Time { return now })
+	record, ok := reopened.Identity("devbox")
+	if !ok || record.MetadataSignature != "c2lnbmF0dXJl" || record.Hostname != "Dev Box" || record.Version != "1.2.3" {
+		t.Fatalf("metadata signature after restart = %+v %v", record, ok)
+	}
+
+	// An unsigned metadata report replaces the signature instead of leaving one
+	// attached to values it never covered.
+	unsigned := req
+	unsigned.MetadataSignature = ""
+	unsigned.Version = "1.2.4"
+	if _, err := reopened.Register(unsigned); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reopened.Identity("devbox")
+	if record.MetadataSignature != "" || record.Version != "1.2.4" {
+		t.Fatalf("unsigned renewal = %+v", record)
+	}
+
+	// Normalization that changes the reported string drops the signature: it
+	// would not verify against the stored lookup values.
+	normalized := req
+	normalized.Hostname = "Dev\x01 Box"
+	if _, err := reopened.Register(normalized); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reopened.Identity("devbox")
+	if record.MetadataSignature != "" || record.Hostname != "Dev Box" {
+		t.Fatalf("normalized metadata = %+v", record)
+	}
+
+	// A fully signed report is stored again.
+	if _, err := reopened.Register(req); err != nil {
+		t.Fatal(err)
+	}
+	record, _ = reopened.Identity("devbox")
+	if record.MetadataSignature != "c2lnbmF0dXJl" {
+		t.Fatalf("restored metadata signature = %+v", record)
+	}
+}
+
 func TestKeyMismatchAndIDValidation(t *testing.T) {
 	reg := New(time.Minute)
 	_, pub := hostKey("host-secret")

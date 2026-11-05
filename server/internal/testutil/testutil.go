@@ -41,13 +41,15 @@ const RelayNodeKey = "test-relay-node-key"
 
 // Options tunes the HTTP handler for tests that exercise operations features.
 type Options struct {
-	RateLimit    float64
-	RateBurst    float64
-	ProxyHeader  string
-	TLS          bool
-	RelayOnly    bool
-	Registration *abuse.Blocker
-	RelayServers []string
+	RateLimit   float64
+	RateBurst   float64
+	ProxyHeader string
+	TLS         bool
+	// RequireHostMetadata mirrors --require-host-metadata-signature.
+	RequireHostMetadata bool
+	RelayOnly           bool
+	Registration        *abuse.Blocker
+	RelayServers        []string
 	// RelayNodes are standalone relay node base URLs. RelayNodeKey is their
 	// shared control key; empty falls back to RelayNodeKey.
 	RelayNodes []string
@@ -288,6 +290,7 @@ func StartWith(t testing.TB, opts Options) *Server {
 		Limiter:                    ratelimit.New(opts.RateLimit, opts.RateBurst),
 		LoginLimiter:               loginLimiter,
 		ProxyHeader:                opts.ProxyHeader,
+		RequireHostMetadata:        opts.RequireHostMetadata,
 		TLS:                        opts.TLS,
 		GeoIP:                      opts.GeoIP,
 		RelayOnly:                  relayOnly,

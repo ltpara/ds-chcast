@@ -135,15 +135,19 @@ type apiError struct {
 func (c *apiClient) register(ctx context.Context, id, oldID string, privateKey ed25519.PrivateKey, fingerprint string) (registerResult, error) {
 	timestamp := time.Now().Unix()
 	hostname, _ := os.Hostname()
+	hostname = strings.TrimSpace(hostname)
+	platform := runtime.GOOS + "/" + runtime.GOARCH
 	body := map[string]any{
 		"id":          id,
 		"public_key":  identity.PublicKeyText(privateKey.Public().(ed25519.PublicKey)),
 		"fingerprint": fingerprint,
 		"hostname":    hostname,
-		"platform":    runtime.GOOS + "/" + runtime.GOARCH,
+		"platform":    platform,
 		"version":     Version,
 		"timestamp":   timestamp,
 		"signature":   identity.Sign(privateKey, identity.RegisterMessage(id, fingerprint, timestamp)),
+		"metadata_signature": identity.Sign(privateKey,
+			identity.HostMetadataMessage(id, hostname, platform, Version)),
 	}
 	if oldID != "" {
 		body["old_id"] = oldID

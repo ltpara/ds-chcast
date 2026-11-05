@@ -49,16 +49,20 @@ func ValidID(id string) bool { return idPattern.MatchString(id) }
 // information in its SQLite peer table so an offline peer still has a name and
 // a version.
 type Identity struct {
-	ID          string    `json:"id"`
-	PublicKey   string    `json:"public_key"`
-	Fingerprint string    `json:"fingerprint,omitempty"`
-	Hostname    string    `json:"hostname,omitempty"`
-	Platform    string    `json:"platform,omitempty"`
-	Version     string    `json:"version,omitempty"`
-	Alias       string    `json:"alias,omitempty"`
-	Tags        []string  `json:"tags,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	LastSeen    time.Time `json:"last_seen,omitempty"`
+	ID          string `json:"id"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Hostname    string `json:"hostname,omitempty"`
+	Platform    string `json:"platform,omitempty"`
+	Version     string `json:"version,omitempty"`
+	// MetadataSignature is the host key's signature over ID, Hostname,
+	// Platform and Version. It is only kept while those values match the
+	// signed report, so a viewer can verify the lookup metadata directly.
+	MetadataSignature string    `json:"metadata_signature,omitempty"`
+	Alias             string    `json:"alias,omitempty"`
+	Tags              []string  `json:"tags,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	LastSeen          time.Time `json:"last_seen,omitempty"`
 }
 
 type Host struct {
@@ -107,11 +111,14 @@ type RegisterRequest struct {
 	PublicKey   string
 	Fingerprint string
 	// Hostname, Platform and Version are display metadata. Empty values keep
-	// whatever a previous registration reported.
-	Hostname string
-	Platform string
-	Version  string
-	TTL      time.Duration
+	// whatever a previous registration reported. MetadataSignature is the
+	// host's signature over all three; it is dropped when normalization
+	// changes the reported strings.
+	Hostname          string
+	Platform          string
+	Version           string
+	MetadataSignature string
+	TTL               time.Duration
 	// OldID is the id this device used before. The caller must have proven
 	// ownership of it; Register moves its durable record to ID, preserving the
 	// creation time and operator labels, and releases its lease. An unknown
@@ -262,14 +269,15 @@ func (r *Registry) Register(req RegisterRequest) (Host, error) {
 		}
 	} else {
 		record = Identity{
-			ID:          req.ID,
-			PublicKey:   req.PublicKey,
-			Fingerprint: req.Fingerprint,
-			Hostname:    normalizeMetadata(req.Hostname, maxHostname),
-			Platform:    normalizeMetadata(req.Platform, maxPlatform),
-			Version:     normalizeMetadata(req.Version, maxVersion),
-			CreatedAt:   now,
-			LastSeen:    now,
+			ID:                req.ID,
+			PublicKey:         req.PublicKey,
+			Fingerprint:       req.Fingerprint,
+			Hostname:          normalizeMetadata(req.Hostname, maxHostname),
+			Platform:          normalizeMetadata(req.Platform, maxPlatform),
+			Version:           normalizeMetadata(req.Version, maxVersion),
+			MetadataSignature: signedMetadata(req),
+			CreatedAt:         now,
+			LastSeen:          now,
 		}
 		if err := r.storeIdentityLocked(record); err != nil {
 			return Host{}, err
@@ -311,7 +319,28 @@ func applyRegistrationMetadata(record Identity, req RegisterRequest) Identity {
 	if req.Version != "" {
 		record.Version = normalizeMetadata(req.Version, maxVersion)
 	}
+	if req.Hostname != "" || req.Platform != "" || req.Version != "" {
+		// A later unsigned registration invalidates an older signature rather
+		// than leaving one attached to metadata it did not cover.
+		record.MetadataSignature = signedMetadata(req)
+	}
 	return record
+}
+
+// signedMetadata keeps a metadata signature only when the reported values are
+// exactly the normalized strings that will be stored and served. If
+// normalization changed anything the signature would not verify against the
+// lookup response, so it is dropped and the metadata is treated as unsigned.
+func signedMetadata(req RegisterRequest) string {
+	if req.MetadataSignature == "" || req.Hostname == "" || req.Platform == "" || req.Version == "" {
+		return ""
+	}
+	if normalizeMetadata(req.Hostname, maxHostname) != req.Hostname ||
+		normalizeMetadata(req.Platform, maxPlatform) != req.Platform ||
+		normalizeMetadata(req.Version, maxVersion) != req.Version {
+		return ""
+	}
+	return req.MetadataSignature
 }
 
 func newCarrierToken() (string, error) {
@@ -821,6 +850,7 @@ func identityChanged(a, b Identity) bool {
 		a.Hostname != b.Hostname ||
 		a.Platform != b.Platform ||
 		a.Version != b.Version ||
+		a.MetadataSignature != b.MetadataSignature ||
 		a.Alias != b.Alias ||
 		!slices.Equal(a.Tags, b.Tags) ||
 		!a.CreatedAt.Equal(b.CreatedAt) ||

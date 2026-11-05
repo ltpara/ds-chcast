@@ -61,6 +61,31 @@ func TestMigrateSignatureBindsBothIDs(t *testing.T) {
 	}
 }
 
+func TestHostMetadataSignature(t *testing.T) {
+	priv := PrivateKeyFromSecret("host-secret")
+	pub := priv.Public().(ed25519.PublicKey)
+	sig := Sign(priv, HostMetadataMessage("devbox", "Dev Box", "windows/amd64", "1.2.3"))
+	if !Verify(pub, HostMetadataMessage("devbox", "Dev Box", "windows/amd64", "1.2.3"), sig) {
+		t.Fatal("valid metadata signature rejected")
+	}
+	if Verify(pub, HostMetadataMessage("devbox", "Dev Box", "windows/amd64", "1.2.4"), sig) {
+		t.Fatal("metadata signature accepted for a different version")
+	}
+	if Verify(pub, HostMetadataMessage("other", "Dev Box", "windows/amd64", "1.2.3"), sig) {
+		t.Fatal("metadata signature accepted for a different id")
+	}
+	if Verify(pub, HostMetadataMessage("devbox", "Dev Box", "", ""), sig) {
+		t.Fatal("metadata signature accepted without platform and version")
+	}
+	if Verify(pub, RegisterMessage("devbox", "windows/amd64", 0), sig) {
+		t.Fatal("metadata signature doubled as a registration proof")
+	}
+	shifted := Sign(priv, HostMetadataMessage("a", "b", "c|d", "e"))
+	if Verify(pub, HostMetadataMessage("a", "b|c", "d", "e"), shifted) {
+		t.Fatal("length prefixes did not separate metadata fields")
+	}
+}
+
 func TestFieldBoundariesCannotBeShifted(t *testing.T) {
 	priv := PrivateKeyFromSecret("host-secret")
 	pub := priv.Public().(ed25519.PublicKey)

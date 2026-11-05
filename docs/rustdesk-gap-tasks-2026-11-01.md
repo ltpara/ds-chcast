@@ -226,13 +226,35 @@ P2 = 平台扩展。
   失败重试不产生重复。
 - 测试：本地 HTTP/S3 模拟端点单测与归档查询断言。
 
-### DEV-07 主机自报元数据签名（P1）
+### DEV-07 主机自报元数据签名（P1，2026-11-05 完成）
 
 - 目标：主机注册/lookup 元数据不可被中间人篡改。
-- 实施：主机用绑定私钥签名元数据摘要；服务器验签后落库；
-  旧客户端无签名时按兼容模式放行并可配置强制。
+- 实施：主机在注册时用绑定私钥对 `id`、`hostname`、`platform`、`version`
+  的长度前缀消息签名（域串 `chast-host-metadata-v1`），随
+  `metadata_signature` 一并提交；服务器在注册签名之后验签，默认兼容
+  旧主机，`chast-server --require-host-metadata-signature` 可强制要求。
+  元数据先规范化再落库：只有规范化未改变上报字符串时才保留签名，
+  否则丢弃，避免签名与 lookup 返回值不一致。带元数据的续租会替换
+  签名（无签名的续租即视为撤销），不带元数据的续租保留上次报告。
+  lookup 与批量 lookup 回显 `metadata_signature`；管理 CLI 的 `peers`
+  显示 `metadata=signed|unsigned`，Web 管理台设备表新增“元数据签名”
+  列。
 - 验收：篡改元数据被拒；兼容模式不破坏旧主机；管理台显示签名状态。
-- 测试：协议/存储单测与回环。
+- 测试：`identity` 覆盖域分离与字段边界；`registry` 覆盖签名跨重启
+  持久化、无签名续租清除、规范化丢弃与重新签名；`api` 覆盖
+  lookup 验签、篡改/错配签名 401、兼容与强制模式、规范化丢签名；
+  `admin` 覆盖状态显示。`go build ./...`、`go vet` 与
+  `go test ./internal/identity ./internal/registry ./internal/api
+  ./internal/admin ./internal/agent ./internal/webadmin ./cmd/chast-server`
+  全部通过。
+- 边界：签名只证明“持有该主机密钥的一方报告了这些值”，不证明主机
+  没有谎报自身信息，也不替代 `server-key` 与 TLS；签名在注册时验证，
+  lookup 响应的完整性仍由 HTTPS 与服务器签名绑定保护。
+- 文件：`server/internal/identity/identity.go`、
+  `server/internal/registry/`、`server/internal/api/api.go`、
+  `server/internal/agent/client.go`、`server/cmd/chast-server/main.go`、
+  `server/internal/admin/admin.go`、
+  `server/internal/webadmin/assets/{index.html,app.js}`。
 
 ### DEV-08 地址簿拼音/模糊搜索与持久化（P2）
 
@@ -287,14 +309,13 @@ P2 = 平台扩展。
 
 1. **ENV-01、ENV-02、ENV-04**：先消除发布可信度风险，直接决定
    默认值与对外承诺。
-2. **DEV-07**：更新链路（DEV-01）已完成，主机元数据签名是剩余的
-   安全边界，优先于功能扩展。
-3. **DEV-02、DEV-03**：可观测性与存储扩展为后续规模化铺路。
-4. **DEV-04、DEV-05、DEV-06**：运营能力对齐。
-5. **ENV-05~ENV-12**：按硬件/网络条件穿插执行，每项完成后在
+2. **DEV-02、DEV-03**：DEV-01（更新链路）与 DEV-07（主机元数据签名）
+   已完成，剩余安全边界关闭；可观测性与存储扩展为后续规模化铺路。
+3. **DEV-04、DEV-05、DEV-06**：运营能力对齐。
+4. **ENV-05~ENV-12**：按硬件/网络条件穿插执行，每项完成后在
    `docs/status-2026-10-25.md` 增补证据小节。
-6. **DEV-08、DEV-09、DEV-10**：体验与增强项。
-7. **PLAT-01~PLAT-03**：等签名证书与平台资源就绪后启动。
+5. **DEV-08、DEV-09、DEV-10**：体验与增强项。
+6. **PLAT-01~PLAT-03**：等签名证书与平台资源就绪后启动。
 
 ## 处置结论（2026-11-05）
 
@@ -355,7 +376,7 @@ WebSocket、便携模式、RDP）补一轮。
 | ID | 处置 | 说明 |
 | --- | --- | --- |
 | DEV-01 | 已完成（2026-11-05） | 发布者签名（服务器/主机/查看器三层校验）、`chast-publish` 签名工具、查看器健康标记回滚与安装器服务恢复均已实现并验证，详见同日小节。 |
-| DEV-07 | 采纳，紧接实现 | 主机注册/lookup 元数据未签名，属安全边界；可与 DEV-01 共用 Ed25519 校验与密钥配置。 |
+| DEV-07 | 已完成（2026-11-05） | 主机用绑定私钥签名元数据，服务器验签后仅在规范化未改动时落库并回显；默认兼容旧主机，`--require-host-metadata-signature` 可强制；管理 CLI/Web 台显示签名状态，详见同日小节。 |
 | DEV-02 | 采纳，P1 | 数据面（punch/relay/QUIC）与 SQLite/队列没有 span 或指标；排在 DEV-01/07 之后。 |
 | DEV-03 | 采纳，P1 | 需 PostgreSQL 实例；先抽存储接口并保持 SQLite 默认部署与现有回归全绿。 |
 | DEV-04 | 采纳，P1 | 账号仍只有逐设备标签，无按组授权与配额；与地址簿分组 ACL 解耦。 |

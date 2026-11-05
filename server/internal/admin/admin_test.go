@@ -157,7 +157,7 @@ func TestConsoleCommands(t *testing.T) {
 	}
 
 	peers := send(t, c, "peers")
-	for _, want := range []string{"devbox online=true", "hostname=Dev Box", "platform=windows/amd64", "version=1.0.0", "alias=-", "tags=-"} {
+	for _, want := range []string{"devbox online=true", "hostname=Dev Box", "platform=windows/amd64", "version=1.0.0", "metadata=unsigned", "alias=-", "tags=-"} {
 		if !strings.Contains(peers, want) {
 			t.Fatalf("peers missing %q:\n%s", want, peers)
 		}

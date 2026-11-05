@@ -21,32 +21,33 @@ import (
 )
 
 type hostReply struct {
-	ID              string   `json:"id"`
-	Online          bool     `json:"online"`
-	Candidate       string   `json:"candidate"`
-	Candidates      []string `json:"candidates"`
-	Relay           string   `json:"relay"`
-	Relays          []string `json:"relays"`
-	Punch           string   `json:"punch"`
-	Carrier         string   `json:"carrier"`
-	CarrierV6       string   `json:"carrier_v6"`
-	CarrierToken    string   `json:"carrier_token"`
-	Fingerprint     string   `json:"fingerprint"`
-	PublicKey       string   `json:"public_key"`
-	ServerPublicKey string   `json:"server_public_key"`
-	Binding         string   `json:"binding"`
-	LocalAddrs      []string `json:"local_addrs"`
-	Hostname        string   `json:"hostname"`
-	Platform        string   `json:"platform"`
-	Version         string   `json:"version"`
-	Alias           string   `json:"alias"`
-	Tags            []string `json:"tags"`
-	LastSeenMS      int64    `json:"last_seen_ms"`
-	ExpiresInMS     int64    `json:"expires_in_ms"`
-	NATType         string   `json:"nat_type"`
-	UpnpPort        int      `json:"upnp_port"`
-	RelayOnly       bool     `json:"relay_only"`
-	Transport       string   `json:"transport"`
+	ID                string   `json:"id"`
+	Online            bool     `json:"online"`
+	Candidate         string   `json:"candidate"`
+	Candidates        []string `json:"candidates"`
+	Relay             string   `json:"relay"`
+	Relays            []string `json:"relays"`
+	Punch             string   `json:"punch"`
+	Carrier           string   `json:"carrier"`
+	CarrierV6         string   `json:"carrier_v6"`
+	CarrierToken      string   `json:"carrier_token"`
+	Fingerprint       string   `json:"fingerprint"`
+	PublicKey         string   `json:"public_key"`
+	ServerPublicKey   string   `json:"server_public_key"`
+	Binding           string   `json:"binding"`
+	LocalAddrs        []string `json:"local_addrs"`
+	Hostname          string   `json:"hostname"`
+	Platform          string   `json:"platform"`
+	Version           string   `json:"version"`
+	MetadataSignature string   `json:"metadata_signature"`
+	Alias             string   `json:"alias"`
+	Tags              []string `json:"tags"`
+	LastSeenMS        int64    `json:"last_seen_ms"`
+	ExpiresInMS       int64    `json:"expires_in_ms"`
+	NATType           string   `json:"nat_type"`
+	UpnpPort          int      `json:"upnp_port"`
+	RelayOnly         bool     `json:"relay_only"`
+	Transport         string   `json:"transport"`
 }
 
 func hostKey(secret string) (ed25519.PrivateKey, string) {
@@ -62,7 +63,7 @@ func registerBody(t *testing.T, id, secret, fingerprint string, timestamp int64)
 func registerBodyWithInfo(t *testing.T, id, secret, fingerprint, hostname, platform, version string, timestamp int64) string {
 	t.Helper()
 	priv, pub := hostKey(secret)
-	body, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"id":          id,
 		"public_key":  pub,
 		"fingerprint": fingerprint,
@@ -71,6 +72,29 @@ func registerBodyWithInfo(t *testing.T, id, secret, fingerprint, hostname, platf
 		"version":     version,
 		"timestamp":   timestamp,
 		"signature":   identity.Sign(priv, identity.RegisterMessage(id, fingerprint, timestamp)),
+	}
+	if hostname != "" || platform != "" || version != "" {
+		fields["metadata_signature"] = identity.Sign(priv,
+			identity.HostMetadataMessage(id, hostname, platform, version))
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func registerBodyUnsignedInfo(t *testing.T, id, secret, hostname, platform, version string, timestamp int64) string {
+	t.Helper()
+	priv, pub := hostKey(secret)
+	body, err := json.Marshal(map[string]any{
+		"id":         id,
+		"public_key": pub,
+		"hostname":   hostname,
+		"platform":   platform,
+		"version":    version,
+		"timestamp":  timestamp,
+		"signature":  identity.Sign(priv, identity.RegisterMessage(id, "", timestamp)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -283,6 +307,148 @@ func TestPeerMetadataInLookup(t *testing.T) {
 	host = lookup()
 	if host.Online || host.Hostname != "Office PC" || host.Version != "1.2.3" {
 		t.Fatalf("offline peer metadata: %+v", host)
+	}
+}
+
+func TestSignedMetadataVerifiesInLookup(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "devbox", "host secret", "", "Dev Box", "windows/amd64", "1.2.3", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("lookup: %d %s", status, body)
+	}
+	var host hostReply
+	if err := json.Unmarshal(body, &host); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := identity.ParsePublicKey(host.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.MetadataSignature == "" {
+		t.Fatal("lookup dropped the metadata signature")
+	}
+	if !identity.Verify(pub, identity.HostMetadataMessage(host.ID, host.Hostname, host.Platform, host.Version), host.MetadataSignature) {
+		t.Fatalf("metadata signature does not cover the lookup values: %+v", host)
+	}
+}
+
+func TestTamperedMetadataRejected(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(registerBodyWithInfo(t, "devbox", "host secret", "", "Dev Box", "windows/amd64", "1.2.3", now)), &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["hostname"] = "Evil Box"
+	body, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, reply := request(t, http.MethodPost, s.URL+"/v1/hosts", string(body), testutil.ServerKey)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("tampered metadata = %d %s, want 401", status, reply)
+	}
+
+	// A signature that covers different values is not accepted either.
+	priv, pub := hostKey("host secret")
+	body, err = json.Marshal(map[string]any{
+		"id":         "devbox",
+		"public_key": pub,
+		"timestamp":  now,
+		"signature":  identity.Sign(priv, identity.RegisterMessage("devbox", "", now)),
+		"hostname":   "Dev Box",
+		"platform":   "windows/amd64",
+		"version":    "1.2.4",
+		"metadata_signature": identity.Sign(priv, identity.HostMetadataMessage(
+			"devbox", "Dev Box", "windows/amd64", "1.2.3")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, reply = request(t, http.MethodPost, s.URL+"/v1/hosts", string(body), testutil.ServerKey)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("mismatched metadata signature = %d %s, want 401", status, reply)
+	}
+}
+
+func TestMetadataSignatureRequirement(t *testing.T) {
+	compat := testutil.Start(t)
+	now := time.Now().Unix()
+	if status, body := request(t, http.MethodPost, compat.URL+"/v1/hosts",
+		registerBodyUnsignedInfo(t, "legacy", "legacy secret", "Legacy PC", "linux/amd64", "0.9.0", now), testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("legacy registration: %d %s", status, body)
+	}
+	status, body := request(t, http.MethodGet, compat.URL+"/v1/hosts/legacy", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("legacy lookup: %d %s", status, body)
+	}
+	var host hostReply
+	if err := json.Unmarshal(body, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.Hostname != "Legacy PC" || host.MetadataSignature != "" {
+		t.Fatalf("legacy registration = %+v", host)
+	}
+
+	strict := testutil.StartWith(t, testutil.Options{RequireHostMetadata: true})
+	if status, body := request(t, http.MethodPost, strict.URL+"/v1/hosts",
+		registerBodyUnsignedInfo(t, "legacy", "legacy secret", "Legacy PC", "linux/amd64", "0.9.0", now), testutil.ServerKey); status != http.StatusUnauthorized {
+		t.Fatalf("unsigned registration in require mode = %d %s, want 401", status, body)
+	}
+	if status, body := request(t, http.MethodPost, strict.URL+"/v1/hosts",
+		registerBody(t, "legacy", "legacy secret", "", now), testutil.ServerKey); status != http.StatusUnauthorized {
+		t.Fatalf("registration without metadata in require mode = %d %s, want 401", status, body)
+	}
+	if status, body := request(t, http.MethodPost, strict.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "modern", "modern secret", "", "Modern", "linux/amd64", "2.0.0", now), testutil.ServerKey); status != http.StatusOK {
+		t.Fatalf("signed registration in require mode: %d %s", status, body)
+	}
+}
+
+func TestMetadataSignatureDroppedWhenNormalized(t *testing.T) {
+	s := testutil.Start(t)
+	now := time.Now().Unix()
+	status, body := request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "devbox", "host secret", "", "Dev\x01 Box", "windows/amd64", "1.2.3", now), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("register: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("lookup: %d %s", status, body)
+	}
+	var host hostReply
+	if err := json.Unmarshal(body, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.Hostname != "Dev Box" {
+		t.Fatalf("normalized hostname = %q", host.Hostname)
+	}
+	if host.MetadataSignature != "" {
+		t.Fatalf("signature survived normalization: %+v", host)
+	}
+
+	// The next clean report is signed and visible again.
+	status, body = request(t, http.MethodPost, s.URL+"/v1/hosts",
+		registerBodyWithInfo(t, "devbox", "host secret", "", "Dev Box", "windows/amd64", "1.2.3", now+1), testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("signed renewal: %d %s", status, body)
+	}
+	status, body = request(t, http.MethodGet, s.URL+"/v1/hosts/devbox", "", testutil.ServerKey)
+	if status != http.StatusOK {
+		t.Fatalf("second lookup: %d %s", status, body)
+	}
+	if err := json.Unmarshal(body, &host); err != nil {
+		t.Fatal(err)
+	}
+	if host.MetadataSignature == "" {
+		t.Fatalf("clean renewal did not restore the signature: %+v", host)
 	}
 }
 

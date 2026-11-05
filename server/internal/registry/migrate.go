@@ -24,6 +24,7 @@ func applyRegistryBaseline(db *sql.DB) error {
 		hostname    TEXT NOT NULL DEFAULT '',
 		platform    TEXT NOT NULL DEFAULT '',
 		version     TEXT NOT NULL DEFAULT '',
+		metadata_signature TEXT NOT NULL DEFAULT '',
 		alias       TEXT NOT NULL DEFAULT '',
 		tags        TEXT NOT NULL DEFAULT '',
 		created_at  INTEGER NOT NULL,

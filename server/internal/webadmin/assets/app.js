@@ -673,6 +673,7 @@
     tr.appendChild(cell(peer.hostname || '—'));
     tr.appendChild(cell(peer.platform || '—'));
     tr.appendChild(cell(peer.version || '—'));
+    tr.appendChild(cell(peer.metadata_signature ? pill('已签名', 'ok') : pill('未签名')));
     tr.appendChild(cell(peer.online ? pill('在线', 'ok') : pill('离线')));
 
     const where = el('div', 'stack');

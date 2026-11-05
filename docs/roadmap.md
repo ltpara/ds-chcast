@@ -3190,6 +3190,19 @@
      `flutter analyze`、Flutter 测试与 Windows release 构建通过。边界：
      健康标记只代表查看器完成首帧；托盘主机仍依赖查看器自身回滚，真实
      Windows 服务重启路径未在本机注册验证。
+142. **P1 · DEV-07 主机自报元数据签名（2026-11-05 完成）**：主机注册时用
+     绑定私钥签名 `id`/`hostname`/`platform`/`version`（域串
+     `chast-host-metadata-v1`、长度前缀），代理自动上报本机主机名、
+     `GOOS/GOARCH` 与版本；服务器在注册签名之后验签，默认兼容旧主机，
+     `chast-server --require-host-metadata-signature` 可强制。元数据规范化
+     未改变字符串时才落库并保留签名，无签名的续租即撤销旧签名，lookup/
+     批量 lookup 回显 `metadata_signature`；管理 CLI `peers` 与 Web 管理台
+     设备表显示签名状态。验证：`go build ./...`、`go vet` 与
+     `go test ./internal/identity ./internal/registry ./internal/api
+     ./internal/admin ./internal/agent ./internal/webadmin
+     ./cmd/chast-server` 通过，新增用例覆盖域分离、跨重启持久化、规范化
+     丢签名、篡改/错配 401 与兼容/强制模式。边界：签名只把报告值与主机
+     密钥绑定，不证明值真实，也不替代 `server-key` 与 TLS。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

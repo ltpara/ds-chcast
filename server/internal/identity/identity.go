@@ -34,6 +34,10 @@ const (
 	DomainRelay = "chast-relay-v1"
 	// DomainCarrierHost covers the TCP/WebSocket relay host link challenge.
 	DomainCarrierHost = "chast-carrier-host-v1"
+	// DomainHostMetadata covers the hostname, platform and version a host
+	// reports at registration. The host key signs the exact strings the server
+	// stores and serves in lookups.
+	DomainHostMetadata = "chast-host-metadata-v1"
 	// DomainHostBinding covers the server-signed id/public-key/fingerprint blob.
 	DomainHostBinding = "chast-host-binding-v1"
 	// DomainPunch covers the viewer's server-key proof in a punch request.
@@ -196,6 +200,14 @@ func (s *Server) SignSoftwarePublisher(keyID, version, downloadURL, digest strin
 		return "", errors.New("publisher signature needs a publisher identity")
 	}
 	return SignSoftwarePublisher(s.priv, keyID, version, downloadURL, digest, size)
+}
+
+// HostMetadataMessage binds the display metadata to the host identity. A
+// viewer holding the host public key can recompute it from a lookup response,
+// so a rendezvous server or a server-key holder cannot alter the reported
+// hostname, platform or version without invalidating the signature.
+func HostMetadataMessage(id, hostname, platform, version string) []byte {
+	return fieldsMessage(DomainHostMetadata, id, hostname, platform, version)
 }
 
 func KeepaliveMessage(id, candidate, nonce string) []byte {

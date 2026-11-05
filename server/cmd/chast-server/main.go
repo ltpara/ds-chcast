@@ -82,6 +82,7 @@ func run() error {
 		softwareURL      = flag.String("software-url", "", "download URL advertised with --software-version")
 		softwareDir      = flag.String("software-dir", "", "release directory published read-only at /software/{name}; the file named by --software-url is hashed and signed in the notice")
 		softwarePubKey   = flag.String("software-publisher-key", "", "pinned release publisher Ed25519 public key; the hosted release must carry a matching .pubsig sidecar")
+		requireHostMeta  = flag.Bool("require-host-metadata-signature", false, "reject hosts whose registration does not carry a signed hostname/platform/version report")
 		smtpAddr         = flag.String("smtp-addr", "", "SMTP host:port used to send password-reset mail; empty disables email recovery")
 		smtpFrom         = flag.String("smtp-from", "", "From address for password-reset mail; required with --smtp-addr")
 		smtpUser         = flag.String("smtp-user", "", "SMTP username for PLAIN authentication; empty sends without auth")
@@ -993,6 +994,7 @@ func run() error {
 			Lockout:     *loginLockout,
 		}, log),
 		ProxyHeader:                *proxyHeader,
+		RequireHostMetadata:        *requireHostMeta,
 		TLS:                        tlsConfig != nil,
 		PunchReadBuffer:            meet.ReadBuffer(),
 		SoftwareVersion:            softwareVersion,

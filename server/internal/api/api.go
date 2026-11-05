@@ -109,6 +109,10 @@ type Config struct {
 	// PunchReadBuffer is the kernel-reported SO_RCVBUF of the rendezvous
 	// socket. Zero means the system default or an unreadable value.
 	PunchReadBuffer int
+	// RequireHostMetadata rejects registrations that do not carry a signed
+	// hostname/platform/version report. It is off by default so hosts running
+	// an older agent still register.
+	RequireHostMetadata bool
 	// SoftwareVersion and SoftwareURL advertise a client/host update the same
 	// way hbbs answers SoftwareUpdate. Both empty disables the notice.
 	SoftwareVersion string
@@ -315,6 +319,10 @@ type registerRequest struct {
 	Version     string `json:"version"`
 	Timestamp   int64  `json:"timestamp"`
 	Signature   string `json:"signature"`
+	// MetadataSignature binds hostname, platform and version to the same host
+	// key as Signature. It is optional so older agents keep registering, but
+	// RequireHostMetadata rejects registrations that leave it out.
+	MetadataSignature string `json:"metadata_signature,omitempty"`
 	// OldID asks the server to move a durable identity to ID. It must be
 	// accompanied by MigrateSignature, made with the same host key over both
 	// ids, which proves the caller owns the old record.
@@ -386,18 +394,20 @@ type lookupResponse struct {
 	NATType         string   `json:"nat_type,omitempty"`
 	// UpnpPort is the host's self-reported gateway mapping. Viewers combine it
 	// with the observed candidate IP to probe a stable external port.
-	UpnpPort     int      `json:"upnp_port,omitempty"`
-	Hostname     string   `json:"hostname,omitempty"`
-	Platform     string   `json:"platform,omitempty"`
-	Version      string   `json:"version,omitempty"`
-	Alias        string   `json:"alias,omitempty"`
-	Tags         []string `json:"tags,omitempty"`
-	LastSeenMS   int64    `json:"last_seen_ms,omitempty"`
-	ExpiresInMS  int64    `json:"expires_in_ms"`
-	Carrier      string   `json:"carrier,omitempty"`
-	CarrierV6    string   `json:"carrier_v6,omitempty"`
-	CarrierToken string   `json:"carrier_token,omitempty"`
-	RelayOnly    bool     `json:"relay_only,omitempty"`
+	UpnpPort int    `json:"upnp_port,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	Platform string `json:"platform,omitempty"`
+	Version  string `json:"version,omitempty"`
+	// MetadataSignature lets a client holding PublicKey verify those values.
+	MetadataSignature string   `json:"metadata_signature,omitempty"`
+	Alias             string   `json:"alias,omitempty"`
+	Tags              []string `json:"tags,omitempty"`
+	LastSeenMS        int64    `json:"last_seen_ms,omitempty"`
+	ExpiresInMS       int64    `json:"expires_in_ms"`
+	Carrier           string   `json:"carrier,omitempty"`
+	CarrierV6         string   `json:"carrier_v6,omitempty"`
+	CarrierToken      string   `json:"carrier_token,omitempty"`
+	RelayOnly         bool     `json:"relay_only,omitempty"`
 	// Transport is the path the server believes is usable: direct when a
 	// candidate was reported, carrier when only the shared carrier link proves
 	// the host alive, relay otherwise. It is a hint; viewers may still try
@@ -457,6 +467,15 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "registration signature was not accepted")
 		return
 	}
+	if req.MetadataSignature == "" {
+		if s.cfg.RequireHostMetadata {
+			writeError(w, http.StatusUnauthorized, "registration must include a signed metadata report")
+			return
+		}
+	} else if !identity.Verify(pub, identity.HostMetadataMessage(req.ID, req.Hostname, req.Platform, req.Version), req.MetadataSignature) {
+		writeError(w, http.StatusUnauthorized, "registration metadata signature was not accepted")
+		return
+	}
 	if req.OldID != "" {
 		if !registry.ValidID(req.OldID) {
 			writeError(w, http.StatusBadRequest, "old_id must be 1..64 characters of [A-Za-z0-9_.-]")
@@ -483,14 +502,15 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, err := s.cfg.Registry.Register(registry.RegisterRequest{
-		ID:          req.ID,
-		PublicKey:   req.PublicKey,
-		Fingerprint: req.Fingerprint,
-		Hostname:    req.Hostname,
-		Platform:    req.Platform,
-		Version:     req.Version,
-		TTL:         s.cfg.TTL,
-		OldID:       req.OldID,
+		ID:                req.ID,
+		PublicKey:         req.PublicKey,
+		Fingerprint:       req.Fingerprint,
+		Hostname:          req.Hostname,
+		Platform:          req.Platform,
+		Version:           req.Version,
+		MetadataSignature: req.MetadataSignature,
+		TTL:               s.cfg.TTL,
+		OldID:             req.OldID,
 	})
 	if err != nil {
 		if errors.Is(err, registry.ErrKeyMismatch) {
@@ -693,6 +713,7 @@ func (s *server) hostLookup(id string, now time.Time, relayOnly bool) (lookupRes
 		resp.Hostname = record.Hostname
 		resp.Platform = record.Platform
 		resp.Version = record.Version
+		resp.MetadataSignature = record.MetadataSignature
 		resp.Alias = record.Alias
 		resp.Tags = record.Tags
 	}
