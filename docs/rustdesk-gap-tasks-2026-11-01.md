@@ -262,14 +262,47 @@ P2 = 平台扩展。
   `server/internal/registry/`、`server/cmd/chast-server/main.go`、
   `server/go.mod`、`server/README.md`。
 
-### DEV-04 账号按组授权与配额（P1）
+### DEV-04 账号按组授权与配额（P1，2026-11-05 完成）
 
 - 目标：账号/设备按组授权，支持配额，而不仅是逐设备标签。
-- 实施：新增组、成员与配额表；管理 API 与 Web 管理台；
-  连接/审计接口按组过滤；与地址簿分组 ACL 解耦。
-- 验收：组内只读/可写/管理员三档生效；超配额被拒并给出明确错误；
-  最后一个管理员保护与现有角色兼容。
-- 测试：Go 存储/HTTP 测试覆盖越权与配额边界；管理台回环。
+- 实施：账号库新增 `account_groups`、`account_group_members`、
+  `account_group_devices`，SQLite 迁移到 v7，PostgreSQL 基线同步追加；
+  组 ID 复核对等 ID 规则，成员沿用 readonly/operator/admin 三档。授权取
+  全局管理台角色与组内角色的较高者，服务器密钥仍最高：readonly 只读，
+  operator 可维护组设备，admin 还可改设置、成员与配额。配额 0 表示不限；
+  重复成员/设备先于配额检查返回，配额不能降到当前用量以下，降级或移除
+  最后一个组管理员返回 409。组管理动作全部落审计（`group_*`）。审计、
+  连接与文件传输接口新增 `?group=` 过滤，组成员（包括没有全局管理台角色
+  的 viewer 账号）可读所属组的记录，未带组参数的接口仍要求全局只读角色，
+  CSV 导出复用同一过滤。Web 管理台新增“分组”页签（创建仅全局 admin，
+  组设置/成员/设备对话框按组内角色启用），审计页加入分组下拉框；仅有
+  分组授权的账号可以登录管理台，只能看到分组页签与所属组的审计。分组与
+  地址簿分组 ACL 完全独立。
+- 验收：组内三档权限、成员/设备配额、重复项、配额下调与最后管理员保护
+  均通过存储与 HTTP 测试；组内连接/审计/CSV 只返回成员与组设备记录，
+  非成员与未授权账号被拒；管理台回环覆盖服务器密钥建组、加成员/设备，
+  以及 `group member quota reached: limit 2`、`group device quota
+  reached: limit 1` 两类配额错误提示。
+- 测试：`internal/account/groups_test.go`（存储、配额与事件过滤）、
+  `internal/api/groups_test.go`（HTTP 越权/配额/过滤/最后管理员）、
+  `internal/account/postgres_test.go` 的 `TestPostgresAccountGroups`
+  （由 `CHAST_TEST_POSTGRES_DSN` 门控）。`go test ./internal/api/
+  ./internal/webadmin/` 通过；`internal/account` 测试本轮再次被
+  Application Control 拦截测试二进制，该包同文存储在 DEV-04 实现阶段已
+  通过，本轮之后未再改动存储代码。
+- 文件：`server/internal/account/groups.go`、
+  `server/internal/account/groups_test.go`、
+  `server/internal/account/audit.go`、
+  `server/internal/account/migrate.go`、
+  `server/internal/account/migrate_postgres.go`、
+  `server/internal/account/postgres_test.go`、
+  `server/internal/api/groups.go`、`server/internal/api/groups_test.go`、
+  `server/internal/api/api.go`、`server/internal/api/audit.go`、
+  `server/internal/api/connection.go`、`server/internal/api/file.go`、
+  `server/internal/api/export.go`、
+  `server/internal/webadmin/assets/index.html`、
+  `server/internal/webadmin/assets/app.js`、
+  `server/internal/webadmin/assets/style.css`。
 
 ### DEV-05 连接审计 GeoIP 与路由关联（P1）
 
@@ -442,7 +475,7 @@ WebSocket、便携模式、RDP）补一轮。
 | DEV-07 | 已完成（2026-11-05） | 主机用绑定私钥签名元数据，服务器验签后仅在规范化未改动时落库并回显；默认兼容旧主机，`--require-host-metadata-signature` 可强制；管理 CLI/Web 台显示签名状态，详见同日小节。 |
 | DEV-02 | 已完成（2026-11-05） | punch 与 relay 会话 span 按主机 ID 归并同一 trace，SQLite 经驱动包装记录查询耗时/错误/慢查询与连接池等待，hbbs 与 relay 的 `/metrics` 暴露队列与数据面指标；QUIC 由 C++ 主机终止，无 Go 侧握手/流 span。 |
 | DEV-03 | 已完成（2026-11-05） | `--postgres-dsn`/`CHAST_POSTGRES_DSN` 让账号、地址簿、审计/连接/文件历史、录制元数据与对等记录改存 PostgreSQL；驱动层方言改写保持调用点不变，ICU 排序规则复现 SQLite NOCASE，并发由 advisory lock 串行；空库迁移、并发与启动验证通过。 |
-| DEV-04 | 采纳，P1 | 账号仍只有逐设备标签，无按组授权与配额；与地址簿分组 ACL 解耦。 |
+| DEV-04 | 已完成（2026-11-05） | 账号分组（成员/设备/配额）与组内 readonly/operator/admin 三档已落地；连接、审计与 CSV 支持按组过滤，最后管理员保护、配额边界与管理台分组页签均已验证，详见同日小节。 |
 | DEV-05 | 采纳，P1 | GeoIP 目前只用于登录审计；连接/文件审计缺地点、路由与逐文件关联。 |
 | DEV-06 | 采纳，P1 | 已有按日轮转与远端投递，缺集中去重与迟到合并。 |
 | DEV-08 | 采纳，P2 小切片 | 拼音/模糊搜索与搜索词持久化属体验增强，可在 UI 批次完成。 |

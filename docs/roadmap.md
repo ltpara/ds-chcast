@@ -3291,6 +3291,23 @@
      日志确认 PostgreSQL 存储、`/metrics` 输出 `chast_db_*`；SQLite 回归
      保持全绿（仅 Application Control 拦截的 `internal/tracing` 测试
      二进制未运行）。
+150. **P1 · DEV-04 账号按组授权与配额（2026-11-05 完成）**：
+     账号库新增 `account_groups`、`account_group_members`、
+     `account_group_devices`（SQLite v7，PostgreSQL 基线同步）。组内沿用
+     readonly/operator/admin 三档，授权取全局管理台角色与组内角色的较高
+     者，服务器密钥仍最高；readonly 只读、operator 维护组设备、admin 改
+     设置/成员/配额。配额 0 不限，重复项先于配额检查，配额不得低于当前
+     用量，降级或移除最后一个组管理员返回 409；组管理动作写入 `group_*`
+     审计。审计、连接、文件传输与 CSV 导出支持 `?group=`，组内无全局角色
+     的账号也可读所属组记录，不带组的接口仍要求全局只读。Web 管理台新增
+     “分组”页签与组设置/成员/设备对话框，审计页加入分组下拉框，仅有分组
+     授权的账号可登录且只显示分组与所属组审计。分组与地址簿 ACL 解耦。
+     验证：存储/HTTP 测试覆盖三档越权、成员与设备配额、配额下调、最后
+     管理员保护、组内事件与 CSV 过滤；管理台回环完成服务器密钥建组、
+     加成员/设备并看到 `group member quota reached: limit 2` 与
+     `group device quota reached: limit 1`；`internal/api` 与
+     `internal/webadmin` 全通过，`internal/account` 测试二进制本轮再次被
+     Application Control 拦截（存储代码此后未改动）。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
