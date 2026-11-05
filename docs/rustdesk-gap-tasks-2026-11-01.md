@@ -365,7 +365,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 已实现（2026-11-05）：协议 v37 新增语音呼叫协商与 `VoiceAudio`，主机按请求采集麦克风上行、查看器解码到输出端点，详见同日小节 |
 | DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
 | DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 已实现（2026-11-05）：协议 v39 的 `OsLoginRequest/Result` 由主机在登录或锁屏界面键入查看器提供的密码；权限位 0x2000 与 `allow_os_login` 默认关闭；密码不落盘、不记日志，详见同日小节 |
-| DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 固定控制当前控制台会话，无可选会话列表 |
+| DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 已实现（2026-11-05）：协议 v40 的 `SessionListRequest/Result`、`SessionSelectRequest/Result` 由服务模式主机列出并切换 WTS 会话；权限位 0x4000 与 `allow_session_select` 默认关闭；查看器工具栏会话选择器在切换后自动重连，详见同日小节 |
 | DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
 | DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | `SessionMode` 只有 Desktop/FileTransfer（`include/chast/protocol.h:1025`）；终端/摄像头/端口转发都依附桌面会话 |
 | DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 终端随会话结束销毁，单会话最多 2 个（`protocol.h:1254`/`:1263`） |
@@ -584,6 +584,53 @@ Unavailable 拒绝且不调用后端、注入失败原因与计数、本地拒�
 模式（SYSTEM 会话）能打开 Winlogon，托盘主机在登录界面回 Unsupported；
 不含“保存密码自动登录”，每次由查看器输入；媒体链路保持零拷贝，无 CPU
 fallback。DEV-14（Switch Sides）仍因需要反向角色交接暂缓。
+
+### DEV-16 Windows 多会话选择（2026-11-05 完成）
+
+协议从 v39 提升到 v40，在可靠控制流上新增 `SessionListRequest(59)` /
+`SessionListResult(60)` 与 `SessionSelectRequest(61)` / `SessionSelectResult(62)`。
+列表结果携带结果码（Ok/Denied/Unsupported/Failed）、原因与至多 16 个
+`RemoteSession{id,user,active,current}`；切换结果携带目标 id、结果码
+（Ok/NotFound/Denied/Unsupported/Busy/Failed）与原因。新增仅掩码权限位
+`kPermissionSessionSelect`（0x4000），默认关闭，`allow_session_select`
+（`host.ini` 的 `session_select=`）是否开启都要求服务模式后端。
+
+- **服务模式闸门**：worker 启动时用 `OpenEventW(EVENT_MODIFY_STATE,
+  kWorkerSwitchEvent)` 探测服务切换通道；只有服务启动的 worker 才注册
+  `list_sessions`/`select_session`，手工/托盘运行即使勾选设置也不会通告
+  权限（日志说明原因）。列表与切换先查会话权限，再查主机设置，再查后端，
+  切换额外要求控制租约（非持有者回 Busy）。
+- **会话枚举**：`WTSEnumerateSessionsW` 跳过会话 0 与 0xFFFFFFFF，仅保留
+  `WTSConnectState == WTSActive` 且有 `WTSUserName` 的会话；`current` 用
+  `ProcessIdToSessionId(GetCurrentProcessId())` 标记。切换前重新枚举校验，
+  目标必须仍然活跃且有用户，否则回 NotFound；选择当前会话是幂等的 Ok。
+- **交接**：worker 将目标 id 写入 `%ProgramData%\chast\session-switch`
+  （先写 `.tmp`，再 `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)`），
+  设置 `Local\chast-worker-switch` 事件；`SessionSelectResult(Ok)` 先入队，
+  然后 worker 置停止标志。服务被唤醒后再次校验活跃+用户，停止旧 worker，
+  用 winlogon 令牌在新会话重新启动 worker；旧会话的流随连接结束。
+- **查看器**：工具栏新增“切换主机的 Windows 会话”按钮（需权限与服务端
+  通告），对话框每 250 ms 刷新状态、显示用户/当前会话、支持手动刷新；
+  切换被接受后页面等待会话结束，用既有重连阶梯（1/2/4/8/15 s）自动重连，
+  落到新会话后随首帧重置。状态新增
+  `sessionSelectSupported/sessions/sessionListCode/sessionListError/
+  sessionListUpdates/sessionSelectId/sessionSelectCode/sessionSelectError/
+  sessionSelectUpdates`。
+- **结果卫生**：用户名字符串按 UTF-8 校验并限制 256 字节，列表最多 16 项、
+  id 不得重复；原因截断到 256 字节。`make_session_select_result` 的缓冲区
+  长度由单测覆盖（修复了少 2 字节导致的截断/越界写）。
+
+验证：`protocol_test` 新增 `test_session_select`（列表/切换编解码往返、
+非法 id、重复 id、未知码、非 Ok 携带条目、超长/畸形用户名、截断与尾部
+字节）；`host_settings_test` 覆盖 `session_select=` 往返与默认关闭；
+`flutter test` 新增 `session_select_status_test`（状态解析、非法 id 过滤、
+`acceptsSessionSelect`、队列调用参数）。全量 `ctest`、`flutter analyze`、
+Windows release 构建结果见 `docs/status-2026-10-25.md`。
+
+边界：只有服务模式能切换；需要目标会话已登录且处于 Active；切换会结束
+当前连接并由查看器重连；测试环境没有第二个已登录会话，WTS 枚举与真实
+会话交接待双机/多会话验收；媒体链路保持零拷贝，无 CPU fallback。
+DEV-14（Switch Sides）仍因需要反向角色交接暂缓。
 
 ### 已核对但不算缺口的项
 

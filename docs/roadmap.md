@@ -3011,6 +3011,22 @@
      host_settings 用例同步扩展，`flutter test` 552 项通过、Windows release
      构建成功。边界：真实登录界面键入待服务模式双机验收，不含保存密码
      自动登录；媒体链路保持零拷贝。
+129. **P2 · DEV-16 Windows 多会话选择（2026-11-05 完成）**：协议 v40 新增
+     `SessionListRequest(59)/SessionListResult(60)` 与
+     `SessionSelectRequest(61)/SessionSelectResult(62)`、仅掩码权限位
+     `kPermissionSessionSelect`(0x4000)，默认关闭。只有服务启动的 worker
+     才注册 `list_sessions/select_session`，手工/托盘运行不通告权限；主机
+     按“会话权限 → `allow_session_select` → 服务后端 → 控制租约”闸门
+     处理，`WTSEnumerateSessionsW` 仅列出 Active 且已登录的会话，切换前
+     重新校验目标。worker 通过 `%ProgramData%\chast\session-switch`（原子
+     替换）与 `Local\chast-worker-switch` 事件把 id 交给服务，服务停止旧
+     worker 后用 winlogon 令牌在目标会话重启；结果先入队再断开。查看器
+     工具栏新增会话选择对话框（250 ms 刷新、显示当前会话），切换被接受后
+     用既有重连阶梯自动重连。新增 `test_session_select` 与
+     `session_select_status_test`，`host_settings_test` 覆盖
+     `session_select=`；全量 `ctest`/`flutter test`/release 构建见状态
+     文档。边界：需服务模式与目标会话已登录；真实多会话交接待双机验收；
+     媒体链路保持零拷贝。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
