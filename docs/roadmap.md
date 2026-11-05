@@ -2967,6 +2967,21 @@
      同一时刻一个发布者，跟随者不能单独切换显示器/分辨率/编码参数；媒体
      路径保持 GPU 零拷贝，无 CPU fallback。详见
      `docs/rustdesk-gap-tasks-2026-11-01.md` 的同日小节。
+126. **P2 · DEV-13 语音通话（主机麦克风上行，2026-11-05 完成）**：协议 v37
+     新增 `VoiceCallRequest(52)/VoiceCallResponse(53)/VoiceAudio(54)`，复用
+     `kPermissionMicrophone` 闸门；协商与语音包走既有可靠控制流，不新开
+     QUIC 流。主机按请求创建 `IMicrophoneCapture`
+     （`HostServerConfig::voice_capture` 可注入），成功回 Ok 并携带 Opus
+     参数，随后逐包转发；未授权/已有通话/采集失败分别回
+     Refused/Busy/Failed。查看器新增 `SetVoiceCall`，用响应参数创建解码器
+     与播放器（沿用已选输出端点、到达即播），工具栏新增通话按钮与接通中
+     状态；权限撤销、主机停止、播放器错误都会结束并清理管线。验证：
+     `chast-host-voice-test`（合成采集器：协商/包序/停止/取消重呼/撤权）、
+     protocol/host_multi/quic_loopback 通过；`flutter analyze` 无问题、
+     `flutter test` 540 项通过、Windows release 构建成功、全量 `ctest`
+     43/43 通过（644.27 s）。边界：
+     真实麦克风/音箱待双机验收；每连接一通通话；语音与系统声音共用可靠
+     控制流的拥塞控制；视频零拷贝链路不变。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

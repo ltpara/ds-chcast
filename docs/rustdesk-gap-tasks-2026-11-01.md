@@ -362,7 +362,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | --- | --- | --- | --- | --- |
 | DEV-11 | P1 | 多查看者并发（同一主机同时多个受控会话） | `src/server.rs:466`/`:488` 以连接表维护多个连接，视频服务按订阅者分发 | 已实现（2026-11-05）：`max_viewers`（1..8，默认 2）并发接纳，每个查看者独立会话/审批/权限/审计，共享桌面流与控制租约，详见同日小节 |
 | DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 已实现（2026-11-05）：会合控制面、TCP 载体与共享载体支持 http/https/socks5/socks5h，代理下强制 TCP 载体，详见同日小节 |
-| DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 只有主机系统声→查看器与查看器麦克风→主机播放（`include/chast/audio.h:3-5`），没有主机麦克风上行，也没有通话请求/接听流程 |
+| DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 已实现（2026-11-05）：协议 v37 新增语音呼叫协商与 `VoiceAudio`，主机按请求采集麦克风上行、查看器解码到输出端点，详见同日小节 |
 | DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
 | DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 可发送 Ctrl+Alt+Del（`include/chast/sas.h`），但不能在锁屏/登录界面输入凭据或自动登录 |
 | DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 固定控制当前控制台会话，无可选会话列表 |
@@ -472,6 +472,33 @@ SOCKS5 UDP ASSOCIATE），因此配置代理后查看器强制走服务器 TCP �
 通过；`flutter build windows --release --no-pub` 成功；`go vet ./...`、
 `go test ./...` 通过（新增 netproxy 单测与 host+viewer 代理回环测试）；
 `chast-host-settings-test.exe`、`chast-host-tunnel-test.exe` 通过。
+
+### DEV-13 语音通话（主机麦克风上行）（2026-11-05 完成）
+
+协议从 v36 提升到 v37，在既有可靠控制流上新增三种消息：
+`VoiceCallRequest(52)`（u8 标志 + u64 请求号，bit0 表示连接/断开）、
+`VoiceCallResponse(53)`（请求号、Ok/Refused/Busy/Failed、原因字符串，
+成功时附 Opus 采样率/声道/帧长与 ≤64 字节 extradata）和
+`VoiceAudio(54)`（48 字节 `AudioHeader` + Opus 包，带长度与 CRC 校验）。
+不新开 QUIC 流，也不占用 DATAGRAM 音频通道。
+
+- 权限复用 `kPermissionMicrophone`。未授权立即 Refused，本连接已有通话
+  Busy，采集启动失败 Failed；运行中撤销权限由两侧结束通话并下发停止。
+- 主机每个 `HostServer` 工作线程独立服务语音（发布者与跟随者皆可），
+  默认打开通信设备麦克风，`HostServerConfig::voice_capture` 可替换为
+  测试采集器；逐包 `send_voice_audio`，发送失败计入 drops，关闭/撤权/
+  采集失败都会停止并释放设备。统计新增 `voice_call_*` 计数。
+- 查看器 `SetVoiceCall` 发起/结束通话，用响应参数创建 Opus 解码器与
+  播放器（沿用已选输出端点、到达即播），工具栏新增通话按钮；状态发布为
+  `voiceAuthorized/voiceEnabled/voicePending/voicePackets/voiceDropped/
+  voiceErrors/voiceError`。
+
+验证：`chast-host-voice-test`（合成采集器覆盖协商、包序、停止、取消后
+重呼、撤权）通过；protocol/host_multi/quic_loopback 通过；`flutter
+analyze` 无问题；`flutter test` 540 项通过；Windows release 构建成功；
+全量 `ctest` 43/43 通过（644.27 s）。
+边界：真实麦克风与音箱待双机验收；每连接一通通话；语音与系统声音共用
+可靠控制流的拥塞控制；视频零拷贝链路未改动，无 CPU fallback。
 
 ### 已核对但不算缺口的项
 
