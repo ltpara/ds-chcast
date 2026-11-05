@@ -7,6 +7,7 @@
 #include <flutter/method_channel.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -51,6 +52,12 @@ private:
     // VK_PROCESSKEY. Restored when control is dropped, which keeps the home
     // page's text fields working in Chinese.
     void SetKeyCapture(bool enable);
+    // Pins the local pointer to the view and turns mouse motion into relative
+    // moves for the host, so a drag never reaches a screen edge. [scale] is
+    // physical window pixels per captured pixel on the host.
+    void SetRelativeMouse(bool enable, double scale);
+    // Confines the pointer to the view's client rect while relative mode is on.
+    void ClipRelativePointer();
     // Picks the host's newest pointer up and installs it as the local system
     // cursor while the page shows remote control on this window. Called from
     // the poll timer, so it runs on the platform thread.
@@ -80,6 +87,13 @@ private:
     HWND window_ = nullptr;
     HWND view_ = nullptr;
     std::atomic<bool> key_capture_{false};
+    std::atomic<bool> relative_mouse_{false};
+    // Physical pixels per captured pixel, and the modifier state carried by
+    // the last Dart input event. Relative moves bypass Dart, so the native
+    // path has to replay the modifiers or a held Ctrl would be lifted by the
+    // host's per-event reconciliation.
+    double relative_scale_ = 1.0;
+    uint16_t last_modifiers_ = 0;
     HIMC saved_himc_ = nullptr;
     // The host pointer, installed as the local cursor while this window is
     // the one under it. Windows asks WM_SETCURSOR for HTCLIENT, so answering

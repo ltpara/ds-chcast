@@ -61,4 +61,36 @@ void main() {
     expect(ViewFilter.load(), <String>{'office'});
     expect(ViewFilter.loadCollapsed(), isEmpty);
   });
+
+  test('searches round-trip per view without clobbering each other', () {
+    ViewFilter.saveSearch(SearchView.devices, ' lab ');
+    ViewFilter.saveSearch(SearchView.shared, 'zs');
+    expect(ViewFilter.loadSearch(SearchView.devices), 'lab');
+    expect(ViewFilter.loadSearch(SearchView.shared), 'zs');
+    expect(ViewFilter.load(), isEmpty);
+
+    ViewFilter.save(<String>{'office'});
+    ViewFilter.saveCollapsed(<String>{'g1'});
+    expect(ViewFilter.loadSearch(SearchView.devices), 'lab');
+    expect(ViewFilter.loadSearch(SearchView.shared), 'zs');
+
+    ViewFilter.saveSearch(SearchView.devices, '');
+    expect(ViewFilter.loadSearch(SearchView.devices), isEmpty);
+    expect(ViewFilter.loadSearch(SearchView.shared), 'zs');
+    expect(ViewFilter.load(), <String>{'office'});
+    expect(ViewFilter.loadCollapsed(), <String>{'g1'});
+    final Map<String, Object?> saved =
+        jsonDecode(File(path).readAsStringSync()) as Map<String, Object?>;
+    expect(saved.containsKey('search_devices'), isFalse);
+    expect(saved['search_shared'], 'zs');
+  });
+
+  test('a whitespace-only search clears the saved query', () {
+    ViewFilter.saveSearch(SearchView.shared, 'zs');
+    ViewFilter.saveSearch(SearchView.shared, '   ');
+    final Map<String, Object?> saved =
+        jsonDecode(File(path).readAsStringSync()) as Map<String, Object?>;
+    expect(saved.containsKey('search_shared'), isFalse);
+    expect(ViewFilter.loadSearch(SearchView.shared), isEmpty);
+  });
 }

@@ -4,9 +4,9 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 /// View state the viewer remembers across launches: how the picture is fitted
-/// (RustDesk's view style), whether the stats overlay is shown, and how the
-/// file browser sorts. All live in `ui.json` next to the language and picture
-/// preferences.
+/// (RustDesk's view style), whether the stats overlay is shown, how the file
+/// browser sorts, and the local mouse remapping. All live in `ui.json` next to
+/// the language and picture preferences.
 class ViewPreferences {
   const ViewPreferences({
     this.fit = 0,
@@ -15,6 +15,8 @@ class ViewPreferences {
     this.fileSortAscending = true,
     this.browserDirectory = '',
     this.terminalFontSize = 13,
+    this.reverseWheel = false,
+    this.swapButtons = false,
   });
 
   /// 0 = adaptive (fit the window), 1 = original pixels.
@@ -31,12 +33,19 @@ class ViewPreferences {
   /// Terminal font size, clamped to the panel's 10–20 range.
   final int terminalFontSize;
 
+  /// Local input remapping: wheel direction flipped, primary/secondary
+  /// buttons exchanged before events reach the host.
+  final bool reverseWheel;
+  final bool swapButtons;
+
   static const String _fitKey = 'view_fit';
   static const String _statsKey = 'view_stats';
   static const String _fileSortKey = 'file_sort';
   static const String _fileSortAscendingKey = 'file_sort_asc';
   static const String _browserDirectoryKey = 'browser_dir';
   static const String _terminalFontSizeKey = 'terminal_font_size';
+  static const String _reverseWheelKey = 'view_reverse_wheel';
+  static const String _swapButtonsKey = 'view_swap_buttons';
 
   /// Redirects the settings file away from the real user profile in tests.
   @visibleForTesting
@@ -51,6 +60,8 @@ class ViewPreferences {
     final Object? rawSort = map[_fileSortKey];
     final Object? rawAscending = map[_fileSortAscendingKey];
     final Object? rawFontSize = map[_terminalFontSizeKey];
+    final Object? rawReverseWheel = map[_reverseWheelKey];
+    final Object? rawSwapButtons = map[_swapButtonsKey];
     return ViewPreferences(
       fit: rawFit is int && (rawFit == 0 || rawFit == 1) ? rawFit : 0,
       stats: rawStats is bool ? rawStats : false,
@@ -61,6 +72,8 @@ class ViewPreferences {
           rawFontSize is int && rawFontSize >= 10 && rawFontSize <= 20
           ? rawFontSize
           : 13,
+      reverseWheel: rawReverseWheel is bool ? rawReverseWheel : false,
+      swapButtons: rawSwapButtons is bool ? rawSwapButtons : false,
     );
   }
 
@@ -100,7 +113,9 @@ class ViewPreferences {
       ..[_terminalFontSizeKey] =
           prefs.terminalFontSize >= 10 && prefs.terminalFontSize <= 20
           ? prefs.terminalFontSize
-          : 13;
+          : 13
+      ..[_reverseWheelKey] = prefs.reverseWheel
+      ..[_swapButtonsKey] = prefs.swapButtons;
     try {
       file.parent.createSync(recursive: true);
       file.writeAsStringSync(jsonEncode(payload));

@@ -182,12 +182,17 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _reconnecting = false;
   bool _closing = false;
   bool _controlEnabled = false;
+  // Relative mode pins the local pointer to the window and sends host motion
+  // itself; it is session-only and starts off.
+  bool _relativeMouse = false;
+  bool _swallowEscapeChordUp = false;
   // An accepted Windows session switch ends this connection on purpose; the
   // page reconnects through the backoff ladder instead of showing a drop.
   bool _sessionSwitchPending = false;
   double _wheelY = 0;
   double _wheelX = 0;
   int _heldButtons = 0;
+  MouseMapping _mouse = const MouseMapping();
   final LinkedHashSet<int> _heldKeys = LinkedHashSet<int>();
   // Touch contacts on the host, keyed by the pointer that owns each slot.
   final RemoteContactTracker _contacts = RemoteContactTracker();
@@ -300,6 +305,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     _fileBrowserSortAscending = viewPrefs.fileSortAscending;
     _fileBrowserDirectory = viewPrefs.browserDirectory;
     _terminalFontSize = viewPrefs.terminalFontSize;
+    _mouse = MouseMapping(
+      reverseWheel: viewPrefs.reverseWheel,
+      swapButtons: viewPrefs.swapButtons,
+    );
     _startPolling();
     _starting = _start();
     unawaited(_starting);
@@ -988,6 +997,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         (nowOver || !status.inputEnabled) && _controlEnabled;
     if (droppedControl) {
       _controlEnabled = false;
+      _disableRelativeMouse();
     }
     // The host answers a switch with one result. Compare the counters with
     // the previous poll rather than the error text: two identical refusals
@@ -1475,6 +1485,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     _viewScale = scale;
     _syncCursor();
+    if (_relativeMouse) {
+      // The native path maps window pixels to captured pixels, so a resize
+      // must update the factor it divides by.
+      _applyRelativeMouse(true);
+    }
   }
 
   void _toggleClipboardSync() {
@@ -1651,8 +1666,30 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         fileSortAscending: _fileBrowserSortAscending,
         browserDirectory: _fileBrowserDirectory,
         terminalFontSize: _terminalFontSize,
+        reverseWheel: _mouse.reverseWheel,
+        swapButtons: _mouse.swapButtons,
       ),
     );
+  }
+
+  void _toggleReverseWheel() {
+    setState(
+      () => _mouse = MouseMapping(
+        reverseWheel: !_mouse.reverseWheel,
+        swapButtons: _mouse.swapButtons,
+      ),
+    );
+    _saveViewPreferences();
+  }
+
+  void _toggleSwapButtons() {
+    setState(
+      () => _mouse = MouseMapping(
+        reverseWheel: _mouse.reverseWheel,
+        swapButtons: !_mouse.swapButtons,
+      ),
+    );
+    _saveViewPreferences();
   }
 
   void _toggleStats() {
@@ -3215,6 +3252,24 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         // double the rate.
         return KeyEventResult.handled;
       }
+      if (event is KeyUpEvent &&
+          _swallowEscapeChordUp &&
+          event.logicalKey == LogicalKeyboardKey.keyR) {
+        // The chord's key-down was consumed, so its key-up must not reach the
+        // host as a lone R release.
+        _swallowEscapeChordUp = false;
+        return KeyEventResult.handled;
+      }
+      if (event is KeyDownEvent &&
+          _relativeMouse &&
+          event.logicalKey == LogicalKeyboardKey.keyR &&
+          HardwareKeyboard.instance.isControlPressed &&
+          HardwareKeyboard.instance.isAltPressed &&
+          HardwareKeyboard.instance.isShiftPressed) {
+        _swallowEscapeChordUp = true;
+        setState(_disableRelativeMouse);
+        return KeyEventResult.handled;
+      }
       if (event is KeyDownEvent || event is KeyUpEvent) {
         // Flutter's usbHidUsage carries the usage page in the upper half
         // (0x00070004 for A); the protocol wants the page-0x07 id alone.
@@ -3278,6 +3333,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       // before dropping the gate keeps a toggle-off from leaving keys or a
       // button down on the far side.
       _releaseRemoteInput();
+      _disableRelativeMouse();
     }
     final bool terminalHadKeyboard = _terminalTyping;
     setState(() {
@@ -3321,7 +3377,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       ViewerMouse.forward,
     ]) {
       if (_heldButtons & bit != 0) {
-        _sendMouse(ViewerMouse.buttonUp, buttons: bit);
+        _sendMouse(ViewerMouse.buttonUp, buttons: _mouse.buttons(bit));
       }
     }
     _heldButtons = 0;
@@ -3808,7 +3864,60 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _setKeyCapture(bool enable) {
+    if (!enable) {
+      _disableRelativeMouse();
+    }
     unawaited(_guardSend(ViewerBridge.setKeyCapture(enable)));
+  }
+
+  void _toggleRelativeMouse() {
+    if (!_inputActive) {
+      return;
+    }
+    final bool enable = !_relativeMouse;
+    setState(() => _relativeMouse = enable);
+    _applyRelativeMouse(enable);
+    if (enable) {
+      // The toolbar button owns focus while its tap is handled; keys, and the
+      // exit chord, must keep reaching this page.
+      _focus.requestFocus();
+    }
+  }
+
+  void _disableRelativeMouse() {
+    if (!_relativeMouse) {
+      return;
+    }
+    _relativeMouse = false;
+    _swallowEscapeChordUp = false;
+    _applyRelativeMouse(false);
+  }
+
+  void _applyRelativeMouse(bool enable) {
+    unawaited(_requestRelativeMouse(enable));
+  }
+
+  Future<bool> _requestRelativeMouse(bool enable) async {
+    bool active = false;
+    try {
+      active = await ViewerBridge.setRelativeMouse(
+        enabled: enable,
+        scale: _cursorTargetScale,
+      );
+    } on PlatformException {
+      active = false;
+    } on MissingPluginException {
+      active = false;
+    }
+    if (enable && !active) {
+      // The native view refused capture; fall back to absolute moves instead
+      // of leaving the page in a mode that never sends pointer motion.
+      if (mounted && _relativeMouse) {
+        setState(() => _relativeMouse = false);
+      }
+      _applyRelativeMouse(false);
+    }
+    return active;
   }
 
   Future<void> _guardSend(Future<bool> send) async {
@@ -4036,13 +4145,21 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   );
 
   void _onPointerHover(Offset frame, int buttons) {
+    if (_relativeMouse) {
+      // Native capture already reported the motion; an absolute move would
+      // drag the host pointer back to the pinned local position.
+      return;
+    }
     final (int x, int y) = _desktopPoint(frame);
-    _sendMouse(ViewerMouse.move, buttons: buttons, x: x, y: y);
+    _sendMouse(ViewerMouse.move, buttons: _mouse.buttons(buttons), x: x, y: y);
   }
 
   void _onPointerMove(Offset frame, int buttons) {
+    if (_relativeMouse) {
+      return;
+    }
     final (int x, int y) = _desktopPoint(frame);
-    _sendMouse(ViewerMouse.move, buttons: buttons, x: x, y: y);
+    _sendMouse(ViewerMouse.move, buttons: _mouse.buttons(buttons), x: x, y: y);
   }
 
   void _onPointerButton(Offset frame, int button, bool down) {
@@ -4053,7 +4170,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     _sendMouse(
       down ? ViewerMouse.buttonDown : ViewerMouse.buttonUp,
-      buttons: button,
+      buttons: _mouse.buttons(button),
     );
   }
 
@@ -4068,7 +4185,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelY -= stepsY * kViewerScrollPixelsPerNotch;
       // Flutter's positive dy scrolls down; Windows WHEEL_DELTA is positive
       // when the wheel turns up (away from the user).
-      _sendMouse(ViewerMouse.wheel, y: -stepsY * kViewerWheelDelta);
+      _sendMouse(
+        ViewerMouse.wheel,
+        y: _mouse.wheelY(-stepsY * kViewerWheelDelta),
+      );
     }
     final int stepsX = (_wheelX / kViewerScrollPixelsPerNotch)
         .truncate()
@@ -4076,7 +4196,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         .toInt();
     if (stepsX != 0) {
       _wheelX -= stepsX * kViewerScrollPixelsPerNotch;
-      _sendMouse(ViewerMouse.wheelHorizontal, x: stepsX * kViewerWheelDelta);
+      _sendMouse(
+        ViewerMouse.wheelHorizontal,
+        x: _mouse.wheelX(stepsX * kViewerWheelDelta),
+      );
     }
   }
 
@@ -4321,7 +4444,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       sourceHeight: _status.sourceHeight,
                       fit: _fit,
                       captureInput: _inputActive,
-                      hideCursor: _inputActive && _cursorInstalled,
+                      hideCursor: _inputActive && (_cursorInstalled || _relativeMouse),
                       onScaleChanged: _onViewScale,
                       onHover: _inputActive ? _onPointerHover : null,
                       onMove: _inputActive ? _onPointerMove : null,
@@ -4425,6 +4548,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onSelectStreamFps: (int fps) =>
                             unawaited(_changeStreamOptions(maxFps: fps)),
                         onToggleControl: _toggleControl,
+                        reverseWheel: _mouse.reverseWheel,
+                        swapButtons: _mouse.swapButtons,
+                        onToggleReverseWheel: _toggleReverseWheel,
+                        onToggleSwapButtons: _toggleSwapButtons,
+                        relativeMouse: _relativeMouse,
+                        onToggleRelativeMouse: _toggleRelativeMouse,
                         specialKeysAvailable: _inputActive,
                         onSpecialAction: (RemoteSpecialAction action) =>
                             unawaited(_sendSpecialAction(action)),

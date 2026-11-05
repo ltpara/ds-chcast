@@ -40,6 +40,13 @@ void main() {
     List<ViewerDisplayMode> modes = const <ViewerDisplayMode>[],
     bool modeChangeAvailable = true,
     ValueChanged<ViewerDisplayMode>? onSelectMode,
+    bool reverseWheel = false,
+    bool swapButtons = false,
+    VoidCallback? onToggleReverseWheel,
+    VoidCallback? onToggleSwapButtons,
+    bool relativeMouse = false,
+    VoidCallback? onToggleRelativeMouse,
+    bool controlEnabled = false,
     bool fileAvailable = true,
     bool fileActive = false,
     VoidCallback? onSendFile,
@@ -85,7 +92,7 @@ void main() {
           fullscreen: false,
           statsVisible: false,
           fit: ViewFit.adaptive,
-          controlEnabled: false,
+          controlEnabled: controlEnabled,
           inputAvailable: true,
           clipboardEnabled: true,
           clipboardAvailable: true,
@@ -130,6 +137,12 @@ void main() {
           onSelectStreamQuality: onSelectStreamQuality ?? (_) {},
           onSelectStreamFps: onSelectStreamFps ?? (_) {},
           onToggleControl: () {},
+          reverseWheel: reverseWheel,
+          swapButtons: swapButtons,
+          onToggleReverseWheel: onToggleReverseWheel,
+          onToggleSwapButtons: onToggleSwapButtons,
+          relativeMouse: relativeMouse,
+          onToggleRelativeMouse: onToggleRelativeMouse,
           specialKeysAvailable: specialKeysAvailable,
           onSpecialAction: onSpecialAction ?? (_) {},
           onSendText: onSendText ?? () {},
@@ -777,5 +790,84 @@ void main() {
     expect(find.text('锁定主机屏幕'), findsNothing);
     expect(find.text('重启主机…'), findsNothing);
     expect(picked, isNull);
+  });
+
+  testWidgets('the mouse menu reports the remapping toggles and the pointer lock',
+      (WidgetTester tester) async {
+    int reverse = 0;
+    int swap = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      reverseWheel: true,
+      onToggleReverseWheel: () => ++reverse,
+      onToggleSwapButtons: () => ++swap,
+    ));
+
+    await tester.tap(find.byIcon(Icons.mouse_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('反向滚轮'), findsOneWidget);
+    expect(find.text('交换左右键'), findsOneWidget);
+    expect(find.text('相对鼠标'), findsOneWidget);
+    expect(
+      tester
+          .widget<PopupMenuItem<int>>(
+              find.widgetWithText(PopupMenuItem<int>, '相对鼠标'))
+          .enabled,
+      isFalse,
+    );
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<int>, '反向滚轮'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<int>, '交换左右键'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsNothing,
+    );
+
+    await tester.tap(find.text('交换左右键'));
+    await tester.pumpAndSettle();
+    expect(swap, 1);
+    expect(reverse, 0);
+
+    await tester.tap(find.byIcon(Icons.mouse_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('反向滚轮'));
+    await tester.pumpAndSettle();
+    expect(reverse, 1);
+  });
+
+  testWidgets('the pointer lock reports taps while control is on',
+      (WidgetTester tester) async {
+    int lock = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      controlEnabled: true,
+      relativeMouse: true,
+      onToggleRelativeMouse: () => ++lock,
+    ));
+
+    await tester.tap(find.byIcon(Icons.mouse_rounded));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<int>, '相对鼠标'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('相对鼠标'));
+    await tester.pumpAndSettle();
+    expect(lock, 1);
   });
 }

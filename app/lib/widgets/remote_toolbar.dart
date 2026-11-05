@@ -82,6 +82,12 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSelectStreamQuality,
     required this.onSelectStreamFps,
     required this.onToggleControl,
+    this.reverseWheel = false,
+    this.swapButtons = false,
+    this.onToggleReverseWheel,
+    this.onToggleSwapButtons,
+    this.relativeMouse = false,
+    this.onToggleRelativeMouse,
     required this.specialKeysAvailable,
     required this.onSpecialAction,
     required this.onSendText,
@@ -205,6 +211,19 @@ class RemoteToolbar extends StatelessWidget {
   final ValueChanged<ViewerStreamQuality> onSelectStreamQuality;
   final ValueChanged<int> onSelectStreamFps;
   final VoidCallback onToggleControl;
+
+  /// Viewer-side mouse remapping, applied before events reach the host and
+  /// kept across sessions.
+  final bool reverseWheel;
+  final bool swapButtons;
+  final VoidCallback? onToggleReverseWheel;
+  final VoidCallback? onToggleSwapButtons;
+
+  /// Locks the local pointer and sends relative movement. Session-only: it is
+  /// never restored, because a fresh session must not start with a locked
+  /// pointer the user did not ask for.
+  final bool relativeMouse;
+  final VoidCallback? onToggleRelativeMouse;
   /// True while remote control is on, so a shortcut would actually reach the
   /// host. The button stays visible but disabled otherwise.
   final bool specialKeysAvailable;
@@ -512,6 +531,15 @@ class RemoteToolbar extends StatelessWidget {
                 onSelectCodec: onSelectStreamCodec,
                 onSelectQuality: onSelectStreamQuality,
                 onSelectFps: onSelectStreamFps,
+              ),
+              _MouseOptionsButton(
+                reverseWheel: reverseWheel,
+                swapButtons: swapButtons,
+                onToggleReverseWheel: onToggleReverseWheel,
+                onToggleSwapButtons: onToggleSwapButtons,
+                relativeMouse: relativeMouse,
+                controlEnabled: controlEnabled,
+                onToggleRelativeMouse: onToggleRelativeMouse,
               ),
               _BarButton(
                 icon: Icons.keyboard_alt_outlined,
@@ -1573,6 +1601,145 @@ class _StreamOptionsButton extends StatelessWidget {
             ),
           ),
           if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+        ],
+      ),
+    );
+  }
+}
+
+/// Local mouse remapping and the pointer lock. Neither switch changes what the
+/// host supports; they only affect how this viewer's pointer events are
+/// translated. The pointer lock needs remote control, so it is disabled while
+/// control is off.
+class _MouseOptionsButton extends StatelessWidget {
+  const _MouseOptionsButton({
+    required this.reverseWheel,
+    required this.swapButtons,
+    required this.onToggleReverseWheel,
+    required this.onToggleSwapButtons,
+    required this.relativeMouse,
+    required this.controlEnabled,
+    required this.onToggleRelativeMouse,
+  });
+
+  final bool reverseWheel;
+  final bool swapButtons;
+  final VoidCallback? onToggleReverseWheel;
+  final VoidCallback? onToggleSwapButtons;
+  final bool relativeMouse;
+  final bool controlEnabled;
+  final VoidCallback? onToggleRelativeMouse;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tr('鼠标：反向滚轮、左右键互换、相对鼠标'),
+      waitDuration: const Duration(milliseconds: 450),
+      child: PopupMenuButton<int>(
+        tooltip: '',
+        color: const Color(0xFF24252B),
+        elevation: 8,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(minWidth: 230, maxWidth: 300),
+        onSelected: (int index) {
+          if (index == 0) {
+            onToggleReverseWheel?.call();
+          } else if (index == 1) {
+            onToggleSwapButtons?.call();
+          } else if (index == 2) {
+            onToggleRelativeMouse?.call();
+          }
+        },
+        itemBuilder: (BuildContext context) {
+          return <PopupMenuEntry<int>>[
+            PopupMenuItem<int>(
+              enabled: false,
+              height: 28,
+              child: Text(
+                tr('鼠标'),
+                style: const TextStyle(
+                  fontSize: 10,
+                  color: Colors.white38,
+                  letterSpacing: 0.6,
+                ),
+              ),
+            ),
+            _toggle(
+              0,
+              tr('反向滚轮'),
+              tr('滚轮方向与主机相反'),
+              Icons.swap_vert_rounded,
+              reverseWheel,
+            ),
+            _toggle(
+              1,
+              tr('交换左右键'),
+              tr('左键触发右键，右键触发左键'),
+              Icons.swap_horiz_rounded,
+              swapButtons,
+            ),
+            _toggle(
+              2,
+              tr('相对鼠标'),
+              controlEnabled
+                  ? tr('锁定指针并发送相对移动（Ctrl+Alt+Shift+R 退出）')
+                  : tr('开启远程键鼠后可用'),
+              Icons.mouse_outlined,
+              relativeMouse,
+              enabled: controlEnabled,
+            ),
+          ];
+        },
+        child: SizedBox(
+          width: 32,
+          height: 32,
+          child: Icon(Icons.mouse_rounded, size: 18, color: Colors.grey.shade300),
+        ),
+      ),
+    );
+  }
+
+  PopupMenuItem<int> _toggle(
+    int index,
+    String title,
+    String detail,
+    IconData icon,
+    bool selected, {
+    bool enabled = true,
+  }) {
+    return PopupMenuItem<int>(
+      value: index,
+      enabled: enabled,
+      height: 42,
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 16, color: selected ? kAccentBright : Colors.white54),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: selected ? kAccentBright : Colors.white70,
+                  ),
+                ),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+          if (selected)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );

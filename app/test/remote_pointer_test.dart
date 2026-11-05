@@ -98,4 +98,38 @@ void main() {
     );
     expect(windowsPenFlags(PointerDeviceKind.touch, kPrimaryButton), 0);
   });
+
+  test('mouse mapping is a no-op when both switches are off', () {
+    const MouseMapping mapping = MouseMapping();
+    expect(mapping.buttons(ViewerMouse.left), ViewerMouse.left);
+    expect(mapping.buttons(ViewerMouse.right), ViewerMouse.right);
+    expect(
+      mapping.buttons(ViewerMouse.left | ViewerMouse.middle),
+      ViewerMouse.left | ViewerMouse.middle,
+    );
+    expect(mapping.wheelY(120), 120);
+    expect(mapping.wheelX(-120), -120);
+  });
+
+  test('swapping exchanges left and right and keeps the other buttons', () {
+    const MouseMapping mapping = MouseMapping(swapButtons: true);
+    expect(mapping.buttons(ViewerMouse.left), ViewerMouse.right);
+    expect(mapping.buttons(ViewerMouse.right), ViewerMouse.left);
+    expect(mapping.buttons(ViewerMouse.left | ViewerMouse.right), 3);
+    expect(
+      mapping.buttons(
+        ViewerMouse.left | ViewerMouse.middle | ViewerMouse.back,
+      ),
+      ViewerMouse.right | ViewerMouse.middle | ViewerMouse.back,
+    );
+    expect(mapping.buttons(0), 0);
+  });
+
+  test('reversing the wheel flips both axes', () {
+    const MouseMapping mapping = MouseMapping(reverseWheel: true);
+    expect(mapping.wheelY(120), -120);
+    expect(mapping.wheelY(-120), 120);
+    expect(mapping.wheelX(240), -240);
+    expect(mapping.buttons(ViewerMouse.left), ViewerMouse.left);
+  });
 }

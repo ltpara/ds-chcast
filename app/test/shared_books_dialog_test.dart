@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -6,6 +8,7 @@ import 'package:chast_viewer/account_store.dart';
 import 'package:chast_viewer/pages/shared_books_dialog.dart';
 import 'package:chast_viewer/server_api.dart';
 import 'package:chast_viewer/server_settings.dart';
+import 'package:chast_viewer/view_filter.dart';
 
 class _Selection {
   AddressBookPeer? peer;
@@ -19,6 +22,18 @@ void main() {
     token: 'account-token',
     expiresAt: DateTime.utc(2030),
   );
+
+  // Search text now persists to the user profile; keep it in a throwaway file.
+  late Directory filterDir;
+  setUp(() {
+    filterDir = Directory.systemTemp.createTempSync('chast_shared_ui_');
+    ViewFilter.configPathOverride =
+        '${filterDir.path}${Platform.pathSeparator}ui-filter.json';
+  });
+  tearDown(() {
+    ViewFilter.configPathOverride = null;
+    filterDir.deleteSync(recursive: true);
+  });
 
   Future<_Selection> open(WidgetTester tester, SharedBooksDialog dialog) async {
     final _Selection selection = _Selection();
@@ -112,6 +127,51 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('没有匹配的共享条目'), findsOneWidget);
     expect(find.text('carol'), findsNothing);
+  });
+
+  testWidgets('a saved shared search is restored and matches pinyin', (
+    tester,
+  ) async {
+    ViewFilter.saveSearch(SearchView.shared, 'zs');
+    ViewFilter.saveSearch(SearchView.devices, 'keep');
+    final SharedBooksDialog dialog = SharedBooksDialog(
+      server: settings,
+      account: account,
+      loadGrants: (ServerSettings server, String token) async =>
+          const AddressBookGrants(),
+      loadBooks: (ServerSettings server, String token) async =>
+          const <SharedAddressBook>[
+            SharedAddressBook(
+              owner: 'carol',
+              revision: 9,
+              peers: <AddressBookPeer>[
+                AddressBookPeer(id: 'zhangsanbox', name: '张三'),
+                AddressBookPeer(id: 'officemac', name: 'Office Mac'),
+              ],
+            ),
+          ],
+    );
+    await open(tester, dialog);
+
+    expect(find.text('张三'), findsOneWidget);
+    expect(find.text('Office Mac'), findsNothing);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('shared-books-search')))
+          .controller
+          ?.text,
+      'zs',
+    );
+
+    await tester.enterText(
+      find.byKey(const Key('shared-books-search')),
+      'office',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Office Mac'), findsOneWidget);
+    expect(find.text('张三'), findsNothing);
+    expect(ViewFilter.loadSearch(SearchView.shared), 'office');
+    expect(ViewFilter.loadSearch(SearchView.devices), 'keep');
   });
 
   testWidgets('a shared entry copies its peer id without write access', (

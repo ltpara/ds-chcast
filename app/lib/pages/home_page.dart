@@ -12,6 +12,7 @@ import '../app_info.dart';
 import '../device_store.dart';
 import '../lan_discovery.dart';
 import '../security_key.dart';
+import '../search_match.dart';
 import '../server_api.dart';
 import '../server_identity.dart';
 import '../server_settings.dart';
@@ -396,6 +397,8 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {
       // Hostname is decorative; keep the fallback.
     }
+    _deviceQuery = ViewFilter.loadSearch(SearchView.devices);
+    _deviceSearch.text = _deviceQuery;
     unawaited(_load());
     _presenceTimer = Timer.periodic(
       _presenceInterval,
@@ -1982,7 +1985,7 @@ class _HomePageState extends State<HomePage> {
     ];
   }
 
-  /// Group ids whose name, or the name of an ancestor, contains [query].
+  /// Group ids whose name, or the name of an ancestor, matches [query].
   /// Only groups cached from the account take part.
   Set<String> _groupsMatchingQuery(String query) {
     final Set<String> hits = <String>{};
@@ -2001,7 +2004,7 @@ class _HomePageState extends State<HomePage> {
         if (current == null) {
           break;
         }
-        if (current.name.toLowerCase().contains(query)) {
+        if (SearchMatch.matches(query, <String>[current.name])) {
           hits.add(group.id);
           break;
         }
@@ -2036,7 +2039,7 @@ class _HomePageState extends State<HomePage> {
       presence?.info?.alias ?? '',
       ...?presence?.info?.tags,
     ];
-    return fields.any((String value) => value.toLowerCase().contains(query));
+    return SearchMatch.matches(query, fields);
   }
 
   void _clearDeviceFilters() {
@@ -2046,6 +2049,7 @@ class _HomePageState extends State<HomePage> {
       _selectedTags.clear();
     });
     ViewFilter.save(_selectedTags);
+    ViewFilter.saveSearch(SearchView.devices, '');
   }
 
   int get _onlineCount => _presence.values
@@ -2557,7 +2561,10 @@ class _HomePageState extends State<HomePage> {
         TextField(
           key: const Key('device-search'),
           controller: _deviceSearch,
-          onChanged: (String value) => setState(() => _deviceQuery = value),
+          onChanged: (String value) {
+            setState(() => _deviceQuery = value);
+            ViewFilter.saveSearch(SearchView.devices, value);
+          },
           style: TextStyle(fontSize: 12.5, color: theme.colorScheme.onSurface),
           decoration: InputDecoration(
             isDense: true,
@@ -2589,6 +2596,7 @@ class _HomePageState extends State<HomePage> {
                     onPressed: () {
                       _deviceSearch.clear();
                       setState(() => _deviceQuery = '');
+                      ViewFilter.saveSearch(SearchView.devices, '');
                     },
                   ),
             suffixIconConstraints: const BoxConstraints(

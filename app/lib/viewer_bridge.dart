@@ -2251,6 +2251,22 @@ class ViewerBridge {
     return active ?? false;
   }
 
+  /// Pins the local pointer to the viewer window and turns motion into
+  /// relative moves for the host, so a drag never hits a screen edge. [scale]
+  /// is physical window pixels per captured pixel. False means native capture
+  /// stayed off (no view window); the page then keeps sending absolute moves.
+  static Future<bool> setRelativeMouse({
+    required bool enabled,
+    required double scale,
+  }) async {
+    final int scaleMilli = (scale * 1000).round().clamp(1, 100000);
+    final bool? active = await _channel.invokeMethod<bool>(
+      'setRelativeMouse',
+      <String, Object>{'enabled': enabled, 'scaleMilli': scaleMilli},
+    );
+    return active ?? false;
+  }
+
   /// Pauses or resumes the native rich-clipboard bridge. While paused neither
   /// direction touches the local clipboard. The host's own clipboard gate is
   /// applied on top of this switch.

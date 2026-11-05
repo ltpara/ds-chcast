@@ -4,14 +4,17 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 /// Persists small pieces of address-book UI state so a viewer comes back the
-/// way it was left: the tag filter applied to "我的设备" and the collapsed
-/// state of address-book groups. The search boxes are deliberately not
-/// persisted: a forgotten text query would hide devices with no visible cause.
+/// way it was left: the tag filter applied to "我的设备", the collapsed state
+/// of address-book groups, and the search text of each address-book view. The
+/// two searches use separate keys so typing in one never hides entries in the
+/// other; clearing a search removes its key entirely.
 class ViewFilter {
   ViewFilter._();
 
   static const String _tagsKey = 'tags';
   static const String _collapsedKey = 'collapsed';
+  static const String _deviceSearchKey = 'search_devices';
+  static const String _sharedSearchKey = 'search_shared';
 
   /// Redirects the filter file away from the real user profile in tests.
   @visibleForTesting
@@ -26,7 +29,7 @@ class ViewFilter {
   /// Writes [tags], trimming blanks and dropping duplicates so the file stays
   /// stable between saves.
   static void save(Iterable<String> tags) {
-    _write(_tagsKey, _clean(tags, dropEmpty: true).toList()..sort());
+    _writeList(_tagsKey, _clean(tags, dropEmpty: true).toList()..sort());
   }
 
   /// Group IDs collapsed on the device page. The empty string is the
@@ -36,7 +39,28 @@ class ViewFilter {
   }
 
   static void saveCollapsed(Iterable<String> groups) {
-    _write(_collapsedKey, _clean(groups, dropEmpty: false).toList()..sort());
+    _writeList(_collapsedKey, _clean(groups, dropEmpty: false).toList()..sort());
+  }
+
+  /// The last search typed in [view]. Empty when none was saved; a locked or
+  /// corrupt file falls back to the same state.
+  static String loadSearch(SearchView view) {
+    final Object? raw = _readMap()[_searchKey(view)];
+    return raw is String ? raw.trim() : '';
+  }
+
+  /// Remembers [query] for [view] until it is cleared. An empty query drops
+  /// the key so the file does not carry a filter that hides everything.
+  static void saveSearch(SearchView view, String query) {
+    final String value = query.trim();
+    _writeValue(_searchKey(view), value.isEmpty ? null : value);
+  }
+
+  static String _searchKey(SearchView view) {
+    return switch (view) {
+      SearchView.devices => _deviceSearchKey,
+      SearchView.shared => _sharedSearchKey,
+    };
   }
 
   static Set<String> _clean(Object? raw, {required bool dropEmpty}) {
@@ -69,12 +93,21 @@ class ViewFilter {
     return <String, Object?>{};
   }
 
-  static void _write(String key, List<String> values) {
+  static void _writeList(String key, List<String> values) {
+    _writeValue(key, values);
+  }
+
+  static void _writeValue(String key, Object? value) {
     final File? file = _file();
     if (file == null) {
       return;
     }
-    final Map<String, Object?> payload = _readMap()..[key] = values;
+    final Map<String, Object?> payload = _readMap();
+    if (value == null) {
+      payload.remove(key);
+    } else {
+      payload[key] = value;
+    }
     try {
       file.parent.createSync(recursive: true);
       file.writeAsStringSync(jsonEncode(payload));
@@ -95,3 +128,6 @@ class ViewFilter {
     return File('$appData\\chast\\ui-filter.json');
   }
 }
+
+/// The two address-book views with independent search state.
+enum SearchView { devices, shared }

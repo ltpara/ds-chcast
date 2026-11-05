@@ -584,4 +584,15 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The RDP forward is not ready: check that the host allows port forwarding',
   '已启动远程桌面：127.0.0.1:{port}': 'Opened Remote Desktop at 127.0.0.1:{port}',
   '无法启动远程桌面：{error}': 'Could not open Remote Desktop: {error}',
+  '鼠标': 'Mouse',
+  '鼠标：反向滚轮、左右键互换、相对鼠标':
+      'Mouse: reverse wheel, swap buttons, relative mouse',
+  '反向滚轮': 'Reverse wheel',
+  '滚轮方向与主机相反': 'Flip the wheel direction',
+  '交换左右键': 'Swap left and right buttons',
+  '左键触发右键，右键触发左键': 'Left clicks act as right and vice versa',
+  '相对鼠标': 'Relative mouse',
+  '锁定指针并发送相对移动（Ctrl+Alt+Shift+R 退出）':
+      'Lock the pointer and send relative motion (Ctrl+Alt+Shift+R to exit)',
+  '开启远程键鼠后可用': 'Available once remote input is on',
 };

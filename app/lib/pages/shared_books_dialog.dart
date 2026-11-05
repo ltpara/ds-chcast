@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../account_store.dart';
+import '../search_match.dart';
 import '../server_api.dart';
 import '../server_settings.dart';
 import '../theme.dart';
+import '../view_filter.dart';
 import 'package:chast_viewer/l10n.dart';
 
 typedef SharedGrantsLoader =
@@ -139,6 +141,7 @@ class SharedBooksDialog extends StatefulWidget {
 
 class _SharedBooksDialogState extends State<SharedBooksDialog> {
   final TextEditingController _username = TextEditingController();
+  final TextEditingController _search = TextEditingController();
   AddressBookGrants _grants = const AddressBookGrants();
   List<SharedAddressBook> _books = const <SharedAddressBook>[];
   String _permission = 'read';
@@ -184,12 +187,15 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   @override
   void initState() {
     super.initState();
+    _query = ViewFilter.loadSearch(SearchView.shared);
+    _search.text = _query;
     _load();
   }
 
   @override
   void dispose() {
     _username.dispose();
+    _search.dispose();
     super.dispose();
   }
 
@@ -452,13 +458,14 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
   }
 
   bool _peerMatches(AddressBookPeer peer, String query) {
-    final String needle = query.trim().toLowerCase();
-    if (needle.isEmpty) {
+    if (query.trim().isEmpty) {
       return true;
     }
-    return peer.id.toLowerCase().contains(needle) ||
-        peer.name.toLowerCase().contains(needle) ||
-        peer.tags.any((String tag) => tag.toLowerCase().contains(needle));
+    return SearchMatch.matches(query, <String>[
+      peer.id,
+      peer.name,
+      ...peer.tags,
+    ]);
   }
 
   List<AddressBookPeer> _visiblePeers(SharedAddressBook book) =>
@@ -491,6 +498,7 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
               width: 170,
               child: TextField(
                 key: const Key('shared-books-search'),
+                controller: _search,
                 style: const TextStyle(fontSize: 12),
                 decoration: InputDecoration(
                   isDense: true,
@@ -502,7 +510,10 @@ class _SharedBooksDialogState extends State<SharedBooksDialog> {
                     horizontal: 8,
                   ),
                 ),
-                onChanged: (String value) => setState(() => _query = value),
+                onChanged: (String value) {
+                  setState(() => _query = value);
+                  ViewFilter.saveSearch(SearchView.shared, value);
+                },
               ),
             ),
           IconButton(

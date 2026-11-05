@@ -36,6 +36,31 @@ class RemoteContactTracker {
   void clear() => _slots.clear();
 }
 
+/// Local mouse remapping: the wheel direction can be flipped and the primary
+/// and secondary buttons exchanged before an event reaches the host. Both are
+/// viewer-side conveniences, so the host never learns about them.
+class MouseMapping {
+  const MouseMapping({this.reverseWheel = false, this.swapButtons = false});
+
+  final bool reverseWheel;
+  final bool swapButtons;
+
+  /// Exchanges the left and right bits of a [ViewerMouse] button mask and
+  /// leaves the other three buttons alone.
+  int buttons(int mask) {
+    if (!swapButtons) {
+      return mask;
+    }
+    final int left = (mask & ViewerMouse.left) << 1;
+    final int right = (mask & ViewerMouse.right) >> 1;
+    return (mask & ~(ViewerMouse.left | ViewerMouse.right)) | left | right;
+  }
+
+  int wheelY(int delta) => reverseWheel ? -delta : delta;
+
+  int wheelX(int delta) => reverseWheel ? -delta : delta;
+}
+
 /// Flutter pressure -> Windows' 0..1024 range, shared by pen and touch. Zero
 /// means "not reported" (a default pressure with no range, or a non-finite
 /// value); the host then omits the pressure field instead of inventing a

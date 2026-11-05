@@ -3606,6 +3606,82 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('a saved device search is restored and matches pinyin', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    ViewFilter.saveSearch(SearchView.devices, 'zhangsan');
+    ViewFilter.saveSearch(SearchView.shared, 'carol');
+
+    final DateTime now = DateTime.now();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[
+            Device(
+              id: 'zhangsanbox',
+              name: '张三',
+              server: 'http://127.0.0.1:8443',
+              saved: true,
+              addedAt: now,
+            ),
+            Device(
+              id: 'lab',
+              name: '实验室',
+              server: 'http://127.0.0.1:8443',
+              saved: true,
+              addedAt: now.subtract(const Duration(minutes: 1)),
+            ),
+          ]),
+          serverStore: _MemoryServers(
+            const ServerSettings(url: 'http://127.0.0.1:8443'),
+          ),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+          lookupBatch: (ServerSettings server, List<String> hostIds) async {
+            return const BatchLookupResult(hosts: <String, HostInfo>{});
+          },
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    expect(_savedCount(tester), '1/2');
+    expect(find.text('张三'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('device-search')))
+          .controller
+          ?.text,
+      'zhangsan',
+    );
+
+    await tester.enterText(find.byKey(const Key('device-search')), 'zs');
+    await tester.pump();
+    expect(_savedCount(tester), '1/2');
+    expect(find.text('张三'), findsOneWidget);
+    expect(find.text('实验室'), findsNothing);
+    expect(ViewFilter.loadSearch(SearchView.devices), 'zs');
+    expect(ViewFilter.loadSearch(SearchView.shared), 'carol');
+
+    await tester.tap(find.byKey(const Key('device-filter-reset')));
+    await tester.pump();
+    expect(_savedCount(tester), '2');
+    expect(find.text('张三'), findsOneWidget);
+    expect(find.text('实验室'), findsOneWidget);
+    expect(ViewFilter.loadSearch(SearchView.devices), isEmpty);
+    expect(ViewFilter.loadSearch(SearchView.shared), 'carol');
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('a saved tag filter is restored at launch and saved again', (
     WidgetTester tester,
   ) async {

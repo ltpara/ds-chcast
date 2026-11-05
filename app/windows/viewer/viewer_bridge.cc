@@ -9,6 +9,7 @@
 #include <flutter/flutter_engine.h>
 #include <flutter/standard_method_codec.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -273,6 +274,7 @@ void ViewerBridge::Shutdown() {
     // the flag itself; clearing it here covers the window already being gone.
     security_key_busy_->store(false);
     SetKeyCapture(false);
+    SetRelativeMouse(false, 1.0);
     ClearCursor();
     if (view_ != nullptr) {
         if (IsWindow(view_)) {
@@ -966,6 +968,23 @@ void ViewerBridge::HandleMethodCall(
         SetKeyCapture(*enable);
         result->Success(
             flutter::EncodableValue(key_capture_.load(std::memory_order_relaxed)));
+        return;
+    }
+
+    if (method == "setRelativeMouse") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        bool enable = false;
+        int64_t scale_milli = 1000;
+        if (args == nullptr || !map_bool(*args, "enabled", &enable) ||
+            !map_int(*args, "scaleMilli", &scale_milli) || scale_milli <= 0 ||
+            scale_milli > 100000) {
+            result->Error("bad_args",
+                          "setRelativeMouse wants enabled and a positive scaleMilli");
+            return;
+        }
+        SetRelativeMouse(enable, static_cast<double>(scale_milli) / 1000.0);
+        result->Success(
+            flutter::EncodableValue(relative_mouse_.load(std::memory_order_relaxed)));
         return;
     }
 
@@ -2164,6 +2183,7 @@ void ViewerBridge::SendInput(
 
     chast::InputEvent event;
     event.modifiers = static_cast<uint16_t>(modifiers);
+    last_modifiers_ = event.modifiers;
     if (kind == 1) {
         event.kind = chast::InputKind::Mouse;
         if (action < 0 || action > 5 || buttons < 0 || buttons > 0x1F ||
@@ -2259,11 +2279,117 @@ void ViewerBridge::SetKeyCapture(bool enable) {
     }
 }
 
+void ViewerBridge::SetRelativeMouse(bool enable, double scale) {
+    relative_scale_ = scale > 0.0 ? scale : 1.0;
+    relative_mouse_.store(enable, std::memory_order_relaxed);
+    if (view_ == nullptr || !IsWindow(view_)) {
+        return;
+    }
+    if (!enable) {
+        ClipCursor(nullptr);
+        return;
+    }
+    // Park the pointer in the middle so the first relative move starts from a
+    // known spot, then confine it so a fast drag cannot leave the video.
+    RECT client{};
+    GetClientRect(view_, &client);
+    if (client.right <= client.left || client.bottom <= client.top) {
+        return;
+    }
+    POINT center{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+    ClientToScreen(view_, &center);
+    ::SetCursorPos(center.x, center.y);
+    ClipRelativePointer();
+}
+
+void ViewerBridge::ClipRelativePointer() {
+    if (view_ == nullptr || !IsWindow(view_)) {
+        return;
+    }
+    RECT client{};
+    if (GetClientRect(view_, &client) == 0) {
+        return;
+    }
+    if (client.right <= client.left || client.bottom <= client.top) {
+        // A minimised window has no client area; an empty clip would pin the
+        // pointer to one screen pixel.
+        ClipCursor(nullptr);
+        return;
+    }
+    POINT top_left{client.left, client.top};
+    POINT bottom_right{client.right, client.bottom};
+    if (ClientToScreen(view_, &top_left) == 0 ||
+        ClientToScreen(view_, &bottom_right) == 0) {
+        return;
+    }
+    const RECT clip{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+    ClipCursor(&clip);
+}
+
 LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARAM wparam,
                                                 LPARAM lparam, UINT_PTR id, DWORD_PTR ref_data) {
     auto* self = reinterpret_cast<ViewerBridge*>(ref_data);
     if (self != nullptr) {
         switch (message) {
+            case WM_MOUSEMOVE:
+                // Relative mode owns the pointer: report the offset from the
+                // client centre as host motion and recentre, then swallow the
+                // message so Flutter never sees the warp as pointer movement.
+                // Only while this window is foreground: after an alt-tab the
+                // pointer must be free to leave, even before focus returns.
+                if (self->relative_mouse_.load(std::memory_order_relaxed) &&
+                    self->viewer_ != nullptr &&
+                    GetAncestor(window, GA_ROOT) == GetForegroundWindow()) {
+                    const int x = static_cast<short>(LOWORD(lparam));
+                    const int y = static_cast<short>(HIWORD(lparam));
+                    RECT client{};
+                    GetClientRect(window, &client);
+                    const int center_x = (client.right - client.left) / 2;
+                    const int center_y = (client.bottom - client.top) / 2;
+                    const int offset_x = x - center_x;
+                    const int offset_y = y - center_y;
+                    if (offset_x != 0 || offset_y != 0) {
+                        const double scale =
+                            self->relative_scale_ > 0.0 ? self->relative_scale_ : 1.0;
+                        const int move_x =
+                            static_cast<int>(std::lround(offset_x / scale));
+                        const int move_y =
+                            static_cast<int>(std::lround(offset_y / scale));
+                        if (move_x != 0 || move_y != 0) {
+                            chast::InputEvent event;
+                            event.kind = chast::InputKind::Mouse;
+                            event.modifiers = self->last_modifiers_;
+                            event.mouse.action = chast::MouseAction::MoveRelative;
+                            event.mouse.buttons = 0;
+                            event.mouse.x = move_x;
+                            event.mouse.y = move_y;
+                            self->viewer_->SendInput(event);
+                        }
+                    }
+                    POINT center{center_x, center_y};
+                    ClientToScreen(window, &center);
+                    ::SetCursorPos(center.x, center.y);
+                    return 0;
+                }
+                break;
+            case WM_SIZE:
+            case WM_MOVE:
+                if (self->relative_mouse_.load(std::memory_order_relaxed)) {
+                    self->ClipRelativePointer();
+                }
+                break;
+            case WM_SETFOCUS:
+                if (self->relative_mouse_.load(std::memory_order_relaxed)) {
+                    self->ClipRelativePointer();
+                }
+                break;
+            case WM_KILLFOCUS:
+                if (self->relative_mouse_.load(std::memory_order_relaxed)) {
+                    // Another window owns the pointer now; keeping the clip
+                    // would trap it outside that window.
+                    ClipCursor(nullptr);
+                }
+                break;
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
             case WM_KEYUP:
@@ -2295,7 +2421,8 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                 // keeps Flutter from installing its own cursor on top: the
                 // page hides the system cursor while control is on, and this
                 // is what puts the host's arrow/I-beam/resize grip back.
-                if (LOWORD(lparam) == HTCLIENT && self->cursor_override_) {
+                if (LOWORD(lparam) == HTCLIENT && self->cursor_override_ &&
+                    !self->relative_mouse_.load(std::memory_order_relaxed)) {
                     HCURSOR cursor = self->remote_cursor_.cursor();
                     if (cursor != nullptr) {
                         ::SetCursor(cursor);
@@ -2332,6 +2459,9 @@ LRESULT CALLBACK ViewerBridge::ViewSubclassProc(HWND window, UINT message, WPARA
                 return 0;
             }
             case WM_NCDESTROY:
+                if (self->relative_mouse_.exchange(false, std::memory_order_relaxed)) {
+                    ClipCursor(nullptr);
+                }
                 RemoveWindowSubclass(window, &ViewerBridge::ViewSubclassProc, id);
                 self->view_ = nullptr;
                 break;

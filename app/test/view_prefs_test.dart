@@ -37,6 +37,8 @@ void main() {
     expect(prefs.fileSortAscending, isTrue);
     expect(prefs.browserDirectory, '');
     expect(prefs.terminalFontSize, 13);
+    expect(prefs.reverseWheel, isFalse);
+    expect(prefs.swapButtons, isFalse);
   });
 
   test('saves and loads the choices', () {
@@ -48,6 +50,8 @@ void main() {
         fileSortAscending: false,
         browserDirectory: 'photos/2026',
         terminalFontSize: 17,
+        reverseWheel: true,
+        swapButtons: true,
       ),
     );
     final ViewPreferences prefs = ViewPreferences.load();
@@ -57,6 +61,8 @@ void main() {
     expect(prefs.fileSortAscending, isFalse);
     expect(prefs.browserDirectory, 'photos/2026');
     expect(prefs.terminalFontSize, 17);
+    expect(prefs.reverseWheel, isTrue);
+    expect(prefs.swapButtons, isTrue);
     expect(readFile(), <String, Object?>{
       'view_fit': 1,
       'view_stats': true,
@@ -64,6 +70,8 @@ void main() {
       'file_sort_asc': false,
       'browser_dir': 'photos/2026',
       'terminal_font_size': 17,
+      'view_reverse_wheel': true,
+      'view_swap_buttons': true,
     });
   });
 
@@ -76,6 +84,8 @@ void main() {
         'file_sort_asc': 'up',
         'browser_dir': 7,
         'terminal_font_size': 99,
+        'view_reverse_wheel': 'yes',
+        'view_swap_buttons': 1,
       }),
     );
     final ViewPreferences prefs = ViewPreferences.load();
@@ -85,6 +95,8 @@ void main() {
     expect(prefs.fileSortAscending, isTrue);
     expect(prefs.browserDirectory, '');
     expect(prefs.terminalFontSize, 13);
+    expect(prefs.reverseWheel, isFalse);
+    expect(prefs.swapButtons, isFalse);
   });
 
   test('browser directory keeps only real path segments', () {
@@ -123,6 +135,8 @@ void main() {
       'file_sort_asc': false,
       'browser_dir': 'photos/2026',
       'terminal_font_size': 13,
+      'view_reverse_wheel': false,
+      'view_swap_buttons': false,
     });
   });
 
