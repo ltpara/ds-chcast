@@ -11,6 +11,7 @@
 #include <sddl.h>
 #include <setupapi.h>
 #include <softpub.h>
+#include <wincrypt.h>
 #include <winternl.h>
 #include <wintrust.h>
 
@@ -944,9 +945,12 @@ VirtualDisplayPackageStatus verify_package_files(
             *package_sha256 = digest;
         }
     }
-    if (!verify_authenticode(dir + L"\\deviceinstaller64.exe", &error)) {
+    // The official package ships deviceinstaller64.exe unsigned; the WHQL
+    // catalog is the signature Windows trusts for the driver payload, so the
+    // catalog is checked instead of the installer binary.
+    if (!verify_catalog_signature(dir + L"\\usbmmidd.cat", &error)) {
         if (detail != nullptr) {
-            *detail = "deviceinstaller64.exe is not trusted: " + error;
+            *detail = "usbmmidd.cat is not trusted: " + error;
         }
         return fail(VirtualDisplayPackageStatus::SignatureMismatch);
     }
@@ -1636,6 +1640,74 @@ bool verify_authenticode(const std::wstring& path, std::string* error) {
         return false;
     }
     return true;
+}
+
+bool verify_catalog_signature(const std::wstring& path, std::string* error) {
+    if (error != nullptr) {
+        error->clear();
+    }
+    if (!verify_authenticode(path, error)) {
+        return false;
+    }
+    HCERTSTORE store = nullptr;
+    HCRYPTMSG message = nullptr;
+    DWORD encoding = 0;
+    DWORD content = 0;
+    DWORD format = 0;
+    const BOOL opened = CryptQueryObject(
+        CERT_QUERY_OBJECT_FILE, path.c_str(),
+        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_FORMAT_FLAG_BINARY, 0, &encoding, &content, &format, &store, &message,
+        nullptr);
+    if (!opened || store == nullptr || message == nullptr) {
+        if (message != nullptr) {
+            CryptMsgClose(message);
+        }
+        if (store != nullptr) {
+            CertCloseStore(store, 0);
+        }
+        if (error != nullptr) {
+            *error = "the catalog is not a readable PKCS#7 signature";
+        }
+        return false;
+    }
+    bool matches = false;
+    std::string reason = "the catalog signer could not be identified";
+    DWORD signer_size = 0;
+    if (CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signer_size) &&
+        signer_size != 0) {
+        std::vector<BYTE> buffer(signer_size);
+        if (CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, buffer.data(), &signer_size)) {
+            auto* signer = reinterpret_cast<CMSG_SIGNER_INFO*>(buffer.data());
+            CERT_INFO info{};
+            info.Issuer = signer->Issuer;
+            info.SerialNumber = signer->SerialNumber;
+            PCCERT_CONTEXT certificate = CertFindCertificateInStore(
+                store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_SUBJECT_CERT,
+                &info, nullptr);
+            if (certificate != nullptr) {
+                wchar_t name[256]{};
+                const DWORD chars =
+                    CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
+                                       name, static_cast<DWORD>(std::size(name)));
+                if (chars > 1 &&
+                    _wcsicmp(name, L"Microsoft Windows Hardware Compatibility Publisher") == 0) {
+                    matches = true;
+                } else if (chars > 1) {
+                    reason = "the catalog signer is '" +
+                             to_utf8(std::wstring(name, chars - 1)) +
+                             "', not the Microsoft Windows Hardware Compatibility Publisher";
+                }
+                CertFreeCertificateContext(certificate);
+            }
+        }
+    }
+    CryptMsgClose(message);
+    CertCloseStore(store, 0);
+    if (!matches && error != nullptr) {
+        *error = reason;
+    }
+    return matches;
 }
 
 VirtualDisplayPackageStatus verify_virtual_display_package(

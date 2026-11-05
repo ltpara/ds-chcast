@@ -5,6 +5,9 @@
 §8.2 的 A1–A10，不代表这些项目已经通过。2026-11-04 的状态是：**A1–A10 均未执行**，
 固定哈希驱动包、Amyuni 再分发许可与专用测试机仍未就绪。
 
+2026-11-06 更新：固定哈希已写入获取脚本，真实包已通过代码校验（见 §1.3/§1.6）；
+再分发许可仍未确认，A1–A10 仍须在专用测试机执行，本手册禁止在开发机安装。
+
 执行前请先读完整份手册。安装显示驱动会改变系统显示拓扑，禁止在开发机或任何
 有人正在使用的机器上执行。
 
@@ -26,18 +29,21 @@
 每台测试机在开始前创建快照或系统还原点。A1、A2、A3 的安装与卸载会写入
 PnP 驱动库，回滚快照比手工清理更可靠。
 
-### 1.2 驱动包（外部前置，当前阻塞）
+### 1.2 驱动包（固定哈希已就绪，再分发许可仍待确认）
 
 仓库**不包含** usbmmidd_v2 驱动包，也不会自动下载。执行 A1–A3、A5–A10 前必须
 拿到 Amyuni 官方发布、经法务确认可再分发的固定哈希包，并完成以下检查：
 
-1. 取得官方 `usbmmidd_v2.zip` 的 SHA-256，与团队评审记录一致；
-2. 评审签名链、文件清单与 Amyuni 再分发条款；
-3. 把评审后的哈希写入 `tools/fetch-usbmmidd.ps1` 的 `$pinnedZipSha256`，
+1. 取得官方 `usbmmidd_v2.zip` 的 SHA-256，与团队评审记录一致
+   （2026-11-06 已固定为
+   `629b51e9944762bae73948171c65d09a79595cf4c771a82ebc003fbba5b24f51`）；
+2. 评审签名链、文件清单与 Amyuni 再分发条款（签名链已复核，再分发仍未确认）；
+3. 固定哈希已写入 `tools/fetch-usbmmidd.ps1` 的 `$pinnedZipSha256`，
    并同步更新 `THIRD-PARTY-NOTICES.md` 的许可全文与来源说明。
 
 在 pin 为空时，`fetch-usbmmidd.ps1` 只会打印本地 zip 的哈希并以退出码 2 结束，
-不会下载或解压。不要为了赶验收跳过这一步。
+不会下载或解压。不要为了赶验收跳过这一步。固定哈希目前只用于内部验收测试，
+发布包仍不得包含驱动二进制。
 
 包目录必须包含：
 
@@ -71,7 +77,8 @@ powershell -ExecutionPolicy Bypass -File tools\package-windows.ps1 `
 ### 1.3 本机构建与包检查
 
 ```powershell
-cmake --build build --config Release --target chast-host chast-service
+cmake --build build\root --config Release --target chast-host chast-service `
+  chast-virtual-display-test
 ```
 
 证据目录统一放在 `build\accept\plat-01\A<n>\`（`build` 已被 git 忽略）：
@@ -79,18 +86,32 @@ cmake --build build --config Release --target chast-host chast-service
 ```powershell
 $root = "C:\Program Files\chast"
 $pkg  = Join-Path $root "drivers\usbmmidd_v2"
-$ev   = "D:\accept\plat-01\A1"
+$ev   = "$PWD\build\accept\plat-01\A1"
 New-Item -ItemType Directory -Force $ev | Out-Null
 
-signtool verify /pa /v "$pkg\deviceinstaller64.exe" *> "$ev\signtool-deviceinstaller64.txt"
+# 信任锚点是 WHQL catalog；deviceinstaller64.exe 官方就无签名（NotSigned）
+signtool verify /pa /v "$pkg\usbmmidd.cat" *> "$ev\signtool-cat.txt"
+Get-FileHash "$pkg\usbmmidd.cat" -Algorithm SHA256 |
+  Out-File "$ev\sha256-cat.txt"
 Get-FileHash "$pkg\deviceinstaller64.exe" -Algorithm SHA256 |
   Out-File "$ev\sha256-deviceinstaller64.txt"
 Get-Content "$pkg\manifest.sha256" | Out-File "$ev\manifest.sha256.txt"
+
+# 只校验、不安装：可在禁止安装显示驱动的机器上执行
+& "build\root\Release\chast-virtual-display-test.exe" --verify-package "$pkg" |
+  Tee-Object "$ev\verify-package.txt"
 ```
 
-`signtool` 来自 Visual Studio 或 Windows SDK 开发者命令行。签名链必须终止于
-`Microsoft Windows Hardware Compatibility Publisher`；不是微软 WHPC 的包拒绝安装
-（CLI 退出码 4）。
+`signtool` 来自 Visual Studio 或 Windows SDK 开发者命令行。`usbmmidd.cat`
+的签名链必须终止于 `Microsoft Windows Hardware Compatibility Publisher`；
+不是微软 WHPC 的包拒绝安装（CLI 退出码 4）。`deviceinstaller64.exe` 的
+`NotSigned` 是官方包的预期状态，不作为拒绝条件。
+
+包目录的 ACL 必须可信：SYSTEM/Administrators 可写、Users 只读，不能让
+Authenticated Users 或其他普通账户有写/改权限，否则校验报
+`UntrustedAcl`（CLI 退出码 3）。从 `build\deps` 直接继承的开发目录通常
+带 `Authenticated Users:(M)`，不要直接用于安装；正式路径是安装根下的
+`drivers\usbmmidd_v2`。
 
 ### 1.4 统一路径
 
@@ -132,6 +153,23 @@ Get-Content "$pkg\manifest.sha256" | Out-File "$ev\manifest.sha256.txt"
 
 `install`/`uninstall`/`set-count` 的日志默认写到 `%ProgramData%\chast\vdisplay.log`。
 `uninstall` 与 `set-count` 只使用安装根下的默认包目录，不接受 `--package`。
+
+### 1.6 2026-11-06 真实包预检（不是 A1–A10 通过）
+
+在 Windows 11 25H2 x64（build 26200）开发机上仅执行了不改变显示拓扑的检查：
+
+| 检查 | 结果 |
+| --- | --- |
+| zip SHA-256 | `629b51e9944762bae73948171c65d09a79595cf4c771a82ebc003fbba5b24f51`，与评审值一致 |
+| `manifest.sha256` | fetch 脚本生成 9 条；逐文件哈希在 `verify_virtual_display_package()` 中复核通过 |
+| `usbmmidd.cat` | `signtool verify /pa` 与 `Get-AuthenticodeSignature` 均为 Valid，主体 `CN=Microsoft Windows Hardware Compatibility Publisher` |
+| `deviceinstaller64.exe` | NotSigned（官方包预期状态） |
+| `--verify-package` | `status=0`、`version=2.0.0.1`、包哈希同上、`guard_active=true` |
+| `--vdisplay status`（未安装） | 退出 0，`state=not_installed provider=usbmmidd active=0 max=4` |
+
+原始输出在 `build/accept/plat-01/precheck-2026-11-06/`（`build/` 已忽略）。
+这证明固定哈希包与校验链路可用，**不**代表 A1–A10 已执行；安装/卸载与显示
+拓扑相关项目仍必须在专用测试机按本手册执行。
 
 ## 2. A1：有物理显示器的安装、连接与卸载
 
@@ -458,7 +496,8 @@ Restart-Computer
 每项完成后在 `docs/status-2026-10-25.md` 增加一个小节，至少包含：
 
 - 测试机信息（Windows 版本/架构、物理或虚拟、是否有无头环境）；
-- `signtool verify /pa /v` 的签名链摘要与 `manifest.sha256` 校验结果；
+- `signtool verify /pa /v` 对 `usbmmidd.cat` 的签名链摘要与
+  `manifest.sha256` 校验结果（另附 `deviceinstaller64.exe` 的 NotSigned 记录）；
 - `pnputil /enum-drivers`、`Get-PnpDevice -Class Display` 的前后对比；
 - `vdisplay.log` 与 `worker.log` 中的 `vdisplay:` 行（原样粘贴关键行）；
 - `virtual-display.json` 内容与 `icacls` 输出；
@@ -490,7 +529,7 @@ Restart-Computer
 
 | 编号 | 差距 | 影响 | 处理 |
 | --- | --- | --- | --- |
-| G1 | 固定哈希包、Amyuni 再分发许可与许可全文未就绪 | 不能合法打包/分发驱动，A1–A3、A5–A10 阻塞 | 外部评审；pin 前不得下载 |
+| G1 | 固定哈希已 pin（2026-11-06），Amyuni 再分发许可与许可全文未确认 | 不能随发布包分发驱动；内部验收可用固定哈希包，A1–A3、A5–A10 仍缺专用测试机 | 法务/厂商确认；发布包不得包含驱动 |
 | G2 | 专用无头/多系统测试机未提供 | A2/A3/A7/A10 无法执行 | 安排测试机与快照 |
 | G3 | CLI `--vdisplay uninstall` 不感知活动会话 | 直接命令行卸载可能失败并返回 7，而非友好拒绝 | 已记录；如需强制，另立跨进程会话标记任务 |
 | G4 | `auto` 依赖 `enumerate_displays()` 判断“无显示” | 虚拟机的虚拟显卡可能被视为活动显示 | 在真正的无头物理机执行 A7；否则记录“环境不具备” |

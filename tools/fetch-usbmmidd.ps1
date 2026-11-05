@@ -23,10 +23,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $downloadUrl = "https://www.amyuni.com/downloads/usbmmidd_v2.zip"
 
-# SHA-256 of the official usbmmidd_v2.zip. Leave empty until the package has
-# been reviewed (signature chain, file list, Amyuni redistribution terms) and
-# update this value together with THIRD-PARTY-NOTICES.md.
-$pinnedZipSha256 = ""
+# SHA-256 of the official usbmmidd_v2.zip, reviewed on 2026-11-03 (signature
+# chain, file list and License.txt). Keep this value in sync with
+# THIRD-PARTY-NOTICES.md; redistribution terms are still unconfirmed, so the
+# package may only be used for internal acceptance testing until Amyuni agrees.
+$pinnedZipSha256 = "629b51e9944762bae73948171c65d09a79595cf4c771a82ebc003fbba5b24f51"
 
 $requiredFiles = @(
     "deviceinstaller64.exe", "usbmmidd.inf", "usbmmidd.cat",
@@ -157,17 +158,19 @@ if ($packageCandidates.Count -ne 1) {
 }
 $packageRoot = $packageCandidates[0]
 
-$installer = Join-Path $packageRoot "deviceinstaller64.exe"
-$signature = Get-AuthenticodeSignature -LiteralPath $installer
-if ($signature.Status -eq "Valid") {
-    Write-Host "deviceinstaller64.exe signer: $($signature.SignerCertificate.Subject)"
-    if ($signature.SignerCertificate.Subject -notlike "*$expectedSigner*") {
-        Write-Warning "the signer is not $expectedSigner; chast-host will reject this package"
-    }
+# The official package ships deviceinstaller64.exe unsigned; the WHQL catalog
+# is the trust anchor chast-host verifies, so fail closed when it is missing or
+# names a different publisher.
+$catalog = Join-Path $packageRoot "usbmmidd.cat"
+$signature = Get-AuthenticodeSignature -LiteralPath $catalog
+if ($signature.Status -ne "Valid") {
+    Remove-Item -LiteralPath $extract -Recurse -Force
+    Fail 4 "usbmmidd.cat signature status is $($signature.Status); chast-host will reject this package"
 }
-else {
-    Write-Warning ("deviceinstaller64.exe signature status is $($signature.Status); " +
-        "chast-host will reject this package unless WinVerifyTrust accepts it")
+Write-Host "usbmmidd.cat signer: $($signature.SignerCertificate.Subject)"
+if ($signature.SignerCertificate.Subject -notlike "*$expectedSigner*") {
+    Remove-Item -LiteralPath $extract -Recurse -Force
+    Fail 4 "usbmmidd.cat signer is not $expectedSigner"
 }
 
 New-Item -ItemType Directory -Path $Destination -Force | Out-Null

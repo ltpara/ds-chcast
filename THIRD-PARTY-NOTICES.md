@@ -21,16 +21,16 @@
 
 ### 分发状态
 
-- 仓库不提交第三方二进制。`tools/fetch-usbmmidd.ps1` 在 `$pinnedZipSha256`
-  配置后下载并校验安装包，解包到 `build/deps/usbmmidd_v2`（`build/` 已被
-  `.gitignore` 忽略），并生成 `manifest.sha256` 与 `SOURCE.txt`。
-- 固定哈希尚未配置，脚本当前会拒绝下载和解包，只打印本地 zip 的 SHA-256
-  供复核。
+- 仓库不提交第三方二进制。`tools/fetch-usbmmidd.ps1` 已固定上述 SHA-256
+  （2026-11-06 复下载一致），下载并校验安装包后解包到
+  `build/deps/usbmmidd_v2`（`build/` 已被 `.gitignore` 忽略），并生成
+  `manifest.sha256` 与 `SOURCE.txt`。
+- 再分发许可仍未确认：该固定哈希目前只用于内部验收测试，发布包仍不得包含
+  驱动二进制。
 - `tools/package-windows.ps1 -VirtualDisplayPackageDir <目录>` 或仓库
   `drivers\usbmmidd_v2` 存在时才把驱动打进安装包；默认安装包不含该驱动。
 - 再分发许可与广告提示条款尚未获得 Amyuni 确认。确认前发布包不应包含该
   驱动二进制，只保留“用户主动获取 + 哈希校验 + 明确确认”的引导安装。
 - 分发该驱动时必须原样保留 `License.txt`，并在安装目录附带 `SOURCE.txt`
   （下载 URL、日期、SHA-256）。
-- 待办：Amyuni 确认后再在本文件追加许可全文或官方许可链接，并同时配置
-  `tools/fetch-usbmmidd.ps1` 的 `$pinnedZipSha256`。
+- 待办：Amyuni 确认后再在本文件追加许可全文或官方许可链接。

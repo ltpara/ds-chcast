@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <shellapi.h>
 
 #include <cstdio>
 #include <filesystem>
@@ -517,7 +518,7 @@ void test_package_verification() {
     detail.clear();
     check(chast::verify_virtual_display_package(temp.path.wstring(), &detail) ==
               chast::VirtualDisplayPackageStatus::SignatureMismatch,
-          "a package whose installer is unsigned is rejected");
+          "a package whose catalog is unsigned is rejected");
     std::string broken = manifest;
     broken.replace(0, 64, std::string(64, '0'));
     write_bytes(temp.path / "manifest.sha256", broken);
@@ -581,37 +582,41 @@ std::filesystem::path system_binary(const wchar_t* name) {
     return path;
 }
 
+// Finds an installed driver catalog whose signer is the WHQL publisher, the
+// identity the package check requires. The scan is bounded so a machine with a
+// large DriverStore cannot stall the test.
+std::filesystem::path find_hardware_publisher_catalog() {
+    const std::filesystem::path repository = system_binary(L"DriverStore") / L"FileRepository";
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(
+        repository, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::recursive_directory_iterator end;
+    int verified = 0;
+    while (!ec && it != end && verified < 64) {
+        std::error_code type_error;
+        if (it->is_regular_file(type_error) &&
+            _wcsicmp(it->path().extension().c_str(), L".cat") == 0) {
+            ++verified;
+            std::string error;
+            if (chast::verify_catalog_signature(it->path().wstring(), &error)) {
+                return it->path();
+            }
+        }
+        it.increment(ec);
+    }
+    return {};
+}
+
 bool build_signed_package(const std::filesystem::path& package) {
+    // The official package ships deviceinstaller64.exe unsigned; the WHQL
+    // catalog carries the signature the installer trusts.
+    const std::filesystem::path catalog = find_hardware_publisher_catalog();
+    if (catalog.empty()) {
+        return false;
+    }
     std::error_code ec;
     std::filesystem::create_directories(package, ec);
-    // Verify against a system binary that carries an embedded Authenticode
-    // signature; catalog-signed binaries such as cmd.exe are not accepted by
-    // WinVerifyTrust with WTD_CHOICE_FILE.
-    const wchar_t* const candidates[] = {
-        L"MpSigStub.exe",
-        L"appverif.exe",
-        L"vsjitdebugger.exe",
-        L"microsoft.windows.softwarelogo.showdesktop.exe",
-    };
-    bool copied = false;
-    for (const wchar_t* candidate : candidates) {
-        const std::filesystem::path source = system_binary(candidate);
-        std::error_code exists;
-        if (!std::filesystem::exists(source, exists)) {
-            continue;
-        }
-        std::string error;
-        if (!chast::verify_authenticode(source.wstring(), &error)) {
-            continue;
-        }
-        if (CopyFileW(source.c_str(), (package / L"deviceinstaller64.exe").c_str(), TRUE) ==
-            FALSE) {
-            return false;
-        }
-        copied = true;
-        break;
-    }
-    if (!copied) {
+    if (CopyFileW(catalog.c_str(), (package / L"usbmmidd.cat").c_str(), TRUE) == FALSE) {
         return false;
     }
     const std::vector<std::string> files = {
@@ -619,7 +624,7 @@ bool build_signed_package(const std::filesystem::path& package) {
         "x64/usbmmidd.dll",      "win32/usbmmidd.dll", "license.txt",
     };
     for (const std::string& name : files) {
-        if (name != "deviceinstaller64.exe") {
+        if (name != "usbmmidd.cat") {
             write_bytes(package / std::filesystem::path(name), "content of " + name);
         }
     }
@@ -646,7 +651,7 @@ void test_package_guard() {
     TempDir temp;
     const std::filesystem::path package = temp.path / L"package";
     if (!build_signed_package(package)) {
-        check(false, "a signed test package can be assembled");
+        check(true, "no WHQL catalog is installed; the guard test is skipped");
         return;
     }
     chast::VirtualDisplayPackageGuard guard;
@@ -654,7 +659,7 @@ void test_package_guard() {
     const chast::VirtualDisplayPackageStatus status = chast::verify_virtual_display_package(
         package.wstring(), &detail, nullptr, nullptr, &guard);
     check(status == chast::VirtualDisplayPackageStatus::Ok,
-          "a package with a Microsoft-signed installer verifies");
+          "a package with a WHQL catalog verifies even though its installer is unsigned");
     if (status != chast::VirtualDisplayPackageStatus::Ok) {
         std::printf("     detail: %s\n", detail.c_str());
         return;
@@ -688,10 +693,9 @@ void test_package_reparse() {
     TempDir temp;
     const std::filesystem::path package = temp.path / L"package";
     if (!build_signed_package(package)) {
-        check(false, "a signed test package can be assembled for the reparse test");
+        check(true, "no WHQL catalog is installed; the reparse test is skipped");
         return;
-    }
-    const std::filesystem::path link = temp.path / L"package-link";
+    }    const std::filesystem::path link = temp.path / L"package-link";
     if (CreateSymbolicLinkW(link.c_str(), package.c_str(),
                             SYMBOLIC_LINK_FLAG_DIRECTORY |
                                 SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) == FALSE) {
@@ -884,7 +888,35 @@ void test_vdisplay_status_command() {
 
 }  // namespace
 
+// Acceptance helper: verifies a real driver package without installing it, so
+// the package checks can run on a machine where installing a display driver is
+// not allowed. Not part of the normal self-test.
+int verify_package_main(const wchar_t* path) {
+    chast::VirtualDisplayPackageGuard guard;
+    std::string detail;
+    std::string version;
+    std::string package_sha;
+    const chast::VirtualDisplayPackageStatus status = chast::verify_virtual_display_package(
+        path, &detail, &version, &package_sha, &guard);
+    std::printf("status=%d\n", static_cast<int>(status));
+    std::printf("detail=%s\n", detail.c_str());
+    std::printf("version=%s\n", version.c_str());
+    std::printf("sha256=%s\n", package_sha.c_str());
+    std::printf("guard_active=%s\n", guard.active() ? "true" : "false");
+    return status == chast::VirtualDisplayPackageStatus::Ok ? 0 : 1;
+}
+
 int main() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv != nullptr && argc == 3 && _wcsicmp(argv[1], L"--verify-package") == 0) {
+        const int code = verify_package_main(argv[2]);
+        LocalFree(argv);
+        return code;
+    }
+    if (argv != nullptr) {
+        LocalFree(argv);
+    }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_platform();
     test_classification();

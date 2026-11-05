@@ -49,6 +49,11 @@
 | --- | --- | --- |
 | `usbmmIdd.cat` / `x64/usbmmIdd.dll` | Microsoft Root Certificate Authority 2010 → Microsoft Windows Third Party Component CA 2014 → **Microsoft Windows Hardware Compatibility Publisher** | 2021-09-09 |
 
+`deviceinstaller64.exe` 本身没有 Authenticode 签名（`signtool verify /pa` 报
+“No signature found”）。包校验的信任锚点是 WHQL 签名的 `usbmmidd.cat`，
+不能要求安装器可执行文件带签名；2026-11-06 的代码已按该事实修正，见 §9
+“固定哈希与签名校验修正”。
+
 INF 关键字段：
 
 ```
@@ -497,11 +502,13 @@ PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动
   `deviceinstaller64.exe`、`usbmmidd.inf`、`usbmmidd.cat`、
   `x64/usbmmidd.dll`、`Win32/usbmmidd.dll`、`License.txt` 和
   `manifest.sha256`。manifest 使用 sha256sum 风格并必须覆盖全部必需文件；
-  逐文件 SHA-256 由 BCrypt 计算；`deviceinstaller64.exe` 通过
-  WinVerifyTrust 校验 Authenticode；可选 `SOURCE.txt` 提供 `VERSION:` 与
+  逐文件 SHA-256 由 BCrypt 计算；`usbmmidd.cat` 通过 WinVerifyTrust 校验
+  Authenticode，且签名主体必须是 Microsoft Windows Hardware Compatibility
+  Publisher（官方包的 `deviceinstaller64.exe` 无签名，不能作为信任锚点）；
+  可选 `SOURCE.txt` 提供 `VERSION:` 与
   包级 `SHA256:`。`verify_virtual_display_package()` 返回
-  Ok/Unsupported/Missing/HashMismatch/SignatureMismatch，驱动 catalog 仍交给
-  PnP 在安装时验证。
+  Ok/Unsupported/Missing/HashMismatch/SignatureMismatch，驱动 catalog 的成员
+  哈希仍交给 PnP 在安装时验证。
 - 状态文件：`%ProgramData%\chast\virtual-display.json`，字段为 provider、
   package_version、package_sha256、installed_at、owned、last_error；自带
   转义/解析，损坏时按无记录处理。`owned=false` 时卸载只复用、不删除驱动。
@@ -574,9 +581,10 @@ PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动
   固定的 Amyuni URL 下载或读取 `-SourceZip`，校验包级 SHA-256，解包到
   `build/deps/usbmmidd_v2`，检查必需文件与唯一包根目录，生成 sha256sum
   风格的 `manifest.sha256` 和 `SOURCE.txt`（URL、日期、包哈希、INF
-  `DriverVer`），并对 `deviceinstaller64.exe` 打印 Authenticode 状态与签名
-  主体。目标目录已存在时先按 manifest 校验，通过则直接成功，否则要求
-  `-Force`。退出码 2/3/4 分别表示未配置固定哈希、包哈希不符、包内容不完整。
+  `DriverVer`），校验 `usbmmidd.cat` 的 Authenticode 状态与签名主体，签名
+  无效或主体不是 WHPC 时退出码 4。目标目录已存在时先按 manifest 校验，
+  通过则直接成功，否则要求 `-Force`。退出码 2/3/4 分别表示未配置固定哈希、
+  包哈希不符、包内容或签名不合格。
 - `THIRD-PARTY-NOTICES.md`：仓库根目录的第三方声明占位，记录 Amyuni 版权、
   产品页、版本 2.0.0.1、2026-11-03 复核的包 SHA-256、WHQL 签名链、不提交
   二进制、默认不捆绑、再分发与广告提示条款待确认、分发时保留 `License.txt`
@@ -596,7 +604,8 @@ PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动
 - 包信任与锁定：`verify_virtual_display_package()` 用
   `GENERIC_READ|READ_CONTROL` + `FILE_SHARE_READ` 打开包目录、manifest、
   全部 manifest 条目和可选 `SOURCE.txt`，拒绝 reparse point、错误对象类型
-  与不可信 ACL；SHA-256 从已锁定的句柄读取，Authenticode 也在锁定期间校验。
+  与不可信 ACL；SHA-256 从已锁定的句柄读取，catalog 的 Authenticode 也在
+  锁定期间校验。
   新增 `VirtualDisplayPackageGuard`，在 `deviceinstaller64.exe` 运行期间保持
   这些句柄；守卫存活时写入、删除、改名文件或改名包目录都会失败，释放后才
   恢复。
@@ -624,10 +633,10 @@ PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动
   删除失败、`reset()` 后恢复）、目录 reparse 拒绝、状态目录信任、记录写入/
   读回/原子替换、无 `.tmp-` 残留、Users 可写记录被丢弃、带 CREATOR
   OWNER 写 ACE 的旧记录经迁移后保留、裸 ProgramData 目录既不信任记录也
-  拒绝写入。签名用例改用带内嵌 Authenticode 签名的系统
-  二进制（`MpSigStub.exe`/`appverif.exe`/`vsjitdebugger.exe`/ShowDesktop，
-  按顺序取第一个可验证者）；catalog 签名的 `cmd.exe` 会被 WinVerifyTrust
-  `WTD_CHOICE_FILE` 拒绝，不再使用。
+  拒绝写入。签名用例改用本机 DriverStore 中带 WHQL 签名主体的 catalog
+  （有界扫描，最多验证 64 个 `.cat`，找不到时跳过正样本），并断言无签名的
+  `deviceinstaller64.exe` 不影响校验结果；catalog 签名的 `cmd.exe` 仍会被
+  WinVerifyTrust `WTD_CHOICE_FILE` 拒绝，不再使用。
 - 验证：全量 Release 构建（所有目标）退出码 0；最终源码全量 `ctest -C
   Release` 42/42 通过（621.55 s，2026-11-04），定向
   `virtual_display|host_i18n|host_settings` 3/3；把 `ProgramData` 重定向到
@@ -658,6 +667,42 @@ PLAT-01d 的安装器/托盘/打包本地接线均已完成。固定哈希驱动
 - 验证：Release 构建 `chast-host` 与 `chast-virtual-display-test` 通过；
   定向 ctest `virtual_display|host_i18n|host_settings` 3/3；虚拟显示单测
   仍为 130 项通过。未安装驱动、未改变本机拓扑，A1–A10 仍未执行。
+
+**固定哈希、签名校验修正与真实包预检（2026-11-06）**
+
+- 固定哈希：重新下载官方 `usbmmidd_v2.zip`（199,309 字节），SHA-256 与
+  2026-11-03 评审记录一致（`629b51e9…24f51`），已写入
+  `tools/fetch-usbmmidd.ps1` 的 `$pinnedZipSha256`，并同步到
+  `THIRD-PARTY-NOTICES.md`。再分发条款仍未确认，该固定值只用于内部验收，
+  发布包不得包含驱动二进制。
+- 缺陷：官方包的 `deviceinstaller64.exe` 没有 Authenticode 签名，原实现用
+  WinVerifyTrust `WTD_CHOICE_FILE` 校验它，真实包会被误判为
+  `SignatureMismatch`（CLI 退出码 4），与 §5.3 要求的 catalog 签名主体校验
+  不一致。
+- 修正：新增 `verify_catalog_signature()`：先对 `usbmmidd.cat` 做
+  WinVerifyTrust 文件校验，再通过 `CryptQueryObject` /
+  `CMSG_SIGNER_INFO_PARAM` 定位签名证书，要求
+  `CN=Microsoft Windows Hardware Compatibility Publisher`。包校验改用它，
+  `deviceinstaller64.exe` 不再要求签名。单元测试改用本机 DriverStore 中
+  带 WHQL 主体的 catalog 构造正样本，并断言无签名安装器仍可通过。
+- 真实包预检（本机 Win11 25H2 x64，未安装驱动）：fetch 脚本生成 9 条
+  manifest；`chast-virtual-display-test.exe --verify-package
+  build/deps/usbmmidd_v2` 返回 `status=0`、`version=2.0.0.1`、包 SHA-256
+  `629b51e9…24f51`、`guard_active=true`；`signtool verify /pa` 与
+  `Get-AuthenticodeSignature` 对 catalog 均为 Valid，
+  `deviceinstaller64.exe` 为 NotSigned。证据在
+  `build/accept/plat-01/precheck-2026-11-06/`（`build/` 已被忽略）。
+- 包目录 ACL：从 `build/deps` 直接继承的 `Authenticated Users:(M)` 会让
+  `AclProfile::Package` 拒绝该包（退出码 3）。预检前已移除继承并只保留
+  SYSTEM/Administrators 完全控制、Users 只读；正式安装应放在
+  `C:\Program Files\chast\drivers\usbmmidd_v2`，不要放宽到其他账户可写。
+- 验证：Release 全量构建通过；全量 `ctest -C Release` 47/48 通过
+  （641.43 s），唯一失败 `service_log` 是构建后首次启动报
+  `BAD_COMMAND`/`Process not started`，单独复跑 1/1 通过（与本改动无关的
+  瞬时故障）；`chast-virtual-display-test` 全部通过，含真实包
+  `--verify-package` 与无签名安装器正样本。
+- 未执行：验收手册禁止在本开发机安装显示驱动，A1–A10 仍未执行；专用
+  Win10/无头/Win11 24H2/ARM64 测试机与 Amyuni 再分发许可仍是阻塞。
 
 ## 10. 风险与未决问题
 

@@ -41,7 +41,7 @@ P2 = 平台扩展。
 | DEV-08 | P2 | 地址簿拼音/模糊搜索与搜索词持久化 | 开发 | 无 | S |
 | DEV-09 | P2 | 更多采集/编码后端 | 开发 | 对应硬件 | L |
 | DEV-10 | P2 | 跨子网/中继协助 Wake-on-LAN | 开发 | 无（超出 RustDesk） | M |
-| PLAT-01 | P2 | 虚拟显示器（01a/01c 完成，01b/01d 代码、本地接线与 ACL/TOCTOU 加固完成，真机安装阻塞） | 平台 | 驱动再分发许可；无头测试机 | L |
+| PLAT-01 | P2 | 虚拟显示器（01a–01d 代码完成；固定哈希与包预检完成，A1–A10 真机验收阻塞） | 平台 | 再分发许可；专用测试机 | L |
 | PLAT-02 | P2 | 远程打印 | 平台 | v4 打印机驱动签名 | L |
 | PLAT-03 | P2 | 非 Windows 平台与打包 | 平台 | CI/平台环境 | XL |
 
@@ -464,9 +464,16 @@ P2 = 平台扩展。
   文件原子替换并读回验证，不可信记录/日志按不存在处理。虚拟显示单测增至
   130 项。同日补上 A5 的 CLI 冲突拒绝（检测到 VDD/Parsec/RustDesk 时退出 8）
   与 A6 的托盘会话中卸载拦截，并新增 `docs/plat-01-acceptance-runbook-2026-11-04.md`
-  覆盖 A1～A10 的前置、命令、证据与回滚。仍缺固定哈希驱动包、Amyuni 再分发
-  许可、许可全文与 A1～A10 真机验收，因此 PLAT-01b/01d 未完成。后续
+  覆盖 A1～A10 的前置、命令、证据与回滚。当时仍缺固定哈希驱动包、Amyuni
+  再分发许可、许可全文与 A1～A10 真机验收，因此 PLAT-01b/01d 未完成。后续
   PLAT-01b～e 见设计文档 §9。
+  2026-11-06：官方包哈希已固定（`629b51e9…24f51`，复下载一致）并写入
+  获取脚本；发现官方 `deviceinstaller64.exe` 无 Authenticode 签名，包校验
+  改为验证 `usbmmidd.cat` 的 WHQL 签名主体（`CN=Microsoft Windows Hardware
+  Compatibility Publisher`），新增 `verify_catalog_signature()` 与
+  `--verify-package` 只校验入口。真实包在本机预检返回 `status=0`、9 个文件、
+  `version=2.0.0.1`、`guard_active=true`。仍未安装驱动，A1～A10 未执行；
+  Amyuni 再分发许可与专用测试机仍是 PLAT-01b/01d 完成的前置。
 
 ### PLAT-02 远程打印（P2）
 

@@ -236,16 +236,22 @@ bool sha256_file_hex(const std::wstring& path, std::string* hex, std::string* er
 // x64/usbmmidd.dll, Win32/usbmmidd.dll, License.txt and manifest.sha256.
 // Every manifest entry is hashed from a held handle, every path is opened
 // without following a reparse point, and owners/DACLs must keep other accounts
-// from changing the files. deviceinstaller64.exe must also carry a valid
-// Authenticode signature. The driver catalog is left to Plug and Play, which
-// refuses an invalid driver package during installation. Passing a guard keeps
-// the verified handles open for the following elevated install step.
+// from changing the files. usbmmidd.cat must also carry a valid Authenticode
+// signature and name the Microsoft Windows Hardware Compatibility Publisher:
+// the official package ships deviceinstaller64.exe unsigned, and the catalog is
+// what Windows trusts for the driver payload. Passing a guard keeps the
+// verified handles open for the following elevated install step.
 VirtualDisplayPackageStatus verify_virtual_display_package(
     const std::wstring& package_dir, std::string* detail,
     std::string* package_version = nullptr, std::string* package_sha256 = nullptr,
     VirtualDisplayPackageGuard* guard = nullptr);
 
 bool verify_authenticode(const std::wstring& path, std::string* error);
+
+// Verifies a catalog file's Authenticode signature and requires its signer to
+// be the Microsoft Windows Hardware Compatibility Publisher. A trusted
+// signature from any other publisher is rejected.
+bool verify_catalog_signature(const std::wstring& path, std::string* error);
 
 // %ProgramData%\chast\virtual-display.json. The elevated CLI writes it; the
 // tray and worker only read it.
