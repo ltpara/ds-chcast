@@ -1137,6 +1137,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                     options.codec = chast::VideoCodec::H264;
                 } else if (value == "hevc" || value == "h265") {
                     options.codec = chast::VideoCodec::Hevc;
+                } else if (value == "av1") {
+                    options.codec = chast::VideoCodec::Av1;
                 } else {
                     std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                     return false;
@@ -5413,8 +5415,15 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
     auto stream_rate_check_at = start;
     uint64_t stream_rate_keyframes_before = 0;
     auto stream_preference = [](chast::VideoCodec codec) {
-        return codec == chast::VideoCodec::Hevc ? chast::StreamCodecPreference::Hevc
-                                                : chast::StreamCodecPreference::H264;
+        switch (codec) {
+            case chast::VideoCodec::H264:
+                return chast::StreamCodecPreference::H264;
+            case chast::VideoCodec::Hevc:
+                return chast::StreamCodecPreference::Hevc;
+            case chast::VideoCodec::Av1:
+                return chast::StreamCodecPreference::Av1;
+        }
+        return chast::StreamCodecPreference::Auto;
     };
     auto send_stream_options = [&](chast::StreamCodecPreference codec, uint16_t max_fps,
                                    chast::StreamQuality quality) -> bool {
@@ -6603,6 +6612,11 @@ struct StreamDigest {
 // decode each access unit, fold the picture hashes in order.
 StreamDigest digest_saved_stream(const std::string& path, chast::VideoCodec codec) {
     StreamDigest result;
+    if (codec == chast::VideoCodec::Av1) {
+        result.error = "AV1 is OBU-framed and has no Annex B split; saved-stream replay "
+                       "supports H.264 and HEVC only";
+        return result;
+    }
     FILE* input = nullptr;
     if (fopen_s(&input, path.c_str(), "rb") != 0 || !input) {
         result.error = "cannot open " + path;

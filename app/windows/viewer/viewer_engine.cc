@@ -148,7 +148,15 @@ const char* session_mode_name(chast::SessionMode mode) {
 }
 
 std::string codec_name(chast::VideoCodec codec) {
-    return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
+    switch (codec) {
+        case chast::VideoCodec::H264:
+            return "H.264";
+        case chast::VideoCodec::Hevc:
+            return "HEVC";
+        case chast::VideoCodec::Av1:
+            return "AV1";
+    }
+    return "H.264";
 }
 
 const char* audio_codec_name(chast::AudioCodec codec) {
@@ -705,6 +713,7 @@ bool ViewerEngine::SetStreamOptions(chast::StreamCodecPreference codec, uint16_t
         case chast::StreamCodecPreference::Auto:
         case chast::StreamCodecPreference::H264:
         case chast::StreamCodecPreference::Hevc:
+        case chast::StreamCodecPreference::Av1:
             break;
         default:
             return false;

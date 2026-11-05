@@ -46,7 +46,15 @@ constexpr auto kReadTimeout = std::chrono::milliseconds(200);
 uint32_t align16(uint32_t value) { return (value + 15u) & ~15u; }
 
 const char* codec_name(VideoCodec codec) {
-    return codec == VideoCodec::Hevc ? "hevc" : "h264";
+    switch (codec) {
+        case VideoCodec::H264:
+            return "h264";
+        case VideoCodec::Hevc:
+            return "hevc";
+        case VideoCodec::Av1:
+            return "av1";
+    }
+    return "h264";
 }
 
 // Same clock and encoding as the desktop stream (FrameHeader::capture_ms).

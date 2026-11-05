@@ -65,6 +65,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                     options.codec = chast::VideoCodec::H264;
                 } else if (value == "hevc" || value == "h265") {
                     options.codec = chast::VideoCodec::Hevc;
+                } else if (value == "av1") {
+                    options.codec = chast::VideoCodec::Av1;
                 } else {
                     std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                     return false;
@@ -121,7 +123,15 @@ bool parse_args(int argc, char** argv, Options& options) {
 }
 
 const char* codec_name(chast::VideoCodec codec) {
-    return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
+    switch (codec) {
+        case chast::VideoCodec::H264:
+            return "H.264";
+        case chast::VideoCodec::Hevc:
+            return "HEVC";
+        case chast::VideoCodec::Av1:
+            return "AV1";
+    }
+    return "unknown";
 }
 
 }  // namespace
@@ -293,9 +303,17 @@ int main(int argc, char** argv) {
             }
             if (!sink) {
                 if (!options.out_path_set) {
-                    options.out_path = encoder->codec() == chast::VideoCodec::H264
-                                           ? "capture.h264"
-                                           : "capture.h265";
+                    switch (encoder->codec()) {
+                        case chast::VideoCodec::H264:
+                            options.out_path = "capture.h264";
+                            break;
+                        case chast::VideoCodec::Hevc:
+                            options.out_path = "capture.h265";
+                            break;
+                        case chast::VideoCodec::Av1:
+                            options.out_path = "capture.av1";
+                            break;
+                    }
                 }
                 if (fopen_s(&sink, options.out_path.c_str(), "wb") != 0 || !sink) {
                     std::fprintf(stderr, "could not open %s\n", options.out_path.c_str());

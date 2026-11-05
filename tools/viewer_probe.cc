@@ -1832,7 +1832,9 @@ int main(int argc, char** argv) {
                     "viewer-probe: streaming %ux%u codec=%s permissions=0x%04X\n",
                     static_cast<unsigned>(stream.width),
                     static_cast<unsigned>(stream.height),
-                    stream.codec == chast::VideoCodec::Hevc ? "hevc" : "h264",
+                    stream.codec == chast::VideoCodec::Hevc
+                        ? "hevc"
+                        : (stream.codec == chast::VideoCodec::Av1 ? "av1" : "h264"),
                     static_cast<unsigned>(stream.permissions));
 
                 WalkOutcome walk;

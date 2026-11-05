@@ -190,7 +190,15 @@ const std::array<uint32_t, 256>& crc_table() {
 }
 
 uint8_t codec_wire(VideoCodec codec) {
-    return codec == VideoCodec::H264 ? 1 : 2;
+    switch (codec) {
+        case VideoCodec::H264:
+            return 1;
+        case VideoCodec::Hevc:
+            return 2;
+        case VideoCodec::Av1:
+            return 3;
+    }
+    return 0;
 }
 
 bool codec_from_wire(uint8_t value, VideoCodec& codec) {
@@ -200,6 +208,10 @@ bool codec_from_wire(uint8_t value, VideoCodec& codec) {
     }
     if (value == 2) {
         codec = VideoCodec::Hevc;
+        return true;
+    }
+    if (value == 3) {
+        codec = VideoCodec::Av1;
         return true;
     }
     return false;
@@ -3586,7 +3598,7 @@ bool parse_set_stream_options(const std::vector<uint8_t>& payload, StreamOptions
         set_error(error, "malformed SetStreamOptions");
         return false;
     }
-    if (raw_codec > static_cast<uint8_t>(StreamCodecPreference::Hevc)) {
+    if (raw_codec > static_cast<uint8_t>(StreamCodecPreference::Av1)) {
         set_error(error, "unknown stream codec preference " + std::to_string(raw_codec));
         return false;
     }

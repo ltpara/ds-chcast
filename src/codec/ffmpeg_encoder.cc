@@ -66,19 +66,21 @@ struct DriverInfo {
     Driver driver = Driver::Nvenc;
     const char* h264 = "";
     const char* hevc = "";
+    const char* av1 = "";
     const char* label = "";
 };
 
 bool driver_for_vendor(UINT vendor, DriverInfo* info) {
     switch (vendor) {
         case kVendorNvidia:
-            *info = {Driver::Nvenc, "h264_nvenc", "hevc_nvenc", "NVIDIA NVENC"};
+            *info = {Driver::Nvenc, "h264_nvenc", "hevc_nvenc", "av1_nvenc",
+                     "NVIDIA NVENC"};
             return true;
         case kVendorAmd:
-            *info = {Driver::Amf, "h264_amf", "hevc_amf", "AMD AMF"};
+            *info = {Driver::Amf, "h264_amf", "hevc_amf", "av1_amf", "AMD AMF"};
             return true;
         case kVendorIntel:
-            *info = {Driver::Qsv, "h264_qsv", "hevc_qsv", "Intel QSV"};
+            *info = {Driver::Qsv, "h264_qsv", "hevc_qsv", "av1_qsv", "Intel QSV"};
             return true;
         default:
             return false;
@@ -86,7 +88,12 @@ bool driver_for_vendor(UINT vendor, DriverInfo* info) {
 }
 
 const char* encoder_name(const DriverInfo& driver, VideoCodec codec) {
-    return codec == VideoCodec::H264 ? driver.h264 : driver.hevc;
+    switch (codec) {
+        case VideoCodec::H264: return driver.h264;
+        case VideoCodec::Hevc: return driver.hevc;
+        case VideoCodec::Av1: return driver.av1;
+    }
+    return driver.h264;
 }
 
 std::string av_error_text(int code) {
@@ -121,8 +128,12 @@ bool adapter_vendor(ID3D11Device* device, UINT* vendor) {
 
 // IDR detection for key-frame packets. Encoders without GLOBAL_HEADER emit
 // Annex B; a CRA picture (HEVC 21) is a key frame for the viewer but not an
-// IDR, and resetting a decoder on it is not required.
+// IDR, and resetting a decoder on it is not required. AV1 has no Annex B
+// framing and no IDR picture type, so only the packet key flag applies.
 bool contains_idr(VideoCodec codec, const uint8_t* data, size_t size) {
+    if (codec == VideoCodec::Av1) {
+        return false;
+    }
     const uint8_t* const end = data + size;
     const uint8_t* cursor = data;
     while (cursor + 3 < end) {
@@ -268,18 +279,30 @@ Error FFmpegEncoder::initialize() {
     }
 
     codec_ = config_.codec;
-    const char* name = encoder_name(driver_, codec_);
-    if (!avcodec_find_encoder_by_name(name)) {
-        if (codec_ == VideoCodec::H264) {
-            return Error(Status::Unsupported,
-                         std::string("this FFmpeg build has no ") + name);
+    // Ladder within the FFmpeg backend: an AV1 request may fall back to HEVC,
+    // and any non-H.264 request to H.264, when this build carries no encoder
+    // for the family (drivers are only listed because the vendor's build does).
+    VideoCodec ladder[3];
+    size_t ladder_size = 0;
+    ladder[ladder_size++] = codec_;
+    if (codec_ == VideoCodec::Av1) {
+        ladder[ladder_size++] = VideoCodec::Hevc;
+    }
+    if (codec_ != VideoCodec::H264) {
+        ladder[ladder_size++] = VideoCodec::H264;
+    }
+    const char* name = nullptr;
+    bool found = false;
+    for (size_t i = 0; i < ladder_size; ++i) {
+        name = encoder_name(driver_, ladder[i]);
+        if (avcodec_find_encoder_by_name(name)) {
+            codec_ = ladder[i];
+            found = true;
+            break;
         }
-        codec_ = VideoCodec::H264;
-        name = encoder_name(driver_, codec_);
-        if (!avcodec_find_encoder_by_name(name)) {
-            return Error(Status::Unsupported,
-                         std::string("this FFmpeg build has no ") + name);
-        }
+    }
+    if (!found) {
+        return Error(Status::Unsupported, std::string("this FFmpeg build has no ") + name);
     }
 
     bitrate_ = config_.bitrate != 0
@@ -401,8 +424,11 @@ Error FFmpegEncoder::open_codec_impl() {
     c->colorspace = AVCOL_SPC_SMPTE170M;
     c->color_primaries = AVCOL_PRI_SMPTE170M;
     c->color_trc = AVCOL_TRC_SMPTE170M;
-    c->profile = codec_ == VideoCodec::H264 ? AV_PROFILE_H264_HIGH
-                                            : AV_PROFILE_HEVC_MAIN;
+    switch (codec_) {
+        case VideoCodec::H264: c->profile = AV_PROFILE_H264_HIGH; break;
+        case VideoCodec::Hevc: c->profile = AV_PROFILE_HEVC_MAIN; break;
+        case VideoCodec::Av1: c->profile = AV_PROFILE_AV1_MAIN; break;
+    }
     if (driver_.driver == Driver::Qsv) {
         // RustDesk's CBR arrangement: QSV selects CBR only when bit_rate and
         // rc_max_rate are equal, so keep max at the target and the target one
@@ -819,15 +845,37 @@ Error FFmpegEncoder::set_rate(UINT bits_per_second, UINT framerate,
 std::unique_ptr<IVideoEncoder> create_ffmpeg_encoder(ID3D11Device* device,
                                                      const EncoderConfig& config,
                                                      std::string* error) {
-    auto encoder = std::make_unique<FFmpegEncoder>(device, config);
-    const Error err = encoder->initialize();
-    if (!err.ok()) {
-        if (error) {
-            *error = err.to_string();
+    auto attempt = [&](VideoCodec codec, bool report) -> std::unique_ptr<IVideoEncoder> {
+        EncoderConfig adjusted = config;
+        adjusted.codec = codec;
+        auto encoder = std::make_unique<FFmpegEncoder>(device, adjusted);
+        const Error err = encoder->initialize();
+        if (!err.ok()) {
+            if (report && error) {
+                *error = err.to_string();
+            }
+            return nullptr;
         }
-        return nullptr;
+        return encoder;
+    };
+    if (auto encoder = attempt(config.codec, true)) {
+        return encoder;
     }
-    return encoder;
+    // The build can carry an encoder the installed GPU cannot run (av1_nvenc
+    // exists on pre-Ada drivers). The build-level ladder in initialize() cannot
+    // see that, so retry the request's fallbacks on a fresh instance; each
+    // attempt releases its own device references.
+    if (config.codec == VideoCodec::Av1) {
+        if (auto encoder = attempt(VideoCodec::Hevc, false)) {
+            return encoder;
+        }
+    }
+    if (config.codec != VideoCodec::H264) {
+        if (auto encoder = attempt(VideoCodec::H264, false)) {
+            return encoder;
+        }
+    }
+    return nullptr;
 }
 
 bool ffmpeg_encoder_available(VideoCodec codec, ID3D11Device* device) {
@@ -841,9 +889,9 @@ bool ffmpeg_encoder_available(VideoCodec codec, ID3D11Device* device) {
         // Without an adapter only the build can be checked. Any vendored
         // hardware encoder means this build carries the backend at all; a
         // probe inside the requested family needs the device.
-        static constexpr const char* kAll[] = {"h264_nvenc", "hevc_nvenc",
-                                               "h264_amf",   "hevc_amf",
-                                               "h264_qsv",   "hevc_qsv"};
+        static constexpr const char* kAll[] = {
+            "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_amf", "hevc_amf",
+            "av1_amf",    "h264_qsv",   "hevc_qsv",   "av1_qsv"};
         for (const char* name : kAll) {
             if (avcodec_find_encoder_by_name(name)) {
                 return true;
@@ -855,7 +903,11 @@ bool ffmpeg_encoder_available(VideoCodec codec, ID3D11Device* device) {
     if (avcodec_find_encoder_by_name(encoder_name(driver, codec))) {
         return true;
     }
-    return codec == VideoCodec::Hevc &&
+    if (codec == VideoCodec::Av1 &&
+        avcodec_find_encoder_by_name(encoder_name(driver, VideoCodec::Hevc))) {
+        return true;
+    }
+    return codec != VideoCodec::H264 &&
            avcodec_find_encoder_by_name(encoder_name(driver, VideoCodec::H264));
 }
 

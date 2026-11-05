@@ -88,11 +88,21 @@ Error mfx_error(mfxStatus sts, std::string_view what) {
 }
 
 mfxU32 codec_id(VideoCodec codec) {
-    return codec == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
+    switch (codec) {
+        case VideoCodec::H264: return MFX_CODEC_AVC;
+        case VideoCodec::Hevc: return MFX_CODEC_HEVC;
+        case VideoCodec::Av1: return MFX_CODEC_AV1;
+    }
+    return MFX_CODEC_AVC;
 }
 
 const char* codec_name(VideoCodec codec) {
-    return codec == VideoCodec::H264 ? "H.264" : "HEVC";
+    switch (codec) {
+        case VideoCodec::H264: return "H.264";
+        case VideoCodec::Hevc: return "HEVC";
+        case VideoCodec::Av1: return "AV1";
+    }
+    return "H.264";
 }
 
 struct ImplCandidate {

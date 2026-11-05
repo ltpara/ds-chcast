@@ -1493,6 +1493,8 @@ class _StreamOptionsButton extends StatelessWidget {
                 Icons.movie_outlined, codec == ViewerStreamCodec.h264),
             _item(_CodecChoice(ViewerStreamCodec.hevc), 'HEVC', tr('同画质更省带宽'),
                 Icons.hd_outlined, codec == ViewerStreamCodec.hevc),
+            _item(_CodecChoice(ViewerStreamCodec.av1), 'AV1', tr('压缩率更高，需要 AV1 硬件'),
+                Icons.auto_awesome_motion_outlined, codec == ViewerStreamCodec.av1),
           ];
         },
         child: SizedBox(

@@ -504,6 +504,7 @@ void main() {
     expect(find.text('60 fps'), findsOneWidget);
     expect(find.text('H.264'), findsOneWidget);
     expect(find.text('HEVC'), findsOneWidget);
+    expect(find.text('AV1'), findsOneWidget);
 
     await tester.tap(find.text('流畅'));
     await tester.pumpAndSettle();

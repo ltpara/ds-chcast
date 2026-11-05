@@ -128,7 +128,15 @@ inline std::vector<AccessUnit> split_access_units(const std::vector<uint8_t>& da
 }
 
 inline const char* codec_name(chast::VideoCodec codec) {
-    return codec == chast::VideoCodec::H264 ? "H.264" : "HEVC";
+    switch (codec) {
+        case chast::VideoCodec::H264:
+            return "H.264";
+        case chast::VideoCodec::Hevc:
+            return "HEVC";
+        case chast::VideoCodec::Av1:
+            return "AV1";
+    }
+    return "unknown";
 }
 
 }  // namespace chast_tools

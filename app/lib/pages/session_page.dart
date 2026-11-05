@@ -998,7 +998,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             // values the host actually runs.
             _streamCodec = status.codec == 'hevc'
                 ? ViewerStreamCodec.hevc
-                : ViewerStreamCodec.h264;
+                : (status.codec == 'av1'
+                    ? ViewerStreamCodec.av1
+                    : ViewerStreamCodec.h264);
             _streamQuality = _streamQualityFor(status.streamQuality);
           }
         } else {

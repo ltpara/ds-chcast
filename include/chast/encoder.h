@@ -42,6 +42,11 @@ namespace chast {
 enum class VideoCodec {
     H264,
     Hevc,
+    // AV1 is only produced by hardware encoders (oneVPL on AV1-capable Intel
+    // GPUs, the FFmpeg vendor encoders on Ada/RDNA3/Arc). There is deliberately
+    // no software path: a machine without an AV1 hardware encoder refuses the
+    // request instead of falling back to SVT-AV1/libaom.
+    Av1,
 };
 
 // Which implementation create_encoder() may use. Auto tries oneVPL first and
@@ -155,16 +160,16 @@ public:
 };
 
 // Which encoders can be used on this machine, for a UI or an auto-selection
-// step. True when a hardware implementation of `codec` (H.264 or HEVC) with
-// D3D11 acceleration is available through `backend`: a oneVPL 2.10+ runtime or
-// the legacy Media SDK runtime for Vpl, NVENC/AMF/QSV for Ffmpeg, either for
-// Auto.
+// step. True when a hardware implementation of `codec` (H.264, HEVC or AV1)
+// with D3D11 acceleration is available through `backend`: a oneVPL 2.10+
+// runtime or the legacy Media SDK runtime for Vpl, NVENC/AMF/QSV for Ffmpeg,
+// either for Auto.
 //
 // When `device` is given, implementations are restricted to the adapter that
-// device lives on, which is the adapter the frames come from. HEVC counts as
-// available when an HEVC implementation exists, or when an H.264 one does:
-// create_encoder() may fall back to the AVC tiers for an HEVC request. The
-// device is not opened.
+// device lives on, which is the adapter the frames come from. A non-H.264
+// codec counts as available when its own implementation exists or when one a
+// lower tier falls back to does: create_encoder() may answer an HEVC request
+// with AVC, and an AV1 request with HEVC or AVC. The device is not opened.
 bool hardware_encoder_available(VideoCodec codec, ID3D11Device* device = nullptr,
                                 EncoderBackend backend = EncoderBackend::Auto);
 

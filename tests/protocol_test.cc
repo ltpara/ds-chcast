@@ -1222,9 +1222,17 @@ void test_stream_options() {
               payload_of(chast::make_set_stream_options(asked)), options, &error),
           "SetStreamOptions rejects a frame cap past the range");
 
+    asked.max_fps = 0;
+    asked.quality = chast::StreamQuality::Balanced;
+    asked.codec = chast::StreamCodecPreference::Av1;
+    check(chast::parse_set_stream_options(
+              payload_of(chast::make_set_stream_options(asked)), options, &error) &&
+              options.codec == chast::StreamCodecPreference::Av1,
+          "SetStreamOptions round-trips an AV1 preference");
+
     std::vector<uint8_t> unknown_codec =
         payload_of(chast::make_set_stream_options(chast::StreamOptions{}));
-    unknown_codec[0] = 3;
+    unknown_codec[0] = 4;
     check(!chast::parse_set_stream_options(unknown_codec, options, &error),
           "SetStreamOptions with an unknown codec is rejected");
     std::vector<uint8_t> unknown_quality =
@@ -1266,9 +1274,17 @@ void test_stream_options() {
     unknown_result[0] = 4;
     check(!chast::parse_stream_options_result(unknown_result, result, &error),
           "StreamOptionsResult with an unknown code is rejected");
+
+    sent.codec = chast::VideoCodec::Av1;
+    check(chast::parse_stream_options_result(
+              payload_of(chast::make_stream_options_result(sent)), result, &error) &&
+              result.codec == chast::VideoCodec::Av1,
+          "StreamOptionsResult carries AV1");
+    sent.codec = chast::VideoCodec::Hevc;
+
     std::vector<uint8_t> unknown_result_codec =
         payload_of(chast::make_stream_options_result(sent));
-    unknown_result_codec[1] = 3;
+    unknown_result_codec[1] = 4;
     check(!chast::parse_stream_options_result(unknown_result_codec, result, &error),
           "StreamOptionsResult with an unknown codec is rejected");
     std::vector<uint8_t> unknown_result_quality =
@@ -1759,6 +1775,12 @@ void test_frame_header() {
     check(chast::decode_frame_header(bytes, sizeof(bytes), got, &error) &&
               got.capture_ms == 0xFFFFFFFFFFFFull,
           "FrameHeader carries the largest 48-bit capture time");
+
+    sent.codec = chast::VideoCodec::Av1;
+    chast::encode_frame_header(sent, bytes);
+    check(chast::decode_frame_header(bytes, sizeof(bytes), got, &error) &&
+              got.codec == chast::VideoCodec::Av1,
+          "FrameHeader carries AV1");
 
     std::vector<uint8_t> old_version(bytes, bytes + sizeof(bytes));
     old_version[4] = static_cast<uint8_t>(chast::kProtocolVersion - 1);

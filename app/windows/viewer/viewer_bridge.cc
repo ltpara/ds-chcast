@@ -473,8 +473,10 @@ void ViewerBridge::HandleMethodCall(
         map[key("port")] = flutter::EncodableValue(static_cast<int32_t>(status.port));
         map[key("transport")] = flutter::EncodableValue(status.transport);
         map[key("transportError")] = flutter::EncodableValue(status.transport_error);
-        map[key("codec")] = flutter::EncodableValue(
-            std::string(status.codec == chast::VideoCodec::H264 ? "h264" : "hevc"));
+        map[key("codec")] = flutter::EncodableValue(std::string(
+            status.codec == chast::VideoCodec::H264
+                ? "h264"
+                : (status.codec == chast::VideoCodec::Hevc ? "hevc" : "av1")));
         map[key("width")] = flutter::EncodableValue(static_cast<int32_t>(status.width));
         map[key("height")] = flutter::EncodableValue(static_cast<int32_t>(status.height));
         map[key("sourceWidth")] =
@@ -1025,10 +1027,10 @@ void ViewerBridge::HandleMethodCall(
         int64_t max_fps = 0;
         int64_t quality = 0;
         if (!map_int(*args, "codec", &codec) || !map_int(*args, "maxFps", &max_fps) ||
-            !map_int(*args, "quality", &quality) || codec < 0 || codec > 2 ||
+            !map_int(*args, "quality", &quality) || codec < 0 || codec > 3 ||
             max_fps < 0 || max_fps > chast::kMaxStreamFps || quality < 0 || quality > 2) {
             result->Error("bad_args",
-                          "setStreamOptions wants codec and quality in 0..2 and maxFps in "
+                          "setStreamOptions wants codec in 0..3 and quality in 0..2 and maxFps in "
                           "0..240");
             return;
         }

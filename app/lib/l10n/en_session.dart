@@ -197,6 +197,7 @@ const Map<String, String> kEnglishSession = <String, String>{
   '取消固定': 'Unpin',
   '取消静音（长按选择输出设备）': 'Unmute (long-press to pick output device)',
   '同画质更省带宽': 'Same quality with less bandwidth',
+  '压缩率更高，需要 AV1 硬件': 'Higher compression, needs AV1 hardware',
   '噪声抑制': 'Noise suppression',
   '回声消除': 'Echo cancellation',
   '固定工具栏': 'Pin toolbar',

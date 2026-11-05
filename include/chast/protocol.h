@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 44;
+inline constexpr uint16_t kProtocolVersion = 45;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -195,7 +195,7 @@ enum class ControlType : uint16_t {
     // permission because it only affects this viewer's picture.
     SetStreamOptions = 30,
     // Host -> viewer: the outcome of SetStreamOptions. Payload: code (u8),
-    // effective codec (u8, 1 = H.264, 2 = HEVC), effective frame rate (u16),
+    // effective codec (u8, 1 = H.264, 2 = HEVC, 3 = AV1), effective frame rate (u16),
     // effective quality (u8), reason length (u16), UTF-8 reason. The
     // effective fields describe the stream that is actually running, even
     // when the request was refused, so the viewer can restore its menu.
@@ -1946,6 +1946,9 @@ enum class StreamCodecPreference : uint8_t {
     Auto = 0,  // follow the host's configured encoder
     H264 = 1,  // require H.264
     Hevc = 2,  // require HEVC; refused when the host cannot produce it
+    // Require AV1 from a hardware encoder. Refused on hosts whose GPU has no
+    // AV1 encoder; there is no software fallback. Protocol v45.
+    Av1 = 3,
 };
 
 enum class StreamQuality : uint8_t {

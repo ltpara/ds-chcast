@@ -252,17 +252,34 @@ struct EncodeTier {
     const char* label;
 };
 
-// Requested codec first. An HEVC request may fall back to H.264 when HEVC
-// hardware encoding is unavailable; an H.264 request never upgrades, so a
-// client that cannot decode HEVC is never sent it.
+// Requested codec first. An AV1 request may fall back to HEVC and then H.264,
+// and an HEVC request may fall back to H.264, when that hardware encoder is
+// unavailable; an H.264 request never upgrades, so a client that cannot decode
+// HEVC is never sent it. AV1 has no VME encoder and no legacy runtime support,
+// so its only tier is VDENC on a oneVPL 2.x implementation.
 std::vector<EncodeTier> encode_tiers(VideoCodec requested) {
     std::vector<EncodeTier> tiers;
-    if (requested == VideoCodec::Hevc) {
+    if (requested == VideoCodec::Av1) {
+        tiers.push_back({VideoCodec::Av1, true, "VDENC AV1"});
+        tiers.push_back({VideoCodec::Hevc, true, "VDENC HEVC"});
+    } else if (requested == VideoCodec::Hevc) {
         tiers.push_back({VideoCodec::Hevc, true, "VDENC HEVC"});
     }
     tiers.push_back({VideoCodec::H264, true, "VDENC AVC"});
     tiers.push_back({VideoCodec::H264, false, "VME AVC"});
     return tiers;
+}
+
+mfxU32 mfx_codec_id(VideoCodec codec) {
+    switch (codec) {
+        case VideoCodec::H264:
+            return MFX_CODEC_AVC;
+        case VideoCodec::Hevc:
+            return MFX_CODEC_HEVC;
+        case VideoCodec::Av1:
+            return MFX_CODEC_AV1;
+    }
+    return MFX_CODEC_AVC;
 }
 
 // Common D3D11 device lifetime for VPL. MFXVideoCORE_SetHandle does not take a
@@ -601,7 +618,7 @@ Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& t
     params.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
     params.AsyncDepth = kAsyncDepth;
     mfxInfoMFX& mfx = params.mfx;
-    mfx.CodecId = tier.codec == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
+    mfx.CodecId = mfx_codec_id(tier.codec);
     // ON selects the fixed-function VDENC encoder where the runtime has both;
     // OFF asks for the VME encoder. oneVPL 2.10+ implementations are VDENC-only,
     // so their VME tier fails Init and the ladder ends there.
@@ -617,8 +634,17 @@ Error MfxEncoder::start_tier(const ImplCandidate& candidate, const EncodeTier& t
         static_cast<mfxU16>((std::clamp)(gop_size_ == 0 ? 0xFFFFu : gop_size_, 1u, 0xFFFFu));
     mfx.GopRefDist = 1;  // no B-frames
     mfx.IdrInterval = 0;  // every I-frame an IDR (H.264)
-    mfx.CodecProfile = static_cast<mfxU16>(
-        tier.codec == VideoCodec::H264 ? MFX_PROFILE_AVC_HIGH : MFX_PROFILE_HEVC_MAIN);
+    switch (tier.codec) {
+        case VideoCodec::H264:
+            mfx.CodecProfile = MFX_PROFILE_AVC_HIGH;
+            break;
+        case VideoCodec::Hevc:
+            mfx.CodecProfile = MFX_PROFILE_HEVC_MAIN;
+            break;
+        case VideoCodec::Av1:
+            mfx.CodecProfile = MFX_PROFILE_AV1_MAIN;
+            break;
+    }
 
     mfxFrameInfo& info = mfx.FrameInfo;
     info.FourCC = MFX_FOURCC_NV12;
@@ -948,7 +974,12 @@ Error MfxEncoder::submit(mfxFrameSurface1* surface, bool force_keyframe,
     mfxEncodeCtrl control{};
     mfxEncodeCtrl* control_ptr = nullptr;
     if (force_keyframe) {
-        control.FrameType = static_cast<mfxU16>(MFX_FRAMETYPE_I | MFX_FRAMETYPE_IDR);
+        // AV1 key frames have no IDR flag; asking for one is rejected by the
+        // runtime. An I-frame request is what makes every AV1 key frame a
+        // clean decoder start.
+        control.FrameType = static_cast<mfxU16>(
+            codec_ == VideoCodec::Av1 ? MFX_FRAMETYPE_I
+                                      : (MFX_FRAMETYPE_I | MFX_FRAMETYPE_IDR));
         control_ptr = &control;
     }
 
@@ -1277,7 +1308,7 @@ bool vpl_encoder_available(VideoCodec codec, ID3D11Device* device) {
         if (!loader) {
             return false;
         }
-        const mfxU32 codec_id = wanted == VideoCodec::H264 ? MFX_CODEC_AVC : MFX_CODEC_HEVC;
+        const mfxU32 codec_id = mfx_codec_id(wanted);
         bool found = false;
         // Any enumerated implementation already satisfies the filters. The
         // description's encoder table is not consulted: mfxhw64 leaves
@@ -1304,9 +1335,13 @@ bool vpl_encoder_available(VideoCodec codec, ID3D11Device* device) {
     if (has_implementation(codec)) {
         return true;
     }
-    // An HEVC request falls back to the AVC tiers when HEVC hardware encoding
-    // is absent, so an AVC encoder on the capture adapter still qualifies.
-    return codec == VideoCodec::Hevc && has_implementation(VideoCodec::H264);
+    // A non-H.264 request falls back through the remaining tiers when the
+    // preferred family has no encoder on the capture adapter, so any lower
+    // family that is present still qualifies.
+    if (codec == VideoCodec::Av1 && has_implementation(VideoCodec::Hevc)) {
+        return true;
+    }
+    return codec != VideoCodec::H264 && has_implementation(VideoCodec::H264);
 }
 
 std::unique_ptr<IVideoEncoder> create_vpl_encoder(ID3D11Device* device,

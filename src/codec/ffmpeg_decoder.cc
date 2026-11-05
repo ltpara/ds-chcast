@@ -42,11 +42,32 @@ constexpr uint64_t kFnvOffset = 14695981039346656037ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
 
 AVCodecID av_codec_id(VideoCodec codec) {
-    return codec == VideoCodec::H264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC;
+    switch (codec) {
+        case VideoCodec::H264: return AV_CODEC_ID_H264;
+        case VideoCodec::Hevc: return AV_CODEC_ID_HEVC;
+        case VideoCodec::Av1: return AV_CODEC_ID_AV1;
+    }
+    return AV_CODEC_ID_H264;
 }
 
 const char* codec_name(VideoCodec codec) {
-    return codec == VideoCodec::H264 ? "H.264" : "HEVC";
+    switch (codec) {
+        case VideoCodec::H264: return "H.264";
+        case VideoCodec::Hevc: return "HEVC";
+        case VideoCodec::Av1: return "AV1";
+    }
+    return "H.264";
+}
+
+const AVCodec* find_decoder(VideoCodec codec) {
+    if (codec == VideoCodec::Av1) {
+        // libdav1d has no AVHWAccel entry; the native decoder is the one that
+        // exposes D3D11VA, and it decodes in software just as well.
+        if (const AVCodec* native = avcodec_find_decoder_by_name("av1")) {
+            return native;
+        }
+    }
+    return avcodec_find_decoder(av_codec_id(codec));
 }
 
 AVPixelFormat select_d3d11(AVCodecContext*, const AVPixelFormat* formats) {
@@ -126,7 +147,7 @@ Error FFmpegDecoder::open() {
         return Error(Status::InvalidCall, "GPU decoding needs a D3D11 device");
     }
 
-    codec_api_ = avcodec_find_decoder(av_codec_id(codec_));
+    codec_api_ = find_decoder(codec_);
     if (!codec_api_) {
         return Error(Status::Unsupported,
                      std::string("this FFmpeg build has no ") + codec_name(codec_) +

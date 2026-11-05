@@ -49,6 +49,7 @@ void main() {
     expect(ViewerStreamCodec.auto.code, 0);
     expect(ViewerStreamCodec.h264.code, 1);
     expect(ViewerStreamCodec.hevc.code, 2);
+    expect(ViewerStreamCodec.av1.code, 3);
     expect(ViewerStreamQuality.high.code, 0);
     expect(ViewerStreamQuality.balanced.code, 1);
     expect(ViewerStreamQuality.smooth.code, 2);

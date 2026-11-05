@@ -1228,7 +1228,8 @@ class ViewerStatus {
   String get audioOutputLabel => audioDeviceName.isNotEmpty
       ? audioDeviceName
       : (audioDevice.isEmpty ? tr('系统默认输出') : tr('输出设备'));
-  String get codecLabel => codec == 'hevc' ? 'HEVC' : 'H.264';
+  String get codecLabel =>
+      codec == 'hevc' ? 'HEVC' : (codec == 'av1' ? 'AV1' : 'H.264');
 
   /// "UDP", "TCP 回退" or "WebSocket 回退" for the stats overlay.
   String get transportLabel {
@@ -2723,7 +2724,8 @@ enum ViewerHostActionCode {
 enum ViewerStreamCodec {
   auto(0),
   h264(1),
-  hevc(2);
+  hevc(2),
+  av1(3);
 
   const ViewerStreamCodec(this.code);
   final int code;
@@ -2736,6 +2738,8 @@ enum ViewerStreamCodec {
         return 'H.264';
       case ViewerStreamCodec.hevc:
         return 'HEVC';
+      case ViewerStreamCodec.av1:
+        return 'AV1';
     }
   }
 }

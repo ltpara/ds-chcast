@@ -448,9 +448,13 @@ void test_codec_names() {
           "h265 is an accepted alias");
     check(chast::parse_codec_setting("avc", codec) && codec == chast::VideoCodec::H264,
           "avc is an accepted alias");
+    check(chast::parse_codec_setting("AV1", codec) && codec == chast::VideoCodec::Av1,
+          "AV1 is accepted in any case");
     check(!chast::parse_codec_setting("vp9", codec), "an unknown codec is rejected");
     check(std::string(chast::codec_setting_name(chast::VideoCodec::Hevc)) == "hevc",
           "HEVC is written as hevc");
+    check(std::string(chast::codec_setting_name(chast::VideoCodec::Av1)) == "av1",
+          "AV1 is written as av1");
 }
 
 void test_service_parsers() {

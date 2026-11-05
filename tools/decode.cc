@@ -37,6 +37,8 @@ bool parse_args(int argc, char** argv, Options& options) {
                 options.codec = chast::VideoCodec::H264;
             } else if (value == "hevc" || value == "h265") {
                 options.codec = chast::VideoCodec::Hevc;
+            } else if (value == "av1") {
+                options.codec = chast::VideoCodec::Av1;
             } else {
                 std::fprintf(stderr, "unknown codec: %s\n", value.c_str());
                 return false;
@@ -88,8 +90,16 @@ int main(int argc, char** argv) {
     }
 
     const std::vector<chast_tools::AccessUnit> units =
-        chast_tools::split_access_units(data, options.codec);
+        options.codec == chast::VideoCodec::Av1
+            ? std::vector<chast_tools::AccessUnit>()
+            : chast_tools::split_access_units(data, options.codec);
     if (units.empty()) {
+        if (options.codec == chast::VideoCodec::Av1) {
+            std::fprintf(stderr,
+                         "AV1 is OBU-framed and has no Annex B split; this tool replays "
+                         "H.264 and HEVC elementary streams only\n");
+            return 1;
+        }
         std::fprintf(stderr, "no NAL units found; is this an Annex B %s stream?\n",
                      chast_tools::codec_name(options.codec));
         return 1;

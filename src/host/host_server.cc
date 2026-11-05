@@ -648,7 +648,15 @@ int foreground_display_index(const std::vector<DisplayInfo>& displays) {
 }
 
 const char* codec_name(VideoCodec codec) {
-    return codec == VideoCodec::Hevc ? "hevc" : "h264";
+    switch (codec) {
+        case VideoCodec::H264:
+            return "h264";
+        case VideoCodec::Hevc:
+            return "hevc";
+        case VideoCodec::Av1:
+            return "av1";
+    }
+    return "h264";
 }
 
 std::string auth_method_suffix(const HostSecurity::Result& result) {
@@ -3914,10 +3922,12 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         if (preference_change) {
             if (options.codec == StreamCodecPreference::Auto) {
                 wanted_codec = settings_.codec;
+            } else if (options.codec == StreamCodecPreference::Hevc) {
+                wanted_codec = VideoCodec::Hevc;
+            } else if (options.codec == StreamCodecPreference::Av1) {
+                wanted_codec = VideoCodec::Av1;
             } else {
-                wanted_codec = options.codec == StreamCodecPreference::Hevc
-                                   ? VideoCodec::Hevc
-                                   : VideoCodec::H264;
+                wanted_codec = VideoCodec::H264;
             }
             codec_rebuild = wanted_codec != encoder->codec();
         }
@@ -3957,9 +3967,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             std::string codec_error;
             replacement = create_encoder(codec_adapter.device, next_config, &codec_error);
             if (!replacement) {
-                return refuse(options.codec == StreamCodecPreference::Hevc
-                                  ? StreamOptionsCode::Unsupported
-                                  : StreamOptionsCode::Failed,
+                const bool unsupported =
+                    options.codec == StreamCodecPreference::Hevc ||
+                    options.codec == StreamCodecPreference::Av1;
+                return refuse(unsupported ? StreamOptionsCode::Unsupported
+                                          : StreamOptionsCode::Failed,
                               "encoder creation failed: " + codec_error);
             }
             if (options.codec != StreamCodecPreference::Auto &&

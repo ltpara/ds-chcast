@@ -765,6 +765,8 @@ std::wstring codec_label(VideoCodec codec) {
             return L"H.264";
         case VideoCodec::Hevc:
             return L"HEVC";
+        case VideoCodec::Av1:
+            return L"AV1";
     }
     return L"—";
 }

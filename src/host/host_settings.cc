@@ -1087,7 +1087,15 @@ bool unprotect_totp_secret(const std::string& stored_base64, SecretScope scope,
 }
 
 const char* codec_setting_name(VideoCodec codec) {
-    return codec == VideoCodec::Hevc ? "hevc" : "h264";
+    switch (codec) {
+        case VideoCodec::H264:
+            return "h264";
+        case VideoCodec::Hevc:
+            return "hevc";
+        case VideoCodec::Av1:
+            return "av1";
+    }
+    return "h264";
 }
 
 bool parse_codec_setting(const std::string& text, VideoCodec& codec) {
@@ -1098,6 +1106,10 @@ bool parse_codec_setting(const std::string& text, VideoCodec& codec) {
     }
     if (value == "hevc" || value == "h265") {
         codec = VideoCodec::Hevc;
+        return true;
+    }
+    if (value == "av1") {
+        codec = VideoCodec::Av1;
         return true;
     }
     return false;

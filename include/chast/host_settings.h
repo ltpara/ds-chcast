@@ -251,7 +251,7 @@ bool protect_totp_secret(const std::string& plaintext, SecretScope scope,
 bool unprotect_totp_secret(const std::string& stored_base64, SecretScope scope,
                            std::string& plaintext, std::string* error);
 
-// "h264"/"hevc", the spelling used in the settings file.
+// "h264"/"hevc"/"av1", the spelling used in the settings file.
 const char* codec_setting_name(VideoCodec codec);
 bool parse_codec_setting(const std::string& text, VideoCodec& codec);
 
