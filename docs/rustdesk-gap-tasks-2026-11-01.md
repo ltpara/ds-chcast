@@ -363,7 +363,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-11 | P1 | 多查看者并发（同一主机同时多个受控会话） | `src/server.rs:466`/`:488` 以连接表维护多个连接，视频服务按订阅者分发 | 已实现（2026-11-05）：`max_viewers`（1..8，默认 2）并发接纳，每个查看者独立会话/审批/权限/审计，共享桌面流与控制租约，详见同日小节 |
 | DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 已实现（2026-11-05）：会合控制面、TCP 载体与共享载体支持 http/https/socks5/socks5h，代理下强制 TCP 载体，详见同日小节 |
 | DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 已实现（2026-11-05）：协议 v37 新增语音呼叫协商与 `VoiceAudio`，主机按请求采集麦克风上行、查看器解码到输出端点，详见同日小节 |
-| DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
+| DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 不实施（2026-11-05 评估）：RustDesk 依赖对等端同时具备客户端与服务端；chast 查看器与主机栈分离，反向交接需合并两套栈或新增本机 IPC/一次性授权，超出单项范围，详见同日小节 |
 | DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 已实现（2026-11-05）：协议 v39 的 `OsLoginRequest/Result` 由主机在登录或锁屏界面键入查看器提供的密码；权限位 0x2000 与 `allow_os_login` 默认关闭；密码不落盘、不记日志，详见同日小节 |
 | DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 已实现（2026-11-05）：协议 v40 的 `SessionListRequest/Result`、`SessionSelectRequest/Result` 由服务模式主机列出并切换 WTS 会话；权限位 0x4000 与 `allow_session_select` 默认关闭；查看器工具栏会话选择器在切换后自动重连，详见同日小节 |
 | DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
@@ -1018,6 +1018,36 @@ RDP 参数用例、设备菜单端口对话框用例）；Windows release 构建
 主机侧 Release 构建通过，`chast-host-settings-test` 新增便携路径用例
 并通过。边界：本机没有第二台可 RDP 的 Windows 主机，mstsc 端到端与
 便携模式实际启动未运行验证；便携模式不改变媒体链路，保持零拷贝。
+
+### DEV-14 会话角色互换（Switch Sides）（2026-11-05 评估：不实施）
+
+RustDesk 的角色互换依赖“每个对等端同时是客户端和服务端”：受控端收到
+`SwitchSidesRequest` 后登记一次性 UUID，拉起本机 GUI 查看器进程
+（`--connect <控制端 id> --switch_uuid <uuid>`）并关闭原会话；控制端服务
+用该 UUID 接受反向连接（`src/server/connection.rs:4001-4017`、
+`src/client.rs:4564-4636`、`:4907-4919`）。切换时不需要重新采集或转码，
+因为双方本来就具备采集/编码、解码/渲染、注入和监听能力。
+
+chast 的两端是分离产品：查看器只有 QUIC 客户端、解码/渲染和输入发送，
+没有采集/编码、输入注入或服务端；主机只有采集/编码、注入和服务端，没有
+解码/渲染或查看器 UI。真正互换角色需要满足以下之一：
+
+- 把两套栈合并进同一程序，让任一端都能受控或控制；或
+- 由主机拉起查看器、由查看器拉起主机，并新增本机 IPC、一次性授权、
+  控制端主机可用性检查与凭据交接。
+
+第二条仍绕不开一次性授权：RustDesk 用 UUID 命令行参数完成，而本项目的
+约束是不把凭据放上命令行或落盘；主机也无法在不经用户确认的情况下让
+查看器变成受控端。两者都超出单个缺口项的范围，且本机没有第二台 Windows
+主机，无法做端到端双机验收。
+
+也评估过“反向 RDP 桥接”（主机经会话把 mstsc 接到查看器的 3389）：它只
+适用于开启远程桌面的专业版/企业版 Windows，连接还会接管或注销查看器的
+本地会话，与 RustDesk 的角色互换语义不等价，因此不采用。
+
+结论：DEV-14 不实施，协议、主机和查看器均不改动，媒体链路与零拷贝约束
+不受影响。若将来主机与查看器合并为单一对等程序，或引入可审计的一次性
+反向授权协议，再重新评估。
 
 ### 已核对但不算缺口的项
 
