@@ -3327,6 +3327,22 @@
      `account_sync_smoke.dart` 全过，连接与两条文件记录共享
      `audit_ref=abcd1234`、地点 `Local lab`、路由 `punch`；未配置 GeoIP
      的接口测试确认只记录 IP。
+152. **P1 · DEV-06 归档集中去重与迟到合并（2026-11-05 完成）**：归档行
+     改按事件时间选日文件（审计 `CreatedAt`、连接 `EndedAt` 回退
+     `StartedAt`、文件 `OccurredAt`），未来时钟偏差夹到当天、早于保留期
+     的行夹到截止日。分页时切出迟到行并按日合并已关闭文件：临时文件 +
+     rename 受控重写，按行 id 最大值重放去重，gz 保持 gz、开启压缩时
+     普通文件立即压缩，合并删除 `.delivered` 标记触发重新投递。新增
+     `delivered-ledger.jsonl` 账本，键为“日期-内容哈希”：标记丢失但账本
+     命中时只补标记不再上传，内容改写后哈希变化再投递一次；HTTP PUT 的
+     `Idempotency-Key` 同样绑定日期与内容哈希，标记和账本同时丢失时接收端
+     对同内容也只保留一份（S3 预签名 PUT 无该头）。管理台 `audit archive`
+     与周期日志新增 `merged` 计数。验证：`internal/auditarchive` 覆盖迟到
+     主机审计并入前一日、跨午夜连接按结束时间归日、迟到文件新建对应日
+     文件、未来/保留期夹取、gz 改写与重放去重、标记丢失后账本抑制上传并
+     补标记、改写后再投递、标记与账本同时丢失时同一幂等键只落一份，以及
+     S3 签名端点上的账本与改写行为；`go vet ./...` 与
+     `go test ./... -count=1` 通过。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

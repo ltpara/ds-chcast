@@ -349,14 +349,36 @@ P2 = 平台扩展。
   `app/windows/viewer/viewer_engine.cc`、
   `app/windows/viewer/viewer_bridge.cc`、`app/tool/account_sync_smoke.dart`。
 
-### DEV-06 归档集中去重与迟到合并（P1）
+### DEV-06 归档集中去重与迟到合并（P1，2026-11-05 完成）
 
 - 目标：远端投递不重复，迟到的主机审计能并入对应日归档。
-- 实施：投递账本按“日期+内容哈希”去重；迟到记录按 `occurred_at`
-  合并到已关闭日文件（重写受控或追加旁路索引）。
+- 实施：归档行改按事件时间选日文件——审计用 `CreatedAt`、连接用
+  `EndedAt`（缺失回退 `StartedAt`）、文件传输用 `OccurredAt`；未来
+  时钟偏差夹到当天，早于保留期的行夹到保留截止日，避免生成未来或
+  已过期文件。分页扫描时把非当天行切出，先按日合并已关闭文件：
+  临时文件 + rename 的受控重写，按行 id 最大值去重（重复扫描不会重复
+  追加），原为 `.gz` 的仍写 `.gz`，普通文件在开启压缩时立即压缩，
+  合并后删除该文件的 `.delivered` 标记以触发重新投递。投递新增账本
+  `delivered-ledger.jsonl`，键为“日期-内容哈希”；标记丢失但账本命中时
+  只补标记不再上传，内容因迟到行改写后哈希变化会再投递一次；HTTP PUT
+  的 `Idempotency-Key` 同样绑定日期与内容哈希，即使进程崩溃丢失标记与
+  账本，接收端对同内容也只保留一份（S3 预签名 PUT 无该头，依靠账本）。
+  管理台 `audit archive` 与周期归档日志新增 `merged` 计数。
 - 验收：重复投递只成功一次；迟到记录可在归档查询到；
   失败重试不产生重复。
-- 测试：本地 HTTP/S3 模拟端点单测与归档查询断言。
+- 测试：`internal/auditarchive` 覆盖迟到主机审计并入前一日、连接跨午夜
+  按结束时间归日、迟到文件传输新建对应日文件、未来/保留期夹取、gz
+  改写与重放去重、标记丢失后账本抑制上传并补标记、改写后内容哈希变化
+  再投递、标记与账本同时丢失时同一 `Idempotency-Key` 只落一份，以及
+  S3 签名端点上的账本与改写行为；`go vet ./...` 与
+  `go test ./... -count=1` 通过。
+- 边界：迟到合并按行 id 去重，要求同一归档流的 id 单调；合并会重写
+  整个日文件，单日文件过大时内存占用随之增长（当前每表上限 1 万行）。
+- 文件：`server/internal/auditarchive/archive.go`、
+  `server/internal/auditarchive/archive_test.go`、
+  `server/internal/auditarchive/remote_test.go`、
+  `server/internal/auditarchive/s3_test.go`、
+  `server/internal/admin/account.go`、`server/cmd/chast-server/main.go`。
 
 ### DEV-07 主机自报元数据签名（P1，2026-11-05 完成）
 
@@ -512,8 +534,8 @@ WebSocket、便携模式、RDP）补一轮。
 | DEV-02 | 已完成（2026-11-05） | punch 与 relay 会话 span 按主机 ID 归并同一 trace，SQLite 经驱动包装记录查询耗时/错误/慢查询与连接池等待，hbbs 与 relay 的 `/metrics` 暴露队列与数据面指标；QUIC 由 C++ 主机终止，无 Go 侧握手/流 span。 |
 | DEV-03 | 已完成（2026-11-05） | `--postgres-dsn`/`CHAST_POSTGRES_DSN` 让账号、地址簿、审计/连接/文件历史、录制元数据与对等记录改存 PostgreSQL；驱动层方言改写保持调用点不变，ICU 排序规则复现 SQLite NOCASE，并发由 advisory lock 串行；空库迁移、并发与启动验证通过。 |
 | DEV-04 | 已完成（2026-11-05） | 账号分组（成员/设备/配额）与组内 readonly/operator/admin 三档已落地；连接、审计与 CSV 支持按组过滤，最后管理员保护、配额边界与管理台分组页签均已验证，详见同日小节。 |
-| DEV-05 | 采纳，P1 | GeoIP 目前只用于登录审计；连接/文件审计缺地点、路由与逐文件关联。 |
-| DEV-06 | 采纳，P1 | 已有按日轮转与远端投递，缺集中去重与迟到合并。 |
+| DEV-05 | 已完成（2026-11-05） | 账号库 v8 为连接/文件审计加地点与路由，GeoIP 登录地点、逐文件批量上报与管理台/CSV 展示均已落地，详见同日小节。 |
+| DEV-06 | 已完成（2026-11-05） | 投递账本按日期+内容哈希去重，HTTP `Idempotency-Key` 绑定内容；迟到行按事件日受控重写合并并重放去重，标记丢失补标记、内容变化再投递，详见同日小节。 |
 | DEV-08 | 采纳，P2 小切片 | 拼音/模糊搜索与搜索词持久化属体验增强，可在 UI 批次完成。 |
 | DEV-09 | 暂缓 | 需要 NVENC/QSV/AMF 等硬件；必须沿用零拷贝链路，新增后端只能直接写入现有 GPU 缓冲，不接受 CPU fallback。 |
 | DEV-10 | 暂缓 | 超出 RustDesk 对齐面的可选增强，按实际需求排期。 |
