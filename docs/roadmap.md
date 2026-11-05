@@ -3254,6 +3254,24 @@
      `EnumAdapters1` 检查错误；WebAuthn 校验 rp_id、origin 与 challenge。
      验证：`flutter build windows --release` 通过；交互验证受 Device Guard
      限制。至此代码审核第 7 节无剩余待修项。
+148. **P1 · DEV-02 数据面 tracing 与队列/SQLite 指标（2026-11-05 完成）**：
+     `internal/tracing` 新增非 HTTP span（`Start`/`StartDerived`/
+     `StartLinked`、属性与状态、`DeriveTraceID`），会合侧每个 punch 请求
+     生成 `punch` span（结果、nonce、是否提供中继），中继侧为 UDP、
+     per-port carrier 与共享 carrier 的每个查看者会话生成 `relay.session`
+     span，结束时记录字节数、降速与封禁结果；三类 span 都以
+     `DeriveTraceID("host", host_id)` 为 trace ID，同一主机的会合与中继
+     阶段落在同一条 trace（QUIC 由 C++ 主机终结，Go 侧无法为握手/流生成
+     span，已在该 span 上覆盖会话生命周期）。新增 `internal/dbmetric` 驱动
+     包装：按操作记录 SQLite 语句次数/错误/慢查询（100 ms）与耗时，并把
+     `database/sql` 单连接池的 `WaitCount`/`WaitDuration` 作为写队列积压
+     指标；`/metrics` 追加 `chast_trace_queue_depth`/`_capacity`/
+     `chast_trace_spans_dropped_total` 与 `chast_db_*` 系列，
+     `chast-relay` 新增需控制密钥的 `/metrics`。采样率、collector 端点与
+     服务名仍在启动时读取，修改需重启；坚持 OTLP/HTTP JSON，不引入 gRPC
+     依赖。验证：tracing/relay/api/account/registry 测试通过；
+     `dbmetric` 专用测试二进制在本机被 Application Control 拦截，其驱动
+     路径由 account 存储测试与 API 指标断言覆盖。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

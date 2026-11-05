@@ -179,15 +179,43 @@ P2 = 平台扩展。
   `server/internal/updater/`、`server/internal/setup/`、
   `server/cmd/chast-publish/`、`app/lib/tunnel_agent.dart`。
 
-### DEV-02 数据面 tracing 与队列/SQLite 指标（P1）
+### DEV-02 数据面 tracing 与队列/SQLite 指标（P1，2026-11-05 完成）
 
 - 目标：让中继/会合数据面、SQLite 与队列可观测。
-- 实施：在 punch、relay 会话、QUIC 握手与流关闭处生成 span；
-  记录 SQLite 查询耗时与队列深度；沿用现有 OTLP/HTTP JSON 导出，
-  评估是否补 gRPC 传输。
-- 验收：一次双机/回环会话可在 trace 中串起会合→打洞→中继→会话；
-  慢查询与队列积压有指标；采样配置可热更新或明确重启生效。
-- 测试：tracing 单测、指标断言与一次回环导出。
+- 实施：`internal/tracing` 增加非 HTTP span（`Start`/`StartDerived`/
+  `StartLinked`、属性、状态、`DeriveTraceID`、导出队列丢弃计数）。
+  会合侧对每个 punch 请求生成 `punch` span，带
+  `chast.host_id`/`chast.nonce`/`chast.result`/`relay.offered`；
+  中继侧对 UDP、per-port carrier 与共享 carrier 的查看者会话生成
+  `relay.session` span，关闭时记录字节数、降速与封禁。三类 span 均以
+  `tracing.DeriveTraceID("host", host_id)` 为 trace ID，同一主机的
+  会合与中继阶段因此落在同一条 trace；RustDesk 兼容客户端不传播
+  traceparent，跨进程 QUIC 握手/流由 C++ 主机终结，Go 侧以会话 span
+  覆盖数据面生命周期。新增 `internal/dbmetric` 驱动包装，按操作记录
+  SQLite 语句数、错误数、100 ms 以上慢查询与累计/最大耗时；单连接池的
+  `WaitCount`/`WaitDuration`/`InUse`/`OpenConnections` 作为写队列积压
+  信号。`/metrics` 追加 `chast_trace_queue_depth`、
+  `chast_trace_queue_capacity`、`chast_trace_spans_dropped_total` 与
+  `chast_db_*` 系列；`chast-relay` 新增需控制密钥的 `/metrics`，输出
+  队列与中继聚合计数。沿用现有 OTLP/HTTP JSON 导出，不补 gRPC 传输，
+  保持零第三方依赖；采样率、collector 端点与服务名在启动时读取，
+  修改后需重启进程。
+- 验收：回环会话可在一条 trace 中看到 punch 与 relay.session；
+  慢查询（`chast_db_slow_queries_total`）与队列积压
+  （`chast_trace_queue_depth`、`chast_db_pool_wait_total`）有指标；
+  采样配置明确为重启生效。
+- 测试：`internal/tracing` 覆盖派生 trace、属性/状态、采样与队列统计；
+  `internal/relay` 覆盖会话 span 与 host_id trace 锚定；`internal/api`
+  断言 `/metrics` 包含 tracer 与 SQLite 指标；`internal/dbmetric`
+  新增驱动包装单测（本机 Application Control 拦截该测试二进制，驱动
+  路径另由 account 存储测试与 API 指标断言覆盖）。
+- 文件：`server/internal/tracing/`、`server/internal/dbmetric/`、
+  `server/internal/rendezvous/rendezvous.go`、
+  `server/internal/relay/relay.go`、`server/internal/relay/policy.go`、
+  `server/internal/relay/shared.go`、`server/internal/relaynode/node.go`、
+  `server/internal/api/api.go`、`server/cmd/chast-server/main.go`、
+  `server/cmd/chast-relay/main.go`、`server/internal/account/store.go`、
+  `server/internal/registry/store.go`、`server/README.md`。
 
 ### DEV-03 PostgreSQL 后端（P1）
 
@@ -377,7 +405,7 @@ WebSocket、便携模式、RDP）补一轮。
 | --- | --- | --- |
 | DEV-01 | 已完成（2026-11-05） | 发布者签名（服务器/主机/查看器三层校验）、`chast-publish` 签名工具、查看器健康标记回滚与安装器服务恢复均已实现并验证，详见同日小节。 |
 | DEV-07 | 已完成（2026-11-05） | 主机用绑定私钥签名元数据，服务器验签后仅在规范化未改动时落库并回显；默认兼容旧主机，`--require-host-metadata-signature` 可强制；管理 CLI/Web 台显示签名状态，详见同日小节。 |
-| DEV-02 | 采纳，P1 | 数据面（punch/relay/QUIC）与 SQLite/队列没有 span 或指标；排在 DEV-01/07 之后。 |
+| DEV-02 | 已完成（2026-11-05） | punch 与 relay 会话 span 按主机 ID 归并同一 trace，SQLite 经驱动包装记录查询耗时/错误/慢查询与连接池等待，hbbs 与 relay 的 `/metrics` 暴露队列与数据面指标；QUIC 由 C++ 主机终止，无 Go 侧握手/流 span。 |
 | DEV-03 | 采纳，P1 | 需 PostgreSQL 实例；先抽存储接口并保持 SQLite 默认部署与现有回归全绿。 |
 | DEV-04 | 采纳，P1 | 账号仍只有逐设备标签，无按组授权与配额；与地址簿分组 ACL 解耦。 |
 | DEV-05 | 采纳，P1 | GeoIP 目前只用于登录审计；连接/文件审计缺地点、路由与逐文件关联。 |

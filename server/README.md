@@ -16,7 +16,7 @@ Go 实现的 chast 连接服务：持久主机身份、查看者寻址、UDP 打
 | WebAuthn 安全密钥 | `--webauthn-rp-id`/`--webauthn-origin` + `/v1/account/webauthn/*` 与 `/v1/account/login/webauthn/*` | Windows Hello / FIDO2 平台认证器可作为登录第二因素（密码 + 断言）或免密码登录（用户名选中已注册凭据后直接断言）；服务端只存 COSE 公钥，挑战 32 字节、5 分钟单活并在登录成功时与令牌同一事务消费，重放必然失败；两种登录使用独立 purpose，互不替换也互不重放；支持 ES256/RS256/EdDSA，attestation 接受 `none`/`packed` 但不校验证书链；查看器账号对话框可注册/命名/删除，登录页提供“使用安全密钥”与“使用安全密钥登录”；未配置时相关接口返回 503 |
 | 登录地点（GeoIP） | `--geoip-file` + 审计 `location` / 会话 `location` | 可选离线表，每行 `CIDR 地点`，按最长前缀把登录 IP 映射为地点（IPv4、IPv6 与 IPv4-mapped 归一）；写入账号安全审计与设备会话列表，管理台与查看器会话对话框显示；缺省不解析，只记录 IP |
 | 日志轮转与归档 | `--log-file` + `--log-max-size`/`--log-max-backups`/`--log-max-age`/`--log-compress` | slog 文本日志同时写 stderr 与文件；按大小轮转为时间戳文件，可选 gzip，按数量与年龄清理旧归档；`chast-relay` 同名旗标 |
-| 请求链路 tracing | `--trace-endpoint` + `--trace-sample`/`--trace-service` | 每个 HTTP 请求按 OTLP/HTTP JSON 导出 span（`service.name`、路由、方法、状态码、≥500 标记错误），接受上游 W3C `traceparent` 并在响应回写；默认关闭，collector 不可达或队列满时丢弃 span，不阻塞请求；`chast-server` 覆盖 API（含 429），`chast-relay` 覆盖节点控制面 |
+| 请求链路 tracing | `--trace-endpoint` + `--trace-sample`/`--trace-service` | HTTP 请求 span（`service.name`、路由、方法、状态码、≥500 标记错误）以及 punch、relay 会话 span；服务端以 `host_id` 派生 trace ID，把同一主机的会合与中继会话归入一条 trace；接受上游 W3C `traceparent` 并在响应回写；默认关闭，collector 不可达或队列满时丢弃 span，不阻塞业务；`chast-server` 覆盖 API（含 429）、会合与中继数据面，`chast-relay` 覆盖节点控制面与中继会话 |
 | HTTPS 与 mTLS | `--tls-cert`/`--tls-key` 或 `--acme-domain` + `--tls-client-ca`；代理与隧道 `--tls-ca`/`--tls-client-cert`/`--tls-client-key` | 服务端与节点控制面可直接 HTTPS；给出客户端 CA 时要求并校验客户端证书。证书既可来自文件，也可由内建 ACME（HTTP-01）自动申请与续期；证书文件与客户端 CA 都在替换后自动热加载（最迟 5 秒，坏文件保留旧内容），ACME 模式下的客户端 CA 同样热加载。代理、`chast-tunnel` 与节点池可信任私有 CA 并出示客户端证书，未配置时行为不变 |
 | 连接审计 | `POST /v1/account/connections` + `GET /v1/audit/connections` + 管理台 `connections` | 查看器在会话结束（首帧后计时）时上报对端、起止时间、结果与说明，服务端推导账号与客户端 IP 并保留最新 10000 条；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤 |
 | 文件传输审计 | `POST /v1/account/file-transfers` + `GET /v1/audit/file-transfers` + 管理台 `transfers` | 查看器按轮询窗口上报完成/失败的上传与下载，含方向、最后文件名与大小、文件数、结果和说明；账号可读自己的记录，运营者按 server-key 查看全部并可按用户名过滤，同样保留最新 10000 条 |
@@ -1023,14 +1023,31 @@ chast-server --http-listen 0.0.0.0:8443 --punch-listen 0.0.0.0:8444 \
   `--log-max-age`（默认 0，不按年龄删除）在每次轮转和重启打开时按目录内容
   统一清理，进程被杀后残留的归档也受同一策略约束。`chast-relay` 提供同名
   旗标。
-- `--trace-endpoint`（默认空，关闭）把 HTTP 请求 span 以 OTLP/HTTP JSON
-  批量 `POST` 到 `<endpoint>/v1/traces`（每 2 s 或 128 条一批），
-  `--trace-sample`（默认 1，范围 0..1）控制本地采样，`--trace-service`
-  （默认 `chast-server` / `chast-relay`）作为资源 `service.name`。请求带
-  上游 `traceparent` 时沿用其 trace ID 与采样位，否则新建 trace；响应总带
-  `traceparent`，便于把客户端日志与导出的 span 关联。导出失败或队列满只
-  丢弃 span，不阻塞业务请求；退出时最多等待 3 s 冲刷。`chast-relay` 旗标
-  相同，覆盖节点控制面。
+- `--trace-endpoint`（默认空，关闭）把 span 以 OTLP/HTTP JSON 批量 `POST`
+  到 `<endpoint>/v1/traces`（每 2 s 或 128 条一批），`--trace-sample`
+  （默认 1，范围 0..1）控制本地采样，`--trace-service`（默认 `chast-server`
+  / `chast-relay`）作为资源 `service.name`。除 HTTP 请求 span 外，会合
+  `punch` span 和 `relay.session` span（UDP、per-port carrier、共享 carrier，
+  结束时带字节数与降速/封禁结果）使用 `tracing.DeriveTraceID("host", host_id)`
+  作为 trace ID，因此同一主机的会合与中继会话落在同一条 trace；RustDesk
+  兼容客户端没有跨进程 traceparent 时按属性 `chast.host_id`、`chast.nonce`
+  与 `relay.session_key` 区分阶段。请求带上游 `traceparent` 时沿用其 trace
+  ID 与采样位，否则新建 trace；响应总带 `traceparent`，便于把客户端日志
+  与导出的 span 关联。导出失败或队列满只丢弃 span，不阻塞业务；退出时最多
+  等待 3 s 冲刷。采样率、collector 端点与服务名在进程启动时读取，修改后
+  需重启进程生效。`chast-relay` 旗标相同，覆盖节点控制面与中继会话。
+- 数据面 span 的队列状态在 `/metrics` 暴露：`chast_trace_queue_depth`、
+  `chast_trace_queue_capacity` 与 `chast_trace_spans_dropped_total`（队列满
+  丢弃数）。`chast-relay` 的 `/metrics` 还输出 `chast_relay_bytes_total` 与
+  策略计数，认证方式同 `/v1/stats`。
+- SQLite 语句通过 `internal/dbmetric` 驱动包装计时，不改变各存储的
+  `database/sql` 调用方式；`/metrics` 输出 `chast_db_queries_total{op}`、
+  `chast_db_query_errors_total{op}`、`chast_db_slow_queries_total{op}`（默认
+  100 ms）、`chast_db_query_duration_seconds_total{op}` 与
+  `chast_db_query_duration_seconds_max{op}`。单连接池的排队情况由
+  `chast_db_pool_wait_total{db}`、`chast_db_pool_wait_seconds_total{db}`、
+  `chast_db_pool_in_use{db}` 与 `chast_db_pool_open_connections{db}` 反映，
+  等待数持续上升即 SQLite 写队列积压。
 - `GET /metrics` 输出 Prometheus 文本格式，配置 `--server-key` 后需要 Bearer
   认证。API 请求延迟以 `chast_http_request_duration_seconds` 直方图暴露，
   按端点分标签，分桶 0.001–10 秒加 `+Inf`，同时给出 `_sum`/`_count`。采集器示例：
