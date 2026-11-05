@@ -3235,6 +3235,13 @@
      `close()` 同锁释放 `swr_`、复位格式并取走句柄后锁外关闭。验证：
      `chast-cursor-test`、`chast.audio`、`chast.codec`、`chast.dxgi` Release
      构建通过；Device Guard 拒绝执行新构建的测试二进制，仅编译验证。
+146. **P1 · 代码审核 V1/V3/V5/V6（2026-11-05 完成）**：`GpuFrameSink` 的
+     插件 `set_texture_` 改在 `mutex_` 内重新校验 `output_` 后调用，detach
+     返回后不再有旧输出的在途调用；`OpenTerminal` 先检查输出是否排空再改
+     `terminal_phase`，失败不再留下 `kRequesting`；bridge 的 `start` 改为
+     `Start` 成功后再 `SetOutput`，busy 不触碰运行中会话；`ViewerEngine::Start`
+     复位 `record_wanted_`，录制按会话重新开启。验证：
+     `flutter build windows --release` 通过；交互验证受 Device Guard 限制。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
