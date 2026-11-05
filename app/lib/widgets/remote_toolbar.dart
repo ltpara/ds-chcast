@@ -55,6 +55,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.onSetAudioProcessing,
     required this.privacyAvailable,
     required this.privacyEnabled,
+    this.osLoginAvailable = false,
+    this.onOsLogin,
     required this.portForwardAvailable,
     required this.portForwardActive,
     required this.onOpenPortForward,
@@ -146,6 +148,12 @@ class RemoteToolbar extends StatelessWidget {
   final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
+
+  /// The host granted input and OS login, so the viewer may offer a password
+  /// dialog. The host still refuses the password unless it is at a logon or
+  /// lock screen, which is why the button stays available at other desktops.
+  final bool osLoginAvailable;
+  final VoidCallback? onOsLogin;
   final bool restartAvailable;
   final bool lockAvailable;
   final bool blockInputAvailable;
@@ -626,6 +634,14 @@ class RemoteToolbar extends StatelessWidget {
                 disabled: !privacyAvailable,
                 active: privacyEnabled,
                 onTap: onTogglePrivacy,
+              ),
+              _BarButton(
+                icon: Icons.password_rounded,
+                tooltip: osLoginAvailable
+                    ? tr('在主机登录或锁屏界面输入密码')
+                    : tr('服务端未开放系统登录'),
+                disabled: !osLoginAvailable,
+                onTap: onOsLogin,
               ),
               _HostPowerButton(
                 restartAvailable: restartAvailable,

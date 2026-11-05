@@ -364,7 +364,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-12 | P1 | 出站 SOCKS5/HTTP(S) 代理 | `flutter/lib/desktop/pages/desktop_setting_page.dart:1938`（Socks5/Http(s) Proxy） | 已实现（2026-11-05）：会合控制面、TCP 载体与共享载体支持 http/https/socks5/socks5h，代理下强制 TCP 载体，详见同日小节 |
 | DEV-13 | P2 | 语音通话（主机麦克风→查看器 + 呼叫协商） | `src/client/io_loop.rs:2540`、`src/server/connection.rs:4101`；`VoiceCallRequest/Response` | 已实现（2026-11-05）：协议 v37 新增语音呼叫协商与 `VoiceAudio`，主机按请求采集麦克风上行、查看器解码到输出端点，详见同日小节 |
 | DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
-| DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 可发送 Ctrl+Alt+Del（`include/chast/sas.h`），但不能在锁屏/登录界面输入凭据或自动登录 |
+| DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 已实现（2026-11-05）：协议 v39 的 `OsLoginRequest/Result` 由主机在登录或锁屏界面键入查看器提供的密码；权限位 0x2000 与 `allow_os_login` 默认关闭；密码不落盘、不记日志，详见同日小节 |
 | DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 固定控制当前控制台会话，无可选会话列表 |
 | DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
 | DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | `SessionMode` 只有 Desktop/FileTransfer（`include/chast/protocol.h:1025`）；终端/摄像头/端口转发都依附桌面会话 |
@@ -541,6 +541,49 @@ host_i18n 通过；`flutter analyze` 无问题、`flutter test` 547 项通过
 使用 `LockWorkStation`，不模拟 Win+L 键入；`BlockInput` 只屏蔽本地物理
 输入，不影响查看者注入；重启会中断会话；阻止状态在会话结束/进程退出时
 释放。DEV-14（Switch Sides）仍因需要反向角色交接暂缓。
+
+### DEV-15 操作系统登录 / 自动登录（2026-11-05 完成）
+
+协议从 v38 提升到 v39，在可靠控制流上新增 `OsLoginRequest(57)`（原始
+UTF-8 密码）与 `OsLoginResult(58)`（结果码 u8 + 原因字符串），结果码为
+Ok/Denied/Unsupported/Busy/Failed。新增仅掩码权限位
+`kPermissionOsLogin`（0x2000，没有对应的 HelloAck 标志位），默认关闭。
+
+- **密码校验**：非空、≤256 字节、合法 UTF-8，且不含任何控制字符——注入器
+  会把 `\n`/`\t` 转成回车/制表符，控制字符会提前拆散密码。结果原因截断到
+  256 字节。
+- **主机闸门顺序**：会话权限（input+oslogin 缺一即 Denied）→ 控制租约
+  （非持有者回 Busy）→ 主机设置（`allow_os_login` 未开启回 Denied）→
+  桌面状态（Unlocked/Unavailable 回 Unsupported）→ 注入。桌面状态在键入
+  前即时复查：WTS 用户名为空或为 SYSTEM 视为登录界面；会话锁定标志 +
+  `OpenInputDesktop` 得到非 “Default” 桌面视为锁屏；UAC 仍是已登录用户且
+  未锁定 → Unlocked → 拒绝，确保密码不会键入普通桌面或 UAC 提示。
+- **注入**：先 `InputInjector::release_held()` 清掉查看者按住的修饰键，再
+  `submit_text(password + "\n")`；注入线程在每个排队项前重新跟随输入桌面，
+  锁屏/登录界面切换后仍能键入。
+- **凭据卫生**：密码只存在于请求队列与瞬时字符串；取出后、发送结果前用 0
+  覆盖并清空，不进日志、不上命令行、不写盘；队列上限 4。查看器侧待发密码
+  在停止或替换时清除，状态只回结果码与原因。
+- **查看器**：工具栏新增密码按钮（需 input+osLogin），对话框只发送一次；
+  状态新增 `osLoginSupported/osLoginCode/osLoginError/osLoginUpdates`；
+  文件传输会话收到请求直接回 Unsupported。
+- **托盘与设置**：安全对话框新增“系统登录”复选框、托盘菜单可直接切换，
+  `host.ini` 持久化为 `os_login=`。与重启/阻止输入一致，主机侧开关对已
+  建立会话可能需下一次连接才生效（会话权限上限在 open 时固定）。
+
+验证：新增 `chast-host-login-test`（真实 QUIC 回环 + 合成桌面状态/注入
+后端）覆盖权限通告、锁屏与登录界面成功、密码原样到达后端、Unlocked/
+Unavailable 拒绝且不调用后端、注入失败原因与计数、本地拒绝空密码/换行、
+撤权后客户端拒绝；`protocol_test` 新增 `OsLoginRequest/Result` 编解码与
+边界用例；`host_settings_test` 覆盖 `os_login=` 往返与默认关闭；
+`flutter analyze` 无问题、`flutter test` 552 项通过（新增
+`os_login_status_test`）、Windows release 构建成功；全量 `ctest` 结果见
+`docs/status-2026-10-25.md`。
+
+边界：真实登录界面键入待双机/服务模式验收（测试用注入后端）；只有服务
+模式（SYSTEM 会话）能打开 Winlogon，托盘主机在登录界面回 Unsupported；
+不含“保存密码自动登录”，每次由查看器输入；媒体链路保持零拷贝，无 CPU
+fallback。DEV-14（Switch Sides）仍因需要反向角色交接暂缓。
 
 ### 已核对但不算缺口的项
 

@@ -537,6 +537,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_block_input)) {
                 warn(result.warning, "block_input '" + value + "' is not a boolean");
             }
+        } else if (key == "os_login") {
+            if (!parse_bool(value, settings.allow_os_login)) {
+                warn(result.warning, "os_login '" + value + "' is not a boolean");
+            }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
                 warn(result.warning, "audio_device is too long; using the default output");
@@ -819,7 +823,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0) |
         (settings.allow_record ? kPermissionRecord : 0) |
         (settings.allow_restart ? kPermissionRestart : 0) |
-        (settings.allow_block_input ? kPermissionBlockInput : 0);
+        (settings.allow_block_input ? kPermissionBlockInput : 0) |
+        (settings.allow_os_login ? kPermissionOsLogin : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
@@ -852,6 +857,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
          << "restart=" << (settings.allow_restart ? 1 : 0) << "\n"
          << "block_input=" << (settings.allow_block_input ? 1 : 0) << "\n"
+         << "os_login=" << (settings.allow_os_login ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

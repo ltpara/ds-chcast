@@ -188,6 +188,11 @@ struct QuicServerConfig {
     // matching permission when false.
     bool allow_restart = false;
     bool allow_block_input = false;
+    // Accept OsLoginRequest and grant kPermissionOsLogin. Off by default: it
+    // lets the viewer type the OS password at the logon or lock screen. The
+    // host still checks the desktop state for every request, so an unlocked
+    // desktop or a UAC prompt refuses it even with this on.
+    bool allow_os_login = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -535,6 +540,21 @@ public:
     // input on its own (permission revoked, session ending). `block_input` is
     // the state in effect after the call and is ignored for other actions.
     Error send_host_action_result(const HostControlResult& result);
+    // Pops one pending OsLoginRequest password. The host checks its
+    // permissions, settings and desktop state, types the password with
+    // inject_login_text() and answers every request with send_os_login_result().
+    bool take_os_login_request(std::string& password);
+    // Number of OsLoginRequests received. Observation hook for tools and the
+    // host's own counters.
+    uint64_t os_login_requests() const;
+    // Answers an OsLoginRequest. Ok only when the password was handed to the
+    // injector while the logon or lock screen was current.
+    Error send_os_login_result(OsLoginCode code, const std::string& reason = {});
+    // Releases anything the viewer still holds, then types the password and
+    // Return through the server's input injector. The injection thread checks
+    // the input desktop before applying, but the caller must still confirm the
+    // logon state right before this call: a UAC prompt must not receive it.
+    Error inject_login_text(const std::string& password);
     // Pops the newest SetStreamOptions request. Only the newest is kept: a
     // viewer that changes several menus in a row wants the final combination.
     // The host answers each taken request with send_stream_options_result().
@@ -699,6 +719,14 @@ public:
     bool take_host_action_result(HostControlResult& result);
     // Total host-control answers received. Observation hook for tools.
     uint64_t host_action_results() const;
+    // Asks the host to type the operating-system password at its logon or lock
+    // screen. Requires the handshake, kPermissionInput and kPermissionOsLogin.
+    // The answer arrives through take_os_login_result().
+    Error request_os_login(const std::string& password);
+    // Pops the newest OS-login answer, which carries the reason on refusal.
+    bool take_os_login_result(OsLoginCode& code, std::string& reason);
+    // Total OS-login answers received. Observation hook for tools.
+    uint64_t os_login_results() const;
     // Asks the host to change this session's video preferences (encoder,
     // frame-rate ceiling and quality preset). The host can only lower its own
     // budget; the answer arrives through take_stream_options_result(). No

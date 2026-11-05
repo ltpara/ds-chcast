@@ -149,6 +149,9 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.block_input_enabled) {
         mask |= kPermissionBlockInput;
     }
+    if (info.os_login_enabled) {
+        mask |= kPermissionOsLogin;
+    }
     return mask;
 }
 
@@ -652,6 +655,15 @@ struct QuicSession::Impl {
     uint64_t host_action_requests_seen = 0;
     std::deque<HostControlResult> host_action_results;
     uint64_t host_action_results_seen = 0;
+    // Server: OS-login passwords waiting for the host loop. Short and bounded
+    // like host actions; dropped, overflowed and reset entries are wiped.
+    std::deque<std::string> os_login_requests;
+    uint64_t os_login_requests_seen = 0;
+    // Client: the newest OS-login answer, which carries the reason.
+    bool os_login_result_ready = false;
+    OsLoginCode os_login_code = OsLoginCode::Ok;
+    std::string os_login_reason;
+    uint64_t os_login_results_seen = 0;
     // Server: the newest SetStreamOptions request. Client: the newest answer,
     // carrying the effective settings even when the request was refused.
     bool stream_options_request_ready = false;
@@ -3305,6 +3317,49 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::OsLoginRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                std::string password;
+                if (!parse_os_login_request(payload, password, &error)) {
+                    // The error names the shape, never the password.
+                    control_protocol_failure("OsLoginRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (os_login_requests.size() >= 4) {
+                        std::string& dropped = os_login_requests.front();
+                        std::fill(dropped.begin(), dropped.end(), '\0');
+                        os_login_requests.pop_front();
+                    }
+                    os_login_requests.push_back(std::move(password));
+                    ++os_login_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::OsLoginResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                OsLoginCode code = OsLoginCode::Failed;
+                std::string reason;
+                if (!parse_os_login_result(payload, code, reason, &error)) {
+                    control_protocol_failure("OsLoginResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    os_login_code = code;
+                    os_login_reason = std::move(reason);
+                    os_login_result_ready = true;
+                    ++os_login_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::SetStreamOptions: {
                 if (role != Role::Server) {
                     break;
@@ -4507,6 +4562,15 @@ struct QuicSession::Impl {
             host_action_requests_seen = 0;
             host_action_results.clear();
             host_action_results_seen = 0;
+            for (std::string& password : os_login_requests) {
+                std::fill(password.begin(), password.end(), '\0');
+            }
+            os_login_requests.clear();
+            os_login_requests_seen = 0;
+            os_login_result_ready = false;
+            os_login_code = OsLoginCode::Ok;
+            os_login_reason.clear();
+            os_login_results_seen = 0;
             stream_options_request_ready = false;
             stream_options_request = StreamOptions{};
             stream_options_requests_seen = 0;
@@ -4622,6 +4686,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_block_input) {
             mask |= kPermissionBlockInput;
+        }
+        if (server_config.allow_os_login) {
+            mask |= kPermissionOsLogin;
         }
         return mask;
     }
@@ -5412,6 +5479,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.record_enabled = (granted & kPermissionRecord) != 0;
     ack.restart_enabled = (granted & kPermissionRestart) != 0;
     ack.block_input_enabled = (granted & kPermissionBlockInput) != 0;
+    ack.os_login_enabled = (granted & kPermissionOsLogin) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -5542,6 +5610,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.record_enabled = (granted & kPermissionRecord) != 0;
     update.restart_enabled = (granted & kPermissionRestart) != 0;
     update.block_input_enabled = (granted & kPermissionBlockInput) != 0;
+    update.os_login_enabled = (granted & kPermissionOsLogin) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -5907,6 +5976,91 @@ bool QuicSession::take_host_action_result(HostControlResult& result) {
 uint64_t QuicSession::host_action_results() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->host_action_results_seen;
+}
+
+bool QuicSession::take_os_login_request(std::string& password) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->os_login_requests.empty()) {
+        return false;
+    }
+    password = std::move(impl_->os_login_requests.front());
+    impl_->os_login_requests.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::os_login_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->os_login_requests_seen;
+}
+
+Error QuicSession::send_os_login_result(OsLoginCode code, const std::string& reason) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_os_login_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    const std::vector<uint8_t> payload = make_os_login_result(code, reason);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "OS login result is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::inject_login_text(const std::string& password) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "inject_login_text is a server operation");
+    }
+    if (!impl.injector) {
+        return Error(Status::Unavailable, "input injection is not available");
+    }
+    // A modifier the viewer still holds must not ride along into the password
+    // box: queue the release first, then the text and Return behind it.
+    impl.injector->release_held();
+    impl.injector->submit_text(password + "\n");
+    return Error::success();
+}
+
+Error QuicSession::request_os_login(const std::string& password) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_os_login is a client operation");
+    }
+    const std::vector<uint8_t> payload = make_os_login_request(password);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall,
+                     "the OS password is empty, too long or contains a control character");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        const uint16_t permissions = impl.session_permissions.load();
+        if ((permissions & (kPermissionInput | kPermissionOsLogin)) !=
+            (kPermissionInput | kPermissionOsLogin)) {
+            return Error(Status::PermissionDenied, "OS login is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_os_login_result(OsLoginCode& code, std::string& reason) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->os_login_result_ready) {
+        return false;
+    }
+    code = impl_->os_login_code;
+    reason = impl_->os_login_reason;
+    impl_->os_login_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::os_login_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->os_login_results_seen;
 }
 
 bool QuicSession::take_stream_options_request(StreamOptions& options) {

@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 38;
+inline constexpr uint16_t kProtocolVersion = 39;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -335,6 +335,18 @@ enum class ControlType : uint16_t {
     // host also sends this unsolicited with Denied when it releases block
     // input itself (permission revocation or session teardown).
     HostActionResult = 56,
+    // Viewer -> host: the operating-system password to type on the logon or
+    // lock screen, so a viewer can sign the host back in or unlock it. Payload:
+    // the UTF-8 password with no length prefix. The host checks the screen
+    // state right before typing, so the password never lands in an unlocked
+    // desktop. Requires kPermissionInput and kPermissionOsLogin. Protocol v39.
+    OsLoginRequest = 57,
+    // Host -> viewer: the outcome of an OsLoginRequest. Payload: code (u8, see
+    // OsLoginCode), reason length (u16), UTF-8 reason. Ok means the password
+    // was handed to the input injector while the logon desktop was current;
+    // whether the credentials were accepted is only visible in the desktop
+    // state that follows.
+    OsLoginResult = 58,
 };
 
 // ----- input -----
@@ -827,7 +839,9 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // "enable-record-session"); camera gates ListCameras, StartCamera and CCAM
 // streams; restart gates the RemoteRestart host action, and block input gates
 // the BlockInput host action (which also needs input: blocking the local
-// keyboard without remote control would lock the operator out).
+// keyboard without remote control would lock the operator out). OS login gates
+// OsLoginRequest and also needs input, because signing in means typing on the
+// secure desktop.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -845,13 +859,17 @@ enum PermissionBit : uint16_t {
     kPermissionCamera = 0x0400,
     kPermissionRestart = 0x0800,
     kPermissionBlockInput = 0x1000,
+    // Like restart and block input, this bit travels in the mask alone: it has
+    // no HelloAck flag of its own.
+    kPermissionOsLogin = 0x2000,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
                                            kPermissionMicrophone | kPermissionPrivacyMode |
                                            kPermissionPortForward | kPermissionTerminal |
                                            kPermissionRecord | kPermissionCamera |
-                                           kPermissionRestart | kPermissionBlockInput;
+                                           kPermissionRestart | kPermissionBlockInput |
+                                           kPermissionOsLogin;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -997,6 +1015,10 @@ struct ServerInfo {
     // against the host's live settings when it arrives.
     bool restart_enabled = false;
     bool block_input_enabled = false;
+    // v39: the viewer may ask the host to type the OS password at its logon or
+    // lock screen. Decoded from the permission mask; the host still checks the
+    // desktop state and its live setting for every request.
+    bool os_login_enabled = false;
     // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
     // audio stream. Set only alongside audio.enabled.
     bool audio_datagram = false;
@@ -1536,6 +1558,41 @@ bool parse_host_action_request(const std::vector<uint8_t>& payload,
 std::vector<uint8_t> make_host_action_result(const HostControlResult& result);
 bool parse_host_action_result(const std::vector<uint8_t>& payload,
                               HostControlResult& result, std::string* error);
+
+// ----- OS login (protocol v39) -----
+//
+// Signing the host back in at the logon or lock screen is typing, not a host
+// action: the password has to reach the secure desktop as keystrokes, and the
+// host can only prove where those keystrokes land at the moment it sends them.
+// The viewer therefore sends the password in its own message and pairs it with
+// the desktop state the host already announces. OsLoginCode::Ok means the
+// password was handed to the input injector while the logon desktop was
+// current; a wrong password is not a protocol failure and simply leaves the
+// host on the logon screen.
+inline constexpr size_t kMaxOsLoginPasswordBytes = 256;
+inline constexpr size_t kMaxOsLoginReason = 256;
+
+enum class OsLoginCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // input or OS-login permission missing, or the setting is off
+    Unsupported = 2,  // the host is not at the logon or lock screen, or it cannot type there
+    Busy = 3,         // another viewer owns the shared desktop's control
+    Failed = 4,       // the password could not be handed to the injector
+};
+
+// The maker rejects an empty password, one over kMaxOsLoginPasswordBytes, one
+// that is not valid UTF-8, and one with a control character (the injector
+// turns '\n' and '\t' into Return and Tab, which must not split a password).
+// The parser rejects the same cases plus trailing bytes. The result reason is
+// truncated on a UTF-8 boundary by the maker and rejected when malformed or
+// over-long by the parser.
+std::vector<uint8_t> make_os_login_request(const std::string& password);
+bool parse_os_login_request(const std::vector<uint8_t>& payload,
+                            std::string& password, std::string* error);
+std::vector<uint8_t> make_os_login_result(OsLoginCode code,
+                                          const std::string& reason = {});
+bool parse_os_login_result(const std::vector<uint8_t>& payload, OsLoginCode& code,
+                           std::string& reason, std::string* error);
 
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that

@@ -484,4 +484,23 @@ const Map<String, String> kEnglishSession = <String, String>{
   '另一查看者正在控制主机': 'Another viewer is controlling the host',
   '主机执行失败': 'The host failed to perform the action',
   '主机拒绝了该操作': 'The host refused this action',
+  '在主机登录或锁屏界面输入密码':
+      'Type a password at the host logon or lock screen',
+  '服务端未开放系统登录': 'The host has not enabled OS login',
+  '已在主机登录/锁屏界面输入密码':
+      'The password was typed at the host logon or lock screen',
+  '系统登录失败：{detail}': 'OS login failed: {detail}',
+  '主机未授权系统登录': 'The host did not authorize OS login',
+  '主机当前不在登录或锁屏界面':
+      'The host is not at a logon or lock screen right now',
+  '主机无法输入密码': 'The host could not type the password',
+  '主机拒绝了系统登录': 'The host refused OS login',
+  '输入主机登录密码': 'Enter the host password',
+  '密码会由主机在登录或锁屏界面键入；其他画面下主机会拒绝。密码不会保存或回传。':
+      'The host types the password at its logon or lock screen and refuses it anywhere else. The password is never stored or echoed back.',
+  '输入密码': 'Type password',
+  '请输入主机的登录密码': 'Enter the host password',
+  '系统登录未能排队：请确认主机权限与会话状态':
+      'The OS login could not be queued: check the host permissions and session state',
+  '无法发送登录密码': 'Cannot send the password',
 };

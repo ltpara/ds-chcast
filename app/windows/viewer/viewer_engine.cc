@@ -258,6 +258,22 @@ const char* host_action_name(chast::HostAction action) {
     return "host action";
 }
 
+const char* os_login_code_name(chast::OsLoginCode code) {
+    switch (code) {
+        case chast::OsLoginCode::Ok:
+            return "the OS password was typed";
+        case chast::OsLoginCode::Denied:
+            return "the host denied OS login";
+        case chast::OsLoginCode::Unsupported:
+            return "the host is not at a logon or lock screen";
+        case chast::OsLoginCode::Busy:
+            return "another viewer controls this host";
+        case chast::OsLoginCode::Failed:
+            return "the host could not type the password";
+    }
+    return "the host refused OS login";
+}
+
 const char* desktop_kind_name(chast::DesktopKind kind) {
     switch (kind) {
         case chast::DesktopKind::Default:
@@ -419,6 +435,14 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     {
         std::lock_guard<std::mutex> lock(host_action_mutex_);
         pending_host_action_.reset();
+    }
+    // An OS password queued for the old host must never reach the next one.
+    {
+        std::lock_guard<std::mutex> lock(os_login_mutex_);
+        if (pending_os_login_) {
+            std::fill(pending_os_login_->begin(), pending_os_login_->end(), '\0');
+            pending_os_login_.reset();
+        }
     }
     // Port forwarding belongs to one session too; the listener lives on the
     // session thread and goes away with it.
@@ -1267,6 +1291,27 @@ bool ViewerEngine::RequestHostAction(chast::HostAction action, bool block_input)
     return true;
 }
 
+bool ViewerEngine::RequestOsLogin(const std::string& password) {
+    if (password.empty() || chast::make_os_login_request(password).empty()) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.os_login_supported) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(os_login_mutex_);
+    if (pending_os_login_) {
+        std::fill(pending_os_login_->begin(), pending_os_login_->end(), '\0');
+    }
+    pending_os_login_ = password;
+    return true;
+}
+
 bool ViewerEngine::SendChat(const std::string& text) {
     if (!chast::valid_chat_text(text)) {
         return false;
@@ -1706,6 +1751,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     int host_action_code = 0;
     std::string host_action_error;
     uint64_t host_action_updates = 0;
+    bool os_login_supported = false;
+    int os_login_code = 0;
+    std::string os_login_error;
+    uint64_t os_login_updates = 0;
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
@@ -1988,6 +2037,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.host_action_code = host_action_code;
             status_.host_action_error = host_action_error;
             status_.host_action_updates = host_action_updates;
+            status_.os_login_supported = os_login_supported;
+            status_.os_login_code = os_login_code;
+            status_.os_login_error = os_login_error;
+            status_.os_login_updates = os_login_updates;
             status_.display_switches = display_switches;
             status_.display_switch_failures = display_switch_failures;
             status_.display_switch_error = display_switch_error;
@@ -2405,8 +2458,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 const bool block_input =
                     (mask & (chast::kPermissionInput | chast::kPermissionBlockInput)) ==
                     (chast::kPermissionInput | chast::kPermissionBlockInput);
+                // Signing in means typing on the secure desktop, so OS login
+                // also requires the input gate.
+                const bool os_login =
+                    (mask & (chast::kPermissionInput | chast::kPermissionOsLogin)) ==
+                    (chast::kPermissionInput | chast::kPermissionOsLogin);
                 restart_supported = restart;
                 block_input_supported = block_input;
+                os_login_supported = os_login;
                 if (!block_input) {
                     block_input_active = false;
                 }
@@ -2435,6 +2494,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.camera_supported = camera_allowed;
                     status_.restart_supported = restart;
                     status_.block_input_supported = block_input;
+                    status_.os_login_supported = os_login;
                     if (!block_input) {
                         status_.block_input_active = false;
                     }
@@ -5206,6 +5266,60 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the newest queued OS password. The slot and the local
+                // copy are wiped as soon as the transport has the payload; a
+                // local refusal is reported like an OsLoginResult.
+                auto drain_os_login = [&] {
+                    std::optional<std::string> password;
+                    {
+                        std::lock_guard<std::mutex> lock(os_login_mutex_);
+                        password.swap(pending_os_login_);
+                    }
+                    if (!password) {
+                        return;
+                    }
+                    const chast::Error sent = session->request_os_login(*password);
+                    std::fill(password->begin(), password->end(), '\0');
+                    password.reset();
+                    if (sent.ok()) {
+                        return;
+                    }
+                    os_login_code = static_cast<int>(chast::OsLoginCode::Failed);
+                    os_login_error = "request: " + sent.to_string();
+                    ++os_login_updates;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.os_login_code = os_login_code;
+                    status_.os_login_error = os_login_error;
+                    status_.os_login_updates = os_login_updates;
+                    std::fprintf(stderr, "viewer: OS login request failed: %s\n",
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts every answer and keeps only the reason, never the
+                // password that was sent.
+                auto receive_os_login = [&] {
+                    chast::OsLoginCode code = chast::OsLoginCode::Ok;
+                    std::string reason;
+                    while (session->take_os_login_result(code, reason)) {
+                        os_login_code = static_cast<int>(code);
+                        os_login_error =
+                            code == chast::OsLoginCode::Ok
+                                ? std::string()
+                                : (reason.empty() ? os_login_code_name(code) : reason);
+                        ++os_login_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.os_login_code = os_login_code;
+                            status_.os_login_error = os_login_error;
+                            status_.os_login_updates = os_login_updates;
+                        }
+                        std::fprintf(stderr, "viewer: OS login %s%s%s\n",
+                                     code == chast::OsLoginCode::Ok ? "done" : "refused",
+                                     os_login_error.empty() ? "" : ": ",
+                                     os_login_error.c_str());
+                    }
+                };
+
                 // Chat is ungated: an admitted session is the authorization.
                 // Text goes into the UI queue; the status only carries counts,
                 // so a 4 KiB line never inflates the poll.
@@ -6487,6 +6601,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     drain_host_action();
                     receive_host_action();
+                    drain_os_login();
+                    receive_os_login();
                     receive_chat();
                     drain_chat();
                     drain_text();
@@ -6594,6 +6710,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     drain_host_action();
                     receive_host_action();
+                    drain_os_login();
+                    receive_os_login();
                     receive_chat();
                     drain_chat();
                     drain_text();

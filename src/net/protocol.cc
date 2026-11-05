@@ -888,6 +888,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.block_input_enabled) {
         permissions |= kPermissionBlockInput;
     }
+    if (info.os_login_enabled) {
+        permissions |= kPermissionOsLogin;
+    }
     put_u16(cursor, permissions);
     return payload;
 }
@@ -1099,12 +1102,14 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck grants unknown permissions");
         return false;
     }
-    // Restart and block input have no flag of their own (their bits collide
-    // with the files-only and datagram-audio flags), so they live in the mask
-    // alone; every other permission must still match its flag.
+    // Restart, block input and OS login have no flag of their own (their bits
+    // collide with the files-only and datagram-audio flags, or have no flag
+    // left), so they live in the mask alone; every other permission must still
+    // match its flag.
     if (permissions !=
         ((flags & kServerInfoPermissionFlags) |
-         (permissions & (kPermissionRestart | kPermissionBlockInput)))) {
+         (permissions &
+          (kPermissionRestart | kPermissionBlockInput | kPermissionOsLogin)))) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
         return false;
     }
@@ -1149,6 +1154,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.camera_enabled = (permissions & kPermissionCamera) != 0;
     info.restart_enabled = (permissions & kPermissionRestart) != 0;
     info.block_input_enabled = (permissions & kPermissionBlockInput) != 0;
+    info.os_login_enabled = (permissions & kPermissionOsLogin) != 0;
     if (!reader.at_end()) {
         set_error(error, "HelloAck carries trailing bytes");
         return false;
@@ -2388,6 +2394,91 @@ bool parse_host_action_result(const std::vector<uint8_t>& payload,
     }
     if (!result.reason.empty() && !valid_utf8(result.reason)) {
         set_error(error, "HostActionResult carries a malformed reason");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool valid_os_login_code(OsLoginCode code) {
+    return code == OsLoginCode::Ok || code == OsLoginCode::Denied ||
+           code == OsLoginCode::Unsupported || code == OsLoginCode::Busy ||
+           code == OsLoginCode::Failed;
+}
+
+// The injector turns '\n' and '\t' into Return and Tab, so any control
+// character in a password would split it before it reaches the logon box.
+bool valid_os_login_password(const std::string& password) {
+    if (password.empty() || password.size() > kMaxOsLoginPasswordBytes ||
+        !valid_utf8(password)) {
+        return false;
+    }
+    for (const unsigned char ch : password) {
+        if (ch < 0x20 || ch == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_os_login_request(const std::string& password) {
+    if (!valid_os_login_password(password)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(password.begin(), password.end());
+    return make_control(ControlType::OsLoginRequest, payload);
+}
+
+bool parse_os_login_request(const std::vector<uint8_t>& payload,
+                            std::string& password, std::string* error) {
+    std::string text(payload.begin(), payload.end());
+    if (!valid_os_login_password(text)) {
+        set_error(error, "malformed OsLoginRequest");
+        return false;
+    }
+    password = std::move(text);
+    return true;
+}
+
+std::vector<uint8_t> make_os_login_result(OsLoginCode code, const std::string& reason) {
+    if (!valid_os_login_code(code)) {
+        return {};
+    }
+    const std::string text = truncate_utf8_reason(reason, kMaxOsLoginReason);
+    std::vector<uint8_t> payload(3 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::OsLoginResult, payload);
+}
+
+bool parse_os_login_result(const std::vector<uint8_t>& payload, OsLoginCode& code,
+                           std::string& reason, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed OsLoginResult");
+        return false;
+    }
+    code = static_cast<OsLoginCode>(raw_code);
+    if (!valid_os_login_code(code)) {
+        set_error(error, "OsLoginResult carries an unknown code");
+        return false;
+    }
+    if (reason.size() > kMaxOsLoginReason) {
+        set_error(error, "OsLoginResult reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "OsLoginResult carries a malformed reason");
         return false;
     }
     return true;

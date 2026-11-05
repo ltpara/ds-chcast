@@ -427,6 +427,15 @@ struct ViewerStatus {
     int host_action_code = 0;
     std::string host_action_error;
     uint64_t host_action_updates = 0;
+    // OS login (protocol v39): the viewer can type the host's OS password at
+    // its logon or lock screen. `os_login_supported` mirrors input plus the
+    // OS-login permission; `os_login_code` is the newest OsLoginCode (0 = Ok),
+    // with its reason in `os_login_error` and a counter that pairs one answer
+    // with one poll. The password itself never enters the status.
+    bool os_login_supported = false;
+    int os_login_code = 0;
+    std::string os_login_error;
+    uint64_t os_login_updates = 0;
     // Session chat. Both directions are ungated once the host admits the
     // viewer. `chat_error` explains a queued line that the transport then
     // failed to send; inbound text is taken through TakeChat() so the status
@@ -834,6 +843,13 @@ public:
     // ViewerStatus::host_action_*; a newer request replaces an unsent one.
     bool RequestHostAction(chast::HostAction action, bool block_input = false);
 
+    // Queues the OS password to type on the host's logon or lock screen.
+    // Returns false when the session is not streaming, the permission pair is
+    // missing, or the password is empty, too long or contains a control
+    // character. A newer queued password replaces an unsent one; the answer
+    // arrives through ViewerStatus::os_login_*.
+    bool RequestOsLogin(const std::string& password);
+
     // Queues one UTF-8 chat line for the host. Returns false for empty or
     // oversized text, when no session is streaming, or when the outgoing queue
     // is full. Host lines are popped one at a time through TakeChat().
@@ -971,6 +987,10 @@ private:
     // Host-control requests are actions too; the newest one wins.
     mutable std::mutex host_action_mutex_;
     std::optional<chast::HostControlRequest> pending_host_action_;
+    // One queued OS password at a time. The slot is cleared when the session
+    // ends and right after the request leaves the queue.
+    mutable std::mutex os_login_mutex_;
+    std::optional<std::string> pending_os_login_;
 
     // The port-forward target crosses to the session thread here. One slot is
     // enough: the operator picks a target, and a newer pick replaces an

@@ -1194,6 +1194,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
       );
     }
+    // Every OS-login request gets one answer. The password itself never comes
+    // back; success only means the host typed it at its logon or lock screen.
+    if (!nowOver && status.osLoginUpdates > _status.osLoginUpdates) {
+      final String reason = status.osLoginError;
+      final String text;
+      if (status.osLoginCode == ViewerHostActionCode.ok.code) {
+        text = tr('已在主机登录/锁屏界面输入密码');
+      } else {
+        final String detail =
+            reason.isEmpty ? _osLoginCodeText(status.osLoginCode) : reason;
+        text = tr('系统登录失败：{detail}', <String, Object?>{'detail': detail});
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 5)),
+      );
+    }
     // Screenshots finish on the session thread; the counter pairs the newest
     // path or failure with this poll.
     if (!nowOver && status.screenshotUpdates > _status.screenshotUpdates) {
@@ -1748,6 +1764,102 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Asks for the host's OS password and queues it for typing at the host's
+  /// logon or lock screen. The host re-checks its desktop right before typing,
+  /// so a password offered to an unlocked or UAC desktop is refused instead of
+  /// typed. The password is never stored; only the answer comes back through
+  /// [ViewerStatus.osLoginUpdates].
+  Future<void> _openOsLoginDialog() async {
+    if (!_status.acceptsOsLogin) {
+      return;
+    }
+    final TextEditingController passwordController = TextEditingController();
+    String? error;
+    final String? password = await showDialog<String>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setDialogState) {
+            void submit() {
+              final String text = passwordController.text;
+              if (text.isEmpty) {
+                setDialogState(() => error = tr('请输入主机的登录密码'));
+                return;
+              }
+              Navigator.of(dialogContext).pop(text);
+            }
+
+            return AlertDialog(
+              title: Text(tr('输入主机登录密码')),
+              content: SizedBox(
+                width: 340,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    Text(
+                      tr('密码会由主机在登录或锁屏界面键入；其他画面下主机会拒绝。密码不会保存或回传。'),
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white54,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: passwordController,
+                      autofocus: true,
+                      obscureText: true,
+                      decoration: InputDecoration(
+                        labelText: tr('密码'),
+                        errorText: error,
+                      ),
+                      onSubmitted: (_) => submit(),
+                    ),
+                  ],
+                ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: Text(tr('取消')),
+                ),
+                FilledButton(
+                  onPressed: submit,
+                  child: Text(tr('输入密码')),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    passwordController.dispose();
+    if (password == null || password.isEmpty || !mounted) {
+      return;
+    }
+    try {
+      final bool queued = await ViewerBridge.requestOsLogin(password);
+      if (!mounted || queued) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('系统登录未能排队：请确认主机权限与会话状态')),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法发送登录密码'))));
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
   String _hostActionText(int action) {
     if (action == ViewerHostAction.restart.code) {
       return tr('重启主机');
@@ -1759,6 +1871,22 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return tr('阻止本地输入');
     }
     return tr('主机操作');
+  }
+
+  String _osLoginCodeText(int code) {
+    if (code == ViewerHostActionCode.denied.code) {
+      return tr('主机未授权系统登录');
+    }
+    if (code == ViewerHostActionCode.unsupported.code) {
+      return tr('主机当前不在登录或锁屏界面');
+    }
+    if (code == ViewerHostActionCode.busy.code) {
+      return tr('另一查看者正在控制主机');
+    }
+    if (code == ViewerHostActionCode.failed.code) {
+      return tr('主机无法输入密码');
+    }
+    return tr('主机拒绝了系统登录');
   }
 
   String _hostActionCodeText(int code) {
@@ -3469,6 +3597,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onToggleVoiceCall: () => unawaited(_toggleVoiceCall()),
                         privacyAvailable: _status.acceptsPrivacy,
                         privacyEnabled: _status.privacyEnabled,
+                        osLoginAvailable: _status.acceptsOsLogin,
+                        onOsLogin: () => unawaited(_openOsLoginDialog()),
                         restartAvailable: _status.acceptsRestart,
                         lockAvailable: _status.acceptsLockScreen,
                         blockInputAvailable: _status.acceptsBlockInput,

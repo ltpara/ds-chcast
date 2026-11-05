@@ -130,6 +130,13 @@ struct HostSettings {
     // control, and the host always releases the block when the session ends
     // or the permission is revoked.
     bool allow_block_input = false;
+    // Let the viewer type the operating-system password at the logon or lock
+    // screen, so it can sign this machine back in or unlock it. Off by
+    // default: the password crosses the wire and is typed on the secure
+    // desktop, and only a host running as SYSTEM in the user's session can do
+    // it at all. Also needs input control, and the host still refuses it
+    // unless a sign-in or lock screen is actually current.
+    bool allow_os_login = false;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.

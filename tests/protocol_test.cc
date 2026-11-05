@@ -797,6 +797,81 @@ void test_host_actions() {
           "empty HostActionResult is rejected");
 }
 
+void test_os_login() {
+    std::string error;
+    std::string password;
+    const std::string utf8_password = "hunter2 \xE5\xAF\x86\xE7\xA0\x81";
+    check(chast::parse_os_login_request(
+              payload_of(chast::make_os_login_request(utf8_password)), password, &error) &&
+              password == utf8_password,
+          "OsLoginRequest round-trips a UTF-8 password");
+    check(chast::make_os_login_request({}).empty(), "an empty password is refused");
+    check(chast::make_os_login_request("two\nlines").empty(),
+          "a password with a line break is refused");
+    check(chast::make_os_login_request("tab\there").empty(),
+          "a password with a tab is refused");
+    check(chast::make_os_login_request(std::string(1, '\x7f')).empty(),
+          "a password with a control character is refused");
+    check(chast::make_os_login_request(std::string(chast::kMaxOsLoginPasswordBytes + 1, 'x'))
+              .empty(),
+          "an oversized password is refused");
+    check(chast::make_os_login_request("\xFF").empty(),
+          "a malformed UTF-8 password is refused");
+    check(chast::parse_os_login_request(
+              std::vector<uint8_t>(chast::kMaxOsLoginPasswordBytes, 'x'), password,
+              &error) &&
+              password.size() == chast::kMaxOsLoginPasswordBytes,
+          "a password at the byte limit round-trips");
+
+    check(!chast::parse_os_login_request(std::vector<uint8_t>(), password, &error),
+          "an empty OsLoginRequest is rejected");
+    std::vector<uint8_t> control_password =
+        payload_of(chast::make_os_login_request("hunter2"));
+    control_password[3] = '\n';
+    check(!chast::parse_os_login_request(control_password, password, &error),
+          "OsLoginRequest carrying a control character is rejected");
+    std::vector<uint8_t> oversized(chast::kMaxOsLoginPasswordBytes + 1, 'x');
+    check(!chast::parse_os_login_request(oversized, password, &error),
+          "an oversized OsLoginRequest is rejected");
+
+    chast::OsLoginCode code = chast::OsLoginCode::Ok;
+    std::string reason;
+    check(chast::parse_os_login_result(
+              payload_of(chast::make_os_login_result(chast::OsLoginCode::Ok, {})),
+              code, reason, &error) &&
+              code == chast::OsLoginCode::Ok && reason.empty(),
+          "OsLoginResult round-trips a success");
+    check(chast::parse_os_login_result(
+              payload_of(chast::make_os_login_result(
+                  chast::OsLoginCode::Unsupported,
+                  "the host is not at a logon or lock screen")),
+              code, reason, &error) &&
+              code == chast::OsLoginCode::Unsupported &&
+              reason == "the host is not at a logon or lock screen",
+          "OsLoginResult round-trips a refusal with its reason");
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_os_login_result(chast::OsLoginCode::Denied, {}));
+    unknown_code[0] = 9;
+    check(!chast::parse_os_login_result(unknown_code, code, reason, &error),
+          "OsLoginResult with an unknown code is rejected");
+    const std::string long_reason(400, 'x');
+    check(chast::parse_os_login_result(
+              payload_of(chast::make_os_login_result(chast::OsLoginCode::Failed,
+                                                     long_reason)),
+              code, reason, &error) &&
+              reason.size() == chast::kMaxOsLoginReason,
+          "OsLoginResult truncates an oversized reason to the protocol limit");
+    std::vector<uint8_t> bad_utf8 =
+        payload_of(chast::make_os_login_result(chast::OsLoginCode::Failed, {}));
+    bad_utf8[1] = 1;
+    bad_utf8[2] = 0;
+    bad_utf8.push_back(0xFF);
+    check(!chast::parse_os_login_result(bad_utf8, code, reason, &error),
+          "OsLoginResult with a malformed reason is rejected");
+    check(!chast::parse_os_login_result(std::vector<uint8_t>(), code, reason, &error),
+          "empty OsLoginResult is rejected");
+}
+
 void test_stream_options() {
     std::string error;
     chast::StreamOptions options;
@@ -3492,6 +3567,7 @@ int main(int argc, char** argv) {
     test_permission_update();
     test_sas();
     test_host_actions();
+    test_os_login();
     test_stream_options();
     test_privacy_mode();
     test_display_switch();

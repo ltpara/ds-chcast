@@ -96,6 +96,27 @@ bool session_locked() {
     return locked;
 }
 
+// Ok with an empty name means the session has no signed-in user; Failed means
+// the query itself did not work, which must not be read as "no user".
+enum class SessionUserQuery { Ok, Empty, Failed };
+
+SessionUserQuery session_user(std::wstring* user) {
+    LPWSTR buffer = nullptr;
+    DWORD bytes = 0;
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSUserName,
+                                     &buffer, &bytes) ||
+        buffer == nullptr) {
+        return SessionUserQuery::Failed;
+    }
+    std::wstring name(buffer, bytes / sizeof(wchar_t));
+    WTSFreeMemory(buffer);
+    while (!name.empty() && name.back() == L'\0') {
+        name.pop_back();
+    }
+    *user = name;
+    return name.empty() ? SessionUserQuery::Empty : SessionUserQuery::Ok;
+}
+
 }  // namespace
 
 InputDesktopStatus input_desktop_status() {
@@ -121,6 +142,48 @@ InputDesktopStatus input_desktop_status() {
     }
     status.name = utf8_from_wide(name);
     status.kind = is_default_desktop(name) ? InputDesktopKind::Default : InputDesktopKind::Secure;
+    return status;
+}
+
+OsLoginStatus os_login_status() {
+    OsLoginStatus status;
+    std::wstring user;
+    const SessionUserQuery query = session_user(&user);
+    if (query == SessionUserQuery::Failed) {
+        status.error = "WTSUserName: " + win32_error(GetLastError());
+        return status;
+    }
+    // "SYSTEM" means the session is running before any user signed in; a
+    // UAC prompt in a signed-in session keeps the user name and is not this.
+    const bool prelogin =
+        query == SessionUserQuery::Empty || _wcsicmp(user.c_str(), L"SYSTEM") == 0;
+    const bool locked = session_locked();
+    if (!prelogin && !locked) {
+        status.state = OsLoginState::Unlocked;
+        return status;
+    }
+    // The state alone is not enough: only a process that can open the secure
+    // desktop can actually type there. The tray application cannot, so it
+    // fails here instead of claiming a login it cannot deliver.
+    HDESK input = open_input_desktop();
+    if (input == nullptr) {
+        status.error = "OpenInputDesktop: " + win32_error(GetLastError());
+        return status;
+    }
+    const std::wstring name = desktop_name(input);
+    const DWORD name_error = name.empty() ? GetLastError() : ERROR_SUCCESS;
+    CloseDesktop(input);
+    if (name.empty()) {
+        status.error = "desktop name: " + win32_error(name_error);
+        return status;
+    }
+    if (is_default_desktop(name)) {
+        // The session reports a logon-like state but input still reaches the
+        // ordinary desktop: this is not a prompt we can type into.
+        status.error = "input desktop is Default";
+        return status;
+    }
+    status.state = locked ? OsLoginState::Locked : OsLoginState::Logon;
     return status;
 }
 

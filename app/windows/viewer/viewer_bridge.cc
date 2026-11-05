@@ -707,6 +707,13 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(status.host_action_error);
         map[key("hostActionUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.host_action_updates));
+        map[key("osLoginSupported")] =
+            flutter::EncodableValue(status.os_login_supported);
+        map[key("osLoginCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.os_login_code));
+        map[key("osLoginError")] = flutter::EncodableValue(status.os_login_error);
+        map[key("osLoginUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.os_login_updates));
         map[key("chatSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.chat_sent));
         map[key("chatReceived")] =
@@ -1377,6 +1384,17 @@ void ViewerBridge::HandleMethodCall(
             viewer_ != nullptr &&
             viewer_->RequestHostAction(static_cast<chast::HostAction>(action),
                                        block_input);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "requestOsLogin") {
+        const auto* password = std::get_if<std::string>(call.arguments());
+        if (password == nullptr || password->empty()) {
+            result->Error("bad_args", "requestOsLogin wants the OS password");
+            return;
+        }
+        const bool queued = viewer_ != nullptr && viewer_->RequestOsLogin(*password);
         result->Success(flutter::EncodableValue(queued));
         return;
     }

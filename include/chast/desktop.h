@@ -39,6 +39,30 @@ struct InputDesktopStatus {
 // change the calling thread's desktop.
 InputDesktopStatus input_desktop_status();
 
+// What the host can type an OS password into. Only Logon and Locked are
+// prompts; a UAC prompt while the session is unlocked must never receive it.
+enum class OsLoginState {
+    Unlocked,
+    // No user signed in to this session yet: the sign-in screen.
+    Logon,
+    // A signed-in session showing its lock screen.
+    Locked,
+    // The state or the secure desktop could not be read; fail closed.
+    Unavailable,
+};
+
+struct OsLoginStatus {
+    OsLoginState state = OsLoginState::Unavailable;
+    // Why the state is Unavailable, or empty.
+    std::string error;
+};
+
+// Reads the session user and lock state, then for a logon-like state confirms
+// that the input desktop is a secure one this process may open and type on.
+// A process without secure-desktop access (the tray application) reports
+// Unavailable even while the workstation is locked.
+OsLoginStatus os_login_status();
+
 // True when the calling thread is attached to the desktop that receives
 // input. False when the desktop cannot be queried.
 bool on_input_desktop();

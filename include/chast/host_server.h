@@ -41,6 +41,7 @@
 #include "chast/encoder.h"
 #include "chast/file_transfer.h"
 #include "chast/host_security.h"
+#include "chast/desktop.h"
 #include "chast/host_settings.h"
 #include "chast/input.h"
 #include "chast/protocol.h"
@@ -150,6 +151,11 @@ struct HostServerStats {
     uint64_t host_actions = 0;
     uint64_t host_action_failures = 0;
     bool block_input_active = false;
+    // OS login (protocol v39): passwords typed at the host's logon or lock
+    // screen. `os_login_requests` counts every request, `os_login_failures`
+    // the ones not answered Ok. The password itself is never kept here.
+    uint64_t os_login_requests = 0;
+    uint64_t os_login_failures = 0;
     // Near-end frames that passed through echo cancellation and how many times
     // its adaptive filter restarted (playback start/stop or endpoint reopen).
     uint64_t audio_dsp_frames = 0;
@@ -376,6 +382,15 @@ struct HostServerConfig {
     // the operator's input; returning false fills the reason and reports
     // Failed.
     std::function<bool(HostAction action, bool block_input, std::string*)> host_control;
+    // Reads what the host can type an OS password into. Empty uses the Win32
+    // backend, which reports Unavailable when this process cannot open the
+    // secure desktop (the tray application) and Unlocked unless a sign-in or
+    // lock screen is actually current.
+    std::function<OsLoginStatus()> os_login_state;
+    // Types the OS password and Return. Empty uses the session's input
+    // injector. Returning false fills the reason and reports Failed. The
+    // password must never be logged or written anywhere by this callback.
+    std::function<bool(const std::string& password, std::string*)> os_login;
 };
 
 class HostServer {
@@ -525,6 +540,12 @@ private:
     // action was refused. `notify` results also carry the resulting block
     // input state.
     bool handle_host_actions(HostServerStats& stats, std::string* error, bool* peer_left);
+    // Answers every pending OsLoginRequest. The permission, the control lease,
+    // the host setting and the desktop state are checked here, in that order,
+    // immediately before the password is typed. The password is cleared as
+    // soon as it has been handed over and is never logged.
+    bool handle_os_login_requests(HostServerStats& stats, std::string* error,
+                                  bool* peer_left);
     // Releases local input blocking if this session owns it. `notify` answers
     // an unsolicited denial, used when the permission is revoked mid-session;
     // the session-end guard passes false because the connection is going away.

@@ -477,6 +477,10 @@ class ViewerStatus {
     this.hostActionCode = 0,
     this.hostActionError = '',
     this.hostActionUpdates = 0,
+    this.osLoginSupported = false,
+    this.osLoginCode = 0,
+    this.osLoginError = '',
+    this.osLoginUpdates = 0,
     this.chatSent = 0,
     this.chatReceived = 0,
     this.chatFailures = 0,
@@ -889,6 +893,17 @@ class ViewerStatus {
   final String hostActionError;
   final int hostActionUpdates;
 
+  /// OS login (typing the host's password at its logon or lock screen).
+  /// [osLoginSupported] requires both the input and OS-login permissions.
+  /// [osLoginCode] is the host's [ViewerHostActionCode]-style answer (0 = Ok),
+  /// [osLoginError] the reason for a refusal, and [osLoginUpdates] counts
+  /// answers so the page can pair one with its poll. The password never
+  /// crosses this status: it is sent once and never echoed back.
+  final bool osLoginSupported;
+  final int osLoginCode;
+  final String osLoginError;
+  final int osLoginUpdates;
+
   /// Session chat counters. Both directions are ungated once the host admits
   /// the viewer. [chatFailures] counts queued lines the transport failed to
   /// send, with [chatError] explaining the most recent one. Inbound text is
@@ -1059,6 +1074,9 @@ class ViewerStatus {
   bool get acceptsBlockInput =>
       isLive && (permissions & ViewerPermission.blockInput) != 0;
   bool get acceptsLockScreen => acceptsInput;
+  // OS login needs both the explicit bit and input; the host refuses it
+  // outside a logon or lock screen even when the menu is enabled.
+  bool get acceptsOsLogin => isLive && osLoginSupported;
   // The port-forward dialog needs a live session and the host's forward bit.
   bool get acceptsPortForward =>
       isLive && (permissions & ViewerPermission.portForward) != 0;
@@ -1339,6 +1357,10 @@ class ViewerStatus {
       hostActionCode: asInt(map['hostActionCode']),
       hostActionError: asString(map['hostActionError']),
       hostActionUpdates: asInt(map['hostActionUpdates']),
+      osLoginSupported: map['osLoginSupported'] == true,
+      osLoginCode: asInt(map['osLoginCode']),
+      osLoginError: asString(map['osLoginError']),
+      osLoginUpdates: asInt(map['osLoginUpdates']),
       chatSent: asInt(map['chatSent']),
       chatReceived: asInt(map['chatReceived']),
       chatFailures: asInt(map['chatFailures']),
@@ -1687,6 +1709,19 @@ class ViewerBridge {
       'requestHostAction',
       <String, Object>{'action': action.code, 'blockInput': blockInput},
     );
+    return queued ?? false;
+  }
+
+  /// Queues one OS password for the host, which types it at its logon or lock
+  /// screen. False means it was not queued: no live session, view-only access,
+  /// or the host did not grant both input and OS login. The host re-checks its
+  /// state right before typing, so a password sent to an unlocked or UAC
+  /// desktop is refused rather than typed. The answer arrives in
+  /// [ViewerStatus.osLoginCode] / [ViewerStatus.osLoginError], counted by
+  /// [ViewerStatus.osLoginUpdates]. The password is never logged or echoed.
+  static Future<bool> requestOsLogin(String password) async {
+    final bool? queued =
+        await _channel.invokeMethod<bool>('requestOsLogin', password);
     return queued ?? false;
   }
 
@@ -2309,6 +2344,9 @@ abstract final class ViewerPermission {
   static const int record = 0x0200;
   static const int restart = 0x0800;
   static const int blockInput = 0x1000;
+  // The host lets the viewer type its OS password at a logon or lock screen.
+  // The host also requires [input] and re-checks its desktop per request.
+  static const int osLogin = 0x2000;
 }
 
 /// Why Ctrl+Alt+Del did not reach the host's secure desktop

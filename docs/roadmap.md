@@ -2998,6 +2998,19 @@
      状态不刷新的问题。边界：真实重启需管理员权限，测试用注入后端；
      锁屏不模拟 Win+L；`BlockInput` 只屏蔽本地物理输入。DEV-14 仍暂缓
      （需反向角色交接）。
+128. **P2 · DEV-15 操作系统登录（2026-11-05 完成）**：协议 v39 新增
+     `OsLoginRequest(57)/OsLoginResult(58)` 与仅掩码权限位
+     `kPermissionOsLogin`(0x2000)，默认关闭。查看器在工具栏输入主机密码，
+     主机按“权限（input+oslogin）→ 控制租约 → `allow_os_login` → 桌面
+     状态 → 注入”闸门处理，桌面状态在键入前即时复查：仅登录界面（无用户/
+     SYSTEM）与锁屏接受密码，普通桌面和 UAC 回 Unsupported。注入前先释放
+     查看者按住的修饰键，再键入密码+回车；密码不落盘、不记日志、不上命令
+     行，取出后即以 0 覆盖，状态只回结果码与原因。托盘与安全设置新增
+     “系统登录”开关（`host.ini os_login=`）。新增 `chast-host-login-test`
+     覆盖成功、解锁桌面/UAC 拒绝、注入失败、本地非法密码与撤权；protocol/
+     host_settings 用例同步扩展，`flutter test` 552 项通过、Windows release
+     构建成功。边界：真实登录界面键入待服务模式双机验收，不含保存密码
+     自动登录；媒体链路保持零拷贝。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

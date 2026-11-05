@@ -429,6 +429,13 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-control-test tests/host_control_test.cc)
     target_link_libraries(chast-host-control-test PRIVATE chast.host)
 
+    # OS login: the password request over loopback QUIC, the permission and
+    # logon-state gates, the exact text handed to a synthetic injector, and the
+    # transport-level rejection of empty or multi-line passwords. Needs a
+    # desktop session, so it skips itself when no interactive desktop exists.
+    add_executable(chast-host-login-test tests/host_login_test.cc)
+    target_link_libraries(chast-host-login-test PRIVATE chast.host)
+
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
     add_executable(chast-host-security-test tests/host_security_test.cc)
@@ -508,6 +515,8 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)
     add_test(NAME host_control COMMAND chast-host-control-test)
     set_tests_properties(host_control PROPERTIES TIMEOUT 180)
+    add_test(NAME host_login COMMAND chast-host-login-test)
+    set_tests_properties(host_login PROPERTIES TIMEOUT 180)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)

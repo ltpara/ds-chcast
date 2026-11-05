@@ -377,6 +377,22 @@ const char* sas_code_name(SasCode code) {
     return "unknown";
 }
 
+const char* os_login_code_name(OsLoginCode code) {
+    switch (code) {
+        case OsLoginCode::Ok:
+            return "ok";
+        case OsLoginCode::Denied:
+            return "denied";
+        case OsLoginCode::Unsupported:
+            return "unsupported";
+        case OsLoginCode::Busy:
+            return "busy";
+        case OsLoginCode::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
 uint16_t settings_permissions(const HostSettings& settings) {
     uint16_t mask = 0;
     if (settings.allow_input) {
@@ -414,6 +430,9 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_block_input) {
         mask |= kPermissionBlockInput;
+    }
+    if (settings.allow_os_login) {
+        mask |= kPermissionOsLogin;
     }
     return mask;
 }
@@ -579,6 +598,9 @@ std::string permission_names(uint16_t mask) {
     }
     if ((mask & kPermissionBlockInput) != 0) {
         add("block input");
+    }
+    if ((mask & kPermissionOsLogin) != 0) {
+        add("OS login");
     }
     return text.empty() ? "view only" : text;
 }
@@ -870,6 +892,7 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_record = settings_.allow_record;
     quic.allow_restart = settings_.allow_restart;
     quic.allow_block_input = settings_.allow_block_input;
+    quic.allow_os_login = settings_.allow_os_login;
     quic.allow_audio = settings_.allow_audio;
     quic.allow_microphone = settings_.allow_microphone;
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
@@ -4243,6 +4266,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             drain_peer(stats);
             return clean;
         }
+        if (!handle_os_login_requests(stats, error, peer_left)) {
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
+        }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
             ++stats.chat_received;
@@ -5925,6 +5953,27 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
             }
             log("host action refused: file-transfer sessions cannot control the host");
         }
+        std::string login_password;
+        while (session_->take_os_login_request(login_password)) {
+            ++stats.os_login_requests;
+            ++stats.os_login_failures;
+            std::fill(login_password.begin(), login_password.end(), '\0');
+            login_password.clear();
+            const Error sent = session_->send_os_login_result(
+                OsLoginCode::Unsupported,
+                "OS login is not available in a file-transfer session");
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "os_login_result: " + sent.to_string();
+                return false;
+            }
+            log("OS login refused: file-transfer sessions cannot type at the logon screen");
+        }
         poll_files(stats);
         if (session_->viewer_finished()) {
             return true;
@@ -6695,6 +6744,89 @@ bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,
         } else {
             ++stats.send_errors;
             *error = "host_action_result: " + sent.to_string();
+        }
+        return false;
+    }
+    return true;
+}
+
+bool HostServer::handle_os_login_requests(HostServerStats& stats, std::string* error,
+                                          bool* peer_left) {
+    std::string password;
+    while (session_->take_os_login_request(password)) {
+        ++stats.os_login_requests;
+        OsLoginCode code = OsLoginCode::Ok;
+        std::string reason;
+        bool at_lock_screen = false;
+        auto refuse = [&](OsLoginCode next, std::string why) {
+            code = next;
+            reason = std::move(why);
+        };
+        const uint16_t permissions = session_->permissions();
+        if ((permissions & (kPermissionInput | kPermissionOsLogin)) !=
+            (kPermissionInput | kPermissionOsLogin)) {
+            refuse(OsLoginCode::Denied, "OS login is not permitted by the host");
+        } else if (registry_ && !registry_->may_change_host_state(this)) {
+            refuse(OsLoginCode::Busy, "another viewer controls this host");
+        } else if (!settings_.allow_os_login) {
+            refuse(OsLoginCode::Denied, "the host does not allow OS login");
+        } else {
+            // Checked here rather than at the transport: a UAC prompt also
+            // lives on Winlogon, so only the session state can tell it apart
+            // from a lock screen. This runs right before the password is
+            // queued to the injection thread.
+            const OsLoginStatus logon =
+                config_.os_login_state ? config_.os_login_state() : os_login_status();
+            if (logon.state == OsLoginState::Unlocked) {
+                refuse(OsLoginCode::Unsupported,
+                       "the host is not at a logon or lock screen");
+            } else if (logon.state == OsLoginState::Unavailable) {
+                refuse(OsLoginCode::Unsupported,
+                       logon.error.empty() ? "the host cannot type at its logon screen"
+                                           : logon.error);
+            } else {
+                at_lock_screen = logon.state == OsLoginState::Locked;
+                std::string platform_error;
+                bool typed = false;
+                if (config_.os_login) {
+                    typed = config_.os_login(password, &platform_error);
+                } else {
+                    const Error injected = session_->inject_login_text(password);
+                    typed = injected.ok();
+                    if (!typed) {
+                        platform_error = injected.to_string();
+                    }
+                }
+                if (!typed) {
+                    refuse(OsLoginCode::Failed,
+                           platform_error.empty() ? "the password could not be typed"
+                                                  : platform_error);
+                }
+            }
+        }
+        // Drop the credential before the answer travels; nothing below or in
+        // the result may carry it.
+        std::fill(password.begin(), password.end(), '\0');
+        password.clear();
+        if (code == OsLoginCode::Ok) {
+            log(at_lock_screen ? "the OS password was typed at the lock screen"
+                               : "the OS password was typed at the logon screen");
+        } else {
+            ++stats.os_login_failures;
+            log(std::string("OS login refused (") + os_login_code_name(code) +
+                "): " + (reason.empty() ? "no reason given" : reason));
+        }
+        const Error sent = session_->send_os_login_result(code, reason);
+        if (sent.ok()) {
+            publish_stats(stats);
+            continue;
+        }
+        if (sent.status() == Status::Unavailable ||
+            sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "os_login_result: " + sent.to_string();
         }
         return false;
     }
