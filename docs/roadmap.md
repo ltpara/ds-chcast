@@ -3211,6 +3211,17 @@
      `wait_sends()` 返回真实排空结果。验证：`chast-quic`、`chast-host`、
      `chast-service` Release 构建通过；本机 Smart App Control 拦截新构建的
      未签名二进制，运行时验证受限。
+144. **P1 · 代码审核 M20～M23（2026-11-05 完成）**：UPnP 发现校验 SSDP
+     应答源（仅私有/回环，排除 169.254/16），`LOCATION` host 必须匹配应答源
+     或解析为私有地址，禁用重定向、忽略 `URLBase`，`controlURL` 只允许同 host
+     或字面私有 IP；host agent 按来源分类型准入控制报文（punch 地址只发
+     `keepalive_*`/`punch_peer`，relay 端点只发 `relay_challenge`/`relay_ack`），
+     relay 在 viewer→host 方向丢弃 `CHASTC1\n`；host 只接受当前 `remote`、
+     relay 端点或 2 分钟内经 `punch_peer` 公告的 viewer 地址作为回程，viewer
+     只认携带本次 nonce 的 punch 证明；TCP/WS accept 改为 5 ms→1 s 退避重试，
+     仅 `net.ErrClosed` 退出并关闭监听器。验证：`go build ./...`、`go vet`、
+     `go test ./internal/agent ./internal/relay ./internal/upnp` 与全量
+     `go test ./...` 通过（`recordings` 被 Device Guard 随机拦截，与改动无关）。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

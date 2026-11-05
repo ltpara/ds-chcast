@@ -321,8 +321,9 @@ P2 = 平台扩展。
 
 `docs/code-review-2026-11-04.md` 的 C1–C5、H1–H7、M1–M4、M7–M19、M24–M29、
 L1–L16 已修复并验证（C++ 目标构建通过；Go 与 Flutter 全量测试通过）。2026-11-05
-M5/M6 亦已修复（文件撤权中止 outgoing upload 并逐块复查权限；发送队列按代数
-复位并加超时）。复审确认 **M20–M23、M30 与原生查看器 V1–V13 仍未修复**，与
+M5/M6、M20–M23 亦已修复（文件撤权中止 outgoing upload 并逐块复查权限；发送队列
+按代数复位并加超时；UPnP 应答源与 controlURL 校验、控制报文来源矩阵、对端地址
+证明、TCP accept 退避重试）。复审确认 **M30 与原生查看器 V1–V13 仍未修复**，与
 代码审核文档第 7 节第五批一致；本清单不把上述条目计入“已关闭”。本轮逐项复核
 本清单：能力面没有新增代码级缺失，剩余项按“真实环境验收 / 本机开发 / 平台前置”
 三类处置。全部条目保留编号，不删除，也不提前标记完成。
@@ -333,15 +334,11 @@ WebSocket、便携模式、RDP）补一轮。
 
 ### 代码审核残余项（2026-11-05 复审）
 
-M5、M6 已于 2026-11-05 修复（修复说明见
+M5、M6、M20–M23 已于 2026-11-05 修复（修复说明见
 `docs/code-review-2026-11-04.md` 对应小节），下表只保留仍未修复的条目。
 
 | 编号 | 位置 | 残余问题 |
 | --- | --- | --- |
-| M20 | `server/internal/upnp/upnp.go` | SSDP 发现不校验应答源，可被伪造应答引导到任意地址 |
-| M21 | `server/internal/agent/host.go` | relay 控制报文未做类型白名单，可诱导主机向任意 UDP 地址发送 |
-| M22 | `server/internal/agent/host.go`、`viewer.go` | 对端地址先到先得，缺少地址所有权证明 |
-| M23 | `server/internal/relay/relay.go`、`shared.go` | TCP `Accept` 瞬时错误直接退出监听循环 |
 | M30 | 采集/解码/音频 | 光标 Pitch 与相机 stride/长度几何未校验；VPL 重试无上限；WASAPI 销毁与 `push()` 竞态 |
 | V1/V3/V5/V6 | `app/windows/viewer/` | 相机输出锁外使用、`OpenTerminal` 状态不回滚、重复 `start` 覆盖输出、录制开关跨会话粘滞 |
 | V2/V4/V7/V8 | `app/windows/viewer/` | WebAuthn busy 卡死、GPU 错误粘住无重建、目录遍历无上限、纹理尺寸无上限 |
