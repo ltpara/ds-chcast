@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -140,9 +141,17 @@ bool copy_nv12(IMFSample* sample, uint32_t width, uint32_t height, uint32_t stri
             *error = hresult_text("IMF2DBuffer::Lock2D", hr);
             return false;
         }
+        if (pitch <= 0) {
+            buffer2d->Unlock2D();
+            *error = "the camera buffer has an invalid stride";
+            return false;
+        }
         ULONG contiguous = 0;
+        // The required NV12 length is computed in 64 bits: a broken driver can
+        // report a pitch large enough to overflow the 32-bit ULONG multiply.
+        const uint64_t needed = static_cast<uint64_t>(pitch) * height * 3 / 2;
         const bool whole = SUCCEEDED(buffer2d->GetContiguousLength(&contiguous)) &&
-                           contiguous >= static_cast<ULONG>(pitch) * height * 3 / 2;
+                           static_cast<uint64_t>(contiguous) >= needed;
         if (!whole || pitch < static_cast<LONG>(width)) {
             buffer2d->Unlock2D();
             *error = "the camera buffer is not a contiguous NV12 surface";
@@ -156,13 +165,17 @@ bool copy_nv12(IMFSample* sample, uint32_t width, uint32_t height, uint32_t stri
             return false;
         }
         // A 1D media buffer has no row padding of its own; the media type's
-        // default stride is the only layout hint.
-        pitch = stride >= width ? static_cast<LONG>(stride) : static_cast<LONG>(width);
-        if (length < static_cast<DWORD>(pitch) * height * 3 / 2) {
+        // default stride is the only layout hint. A negative default stride
+        // (bottom-up surface) is rejected when the media type is read, and the
+        // length comparison stays in 64 bits.
+        const uint64_t row = stride >= width ? stride : width;
+        if (row > static_cast<uint64_t>(LONG_MAX) ||
+            row * height * 3 / 2 > static_cast<uint64_t>(length)) {
             buffer->Unlock();
             *error = "the camera buffer is smaller than its NV12 frame";
             return false;
         }
+        pitch = static_cast<LONG>(row);
     }
 
     out.resize(static_cast<size_t>(width) * height * 3 / 2);
@@ -542,13 +555,16 @@ std::unique_ptr<ICameraCapture> open_camera(const CameraDevice& device, uint32_t
         rate_numerator = framerate > 0 ? framerate : 30;
         rate_denominator = 1;
     }
-    UINT32 stride = 0;
-    current->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride);
+    // MF_MT_DEFAULT_STRIDE is a signed INT32: negative values describe a
+    // bottom-up surface, which the top-down NV12 copy below cannot express.
+    UINT32 stride_bits = 0;
+    current->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride_bits);
+    const INT32 signed_stride = static_cast<INT32>(stride_bits);
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->width = width;
         state->height = height;
-        state->stride = stride;
+        state->stride = signed_stride > 0 ? static_cast<uint32_t>(signed_stride) : 0;
     }
     const uint32_t actual_rate =
         std::max<UINT32>(1, static_cast<UINT32>(static_cast<double>(rate_numerator) /

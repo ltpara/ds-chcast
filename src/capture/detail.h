@@ -333,6 +333,14 @@ inline bool has_pointer_shape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shape) noex
     return shape.Type != kNoShapeType;
 }
 
+// Validates a driver-reported pointer shape against the bytes DXGI returned.
+// The decoders walk full rows at Pitch spacing, so a pitch shorter than the
+// pixel row, an odd monochrome height or a shape larger than `data_size` would
+// read past the buffer. `max_bytes` bounds the decoded sprite, which the
+// monochrome expansion could otherwise amplify.
+bool pointer_shape_valid(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shape, UINT data_size,
+                         UINT max_bytes);
+
 class CursorDecoder {
 public:
     explicit CursorDecoder(UINT max_bitmap_bytes = 4u * 1024u * 1024u)

@@ -138,6 +138,48 @@ size_t cursor_buffer_size(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shape) {
     return pitch_rows + mask_row_bytes(shape.Width) * shape.Height;
 }
 
+bool pointer_shape_valid(const DXGI_OUTDUPL_POINTER_SHAPE_INFO& shape, UINT data_size,
+                         UINT max_bytes) {
+    if (shape.Width == 0 || shape.Height == 0 || shape.Pitch == 0) {
+        return false;
+    }
+    const uint64_t width = shape.Width;
+    const uint64_t height = shape.Height;
+    const uint64_t pitch = shape.Pitch;
+    uint64_t tail_bytes = 0;
+    uint64_t decoded_height = height;
+    switch (shape.Type) {
+        case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR:
+        case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR:
+            // Every decoder reads four bytes per pixel across a full row, so a
+            // short pitch would walk past the returned bytes.
+            if (pitch < width * 4u) {
+                return false;
+            }
+            if (shape.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+                tail_bytes = static_cast<uint64_t>(mask_row_bytes(shape.Width)) * height;
+            }
+            break;
+        case DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME:
+            // The AND and XOR planes are stacked, so the reported height must
+            // be even and each plane row must fit the pitch.
+            if ((shape.Height & 1u) != 0 || pitch < mask_row_bytes(shape.Width)) {
+                return false;
+            }
+            decoded_height = height / 2u;
+            break;
+        default:
+            return false;
+    }
+    // Compare through division: a hostile driver can report dimensions whose
+    // product wraps 64 bits, which would turn a rounded-up length check into a
+    // pass. decoded_height and height are non-zero here.
+    if (tail_bytes > data_size || pitch > (static_cast<uint64_t>(data_size) - tail_bytes) / height) {
+        return false;
+    }
+    return width <= static_cast<uint64_t>(max_bytes) / 4u / decoded_height;
+}
+
 uint64_t cursor_content_id(UINT width, UINT height, POINT hotspot,
                            const std::vector<uint8_t>& color) {
     uint64_t hash = 0xCBF29CE484222325ull;  // FNV-1a offset basis
@@ -285,7 +327,7 @@ void CursorDecoder::update_shape(IDXGIOutputDuplication* duplication) {
         // cached bitmap rather than clearing it.
         return;
     }
-    if (cursor_buffer_size(actual) > raw_.size()) {
+    if (data_size > raw_.size() || !pointer_shape_valid(actual, data_size, max_bitmap_bytes_)) {
         clear_shape();
         return;
     }

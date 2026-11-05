@@ -123,6 +123,9 @@ private:
     Error convert(const DecodedAudio& audio, std::vector<uint8_t>& pcm, size_t& frames);
     void apply_fade(uint8_t* data, size_t frames);
     void fail(const std::string& message);
+    // Wakes the render thread through the handle under format_mutex_, the same
+    // lock close() holds while it retires the handle.
+    void signal_render();
     void close();
     bool stopping() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -525,15 +528,20 @@ Error WasapiPlayer::start() {
     return Error::success();
 }
 
+void WasapiPlayer::signal_render() {
+    std::lock_guard<std::mutex> lock(format_mutex_);
+    if (event_) {
+        SetEvent(event_);
+    }
+}
+
 void WasapiPlayer::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping_ = true;
     }
     cv_.notify_all();
-    if (event_) {
-        SetEvent(event_);
-    }
+    signal_render();
     if (thread_.joinable()) {
         thread_.join();
     }
@@ -541,13 +549,24 @@ void WasapiPlayer::stop() {
 
 void WasapiPlayer::close() {
     stop();
-    if (swr_) {
-        swr_free(&swr_);
-    }
-    av_channel_layout_uninit(&swr_input_);
-    if (event_) {
-        CloseHandle(event_);
+    HANDLE event = nullptr;
+    {
+        // push() and the setters signal through this lock, so retiring the
+        // handle here cannot race a SetEvent on a closed handle.
+        std::lock_guard<std::mutex> lock(format_mutex_);
+        endpoint_ready_ = false;
+        if (swr_) {
+            swr_free(&swr_);
+        }
+        av_channel_layout_uninit(&swr_input_);
+        swr_input_rate_ = 0;
+        swr_input_channels_ = 0;
+        format_ = wasapi::MixFormat{};
+        event = event_;
         event_ = nullptr;
+    }
+    if (event) {
+        CloseHandle(event);
     }
 }
 
@@ -1042,9 +1061,10 @@ Error WasapiPlayer::push(const DecodedAudio& audio) {
             queue_.pop_front();
             dropped_.fetch_add(1);
         }
-    }
-    if (event_) {
-        SetEvent(event_);
+        // Signal under format_mutex_ so close() cannot free the handle first.
+        if (event_) {
+            SetEvent(event_);
+        }
     }
     return Error::success();
 }
@@ -1071,23 +1091,17 @@ void WasapiPlayer::set_clock_offset(int64_t host_minus_local_ms) {
         offset_ms_.store(host_minus_local_ms);
         have_offset_.store(true);
     }
-    if (event_) {
-        SetEvent(event_);
-    }
+    signal_render();
 }
 
 void WasapiPlayer::set_lead_ms(uint32_t lead_ms) {
     lead_ms_.store(std::min<uint32_t>(lead_ms, 1000));
-    if (event_) {
-        SetEvent(event_);
-    }
+    signal_render();
 }
 
 void WasapiPlayer::set_mute(bool mute) {
     muted_.store(mute);
-    if (event_) {
-        SetEvent(event_);
-    }
+    signal_render();
 }
 
 AudioPlayerStats WasapiPlayer::stats() const {
@@ -1129,9 +1143,7 @@ void WasapiPlayer::fail(const std::string& message) {
         }
         stopping_ = true;
     }
-    if (event_) {
-        SetEvent(event_);
-    }
+    signal_render();
     cv_.notify_all();
 }
 

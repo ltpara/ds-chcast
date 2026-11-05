@@ -91,6 +91,50 @@ void test_outline() {
     EXPECT(!untouched.outlined);
 }
 
+DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info(UINT type, UINT width, UINT height, UINT pitch) {
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO info{};
+    info.Type = type;
+    info.Width = width;
+    info.Height = height;
+    info.Pitch = pitch;
+    return info;
+}
+
+void test_pointer_shape_valid() {
+    using chast::detail::pointer_shape_valid;
+    constexpr UINT kColor = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR;
+    constexpr UINT kMasked = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR;
+    constexpr UINT kMono = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME;
+
+    // A 16x16 colour pointer is 64 bytes per row; the reported size must match.
+    EXPECT(pointer_shape_valid(shape_info(kColor, 16, 16, 64), 1024, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kColor, 16, 16, 64), 1023, 4096));
+    // A pitch below width * 4 would make the decoder read past each row.
+    EXPECT(!pointer_shape_valid(shape_info(kColor, 16, 16, 60), 4096, 4096));
+    // The decoded sprite is bounded separately from the source bytes.
+    EXPECT(!pointer_shape_valid(shape_info(kColor, 16, 16, 64), 1024, 1023));
+    // Degenerate geometry never decodes.
+    EXPECT(!pointer_shape_valid(shape_info(kColor, 0, 16, 64), 1024, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kColor, 16, 0, 64), 1024, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kColor, 16, 16, 0), 1024, 4096));
+    // Unknown shape types are rejected rather than decoded as colour.
+    EXPECT(!pointer_shape_valid(shape_info(7, 16, 16, 64), 1024, 4096));
+
+    // Masked colour adds a 1bpp mask plane per row after the pixels: width 16
+    // rounds to a 4-byte mask row, so 16x2 needs 64*2 + 4*2 == 136 bytes.
+    EXPECT(pointer_shape_valid(shape_info(kMasked, 16, 2, 64), 136, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kMasked, 16, 2, 64), 135, 4096));
+
+    // Monochrome stacks AND and XOR planes: height is doubled, each plane row
+    // spans the 4-byte mask row, and the decoded height is halved.
+    EXPECT(pointer_shape_valid(shape_info(kMono, 16, 4, 4), 16, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kMono, 16, 3, 4), 16, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kMono, 16, 4, 2), 16, 4096));
+    EXPECT(!pointer_shape_valid(shape_info(kMono, 16, 4, 4), 15, 4096));
+    // 16x4 source decodes to 16x2, i.e. 128 bytes of RGBA.
+    EXPECT(!pointer_shape_valid(shape_info(kMono, 16, 4, 4), 16, 127));
+}
+
 chast::CursorInfo cursor_info(uint64_t id, size_t bytes) {
     chast::CursorInfo info;
     info.shape_valid = true;
@@ -143,6 +187,7 @@ void test_cache() {
 int main() {
     test_content_id();
     test_outline();
+    test_pointer_shape_valid();
     test_cache();
     if (g_failures == 0) {
         std::printf("cursor tests passed\n");

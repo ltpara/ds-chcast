@@ -39,6 +39,12 @@ namespace chast {
 namespace {
 
 constexpr mfxU32 kSyncTimeoutMs = 10000;
+// DecodeFrameAsync may ask for another surface or report a busy device without
+// making progress. Both are transient normally, but a wedged GPU must not spin
+// the decode thread forever: after these bounds the error reaches the caller,
+// which rebuilds the pipeline on DeviceRemoved.
+constexpr int kMaxSurfaceRetries = 10;
+constexpr int kMaxBusyRetries = 1000;
 // Extra surfaces beyond what QueryIOSurf asks for: the runtime returns
 // MFX_ERR_MORE_SURFACE while its reference pool fills, and having a couple of
 // spares keeps that off the steady-state path.
@@ -599,6 +605,8 @@ VideoSurface* MfxDecoder::free_video_surface() {
 }
 
 Error MfxDecoder::pump(mfxBitstream* bitstream, std::vector<DecodedFrame>& out) {
+    int surface_retries = 0;
+    int busy_retries = 0;
     for (;;) {
         if (gpu_ && !legacy_) {
             // oneVPL 2.x owns the surface pool. GetNativeHandle hands out the
@@ -612,9 +620,16 @@ Error MfxDecoder::pump(mfxBitstream* bitstream, std::vector<DecodedFrame>& out) 
                 return Error::success();
             }
             if (sts == MFX_ERR_MORE_SURFACE) {
+                if (++surface_retries > kMaxSurfaceRetries) {
+                    return Error(Status::NotCurrentlyAvailable,
+                                 "decode device kept asking for another surface");
+                }
                 continue;
             }
             if (sts == MFX_WRN_DEVICE_BUSY) {
+                if (++busy_retries > kMaxBusyRetries) {
+                    return Error(Status::DeviceRemoved, "decode device stayed busy");
+                }
                 Sleep(1);
                 continue;
             }
@@ -625,6 +640,8 @@ Error MfxDecoder::pump(mfxBitstream* bitstream, std::vector<DecodedFrame>& out) 
             if (!decoded) {
                 continue;
             }
+            surface_retries = 0;
+            busy_retries = 0;
             mfxStatus synced = MFX_ERR_NONE;
             if (decoded->FrameInterface && decoded->FrameInterface->Synchronize) {
                 do {
@@ -672,9 +689,16 @@ Error MfxDecoder::pump(mfxBitstream* bitstream, std::vector<DecodedFrame>& out) 
             return Error::success();
         }
         if (sts == MFX_ERR_MORE_SURFACE) {
+            if (++surface_retries > kMaxSurfaceRetries) {
+                return Error(Status::NotCurrentlyAvailable,
+                             "decode device kept asking for another surface");
+            }
             continue;
         }
         if (sts == MFX_WRN_DEVICE_BUSY) {
+            if (++busy_retries > kMaxBusyRetries) {
+                return Error(Status::DeviceRemoved, "decode device stayed busy");
+            }
             Sleep(1);
             continue;
         }
@@ -685,6 +709,8 @@ Error MfxDecoder::pump(mfxBitstream* bitstream, std::vector<DecodedFrame>& out) 
         if (!decoded || !sync) {
             continue;
         }
+        surface_retries = 0;
+        busy_retries = 0;
         const mfxStatus synced = MFXVideoCORE_SyncOperation(session_, sync, kSyncTimeoutMs);
         if (synced < MFX_ERR_NONE) {
             return mfx_error(synced, "MFXVideoCORE_SyncOperation");
