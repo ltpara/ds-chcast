@@ -1,5 +1,9 @@
 # M11 P2：远程终端（chast 自有设计）
 
+2026-11-04 更新：查看器现已接入两个独立终端标签；本页以下为 v27 的原始设计与历史验收，
+单控制台 UI 限制已不再适用。当前仍不保留断线 shell；后续保留/恢复工作与验证状态见
+[Windows 功能对齐进度](windows-parity-progress-2026-11-04.md)。
+
 状态：协议 v27、传输、主机 ConPTY、查看器原生通道、CLI 验收与 Flutter
 终端面板已完成（2026-10-27）；`ctest -C Release` 的 `quic_terminal` /
 `quic_terminal_denied` 通过，`flutter analyze`、`flutter test`（303 项）
