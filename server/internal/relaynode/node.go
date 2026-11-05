@@ -20,6 +20,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
 	"github.com/ltpara/ds-chcast/server/internal/relay"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 const (
@@ -37,6 +38,9 @@ type Config struct {
 	AdvertiseV6 string
 	Key         string
 	Logger      *slog.Logger
+	// Tracer exports relay session spans and supplies the queue gauges on
+	// /metrics. Nil disables both.
+	Tracer *tracing.Tracer
 }
 
 type Server struct {
@@ -44,6 +48,7 @@ type Server struct {
 	manager *relay.Manager
 	auth    *Authenticator
 	log     *slog.Logger
+	tracer  *tracing.Tracer
 	started time.Time
 
 	provisionMu sync.Mutex
@@ -109,6 +114,7 @@ func New(cfg Config, manager *relay.Manager, auth *Authenticator) (*Server, erro
 		manager: manager,
 		auth:    auth,
 		log:     cfg.Logger,
+		tracer:  cfg.Tracer,
 		started: time.Now(),
 		done:    make(chan struct{}),
 	}, nil
@@ -154,6 +160,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/leases", s.requireKey(http.HandlerFunc(s.handleLease)))
 	mux.Handle("DELETE /v1/leases/{id}", s.requireKey(http.HandlerFunc(s.handleRelease)))
 	mux.Handle("GET /v1/stats", s.requireKey(http.HandlerFunc(s.handleStats)))
+	mux.Handle("GET /metrics", s.requireKey(http.HandlerFunc(s.handleMetrics)))
 	return mux
 }
 
@@ -332,6 +339,33 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.Stats())
+}
+
+// handleMetrics exposes the exporter queue and the relay counters in
+// Prometheus text format so a standalone node can be scraped without a JSON
+// shim. The control key protects it exactly like /v1/stats.
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	stats := s.manager.Stats()
+	policy := stats.Policy
+	var toHost, toViewer uint64
+	for _, port := range stats.Ports {
+		toHost += port.ToHost + port.TCPToHost
+		toViewer += port.ToViewer + port.TCPToViewer
+	}
+	var b strings.Builder
+	if s.tracer != nil {
+		fmt.Fprintf(&b, "# HELP chast_trace_queue_depth Spans waiting for the OTLP exporter.\n# TYPE chast_trace_queue_depth gauge\nchast_trace_queue_depth %d\n", s.tracer.QueueDepth())
+		fmt.Fprintf(&b, "# HELP chast_trace_queue_capacity OTLP exporter queue capacity.\n# TYPE chast_trace_queue_capacity gauge\nchast_trace_queue_capacity %d\n", s.tracer.QueueCapacity())
+		fmt.Fprintf(&b, "# HELP chast_trace_spans_dropped_total Spans discarded because the OTLP queue was full.\n# TYPE chast_trace_spans_dropped_total counter\nchast_trace_spans_dropped_total %d\n", s.tracer.DroppedSpans())
+	}
+	fmt.Fprintf(&b, "# HELP chast_relay_bytes_total Relay bytes by direction.\n# TYPE chast_relay_bytes_total counter\nchast_relay_bytes_total{direction=\"to_host\"} %d\nchast_relay_bytes_total{direction=\"to_viewer\"} %d\n", toHost, toViewer)
+	fmt.Fprintf(&b, "# HELP chast_relay_policy_sessions Relay sessions under policy accounting.\n# TYPE chast_relay_policy_sessions gauge\nchast_relay_policy_sessions %d\n", policy.Sessions)
+	fmt.Fprintf(&b, "# HELP chast_relay_rate_dropped_datagrams_total UDP datagrams dropped by the bandwidth limit.\n# TYPE chast_relay_rate_dropped_datagrams_total counter\nchast_relay_rate_dropped_datagrams_total %d\n", policy.RateDroppedDatagrams)
+	fmt.Fprintf(&b, "# HELP chast_relay_blocked_sessions_total Sessions refused because the address was blocklisted.\n# TYPE chast_relay_blocked_sessions_total counter\nchast_relay_blocked_sessions_total %d\n", policy.BlockedSessions)
+	fmt.Fprintf(&b, "# HELP chast_relay_downgraded_sessions_total Sessions downgraded to the blacklist speed.\n# TYPE chast_relay_downgraded_sessions_total counter\nchast_relay_downgraded_sessions_total %d\n", policy.DowngradedSessions)
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(b.String()))
 }
 
 func (s *Server) requireKey(next http.Handler) http.Handler {

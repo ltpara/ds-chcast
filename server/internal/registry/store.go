@@ -15,6 +15,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/ltpara/ds-chcast/server/internal/dbmetric"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/schemamig"
 )
@@ -39,7 +40,7 @@ func NewStore(path string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("state directory %s: %w", dir, err)
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := dbmetric.OpenSQLite("registry", path)
 	if err != nil {
 		return nil, fmt.Errorf("open state %s: %w", path, err)
 	}

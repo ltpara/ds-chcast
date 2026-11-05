@@ -1,13 +1,14 @@
-// Package tracing exports HTTP request spans to an OpenTelemetry collector
-// over OTLP/HTTP JSON. It keeps the dependency list empty: the payload is
-// encoded by hand and delivery is best effort, so a slow or missing collector
-// never blocks application requests.
+// Package tracing exports HTTP and data-plane spans to an OpenTelemetry
+// collector over OTLP/HTTP JSON. It keeps the dependency list empty: the
+// payload is encoded by hand and delivery is best effort, so a slow or missing
+// collector never blocks application requests.
 package tracing
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	randv2 "math/rand/v2"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,11 +25,16 @@ const (
 	flushBatch    = 128
 	queueSize     = 512
 	exportTimeout = 5 * time.Second
+
+	// Span kinds as defined by OTLP.
+	kindInternal = 1
+	kindServer   = 2
 )
 
 // Config describes the collector and sampling policy. Endpoint is the
 // OTLP/HTTP base URL; "/v1/traces" is appended. An empty endpoint disables
-// tracing entirely and New returns nil.
+// tracing entirely and New returns nil. Sample is read at startup; changing it
+// requires a restart.
 type Config struct {
 	Endpoint string
 	Service  string
@@ -45,6 +52,7 @@ type Tracer struct {
 	done     chan struct{}
 	once     sync.Once
 	wg       sync.WaitGroup
+	dropped  atomic.Uint64
 }
 
 type span struct {
@@ -52,21 +60,40 @@ type span struct {
 	spanID   string
 	parentID string
 	name     string
-	method   string
-	route    string
-	status   int
+	kind     int
+	attrs    []otlpAttribute
 	start    time.Time
 	end      time.Time
-	scheme   string
+	status   int
 }
 
-// Span is the live state returned by Begin and handed back to End. Callers
-// must not reuse a Span after End.
+// Span is the live state returned by Begin, Start or StartLinked and handed
+// back to End or EndSpan. Callers must not reuse a Span after finishing it.
 type Span struct {
 	traceID  string
 	spanID   string
 	parentID string
+	name     string
+	kind     int
+	attrs    []otlpAttribute
 	start    time.Time
+	status   int
+}
+
+// Attribute is one span attribute. Values stay strings on the wire except for
+// Int, which is exported as an OTLP intValue.
+type Attribute struct {
+	Key   string
+	Value string
+	int   bool
+}
+
+// String returns a string attribute.
+func String(key, value string) Attribute { return Attribute{Key: key, Value: value} }
+
+// Int returns an integer attribute.
+func Int(key string, value int64) Attribute {
+	return Attribute{Key: key, Value: strconv.FormatInt(value, 10), int: true}
 }
 
 // New starts the exporter goroutine. A configuration without an endpoint
@@ -103,6 +130,133 @@ func New(cfg Config) *Tracer {
 // Enabled reports whether spans are collected.
 func (t *Tracer) Enabled() bool { return t != nil && t.sample > 0 }
 
+// QueueDepth is the number of spans waiting for the exporter.
+func (t *Tracer) QueueDepth() int {
+	if t == nil {
+		return 0
+	}
+	return len(t.queue)
+}
+
+// QueueCapacity is the exporter queue size.
+func (t *Tracer) QueueCapacity() int {
+	if t == nil {
+		return 0
+	}
+	return cap(t.queue)
+}
+
+func (t *Tracer) keep() bool {
+	if !t.Enabled() {
+		return false
+	}
+	return t.sample >= 1 || randv2.Float64() < t.sample
+}
+
+// Start begins a new root trace for a non-HTTP operation such as a punch or a
+// relay session. The span is dropped when the local sampler declines it.
+func (t *Tracer) Start(name string, attrs ...Attribute) *Span {
+	if !t.keep() {
+		return nil
+	}
+	return &Span{
+		traceID: newID(16),
+		spanID:  newID(8),
+		name:    name,
+		kind:    kindInternal,
+		attrs:   attributes(attrs),
+		start:   time.Now(),
+	}
+}
+
+// StartLinked joins an existing trace. A malformed or all-zero trace ID falls
+// back to Start. Linked spans are exported whenever tracing is enabled because
+// the sampling decision was already made upstream.
+func (t *Tracer) StartLinked(traceID, parentSpanID, name string, attrs ...Attribute) *Span {
+	if !t.Enabled() {
+		return nil
+	}
+	if !validTraceID(traceID) {
+		return t.Start(name, attrs...)
+	}
+	if parentSpanID != "" && (!lowerHex(parentSpanID) || parentSpanID == strings.Repeat("0", 16)) {
+		parentSpanID = ""
+	}
+	return &Span{
+		traceID:  traceID,
+		spanID:   newID(8),
+		parentID: parentSpanID,
+		name:     name,
+		kind:     kindInternal,
+		attrs:    attributes(attrs),
+		start:    time.Now(),
+	}
+}
+
+// StartDerived starts a span on a deterministic trace while still honouring
+// the local sampler. Operations without an inbound traceparent use it so a
+// stable key, such as a host ID, makes their spans searchable and joins them
+// into one trace across processes that derive the same ID.
+func (t *Tracer) StartDerived(traceID, name string, attrs ...Attribute) *Span {
+	if !t.keep() {
+		return nil
+	}
+	if !validTraceID(traceID) {
+		traceID = newID(16)
+	}
+	return &Span{
+		traceID: traceID,
+		spanID:  newID(8),
+		name:    name,
+		kind:    kindInternal,
+		attrs:   attributes(attrs),
+		start:   time.Now(),
+	}
+}
+
+// TraceID is the trace the span belongs to, or "" for a nil span.
+func (s *Span) TraceID() string {
+	if s == nil {
+		return ""
+	}
+	return s.traceID
+}
+
+// Add appends attributes to a span.
+func (s *Span) Add(attrs ...Attribute) {
+	if s == nil {
+		return
+	}
+	s.attrs = append(s.attrs, attributes(attrs)...)
+}
+
+// SetStatus marks the span as failed when code is non-zero. OTLP uses 2 for an
+// error and 0 for unset.
+func (s *Span) SetStatus(code int) {
+	if s == nil {
+		return
+	}
+	s.status = code
+}
+
+// EndSpan finishes a non-HTTP span.
+func (t *Tracer) EndSpan(s *Span) {
+	if t == nil || s == nil {
+		return
+	}
+	t.enqueue(span{
+		traceID:  s.traceID,
+		spanID:   s.spanID,
+		parentID: s.parentID,
+		name:     s.name,
+		kind:     s.kind,
+		attrs:    s.attrs,
+		start:    s.start,
+		end:      time.Now(),
+		status:   s.status,
+	})
+}
+
 // Begin starts a span for an incoming request. A valid inbound traceparent
 // keeps its trace ID and sampled bit; otherwise a new trace is started when
 // the local sampler selects it. The response carries a traceparent header so
@@ -117,7 +271,7 @@ func (t *Tracer) Begin(w http.ResponseWriter, r *http.Request) *Span {
 			return nil
 		}
 	} else {
-		if t.sample < 1 && randv2.Float64() >= t.sample {
+		if !t.keep() {
 			return nil
 		}
 		traceID = newID(16)
@@ -146,22 +300,42 @@ func (t *Tracer) End(sp *Span, r *http.Request, status int) {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	out := span{
+	code := 0
+	if status >= 500 {
+		code = 2
+	}
+	t.enqueue(span{
 		traceID:  sp.traceID,
 		spanID:   sp.spanID,
 		parentID: sp.parentID,
 		name:     name,
-		method:   r.Method,
-		route:    route,
-		status:   status,
-		start:    sp.start,
-		end:      time.Now(),
-		scheme:   scheme,
-	}
+		kind:     kindServer,
+		attrs: []otlpAttribute{
+			{Key: "http.request.method", Value: stringValue(r.Method)},
+			{Key: "http.route", Value: stringValue(route)},
+			{Key: "url.scheme", Value: stringValue(scheme)},
+			{Key: "http.response.status_code", Value: intValue(status)},
+		},
+		start:  sp.start,
+		end:    time.Now(),
+		status: code,
+	})
+}
+
+func (t *Tracer) enqueue(out span) {
 	select {
 	case t.queue <- out:
 	default:
+		t.dropped.Add(1)
 	}
+}
+
+// DroppedSpans counts spans discarded because the exporter queue was full.
+func (t *Tracer) DroppedSpans() uint64 {
+	if t == nil {
+		return 0
+	}
+	return t.dropped.Load()
 }
 
 // Handler wraps next with Begin/End. Use it where the served handler does not
@@ -317,29 +491,38 @@ func intValue(v int) otlpValue {
 	return otlpValue{IntValue: &s}
 }
 
+func attributes(in []Attribute) []otlpAttribute {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]otlpAttribute, 0, len(in))
+	for _, attr := range in {
+		if attr.Key == "" {
+			continue
+		}
+		value := stringValue(attr.Value)
+		if attr.int {
+			v := attr.Value
+			value = otlpValue{IntValue: &v}
+		}
+		out = append(out, otlpAttribute{Key: attr.Key, Value: value})
+	}
+	return out
+}
+
 func (t *Tracer) export(batch []span) {
 	spans := make([]otlpSpan, 0, len(batch))
 	for _, s := range batch {
-		code := 0
-		if s.status >= 500 {
-			code = 2
-		}
-		attrs := []otlpAttribute{
-			{Key: "http.request.method", Value: stringValue(s.method)},
-			{Key: "http.route", Value: stringValue(s.route)},
-			{Key: "url.scheme", Value: stringValue(s.scheme)},
-			{Key: "http.response.status_code", Value: intValue(s.status)},
-		}
 		spans = append(spans, otlpSpan{
 			TraceID:           s.traceID,
 			SpanID:            s.spanID,
 			ParentSpanID:      s.parentID,
 			Name:              s.name,
-			Kind:              2,
+			Kind:              s.kind,
 			StartTimeUnixNano: strconv.FormatInt(s.start.UnixNano(), 10),
 			EndTimeUnixNano:   strconv.FormatInt(s.end.UnixNano(), 10),
-			Attributes:        attrs,
-			Status:            otlpStatus{Code: code},
+			Attributes:        s.attrs,
+			Status:            otlpStatus{Code: s.status},
 		})
 	}
 	payload := otlpPayload{ResourceSpans: []otlpResourceSpans{{
@@ -367,6 +550,33 @@ func (t *Tracer) export(batch []span) {
 		return
 	}
 	resp.Body.Close()
+}
+
+// DeriveTraceID builds a stable 16-byte trace ID from a namespace and a
+// session identifier. Both ends of a punch or relay handshake know the same
+// identifier (nonce or carrier token), so their spans land in one trace even
+// though the protocol carries no trace headers. The first byte is forced
+// non-zero so the result is a valid OTLP trace ID.
+func DeriveTraceID(namespace, value string) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + value))
+	sum[0] |= 1
+	return hex.EncodeToString(sum[:16])
+}
+
+// NewSpanID returns a fresh 8-byte span ID as lowercase hex.
+func NewSpanID() string { return newID(8) }
+
+// Traceparent formats a W3C traceparent with the sampled bit set. A malformed
+// trace ID yields "", which callers should treat as "do not propagate".
+func Traceparent(traceID string) string {
+	if !validTraceID(traceID) {
+		return ""
+	}
+	return "00-" + traceID + "-" + newID(8) + "-01"
+}
+
+func validTraceID(value string) bool {
+	return len(value) == 32 && lowerHex(value) && value != strings.Repeat("0", 32)
 }
 
 // parseTraceparent accepts the W3C version-00 layout and rejects all-zero

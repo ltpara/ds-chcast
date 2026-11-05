@@ -15,6 +15,7 @@ import (
 
 	"github.com/ltpara/ds-chcast/server/internal/carrier"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 // SharedCarrier is one TCP/WebSocket listener that serves every host. Host
@@ -433,7 +434,10 @@ func (sc *SharedCarrier) serveViewer(v *carrierViewer, hello carrier.SharedViewe
 		sc.mu.Unlock()
 		return
 	}
-	session, err := sc.policy.Open("shared:"+hello.HostID, peerIP(v.peer))
+	key := "shared:" + hello.HostID
+	session, err := sc.policy.OpenTraced(sessionTraceID(hello.HostID, key), key, peerIP(v.peer),
+		tracing.String("chast.host_id", hello.HostID),
+		tracing.String("relay.transport", "shared"))
 	if err != nil {
 		sc.blocked++
 		sc.mu.Unlock()

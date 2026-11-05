@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 const (
@@ -131,6 +133,8 @@ type Policy struct {
 	sessions map[string]*Session
 	counters policyCounters
 
+	tracer *tracing.Tracer
+
 	now func() time.Time
 }
 
@@ -154,6 +158,8 @@ type Session struct {
 	blacklisted   bool
 	blocked       bool
 	lastListCheck time.Time
+
+	span *tracing.Span
 }
 
 func newPolicy(cfg PolicyConfig) (*Policy, error) {
@@ -261,8 +267,38 @@ func (p *Policy) Blocked(ip string) bool {
 	return ok
 }
 
+// setTracer installs the session tracer. It must be called before the policy
+// serves viewers.
+func (p *Policy) setTracer(tracer *tracing.Tracer) { p.tracer = tracer }
+
 // Open starts a session for one viewer. The key is unique per relay slot.
 func (p *Policy) Open(key, ip string) (*Session, error) {
+	return p.open(key, ip, nil)
+}
+
+// OpenTraced is Open plus a span that ends when the session closes. The trace
+// ID normally comes from the host ID so rendezvous, lease and relay spans for
+// one host share a trace.
+func (p *Policy) OpenTraced(traceID, key, ip string, attrs ...tracing.Attribute) (*Session, error) {
+	if p.tracer == nil || traceID == "" {
+		return p.open(key, ip, nil)
+	}
+	attrs = append(attrs,
+		tracing.String("relay.session_key", key),
+		tracing.String("client.address", canonicalIP(ip)),
+	)
+	span := p.tracer.StartDerived(traceID, "relay.session", attrs...)
+	session, err := p.open(key, ip, span)
+	if err != nil {
+		span.Add(tracing.String("chast.result", "blocked"))
+		span.SetStatus(2)
+		p.tracer.EndSpan(span)
+		return nil, err
+	}
+	return session, nil
+}
+
+func (p *Policy) open(key, ip string, span *tracing.Span) (*Session, error) {
 	ip = canonicalIP(ip)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -281,6 +317,7 @@ func (p *Policy) Open(key, ip string) (*Session, error) {
 		start:         now,
 		windowStart:   now,
 		lastListCheck: now,
+		span:          span,
 	}
 	_, s.blacklisted = p.blacklist[ip]
 	p.sessions[key] = s
@@ -290,10 +327,29 @@ func (p *Policy) Open(key, ip string) (*Session, error) {
 func (s *Session) Close() {
 	p := s.policy
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.sessions[s.key] == s {
 		delete(p.sessions, s.key)
 	}
+	span := s.span
+	s.span = nil
+	bytes := s.totalBytes
+	downgraded := s.downgraded
+	blocked := s.blocked
+	p.mu.Unlock()
+	if span == nil {
+		return
+	}
+	span.Add(tracing.Int("relay.total_bytes", int64(bytes)))
+	if downgraded {
+		span.Add(tracing.Int("relay.downgraded", 1))
+	}
+	if blocked {
+		span.Add(tracing.String("chast.result", "blocked"))
+		span.SetStatus(2)
+	} else {
+		span.Add(tracing.String("chast.result", "ok"))
+	}
+	p.tracer.EndSpan(span)
 }
 
 // Take waits until the session and total buckets have room for payload bytes.

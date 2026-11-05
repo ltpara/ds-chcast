@@ -285,6 +285,133 @@ func TestNilTracerIsInert(t *testing.T) {
 	}
 }
 
+func TestStartExportsAttributes(t *testing.T) {
+	col, srv := newCollector(t)
+	tr := New(Config{Endpoint: srv.URL, Service: "chast-test", Sample: 1})
+	if tr == nil {
+		t.Fatal("tracer disabled")
+	}
+	sp := tr.Start("relay.session",
+		String("relay.transport", "udp"),
+		Int("relay.port", 21117),
+		String("chast.host_id", "devbox"),
+	)
+	if sp == nil {
+		t.Fatal("start returned a nil span")
+	}
+	sp.Add(String("chast.result", "closed"))
+	sp.SetStatus(2)
+	tr.EndSpan(sp)
+	closeTracer(t, tr)
+
+	spans := col.spans()
+	if len(spans) != 1 {
+		t.Fatalf("exported %d spans, want 1", len(spans))
+	}
+	exported := spans[0]
+	if exported.Name != "relay.session" || exported.Kind != 1 {
+		t.Fatalf("span name/kind = %q/%d", exported.Name, exported.Kind)
+	}
+	if exported.ParentSpanID != "" {
+		t.Fatalf("root span has parent %q", exported.ParentSpanID)
+	}
+	if exported.Status.Code != 2 {
+		t.Fatalf("status code = %d", exported.Status.Code)
+	}
+	if got := attribute(t, exported.Attributes, "relay.transport"); got != "udp" {
+		t.Fatalf("transport attribute = %q", got)
+	}
+	if got := attribute(t, exported.Attributes, "relay.port"); got != "21117" {
+		t.Fatalf("port attribute = %q", got)
+	}
+	if got := attribute(t, exported.Attributes, "chast.result"); got != "closed" {
+		t.Fatalf("result attribute = %q", got)
+	}
+}
+
+func TestStartLinkedJoinsDerivedTrace(t *testing.T) {
+	col, srv := newCollector(t)
+	tr := New(Config{Endpoint: srv.URL, Sample: 1})
+	traceID := DeriveTraceID("relay", "carrier-token")
+	if len(traceID) != 32 {
+		t.Fatalf("derived trace id = %q", traceID)
+	}
+	if again := DeriveTraceID("relay", "carrier-token"); again != traceID {
+		t.Fatalf("derived trace id is not stable: %q then %q", traceID, again)
+	}
+	if other := DeriveTraceID("punch", "carrier-token"); other == traceID {
+		t.Fatal("different namespaces share a trace id")
+	}
+	sp := tr.StartLinked(traceID, "", "relay.lease")
+	if sp == nil || sp.TraceID() != traceID {
+		t.Fatalf("linked span trace = %q", sp.TraceID())
+	}
+	tr.EndSpan(sp)
+	closeTracer(t, tr)
+
+	spans := col.spans()
+	if len(spans) != 1 {
+		t.Fatalf("exported %d spans, want 1", len(spans))
+	}
+	if spans[0].TraceID != traceID || spans[0].Kind != 1 {
+		t.Fatalf("linked span = trace %q kind %d", spans[0].TraceID, spans[0].Kind)
+	}
+}
+
+func TestTraceparentFormat(t *testing.T) {
+	traceID := DeriveTraceID("punch", "nonce")
+	header := Traceparent(traceID)
+	if !strings.HasPrefix(header, "00-"+traceID+"-") || !strings.HasSuffix(header, "-01") {
+		t.Fatalf("traceparent = %q", header)
+	}
+	if got := Traceparent("not-a-trace"); got != "" {
+		t.Fatalf("malformed trace id produced %q", got)
+	}
+}
+
+func TestQueueStats(t *testing.T) {
+	var nilTracer *Tracer
+	if nilTracer.QueueDepth() != 0 || nilTracer.QueueCapacity() != 0 {
+		t.Fatal("nil tracer reported queue stats")
+	}
+	if nilTracer.DroppedSpans() != 0 {
+		t.Fatal("nil tracer reported dropped spans")
+	}
+	tr := New(Config{Endpoint: "http://127.0.0.1:1", Sample: 1})
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = tr.Close(ctx)
+	}()
+	if tr.QueueCapacity() != queueSize {
+		t.Fatalf("capacity = %d", tr.QueueCapacity())
+	}
+	if tr.QueueDepth() != 0 {
+		t.Fatalf("depth = %d", tr.QueueDepth())
+	}
+}
+
+func TestStartDerivedHonoursSampling(t *testing.T) {
+	col, srv := newCollector(t)
+	tr := New(Config{Endpoint: srv.URL, Sample: 1})
+	traceID := DeriveTraceID("host", "devbox")
+	sp := tr.StartDerived(traceID, "punch", String("chast.host_id", "devbox"))
+	if sp == nil || sp.TraceID() != traceID {
+		t.Fatalf("derived span trace = %q", sp.TraceID())
+	}
+	tr.EndSpan(sp)
+	closeTracer(t, tr)
+	if spans := col.spans(); len(spans) != 1 || spans[0].TraceID != traceID {
+		t.Fatalf("derived span not exported on the derived trace: %+v", spans)
+	}
+
+	off := New(Config{Endpoint: srv.URL, Sample: 0})
+	defer closeTracer(t, off)
+	if sp := off.StartDerived(traceID, "punch"); sp != nil {
+		t.Fatal("zero sample rate started a derived span")
+	}
+}
+
 func TestParseTraceparent(t *testing.T) {
 	trace := "4bf92f3577b34da6a3ce929d0e0e4736"
 	span := "00f067aa0ba902b7"

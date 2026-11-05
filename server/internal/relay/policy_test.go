@@ -1,12 +1,15 @@
 package relay
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 type testClock struct {
@@ -283,4 +286,43 @@ func TestPolicyConfigValidation(t *testing.T) {
 	if cfg.SingleBandwidthBps != 64*1024*1024 || cfg.TotalBandwidthBps != 0 || cfg.BlacklistSpeedBps != 8*1024*1024 {
 		t.Fatalf("ConfigFromMbit: %+v", cfg)
 	}
+}
+
+func TestOpenTracedAnchorsSessionSpan(t *testing.T) {
+	p := newTestPolicy(t, DefaultPolicyConfig())
+	tr := tracing.New(tracing.Config{Endpoint: "http://127.0.0.1:1", Sample: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	defer func() { _ = tr.Close(ctx) }()
+	p.setTracer(tr)
+
+	traceID := tracing.DeriveTraceID("host", "devbox")
+	session, err := p.OpenTraced(traceID, "udp:21117/v4", "203.0.113.9",
+		tracing.String("chast.host_id", "devbox"))
+	if err != nil {
+		t.Fatalf("open traced: %v", err)
+	}
+	if session.span == nil || session.span.TraceID() != traceID {
+		t.Fatalf("session span trace = %q, want %q", session.span.TraceID(), traceID)
+	}
+	if _, err := session.Drop(1024); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	session.Close()
+	if session.span != nil {
+		t.Fatal("close did not release the span")
+	}
+	session.Close()
+}
+
+func TestOpenTracedSkipsSpanWithoutTracer(t *testing.T) {
+	p := newTestPolicy(t, DefaultPolicyConfig())
+	session, err := p.OpenTraced("trace", "udp:1/v4", "203.0.113.9")
+	if err != nil {
+		t.Fatalf("open traced: %v", err)
+	}
+	if session.span != nil {
+		t.Fatal("session with no tracer got a span")
+	}
+	session.Close()
 }

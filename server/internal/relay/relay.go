@@ -29,6 +29,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/ratelimit"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -86,6 +87,10 @@ type Manager struct {
 	// per source IP so the port cannot be used as a reflection amplifier.
 	handshakeLimiter *ratelimit.Limiter
 
+	// tracer records one span per viewer session, joined to the trace derived
+	// from the host ID so rendezvous and relay activity share one trace.
+	tracer *tracing.Tracer
+
 	wantedReadBuffer int
 	readBuffer       int
 }
@@ -117,6 +122,13 @@ func WithHandshakeRateMax(max int) Option {
 	return func(m *Manager) {
 		m.handshakeLimiter = ratelimit.New(float64(max)/10, float64(max))
 	}
+}
+
+// WithTracer records one span per viewer session. Session spans join the trace
+// derived from the host ID, which the rendezvous server also derives, so a
+// loopback session shows up in one trace across both data planes.
+func WithTracer(tracer *tracing.Tracer) Option {
+	return func(m *Manager) { m.tracer = tracer }
 }
 
 // WithBind6 listens on an additional IPv6 address with the same port numbers.
@@ -171,6 +183,10 @@ type port struct {
 	set    *portSet
 	number int
 	family string
+
+	// hostID mirrors portSet.hostID under this listener's lock so session
+	// spans can name their host without taking the set lock in the data path.
+	hostID string
 
 	mu         sync.Mutex
 	conn       *net.UDPConn
@@ -276,6 +292,16 @@ func peerIP(peer string) string {
 	return host
 }
 
+// sessionTraceID anchors relay spans on the host ID so they join the punch
+// spans the rendezvous server derives from the same value. A slot without a
+// lease falls back to its own key instead of sharing the empty-host trace.
+func sessionTraceID(hostID, key string) string {
+	if hostID != "" {
+		return tracing.DeriveTraceID("host", hostID)
+	}
+	return tracing.DeriveTraceID("relay", key)
+}
+
 // NewManager binds every requested UDP port and serves it for the lifetime of
 // the manager. Each port also gets a TCP carrier listener; when it cannot be
 // bound the port keeps serving UDP without a carrier. A port of 0 asks the
@@ -312,6 +338,7 @@ func NewManager(bind string, ports []int, auth Authenticator, log *slog.Logger, 
 	for _, opt := range opts {
 		opt(m)
 	}
+	policy.setTracer(m.tracer)
 	if m.bind6Err != nil {
 		return nil, m.bind6Err
 	}
@@ -672,6 +699,7 @@ func (m *Manager) Allocate(hostID string) (int, error) {
 			set.hostID = hostID
 			for _, p := range set.members {
 				p.mu.Lock()
+				p.hostID = hostID
 				p.hostAddr = nil
 				p.viewerAddr = nil
 				p.viewerAuthAddr = nil
@@ -710,6 +738,7 @@ func (m *Manager) Release(hostID string) {
 		var viewers []*carrierViewer
 		for _, p := range set.members {
 			p.mu.Lock()
+			p.hostID = ""
 			p.hostAddr = nil
 			p.viewerAddr = nil
 			p.viewerAuthAddr = nil
@@ -1046,7 +1075,12 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 		return
 	}
 	if p.viewerAddr == nil || now.Sub(p.viewerSeen) > viewerIdle {
-		session, err := p.set.manager.policy.Open(fmt.Sprintf("udp:%d/%s", p.number, p.family), src.IP.String())
+		key := fmt.Sprintf("udp:%d/%s", p.number, p.family)
+		session, err := p.set.manager.policy.OpenTraced(sessionTraceID(p.hostID, key), key, src.IP.String(),
+			tracing.String("chast.host_id", p.hostID),
+			tracing.String("relay.transport", "udp"),
+			tracing.String("relay.family", p.family),
+			tracing.Int("relay.port", int64(p.number)))
 		if err != nil {
 			if p.udpSession != nil {
 				p.udpSession.Close()
@@ -1478,7 +1512,12 @@ func (p *port) serveViewer(v *carrierViewer) {
 		v.close()
 		return
 	}
-	session, err := p.set.manager.policy.Open(fmt.Sprintf("carrier:%d/%s", p.number, p.family), peerIP(v.peer))
+	key := fmt.Sprintf("carrier:%d/%s", p.number, p.family)
+	session, err := p.set.manager.policy.OpenTraced(sessionTraceID(p.hostID, key), key, peerIP(v.peer),
+		tracing.String("chast.host_id", p.hostID),
+		tracing.String("relay.transport", "carrier"),
+		tracing.String("relay.family", p.family),
+		tracing.Int("relay.port", int64(p.number)))
 	if err != nil {
 		p.blocked++
 		p.mu.Unlock()

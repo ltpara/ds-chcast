@@ -28,6 +28,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/account"
 	"github.com/ltpara/ds-chcast/server/internal/authlimit"
 	"github.com/ltpara/ds-chcast/server/internal/configpush"
+	"github.com/ltpara/ds-chcast/server/internal/dbmetric"
 	"github.com/ltpara/ds-chcast/server/internal/geoip"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/ipchange"
@@ -1270,6 +1271,13 @@ func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "chast_http_request_duration_seconds_sum{endpoint=%q} %.6f\n", endpoint, sums[endpoint])
 		fmt.Fprintf(&b, "chast_http_request_duration_seconds_count{endpoint=%q} %d\n", endpoint, counts[endpoint])
 	}
+
+	if s.cfg.Tracer != nil {
+		gauge("chast_trace_queue_depth", "Spans waiting for the OTLP exporter.", s.cfg.Tracer.QueueDepth())
+		gauge("chast_trace_queue_capacity", "OTLP exporter queue capacity.", s.cfg.Tracer.QueueCapacity())
+		counter("chast_trace_spans_dropped_total", "Spans discarded because the OTLP queue was full.", "", s.cfg.Tracer.DroppedSpans())
+	}
+	dbmetric.Default.WritePrometheus(&b)
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

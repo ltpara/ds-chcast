@@ -21,6 +21,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/netutil"
 	"github.com/ltpara/ds-chcast/server/internal/punchlog"
 	"github.com/ltpara/ds-chcast/server/internal/registry"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 	"github.com/ltpara/ds-chcast/server/internal/wire"
 )
 
@@ -40,6 +41,7 @@ type options struct {
 	rateMax          int
 	keepaliveRateMax int
 	serverKey        string
+	tracer           *tracing.Tracer
 }
 
 // Option customizes the rendezvous socket without changing the call sites that
@@ -70,6 +72,13 @@ func WithServerKey(key string) Option {
 	return func(o *options) { o.serverKey = key }
 }
 
+// WithTracer records one span per punch request. Spans join the trace derived
+// from the host ID, which the relay also uses, so rendezvous and relay activity
+// for one host is visible together.
+func WithTracer(tracer *tracing.Tracer) Option {
+	return func(o *options) { o.tracer = tracer }
+}
+
 type Server struct {
 	conn      *net.UDPConn
 	reg       *registry.Registry
@@ -84,6 +93,7 @@ type Server struct {
 	// registry can sign them.
 	keepaliveLimiter *limiter
 	serverKey        string
+	tracer           *tracing.Tracer
 	readBuffer       int
 	done             chan struct{}
 	closeOnce        sync.Once
@@ -119,6 +129,7 @@ func New(bind string, reg *registry.Registry, relayAddr func(port int) string, l
 		limiter:          newLimiter(cfg.rateMax, defaultRateSpan),
 		keepaliveLimiter: newLimiter(cfg.keepaliveRateMax, defaultRateSpan),
 		serverKey:        cfg.serverKey,
+		tracer:           cfg.tracer,
 		readBuffer:       readBuffer,
 		done:             make(chan struct{}),
 	}, nil
@@ -274,23 +285,44 @@ func (s *Server) relayFor(host registry.Host) string {
 
 func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	reply := wire.Message{Type: wire.TypePunchPeer, Nonce: msg.Nonce}
+	span := s.tracer.StartDerived(tracing.DeriveTraceID("host", msg.HostID), "punch",
+		tracing.String("chast.host_id", msg.HostID),
+		tracing.String("chast.nonce", msg.Nonce),
+		tracing.String("client.address", src.IP.String()),
+	)
+	result := "error"
+	relayOffered := false
+	defer func() {
+		span.Add(tracing.String("chast.result", result))
+		if relayOffered {
+			span.Add(tracing.Int("relay.offered", 1))
+		}
+		if result != "ok" {
+			span.SetStatus(2)
+		}
+		s.tracer.EndSpan(span)
+	}()
 	if !s.limiter.allow(src.IP.String()) {
+		result = "rate_limited"
 		reply.Error = "too many punch requests; retry later"
 		s.reply(src, reply)
 		return
 	}
 	if len(msg.Nonce) < 8 || len(msg.Nonce) > 64 {
+		result = "invalid_nonce"
 		reply.Error = "nonce must be 8..64 characters"
 		s.reply(src, reply)
 		return
 	}
 	if !validUpnpPort(msg.UpnpPort) {
+		result = "invalid_upnp_port"
 		reply.Error = "upnp_port must be 0..65535"
 		s.reply(src, reply)
 		return
 	}
 	if !identity.CheckPunchAuth(s.serverKey, msg.HostID, msg.Nonce, msg.Auth,
 		msg.Timestamp, time.Now(), punchAuthWindow) {
+		result = "auth_failed"
 		reply.Error = "punch authentication failed"
 		s.reply(src, reply)
 		return
@@ -299,6 +331,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	if !ok || !s.reg.Online(host) {
 		// One message for unknown and offline hosts: distinguishing them
 		// would turn the punch port into a registration oracle.
+		result = "host_offline"
 		reply.Error = "host is offline"
 		s.reply(src, reply)
 		return
@@ -314,10 +347,12 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 		}
 	}
 	if len(hostAddrs) == 0 {
+		result = "no_host_address"
 		reply.Error = "host has no usable address"
 		s.reply(src, reply)
 		return
 	}
+	result = "ok"
 	viewer4, viewer6 := observedCandidate(src)
 	// Record only requests that can actually be coordinated, matching hbbs's
 	// record point after the target's online check. A dual-stack host gets one
@@ -357,6 +392,7 @@ func (s *Server) handlePunchRequest(msg wire.Message, src *net.UDPAddr) {
 	}
 	if host.RelayPort != 0 {
 		reply.Relay = s.relayAddr(host.RelayPort)
+		relayOffered = true
 	}
 	reply.ExpiresMS = punchTTL.Milliseconds()
 	s.reply(src, reply)

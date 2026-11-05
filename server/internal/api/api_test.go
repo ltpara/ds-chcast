@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"github.com/ltpara/ds-chcast/server/internal/abuse"
 	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/testutil"
+	"github.com/ltpara/ds-chcast/server/internal/tracing"
 )
 
 type hostReply struct {
@@ -807,6 +809,29 @@ func registerRaw(t *testing.T, url, body string) (*http.Response, []byte) {
 		t.Fatal(err)
 	}
 	return resp, data
+}
+
+func TestMetricsIncludeTracerQueueAndDatabase(t *testing.T) {
+	tracer := tracing.New(tracing.Config{Endpoint: "http://127.0.0.1:1", Sample: 0})
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = tracer.Close(ctx)
+	}()
+	s := testutil.StartWith(t, testutil.Options{Tracer: tracer})
+	_, metrics := request(t, http.MethodGet, s.URL+"/metrics", "", testutil.ServerKey)
+	text := string(metrics)
+	for _, want := range []string{
+		"chast_trace_queue_depth 0",
+		"chast_trace_queue_capacity 512",
+		"chast_trace_spans_dropped_total 0",
+		`chast_db_pool_wait_total{db="account"}`,
+		`chast_db_pool_max_open{db="account"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, text)
+		}
+	}
 }
 
 func TestRegistrationBlocker(t *testing.T) {
