@@ -163,6 +163,7 @@ class ServerSettings {
     this.key = '',
     this.proxy = '',
     this.uploadRecordings = false,
+    this.useWebSocket = false,
   });
 
   final String url;
@@ -181,6 +182,13 @@ class ServerSettings {
   /// The server decides whether an archive exists; this only records intent.
   final bool uploadRecordings;
 
+  /// Forces the session onto the WebSocket carrier instead of trying UDP and
+  /// raw TCP first. It exists for networks whose only allowed path is a
+  /// WebSocket reverse proxy or CDN; the carrier still runs the end-to-end
+  /// QUIC handshake inside each message, so pinning and permissions are
+  /// unchanged. RustDesk exposes the same switch as `allow-websocket`.
+  final bool useWebSocket;
+
   bool get configured => url.isNotEmpty;
 
   ServerSettings copyWith({
@@ -189,6 +197,7 @@ class ServerSettings {
     String? key,
     String? proxy,
     bool? uploadRecordings,
+    bool? useWebSocket,
   }) {
     return ServerSettings(
       url: url ?? this.url,
@@ -196,6 +205,7 @@ class ServerSettings {
       key: key ?? this.key,
       proxy: proxy ?? this.proxy,
       uploadRecordings: uploadRecordings ?? this.uploadRecordings,
+      useWebSocket: useWebSocket ?? this.useWebSocket,
     );
   }
 
@@ -205,6 +215,7 @@ class ServerSettings {
         'key': key,
         'proxy': proxy,
         'upload_recordings': uploadRecordings,
+        'use_websocket': useWebSocket,
       };
 
   static ServerSettings fromJson(Object? value) {
@@ -220,6 +231,7 @@ class ServerSettings {
       // loudly when used, never silently turn into a direct connection.
       proxy: value['proxy']?.toString().trim() ?? '',
       uploadRecordings: value['upload_recordings'] == true,
+      useWebSocket: value['use_websocket'] == true,
     );
   }
 }

@@ -1243,7 +1243,7 @@ void create_controls() {
     left = 24;
     g_app->microphone_check = check_row(tr(L"接收查看者麦克风"), 408 + shift, kMicrophoneCheck);
     g_app->privacy_check = check_row(tr(L"允许隐私模式"), 408 + shift, kPrivacyModeCheck);
-    g_app->carrier_check = check_row(tr(L"弱网回退（TCP）"), 408 + shift, kCarrierCheck);
+    g_app->carrier_check = check_row(tr(L"弱网回退（TCP/WebSocket）"), 408 + shift, kCarrierCheck);
 
     left = 24;
     const auto row_button = [&left](const wchar_t* text, int top, int height, int id,

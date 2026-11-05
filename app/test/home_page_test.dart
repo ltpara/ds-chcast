@@ -2960,6 +2960,53 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('the server dialog can force the WebSocket carrier', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final _SavingServers servers = _SavingServers(
+      const ServerSettings(url: 'http://127.0.0.1:8443'),
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[]),
+          serverStore: servers,
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+        ),
+      ),
+    );
+    for (int i = 0; i < 6; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    await tester.tap(find.byIcon(Icons.settings_outlined).first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    final Finder toggle = find.byKey(const Key('server-use-websocket'));
+    expect(toggle, findsOneWidget);
+    expect(tester.widget<SwitchListTile>(toggle).value, isFalse);
+    await tester.ensureVisible(toggle);
+
+    await tester.tap(toggle);
+    await tester.pump();
+    expect(tester.widget<SwitchListTile>(toggle).value, isTrue);
+
+    await tester.tap(find.widgetWithText(FilledButton, '保存'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(servers.saved?.useWebSocket, isTrue);
+    expect(servers.saved?.url, 'http://127.0.0.1:8443');
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets(
     'saved devices show server groups and can be moved between them',
     (WidgetTester tester) async {

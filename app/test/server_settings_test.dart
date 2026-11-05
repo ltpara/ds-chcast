@@ -95,6 +95,7 @@ void main() {
       key: 'dev-secret',
       proxy: 'socks5://127.0.0.1:10808',
       uploadRecordings: true,
+      useWebSocket: true,
     ));
     final ServerSettings loaded = await store.load();
     expect(loaded.url, 'https://chast.example');
@@ -102,6 +103,7 @@ void main() {
     expect(loaded.key, 'dev-secret');
     expect(loaded.proxy, 'socks5://127.0.0.1:10808');
     expect(loaded.uploadRecordings, isTrue);
+    expect(loaded.useWebSocket, isTrue);
     expect(loaded.configured, isTrue);
   });
 

@@ -297,6 +297,9 @@ const Map<String, String> kEnglishHome = <String, String>{
       'Invalid proxy address; for example socks5://127.0.0.1:10808',
   '支持 http://、https://、socks5:// 和 socks5h://（需带端口，可含用户名密码）。配置代理后会话强制走服务器 TCP 中继：UDP 直连、UDP 中继和打洞无法穿过代理；服务端没有中继能力时会明确报错而不是绕过代理直连。':
       'Supports http://, https://, socks5:// and socks5h:// (explicit port, optional user and password). With a proxy the session is forced onto the server TCP carrier: direct UDP, UDP relay and punching cannot traverse a proxy, and a server without a carrier fails with a clear error instead of bypassing the proxy.',
+  '使用 WebSocket': 'Use WebSocket',
+  '强制通过 WebSocket 载体连接：适用于只允许 WebSocket 的反向代理或 CDN，开启后不再尝试 UDP 与 TCP 直连。':
+      'Forces the session onto the WebSocket carrier: use it behind a WebSocket-only reverse proxy or CDN. Direct UDP and raw TCP are no longer attempted.',
   '连接服务未启用单点登录': 'The connection service does not offer single sign-on',
   '单点登录状态无效': 'Invalid single sign-on state',
   '单点登录失败，请重试': 'Single sign-on failed; try again',

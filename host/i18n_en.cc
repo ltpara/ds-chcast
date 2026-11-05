@@ -140,7 +140,7 @@ const std::map<std::wstring, std::wstring>& english_strings() {
         {L"开机自动启动", L"Start with Windows"},
         {L"接收查看者麦克风", L"Receive viewer microphone"},
         {L"允许隐私模式", L"Allow privacy mode"},
-        {L"弱网回退（TCP）", L"Weak-network fallback (TCP)"},
+        {L"弱网回退（TCP/WebSocket）", L"Weak-network fallback (TCP/WebSocket)"},
         {L"安全设置…", L"Security settings…"},
         {L"连接服务设置…", L"Connection service settings…"},
         {L"打开设置文件", L"Open settings file"},

@@ -746,6 +746,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         password: _password,
         totp: _totp,
         trustDevice: _trustDevice,
+        // With an outbound proxy the agent already forces the carrier, and the
+        // engine's only carrier endpoint is the agent's loopback, so the
+        // WebSocket preference cannot apply there.
+        transport: widget.settings.useWebSocket && !proxied ? 'ws' : 'auto',
         carrierHost: carrierHost,
         carrierPort: carrierPort,
         carrierHostId: carrierHostId,

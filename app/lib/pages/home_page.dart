@@ -5937,6 +5937,7 @@ class _ServerDialogState extends State<_ServerDialog> {
   late final TextEditingController _key;
   late final TextEditingController _proxy;
   late TunnelMode _mode;
+  bool _useWebSocket = false;
   bool _testing = false;
   bool _showKey = false;
   bool _showProxy = false;
@@ -5951,6 +5952,7 @@ class _ServerDialogState extends State<_ServerDialog> {
     _key = TextEditingController(text: widget.initial.key);
     _proxy = TextEditingController(text: widget.initial.proxy);
     _mode = widget.initial.mode;
+    _useWebSocket = widget.initial.useWebSocket;
     _url.addListener(_loadPin);
     unawaited(_loadPin());
   }
@@ -6058,6 +6060,7 @@ class _ServerDialogState extends State<_ServerDialog> {
         mode: _mode,
         key: _key.text.trim(),
         proxy: proxy,
+        useWebSocket: _useWebSocket,
       ),
     );
   }
@@ -6131,6 +6134,21 @@ class _ServerDialogState extends State<_ServerDialog> {
                 style: mutedStyle(context, size: 10.5),
               ),
               const SizedBox(height: 12),
+              SwitchListTile(
+                key: const Key('server-use-websocket'),
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: Text(tr('使用 WebSocket')),
+                subtitle: Text(
+                  tr(
+                    '强制通过 WebSocket 载体连接：适用于只允许 WebSocket 的反向代理或 CDN，开启后不再尝试 UDP 与 TCP 直连。',
+                  ),
+                  style: mutedStyle(context, size: 10.5),
+                ),
+                value: _useWebSocket,
+                onChanged: (bool value) =>
+                    setState(() => _useWebSocket = value),
+              ),
               DropdownButtonFormField<TunnelMode>(
                 initialValue: _mode,
                 decoration: InputDecoration(labelText: tr('路径策略')),
