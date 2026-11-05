@@ -65,6 +65,11 @@ void main() {
     ValueChanged<ViewerStreamCodec>? onSelectStreamCodec,
     ValueChanged<ViewerStreamQuality>? onSelectStreamQuality,
     ValueChanged<int>? onSelectStreamFps,
+    bool restartAvailable = false,
+    bool lockAvailable = false,
+    bool blockInputAvailable = false,
+    bool blockInputActive = false,
+    ValueChanged<ViewerHostAction>? onHostAction,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -133,6 +138,11 @@ void main() {
           portForwardAvailable: true,
           portForwardActive: false,
           onOpenPortForward: () {},
+          restartAvailable: restartAvailable,
+          lockAvailable: lockAvailable,
+          blockInputAvailable: blockInputAvailable,
+          blockInputActive: blockInputActive,
+          onHostAction: onHostAction ?? (_) {},
           onToggleAudio: () {},
           onToggleMicrophone: () {},
           onTogglePrivacy: () {},
@@ -612,6 +622,68 @@ void main() {
     await tester.longPress(find.byIcon(Icons.volume_up_rounded));
     await tester.pumpAndSettle();
     expect(find.text('扬声器'), findsNothing);
+    expect(picked, isNull);
+  });
+
+  testWidgets('the power menu reports the picked host action',
+      (WidgetTester tester) async {
+    ViewerHostAction? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      restartAvailable: true,
+      lockAvailable: true,
+      blockInputAvailable: true,
+      onHostAction: (ViewerHostAction action) => picked = action,
+    ));
+
+    await tester.tap(find.byIcon(Icons.power_settings_new_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('锁定主机屏幕'), findsOneWidget);
+    expect(find.text('阻止主机本地输入'), findsOneWidget);
+    expect(find.text('重启主机…'), findsOneWidget);
+
+    await tester.tap(find.text('锁定主机屏幕'));
+    await tester.pumpAndSettle();
+    expect(picked, ViewerHostAction.lockScreen);
+  });
+
+  testWidgets('the power menu mirrors the blocked local input state',
+      (WidgetTester tester) async {
+    ViewerHostAction? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      blockInputAvailable: true,
+      blockInputActive: true,
+      onHostAction: (ViewerHostAction action) => picked = action,
+    ));
+
+    expect(find.text('阻止主机本地输入'), findsNothing);
+    await tester.tap(find.byIcon(Icons.power_settings_new_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('恢复主机本地输入'), findsOneWidget);
+    await tester.tap(find.text('恢复主机本地输入'));
+    await tester.pumpAndSettle();
+    expect(picked, ViewerHostAction.blockInput);
+  });
+
+  testWidgets('the power menu is inert without a host grant',
+      (WidgetTester tester) async {
+    ViewerHostAction? picked;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      onHostAction: (ViewerHostAction action) => picked = action,
+    ));
+
+    await tester.tap(find.byIcon(Icons.power_settings_new_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('锁定主机屏幕'), findsNothing);
+    expect(find.text('重启主机…'), findsNothing);
     expect(picked, isNull);
   });
 }

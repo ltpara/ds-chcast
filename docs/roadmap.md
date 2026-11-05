@@ -2982,6 +2982,22 @@
      43/43 通过（644.27 s）。边界：
      真实麦克风/音箱待双机验收；每连接一通通话；语音与系统声音共用可靠
      控制流的拥塞控制；视频零拷贝链路不变。
+127. **P2 · DEV-17 远程重启 / 阻止本地输入 / 锁屏（2026-11-05 完成）**：
+     协议 v38 新增 `HostActionRequest(55)/HostActionResult(56)` 与权限位
+     `kPermissionRestart`(0x0800)、`kPermissionBlockInput`(0x1000)，默认
+     关闭。主机按“权限 → 控制租约 → 主机设置 → 平台调用”闸门执行
+     `ExitWindowsEx`/`LockWorkStation`/`BlockInput`，失败原因回传查看器；
+     `HostServerConfig::host_control` 可注入测试后端。阻止状态由
+     `BlockInputGuard` 保证在会话结束、进程退出与权限撤销时释放，并向
+     查看器补发 Denied 通知。查看器工具栏新增电源菜单（锁定、阻止/恢复
+     本地输入、重启，重启带确认），托盘与安全设置新增两个开关
+     （`host.ini restart=/block_input=`），对已建立会话立即更新权限掩码。
+     新增 `chast-host-control-test` 覆盖权限、成功、失败计数、撤权与会话
+     结束解禁；host 测试组全绿，`flutter analyze` 无问题、`flutter test`
+     547 项通过、Windows release 构建成功；顺带修复静态桌面下语音通话
+     状态不刷新的问题。边界：真实重启需管理员权限，测试用注入后端；
+     锁屏不模拟 Win+L；`BlockInput` 只屏蔽本地物理输入。DEV-14 仍暂缓
+     （需反向角色交接）。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

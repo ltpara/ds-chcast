@@ -529,6 +529,14 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_privacy_mode)) {
                 warn(result.warning, "privacy_mode '" + value + "' is not a boolean");
             }
+        } else if (key == "restart") {
+            if (!parse_bool(value, settings.allow_restart)) {
+                warn(result.warning, "restart '" + value + "' is not a boolean");
+            }
+        } else if (key == "block_input") {
+            if (!parse_bool(value, settings.allow_block_input)) {
+                warn(result.warning, "block_input '" + value + "' is not a boolean");
+            }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
                 warn(result.warning, "audio_device is too long; using the default output");
@@ -781,9 +789,9 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_terminal = (permissions_mask & kPermissionTerminal) != 0;
         settings.allow_privacy_mode = (permissions_mask & kPermissionPrivacyMode) != 0;
         // The mask is authoritative for every gate it predates, but not for
-        // record or camera: older builds never wrote those bits, and the
-        // explicit record=/camera= lines (which save always emits alongside
-        // the mask) decide them.
+        // record, camera, restart or block input: older builds never wrote
+        // those bits, and the explicit lines (which save always emits
+        // alongside the mask) decide them.
     }
     return result;
 }
@@ -809,7 +817,9 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_terminal ? kPermissionTerminal : 0) |
         (settings.allow_camera ? kPermissionCamera : 0) |
         (settings.allow_privacy_mode ? kPermissionPrivacyMode : 0) |
-        (settings.allow_record ? kPermissionRecord : 0);
+        (settings.allow_record ? kPermissionRecord : 0) |
+        (settings.allow_restart ? kPermissionRestart : 0) |
+        (settings.allow_block_input ? kPermissionBlockInput : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
@@ -840,6 +850,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "audio_silence_gate_ms=" << settings.audio_silence_gate_ms << "\n"
          << "microphone=" << (settings.allow_microphone ? 1 : 0) << "\n"
          << "privacy_mode=" << (settings.allow_privacy_mode ? 1 : 0) << "\n"
+         << "restart=" << (settings.allow_restart ? 1 : 0) << "\n"
+         << "block_input=" << (settings.allow_block_input ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

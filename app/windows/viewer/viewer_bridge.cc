@@ -693,6 +693,20 @@ void ViewerBridge::HandleMethodCall(
         map[key("sasError")] = flutter::EncodableValue(status.sas_error);
         map[key("sasUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.sas_updates));
+        map[key("restartSupported")] =
+            flutter::EncodableValue(status.restart_supported);
+        map[key("blockInputSupported")] =
+            flutter::EncodableValue(status.block_input_supported);
+        map[key("blockInputActive")] =
+            flutter::EncodableValue(status.block_input_active);
+        map[key("hostActionAction")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.host_action_action));
+        map[key("hostActionCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.host_action_code));
+        map[key("hostActionError")] =
+            flutter::EncodableValue(status.host_action_error);
+        map[key("hostActionUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.host_action_updates));
         map[key("chatSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.chat_sent));
         map[key("chatReceived")] =
@@ -1339,6 +1353,30 @@ void ViewerBridge::HandleMethodCall(
 
     if (method == "sendSas") {
         const bool queued = viewer_ != nullptr && viewer_->SendSas();
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "requestHostAction") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t action = 0;
+        bool block_input = false;
+        if (args == nullptr || !map_int(*args, "action", &action) ||
+            (action != 1 && action != 2 && action != 3)) {
+            result->Error("bad_args", "requestHostAction wants action 1, 2 or 3");
+            return;
+        }
+        if (!map_bool(*args, "blockInput", &block_input)) {
+            block_input = false;
+        }
+        if (action != 3 && block_input) {
+            result->Error("bad_args", "only block input carries blockInput");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->RequestHostAction(static_cast<chast::HostAction>(action),
+                                       block_input);
         result->Success(flutter::EncodableValue(queued));
         return;
     }

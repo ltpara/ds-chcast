@@ -451,4 +451,37 @@ const Map<String, String> kEnglishSession = <String, String>{
   '已删除 {done} 项，{failed} 项失败：{reason}':
       'Deleted {done} entries; {failed} failed: {reason}',
   '删除失败：{reason}': 'Delete failed: {reason}',
+  '主机控制（锁屏、阻止输入、重启）': 'Host controls (lock, block input, restart)',
+  '服务端未开放主机控制': 'The host has not enabled host controls',
+  '锁定主机屏幕': 'Lock the host screen',
+  '保留远程画面，重新登录需要凭据':
+      'The remote picture stays visible; signing back in needs credentials',
+  '阻止主机本地输入': 'Block local input at the host',
+  '恢复主机本地输入': 'Restore local input at the host',
+  '需要主机同时开放键鼠与阻止输入':
+      'The host must allow input and block-input together',
+  '重启主机…': 'Restart the host…',
+  '会中断本次会话，确认后立即重启':
+      'This ends the session; the host restarts after confirmation',
+  '重启主机？': 'Restart the host?',
+  '主机会立即重启，本次会话将中断。':
+      'The host restarts immediately and this session will end.',
+  '重启': 'Restart',
+  '重启主机': 'Restart the host',
+  '阻止本地输入': 'Block local input',
+  '主机操作': 'Host action',
+  '{action}未执行：{detail}': '{action} was not performed: {detail}',
+  '主机本地输入已阻止': 'Local input at the host is blocked',
+  '主机本地输入已恢复': 'Local input at the host is restored',
+  '已请求主机锁屏': 'The host was asked to lock the screen',
+  '已请求主机重启': 'The host was asked to restart',
+  '主机输入已阻止': 'Host input blocked',
+  '主机操作未能排队：请确认主机权限与会话状态':
+      'The host action could not be queued: check the host permissions and session state',
+  '无法执行主机操作': 'Cannot perform the host action',
+  '主机未授权该操作': 'The host did not authorize this action',
+  '主机不支持该操作': 'The host does not support this action',
+  '另一查看者正在控制主机': 'Another viewer is controlling the host',
+  '主机执行失败': 'The host failed to perform the action',
+  '主机拒绝了该操作': 'The host refused this action',
 };

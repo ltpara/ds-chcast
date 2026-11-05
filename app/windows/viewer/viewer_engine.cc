@@ -230,6 +230,34 @@ const char* sas_code_name(chast::SasCode code) {
     return "the host refused Ctrl+Alt+Del";
 }
 
+const char* host_action_code_name(chast::HostActionCode code) {
+    switch (code) {
+        case chast::HostActionCode::Ok:
+            return "the host performed the action";
+        case chast::HostActionCode::Denied:
+            return "the host denied the action";
+        case chast::HostActionCode::Unsupported:
+            return "this host does not support the action";
+        case chast::HostActionCode::Busy:
+            return "another viewer controls this host";
+        case chast::HostActionCode::Failed:
+            return "the host could not perform the action";
+    }
+    return "the host refused the action";
+}
+
+const char* host_action_name(chast::HostAction action) {
+    switch (action) {
+        case chast::HostAction::Restart:
+            return "restart";
+        case chast::HostAction::LockScreen:
+            return "lock screen";
+        case chast::HostAction::BlockInput:
+            return "block input";
+    }
+    return "host action";
+}
+
 const char* desktop_kind_name(chast::DesktopKind kind) {
     switch (kind) {
         case chast::DesktopKind::Default:
@@ -387,6 +415,11 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
     // A SAS request queued for a session that ended must not fire into the
     // next one.
     pending_sas_.store(false, std::memory_order_release);
+    // Nor may a host-control action reach the next host.
+    {
+        std::lock_guard<std::mutex> lock(host_action_mutex_);
+        pending_host_action_.reset();
+    }
     // Port forwarding belongs to one session too; the listener lives on the
     // session thread and goes away with it.
     {
@@ -1199,6 +1232,41 @@ bool ViewerEngine::SendSas() {
     return true;
 }
 
+bool ViewerEngine::RequestHostAction(chast::HostAction action, bool block_input) {
+    if (action != chast::HostAction::Restart && action != chast::HostAction::LockScreen &&
+        action != chast::HostAction::BlockInput) {
+        return false;
+    }
+    if (action != chast::HostAction::BlockInput && block_input) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming) {
+            return false;
+        }
+        if (action == chast::HostAction::Restart && !status_.restart_supported) {
+            return false;
+        }
+        if (action == chast::HostAction::LockScreen && !status_.input_enabled) {
+            return false;
+        }
+        if (action == chast::HostAction::BlockInput &&
+            (!status_.input_enabled || !status_.block_input_supported)) {
+            return false;
+        }
+    }
+    chast::HostControlRequest request;
+    request.action = action;
+    request.block_input = block_input;
+    std::lock_guard<std::mutex> lock(host_action_mutex_);
+    pending_host_action_ = request;
+    return true;
+}
+
 bool ViewerEngine::SendChat(const std::string& text) {
     if (!chast::valid_chat_text(text)) {
         return false;
@@ -1631,6 +1699,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     int sas_code = 0;
     std::string sas_error;
     uint64_t sas_updates = 0;
+    bool restart_supported = false;
+    bool block_input_supported = false;
+    bool block_input_active = false;
+    int host_action_action = 0;
+    int host_action_code = 0;
+    std::string host_action_error;
+    uint64_t host_action_updates = 0;
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
@@ -1906,6 +1981,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.sas_code = sas_code;
             status_.sas_error = sas_error;
             status_.sas_updates = sas_updates;
+            status_.restart_supported = restart_supported;
+            status_.block_input_supported = block_input_supported;
+            status_.block_input_active = block_input_active;
+            status_.host_action_action = host_action_action;
+            status_.host_action_code = host_action_code;
+            status_.host_action_error = host_action_error;
+            status_.host_action_updates = host_action_updates;
             status_.display_switches = display_switches;
             status_.display_switch_failures = display_switch_failures;
             status_.display_switch_error = display_switch_error;
@@ -2317,6 +2399,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 const bool terminal_allowed =
                     (mask & chast::kPermissionTerminal) != 0;
                 const bool camera_allowed = (mask & chast::kPermissionCamera) != 0;
+                const bool restart = (mask & chast::kPermissionRestart) != 0;
+                // Blocking the operator's own input needs both the input gate
+                // and the explicit block-input permission.
+                const bool block_input =
+                    (mask & (chast::kPermissionInput | chast::kPermissionBlockInput)) ==
+                    (chast::kPermissionInput | chast::kPermissionBlockInput);
+                restart_supported = restart;
+                block_input_supported = block_input;
+                if (!block_input) {
+                    block_input_active = false;
+                }
                 {
                     std::lock_guard<std::mutex> lock(input_mutex_);
                     input_enabled_ = input;
@@ -2340,6 +2433,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.port_forward_enabled = forward_allowed;
                     status_.terminal_supported = terminal_allowed;
                     status_.camera_supported = camera_allowed;
+                    status_.restart_supported = restart;
+                    status_.block_input_supported = block_input;
+                    if (!block_input) {
+                        status_.block_input_active = false;
+                    }
                 }
                 // The transport aborts the stream on revocation; stopping here
                 // releases the microphone at once and tells the UI why.
@@ -5039,6 +5137,75 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the newest queued host-control action. A local failure
+                // (the permission was revoked between the queue and the send)
+                // is reported like a HostActionResult, so the UI always gets an
+                // answer.
+                auto drain_host_action = [&] {
+                    std::optional<chast::HostControlRequest> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(host_action_mutex_);
+                        requested.swap(pending_host_action_);
+                    }
+                    if (!requested) {
+                        return;
+                    }
+                    const chast::Error sent =
+                        session->request_host_action(requested->action,
+                                                     requested->block_input);
+                    if (sent.ok()) {
+                        return;
+                    }
+                    host_action_action = static_cast<int>(requested->action);
+                    host_action_code = static_cast<int>(chast::HostActionCode::Failed);
+                    host_action_error = "request: " + sent.to_string();
+                    ++host_action_updates;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.host_action_action = host_action_action;
+                    status_.host_action_code = host_action_code;
+                    status_.host_action_error = host_action_error;
+                    status_.host_action_updates = host_action_updates;
+                    std::fprintf(stderr, "viewer: %s: %s\n",
+                                 host_action_name(requested->action),
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts every answer. The host also sends an unsolicited
+                // BlockInput denial when it releases the block itself, so the
+                // toggle always follows what the host actually did.
+                auto receive_host_action = [&] {
+                    chast::HostControlResult result;
+                    while (session->take_host_action_result(result)) {
+                        host_action_action = static_cast<int>(result.action);
+                        host_action_code = static_cast<int>(result.code);
+                        host_action_error =
+                            result.code == chast::HostActionCode::Ok
+                                ? std::string()
+                                : (result.reason.empty()
+                                       ? host_action_code_name(result.code)
+                                       : result.reason);
+                        if (result.action == chast::HostAction::BlockInput) {
+                            block_input_active = result.block_input;
+                        }
+                        ++host_action_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.host_action_action = host_action_action;
+                            status_.host_action_code = host_action_code;
+                            status_.host_action_error = host_action_error;
+                            status_.host_action_updates = host_action_updates;
+                            status_.block_input_active = block_input_active;
+                        }
+                        std::fprintf(stderr, "viewer: %s %s%s%s\n",
+                                     host_action_name(result.action),
+                                     result.code == chast::HostActionCode::Ok
+                                         ? "done"
+                                         : "refused",
+                                     host_action_error.empty() ? "" : ": ",
+                                     host_action_error.c_str());
+                    }
+                };
+
                 // Chat is ungated: an admitted session is the authorization.
                 // Text goes into the UI queue; the status only carries counts,
                 // so a 4 KiB line never inflates the poll.
@@ -6318,6 +6485,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_privacy();
                     drain_sas();
                     receive_sas();
+                    drain_host_action();
+                    receive_host_action();
                     receive_chat();
                     drain_chat();
                     drain_text();
@@ -6423,6 +6592,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_privacy();
                     drain_sas();
                     receive_sas();
+                    drain_host_action();
+                    receive_host_action();
                     receive_chat();
                     drain_chat();
                     drain_text();

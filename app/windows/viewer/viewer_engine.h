@@ -412,6 +412,21 @@ struct ViewerStatus {
     int sas_code = 0;
     std::string sas_error;
     uint64_t sas_updates = 0;
+    // Host control (protocol v38): remote restart, console lock and local
+    // input blocking. `restart_supported`/`block_input_supported` mirror the
+    // host's permissions; `block_input_active` is the state the host last
+    // reported. `host_action_action` names the answered action (1 restart,
+    // 2 lock, 3 block input); `host_action_code` is its HostActionResult code
+    // (0 = Ok), and `host_action_updates` pairs an answer with one poll. The
+    // host also sends an unsolicited BlockInput denial when it releases the
+    // block itself.
+    bool restart_supported = false;
+    bool block_input_supported = false;
+    bool block_input_active = false;
+    int host_action_action = 0;
+    int host_action_code = 0;
+    std::string host_action_error;
+    uint64_t host_action_updates = 0;
     // Session chat. Both directions are ungated once the host admits the
     // viewer. `chat_error` explains a queued line that the transport then
     // failed to send; inbound text is taken through TakeChat() so the status
@@ -812,6 +827,12 @@ public:
     // through ViewerStatus::sas_code/sas_error/sas_updates; a newer request
     // replaces one that has not been sent yet.
     bool SendSas();
+    // Queues one host-control action. Restart needs kPermissionRestart, lock
+    // needs input control, and block input needs both input and
+    // kPermissionBlockInput. Returns false when the session is not streaming
+    // or the matching permission is missing. The answer arrives through
+    // ViewerStatus::host_action_*; a newer request replaces an unsent one.
+    bool RequestHostAction(chast::HostAction action, bool block_input = false);
 
     // Queues one UTF-8 chat line for the host. Returns false for empty or
     // oversized text, when no session is streaming, or when the outgoing queue
@@ -947,6 +968,9 @@ private:
     // SAS is an action, not a state: one pending request is enough, and a
     // second tap replaces an unsent one instead of queueing a burst.
     std::atomic<bool> pending_sas_{false};
+    // Host-control requests are actions too; the newest one wins.
+    mutable std::mutex host_action_mutex_;
+    std::optional<chast::HostControlRequest> pending_host_action_;
 
     // The port-forward target crosses to the session thread here. One slot is
     // enough: the operator picks a target, and a newer pick replaces an

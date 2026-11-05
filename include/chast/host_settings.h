@@ -121,6 +121,15 @@ struct HostSettings {
     // monitor, so a person sitting at the machine cannot see the desktop until
     // the session ends or the operator revokes the permission.
     bool allow_privacy_mode = false;
+    // Let the viewer reboot this machine. Off by default: a restart drops
+    // every local session and unsaved work, so it is an explicit grant in the
+    // same spirit as port forwarding and the camera.
+    bool allow_restart = false;
+    // Let the viewer block the local keyboard and pointer while it keeps
+    // injecting its own input. Off by default; the action also needs input
+    // control, and the host always releases the block when the session ends
+    // or the permission is revoked.
+    bool allow_block_input = false;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.

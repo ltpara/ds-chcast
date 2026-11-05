@@ -882,6 +882,12 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.camera_enabled) {
         permissions |= kPermissionCamera;
     }
+    if (info.restart_enabled) {
+        permissions |= kPermissionRestart;
+    }
+    if (info.block_input_enabled) {
+        permissions |= kPermissionBlockInput;
+    }
     put_u16(cursor, permissions);
     return payload;
 }
@@ -1093,7 +1099,12 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck grants unknown permissions");
         return false;
     }
-    if (permissions != (flags & kServerInfoPermissionFlags)) {
+    // Restart and block input have no flag of their own (their bits collide
+    // with the files-only and datagram-audio flags), so they live in the mask
+    // alone; every other permission must still match its flag.
+    if (permissions !=
+        ((flags & kServerInfoPermissionFlags) |
+         (permissions & (kPermissionRestart | kPermissionBlockInput)))) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
         return false;
     }
@@ -1136,6 +1147,8 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.terminal_enabled = (permissions & kPermissionTerminal) != 0;
     info.record_enabled = (permissions & kPermissionRecord) != 0;
     info.camera_enabled = (permissions & kPermissionCamera) != 0;
+    info.restart_enabled = (permissions & kPermissionRestart) != 0;
+    info.block_input_enabled = (permissions & kPermissionBlockInput) != 0;
     if (!reader.at_end()) {
         set_error(error, "HelloAck carries trailing bytes");
         return false;
@@ -2262,6 +2275,121 @@ bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
         return false;
     }
     *audio = data;
+    return true;
+}
+
+namespace {
+
+bool valid_host_action(HostAction action) {
+    return action == HostAction::Restart || action == HostAction::LockScreen ||
+           action == HostAction::BlockInput;
+}
+
+bool valid_host_action_code(HostActionCode code) {
+    return code == HostActionCode::Ok || code == HostActionCode::Denied ||
+           code == HostActionCode::Unsupported || code == HostActionCode::Busy ||
+           code == HostActionCode::Failed;
+}
+
+// Only BlockInput carries a value; the other actions must send zero so a
+// malformed request cannot be mistaken for a state toggle.
+bool valid_host_action_value(HostAction action, uint8_t value) {
+    return action == HostAction::BlockInput ? value <= 1 : value == 0;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_host_action_request(const HostControlRequest& request) {
+    if (!valid_host_action(request.action)) {
+        return {};
+    }
+    if (request.action != HostAction::BlockInput && request.block_input) {
+        return {};
+    }
+    std::vector<uint8_t> payload(2);
+    payload[0] = static_cast<uint8_t>(request.action);
+    payload[1] = request.block_input ? 1 : 0;
+    return make_control(ControlType::HostActionRequest, payload);
+}
+
+bool parse_host_action_request(const std::vector<uint8_t>& payload,
+                               HostControlRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_action = 0;
+    uint8_t raw_value = 0;
+    if (!reader.u8(raw_action) || !reader.u8(raw_value) || !reader.at_end()) {
+        set_error(error, "malformed HostActionRequest");
+        return false;
+    }
+    request.action = static_cast<HostAction>(raw_action);
+    if (!valid_host_action(request.action)) {
+        set_error(error, "HostActionRequest carries an unknown action");
+        return false;
+    }
+    if (!valid_host_action_value(request.action, raw_value)) {
+        set_error(error, "HostActionRequest carries an invalid value");
+        return false;
+    }
+    request.block_input = raw_value != 0;
+    return true;
+}
+
+std::vector<uint8_t> make_host_action_result(const HostControlResult& result) {
+    if (!valid_host_action(result.action) || !valid_host_action_code(result.code)) {
+        return {};
+    }
+    if (result.action != HostAction::BlockInput && result.block_input) {
+        return {};
+    }
+    const std::string text = truncate_utf8_reason(result.reason, kMaxHostActionReason);
+    std::vector<uint8_t> payload(5 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(result.action));
+    put_u8(cursor, result.block_input ? 1 : 0);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::HostActionResult, payload);
+}
+
+bool parse_host_action_result(const std::vector<uint8_t>& payload,
+                              HostControlResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_action = 0;
+    uint8_t raw_state = 0;
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u8(raw_action) || !reader.u8(raw_state) || !reader.u8(raw_code) ||
+        !reader.u16(reason_size) || !reader.string(result.reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, "malformed HostActionResult");
+        return false;
+    }
+    result.action = static_cast<HostAction>(raw_action);
+    if (!valid_host_action(result.action)) {
+        set_error(error, "HostActionResult carries an unknown action");
+        return false;
+    }
+    if (!valid_host_action_value(result.action, raw_state)) {
+        set_error(error, "HostActionResult carries an invalid state");
+        return false;
+    }
+    result.block_input = raw_state != 0;
+    result.code = static_cast<HostActionCode>(raw_code);
+    if (!valid_host_action_code(result.code)) {
+        set_error(error, "HostActionResult carries an unknown code");
+        return false;
+    }
+    if (result.reason.size() > kMaxHostActionReason) {
+        set_error(error, "HostActionResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "HostActionResult carries a malformed reason");
+        return false;
+    }
     return true;
 }
 

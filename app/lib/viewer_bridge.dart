@@ -470,6 +470,13 @@ class ViewerStatus {
     this.sasCode = 0,
     this.sasError = '',
     this.sasUpdates = 0,
+    this.restartSupported = false,
+    this.blockInputSupported = false,
+    this.blockInputActive = false,
+    this.hostActionAction = 0,
+    this.hostActionCode = 0,
+    this.hostActionError = '',
+    this.hostActionUpdates = 0,
     this.chatSent = 0,
     this.chatReceived = 0,
     this.chatFailures = 0,
@@ -865,6 +872,23 @@ class ViewerStatus {
   final String sasError;
   final int sasUpdates;
 
+  /// Host-control actions (remote restart, console lock, local input block).
+  /// [restartSupported] and [blockInputSupported] mirror the host's
+  /// permissions; [blockInputActive] is the host's block state as last
+  /// reported. [hostActionAction] names the answered action
+  /// ([ViewerHostAction.code]), [hostActionCode] is its
+  /// [ViewerHostActionCode] (0 = Ok), [hostActionError] the reason for a
+  /// refusal, and [hostActionUpdates] counts answers so the page can pair one
+  /// with its poll. The host also sends an unsolicited BlockInput denial when
+  /// it releases the block itself.
+  final bool restartSupported;
+  final bool blockInputSupported;
+  final bool blockInputActive;
+  final int hostActionAction;
+  final int hostActionCode;
+  final String hostActionError;
+  final int hostActionUpdates;
+
   /// Session chat counters. Both directions are ungated once the host admits
   /// the viewer. [chatFailures] counts queued lines the transport failed to
   /// send, with [chatError] explaining the most recent one. Inbound text is
@@ -1028,6 +1052,13 @@ class ViewerStatus {
   // The privacy button needs a live session and the host's privacy bit.
   bool get acceptsPrivacy =>
       isLive && (permissions & ViewerPermission.privacyMode) != 0;
+  // Host-control menu entries: restart has its own bit, block input needs the
+  // explicit bit (the host also requires input), and locking follows input.
+  bool get acceptsRestart =>
+      isLive && (permissions & ViewerPermission.restart) != 0;
+  bool get acceptsBlockInput =>
+      isLive && (permissions & ViewerPermission.blockInput) != 0;
+  bool get acceptsLockScreen => acceptsInput;
   // The port-forward dialog needs a live session and the host's forward bit.
   bool get acceptsPortForward =>
       isLive && (permissions & ViewerPermission.portForward) != 0;
@@ -1301,6 +1332,13 @@ class ViewerStatus {
       sasCode: asInt(map['sasCode']),
       sasError: asString(map['sasError']),
       sasUpdates: asInt(map['sasUpdates']),
+      restartSupported: map['restartSupported'] == true,
+      blockInputSupported: map['blockInputSupported'] == true,
+      blockInputActive: map['blockInputActive'] == true,
+      hostActionAction: asInt(map['hostActionAction']),
+      hostActionCode: asInt(map['hostActionCode']),
+      hostActionError: asString(map['hostActionError']),
+      hostActionUpdates: asInt(map['hostActionUpdates']),
       chatSent: asInt(map['chatSent']),
       chatReceived: asInt(map['chatReceived']),
       chatFailures: asInt(map['chatFailures']),
@@ -1633,6 +1671,22 @@ class ViewerBridge {
   /// [ViewerStatus.sasUpdates].
   static Future<bool> sendSas() async {
     final bool? queued = await _channel.invokeMethod<bool>('sendSas');
+    return queued ?? false;
+  }
+
+  /// Queues one host-control action. False means it was not queued (no live
+  /// session or the matching permission is missing). The host's answer
+  /// arrives in [ViewerStatus.hostActionCode] / [ViewerStatus.hostActionError],
+  /// counted by [ViewerStatus.hostActionUpdates]; [ViewerStatus.blockInputActive]
+  /// follows the block state the host reports.
+  static Future<bool> requestHostAction(
+    ViewerHostAction action, {
+    bool blockInput = false,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'requestHostAction',
+      <String, Object>{'action': action.code, 'blockInput': blockInput},
+    );
     return queued ?? false;
   }
 
@@ -2253,6 +2307,8 @@ abstract final class ViewerPermission {
   // The host's consent to a local recording of the received stream; advisory,
   // because the host cannot see or stop the recording itself.
   static const int record = 0x0200;
+  static const int restart = 0x0800;
+  static const int blockInput = 0x1000;
 }
 
 /// Why Ctrl+Alt+Del did not reach the host's secure desktop
@@ -2264,6 +2320,28 @@ enum ViewerSasCode {
   failed(3);
 
   const ViewerSasCode(this.code);
+  final int code;
+}
+
+/// One host-control action (chast::HostAction in chast/protocol.h).
+enum ViewerHostAction {
+  restart(1),
+  lockScreen(2),
+  blockInput(3);
+
+  const ViewerHostAction(this.code);
+  final int code;
+}
+
+/// Why a host-control action was not performed (chast::HostActionCode).
+enum ViewerHostActionCode {
+  ok(0),
+  denied(1),
+  unsupported(2),
+  busy(3),
+  failed(4);
+
+  const ViewerHostActionCode(this.code);
   final int code;
 }
 

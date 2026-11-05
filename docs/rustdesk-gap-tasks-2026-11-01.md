@@ -366,7 +366,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-14 | P2 | 会话角色互换（Switch Sides） | `flutter/lib/common/widgets/toolbar.dart:702`、`src/client.rs:4564`/`:4913` | 无；连接方向固定为查看器控制主机 |
 | DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 可发送 Ctrl+Alt+Del（`include/chast/sas.h`），但不能在锁屏/登录界面输入凭据或自动登录 |
 | DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 固定控制当前控制台会话，无可选会话列表 |
-| DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 只有隐私遮罩（黑屏）；不能重启主机、屏蔽本地键鼠或发送 Win+L |
+| DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
 | DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | `SessionMode` 只有 Desktop/FileTransfer（`include/chast/protocol.h:1025`）；终端/摄像头/端口转发都依附桌面会话 |
 | DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 终端随会话结束销毁，单会话最多 2 个（`protocol.h:1254`/`:1263`） |
 | DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 协议支持多个 `forward_id`（上限 8），但查看器只管理一个活动目标（`app/lib/pages/session_page.dart:1602-1755`） |
@@ -499,6 +499,48 @@ analyze` 无问题；`flutter test` 540 项通过；Windows release 构建成功
 全量 `ctest` 43/43 通过（644.27 s）。
 边界：真实麦克风与音箱待双机验收；每连接一通通话；语音与系统声音共用
 可靠控制流的拥塞控制；视频零拷贝链路未改动，无 CPU fallback。
+
+### DEV-17 远程重启 / 阻止本地输入 / 锁屏（2026-11-05 完成）
+
+协议从 v37 提升到 v38，在可靠控制流上新增 `HostActionRequest(55)` 与
+`HostActionResult(56)`：请求为 action(u8)+value(u8)，结果为 action(u8)+
+当前阻止状态(u8)+结果码(u8)+原因字符串，结果码为
+Ok/Denied/Unsupported/Busy/Failed。新增权限位 `kPermissionRestart`（0x0800）
+与 `kPermissionBlockInput`（0x1000），默认关闭，随 HelloAck 权限掩码下发
+（0x0800/0x1000 已被 FilesOnly/AudioDatagram 标志占用，因此不再复用标志位）。
+
+- **主机闸门顺序**：会话权限 → 控制租约（非持有者回 Busy）→ 主机设置
+  （`allow_restart`/`allow_block_input`，未开启回 Denied）→ 平台调用。
+  锁屏沿用输入权限，未授权回 Denied。
+- **平台实现**：重启 `ExitWindowsEx(EWX_REBOOT|EWX_FORCEIFHUNG)`（无管理员
+  权限时回 Failed 并携带 Win32 错误）、锁屏 `LockWorkStation()`、阻止/恢复
+  本地输入 `BlockInput(TRUE/FALSE)`；`HostServerConfig::host_control` 允许
+  测试替换整个后端。
+- **阻止状态生命周期**：`BlockInputGuard` 在会话退出时恢复本地输入；查看者
+  主动解除、权限撤销、会话结束都会释放阻止，并向查看器补发一条 Denied 结果
+  （原因 “the host released local input”）。统计新增
+  `host_actions/host_action_failures/block_input_active`。
+- **查看器**：工具栏新增电源菜单（锁定、阻止/恢复本地输入、重启），重启带
+  二次确认；`RequestHostAction` 队列以最新请求为准；状态新增
+  `restartSupported/blockInputSupported/blockInputActive/hostActionAction/
+  hostActionCode/hostActionError/hostActionUpdates`。
+- **托盘与设置**：安全对话框新增“允许远程重启”“允许阻止本地输入”复选框，
+  托盘菜单可直接切换；`host.ini` 持久化为 `restart=`/`block_input=`；对已
+  建立会话立即更新权限掩码，主机侧开关在下一次连接生效。
+
+验证：新增 `chast-host-control-test`（真实 QUIC 回环 + 合成 `host_control`
+后端）覆盖权限通告、锁屏/重启成功、后端失败上报原因与计数、阻止幂等与恢复、
+撤权补发 Denied 且后端释放、查看器观察到权限变化、会话结束自动解禁；
+protocol/host_settings/host_multi/host_voice/host_security/host_tunnel/
+host_i18n 通过；`flutter analyze` 无问题、`flutter test` 547 项通过
+（新增 host-action 状态与工具栏菜单用例）、Windows release 构建成功。
+顺带修复语音通话状态在静态桌面下不写入 `status()` 的问题（接受/停止时立即
+`publish_stats`，见 `docs/status-2026-10-25.md`）。
+
+边界：真实重启需要主机进程具备管理员权限，测试注入后端避免重启本机；锁屏
+使用 `LockWorkStation`，不模拟 Win+L 键入；`BlockInput` 只屏蔽本地物理
+输入，不影响查看者注入；重启会中断会话；阻止状态在会话结束/进程退出时
+释放。DEV-14（Switch Sides）仍因需要反向角色交接暂缓。
 
 ### 已核对但不算缺口的项
 

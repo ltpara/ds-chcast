@@ -1167,6 +1167,33 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
       );
     }
+    // Every host-control action gets one answer. A refusal explains itself;
+    // success confirms the new state, and a host-initiated block release
+    // arrives as a denial with the block off.
+    if (!nowOver && status.hostActionUpdates > _status.hostActionUpdates) {
+      final String reason = status.hostActionError;
+      final String action = _hostActionText(status.hostActionAction);
+      final String text;
+      if (status.hostActionCode != ViewerHostActionCode.ok.code) {
+        final String detail =
+            reason.isEmpty ? _hostActionCodeText(status.hostActionCode) : reason;
+        text = tr('{action}未执行：{detail}', <String, Object?>{
+          'action': action,
+          'detail': detail,
+        });
+      } else if (status.hostActionAction == ViewerHostAction.blockInput.code) {
+        text = status.blockInputActive
+            ? tr('主机本地输入已阻止')
+            : tr('主机本地输入已恢复');
+      } else if (status.hostActionAction == ViewerHostAction.lockScreen.code) {
+        text = tr('已请求主机锁屏');
+      } else {
+        text = tr('已请求主机重启');
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+      );
+    }
     // Screenshots finish on the session thread; the counter pairs the newest
     // path or failure with this poll.
     if (!nowOver && status.screenshotUpdates > _status.screenshotUpdates) {
@@ -1640,6 +1667,114 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     } on MissingPluginException {
       // The native viewer is going away.
     }
+  }
+
+  /// Runs one entry of the toolbar's host-control menu. Restart interrupts
+  /// this session, so it asks first; the host's answer arrives later through
+  /// [ViewerStatus.hostActionUpdates].
+  Future<void> _onHostAction(ViewerHostAction action) async {
+    switch (action) {
+      case ViewerHostAction.restart:
+        if (!_status.acceptsRestart) {
+          return;
+        }
+        final bool? confirmed = await showDialog<bool>(
+          context: context,
+          builder: (BuildContext dialogContext) => AlertDialog(
+            title: Text(tr('重启主机？')),
+            content: Text(tr('主机会立即重启，本次会话将中断。')),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: Text(tr('取消')),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: Text(tr('重启')),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true || !mounted) {
+          return;
+        }
+        await _requestHostAction(ViewerHostAction.restart);
+        return;
+      case ViewerHostAction.lockScreen:
+        if (!_status.acceptsLockScreen) {
+          return;
+        }
+        await _requestHostAction(ViewerHostAction.lockScreen);
+        return;
+      case ViewerHostAction.blockInput:
+        if (!_status.acceptsBlockInput) {
+          return;
+        }
+        await _requestHostAction(
+          ViewerHostAction.blockInput,
+          blockInput: !_status.blockInputActive,
+        );
+        return;
+    }
+  }
+
+  Future<void> _requestHostAction(
+    ViewerHostAction action, {
+    bool blockInput = false,
+  }) async {
+    try {
+      final bool queued = await ViewerBridge.requestHostAction(
+        action,
+        blockInput: blockInput,
+      );
+      if (!mounted || queued) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('主机操作未能排队：请确认主机权限与会话状态')),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法执行主机操作'))));
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  String _hostActionText(int action) {
+    if (action == ViewerHostAction.restart.code) {
+      return tr('重启主机');
+    }
+    if (action == ViewerHostAction.lockScreen.code) {
+      return tr('锁定主机屏幕');
+    }
+    if (action == ViewerHostAction.blockInput.code) {
+      return tr('阻止本地输入');
+    }
+    return tr('主机操作');
+  }
+
+  String _hostActionCodeText(int code) {
+    if (code == ViewerHostActionCode.denied.code) {
+      return tr('主机未授权该操作');
+    }
+    if (code == ViewerHostActionCode.unsupported.code) {
+      return tr('主机不支持该操作');
+    }
+    if (code == ViewerHostActionCode.busy.code) {
+      return tr('另一查看者正在控制主机');
+    }
+    if (code == ViewerHostActionCode.failed.code) {
+      return tr('主机执行失败');
+    }
+    return tr('主机拒绝了该操作');
   }
 
   /// Opens the port-forward dialog. The listener binds 127.0.0.1 on the
@@ -3334,6 +3469,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onToggleVoiceCall: () => unawaited(_toggleVoiceCall()),
                         privacyAvailable: _status.acceptsPrivacy,
                         privacyEnabled: _status.privacyEnabled,
+                        restartAvailable: _status.acceptsRestart,
+                        lockAvailable: _status.acceptsLockScreen,
+                        blockInputAvailable: _status.acceptsBlockInput,
+                        blockInputActive: _status.blockInputActive,
+                        onHostAction: (ViewerHostAction action) =>
+                            unawaited(_onHostAction(action)),
                         portForwardAvailable: _status.acceptsPortForward,
                         portForwardActive: _status.portForwardActive,
                         onOpenPortForward: () =>
@@ -3544,6 +3685,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                     !_chatOpen &&
                     !_terminalOpen &&
                     (_status.privacyEnabled ||
+                        _status.blockInputActive ||
                         (_status.acceptsAudio && _status.audioMuted)))
                   Positioned(
                     right: 10,
@@ -3555,7 +3697,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         children: <Widget>[
                           if (_status.privacyEnabled)
                             _statusBadge(Icons.shield_rounded, tr('隐私模式')),
-                          if (_status.privacyEnabled &&
+                          if (_status.privacyEnabled && _status.blockInputActive)
+                            const SizedBox(height: 6),
+                          if (_status.blockInputActive)
+                            _statusBadge(
+                                Icons.pause_circle_rounded, tr('主机输入已阻止')),
+                          if ((_status.privacyEnabled || _status.blockInputActive) &&
                               _status.acceptsAudio &&
                               _status.audioMuted)
                             const SizedBox(height: 6),

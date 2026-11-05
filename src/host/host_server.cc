@@ -409,6 +409,12 @@ uint16_t settings_permissions(const HostSettings& settings) {
     if (settings.allow_record) {
         mask |= kPermissionRecord;
     }
+    if (settings.allow_restart) {
+        mask |= kPermissionRestart;
+    }
+    if (settings.allow_block_input) {
+        mask |= kPermissionBlockInput;
+    }
     return mask;
 }
 
@@ -568,7 +574,95 @@ std::string permission_names(uint16_t mask) {
     if ((mask & kPermissionFileTransfer) != 0) {
         add("file transfer");
     }
+    if ((mask & kPermissionRestart) != 0) {
+        add("restart");
+    }
+    if ((mask & kPermissionBlockInput) != 0) {
+        add("block input");
+    }
     return text.empty() ? "view only" : text;
+}
+
+// The host-control actions run in the worker process, which the service starts
+// in the interactive user session, so these Win32 calls reach the operator's
+// real desktop instead of session 0.
+bool enable_process_privilege(const wchar_t* name) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                          &token)) {
+        return false;
+    }
+    LUID luid{};
+    bool ok = LookupPrivilegeValueW(nullptr, name, &luid) != FALSE;
+    if (ok) {
+        TOKEN_PRIVILEGES privileges{};
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        SetLastError(ERROR_SUCCESS);
+        ok = AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) !=
+                 FALSE &&
+             GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(token);
+    return ok;
+}
+
+std::string last_error_text() {
+    return "error " + std::to_string(GetLastError());
+}
+
+bool restart_host_system(std::string* error) {
+    // SeShutdownPrivilege is granted to Users by default; an interactive
+    // worker can reboot without elevation. A local policy that removes it
+    // surfaces as a Failed result instead of silently doing nothing.
+    if (!enable_process_privilege(L"SeShutdownPrivilege")) {
+        *error = "the shutdown privilege is not available";
+        return false;
+    }
+    const DWORD reason = SHTDN_REASON_FLAG_PLANNED | SHTDN_REASON_MAJOR_APPLICATION |
+                         SHTDN_REASON_MINOR_MAINTENANCE;
+    if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, reason)) {
+        *error = "ExitWindowsEx failed (" + last_error_text() + ")";
+        return false;
+    }
+    return true;
+}
+
+bool lock_host_workstation(std::string* error) {
+    if (!LockWorkStation()) {
+        *error = "LockWorkStation failed (" + last_error_text() + ")";
+        return false;
+    }
+    return true;
+}
+
+bool block_host_input(bool block, std::string* error) {
+    // BlockInput binds the block to the calling thread: the session loop keeps
+    // running on this thread, and Windows releases the block if the thread
+    // ever exits without calling it again.
+    if (!BlockInput(block ? TRUE : FALSE)) {
+        *error = std::string("BlockInput(") + (block ? "on" : "off") + ") failed (" +
+                 last_error_text() + ")";
+        return false;
+    }
+    return true;
+}
+
+const char* host_action_code_name(HostActionCode code) {
+    switch (code) {
+        case HostActionCode::Ok:
+            return "ok";
+        case HostActionCode::Denied:
+            return "denied";
+        case HostActionCode::Unsupported:
+            return "unsupported";
+        case HostActionCode::Busy:
+            return "busy";
+        case HostActionCode::Failed:
+            return "failed";
+    }
+    return "unknown";
 }
 
 // Puts a session's temporary display mode back when the session ends, however
@@ -774,6 +868,8 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_terminal = settings_.allow_terminal;
     quic.allow_camera = settings_.allow_camera;
     quic.allow_record = settings_.allow_record;
+    quic.allow_restart = settings_.allow_restart;
+    quic.allow_block_input = settings_.allow_block_input;
     quic.allow_audio = settings_.allow_audio;
     quic.allow_microphone = settings_.allow_microphone;
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
@@ -901,9 +997,11 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
     // A refused Hello must not take the control lease with it.
     if (adopted_ && registry_ && pending_security_.decision != HostSecurity::Decision::Deny) {
         if (request.mode != SessionMode::Desktop) {
-            // A files-only connection has no input surface. Dropping the bit
-            // here also keeps it from joining the control-lease election.
-            auth.permissions &= ~static_cast<uint16_t>(kPermissionInput);
+            // A files-only connection has no input surface and its worker
+            // refuses host actions, so drop those grants here instead of
+            // advertising controls that would only be denied.
+            auth.permissions &= ~static_cast<uint16_t>(
+                kPermissionInput | kPermissionRestart | kPermissionBlockInput);
         } else if (settings_.allow_input && (auth.permissions & kPermissionInput) != 0) {
             if (!registry_->acquire_control(this)) {
                 auth.permissions &= ~static_cast<uint16_t>(kPermissionInput);
@@ -2112,6 +2210,20 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
                 return SharedFollowResult::Ended;
             }
         }
+        HostControlRequest host_action;
+        while (session_->take_host_action_request(host_action)) {
+            ++stats.host_actions;
+            ++stats.host_action_failures;
+            HostControlResult denied;
+            denied.action = host_action.action;
+            denied.code = HostActionCode::Busy;
+            denied.reason =
+                "host actions are controlled by the viewer that owns the stream";
+            if (!send_failed(session_->send_host_action_result(denied),
+                             "host_action_result")) {
+                return SharedFollowResult::Ended;
+            }
+        }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
             ++stats.chat_received;
@@ -2257,8 +2369,21 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     stats.privacy_mode_changes = 0;
     stats.sas_requests = 0;
     stats.sas_failures = 0;
+    stats.host_actions = 0;
+    stats.host_action_failures = 0;
+    stats.block_input_active = false;
     stats.resolution_percent = 100;
     stats.resolution_changes = 0;
+    // Blocking local input lasts only as long as the session that asked for
+    // it; however the loop below ends, the operator's input comes back.
+    struct BlockInputGuard {
+        HostServer* self;
+        HostServerStats* stats;
+        ~BlockInputGuard() {
+            self->release_block_input_local();
+            stats->block_input_active = false;
+        }
+    } block_input_guard{this, &stats};
     // The last scale the ladder asked for. A merged canvas may cap it lower,
     // and stats.resolution_percent reports what is actually encoded.
     uint16_t resolution_request = 100;
@@ -2646,6 +2771,15 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         // grant to another viewer can take it.
         if (registry_ && adopted_ && (now_mask & kPermissionInput) == 0) {
             registry_->release_control(this);
+        }
+        // Blocked local input must not outlive the permissions that allowed
+        // it: the operator would be locked out of their own machine.
+        if (block_input_active_.load() &&
+            (now_mask & (kPermissionInput | kPermissionBlockInput)) !=
+                (kPermissionInput | kPermissionBlockInput)) {
+            if (!release_block_input(stats, error, peer_left, true)) {
+                return false;
+            }
         }
         // A revoked permission must take the mask down with it: leaving the
         // operator's screen black after they turned the feature off would be
@@ -4042,6 +4176,17 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             std::chrono::duration<double>(now - start).count() >= config_.run_seconds) {
             break;
         }
+        // A viewer that closed its side ends the session here, like the shared
+        // and file loops. Waiting for a failed send is not enough: a static
+        // desktop produces no frames to send, and the session would outlive
+        // the viewer -- along with a blocked local input.
+        if (!session_->peer_alive()) {
+            *peer_left = true;
+            break;
+        }
+        if (session_->viewer_finished()) {
+            break;
+        }
         uint16_t switch_index = kDisplayAuto;
         if (session_->take_display_switch_request(switch_index) &&
             !switch_display(switch_index)) {
@@ -4092,6 +4237,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
                 drain_peer(stats);
                 return clean;
             }
+        }
+        if (!handle_host_actions(stats, error, peer_left)) {
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
         }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
@@ -5754,6 +5904,27 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
 
     while (!stopping_.load()) {
         apply_pending_permissions();
+        HostControlRequest host_action;
+        while (session_->take_host_action_request(host_action)) {
+            ++stats.host_actions;
+            ++stats.host_action_failures;
+            HostControlResult denied;
+            denied.action = host_action.action;
+            denied.code = HostActionCode::Denied;
+            denied.reason = "host actions are not available in a file-transfer session";
+            const Error sent = session_->send_host_action_result(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "host_action_result: " + sent.to_string();
+                return false;
+            }
+            log("host action refused: file-transfer sessions cannot control the host");
+        }
         poll_files(stats);
         if (session_->viewer_finished()) {
             return true;
@@ -6273,6 +6444,9 @@ void HostServer::stop_voice_call(HostServerStats& stats, const std::string& reas
             log("voice call close failed: " + closed.to_string());
         }
     }
+    // Status readers (the tray and callers of status()) must see the call end
+    // even when a static desktop produces no frames to publish them with.
+    publish_stats(stats);
 }
 
 void HostServer::handle_voice_call_requests(HostServerStats& stats) {
@@ -6354,6 +6528,7 @@ void HostServer::handle_voice_call_requests(HostServerStats& stats) {
         voice_send_drops_ = 0;
         ++stats.voice_call_accepted;
         stats.voice_call_active = true;
+        publish_stats(stats);
         log("voice call: host microphone sending Opus " +
             std::to_string(voice_info_.sample_rate / 1000u) + " kHz, " +
             std::to_string(voice_info_.channels) + " ch");
@@ -6407,6 +6582,175 @@ void HostServer::drain_voice_call(HostServerStats& stats) {
     }
     const AudioCaptureStats captured = voice_capture_->stats();
     stats.voice_call_dropped = voice_send_drops_ + captured.dropped;
+}
+
+bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,
+                                     bool* peer_left) {
+    HostControlRequest request;
+    while (session_->take_host_action_request(request)) {
+        ++stats.host_actions;
+        HostActionCode code = HostActionCode::Ok;
+        std::string reason;
+        auto refuse = [&](HostActionCode next, std::string why) {
+            code = next;
+            reason = std::move(why);
+        };
+        const uint16_t permissions = session_->permissions();
+        if (request.action == HostAction::Restart) {
+            if ((permissions & kPermissionRestart) == 0) {
+                refuse(HostActionCode::Denied, "restart is not permitted by the host");
+            } else if (registry_ && !registry_->may_change_host_state(this)) {
+                refuse(HostActionCode::Busy, "another viewer controls this host");
+            } else if (!settings_.allow_restart) {
+                refuse(HostActionCode::Denied, "the host does not allow remote restarts");
+            } else {
+                std::string platform_error;
+                const bool done =
+                    config_.host_control
+                        ? config_.host_control(HostAction::Restart, false, &platform_error)
+                        : restart_host_system(&platform_error);
+                if (!done) {
+                    refuse(HostActionCode::Failed,
+                           platform_error.empty() ? "the restart failed" : platform_error);
+                }
+            }
+        } else if (request.action == HostAction::LockScreen) {
+            if ((permissions & kPermissionInput) == 0) {
+                refuse(HostActionCode::Denied,
+                       "input control is not permitted by the host");
+            } else if (registry_ && !registry_->may_change_host_state(this)) {
+                refuse(HostActionCode::Busy, "another viewer controls this host");
+            } else {
+                std::string platform_error;
+                const bool done =
+                    config_.host_control
+                        ? config_.host_control(HostAction::LockScreen, false,
+                                               &platform_error)
+                        : lock_host_workstation(&platform_error);
+                if (!done) {
+                    refuse(HostActionCode::Failed,
+                           platform_error.empty() ? "the lock failed" : platform_error);
+                }
+            }
+        } else if (request.action == HostAction::BlockInput) {
+            if ((permissions & (kPermissionInput | kPermissionBlockInput)) !=
+                (kPermissionInput | kPermissionBlockInput)) {
+                refuse(HostActionCode::Denied,
+                       "blocking local input is not permitted by the host");
+            } else if (registry_ && !registry_->may_change_host_state(this)) {
+                refuse(HostActionCode::Busy, "another viewer controls this host");
+            } else if (!settings_.allow_block_input) {
+                refuse(HostActionCode::Denied,
+                       "the host does not allow blocking local input");
+            } else if (request.block_input != block_input_active_.load()) {
+                std::string platform_error;
+                const bool done = config_.host_control
+                                      ? config_.host_control(HostAction::BlockInput,
+                                                             request.block_input,
+                                                             &platform_error)
+                                      : block_host_input(request.block_input,
+                                                         &platform_error);
+                if (!done) {
+                    refuse(HostActionCode::Failed,
+                           platform_error.empty() ? "block input failed" : platform_error);
+                } else {
+                    block_input_active_.store(request.block_input);
+                    stats.block_input_active = request.block_input;
+                    log(request.block_input ? "local input is blocked"
+                                            : "local input is released");
+                }
+            }
+        } else {
+            refuse(HostActionCode::Unsupported, "unknown host action");
+        }
+        HostControlResult result;
+        result.action = request.action;
+        // The protocol keeps the state field zero for restart and lock.
+        result.block_input = request.action == HostAction::BlockInput
+                                 ? block_input_active_.load()
+                                 : false;
+        result.code = code;
+        result.reason = reason;
+        if (code == HostActionCode::Ok) {
+            if (request.action == HostAction::Restart) {
+                log("remote restart requested");
+            } else if (request.action == HostAction::LockScreen) {
+                log("the workstation was locked by the viewer");
+            }
+        } else {
+            ++stats.host_action_failures;
+            log(std::string("host action refused (") + host_action_code_name(code) +
+                "): " + (reason.empty() ? "no reason given" : reason));
+        }
+        const Error sent = session_->send_host_action_result(result);
+        if (sent.ok()) {
+            // The tray shows the block state and the counters; the periodic
+            // publisher alone would leave them stale until the next ABR step.
+            publish_stats(stats);
+            continue;
+        }
+        if (sent.status() == Status::Unavailable ||
+            sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "host_action_result: " + sent.to_string();
+        }
+        return false;
+    }
+    return true;
+}
+
+bool HostServer::release_block_input(HostServerStats& stats, std::string* error,
+                                     bool* peer_left, bool notify) {
+    if (!block_input_active_.exchange(false)) {
+        return true;
+    }
+    stats.block_input_active = false;
+    std::string release_error;
+    const bool released =
+        config_.host_control
+            ? config_.host_control(HostAction::BlockInput, false, &release_error)
+            : block_host_input(false, &release_error);
+    log(released ? "local input is released"
+                 : "cannot release local input: " +
+                       (release_error.empty() ? std::string("no reason given")
+                                              : release_error));
+    if (!notify) {
+        return true;
+    }
+    HostControlResult result;
+    result.action = HostAction::BlockInput;
+    result.block_input = false;
+    result.code = HostActionCode::Denied;
+    result.reason = "the host released local input";
+    const Error sent = session_->send_host_action_result(result);
+    if (sent.ok()) {
+        publish_stats(stats);
+        return true;
+    }
+    if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+        *peer_left = true;
+    } else {
+        ++stats.send_errors;
+        *error = "host_action_result: " + sent.to_string();
+    }
+    return false;
+}
+
+void HostServer::release_block_input_local() {
+    if (!block_input_active_.exchange(false)) {
+        return;
+    }
+    std::string release_error;
+    const bool released =
+        config_.host_control
+            ? config_.host_control(HostAction::BlockInput, false, &release_error)
+            : block_host_input(false, &release_error);
+    log(released ? "local input is released"
+                 : "cannot release local input: " +
+                       (release_error.empty() ? std::string("no reason given")
+                                              : release_error));
 }
 
 bool HostServer::send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left) {

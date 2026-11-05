@@ -142,7 +142,7 @@ void test_hello() {
 
     std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
     unknown_permissions[8] = 0x00;  // version, display, token length, password length
-    unknown_permissions[9] = 0x08;  // bit 11: outside every permission this build knows
+    unknown_permissions[9] = 0x80;  // bit 15: outside every permission this build knows
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
     std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
@@ -459,7 +459,7 @@ void test_hello_ack() {
                 "a HelloAck whose permission mask disagrees with its flags is rejected");
     std::vector<uint8_t> unknown_permissions = ack_payload();
     unknown_permissions[unknown_permissions.size() - 2] = 0x00;
-    unknown_permissions[unknown_permissions.size() - 1] = 0x08;
+    unknown_permissions[unknown_permissions.size() - 1] = 0x80;
     rejects_ack(std::move(unknown_permissions),
                 "a HelloAck granting unknown permissions is rejected");
 
@@ -618,7 +618,7 @@ void test_permission_update() {
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
     unknown[0] = 0x00;
-    unknown[1] = 0x08;
+    unknown[1] = 0x80;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -674,6 +674,127 @@ void test_sas() {
           "SasResult with a malformed reason is rejected");
     check(!chast::parse_sas_result(std::vector<uint8_t>(), code, reason, &error),
           "empty SasResult is rejected");
+}
+
+void test_host_actions() {
+    std::string error;
+    chast::HostControlRequest request;
+    check(chast::parse_host_action_request(
+              payload_of(chast::make_host_action_request(
+                  {chast::HostAction::Restart, false})),
+              request, &error) &&
+              request.action == chast::HostAction::Restart && !request.block_input,
+          "HostActionRequest round-trips a restart");
+    check(chast::parse_host_action_request(
+              payload_of(chast::make_host_action_request(
+                  {chast::HostAction::LockScreen, false})),
+              request, &error) &&
+              request.action == chast::HostAction::LockScreen,
+          "HostActionRequest round-trips a console lock");
+    check(chast::parse_host_action_request(
+              payload_of(chast::make_host_action_request(
+                  {chast::HostAction::BlockInput, true})),
+              request, &error) &&
+              request.action == chast::HostAction::BlockInput && request.block_input,
+          "HostActionRequest round-trips a block-input request");
+    check(chast::parse_host_action_request(
+              payload_of(chast::make_host_action_request(
+                  {chast::HostAction::BlockInput, false})),
+              request, &error) &&
+              !request.block_input,
+          "HostActionRequest round-trips an unblock request");
+
+    check(chast::make_host_action_request({chast::HostAction::Restart, true}).empty(),
+          "a restart that carries a stateful value is refused");
+    std::vector<uint8_t> unknown_action =
+        payload_of(chast::make_host_action_request({chast::HostAction::LockScreen, false}));
+    unknown_action[0] = 4;
+    check(!chast::parse_host_action_request(unknown_action, request, &error),
+          "HostActionRequest with an unknown action is rejected");
+    std::vector<uint8_t> nonzero_value =
+        payload_of(chast::make_host_action_request({chast::HostAction::LockScreen, false}));
+    nonzero_value[1] = 1;
+    check(!chast::parse_host_action_request(nonzero_value, request, &error),
+          "HostActionRequest gives a stateless action no value");
+    std::vector<uint8_t> bad_block_value =
+        payload_of(chast::make_host_action_request({chast::HostAction::BlockInput, true}));
+    bad_block_value[1] = 2;
+    check(!chast::parse_host_action_request(bad_block_value, request, &error),
+          "HostActionRequest with an invalid block state is rejected");
+    std::vector<uint8_t> trailing =
+        payload_of(chast::make_host_action_request({chast::HostAction::Restart, false}));
+    trailing.push_back(0);
+    check(!chast::parse_host_action_request(trailing, request, &error),
+          "HostActionRequest with trailing bytes is rejected");
+    check(!chast::parse_host_action_request(std::vector<uint8_t>(1), request, &error),
+          "a short HostActionRequest is rejected");
+
+    chast::HostControlResult result;
+    check(chast::parse_host_action_result(
+              payload_of(chast::make_host_action_result(
+                  {chast::HostAction::Restart, false, chast::HostActionCode::Ok, {}})),
+              result, &error) &&
+              result.action == chast::HostAction::Restart &&
+              result.code == chast::HostActionCode::Ok && result.reason.empty(),
+          "HostActionResult round-trips a success");
+    check(chast::parse_host_action_result(
+              payload_of(chast::make_host_action_result(
+                  {chast::HostAction::BlockInput, true, chast::HostActionCode::Ok,
+                   "local input is blocked"})),
+              result, &error) &&
+              result.action == chast::HostAction::BlockInput && result.block_input &&
+              result.code == chast::HostActionCode::Ok &&
+              result.reason == "local input is blocked",
+          "HostActionResult round-trips a block state and its reason");
+    check(chast::parse_host_action_result(
+              payload_of(chast::make_host_action_result(
+                  {chast::HostAction::LockScreen, false, chast::HostActionCode::Busy,
+                   "another viewer controls this host"})),
+              result, &error) &&
+              result.code == chast::HostActionCode::Busy &&
+              result.reason == "another viewer controls this host",
+          "HostActionResult round-trips a busy refusal");
+
+    check(chast::make_host_action_result(
+              {chast::HostAction::Restart, true, chast::HostActionCode::Ok, {}})
+              .empty(),
+          "a stateless action result cannot claim a block state");
+    std::vector<uint8_t> unknown_result_action =
+        payload_of(chast::make_host_action_result(
+            {chast::HostAction::Restart, false, chast::HostActionCode::Ok, {}}));
+    unknown_result_action[0] = 9;
+    check(!chast::parse_host_action_result(unknown_result_action, result, &error),
+          "HostActionResult with an unknown action is rejected");
+    std::vector<uint8_t> unknown_code =
+        payload_of(chast::make_host_action_result(
+            {chast::HostAction::Restart, false, chast::HostActionCode::Ok, {}}));
+    unknown_code[2] = 9;
+    check(!chast::parse_host_action_result(unknown_code, result, &error),
+          "HostActionResult with an unknown code is rejected");
+    std::vector<uint8_t> nonzero_state =
+        payload_of(chast::make_host_action_result(
+            {chast::HostAction::LockScreen, false, chast::HostActionCode::Ok, {}}));
+    nonzero_state[1] = 1;
+    check(!chast::parse_host_action_result(nonzero_state, result, &error),
+          "HostActionResult gives a stateless action no block state");
+    const std::string long_reason(400, 'x');
+    check(chast::parse_host_action_result(
+              payload_of(chast::make_host_action_result(
+                  {chast::HostAction::Restart, false, chast::HostActionCode::Failed,
+                   long_reason})),
+              result, &error) &&
+              result.reason.size() == chast::kMaxHostActionReason,
+          "HostActionResult truncates an oversized reason to the protocol limit");
+    std::vector<uint8_t> bad_utf8 =
+        payload_of(chast::make_host_action_result(
+            {chast::HostAction::Restart, false, chast::HostActionCode::Failed, {}}));
+    bad_utf8[3] = 1;
+    bad_utf8[4] = 0;
+    bad_utf8.push_back(0xFF);
+    check(!chast::parse_host_action_result(bad_utf8, result, &error),
+          "HostActionResult with a malformed reason is rejected");
+    check(!chast::parse_host_action_result(std::vector<uint8_t>(), result, &error),
+          "empty HostActionResult is rejected");
 }
 
 void test_stream_options() {
@@ -3370,6 +3491,7 @@ int main(int argc, char** argv) {
     test_merged_hello_ack();
     test_permission_update();
     test_sas();
+    test_host_actions();
     test_stream_options();
     test_privacy_mode();
     test_display_switch();

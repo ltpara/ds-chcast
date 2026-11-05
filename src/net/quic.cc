@@ -143,6 +143,12 @@ uint16_t permission_mask_from_info(const ServerInfo& info) {
     if (info.record_enabled) {
         mask |= kPermissionRecord;
     }
+    if (info.restart_enabled) {
+        mask |= kPermissionRestart;
+    }
+    if (info.block_input_enabled) {
+        mask |= kPermissionBlockInput;
+    }
     return mask;
 }
 
@@ -640,6 +646,12 @@ struct QuicSession::Impl {
     SasCode sas_code = SasCode::Ok;
     std::string sas_reason;
     uint64_t sas_results_seen = 0;
+    // Host-control requests and answers are short ordered queues: a toggle
+    // sequence must run in order, and every action produces one answer.
+    std::deque<HostControlRequest> host_action_requests;
+    uint64_t host_action_requests_seen = 0;
+    std::deque<HostControlResult> host_action_results;
+    uint64_t host_action_results_seen = 0;
     // Server: the newest SetStreamOptions request. Client: the newest answer,
     // carrying the effective settings even when the request was refused.
     bool stream_options_request_ready = false;
@@ -3251,6 +3263,48 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::HostActionRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                HostControlRequest request;
+                if (!parse_host_action_request(payload, request, &error)) {
+                    control_protocol_failure("HostActionRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    // Taps are user-paced; a bounded queue drains stale
+                    // toggles instead of growing without limit.
+                    if (host_action_requests.size() >= 8) {
+                        host_action_requests.pop_front();
+                    }
+                    host_action_requests.push_back(request);
+                    ++host_action_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::HostActionResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                HostControlResult result;
+                if (!parse_host_action_result(payload, result, &error)) {
+                    control_protocol_failure("HostActionResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (host_action_results.size() >= 16) {
+                        host_action_results.pop_front();
+                    }
+                    host_action_results.push_back(std::move(result));
+                    ++host_action_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::SetStreamOptions: {
                 if (role != Role::Server) {
                     break;
@@ -4449,6 +4503,10 @@ struct QuicSession::Impl {
             sas_code = SasCode::Ok;
             sas_reason.clear();
             sas_results_seen = 0;
+            host_action_requests.clear();
+            host_action_requests_seen = 0;
+            host_action_results.clear();
+            host_action_results_seen = 0;
             stream_options_request_ready = false;
             stream_options_request = StreamOptions{};
             stream_options_requests_seen = 0;
@@ -4558,6 +4616,12 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_record) {
             mask |= kPermissionRecord;
+        }
+        if (server_config.allow_restart) {
+            mask |= kPermissionRestart;
+        }
+        if (server_config.allow_block_input) {
+            mask |= kPermissionBlockInput;
         }
         return mask;
     }
@@ -5346,6 +5410,8 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.terminal_enabled = (granted & kPermissionTerminal) != 0;
     ack.camera_enabled = (granted & kPermissionCamera) != 0;
     ack.record_enabled = (granted & kPermissionRecord) != 0;
+    ack.restart_enabled = (granted & kPermissionRestart) != 0;
+    ack.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -5474,6 +5540,8 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.terminal_enabled = (granted & kPermissionTerminal) != 0;
     update.camera_enabled = (granted & kPermissionCamera) != 0;
     update.record_enabled = (granted & kPermissionRecord) != 0;
+    update.restart_enabled = (granted & kPermissionRestart) != 0;
+    update.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -5753,6 +5821,92 @@ bool QuicSession::take_sas_result(SasCode& code, std::string& reason) {
 uint64_t QuicSession::sas_results() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->sas_results_seen;
+}
+
+bool QuicSession::take_host_action_request(HostControlRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->host_action_requests.empty()) {
+        return false;
+    }
+    request = impl_->host_action_requests.front();
+    impl_->host_action_requests.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::host_action_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->host_action_requests_seen;
+}
+
+Error QuicSession::send_host_action_result(const HostControlResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_host_action_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    const std::vector<uint8_t> payload = make_host_action_result(result);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "host action result is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_host_action(HostAction action, bool block_input) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_host_action is a client operation");
+    }
+    if (action != HostAction::Restart && action != HostAction::LockScreen &&
+        action != HostAction::BlockInput) {
+        return Error(Status::InvalidCall, "unknown host action");
+    }
+    if (action != HostAction::BlockInput && block_input) {
+        return Error(Status::InvalidCall, "only block input carries a value");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        const uint16_t permissions = impl.session_permissions.load();
+        if (action == HostAction::Restart) {
+            if ((permissions & kPermissionRestart) == 0) {
+                return Error(Status::PermissionDenied,
+                             "restart is disabled by the host");
+            }
+        } else if (action == HostAction::LockScreen) {
+            if ((permissions & kPermissionInput) == 0) {
+                return Error(Status::PermissionDenied,
+                             "input control is disabled by the host");
+            }
+        } else if ((permissions & (kPermissionInput | kPermissionBlockInput)) !=
+                   (kPermissionInput | kPermissionBlockInput)) {
+            return Error(Status::PermissionDenied,
+                         "blocking local input is disabled by the host");
+        }
+    }
+    HostControlRequest request;
+    request.action = action;
+    request.block_input = block_input;
+    return impl.send_bytes(impl.control.load(), make_host_action_request(request),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_host_action_result(HostControlResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->host_action_results.empty()) {
+        return false;
+    }
+    result = std::move(impl_->host_action_results.front());
+    impl_->host_action_results.pop_front();
+    return true;
+}
+
+uint64_t QuicSession::host_action_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->host_action_results_seen;
 }
 
 bool QuicSession::take_stream_options_request(StreamOptions& options) {

@@ -143,6 +143,13 @@ struct HostServerStats {
     uint64_t audio_errors = 0;
     uint64_t audio_capture_recoveries = 0;
     uint64_t audio_gate_transitions = 0;
+    // Host-control actions (protocol v38): restart, console lock and local
+    // input blocking. `block_input_active` is the state this session set; the
+    // host always releases it when the session ends or the permission is
+    // revoked.
+    uint64_t host_actions = 0;
+    uint64_t host_action_failures = 0;
+    bool block_input_active = false;
     // Near-end frames that passed through echo cancellation and how many times
     // its adaptive filter restarted (playback start/stop or endpoint reopen).
     uint64_t audio_dsp_frames = 0;
@@ -363,6 +370,12 @@ struct HostServerConfig {
     // loopback check substitutes a callback so it never touches the real
     // secure desktop; returning false fills the reason and reports Failed.
     std::function<bool(std::string*)> send_sas;
+    // Performs one host-control action: restart, console lock, or block/unblock
+    // the local keyboard and pointer. Empty uses the Win32 backend. The
+    // loopback check substitutes callbacks so a test never reboots or blocks
+    // the operator's input; returning false fills the reason and reports
+    // Failed.
+    std::function<bool(HostAction action, bool block_input, std::string*)> host_control;
 };
 
 class HostServer {
@@ -507,6 +520,17 @@ private:
     void stop_voice_call(HostServerStats& stats, const std::string& reason,
                          bool notify);
     bool send_sas_result(HostServerStats& stats, std::string* error, bool* peer_left);
+    // Answers every pending HostActionRequest. The permission and the control
+    // lease are checked here, not in the transport, so a viewer learns why an
+    // action was refused. `notify` results also carry the resulting block
+    // input state.
+    bool handle_host_actions(HostServerStats& stats, std::string* error, bool* peer_left);
+    // Releases local input blocking if this session owns it. `notify` answers
+    // an unsolicited denial, used when the permission is revoked mid-session;
+    // the session-end guard passes false because the connection is going away.
+    bool release_block_input(HostServerStats& stats, std::string* error, bool* peer_left,
+                             bool notify);
+    void release_block_input_local();
     // Serves a viewer that asked for a file-transfer-only session: no capture,
     // encoder, display or audio exists. The same file machinery as a desktop
     // session runs in a short polling loop until the viewer leaves.
@@ -555,6 +579,11 @@ private:
     std::atomic<bool> stopping_{false};
     std::atomic<bool> running_{false};
     bool started_ = false;
+    // True while this session's block-input action is in effect. The OS
+    // releases the block when the calling thread exits, but the session may
+    // end first; the guard calls the platform again so the operator's input
+    // returns before the worker exits.
+    std::atomic<bool> block_input_active_{false};
 
     // Owned by the host thread after start(); created in create(). A viewer
     // worker owns the accepted connection instead and leaves this null.

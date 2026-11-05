@@ -92,6 +92,11 @@ class RemoteToolbar extends StatelessWidget {
     required this.onToggleAudio,
     required this.onToggleMicrophone,
     required this.onTogglePrivacy,
+    required this.restartAvailable,
+    required this.lockAvailable,
+    required this.blockInputAvailable,
+    required this.blockInputActive,
+    required this.onHostAction,
     this.recordingAvailable = false,
     this.recordingDenied = false,
     this.recording = false,
@@ -141,6 +146,11 @@ class RemoteToolbar extends StatelessWidget {
   final Future<void> Function(bool aec, bool noiseSuppression) onSetAudioProcessing;
   final bool privacyAvailable;
   final bool privacyEnabled;
+  final bool restartAvailable;
+  final bool lockAvailable;
+  final bool blockInputAvailable;
+  final bool blockInputActive;
+  final ValueChanged<ViewerHostAction> onHostAction;
 
   /// A viewer-side port-forward listener is running and the host accepted
   /// the target; the button stays enabled either way so the dialog can stop
@@ -617,6 +627,13 @@ class RemoteToolbar extends StatelessWidget {
                 active: privacyEnabled,
                 onTap: onTogglePrivacy,
               ),
+              _HostPowerButton(
+                restartAvailable: restartAvailable,
+                lockAvailable: lockAvailable,
+                blockInputAvailable: blockInputAvailable,
+                blockInputActive: blockInputActive,
+                onSelected: onHostAction,
+              ),
               _BarButton(
                 icon: recording
                     ? Icons.stop_circle_rounded
@@ -814,6 +831,138 @@ class _SpecialKeysButton extends StatelessWidget {
         icon: Icons.keyboard_command_key_rounded,
         tooltip: available ? tr('特殊按键') : tr('先开启远程键鼠'),
         disabled: !available,
+        onTap: () => unawaited(_open(buttonContext)),
+      ),
+    );
+  }
+}
+
+/// Host power and local-input controls. Every entry is gated by the host's
+/// permission; the restart confirmation lives in the session page so this
+/// widget stays stateless.
+class _HostPowerButton extends StatelessWidget {
+  const _HostPowerButton({
+    required this.restartAvailable,
+    required this.lockAvailable,
+    required this.blockInputAvailable,
+    required this.blockInputActive,
+    required this.onSelected,
+  });
+
+  final bool restartAvailable;
+  final bool lockAvailable;
+  final bool blockInputAvailable;
+  final bool blockInputActive;
+  final ValueChanged<ViewerHostAction> onSelected;
+
+  Future<void> _open(BuildContext context) async {
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) {
+      return;
+    }
+    final Offset origin = box.localToGlobal(Offset.zero);
+    final ViewerHostAction? selected = await showMenu<ViewerHostAction>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        origin.dx,
+        origin.dy + box.size.height,
+        origin.dx + 300,
+        origin.dy + box.size.height,
+      ),
+      color: const Color(0xFF24252B),
+      elevation: 8,
+      items: <PopupMenuEntry<ViewerHostAction>>[
+        _item(
+          ViewerHostAction.lockScreen,
+          Icons.lock_outline_rounded,
+          tr('锁定主机屏幕'),
+          tr('保留远程画面，重新登录需要凭据'),
+          enabled: lockAvailable,
+        ),
+        _item(
+          ViewerHostAction.blockInput,
+          blockInputActive
+              ? Icons.pause_circle_rounded
+              : Icons.pause_circle_outline_rounded,
+          blockInputActive ? tr('恢复主机本地输入') : tr('阻止主机本地输入'),
+          tr('需要主机同时开放键鼠与阻止输入'),
+          enabled: blockInputAvailable,
+        ),
+        const PopupMenuDivider(),
+        _item(
+          ViewerHostAction.restart,
+          Icons.power_settings_new_rounded,
+          tr('重启主机…'),
+          tr('会中断本次会话，确认后立即重启'),
+          enabled: restartAvailable,
+          danger: true,
+        ),
+      ],
+    );
+    if (selected != null) {
+      onSelected(selected);
+    }
+  }
+
+  PopupMenuItem<ViewerHostAction> _item(
+    ViewerHostAction action,
+    IconData icon,
+    String title,
+    String detail, {
+    required bool enabled,
+    bool danger = false,
+  }) {
+    return PopupMenuItem<ViewerHostAction>(
+      value: action,
+      height: 44,
+      enabled: enabled,
+      child: Row(
+        children: <Widget>[
+          Icon(
+            icon,
+            size: 16,
+            color: !enabled
+                ? Colors.white24
+                : danger
+                    ? Colors.redAccent
+                    : Colors.white54,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: enabled ? Colors.white70 : Colors.white24,
+                  ),
+                ),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool any = restartAvailable || lockAvailable || blockInputAvailable;
+    return Builder(
+      builder: (BuildContext buttonContext) => _BarButton(
+        icon: Icons.power_settings_new_rounded,
+        tooltip: any ? tr('主机控制（锁屏、阻止输入、重启）') : tr('服务端未开放主机控制'),
+        disabled: !any,
+        active: blockInputActive,
         onTap: () => unawaited(_open(buttonContext)),
       ),
     );

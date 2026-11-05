@@ -421,6 +421,14 @@ if(CHAST_BUILD_TESTS)
     add_executable(chast-host-voice-test tests/host_voice_test.cc)
     target_link_libraries(chast-host-voice-test PRIVATE chast.host)
 
+    # Host controls: lock, restart and block-input requests over loopback QUIC,
+    # the permission and settings gates, the idempotent block toggle, and the
+    # automatic release on revocation and session end. A synthetic backend
+    # stands in for ExitWindowsEx/LockWorkStation/BlockInput. Needs a desktop
+    # session, so it skips itself when no interactive desktop exists.
+    add_executable(chast-host-control-test tests/host_control_test.cc)
+    target_link_libraries(chast-host-control-test PRIVATE chast.host)
+
     # Authentication policy: modes, lockout, temporary password, 2FA,
     # trusted devices, allow list and permission intersection.
     add_executable(chast-host-security-test tests/host_security_test.cc)
@@ -498,6 +506,8 @@ if(CHAST_BUILD_TESTS)
     set_tests_properties(host_multi PROPERTIES TIMEOUT 180)
     add_test(NAME host_voice COMMAND chast-host-voice-test)
     set_tests_properties(host_voice PROPERTIES TIMEOUT 180)
+    add_test(NAME host_control COMMAND chast-host-control-test)
+    set_tests_properties(host_control PROPERTIES TIMEOUT 180)
     add_test(NAME host_security COMMAND chast-host-security-test)
     add_test(NAME host_tunnel COMMAND chast-host-tunnel-test)
     add_test(NAME host_i18n COMMAND chast-host-i18n-test)

@@ -98,6 +98,8 @@ enum ControlId {
     kAudioCheck,
     kMicrophoneCheck,
     kPrivacyModeCheck,
+    kRestartCheck,
+    kBlockInputCheck,
     kCarrierCheck,
     kAutostartCheck,
     kSecurityButton,
@@ -874,6 +876,12 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionCamera) != 0) {
         add(tr(L"摄像头"));
     }
+    if ((mask & kPermissionRestart) != 0) {
+        add(tr(L"远程重启"));
+    }
+    if ((mask & kPermissionBlockInput) != 0) {
+        add(tr(L"阻止本地输入"));
+    }
     return text.empty() ? tr(L"只看") : text;
 }
 
@@ -890,7 +898,10 @@ uint16_t current_gate_mask() {
                                                                      : 0) |
                                  (g_app->settings.allow_terminal ? kPermissionTerminal : 0) |
                                  (g_app->settings.allow_record ? kPermissionRecord : 0) |
-                                 (g_app->settings.allow_camera ? kPermissionCamera : 0));
+                                 (g_app->settings.allow_camera ? kPermissionCamera : 0) |
+                                 (g_app->settings.allow_restart ? kPermissionRestart : 0) |
+                                 (g_app->settings.allow_block_input ? kPermissionBlockInput
+                                                                    : 0));
 }
 
 std::wstring security_summary_text(const HostStatus& status) {
@@ -913,6 +924,9 @@ std::wstring session_permission_text(const HostStatus& status) {
     std::wstring text = tr(L"本次会话权限：") + permission_label(status.session_permissions);
     if (status.stats.privacy_mode_active) {
         text += tr(L" · 本地屏幕已遮挡（隐私模式）");
+    }
+    if (status.stats.block_input_active) {
+        text += tr(L" · 本地输入已阻止");
     }
     return text;
 }
@@ -1756,6 +1770,8 @@ enum SecurityDialogId {
     kSecAllowTerminal,
     kSecAllowRecord,
     kSecAllowCamera,
+    kSecAllowRestart,
+    kSecAllowBlockInput,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1799,6 +1815,8 @@ struct SecurityDialogState {
     HWND allow_terminal = nullptr;
     HWND allow_record = nullptr;
     HWND allow_camera = nullptr;
+    HWND allow_restart = nullptr;
+    HWND allow_block_input = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -2025,6 +2043,8 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_terminal = is_checked(dialog.allow_terminal);
     updated.allow_record = is_checked(dialog.allow_record);
     updated.allow_camera = is_checked(dialog.allow_camera);
+    updated.allow_restart = is_checked(dialog.allow_restart);
+    updated.allow_block_input = is_checked(dialog.allow_block_input);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2311,7 +2331,7 @@ bool edit_security_settings(HostSettings& result) {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const int dialog_width = chast::host::english_ui() ? 700 : 620;
     const int page_text_width = dialog_width - 80;
-    RECT frame{0, 0, px(dialog_width), px(626)};
+    RECT frame{0, 0, px(dialog_width), px(658)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_DLGMODALFRAME);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -2344,7 +2364,7 @@ bool edit_security_settings(HostSettings& result) {
 
     dialog.tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, px(16), px(12),
-                                 px(dialog_width - 32), px(546), window,
+                                 px(dialog_width - 32), px(578), window,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSecTab)),
                                  g_app->instance, nullptr);
     if (dialog.tab != nullptr) {
@@ -2527,6 +2547,16 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", tr(L"允许查看器串流本机的一台摄像头（与桌面画面同时）。"), SS_LEFT, 0,
         camera_left, 520, page_right - camera_left, 20, 0, nullptr, &dialog.access_page);
 
+    const wchar_t* allow_restart_text = tr(L"远程重启主机");
+    const wchar_t* allow_block_input_text = tr(L"允许阻止本地输入");
+    const int allow_restart_width = std::max(160, check_px(allow_restart_text));
+    dialog.allow_restart = page_check(allow_restart_text, 32, 544, kSecAllowRestart);
+    dialog.allow_block_input =
+        page_check(allow_block_input_text, 32 + allow_restart_width + 24, 544,
+                   kSecAllowBlockInput);
+    add(L"STATIC", tr(L"阻止本地输入需要同时授予键盘与鼠标权限。"), SS_LEFT, 0, 32, 570,
+        page_text_width, 20, 0, nullptr, &dialog.access_page);
+
     // ----- advanced page -----
     add(L"STATIC", tr(L"访问令牌（仅供 CLI 与自动化，默认关闭）"), SS_LEFT, 0, 32, 56, 500, 20, 0,
         nullptr, &dialog.advanced_page);
@@ -2579,9 +2609,9 @@ bool edit_security_settings(HostSettings& result) {
         414, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
     const int sec_cancel_left = dialog_width - 20 - 90;
-    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 574,
+    add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 606,
         90, 32, kSecSave, nullptr, nullptr);
-    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 574, 90, 32,
+    add(L"BUTTON", tr(L"取消"), BS_PUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left, 606, 90, 32,
         kSecCancel, nullptr, nullptr);
 
     // ----- initial state -----
@@ -2600,6 +2630,8 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_terminal, settings.allow_terminal);
     set_check(dialog.allow_record, settings.allow_record);
     set_check(dialog.allow_camera, settings.allow_camera);
+    set_check(dialog.allow_restart, settings.allow_restart);
+    set_check(dialog.allow_block_input, settings.allow_block_input);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2746,6 +2778,10 @@ void show_tray_menu() {
                 kMicrophoneCheck, tr(L"接收查看者麦克风"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_privacy_mode ? MF_CHECKED : 0),
                 kPrivacyModeCheck, tr(L"允许查看者开启隐私模式"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_restart ? MF_CHECKED : 0),
+                kRestartCheck, tr(L"允许查看者远程重启主机"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_block_input ? MF_CHECKED : 0),
+                kBlockInputCheck, tr(L"允许查看者阻止本地输入"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
                 tr(L"弱网回退（TCP/WebSocket）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
@@ -3031,6 +3067,54 @@ void handle_command(int id) {
                                                                    : tr(L"隐私模式已关闭"));
             }
             break;
+        case kRestartCheck: {
+            g_app->settings.allow_restart = !g_app->settings.allow_restart;
+            save_settings();
+            if (session_is_live()) {
+                const HostStatus status = g_app->server->status();
+                g_app->server->set_permissions(current_gate_mask());
+                if (g_app->settings.allow_restart &&
+                    (status.session_permissions & kPermissionRestart) == 0) {
+                    // The permission ceiling was fixed at handshake, so a
+                    // session that started without consent cannot gain it.
+                    append_log_line(
+                        tr(L"已允许远程重启；当前会话未获授权，将在下次连接时生效"));
+                } else if (g_app->settings.allow_restart) {
+                    append_log_line(tr(L"已允许远程重启（本次会话实时生效）"));
+                } else {
+                    append_log_line(tr(L"已撤回远程重启权限（本次会话实时生效）"));
+                }
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_restart ? tr(L"已允许远程重启")
+                                                              : tr(L"已撤回远程重启权限"));
+            }
+            break;
+        }
+        case kBlockInputCheck: {
+            g_app->settings.allow_block_input = !g_app->settings.allow_block_input;
+            save_settings();
+            if (session_is_live()) {
+                const HostStatus status = g_app->server->status();
+                g_app->server->set_permissions(current_gate_mask());
+                if (g_app->settings.allow_block_input &&
+                    (status.session_permissions & kPermissionBlockInput) == 0) {
+                    append_log_line(
+                        tr(L"已允许阻止本地输入；当前会话未获授权，将在下次连接时生效"));
+                } else if (g_app->settings.allow_block_input) {
+                    append_log_line(tr(L"已允许阻止本地输入（本次会话实时生效）"));
+                } else {
+                    append_log_line(
+                        tr(L"已撤回阻止本地输入权限（本次会话实时生效，输入会立即恢复）"));
+                }
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_block_input
+                                    ? tr(L"已允许阻止本地输入")
+                                    : tr(L"已撤回阻止本地输入权限"));
+            }
+            break;
+        }
         case kCarrierCheck:
             g_app->settings.carrier = !g_app->settings.carrier;
             save_settings();

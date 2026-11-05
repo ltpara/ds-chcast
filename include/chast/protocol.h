@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 37;
+inline constexpr uint16_t kProtocolVersion = 38;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -322,6 +322,19 @@ enum class ControlType : uint16_t {
     // call is open; the viewer drops it otherwise. The control stream is
     // ordered, so packets arrive in capture order. Protocol v37.
     VoiceAudio = 54,
+    // Viewer -> host: one host-control action. Payload: action (u8, see
+    // HostAction) and value (u8, the requested block-input state for
+    // BlockInput, zero otherwise). Restart needs kPermissionRestart, lock
+    // screen needs kPermissionInput, and block input needs both
+    // kPermissionInput and kPermissionBlockInput. The host answers every
+    // request with HostActionResult. Protocol v38.
+    HostActionRequest = 55,
+    // Host -> viewer: the outcome of a HostActionRequest. Payload: action
+    // (u8), block-input state after the action (u8, zero for other actions),
+    // code (u8, see HostActionCode), reason length (u16), UTF-8 reason. The
+    // host also sends this unsolicited with Denied when it releases block
+    // input itself (permission revocation or session teardown).
+    HostActionResult = 56,
 };
 
 // ----- input -----
@@ -783,7 +796,9 @@ inline constexpr uint16_t kServerInfoFileTransferOnly = 0x0800;
 inline constexpr uint16_t kServerInfoAudioDatagram = 0x1000;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
-// this mask rather than with every known flag.
+// this mask rather than with every known flag. Restart and block input have no
+// flag: their permission bits collide with the files-only and datagram-audio
+// flags, so they travel in the mask alone.
 inline constexpr uint16_t kServerInfoPermissionFlags = kServerInfoInputEnabled |
                                                        kServerInfoClipboardEnabled |
                                                        kServerInfoAudioEnabled |
@@ -810,7 +825,9 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // for the viewer to keep a local recording of the received stream (the host
 // cannot enforce it, so it is an advisory permission like RustDesk's
 // "enable-record-session"); camera gates ListCameras, StartCamera and CCAM
-// streams.
+// streams; restart gates the RemoteRestart host action, and block input gates
+// the BlockInput host action (which also needs input: blocking the local
+// keyboard without remote control would lock the operator out).
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -826,12 +843,15 @@ enum PermissionBit : uint16_t {
     kPermissionTerminal = 0x0100,
     kPermissionRecord = 0x0200,
     kPermissionCamera = 0x0400,
+    kPermissionRestart = 0x0800,
+    kPermissionBlockInput = 0x1000,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
                                            kPermissionMicrophone | kPermissionPrivacyMode |
                                            kPermissionPortForward | kPermissionTerminal |
-                                           kPermissionRecord | kPermissionCamera;
+                                           kPermissionRecord | kPermissionCamera |
+                                           kPermissionRestart | kPermissionBlockInput;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -972,6 +992,11 @@ struct ServerInfo {
     // The viewer may list and start cameras. Decoded from the permission
     // mask; the device is still checked when it is requested.
     bool camera_enabled = false;
+    // v38: the viewer may ask for a remote restart or for local input to be
+    // blocked. Decoded from the permission mask; each action is still checked
+    // against the host's live settings when it arrives.
+    bool restart_enabled = false;
+    bool block_input_enabled = false;
     // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
     // audio stream. Set only alongside audio.enabled.
     bool audio_datagram = false;
@@ -1462,6 +1487,55 @@ std::vector<uint8_t> make_voice_audio(const AudioHeader& header,
                                       const uint8_t* payload, size_t size);
 bool parse_voice_audio(const std::vector<uint8_t>& payload, AudioHeader& header,
                        const uint8_t** audio, size_t& audio_size, std::string* error);
+
+// ----- host control (protocol v38) -----
+//
+// Actions that change the host machine itself rather than the remote picture:
+// restart the operating system, lock the console, and block the local
+// keyboard and pointer while the viewer keeps injecting input. They are
+// modelled apart from InputEvent because they are edge-triggered commands,
+// not key chords, and every one is destructive or security-sensitive enough
+// to deserve its own permission bit and an explicit answer. Block input is a
+// state, so its request carries the wanted state and the answer carries the
+// state in effect after the call.
+inline constexpr size_t kMaxHostActionReason = 256;
+
+enum class HostAction : uint8_t {
+    Restart = 1,
+    LockScreen = 2,
+    BlockInput = 3,
+};
+
+enum class HostActionCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // the permission or the host's setting does not allow it
+    Unsupported = 2,  // this host cannot perform the action
+    Busy = 3,         // another viewer owns the shared desktop's control
+    Failed = 4,       // the platform call failed; the reason says why
+};
+
+struct HostControlRequest {
+    HostAction action = HostAction::Restart;
+    bool block_input = false;
+};
+
+struct HostControlResult {
+    HostAction action = HostAction::Restart;
+    bool block_input = false;
+    HostActionCode code = HostActionCode::Ok;
+    std::string reason;
+};
+
+// The makers reject an unknown action and a value that does not belong to it;
+// the parsers reject those cases plus trailing bytes. The result reason is
+// truncated on a UTF-8 boundary by the maker and rejected when malformed or
+// over-long by the parser.
+std::vector<uint8_t> make_host_action_request(const HostControlRequest& request);
+bool parse_host_action_request(const std::vector<uint8_t>& payload,
+                               HostControlRequest& request, std::string* error);
+std::vector<uint8_t> make_host_action_result(const HostControlResult& result);
+bool parse_host_action_result(const std::vector<uint8_t>& payload,
+                              HostControlResult& result, std::string* error);
 
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that
