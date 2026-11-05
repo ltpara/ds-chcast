@@ -3065,6 +3065,20 @@
      `flutter test` 与 Windows release 构建通过（C++ 为编译验证）。边界：
      真实 TCP 目标需双机验收；规则随会话结束销毁，不跨重连保留；媒体
      链路未改动。
+133. **P2 · DEV-21 OIDC 账号登录（2026-11-05 完成）**：Go 服务端新增
+     无第三方依赖的 OIDC 客户端（懒发现、state/nonce/PKCE S256、JWKS
+     RS256/PS256/ES256 验签与 iss/aud/azp/exp/nonce/sub 校验）；schema v6
+     新增按 issuer 隔离的 `oidc_identities` 链接表，`LoginOIDC` 支持已链接
+     账号与可选自动建号（随机密码、唯一用户名、仅已验证邮箱、首账号仍为
+     管理员、封禁拒绝），签发与密码登录相同的令牌。新增
+     `/v1/account/oidc` 状态、`begin`、浏览器 `callback` 与 `poll`
+     （202 等待/200 登录/401·404 错误码；待处理状态 10 分钟 TTL、512 上限、
+     state 单次使用，令牌不经浏览器 URL）接口与 `--oidc-*` 配置。查看器
+     登录框探测后显示 SSO 按钮，经原生 `ShellExecuteW` 打开系统浏览器并
+     每 2 秒轮询至完成/失败/5 分钟超时。`go test ./...`、`flutter analyze`、
+     574 项 `flutter test` 与 Windows release 构建通过（C++ 桥接为编译
+     验证）。边界：单 IdP、不做 RP 发起的登出、OIDC 绕过本地 TOTP、真实
+     IdP 与浏览器交互需实机验收；媒体链路未改动。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

@@ -370,7 +370,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | 已实现（2026-11-05）：协议 v41 的 `SessionMode` 增加 Terminal/Camera/PortForward 与 `kServerInfoControlOnly`；主机为控制型会话单独派发 relay，不建立采集/编码；查看器对端菜单可直接发起三种独立会话，详见同日小节 |
 | DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 已实现（2026-11-05）：协议 v42 的 `TerminalRequest` 增加 persist/attach 标志与 `service_id`，主机进程级注册表保留最多 100 个服务，空闲 1 小时回收并回放 1 MiB 输出；`terminal_persist=` 默认关闭，详见同日小节 |
 | DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 已实现（2026-11-05）：查看器引擎维护规则表，每条规则独立 `forward_id`、本地监听端口、目标与计数，最多 8 条并行；面板列出规则并可逐条停止，详见同日小节 |
-| DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 账号体系有密码/TOTP/短信/邮件/WebAuthn，没有 OIDC 联邦登录 |
+| DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 已实现（2026-11-05）：服务端完成授权码 + PKCE 的 OIDC 登录（JWKS 验签、按 issuer 隔离的身份链接、可选自动建号），查看器用系统浏览器完成认证并轮询取回与密码登录相同的会话，详见同日小节 |
 | DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | `InputKind` 只有 Mouse/Key（`protocol.h:319`），触摸板/手写笔按鼠标模拟 |
 | DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 只有 H.264/HEVC 的 NV12 4:2:0 硬件编码（`include/chast/encoder.h:42-44`）；受零拷贝约束，只能增加直接写 GPU 缓冲的硬件后端 |
 | DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 支持切换单个/全部显示器与多屏坐标映射（`frameToDesktop`），但没有按显示器开窗、跟随/光标缩放，也不能改主机显示分辨率（只有采集缩放百分比） |
@@ -542,6 +542,55 @@ service ID 一致性、Ok 携带服务 ID、错误结果禁止携带、HelloAck 
 
 边界：持久控制台的断线重连与空闲回收需双机验收；关闭 `terminal_persist`
 不追溯已分离的服务；持久 shell 以主机账户继续运行，默认不开启。
+
+### DEV-21 OIDC 账号登录（2026-11-05 完成）
+
+服务端不引入新依赖，实现标准授权码 + PKCE 的 OIDC 联邦登录；查看器用系统
+浏览器完成认证，令牌从不经过浏览器地址栏。
+
+- **服务端 OIDC 客户端**（`internal/oidc`）：懒发现
+  `issuer/.well-known/openid-configuration`（启动时不访问网络，IdP 不可用
+  不阻塞启动），校验 issuer 回显与 https（仅回环允许 http）；授权 URL 带
+  state、nonce、S256 PKCE；令牌交换用 Basic 认证并校验 ID Token
+  （RS256/PS256/ES256 JWKS 验签、iss/aud/azp、exp/nbf/iat ±60s、nonce、
+  sub）。
+- **账号存储**：schema v6 新增 `oidc_identities(issuer, subject, user_id)`，
+  subject 按 issuer 隔离；`LoginOIDC` 支持已链接账号登录与可选自动建号
+  （随机不可用密码、按 preferred_username/邮箱本地部分/`oidc-<hash>` 派生
+  用户名并在冲突时加 `-2…-50`、只接受已验证邮箱、首个账号仍为管理员），
+  封禁账号拒绝；签发与密码登录相同的访问/刷新令牌。
+- **HTTP 接口**：`GET /v1/account/oidc` 返回 `{enabled,name,auto_create}`
+  （未配置也回 200 false）；`POST begin` 返回
+  `auth_url/state/expires_in_ms`；浏览器回调
+  `GET /v1/account/oidc/callback` 完成交换并把会话暂存在内存（10 分钟 TTL、
+  512 上限、state 单次使用、`no-store`/`no-referrer`/CSP），渲染纯文本结果
+  页；`POST poll` 以 202 表示等待、200 返回登录响应、401/404 带
+  `account_banned`/`no_account`/`oidc_failed`/`oidc_expired` 错误码。令牌只
+  经轮询返回，不出现在浏览器 URL、历史或 Referer 中。
+- **服务端配置**：`--oidc-issuer/--oidc-client-id/--oidc-client-secret/
+  --oidc-redirect-url/--oidc-scopes/--oidc-name/--oidc-auto-create`，issuer、
+  client id、redirect 三项必须同时设置；client secret 可选（公共客户端 +
+  PKCE），仅存内存、不写日志。
+- **查看器**：`ServerApi.oidcInfo/oidcBegin/oidcPoll/loginOidc`；登录对话框
+  探测到 SSO 后显示“使用单点登录”或“单点登录：<提供方>”，点击经原生
+  `ShellExecuteW` 打开系统浏览器（仅 http/https），随后每 2 秒轮询直至
+  成功、终止错误或 5 分钟超时；临时网络错误继续重试。新增
+  `openExternalUrl` 桥接（C++ 侧校验长度与协议）。
+- **零拷贝**：只新增账号登录控制面，采集、编码、解码与渲染路径未改动。
+
+验证：`go build ./...`、`go vet ./...` 通过；`go test ./...` 全部通过
+（新增 `internal/oidc` 提供方用例、`internal/account` 链接/建号用例与 API
+端到端用例：begin→callback→poll 成功后令牌可用、state 单次使用、提供方
+拒绝、未知 state、未配置时 503/false）；`flutter analyze` 无问题；
+`flutter test` 574 项通过（新增 Dart 侧 info/begin/poll/完整登录/超时/
+浏览器打开失败用例）；Windows release 构建成功（含原生
+`openExternalUrl` 编译）。本机无真实 IdP，跨真实提供方登录与系统浏览器
+交互需实机验收；C++ 桥接为编译验证（Device Guard 阻止运行新生成的无签名
+二进制）。
+
+边界：一个服务器只接一个 IdP；不实现 RP 发起的登出（会话仍由现有访问/
+刷新令牌与封禁控制）；自动建号默认开启但只接受已验证邮箱；OIDC 登录绕过
+本地 TOTP（强认证由 IdP 负责）；内存中的待处理登录在服务端重启后丢失。
 
 ### DEV-20 多条端口转发规则并行（2026-11-05 完成）
 
