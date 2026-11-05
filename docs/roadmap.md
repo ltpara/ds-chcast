@@ -3124,6 +3124,19 @@
      `host-settings-test`、582 项 `flutter test`、`flutter analyze` 与
      Windows release 构建通过。边界：本机无 AV1 硬件，只做编译与单元
      验证；媒体链路保持零拷贝。
+137. **P3 · DEV-25 WebSocket 强制传输（2026-11-05 完成）**：复核确认主机
+     `CarrierServer` 与中继/共享载体已同时接受裸 TCP 与 WebSocket（RFC
+     6455 `/chast`、`chast-carrier.v1` 子协议），查看器 `auto` 也已按
+     UDP→TCP→WS 回退；缺的只是 RustDesk 的“Use WebSocket”主动选项。
+     `ServerSettings` 新增 `useWebSocket` 并持久化为 `server.json` 的
+     `use_websocket`，连接服务对话框加入开关；开启后会话向引擎传
+     `transport: 'ws'`，固定走 WS 载体、不再尝试 UDP/TCP，内层仍是端到端
+     QUIC，证书固定与权限语义不变；配置出站代理时不强制（代理已压到载体）。
+     主机文案统一为“弱网回退（TCP/WebSocket）”。验证：`flutter analyze`
+     无问题，`flutter test` 583 项通过（新增开关与持久化用例），Windows
+     release 构建通过；C++ 载体未改，`carrier_test` 覆盖 WS 握手与桥接。
+     边界：WS 载体不带 TLS，加密由内层 QUIC 提供；反代/CDN 需原样转发
+     `/chast` 并保留子协议，真实 CDN 场景仍由 ENV-12 验收。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

@@ -374,7 +374,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | 已实现（2026-11-05）：协议 v43 的 `InputEvent` 增加 Touch/Pen，主机用 Windows 触摸注入与合成笔注入（不可用时降级为鼠标拖动），查看器映射多触点、压感、倾斜与橡皮/桶形键，详见同日小节 |
 | DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 已实现 AV1（2026-11-05，仅硬件零拷贝）：协议 v45 增加 AV1 wire 3，主机 oneVPL 的 AV1→HEVC→AVC 与 FFmpeg `av1_nvenc`/`av1_amf`/`av1_qsv` 阶梯，查看器用原生 `av1` 解码器走 D3D11VA；VP8/VP9 没有 Windows 硬件编码器，I444 需要新增 GPU 色彩通道与 4:4:4 硬件解码，受零拷贝约束不实现，详见同日小节 |
 | DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 已实现（2026-11-05）：协议 v44 的 `SetDisplayFollow/DisplayFollowState` 让主机跟随远程光标或前台窗口自动切换输出；远程分辨率与光标缩放此前已具备；RustDesk 1.5.1 的“按显示器独立开窗”只存配置、无消费方，暂不按多窗口架构实现，详见同日小节 |
-| DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 有 TLS TCP 共享载体，没有 WebSocket 选项，无法直接挂在仅支持 WS 的反代/CDN 后 |
+| DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 已实现（2026-11-05）：主机/中继的载体端口本就同时接受裸 TCP 与 WebSocket，本轮补上查看器“使用 WebSocket”开关（`server.json` 的 `use_websocket`），开启后引擎固定走 WS 载体，详见同日小节 |
 | DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 主机设置只在本机/服务端管理；无“会话结束后锁定主机”选项 |
 | DEV-27 | P3 | RDP 快捷方式与便携模式 | `flutter/lib/common/widgets/peer_card.dart:735-769`、`src/server/portable_service.rs` | 无 RDP 快捷入口（可手工用端口转发替代）；只有安装器，没有便携服务模式 |
 
@@ -922,6 +922,35 @@ Windows 上有三家厂商的硬件编码器（oneVPL 2.x 的 AV1 VDEnc、NVENC
 验证，需在 Arc / Ada / RDNA3 等真机上验收画质、码率与 D3D11VA 解码；
 媒体链路未改变，主机纹理直接进入硬件编码器、查看器解码到 D3D11 纹理，
 全程保持零拷贝。
+
+### DEV-25 WebSocket 强制传输（2026-11-05 完成）
+
+载体的 WebSocket 服务端与自动回退此前已经具备：主机的 `CarrierServer`
+在 QUIC 端口 + 1 上按首字节区分裸 TCP 与 WebSocket 升级，中继/共享载体
+的 `UpgradeServer` 同样接受 `/chast` 的 RFC 6455 升级；查看器 `auto`
+策略按 UDP → TCP → WebSocket 依次尝试，中继地址也在与 UDP 相同的端口上
+提供 TCP/WS。真正的缺口是查看器没有 RustDesk 的“Use WebSocket”开关，
+无法在只允许 WebSocket 的反代/CDN 后主动跳过 UDP 与裸 TCP。
+
+- **设置**：`ServerSettings` 新增 `useWebSocket`，持久化到 `server.json`
+  的 `use_websocket`（非机密，与 `use_recordings` 同层）；连接服务对话框
+  新增“使用 WebSocket”开关，说明其用途是 WebSocket-only 反代或 CDN。
+- **连接**：会话页在开关打开时向引擎传 `transport: 'ws'`，引擎固定只建
+  一次 WebSocket 载体连接，不再尝试 UDP/TCP；载体内部仍是端到端 QUIC，
+  证书固定、令牌、审批与权限语义不变，浮层显示“WebSocket 回退”。
+  配置了出站代理时不强制 WS：此时隧道代理已把会话压到载体，引擎只有
+  环回端点，开关不适用。
+- **主机**：托盘与设置页的开关文案改为“弱网回退（TCP/WebSocket）”，
+  监听行为不变，仍是一个端口同时服务两种载体。
+
+验证：`flutter analyze` 无问题；`flutter test` 全量 583 项通过（新增
+连接服务对话框开关用例、`use_websocket` 持久化往返）；Windows release
+构建通过。C++ 只改了主机文案，载体实现未变，`carrier_test` 已覆盖
+WS 握手、子协议、分片/超长消息拒绝与桥接往返。
+
+边界：WebSocket 载体本身不带 TLS，加密由内层 QUIC 握手提供；若由反代/
+CDN 终止 TLS，需要把 `/chast` 原样转发并保留 `chast-carrier.v1`
+子协议。本机没有真实 CDN/反代环境，ENV-12 仍负责该场景的实机验收。
 
 ### 已核对但不算缺口的项
 
