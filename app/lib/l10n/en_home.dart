@@ -312,4 +312,12 @@ const Map<String, String> kEnglishHome = <String, String>{
   '使用单点登录': 'Sign in with single sign-on',
   '单点登录：{provider}': 'Single sign-on: {provider}',
   '请在浏览器中完成登录，然后返回这里。': 'Finish signing in in your browser, then return here.',
+  'RDP': 'RDP',
+  'RDP 设置': 'RDP settings',
+  '远程桌面端口': 'Remote desktop port',
+  '端口须为 1–65535': 'The port must be 1–65535',
+  '通过已登录的会话把本机的一个随机端口转发到主机的 127.0.0.1 端口，再用系统远程桌面连接。凭据由远程桌面自行询问，不会保存。':
+      'Forwards a random local port through the signed-in session to the host\'s '
+          '127.0.0.1 port, then opens the system RDP client. Credentials are '
+          'prompted by RDP and never stored.',
 };

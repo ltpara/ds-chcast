@@ -563,6 +563,17 @@ void test_machine_paths() {
     }
 }
 
+void test_portable_path() {
+    const std::string path = chast::portable_settings_path("C:\\Tools\\chast\\chast-host.exe");
+    check(!path.empty(), "portable mode finds a settings path");
+    check(path == "C:\\Tools\\chast\\chast-portable\\host.ini",
+          "portable settings sit beside the executable");
+    check(chast::portable_settings_path("").empty(),
+          "portable mode reports an unresolvable executable");
+    check(chast::portable_settings_path("chast-host.exe").empty(),
+          "portable mode needs a directory to place the settings in");
+}
+
 void test_identity_defaults() {
     chast::QuicServerConfig quic;
     check(quic.identity_scope == chast::IdentityScope::CurrentUser,
@@ -690,6 +701,7 @@ int main() {
     test_service_parsers();
     test_generated_tunnel_id();
     test_machine_paths();
+    test_portable_path();
     test_identity_defaults();
     test_audit_spool(dir);
     test_unicode_path(dir);

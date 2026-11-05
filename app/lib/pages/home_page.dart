@@ -720,6 +720,7 @@ class _HomePageState extends State<HomePage> {
     Device device, {
     bool fileTransferOnly = false,
     String sessionMode = 'desktop',
+    int rdpPort = 0,
   }) async {
     if (_opening) {
       return;
@@ -755,13 +756,85 @@ class _HomePageState extends State<HomePage> {
       target,
       fileTransferOnly: fileTransferOnly,
       sessionMode: sessionMode,
+      rdpPort: rdpPort,
     );
+  }
+
+  /// Asks for the host's RDP port, then opens a port-forward session that
+  /// launches the system RDP client once the viewer listener is up.
+  Future<void> _connectRdp(Device device) async {
+    final TextEditingController portController = TextEditingController(
+      text: '3389',
+    );
+    String? error;
+    final int? port = await showDialog<int>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setDialogState) {
+            return AlertDialog(
+              title: Text(tr('RDP 设置')),
+              content: SizedBox(
+                width: 360,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      tr(
+                        '通过已登录的会话把本机的一个随机端口转发到主机的 127.0.0.1 端口，再用系统远程桌面连接。凭据由远程桌面自行询问，不会保存。',
+                      ),
+                      style: const TextStyle(fontSize: 12, height: 1.4),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: portController,
+                      autofocus: true,
+                      keyboardType: TextInputType.number,
+                      decoration: InputDecoration(
+                        labelText: tr('远程桌面端口'),
+                        hintText: '3389',
+                        errorText: error,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: Text(tr('取消')),
+                ),
+                TextButton(
+                  onPressed: () {
+                    final int? value = int.tryParse(
+                      portController.text.trim(),
+                    );
+                    if (value == null || value < 1 || value > 65535) {
+                      setDialogState(() => error = tr('端口须为 1–65535'));
+                      return;
+                    }
+                    Navigator.of(dialogContext).pop(value);
+                  },
+                  child: Text(tr('连接')),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (port == null || !mounted) {
+      return;
+    }
+    await _connectDevice(device, sessionMode: 'port_forward', rdpPort: port);
   }
 
   Future<void> _open(
     ConnectTarget target, {
     bool fileTransferOnly = false,
     String sessionMode = 'desktop',
+    int rdpPort = 0,
   }) async {
     if (_opening) {
       return;
@@ -787,6 +860,7 @@ class _HomePageState extends State<HomePage> {
             identityStore: _identityStore,
             fileTransferOnly: fileTransferOnly,
             sessionMode: sessionMode,
+            rdpPort: rdpPort,
           );
         },
       ),
@@ -2449,6 +2523,7 @@ class _HomePageState extends State<HomePage> {
                             device,
                             sessionMode: 'port_forward',
                           ),
+                          onRdp: () => _connectRdp(device),
                           onRename: () => _renameDevice(device),
                           onSave: () => _promote(device),
                           onRemove: () => _removeRecent(device),
@@ -2898,6 +2973,7 @@ class _HomePageState extends State<HomePage> {
       onTerminal: () => _connectDevice(device, sessionMode: 'terminal'),
       onCamera: () => _connectDevice(device, sessionMode: 'camera'),
       onPortForward: () => _connectDevice(device, sessionMode: 'port_forward'),
+      onRdp: () => _connectRdp(device),
       onRename: () => _renameDevice(device),
       onWake: () => _wakeDevice(device),
       onLabels: device.viaServer ? () => _editLabels(device) : null,
@@ -4091,6 +4167,7 @@ class _DeviceCard extends StatelessWidget {
     required this.onTerminal,
     required this.onCamera,
     required this.onPortForward,
+    required this.onRdp,
     required this.onRename,
     required this.onWake,
     required this.onDelete,
@@ -4111,6 +4188,7 @@ class _DeviceCard extends StatelessWidget {
   final VoidCallback onTerminal;
   final VoidCallback onCamera;
   final VoidCallback onPortForward;
+  final VoidCallback onRdp;
   final VoidCallback onRename;
   final VoidCallback onWake;
   final VoidCallback onDelete;
@@ -4266,6 +4344,8 @@ class _DeviceCard extends StatelessWidget {
                       onCamera();
                     } else if (value == 'port-forward') {
                       onPortForward();
+                    } else if (value == 'rdp') {
+                      onRdp();
                     } else if (value == 'copy-id') {
                       unawaited(_copyId(context));
                     } else if (value == 'copy-server') {
@@ -4305,6 +4385,10 @@ class _DeviceCard extends StatelessWidget {
                         PopupMenuItem<String>(
                           value: 'port-forward',
                           child: Text(tr('端口转发')),
+                        ),
+                        PopupMenuItem<String>(
+                          value: 'rdp',
+                          child: Text(tr('RDP')),
                         ),
                         PopupMenuItem<String>(
                           value: 'copy-id',
@@ -4429,6 +4513,7 @@ class _RecentCard extends StatelessWidget {
     required this.onTerminal,
     required this.onCamera,
     required this.onPortForward,
+    required this.onRdp,
     required this.onRename,
     required this.onSave,
     required this.onRemove,
@@ -4441,6 +4526,7 @@ class _RecentCard extends StatelessWidget {
   final VoidCallback onTerminal;
   final VoidCallback onCamera;
   final VoidCallback onPortForward;
+  final VoidCallback onRdp;
   final VoidCallback onRename;
   final VoidCallback onSave;
   final VoidCallback onRemove;
@@ -4462,6 +4548,7 @@ class _RecentCard extends StatelessWidget {
         PopupMenuItem<String>(value: 'terminal', child: Text(tr('远程终端'))),
         PopupMenuItem<String>(value: 'camera', child: Text(tr('主机摄像头'))),
         PopupMenuItem<String>(value: 'port-forward', child: Text(tr('端口转发'))),
+        PopupMenuItem<String>(value: 'rdp', child: Text(tr('RDP'))),
         PopupMenuItem<String>(value: 'copy-id', child: Text(tr('复制 ID'))),
         PopupMenuItem<String>(value: 'rename', child: Text(tr('重命名'))),
         PopupMenuItem<String>(value: 'save', child: Text(tr('保存到我的设备'))),
@@ -4479,6 +4566,8 @@ class _RecentCard extends StatelessWidget {
       onCamera();
     } else if (value == 'port-forward') {
       onPortForward();
+    } else if (value == 'rdp') {
+      onRdp();
     } else if (value == 'copy-id') {
       await _copyDeviceId(context, device.id);
     } else if (value == 'rename') {

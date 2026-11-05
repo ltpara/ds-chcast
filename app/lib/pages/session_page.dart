@@ -15,6 +15,7 @@ import '../stream_prefs.dart';
 import '../target.dart';
 import '../theme.dart';
 import '../reconnect_policy.dart';
+import '../rdp.dart';
 import '../remote_key_sequence.dart';
 import '../remote_pointer.dart';
 import '../trust_store.dart';
@@ -40,6 +41,7 @@ class SessionPage extends StatefulWidget {
     this.identityStore,
     this.fileTransferOnly = false,
     this.sessionMode = 'desktop',
+    this.rdpPort = 0,
   });
 
   final ConnectTarget target;
@@ -55,6 +57,11 @@ class SessionPage extends StatefulWidget {
   /// modes carry no screen stream and show their own panel instead of the
   /// remote-screen stack.
   final String sessionMode;
+
+  /// Positive when this page is the RDP shortcut: it runs a port-forward
+  /// session and, once the viewer listener is up, forwards the host's
+  /// 127.0.0.1:[rdpPort] and opens the system RDP client against it.
+  final int rdpPort;
 
   /// The signed-in account, if any. It is used to report a finished remote
   /// session and, when enabled, to upload finished recordings.
@@ -135,6 +142,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // The standalone port-forward session raises its setup dialog once when the
   // session turns live; closing it leaves the status card behind.
   bool _portForwardPrompted = false;
+  // RDP shortcut: the forward starts once, then the client opens as soon as
+  // the engine publishes the listener's bound port.
+  int _rdpRuleId = 0;
+  bool _rdpStarting = false;
+  bool _rdpLaunched = false;
   // Host shared-folder browser. Modeless like chat; it never takes the
   // keyboard, so remote input keeps flowing while it is open.
   bool _fileBrowserOpen = false;
@@ -3394,12 +3406,102 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         !_portForwardPrompted &&
         status.acceptsPortForward) {
       _portForwardPrompted = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && !_status.isOver) {
-          unawaited(_openPortForwardDialog());
-        }
-      });
+      if (widget.rdpPort > 0) {
+        unawaited(_startRdpSession());
+      } else {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && !_status.isOver) {
+            unawaited(_openPortForwardDialog());
+          }
+        });
+      }
     }
+  }
+
+  /// Starts the RDP shortcut's single forward rule, then waits for the engine
+  /// to publish the bound listener port before opening the RDP client.
+  Future<void> _startRdpSession() async {
+    if (_rdpStarting || _rdpRuleId != 0 || _rdpLaunched) {
+      return;
+    }
+    _rdpStarting = true;
+    try {
+      final int ruleId = await ViewerBridge.startPortForward(
+        localPort: 0,
+        remoteHost: '127.0.0.1',
+        remotePort: widget.rdpPort,
+      );
+      if (!mounted) {
+        return;
+      }
+      if (ruleId == 0) {
+        _showRdpMessage(tr('无法开始 RDP 转发：主机未开放端口转发'));
+        return;
+      }
+      _rdpRuleId = ruleId;
+      for (int attempt = 0; attempt < 50 && mounted; ++attempt) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        if (!mounted) {
+          return;
+        }
+        for (final ViewerPortForwardRule rule in _portForwardRules.value) {
+          if (rule.ruleId == ruleId &&
+              rule.active &&
+              rule.localPort != 0) {
+            _rdpLaunched = true;
+            await _launchRdpClient(rule.localPort);
+            return;
+          }
+        }
+        if (_status.isOver) {
+          break;
+        }
+      }
+      if (mounted) {
+        _showRdpMessage(tr('RDP 转发未就绪：请确认主机允许端口转发'));
+      }
+    } on PlatformException catch (failure) {
+      if (mounted) {
+        _showRdpMessage(
+          failure.message ?? tr('RDP 转发未就绪：请确认主机允许端口转发'),
+        );
+      }
+    } on MissingPluginException {
+      // The native viewer is going away; _start reports the real error.
+    } finally {
+      _rdpStarting = false;
+    }
+  }
+
+  Future<void> _launchRdpClient(int localPort) async {
+    try {
+      await launchRdpClient(localPort);
+      if (!mounted) {
+        return;
+      }
+      _showRdpMessage(
+        tr('已启动远程桌面：127.0.0.1:{port}', <String, Object?>{
+          'port': localPort,
+        }),
+      );
+    } on ProcessException catch (failure) {
+      if (mounted) {
+        _showRdpMessage(
+          tr('无法启动远程桌面：{error}', <String, Object?>{
+            'error': failure.message,
+          }),
+        );
+      }
+    }
+  }
+
+  void _showRdpMessage(String text) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text), duration: const Duration(seconds: 4)),
+    );
   }
 
   void _toggleTerminal() {

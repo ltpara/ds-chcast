@@ -159,6 +159,9 @@ struct HostApp {
     std::wstring tray_tip;
 
     std::string config_path;
+    // Portable mode: settings live beside the executable and the host never
+    // writes the login autostart entry, so the folder stays self-contained.
+    bool portable = false;
     HostSettings settings;
     // The listener's microphone gate is fixed at creation; the UI uses this to
     // tell an operator whether enabling it applies now or next session.
@@ -1156,6 +1159,11 @@ void process_tunnel_events() {
 void load_settings() {
     const HostSettingsLoad loaded = load_host_settings(g_app->config_path);
     g_app->settings = loaded.settings;
+    if (g_app->portable) {
+        // A copied folder must not keep a login entry pointing at whatever
+        // path it had on the machine that created it.
+        g_app->settings.autostart = false;
+    }
     g_app->startup_warning = loaded.warning;
     g_app->startup_created = !loaded.existed || g_app->settings.access_token.empty() ||
                              g_app->settings.tunnel_id.empty() ||
@@ -1285,6 +1293,9 @@ void create_controls() {
     g_app->clipboard_check = check_row(tr(L"同步剪贴板"), 380 + shift, kClipboardCheck);
     g_app->audio_check = check_row(tr(L"共享系统声音"), 380 + shift, kAudioCheck);
     g_app->autostart_check = check_row(tr(L"开机自动启动"), 380 + shift, kAutostartCheck);
+    if (g_app->portable) {
+        EnableWindow(g_app->autostart_check, FALSE);
+    }
     left = 24;
     g_app->microphone_check = check_row(tr(L"接收查看者麦克风"), 408 + shift, kMicrophoneCheck);
     g_app->privacy_check = check_row(tr(L"允许隐私模式"), 408 + shift, kPrivacyModeCheck);
@@ -2910,8 +2921,10 @@ void show_tray_menu() {
                 kLockAfterEndCheck, tr(L"会话结束后锁定本机"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
                 tr(L"弱网回退（TCP/WebSocket）"));
-    AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
-                tr(L"开机自动启动"));
+    AppendMenuW(menu,
+                MF_STRING | (g_app->portable ? MF_GRAYED
+                                             : (g_app->settings.autostart ? MF_CHECKED : 0)),
+                kAutostartCheck, tr(L"开机自动启动"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kSecurityButton, tr(L"安全设置…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -3576,11 +3589,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::string config_path = host_settings_path();
+    bool config_overridden = false;
     bool start_hidden = false;
+    bool portable = false;
     for (int i = 1; argv != nullptr && i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--config" && i + 1 < argc) {
             config_path = narrow(absolute_path(argv[++i]));
+            config_overridden = true;
+        } else if (arg == L"--portable") {
+            portable = true;
         } else if (arg == L"--tray") {
             start_hidden = true;
         } else if (arg == L"--firewall" && i + 1 < argc) {
@@ -3607,6 +3625,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             MessageBoxW(nullptr,
                         tr(L"chast 主机\n\n"
                         L"--config <路径>     使用其他设置文件\n"
+                        L"--portable          便携模式：设置保存在程序目录下，不写开机启动\n"
                         L"--tray              启动后隐藏窗口\n"
                         L"--autostart on|off  设置开机启动\n"
                         L"--firewall <端口> [隧道端口]  添加防火墙规则（含局域网发现 21129/UDP，需要管理员）"),
@@ -3616,6 +3635,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
     LocalFree(argv);
+    if (portable) {
+        g_app->portable = true;
+        if (!config_overridden) {
+            config_path = chast::portable_settings_path(
+                narrow(chast::host::executable_path()));
+        }
+    }
     if (config_path.empty()) {
         MessageBoxW(nullptr, tr(L"无法确定设置文件的位置。"), window_title(), MB_ICONERROR | MB_OK);
         return 1;
@@ -3698,7 +3724,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             append_log_line(tr(L"开机启动：") + widen(error));
         }
     }
-
     start_server();
     if (g_app->server) {
         const HostStatus status = g_app->server->status();

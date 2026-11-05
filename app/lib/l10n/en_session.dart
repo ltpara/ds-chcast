@@ -578,4 +578,10 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The request could not be queued: check the host permissions and session state',
   '正在等待主机确认…': 'Waiting for the host to confirm…',
   '修改未生效：{reason}': 'The change did not take effect: {reason}',
+  '无法开始 RDP 转发：主机未开放端口转发':
+      'Could not start the RDP forward: the host has not enabled port forwarding',
+  'RDP 转发未就绪：请确认主机允许端口转发':
+      'The RDP forward is not ready: check that the host allows port forwarding',
+  '已启动远程桌面：127.0.0.1:{port}': 'Opened Remote Desktop at 127.0.0.1:{port}',
+  '无法启动远程桌面：{error}': 'Could not open Remote Desktop: {error}',
 };

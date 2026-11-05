@@ -954,6 +954,17 @@ std::string machine_settings_path() {
     return dir.empty() ? std::string() : dir + "\\host.ini";
 }
 
+std::string portable_settings_path(const std::string& executable_path) {
+    if (executable_path.empty()) {
+        return {};
+    }
+    const std::filesystem::path exe = native_path(executable_path);
+    if (!exe.has_parent_path()) {
+        return {};
+    }
+    return (exe.parent_path() / L"chast-portable" / L"host.ini").string();
+}
+
 std::string generate_access_token(size_t length) {
     static constexpr char kAlphabet[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     constexpr uint32_t kAlphabetSize = sizeof(kAlphabet) - 1;

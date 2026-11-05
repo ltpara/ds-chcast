@@ -239,6 +239,11 @@ std::string host_settings_path();
 std::string machine_settings_directory();
 std::string machine_settings_path();
 
+// Portable mode keeps settings beside the executable, so a copied folder
+// carries its own identity and never inherits the installed machine's.
+// `executable_path` is the module file name; empty when it cannot be resolved.
+std::string portable_settings_path(const std::string& executable_path);
+
 // 8 characters from an alphabet without look-alikes (no 0/O/1/I), so a token
 // read out loud or typed from a screen cannot be mistyped as another one.
 std::string generate_access_token(size_t length = 8);

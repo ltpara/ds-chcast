@@ -4299,6 +4299,72 @@ void main() {
     await tester.pumpWidget(const SizedBox());
   });
 
+  testWidgets('the RDP entry asks for the host port before connecting', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final DateTime now = DateTime.now();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          deviceStore: _MemoryDevices(<Device>[
+            Device(id: '10.0.0.9:4433', addedAt: now, lastUsed: now),
+          ]),
+          serverStore: _MemoryServers(const ServerSettings()),
+          identityStore: _MemoryIdentity(),
+          trustStore: _MemoryTrust(<String, String>{}),
+          accountStore: _MemoryAccount(),
+          lookupBatch: (ServerSettings server, List<String> hostIds) async =>
+              const BatchLookupResult(hosts: <String, HostInfo>{}),
+        ),
+      ),
+    );
+    for (int i = 0; i < 4; ++i) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+
+    final Finder card = find.byKey(const Key('recent-direct|10.0.0.9:4433'));
+    expect(card, findsOneWidget);
+    await tester.tap(card, buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    expect(find.text('RDP'), findsOneWidget);
+
+    await tester.tap(find.text('RDP'));
+    await tester.pumpAndSettle();
+    expect(find.text('RDP 设置'), findsOneWidget);
+
+    final Finder portField = find.descendant(
+      of: find.byType(AlertDialog),
+      matching: find.byType(TextField),
+    );
+    expect(portField, findsOneWidget);
+    expect(tester.widget<TextField>(portField).controller?.text, '3389');
+    await tester.enterText(portField, '70000');
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.text('连接'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('端口须为 1–65535'), findsOneWidget);
+
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.text('取消'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('RDP 设置'), findsNothing);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('clearing the recent list asks first', (
     WidgetTester tester,
   ) async {
