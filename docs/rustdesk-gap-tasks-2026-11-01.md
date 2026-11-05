@@ -375,7 +375,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 已实现 AV1（2026-11-05，仅硬件零拷贝）：协议 v45 增加 AV1 wire 3，主机 oneVPL 的 AV1→HEVC→AVC 与 FFmpeg `av1_nvenc`/`av1_amf`/`av1_qsv` 阶梯，查看器用原生 `av1` 解码器走 D3D11VA；VP8/VP9 没有 Windows 硬件编码器，I444 需要新增 GPU 色彩通道与 4:4:4 硬件解码，受零拷贝约束不实现，详见同日小节 |
 | DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 已实现（2026-11-05）：协议 v44 的 `SetDisplayFollow/DisplayFollowState` 让主机跟随远程光标或前台窗口自动切换输出；远程分辨率与光标缩放此前已具备；RustDesk 1.5.1 的“按显示器独立开窗”只存配置、无消费方，暂不按多窗口架构实现，详见同日小节 |
 | DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 已实现（2026-11-05）：主机/中继的载体端口本就同时接受裸 TCP 与 WebSocket，本轮补上查看器“使用 WebSocket”开关（`server.json` 的 `use_websocket`），开启后引擎固定走 WS 载体，详见同日小节 |
-| DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 主机设置只在本机/服务端管理；无“会话结束后锁定主机”选项 |
+| DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 已实现（2026-11-05）：协议 v46 的 `RemoteConfigRequest/State` 在会话内读取并修改主机暴露的 14 项策略开关，权限位 0x8000 由 `allow_remote_config` 控制；`lock_after_session_end` 在会话收尾时锁定主机，详见同日小节 |
 | DEV-27 | P3 | RDP 快捷方式与便携模式 | `flutter/lib/common/widgets/peer_card.dart:735-769`、`src/server/portable_service.rs` | 无 RDP 快捷入口（可手工用端口转发替代）；只有安装器，没有便携服务模式 |
 
 ### 排期建议
@@ -951,6 +951,41 @@ WS 握手、子协议、分片/超长消息拒绝与桥接往返。
 边界：WebSocket 载体本身不带 TLS，加密由内层 QUIC 握手提供；若由反代/
 CDN 终止 TLS，需要把 `/chast` 原样转发并保留 `chast-carrier.v1`
 子协议。本机没有真实 CDN/反代环境，ENV-12 仍负责该场景的实机验收。
+
+### DEV-26 远程配置修改与会话结束后锁定（2026-11-05 完成）
+
+RustDesk 的“远程配置”允许已连接的查看者读取并修改主机暴露的策略开关，
+`lock_after_session_end` 则在会话结束时锁定主机。chast 此前只有本机托盘
+与安全页能改这些开关，查看器既读不到也改不了，也没有结束即锁定选项。
+
+- **协议（v46）**：新增控制消息 `RemoteConfigRequest`(65) /
+  `RemoteConfigState`(66)。请求携带 `keys` 与 `values` 两个 u32 位图：
+  `keys = 0` 是读取，任一位表示写入；`values` 必须是 `keys` 的子集。
+  应答携带结果码（Ok/Denied/Unsupported/Busy/Failed）、错误原因与仅 Ok
+  才出现的开关快照；非 Ok 携带快照会被判为格式错误。共 14 项开关，
+  `kRemoteConfigAll = 0x3FFF` 恰好用满 32 位中的 14 位。
+- **权限**：新增 `kPermissionRemoteConfig = 0x8000`（最后一个空闲位；
+  0x0040 属于 HelloAck 合并布局标记，仍保留不用）。主机仅在
+  `allow_remote_config` 打开时把该位放入 HelloAck，查看器据此启停工具栏
+  的“修改主机设置”按钮。
+- **主机**：`handle_remote_config_requests` 校验位图、软件模拟开关与
+  当前策略，写入沿用本机设置的同一条持久化路径；`allow_permission_change`
+  打开时改动立即生效（含在线撤权），多查看者共享注册表快照。
+  `lock_after_session_end` 在会话收尾时调用与托盘一致的锁定流程。
+- **查看器**：引擎新增 `RequestRemoteConfig(keys, values)`（最新请求覆盖
+  pending 槽）与状态字段（supported/flags/code/error/updates）；桥接与
+  Dart 模型同步暴露；工具栏按钮打开设置对话框，先发一次读取，收到应答
+  后展示 14 项开关，保存时只发送相对基线的差异位并等待主机 Ok 确认，
+  被拒绝时保留编辑并显示原因。
+
+验证：C++ Release 构建通过；`protocol_test` 新增 17 项位图/应答编解码
+用例并通过；`host-settings-test` 覆盖新开关的往返与默认值并通过；
+`chast-viewer-probe` 编译通过；`flutter analyze` 无问题；`flutter test`
+全量 584 项通过（新增工具栏授权跟随用例）；Windows release 构建通过。
+
+边界：本机单机验证，没有第二台真实主机做端到端远程配置验收；开关
+语义仍以 `REMOTE_CONFIG` 暴露的范围为准，未暴露的策略（如安装、网络
+适配器）不在远程修改之列。
 
 ### 已核对但不算缺口的项
 

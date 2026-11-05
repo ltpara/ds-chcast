@@ -3137,6 +3137,19 @@
      release 构建通过；C++ 载体未改，`carrier_test` 覆盖 WS 握手与桥接。
      边界：WS 载体不带 TLS，加密由内层 QUIC 提供；反代/CDN 需原样转发
      `/chast` 并保留子协议，真实 CDN 场景仍由 ENV-12 验收。
+138. **P3 · DEV-26 远程配置修改与会话结束后锁定（2026-11-05 完成）**：
+     协议 v46 新增 `RemoteConfigRequest/State`，查看者在会话内读取并修改
+     主机暴露的 14 项策略开关（keys 为 0 是读取、任一位是写入、values
+     必须是 keys 子集），应答仅 Ok 携带快照；新增权限位 0x8000
+     （`kPermissionRemoteConfig`）由 `allow_remote_config` 控制，0x0040
+     因是 HelloAck 合并布局标记继续保留。主机侧改动沿用本机设置的持久化
+     路径，`allow_permission_change` 打开时立即生效（含在线撤权），多查看者
+     共享注册表；`lock_after_session_end` 在会话收尾时锁定主机。查看器
+     工具栏新增“修改主机设置”，先读取再以差异位保存，被拒绝时保留编辑并
+     显示原因。验证：C++ Release 构建、`protocol_test`（新增 17 项位图/
+     应答用例）、`host-settings-test`、`chast-viewer-probe` 编译、
+     `flutter analyze`、584 项 `flutter test` 与 Windows release 构建通过。
+     边界：单机验证，无第二台真实主机做端到端验收。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
