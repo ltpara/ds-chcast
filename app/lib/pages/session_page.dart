@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_gpu_texture_renderer/flutter_gpu_texture_renderer.dart';
@@ -15,6 +16,7 @@ import '../target.dart';
 import '../theme.dart';
 import '../reconnect_policy.dart';
 import '../remote_key_sequence.dart';
+import '../remote_pointer.dart';
 import '../trust_store.dart';
 import '../tunnel_agent.dart';
 import '../view_prefs.dart';
@@ -175,6 +177,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   double _wheelX = 0;
   int _heldButtons = 0;
   final LinkedHashSet<int> _heldKeys = LinkedHashSet<int>();
+  // Touch contacts on the host, keyed by the pointer that owns each slot.
+  final RemoteContactTracker _contacts = RemoteContactTracker();
+  // The pointer currently drawing with the pen, or null when the pen is up.
+  int? _penPointer;
   ViewFit _fit = ViewFit.adaptive;
   // What the next connection asks the server for. Kept across reconnects so
   // "重新连接" returns to the same output; kViewerDisplayAuto leaves the
@@ -2992,6 +2998,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _wheelY = 0;
       _heldButtons = 0;
       _heldKeys.clear();
+      _contacts.clear();
+      _penPointer = null;
       _chatEntries.clear();
       _chatOpen = false;
       _chatTyping = false;
@@ -3185,6 +3193,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       }
     }
     _heldButtons = 0;
+    _cancelRemotePointers();
     // Even if an Up above was lost, or the host saw a press this page never
     // recorded, this lifts whatever it still holds.
     unawaited(_guardSend(ViewerBridge.releaseInput()));
@@ -3612,6 +3621,89 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     );
   }
 
+  void _sendTouch(
+    int action,
+    int contact, {
+    int x = 0,
+    int y = 0,
+    int pressure = 0,
+  }) {
+    unawaited(
+      _guardSend(
+        ViewerBridge.sendTouch(
+          action: action,
+          contact: contact,
+          x: x,
+          y: y,
+          pressure: pressure,
+          modifiers: _inputState(),
+        ),
+      ),
+    );
+  }
+
+  void _sendPen(
+    int action, {
+    int x = 0,
+    int y = 0,
+    int pressure = 0,
+    int flags = 0,
+    int tiltX = 0,
+    int tiltY = 0,
+  }) {
+    unawaited(
+      _guardSend(
+        ViewerBridge.sendPen(
+          action: action,
+          x: x,
+          y: y,
+          pressure: pressure,
+          flags: flags,
+          tiltX: tiltX,
+          tiltY: tiltY,
+          modifiers: _inputState(),
+        ),
+      ),
+    );
+  }
+
+  /// Lifts every touch contact and the pen the host may still hold. The
+  /// subsequent [ViewerBridge.releaseInput] repeats this host-side, but the
+  /// tracker must be emptied here so a later gesture starts with clean slots.
+  void _cancelRemotePointers() {
+    if (_contacts.contacts.isEmpty && _penPointer == null) {
+      return;
+    }
+    final int modifiers = _inputState();
+    for (final int contact in _contacts.contacts.toList()) {
+      unawaited(
+        _guardSend(
+          ViewerBridge.sendTouch(
+            action: ViewerTouchAction.cancel,
+            contact: contact,
+            x: 0,
+            y: 0,
+            modifiers: modifiers,
+          ),
+        ),
+      );
+    }
+    _contacts.clear();
+    if (_penPointer != null) {
+      _penPointer = null;
+      unawaited(
+        _guardSend(
+          ViewerBridge.sendPen(
+            action: ViewerTouchAction.cancel,
+            x: 0,
+            y: 0,
+            modifiers: modifiers,
+          ),
+        ),
+      );
+    }
+  }
+
   Future<void> _sendKey(int usage, bool down) {
     return _guardSend(
       ViewerBridge.sendKey(usage: usage, down: down, modifiers: _inputState()),
@@ -3766,6 +3858,108 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
   }
 
+  void _onDevicePointer(PointerEvent event, Offset frame) {
+    final (int x, int y) = _desktopPoint(frame);
+    if (event.kind == PointerDeviceKind.touch) {
+      _handleTouchPointer(event, x, y);
+    } else {
+      _handlePenPointer(event, x, y);
+    }
+  }
+
+  void _onDeviceCancel(PointerEvent event, Offset frame) {
+    final (int x, int y) = _desktopPoint(frame);
+    if (event.kind == PointerDeviceKind.touch) {
+      _handleTouchPointer(event, x, y);
+    } else {
+      _handlePenPointer(event, x, y);
+    }
+  }
+
+  void _handleTouchPointer(PointerEvent event, int x, int y) {
+    final int pressure = windowsPointerPressure(
+      event.pressure,
+      event.pressureMin,
+      event.pressureMax,
+    );
+    if (event is PointerDownEvent) {
+      final int? contact = _contacts.acquire(event.pointer);
+      if (contact != null) {
+        _sendTouch(
+          ViewerTouchAction.down,
+          contact,
+          x: x,
+          y: y,
+          pressure: pressure,
+        );
+      }
+      return;
+    }
+    if (event is PointerMoveEvent) {
+      final int? contact = _contacts.slotFor(event.pointer);
+      if (contact != null) {
+        _sendTouch(
+          ViewerTouchAction.move,
+          contact,
+          x: x,
+          y: y,
+          pressure: pressure,
+        );
+      }
+      return;
+    }
+    final int? contact = _contacts.release(event.pointer);
+    if (contact == null) {
+      return;
+    }
+    _sendTouch(
+      event is PointerCancelEvent
+          ? ViewerTouchAction.cancel
+          : ViewerTouchAction.up,
+      contact,
+      x: x,
+      y: y,
+      pressure: pressure,
+    );
+  }
+
+  void _handlePenPointer(PointerEvent event, int x, int y) {
+    final int pressure = windowsPointerPressure(
+      event.pressure,
+      event.pressureMin,
+      event.pressureMax,
+    );
+    final int flags = windowsPenFlags(event.kind, event.buttons);
+    final (int tiltX, int tiltY) = windowsPenTilt(event.tilt, event.orientation);
+    void send(int action) => _sendPen(
+      action,
+      x: x,
+      y: y,
+      pressure: pressure,
+      flags: flags,
+      tiltX: tiltX,
+      tiltY: tiltY,
+    );
+    if (event is PointerDownEvent) {
+      _penPointer = event.pointer;
+      send(ViewerTouchAction.down);
+      return;
+    }
+    if (_penPointer != event.pointer) {
+      return;
+    }
+    if (event is PointerMoveEvent) {
+      send(ViewerTouchAction.move);
+      return;
+    }
+    _penPointer = null;
+    send(
+      event is PointerCancelEvent
+          ? ViewerTouchAction.cancel
+          : ViewerTouchAction.up,
+    );
+  }
+
   /// Path selected by the embedded agent, empty for a direct connection that
   /// does not use the connection service.
   String get _tunnelPath {
@@ -3891,6 +4085,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                       onMove: _inputActive ? _onPointerMove : null,
                       onButton: _inputActive ? _onPointerButton : null,
                       onScroll: _inputActive ? _onPointerScroll : null,
+                      onDevicePointer: _inputActive ? _onDevicePointer : null,
+                      onDeviceCancel: _inputActive ? _onDeviceCancel : null,
                       onFocusRequested: _focus.requestFocus,
                     ),
                   )

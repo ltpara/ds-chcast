@@ -14,6 +14,9 @@ enum ViewFit { adaptive, original }
 typedef FramePointerHandler = void Function(Offset position, int buttons);
 typedef FrameButtonHandler = void Function(Offset position, int button, bool down);
 typedef FrameScrollHandler = void Function(Offset position, Offset delta);
+/// Touch and stylus events, which carry pressure and tilt the mouse path does
+/// not model.
+typedef FrameDeviceHandler = void Function(PointerEvent event, Offset position);
 
 const int _mouseButtonMask = ViewerMouse.left |
     ViewerMouse.right |
@@ -66,6 +69,8 @@ class RemoteView extends StatefulWidget {
     this.onMove,
     this.onButton,
     this.onScroll,
+    this.onDevicePointer,
+    this.onDeviceCancel,
     this.onFocusRequested,
   });
 
@@ -101,6 +106,12 @@ class RemoteView extends StatefulWidget {
   final FramePointerHandler? onMove;
   final FrameButtonHandler? onButton;
   final FrameScrollHandler? onScroll;
+
+  /// Receives every touch or stylus down/move/up; [onDeviceCancel] receives a
+  /// cancelled contact. Hover events are not forwarded because a floating pen
+  /// has no contact to inject.
+  final FrameDeviceHandler? onDevicePointer;
+  final FrameDeviceHandler? onDeviceCancel;
   final VoidCallback? onFocusRequested;
 
   @override
@@ -200,6 +211,12 @@ class _RemoteViewState extends State<RemoteView> {
     }
   }
 
+  bool _isDevicePointer(PointerEvent event) {
+    return event.kind == PointerDeviceKind.touch ||
+        event.kind == PointerDeviceKind.stylus ||
+        event.kind == PointerDeviceKind.invertedStylus;
+  }
+
   Widget _layer(Size box) {
     _reportScale(box);
     final Widget texture = Texture(
@@ -216,22 +233,48 @@ class _RemoteViewState extends State<RemoteView> {
         behavior: HitTestBehavior.opaque,
         onPointerDown: (PointerDownEvent event) {
           widget.onFocusRequested?.call();
-          _syncButtons(event.buttons, _toFrame(event.localPosition, box));
+          final Offset position = _toFrame(event.localPosition, box);
+          if (_isDevicePointer(event)) {
+            widget.onDevicePointer?.call(event, position);
+            return;
+          }
+          _syncButtons(event.buttons, position);
         },
-        onPointerUp: (PointerUpEvent event) =>
-            _syncButtons(event.buttons, _toFrame(event.localPosition, box)),
+        onPointerUp: (PointerUpEvent event) {
+          final Offset position = _toFrame(event.localPosition, box);
+          if (_isDevicePointer(event)) {
+            widget.onDevicePointer?.call(event, position);
+            return;
+          }
+          _syncButtons(event.buttons, position);
+        },
         onPointerMove: (PointerMoveEvent event) {
           final Offset position = _toFrame(event.localPosition, box);
+          if (_isDevicePointer(event)) {
+            widget.onDevicePointer?.call(event, position);
+            return;
+          }
           _syncButtons(event.buttons, position);
           widget.onMove?.call(position, event.buttons);
         },
         onPointerHover: (PointerHoverEvent event) {
+          // A hovering stylus has no contact to inject; only the mouse moves
+          // the host pointer without a button.
+          if (_isDevicePointer(event)) {
+            return;
+          }
           final Offset position = _toFrame(event.localPosition, box);
           _syncButtons(event.buttons, position);
           widget.onHover?.call(position, event.buttons);
         },
-        onPointerCancel: (PointerCancelEvent event) =>
-            _syncButtons(0, _toFrame(event.localPosition, box)),
+        onPointerCancel: (PointerCancelEvent event) {
+          final Offset position = _toFrame(event.localPosition, box);
+          if (_isDevicePointer(event)) {
+            widget.onDeviceCancel?.call(event, position);
+            return;
+          }
+          _syncButtons(0, position);
+        },
         onPointerSignal: (PointerSignalEvent event) {
           if (event is PointerScrollEvent) {
             widget.onScroll?.call(_toFrame(event.localPosition, box), event.scrollDelta);

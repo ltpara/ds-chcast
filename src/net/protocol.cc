@@ -1277,17 +1277,58 @@ bool parse_latency_reply(const std::vector<uint8_t>& payload, uint64_t& client_u
 }
 
 std::vector<uint8_t> make_input_event(const InputEvent& event) {
-    std::vector<uint8_t> payload(16);
+    std::vector<uint8_t> payload(24);
     uint8_t* cursor = payload.data();
+    uint8_t action = 0;
+    uint16_t buttons = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint16_t hid_usage = 0;
+    uint16_t pressure = 0;
+    uint8_t contact = 0;
+    uint8_t flags = 0;
+    int16_t tilt_x = 0;
+    int16_t tilt_y = 0;
+    switch (event.kind) {
+        case InputKind::Mouse:
+            action = static_cast<uint8_t>(event.mouse.action);
+            buttons = event.mouse.buttons;
+            x = static_cast<uint32_t>(event.mouse.x);
+            y = static_cast<uint32_t>(event.mouse.y);
+            break;
+        case InputKind::Key:
+            action = static_cast<uint8_t>(event.key.action);
+            hid_usage = event.key.hid_usage;
+            break;
+        case InputKind::Touch:
+            action = static_cast<uint8_t>(event.touch.action);
+            contact = event.touch.contact;
+            x = static_cast<uint32_t>(event.touch.x);
+            y = static_cast<uint32_t>(event.touch.y);
+            pressure = event.touch.pressure;
+            break;
+        case InputKind::Pen:
+            action = static_cast<uint8_t>(event.pen.action);
+            x = static_cast<uint32_t>(event.pen.x);
+            y = static_cast<uint32_t>(event.pen.y);
+            pressure = event.pen.pressure;
+            flags = event.pen.flags;
+            tilt_x = event.pen.tilt_x;
+            tilt_y = event.pen.tilt_y;
+            break;
+    }
     put_u8(cursor, static_cast<uint8_t>(event.kind));
-    const bool mouse = event.kind == InputKind::Mouse;
-    put_u8(cursor, mouse ? static_cast<uint8_t>(event.mouse.action)
-                         : static_cast<uint8_t>(event.key.action));
-    put_u16(cursor, mouse ? event.mouse.buttons : 0);
-    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.x : 0));
-    put_u32(cursor, static_cast<uint32_t>(mouse ? event.mouse.y : 0));
-    put_u16(cursor, mouse ? 0 : event.key.hid_usage);
+    put_u8(cursor, action);
+    put_u16(cursor, buttons);
+    put_u32(cursor, x);
+    put_u32(cursor, y);
+    put_u16(cursor, hid_usage);
     put_u16(cursor, static_cast<uint16_t>(event.modifiers & kInputStateMask));
+    put_u16(cursor, pressure);
+    put_u8(cursor, contact);
+    put_u8(cursor, flags);
+    put_u16(cursor, static_cast<uint16_t>(tilt_x));
+    put_u16(cursor, static_cast<uint16_t>(tilt_y));
     return make_control(ControlType::InputEvent, payload);
 }
 
@@ -1300,9 +1341,20 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
     uint32_t y = 0;
     uint16_t hid_usage = 0;
     uint16_t modifiers = 0;
+    uint16_t pressure = 0;
+    uint8_t contact = 0;
+    uint8_t flags = 0;
+    uint16_t tilt_x_raw = 0;
+    uint16_t tilt_y_raw = 0;
     if (!reader.u8(kind) || !reader.u8(action) || !reader.u16(buttons) || !reader.u32(x) ||
-        !reader.u32(y) || !reader.u16(hid_usage) || !reader.u16(modifiers)) {
+        !reader.u32(y) || !reader.u16(hid_usage) || !reader.u16(modifiers) ||
+        !reader.u16(pressure) || !reader.u8(contact) || !reader.u8(flags) ||
+        !reader.u16(tilt_x_raw) || !reader.u16(tilt_y_raw)) {
         set_error(error, "truncated InputEvent");
+        return false;
+    }
+    if (!reader.at_end()) {
+        set_error(error, "InputEvent carries trailing bytes");
         return false;
     }
     if ((modifiers & ~kInputStateMask) != 0) {
@@ -1310,6 +1362,8 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
         return false;
     }
     event.modifiers = modifiers;
+    const int16_t tilt_x = static_cast<int16_t>(tilt_x_raw);
+    const int16_t tilt_y = static_cast<int16_t>(tilt_y_raw);
     switch (kind) {
         case static_cast<uint8_t>(InputKind::Mouse):
             if (action > static_cast<uint8_t>(MouseAction::WheelHorizontal)) {
@@ -1319,6 +1373,11 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
             }
             if (buttons & ~0x1Fu) {
                 set_error(error, "InputEvent carries unknown mouse buttons");
+                return false;
+            }
+            if (pressure != 0 || contact != 0 || flags != 0 || tilt_x != 0 || tilt_y != 0 ||
+                hid_usage != 0) {
+                set_error(error, "InputEvent mouse event carries non-mouse fields");
                 return false;
             }
             event.kind = InputKind::Mouse;
@@ -1336,17 +1395,73 @@ bool parse_input_event(const std::vector<uint8_t>& payload, InputEvent& event, s
                 set_error(error, "InputEvent carries no HID usage");
                 return false;
             }
+            if (buttons != 0 || pressure != 0 || contact != 0 || flags != 0 || tilt_x != 0 ||
+                tilt_y != 0) {
+                set_error(error, "InputEvent key event carries non-key fields");
+                return false;
+            }
             event.kind = InputKind::Key;
             event.key.action = static_cast<KeyAction>(action);
             event.key.hid_usage = hid_usage;
             break;
+        case static_cast<uint8_t>(InputKind::Touch):
+            if (action > static_cast<uint8_t>(TouchAction::Cancel)) {
+                set_error(error, "InputEvent names unknown touch action " +
+                                     std::to_string(action));
+                return false;
+            }
+            if (contact >= kMaxTouchContacts) {
+                set_error(error, "InputEvent touch contact is out of range");
+                return false;
+            }
+            if (pressure > 1024) {
+                set_error(error, "InputEvent touch pressure is out of range");
+                return false;
+            }
+            if (buttons != 0 || hid_usage != 0 || flags != 0 || tilt_x != 0 || tilt_y != 0) {
+                set_error(error, "InputEvent touch event carries non-touch fields");
+                return false;
+            }
+            event.kind = InputKind::Touch;
+            event.touch.action = static_cast<TouchAction>(action);
+            event.touch.contact = contact;
+            event.touch.x = static_cast<int32_t>(x);
+            event.touch.y = static_cast<int32_t>(y);
+            event.touch.pressure = pressure;
+            break;
+        case static_cast<uint8_t>(InputKind::Pen):
+            if (action > static_cast<uint8_t>(TouchAction::Cancel)) {
+                set_error(error, "InputEvent names unknown pen action " + std::to_string(action));
+                return false;
+            }
+            if ((flags & ~0x07u) != 0) {
+                set_error(error, "InputEvent pen event carries unknown flags");
+                return false;
+            }
+            if (pressure > 1024) {
+                set_error(error, "InputEvent pen pressure is out of range");
+                return false;
+            }
+            if (tilt_x < -90 || tilt_x > 90 || tilt_y < -90 || tilt_y > 90) {
+                set_error(error, "InputEvent pen tilt is out of range");
+                return false;
+            }
+            if (buttons != 0 || hid_usage != 0 || contact != 0) {
+                set_error(error, "InputEvent pen event carries non-pen fields");
+                return false;
+            }
+            event.kind = InputKind::Pen;
+            event.pen.action = static_cast<TouchAction>(action);
+            event.pen.x = static_cast<int32_t>(x);
+            event.pen.y = static_cast<int32_t>(y);
+            event.pen.pressure = pressure;
+            event.pen.flags = flags;
+            event.pen.tilt_x = tilt_x;
+            event.pen.tilt_y = tilt_y;
+            break;
         default:
             set_error(error, "InputEvent names unknown kind " + std::to_string(kind));
             return false;
-    }
-    if (!reader.at_end()) {
-        set_error(error, "InputEvent carries trailing bytes");
-        return false;
     }
     return true;
 }

@@ -2127,7 +2127,8 @@ struct ReceiverStats {
 
 // The input script connect and verify replay. It exercises every action the
 // protocol carries: an absolute move, a click, both wheel axes, a relative
-// move, and a chord that leaves a modifier down across other events.
+// move, a chord that leaves a modifier down across other events, a two-finger
+// touch gesture, and a pen stroke with barrel and tilt.
 std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, bool keys) {
     std::vector<chast::InputEvent> events;
     auto mouse = [&](chast::MouseAction action, uint16_t buttons, int32_t x, int32_t y) {
@@ -2147,6 +2148,30 @@ std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, 
         event.modifiers = modifiers;
         events.push_back(event);
     };
+    auto touch = [&](chast::TouchAction action, uint8_t contact, int32_t x, int32_t y,
+                     uint16_t pressure) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Touch;
+        event.touch.action = action;
+        event.touch.contact = contact;
+        event.touch.x = x;
+        event.touch.y = y;
+        event.touch.pressure = pressure;
+        events.push_back(event);
+    };
+    auto pen = [&](chast::TouchAction action, int32_t x, int32_t y, uint16_t pressure,
+                   uint8_t flags, int16_t tilt_x, int16_t tilt_y) {
+        chast::InputEvent event;
+        event.kind = chast::InputKind::Pen;
+        event.pen.action = action;
+        event.pen.x = x;
+        event.pen.y = y;
+        event.pen.pressure = pressure;
+        event.pen.flags = flags;
+        event.pen.tilt_x = tilt_x;
+        event.pen.tilt_y = tilt_y;
+        events.push_back(event);
+    };
 
     mouse(chast::MouseAction::Move, 0, origin_x + 10, origin_y + 10);
     mouse(chast::MouseAction::ButtonDown, chast::kMouseLeft, 0, 0);
@@ -2159,6 +2184,16 @@ std::vector<chast::InputEvent> input_script(int32_t origin_x, int32_t origin_y, 
         key(0x04, chast::KeyAction::Down, chast::kModifierLeftShift);  // A
         key(0x04, chast::KeyAction::Up, chast::kModifierLeftShift);
         key(0xE1, chast::KeyAction::Up, 0);
+        touch(chast::TouchAction::Down, 0, origin_x + 20, origin_y + 20, 512);
+        touch(chast::TouchAction::Down, 1, origin_x + 40, origin_y + 40, 512);
+        touch(chast::TouchAction::Move, 1, origin_x + 45, origin_y + 45, 640);
+        touch(chast::TouchAction::Up, 1, origin_x + 45, origin_y + 45, 0);
+        touch(chast::TouchAction::Move, 0, origin_x + 25, origin_y + 25, 600);
+        touch(chast::TouchAction::Up, 0, origin_x + 25, origin_y + 25, 0);
+        pen(chast::TouchAction::Down, origin_x + 60, origin_y + 60, 300, 0, 10, -5);
+        pen(chast::TouchAction::Move, origin_x + 70, origin_y + 65, 450,
+            chast::kPenBarrel, 12, -6);
+        pen(chast::TouchAction::Up, origin_x + 70, origin_y + 65, 0, 0, 0, 0);
     }
     return events;
 }
@@ -2167,11 +2202,22 @@ bool same_event(const chast::InputEvent& a, const chast::InputEvent& b) {
     if (a.kind != b.kind || a.modifiers != b.modifiers) {
         return false;
     }
-    if (a.kind == chast::InputKind::Mouse) {
-        return a.mouse.action == b.mouse.action && a.mouse.buttons == b.mouse.buttons &&
-               a.mouse.x == b.mouse.x && a.mouse.y == b.mouse.y;
+    switch (a.kind) {
+        case chast::InputKind::Mouse:
+            return a.mouse.action == b.mouse.action && a.mouse.buttons == b.mouse.buttons &&
+                   a.mouse.x == b.mouse.x && a.mouse.y == b.mouse.y;
+        case chast::InputKind::Key:
+            return a.key.action == b.key.action && a.key.hid_usage == b.key.hid_usage;
+        case chast::InputKind::Touch:
+            return a.touch.action == b.touch.action && a.touch.contact == b.touch.contact &&
+                   a.touch.x == b.touch.x && a.touch.y == b.touch.y &&
+                   a.touch.pressure == b.touch.pressure;
+        case chast::InputKind::Pen:
+            return a.pen.action == b.pen.action && a.pen.x == b.pen.x && a.pen.y == b.pen.y &&
+                   a.pen.pressure == b.pen.pressure && a.pen.flags == b.pen.flags &&
+                   a.pen.tilt_x == b.pen.tilt_x && a.pen.tilt_y == b.pen.tilt_y;
     }
-    return a.key.action == b.key.action && a.key.hid_usage == b.key.hid_usage;
+    return false;
 }
 
 bool same_display(const chast::DisplayDescription& a, const chast::DisplayDescription& b) {
@@ -2331,10 +2377,22 @@ SenderStats run_sender(const Options& options, const std::string& save_path,
             std::printf("input: mouse action=%u buttons=%u x=%d y=%d state=0x%03X\n",
                         static_cast<unsigned>(event.mouse.action), event.mouse.buttons,
                         event.mouse.x, event.mouse.y, event.modifiers);
-        } else {
+        } else if (event.kind == chast::InputKind::Key) {
             std::printf("input: key action=%u usage=0x%02X state=0x%03X\n",
                         static_cast<unsigned>(event.key.action), event.key.hid_usage,
                         event.modifiers);
+        } else if (event.kind == chast::InputKind::Touch) {
+            std::printf("input: touch action=%u contact=%u x=%d y=%d pressure=%u state=0x%03X\n",
+                        static_cast<unsigned>(event.touch.action),
+                        static_cast<unsigned>(event.touch.contact), event.touch.x, event.touch.y,
+                        static_cast<unsigned>(event.touch.pressure), event.modifiers);
+        } else {
+            std::printf("input: pen action=%u x=%d y=%d pressure=%u flags=0x%02X tilt=%d,%d "
+                        "state=0x%03X\n",
+                        static_cast<unsigned>(event.pen.action), event.pen.x, event.pen.y,
+                        static_cast<unsigned>(event.pen.pressure),
+                        static_cast<unsigned>(event.pen.flags), event.pen.tilt_x,
+                        event.pen.tilt_y, event.modifiers);
         }
     };
     if (options.fake_clipboard) {

@@ -2039,6 +2039,11 @@ void ViewerBridge::SendInput(
     int64_t y = 0;
     int64_t usage = 0;
     int64_t modifiers = 0;
+    int64_t contact = 0;
+    int64_t pressure = 0;
+    int64_t flags = 0;
+    int64_t tilt_x = 0;
+    int64_t tilt_y = 0;
     if (!map_int(args, "kind", &kind) || !map_int(args, "action", &action) ||
         !map_int(args, "buttons", &buttons) || !map_int(args, "x", &x) ||
         !map_int(args, "y", &y) || !map_int(args, "modifiers", &modifiers) ||
@@ -2090,8 +2095,41 @@ void ViewerBridge::SendInput(
         }
         event.key.action = static_cast<chast::KeyAction>(action);
         event.key.hid_usage = static_cast<uint16_t>(usage);
+    } else if (kind == 3) {
+        event.kind = chast::InputKind::Touch;
+        if (!map_int(args, "contact", &contact) || !map_int(args, "pressure", &pressure) ||
+            action < 0 || action > 3 || contact < 0 ||
+            contact >= chast::kMaxTouchContacts || pressure < 0 || pressure > 1024 ||
+            buttons != 0 || x < INT32_MIN || x > INT32_MAX || y < INT32_MIN ||
+            y > INT32_MAX) {
+            result->Error("bad_args", "touch event out of range");
+            return;
+        }
+        event.touch.action = static_cast<chast::TouchAction>(action);
+        event.touch.contact = static_cast<uint8_t>(contact);
+        event.touch.x = static_cast<int32_t>(x);
+        event.touch.y = static_cast<int32_t>(y);
+        event.touch.pressure = static_cast<uint16_t>(pressure);
+    } else if (kind == 4) {
+        event.kind = chast::InputKind::Pen;
+        if (!map_int(args, "pressure", &pressure) || !map_int(args, "flags", &flags) ||
+            !map_int(args, "tiltX", &tilt_x) || !map_int(args, "tiltY", &tilt_y) ||
+            action < 0 || action > 3 || pressure < 0 || pressure > 1024 || flags < 0 ||
+            flags > 0x07 || tilt_x < -90 || tilt_x > 90 || tilt_y < -90 ||
+            tilt_y > 90 || buttons != 0 || contact != 0 || x < INT32_MIN ||
+            x > INT32_MAX || y < INT32_MIN || y > INT32_MAX) {
+            result->Error("bad_args", "pen event out of range");
+            return;
+        }
+        event.pen.action = static_cast<chast::TouchAction>(action);
+        event.pen.x = static_cast<int32_t>(x);
+        event.pen.y = static_cast<int32_t>(y);
+        event.pen.pressure = static_cast<uint16_t>(pressure);
+        event.pen.flags = static_cast<uint8_t>(flags);
+        event.pen.tilt_x = static_cast<int16_t>(tilt_x);
+        event.pen.tilt_y = static_cast<int16_t>(tilt_y);
     } else {
-        result->Error("bad_args", "input kind must be 1 (mouse) or 2 (key)");
+        result->Error("bad_args", "input kind must be 1 (mouse) or 2 (key), 3 (touch) or 4 (pen)");
         return;
     }
 

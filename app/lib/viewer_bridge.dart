@@ -1766,6 +1766,61 @@ class ViewerBridge {
     return queued ?? false;
   }
 
+  /// Sends one touch contact transition. [contact] is a slot in
+  /// 0..[kViewerMaxTouchContacts]-1 and stays the same for the contact's
+  /// lifetime; [x]/[y] are virtual-desktop pixels and [pressure] is 0..1024.
+  /// The host injects the whole active contact set on every frame, so a
+  /// viewer must send Down before Move/Up for the same slot.
+  static Future<bool> sendTouch({
+    required int action,
+    required int contact,
+    required int x,
+    required int y,
+    int pressure = 0,
+    int modifiers = 0,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendInput', <String, Object>{
+      'kind': 3,
+      'action': action,
+      'buttons': 0,
+      'x': x,
+      'y': y,
+      'contact': contact,
+      'pressure': pressure,
+      'modifiers': modifiers,
+    });
+    return queued ?? false;
+  }
+
+  /// Sends one pen transition. [tiltX]/[tiltY] are degrees from the surface
+  /// normal (-90..90, positive right / toward the user), and [flags] is a
+  /// combination of [ViewerPenFlag]. Pressure and tilt are stored by the host
+  /// until the lift, so Move may carry only the position.
+  static Future<bool> sendPen({
+    required int action,
+    required int x,
+    required int y,
+    int pressure = 0,
+    int flags = 0,
+    int tiltX = 0,
+    int tiltY = 0,
+    int modifiers = 0,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>('sendInput', <String, Object>{
+      'kind': 4,
+      'action': action,
+      'buttons': 0,
+      'x': x,
+      'y': y,
+      'pressure': pressure,
+      'flags': flags,
+      'tiltX': tiltX,
+      'tiltY': tiltY,
+      'modifiers': modifiers,
+    });
+    return queued ?? false;
+  }
+
   /// Asks the host to lift every key and button its injector still holds.
   /// Sent when the viewer gives up control or the window loses focus, so a
   /// release that never made it out cannot leave the host stuck. Queued in
@@ -2449,6 +2504,25 @@ abstract final class ViewerMouse {
   static const int back = 8;
   static const int forward = 16;
 }
+
+/// Touch and pen transitions share one action space in the protocol.
+abstract final class ViewerTouchAction {
+  static const int down = 0;
+  static const int move = 1;
+  static const int up = 2;
+  static const int cancel = 3;
+}
+
+/// Pen button/eraser flags, matching Windows' PEN_FLAG_* values.
+abstract final class ViewerPenFlag {
+  static const int barrel = 1;
+  static const int inverted = 2;
+  static const int eraser = 4;
+}
+
+/// Simultaneous contacts both the protocol and the host injector accept
+/// (chast::kMaxTouchContacts).
+const int kViewerMaxTouchContacts = 10;
 
 /// Modifier bitmap carried by every input event. One bit per HID usage id
 /// 0xE0..0xE7, in that order; the host reconciles its held modifiers to it.

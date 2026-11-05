@@ -232,6 +232,17 @@ bool system_lock_state(uint16_t bit) {
     }
 }
 
+// Touch contacts (and synthetic pointers for the pen) live in screen
+// coordinates; the virtual screen is the union of the monitors and can have
+// a negative origin when one sits left of or above the primary.
+bool virtual_screen_rect(int32_t& left, int32_t& top, int32_t& width, int32_t& height) {
+    left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return width > 0 && height > 0;
+}
+
 }  // namespace
 
 bool hid_to_scancode(uint16_t hid_usage, uint16_t& scan_code, bool& extended) {
@@ -296,11 +307,22 @@ void InputInjector::follow_input_desktop_if_due() {
         held_keys_.clear();
         held_buttons_ = 0;
         locks_seeded_ = false;
+        // The OS cancels injected contacts with the old desktop; attempting
+        // to lift them on the new one would create phantom touches there.
+        for (TouchSlot& slot : touch_slots_) {
+            slot = TouchSlot{};
+        }
+        pen_down_ = false;
+        fallback_pointer_ = FallbackPointer::None;
     }
 }
 
 InputInjector::~InputInjector() {
     stop();
+    if (destroy_pointer_device_ != nullptr && pen_device_ != nullptr) {
+        destroy_pointer_device_(pen_device_);
+        pen_device_ = nullptr;
+    }
 }
 
 void InputInjector::submit(const InputEvent& event) {
@@ -433,10 +455,19 @@ void InputInjector::apply(const InputEvent& event) {
         }
     }
     sync_modifiers(reported);
-    if (event.kind == InputKind::Mouse) {
-        apply_mouse(event.mouse);
-    } else {
-        apply_key(event.key);
+    switch (event.kind) {
+        case InputKind::Mouse:
+            apply_mouse(event.mouse);
+            break;
+        case InputKind::Key:
+            apply_key(event.key);
+            break;
+        case InputKind::Touch:
+            apply_touch(event.touch);
+            break;
+        case InputKind::Pen:
+            apply_pen(event.pen);
+            break;
     }
 }
 
@@ -638,6 +669,362 @@ void InputInjector::apply_mouse(const MouseEvent& event) {
     }
 }
 
+bool InputInjector::ensure_touch_available() {
+    if (touch_state_ == DeviceState::Unknown) {
+        if (dry_run_) {
+            // A dry run must not touch the OS; it still exercises the frame
+            // builder and the contact bookkeeping below.
+            touch_state_ = DeviceState::Ready;
+        } else if (InitializeTouchInjection(kMaxTouchContacts, TOUCH_FEEDBACK_NONE)) {
+            touch_state_ = DeviceState::Ready;
+        } else {
+            touch_state_ = DeviceState::Unavailable;
+        }
+    }
+    return touch_state_ == DeviceState::Ready;
+}
+
+void InputInjector::apply_touch(const TouchEvent& event) {
+    if (event.contact >= kMaxTouchContacts) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.rejected;
+        return;
+    }
+    if (!ensure_touch_available()) {
+        apply_touch_fallback(event);
+        return;
+    }
+
+    TouchSlot& slot = touch_slots_[event.contact];
+    TouchAction action = event.action;
+    bool deactivate = false;
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+    switch (action) {
+        case TouchAction::Down:
+        case TouchAction::Move:
+            if (!virtual_screen_rect(left, top, width, height)) {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                ++stats_.rejected;
+                return;
+            }
+            if (!slot.used) {
+                // A Move without a Down (a lost frame, or the viewer joined
+                // mid-gesture) opens the contact instead of being rejected:
+                // the OS never sees an UPDATE for a pointer it does not know.
+                action = TouchAction::Down;
+                slot.used = true;
+            }
+            slot.x = std::clamp(event.x, left, left + width - 1);
+            slot.y = std::clamp(event.y, top, top + height - 1);
+            slot.pressure = std::min<uint16_t>(event.pressure, 1024);
+            break;
+        case TouchAction::Up:
+        case TouchAction::Cancel:
+            if (!slot.used) {
+                return;
+            }
+            // The last frame carrying this contact must repeat the position
+            // of its previous UPDATE, so the lift uses the stored point.
+            deactivate = true;
+            break;
+    }
+
+    std::vector<POINTER_TOUCH_INFO> contacts;
+    contacts.reserve(kMaxTouchContacts);
+    for (size_t i = 0; i < touch_slots_.size(); ++i) {
+        const TouchSlot& current = touch_slots_[i];
+        if (!current.used) {
+            continue;
+        }
+        POINTER_TOUCH_INFO info{};
+        info.pointerInfo.pointerType = PT_TOUCH;
+        info.pointerInfo.pointerId = static_cast<UINT32>(i);
+        info.pointerInfo.ptPixelLocation.x = current.x;
+        info.pointerInfo.ptPixelLocation.y = current.y;
+        if (i == event.contact) {
+            switch (action) {
+                case TouchAction::Down:
+                    info.pointerInfo.pointerFlags =
+                        POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+                    break;
+                case TouchAction::Move:
+                    info.pointerInfo.pointerFlags =
+                        POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+                    break;
+                case TouchAction::Up:
+                    info.pointerInfo.pointerFlags = POINTER_FLAG_UP;
+                    break;
+                case TouchAction::Cancel:
+                    info.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED;
+                    break;
+            }
+        } else {
+            // Every frame InjectTouchInput takes must describe all contacts
+            // still on the desktop, not just the one that changed.
+            info.pointerInfo.pointerFlags =
+                POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+        }
+        if (current.pressure > 0) {
+            info.touchMask = TOUCH_MASK_PRESSURE;
+            info.pressure = current.pressure;
+        }
+        contacts.push_back(info);
+    }
+
+    bool ok = true;
+    if (!contacts.empty() && !dry_run_) {
+        ok = InjectTouchInput(static_cast<UINT32>(contacts.size()), contacts.data()) != 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        if (ok) {
+            ++stats_.applied;
+        } else {
+            ++stats_.failed;
+        }
+    }
+    if (!ok) {
+        // Windows cancels every contact when a frame is invalid, so drop our
+        // view of them; the next Down starts a fresh sequence.
+        for (TouchSlot& current : touch_slots_) {
+            current = TouchSlot{};
+        }
+        return;
+    }
+    if (deactivate) {
+        slot.used = false;
+    }
+}
+
+bool InputInjector::ensure_pen_available() {
+    if (pen_state_ == DeviceState::Unknown) {
+        if (dry_run_) {
+            pen_state_ = DeviceState::Ready;
+        } else {
+            HMODULE user32 = GetModuleHandleW(L"user32.dll");
+            if (user32 != nullptr) {
+                create_pointer_device_ = reinterpret_cast<CreatePointerDeviceFn>(
+                    GetProcAddress(user32, "CreateSyntheticPointerDevice"));
+                inject_pointer_input_ = reinterpret_cast<InjectPointerInputFn>(
+                    GetProcAddress(user32, "InjectSyntheticPointerInput"));
+                destroy_pointer_device_ = reinterpret_cast<DestroyPointerDeviceFn>(
+                    GetProcAddress(user32, "DestroySyntheticPointerDevice"));
+            }
+            if (create_pointer_device_ != nullptr && inject_pointer_input_ != nullptr &&
+                destroy_pointer_device_ != nullptr) {
+                pen_device_ =
+                    create_pointer_device_(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT);
+            }
+            pen_state_ = pen_device_ != nullptr ? DeviceState::Ready : DeviceState::Unavailable;
+        }
+    }
+    return pen_state_ == DeviceState::Ready;
+}
+
+void InputInjector::apply_pen(const PenEvent& event) {
+    if (!ensure_pen_available()) {
+        apply_pen_fallback(event);
+        return;
+    }
+
+    TouchAction action = event.action;
+    bool deactivate = false;
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+    switch (action) {
+        case TouchAction::Down:
+        case TouchAction::Move:
+            if (!virtual_screen_rect(left, top, width, height)) {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                ++stats_.rejected;
+                return;
+            }
+            if (!pen_down_) {
+                action = TouchAction::Down;
+                pen_down_ = true;
+            }
+            pen_x_ = std::clamp(event.x, left, left + width - 1);
+            pen_y_ = std::clamp(event.y, top, top + height - 1);
+            pen_pressure_ = std::min<uint16_t>(event.pressure, 1024);
+            pen_flags_ = event.flags;
+            pen_tilt_x_ = event.tilt_x;
+            pen_tilt_y_ = event.tilt_y;
+            break;
+        case TouchAction::Up:
+        case TouchAction::Cancel:
+            if (!pen_down_) {
+                return;
+            }
+            deactivate = true;
+            break;
+    }
+
+    // Synthetic pointer coordinates are relative to the virtual-screen
+    // origin, unlike touch injection, which takes desktop coordinates.
+    if (!virtual_screen_rect(left, top, width, height)) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.rejected;
+        return;
+    }
+    POINTER_TYPE_INFO info{};
+    info.type = PT_PEN;
+    info.penInfo.pointerInfo.pointerType = PT_PEN;
+    info.penInfo.pointerInfo.pointerId = 0;
+    info.penInfo.pointerInfo.ptPixelLocation.x = pen_x_ - left;
+    info.penInfo.pointerInfo.ptPixelLocation.y = pen_y_ - top;
+    switch (action) {
+        case TouchAction::Down:
+            info.penInfo.pointerInfo.pointerFlags =
+                POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            break;
+        case TouchAction::Move:
+            info.penInfo.pointerInfo.pointerFlags =
+                POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            break;
+        case TouchAction::Up:
+            info.penInfo.pointerInfo.pointerFlags = POINTER_FLAG_UP;
+            break;
+        case TouchAction::Cancel:
+            info.penInfo.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED;
+            break;
+    }
+    info.penInfo.penFlags = pen_flags_ & (PEN_FLAG_BARREL | PEN_FLAG_INVERTED | PEN_FLAG_ERASER);
+    if (pen_pressure_ > 0) {
+        info.penInfo.penMask |= PEN_MASK_PRESSURE;
+        info.penInfo.pressure = pen_pressure_;
+    }
+    if (pen_tilt_x_ != 0) {
+        info.penInfo.penMask |= PEN_MASK_TILT_X;
+        info.penInfo.tiltX = pen_tilt_x_;
+    }
+    if (pen_tilt_y_ != 0) {
+        info.penInfo.penMask |= PEN_MASK_TILT_Y;
+        info.penInfo.tiltY = pen_tilt_y_;
+    }
+
+    const bool ok = dry_run_ || inject_pointer_input_(pen_device_, &info, 1) != 0;
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        if (ok) {
+            ++stats_.applied;
+        } else {
+            ++stats_.failed;
+        }
+    }
+    if (!ok || deactivate) {
+        pen_down_ = false;
+    }
+}
+
+void InputInjector::apply_touch_fallback(const TouchEvent& event) {
+    switch (event.action) {
+        case TouchAction::Down:
+        case TouchAction::Move: {
+            bool begin = false;
+            if (fallback_pointer_ == FallbackPointer::None) {
+                fallback_pointer_ = FallbackPointer::Touch;
+                fallback_contact_ = event.contact;
+                begin = true;
+            } else if (fallback_pointer_ != FallbackPointer::Touch ||
+                       fallback_contact_ != event.contact) {
+                // One emulated pointer is all the mouse can express; extra
+                // contacts are ignored until this one lifts.
+                return;
+            }
+            MouseEvent move;
+            move.action = MouseAction::Move;
+            move.x = event.x;
+            move.y = event.y;
+            apply_mouse(move);
+            if (begin) {
+                MouseEvent down;
+                down.action = MouseAction::ButtonDown;
+                down.buttons = kMouseLeft;
+                apply_mouse(down);
+            }
+            return;
+        }
+        case TouchAction::Up:
+        case TouchAction::Cancel:
+            if (fallback_pointer_ == FallbackPointer::Touch &&
+                fallback_contact_ == event.contact) {
+                release_fallback_pointer();
+            }
+            return;
+    }
+}
+
+void InputInjector::apply_pen_fallback(const PenEvent& event) {
+    switch (event.action) {
+        case TouchAction::Down:
+        case TouchAction::Move: {
+            bool begin = false;
+            if (fallback_pointer_ == FallbackPointer::None) {
+                fallback_pointer_ = FallbackPointer::Pen;
+                begin = true;
+            } else if (fallback_pointer_ != FallbackPointer::Pen) {
+                return;
+            }
+            MouseEvent move;
+            move.action = MouseAction::Move;
+            move.x = event.x;
+            move.y = event.y;
+            apply_mouse(move);
+            if (begin) {
+                MouseEvent down;
+                down.action = MouseAction::ButtonDown;
+                down.buttons = kMouseLeft;
+                apply_mouse(down);
+            }
+            return;
+        }
+        case TouchAction::Up:
+        case TouchAction::Cancel:
+            if (fallback_pointer_ == FallbackPointer::Pen) {
+                release_fallback_pointer();
+            }
+            return;
+    }
+}
+
+void InputInjector::release_fallback_pointer() {
+    if (fallback_pointer_ == FallbackPointer::None) {
+        return;
+    }
+    fallback_pointer_ = FallbackPointer::None;
+    MouseEvent up;
+    up.action = MouseAction::ButtonUp;
+    up.buttons = kMouseLeft;
+    apply_mouse(up);
+}
+
+void InputInjector::release_touch_contacts() {
+    for (size_t i = 0; i < touch_slots_.size(); ++i) {
+        if (!touch_slots_[i].used) {
+            continue;
+        }
+        TouchEvent cancel;
+        cancel.action = TouchAction::Cancel;
+        cancel.contact = static_cast<uint8_t>(i);
+        apply_touch(cancel);
+    }
+}
+
+void InputInjector::release_pen() {
+    if (pen_down_) {
+        PenEvent cancel;
+        cancel.action = TouchAction::Cancel;
+        apply_pen(cancel);
+    } else if (fallback_pointer_ == FallbackPointer::Pen) {
+        release_fallback_pointer();
+    }
+}
+
 void InputInjector::apply_key(const KeyEvent& event) {
     uint16_t scan = 0;
     bool extended = false;
@@ -787,6 +1174,12 @@ void InputInjector::release_all() {
             apply_mouse(release);
         }
     }
+    // Contacts and the emulated pointer are drags too: lift them before the
+    // keys so a gesture cannot stay active behind a released modifier.
+    release_touch_contacts();
+    release_pen();
+    // Catches a mouse-emulated contact when injection never started.
+    release_fallback_pointer();
     while (!held_keys_.empty()) {
         const HeldKey held = held_keys_.back();
         held_keys_.pop_back();

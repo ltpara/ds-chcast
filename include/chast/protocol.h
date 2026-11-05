@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 41.
+// The chast wire protocol, version 43.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 42;
+inline constexpr uint16_t kProtocolVersion = 43;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -375,19 +375,36 @@ enum class ControlType : uint16_t {
 
 // ----- input -----
 //
-// The client sends one InputEvent message per pointer or keyboard event on the
-// control stream, in the order they happened. Coordinates are in the host's
-// virtual-desktop space (pixels), so the server never needs to know which
-// output the viewer is looking at and a later multi-display UI needs no wire
-// change. Keys travel as USB HID usage ids: layout independent, and mapped to
-// scan codes on the injecting side. Every event also carries the modifier
+// The client sends one InputEvent message per pointer, touch, pen or keyboard
+// event on the control stream, in the order they happened. Coordinates are in
+// the host's virtual-desktop space (pixels), so the server never needs to know
+// which output the viewer is looking at and a later multi-display UI needs no
+// wire change. Keys travel as USB HID usage ids: layout independent, and mapped
+// to scan codes on the injecting side. Every event also carries the modifier
 // keys held at that moment, which lets the injecting side repair a lost key
 // transition instead of trusting that every Down has a matching Up.
+//
+// The payload is 24 bytes: kind (u8), action (u8), buttons (u16), x (u32),
+// y (u32), hid usage (u16), modifiers (u16), pressure (u16), contact (u8),
+// flags (u8), tilt x (i16), tilt y (i16). Fields a kind does not use are zero;
+// a parser rejects non-zero spare fields so a mislabelled event is caught
+// instead of silently ignored.
 
 enum class InputKind : uint8_t {
     Mouse = 1,
     Key = 2,
+    // Direct touch and pen digitizer contacts (protocol v43). Unlike mouse
+    // events they carry a pressure value and, for touch, a contact slot, so a
+    // viewer with a touchscreen can drive the host's real touch stack (press
+    // and hold, two-finger scroll, pinch) instead of a synthesized mouse.
+    Touch = 3,
+    Pen = 4,
 };
+
+// Simultaneous touch contacts the protocol and the Windows injector accept.
+// Windows allows up to 256; digitizers and the viewer's pointer tracker are
+// the practical limits, and a small fixed array keeps the injector simple.
+inline constexpr uint8_t kMaxTouchContacts = 10;
 
 enum class MouseAction : uint8_t {
     Move = 0,             // absolute, virtual-desktop pixels
@@ -432,6 +449,50 @@ struct KeyEvent {
     uint16_t hid_usage = 0;
 };
 
+enum class TouchAction : uint8_t {
+    Down = 0,
+    Move = 1,
+    Up = 2,
+    // The viewer lost the contact (focus left the window, capture was
+    // interrupted). The host lifts it at its last position instead of ending
+    // a drag at a coordinate the user never touched.
+    Cancel = 3,
+};
+
+struct TouchEvent {
+    TouchAction action = TouchAction::Down;
+    // Stable for the contact's lifetime, 0..kMaxTouchContacts-1. A slot can
+    // be reused by a later contact once it lifts.
+    uint8_t contact = 0;
+    // Virtual-desktop pixels, like MouseEvent.
+    int32_t x = 0;
+    int32_t y = 0;
+    // 0..1024 (Windows' range), 0 when the device reports no pressure.
+    uint16_t pressure = 0;
+};
+
+// Bit positions in PenEvent::flags; the values match Windows' own PEN_FLAG_*
+// so the injector can pass them through.
+enum PenFlag : uint8_t {
+    kPenBarrel = 1u << 0,
+    kPenInverted = 1u << 1,
+    kPenEraser = 1u << 2,
+};
+
+struct PenEvent {
+    TouchAction action = TouchAction::Down;
+    int32_t x = 0;
+    int32_t y = 0;
+    // 0..1024 (Windows' range), 0 when the device reports no pressure.
+    uint16_t pressure = 0;
+    uint8_t flags = 0;  // PenFlag bits
+    // Degrees from the surface normal, -90..90. Positive tilts right (+x)
+    // and toward the user (+y), which is the Windows POINTER_PEN_INFO
+    // convention; the viewer converts its polar tilt/orientation to it.
+    int16_t tilt_x = 0;
+    int16_t tilt_y = 0;
+};
+
 // Bit positions in InputEvent::modifiers. Bits 0..7 are the modifier keys on
 // HID usage page 0x07 (0xE0..0xE7) in that order; every event, pointer or
 // keyboard, carries the set the client saw held at that moment. The injector
@@ -468,6 +529,8 @@ struct InputEvent {
     InputKind kind = InputKind::Mouse;
     MouseEvent mouse;
     KeyEvent key;
+    TouchEvent touch;
+    PenEvent pen;
     // Modifier keys held and lock keys on, when the event happened; see
     // ModifierBit and LockStateBit.
     uint16_t modifiers = 0;

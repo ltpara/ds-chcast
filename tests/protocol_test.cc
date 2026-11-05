@@ -2893,6 +2893,43 @@ void test_input_events() {
     check(got.key.hid_usage == 0xE6, "key event keeps the HID usage");
     check(got.modifiers == chast::kModifierRightAlt, "key event keeps the modifier bitmap");
 
+    chast::InputEvent touch;
+    touch.kind = chast::InputKind::Touch;
+    touch.touch.action = chast::TouchAction::Move;
+    touch.touch.contact = chast::kMaxTouchContacts - 1;
+    touch.touch.x = -1920;
+    touch.touch.y = 1080;
+    touch.touch.pressure = 777;
+    touch.modifiers = chast::kModifierLeftShift;
+    check(chast::parse_input_event(payload_of(chast::make_input_event(touch)), got, &error),
+          "touch event round-trips");
+    check(got.kind == chast::InputKind::Touch &&
+              got.touch.action == chast::TouchAction::Move &&
+              got.touch.contact == chast::kMaxTouchContacts - 1,
+          "touch event keeps kind, action and contact");
+    check(got.touch.x == -1920 && got.touch.y == 1080 && got.touch.pressure == 777,
+          "touch event keeps signed coordinates and pressure");
+    check(got.modifiers == chast::kModifierLeftShift, "touch event keeps the input state");
+
+    chast::InputEvent pen;
+    pen.kind = chast::InputKind::Pen;
+    pen.pen.action = chast::TouchAction::Down;
+    pen.pen.x = 100;
+    pen.pen.y = -200;
+    pen.pen.pressure = 900;
+    pen.pen.flags = chast::kPenBarrel | chast::kPenInverted | chast::kPenEraser;
+    pen.pen.tilt_x = -45;
+    pen.pen.tilt_y = 30;
+    check(chast::parse_input_event(payload_of(chast::make_input_event(pen)), got, &error),
+          "pen event round-trips");
+    check(got.kind == chast::InputKind::Pen && got.pen.action == chast::TouchAction::Down,
+          "pen event keeps kind and action");
+    check(got.pen.x == 100 && got.pen.y == -200 && got.pen.pressure == 900,
+          "pen event keeps signed coordinates and pressure");
+    check(got.pen.flags == (chast::kPenBarrel | chast::kPenInverted | chast::kPenEraser),
+          "pen event keeps its button flags");
+    check(got.pen.tilt_x == -45 && got.pen.tilt_y == 30, "pen event keeps signed tilt");
+
     auto rejects = [&](std::vector<uint8_t> payload, const char* what) {
         chast::InputEvent dropped;
         check(!chast::parse_input_event(payload, dropped, &error), what);
@@ -2918,6 +2955,40 @@ void test_input_events() {
     std::vector<uint8_t> trailing_event = body;
     trailing_event.push_back(0);
     rejects(trailing_event, "InputEvent with trailing bytes is rejected");
+
+    const std::vector<uint8_t> touch_body = payload_of(chast::make_input_event(touch));
+    std::vector<uint8_t> touch_contact = touch_body;
+    touch_contact[18] = chast::kMaxTouchContacts;
+    rejects(touch_contact, "touch contact outside the slot range is rejected");
+    std::vector<uint8_t> touch_action = touch_body;
+    touch_action[1] = 9;
+    rejects(touch_action, "unknown touch action is rejected");
+    std::vector<uint8_t> touch_pressure = touch_body;
+    touch_pressure[16] = 0x01;
+    touch_pressure[17] = 0x04;  // 1025
+    rejects(touch_pressure, "touch pressure above 1024 is rejected");
+    std::vector<uint8_t> touch_tilt = touch_body;
+    touch_tilt[20] = 1;
+    rejects(touch_tilt, "touch event with pen tilt is rejected");
+
+    const std::vector<uint8_t> pen_body = payload_of(chast::make_input_event(pen));
+    std::vector<uint8_t> pen_flags = pen_body;
+    pen_flags[19] = 0x08;
+    rejects(pen_flags, "unknown pen flags are rejected");
+    std::vector<uint8_t> pen_tilt = pen_body;
+    pen_tilt[20] = 91;
+    pen_tilt[21] = 0;
+    rejects(pen_tilt, "pen tilt outside -90..90 is rejected");
+    std::vector<uint8_t> pen_contact = pen_body;
+    pen_contact[18] = 1;
+    rejects(pen_contact, "pen event carrying a touch contact is rejected");
+
+    std::vector<uint8_t> mouse_pressure = body;
+    mouse_pressure[16] = 1;
+    rejects(mouse_pressure, "mouse event carrying touch fields is rejected");
+    std::vector<uint8_t> key_buttons = payload_of(chast::make_input_event(key));
+    key_buttons[2] = 1;
+    rejects(key_buttons, "key event carrying mouse buttons is rejected");
 
     chast::ClientStats stats;
     stats.received = 10;
