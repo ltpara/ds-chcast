@@ -2955,9 +2955,15 @@
      连接上运行输入/剪贴板/聊天/文件/终端/端口转发/摄像头/麦克风/SAS 控制面。
      发布者离开后一个跟随者接管并 `refresh_stream()` 接续已宣告的流。输入
      仍单租约，新增 `QuicSession::set_permission_ceiling()` 使只读查看者在
-     租约释放后可被授予输入而不扩大审批范围。验证：新增
+     租约释放后可被授予输入而不扩大审批范围。一次性运行的多查看者路径把
+     listener 的剩余 `run_seconds` 传给工作线程（到期自行 `finish_server`，
+     流与音频带 FIN），listener 仅在其后 `finish_timeout_ms` 宽限才强制停止，
+     跟随者同样按预算退出。验证：新增
      `chast-host-multi-test`（并发、超限、重复审计引用、租约与接管），
-     protocol/settings/carrier/tunnel 测试通过。边界：最多 8 个查看者，
+     protocol/settings/carrier/tunnel 测试通过；全量 `ctest` 37/42 通过
+     （其余 5 项为本机 Smart App Control 拒绝未签名 `chast-viewer-probe.exe`
+     导致 Not Run，非代码失败），21 个 `quic_*` 端到端用例全部通过。边界：
+     最多 8 个查看者，
      同一时刻一个发布者，跟随者不能单独切换显示器/分辨率/编码参数；媒体
      路径保持 GPU 零拷贝，无 CPU fallback。详见
      `docs/rustdesk-gap-tasks-2026-11-01.md` 的同日小节。

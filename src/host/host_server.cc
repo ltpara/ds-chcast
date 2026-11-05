@@ -1449,16 +1449,44 @@ void HostServer::run_multi() {
     bool listening_logged = false;
     bool stop_after_viewer = false;
     Clock::time_point run_start{};
+    // The absolute end of this run, armed when the first viewer is admitted.
+    // Workers inherit what remains of it so they stop their own sessions
+    // gracefully; the listener only stops accepting.
+    Clock::time_point run_deadline = Clock::time_point::max();
 
     while (!stopping_.load()) {
         reap_viewers();
+        const bool past_deadline =
+            run_deadline != Clock::time_point::max() && Clock::now() >= run_deadline;
         if (config_.serve_once && stop_after_viewer) {
             if (viewers_.empty()) {
                 break;
             }
             // A one-shot host serves the connection it admitted and accepts
-            // nothing more while it runs.
+            // nothing more while it runs. The worker ends itself at the
+            // deadline; the grace only covers a session that ignores it.
+            if (past_deadline &&
+                Clock::now() >=
+                    run_deadline + std::chrono::milliseconds(config_.finish_timeout_ms)) {
+                stop_viewers();
+                break;
+            }
             sleep_unless_stopping(std::chrono::milliseconds(100));
+            continue;
+        }
+        if (past_deadline) {
+            // Let the workers finish their own sessions at the shared
+            // deadline; stopping them here would cut audio and video without
+            // a FIN.
+            if (viewers_.empty()) {
+                break;
+            }
+            if (Clock::now() >=
+                run_deadline + std::chrono::milliseconds(config_.finish_timeout_ms)) {
+                stop_viewers();
+                break;
+            }
+            sleep_unless_stopping(std::chrono::milliseconds(50));
             continue;
         }
         if (!session_) {
@@ -1489,10 +1517,21 @@ void HostServer::run_multi() {
         Error accepted = session_->accept(connection, std::chrono::milliseconds(200));
         if (accepted.ok()) {
             failures = 0;
+            double run_seconds_left = 0.0;
             if (run_start == Clock::time_point{}) {
                 run_start = Clock::now();
+                if (config_.run_seconds > 0.0) {
+                    run_deadline = run_start + std::chrono::duration_cast<Clock::duration>(
+                                                  std::chrono::duration<double>(
+                                                      config_.run_seconds));
+                }
             }
-            start_viewer(std::move(connection));
+            if (run_deadline != Clock::time_point::max()) {
+                // Never zero: a zero budget means "unlimited" to the worker.
+                run_seconds_left = std::max(
+                    0.001, std::chrono::duration<double>(run_deadline - Clock::now()).count());
+            }
+            start_viewer(std::move(connection), run_seconds_left);
             if (config_.serve_once) {
                 // One connection: stop accepting, then wait for its worker.
                 stop_after_viewer = true;
@@ -1548,12 +1587,6 @@ void HostServer::run_multi() {
         if (active == 0) {
             publish_state(HostState::Listening);
         }
-        if (config_.run_seconds > 0.0 && run_start != Clock::time_point{} &&
-            std::chrono::duration<double>(Clock::now() - run_start).count() >=
-                config_.run_seconds) {
-            stopping_ = true;
-            break;
-        }
     }
 
     stop_viewers();
@@ -1566,7 +1599,8 @@ void HostServer::run_multi() {
     running_ = false;
 }
 
-void HostServer::start_viewer(std::unique_ptr<QuicSession> connection) {
+void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
+                              double run_seconds_left) {
     auto viewer = std::shared_ptr<HostServer>(new HostServer(config_));
     viewer->settings_ = settings_;
     viewer->session_ = std::move(connection);
@@ -1574,9 +1608,10 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection) {
     viewer->registry_ = registry_;
     viewer->adopted_ = true;
     viewer->self_ = viewer;
-    // The listener owns run_seconds, serve_once and token rotation. The
-    // worker only serves its own connection.
-    viewer->config_.run_seconds = 0.0;
+    // The listener owns serve_once and token rotation; it passes only what
+    // remains of its run budget, so the worker ends its own session instead of
+    // being stopped mid-stream.
+    viewer->config_.run_seconds = run_seconds_left;
     viewer->config_.serve_once = false;
     HostServer* raw = viewer.get();
     viewer->session_->set_server_callbacks(
@@ -1997,8 +2032,15 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
                                          settings_.framerate > 0 ? settings_.framerate : 30u});
 
     auto last_publish = Clock::now();
+    const auto run_start = Clock::now();
     while (!stopping_.load()) {
         const auto now = Clock::now();
+        // A follower shares the listener's run budget the same way a
+        // publisher does; without this it would outlive the run.
+        if (config_.run_seconds > 0.0 &&
+            std::chrono::duration<double>(now - run_start).count() >= config_.run_seconds) {
+            break;
+        }
         apply_pending_permissions();
         uint16_t switch_index = kDisplayAuto;
         if (session_->take_display_switch_request(switch_index)) {

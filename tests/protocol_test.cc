@@ -2637,9 +2637,16 @@ void test_file_transfer() {
 
     chast::FileOffer huge;
     huge.transfer_id = 1;
-    huge.size = chast::kMaxFileTransferBytes + 1;
+    // The maker refuses a size past the limit (it returns an empty message),
+    // so build a valid offer and raise the size field on the wire instead.
+    huge.size = chast::kMaxFileTransferBytes;
     huge.name = "huge.bin";
     std::vector<uint8_t> huge_payload = payload_of(chast::make_file_offer(huge));
+    const uint64_t over_limit = chast::kMaxFileTransferBytes + 1;
+    for (size_t i = 0; i < 8; ++i) {
+        // transfer id (4 bytes), then the little-endian size.
+        huge_payload[4 + i] = static_cast<uint8_t>(over_limit >> (8 * i));
+    }
     rejects_offer(std::move(huge_payload), "FileOffer past the protocol limit is rejected");
 
     chast::FileAnswer answer;

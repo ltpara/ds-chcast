@@ -421,8 +421,11 @@ private:
     bool serve_current_session(HostServerStats& stats, bool rotate_token,
                                std::string* error, bool* peer_left);
     // Starts one worker for an accepted connection and makes it the focused
-    // viewer for status() and the operator actions.
-    void start_viewer(std::unique_ptr<QuicSession> connection);
+    // viewer for status() and the operator actions. `run_seconds_left` is what
+    // remains of the listener's run budget (0 = unlimited): the worker ends its
+    // own session at that deadline so the stream and audio finish with a FIN
+    // instead of being torn down by the listener.
+    void start_viewer(std::unique_ptr<QuicSession> connection, double run_seconds_left);
     // Joins and drops workers that finished. Runs on the parent host thread.
     void reap_viewers();
     // Stops and joins every viewer worker. Used when the listener goes away

@@ -422,7 +422,21 @@ host-generated 回退 ID 区分。
 覆盖两个查看者并发、超限拒绝、重复审计引用、控制租约的授予/拒绝/释放与
 发布者离开后的接管（含共享帧接收和租约恢复）。同轮
 `chast-protocol-test`、`chast-host-settings-test`、`chast-carrier-test`、
-`chast-host-tunnel-test` 通过。
+`chast-host-tunnel-test` 通过；全量 `ctest` 37/42 通过，21 个 `quic_*`
+端到端用例全部通过。剩余 5 项均为 `chast-viewer-probe.exe` 相关用例
+（`viewer_folder_download`、`viewer_files_only`、`viewer_files_only_denied`、
+`viewer_clipboard_files`、`viewer_clipboard_files_up`）在本机被 Smart App
+Control / Code Integrity 以未签名二进制为由拒绝执行，状态 BAD_COMMAND，
+属于已记录的本机环境限制，不是代码失败。
+
+一次性运行（`run_seconds`>0 且 `serve_once`）的预算语义：listener 在首次
+accept 时记录 `run_deadline`，把剩余秒数（下限 0.001，0 表示无限）传给
+工作线程；工作线程到点自己结束会话，流和音频都经 `finish_server` 发 FIN。
+listener 到期后只停止 accept，在 `finish_timeout_ms` 宽限后才强制停止，
+跟随者循环同样按 `run_seconds` 退出。此前遗漏该预算会导致探测结束后主机
+空转、音频无 FIN 被硬断（`audio errors=1`）。同轮修复
+`chast-protocol-test` 中对空 `FileOffer` payload 截取导致的 UB 崩溃
+（0xc0000409）：改为先构造合法 offer，再在线路上改写 size 字段验证拒绝。
 
 边界：并发上限 8；同一时刻只有一个发布者，所有桌面查看者共享同一显示器与
 编码器，因此跟随者不能单独切换显示器/分辨率/编码参数（请求会被告知由发布
