@@ -3110,6 +3110,20 @@
      通过，`flutter analyze` 无问题，Windows release 构建通过。边界：单机
      没有真实多屏，命中与去抖需双屏实机验收；媒体链路保持零拷贝，无 CPU
      fallback。
+136. **P3 · DEV-23 AV1 硬件零拷贝编码（2026-11-05 完成）**：先按“只支持
+     零拷贝、不考虑 CPU fallback”筛选：AV1 有三家厂商的 Windows 硬件
+     编码器（oneVPL AV1 VDEnc、`av1_nvenc`、`av1_amf`、`av1_qsv`），
+     VP8/VP9 没有硬件编码器，I444 需要新增 GPU 色彩通道与 4:4:4 硬件
+     解码，均不实现也不加软件兜底。协议 v45 增加 AV1 wire 3 与
+     `StreamCodecPreference::Av1`；主机设置支持 `codec=av1`，oneVPL 阶梯
+     AV1→HEVC→AVC，FFmpeg 按厂商取 AV1 编码器并在构建缺失或 GPU 不支持
+     时回退，显式点选 AV1 而最终不是 AV1 时以 Unsupported 拒绝；强制关键帧只置 I
+     帧（AV1 无 IDR）。查看器固定用原生 `av1` 解码器走 D3D11VA
+     （libdav1d 无 AVHWAccel），菜单/状态/偏好新增 AV1；MP4 录制与
+     Annex B 回放工具对 AV1 明确拒绝。C++ Release 构建、`protocol_test`、
+     `host-settings-test`、582 项 `flutter test`、`flutter analyze` 与
+     Windows release 构建通过。边界：本机无 AV1 硬件，只做编译与单元
+     验证；媒体链路保持零拷贝。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

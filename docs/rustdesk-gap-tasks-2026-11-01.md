@@ -372,7 +372,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 已实现（2026-11-05）：查看器引擎维护规则表，每条规则独立 `forward_id`、本地监听端口、目标与计数，最多 8 条并行；面板列出规则并可逐条停止，详见同日小节 |
 | DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 已实现（2026-11-05）：服务端完成授权码 + PKCE 的 OIDC 登录（JWKS 验签、按 issuer 隔离的身份链接、可选自动建号），查看器用系统浏览器完成认证并轮询取回与密码登录相同的会话，详见同日小节 |
 | DEV-22 | P2 | 触摸/笔输入 | `libs/base/protos/message.proto:190`（`PointerDeviceEvent`） | 已实现（2026-11-05）：协议 v43 的 `InputEvent` 增加 Touch/Pen，主机用 Windows 触摸注入与合成笔注入（不可用时降级为鼠标拖动），查看器映射多触点、压感、倾斜与橡皮/桶形键，详见同日小节 |
-| DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 只有 H.264/HEVC 的 NV12 4:2:0 硬件编码（`include/chast/encoder.h:42-44`）；受零拷贝约束，只能增加直接写 GPU 缓冲的硬件后端 |
+| DEV-23 | P3 | 编码扩展：I444/AV1/VP8/VP9 | `message.proto:22`（I444）、`:109`/`:117`、`:659-663`（VP9/H264/H265/VP8/AV1） | 已实现 AV1（2026-11-05，仅硬件零拷贝）：协议 v45 增加 AV1 wire 3，主机 oneVPL 的 AV1→HEVC→AVC 与 FFmpeg `av1_nvenc`/`av1_amf`/`av1_qsv` 阶梯，查看器用原生 `av1` 解码器走 D3D11VA；VP8/VP9 没有 Windows 硬件编码器，I444 需要新增 GPU 色彩通道与 4:4:4 硬件解码，受零拷贝约束不实现，详见同日小节 |
 | DEV-24 | P2 | 多显示器查看体验与远程分辨率：独立窗口、跟随光标/窗口、缩放光标、修改主机显示分辨率 | `toolbar.dart:969-1040`、`:1157-1184`；`message.proto:598`/`:866`（`change_display_resolution`） | 已实现（2026-11-05）：协议 v44 的 `SetDisplayFollow/DisplayFollowState` 让主机跟随远程光标或前台窗口自动切换输出；远程分辨率与光标缩放此前已具备；RustDesk 1.5.1 的“按显示器独立开窗”只存配置、无消费方，暂不按多窗口架构实现，详见同日小节 |
 | DEV-25 | P3 | WebSocket 传输 | `desktop_setting_page.dart:1945`（Use WebSocket） | 有 TLS TCP 共享载体，没有 WebSocket 选项，无法直接挂在仅支持 WS 的反代/CDN 后 |
 | DEV-26 | P3 | 远程配置修改、会话结束后锁定 | `desktop_setting_page.dart:1286`（远程配置）、`libs/base/protos/message.proto:683`（`lock_after_session_end`） | 主机设置只在本机/服务端管理；无“会话结束后锁定主机”选项 |
@@ -875,6 +875,53 @@ Windows release 构建通过。
 边界：本机没有真实多显示器环境，光标/窗口命中所依赖的 DXGI 输出矩形与
 虚拟桌面坐标只做了编译与单元验证，需双屏真机验收切换与去抖效果；跟随只
 改变采集输出，媒体链路保持零拷贝，无 CPU fallback。
+
+### DEV-23 AV1 硬件零拷贝编码（2026-11-05 完成）
+
+按“只支持零拷贝、不考虑 CPU fallback”的方案先做可行性筛选：AV1 在
+Windows 上有三家厂商的硬件编码器（oneVPL 2.x 的 AV1 VDEnc、NVENC
+`av1_nvenc`、AMF `av1_amf`、QSV `av1_qsv`），可以沿用现有 D3D11 纹理
+导入链路；VP8/VP9 没有 Windows 硬件编码器（只有 Linux VA-API 软件/硬件
+封装），I444 需要新增 NV12→4:4:4 的 GPU 色彩通道，且 NVIDIA/AMD/Intel
+的 D3D11VA 解码器都不向 FFmpeg 暴露 4:4:4 输出，两条路都无法在零拷贝
+硬件路径内完成，因此本轮不实现，也不引入软件编码兜底。
+
+协议从 v44 提升到 v45：`VideoCodec` 增加 `Av1`，帧头 codec wire 值 3，
+`StreamCodecPreference::Av1 = 3`，`StreamOptionsResult` 的 codec 字段
+同样接受 3；旧值 1/2 不变，未知值仍拒绝。
+
+- **主机编码**：`host.ini` 的 `codec=av1` 与 `parse_codec_setting` 生效。
+  自动模式沿用主机设置；查看器显式点选 AV1 时，若最终编码器不是 AV1，
+  主机以 `Unsupported` 拒绝并写日志，与 HEVC 的显式语义一致。oneVPL
+  阶梯为 AV1 VDENC → HEVC VDENC → AVC（AV1 没有 VME/legacy runtime
+  实现）；FFmpeg 后端按厂商取 `av1_nvenc`/`av1_amf`/`av1_qsv`，构建中
+  缺少该编码器、或当前 GPU 无法运行它（例如 Turing 驱动上的
+  `av1_nvenc`）时，在 FFmpeg 后端内新建实例回退 HEVC→H.264。强制
+  关键帧在 AV1 上只置 `MFX_FRAMETYPE_I`（AV1 没有 IDR 图片类型），
+  FFmpeg 侧的关键帧判定依赖 `AV_PKT_FLAG_KEY`，`idr` 标志保持 0。
+- **查看器解码**：`SetStreamOptions` 接受 3，状态里的 codec 字符串新增
+  “av1”。FFmpeg 解码器对 AV1 固定选择原生 `av1` 解码器而不是
+  `avcodec_find_decoder` 的默认项，因为 libdav1d 没有 AVHWAccel 注册；
+  本机 FFmpeg 7 构建确认包含 `av1_d3d11va_hwaccel`，解码帧仍是 D3D11
+  纹理，渲染链路不变。
+- **查看器 UI**：`ViewerStreamCodec` 增加 `av1(3)`，编码器菜单新增 AV1
+  项并标注“需要 AV1 硬件”；状态码 `av1` 回填到菜单与浮层标签；偏好
+  持久化范围扩到 0..3。
+- **录制与工具**：MP4 录制仍只支持 H.264/HEVC，AV1 会话启动录制会得到
+  “MP4 recording supports H.264 and HEVC only”的明确拒绝，不产出坏文件；
+  `chast-decode` 与 `chast-quic --in` 的 Annex B 回放同样对 AV1 给出明确
+  错误。`chast-encode --codec av1` 可输出裸 OBU 流，QUIC 会话与摄像头
+  中继直接以编码包传输，不需要 Annex B 拆分。
+
+验证：C++ Release 全量构建通过；`protocol_test` 新增 AV1 帧头往返、
+`SetStreamOptions`/`StreamOptionsResult` 的 AV1 往返（并把未知值测试改
+到 4）；`host-settings-test` 覆盖 av1 解析与回写；`flutter analyze` 无
+问题，`flutter test` 全量 582 项通过；Windows release 构建通过。
+
+边界：本机没有 AV1 编码或解码硬件，AV1 路径只做了编译、协议与单元
+验证，需在 Arc / Ada / RDNA3 等真机上验收画质、码率与 D3D11VA 解码；
+媒体链路未改变，主机纹理直接进入硬件编码器、查看器解码到 D3D11 纹理，
+全程保持零拷贝。
 
 ### 已核对但不算缺口的项
 
