@@ -745,7 +745,11 @@ func (v *ViewerAgent) readLoop() {
 				v.handleControl(data)
 				continue
 			}
-			if msg, err := wire.Decode(data); err == nil && msg.Type == wire.TypePunch {
+			if msg, err := wire.Decode(data); err == nil && msg.Type == wire.TypePunch &&
+				msg.Nonce == v.nonce {
+				// Only a punch carrying the nonce this viewer generated proves the
+				// peer learned it from the rendezvous service; anyone else could
+				// otherwise claim the direct path by sending one datagram.
 				v.onDirectPacket(src)
 			}
 			continue
@@ -766,9 +770,10 @@ func (v *ViewerAgent) readLoop() {
 			}
 			continue
 		}
-		if sameAddr(src, direct) || sameAddr(src, relay) || !src.IP.IsLoopback() {
-			// Host data, either from the announced candidate or from the
-			// address the host's NAT actually mapped us to.
+		if sameAddr(src, direct) {
+			// Host data from the address a nonce-checked punch announced. A host
+			// whose NAT mapped another source must prove the punch nonce first,
+			// which onDirectPacket records as the new direct address.
 			v.onDirectPacket(src)
 			v.mu.Lock()
 			local := cloneAddr(v.local)
@@ -776,6 +781,11 @@ func (v *ViewerAgent) readLoop() {
 			if local != nil {
 				v.conn.WriteToUDP(data, local)
 			}
+			continue
+		}
+		if !src.IP.IsLoopback() {
+			// Neither the announced host path nor the relay: dropping avoids
+			// feeding a stray datagram to the local client.
 			continue
 		}
 		// Everything else on a loopback-only listener is the local QUIC client.

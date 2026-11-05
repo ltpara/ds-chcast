@@ -202,11 +202,9 @@ func (sc *SharedCarrier) Close() {
 
 func (sc *SharedCarrier) serve(ln net.Listener) {
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				sc.log.Warn("shared carrier accept", "on", ln.Addr().String(), "error", err)
-			}
+		conn := acceptWithRetry(ln, sc.log, "shared carrier accept")
+		if conn == nil {
+			ln.Close()
 			return
 		}
 		go sc.handle(conn)

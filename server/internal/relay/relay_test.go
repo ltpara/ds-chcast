@@ -125,6 +125,34 @@ func TestRelayForwardsBothWays(t *testing.T) {
 	}
 }
 
+// Control datagrams from a viewer must not reach the host agent: the host
+// trusts its relay addresses, so a forwarded relay_ack would pass its source
+// check.
+func TestRelayDropsViewerControl(t *testing.T) {
+	m, _, relayAddr, priv := startRelayWith(t, "devbox", "host-secret", WithViewerTokenRequired(false))
+	host := listenUDP(t)
+	viewer := listenUDP(t)
+
+	if ack := relayHandshake(t, host, relayAddr, "devbox", priv); !ack.OK {
+		t.Fatalf("relay handshake: %+v", ack)
+	}
+
+	viewer.WriteToUDP(wire.Encode(wire.Message{Type: wire.TypeRelayAck, OK: true}), relayAddr)
+	host.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	buf := make([]byte, 2048)
+	if n, _, err := host.ReadFromUDP(buf); err == nil {
+		t.Fatalf("host received a control datagram through the relay: %q", buf[:n])
+	}
+
+	viewer.WriteToUDP([]byte("quic-from-viewer"), relayAddr)
+	if got := string(recv(t, host, 2*time.Second)); got != "quic-from-viewer" {
+		t.Fatalf("host received %q", got)
+	}
+	if stats := m.Stats().Ports[0]; stats.Dropped == 0 {
+		t.Fatalf("control datagram was not counted as dropped: %+v", stats)
+	}
+}
+
 // TestBindHostKeepsRelaySourceAddress checks that a port moved to another
 // local address replies from that address. Without the rebind the viewer sees
 // the configured bind address and discards the relayed datagrams.

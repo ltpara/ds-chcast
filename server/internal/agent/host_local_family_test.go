@@ -46,6 +46,12 @@ func TestHostForwardsAcrossLocalFamilies(t *testing.T) {
 	}
 	defer localOut.Close()
 
+	viewer, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer viewer.Close()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h := &HostAgent{
@@ -54,15 +60,15 @@ func TestHostForwardsAcrossLocalFamilies(t *testing.T) {
 		local:    local,
 		ctx:      ctx,
 		log:      quietLogger(),
+		// The rendezvous service announces the viewer before it sends data;
+		// without that punch record the agent refuses to adopt a remote.
+		punchPeers: map[string]time.Time{
+			viewer.LocalAddr().String(): time.Now().Add(punchTargetTTL),
+		},
 	}
 	go h.readLoop()
 	go h.localLoop()
 
-	viewer, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer viewer.Close()
 	payload := []byte("cross-family-viewer-data")
 	deadline := time.Now().Add(3 * time.Second)
 	buf := make([]byte, 2048)

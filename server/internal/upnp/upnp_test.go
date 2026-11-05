@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,7 +98,7 @@ func TestGatewayFromDescriptionFindsWanConnection(t *testing.T) {
 	}))
 	defer server.Close()
 
-	gateway, err := gatewayFromLocation(context.Background(), server.URL+"/rootDesc.xml")
+	gateway, err := gatewayFromLocation(context.Background(), server.URL+"/rootDesc.xml", net.ParseIP("127.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +118,65 @@ func TestGatewayFromDescriptionRequiresWanService(t *testing.T) {
 		[]byte(`<root><device><serviceList><service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType><controlURL>/x</controlURL></service></serviceList></device></root>`))
 	if err == nil {
 		t.Fatal("a device without a WAN connection service was accepted")
+	}
+}
+
+func TestGatewayFromDescriptionIgnoresExternalURLBase(t *testing.T) {
+	body := []byte(`<root><URLBase>http://203.0.113.9/</URLBase><device><serviceList><service>` +
+		`<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>` +
+		`<controlURL>/control</controlURL></service></serviceList></device></root>`)
+	gateway, err := gatewayFromDescription("http://192.168.1.1/rootDesc.xml", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gateway.ControlURL != "http://192.168.1.1/control" {
+		t.Fatalf("control URL = %q, want the description location", gateway.ControlURL)
+	}
+}
+
+func TestGatewayFromDescriptionRejectsExternalControlURL(t *testing.T) {
+	body := []byte(`<root><device><serviceList><service>` +
+		`<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>` +
+		`<controlURL>http://203.0.113.9/control</controlURL></service></serviceList></device></root>`)
+	if _, err := gatewayFromDescription("http://192.168.1.1/rootDesc.xml", body); err == nil {
+		t.Fatal("an off-LAN control URL was accepted")
+	}
+}
+
+func TestGatewayFromLocationRejectsForeignHost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<root><device><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/control</controlURL></service></serviceList></device></root>`)
+	}))
+	defer server.Close()
+	// The responder claims to be a LAN gateway but its description points at
+	// the loopback test server.
+	if _, err := gatewayFromLocation(context.Background(), server.URL+"/rootDesc.xml", net.ParseIP("192.168.1.1")); err == nil {
+		t.Fatal("a description on a different host than the responder was accepted")
+	}
+}
+
+func TestGatewayFromLocationRejectsPublicResponder(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<root></root>`)
+	}))
+	defer server.Close()
+	if _, err := gatewayFromLocation(context.Background(), server.URL+"/rootDesc.xml", net.ParseIP("203.0.113.9")); err == nil {
+		t.Fatal("a public SSDP responder was accepted")
+	}
+	if _, err := gatewayFromLocation(context.Background(), server.URL+"/rootDesc.xml", net.ParseIP("169.254.169.254")); err == nil {
+		t.Fatal("a link-local SSDP responder was accepted")
+	}
+}
+
+func TestGatewayFromLocationDoesNotFollowRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<root></root>`)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.RedirectHandler(target.URL+"/rootDesc.xml", http.StatusFound))
+	defer redirect.Close()
+	if _, err := gatewayFromLocation(context.Background(), redirect.URL+"/rootDesc.xml", net.ParseIP("127.0.0.1")); err == nil {
+		t.Fatal("a redirecting description was followed")
 	}
 }
 

@@ -171,6 +171,11 @@ type HostAgent struct {
 	// remote is guarded by mu: both read loops use it. It is the source of the
 	// last datagram that came from a viewer path (direct or via the relay).
 	remote *net.UDPAddr
+	// punchPeers are viewer addresses the rendezvous service asked this host
+	// to punch, with an expiry. Only these, the current remote and relay
+	// endpoints may become the forwarding target, so one stray datagram
+	// cannot steal the return path.
+	punchPeers map[string]time.Time
 
 	keepaliveOnce  sync.Once
 	relayOnce      sync.Once
@@ -259,6 +264,7 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 		ctx:            ctx,
 		cancel:         cancel,
 		refresh:        20 * time.Second,
+		punchPeers:     make(map[string]time.Time),
 		keepaliveReady: make(chan struct{}),
 		relayReady:     make(chan struct{}),
 		carrierReady:   make(chan struct{}),
@@ -633,6 +639,10 @@ func (h *HostAgent) getRelay() *net.UDPAddr {
 func (h *HostAgent) relayEndpoints() []*net.UDPAddr {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.relayEndpointsLocked()
+}
+
+func (h *HostAgent) relayEndpointsLocked() []*net.UDPAddr {
 	out := make([]*net.UDPAddr, 0, len(h.relaySet)+1)
 	for _, addr := range h.relaySet {
 		out = append(out, cloneAddr(addr))
@@ -657,6 +667,56 @@ func (h *HostAgent) relayAllowed(src *net.UDPAddr) bool {
 // dropping the IPv6 source would leave that mapping unverified.
 func (h *HostAgent) acceptsControl(src, punch, punch6 *net.UDPAddr) bool {
 	return sameAddr(src, punch) || sameAddr(src, punch6) || h.relayAllowed(src)
+}
+
+// acceptViewerSourceLocked reports whether data from src may become the
+// forwarding target. The current remote, a relay endpoint and a recently
+// punched viewer address qualify; anything else would let a single stray
+// datagram steal the return path.
+func (h *HostAgent) acceptViewerSourceLocked(src *net.UDPAddr) bool {
+	if h.remote != nil && sameAddr(h.remote, src) {
+		return true
+	}
+	for _, relay := range h.relayEndpointsLocked() {
+		if sameAddr(src, relay) {
+			return true
+		}
+	}
+	key := src.String()
+	expiry, ok := h.punchPeers[key]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiry) {
+		delete(h.punchPeers, key)
+		return false
+	}
+	return true
+}
+
+// rememberPunchPeer records a viewer address the rendezvous service vouched
+// for, with a short expiry.
+func (h *HostAgent) rememberPunchPeer(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.punchPeers == nil {
+		h.punchPeers = make(map[string]time.Time)
+	}
+	if len(h.punchPeers) >= 64 {
+		now := time.Now()
+		for key, expiry := range h.punchPeers {
+			if now.After(expiry) {
+				delete(h.punchPeers, key)
+			}
+		}
+		if len(h.punchPeers) >= 64 {
+			return
+		}
+	}
+	h.punchPeers[addr.String()] = time.Now().Add(punchTargetTTL)
 }
 
 func (h *HostAgent) getNATType() string {
@@ -733,10 +793,18 @@ func (h *HostAgent) readLoop() {
 			h.conn.WriteToUDP(data, remote)
 			continue
 		}
-		h.noteViewer(src)
 		h.mu.Lock()
-		h.remote = cloneAddr(src)
+		accepted := h.acceptViewerSourceLocked(src)
+		if accepted {
+			h.remote = cloneAddr(src)
+		}
 		h.mu.Unlock()
+		if !accepted {
+			// Not the punched viewer and not the relay: forwarding replies
+			// here would let one datagram redirect the whole session.
+			continue
+		}
+		h.noteViewer(src)
 		if h.localOut != nil {
 			h.localOut.WriteToUDP(data, h.local)
 		} else {
@@ -806,9 +874,11 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 	if err != nil {
 		return
 	}
+	fromPunch := sameAddr(src, h.getPunch()) || sameAddr(src, h.getPunch6())
+	fromRelay := h.relayAllowed(src)
 	switch msg.Type {
 	case wire.TypeKeepaliveChallenge:
-		if (!sameAddr(src, h.getPunch()) && !sameAddr(src, h.getPunch6())) ||
+		if !fromPunch ||
 			msg.HostID != h.cfg.ID || (msg.Candidate == "" && msg.CandidateV6 == "") || msg.Nonce == "" {
 			h.log.Debug("ignoring keepalive challenge", "from", src.String(), "host", msg.HostID,
 				"candidate", msg.Candidate, "candidate_v6", msg.CandidateV6)
@@ -832,6 +902,9 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 			UpnpPort:     h.upnpPort,
 		}), src)
 	case wire.TypeKeepaliveAck:
+		if !fromPunch {
+			return
+		}
 		if !msg.OK {
 			h.log.Warn("keepalive refused", "error", msg.Error)
 			return
@@ -841,6 +914,9 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 		}
 		h.keepaliveOnce.Do(func() { close(h.keepaliveReady) })
 	case wire.TypePunchPeer:
+		if !fromPunch {
+			return
+		}
 		peer, err := resolveUDP(msg.Candidate)
 		if err != nil || peer == nil {
 			peer, err = resolveUDP(msg.CandidateV6)
@@ -848,17 +924,19 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 				return
 			}
 		}
+		h.rememberPunchPeer(peer)
 		h.log.Info("punch request from viewer", "candidate", peer.String())
 		go h.sendPunches(peer, msg.Nonce)
 		// The viewer's gateway mapping stays reachable even when its observed
 		// source port differs per destination (symmetric NAT).
 		if mapped, err := resolveUDP(candidateWithUpnpPort(msg.Candidate, msg.UpnpPort)); err == nil &&
 			mapped != nil && !sameAddr(mapped, peer) {
+			h.rememberPunchPeer(mapped)
 			h.log.Info("punching the viewer's UPnP mapping", "candidate", mapped.String())
 			go h.sendPunches(mapped, msg.Nonce)
 		}
 	case wire.TypeRelayChallenge:
-		if !h.relayAllowed(src) || msg.HostID != h.cfg.ID ||
+		if !fromRelay || msg.HostID != h.cfg.ID ||
 			msg.Candidate == "" || msg.Nonce == "" {
 			return
 		}
@@ -872,6 +950,9 @@ func (h *HostAgent) handleControl(data []byte, src *net.UDPAddr) {
 			Signature: signature,
 		}), src)
 	case wire.TypeRelayAck:
+		if !fromRelay {
+			return
+		}
 		if !msg.OK {
 			h.log.Warn("relay refused the host", "error", msg.Error)
 			return
@@ -953,6 +1034,10 @@ const (
 	carrierReadIdle  = 60 * time.Second
 	carrierKeepalive = 20 * time.Second
 	carrierRetryMax  = 10 * time.Second
+	// punchTargetTTL bounds how long a rendezvous-announced viewer address may
+	// become the forwarding target. The viewer connects right after the punch,
+	// so a longer window would only widen the spoofing window.
+	punchTargetTTL = 2 * time.Minute
 )
 
 // carrierLinkLoop keeps one authenticated TCP link to the relay so viewers on

@@ -1083,6 +1083,12 @@ func (p *port) handle(conn *net.UDPConn, data []byte, src *net.UDPAddr, now time
 		p.dropped++
 		return
 	}
+	if wire.IsControl(data) {
+		// The relay address is trusted by the host agent, so a viewer must not
+		// be able to inject control datagrams such as relay_ack through it.
+		p.dropped++
+		return
+	}
 	if _, err := conn.WriteToUDP(data, p.hostAddr); err != nil {
 		p.dropped++
 		return
@@ -1179,14 +1185,35 @@ func (p *port) handleViewerAuth(conn *net.UDPConn, msg wire.Message, src *net.UD
 // serveTCP accepts both raw carriers and WebSocket upgrades on the relay port.
 func (p *port) serveTCP(tcp net.Listener) {
 	for {
-		conn, err := tcp.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				p.set.manager.log.Warn("relay carrier accept", "port", p.number, "error", err)
-			}
+		conn := acceptWithRetry(tcp, p.set.manager.log, "relay carrier accept")
+		if conn == nil {
+			tcp.Close()
 			return
 		}
 		go p.handleTCP(conn)
+	}
+}
+
+// acceptWithRetry returns the next accepted connection, or nil once the
+// listener is closed. Transient failures such as EMFILE must not disable the
+// listener permanently, so they back off and retry instead of ending the loop.
+func acceptWithRetry(ln net.Listener, log *slog.Logger, message string) net.Conn {
+	const maxBackoff = time.Second
+	backoff := 5 * time.Millisecond
+	for {
+		conn, err := ln.Accept()
+		if err == nil {
+			return conn
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		log.Warn(message, "on", ln.Addr().String(), "error", err)
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
 }
 

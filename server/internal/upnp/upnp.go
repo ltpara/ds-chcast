@@ -82,7 +82,7 @@ func Discover(ctx context.Context, timeout time.Duration) (Gateway, error) {
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			return Gateway{}, err
 		}
-		n, _, err := conn.ReadFromUDP(buf)
+		n, source, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if lastErr != nil {
 				return Gateway{}, lastErr
@@ -92,11 +92,16 @@ func Discover(ctx context.Context, timeout time.Duration) (Gateway, error) {
 			}
 			return Gateway{}, fmt.Errorf("upnp discovery read: %w", err)
 		}
+		if source == nil || !isPrivateIP(source.IP) {
+			// Anyone who can inject into the SSDP group could otherwise point
+			// the description fetch at a URL of their choosing.
+			continue
+		}
 		location := searchLocation(buf[:n])
 		if location == "" {
 			continue
 		}
-		gateway, err := gatewayFromLocation(ctx, location)
+		gateway, err := gatewayFromLocation(ctx, location, source.IP)
 		if err != nil {
 			lastErr = err
 			continue
@@ -128,13 +133,33 @@ func searchLocation(response []byte) string {
 }
 
 // gatewayFromLocation fetches and parses a device description. It is separated
-// from Discover so the XML handling can be tested without multicast.
-func gatewayFromLocation(ctx context.Context, location string) (Gateway, error) {
+// from Discover so the XML handling can be tested without multicast. sourceIP
+// is the address the SSDP response came from: the LOCATION host must resolve to
+// it, so a forged response cannot redirect the fetch elsewhere on the LAN or to
+// the Internet.
+func gatewayFromLocation(ctx context.Context, location string, sourceIP net.IP) (Gateway, error) {
+	parsed, err := url.Parse(location)
+	if err != nil {
+		return Gateway{}, fmt.Errorf("upnp description URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return Gateway{}, fmt.Errorf("upnp description URL scheme %q", parsed.Scheme)
+	}
+	if err := checkLocationHost(parsed, sourceIP); err != nil {
+		return Gateway{}, err
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
 	if err != nil {
 		return Gateway{}, err
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		// A redirect would hand the fetch to a host that was never tied to the
+		// SSDP responder.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return Gateway{}, fmt.Errorf("upnp description: %w", err)
@@ -150,13 +175,57 @@ func gatewayFromLocation(ctx context.Context, location string) (Gateway, error) 
 	return gatewayFromDescription(location, body)
 }
 
+// isPrivateIP admits RFC1918 and IPv6 ULA addresses plus loopback. Link-local
+// (169.254.0.0/16) is deliberately excluded: cloud metadata services live
+// there and no LAN gateway answers SSDP from that range.
+func isPrivateIP(ip net.IP) bool {
+	return ip != nil && (ip.IsPrivate() || ip.IsLoopback())
+}
+
+// checkLocationHost requires the description host to resolve to the SSDP
+// responder. Literal addresses must match exactly; names are resolved once and
+// every answer must stay private, with at least one equal to the responder.
+func checkLocationHost(location *url.URL, sourceIP net.IP) error {
+	if !isPrivateIP(sourceIP) {
+		return fmt.Errorf("upnp response came from a non-private address %v", sourceIP)
+	}
+	host := location.Hostname()
+	if host == "" {
+		return errors.New("upnp description URL has no host")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if !ip.Equal(sourceIP) {
+			return fmt.Errorf("upnp description host %s does not match the responder %s", ip, sourceIP)
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("upnp description host %q: %w", host, err)
+	}
+	matched := false
+	for _, address := range addresses {
+		if !isPrivateIP(address.IP) {
+			return fmt.Errorf("upnp description host %q resolves to a non-private address", host)
+		}
+		if address.IP.Equal(sourceIP) {
+			matched = true
+		}
+	}
+	if !matched {
+		return fmt.Errorf("upnp description host %q does not resolve to the responder %s", host, sourceIP)
+	}
+	return nil
+}
+
 type descriptionService struct {
 	ServiceType string `xml:"serviceType"`
 	ControlURL  string `xml:"controlURL"`
 }
 
 type descriptionDevice struct {
-	URLBase     string               `xml:"URLBase"`
 	ServiceList []descriptionService `xml:"serviceList>service"`
 	Devices     []descriptionDevice  `xml:"deviceList>device"`
 }
@@ -170,20 +239,17 @@ func (d descriptionDevice) walkServices() []descriptionService {
 }
 
 // gatewayFromDescription walks the device tree and prefers WANIPConnection over
-// WANPPPConnection, then the highest service version.
+// WANPPPConnection, then the highest service version. URLs resolve against the
+// validated description location, never against the document's own URLBase: a
+// forged description must not be able to move the SOAP calls to another host.
 func gatewayFromDescription(location string, body []byte) (Gateway, error) {
 	var document struct {
-		URLBase string            `xml:"URLBase"`
-		Device  descriptionDevice `xml:"device"`
+		Device descriptionDevice `xml:"device"`
 	}
 	if err := xml.Unmarshal(body, &document); err != nil {
 		return Gateway{}, fmt.Errorf("upnp description xml: %w", err)
 	}
-	baseText := document.URLBase
-	if baseText == "" {
-		baseText = location
-	}
-	base, err := url.Parse(baseText)
+	base, err := url.Parse(location)
 	if err != nil {
 		return Gateway{}, fmt.Errorf("upnp URLBase: %w", err)
 	}
@@ -204,11 +270,28 @@ func gatewayFromDescription(location string, body []byte) (Gateway, error) {
 	if err != nil {
 		return Gateway{}, fmt.Errorf("upnp control URL: %w", err)
 	}
+	if !controlHostAllowed(control, base) {
+		return Gateway{}, fmt.Errorf("upnp control URL %q is not on a private host", control.Redacted())
+	}
 	localIP, err := localIPFor(control.Host)
 	if err != nil {
 		return Gateway{}, err
 	}
 	return Gateway{ControlURL: control.String(), Service: chosen.ServiceType, LocalIP: localIP}, nil
+}
+
+// controlHostAllowed accepts a literal private address or the same host name
+// the description came from. Anything else would let the description point the
+// SOAP calls at another machine or at the Internet.
+func controlHostAllowed(control, base *url.URL) bool {
+	host := control.Hostname()
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return isPrivateIP(ip)
+	}
+	return strings.EqualFold(host, base.Hostname())
 }
 
 // serviceRank orders candidates: WANIPConnection before WANPPPConnection, and
