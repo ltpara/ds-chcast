@@ -507,6 +507,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_terminal)) {
                 warn(result.warning, "terminal '" + value + "' is not a boolean");
             }
+        } else if (key == "terminal_persist") {
+            if (!parse_bool(value, settings.allow_terminal_persist)) {
+                warn(result.warning, "terminal_persist '" + value + "' is not a boolean");
+            }
         } else if (key == "camera") {
             if (!parse_bool(value, settings.allow_camera)) {
                 warn(result.warning, "camera '" + value + "' is not a boolean");
@@ -851,6 +855,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "file_transfer=" << (settings.allow_file_transfer ? 1 : 0) << "\n"
          << "port_forward=" << (settings.allow_port_forward ? 1 : 0) << "\n"
          << "terminal=" << (settings.allow_terminal ? 1 : 0) << "\n"
+         << "terminal_persist=" << (settings.allow_terminal_persist ? 1 : 0) << "\n"
          << "camera=" << (settings.allow_camera ? 1 : 0) << "\n"
          << "record=" << (settings.allow_record ? 1 : 0) << "\n"
          << "file_receive_dir=" << settings.file_receive_directory << "\n"

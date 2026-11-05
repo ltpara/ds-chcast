@@ -127,9 +127,6 @@ constexpr auto kFileSendBudget = std::chrono::milliseconds(8);
 constexpr double kFileUploadBytesPerSecond = 32.0 * 1024.0 * 1024.0;
 constexpr double kFileUploadBurst = 256.0 * 1024.0;
 constexpr size_t kMaxPendingInput = 256;
-// The viewer runs one console per session; the id only has to be stable
-// within that session.
-constexpr uint32_t kViewerTerminalId = 1;
 // Safety valve for a folder that expands into a huge tree; the UI would
 // otherwise build an unbounded queue on the session thread.
 constexpr size_t kMaxQueuedUploads = 10000;
@@ -1456,17 +1453,23 @@ bool ViewerEngine::TakeChat(std::string& text) {
     return true;
 }
 
-bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows) {
+bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows,
+                                uint32_t service_id) {
     if (!chast::valid_terminal_size(columns, rows)) {
         return false;
     }
     if (!running_.load(std::memory_order_acquire)) {
         return false;
     }
+    uint8_t flags = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (status_.state != ViewerState::kStreaming ||
             (status_.permissions & chast::kPermissionTerminal) == 0) {
+            return false;
+        }
+        // An attach names a console only a persistent host can have kept.
+        if (service_id != 0 && !status_.terminal_persist_supported) {
             return false;
         }
         if (status_.terminal_phase == TerminalPhase::kRequesting ||
@@ -1479,7 +1482,15 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows) {
         status_.terminal_error.clear();
         status_.terminal_columns = columns;
         status_.terminal_rows = rows;
+        // The previous id says nothing about the console being opened now; a
+        // fresh one arrives with the host's answer.
+        status_.terminal_service_id = 0;
         ++status_.terminal_updates;
+        if (service_id != 0) {
+            flags = chast::kTerminalRequestAttach;
+        } else if (status_.terminal_persist_supported) {
+            flags = chast::kTerminalRequestPersist;
+        }
     }
     std::lock_guard<std::mutex> lock(terminal_mutex_);
     // The previous console's bytes must be on the panel before its phase can
@@ -1496,6 +1507,8 @@ bool ViewerEngine::OpenTerminal(uint16_t columns, uint16_t rows) {
     command.kind = TerminalCommand::Kind::kOpen;
     command.columns = columns;
     command.rows = rows;
+    command.flags = flags;
+    command.service_id = service_id;
     pending_terminal_.push_back(std::move(command));
     return true;
 }
@@ -1562,6 +1575,9 @@ void ViewerEngine::CloseTerminal() {
             status_.terminal_code = 0;
             status_.terminal_reason.clear();
             status_.terminal_error.clear();
+            // The stop kills a persistent service too, so the id must not
+            // invite a later attach.
+            status_.terminal_service_id = 0;
             ++status_.terminal_updates;
         }
     }
@@ -2413,6 +2429,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 status_.origin_y = info.origin_y;
                 status_.displays = info.displays;
                 status_.merged_layout = info.merged;
+                status_.terminal_persist_supported = info.terminal_persist;
             }
             {
                 std::lock_guard<std::mutex> lock(input_mutex_);
@@ -5769,9 +5786,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // Remote terminal. The panel drives one console through the
                 // command queue; this thread owns the session, so request,
                 // input, resize and the stop all leave from here in order.
-                // `terminal_active` means the session holds an entry for
-                // kViewerTerminalId; `terminal_closing` means a stop went out
-                // or came in and the remaining output is still draining.
+                // `terminal_id` is allocated per open, so an attached service
+                // gets a fresh session-scoped id and stale answers for the
+                // previous console can no longer match. `terminal_active`
+                // means the session holds that entry; `terminal_closing` means
+                // a stop went out or came in and the remaining output is still
+                // draining.
+                uint32_t terminal_id = 0;
+                uint32_t terminal_next_id = 1;
                 bool terminal_active = false;
                 bool terminal_closing = false;
                 uint64_t terminal_bytes = 0;
@@ -5783,6 +5805,12 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.terminal_code = code;
                     status_.terminal_reason = std::move(reason);
                     status_.terminal_error = std::move(error);
+                    if (phase == TerminalPhase::kEnded ||
+                        phase == TerminalPhase::kFailed) {
+                        // Nothing is left to attach to once the console is
+                        // over or its open was refused.
+                        status_.terminal_service_id = 0;
+                    }
                     ++status_.terminal_updates;
                 };
                 auto terminal_phase_is = [&](TerminalPhase phase) {
@@ -5792,11 +5820,20 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
 
                 // Forgets the session-side entry once its output is done. The
                 // UI keeps whatever was already handed over, and the phase it
-                // sees next poll is the caller's.
+                // sees next poll is the caller's. The service id goes with the
+                // entry: either the host removed the service or the next open
+                // names a different one.
                 auto finish_terminal = [&] {
-                    session->close_terminal(kViewerTerminalId);
+                    if (terminal_id != 0) {
+                        session->close_terminal(terminal_id);
+                    }
+                    terminal_id = 0;
                     terminal_active = false;
                     terminal_closing = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.terminal_service_id = 0;
+                    }
                     std::lock_guard<std::mutex> lock(terminal_mutex_);
                     terminal_output_ended_ = true;
                 };
@@ -5835,9 +5872,17 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     pending_terminal_.push_front(std::move(command));
                                     return;
                                 }
+                                // A fresh id per console, wrapping only past
+                                // ids no session could still be waiting on.
+                                terminal_id = terminal_next_id++;
+                                if (terminal_next_id == 0) {
+                                    terminal_next_id = 1;
+                                }
                                 chast::Error requested = session->request_terminal(
-                                    kViewerTerminalId, command.columns, command.rows);
+                                    terminal_id, command.columns, command.rows,
+                                    command.flags, command.service_id);
                                 if (!requested.ok()) {
+                                    terminal_id = 0;
                                     set_terminal_phase(TerminalPhase::kFailed, 0, {},
                                                        "request: " +
                                                            requested.to_string());
@@ -5853,8 +5898,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     status_.terminal_rows = command.rows;
                                 }
                                 std::fprintf(stderr,
-                                             "viewer: terminal requested %ux%u\n",
-                                             command.columns, command.rows);
+                                             "viewer: terminal requested %ux%u "
+                                             "(id %u, flags 0x%02x, service %u)\n",
+                                             command.columns, command.rows, terminal_id,
+                                             command.flags, command.service_id);
                                 continue;
                             }
                             case TerminalCommand::Kind::kInput: {
@@ -5866,7 +5913,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     const size_t chunk = std::min(
                                         command.bytes.size(), chast::kMaxTerminalChunkBytes);
                                     chast::Error sent = session->send_terminal_input(
-                                        kViewerTerminalId,
+                                        terminal_id,
                                         reinterpret_cast<const uint8_t*>(
                                             command.bytes.data()),
                                         chunk, std::chrono::milliseconds(0));
@@ -5896,7 +5943,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     continue;
                                 }
                                 chast::Error sent = session->send_terminal_resize(
-                                    kViewerTerminalId, command.columns, command.rows);
+                                    terminal_id, command.columns, command.rows);
                                 if (!sent.ok()) {
                                     std::fprintf(stderr,
                                                  "viewer: terminal resize %ux%u: %s\n",
@@ -5912,7 +5959,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             case TerminalCommand::Kind::kClose: {
                                 if (terminal_active && !terminal_closing) {
                                     chast::Error stopped = session->send_terminal_stop(
-                                        kViewerTerminalId,
+                                        terminal_id,
                                         chast::TerminalCode::Cancelled,
                                         "closed by the viewer");
                                     terminal_closing = true;
@@ -5931,14 +5978,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto poll_terminal = [&] {
                     chast::TerminalResult result;
                     while (session->take_terminal_result(result)) {
-                        if (result.terminal_id != kViewerTerminalId) {
+                        if (terminal_id == 0 || result.terminal_id != terminal_id) {
                             continue;
                         }
                         if (terminal_phase_is(TerminalPhase::kClosed)) {
                             // The panel closed while the answer was in
                             // flight; the host's console must not outlive it.
                             if (result.code == chast::TerminalCode::Ok) {
-                                session->close_terminal(kViewerTerminalId);
+                                session->close_terminal(terminal_id);
+                                terminal_id = 0;
                                 terminal_active = false;
                                 terminal_closing = false;
                                 std::lock_guard<std::mutex> lock(terminal_mutex_);
@@ -5947,6 +5995,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             continue;
                         }
                         if (result.code != chast::TerminalCode::Ok) {
+                            terminal_id = 0;
                             terminal_active = false;
                             terminal_closing = false;
                             set_terminal_phase(TerminalPhase::kFailed,
@@ -5959,9 +6008,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             terminal_output_ended_ = true;
                             continue;
                         }
-                        chast::Error opened = session->open_terminal_input(kViewerTerminalId);
+                        // Persistent consoles hand back the id a later session
+                        // attaches with. A legacy console leaves it at 0.
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.terminal_service_id = result.service_id;
+                        }
+                        chast::Error opened = session->open_terminal_input(terminal_id);
                         if (!opened.ok()) {
-                            session->close_terminal(kViewerTerminalId);
+                            session->close_terminal(terminal_id);
+                            terminal_id = 0;
                             terminal_active = false;
                             terminal_closing = false;
                             set_terminal_phase(
@@ -5973,12 +6029,18 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             continue;
                         }
                         set_terminal_phase(TerminalPhase::kOpen, 0, {}, {});
-                        std::fprintf(stderr, "viewer: terminal open\n");
+                        if (result.service_id != 0) {
+                            std::fprintf(stderr, "viewer: terminal open (service #%u)\n",
+                                         result.service_id);
+                        } else {
+                            std::fprintf(stderr, "viewer: terminal open\n");
+                        }
                     }
 
                     chast::TerminalStop stop;
                     while (session->take_terminal_stop(stop)) {
-                        if (stop.terminal_id != kViewerTerminalId || !terminal_active) {
+                        if (terminal_id == 0 || stop.terminal_id != terminal_id ||
+                            !terminal_active) {
                             continue;
                         }
                         terminal_closing = true;
@@ -6026,7 +6088,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         std::vector<uint8_t> data;
                         bool ended = false;
-                        if (!session->take_terminal_output(kViewerTerminalId, data,
+                        if (!session->take_terminal_output(terminal_id, data,
                                                            ended)) {
                             if (ended) {
                                 // A host-initiated ending carries its own stop;
@@ -6777,6 +6839,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             status_.origin_y = info.origin_y;
                             status_.displays = info.displays;
                             status_.merged_layout = info.merged;
+                            status_.terminal_persist_supported =
+                                info.terminal_persist;
                         }
                         {
                             std::lock_guard<std::mutex> lock(input_mutex_);

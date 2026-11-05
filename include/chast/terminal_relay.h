@@ -6,9 +6,13 @@
 // blocks. A console whose far end is busy falls back to "try again next
 // frame"; the QUIC receive window and a bounded queue absorb the burst.
 //
-// The relay owns the child process: ending a session, revoking the terminal
-// permission or losing the viewer kills the console before the next session
-// starts, so no shell survives its session.
+// With terminal persistence enabled, a console created with the persist flag
+// becomes a host-level service: when the session ends the relay detaches it
+// instead of killing it, keeps the last kTerminalScrollbackBytes of output and
+// replays them to the next session that attaches by service id. A service no
+// viewer attaches to within kTerminalServiceIdleSeconds is reaped. Services
+// live in a process-wide registry, so a shell survives the HostServer that
+// created it. Every other console is killed when its session ends.
 
 #include <cstddef>
 #include <cstdint>
@@ -20,9 +24,11 @@
 
 namespace chast {
 
+struct TerminalConsole;
+
 class TerminalRelay {
 public:
-    explicit TerminalRelay(QuicSession& session);
+    explicit TerminalRelay(QuicSession& session, bool allow_persist = false);
     ~TerminalRelay();
     TerminalRelay(const TerminalRelay&) = delete;
     TerminalRelay& operator=(const TerminalRelay&) = delete;
@@ -34,23 +40,28 @@ public:
 
     uint64_t terminals() const { return started_; }
     uint64_t failures() const { return failures_; }
+    uint64_t resumes() const { return resumed_; }
 
 private:
-    struct Console;
     enum class Outcome { Keep, Done, Failed };
 
     void start_console(const TerminalRequest& request, std::vector<std::string>& events);
-    Outcome drive(Console& console, std::vector<std::string>& events);
-    void apply_resize(Console& console, const TerminalSize& size,
+    void attach_console(const TerminalRequest& request, std::vector<std::string>& events);
+    Outcome drive(const std::shared_ptr<TerminalConsole>& console,
+                  std::vector<std::string>& events);
+    void apply_resize(TerminalConsole& console, const TerminalSize& size,
                       std::vector<std::string>& events);
-    void stop_console(Console& console);
-    void finish(Console& console, TerminalCode code, const std::string& reason,
-                std::vector<std::string>& events);
+    void stop_console(TerminalConsole& console);
+    void detach_console(const std::shared_ptr<TerminalConsole>& console);
+    void finish(const std::shared_ptr<TerminalConsole>& console, TerminalCode code,
+                const std::string& reason, std::vector<std::string>& events);
 
     QuicSession& session_;
-    std::vector<std::unique_ptr<Console>> live_;
+    bool allow_persist_ = false;
+    std::vector<std::shared_ptr<TerminalConsole>> live_;
     uint64_t started_ = 0;
     uint64_t failures_ = 0;
+    uint64_t resumed_ = 0;
 };
 
 }  // namespace chast

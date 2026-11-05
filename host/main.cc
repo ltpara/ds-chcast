@@ -1780,6 +1780,7 @@ enum SecurityDialogId {
     kSecAllowPrivacy,
     kSecAllowPortForward,
     kSecAllowTerminal,
+    kSecAllowTerminalPersist,
     kSecAllowRecord,
     kSecAllowCamera,
     kSecAllowRestart,
@@ -1827,6 +1828,7 @@ struct SecurityDialogState {
     std::string receive_directory;
     HWND allow_port_forward = nullptr;
     HWND allow_terminal = nullptr;
+    HWND allow_terminal_persist = nullptr;
     HWND allow_record = nullptr;
     HWND allow_camera = nullptr;
     HWND allow_restart = nullptr;
@@ -2057,6 +2059,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_file_transfer = is_checked(dialog.allow_file);
     updated.allow_port_forward = is_checked(dialog.allow_port_forward);
     updated.allow_terminal = is_checked(dialog.allow_terminal);
+    updated.allow_terminal_persist = is_checked(dialog.allow_terminal_persist);
     updated.allow_record = is_checked(dialog.allow_record);
     updated.allow_camera = is_checked(dialog.allow_camera);
     updated.allow_restart = is_checked(dialog.allow_restart);
@@ -2555,9 +2558,17 @@ bool edit_security_settings(HostSettings& result) {
 
     const wchar_t* allow_terminal_text = tr(L"远程终端");
     dialog.allow_terminal = page_check(allow_terminal_text, 32, 488, kSecAllowTerminal);
+    // The persist box shares this row: it only means anything with the
+    // permission beside it, and the page has no spare row left.
+    const wchar_t* terminal_persist_text = tr(L"断线后保留");
+    const int terminal_persist_width = std::max(120, check_px(terminal_persist_text));
+    dialog.allow_terminal_persist = page_check(terminal_persist_text,
+                                               page_right - terminal_persist_width, 488,
+                                               kSecAllowTerminalPersist);
     const int terminal_left = 32 + std::max(120, check_px(allow_terminal_text)) + 10;
-    add(L"STATIC", tr(L"允许查看器在本机打开 shell（使用当前账户）。"), SS_LEFT, 0, terminal_left,
-        492, page_right - terminal_left, 20, 0, nullptr, &dialog.access_page);
+    add(L"STATIC", tr(L"允许查看器打开本机 shell。"), SS_LEFT, 0, terminal_left, 492,
+        page_right - terminal_left - terminal_persist_width - 16, 20, 0, nullptr,
+        &dialog.access_page);
 
     const wchar_t* allow_camera_text = tr(L"摄像头");
     dialog.allow_camera = page_check(allow_camera_text, 32, 516, kSecAllowCamera);
@@ -2661,6 +2672,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_file, settings.allow_file_transfer);
     set_check(dialog.allow_port_forward, settings.allow_port_forward);
     set_check(dialog.allow_terminal, settings.allow_terminal);
+    set_check(dialog.allow_terminal_persist, settings.allow_terminal_persist);
     set_check(dialog.allow_record, settings.allow_record);
     set_check(dialog.allow_camera, settings.allow_camera);
     set_check(dialog.allow_restart, settings.allow_restart);

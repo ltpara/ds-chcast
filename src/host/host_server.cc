@@ -547,7 +547,8 @@ std::string streamed_display_name(const IDxgiCapturer& capturer) {
 ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
                            const IDxgiCapturer& capturer, const IVideoEncoder& encoder,
                            UINT source_width, UINT source_height, uint16_t framerate,
-                           uint16_t permissions, const AudioInfo& audio) {
+                           uint16_t permissions, const AudioInfo& audio,
+                           bool terminal_persist) {
     const DisplayInfo& display = capturer.display();
     ServerInfo info;
     info.codec = encoder.codec();
@@ -565,6 +566,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
     info.session_select_enabled = (permissions & kPermissionSessionSelect) != 0;
+    info.terminal_persist = terminal_persist;
     info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
     const std::vector<DisplayInfo> listed =
@@ -2197,7 +2199,7 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
     };
 
     PortForwardRelay port_forward(*session_);
-    TerminalRelay terminal(*session_);
+    TerminalRelay terminal(*session_, settings_.allow_terminal_persist);
     // A follower has no capturer to borrow an adapter from; the camera relay
     // opens its own device instead.
     CameraRelay camera(*session_, [] { return LUID{}; },
@@ -2773,7 +2775,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
 
     ServerInfo stream_info =
         describe_stream(attached, *capturer, *encoder, first.width, first.height,
-                        static_cast<uint16_t>(framerate), granted_permissions, audio_info);
+                        static_cast<uint16_t>(framerate), granted_permissions, audio_info,
+                        settings_.allow_terminal_persist);
     publish_current(stream_info);
     if (config_.stream_announced) {
         config_.stream_announced(stream_info);
@@ -3438,7 +3441,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             capturer->merged() ? size_t{0} : find_display(attached, capturer->display());
         stream_info = describe_stream(attached, *capturer, *encoder, next_frame.width,
                                       next_frame.height, static_cast<uint16_t>(framerate),
-                                      session_->permissions(), audio_info);
+                                      session_->permissions(), audio_info,
+                                      settings_.allow_terminal_persist);
         publish_current(stream_info);
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
@@ -3746,7 +3750,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         attached = enumerate_displays();
         stream_info = describe_stream(attached, *capturer, *encoder, mode_frame.width,
                                       mode_frame.height, static_cast<uint16_t>(framerate),
-                                      session_->permissions(), audio_info);
+                                      session_->permissions(), audio_info,
+                                      settings_.allow_terminal_persist);
         publish_current(stream_info);
         if (config_.stream_announced) {
             config_.stream_announced(stream_info);
@@ -3944,7 +3949,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             stream_info =
                 describe_stream(attached, *capturer, *encoder, stream_info.source_width,
                                 stream_info.source_height, static_cast<uint16_t>(framerate),
-                                session_->permissions(), audio_info);
+                                session_->permissions(), audio_info,
+                                settings_.allow_terminal_persist);
             publish_current(stream_info);
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
@@ -4239,7 +4245,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
     // path, before the caller resets the transport for the next viewer.
     PortForwardRelay port_forward(*session_);
     // Same lifetime rule: its destructor terminates every shell still running.
-    TerminalRelay terminal(*session_);
+    TerminalRelay terminal(*session_, settings_.allow_terminal_persist);
     // The camera opens only when the viewer asks, and only if the host allows
     // cameras; it encodes on the capture adapter with its own device so it
     // never shares the capturer's immediate context.
@@ -4649,7 +4655,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             stream_info =
                 describe_stream(refreshed, *capturer, *encoder, frame.width, frame.height,
                                 static_cast<uint16_t>(framerate), session_->permissions(),
-                                audio_info);
+                                audio_info, settings_.allow_terminal_persist);
             publish_current(stream_info);
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
@@ -4733,7 +4739,7 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             stream_info =
                 describe_stream(attached, *capturer, *encoder, frame.width, frame.height,
                                 static_cast<uint16_t>(framerate), session_->permissions(),
-                                audio_info);
+                                audio_info, settings_.allow_terminal_persist);
             publish_current(stream_info);
             if (config_.stream_announced) {
                 config_.stream_announced(stream_info);
@@ -6102,6 +6108,7 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
     ServerInfo info;
     info.control_only = true;
     info.mode = mode;
+    info.terminal_persist = settings_.allow_terminal_persist;
     publish_stream(info, 0, std::string());
     if (config_.stream_announced) {
         config_.stream_announced(info);
@@ -6151,7 +6158,7 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
     // The relays own every socket and shell they open; their destructors run
     // on every exit path below.
     PortForwardRelay port_forward(*session_);
-    TerminalRelay terminal(*session_);
+    TerminalRelay terminal(*session_, settings_.allow_terminal_persist);
     // A control-only session has no capturer to borrow an adapter from; the
     // camera relay opens its own device instead.
     CameraRelay camera(*session_, [] { return LUID{}; },

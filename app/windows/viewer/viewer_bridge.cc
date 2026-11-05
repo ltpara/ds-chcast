@@ -775,6 +775,10 @@ void ViewerBridge::HandleMethodCall(
         map[key("chatError")] = flutter::EncodableValue(status.chat_error);
         map[key("terminalSupported")] =
             flutter::EncodableValue(status.terminal_supported);
+        map[key("terminalPersistSupported")] =
+            flutter::EncodableValue(status.terminal_persist_supported);
+        map[key("terminalServiceId")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.terminal_service_id));
         map[key("terminalPhase")] =
             flutter::EncodableValue(static_cast<int32_t>(status.terminal_phase));
         map[key("terminalCode")] =
@@ -1509,16 +1513,26 @@ void ViewerBridge::HandleMethodCall(
         const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
         int64_t columns = 0;
         int64_t rows = 0;
+        // A non-zero serviceId reattaches to a console the host kept; it is
+        // optional so older callers keep opening a fresh console.
+        int64_t service_id = 0;
+        const bool has_service_id =
+            args != nullptr && args->find(key("serviceId")) != args->end();
         if (args == nullptr || !map_int(*args, "columns", &columns) ||
             !map_int(*args, "rows", &rows) || columns <= 0 || columns > 500 ||
-            rows <= 0 || rows > 200) {
-            result->Error("bad_args", "openTerminal wants columns 1..500 and rows 1..200");
+            rows <= 0 || rows > 200 ||
+            (has_service_id && (!map_int(*args, "serviceId", &service_id) ||
+                                service_id < 0 || service_id > 0xFFFFFFFFLL))) {
+            result->Error("bad_args",
+                          "openTerminal wants columns 1..500, rows 1..200 and an "
+                          "optional serviceId in 0..2^32-1");
             return;
         }
         const bool opened =
             viewer_ != nullptr && viewer_->OpenTerminal(
                                       static_cast<uint16_t>(columns),
-                                      static_cast<uint16_t>(rows));
+                                      static_cast<uint16_t>(rows),
+                                      static_cast<uint32_t>(service_id));
         result->Success(flutter::EncodableValue(opened));
         return;
     }

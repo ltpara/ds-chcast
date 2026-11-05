@@ -555,6 +555,8 @@ class ViewerStatus {
     this.portForwardBytesDown = 0,
     this.portForwardError = '',
     this.terminalSupported = false,
+    this.terminalPersistSupported = false,
+    this.terminalServiceId = 0,
     this.terminalPhase = ViewerTerminalPhase.closed,
     this.terminalCode = 0,
     this.terminalReason = '',
@@ -1054,15 +1056,20 @@ class ViewerStatus {
   final String portForwardError;
 
   /// Remote terminal. [terminalSupported] mirrors the host's permission;
-  /// [terminalPhase] is the console's state, [terminalCode] and
-  /// [terminalReason] carry the host's TerminalCode and wording for a refusal
-  /// or an ending, and [terminalError] explains a local failure such as a send
-  /// error or a revoked permission. [terminalColumns]/[terminalRows] are the
-  /// size the host last acknowledged. Output never travels in this struct:
+  /// [terminalPersistSupported] says the host keeps consoles across
+  /// disconnects (protocol v42) and [terminalServiceId] is the kept console's
+  /// id, 0 for a session console or before the host answers. [terminalPhase]
+  /// is the console's state, [terminalCode] and [terminalReason] carry the
+  /// host's TerminalCode and wording for a refusal or an ending, and
+  /// [terminalError] explains a local failure such as a send error or a
+  /// revoked permission. [terminalColumns]/[terminalRows] are the size the
+  /// host last acknowledged. Output never travels in this struct:
   /// [ViewerBridge.takeTerminalOutput] hands it over and [terminalBytes]
   /// counts what arrived. [terminalUpdates] counts phase transitions so the
   /// panel pairs each ending with the poll that saw it.
   final bool terminalSupported;
+  final bool terminalPersistSupported;
+  final int terminalServiceId;
   final ViewerTerminalPhase terminalPhase;
   final int terminalCode;
   final String terminalReason;
@@ -1491,6 +1498,8 @@ class ViewerStatus {
       portForwardBytesDown: asInt(map['portForwardBytesDown']),
       portForwardError: asString(map['portForwardError']),
       terminalSupported: map['terminalSupported'] == true,
+      terminalPersistSupported: map['terminalPersistSupported'] == true,
+      terminalServiceId: asInt(map['terminalServiceId']),
       terminalPhase:
           ViewerTerminalPhase.fromCode(asInt(map['terminalPhase'])),
       terminalCode: asInt(map['terminalCode']),
@@ -1878,18 +1887,26 @@ class ViewerBridge {
   }
 
   /// Opens the session's one remote console at [columns] x [rows] characters
-  /// (1..500 by 1..200). False means it was not queued: no streaming session,
-  /// the host did not grant [ViewerPermission.terminal], a console is already
-  /// open, or the previous one's output has not been drained yet. The host's
-  /// answer arrives through [ViewerStatus.terminalPhase],
-  /// [ViewerStatus.terminalCode] and [ViewerStatus.terminalReason].
+  /// (1..500 by 1..200). A non-zero [serviceId] reattaches to a console the
+  /// host kept after an earlier disconnect, which requires the host to have
+  /// announced terminal persistence. False means it was not queued: no
+  /// streaming session, the host did not grant [ViewerPermission.terminal], a
+  /// console is already open, or the previous one's output has not been
+  /// drained yet. The host's answer arrives through
+  /// [ViewerStatus.terminalPhase], [ViewerStatus.terminalCode],
+  /// [ViewerStatus.terminalReason] and [ViewerStatus.terminalServiceId].
   static Future<bool> openTerminal({
     required int columns,
     required int rows,
+    int serviceId = 0,
   }) async {
     final bool? opened = await _channel.invokeMethod<bool>(
       'openTerminal',
-      <String, Object>{'columns': columns, 'rows': rows},
+      <String, Object>{
+        'columns': columns,
+        'rows': rows,
+        'serviceId': serviceId,
+      },
     );
     return opened ?? false;
   }

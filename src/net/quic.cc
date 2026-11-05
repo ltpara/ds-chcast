@@ -5575,6 +5575,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
     ack.port_forward_enabled = (granted & kPermissionPortForward) != 0;
     ack.terminal_enabled = (granted & kPermissionTerminal) != 0;
+    ack.terminal_persist = ack.terminal_persist && ack.terminal_enabled;
     ack.camera_enabled = (granted & kPermissionCamera) != 0;
     ack.record_enabled = (granted & kPermissionRecord) != 0;
     ack.restart_enabled = (granted & kPermissionRestart) != 0;
@@ -5707,6 +5708,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.privacy_mode_enabled = (granted & kPermissionPrivacyMode) != 0;
     update.port_forward_enabled = (granted & kPermissionPortForward) != 0;
     update.terminal_enabled = (granted & kPermissionTerminal) != 0;
+    update.terminal_persist = update.terminal_persist && update.terminal_enabled;
     update.camera_enabled = (granted & kPermissionCamera) != 0;
     update.record_enabled = (granted & kPermissionRecord) != 0;
     update.restart_enabled = (granted & kPermissionRestart) != 0;
@@ -8632,9 +8634,11 @@ Error QuicSession::send_terminal_result(const TerminalResult& result) {
             if ((impl.session_permissions.load() & kPermissionTerminal) == 0) {
                 answer.code = TerminalCode::Refused;
                 answer.reason = "terminal access was revoked";
+                answer.service_id = 0;
             } else if (impl.active_terminal_targets.size() >= kMaxTerminals) {
                 answer.code = TerminalCode::Busy;
                 answer.reason = "too many terminals";
+                answer.service_id = 0;
             } else {
                 impl.active_terminal_targets[result.terminal_id] = pending->second;
                 Impl::TerminalEntry entry;
@@ -8651,7 +8655,8 @@ Error QuicSession::send_terminal_result(const TerminalResult& result) {
                            QUIC_SEND_FLAG_NONE);
 }
 
-Error QuicSession::request_terminal(uint32_t terminal_id, uint16_t columns, uint16_t rows) {
+Error QuicSession::request_terminal(uint32_t terminal_id, uint16_t columns, uint16_t rows,
+                                    uint8_t flags, uint32_t service_id) {
     Impl& impl = *impl_;
     if (impl.role != Impl::Role::Client) {
         return Error(Status::InvalidCall, "request_terminal is a client operation");
@@ -8660,9 +8665,11 @@ Error QuicSession::request_terminal(uint32_t terminal_id, uint16_t columns, uint
     request.terminal_id = terminal_id;
     request.columns = columns;
     request.rows = rows;
+    request.flags = flags;
+    request.service_id = service_id;
     std::vector<uint8_t> message = make_terminal_request(request);
     if (message.empty()) {
-        return Error(Status::InvalidCall, "the terminal id or size is out of range");
+        return Error(Status::InvalidCall, "the terminal id, size or flags are out of range");
     }
     {
         std::lock_guard<std::mutex> lock(impl.mutex);

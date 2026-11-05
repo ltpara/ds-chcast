@@ -48,20 +48,25 @@ class TerminalPanel extends StatefulWidget {
     required this.onTakeOutput,
     required this.onSendInput,
     required this.onResize,
-    required this.onClose,
     required this.onDismiss,
+    this.resumeServiceId = 0,
     this.initialFontSize = 13,
     this.onFontSizeChanged,
   });
 
   final ViewerStatus status;
   final FocusNode focusNode;
-  final Future<bool> Function(int columns, int rows) onOpen;
+  /// Opens a console. A non-zero [serviceId] attaches to one the host kept
+  /// after an earlier disconnect instead of starting a fresh shell.
+  final Future<bool> Function(int columns, int rows, int serviceId) onOpen;
   final Future<ViewerTerminalOutput?> Function() onTakeOutput;
   final Future<bool> Function(String input) onSendInput;
   final Future<bool> Function(int columns, int rows) onResize;
-  final Future<void> Function() onClose;
   final VoidCallback onDismiss;
+  /// The service id to attach to when this panel opens its console. Zero
+  /// starts a fresh console. Only the first open uses it; the panel's own
+  /// reopen button always asks for a fresh console.
+  final int resumeServiceId;
   final int initialFontSize;
   final ValueChanged<int>? onFontSizeChanged;
 
@@ -120,7 +125,8 @@ class _TerminalPanelState extends State<TerminalPanel> {
     _scroll.dispose();
     _search.dispose();
     _searchFocus.dispose();
-    unawaited(_closeQuietly());
+    // Disposal is not a close: a reconnect tears the page's widgets down while
+    // a persistent console must keep running for the next session to attach.
     super.dispose();
   }
 
@@ -197,7 +203,7 @@ class _TerminalPanelState extends State<TerminalPanel> {
     if (first) {
       _openQueued = true;
       setState(() {});
-      unawaited(_open(columns, rows));
+      unawaited(_open(columns, rows, widget.resumeServiceId));
       return;
     }
     setState(() {});
@@ -213,14 +219,14 @@ class _TerminalPanelState extends State<TerminalPanel> {
     });
   }
 
-  Future<void> _open(int columns, int rows) async {
+  Future<void> _open(int columns, int rows, int serviceId) async {
     if (_opening) {
       return;
     }
     _opening = true;
     bool queued = false;
     try {
-      queued = await widget.onOpen(columns, rows);
+      queued = await widget.onOpen(columns, rows, serviceId);
     } on PlatformException {
       queued = false;
     } on MissingPluginException {
@@ -309,16 +315,6 @@ class _TerminalPanelState extends State<TerminalPanel> {
       if (changed && _follow) {
         _scheduleScrollToBottom();
       }
-    }
-  }
-
-  Future<void> _closeQuietly() async {
-    try {
-      await widget.onClose();
-    } on PlatformException {
-      // A closing session already dropped the console.
-    } on MissingPluginException {
-      // The native viewer is going away.
     }
   }
 
@@ -537,7 +533,9 @@ class _TerminalPanelState extends State<TerminalPanel> {
       _ended = false;
       _openFailed = false;
     });
-    unawaited(_open(math.max(1, _layoutColumns), math.max(1, _layoutRows)));
+    // A resume that failed means the service is gone; a fresh console is the
+    // only thing left to try.
+    unawaited(_open(math.max(1, _layoutColumns), math.max(1, _layoutRows), 0));
   }
 
   // ------------------------------------------------------------------ keys
@@ -651,7 +649,9 @@ class _TerminalPanelState extends State<TerminalPanel> {
   }
 
   Widget _buildHeader(bool busy) {
-    final String title = _grid.title.isEmpty ? tr('远程终端') : _grid.title;
+    final String shellTitle = _grid.title.isEmpty ? tr('远程终端') : _grid.title;
+    final int serviceId = widget.status.terminalServiceId;
+    final String title = serviceId == 0 ? shellTitle : '$shellTitle · #$serviceId';
     return Container(
       height: 36,
       color: const Color(0xFF1B1C20),

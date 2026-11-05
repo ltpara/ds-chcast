@@ -28,7 +28,7 @@ void main() {
           terminalSupported: true,
           terminalPhase: ViewerTerminalPhase.requesting,
         ),
-        onOpen: (int columns, int rows) async {
+        onOpen: (int columns, int rows, int serviceId) async {
           openedColumns = columns;
           openedRows = rows;
           return true;
@@ -46,6 +46,38 @@ void main() {
     expect(openedRows! > 0, isTrue);
     expect(_consoleText(tester), contains('hello'));
     expect(_consoleText(tester), contains('world'));
+  });
+
+  testWidgets('attaches to a kept console and shows its service id', (
+    WidgetTester tester,
+  ) async {
+    final FocusNode focus = FocusNode(debugLabel: 'terminal-test');
+    addTearDown(focus.dispose);
+    int? requestedService;
+
+    await tester.pumpWidget(
+      _host(
+        focus: focus,
+        status: const ViewerStatus(
+          terminalSupported: true,
+          terminalPersistSupported: true,
+          terminalServiceId: 42,
+          terminalPhase: ViewerTerminalPhase.requesting,
+        ),
+        resumeServiceId: 42,
+        onOpen: (int columns, int rows, int serviceId) async {
+          requestedService = serviceId;
+          return true;
+        },
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.pump();
+
+    expect(requestedService, 42);
+    expect(find.textContaining('#42'), findsOneWidget);
   });
 
   testWidgets('sends console bytes for keys while focused', (
@@ -141,7 +173,7 @@ void main() {
           terminalSupported: true,
           terminalPhase: ViewerTerminalPhase.open,
         ),
-        onOpen: (int width, int rows) async {
+        onOpen: (int width, int rows, int serviceId) async {
           columns.add(width);
           return true;
         },
@@ -618,10 +650,11 @@ void _mockClipboard(WidgetTester tester, List<String> copies) {
 Widget _host({
   required FocusNode focus,
   required ViewerStatus status,
-  Future<bool> Function(int columns, int rows)? onOpen,
+  Future<bool> Function(int columns, int rows, int serviceId)? onOpen,
   Future<ViewerTerminalOutput?> Function()? onTakeOutput,
   Future<bool> Function(String input)? onSendInput,
   Future<bool> Function(int columns, int rows)? onResize,
+  int resumeServiceId = 0,
   int initialFontSize = 13,
   ValueChanged<int>? onFontSizeChanged,
 }) {
@@ -634,11 +667,13 @@ Widget _host({
           child: TerminalPanel(
             status: status,
             focusNode: focus,
-            onOpen: onOpen ?? (int columns, int rows) async => true,
+            resumeServiceId: resumeServiceId,
+            onOpen:
+                onOpen ??
+                (int columns, int rows, int serviceId) async => true,
             onTakeOutput: onTakeOutput ?? () async => null,
             onSendInput: onSendInput ?? (String input) async => true,
             onResize: onResize ?? (int columns, int rows) async => true,
-            onClose: () async {},
             onDismiss: () {},
             initialFontSize: initialFontSize,
             onFontSizeChanged: onFontSizeChanged,

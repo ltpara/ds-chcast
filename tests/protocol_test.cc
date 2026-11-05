@@ -260,6 +260,7 @@ void test_hello_ack() {
     sent.privacy_mode_enabled = true;
     sent.port_forward_enabled = true;
     sent.terminal_enabled = true;
+    sent.terminal_persist = true;
     sent.record_enabled = true;
     sent.camera_enabled = true;
     sent.session_select_enabled = true;
@@ -307,6 +308,7 @@ void test_hello_ack() {
     check(got.privacy_mode_enabled, "HelloAck keeps the privacy mode flag");
     check(got.port_forward_enabled, "HelloAck keeps the port forward flag");
     check(got.terminal_enabled, "HelloAck keeps the terminal flag");
+    check(got.terminal_persist, "HelloAck keeps the terminal persistence flag");
     check(got.record_enabled, "HelloAck keeps the record flag");
     check(got.camera_enabled, "HelloAck keeps the camera flag");
     check(got.session_select_enabled, "HelloAck keeps the session select flag");
@@ -2343,9 +2345,45 @@ void test_terminal() {
           "TerminalRequest names its control type");
     chast::TerminalRequest got;
     check(chast::parse_terminal_request(payload_of(encoded), got, &error) &&
-              got.terminal_id == 3 && got.columns == 100 && got.rows == 30,
-          "TerminalRequest round-trips its size");
+              got.terminal_id == 3 && got.columns == 100 && got.rows == 30 &&
+              got.flags == 0 && got.service_id == 0,
+          "TerminalRequest round-trips its size, flags and service id");
 
+    chast::TerminalRequest persist = request;
+    persist.flags = chast::kTerminalRequestPersist;
+    chast::TerminalRequest persist_got;
+    check(chast::parse_terminal_request(payload_of(chast::make_terminal_request(persist)),
+                                        persist_got, &error) &&
+              persist_got.flags == chast::kTerminalRequestPersist &&
+              persist_got.service_id == 0,
+          "TerminalRequest round-trips the persist flag");
+
+    chast::TerminalRequest attach = request;
+    attach.flags = chast::kTerminalRequestAttach;
+    attach.service_id = 77;
+    chast::TerminalRequest attach_got;
+    check(chast::parse_terminal_request(payload_of(chast::make_terminal_request(attach)),
+                                        attach_got, &error) &&
+              attach_got.flags == chast::kTerminalRequestAttach &&
+              attach_got.service_id == 77,
+          "TerminalRequest round-trips an attach with its service id");
+    check(chast::make_terminal_request(attach).size() ==
+              chast::kControlHeaderSize + 13,
+          "a v42 TerminalRequest is 13 payload bytes plus the control header");
+
+    chast::TerminalRequest bad_attach = request;
+    bad_attach.flags = chast::kTerminalRequestAttach;
+    check(chast::make_terminal_request(bad_attach).empty(),
+          "an attach without a service id is not encoded");
+    chast::TerminalRequest stray_service = request;
+    stray_service.service_id = 77;
+    check(chast::make_terminal_request(stray_service).empty(),
+          "a service id without the attach flag is not encoded");
+    chast::TerminalRequest both = request;
+    both.flags = chast::kTerminalRequestPersist | chast::kTerminalRequestAttach;
+    both.service_id = 77;
+    check(chast::make_terminal_request(both).empty(),
+          "persist and attach together are not encoded");
     chast::TerminalRequest bad = request;
     bad.terminal_id = 0;
     check(chast::make_terminal_request(bad).empty(),
@@ -2375,12 +2413,27 @@ void test_terminal() {
     check(chast::parse_terminal_result(
               payload_of(chast::make_terminal_result(result)), result_out, &error) &&
               result_out.terminal_id == 3 && result_out.code == chast::TerminalCode::Failed &&
-              result_out.reason == result.reason,
+              result_out.reason == result.reason && result_out.service_id == 0,
           "TerminalResult round-trips a failure with its reason");
+    // v42: terminal id, service id, code, reason length and text.
     std::vector<uint8_t> unknown = payload_of(chast::make_terminal_result(result));
-    unknown[4] = 9;
+    unknown[8] = 9;
     check(!chast::parse_terminal_result(unknown, result_out, &error),
           "TerminalResult with an unknown code is rejected");
+
+    chast::TerminalResult opened;
+    opened.terminal_id = 4;
+    opened.service_id = 900;
+    opened.code = chast::TerminalCode::Ok;
+    chast::TerminalResult opened_got;
+    check(chast::parse_terminal_result(payload_of(chast::make_terminal_result(opened)),
+                                       opened_got, &error) &&
+              opened_got.service_id == 900 && opened_got.code == chast::TerminalCode::Ok,
+          "TerminalResult keeps the service id of a persistent console");
+    chast::TerminalResult missed = opened;
+    missed.code = chast::TerminalCode::NotFound;
+    check(chast::make_terminal_result(missed).empty(),
+          "an error TerminalResult may not carry a service id");
     result.reason = std::string(400, 'x');
     check(chast::parse_terminal_result(payload_of(chast::make_terminal_result(result)),
                                        result_out, &error) &&

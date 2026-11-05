@@ -977,9 +977,10 @@ public:
     //
     // The viewer asks for a console; the host runs it under ConPTY and
     // answers. The viewer then opens a CTTY uplink and sends keystrokes, and
-    // the host opens a CTTY downlink the first time the console prints. There
-    // is no replay buffer: output that was not read while the session was
-    // alive is gone. Every call requires kPermissionTerminal.
+    // the host opens a CTTY downlink the first time the console prints. A
+    // session console ends with the session; a persistent console (v42) keeps
+    // its service and a 1 MiB scrollback, and a later session attaches to it
+    // by service id. Every call requires kPermissionTerminal.
 
     // Server: pops the oldest TerminalRequest accepted by the permission and
     // settings filters. The console is created by the host, which then answers
@@ -992,7 +993,11 @@ public:
 
     // Client: asks the host for a console of the given size. The answer comes
     // through take_terminal_result(); at most kMaxTerminals are tracked.
-    Error request_terminal(uint32_t terminal_id, uint16_t columns, uint16_t rows);
+    // `flags` is kTerminalRequestPersist to ask for a service that outlives
+    // the session (the host answers with its service id) or
+    // kTerminalRequestAttach with `service_id` set to reattach to one.
+    Error request_terminal(uint32_t terminal_id, uint16_t columns, uint16_t rows,
+                           uint8_t flags = 0, uint32_t service_id = 0);
     // Client: pops the oldest answer. Ok means open_terminal_input() may run.
     bool take_terminal_result(TerminalResult& result);
     // Client: opens the CTTY uplink for an approved terminal. Keystrokes are

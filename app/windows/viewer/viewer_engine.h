@@ -536,6 +536,12 @@ struct ViewerStatus {
     // recent resize. `terminal_updates` counts phase transitions so the panel
     // can pair an ending with the poll that saw it.
     bool terminal_supported = false;
+    // Protocol v42: the host keeps a console alive across disconnects and
+    // hands back a service id another session can attach to. The id is 0 until
+    // the host opens a persistent console and clears on the next open and when
+    // the console ends, so the page knows what it could resume.
+    bool terminal_persist_supported = false;
+    uint32_t terminal_service_id = 0;
     TerminalPhase terminal_phase = TerminalPhase::kClosed;
     int terminal_code = 0;
     std::string terminal_reason;
@@ -900,9 +906,12 @@ public:
     // Opens the session's remote console at the given character size. Returns
     // false when no session is streaming, the host did not grant
     // kPermissionTerminal, the size is outside 1..500 x 1..200, or a console
-    // is already open (or being requested). The round trip and the host's
-    // answer arrive through terminal_phase/terminal_code/terminal_reason.
-    bool OpenTerminal(uint16_t columns, uint16_t rows);
+    // is already open (or being requested). A non-zero `service_id` asks to
+    // resume a console the host kept after an earlier disconnect and requires
+    // the host to have announced terminal persistence; the id shows up in
+    // terminal_service_id once the host has answered. The round trip and the
+    // host's answer arrive through terminal_phase/terminal_code/terminal_reason.
+    bool OpenTerminal(uint16_t columns, uint16_t rows, uint32_t service_id = 0);
     // Queues raw console input: printable text as UTF-8 and control sequences
     // as bytes (for example "\x03" for Ctrl+C). Returns false when no console
     // is open or the queue's 256 KiB bound is reached.
@@ -1076,6 +1085,11 @@ private:
         std::string bytes;
         uint16_t columns = 0;
         uint16_t rows = 0;
+        // Persist/attach flags and the service id to resume for kOpen; both
+        // stay zero for the other commands, which act on the console the
+        // session loop currently has open.
+        uint8_t flags = 0;
+        uint32_t service_id = 0;
     };
     mutable std::mutex terminal_mutex_;
     std::deque<TerminalCommand> pending_terminal_;

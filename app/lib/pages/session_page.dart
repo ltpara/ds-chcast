@@ -115,6 +115,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   final FocusNode _terminalFocus = FocusNode(debugLabel: 'remote-terminal');
   bool _terminalOpen = false;
   bool _terminalTyping = false;
+  // Protocol v42: the host keeps the console across a disconnect. The id is
+  // remembered here (the engine's status restarts at 0 with the new session)
+  // and handed back to a rebuilt panel so it attaches instead of starting a
+  // fresh shell. Only a persistent console has one.
+  int _terminalServiceId = 0;
   // Host camera preview. The native side decodes into a second plugin
   // texture, so the panel only owns that texture's life; opening registers
   // it and attaches the output, closing detaches and unregisters. The panel
@@ -848,6 +853,15 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(_confirmFirstFingerprint(status.serverFingerprint));
     }
     _trackRecording(status);
+    // Track a persistent console's service id while it is alive. An ending or
+    // refusal leaves nothing to attach to, and a poll from a fresh engine
+    // (id still 0) must not erase what the page remembers for a reconnect.
+    if (status.terminalPhase == ViewerTerminalPhase.ended ||
+        status.terminalPhase == ViewerTerminalPhase.failed) {
+      _terminalServiceId = 0;
+    } else if (status.terminalServiceId != 0) {
+      _terminalServiceId = status.terminalServiceId;
+    }
     final int previousPermissions = _status.permissions;
     final int previousPermissionUpdates = _status.permissionUpdates;
     // A new native session restarts these counters at zero; that first poll is
@@ -2795,6 +2809,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (!automatic) {
       _cancelAutoReconnect();
     }
+    // A persistent console outlives the widgets below; keep the panel open so
+    // it attaches again once the new session is streaming. A session console
+    // dies with the old session, so its panel closes as before.
+    final bool resumeTerminal = _terminalOpen && _terminalServiceId != 0;
     setState(() {
       _reconnecting = true;
       _startError = null;
@@ -2835,8 +2853,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       _chatEntries.clear();
       _chatOpen = false;
       _chatTyping = false;
-      _terminalOpen = false;
+      _terminalOpen = resumeTerminal;
       _terminalTyping = false;
+      if (!resumeTerminal) {
+        _terminalServiceId = 0;
+      }
       _cameraOpen = false;
       _fileBrowserOpen = false;
     });
@@ -3127,8 +3148,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     if (_terminalFocus.hasFocus) {
       _terminalFocus.unfocus();
     }
-    // The panel's dispose asks the engine to close the console, so the host
-    // shell ends with the overlay.
+    // Closing the overlay ends the console. The panel no longer closes it on
+    // dispose (a reconnect disposes the widgets but keeps the service), so
+    // this is the one place a user-initiated close sends the stop, and a
+    // persistent service dies with it.
+    unawaited(ViewerBridge.closeTerminal());
+    _terminalServiceId = 0;
     setState(() => _terminalOpen = false);
     _setKeyCapture(_inputActive && !_chatTyping);
     if (_inputActive) {
@@ -4063,10 +4088,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                           child: TerminalPanel(
                             status: _status,
                             focusNode: _terminalFocus,
-                            onOpen: (int columns, int rows) =>
+                            resumeServiceId: _terminalServiceId,
+                            onOpen: (int columns, int rows, int serviceId) =>
                                 ViewerBridge.openTerminal(
                                   columns: columns,
                                   rows: rows,
+                                  serviceId: serviceId,
                                 ),
                             onTakeOutput: ViewerBridge.takeTerminalOutput,
                             onSendInput: ViewerBridge.sendTerminalInput,
@@ -4075,7 +4102,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                                   columns: columns,
                                   rows: rows,
                                 ),
-                            onClose: ViewerBridge.closeTerminal,
                             onDismiss: _closeTerminalPanel,
                             initialFontSize: _terminalFontSize,
                             onFontSizeChanged: _rememberTerminalFontSize,
@@ -4387,14 +4413,25 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
           child: TerminalPanel(
             status: _status,
             focusNode: _terminalFocus,
-            onOpen: (int columns, int rows) =>
-                ViewerBridge.openTerminal(columns: columns, rows: rows),
+            resumeServiceId: _terminalServiceId,
+            onOpen: (int columns, int rows, int serviceId) =>
+                ViewerBridge.openTerminal(
+                  columns: columns,
+                  rows: rows,
+                  serviceId: serviceId,
+                ),
             onTakeOutput: ViewerBridge.takeTerminalOutput,
             onSendInput: ViewerBridge.sendTerminalInput,
             onResize: (int columns, int rows) =>
                 ViewerBridge.resizeTerminal(columns: columns, rows: rows),
-            onClose: ViewerBridge.closeTerminal,
-            onDismiss: _leave,
+            onDismiss: () {
+              // The X ends the console before the standalone session goes;
+              // otherwise a persistent service would outlive the panel the
+              // operator just dismissed.
+              unawaited(ViewerBridge.closeTerminal());
+              _terminalServiceId = 0;
+              unawaited(_leave());
+            },
             initialFontSize: _terminalFontSize,
             onFontSizeChanged: _rememberTerminalFontSize,
           ),

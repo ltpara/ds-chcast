@@ -77,6 +77,7 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_file_transfer == b.allow_file_transfer &&
            a.allow_port_forward == b.allow_port_forward &&
            a.allow_terminal == b.allow_terminal && a.allow_record == b.allow_record &&
+           a.allow_terminal_persist == b.allow_terminal_persist &&
            a.file_receive_directory == b.file_receive_directory &&
            a.allow_audio == b.allow_audio && a.allow_microphone == b.allow_microphone &&
            a.audio_device == b.audio_device && a.audio_aec == b.audio_aec &&
@@ -111,6 +112,7 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_file_transfer = false;
     settings.allow_port_forward = true;
     settings.allow_terminal = true;
+    settings.allow_terminal_persist = true;
     settings.allow_record = false;
     settings.file_receive_directory = "D:\\接收 文件\\chast";
     settings.allow_audio = false;
@@ -191,6 +193,8 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(loaded.settings.allow_audio, "a fresh host shares the system sound");
     check(!loaded.settings.allow_microphone,
           "a fresh host does not accept the viewer microphone");
+    check(!loaded.settings.allow_terminal_persist,
+          "a fresh host does not keep consoles after a disconnect");
     check(loaded.settings.audio_device.empty(), "a fresh host follows the default output");
     check(loaded.settings.audio_aec, "a fresh host cancels echo out of the loopback");
     check(loaded.settings.audio_silence_gate_ms == 2000,

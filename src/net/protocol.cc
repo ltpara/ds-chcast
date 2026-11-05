@@ -821,7 +821,10 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
                         (info.merged ? kServerInfoMergedLayout : 0) |
                         (info.files_only ? kServerInfoFileTransferOnly : 0) |
                         (info.audio_datagram && info.audio.enabled ? kServerInfoAudioDatagram : 0) |
-                        (info.control_only ? kServerInfoControlOnly : 0)));
+                        (info.control_only ? kServerInfoControlOnly : 0) |
+                        (info.terminal_persist && info.terminal_enabled
+                             ? kServerInfoTerminalPersist
+                             : 0)));
     put_u16(cursor, static_cast<uint16_t>(info.encoder.size()));
     std::memcpy(cursor, info.encoder.data(), info.encoder.size());
     cursor += info.encoder.size();
@@ -939,6 +942,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.merged = (flags & kServerInfoMergedLayout) != 0;
     info.files_only = (flags & kServerInfoFileTransferOnly) != 0;
     info.control_only = (flags & kServerInfoControlOnly) != 0;
+    info.terminal_persist = (flags & kServerInfoTerminalPersist) != 0;
     const bool audio_flag = (flags & kServerInfoAudioEnabled) != 0;
     info.audio_datagram = (flags & kServerInfoAudioDatagram) != 0;
     if (info.audio_datagram && !audio_flag) {
@@ -1195,6 +1199,10 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.block_input_enabled = (permissions & kPermissionBlockInput) != 0;
     info.os_login_enabled = (permissions & kPermissionOsLogin) != 0;
     info.session_select_enabled = (permissions & kPermissionSessionSelect) != 0;
+    if (info.terminal_persist && !info.terminal_enabled) {
+        set_error(error, "HelloAck announces terminal persistence without terminals");
+        return false;
+    }
     if (!reader.at_end()) {
         set_error(error, "HelloAck carries trailing bytes");
         return false;
@@ -1627,7 +1635,15 @@ namespace {
 bool valid_terminal_code(TerminalCode code) {
     return code == TerminalCode::Ok || code == TerminalCode::Refused ||
            code == TerminalCode::Busy || code == TerminalCode::Failed ||
-           code == TerminalCode::Cancelled;
+           code == TerminalCode::Cancelled || code == TerminalCode::NotFound;
+}
+
+bool valid_terminal_flags(uint8_t flags) {
+    const uint8_t known = kTerminalRequestPersist | kTerminalRequestAttach;
+    if ((flags & ~known) != 0) {
+        return false;
+    }
+    return (flags & known) != known;
 }
 
 std::string truncate_terminal_reason(const std::string& reason) {
@@ -1695,14 +1711,24 @@ bool valid_terminal_size(uint16_t columns, uint16_t rows) {
 }
 
 std::vector<uint8_t> make_terminal_request(const TerminalRequest& request) {
-    if (request.terminal_id == 0 || !valid_terminal_size(request.columns, request.rows)) {
+    if (request.terminal_id == 0 || !valid_terminal_size(request.columns, request.rows) ||
+        !valid_terminal_flags(request.flags)) {
         return {};
     }
-    std::vector<uint8_t> payload(4 + 2 + 2);
+    if ((request.flags & kTerminalRequestAttach) != 0) {
+        if (request.service_id == 0) {
+            return {};
+        }
+    } else if (request.service_id != 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4 + 2 + 2 + 1 + 4);
     uint8_t* cursor = payload.data();
     put_u32(cursor, request.terminal_id);
     put_u16(cursor, request.columns);
     put_u16(cursor, request.rows);
+    put_u8(cursor, request.flags);
+    put_u32(cursor, request.service_id);
     return make_control(ControlType::TerminalRequest, payload);
 }
 
@@ -1710,7 +1736,8 @@ bool parse_terminal_request(const std::vector<uint8_t>& payload,
                             TerminalRequest& request, std::string* error) {
     Reader reader(payload.data(), payload.size());
     if (!reader.u32(request.terminal_id) || !reader.u16(request.columns) ||
-        !reader.u16(request.rows) || !reader.at_end()) {
+        !reader.u16(request.rows) || !reader.u8(request.flags) ||
+        !reader.u32(request.service_id) || !reader.at_end()) {
         set_error(error, "malformed TerminalRequest");
         return false;
     }
@@ -1722,18 +1749,72 @@ bool parse_terminal_request(const std::vector<uint8_t>& payload,
         set_error(error, "TerminalRequest carries a size out of range");
         return false;
     }
+    if (!valid_terminal_flags(request.flags)) {
+        set_error(error, "TerminalRequest carries unknown or conflicting flags");
+        return false;
+    }
+    if ((request.flags & kTerminalRequestAttach) != 0) {
+        if (request.service_id == 0) {
+            set_error(error, "TerminalRequest attaches without a service id");
+            return false;
+        }
+    } else if (request.service_id != 0) {
+        set_error(error, "TerminalRequest carries a service id without attaching");
+        return false;
+    }
     return true;
 }
 
 std::vector<uint8_t> make_terminal_result(const TerminalResult& result) {
-    return make_terminal_reason_message(ControlType::TerminalResult, result.terminal_id,
-                                        result.code, result.reason);
+    if (result.terminal_id == 0 || !valid_terminal_code(result.code)) {
+        return {};
+    }
+    if (result.code != TerminalCode::Ok && result.service_id != 0) {
+        return {};
+    }
+    const std::string text = truncate_terminal_reason(result.reason);
+    std::vector<uint8_t> payload(4 + 4 + 1 + 2 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, result.terminal_id);
+    put_u32(cursor, result.service_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::TerminalResult, payload);
 }
 
 bool parse_terminal_result(const std::vector<uint8_t>& payload,
                            TerminalResult& result, std::string* error) {
-    return parse_terminal_reason_message(payload, result.terminal_id, result.code,
-                                         result.reason, error, "TerminalResult");
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(result.terminal_id) || !reader.u32(result.service_id) ||
+        !reader.u8(raw_code) || !reader.u16(reason_size)) {
+        set_error(error, "truncated TerminalResult");
+        return false;
+    }
+    result.code = static_cast<TerminalCode>(raw_code);
+    if (!valid_terminal_code(result.code)) {
+        set_error(error, "TerminalResult carries an unknown code");
+        return false;
+    }
+    if (result.terminal_id == 0 || (result.code != TerminalCode::Ok &&
+                                    result.service_id != 0)) {
+        set_error(error, "TerminalResult carries an inconsistent service id");
+        return false;
+    }
+    if (reason_size > kMaxTerminalReasonBytes || !reader.string(result.reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, "TerminalResult carries a malformed reason");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "TerminalResult reason is not valid UTF-8");
+        return false;
+    }
+    return true;
 }
 
 std::vector<uint8_t> make_terminal_stop(const TerminalStop& stop) {

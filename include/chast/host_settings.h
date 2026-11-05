@@ -86,6 +86,11 @@ struct HostSettings {
     // HelloAck reports terminal unavailable and every TerminalRequest is
     // refused.
     bool allow_terminal = false;
+    // Keep a terminal service alive across viewer disconnects so a later
+    // session can attach to it by service id. Off by default: a detached shell
+    // keeps running with the operator's account, so the host opts in
+    // explicitly. Only meaningful while allow_terminal is on.
+    bool allow_terminal_persist = false;
     // Let the viewer stream one of this machine's cameras. Off by default:
     // the camera looks into the room, so this is an explicit decision in the
     // same spirit as port forwarding. Off means the HelloAck reports cameras

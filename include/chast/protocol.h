@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 41;
+inline constexpr uint16_t kProtocolVersion = 42;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -835,6 +835,10 @@ inline constexpr uint16_t kServerInfoAudioDatagram = 0x1000;
 // PortForward); FileTransfer keeps using the older FileTransferOnly flag. The
 // viewer never creates a decoder for such a session.
 inline constexpr uint16_t kServerInfoControlOnly = 0x2000;
+// v42: the host keeps a persistent terminal service across viewer disconnects.
+// The terminal permission must also be granted. Not a permission bit: it says
+// the operator enabled terminal persistence (host.ini terminal_persist=).
+inline constexpr uint16_t kServerInfoTerminalPersist = 0x4000;
 // Flags that describe what the viewer may do. The permission mask appended to
 // HelloAck is the authority for these bits, so the parser compares it with
 // this mask rather than with every known flag. Restart and block input have no
@@ -854,7 +858,8 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
                                                   kServerInfoMergedLayout |
                                                   kServerInfoFileTransferOnly |
                                                   kServerInfoAudioDatagram |
-                                                  kServerInfoControlOnly;
+                                                  kServerInfoControlOnly |
+                                                  kServerInfoTerminalPersist;
 
 // The permission mask. It is the v13 authority: HelloAck/StreamInfo append it
 // after the source size, PermissionUpdate replaces it mid-session, and the
@@ -1062,6 +1067,11 @@ struct ServerInfo {
     // The viewer may ask for remote terminals. Decoded from the permission
     // mask; every request is still checked against the host's settings.
     bool terminal_enabled = false;
+    // v42: the host runs persistent terminal services, so a TerminalRequest
+    // may ask for one and a later session may attach to it by service id.
+    // Only set when terminal access is granted and the operator enabled
+    // persistence.
+    bool terminal_persist = false;
     // The host consents to the viewer keeping a local recording of the
     // received stream. Advisory: the stream is already on the viewer's side,
     // so the host cannot enforce it; the viewer hides its record button when
@@ -1374,12 +1384,25 @@ bool decode_port_forward_stream_header(const uint8_t* data, size_t size,
 // opens a `CTTY` downlink stream the first time the console produces output.
 // Both carry raw console bytes after their 16-byte header, including the VT
 // sequences ConPTY emits. A stream FIN ends that direction; aborting tears the
-// terminal down. There is no replay buffer: a terminal lives and dies with the
-// session, exactly like the forwarded TCP connections.
+// terminal down. A plain terminal lives and dies with its session. v42 adds
+// persistent services: the host keeps such a shell after the session ends,
+// buffers the last 1 MiB of its output and lets a later session attach to it
+// by service id, replaying the buffer into the new CTTY stream.
 inline constexpr char kTerminalStreamMagic[4] = {'C', 'T', 'T', 'Y'};
 inline constexpr uint8_t kTerminalStreamVersion = 1;
 inline constexpr size_t kTerminalStreamHeaderSize = 16;
 inline constexpr size_t kMaxTerminalReasonBytes = 256;
+// v42: TerminalRequest flags. Persist asks the host to keep the new console
+// after the session ends and to answer with a service id; Attach reconnects to
+// a service from an earlier session. They are mutually exclusive, attach needs
+// a service id in the request and persist needs an empty one.
+inline constexpr uint8_t kTerminalRequestPersist = 0x01;
+inline constexpr uint8_t kTerminalRequestAttach = 0x02;
+// Persistent services one host keeps at once, how long a detached service
+// survives without a viewer, and how much console output it replays.
+inline constexpr size_t kMaxTerminalServices = 100;
+inline constexpr uint32_t kTerminalServiceIdleSeconds = 3600;
+inline constexpr size_t kTerminalScrollbackBytes = 1024u * 1024u;
 // Consoles one session may open at once, and the accepted size range. Sizes
 // outside it are refused instead of clamped: a viewer that asks for 0 columns
 // has a bug, and silently "fixing" it would hide it.
@@ -1399,16 +1422,25 @@ enum class TerminalCode : uint8_t {
     Busy = 2,     // the per-session terminal budget is full
     Failed = 3,   // ConPTY or the child process could not be created
     Cancelled = 4,
+    NotFound = 5,  // the attach names no live terminal service
 };
 
 struct TerminalRequest {
+    // Session-scoped id for the CTTY streams. A persistent service keeps its
+    // own `service_id` across sessions; on attach the new session picks a new
+    // terminal id and names the service separately.
     uint32_t terminal_id = 0;
     uint16_t columns = 0;
     uint16_t rows = 0;
+    uint8_t flags = 0;
+    uint32_t service_id = 0;
 };
 
 struct TerminalResult {
     uint32_t terminal_id = 0;
+    // Non-zero only for Ok on a persistent console: the id a later session
+    // uses to attach.
+    uint32_t service_id = 0;
     TerminalCode code = TerminalCode::Ok;
     std::string reason;
 };
@@ -1430,9 +1462,10 @@ struct TerminalStreamHeader {
 };
 
 bool valid_terminal_size(uint16_t columns, uint16_t rows);
-// The makers reject a zero id or an out-of-range size and return an empty
-// vector; the parsers reject unknown codes, malformed UTF-8 and trailing
-// bytes rather than repairing a broken message.
+// The makers reject a zero id, an out-of-range size or an inconsistent flag
+// combination and return an empty vector; the parsers reject unknown codes and
+// flags, malformed UTF-8 and trailing bytes rather than repairing a broken
+// message.
 std::vector<uint8_t> make_terminal_request(const TerminalRequest& request);
 bool parse_terminal_request(const std::vector<uint8_t>& payload,
                             TerminalRequest& request, std::string* error);
