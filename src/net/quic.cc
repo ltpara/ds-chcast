@@ -97,6 +97,11 @@ constexpr size_t kMaxQueuedPortForwardStops = 16;
 const std::chrono::steady_clock::time_point kNoSendDeadline =
     (std::chrono::steady_clock::time_point::max)();
 
+// A producer must not wait forever on completions that a half-dead
+// connection may never deliver. Ten seconds is far beyond a healthy drain,
+// yet short enough for the caller to surface the stuck transport as an error.
+constexpr std::chrono::milliseconds kSendCapacityTimeout{10000};
+
 // Device names come from the local computer and the protocol caps them at
 // kMaxDeviceNameLength bytes. Cut on a whole UTF-8 sequence so a long name
 // never produces a Hello the host rejects as malformed.
@@ -505,6 +510,10 @@ struct QuicSession::Impl {
     struct PendingSend {
         std::vector<uint8_t> bytes;
         QUIC_BUFFER buffer{};
+        // The send generation this request was admitted under. A completion
+        // that arrives after the queue was reset for a new connection carries
+        // the old value and must not touch the new counters.
+        uint64_t generation = 0;
     };
 
     Role role = Role::Server;
@@ -988,6 +997,7 @@ struct QuicSession::Impl {
     std::condition_variable send_cv;
     size_t in_flight_bytes = 0;
     size_t in_flight_sends = 0;
+    uint64_t send_generation = 0;
 
     ~Impl() {
         close();
@@ -2445,7 +2455,7 @@ struct QuicSession::Impl {
             case QUIC_STREAM_EVENT_SEND_COMPLETE: {
                 auto* pending = static_cast<PendingSend*>(event.SEND_COMPLETE.ClientContext);
                 if (pending) {
-                    release_send(pending->bytes.size());
+                    release_send(pending->bytes.size(), pending->generation);
                     delete pending;
                 }
                 break;
@@ -4399,11 +4409,29 @@ struct QuicSession::Impl {
 
     // ----- sending -----
 
-    void release_send(size_t bytes) {
+    void release_send(size_t bytes, uint64_t generation) {
         {
             std::lock_guard<std::mutex> lock(send_mutex);
+            // The queue was reset for a new connection: this completion
+            // belongs to the old one and its counters are already gone.
+            if (generation != send_generation) {
+                return;
+            }
             --in_flight_sends;
             in_flight_bytes -= bytes;
+        }
+        send_cv.notify_all();
+    }
+
+    // Teardown drops sends that will never complete. Bumping the generation
+    // makes late completions from the old connection no-ops instead of
+    // underflowing the counters of the session that replaces it.
+    void reset_send_queue() {
+        {
+            std::lock_guard<std::mutex> lock(send_mutex);
+            ++send_generation;
+            in_flight_bytes = 0;
+            in_flight_sends = 0;
         }
         send_cv.notify_all();
     }
@@ -4465,6 +4493,7 @@ struct QuicSession::Impl {
         if (bytes.empty()) {
             return Error(Status::InvalidCall, "refusing to send an empty message");
         }
+        uint64_t generation = 0;
         {
             std::unique_lock<std::mutex> lock(send_mutex);
             const auto has_capacity = [this] {
@@ -4474,7 +4503,9 @@ struct QuicSession::Impl {
             };
             if (wait_for_capacity) {
                 if (deadline == kNoSendDeadline) {
-                    send_cv.wait(lock, has_capacity);
+                    if (!send_cv.wait_for(lock, kSendCapacityTimeout, has_capacity)) {
+                        return Error(Status::WaitTimeout, "send queue did not drain");
+                    }
                 } else if (!send_cv.wait_until(lock, deadline, has_capacity)) {
                     return Error(Status::WaitTimeout, "send queue is full");
                 }
@@ -4486,16 +4517,18 @@ struct QuicSession::Impl {
             }
             ++in_flight_sends;
             in_flight_bytes += bytes.size();
+            generation = send_generation;
         }
 
         auto* pending = new PendingSend;
         pending->bytes = std::move(bytes);
+        pending->generation = generation;
         pending->buffer.Buffer = pending->bytes.data();
         pending->buffer.Length = static_cast<uint32_t>(pending->bytes.size());
         const QUIC_STATUS status =
             api->StreamSend(stream, &pending->buffer, 1, flags, pending);
         if (QUIC_FAILED(status)) {
-            release_send(pending->bytes.size());
+            release_send(pending->bytes.size(), pending->generation);
             delete pending;
             // A send that aborts is the stream or connection already closing,
             // which for the host means the viewer is gone. Not a failure.
@@ -4531,26 +4564,32 @@ struct QuicSession::Impl {
         if (!stream) {
             return Error(Status::Unavailable, "no stream is open");
         }
+        uint64_t generation = 0;
         {
             std::unique_lock<std::mutex> lock(send_mutex);
-            send_cv.wait(lock, [this] {
+            const auto has_capacity = [this] {
                 return (in_flight_sends < kMaxInFlightSends &&
                         in_flight_bytes < kMaxInFlightBytes) ||
                        transport_down.load();
-            });
+            };
+            if (!send_cv.wait_for(lock, kSendCapacityTimeout, has_capacity)) {
+                return Error(Status::WaitTimeout, "send queue did not drain");
+            }
             if (transport_down.load()) {
                 return Error(Status::Unavailable, "connection closed before send");
             }
             ++in_flight_sends;
+            generation = send_generation;
         }
         auto* pending = new PendingSend;
+        pending->generation = generation;
         static uint8_t empty = 0;
         pending->buffer.Buffer = &empty;
         pending->buffer.Length = 0;
         const QUIC_STATUS status =
             api->StreamSend(stream, &pending->buffer, 1, QUIC_SEND_FLAG_FIN, pending);
         if (QUIC_FAILED(status)) {
-            release_send(0);
+            release_send(0, pending->generation);
             delete pending;
             if (status == QUIC_STATUS_ABORTED || status == QUIC_STATUS_INVALID_STATE) {
                 return Error(Status::Unavailable, "the connection closed before the send");
@@ -4566,9 +4605,12 @@ struct QuicSession::Impl {
 
     bool wait_sends(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(send_mutex);
-        return send_cv.wait_for(lock, timeout, [this] {
+        send_cv.wait_for(lock, timeout, [this] {
             return in_flight_sends == 0 || transport_down.load();
         });
+        // Waking because the transport went down is not a drain; the caller
+        // needs to know whether the queue is actually empty.
+        return in_flight_sends == 0;
     }
 
     std::string remote_address() const {
@@ -4625,7 +4667,9 @@ struct QuicSession::Impl {
                             [this] { return shutdown_complete; });
             }
         }
-        wait_sends(std::chrono::milliseconds(500));
+        if (!wait_sends(std::chrono::milliseconds(500))) {
+            reset_send_queue();
+        }
         if (HQUIC handle = audio.exchange(nullptr)) {
             api->StreamClose(handle);
         }
@@ -4953,7 +4997,9 @@ struct QuicSession::Impl {
                             [this] { return shutdown_complete; });
             }
         }
-        wait_sends(std::chrono::milliseconds(1000));
+        if (!wait_sends(std::chrono::milliseconds(1000))) {
+            reset_send_queue();
+        }
 
         // A server-initiated stream parked for classification still holds an
         // application reference; left open it would keep the connection alive
@@ -5539,6 +5585,17 @@ Error QuicSession::set_permissions(uint16_t permissions) {
             impl.file_offers.clear();
             impl.file_chunks.clear();
             impl.buffered_file_bytes = 0;
+            // The download direction is the host's own outgoing uploads; the
+            // stream abort stops the viewer's receive before the next chunk,
+            // and send_file_data() refuses any queued chunk after that.
+            for (auto& entry : impl.outgoing_uploads) {
+                if (!entry.second.finished) {
+                    entry.second.finished = true;
+                    if (entry.second.stream) {
+                        aborts.push_back(entry.second.stream);
+                    }
+                }
+            }
             impl.abort_streams_locked(aborts);
         }
         for (const auto& entry : cancelled) {
@@ -7887,6 +7944,11 @@ Error QuicSession::send_file_data(uint32_t transfer_id, const uint8_t* data, siz
     if (!data || size == 0 || size > kFileChunkBytes) {
         return Error(Status::InvalidCall, "a file chunk is between 1 byte and 64 KiB");
     }
+    // Checked per chunk: a revocation between two chunks ends the transfer
+    // before another byte leaves the host.
+    if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        return Error(Status::PermissionDenied, "file transfer was disabled");
+    }
     HQUIC stream = nullptr;
     std::vector<uint8_t> bytes;
     bool starting = false;
@@ -7954,6 +8016,9 @@ Error QuicSession::try_send_file_data(uint32_t transfer_id, const uint8_t* data,
 
 Error QuicSession::finish_file_upload(uint32_t transfer_id) {
     Impl& impl = *impl_;
+    if ((impl.session_permissions.load() & kPermissionFileTransfer) == 0) {
+        return Error(Status::PermissionDenied, "file transfer was disabled");
+    }
     HQUIC stream = nullptr;
     bool starting = false;
     std::vector<uint8_t> header_bytes;
