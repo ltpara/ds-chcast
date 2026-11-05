@@ -367,7 +367,7 @@ DEV-11～DEV-27。它们不是安全审核项，也不改变上一节 ENV/DEV/PL
 | DEV-15 | P2 | 操作系统登录/自动登录 | `src/client.rs:3848`（`OSLogin`）、`:4459-4477`（自动登录）；`src/server/connection.rs:2856` | 已实现（2026-11-05）：协议 v39 的 `OsLoginRequest/Result` 由主机在登录或锁屏界面键入查看器提供的密码；权限位 0x2000 与 `allow_os_login` 默认关闭；密码不落盘、不记日志，详见同日小节 |
 | DEV-16 | P2 | Windows 多会话选择（share-rdp 且存在多个会话时） | `src/server/connection.rs:2306-2322`（`WindowsSessions`）、`src/ui_session_interface.rs:1887-1897` | 已实现（2026-11-05）：协议 v40 的 `SessionListRequest/Result`、`SessionSelectRequest/Result` 由服务模式主机列出并切换 WTS 会话；权限位 0x4000 与 `allow_session_select` 默认关闭；查看器工具栏会话选择器在切换后自动重连，详见同日小节 |
 | DEV-17 | P2 | 主机控制：远程重启、阻止本地输入、插入锁屏 | `toolbar.dart:661`/`:671`/`:683`；`src/server/connection.rs:691-697`、`:1255-1308` | 已实现（2026-11-05）：协议 v38 的 `HostActionRequest/Result` 支持重启、锁屏、阻止/恢复本地输入；权限位 0x0800/0x1000 默认关闭；会话结束或撤权自动解除阻止，详见同日小节 |
-| DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | `SessionMode` 只有 Desktop/FileTransfer（`include/chast/protocol.h:1025`）；终端/摄像头/端口转发都依附桌面会话 |
+| DEV-18 | P2 | 独立会话类型：终端/摄像头/TCP 隧道无需桌面流 | `toolbar.dart:595-610` 分别发起文件、摄像头、终端、TCP tunneling 连接；`src/client.rs:3882` | 已实现（2026-11-05）：协议 v41 的 `SessionMode` 增加 Terminal/Camera/PortForward 与 `kServerInfoControlOnly`；主机为控制型会话单独派发 relay，不建立采集/编码；查看器对端菜单可直接发起三种独立会话，详见同日小节 |
 | DEV-19 | P2 | 终端持久化服务（断线重连、服务 ID） | `src/server/terminal_service.rs:30-37`（100 个服务、1 小时空闲、1 MB 缓冲、重连回放）、`:105`/`:216` | 终端随会话结束销毁，单会话最多 2 个（`protocol.h:1254`/`:1263`） |
 | DEV-20 | P2 | 多条端口转发规则并行 | `src/port_forward_mux.rs`、`flutter/lib/desktop/pages/port_forward_page.dart:294` 规则列表 | 协议支持多个 `forward_id`（上限 8），但查看器只管理一个活动目标（`app/lib/pages/session_page.dart:1602-1755`） |
 | DEV-21 | P2 | OIDC 账号登录 | `flutter/lib/common/widgets/login.dart:699`/`:732`、`src/hbbs_http/account.rs` | 账号体系有密码/TOTP/短信/邮件/WebAuthn，没有 OIDC 联邦登录 |
@@ -499,6 +499,41 @@ analyze` 无问题；`flutter test` 540 项通过；Windows release 构建成功
 全量 `ctest` 43/43 通过（644.27 s）。
 边界：真实麦克风与音箱待双机验收；每连接一通通话；语音与系统声音共用
 可靠控制流的拥塞控制；视频零拷贝链路未改动，无 CPU fallback。
+
+### DEV-18 独立终端 / 摄像头 / TCP 隧道会话（2026-11-05 完成）
+
+协议从 v40 提升到 v41：`SessionMode` 增加 `Terminal=2`、`Camera=3`、
+`PortForward=4`；HelloAck/StreamInfo 在权限掩码之后追加一个 mode 字节；
+新增标志 `kServerInfoControlOnly`（0x2000）表示会话没有桌面画面。解析器
+强制 mode 与 files-only/control-only 一致，控制型会话不得携带画面、音频、
+合并布局或显示器列表，权限掩码只能保留该模式对应的一个位。
+
+- **主机策略**：`HostSecurity` 按 mode 把协商权限裁剪到单个能力位
+  （Terminal→终端、Camera→摄像头、PortForward→端口转发）；未开启对应
+  `allow_*` 时在握手阶段拒绝。Desktop 路径不变。
+- **主机派发**：`HostServer::serve_current_session` 对三种控制型会话走新的
+  `control_session`，`announce()` 不打开视频/音频流，不创建采集器或编码器；
+  循环只泵 `TerminalRelay`/`CameraRelay`/`PortForwardRelay`。桌面专有请求
+  （主机动作、OS 登录、会话列表/切换）一律回明确拒绝，避免查看器空等；
+  控制型会话不参与多查看者 publisher/follower 注册。
+- **查看器引擎**：`Start`/`Run` 增加 `session_mode`，状态新增
+  `control_only` 与 `session_mode`；无画面会话跳过解码器、GPU sink 与帧
+  停滞检查，HelloAck 后直接进入 streaming（摄像头仍走零拷贝 GPU 纹理）。
+- **查看器界面**：设备卡片与最近连接菜单新增“远程终端”“主机摄像头”
+  “端口转发”。独立会话页只有模式标题栏与对应面板：终端面板自动打开；
+  摄像头面板自动注册纹理、列出设备并启动默认摄像头；端口转发弹出一次
+  目标配置对话框，之后保留状态卡片（更换/停止）。
+- **零拷贝**：控制型会话不触碰桌面采集/编码链路；摄像头复用既有
+  `CameraRelay` 与 GPU 纹理路径，未引入 CPU fallback。
+
+验证：`chast-protocol-test` 新增 v41 用例（三种 mode 的 Hello 往返、
+HelloAck 的 mode/control_only 一致性、无画面/无媒体、权限裁剪、未知 mode
+拒绝），全量 C++ Release 构建成功；本机 Device Guard 阻止运行新生成的无
+签名二进制（既有环境限制），C++ 侧为编译验证。`flutter analyze` 无问题；
+`flutter test` 558 项通过；Windows release 构建成功。
+
+边界：终端 shell、真实摄像头与 TCP 目标待双机验收；独立摄像头会话每次
+连接只服务一个查看者；桌面采集/编码链路未改动，仍保持零拷贝。
 
 ### DEV-17 远程重启 / 阻止本地输入 / 锁屏（2026-11-05 完成）
 

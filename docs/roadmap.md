@@ -3027,6 +3027,20 @@
      `session_select=`；全量 `ctest`/`flutter test`/release 构建见状态
      文档。边界：需服务模式与目标会话已登录；真实多会话交接待双机验收；
      媒体链路保持零拷贝。
+130. **P2 · DEV-18 独立终端 / 摄像头 / TCP 隧道会话（2026-11-05 完成）**：
+     协议 v41 的 `SessionMode` 增加 Terminal/Camera/PortForward，HelloAck/
+     StreamInfo 在权限掩码后追加 mode 字节，并用 `kServerInfoControlOnly`
+     (0x2000) 标记无桌面画面。主机按 mode 把权限裁剪到单个能力位，未开启
+     对应 `allow_*` 时握手拒绝；`HostServer::control_session` 只泵
+     `TerminalRelay`/`CameraRelay`/`PortForwardRelay`，不创建采集器或
+     编码器，桌面专有请求明确拒绝。查看器引擎新增 `control_only`/
+     `session_mode`，无画面会话跳过解码器与 GPU sink；设备/最近连接菜单
+     新增三种独立连接，会话页自动打开终端、列出并启动默认摄像头、弹出
+     端口转发配置并保留状态卡片。protocol 用例、全量 C++ 构建、
+     `flutter analyze`、558 项 `flutter test` 与 Windows release 构建
+     通过（本机 Device Guard 阻止运行新二进制，C++ 为编译验证）。边界：
+     真实 shell/摄像头/TCP 目标待双机验收；控制型会话不参与多查看者
+     注册；桌面与摄像头媒体链路保持零拷贝。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
