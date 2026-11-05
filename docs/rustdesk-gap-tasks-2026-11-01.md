@@ -474,6 +474,8 @@ P2 = 平台扩展。
   `--verify-package` 只校验入口。真实包在本机预检返回 `status=0`、9 个文件、
   `version=2.0.0.1`、`guard_active=true`。仍未安装驱动，A1～A10 未执行；
   Amyuni 再分发许可与专用测试机仍是 PLAT-01b/01d 完成的前置。
+  功能完整性与后续开发清单见
+  `docs/plat-01-virtual-display-gap-analysis-2026-11-06.md`。
 
 ### PLAT-02 远程打印（P2）
 
