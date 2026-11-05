@@ -3242,6 +3242,18 @@
      `Start` 成功后再 `SetOutput`，busy 不触碰运行中会话；`ViewerEngine::Start`
      复位 `record_wanted_`，录制按会话重新开启。验证：
      `flutter build windows --release` 通过；交互验证受 Device Guard 限制。
+147. **P1 · 代码审核 V2/V4/V7/V8 与 V9–V13（2026-11-05 完成）**：
+     WebAuthn 请求用共享 busy 标志与 `answered` 复位，取消/失败都完成
+     调用；`GpuFrameSink` 区分设备丢失与瞬态失败，逐帧清除瞬态错误，
+     `Reset()` 重建 D3D11 设备与视频处理器管线，引擎在致命错误时重建
+     解码器并请求 IDR，连续 300 次瞬态失败才断流；文件夹下载按根限制
+     20 万条目与 64 层深度；纹理边长上限 8192、像素上限 7680×4320 在
+     sink 与握手/StreamInfo 双侧校验；剪贴板 CF_HDROP 只从
+     `FileReceiver::finish()` 的落盘路径推导并拒绝越出暂存目录；文件
+     浏览统一走 `valid_file_browser_path`；光标缓存淘汰跳过活跃形状；
+     `EnumAdapters1` 检查错误；WebAuthn 校验 rp_id、origin 与 challenge。
+     验证：`flutter build windows --release` 通过；交互验证受 Device Guard
+     限制。至此代码审核第 7 节无剩余待修项。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
