@@ -307,6 +307,22 @@ const char* os_login_code_name(chast::OsLoginCode code) {
     return "the host refused OS login";
 }
 
+const char* remote_config_code_name(chast::RemoteConfigCode code) {
+    switch (code) {
+        case chast::RemoteConfigCode::Ok:
+            return "the host applied the change";
+        case chast::RemoteConfigCode::Denied:
+            return "the host denied the change";
+        case chast::RemoteConfigCode::Unsupported:
+            return "this host cannot change that switch";
+        case chast::RemoteConfigCode::Busy:
+            return "another viewer controls this host";
+        case chast::RemoteConfigCode::Failed:
+            return "the host could not store the change";
+    }
+    return "the host refused the change";
+}
+
 const char* session_list_code_name(chast::SessionListCode code) {
     switch (code) {
         case chast::SessionListCode::Ok:
@@ -1449,6 +1465,25 @@ bool ViewerEngine::RequestSessionSelect(uint32_t session_id) {
     return true;
 }
 
+bool ViewerEngine::RequestRemoteConfig(uint32_t keys, uint32_t values) {
+    if ((keys & ~chast::kRemoteConfigAll) != 0 || (values & ~keys) != 0) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming ||
+            !status_.remote_config_supported) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(remote_config_mutex_);
+    pending_remote_config_ = std::make_pair(keys, values);
+    return true;
+}
+
 bool ViewerEngine::SendChat(const std::string& text) {
     if (!chast::valid_chat_text(text)) {
         return false;
@@ -1947,6 +1982,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     int stream_option_code = 0;
     std::string stream_option_error;
     uint64_t stream_option_results = 0;
+    bool remote_config_supported = false;
+    uint32_t remote_config_flags = 0;
+    int remote_config_code = 0;
+    std::string remote_config_error;
+    uint64_t remote_config_updates = 0;
     double rtt_ms = 0.0;
     double latency_ms = 0.0;
     bool frame_age_valid = false;
@@ -2249,6 +2289,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.stream_option_code = stream_option_code;
             status_.stream_option_error = stream_option_error;
             status_.stream_option_results = stream_option_results;
+            status_.remote_config_supported = remote_config_supported;
+            status_.remote_config_flags = remote_config_flags;
+            status_.remote_config_code = remote_config_code;
+            status_.remote_config_error = remote_config_error;
+            status_.remote_config_updates = remote_config_updates;
             if (!active_transport.empty()) {
                 status_.transport = active_transport;
             }
@@ -2666,10 +2711,13 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 // the service backend can honour a switch.
                 const bool session_select =
                     (mask & chast::kPermissionSessionSelect) != 0;
+                const bool remote_config =
+                    (mask & chast::kPermissionRemoteConfig) != 0;
                 restart_supported = restart;
                 block_input_supported = block_input;
                 os_login_supported = os_login;
                 session_select_supported = session_select;
+                remote_config_supported = remote_config;
                 if (!block_input) {
                     block_input_active = false;
                 }
@@ -2700,6 +2748,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.block_input_supported = block_input;
                     status_.os_login_supported = os_login;
                     status_.session_select_supported = session_select;
+                    status_.remote_config_supported = remote_config;
                     if (!block_input) {
                         status_.block_input_active = false;
                     }
@@ -5471,6 +5520,68 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the newest queued remote-config request. A local
+                // failure (the permission was revoked between the queue and
+                // the send) is reported like a RemoteConfigState, so the
+                // dialog always gets an answer.
+                auto drain_remote_config = [&] {
+                    std::optional<std::pair<uint32_t, uint32_t>> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(remote_config_mutex_);
+                        requested.swap(pending_remote_config_);
+                    }
+                    if (!requested) {
+                        return;
+                    }
+                    const chast::Error sent =
+                        session->request_remote_config(requested->first, requested->second);
+                    if (sent.ok()) {
+                        return;
+                    }
+                    remote_config_code =
+                        static_cast<int>(chast::RemoteConfigCode::Failed);
+                    remote_config_error = "request: " + sent.to_string();
+                    ++remote_config_updates;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.remote_config_code = remote_config_code;
+                    status_.remote_config_error = remote_config_error;
+                    status_.remote_config_updates = remote_config_updates;
+                    std::fprintf(stderr, "viewer: remote configuration: %s\n",
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts the newest answer. The flags snapshot is what the
+                // host stored, so the dialog closes on the state that actually
+                // took effect.
+                auto receive_remote_config = [&] {
+                    chast::RemoteConfigState state;
+                    while (session->take_remote_config_state(state)) {
+                        remote_config_flags = state.flags;
+                        remote_config_code = static_cast<int>(state.code);
+                        remote_config_error =
+                            state.code == chast::RemoteConfigCode::Ok
+                                ? std::string()
+                                : (state.reason.empty()
+                                       ? remote_config_code_name(state.code)
+                                       : state.reason);
+                        ++remote_config_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.remote_config_flags = remote_config_flags;
+                            status_.remote_config_code = remote_config_code;
+                            status_.remote_config_error = remote_config_error;
+                            status_.remote_config_updates = remote_config_updates;
+                        }
+                        std::fprintf(stderr,
+                                     "viewer: remote configuration %s%s%s (flags 0x%08x)\n",
+                                     state.code == chast::RemoteConfigCode::Ok
+                                         ? "applied"
+                                         : "refused",
+                                     remote_config_error.empty() ? "" : ": ",
+                                     remote_config_error.c_str(), state.flags);
+                    }
+                };
+
                 // Sends the newest queued OS password. The slot and the local
                 // copy are wiped as soon as the transport has the payload; a
                 // local refusal is reported like an OsLoginResult.
@@ -7050,6 +7161,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     drain_host_action();
                     receive_host_action();
+                    drain_remote_config();
+                    receive_remote_config();
                     drain_os_login();
                     receive_os_login();
                     drain_session_requests();
@@ -7163,6 +7276,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_sas();
                     drain_host_action();
                     receive_host_action();
+                    drain_remote_config();
+                    receive_remote_config();
                     drain_os_login();
                     receive_os_login();
                     drain_session_requests();

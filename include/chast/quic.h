@@ -198,6 +198,10 @@ struct QuicServerConfig {
     // users and a selection moves the stream to another Windows session. The
     // host only sets this in service mode, where a backend can actually switch.
     bool allow_session_select = false;
+    // Accept RemoteConfigRequest and grant kPermissionRemoteConfig. Off by
+    // default: an accepted change is stored in the host settings and outlives
+    // the session.
+    bool allow_remote_config = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -591,6 +595,17 @@ public:
     // Answers a SessionSelectRequest. Ok means the host accepted the handoff
     // and is ending this session so the worker can restart in the target.
     Error send_session_select_result(const SessionSelectResult& result);
+    // Pops the newest RemoteConfigRequest. Only the newest is kept: a viewer
+    // that toggles several switches in a row wants the final combination.
+    // The host checks kPermissionRemoteConfig and its allow_remote_config
+    // setting, applies the change and answers with send_remote_config_state().
+    bool take_remote_config_request(RemoteConfigRequest& request);
+    // Number of RemoteConfigRequests received. Observation hook for tools and
+    // the host's own counters.
+    uint64_t remote_config_requests() const;
+    // Answers a RemoteConfigRequest with the switch state now stored on the
+    // host. A non-Ok code must carry flags=0; the maker refuses anything else.
+    Error send_remote_config_state(const RemoteConfigState& state);
     // Releases anything the viewer still holds, then types the password and
     // Return through the server's input injector. The injection thread checks
     // the input desktop before applying, but the caller must still confirm the
@@ -760,6 +775,15 @@ public:
     bool take_host_action_result(HostControlResult& result);
     // Total host-control answers received. Observation hook for tools.
     uint64_t host_action_results() const;
+    // Asks the host to read or change its exposed policy switches. Requires
+    // the handshake and kPermissionRemoteConfig; mask=0 queries the current
+    // state. The answer arrives through take_remote_config_state().
+    Error request_remote_config(uint32_t keys, uint32_t values);
+    // Pops the newest remote-config answer. `flags` carries the state stored
+    // on the host; a refusal carries the host's UTF-8 reason.
+    bool take_remote_config_state(RemoteConfigState& state);
+    // Total remote-config answers received. Observation hook for tools.
+    uint64_t remote_config_states() const;
     // Asks the host to type the operating-system password at its logon or lock
     // screen. Requires the handshake, kPermissionInput and kPermissionOsLogin.
     // The answer arrives through take_os_login_result().

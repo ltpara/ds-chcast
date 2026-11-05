@@ -217,6 +217,17 @@ struct ViewerRegistry {
         std::lock_guard<std::mutex> lock(mutex);
         return active <= 1 || controller == viewer;
     }
+
+    // Remote configuration is process-wide. A worker that changed the exposed
+    // switches stores them here so the listener seeds later workers from the
+    // current policy instead of its start-time copy. `remote_settings_valid`
+    // is set once the listener seeds the copy.
+    HostSettings remote_settings;
+    bool remote_settings_valid = false;
+    // Read by the last worker at session teardown, possibly from a different
+    // worker than the one that set it.
+    std::atomic<bool> lock_after_session_end{false};
+    std::atomic<uint64_t> remote_settings_version{0};
 };
 
 namespace {
@@ -469,7 +480,85 @@ uint16_t settings_permissions(const HostSettings& settings) {
     if (settings.allow_session_select) {
         mask |= kPermissionSessionSelect;
     }
+    if (settings.allow_remote_config) {
+        mask |= kPermissionRemoteConfig;
+    }
     return mask;
+}
+
+// The switches a viewer holding kPermissionRemoteConfig may read (keys = 0)
+// and change. allow_input and allow_remote_config itself are deliberately
+// absent: remote configuration must not hand its holder either of them.
+uint32_t remote_config_flags(const HostSettings& settings) {
+    uint32_t flags = 0;
+    auto set = [&flags](uint32_t bit, bool value) {
+        if (value) {
+            flags |= bit;
+        }
+    };
+    set(kRemoteConfigLockAfterSessionEnd, settings.lock_after_session_end);
+    set(kRemoteConfigClipboard, settings.allow_clipboard);
+    set(kRemoteConfigFileTransfer, settings.allow_file_transfer);
+    set(kRemoteConfigAudio, settings.allow_audio);
+    set(kRemoteConfigMicrophone, settings.allow_microphone);
+    set(kRemoteConfigPrivacyMode, settings.allow_privacy_mode);
+    set(kRemoteConfigRestart, settings.allow_restart);
+    set(kRemoteConfigBlockInput, settings.allow_block_input);
+    set(kRemoteConfigOsLogin, settings.allow_os_login);
+    set(kRemoteConfigSessionSelect, settings.allow_session_select);
+    set(kRemoteConfigTerminal, settings.allow_terminal);
+    set(kRemoteConfigPortForward, settings.allow_port_forward);
+    set(kRemoteConfigCamera, settings.allow_camera);
+    set(kRemoteConfigRecord, settings.allow_record);
+    return flags;
+}
+
+// Copies only the switches a viewer may change remotely; credentials, ports
+// and the remote-config gate itself never enter the shared registry copy.
+void copy_remote_config_fields(const HostSettings& from, HostSettings& to) {
+    to.lock_after_session_end = from.lock_after_session_end;
+    to.allow_clipboard = from.allow_clipboard;
+    to.allow_file_transfer = from.allow_file_transfer;
+    to.allow_audio = from.allow_audio;
+    to.allow_microphone = from.allow_microphone;
+    to.allow_privacy_mode = from.allow_privacy_mode;
+    to.allow_restart = from.allow_restart;
+    to.allow_block_input = from.allow_block_input;
+    to.allow_os_login = from.allow_os_login;
+    to.allow_session_select = from.allow_session_select;
+    to.allow_terminal = from.allow_terminal;
+    to.allow_port_forward = from.allow_port_forward;
+    to.allow_camera = from.allow_camera;
+    to.allow_record = from.allow_record;
+}
+
+// Permissions the current session loses when a switch it just watched turn
+// off. Only fields that actually changed are revoked; a switch that was
+// already off has no grant to take back.
+uint16_t remote_config_revocations(const HostSettings& settings, uint32_t changed) {
+    uint16_t revoke = 0;
+    auto take = [&revoke, &settings, changed](uint32_t bit, bool enabled,
+                                              uint16_t permission) {
+        if ((changed & bit) != 0 && !enabled) {
+            revoke |= permission;
+        }
+    };
+    take(kRemoteConfigClipboard, settings.allow_clipboard, kPermissionClipboard);
+    take(kRemoteConfigFileTransfer, settings.allow_file_transfer,
+         kPermissionFileTransfer);
+    take(kRemoteConfigAudio, settings.allow_audio, kPermissionAudio);
+    take(kRemoteConfigMicrophone, settings.allow_microphone, kPermissionMicrophone);
+    take(kRemoteConfigPrivacyMode, settings.allow_privacy_mode, kPermissionPrivacyMode);
+    take(kRemoteConfigRestart, settings.allow_restart, kPermissionRestart);
+    take(kRemoteConfigBlockInput, settings.allow_block_input, kPermissionBlockInput);
+    take(kRemoteConfigOsLogin, settings.allow_os_login, kPermissionOsLogin);
+    take(kRemoteConfigSessionSelect, settings.allow_session_select,
+         kPermissionSessionSelect);
+    take(kRemoteConfigTerminal, settings.allow_terminal, kPermissionTerminal);
+    take(kRemoteConfigPortForward, settings.allow_port_forward, kPermissionPortForward);
+    take(kRemoteConfigCamera, settings.allow_camera, kPermissionCamera);
+    take(kRemoteConfigRecord, settings.allow_record, kPermissionRecord);
+    return revoke;
 }
 
 bool wait_for_usable_frame(IDxgiCapturer& capturer, bool quiet, const std::atomic<bool>& stopping,
@@ -704,6 +793,9 @@ std::string permission_names(uint16_t mask) {
     if ((mask & kPermissionSessionSelect) != 0) {
         add("session select");
     }
+    if ((mask & kPermissionRemoteConfig) != 0) {
+        add("remote configuration");
+    }
     return text.empty() ? "view only" : text;
 }
 
@@ -787,6 +879,75 @@ const char* host_action_code_name(HostActionCode code) {
             return "failed";
     }
     return "unknown";
+}
+
+const char* remote_config_code_name(RemoteConfigCode code) {
+    switch (code) {
+        case RemoteConfigCode::Ok:
+            return "ok";
+        case RemoteConfigCode::Denied:
+            return "denied";
+        case RemoteConfigCode::Unsupported:
+            return "unsupported";
+        case RemoteConfigCode::Busy:
+            return "busy";
+        case RemoteConfigCode::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
+std::string remote_config_change_names(uint32_t mask) {
+    std::string text;
+    auto add = [&text](const char* name) {
+        if (!text.empty()) {
+            text += ", ";
+        }
+        text += name;
+    };
+    if ((mask & kRemoteConfigLockAfterSessionEnd) != 0) {
+        add("lock after session end");
+    }
+    if ((mask & kRemoteConfigClipboard) != 0) {
+        add("clipboard");
+    }
+    if ((mask & kRemoteConfigFileTransfer) != 0) {
+        add("file transfer");
+    }
+    if ((mask & kRemoteConfigAudio) != 0) {
+        add("audio");
+    }
+    if ((mask & kRemoteConfigMicrophone) != 0) {
+        add("microphone");
+    }
+    if ((mask & kRemoteConfigPrivacyMode) != 0) {
+        add("privacy mode");
+    }
+    if ((mask & kRemoteConfigRestart) != 0) {
+        add("restart");
+    }
+    if ((mask & kRemoteConfigBlockInput) != 0) {
+        add("block input");
+    }
+    if ((mask & kRemoteConfigOsLogin) != 0) {
+        add("OS login");
+    }
+    if ((mask & kRemoteConfigSessionSelect) != 0) {
+        add("session select");
+    }
+    if ((mask & kRemoteConfigTerminal) != 0) {
+        add("terminal");
+    }
+    if ((mask & kRemoteConfigPortForward) != 0) {
+        add("port forward");
+    }
+    if ((mask & kRemoteConfigCamera) != 0) {
+        add("camera");
+    }
+    if ((mask & kRemoteConfigRecord) != 0) {
+        add("record");
+    }
+    return text;
 }
 
 // Puts a session's temporary display mode back when the session ends, however
@@ -874,6 +1035,9 @@ std::unique_ptr<HostServer> HostServer::create(HostServerConfig config, std::str
     if (server->settings_.max_viewers > 1) {
         server->registry_ = std::make_shared<ViewerRegistry>();
         server->registry_->max_viewers = server->settings_.max_viewers;
+        copy_remote_config_fields(server->settings_, server->registry_->remote_settings);
+        server->registry_->remote_settings_valid = true;
+        server->registry_->lock_after_session_end = server->settings_.lock_after_session_end;
     }
     server->publish_security_status();
     if (server->config_.service_mode && server->settings_.password_hash.empty()) {
@@ -1004,6 +1168,7 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_microphone = settings_.allow_microphone;
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
     quic.allow_permission_change = settings_.allow_permission_change;
+    quic.allow_remote_config = settings_.allow_remote_config;
     quic.dry_run_input = config_.dry_run_input;
     // The one-shot tool reports a refused password instead of waiting for the
     // next viewer; the interactive host keeps listening.
@@ -1336,6 +1501,18 @@ void HostServer::set_permissions(uint16_t permissions) {
     permission_update_pending_.store(true);
 }
 
+void HostServer::set_lock_after_session_end(bool enabled) {
+    settings_.lock_after_session_end = enabled;
+    if (!registry_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(registry_->mutex);
+    registry_->remote_settings.lock_after_session_end = enabled;
+    registry_->remote_settings_valid = true;
+    registry_->lock_after_session_end.store(enabled);
+    ++registry_->remote_settings_version;
+}
+
 bool HostServer::send_chat(const std::string& text) {
     if (registry_ && !adopted_) {
         std::shared_ptr<HostServer> target = focused_viewer();
@@ -1527,6 +1704,9 @@ void HostServer::run_single() {
         std::string error;
         bool peer_left = false;
         const bool ok = serve_current_session(stats, true, &error, &peer_left);
+        if (settings_.lock_after_session_end) {
+            lock_after_session_end_workstation();
+        }
         if (!ok || !error.empty()) {
             log(error.empty() ? "the session ended" : error);
             publish_state(HostState::Failed, error.empty() ? "the session failed" : error);
@@ -1840,6 +2020,16 @@ void HostServer::start_viewer(std::unique_ptr<QuicSession> connection,
                               double run_seconds_left) {
     auto viewer = std::shared_ptr<HostServer>(new HostServer(config_));
     viewer->settings_ = settings_;
+    // Another worker may have changed the exposed switches since the listener
+    // loaded its copy; seed this session from the freshest policy.
+    {
+        std::lock_guard<std::mutex> lock(registry_->mutex);
+        if (registry_->remote_settings_valid) {
+            copy_remote_config_fields(registry_->remote_settings, viewer->settings_);
+        }
+        viewer->settings_.lock_after_session_end =
+            registry_->lock_after_session_end.load();
+    }
     viewer->session_ = std::move(connection);
     viewer->security_ = security_;
     viewer->registry_ = registry_;
@@ -2010,15 +2200,22 @@ void HostServer::run_adopted() {
     }
 
     registry_->release_control(this);
+    bool last_viewer = false;
+    bool lock_after = false;
     {
         std::lock_guard<std::mutex> lock(registry_->mutex);
         if (registry_->active > 0) {
             --registry_->active;
         }
+        last_viewer = registry_->active == 0;
+        lock_after = registry_->lock_after_session_end.load();
         std::shared_ptr<HostServer> focused = registry_->focused.lock();
         if (focused.get() == this) {
             registry_->focused.reset();
         }
+    }
+    if (last_viewer && lock_after) {
+        lock_after_session_end_workstation();
     }
     // Close the connection now instead of in the destructor: the listener can
     // admit the next viewer without waiting for this worker to be reaped.
@@ -2360,6 +2557,29 @@ HostServer::SharedFollowResult HostServer::follow_shared_desktop(
                 "host actions are controlled by the viewer that owns the stream";
             if (!send_failed(session_->send_host_action_result(denied),
                              "host_action_result")) {
+                return SharedFollowResult::Ended;
+            }
+        }
+        // Reads are harmless; a change would race the publisher's copy of the
+        // policy, so only the viewer that owns the stream may write.
+        RemoteConfigRequest config_request;
+        while (session_->take_remote_config_request(config_request)) {
+            ++stats.remote_config_requests;
+            RemoteConfigState state;
+            if (config_request.keys != 0) {
+                ++stats.remote_config_failures;
+                state.code = RemoteConfigCode::Busy;
+                state.reason =
+                    "host settings are controlled by the viewer that owns the stream";
+            }
+            {
+                std::lock_guard<std::mutex> lock(registry_->mutex);
+                state.flags = registry_->remote_settings_valid
+                                  ? remote_config_flags(registry_->remote_settings)
+                                  : remote_config_flags(settings_);
+            }
+            if (!send_failed(session_->send_remote_config_state(state),
+                             "remote_config_state")) {
                 return SharedFollowResult::Ended;
             }
         }
@@ -4507,6 +4727,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             drain_peer(stats);
             return clean;
         }
+        if (!handle_remote_config_requests(stats, error, peer_left)) {
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
+        }
         std::string chat_text;
         while (session_->take_chat(chat_text)) {
             ++stats.chat_received;
@@ -6190,6 +6415,27 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
             }
             log("host action refused: file-transfer sessions cannot control the host");
         }
+        RemoteConfigRequest config_request;
+        while (session_->take_remote_config_request(config_request)) {
+            ++stats.remote_config_requests;
+            ++stats.remote_config_failures;
+            RemoteConfigState denied;
+            denied.code = RemoteConfigCode::Unsupported;
+            denied.reason =
+                "remote configuration is not available in a file-transfer session";
+            const Error sent = session_->send_remote_config_state(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "remote_config_state: " + sent.to_string();
+                return false;
+            }
+            log("remote configuration refused: file-transfer sessions cannot change host settings");
+        }
         std::string login_password;
         while (session_->take_os_login_request(login_password)) {
             ++stats.os_login_requests;
@@ -6361,6 +6607,27 @@ bool HostServer::control_session(SessionMode mode, HostServerStats& stats,
                 return false;
             }
             log("host action refused: a control-only session cannot control the host");
+        }
+        RemoteConfigRequest config_request;
+        while (session_->take_remote_config_request(config_request)) {
+            ++stats.remote_config_requests;
+            ++stats.remote_config_failures;
+            RemoteConfigState denied;
+            denied.code = RemoteConfigCode::Unsupported;
+            denied.reason =
+                "remote configuration is not available in a control-only session";
+            const Error sent = session_->send_remote_config_state(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "remote_config_state: " + sent.to_string();
+                return false;
+            }
+            log("remote configuration refused: a control-only session cannot change host settings");
         }
         std::string login_password;
         while (session_->take_os_login_request(login_password)) {
@@ -7230,6 +7497,127 @@ bool HostServer::handle_host_actions(HostServerStats& stats, std::string* error,
         return false;
     }
     return true;
+}
+
+bool HostServer::handle_remote_config_requests(HostServerStats& stats, std::string* error,
+                                               bool* peer_left) {
+    RemoteConfigRequest request;
+    while (session_->take_remote_config_request(request)) {
+        ++stats.remote_config_requests;
+        const uint16_t permissions = session_->permissions();
+        // keys = 0 is a read; any key bit asks to write that switch.
+        const bool changing = request.keys != 0;
+        RemoteConfigState state;
+        state.code = RemoteConfigCode::Ok;
+        if ((permissions & kPermissionRemoteConfig) == 0) {
+            state.code = RemoteConfigCode::Denied;
+            state.reason = "remote configuration is not permitted by the host";
+        } else if (changing && !settings_.allow_remote_config) {
+            state.code = RemoteConfigCode::Denied;
+            state.reason = "the host does not allow remote configuration changes";
+        } else if (changing && registry_ && !registry_->may_change_host_state(this)) {
+            state.code = RemoteConfigCode::Busy;
+            state.reason = "another viewer controls this host";
+        } else if (changing) {
+            uint32_t changed = 0;
+            auto assign = [&request, &changed](uint32_t bit, bool& field) {
+                if ((request.keys & bit) == 0) {
+                    return;
+                }
+                const bool value = (request.values & bit) != 0;
+                if (field != value) {
+                    field = value;
+                    changed |= bit;
+                }
+            };
+            assign(kRemoteConfigLockAfterSessionEnd, settings_.lock_after_session_end);
+            assign(kRemoteConfigClipboard, settings_.allow_clipboard);
+            assign(kRemoteConfigFileTransfer, settings_.allow_file_transfer);
+            assign(kRemoteConfigAudio, settings_.allow_audio);
+            assign(kRemoteConfigMicrophone, settings_.allow_microphone);
+            assign(kRemoteConfigPrivacyMode, settings_.allow_privacy_mode);
+            assign(kRemoteConfigRestart, settings_.allow_restart);
+            assign(kRemoteConfigBlockInput, settings_.allow_block_input);
+            assign(kRemoteConfigOsLogin, settings_.allow_os_login);
+            assign(kRemoteConfigSessionSelect, settings_.allow_session_select);
+            assign(kRemoteConfigTerminal, settings_.allow_terminal);
+            assign(kRemoteConfigPortForward, settings_.allow_port_forward);
+            assign(kRemoteConfigCamera, settings_.allow_camera);
+            assign(kRemoteConfigRecord, settings_.allow_record);
+            if (changed != 0) {
+                // A gate that just closed loses its grant now; a gate that
+                // opened only affects the next connection, because the
+                // transport's ceiling was fixed at this session's handshake.
+                const uint16_t revoke = remote_config_revocations(settings_, changed);
+                if ((revoke & permissions) != 0) {
+                    if (settings_.allow_permission_change) {
+                        set_permissions(permissions & ~revoke);
+                    } else {
+                        log("the disabled switches stay effective for the rest of "
+                            "this session; permission changes are off");
+                    }
+                }
+                if (registry_) {
+                    std::lock_guard<std::mutex> lock(registry_->mutex);
+                    copy_remote_config_fields(settings_, registry_->remote_settings);
+                    registry_->remote_settings_valid = true;
+                    registry_->lock_after_session_end.store(
+                        settings_.lock_after_session_end);
+                    ++registry_->remote_settings_version;
+                }
+                if (config_.settings_changed) {
+                    if (registry_) {
+                        // The listener may persist from its own thread; the
+                        // registry mutex serializes the two writers.
+                        std::lock_guard<std::mutex> lock(registry_->callback_mutex);
+                        config_.settings_changed(settings_);
+                    } else {
+                        config_.settings_changed(settings_);
+                    }
+                }
+                log("remote configuration changed by the viewer: " +
+                    remote_config_change_names(changed));
+            }
+        }
+        state.flags = remote_config_flags(settings_);
+        if (state.code != RemoteConfigCode::Ok) {
+            ++stats.remote_config_failures;
+            log(std::string("remote configuration refused (") +
+                remote_config_code_name(state.code) +
+                "): " + (state.reason.empty() ? "no reason given" : state.reason));
+        }
+        const Error sent = session_->send_remote_config_state(state);
+        if (sent.ok()) {
+            publish_stats(stats);
+            continue;
+        }
+        if (sent.status() == Status::Unavailable ||
+            sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "remote_config_state: " + sent.to_string();
+        }
+        return false;
+    }
+    return true;
+}
+
+void HostServer::lock_after_session_end_workstation() {
+    if (stopping_.load()) {
+        return;
+    }
+    std::string platform_error;
+    const bool done = config_.host_control
+                          ? config_.host_control(HostAction::LockScreen, false,
+                                                 &platform_error)
+                          : lock_host_workstation(&platform_error);
+    if (done) {
+        log("the workstation was locked after the session ended");
+    } else {
+        log("cannot lock the workstation after the session: " +
+            (platform_error.empty() ? "unknown error" : platform_error));
+    }
 }
 
 bool HostServer::handle_os_login_requests(HostServerStats& stats, std::string* error,

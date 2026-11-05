@@ -2019,6 +2019,58 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     );
   }
 
+  /// Reads the host's exposed policy switches and lets the operator change
+  /// them. The dialog keeps polling while it is open: the save is confirmed
+  /// only when the host answers with an Ok RemoteConfigState.
+  Future<void> _openRemoteConfigDialog() async {
+    if (!_status.remoteConfigSupported) {
+      return;
+    }
+    try {
+      final bool queued = await ViewerBridge.requestRemoteConfig(0, 0);
+      if (!mounted) {
+        return;
+      }
+      if (!queued) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('主机设置未能读取：请确认主机权限与会话状态')),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+        return;
+      }
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法读取主机设置'))));
+      return;
+    } on MissingPluginException {
+      // The native viewer is going away.
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+    final bool? saved = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return _RemoteConfigDialog(initial: _status);
+      },
+    );
+    if (saved == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('主机设置已更新')),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
+
   /// Starts the reconnect ladder after an accepted session switch. The host
   /// ends the old connection itself, so this is not a drop; the service may
   /// still be stopping the old worker, and the ladder covers that window.
@@ -4220,6 +4272,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         onOsLogin: () => unawaited(_openOsLoginDialog()),
                         sessionSelectAvailable: _status.acceptsSessionSelect,
                         onSessionSelect: () => unawaited(_openSessionDialog()),
+                        remoteConfigAvailable: _status.remoteConfigSupported,
+                        onRemoteConfig: () =>
+                            unawaited(_openRemoteConfigDialog()),
                         restartAvailable: _status.acceptsRestart,
                         lockAvailable: _status.acceptsLockScreen,
                         blockInputAvailable: _status.acceptsBlockInput,
@@ -5974,6 +6029,275 @@ String _sessionSelectCodeText(int code) {
     return tr('主机无法切换会话');
   }
   return tr('主机拒绝了会话切换');
+}
+
+/// One editable host policy switch.
+class _RemoteConfigToggle {
+  const _RemoteConfigToggle(this.bit, this.label);
+
+  final int bit;
+  final String label;
+}
+
+const List<_RemoteConfigToggle> _remoteConfigToggles = <_RemoteConfigToggle>[
+  _RemoteConfigToggle(
+    ViewerRemoteConfigSwitch.lockAfterSessionEnd,
+    '会话结束后锁定本机',
+  ),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.clipboard, '剪贴板同步'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.fileTransfer, '文件传输'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.audio, '声音播放'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.microphone, '麦克风'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.privacyMode, '隐私模式'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.restart, '远程重启'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.blockInput, '阻止本地输入'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.osLogin, '操作系统登录'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.sessionSelect, 'Windows 会话切换'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.terminal, '远程终端'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.portForward, '端口转发'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.camera, '摄像头'),
+  _RemoteConfigToggle(ViewerRemoteConfigSwitch.record, '录制授权'),
+];
+
+String _remoteConfigCodeText(int code) {
+  switch (code) {
+    case 1:
+      return tr('主机拒绝了这次修改');
+    case 2:
+      return tr('主机不支持修改该设置');
+    case 3:
+      return tr('另一个查看者正在控制主机');
+    case 4:
+      return tr('主机无法保存这次修改');
+  }
+  return tr('主机拒绝了这次修改');
+}
+
+/// Edits the host's exposed policy switches. Only the switches the operator
+/// actually changed are sent; the host's answer (the stored snapshot) is what
+/// closes the dialog, so a refusal keeps the edits on screen.
+class _RemoteConfigDialog extends StatefulWidget {
+  const _RemoteConfigDialog({required this.initial});
+
+  final ViewerStatus initial;
+
+  @override
+  State<_RemoteConfigDialog> createState() => _RemoteConfigDialogState();
+}
+
+class _RemoteConfigDialogState extends State<_RemoteConfigDialog> {
+  late ViewerStatus _status = widget.initial;
+  // The snapshot the checkboxes were seeded from; a save sends the difference.
+  late int _baseFlags = widget.initial.remoteConfigFlags;
+  late int _flags = widget.initial.remoteConfigFlags;
+  int? _savingSince;
+  bool _dirty = false;
+  bool _saving = false;
+  String? _error;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => unawaited(_poll()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _poll() async {
+    try {
+      final ViewerStatus next = await ViewerBridge.status();
+      if (!mounted) {
+        return;
+      }
+      bool applied = false;
+      String? refusal;
+      final int? savingSince = _savingSince;
+      if (_saving &&
+          savingSince != null &&
+          next.remoteConfigUpdates > savingSince) {
+        if (next.remoteConfigCode == ViewerRemoteConfigCode.ok.code) {
+          applied = true;
+        } else {
+          refusal = next.remoteConfigError.isNotEmpty
+              ? next.remoteConfigError
+              : _remoteConfigCodeText(next.remoteConfigCode);
+        }
+      }
+      setState(() {
+        // A fresh answer from the read request replaces the seed while the
+        // operator has not touched anything; unsaved edits always win.
+        if (!_dirty &&
+            next.remoteConfigUpdates != _status.remoteConfigUpdates) {
+          _baseFlags = next.remoteConfigFlags;
+          _flags = next.remoteConfigFlags;
+        }
+        _status = next;
+        if (applied) {
+          _saving = false;
+        }
+        if (refusal != null) {
+          _saving = false;
+          _savingSince = null;
+          _error = refusal;
+        }
+      });
+      if (applied && mounted) {
+        Navigator.of(context).pop(true);
+      }
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } on PlatformException {
+      // A single failed poll is transient; the next tick retries.
+    }
+  }
+
+  Future<void> _save() async {
+    if (_saving) {
+      return;
+    }
+    int keys = 0;
+    int values = 0;
+    for (final _RemoteConfigToggle toggle in _remoteConfigToggles) {
+      final bool now = (_flags & toggle.bit) != 0;
+      final bool was = (_baseFlags & toggle.bit) != 0;
+      if (now != was) {
+        keys |= toggle.bit;
+        if (now) {
+          values |= toggle.bit;
+        }
+      }
+    }
+    if (keys == 0) {
+      Navigator.of(context).pop(false);
+      return;
+    }
+    setState(() {
+      _saving = true;
+      _savingSince = _status.remoteConfigUpdates;
+      _error = null;
+    });
+    try {
+      final bool queued = await ViewerBridge.requestRemoteConfig(keys, values);
+      if (!mounted) {
+        return;
+      }
+      if (!queued) {
+        setState(() {
+          _saving = false;
+          _savingSince = null;
+          _error = tr('请求未能排队：请确认主机权限与会话状态');
+        });
+      }
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _saving = false;
+        _savingSince = null;
+        _error = error.message ?? tr('无法修改主机设置');
+      });
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(tr('主机设置')),
+      content: SizedBox(
+        width: 360,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            Text(
+              tr('这里只列出主机开放给查看者的开关；改动会在主机保存后生效。'),
+              style: const TextStyle(fontSize: 12, color: Colors.white54),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    for (final _RemoteConfigToggle toggle
+                        in _remoteConfigToggles)
+                      CheckboxListTile(
+                        dense: true,
+                        visualDensity: VisualDensity.compact,
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        title: Text(
+                          tr(toggle.label),
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                        value: (_flags & toggle.bit) != 0,
+                        onChanged: _saving
+                            ? null
+                            : (bool? value) {
+                                setState(() {
+                                  _flags = value == true
+                                      ? _flags | toggle.bit
+                                      : _flags & ~toggle.bit;
+                                  _dirty = true;
+                                  _error = null;
+                                });
+                              },
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            if (_saving)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Row(
+                  children: <Widget>[
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(child: Text(tr('正在等待主机确认…'))),
+                  ],
+                ),
+              ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  tr('修改未生效：{reason}', <String, Object?>{
+                    'reason': _error!,
+                  }),
+                  style: const TextStyle(fontSize: 12, color: Colors.redAccent),
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.of(context).pop(false),
+          child: Text(tr('取消')),
+        ),
+        FilledButton(
+          onPressed: _saving ? null : () => unawaited(_save()),
+          child: Text(tr('保存')),
+        ),
+      ],
+    );
+  }
 }
 
 /// Picks one of the host's active Windows sessions. The dialog polls the

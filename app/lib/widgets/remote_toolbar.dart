@@ -59,6 +59,8 @@ class RemoteToolbar extends StatelessWidget {
     this.onOsLogin,
     this.sessionSelectAvailable = false,
     this.onSessionSelect,
+    this.remoteConfigAvailable = false,
+    this.onRemoteConfig,
     required this.portForwardAvailable,
     required this.portForwardActive,
     required this.onOpenPortForward,
@@ -165,6 +167,11 @@ class RemoteToolbar extends StatelessWidget {
   /// session it streams from. The page owns the picker and the requests.
   final bool sessionSelectAvailable;
   final VoidCallback? onSessionSelect;
+
+  /// The host lets this viewer read and change its exposed policy switches
+  /// (protocol v46). The page owns the dialog and the requests.
+  final bool remoteConfigAvailable;
+  final VoidCallback? onRemoteConfig;
   final bool restartAvailable;
   final bool lockAvailable;
   final bool blockInputAvailable;
@@ -673,6 +680,14 @@ class RemoteToolbar extends StatelessWidget {
                     : tr('服务端未开放会话切换'),
                 disabled: !sessionSelectAvailable,
                 onTap: onSessionSelect,
+              ),
+              _BarButton(
+                icon: Icons.settings_suggest_rounded,
+                tooltip: remoteConfigAvailable
+                    ? tr('修改主机设置')
+                    : tr('服务端未开放远程配置'),
+                disabled: !remoteConfigAvailable,
+                onTap: onRemoteConfig,
               ),
               _HostPowerButton(
                 restartAvailable: restartAvailable,

@@ -552,4 +552,30 @@ const Map<String, String> kEnglishSession = <String, String>{
       'The session is live; you can open the host camera.',
   '面板准备好后会自动列出主机上的摄像头。':
       'The host cameras are listed as soon as the panel is ready.',
+  '修改主机设置': 'Change host settings',
+  '服务端未开放远程配置':
+      'The host has not enabled remote configuration',
+  '主机设置': 'Host settings',
+  '主机设置未能读取：请确认主机权限与会话状态':
+      'The host settings could not be read: check the host permissions and session state',
+  '无法读取主机设置': 'Cannot read the host settings',
+  '无法修改主机设置': 'Cannot change the host settings',
+  '主机设置已更新': 'Host settings updated',
+  '会话结束后锁定本机': 'Lock this PC when the session ends',
+  '剪贴板同步': 'Clipboard sync',
+  '声音播放': 'Sound playback',
+  '远程重启': 'Remote restart',
+  '操作系统登录': 'OS login',
+  'Windows 会话切换': 'Windows session switching',
+  '录制授权': 'Recording consent',
+  '这里只列出主机开放给查看者的开关；改动会在主机保存后生效。':
+      'Only the switches the host exposes to viewers are listed; changes take effect once the host stores them.',
+  '主机拒绝了这次修改': 'The host refused this change',
+  '主机不支持修改该设置': 'The host cannot change that setting',
+  '另一个查看者正在控制主机': 'Another viewer controls this host',
+  '主机无法保存这次修改': 'The host could not store this change',
+  '请求未能排队：请确认主机权限与会话状态':
+      'The request could not be queued: check the host permissions and session state',
+  '正在等待主机确认…': 'Waiting for the host to confirm…',
+  '修改未生效：{reason}': 'The change did not take effect: {reason}',
 };

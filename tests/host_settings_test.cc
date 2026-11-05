@@ -85,6 +85,8 @@ bool same(const chast::HostSettings& a, const chast::HostSettings& b) {
            a.allow_privacy_mode == b.allow_privacy_mode &&
            a.allow_os_login == b.allow_os_login &&
            a.allow_session_select == b.allow_session_select && a.auth_mode == b.auth_mode &&
+           a.allow_remote_config == b.allow_remote_config &&
+           a.lock_after_session_end == b.lock_after_session_end &&
            a.require_approval == b.require_approval && a.password_hash == b.password_hash &&
            a.token_auth == b.token_auth &&
            a.allow_permission_change == b.allow_permission_change &&
@@ -123,6 +125,8 @@ void test_round_trip(const std::filesystem::path& dir) {
     settings.allow_privacy_mode = true;
     settings.allow_os_login = true;
     settings.allow_session_select = true;
+    settings.allow_remote_config = true;
+    settings.lock_after_session_end = true;
     settings.auth_mode = chast::HostAuthMode::Password;
     settings.require_approval = false;
     settings.password_hash =
@@ -203,6 +207,10 @@ void test_missing_file(const std::filesystem::path& dir) {
     check(!loaded.settings.allow_os_login, "a fresh host does not accept OS login");
     check(!loaded.settings.allow_session_select,
           "a fresh host does not allow session switching");
+    check(!loaded.settings.allow_remote_config,
+          "a fresh host does not let viewers change its switches");
+    check(!loaded.settings.lock_after_session_end,
+          "a fresh host does not lock the console after a session");
     check(loaded.settings.allow_record, "a fresh host consents to viewer recording");
     check(loaded.settings.token_mode == chast::HostTokenMode::OneTime,
           "a fresh host asks for a one-time token");

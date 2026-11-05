@@ -71,6 +71,7 @@ constexpr UINT kSecurityMessage = WM_APP + 6;
 constexpr UINT kSecurityPageMessage = WM_APP + 7;
 constexpr UINT kChatMessage = WM_APP + 8;
 constexpr UINT kPasswordHashMessage = WM_APP + 9;
+constexpr UINT kSettingsMessage = WM_APP + 10;
 constexpr UINT_PTR kStatusTimer = 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -102,6 +103,8 @@ enum ControlId {
     kBlockInputCheck,
     kOsLoginCheck,
     kSessionSelectCheck,
+    kRemoteConfigCheck,
+    kLockAfterEndCheck,
     kCarrierCheck,
     kAutostartCheck,
     kSecurityButton,
@@ -297,6 +300,33 @@ void server_password_hash_changed(const std::string& hash) {
     }
 }
 
+// The switches a viewer may change remotely. Credentials, ports and the
+// remote-config gate itself stay with the listener's copy of the settings.
+void apply_remote_switches(const HostSettings& from, HostSettings& to) {
+    to.lock_after_session_end = from.lock_after_session_end;
+    to.allow_clipboard = from.allow_clipboard;
+    to.allow_file_transfer = from.allow_file_transfer;
+    to.allow_audio = from.allow_audio;
+    to.allow_microphone = from.allow_microphone;
+    to.allow_privacy_mode = from.allow_privacy_mode;
+    to.allow_restart = from.allow_restart;
+    to.allow_block_input = from.allow_block_input;
+    to.allow_os_login = from.allow_os_login;
+    to.allow_session_select = from.allow_session_select;
+    to.allow_terminal = from.allow_terminal;
+    to.allow_port_forward = from.allow_port_forward;
+    to.allow_camera = from.allow_camera;
+    to.allow_record = from.allow_record;
+}
+
+void server_settings_changed(const HostSettings& settings) {
+    auto* copy = new HostSettings();
+    apply_remote_switches(settings, *copy);
+    if (!PostMessageW(g_app->window, kSettingsMessage, 0, reinterpret_cast<LPARAM>(copy))) {
+        delete copy;
+    }
+}
+
 void server_chat(const std::string& text) {
     auto* copy = new std::string(text);
     if (!PostMessageW(g_app->window, kChatMessage, 0, reinterpret_cast<LPARAM>(copy))) {
@@ -330,6 +360,7 @@ enum ApprovalDialogId {
     kApprovalMicrophone,
     kApprovalPrivacy,
     kApprovalRecord,
+    kApprovalRemoteConfig,
     kApprovalAllow,
     kApprovalDeny,
 };
@@ -343,6 +374,7 @@ struct ApprovalDialogState {
     HWND microphone = nullptr;
     HWND privacy = nullptr;
     HWND record = nullptr;
+    HWND remote_config = nullptr;
     // Valid for the duration of server_approve(): the transport keeps the
     // request alive across the callback and re-checks liveness before it
     // admits the viewer.
@@ -384,6 +416,9 @@ void finish_approval(ApprovalDialogState& dialog, bool allowed) {
         }
         if (SendMessageW(dialog.record, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             mask |= kPermissionRecord;
+        }
+        if (SendMessageW(dialog.remote_config, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            mask |= kPermissionRemoteConfig;
         }
         dialog.result = mask;
     }
@@ -498,6 +533,7 @@ ClientApproval server_approve(const ClientRequest& request) {
     const wchar_t* microphone_text = tr(L"麦克风（上行）");
     const wchar_t* privacy_text = tr(L"隐私模式（黑屏）");
     const wchar_t* record_text = tr(L"查看者录制会话");
+    const wchar_t* remote_config_text = tr(L"修改主机设置");
     const int column1 = std::max(130, std::max(check_px(input_text), check_px(file_text)));
     const int column2 = std::max(130, std::max(check_px(clipboard_text), check_px(microphone_text)));
     const int column3 =
@@ -508,7 +544,7 @@ ClientApproval server_approve(const ClientRequest& request) {
     const int dialog_width = third + column3 + 20;
     const int full_width = dialog_width - 40;
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT frame{0, 0, px(dialog_width), px(348)};
+    RECT frame{0, 0, px(dialog_width), px(376)};
     AdjustWindowRectEx(&frame, style, FALSE, WS_EX_TOPMOST);
     const int width = frame.right - frame.left;
     const int height = frame.bottom - frame.top;
@@ -589,12 +625,14 @@ ClientApproval server_approve(const ClientRequest& request) {
                                       kApprovalPrivacy);
     dialog.record = permission_check(record_text, kPermissionRecord, third, column3, 244,
                                      kApprovalRecord);
+    dialog.remote_config = permission_check(remote_config_text, kPermissionRemoteConfig, third,
+                                            column3, 272, kApprovalRemoteConfig);
 
     const int deny_left = dialog_width - 20 - 90;
     const int allow_left = deny_left - 10 - 90;
-    add(L"BUTTON", tr(L"允许"), BS_DEFPUSHBUTTON | WS_TABSTOP, allow_left, 278, 90, 32,
+    add(L"BUTTON", tr(L"允许"), BS_DEFPUSHBUTTON | WS_TABSTOP, allow_left, 306, 90, 32,
         kApprovalAllow, nullptr);
-    add(L"BUTTON", tr(L"拒绝"), BS_PUSHBUTTON | WS_TABSTOP, deny_left, 278, 90, 32, kApprovalDeny,
+    add(L"BUTTON", tr(L"拒绝"), BS_PUSHBUTTON | WS_TABSTOP, deny_left, 306, 90, 32, kApprovalDeny,
         nullptr);
 
     SetTimer(window, 1, 200, nullptr);
@@ -715,6 +753,7 @@ void start_server() {
     config.token_changed = server_token_changed;
     config.trusted_devices_changed = server_trusted_devices_changed;
     config.password_hash_changed = server_password_hash_changed;
+    config.settings_changed = server_settings_changed;
     config.chat_message = server_chat;
     std::string error;
     g_app->server = HostServer::create(std::move(config), &error);
@@ -892,6 +931,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionSessionSelect) != 0) {
         add(tr(L"会话切换"));
     }
+    if ((mask & kPermissionRemoteConfig) != 0) {
+        add(tr(L"远程配置"));
+    }
     return text.empty() ? tr(L"只看") : text;
 }
 
@@ -915,6 +957,9 @@ uint16_t current_gate_mask() {
                                  (g_app->settings.allow_os_login ? kPermissionOsLogin : 0) |
                                  (g_app->settings.allow_session_select
                                       ? kPermissionSessionSelect
+                                      : 0) |
+                                 (g_app->settings.allow_remote_config
+                                      ? kPermissionRemoteConfig
                                       : 0));
 }
 
@@ -1789,6 +1834,8 @@ enum SecurityDialogId {
     kSecAllowBlockInput,
     kSecAllowOsLogin,
     kSecAllowSessionSelect,
+    kSecAllowRemoteConfig,
+    kSecLockAfterEnd,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1837,6 +1884,8 @@ struct SecurityDialogState {
     HWND allow_block_input = nullptr;
     HWND allow_os_login = nullptr;
     HWND allow_session_select = nullptr;
+    HWND allow_remote_config = nullptr;
+    HWND lock_after_end = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -2068,6 +2117,8 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_block_input = is_checked(dialog.allow_block_input);
     updated.allow_os_login = is_checked(dialog.allow_os_login);
     updated.allow_session_select = is_checked(dialog.allow_session_select);
+    updated.allow_remote_config = is_checked(dialog.allow_remote_config);
+    updated.lock_after_session_end = is_checked(dialog.lock_after_end);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2654,6 +2705,20 @@ bool edit_security_settings(HostSettings& result) {
         tr(L"查看器可列出并切换到本机其他已登录的 Windows 会话；手工运行主机时该项不会生效。"),
         SS_LEFT, 0, 32, 478, page_text_width, 36, 0, nullptr, &dialog.advanced_page);
 
+    const wchar_t* allow_remote_config_text = tr(L"允许查看者修改本页的开关（远程配置）");
+    dialog.allow_remote_config =
+        add(L"BUTTON", allow_remote_config_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 520,
+            std::max(400, check_px(allow_remote_config_text)), 24, kSecAllowRemoteConfig,
+            nullptr, &dialog.advanced_page);
+    const wchar_t* lock_after_end_text = tr(L"最后一个查看者离开后锁定本机");
+    dialog.lock_after_end =
+        add(L"BUTTON", lock_after_end_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 548,
+            std::max(400, check_px(lock_after_end_text)), 24, kSecLockAfterEnd, nullptr,
+            &dialog.advanced_page);
+    add(L"STATIC",
+        tr(L"远程配置需要单独授予权限；关闭某个开关会在本会话立即撤销对应权限，开启则从下次连接生效。"),
+        SS_LEFT, 0, 32, 576, page_text_width, 24, 0, nullptr, &dialog.advanced_page);
+
     const int sec_cancel_left = dialog_width - 20 - 90;
     add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 606,
         90, 32, kSecSave, nullptr, nullptr);
@@ -2681,6 +2746,8 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_block_input, settings.allow_block_input);
     set_check(dialog.allow_os_login, settings.allow_os_login);
     set_check(dialog.allow_session_select, settings.allow_session_select);
+    set_check(dialog.allow_remote_config, settings.allow_remote_config);
+    set_check(dialog.lock_after_end, settings.lock_after_session_end);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2836,6 +2903,11 @@ void show_tray_menu() {
     AppendMenuW(menu,
                 MF_STRING | (g_app->settings.allow_session_select ? MF_CHECKED : 0),
                 kSessionSelectCheck, tr(L"允许查看者切换 Windows 会话（仅服务模式）"));
+    AppendMenuW(menu, MF_STRING | (g_app->settings.allow_remote_config ? MF_CHECKED : 0),
+                kRemoteConfigCheck, tr(L"允许查看者修改主机设置"));
+    AppendMenuW(menu,
+                MF_STRING | (g_app->settings.lock_after_session_end ? MF_CHECKED : 0),
+                kLockAfterEndCheck, tr(L"会话结束后锁定本机"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
                 tr(L"弱网回退（TCP/WebSocket）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
@@ -3205,6 +3277,42 @@ void handle_command(int id) {
                                 : tr(L"已撤回切换 Windows 会话权限"));
             break;
         }
+        case kRemoteConfigCheck: {
+            g_app->settings.allow_remote_config = !g_app->settings.allow_remote_config;
+            save_settings();
+            if (session_is_live()) {
+                const HostStatus status = g_app->server->status();
+                g_app->server->set_permissions(current_gate_mask());
+                if (g_app->settings.allow_remote_config &&
+                    (status.session_permissions & kPermissionRemoteConfig) == 0) {
+                    append_log_line(
+                        tr(L"已允许远程修改主机设置；当前会话未获授权，将在下次连接时生效"));
+                } else if (g_app->settings.allow_remote_config) {
+                    append_log_line(tr(L"已允许远程修改主机设置（本次会话实时生效）"));
+                } else {
+                    append_log_line(tr(L"已撤回远程修改主机设置的权限（本次会话实时生效）"));
+                }
+            } else {
+                restart_server();
+                append_log_line(g_app->settings.allow_remote_config
+                                    ? tr(L"已允许远程修改主机设置")
+                                    : tr(L"已撤回远程修改主机设置的权限"));
+            }
+            break;
+        }
+        case kLockAfterEndCheck: {
+            g_app->settings.lock_after_session_end =
+                !g_app->settings.lock_after_session_end;
+            save_settings();
+            if (g_app->server) {
+                g_app->server->set_lock_after_session_end(
+                    g_app->settings.lock_after_session_end);
+            }
+            append_log_line(g_app->settings.lock_after_session_end
+                                ? tr(L"最后一个查看者离开后将锁定本机")
+                                : tr(L"会话结束后不再锁定本机"));
+            break;
+        }
         case kCarrierCheck:
             g_app->settings.carrier = !g_app->settings.carrier;
             save_settings();
@@ -3363,6 +3471,15 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             g_app->settings.password_hash = *hash;
             delete hash;
             save_settings();
+            return 0;
+        }
+        case kSettingsMessage: {
+            auto* update = reinterpret_cast<HostSettings*>(lparam);
+            apply_remote_switches(*update, g_app->settings);
+            delete update;
+            save_settings();
+            append_log_line(tr(L"查看者修改了主机设置，已保存"));
+            refresh_ui();
             return 0;
         }
         case kChatMessage: {

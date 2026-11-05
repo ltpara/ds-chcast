@@ -74,6 +74,8 @@ void main() {
     bool blockInputAvailable = false,
     bool blockInputActive = false,
     ValueChanged<ViewerHostAction>? onHostAction,
+    bool remoteConfigAvailable = false,
+    VoidCallback? onRemoteConfig,
   }) {
     return MaterialApp(
       home: Scaffold(
@@ -151,6 +153,8 @@ void main() {
           blockInputAvailable: blockInputAvailable,
           blockInputActive: blockInputActive,
           onHostAction: onHostAction ?? (_) {},
+          remoteConfigAvailable: remoteConfigAvailable,
+          onRemoteConfig: onRemoteConfig,
           onToggleAudio: () {},
           onToggleMicrophone: () {},
           onTogglePrivacy: () {},
@@ -538,6 +542,30 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('高清'), findsNothing);
     expect(quality, isNull);
+  });
+
+  testWidgets('the host settings button follows the host grant',
+      (WidgetTester tester) async {
+    int taps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      remoteConfigAvailable: true,
+      onRemoteConfig: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.settings_suggest_rounded));
+    expect(taps, 1);
+
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      remoteConfigAvailable: false,
+      onRemoteConfig: () => ++taps,
+    ));
+    await tester.tap(find.byIcon(Icons.settings_suggest_rounded));
+    expect(taps, 1);
   });
 
   testWidgets('the volume long press lists playback endpoints and reports the pick',

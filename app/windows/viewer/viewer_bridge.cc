@@ -862,6 +862,16 @@ void ViewerBridge::HandleMethodCall(
             flutter::EncodableValue(status.stream_option_error);
         map[key("streamOptionResults")] =
             flutter::EncodableValue(static_cast<int64_t>(status.stream_option_results));
+        map[key("remoteConfigSupported")] =
+            flutter::EncodableValue(status.remote_config_supported);
+        map[key("remoteConfigFlags")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.remote_config_flags));
+        map[key("remoteConfigCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.remote_config_code));
+        map[key("remoteConfigError")] =
+            flutter::EncodableValue(status.remote_config_error);
+        map[key("remoteConfigUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.remote_config_updates));
         map[key("portForwardEnabled")] =
             flutter::EncodableValue(status.port_forward_enabled);
         flutter::EncodableList forward_rules;
@@ -1502,6 +1512,25 @@ void ViewerBridge::HandleMethodCall(
         const bool queued =
             viewer_ != nullptr &&
             viewer_->RequestSessionSelect(static_cast<uint32_t>(id));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "requestRemoteConfig") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t keys = 0;
+        int64_t values = 0;
+        if (args == nullptr || !map_int(*args, "keys", &keys) ||
+            !map_int(*args, "values", &values) || keys < 0 ||
+            keys > static_cast<int64_t>(chast::kRemoteConfigAll) || values < 0 ||
+            values > static_cast<int64_t>(chast::kRemoteConfigAll)) {
+            result->Error("bad_args", "requestRemoteConfig wants keys and values masks");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->RequestRemoteConfig(static_cast<uint32_t>(keys),
+                                         static_cast<uint32_t>(values));
         result->Success(flutter::EncodableValue(queued));
         return;
     }

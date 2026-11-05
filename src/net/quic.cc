@@ -662,6 +662,14 @@ struct QuicSession::Impl {
     uint64_t host_action_requests_seen = 0;
     std::deque<HostControlResult> host_action_results;
     uint64_t host_action_results_seen = 0;
+    // Server: the newest RemoteConfigRequest. Client: the newest state the
+    // host answered, coalesced like the other one-shot control replies.
+    bool remote_config_request_ready = false;
+    RemoteConfigRequest remote_config_request;
+    uint64_t remote_config_requests_seen = 0;
+    bool remote_config_state_ready = false;
+    RemoteConfigState remote_config_state;
+    uint64_t remote_config_states_seen = 0;
     // Server: OS-login passwords waiting for the host loop. Short and bounded
     // like host actions; dropped, overflowed and reset entries are wiped.
     std::deque<std::string> os_login_requests;
@@ -3379,6 +3387,42 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::RemoteConfigRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                RemoteConfigRequest request;
+                if (!parse_remote_config_request(payload, request, &error)) {
+                    control_protocol_failure("RemoteConfigRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    remote_config_request = request;
+                    remote_config_request_ready = true;
+                    ++remote_config_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::RemoteConfigState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                RemoteConfigState state;
+                if (!parse_remote_config_state(payload, state, &error)) {
+                    control_protocol_failure("RemoteConfigState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    remote_config_state = std::move(state);
+                    remote_config_state_ready = true;
+                    ++remote_config_states_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::OsLoginRequest: {
                 if (role != Role::Server) {
                     break;
@@ -4694,6 +4738,12 @@ struct QuicSession::Impl {
             host_action_requests_seen = 0;
             host_action_results.clear();
             host_action_results_seen = 0;
+            remote_config_request_ready = false;
+            remote_config_request = RemoteConfigRequest{};
+            remote_config_requests_seen = 0;
+            remote_config_state_ready = false;
+            remote_config_state = RemoteConfigState{};
+            remote_config_states_seen = 0;
             for (std::string& password : os_login_requests) {
                 std::fill(password.begin(), password.end(), '\0');
             }
@@ -4835,6 +4885,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_session_select) {
             mask |= kPermissionSessionSelect;
+        }
+        if (server_config.allow_remote_config) {
+            mask |= kPermissionRemoteConfig;
         }
         return mask;
     }
@@ -6055,6 +6108,76 @@ bool QuicSession::take_host_action_request(HostControlRequest& request) {
 uint64_t QuicSession::host_action_requests() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->host_action_requests_seen;
+}
+
+bool QuicSession::take_remote_config_request(RemoteConfigRequest& request) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->remote_config_request_ready) {
+        return false;
+    }
+    request = impl_->remote_config_request;
+    impl_->remote_config_request_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::remote_config_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->remote_config_requests_seen;
+}
+
+Error QuicSession::send_remote_config_state(const RemoteConfigState& state) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_remote_config_state is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    const std::vector<uint8_t> payload = make_remote_config_state(state);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "remote config state is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_remote_config(uint32_t keys, uint32_t values) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_remote_config is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionRemoteConfig) == 0) {
+            return Error(Status::PermissionDenied,
+                         "remote configuration is disabled by the host");
+        }
+    }
+    RemoteConfigRequest request;
+    request.keys = keys;
+    request.values = values;
+    const std::vector<uint8_t> payload = make_remote_config_request(request);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "remote config request is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_remote_config_state(RemoteConfigState& state) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->remote_config_state_ready) {
+        return false;
+    }
+    state = std::move(impl_->remote_config_state);
+    impl_->remote_config_state_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::remote_config_states() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->remote_config_states_seen;
 }
 
 Error QuicSession::send_host_action_result(const HostControlResult& result) {

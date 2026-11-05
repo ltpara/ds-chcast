@@ -549,6 +549,16 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_session_select)) {
                 warn(result.warning, "session_select '" + value + "' is not a boolean");
             }
+        } else if (key == "allow_remote_config") {
+            if (!parse_bool(value, settings.allow_remote_config)) {
+                warn(result.warning,
+                     "allow_remote_config '" + value + "' is not a boolean");
+            }
+        } else if (key == "lock_after_session_end") {
+            if (!parse_bool(value, settings.lock_after_session_end)) {
+                warn(result.warning,
+                     "lock_after_session_end '" + value + "' is not a boolean");
+            }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
                 warn(result.warning, "audio_device is too long; using the default output");
@@ -869,6 +879,9 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "block_input=" << (settings.allow_block_input ? 1 : 0) << "\n"
          << "os_login=" << (settings.allow_os_login ? 1 : 0) << "\n"
          << "session_select=" << (settings.allow_session_select ? 1 : 0) << "\n"
+         << "allow_remote_config=" << (settings.allow_remote_config ? 1 : 0) << "\n"
+         << "lock_after_session_end=" << (settings.lock_after_session_end ? 1 : 0)
+         << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

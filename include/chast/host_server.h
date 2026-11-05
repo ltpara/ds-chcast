@@ -163,6 +163,10 @@ struct HostServerStats {
     uint64_t session_select_requests = 0;
     uint64_t session_switches = 0;
     uint64_t session_select_failures = 0;
+    // Remote configuration (protocol v46): requests read or changed, and the
+    // ones refused. A query (mask 0) counts as a request.
+    uint64_t remote_config_requests = 0;
+    uint64_t remote_config_failures = 0;
     // Near-end frames that passed through echo cancellation and how many times
     // its adaptive filter restarted (playback start/stop or endpoint reopen).
     uint64_t audio_dsp_frames = 0;
@@ -333,6 +337,12 @@ struct HostServerConfig {
     // the current cost. Called on the host thread; the receiver saves the new
     // encoding so the upgrade survives a restart.
     std::function<void(const std::string&)> password_hash_changed;
+    // A viewer changed persistent host settings through RemoteConfigRequest.
+    // Called on the host thread after the change was applied to this
+    // session's copy; the receiver stores the exposed switches so they
+    // survive a restart. Only the remote-config fields differ from the
+    // listener's copy.
+    std::function<void(const HostSettings&)> settings_changed;
     // Called after HelloAck with the description that went out.
     std::function<void(const ServerInfo&)> stream_announced;
     // Called for every encoded access unit that was handed to the transport,
@@ -453,6 +463,11 @@ public:
     // and to the settings gates; the viewer is told through PermissionUpdate.
     // Ignored while no session is streaming.
     void set_permissions(uint16_t permissions);
+
+    // Applies a lock-after-session-end choice made in the operator UI. The
+    // listener also shares it with its workers, so the last viewer of a
+    // multi-viewer host triggers the lock. Safe to call from the UI thread.
+    void set_lock_after_session_end(bool enabled);
 
     // Queues one file to send to the current viewer. Only valid while a viewer
     // is streaming and file transfer is allowed; the host thread hashes the
@@ -575,6 +590,14 @@ private:
     // refused instead of switching into a session that is gone.
     bool handle_session_requests(HostServerStats& stats, std::string* error,
                                  bool* peer_left);
+    // Answers every pending RemoteConfigRequest. The permission, the host's
+    // allow_remote_config, the control lease and the persistence callback are
+    // checked here; a refusal leaves every switch unchanged.
+    bool handle_remote_config_requests(HostServerStats& stats, std::string* error,
+                                       bool* peer_left);
+    // Locks the console once the last viewer is gone, when the policy asks for
+    // it. A host that is shutting down returns without touching the desktop.
+    void lock_after_session_end_workstation();
     // Releases local input blocking if this session owns it. `notify` answers
     // an unsolicited denial, used when the permission is revoked mid-session;
     // the session-end guard passes false because the connection is going away.

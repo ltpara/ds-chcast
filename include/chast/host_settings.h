@@ -161,6 +161,18 @@ struct HostSettings {
     // The operator may narrow permissions in the approval window and toggle
     // them during a session.
     bool allow_permission_change = true;
+    // Let a viewer holding kPermissionRemoteConfig read and change this
+    // host's exposed policy switches (clipboard, file transfer, audio,
+    // microphone, privacy mode, restart, block input, OS login, session
+    // select, terminal, port forwarding, camera, recording) and the
+    // lock-after-session-end switch. Off by default: the change is stored in
+    // host.ini and outlives the session, so it is an explicit grant.
+    bool allow_remote_config = false;
+    // Lock this machine's console when the last viewer of a session leaves.
+    // Off by default: a remote viewer locking the operator's console is a
+    // host-state change, like a restart. The lock runs after the session has
+    // already ended, so it never interrupts the viewer.
+    bool lock_after_session_end = false;
     // DPAPI-protected TOTP secret (base64); empty means 2FA is off. Use
     // protect_totp_secret()/unprotect_totp_secret() for the clear text.
     std::string totp_secret;

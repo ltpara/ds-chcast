@@ -533,6 +533,18 @@ struct ViewerStatus {
     int stream_option_code = 0;
     std::string stream_option_error;
     uint64_t stream_option_results = 0;
+    // Remote configuration (protocol v46). `remote_config_supported` mirrors
+    // the host's announced kPermissionRemoteConfig; `remote_config_flags` is
+    // the switch snapshot the host last reported (chast::kRemoteConfig*
+    // bits). `remote_config_code` is the host's RemoteConfigCode of the newest
+    // answer (0 = Ok) with its reason in `remote_config_error`, and
+    // `remote_config_updates` counts answers (including local send failures),
+    // so the UI can pair one answer with one poll.
+    bool remote_config_supported = false;
+    uint32_t remote_config_flags = 0;
+    int remote_config_code = 0;
+    std::string remote_config_error;
+    uint64_t remote_config_updates = 0;
     // Viewer-side port forwarding. `port_forward_enabled` mirrors the host's
     // announced permission; every rule in `port_forward_rules` owns a local
     // listener on 127.0.0.1 and one host target. Up to
@@ -917,6 +929,15 @@ public:
     // accepted switch ends this connection, so the caller reconnects and is
     // served from the target session.
     bool RequestSessionSelect(uint32_t session_id);
+
+    // Queues a remote-configuration request. `keys` selects the switches to
+    // change (chast::kRemoteConfig* bits) and `values` their new state; zero
+    // `keys` asks the host to report the current snapshot. Returns false when
+    // the session is not streaming, the host did not grant
+    // kPermissionRemoteConfig, or a bit outside chast::kRemoteConfigAll is
+    // set. The answer arrives through ViewerStatus::remote_config_*; a newer
+    // request replaces one that has not been sent yet.
+    bool RequestRemoteConfig(uint32_t keys, uint32_t values);
 
     // Queues one UTF-8 chat line for the host. Returns false for empty or
     // oversized text, when no session is streaming, or when the outgoing queue
@@ -1341,6 +1362,11 @@ private:
     // menu's last choice applied, not every intermediate one.
     mutable std::mutex stream_option_mutex_;
     std::optional<chast::StreamOptions> pending_stream_options_;
+
+    // The host settings dialog edits a copy of the snapshot, so only its last
+    // save matters; an unsent request is replaced by the next one.
+    mutable std::mutex remote_config_mutex_;
+    std::optional<std::pair<uint32_t, uint32_t>> pending_remote_config_;
 };
 
 }  // namespace chast_viewer

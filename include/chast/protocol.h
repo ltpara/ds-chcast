@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 45;
+inline constexpr uint16_t kProtocolVersion = 46;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -383,6 +383,20 @@ enum class ControlType : uint16_t {
     // host turns a mode off itself (input permission revoked, merged view,
     // session ending). See kDisplayFollowCursor/kDisplayFollowWindow.
     DisplayFollowState = 64,
+    // Viewer -> host: read or change the host's persistent policy switches.
+    // Payload: keys (u32), values (u32). Each set bit in `keys` names one
+    // switch (see RemoteConfigKey) and carries the wanted state in the same
+    // bit of `values`; a value bit without its key bit is malformed. keys=0
+    // is a query that changes nothing. Requires kPermissionRemoteConfig; the
+    // host only grants it when its allow_remote_config setting is on. The
+    // answer is RemoteConfigState. Protocol v46.
+    RemoteConfigRequest = 65,
+    // Host -> viewer: the answer to a RemoteConfigRequest, and the state of
+    // the exposed switches after the call. Payload: flags (u32, one bit per
+    // RemoteConfigKey, the state now stored on the host), code (u8, see
+    // RemoteConfigCode), reason length (u16), UTF-8 reason. A non-Ok answer
+    // leaves every switch unchanged.
+    RemoteConfigState = 66,
 };
 
 // ----- input -----
@@ -980,6 +994,10 @@ enum PermissionBit : uint16_t {
     // the bit when the machine is not running in service mode. Like the bits
     // above it travels in the mask alone.
     kPermissionSessionSelect = 0x4000,
+    // v46: read and change the host's exposed policy switches
+    // (RemoteConfigRequest). The host grants it only when allow_remote_config
+    // is on; it travels in the mask alone.
+    kPermissionRemoteConfig = 0x8000,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
@@ -987,7 +1005,8 @@ inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboa
                                            kPermissionPortForward | kPermissionTerminal |
                                            kPermissionRecord | kPermissionCamera |
                                            kPermissionRestart | kPermissionBlockInput |
-                                           kPermissionOsLogin | kPermissionSessionSelect;
+                                           kPermissionOsLogin | kPermissionSessionSelect |
+                                           kPermissionRemoteConfig;
 
 // What the viewer wants to do on this connection. Desktop is the full remote
 // desktop. The other modes ask for a control-only session that never starts a
@@ -2023,6 +2042,74 @@ bool parse_set_display_follow(const std::vector<uint8_t>& payload, uint8_t& flag
 std::vector<uint8_t> make_display_follow_state(const DisplayFollowState& state);
 bool parse_display_follow_state(const std::vector<uint8_t>& payload,
                                 DisplayFollowState& state, std::string* error);
+
+// ----- remote configuration (protocol v46) -----
+//
+// A viewer holding kPermissionRemoteConfig may read and change the policy
+// switches the host exposes to it. The host grants the permission only when
+// its allow_remote_config setting is on and the operator approved it. The
+// exposed set is deliberately the switches a running host re-checks per
+// request; listener settings that need a restart (bind address, port,
+// carrier, viewer cap, codec) never travel here. Enabling a switch the
+// transport refused at handshake still takes effect on the next connection,
+// while disabling one applies immediately.
+inline constexpr size_t kMaxRemoteConfigReason = 256;
+
+enum RemoteConfigKey : uint32_t {
+    // Lock the host's console when the last viewer of the session leaves.
+    kRemoteConfigLockAfterSessionEnd = 1u << 0,
+    kRemoteConfigClipboard = 1u << 1,
+    kRemoteConfigFileTransfer = 1u << 2,
+    kRemoteConfigAudio = 1u << 3,
+    kRemoteConfigMicrophone = 1u << 4,
+    kRemoteConfigPrivacyMode = 1u << 5,
+    kRemoteConfigRestart = 1u << 6,
+    kRemoteConfigBlockInput = 1u << 7,
+    kRemoteConfigOsLogin = 1u << 8,
+    kRemoteConfigSessionSelect = 1u << 9,
+    kRemoteConfigTerminal = 1u << 10,
+    kRemoteConfigPortForward = 1u << 11,
+    kRemoteConfigCamera = 1u << 12,
+    kRemoteConfigRecord = 1u << 13,
+};
+inline constexpr uint32_t kRemoteConfigAll =
+    kRemoteConfigLockAfterSessionEnd | kRemoteConfigClipboard |
+    kRemoteConfigFileTransfer | kRemoteConfigAudio | kRemoteConfigMicrophone |
+    kRemoteConfigPrivacyMode | kRemoteConfigRestart | kRemoteConfigBlockInput |
+    kRemoteConfigOsLogin | kRemoteConfigSessionSelect | kRemoteConfigTerminal |
+    kRemoteConfigPortForward | kRemoteConfigCamera | kRemoteConfigRecord;
+
+// Why a remote configuration request was refused. Ok is the only code that
+// stores anything; every other code leaves the host settings untouched.
+enum class RemoteConfigCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // the permission or the host's allow_remote_config is off
+    Unsupported = 2,  // this host cannot change that switch
+    Busy = 3,         // another viewer owns the shared desktop's control
+    Failed = 4,       // the change could not be stored
+};
+
+struct RemoteConfigRequest {
+    uint32_t keys = 0;
+    uint32_t values = 0;
+};
+
+struct RemoteConfigState {
+    uint32_t flags = 0;
+    RemoteConfigCode code = RemoteConfigCode::Ok;
+    std::string reason;
+};
+
+// The makers reject an unknown key or a value bit without its key; the
+// parsers reject those cases plus trailing bytes. The state maker truncates
+// `reason` on a UTF-8 boundary.
+std::vector<uint8_t> make_remote_config_request(const RemoteConfigRequest& request);
+bool parse_remote_config_request(const std::vector<uint8_t>& payload,
+                                 RemoteConfigRequest& request, std::string* error);
+std::vector<uint8_t> make_remote_config_state(const RemoteConfigState& state);
+bool parse_remote_config_state(const std::vector<uint8_t>& payload,
+                               RemoteConfigState& state, std::string* error);
+
 // Viewer -> host mode list request for one announced display.
 std::vector<uint8_t> make_list_display_modes(uint16_t display_index);
 bool parse_list_display_modes(const std::vector<uint8_t>& payload, uint16_t& display_index,

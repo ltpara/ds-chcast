@@ -597,6 +597,11 @@ class ViewerStatus {
     this.streamOptionCode = 0,
     this.streamOptionError = '',
     this.streamOptionResults = 0,
+    this.remoteConfigSupported = false,
+    this.remoteConfigFlags = 0,
+    this.remoteConfigCode = 0,
+    this.remoteConfigError = '',
+    this.remoteConfigUpdates = 0,
     this.portForwardEnabled = false,
     this.portForwardRules = const <ViewerPortForwardRule>[],
     this.terminalSupported = false,
@@ -1093,6 +1098,19 @@ class ViewerStatus {
   final String streamOptionError;
   final int streamOptionResults;
 
+  /// Remote configuration (protocol v46). [remoteConfigSupported] mirrors the
+  /// host's announced [ViewerPermission.remoteConfig]; [remoteConfigFlags] is
+  /// the switch snapshot the host last reported (bits from
+  /// [ViewerRemoteConfigSwitch]). [remoteConfigCode] is the host's
+  /// [ViewerRemoteConfigCode] (0 = Ok) for the newest answer, with its reason
+  /// in [remoteConfigError]; [remoteConfigUpdates] counts answers, including
+  /// local send failures, so the page can pair one with its poll.
+  final bool remoteConfigSupported;
+  final int remoteConfigFlags;
+  final int remoteConfigCode;
+  final String remoteConfigError;
+  final int remoteConfigUpdates;
+
   /// Viewer-side port forwarding. [portForwardEnabled] mirrors the host's
   /// permission; every entry in [portForwardRules] owns a local listener on
   /// 127.0.0.1 and one host target. A rule is active once the host accepted
@@ -1552,6 +1570,11 @@ class ViewerStatus {
       streamOptionCode: asInt(map['streamOptionCode']),
       streamOptionError: asString(map['streamOptionError']),
       streamOptionResults: asInt(map['streamOptionResults']),
+      remoteConfigSupported: map['remoteConfigSupported'] == true,
+      remoteConfigFlags: asInt(map['remoteConfigFlags']),
+      remoteConfigCode: asInt(map['remoteConfigCode']),
+      remoteConfigError: asString(map['remoteConfigError']),
+      remoteConfigUpdates: asInt(map['remoteConfigUpdates']),
       portForwardEnabled: map['portForwardEnabled'] == true,
       portForwardRules: List<ViewerPortForwardRule>.unmodifiable(forwardRules),
       terminalSupported: map['terminalSupported'] == true,
@@ -1994,6 +2017,22 @@ class ViewerBridge {
     final bool? queued = await _channel.invokeMethod<bool>(
       'requestSessionSelect',
       <String, Object>{'id': id},
+    );
+    return queued ?? false;
+  }
+
+  /// Reads or changes the host's exposed policy switches. [keys] selects the
+  /// switches ([ViewerRemoteConfigSwitch] bits) and [values] their new state;
+  /// zero [keys] asks for the current snapshot. False means it was not queued:
+  /// no live session, the host did not grant
+  /// [ViewerPermission.remoteConfig], or a bit is unknown. The host's answer,
+  /// including the flags now in effect, arrives in
+  /// [ViewerStatus.remoteConfigFlags] / [ViewerStatus.remoteConfigCode],
+  /// counted by [ViewerStatus.remoteConfigUpdates].
+  static Future<bool> requestRemoteConfig(int keys, int values) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'requestRemoteConfig',
+      <String, Object>{'keys': keys, 'values': values},
     );
     return queued ?? false;
   }
@@ -2658,6 +2697,41 @@ abstract final class ViewerPermission {
   // The host can list and switch the Windows session it streams from. Only
   // the service backend grants the bit; a tray host never sends it.
   static const int sessionSelect = 0x4000;
+  // The host lets this viewer read and change the policy switches the host
+  // owner exposed. The host re-checks its own switches on every request.
+  static const int remoteConfig = 0x8000;
+}
+
+/// Bits of the host-settings snapshot exchanged with a remote-config request
+/// (chast::kRemoteConfig* in chast/protocol.h).
+abstract final class ViewerRemoteConfigSwitch {
+  static const int lockAfterSessionEnd = 1 << 0;
+  static const int clipboard = 1 << 1;
+  static const int fileTransfer = 1 << 2;
+  static const int audio = 1 << 3;
+  static const int microphone = 1 << 4;
+  static const int privacyMode = 1 << 5;
+  static const int restart = 1 << 6;
+  static const int blockInput = 1 << 7;
+  static const int osLogin = 1 << 8;
+  static const int sessionSelect = 1 << 9;
+  static const int terminal = 1 << 10;
+  static const int portForward = 1 << 11;
+  static const int camera = 1 << 12;
+  static const int record = 1 << 13;
+  static const int all = 0x3FFF;
+}
+
+/// Why a remote-configuration request was refused (chast::RemoteConfigCode).
+enum ViewerRemoteConfigCode {
+  ok(0),
+  denied(1),
+  unsupported(2),
+  busy(3),
+  failed(4);
+
+  const ViewerRemoteConfigCode(this.code);
+  final int code;
 }
 
 /// Why a session list was not returned (chast::SessionListCode).

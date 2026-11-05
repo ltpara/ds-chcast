@@ -3252,6 +3252,82 @@ bool parse_display_follow_state(const std::vector<uint8_t>& payload,
     return true;
 }
 
+std::vector<uint8_t> make_remote_config_request(const RemoteConfigRequest& request) {
+    if ((request.keys & ~kRemoteConfigAll) != 0 ||
+        (request.values & ~request.keys) != 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(8);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, request.keys);
+    put_u32(cursor, request.values);
+    return make_control(ControlType::RemoteConfigRequest, payload);
+}
+
+bool parse_remote_config_request(const std::vector<uint8_t>& payload,
+                                 RemoteConfigRequest& request, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(request.keys) || !reader.u32(request.values) || !reader.at_end()) {
+        set_error(error, "malformed RemoteConfigRequest");
+        return false;
+    }
+    if ((request.keys & ~kRemoteConfigAll) != 0) {
+        set_error(error, "RemoteConfigRequest carries an unknown key");
+        return false;
+    }
+    if ((request.values & ~request.keys) != 0) {
+        set_error(error, "RemoteConfigRequest carries a value without its key");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_remote_config_state(const RemoteConfigState& state) {
+    if (state.code != RemoteConfigCode::Ok && state.flags != 0) {
+        return {};
+    }
+    const std::string text = truncate_utf8_reason(state.reason, kMaxRemoteConfigReason);
+    std::vector<uint8_t> payload(7 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, state.flags);
+    put_u8(cursor, static_cast<uint8_t>(state.code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::RemoteConfigState, payload);
+}
+
+bool parse_remote_config_state(const std::vector<uint8_t>& payload,
+                               RemoteConfigState& state, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    if (!reader.u32(state.flags) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(state.reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed RemoteConfigState");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(RemoteConfigCode::Failed)) {
+        set_error(error, "unknown remote config code " + std::to_string(raw_code));
+        return false;
+    }
+    state.code = static_cast<RemoteConfigCode>(raw_code);
+    if (state.code != RemoteConfigCode::Ok && state.flags != 0) {
+        set_error(error, "RemoteConfigState carries flags with a refusal");
+        return false;
+    }
+    if (state.reason.size() > kMaxRemoteConfigReason) {
+        set_error(error, "RemoteConfigState reason is too long");
+        return false;
+    }
+    if (!state.reason.empty() && !valid_utf8(state.reason)) {
+        set_error(error, "RemoteConfigState carries a malformed reason");
+        return false;
+    }
+    return true;
+}
+
 std::vector<uint8_t> make_list_display_modes(uint16_t display_index) {
     std::vector<uint8_t> payload(2);
     uint8_t* cursor = payload.data();

@@ -82,6 +82,35 @@ void save_password_hash(const std::string& hash) {
     }
 }
 
+// A viewer with kPermissionRemoteConfig changed one of the exposed switches.
+// Only those fields are taken from the worker's copy; credentials and the
+// listener's other state stay with the file already on disk.
+void save_remote_settings(const HostSettings& update) {
+    std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
+    HostSettings& settings = g_worker->settings;
+    settings.lock_after_session_end = update.lock_after_session_end;
+    settings.allow_clipboard = update.allow_clipboard;
+    settings.allow_file_transfer = update.allow_file_transfer;
+    settings.allow_audio = update.allow_audio;
+    settings.allow_microphone = update.allow_microphone;
+    settings.allow_privacy_mode = update.allow_privacy_mode;
+    settings.allow_restart = update.allow_restart;
+    settings.allow_block_input = update.allow_block_input;
+    settings.allow_os_login = update.allow_os_login;
+    settings.allow_session_select = update.allow_session_select;
+    settings.allow_terminal = update.allow_terminal;
+    settings.allow_port_forward = update.allow_port_forward;
+    settings.allow_camera = update.allow_camera;
+    settings.allow_record = update.allow_record;
+    if (g_worker->settings_path.empty()) {
+        return;
+    }
+    std::string error;
+    if (!save_host_settings(g_worker->settings_path, settings, &error)) {
+        worker_log("cannot save the remote settings change: " + error);
+    }
+}
+
 void clear_migrated_identity(const std::string& old_id) {
     std::lock_guard<std::mutex> lock(g_worker->settings_mutex);
     if (g_worker->settings.tunnel_old_id != old_id) {
@@ -327,6 +356,7 @@ int run_worker(std::string* error) {
     config.token_changed = save_rotated_token;
     config.trusted_devices_changed = save_trusted_devices;
     config.password_hash_changed = save_password_hash;
+    config.settings_changed = save_remote_settings;
 
     // Only a worker started by the service can hand the stream to another
     // session; a manual run must not advertise a switch it cannot perform.

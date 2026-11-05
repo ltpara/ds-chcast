@@ -146,9 +146,10 @@ void test_hello() {
     long_password[7] = 0;
     rejects_hello(long_password, "Hello with an oversized password is rejected");
 
-    std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(sent));
-    unknown_permissions[8] = 0x00;  // version, display, token length, password length
-    unknown_permissions[9] = 0x80;  // bit 15: outside every permission this build knows
+    chast::ClientHello plain;
+    std::vector<uint8_t> unknown_permissions = payload_of(chast::make_hello(plain));
+    unknown_permissions[8] = 0x40;  // bit 6: the one slot outside every permission
+    unknown_permissions[9] = 0x00;
     rejects_hello(unknown_permissions, "Hello requesting unknown permissions is rejected");
 
     std::vector<uint8_t> trailing = payload_of(chast::make_hello(sent));
@@ -710,8 +711,8 @@ void test_permission_update() {
           "PermissionUpdate round-trips every permission");
 
     std::vector<uint8_t> unknown = payload_of(chast::make_permission_update(0));
-    unknown[0] = 0x00;
-    unknown[1] = 0x80;
+    unknown[0] = 0x40;  // little-endian bit 6: the one slot outside every permission
+    unknown[1] = 0x00;
     check(!chast::parse_permission_update(unknown, permissions, &error),
           "PermissionUpdate with unknown bits is rejected");
     std::vector<uint8_t> trailing = payload_of(chast::make_permission_update(0));
@@ -1314,6 +1315,104 @@ void test_stream_options() {
           "StreamOptionsResult with a malformed reason is rejected");
     check(!chast::parse_stream_options_result(std::vector<uint8_t>(), result, &error),
           "empty StreamOptionsResult is rejected");
+}
+
+void test_remote_config() {
+    std::string error;
+    chast::RemoteConfigRequest change;
+    change.keys = chast::kRemoteConfigClipboard | chast::kRemoteConfigTerminal;
+    change.values = chast::kRemoteConfigClipboard;
+    chast::RemoteConfigRequest got_request;
+    check(chast::parse_remote_config_request(
+              payload_of(chast::make_remote_config_request(change)), got_request, &error) &&
+              got_request.keys == change.keys && got_request.values == change.values,
+          "RemoteConfigRequest round-trips a change");
+    chast::RemoteConfigRequest read;
+    check(chast::parse_remote_config_request(
+              payload_of(chast::make_remote_config_request(read)), got_request, &error) &&
+              got_request.keys == 0 && got_request.values == 0,
+          "RemoteConfigRequest round-trips a read");
+    check(chast::make_remote_config_request(
+              chast::RemoteConfigRequest{static_cast<uint32_t>(chast::kRemoteConfigAll) |
+                                             (1u << 14),
+                                         0})
+              .empty(),
+          "RemoteConfigRequest with an unknown key is refused");
+    check(chast::make_remote_config_request(
+              chast::RemoteConfigRequest{chast::kRemoteConfigAudio,
+                                         chast::kRemoteConfigClipboard})
+              .empty(),
+          "RemoteConfigRequest with a value without its key is refused");
+    check(!chast::parse_remote_config_request(std::vector<uint8_t>(), got_request, &error),
+          "empty RemoteConfigRequest is rejected");
+    check(!chast::parse_remote_config_request(std::vector<uint8_t>(7, 0), got_request,
+                                              &error),
+          "truncated RemoteConfigRequest is rejected");
+    std::vector<uint8_t> request_trailing =
+        payload_of(chast::make_remote_config_request(read));
+    request_trailing.push_back(0);
+    check(!chast::parse_remote_config_request(request_trailing, got_request, &error),
+          "RemoteConfigRequest with trailing bytes is rejected");
+    std::vector<uint8_t> request_unknown =
+        payload_of(chast::make_remote_config_request(read));
+    request_unknown[0] = 0;
+    request_unknown[1] = 0x40;
+    check(!chast::parse_remote_config_request(request_unknown, got_request, &error),
+          "RemoteConfigRequest with an unknown key is rejected");
+
+    chast::RemoteConfigState state;
+    state.flags = chast::kRemoteConfigClipboard | chast::kRemoteConfigLockAfterSessionEnd;
+    chast::RemoteConfigState got_state;
+    check(chast::parse_remote_config_state(
+              payload_of(chast::make_remote_config_state(state)), got_state, &error) &&
+              got_state.code == chast::RemoteConfigCode::Ok &&
+              got_state.flags == state.flags && got_state.reason.empty(),
+          "RemoteConfigState round-trips the flags snapshot");
+    chast::RemoteConfigState denied;
+    denied.code = chast::RemoteConfigCode::Denied;
+    denied.reason = "the host settings are read-only";
+    check(chast::parse_remote_config_state(
+              payload_of(chast::make_remote_config_state(denied)), got_state, &error) &&
+              got_state.code == chast::RemoteConfigCode::Denied &&
+              got_state.reason == denied.reason && got_state.flags == 0,
+          "RemoteConfigState round-trips a refusal with its reason");
+    chast::RemoteConfigState refused_with_flags;
+    refused_with_flags.flags = chast::kRemoteConfigAudio;
+    refused_with_flags.code = chast::RemoteConfigCode::Busy;
+    check(chast::make_remote_config_state(refused_with_flags).empty(),
+          "a non-Ok RemoteConfigState with flags is refused");
+    chast::RemoteConfigState long_reason;
+    long_reason.code = chast::RemoteConfigCode::Failed;
+    long_reason.reason = std::string(400, 'x');
+    check(chast::parse_remote_config_state(
+              payload_of(chast::make_remote_config_state(long_reason)), got_state,
+              &error) &&
+              got_state.reason.size() == chast::kMaxRemoteConfigReason,
+          "RemoteConfigState truncates an oversized reason to the protocol limit");
+    std::vector<uint8_t> state_unknown_code =
+        payload_of(chast::make_remote_config_state(denied));
+    state_unknown_code[4] = 9;
+    check(!chast::parse_remote_config_state(state_unknown_code, got_state, &error),
+          "RemoteConfigState with an unknown code is rejected");
+    std::vector<uint8_t> state_flags_with_refusal =
+        payload_of(chast::make_remote_config_state(denied));
+    state_flags_with_refusal[0] = 1;
+    check(!chast::parse_remote_config_state(state_flags_with_refusal, got_state, &error),
+          "RemoteConfigState carrying flags with a refusal is rejected");
+    std::vector<uint8_t> state_bad_reason =
+        payload_of(chast::make_remote_config_state(denied));
+    state_bad_reason[5] = 1;
+    state_bad_reason[6] = 0;
+    state_bad_reason.push_back(0xFF);
+    check(!chast::parse_remote_config_state(state_bad_reason, got_state, &error),
+          "RemoteConfigState with a malformed reason is rejected");
+    std::vector<uint8_t> state_trailing =
+        payload_of(chast::make_remote_config_state(state));
+    state_trailing.push_back(0);
+    check(!chast::parse_remote_config_state(state_trailing, got_state, &error),
+          "RemoteConfigState with trailing bytes is rejected");
+    check(!chast::parse_remote_config_state(std::vector<uint8_t>(), got_state, &error),
+          "empty RemoteConfigState is rejected");
 }
 
 void test_privacy_mode() {
@@ -4112,6 +4211,7 @@ int main(int argc, char** argv) {
     test_os_login();
     test_session_select();
     test_stream_options();
+    test_remote_config();
     test_privacy_mode();
     test_display_switch();
     test_display_follow();
