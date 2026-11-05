@@ -122,6 +122,12 @@ type Config struct {
 	SoftwareSHA256    string
 	SoftwareSize      int64
 	SoftwareSignature string
+	// SoftwarePublisherKeyID and SoftwarePublisherSignature carry the
+	// publisher's detached signature over the same release. They are set only
+	// when the operator pinned a publisher key and the hosted sidecar verified
+	// at startup.
+	SoftwarePublisherKeyID     string
+	SoftwarePublisherSignature string
 	// Accounts backs user login and the per-user address book. Nil means the
 	// server runs without persistent state, so those routes report 503.
 	Accounts *account.Store
@@ -354,6 +360,11 @@ type softwareInfo struct {
 	SHA256    string `json:"sha256,omitempty"`
 	Size      int64  `json:"size,omitempty"`
 	Signature string `json:"signature,omitempty"`
+	// PublisherKeyID and PublisherSignature are a second, independent
+	// signature made with the release publisher key. A client that pins that
+	// key still rejects a build signed only by the rendezvous server.
+	PublisherKeyID     string `json:"publisher_key_id,omitempty"`
+	PublisherSignature string `json:"publisher_sig,omitempty"`
 }
 
 type lookupResponse struct {
@@ -876,11 +887,13 @@ func (s *server) software() *softwareInfo {
 		return nil
 	}
 	return &softwareInfo{
-		Version:   s.cfg.SoftwareVersion,
-		URL:       s.cfg.SoftwareURL,
-		SHA256:    s.cfg.SoftwareSHA256,
-		Size:      s.cfg.SoftwareSize,
-		Signature: s.cfg.SoftwareSignature,
+		Version:            s.cfg.SoftwareVersion,
+		URL:                s.cfg.SoftwareURL,
+		SHA256:             s.cfg.SoftwareSHA256,
+		Size:               s.cfg.SoftwareSize,
+		Signature:          s.cfg.SoftwareSignature,
+		PublisherKeyID:     s.cfg.SoftwarePublisherKeyID,
+		PublisherSignature: s.cfg.SoftwarePublisherSignature,
 	}
 }
 

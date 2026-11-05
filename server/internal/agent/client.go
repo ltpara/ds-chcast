@@ -33,6 +33,10 @@ type softwareInfo struct {
 	SHA256    string `json:"sha256"`
 	Size      int64  `json:"size"`
 	Signature string `json:"signature"`
+	// PublisherKeyID and PublisherSignature carry the publisher's detached
+	// signature over the same release. They are absent on older servers.
+	PublisherKeyID     string `json:"publisher_key_id"`
+	PublisherSignature string `json:"publisher_sig"`
 }
 
 // updateAvailable mirrors RustDesk's SoftwareUpdate check: the server only

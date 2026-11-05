@@ -1016,6 +1016,65 @@ func TestHostedSoftwareArtifact(t *testing.T) {
 	}
 }
 
+func TestSoftwarePublisherNotice(t *testing.T) {
+	dir := t.TempDir()
+	const name = "chast-2.3.0.exe"
+	content := []byte("publisher-signed update payload")
+	if err := os.WriteFile(filepath.Join(dir, name), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := identity.GenerateServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testutil.StartWith(t, testutil.Options{
+		SoftwareVersion:   "2.3.0",
+		SoftwareURL:       "https://downloads.example.com/software/" + name,
+		SoftwareDir:       dir,
+		SoftwarePublisher: publisher,
+	})
+	status, body := request(t, http.MethodGet, s.URL+"/v1/server", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("server info: %d %s", status, body)
+	}
+	var info struct {
+		Software *struct {
+			Version            string `json:"version"`
+			URL                string `json:"url"`
+			SHA256             string `json:"sha256"`
+			Size               int64  `json:"size"`
+			PublisherKeyID     string `json:"publisher_key_id"`
+			PublisherSignature string `json:"publisher_sig"`
+		} `json:"software"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		t.Fatal(err)
+	}
+	sw := info.Software
+	if sw == nil || sw.PublisherKeyID == "" || sw.PublisherSignature == "" {
+		t.Fatalf("server info software = %+v", info.Software)
+	}
+	wantID, err := identity.PublisherKeyID(publisher.PublicKeyText())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sw.PublisherKeyID != wantID {
+		t.Fatalf("publisher key id = %q, want %q", sw.PublisherKeyID, wantID)
+	}
+	msg := identity.PublisherSoftwareMessage(wantID, sw.Version, sw.URL, sw.SHA256, sw.Size)
+	if !identity.Verify(mustPublicKey(t, publisher.PublicKeyText()), msg, sw.PublisherSignature) {
+		t.Fatal("publisher signature does not verify")
+	}
+}
+
+func mustPublicKey(t *testing.T, text string) ed25519.PublicKey {
+	t.Helper()
+	pub, err := identity.ParsePublicKey(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub
+}
 func TestSoftwareUpdateAbsentByDefault(t *testing.T) {
 	s := testutil.Start(t)
 	_, body := request(t, http.MethodGet, s.URL+"/v1/server", "", "")

@@ -232,6 +232,103 @@ func TestAbsoluteRoot(t *testing.T) {
 	}
 }
 
+func TestSnapshotServiceBinariesRestoresPreviousRelease(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "chast")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("chast-host.exe", "old host")
+	write("chast-service.exe", "old service")
+	write("chast_viewer.exe", "viewer")
+
+	backup, err := snapshotServiceBinaries(root)
+	if err != nil || backup == nil {
+		t.Fatalf("snapshotServiceBinaries = %v, %v", backup, err)
+	}
+	if _, err := os.Stat(backup.dir); err != nil {
+		t.Fatalf("backup directory: %v", err)
+	}
+
+	write("chast-host.exe", "new host")
+	write("chast-service.exe", "new service")
+	if err := backup.restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "chast-host.exe")); err != nil || string(body) != "old host" {
+		t.Fatalf("chast-host.exe = %q, %v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "chast-service.exe")); err != nil || string(body) != "old service" {
+		t.Fatalf("chast-service.exe = %q, %v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "chast_viewer.exe")); err != nil || string(body) != "viewer" {
+		t.Fatalf("chast_viewer.exe = %q, %v", body, err)
+	}
+	backup.discard()
+	if _, err := os.Stat(backup.dir); !os.IsNotExist(err) {
+		t.Fatalf("backup directory survived discard: %v", err)
+	}
+}
+
+func TestSnapshotServiceBinariesWithoutInstalledTree(t *testing.T) {
+	backup, err := snapshotServiceBinaries(filepath.Join(t.TempDir(), "missing"))
+	if err != nil || backup != nil {
+		t.Fatalf("missing tree = %v, %v", backup, err)
+	}
+}
+
+func TestInstallRestoresBinariesWhenExtractionFails(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "chast")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "chast-host.exe"), []byte("old host"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(dir, "bad.zip")
+	out, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(out)
+	for _, entry := range []struct{ name, body string }{
+		{"chast-host.exe", "new host"},
+		{"../escaped.txt", "no"},
+	} {
+		w, err := zw.Create(entry.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(entry.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := openZip(t, archive)
+	if err := Install(payload, Options{Root: root, Quiet: true}); err == nil {
+		t.Fatal("an escaping payload was installed")
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "chast-host.exe")); err != nil || string(body) != "old host" {
+		t.Fatalf("chast-host.exe = %q, %v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "escaped.txt")); !os.IsNotExist(err) {
+		t.Fatalf("escaping entry was written: %v", err)
+	}
+}
+
 func TestRemoveTreeDeletesRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "chast")
 	if err := os.MkdirAll(filepath.Join(root, "data"), 0o755); err != nil {

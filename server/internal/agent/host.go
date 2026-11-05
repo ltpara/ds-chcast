@@ -45,8 +45,15 @@ type HostConfig struct {
 	// ServerPublicKey pins the rendezvous server identity. When set, the
 	// registration reply must contain a valid server-signed host binding.
 	ServerPublicKey string
-	ID              string
-	Key             string
+	// PublisherPublicKey pins the release publisher key. When set, every
+	// update notice must carry a matching publisher key id and signature.
+	PublisherPublicKey string
+	// RequirePublisherSignature refuses updates without a publisher signature.
+	// It is implied by PublisherPublicKey and rejects a notice that carries
+	// none instead of silently downgrading.
+	RequirePublisherSignature bool
+	ID                        string
+	Key                       string
 	// OldID is the previous rendezvous id when the operator changed it. The
 	// agent proves ownership with its host key and the server moves the
 	// durable identity instead of leaving the old peer orphaned.
@@ -190,6 +197,17 @@ func StartHost(parent context.Context, cfg HostConfig) (*HostAgent, error) {
 	}
 	if cfg.AutoUpdate && cfg.ServerPublicKey == "" {
 		return nil, fmt.Errorf("--auto-update needs --server-pubkey so the update notice can be verified")
+	}
+	if cfg.PublisherPublicKey != "" {
+		if _, err := identity.ParsePublicKey(cfg.PublisherPublicKey); err != nil {
+			return nil, fmt.Errorf("--publisher-pubkey: %w", err)
+		}
+		if _, err := identity.PublisherKeyID(cfg.PublisherPublicKey); err != nil {
+			return nil, fmt.Errorf("--publisher-pubkey: %w", err)
+		}
+	}
+	if cfg.RequirePublisherSignature && cfg.PublisherPublicKey == "" {
+		return nil, fmt.Errorf("--require-publisher-signature needs --publisher-pubkey")
 	}
 	servers, err := newServerPool(cfg.ServerURL, cfg.Servers)
 	if err != nil {
@@ -545,16 +563,24 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 	h.mu.Unlock()
 
 	notice := updater.Notice{
-		Version:   n.Version,
-		URL:       n.URL,
-		SHA256:    n.SHA256,
-		Size:      n.Size,
-		Signature: n.Signature,
+		Version:            n.Version,
+		URL:                n.URL,
+		SHA256:             n.SHA256,
+		Size:               n.Size,
+		Signature:          n.Signature,
+		PublisherKeyID:     n.PublisherKeyID,
+		PublisherSignature: n.PublisherSignature,
 	}
 	go func() {
 		if err := updater.Verify(notice, h.cfg.ServerPublicKey); err != nil {
 			h.log.Error("software update rejected", "version", notice.Version, "error", err)
 			return
+		}
+		if h.cfg.PublisherPublicKey != "" {
+			if err := updater.VerifyPublisher(notice, h.cfg.PublisherPublicKey); err != nil {
+				h.log.Error("software update publisher rejected", "version", notice.Version, "error", err)
+				return
+			}
 		}
 		client := &http.Client{Timeout: 15 * time.Minute}
 		if h.cfg.TLS != nil || h.cfg.Proxy != nil {

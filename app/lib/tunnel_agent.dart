@@ -108,12 +108,20 @@ class TunnelAgent {
     required int size,
     required String signature,
     required String serverPublicKey,
+    String publisherSignature = '',
     String? executable,
   }) async {
     if (!Platform.isWindows) {
       throw UnsupportedError('automatic update is only supported on Windows');
     }
     final String helper = executable ?? defaultExecutable();
+    // The publisher key is a second, independent pin. Deployments that hold
+    // the publisher public key set CHAST_PUBLISHER_KEY; without it the helper
+    // still verifies the server signature.
+    final String publisherKey =
+        (Platform.environment['CHAST_PUBLISHER_KEY'] ?? '').trim();
+    final bool requirePublisher =
+        (Platform.environment['CHAST_REQUIRE_PUBLISHER'] ?? '') == '1';
     await Process.start(
       helper,
       <String>[
@@ -130,6 +138,13 @@ class TunnelAgent {
         signature,
         '--server-pubkey',
         serverPublicKey,
+        if (publisherKey.isNotEmpty) ...<String>[
+          '--publisher-pubkey',
+          publisherKey,
+          '--publisher-sig',
+          publisherSignature,
+        ],
+        if (requirePublisher) '--require-publisher',
         '--target',
         Platform.resolvedExecutable,
         '--wait-pid',

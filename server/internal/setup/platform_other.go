@@ -22,7 +22,7 @@ func IsElevated() bool {
 	return os.Geteuid() == 0
 }
 
-func prepareInstall(opts Options) (func(), error) {
+func prepareInstall(opts Options) (func() error, error) {
 	return nil, nil
 }
 

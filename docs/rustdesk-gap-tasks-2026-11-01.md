@@ -154,19 +154,30 @@ P2 = 平台扩展。
 
 ## B. 本机开发（DEV）
 
-### DEV-01 更新发布者签名与启动回滚（P0）
+### DEV-01 更新发布者签名与启动回滚（P0，2026-11-05 完成）
 
 - 目标：更新包同时校验服务器签名与发布者签名，升级失败可回滚。
 - 实施：发布清单增加 `publisher_key_id` 与 `publisher_sig`（Ed25519，
-  对版本/URL/SHA-256 签名）；`chast-server --software-publisher-key`
-  与签名工具；主机代理与 `chast-tunnel apply-update` 双重校验；
-  新版本启动写入健康标记，超时未标记则回滚到上一版本。
+  对域串/密钥 ID/版本/URL/SHA-256/长度的长度前缀消息签名）；
+  `chast-server --software-publisher-key` 启动时校验 `.pubsig` 边车并随
+  通告下发；主机代理（`--publisher-pubkey`/`--require-publisher-signature`）
+  与 `chast-tunnel apply-update`（`--publisher-pubkey`/`--publisher-sig`/
+  `--require-publisher`）双重校验；新增 `chast-publish` 从 32 字节
+  Ed25519 种子生成边车。查看器在新版本首帧后写入
+  `CHAST_UPDATE_HEALTH_FILE` 健康标记，`apply-update` 看门狗在
+  `--health-timeout`（默认 60 s）内未见到标记且进程已退出时恢复
+  `.old-*` 备份并重启；机器安装器在替换前快照 `chast-host.exe`/
+  `chast-service.exe`，新服务未能进入 Running 时恢复并重新启动。
 - 验收：篡改清单/替换文件被拒；未签名包在强制模式下被拒；
   健康检查失败自动回滚；正常升级与回滚各一次真实进程回环。
-- 测试：Go 单测覆盖签名与清单解析；C++/Dart 更新路径单测；
-  回环脚本断言两种失败分支。
+- 测试：Go 单测覆盖签名与清单解析（`identity`、`updater`、
+  `software`、`api`、`chast-publish`）；`CHAST_UPDATE_LOOPBACK=1`
+  的 `TestUpdateLoopbackHealthyAndRollback` 用真实进程验证正常升级与
+  崩溃回滚；`setup` 的 `TestInstallRestoresBinariesWhenExtractionFails`
+  覆盖安装器恢复；查看器侧 `software_info_test.dart` 覆盖新字段。
 - 文件：`server/internal/software/`、`server/internal/agent/host.go`、
-  `server/internal/updater/`、`tools/` 下的更新工具。
+  `server/internal/updater/`、`server/internal/setup/`、
+  `server/cmd/chast-publish/`、`app/lib/tunnel_agent.dart`。
 
 ### DEV-02 数据面 tracing 与队列/SQLite 指标（P1）
 
@@ -276,8 +287,8 @@ P2 = 平台扩展。
 
 1. **ENV-01、ENV-02、ENV-04**：先消除发布可信度风险，直接决定
    默认值与对外承诺。
-2. **DEV-01、DEV-07**：更新链路与主机元数据是安全边界，优先于
-   功能扩展。
+2. **DEV-07**：更新链路（DEV-01）已完成，主机元数据签名是剩余的
+   安全边界，优先于功能扩展。
 3. **DEV-02、DEV-03**：可观测性与存储扩展为后续规模化铺路。
 4. **DEV-04、DEV-05、DEV-06**：运营能力对齐。
 5. **ENV-05~ENV-12**：按硬件/网络条件穿插执行，每项完成后在
@@ -287,10 +298,31 @@ P2 = 平台扩展。
 
 ## 处置结论（2026-11-05）
 
-`docs/code-review-2026-11-04.md` 的 C1–C5、H1–H7、M1–M29、L1–L16 已全部
-修复并验证（C++ 目标构建通过；Go 与 Flutter 全量测试通过）。本轮逐项复核本
-清单：能力面没有新增代码级缺失，剩余项按“真实环境验收 / 本机开发 / 平台前置”
-三类处置。全部条目保留编号，不删除，也不提前标记完成。
+`docs/code-review-2026-11-04.md` 的 C1–C5、H1–H7、M1–M4、M7–M19、M24–M29、
+L1–L16 已修复并验证（C++ 目标构建通过；Go 与 Flutter 全量测试通过）。2026-11-05
+复审确认 **M5/M6/M20–M23、M30 与原生查看器 V1–V13 仍未修复**，与代码审核文档
+第 7 节第五批一致；本清单不把上述条目计入“已关闭”。本轮逐项复核本清单：能力面
+没有新增代码级缺失，剩余项按“真实环境验收 / 本机开发 / 平台前置”三类处置。
+全部条目保留编号，不删除，也不提前标记完成。
+
+另：DEV-11～DEV-27 的实现晚于 2026-11-04 的代码审核，尚未做专项安全复审；
+发布前应针对新增协议面（语音、终端持久化、远程配置、代理、OIDC、触摸、
+WebSocket、便携模式、RDP）补一轮。
+
+### 代码审核残余项（2026-11-05 复审）
+
+| 编号 | 位置 | 残余问题 |
+| --- | --- | --- |
+| M5 | `src/net/quic.cc` | 撤权只中止 `received_uploads`；`send_file_data`/`finish_file_upload` 不复查文件权限，已开始的 outgoing upload 可继续 |
+| M6 | `src/net/quic.cc` | `in_flight_sends`/`in_flight_bytes` 不随会话复位；无截止时间的 `send_cv.wait` 可永久阻塞；`wait_sends` 结果被忽略 |
+| M20 | `server/internal/upnp/upnp.go` | SSDP 发现不校验应答源，可被伪造应答引导到任意地址 |
+| M21 | `server/internal/agent/host.go` | relay 控制报文未做类型白名单，可诱导主机向任意 UDP 地址发送 |
+| M22 | `server/internal/agent/host.go`、`viewer.go` | 对端地址先到先得，缺少地址所有权证明 |
+| M23 | `server/internal/relay/relay.go`、`shared.go` | TCP `Accept` 瞬时错误直接退出监听循环 |
+| M30 | 采集/解码/音频 | 光标 Pitch 与相机 stride/长度几何未校验；VPL 重试无上限；WASAPI 销毁与 `push()` 竞态 |
+| V1/V3/V5/V6 | `app/windows/viewer/` | 相机输出锁外使用、`OpenTerminal` 状态不回滚、重复 `start` 覆盖输出、录制开关跨会话粘滞 |
+| V2/V4/V7/V8 | `app/windows/viewer/` | WebAuthn busy 卡死、GPU 错误粘住无重建、目录遍历无上限、纹理尺寸无上限 |
+| V9–V13 | `app/windows/viewer/` | 剪贴板路径、文件浏览路径、光标淘汰、适配器枚举、WebAuthn origin/rp_id 低危项 |
 
 ### ENV：保留为发布前验收
 
@@ -322,7 +354,7 @@ P2 = 平台扩展。
 
 | ID | 处置 | 说明 |
 | --- | --- | --- |
-| DEV-01 | 采纳，紧接实现 | 更新链目前只有服务器签名与 SHA-256/长度校验（M17 已补安装器启动前重算），缺发布者签名与启动健康回滚，属安全边界。 |
+| DEV-01 | 已完成（2026-11-05） | 发布者签名（服务器/主机/查看器三层校验）、`chast-publish` 签名工具、查看器健康标记回滚与安装器服务恢复均已实现并验证，详见同日小节。 |
 | DEV-07 | 采纳，紧接实现 | 主机注册/lookup 元数据未签名，属安全边界；可与 DEV-01 共用 Ed25519 校验与密钥配置。 |
 | DEV-02 | 采纳，P1 | 数据面（punch/relay/QUIC）与 SQLite/队列没有 span 或指标；排在 DEV-01/07 之后。 |
 | DEV-03 | 采纳，P1 | 需 PostgreSQL 实例；先抽存储接口并保持 SQLite 默认部署与现有回归全绿。 |
@@ -341,11 +373,11 @@ P2 = 平台扩展。
 | PLAT-02 | 暂缓 | 缺签名的 v4 打印机驱动与安装权限，没有免驱路径。 |
 | PLAT-03 | 暂缓 | 需要 CI 与非 Windows 平台资源；先补 Linux 查看器再评估主机。 |
 
-审核修复不改变上表能力面：M17–M19 只让更新器在启动安装器前重新校验暂存
-文件并把暂存目录移出用户可写路径，DEV-01 的发布者签名与回滚仍需实现；
-M24–M29 把用户态连接服务收紧为回环外强制 HTTPS、密钥走 DPAPI、直连首用
-确认并限制终端 CSI/录制下载校验，不改变 ENV-12 的服务端 CA/ACME/CDN 验收
-需求。
+审核修复不改变上表能力面：M17–M19 让更新器在启动安装器前重新校验暂存
+文件并把暂存目录移出用户可写路径，DEV-01 在此基础上补齐了发布者签名、
+查看器健康回滚与安装器服务恢复；M24–M29 把用户态连接服务收紧为回环外
+强制 HTTPS、密钥走 DPAPI、直连首用确认并限制终端 CSI/录制下载校验，不
+改变 ENV-12 的服务端 CA/ACME/CDN 验收需求。
 
 每项完成后更新上表状态、`roadmap.md` 与 `docs/status-2026-10-25.md` 并附
 证据位置；ENV 项必须以真机日志/截图/指标关闭。

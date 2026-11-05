@@ -149,16 +149,128 @@ func Install(payload *Payload, opts Options) error {
 	if err != nil {
 		return err
 	}
-	if restart != nil {
-		defer restart()
+	backup, err := snapshotServiceBinaries(opts.Root)
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		if backup != nil {
+			if restoreErr := backup.restore(); restoreErr != nil {
+				cause = fmt.Errorf("%v (restoring the previous binaries also failed: %v)", cause, restoreErr)
+			} else {
+				_ = os.RemoveAll(backup.dir)
+			}
+		}
+		if restart != nil {
+			if startErr := restart(); startErr != nil {
+				cause = fmt.Errorf("%v (%v)", cause, startErr)
+			}
+		}
+		return cause
 	}
 	if err := extract(payload, opts.Root, opts.logf); err != nil {
-		return err
+		return rollback(err)
 	}
 	if err := copySelf(opts.Root); err != nil {
+		return rollback(err)
+	}
+	if err := platformInstall(opts, payload.Bytes); err != nil {
+		return rollback(err)
+	}
+	if restart != nil {
+		if err := restart(); err != nil {
+			return rollback(err)
+		}
+	}
+	if backup != nil {
+		_ = os.RemoveAll(backup.dir)
+	}
+	return nil
+}
+
+// installBackup keeps the previous service binaries so a failed install can
+// put them back before the service is started again.
+type installBackup struct {
+	dir   string
+	files []backupFile
+}
+
+type backupFile struct {
+	original string
+	saved    string
+}
+
+var serviceBinaries = []string{"chast-host.exe", "chast-service.exe"}
+
+func snapshotServiceBinaries(root string) (*installBackup, error) {
+	backup := &installBackup{}
+	for _, name := range serviceBinaries {
+		original := filepath.Join(root, name)
+		info, err := os.Stat(original)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			backup.discard()
+			return nil, fmt.Errorf("snapshot %s: %w", original, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if backup.dir == "" {
+			dir, err := os.MkdirTemp("", "chast-install-backup-")
+			if err != nil {
+				return nil, fmt.Errorf("create the install backup: %w", err)
+			}
+			backup.dir = dir
+		}
+		saved := filepath.Join(backup.dir, name)
+		if err := copyFile(original, saved); err != nil {
+			backup.discard()
+			return nil, fmt.Errorf("snapshot %s: %w", original, err)
+		}
+		backup.files = append(backup.files, backupFile{original: original, saved: saved})
+	}
+	if len(backup.files) == 0 {
+		return nil, nil
+	}
+	return backup, nil
+}
+
+func (b *installBackup) restore() error {
+	if b == nil {
+		return nil
+	}
+	var firstErr error
+	for _, file := range b.files {
+		if err := copyFile(file.saved, file.original); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("restore %s: %w", file.original, err)
+		}
+	}
+	return firstErr
+}
+
+func (b *installBackup) discard() {
+	if b != nil && b.dir != "" {
+		_ = os.RemoveAll(b.dir)
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
 		return err
 	}
-	return platformInstall(opts, payload.Bytes)
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // Uninstall removes the platform registration and then the installed tree.

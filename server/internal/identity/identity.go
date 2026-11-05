@@ -46,6 +46,10 @@ const (
 	// URL, SHA-256 and size. Clients that pin the server key can reject a
 	// notice or binary swapped between the server and the download host.
 	DomainSoftware = "chast-software-v1"
+	// DomainSoftwarePublisher covers the publisher's detached signature on a
+	// release. It is a second trust root: a compromised rendezvous server
+	// still cannot publish a build the publisher did not sign.
+	DomainSoftwarePublisher = "chast-software-publisher-v1"
 )
 
 var (
@@ -149,6 +153,49 @@ func (s *Server) SignSoftware(version, downloadURL, digest string, size int64) (
 		return "", errors.New("software notice needs version, url, digest and a positive size")
 	}
 	return Sign(s.priv, SoftwareMessage(version, downloadURL, digest, size)), nil
+}
+
+// PublisherKeyID derives the short identifier advertised with a release from
+// the publisher public key. Pins compare this id first, so a notice cannot
+// silently select a different key.
+func PublisherKeyID(publicKeyText string) (string, error) {
+	pub, err := ParsePublicKey(publicKeyText)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:8]), nil
+}
+
+// PublisherSoftwareMessage binds the publisher key id and every release field
+// the publisher signs. It deliberately includes the size as well as the digest
+// so a truncated release cannot reuse a signature.
+func PublisherSoftwareMessage(keyID, version, downloadURL, digest string, size int64) []byte {
+	return fieldsMessage(DomainSoftwarePublisher, strings.ToLower(keyID), version,
+		downloadURL, digest, strconv.FormatInt(size, 10))
+}
+
+// SignSoftwarePublisher signs one release with the publisher key. The private
+// key is normally held offline; chast-publish writes the detached sidecar the
+// server advertises.
+func SignSoftwarePublisher(priv ed25519.PrivateKey, keyID, version, downloadURL, digest string,
+	size int64) (string, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return "", errors.New("publisher private key must be a 64-byte Ed25519 key")
+	}
+	if keyID == "" || version == "" || downloadURL == "" || digest == "" || size <= 0 {
+		return "", errors.New("publisher signature needs key id, version, url, digest and a positive size")
+	}
+	return Sign(priv, PublisherSoftwareMessage(keyID, version, downloadURL, digest, size)), nil
+}
+
+// SignSoftwarePublisher signs with this identity's private key.
+func (s *Server) SignSoftwarePublisher(keyID, version, downloadURL, digest string,
+	size int64) (string, error) {
+	if s == nil {
+		return "", errors.New("publisher signature needs a publisher identity")
+	}
+	return SignSoftwarePublisher(s.priv, keyID, version, downloadURL, digest, size)
 }
 
 func KeepaliveMessage(id, candidate, nonce string) []byte {

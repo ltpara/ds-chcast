@@ -35,6 +35,12 @@ type Notice struct {
 	SHA256    string
 	Size      int64
 	Signature string
+	// PublisherKeyID and PublisherSignature are the publisher's detached
+	// signature over the same release. They are a second trust root: the
+	// server signature alone only proves what the rendezvous server chose to
+	// advertise.
+	PublisherKeyID     string
+	PublisherSignature string
 }
 
 // Complete reports whether the server hosted the file itself and signed the
@@ -42,6 +48,40 @@ type Notice struct {
 // cannot be verified before running.
 func (n Notice) Complete() bool {
 	return n.SHA256 != "" && n.Size > 0 && n.Signature != ""
+}
+
+// PublisherComplete reports whether the notice carries a publisher signature.
+func (n Notice) PublisherComplete() bool {
+	return n.PublisherKeyID != "" && n.PublisherSignature != ""
+}
+
+// VerifyPublisher checks the publisher's detached signature against a pinned
+// publisher key. Pinning a key makes the check mandatory: a notice without a
+// publisher signature is rejected instead of silently downgraded.
+func VerifyPublisher(n Notice, publisherPublicKey string) error {
+	key := strings.TrimSpace(publisherPublicKey)
+	if key == "" {
+		return errors.New("publisher verification needs a pinned publisher key")
+	}
+	pub, err := identity.ParsePublicKey(key)
+	if err != nil {
+		return err
+	}
+	keyID, err := identity.PublisherKeyID(key)
+	if err != nil {
+		return err
+	}
+	if !n.PublisherComplete() {
+		return errors.New("the update notice carries no publisher signature")
+	}
+	if !strings.EqualFold(n.PublisherKeyID, keyID) {
+		return errors.New("publisher key id does not match the pinned key")
+	}
+	if !identity.Verify(pub, identity.PublisherSoftwareMessage(keyID, n.Version, n.URL,
+		n.SHA256, n.Size), n.PublisherSignature) {
+		return errors.New("publisher signature was not accepted")
+	}
+	return nil
 }
 
 // Verify checks the notice signature against the pinned server key.

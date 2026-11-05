@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ltpara/ds-chcast/server/internal/identity"
 	"github.com/ltpara/ds-chcast/server/internal/updater"
 )
 
@@ -25,11 +26,16 @@ func runApplyUpdate(args []string) error {
 	size := fs.Int64("size", 0, "release size in bytes")
 	signature := fs.String("signature", "", "server signature over version, url, sha256 and size")
 	serverPubKey := fs.String("server-pubkey", "", "pinned server Ed25519 public key; required")
+	publisherPubKey := fs.String("publisher-pubkey", "", "pinned release publisher Ed25519 public key; checks a second signature")
+	publisherSig := fs.String("publisher-sig", "", "publisher signature over version, url, sha256 and size")
+	requirePublisher := fs.Bool("require-publisher", false, "refuse the release unless --publisher-pubkey and a publisher signature are present")
 	target := fs.String("target", "", "binary to replace, e.g. chast_viewer.exe")
 	launch := fs.String("launch", "", "binary to start after the swap; defaults to --target")
 	staging := fs.String("dir", "", "staging directory (default: updates beside this helper)")
 	waitPID := fs.Int("wait-pid", 0, "wait for this process to exit before swapping")
 	waitTimeout := fs.Duration("wait-timeout", 90*time.Second, "how long to wait for --wait-pid")
+	healthTimeout := fs.Duration("health-timeout", 60*time.Second, "wait this long for the new process to write its health marker; 0 disables the startup rollback")
+	healthFile := fs.String("health-file", "", "health marker path (default: a fresh file in the staging directory)")
 	retireTimeout := fs.Duration("retire-timeout", 20*time.Second, "how long to retry removing the previous binary")
 	logPath := fs.String("log", "", "append progress to this file; stderr is always written")
 	fs.Parse(args)
@@ -53,6 +59,20 @@ func runApplyUpdate(args []string) error {
 	}
 	if err := updater.Verify(notice, *serverPubKey); err != nil {
 		return err
+	}
+	if *requirePublisher && (*publisherPubKey == "" || *publisherSig == "") {
+		return errors.New("--require-publisher needs --publisher-pubkey and --publisher-sig")
+	}
+	if *publisherPubKey != "" {
+		keyID, err := identity.PublisherKeyID(*publisherPubKey)
+		if err != nil {
+			return fmt.Errorf("--publisher-pubkey: %w", err)
+		}
+		notice.PublisherKeyID = keyID
+		notice.PublisherSignature = *publisherSig
+		if err := updater.VerifyPublisher(notice, *publisherPubKey); err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(*target) == "" {
 		return errors.New("--target is required")
@@ -88,17 +108,53 @@ func runApplyUpdate(args []string) error {
 	if launchPath == "" {
 		launchPath = *target
 	}
-	if err := updater.Launch(launchPath); err != nil {
+	rollback := func(reason error) error {
+		if backup == "" {
+			return reason
+		}
 		if restoreErr := updater.Restore(*target, backup); restoreErr != nil {
-			return fmt.Errorf("start %s: %v (restoring the previous binary also failed: %v)", launchPath, err, restoreErr)
+			return fmt.Errorf("%v (restoring the previous binary also failed: %v)", reason, restoreErr)
 		}
 		if relaunchErr := updater.Launch(*target); relaunchErr != nil {
-			return fmt.Errorf("start %s: %v (the previous binary was restored but starting it also failed: %v)", launchPath, err, relaunchErr)
+			return fmt.Errorf("%v (the previous binary was restored but starting it also failed: %v)", reason, relaunchErr)
 		}
 		logf("restored and restarted the previous binary at %s", *target)
-		return fmt.Errorf("start %s: %w", launchPath, err)
+		return reason
 	}
-	logf("started %s", launchPath)
+	if *healthTimeout > 0 {
+		marker := strings.TrimSpace(*healthFile)
+		if marker == "" {
+			stagingDir, err := filepath.Abs(*staging)
+			if err != nil {
+				stagingDir = *staging
+			}
+			marker = filepath.Join(stagingDir, fmt.Sprintf(".health-%d", time.Now().UnixNano()))
+		} else if abs, err := filepath.Abs(marker); err == nil {
+			marker = abs
+		}
+		pid, launchErr := updater.LaunchEnv(launchPath, []string{updater.HealthEnv + "=" + marker})
+		if launchErr != nil {
+			return rollback(fmt.Errorf("start %s: %w", launchPath, launchErr))
+		}
+		logf("started %s (pid %d), waiting for the health marker", launchPath, pid)
+		healthy, alive := updater.WaitForHealth(marker, pid, *healthTimeout, 250*time.Millisecond)
+		if healthy {
+			os.Remove(marker)
+			logf("the new release reported healthy")
+		} else if !alive {
+			return rollback(fmt.Errorf("the new release exited before reporting healthy"))
+		} else {
+			// The process is still running but slow to report. Leaving it alone
+			// is safer than killing a live UI; keep the backup for a manual
+			// rollback and let the next update replace it.
+			logf("the new release is still running but did not report healthy within %s; kept %s", *healthTimeout, backup)
+			return nil
+		}
+	} else if err := updater.Launch(launchPath); err != nil {
+		return rollback(fmt.Errorf("start %s: %w", launchPath, err))
+	} else {
+		logf("started %s", launchPath)
+	}
 	updater.Retire(backup, *retireTimeout)
 	logf("update to %s finished", notice.Version)
 	return nil

@@ -81,6 +81,7 @@ func run() error {
 		softwareVer      = flag.String("software-version", "", "latest client/host version advertised to peers; requires --software-url")
 		softwareURL      = flag.String("software-url", "", "download URL advertised with --software-version")
 		softwareDir      = flag.String("software-dir", "", "release directory published read-only at /software/{name}; the file named by --software-url is hashed and signed in the notice")
+		softwarePubKey   = flag.String("software-publisher-key", "", "pinned release publisher Ed25519 public key; the hosted release must carry a matching .pubsig sidecar")
 		smtpAddr         = flag.String("smtp-addr", "", "SMTP host:port used to send password-reset mail; empty disables email recovery")
 		smtpFrom         = flag.String("smtp-from", "", "From address for password-reset mail; required with --smtp-addr")
 		smtpUser         = flag.String("smtp-user", "", "SMTP username for PLAIN authentication; empty sends without auth")
@@ -561,9 +562,11 @@ func run() error {
 	log.Info("server identity", "public_key", serverIdentity.PublicKeyText())
 
 	var (
-		softwareSHA256    string
-		softwareSize      int64
-		softwareSignature string
+		softwareSHA256             string
+		softwareSize               int64
+		softwareSignature          string
+		softwarePublisherKeyID     string
+		softwarePublisherSignature string
 	)
 	if softwareName != "" {
 		artifact, err := software.Load(*softwareDir, softwareName)
@@ -577,6 +580,33 @@ func run() error {
 			return err
 		}
 		log.Info("software update artifact", "name", artifact.Name, "size", softwareSize, "sha256", softwareSHA256)
+	}
+	if key := strings.TrimSpace(*softwarePubKey); key != "" {
+		if softwareName == "" {
+			return errors.New("--software-publisher-key needs --software-dir and a hosted --software-url")
+		}
+		pub, err := identity.ParsePublicKey(key)
+		if err != nil {
+			return fmt.Errorf("--software-publisher-key: %w", err)
+		}
+		keyID, err := identity.PublisherKeyID(key)
+		if err != nil {
+			return fmt.Errorf("--software-publisher-key: %w", err)
+		}
+		sidecar, err := software.LoadPublisherSignature(*softwareDir, softwareName)
+		if err != nil {
+			return fmt.Errorf("--software-publisher-key: %w", err)
+		}
+		if !strings.EqualFold(sidecar.KeyID, keyID) {
+			return fmt.Errorf("--software-publisher-key: sidecar key id %q does not match the pinned key %q", sidecar.KeyID, keyID)
+		}
+		message := identity.PublisherSoftwareMessage(keyID, softwareVersion, softwareDownload, softwareSHA256, softwareSize)
+		if !identity.Verify(pub, message, sidecar.Signature) {
+			return errors.New("--software-publisher-key: publisher signature was not accepted")
+		}
+		softwarePublisherKeyID = keyID
+		softwarePublisherSignature = sidecar.Signature
+		log.Info("software update publisher signature verified", "key_id", keyID)
 	}
 
 	reg, err := registry.NewPersistent(*offline, *stateFile)
@@ -962,25 +992,27 @@ func run() error {
 			MaxFailures: *loginFails,
 			Lockout:     *loginLockout,
 		}, log),
-		ProxyHeader:       *proxyHeader,
-		TLS:               tlsConfig != nil,
-		PunchReadBuffer:   meet.ReadBuffer(),
-		SoftwareVersion:   softwareVersion,
-		SoftwareURL:       softwareDownload,
-		SoftwareDir:       *softwareDir,
-		SoftwareSHA256:    softwareSHA256,
-		SoftwareSize:      softwareSize,
-		SoftwareSignature: softwareSignature,
-		Rendezvous:        rendezvousConfig,
-		Mailer:            apiMailer,
-		SMS:               apiSMS,
-		RecoveryURL:       resetPage,
-		RecoveryTTL:       *recoveryTTL,
-		SMSTTL:            *smsTTL,
-		WebAuthnRPID:      relyingParty,
-		WebAuthnOrigins:   webauthnOrigins,
-		OIDC:              oidcProvider,
-		Tracer:            tracer,
+		ProxyHeader:                *proxyHeader,
+		TLS:                        tlsConfig != nil,
+		PunchReadBuffer:            meet.ReadBuffer(),
+		SoftwareVersion:            softwareVersion,
+		SoftwareURL:                softwareDownload,
+		SoftwareDir:                *softwareDir,
+		SoftwareSHA256:             softwareSHA256,
+		SoftwareSize:               softwareSize,
+		SoftwareSignature:          softwareSignature,
+		SoftwarePublisherKeyID:     softwarePublisherKeyID,
+		SoftwarePublisherSignature: softwarePublisherSignature,
+		Rendezvous:                 rendezvousConfig,
+		Mailer:                     apiMailer,
+		SMS:                        apiSMS,
+		RecoveryURL:                resetPage,
+		RecoveryTTL:                *recoveryTTL,
+		SMSTTL:                     *smsTTL,
+		WebAuthnRPID:               relyingParty,
+		WebAuthnOrigins:            webauthnOrigins,
+		OIDC:                       oidcProvider,
+		Tracer:                     tracer,
 	})
 	httpServer := &http.Server{
 		Addr:              *httpListen,

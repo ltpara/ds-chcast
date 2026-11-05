@@ -266,6 +266,7 @@ class _HomePageState extends State<HomePage> {
               size: update.size,
               signature: update.signature,
               serverPublicKey: serverPublicKey,
+              publisherSignature: update.publisherSignature,
             );
     _exitApp = widget.appExit ?? exit;
     _updateLabels = widget.labelsUpdater ?? ServerApi.updateLabels;

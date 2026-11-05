@@ -56,8 +56,9 @@ func IsElevated() bool {
 }
 
 // prepareInstall stops a registered chast-host service so its executable can
-// be replaced. The returned function starts it again after the install.
-func prepareInstall(opts Options) (func(), error) {
+// be replaced. The returned function starts it again and waits until the new
+// binary is running, so the installer can roll back when it does not.
+func prepareInstall(opts Options) (func() error, error) {
 	if !opts.Machine || !serviceInstalled() {
 		return nil, nil
 	}
@@ -71,10 +72,20 @@ func prepareInstall(opts Options) (func(), error) {
 	}
 	for i := 0; i < 30; i++ {
 		if serviceStatus() == "Stopped" {
-			return func() {
-				if out, err := runPowerShell("Start-Service -Name 'chast-host' -ErrorAction Stop"); err != nil {
-					opts.logf("start the chast-host service: %v (%s)", err, firstLine(out))
+			return func() error {
+				if serviceStatus() == "Running" {
+					return nil
 				}
+				if out, err := runPowerShell("Start-Service -Name 'chast-host' -ErrorAction Stop"); err != nil {
+					return fmt.Errorf("start the chast-host service: %w (%s)", err, firstLine(out))
+				}
+				for i := 0; i < 30; i++ {
+					if serviceStatus() == "Running" {
+						return nil
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+				return errors.New("the chast-host service did not reach the running state")
 			}, nil
 		}
 		time.Sleep(500 * time.Millisecond)

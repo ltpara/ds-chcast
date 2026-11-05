@@ -3174,6 +3174,22 @@
      远程桌面的专业版/企业版，并会接管查看器本地会话，与 RustDesk 语义
      不等价，不采用。结论：协议、主机与查看器均不改动，零拷贝链路不受
      影响；待主机与查看器合并为单一对等程序后再评估。
+141. **P0 · DEV-01 更新发布者签名与启动回滚（2026-11-05 完成）**：更新
+     通告在服务器签名之外增加发布者 Ed25519 签名（域串 + 密钥 ID + 版本
+     + URL + SHA-256 + 长度的长度前缀消息），密钥 ID 为公钥摘要前 8 字节；
+     `chast-publish` 生成 `<release>.pubsig` 边车，`chast-server
+     --software-publisher-key` 启动时校验并随通告下发，主机代理与
+     `chast-tunnel apply-update` 可固定发布者公钥并强制要求签名，查看器
+     经 `CHAST_PUBLISHER_KEY` 透传。查看器升级后由首帧写入
+     `CHAST_UPDATE_HEALTH_FILE`，`apply-update` 在 `--health-timeout`
+     （默认 60 s）内未收到标记且进程已退出时恢复 `.old-*` 并重启；机器
+     安装器在停止服务后快照 `chast-host.exe`/`chast-service.exe`，解包、
+     注册或服务启动失败时恢复并重启，启动判定改为轮询 Running。验证：
+     Go 侧签名/篡改/边车/安装器恢复单测通过，
+     `CHAST_UPDATE_LOOPBACK=1` 的真实进程回环覆盖正常升级与崩溃回滚，
+     `flutter analyze`、Flutter 测试与 Windows release 构建通过。边界：
+     健康标记只代表查看器完成首帧；托盘主机仍依赖查看器自身回滚，真实
+     Windows 服务重启路径未在本机注册验证。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。

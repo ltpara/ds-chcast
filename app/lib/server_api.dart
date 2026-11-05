@@ -82,6 +82,8 @@ class SoftwareInfo {
     this.sha256 = '',
     this.size = 0,
     this.signature = '',
+    this.publisherKeyId = '',
+    this.publisherSignature = '',
   });
 
   final String version;
@@ -92,6 +94,13 @@ class SoftwareInfo {
   final String sha256;
   final int size;
   final String signature;
+
+  /// The release publisher's detached signature over the same fields. It is
+  /// checked by the helper only when the viewer deployment pins
+  /// CHAST_PUBLISHER_KEY, so a compromised rendezvous server still cannot
+  /// publish a build the publisher did not sign.
+  final String publisherKeyId;
+  final String publisherSignature;
 
   bool get installable => sha256.isNotEmpty && size > 0 && signature.isNotEmpty;
 
@@ -111,6 +120,8 @@ class SoftwareInfo {
       sha256: value['sha256']?.toString().trim() ?? '',
       size: rawSize is num && rawSize > 0 ? rawSize.toInt() : 0,
       signature: value['signature']?.toString().trim() ?? '',
+      publisherKeyId: value['publisher_key_id']?.toString().trim() ?? '',
+      publisherSignature: value['publisher_sig']?.toString().trim() ?? '',
     );
   }
 }

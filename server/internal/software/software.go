@@ -7,6 +7,7 @@ package software
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,76 @@ import (
 
 // RoutePrefix is where hosted artifacts are published.
 const RoutePrefix = "/software/"
+
+// PublisherSuffix names the detached publisher signature beside a release.
+const PublisherSuffix = ".pubsig"
+
+// PublisherSignature is the sidecar written by chast-publish. The signature
+// itself binds the key id, version, URL, digest and size, so the sidecar only
+// has to carry the selector and signature.
+type PublisherSignature struct {
+	KeyID     string `json:"key_id"`
+	Signature string `json:"signature"`
+}
+
+// PublisherPath returns the sidecar path for a hosted artifact.
+func PublisherPath(dir, name string) string {
+	return filepath.Join(dir, name+PublisherSuffix)
+}
+
+// LoadPublisherSignature reads and validates the sidecar. A missing or
+// malformed sidecar is an error when the operator pinned a publisher key.
+func LoadPublisherSignature(dir, name string) (PublisherSignature, error) {
+	if !ValidName(name) {
+		return PublisherSignature{}, fmt.Errorf("invalid software file name %q", name)
+	}
+	raw, err := os.ReadFile(PublisherPath(dir, name))
+	if err != nil {
+		return PublisherSignature{}, err
+	}
+	var sig PublisherSignature
+	if err := json.Unmarshal(raw, &sig); err != nil {
+		return PublisherSignature{}, fmt.Errorf("publisher signature %s: %w", name+PublisherSuffix, err)
+	}
+	sig.KeyID = strings.TrimSpace(sig.KeyID)
+	sig.Signature = strings.TrimSpace(sig.Signature)
+	if sig.KeyID == "" || len(sig.KeyID) > 64 || sig.Signature == "" || len(sig.Signature) > 256 {
+		return PublisherSignature{}, fmt.Errorf("publisher signature %s is malformed", name+PublisherSuffix)
+	}
+	return sig, nil
+}
+
+// SavePublisherSignature writes the sidecar atomically. The caller has already
+// signed the release.
+func SavePublisherSignature(path string, sig PublisherSignature) error {
+	raw, err := json.MarshalIndent(sig, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".chast-pubsig-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
 
 // Artifact is a hosted update file with its content digest.
 type Artifact struct {

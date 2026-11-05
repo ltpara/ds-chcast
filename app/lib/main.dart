@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
@@ -9,6 +11,26 @@ void main(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
   AppLanguage.load();
   runApp(ChastApp(connectTarget: _connectTarget(args)));
+  _markUpdateHealthy();
+}
+
+/// The update helper keeps the previous executable until this marker exists.
+/// Writing it after the first frame means a release that crashes during startup
+/// is rolled back instead of leaving the viewer unusable.
+void _markUpdateHealthy() {
+  final String path =
+      (Platform.environment['CHAST_UPDATE_HEALTH_FILE'] ?? '').trim();
+  if (path.isEmpty) {
+    return;
+  }
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    try {
+      File(path).writeAsStringSync('healthy\n');
+    } catch (_) {
+      // A marker we cannot write only disables the automatic rollback; it must
+      // never prevent the viewer from starting.
+    }
+  });
 }
 
 String? _connectTarget(List<String> args) {

@@ -70,6 +70,8 @@ func runHost(args []string) error {
 	upnpEnabled := fs.Bool("upnp", false, "map the UDP port on the local UPnP gateway and report it")
 	autoUpdate := fs.Bool("auto-update", false, "stage and launch the installer advertised by the server; needs --server-pubkey")
 	autoUpdateDir := fs.String("auto-update-dir", "", "directory for the downloaded installer (default: updates beside the executable)")
+	publisherPubKey := fs.String("publisher-pubkey", "", "pin the release publisher Ed25519 public key; update notices must carry a matching signature")
+	requirePublisher := fs.Bool("require-publisher-signature", false, "refuse releases without a valid publisher signature; implied by --publisher-pubkey")
 	lanDiscovery := fs.Bool("lan-discovery", true, "answer LAN discovery pings; exposes id, hostname, username, platform and version on the local link")
 	lanPort := fs.Int("lan-port", lan.DefaultPort, "UDP port for LAN discovery")
 	tlsCA := fs.String("tls-ca", "", "PEM CA bundle for an HTTPS rendezvous server using a private CA")
@@ -111,25 +113,27 @@ func runHost(args []string) error {
 	}
 
 	h, err := agent.StartHost(ctx, agent.HostConfig{
-		ServerURL:       *server,
-		Servers:         splitCSV(*rendezvousList),
-		ServerKey:       *serverKey,
-		ServerPublicKey: *serverPubKey,
-		Proxy:           proxy,
-		ID:              *id,
-		OldID:           *oldID,
-		Key:             *key,
-		Fingerprint:     *fingerprint,
-		LocalAddr:       *local,
-		CarrierAddr:     *carrierAddr,
-		AuditSpool:      *auditSpool,
-		ListenAddr:      *listen,
-		Keepalive:       *keepalive,
-		UPnP:            *upnpEnabled,
-		AutoUpdate:      *autoUpdate,
-		UpdateDir:       *autoUpdateDir,
-		TLS:             tlsConfig,
-		Logger:          log,
+		ServerURL:                 *server,
+		Servers:                   splitCSV(*rendezvousList),
+		ServerKey:                 *serverKey,
+		ServerPublicKey:           *serverPubKey,
+		Proxy:                     proxy,
+		ID:                        *id,
+		OldID:                     *oldID,
+		Key:                       *key,
+		Fingerprint:               *fingerprint,
+		LocalAddr:                 *local,
+		CarrierAddr:               *carrierAddr,
+		AuditSpool:                *auditSpool,
+		ListenAddr:                *listen,
+		Keepalive:                 *keepalive,
+		UPnP:                      *upnpEnabled,
+		AutoUpdate:                *autoUpdate,
+		UpdateDir:                 *autoUpdateDir,
+		PublisherPublicKey:        *publisherPubKey,
+		RequirePublisherSignature: *requirePublisher,
+		TLS:                       tlsConfig,
+		Logger:                    log,
 		OnInfo: func(info agent.HostInfo) {
 			emitMu.Lock()
 			defer emitMu.Unlock()
