@@ -3203,6 +3203,14 @@
      ./cmd/chast-server` 通过，新增用例覆盖域分离、跨重启持久化、规范化
      丢签名、篡改/错配 401 与兼容/强制模式。边界：签名只把报告值与主机
      密钥绑定，不证明值真实，也不替代 `server-key` 与 TLS。
+143. **P1 · 代码审核 M5/M6（2026-11-05 完成）**：文件传输撤权时在同一把锁
+     内中止 `outgoing_uploads`，`send_file_data()`/`finish_file_upload()`
+     每次调用前复查 `session_permissions`，撤销后返回 `PermissionDenied`；
+     发送队列引入 `send_generation`，会话拆除时复位计数并让旧连接的迟到
+     `SEND_COMPLETE` 失效，无截止时间的 `send_cv.wait` 改为 10 s 上限，
+     `wait_sends()` 返回真实排空结果。验证：`chast-quic`、`chast-host`、
+     `chast-service` Release 构建通过；本机 Smart App Control 拦截新构建的
+     未签名二进制，运行时验证受限。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
