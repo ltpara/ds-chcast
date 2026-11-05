@@ -1392,6 +1392,33 @@ void ViewerBridge::HandleMethodCall(
         return;
     }
 
+    if (method == "takeCompletedFiles") {
+        if (viewer_ == nullptr) {
+            result->Success();
+            return;
+        }
+        std::vector<ViewerEngine::CompletedFile> files;
+        if (!viewer_->TakeCompletedFiles(files)) {
+            result->Success();
+            return;
+        }
+        flutter::EncodableList list;
+        list.reserve(files.size());
+        for (const ViewerEngine::CompletedFile& file : files) {
+            flutter::EncodableMap entry;
+            entry[key("upload")] = flutter::EncodableValue(file.upload);
+            entry[key("name")] = flutter::EncodableValue(file.name);
+            entry[key("size")] = flutter::EncodableValue(static_cast<int64_t>(file.size));
+            entry[key("success")] = flutter::EncodableValue(file.success);
+            entry[key("detail")] = flutter::EncodableValue(file.detail);
+            entry[key("occurredAtMs")] =
+                flutter::EncodableValue(static_cast<int64_t>(file.occurred_at_ms));
+            list.push_back(flutter::EncodableValue(std::move(entry)));
+        }
+        result->Success(flutter::EncodableValue(std::move(list)));
+        return;
+    }
+
     if (method == "setAudioMuted") {
         const auto* mute = std::get_if<bool>(call.arguments());
         if (mute == nullptr) {

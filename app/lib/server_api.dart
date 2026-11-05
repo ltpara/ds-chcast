@@ -895,6 +895,27 @@ class DevicePresence {
   bool get online => state == HostPresence.online;
 }
 
+/// One finished file in a viewer audit report. [direction] is `upload` or
+/// `download`; [detail] explains a failure and is empty on success;
+/// [occurredAt] is when the transfer finished.
+class FileTransferReport {
+  const FileTransferReport({
+    required this.direction,
+    required this.name,
+    required this.size,
+    required this.success,
+    this.detail = '',
+    this.occurredAt,
+  });
+
+  final String direction;
+  final String name;
+  final int size;
+  final bool success;
+  final String detail;
+  final DateTime? occurredAt;
+}
+
 /// Collects the single digest produced by a chunked hash conversion without
 /// buffering the bytes that produced it.
 class _DigestSink implements Sink<Digest> {
@@ -2065,8 +2086,10 @@ class ServerApi {
 
   /// Reports one finished remote session to the account's server. The server
   /// derives the username and client address from the token and request, so
-  /// callers only describe the peer and timing. Audit delivery is best-effort;
-  /// callers should ignore failures rather than disturb the viewer.
+  /// callers only describe the peer and timing. [route] is one of `direct`,
+  /// `punch`, `relay` or `carrier` (empty when the path never settled).
+  /// Audit delivery is best-effort; callers should ignore failures rather
+  /// than disturb the viewer.
   static Future<void> reportConnection(
     ServerSettings settings,
     String token, {
@@ -2076,6 +2099,7 @@ class ServerApi {
     bool success = true,
     String detail = '',
     String auditRef = '',
+    String route = '',
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
@@ -2101,36 +2125,33 @@ class ServerApi {
         'success': success,
         if (detail.trim().isNotEmpty) 'detail': detail.trim(),
         if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
+        if (route.isNotEmpty) 'route': route,
       },
       success: const <int>{HttpStatus.created},
       unauthorized: tr('账号登录已失效，请重新登录'),
     );
   }
 
-  /// Reports files that finished between two viewer polls. One call can cover
-  /// several files, in which case [name] and [size] describe the last one.
-  static Future<void> reportFileTransfers(
+  /// Reports finished files one row per file, all sharing one audit reference
+  /// and route. The server accepts at most 200 items per call; callers batch
+  /// larger drains themselves.
+  static Future<void> reportFileTransfersBatch(
     ServerSettings settings,
     String token, {
     required String peerId,
-    required String direction,
-    String name = '',
-    int size = 0,
-    int files = 1,
-    bool success = true,
-    String detail = '',
+    required List<FileTransferReport> items,
     String auditRef = '',
-    DateTime? occurredAt,
+    String route = '',
     Duration timeout = const Duration(seconds: 6),
   }) async {
     final String accountToken = _accountToken(settings, token);
     final String peer = peerId.trim();
-    if (peer.isEmpty || (direction != 'upload' && direction != 'download')) {
+    if (peer.isEmpty || items.isEmpty) {
       return;
     }
     final Uri uri;
     try {
-      uri = Uri.parse('${settings.url}/v1/account/file-transfers');
+      uri = Uri.parse('${settings.url}/v1/account/file-transfers/batch');
     } on FormatException {
       throw ServerApiException(tr('连接服务地址无效'));
     }
@@ -2141,15 +2162,21 @@ class ServerApi {
       accountToken: accountToken,
       body: <String, Object?>{
         'peer_id': peer,
-        'direction': direction,
-        'files': files < 1 ? 1 : files,
-        if (name.trim().isNotEmpty) 'name': name.trim(),
-        if (size > 0) 'size': size,
-        'success': success,
-        if (detail.trim().isNotEmpty) 'detail': detail.trim(),
         if (auditRef.trim().isNotEmpty) 'audit_ref': auditRef.trim(),
-        if (occurredAt != null)
-          'occurred_at_ms': occurredAt.toUtc().millisecondsSinceEpoch,
+        if (route.isNotEmpty) 'route': route,
+        'items': items
+            .map((FileTransferReport item) => <String, Object?>{
+                  'direction': item.direction,
+                  'name': item.name.trim(),
+                  if (item.size > 0) 'size': item.size,
+                  'success': item.success,
+                  if (item.detail.trim().isNotEmpty)
+                    'detail': item.detail.trim(),
+                  if (item.occurredAt != null)
+                    'occurred_at_ms':
+                        item.occurredAt!.toUtc().millisecondsSinceEpoch,
+                })
+            .toList(),
       },
       success: const <int>{HttpStatus.created},
       unauthorized: tr('账号登录已失效，请重新登录'),

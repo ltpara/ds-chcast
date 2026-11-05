@@ -166,6 +166,44 @@ class ViewerFileSelection {
   final bool directory;
 }
 
+/// One finished transfer the native session queued for the audit. [upload] is
+/// true for a viewer-to-host transfer and false for a host download; [detail]
+/// explains a failure and is empty on success. [occurredAtMs] is Unix
+/// milliseconds taken when the transfer finished. Clipboard staging is not
+/// queued, matching what the host audits.
+class ViewerCompletedFile {
+  const ViewerCompletedFile({
+    required this.upload,
+    required this.name,
+    required this.size,
+    required this.success,
+    required this.detail,
+    required this.occurredAtMs,
+  });
+
+  final bool upload;
+  final String name;
+  final int size;
+  final bool success;
+  final String detail;
+  final int occurredAtMs;
+
+  static ViewerCompletedFile? fromMap(Map<Object?, Object?> map) {
+    final String name = map['name']?.toString() ?? '';
+    if (name.isEmpty) {
+      return null;
+    }
+    return ViewerCompletedFile(
+      upload: map['upload'] == true,
+      name: name,
+      size: (map['size'] as num?)?.toInt() ?? 0,
+      success: map['success'] == true,
+      detail: map['detail']?.toString() ?? '',
+      occurredAtMs: (map['occurredAtMs'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
 /// One output the server announced in HelloAck. [index] is its position in
 /// the list, which is what a reconnect sends back to pick that output.
 class ViewerDisplay {
@@ -2378,6 +2416,29 @@ class ViewerBridge {
   /// while nothing is uploading is a no-op.
   static Future<void> cancelUploads() async {
     await _channel.invokeMethod<void>('cancelUploads');
+  }
+
+  /// Drains the finished transfers the native session queued for the audit.
+  /// The queue survives status polls, so a file that finished between two
+  /// polls is not lost; call this after every poll and once more after the
+  /// session stops. Returns an empty list when nothing finished.
+  static Future<List<ViewerCompletedFile>> takeCompletedFiles() async {
+    final Object? result =
+        await _channel.invokeMethod<Object?>('takeCompletedFiles');
+    if (result is! List) {
+      return const <ViewerCompletedFile>[];
+    }
+    final List<ViewerCompletedFile> files = <ViewerCompletedFile>[];
+    for (final Object? entry in result) {
+      if (entry is Map) {
+        final ViewerCompletedFile? file =
+            ViewerCompletedFile.fromMap(Map<Object?, Object?>.from(entry));
+        if (file != null) {
+          files.add(file);
+        }
+      }
+    }
+    return files;
   }
 
   /// Pops the newest directory listing the host sent. Returns null when none

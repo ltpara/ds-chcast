@@ -408,6 +408,11 @@ int64_t steady_us(std::chrono::steady_clock::time_point time) {
     return std::chrono::duration_cast<std::chrono::microseconds>(time.time_since_epoch()).count();
 }
 
+// Finished transfers kept for the page's audit drain. The page polls four
+// times a second, so this only caps a session whose page stopped draining;
+// the newest events win.
+constexpr size_t kMaxCompletedFiles = 512;
+
 }  // namespace
 
 ViewerEngine::ViewerEngine(FrameSink* sink, FrameSink* camera_sink)
@@ -443,6 +448,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         last_upload_ = FileUpload{};
         last_upload_.stage = FileUpload::Stage::kDone;
         next_file_id_ = 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        completed_files_.clear();
     }
     file_work_cv_.notify_all();
     if (file_worker_.joinable()) {
@@ -975,6 +984,20 @@ bool ViewerEngine::TakeFileList(FileListAnswer& answer) {
     }
     answer = std::move(*newest_file_list_);
     newest_file_list_.reset();
+    return true;
+}
+
+bool ViewerEngine::TakeCompletedFiles(std::vector<CompletedFile>& files) {
+    files.clear();
+    std::lock_guard<std::mutex> lock(completed_mutex_);
+    if (completed_files_.empty()) {
+        return false;
+    }
+    files.reserve(completed_files_.size());
+    for (CompletedFile& file : completed_files_) {
+        files.push_back(std::move(file));
+    }
+    completed_files_.clear();
     return true;
 }
 
@@ -1914,6 +1937,26 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t files_received = 0;
     uint64_t file_receive_failures = 0;
     uint64_t download_cancels = 0;
+    // A finished transfer is queued here so the page reports it even if its
+    // poll missed the moment. Clipboard staging is excluded: the host does not
+    // audit it either, and the two sides must agree on the same file set.
+    auto record_completed_file = [&](bool upload, const std::string& name, uint64_t size,
+                                     bool success, const std::string& detail) {
+        CompletedFile file;
+        file.upload = upload;
+        file.name = name;
+        file.size = size;
+        file.success = success;
+        file.detail = detail;
+        file.occurred_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        completed_files_.push_back(std::move(file));
+        while (completed_files_.size() > kMaxCompletedFiles) {
+            completed_files_.pop_front();
+        }
+    };
     uint64_t cursor_updates = 0;
     bool audio_announced = false;
     bool audio_finished = false;
@@ -3404,6 +3447,19 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 it->stage == FileUpload::Stage::kFinishing) {
                                 active_id = it->transfer_id;
                             }
+                            // An entry that already reached a terminal stage
+                            // keeps its real outcome in the audit; only the
+                            // entries the purge actually aborts are failures.
+                            const bool terminal = it->stage == FileUpload::Stage::kDone ||
+                                                  it->stage == FileUpload::Stage::kFailed;
+                            if (terminal) {
+                                record_completed_file(true, it->name, it->size,
+                                                      it->stage == FileUpload::Stage::kDone,
+                                                      it->error);
+                            } else {
+                                record_completed_file(true, it->name, it->size, false,
+                                                      message);
+                            }
                             if (!reported) {
                                 reported = true;
                                 name = it->name;
@@ -3634,10 +3690,16 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                 stage != FileUpload::Stage::kFailed) {
                                 break;
                             }
-                            if (stage == FileUpload::Stage::kFailed) {
+                            const bool success = stage == FileUpload::Stage::kDone;
+                            if (!success) {
                                 ++file_failures;
                             } else {
                                 ++files_sent;
+                            }
+                            if (!uploads_.front().clipboard) {
+                                record_completed_file(true, uploads_.front().name,
+                                                      uploads_.front().size, success,
+                                                      uploads_.front().error);
                             }
                             last_upload_ = std::move(uploads_.front());
                             uploads_.pop_front();
@@ -3874,6 +3936,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 auto download_fail = [&](const std::string& message, bool report) {
                     uint32_t transfer_id = 0;
                     std::string name;
+                    uint64_t size = 0;
                     bool clipboard_transfer = false;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
@@ -3882,6 +3945,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         transfer_id = download_.transfer_id;
                         name = download_.name;
+                        size = download_.size;
                         if (download_.receiver) {
                             download_.receiver->abort(true);
                             download_.receiver.reset();
@@ -3891,6 +3955,9 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         clipboard_transfer =
                             clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
                             clipboard_files.transfer_id == transfer_id;
+                    }
+                    if (!clipboard_transfer) {
+                        record_completed_file(false, name, size, false, message);
                     }
                     if (report) {
                         (void)session->send_file_result(transfer_id, chast::FileCode::IoError, 0,
@@ -3911,6 +3978,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     uint32_t transfer_id = 0;
                     uint64_t received = 0;
                     std::string name;
+                    uint64_t size = 0;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
                         if (download_.stage != FileDownload::Stage::kReceiving) {
@@ -3944,7 +4012,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         }
                         download_.stage = FileDownload::Stage::kFailed;
                         download_.error = "the viewer cancelled the download";
+                        size = download_.size;
                     }
+                    record_completed_file(false, name, size, false,
+                                          "the viewer cancelled the download");
                     ++download_cancels;
                     (void)session->send_file_result(transfer_id, chast::FileCode::Cancelled,
                                                     received,
@@ -4154,6 +4225,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             } else if (walk_transfer) {
                                 finish_folder_download(1, reason);
                             }
+                            if (!retry) {
+                                record_completed_file(false, offer.name, offer.size, false,
+                                                      reason);
+                            }
                             continue;
                         }
                         chast::FileReceiveOptions options;
@@ -4203,6 +4278,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                                 "': " + receive_error);
                                 continue;
                             }
+                            record_completed_file(false, offer.name, offer.size, false,
+                                                  receive_error);
                             bool walk_transfer = false;
                             {
                                 std::lock_guard<std::mutex> lock(browse_mutex_);
@@ -4227,6 +4304,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                             download_.answer_time = Clock::now();
                             download_.receiver = std::move(receiver);
                             download_.cancellable = !clipboard_transfer && !walk_offer;
+                            download_.clipboard = clipboard_transfer;
                         }
                         if (clipboard_transfer) {
                             clipboard_files.stage = ClipboardFiles::Stage::kReceiving;
@@ -4358,12 +4436,20 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         download_fail(finish_error, true);
                         return;
                     }
+                    const bool clipboard_transfer =
+                        clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
+                        clipboard_files.transfer_id == transfer_id;
+                    std::string completed_name;
                     {
                         std::lock_guard<std::mutex> lock(file_mutex_);
+                        completed_name = download_.name;
                         download_.receiver.reset();
                         download_.stage = FileDownload::Stage::kDone;
                         download_.path = final_path;
                         download_.error.clear();
+                    }
+                    if (!clipboard_transfer) {
+                        record_completed_file(false, completed_name, bytes, true, "");
                     }
                     if (clipboard_files.stage == ClipboardFiles::Stage::kReceiving &&
                         clipboard_files.transfer_id == transfer_id &&
@@ -4944,11 +5030,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                         if (cancel) {
                             if (transfer != 0) {
                                 bool active = false;
+                                std::string cancelled_name;
+                                uint64_t cancelled_size = 0;
                                 {
                                     std::lock_guard<std::mutex> lock(file_mutex_);
                                     active = download_.stage == FileDownload::Stage::kReceiving &&
                                              download_.transfer_id == transfer;
                                     if (active) {
+                                        cancelled_name = download_.name;
+                                        cancelled_size = download_.size;
                                         if (download_.receiver) {
                                             download_.receiver->abort(false);
                                             download_.receiver.reset();
@@ -4958,6 +5048,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                                     }
                                 }
                                 if (active) {
+                                    record_completed_file(false, cancelled_name, cancelled_size,
+                                                          false, "cancelled by the operator");
                                     (void)session->send_file_result(
                                         transfer, chast::FileCode::IoError, 0,
                                         "cancelled by the operator");
@@ -7665,10 +7757,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 stage != FileUpload::Stage::kFailed) {
                 break;
             }
-            if (stage == FileUpload::Stage::kFailed) {
+            const bool success = stage == FileUpload::Stage::kDone;
+            if (!success) {
                 ++file_failures;
             } else {
                 ++files_sent;
+            }
+            if (!uploads_.front().clipboard) {
+                record_completed_file(true, uploads_.front().name, uploads_.front().size,
+                                      success, uploads_.front().error);
             }
             last_upload_ = std::move(uploads_.front());
             uploads_.pop_front();
@@ -7682,6 +7779,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     break;
                 }
             }
+            // Every entry that cannot continue is one failed file in the
+            // audit, not a single aggregate failure.
+            for (const FileUpload& upload : uploads_) {
+                if (!upload.clipboard) {
+                    record_completed_file(true, upload.name, upload.size, false,
+                                          "the session ended before the file finished");
+                }
+            }
             last_upload_ = std::move(uploads_.front());
             last_upload_.stage = FileUpload::Stage::kFailed;
             last_upload_.error = "the session ended before the file finished";
@@ -7691,6 +7796,33 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     }
     if (cancelled_upload != 0) {
         session->cancel_file_upload(cancelled_upload);
+    }
+    // A download that outlived the stream cannot finish on this connection.
+    // Clipboard staging is handled with the rest of the clipboard state below.
+    {
+        bool failed_download = false;
+        std::string download_name;
+        uint64_t download_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(file_mutex_);
+            if (download_.stage == FileDownload::Stage::kReceiving) {
+                if (!download_.clipboard) {
+                    failed_download = true;
+                    download_name = download_.name;
+                    download_size = download_.size;
+                    if (download_.receiver) {
+                        download_.receiver->abort(true);
+                        download_.receiver.reset();
+                    }
+                    download_.stage = FileDownload::Stage::kFailed;
+                    download_.error = "the session ended before the download finished";
+                }
+            }
+        }
+        if (failed_download) {
+            record_completed_file(false, download_name, download_size, false,
+                                  "the session ended before the download finished");
+        }
     }
     // A folder walk cannot continue on a closed session; nothing of it may
     // leak into the next connection either.

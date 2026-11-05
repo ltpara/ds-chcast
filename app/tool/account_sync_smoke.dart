@@ -542,6 +542,8 @@ Future<void> main(List<String> args) async {
       startedAt: startedAt,
       endedAt: endedAt,
       detail: 'probe session',
+      auditRef: 'abcd1234',
+      route: 'punch',
     );
     try {
       await ServerApi.reportConnection(
@@ -596,15 +598,21 @@ Future<void> main(List<String> args) async {
     }
 
     final DateTime transferAt = startedAt.add(const Duration(hours: 1));
-    await ServerApi.reportFileTransfers(
+    await ServerApi.reportFileTransfersBatch(
       settings,
       token,
       peerId: 'smoke-peer',
-      direction: 'download',
-      name: 'photos.zip',
-      size: 900,
-      files: 3,
-      occurredAt: transferAt,
+      auditRef: 'abcd1234',
+      route: 'punch',
+      items: <FileTransferReport>[
+        FileTransferReport(
+          direction: 'download',
+          name: 'photos.zip',
+          size: 900,
+          success: true,
+          occurredAt: transferAt,
+        ),
+      ],
     );
     final HttpClient filesHttp = HttpClient();
     try {
@@ -633,7 +641,9 @@ Future<void> main(List<String> args) async {
             recorded['direction'] == 'download' &&
             recorded['name'] == 'photos.zip' &&
             recorded['size'] == 900 &&
-            recorded['files'] == 3 &&
+            recorded['files'] == 1 &&
+            recorded['audit_ref'] == 'abcd1234' &&
+            recorded['route'] == 'punch' &&
             recorded['occurred_at_ms'] ==
                 transferAt.millisecondsSinceEpoch &&
             recorded['success'] == true &&
@@ -683,6 +693,27 @@ Future<void> main(List<String> args) async {
         'the old access token is rejected after rotation',
       );
     }
+    // The first reuse of the retired token is the lost-response retry the
+    // grace window exists for: its replacement was never delivered, so the
+    // server hands back a fresh pair instead of ending the session.
+    final AccountLoginResult recovered =
+        await ServerApi.refresh(settings, lifecycle.refreshToken);
+    check(
+      recovered.token.isNotEmpty &&
+          recovered.refreshToken.isNotEmpty &&
+          recovered.refreshToken != renewed.refreshToken,
+      'a lost-response retry inside the grace window recovers a new pair',
+    );
+    try {
+      await ServerApi.accountInfo(settings, renewed.token);
+      check(false, 'the recovered pair replaces the previous access token');
+    } on ServerApiException catch (error) {
+      check(
+        error.statusCode == 401,
+        'the recovered pair replaces the previous access token',
+      );
+    }
+    // A second use of the same retired token can only be a copy.
     try {
       await ServerApi.refresh(settings, lifecycle.refreshToken);
       check(false, 'a replayed refresh token is rejected');
@@ -690,7 +721,7 @@ Future<void> main(List<String> args) async {
       check(error.statusCode == 401, 'a replayed refresh token is rejected');
     }
     try {
-      await ServerApi.accountInfo(settings, renewed.token);
+      await ServerApi.accountInfo(settings, recovered.token);
       check(false, 'a replay revokes the rotated session');
     } on ServerApiException catch (error) {
       check(error.statusCode == 401, 'a replay revokes the rotated session');

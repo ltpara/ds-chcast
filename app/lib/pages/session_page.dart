@@ -269,6 +269,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   // once to the signed-in account's server. Handshake failures stay out of
   // this trail because no session existed yet.
   DateTime? _auditStartedAt;
+  // One file-audit drain at a time; a poll that arrives during a slow post
+  // leaves the native queue untouched for the next tick.
+  bool _fileReportBusy = false;
 
   bool get _inputActive =>
       _controlEnabled && _status.acceptsInput && _startError == null;
@@ -355,42 +358,74 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         endedAt: DateTime.now(),
         detail: detail,
         auditRef: _status.auditRef,
+        route: _connectionRoute,
       );
     } catch (_) {
       // Audit delivery must not disturb the session or the returned page.
     }
   }
 
-  Future<void> _reportFileEvent(
-    String direction,
-    String name,
-    int size,
-    int files,
-    bool success,
-    String detail,
-  ) async {
-    final AccountSession? account = widget.account;
-    if (account == null || !account.isActiveAt(DateTime.now())) {
+  /// Posts every file the native side finished since the last drain. The
+  /// engine queues one row per completed transfer, so the audit can be
+  /// checked file by file instead of inferred from session counters.
+  /// Delivery is best effort: a failed batch is dropped, exactly like the
+  /// session report, and the next poll drains whatever is still queued.
+  Future<void> _reportCompletedFiles() async {
+    if (_fileReportBusy) {
       return;
     }
-    final String peer = widget.target.hostId.isNotEmpty
-        ? widget.target.hostId
-        : widget.target.label;
+    _fileReportBusy = true;
     try {
-      await ServerApi.reportFileTransfers(
-        ServerSettings(url: account.server),
-        account.token,
-        peerId: peer,
-        direction: direction,
-        name: name,
-        size: size,
-        files: files,
-        success: success,
-        detail: detail,
-        auditRef: _status.auditRef,
-      );
+      final List<ViewerCompletedFile> files =
+          await ViewerBridge.takeCompletedFiles();
+      if (files.isEmpty) {
+        return;
+      }
+      final AccountSession? account = widget.account;
+      if (account == null || !account.isActiveAt(DateTime.now())) {
+        return;
+      }
+      final String peer = widget.target.hostId.isNotEmpty
+          ? widget.target.hostId
+          : widget.target.label;
+      final String auditRef = _status.auditRef;
+      final String route = _connectionRoute;
+      final ServerSettings settings = ServerSettings(url: account.server);
+      // The server accepts at most 200 rows per call.
+      for (int start = 0; start < files.length; start += 200) {
+        final int end =
+            start + 200 < files.length ? start + 200 : files.length;
+        final List<FileTransferReport> items = <FileTransferReport>[
+          for (final ViewerCompletedFile file in files.sublist(start, end))
+            FileTransferReport(
+              direction: file.upload ? 'upload' : 'download',
+              name: file.name,
+              size: file.size,
+              success: file.success,
+              detail: file.detail,
+              occurredAt: file.occurredAtMs > 0
+                  ? DateTime.fromMillisecondsSinceEpoch(file.occurredAtMs,
+                      isUtc: true)
+                  : null,
+            ),
+        ];
+        try {
+          await ServerApi.reportFileTransfersBatch(
+            settings,
+            account.token,
+            peerId: peer,
+            items: items,
+            auditRef: auditRef,
+            route: route,
+          );
+        } catch (_) {
+          // Keep draining: one lost batch must not hold back the rest.
+        }
+      }
     } catch (_) {
-      // Audit delivery is best effort, exactly like the session report.
+      // The channel may be gone during teardown; auditing never disturbs it.
+    } finally {
+      _fileReportBusy = false;
     }
   }
 
@@ -857,6 +892,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         return;
       }
       _applyStatus(status);
+      // Drain after the status update: the audit reference and route of the
+      // connection are only current once _applyStatus has read this poll.
+      unawaited(_reportCompletedFiles());
     } on MissingPluginException {
       // Reported by _start; keep waiting for the channel to come up.
     } on PlatformException {
@@ -983,13 +1021,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     final bool downloadDone = status.filesReceived > _status.filesReceived;
     final bool downloadFailed =
         status.fileReceiveFailures > _status.fileReceiveFailures;
-    // A poll can swallow several completions, especially for small files.
-    // The audit keeps the count and the last name/size seen in this window.
-    final int uploadsDone = status.filesSent - _status.filesSent;
-    final int uploadsFailed = status.fileFailures - _status.fileFailures;
-    final int downloadsDone = status.filesReceived - _status.filesReceived;
-    final int downloadsFailed =
-        status.fileReceiveFailures - _status.fileReceiveFailures;
     final bool chatArrived = status.chatReceived > _status.chatReceived;
     final bool chatFailed = status.chatFailures > _status.chatFailures;
     if (modeChangeAccepted) {
@@ -1186,54 +1217,6 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                 : tr('文件接收失败：{reason}', <String, Object?>{'reason': reason}),
           ),
           duration: const Duration(seconds: 5),
-        ),
-      );
-    }
-    if (uploadsDone > 0) {
-      unawaited(
-        _reportFileEvent(
-          'upload',
-          status.lastFileName,
-          uploadsDone == 1 ? status.fileSize : 0,
-          uploadsDone,
-          true,
-          '',
-        ),
-      );
-    }
-    if (uploadsFailed > 0) {
-      unawaited(
-        _reportFileEvent(
-          'upload',
-          status.lastFileName,
-          0,
-          uploadsFailed,
-          false,
-          status.lastFileError,
-        ),
-      );
-    }
-    if (downloadsDone > 0) {
-      unawaited(
-        _reportFileEvent(
-          'download',
-          status.downloadName,
-          downloadsDone == 1 ? status.downloadSize : 0,
-          downloadsDone,
-          true,
-          '',
-        ),
-      );
-    }
-    if (downloadsFailed > 0) {
-      unawaited(
-        _reportFileEvent(
-          'download',
-          status.downloadName,
-          0,
-          downloadsFailed,
-          false,
-          status.downloadError,
         ),
       );
     }
@@ -3127,6 +3110,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       unawaited(_reportFinishedSession(auditStartedAt, tr('重新连接')));
     }
     await _stopSession();
+    // Teardown fails queued uploads and an unfinished download; drain those
+    // rows while the old audit reference and route are still current.
+    await _reportCompletedFiles();
     _clearCursor();
     if (!mounted) {
       return;
@@ -3177,6 +3163,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     await _starting;
     _teardown = null;
     await _stopSession();
+    await _reportCompletedFiles();
     await _tunnel?.stop();
     _tunnel = null;
     _tunnelStarting = null;
@@ -4202,6 +4189,26 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       return '';
     }
     return _tunnel?.pathLabel ?? tr('连接中');
+  }
+
+  /// Audit route of the current connection. A direct connection that never
+  /// touched the connection service is `direct`; the agent's `direct` label
+  /// means the server introduced the peers, which the audit calls `punch`.
+  /// Empty while the path is still being chosen, so no route is guessed.
+  String get _connectionRoute {
+    if (!widget.target.viaServer) {
+      return 'direct';
+    }
+    switch (_tunnel?.path) {
+      case 'direct':
+        return 'punch';
+      case 'relay':
+        return 'relay';
+      case 'carrier':
+        return 'carrier';
+      default:
+        return '';
+    }
   }
 
   String get _stateText {

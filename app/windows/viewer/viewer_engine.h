@@ -789,6 +789,24 @@ public:
     // Copies the newest listing the host sent, once per answer. Returns false
     // when nothing new arrived.
     bool TakeFileList(FileListAnswer& answer);
+    // One finished transfer for the viewer's audit. The session thread queues
+    // these so a poll that missed the moment still reports every file;
+    // TakeCompletedFiles() drains the queue. `upload` is true for a
+    // viewer-to-host transfer and false for a host download; `detail`
+    // explains a failure and is empty on success. Clipboard staging stays out,
+    // matching what the host itself audits.
+    struct CompletedFile {
+        bool upload = true;
+        std::string name;
+        uint64_t size = 0;
+        bool success = false;
+        std::string detail;
+        int64_t occurred_at_ms = 0;
+    };
+    // Moves the finished files queued since the last call into `files` and
+    // clears the queue. Returns false when nothing finished. A session that is
+    // not polled keeps its newest events only; the oldest are dropped first.
+    bool TakeCompletedFiles(std::vector<CompletedFile>& files);
     // Asks the host to create a folder, rename one entry or remove one below
     // its shared receive root. `path` is the '/'-separated relative path of
     // the entry (for MakeDirectory, the folder to create); `new_name` is one
@@ -1237,6 +1255,8 @@ private:
         std::unique_ptr<chast::FileReceiver> receiver;
         // Only an ordinary single-file request can be stopped here.
         bool cancellable = false;
+        // Clipboard staging reuses this download slot but is not audited.
+        bool clipboard = false;
         std::string error;
     };
     // Shared-folder browse requests cross in order: a listing, a download or
@@ -1335,6 +1355,11 @@ private:
     // Set by CancelDownload(); the session thread cancels the active transfer.
     std::atomic<bool> download_cancel_{false};
     uint32_t next_file_id_ = 1;
+    // Finished transfers wait here for the page's audit drain. The session
+    // thread appends, the UI thread takes; a queue that is never drained keeps
+    // only its newest entries.
+    std::mutex completed_mutex_;
+    std::deque<CompletedFile> completed_files_;
 
     // Pointer state crosses the same way, but only the newest update is kept:
     // a viewer that falls behind wants where the pointer is now, not a replay.

@@ -2811,6 +2811,8 @@ void main() {
       startedAt: started,
       endedAt: ended,
       detail: 'closed',
+      auditRef: ' ref-1 ',
+      route: 'punch',
     );
 
     expect(method, 'POST');
@@ -2821,6 +2823,8 @@ void main() {
     expect(body?['ended_at_ms'], ended.millisecondsSinceEpoch);
     expect(body?['success'], isTrue);
     expect(body?['detail'], 'closed');
+    expect(body?['audit_ref'], 'ref-1');
+    expect(body?['route'], 'punch');
   });
 
   test('an empty connection peer issues no request', () async {
@@ -2840,72 +2844,100 @@ void main() {
     expect(calls, 0);
   });
 
-  test(
-    'file transfer reports carry direction, count and account token',
-    () async {
-      String? method;
-      Uri? requested;
-      String? authorization;
-      Map<String, Object?>? body;
-      server.listen((HttpRequest request) async {
-        method = request.method;
-        requested = request.uri;
-        authorization = request.headers.value(HttpHeaders.authorizationHeader);
-        body =
-            jsonDecode(await utf8.decoder.bind(request).join())
-                as Map<String, Object?>;
-        request.response.statusCode = HttpStatus.created;
-        request.response.headers.contentType = ContentType.json;
-        request.response.write(jsonEncode(<String, Object?>{'id': 9}));
-        await request.response.close();
-      });
-
-      final DateTime occurred = DateTime.utc(2026, 10, 25, 12);
-      await ServerApi.reportFileTransfers(
-        settings,
-        'account-token',
-        peerId: ' devbox ',
-        direction: 'download',
-        name: ' photos.zip ',
-        size: 900,
-        files: 3,
-        success: false,
-        detail: 'disk full',
-        occurredAt: occurred,
+  test('file transfer batches carry one row per file', () async {
+    String? method;
+    Uri? requested;
+    String? authorization;
+    Map<String, Object?>? body;
+    server.listen((HttpRequest request) async {
+      method = request.method;
+      requested = request.uri;
+      authorization = request.headers.value(HttpHeaders.authorizationHeader);
+      body =
+          jsonDecode(await utf8.decoder.bind(request).join())
+              as Map<String, Object?>;
+      request.response.statusCode = HttpStatus.created;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, Object?>{'transfers': <Object?>[]}),
       );
+      await request.response.close();
+    });
 
-      expect(method, 'POST');
-      expect(requested?.path, '/v1/account/file-transfers');
-      expect(authorization, 'Bearer account-token');
-      expect(body?['peer_id'], 'devbox');
-      expect(body?['direction'], 'download');
-      expect(body?['name'], 'photos.zip');
-      expect(body?['size'], 900);
-      expect(body?['files'], 3);
-      expect(body?['success'], isFalse);
-      expect(body?['detail'], 'disk full');
-      expect(body?['occurred_at_ms'], occurred.millisecondsSinceEpoch);
-    },
-  );
+    final DateTime occurred = DateTime.utc(2026, 10, 25, 12);
+    await ServerApi.reportFileTransfersBatch(
+      settings,
+      'account-token',
+      peerId: ' devbox ',
+      auditRef: ' ref-1 ',
+      route: 'relay',
+      items: <FileTransferReport>[
+        FileTransferReport(
+          direction: 'download',
+          name: ' photos.zip ',
+          size: 900,
+          success: false,
+          detail: 'disk full',
+          occurredAt: occurred,
+        ),
+        const FileTransferReport(
+          direction: 'upload',
+          name: 'notes.txt',
+          size: 0,
+          success: true,
+        ),
+      ],
+    );
 
-  test('an empty peer or unknown direction issues no file request', () async {
+    expect(method, 'POST');
+    expect(requested?.path, '/v1/account/file-transfers/batch');
+    expect(authorization, 'Bearer account-token');
+    expect(body?['peer_id'], 'devbox');
+    expect(body?['audit_ref'], 'ref-1');
+    expect(body?['route'], 'relay');
+    final List<Object?> items = body?['items']! as List<Object?>;
+    expect(items, hasLength(2));
+    final Map<String, Object?> first = items[0]! as Map<String, Object?>;
+    expect(first['direction'], 'download');
+    expect(first['name'], 'photos.zip');
+    expect(first['size'], 900);
+    expect(first['success'], isFalse);
+    expect(first['detail'], 'disk full');
+    expect(first['occurred_at_ms'], occurred.millisecondsSinceEpoch);
+    final Map<String, Object?> second = items[1]! as Map<String, Object?>;
+    expect(second['direction'], 'upload');
+    expect(second['name'], 'notes.txt');
+    expect(second['success'], isTrue);
+    expect(second.containsKey('size'), isFalse);
+    expect(second.containsKey('detail'), isFalse);
+    expect(second.containsKey('occurred_at_ms'), isFalse);
+  });
+
+  test('an empty peer or empty batch issues no file request', () async {
     int calls = 0;
     server.listen((HttpRequest request) async {
       calls += 1;
       await request.response.close();
     });
 
-    await ServerApi.reportFileTransfers(
+    await ServerApi.reportFileTransfersBatch(
       settings,
       'account-token',
       peerId: '  ',
-      direction: 'upload',
+      items: const <FileTransferReport>[
+        FileTransferReport(
+          direction: 'upload',
+          name: 'notes.txt',
+          size: 5,
+          success: true,
+        ),
+      ],
     );
-    await ServerApi.reportFileTransfers(
+    await ServerApi.reportFileTransfersBatch(
       settings,
       'account-token',
       peerId: 'devbox',
-      direction: 'viewer',
+      items: const <FileTransferReport>[],
     );
     expect(calls, 0);
   });
