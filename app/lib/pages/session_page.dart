@@ -144,6 +144,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   bool _reconnecting = false;
   bool _closing = false;
   bool _controlEnabled = false;
+  // An accepted Windows session switch ends this connection on purpose; the
+  // page reconnects through the backoff ladder instead of showing a drop.
+  bool _sessionSwitchPending = false;
   double _wheelY = 0;
   double _wheelX = 0;
   int _heldButtons = 0;
@@ -814,6 +817,9 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
   }
 
   void _applyStatus(ViewerStatus status) {
+    // Captured before the setState below replaces _status: the answer checks
+    // further down need the snapshot this poll is being compared against.
+    final ViewerStatus previous = _status;
     // First contact: the native side connected without a pin so it could
     // report the certificate. Ask before remembering it; every later
     // connection is verified against the accepted value.
@@ -969,6 +975,37 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         ),
       );
     }
+    // A session switch answer. Acceptance ends this connection on purpose, so
+    // the page reconnects through the ladder instead of showing a drop; the
+    // answer may arrive on the same poll that reports the end.
+    if (status.sessionSelectUpdates > previous.sessionSelectUpdates) {
+      final String reason = status.sessionSelectError;
+      if (status.sessionSelectCode == ViewerSessionSelectCode.ok.code) {
+        _sessionSwitchPending = true;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('正在切换到会话 {id}…', <String, Object?>{
+                'id': status.sessionSelectId,
+              }),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      } else {
+        final String detail = reason.isEmpty
+            ? _sessionSelectCodeText(status.sessionSelectCode)
+            : reason;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              tr('切换会话失败：{detail}', <String, Object?>{'detail': detail}),
+            ),
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    }
     if (justOver) {
       if (_cameraOpen) {
         unawaited(_closeCameraPanel());
@@ -981,7 +1018,12 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
       if (auditStartedAt != null) {
         unawaited(_reportFinishedSession(auditStartedAt, status.error));
       }
-      _maybeStartAutoReconnect(status);
+      if (_sessionSwitchPending) {
+        _sessionSwitchPending = false;
+        _scheduleSessionSwitchReconnect();
+      } else {
+        _maybeStartAutoReconnect(status);
+      }
     }
     if (switchRefused) {
       final String reason = status.displaySwitchError;
@@ -1116,7 +1158,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     // A microphone failure stops only the uplink; video and system sound keep
     // running. The counter tells a new failure from the stale reason text.
-    if (!nowOver && status.microphoneErrors > _status.microphoneErrors) {
+    if (!nowOver && status.microphoneErrors > previous.microphoneErrors) {
       final String reason = status.microphoneError;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1131,7 +1173,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     // Every privacy answer is one event. A refusal or a host-initiated
     // disable explains itself; a success just confirms the new state.
-    if (!nowOver && status.privacyUpdates > _status.privacyUpdates) {
+    if (!nowOver && status.privacyUpdates > previous.privacyUpdates) {
       final String reason = status.privacyError;
       final String text;
       if (status.privacyCode != 0) {
@@ -1150,7 +1192,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Every Ctrl+Alt+Del request gets one answer. A refusal or unsupported
     // host explains itself; success only means SendSAS was invoked, because
     // Windows never reports whether the secure desktop actually appeared.
-    if (!nowOver && status.sasUpdates > _status.sasUpdates) {
+    if (!nowOver && status.sasUpdates > previous.sasUpdates) {
       final String reason = status.sasError;
       final String text;
       if (status.sasCode == ViewerSasCode.ok.code) {
@@ -1170,7 +1212,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     // Every host-control action gets one answer. A refusal explains itself;
     // success confirms the new state, and a host-initiated block release
     // arrives as a denial with the block off.
-    if (!nowOver && status.hostActionUpdates > _status.hostActionUpdates) {
+    if (!nowOver && status.hostActionUpdates > previous.hostActionUpdates) {
       final String reason = status.hostActionError;
       final String action = _hostActionText(status.hostActionAction);
       final String text;
@@ -1196,7 +1238,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     // Every OS-login request gets one answer. The password itself never comes
     // back; success only means the host typed it at its logon or lock screen.
-    if (!nowOver && status.osLoginUpdates > _status.osLoginUpdates) {
+    if (!nowOver && status.osLoginUpdates > previous.osLoginUpdates) {
       final String reason = status.osLoginError;
       final String text;
       if (status.osLoginCode == ViewerHostActionCode.ok.code) {
@@ -1212,7 +1254,7 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     }
     // Screenshots finish on the session thread; the counter pairs the newest
     // path or failure with this poll.
-    if (!nowOver && status.screenshotUpdates > _status.screenshotUpdates) {
+    if (!nowOver && status.screenshotUpdates > previous.screenshotUpdates) {
       final String reason = status.screenshotError;
       final String path = status.screenshotPath;
       final String text;
@@ -1858,6 +1900,72 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     } on MissingPluginException {
       // The native viewer is going away.
     }
+  }
+
+  /// Asks the host for its active Windows sessions and lets the operator pick
+  /// one. An accepted switch ends this connection on purpose; the page then
+  /// reconnects through the ladder and lands in the target session.
+  Future<void> _openSessionDialog() async {
+    if (!_status.acceptsSessionSelect) {
+      return;
+    }
+    final int baseline = _status.sessionListUpdates;
+    try {
+      final bool queued = await ViewerBridge.requestSessionList();
+      if (!mounted) {
+        return;
+      }
+      if (!queued) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(tr('会话列表未能排队：请确认主机权限与会话状态')),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+        return;
+      }
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message ?? tr('无法读取主机会话'))));
+      return;
+    } on MissingPluginException {
+      // The native viewer is going away.
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return _SessionPickerDialog(initial: _status, baseline: baseline);
+      },
+    );
+  }
+
+  /// Starts the reconnect ladder after an accepted session switch. The host
+  /// ends the old connection itself, so this is not a drop; the service may
+  /// still be stopping the old worker, and the ladder covers that window.
+  void _scheduleSessionSwitchReconnect() {
+    if (_closing || _autoTimer != null) {
+      return;
+    }
+    _autoPolicy.reset();
+    // Reserve the first attempt; a failed reconnect continues the ladder at
+    // the next backoff instead of starting over at one second.
+    _autoPolicy.next();
+    setState(() {});
+    _autoTimer = Timer(const Duration(milliseconds: 800), () {
+      _autoTimer = null;
+      if (!mounted || _closing) {
+        return;
+      }
+      unawaited(_reconnect(automatic: true));
+    });
   }
 
   String _hostActionText(int action) {
@@ -3599,6 +3707,8 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                         privacyEnabled: _status.privacyEnabled,
                         osLoginAvailable: _status.acceptsOsLogin,
                         onOsLogin: () => unawaited(_openOsLoginDialog()),
+                        sessionSelectAvailable: _status.acceptsSessionSelect,
+                        onSessionSelect: () => unawaited(_openSessionDialog()),
                         restartAvailable: _status.acceptsRestart,
                         lockAvailable: _status.acceptsLockScreen,
                         blockInputAvailable: _status.acceptsBlockInput,
@@ -5026,4 +5136,207 @@ class _FinishedRecording {
 
   final String path;
   final DateTime? startedAt;
+}
+
+String _sessionListCodeText(int code) {
+  if (code == ViewerSessionListCode.denied.code) {
+    return tr('主机未授权读取会话列表');
+  }
+  if (code == ViewerSessionListCode.unsupported.code) {
+    return tr('主机不支持读取 Windows 会话');
+  }
+  if (code == ViewerSessionListCode.failed.code) {
+    return tr('主机无法读取会话列表');
+  }
+  return tr('主机拒绝了会话列表');
+}
+
+String _sessionSelectCodeText(int code) {
+  if (code == ViewerSessionSelectCode.notFound.code) {
+    return tr('目标会话已不活跃');
+  }
+  if (code == ViewerSessionSelectCode.denied.code) {
+    return tr('主机未授权会话切换');
+  }
+  if (code == ViewerSessionSelectCode.unsupported.code) {
+    return tr('主机不支持切换 Windows 会话');
+  }
+  if (code == ViewerSessionSelectCode.busy.code) {
+    return tr('另一查看者正在控制主机');
+  }
+  if (code == ViewerSessionSelectCode.failed.code) {
+    return tr('主机无法切换会话');
+  }
+  return tr('主机拒绝了会话切换');
+}
+
+/// Picks one of the host's active Windows sessions. The dialog polls the
+/// viewer status only while it is open, so the page's own poll can keep
+/// updating the session underneath. The newest list answer is the one whose
+/// counter differs from [baseline].
+class _SessionPickerDialog extends StatefulWidget {
+  const _SessionPickerDialog({required this.initial, required this.baseline});
+
+  final ViewerStatus initial;
+  final int baseline;
+
+  @override
+  State<_SessionPickerDialog> createState() => _SessionPickerDialogState();
+}
+
+class _SessionPickerDialogState extends State<_SessionPickerDialog> {
+  late ViewerStatus _status = widget.initial;
+  late int _pendingSince = widget.baseline;
+  Timer? _timer;
+  bool _selecting = false;
+  bool _refreshing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => unawaited(_poll()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _poll() async {
+    try {
+      final ViewerStatus next = await ViewerBridge.status();
+      if (!mounted) {
+        return;
+      }
+      setState(() => _status = next);
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } on PlatformException {
+      // A single failed poll is transient; the next tick retries.
+    }
+  }
+
+  Future<void> _refresh() async {
+    if (_refreshing) {
+      return;
+    }
+    setState(() {
+      _refreshing = true;
+      _pendingSince = _status.sessionListUpdates;
+    });
+    try {
+      await ViewerBridge.requestSessionList();
+    } on PlatformException {
+      // The counter does not move, so the spinner stays until a real answer.
+    } on MissingPluginException {
+      // The native viewer is going away.
+    } finally {
+      if (mounted) {
+        setState(() => _refreshing = false);
+      }
+    }
+  }
+
+  Future<void> _select(ViewerRemoteSession session) async {
+    if (_selecting) {
+      return;
+    }
+    setState(() => _selecting = true);
+    try {
+      final bool queued = await ViewerBridge.requestSessionSelect(session.id);
+      if (!mounted) {
+        return;
+      }
+      if (queued) {
+        Navigator.of(context).pop();
+        return;
+      }
+      setState(() => _selecting = false);
+    } on PlatformException {
+      if (mounted) {
+        setState(() => _selecting = false);
+      }
+    } on MissingPluginException {
+      // The native viewer is going away.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool waiting = _status.sessionListUpdates == _pendingSince;
+    final bool answered = !waiting;
+    final bool ok =
+        answered && _status.sessionListCode == ViewerSessionListCode.ok.code;
+    final List<ViewerRemoteSession> sessions = _status.sessions;
+    Widget body;
+    if (waiting) {
+      body = Row(
+        children: <Widget>[
+          const SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 12),
+          Expanded(child: Text(tr('正在读取主机会话…'))),
+        ],
+      );
+    } else if (!ok) {
+      final String detail = _status.sessionListError.isNotEmpty
+          ? _status.sessionListError
+          : _sessionListCodeText(_status.sessionListCode);
+      body = Text(
+        tr('读取会话列表失败：{detail}', <String, Object?>{'detail': detail}),
+      );
+    } else if (sessions.isEmpty) {
+      body = Text(tr('主机上没有可切换的已登录会话。'));
+    } else {
+      body = Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Text(
+            tr('切换到该会话会结束当前连接，并在目标会话继续。'),
+            style: const TextStyle(fontSize: 12, color: Colors.white54),
+          ),
+          const SizedBox(height: 8),
+          Flexible(
+            child: ListView(
+              shrinkWrap: true,
+              children: <Widget>[
+                for (final ViewerRemoteSession session in sessions)
+                  ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.desktop_windows_outlined),
+                    title: Text(session.label),
+                    subtitle: session.current ? Text(tr('当前会话')) : null,
+                    enabled:
+                        !_selecting && session.active && !session.current,
+                    onTap: () => unawaited(_select(session)),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      );
+    }
+    return AlertDialog(
+      title: Text(tr('切换主机的 Windows 会话')),
+      content: SizedBox(width: 380, child: body),
+      actions: <Widget>[
+        TextButton(
+          onPressed: _refreshing ? null : () => unawaited(_refresh()),
+          child: Text(tr('刷新')),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(tr('取消')),
+        ),
+      ],
+    );
+  }
 }

@@ -256,6 +256,7 @@ void test_hello_ack() {
     sent.terminal_enabled = true;
     sent.record_enabled = true;
     sent.camera_enabled = true;
+    sent.session_select_enabled = true;
     sent.encoder = "mfxhw64 (VDENC HEVC)";
     chast::DisplayDescription primary;
     primary.name = "\\\\.\\DISPLAY1";
@@ -302,10 +303,12 @@ void test_hello_ack() {
     check(got.terminal_enabled, "HelloAck keeps the terminal flag");
     check(got.record_enabled, "HelloAck keeps the record flag");
     check(got.camera_enabled, "HelloAck keeps the camera flag");
+    check(got.session_select_enabled, "HelloAck keeps the session select flag");
     check(got.input_enabled && got.clipboard_enabled && got.audio.enabled &&
               got.file_transfer_enabled && got.microphone_enabled &&
               got.privacy_mode_enabled && got.port_forward_enabled &&
-              got.terminal_enabled && got.record_enabled && got.camera_enabled,
+              got.terminal_enabled && got.record_enabled && got.camera_enabled &&
+              got.session_select_enabled,
           "HelloAck mask grants every permission");
     check(got.encoder == sent.encoder, "HelloAck keeps the encoder name");
     check(got.displays.size() == 2, "HelloAck keeps the display count");
@@ -870,6 +873,233 @@ void test_os_login() {
           "OsLoginResult with a malformed reason is rejected");
     check(!chast::parse_os_login_result(std::vector<uint8_t>(), code, reason, &error),
           "empty OsLoginResult is rejected");
+}
+
+void test_session_select() {
+    std::string error;
+    check(chast::parse_session_list_request(
+              payload_of(chast::make_session_list_request()), &error),
+          "SessionListRequest round-trips");
+    check(!chast::parse_session_list_request(std::vector<uint8_t>{0}, &error),
+          "SessionListRequest with a payload is rejected");
+
+    chast::SessionListResult sent;
+    chast::RemoteSession console;
+    console.id = 1;
+    console.user = "admin";
+    console.active = true;
+    console.current = true;
+    chast::RemoteSession desktop;
+    desktop.id = 2;
+    desktop.user = "other \xE7\x94\xA8\xE6\x88\xB7";
+    desktop.active = true;
+    sent.sessions = {console, desktop};
+    chast::SessionListResult got;
+    check(chast::parse_session_list_result(
+              payload_of(chast::make_session_list_result(sent)), got, &error) &&
+              got.code == chast::SessionListCode::Ok && got.sessions.size() == 2,
+          "SessionListResult round-trips an Ok list");
+    if (got.sessions.size() == 2) {
+        check(got.sessions[0].id == 1 && got.sessions[0].user == "admin" &&
+                  got.sessions[0].active && got.sessions[0].current,
+              "SessionListResult keeps the current session flags");
+        check(got.sessions[1].id == 2 && got.sessions[1].user == desktop.user &&
+                  got.sessions[1].active && !got.sessions[1].current,
+              "SessionListResult keeps a UTF-8 user name and clears current");
+    }
+    chast::SessionListResult refused;
+    refused.code = chast::SessionListCode::Denied;
+    refused.reason = "session select is disabled";
+    check(chast::parse_session_list_result(
+              payload_of(chast::make_session_list_result(refused)), got, &error) &&
+              got.code == chast::SessionListCode::Denied &&
+              got.reason == refused.reason && got.sessions.empty(),
+          "SessionListResult round-trips a refusal with its reason");
+
+    chast::SessionListResult empty_answer;
+    empty_answer.code = chast::SessionListCode::Unsupported;
+    check(chast::parse_session_list_result(
+              payload_of(chast::make_session_list_result(empty_answer)), got, &error) &&
+              got.code == chast::SessionListCode::Unsupported && got.sessions.empty(),
+          "SessionListResult round-trips an Unsupported answer");
+
+    chast::SessionListResult bad = sent;
+    bad.sessions[0].id = 0;
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with session id 0 is refused");
+    bad = sent;
+    bad.sessions[0].id = 0xFFFFFFFFu;
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with session id 0xFFFFFFFF is refused");
+    bad = sent;
+    bad.sessions[1].id = bad.sessions[0].id;
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with a repeated session id is refused");
+    bad = sent;
+    bad.sessions[0].user.assign(chast::kMaxSessionUserBytes + 1, 'x');
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with an oversized user name is refused");
+    bad = sent;
+    bad.sessions[0].user = "\xFF";
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with a malformed user name is refused");
+    bad = sent;
+    bad.sessions.resize(chast::kMaxRemoteSessions + 1);
+    for (size_t i = 0; i < bad.sessions.size(); ++i) {
+        bad.sessions[i].id = static_cast<uint32_t>(i + 1);
+    }
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with too many sessions is refused");
+    bad = refused;
+    bad.sessions = {console};
+    check(chast::make_session_list_result(bad).empty(),
+          "a non-Ok SessionListResult with entries is refused");
+    bad = sent;
+    bad.code = static_cast<chast::SessionListCode>(9);
+    check(chast::make_session_list_result(bad).empty(),
+          "SessionListResult with an unknown code is refused");
+
+    std::vector<uint8_t> list_unknown =
+        payload_of(chast::make_session_list_result(sent));
+    list_unknown[0] = 9;
+    check(!chast::parse_session_list_result(list_unknown, got, &error),
+          "SessionListResult with an unknown code is rejected");
+    std::vector<uint8_t> list_with_entries =
+        payload_of(chast::make_session_list_result(sent));
+    list_with_entries[0] = static_cast<uint8_t>(chast::SessionListCode::Denied);
+    check(!chast::parse_session_list_result(list_with_entries, got, &error),
+          "a non-Ok SessionListResult carrying entries is rejected");
+    std::vector<uint8_t> list_bad_id =
+        payload_of(chast::make_session_list_result(sent));
+    // code(1) reason size(2) reason(0) count(2), then the first id.
+    list_bad_id[5] = list_bad_id[6] = list_bad_id[7] = list_bad_id[8] = 0;
+    check(!chast::parse_session_list_result(list_bad_id, got, &error),
+          "SessionListResult with session id 0 is rejected");
+    std::vector<uint8_t> list_bad_flags =
+        payload_of(chast::make_session_list_result(sent));
+    // first entry id(4) then flags at offset 5+4 = 9
+    list_bad_flags[9] = 4;
+    check(!chast::parse_session_list_result(list_bad_flags, got, &error),
+          "SessionListResult with unknown flags is rejected");
+    std::vector<uint8_t> list_bad_user =
+        payload_of(chast::make_session_list_result(sent));
+    // reuse the first entry, give it a one-byte malformed user name
+    list_bad_user[10] = 1;
+    list_bad_user[11] = 0;
+    list_bad_user[12] = 0xFF;
+    check(!chast::parse_session_list_result(list_bad_user, got, &error),
+          "SessionListResult with a malformed user name is rejected");
+    chast::SessionListResult long_user;
+    long_user.sessions = {console};
+    long_user.sessions[0].user.assign(chast::kMaxSessionUserBytes, 'x');
+    std::vector<uint8_t> list_long_user =
+        payload_of(chast::make_session_list_result(long_user));
+    // first entry user size field at offset 10, grow it past the limit and add
+    // the extra byte at the end (the entry is last in this list)
+    list_long_user[10] = static_cast<uint8_t>((chast::kMaxSessionUserBytes + 1) & 0xFFu);
+    list_long_user[11] = 0;
+    list_long_user.push_back('x');
+    check(!chast::parse_session_list_result(list_long_user, got, &error),
+          "SessionListResult with an oversized user name is rejected");
+    std::vector<uint8_t> list_trailing =
+        payload_of(chast::make_session_list_result(sent));
+    list_trailing.push_back(0);
+    check(!chast::parse_session_list_result(list_trailing, got, &error),
+          "SessionListResult with trailing bytes is rejected");
+    check(!chast::parse_session_list_result(std::vector<uint8_t>(), got, &error),
+          "empty SessionListResult is rejected");
+
+    uint32_t session_id = 0;
+    check(chast::parse_session_select_request(
+              payload_of(chast::make_session_select_request(7)), session_id, &error) &&
+              session_id == 7,
+          "SessionSelectRequest round-trips");
+    check(chast::make_session_select_request(0).empty(),
+          "a SessionSelectRequest for session 0 is refused");
+    check(chast::make_session_select_request(0xFFFFFFFFu).empty(),
+          "a SessionSelectRequest for session 0xFFFFFFFF is refused");
+    check(!chast::parse_session_select_request(std::vector<uint8_t>(), session_id, &error),
+          "an empty SessionSelectRequest is rejected");
+    check(!chast::parse_session_select_request(std::vector<uint8_t>(3, 0), session_id,
+                                               &error),
+          "a truncated SessionSelectRequest is rejected");
+    std::vector<uint8_t> select_zero = payload_of(chast::make_session_select_request(7));
+    select_zero[0] = select_zero[1] = select_zero[2] = select_zero[3] = 0;
+    check(!chast::parse_session_select_request(select_zero, session_id, &error),
+          "a SessionSelectRequest for session 0 is rejected");
+    std::vector<uint8_t> select_trailing =
+        payload_of(chast::make_session_select_request(7));
+    select_trailing.push_back(0);
+    check(!chast::parse_session_select_request(select_trailing, session_id, &error),
+          "a SessionSelectRequest with trailing bytes is rejected");
+
+    chast::SessionSelectResult accepted;
+    accepted.session_id = 3;
+    chast::SessionSelectResult select_got;
+    check(chast::parse_session_select_result(
+              payload_of(chast::make_session_select_result(accepted)), select_got, &error) &&
+              select_got.session_id == 3 && select_got.code == chast::SessionSelectCode::Ok &&
+              select_got.reason.empty(),
+          "SessionSelectResult round-trips an acceptance");
+    chast::SessionSelectResult busy;
+    busy.session_id = 4;
+    busy.code = chast::SessionSelectCode::Busy;
+    busy.reason = "another viewer owns the control";
+    check(chast::parse_session_select_result(
+              payload_of(chast::make_session_select_result(busy)), select_got, &error) &&
+              select_got.session_id == 4 && select_got.code == chast::SessionSelectCode::Busy &&
+              select_got.reason == busy.reason,
+          "SessionSelectResult round-trips a refusal with its reason");
+    const std::string long_reason(400, 'x');
+    chast::SessionSelectResult long_select;
+    long_select.session_id = 5;
+    long_select.code = chast::SessionSelectCode::Failed;
+    long_select.reason = long_reason;
+    check(chast::parse_session_select_result(
+              payload_of(chast::make_session_select_result(long_select)), select_got,
+              &error) &&
+              select_got.reason.size() == chast::kMaxSessionReason,
+          "SessionSelectResult truncates an oversized reason to the protocol limit");
+    check(chast::make_session_select_result(chast::SessionSelectResult{}).empty(),
+          "SessionSelectResult with session id 0 is refused");
+    chast::SessionSelectResult bad_code = accepted;
+    bad_code.code = static_cast<chast::SessionSelectCode>(9);
+    check(chast::make_session_select_result(bad_code).empty(),
+          "SessionSelectResult with an unknown code is refused");
+
+    std::vector<uint8_t> select_unknown =
+        payload_of(chast::make_session_select_result(accepted));
+    select_unknown[4] = 9;
+    check(!chast::parse_session_select_result(select_unknown, select_got, &error),
+          "SessionSelectResult with an unknown code is rejected");
+    std::vector<uint8_t> select_bad_id =
+        payload_of(chast::make_session_select_result(accepted));
+    select_bad_id[0] = select_bad_id[1] = select_bad_id[2] = select_bad_id[3] = 0;
+    check(!chast::parse_session_select_result(select_bad_id, select_got, &error),
+          "SessionSelectResult with session id 0 is rejected");
+    std::vector<uint8_t> select_bad_reason =
+        payload_of(chast::make_session_select_result(accepted));
+    // id(4) code(1) reason size(2)
+    select_bad_reason[5] = 1;
+    select_bad_reason[6] = 0;
+    select_bad_reason.push_back(0xFF);
+    check(!chast::parse_session_select_result(select_bad_reason, select_got, &error),
+          "SessionSelectResult with a malformed reason is rejected");
+    std::vector<uint8_t> select_oversized_reason =
+        payload_of(chast::make_session_select_result(accepted));
+    const size_t oversized_size = chast::kMaxSessionReason + 1;
+    select_oversized_reason[5] = static_cast<uint8_t>(oversized_size & 0xFFu);
+    select_oversized_reason[6] = static_cast<uint8_t>(oversized_size >> 8u);
+    select_oversized_reason.resize(select_oversized_reason.size() + oversized_size, 'x');
+    check(!chast::parse_session_select_result(select_oversized_reason, select_got, &error),
+          "SessionSelectResult with an oversized reason is rejected");
+    std::vector<uint8_t> select_extra =
+        payload_of(chast::make_session_select_result(accepted));
+    select_extra.push_back(0);
+    check(!chast::parse_session_select_result(select_extra, select_got, &error),
+          "SessionSelectResult with trailing bytes is rejected");
+    check(!chast::parse_session_select_result(std::vector<uint8_t>(), select_got, &error),
+          "empty SessionSelectResult is rejected");
 }
 
 void test_stream_options() {
@@ -3568,6 +3798,7 @@ int main(int argc, char** argv) {
     test_sas();
     test_host_actions();
     test_os_login();
+    test_session_select();
     test_stream_options();
     test_privacy_mode();
     test_display_switch();

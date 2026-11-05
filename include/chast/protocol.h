@@ -1,6 +1,6 @@
 #pragma once
 
-// The chast wire protocol, version 36.
+// The chast wire protocol, version 40.
 //
 // One QUIC connection carries:
 //
@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 39;
+inline constexpr uint16_t kProtocolVersion = 40;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -347,6 +347,30 @@ enum class ControlType : uint16_t {
     // whether the credentials were accepted is only visible in the desktop
     // state that follows.
     OsLoginResult = 58,
+    // Viewer -> host: ask which Windows sessions this machine can hand the
+    // stream to. No payload. Requires kPermissionSessionSelect; the host
+    // answers SessionListResult. The list is asked for rather than pushed in
+    // HelloAck so a pre-auth peer learns nothing about other sessions.
+    // Protocol v40.
+    SessionListRequest = 59,
+    // Host -> viewer: the answer to SessionListRequest. Payload: code (u8, see
+    // SessionListCode), reason length (u16), UTF-8 reason, count (u16), then
+    // per session id (u32), flags (u8, bit 0 = active, bit 1 = the session the
+    // stream currently runs in) and the UTF-8 user name (u16 length). Only
+    // sessions that are active and have a signed-in user are listed: DXGI
+    // cannot capture a disconnected desktop. A non-Ok answer carries no
+    // entries.
+    SessionListResult = 60,
+    // Viewer -> host: move the stream to another Windows session. Payload:
+    // session id (u32). Requires kPermissionSessionSelect and a fresh list;
+    // the host answers SessionSelectResult and then ends the session so the
+    // service can relaunch its worker in the chosen session. Protocol v40.
+    SessionSelectRequest = 61,
+    // Host -> viewer: the outcome of a SessionSelectRequest. Payload: session
+    // id (u32), code (u8, see SessionSelectCode), reason length (u16), UTF-8
+    // reason. Ok means the host accepted the handoff and is about to end this
+    // session; every other code leaves it running.
+    SessionSelectResult = 62,
 };
 
 // ----- input -----
@@ -841,7 +865,10 @@ inline constexpr uint16_t kServerInfoKnownFlags = kServerInfoPermissionFlags |
 // the BlockInput host action (which also needs input: blocking the local
 // keyboard without remote control would lock the operator out). OS login gates
 // OsLoginRequest and also needs input, because signing in means typing on the
-// secure desktop.
+// secure desktop. Session select gates SessionListRequest and
+// SessionSelectRequest and needs the host's serving backend: the viewer moves
+// the stream between Windows sessions, so the grant is refused when the service
+// that owns the worker is not present.
 enum PermissionBit : uint16_t {
     kPermissionInput = 0x0001,
     kPermissionClipboard = 0x0002,
@@ -862,6 +889,11 @@ enum PermissionBit : uint16_t {
     // Like restart and block input, this bit travels in the mask alone: it has
     // no HelloAck flag of its own.
     kPermissionOsLogin = 0x2000,
+    // v40: list and switch the Windows session the stream is served from. Only
+    // the service backend can honour a switch, so its transport ceiling refuses
+    // the bit when the machine is not running in service mode. Like the bits
+    // above it travels in the mask alone.
+    kPermissionSessionSelect = 0x4000,
 };
 inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboard |
                                            kPermissionAudio | kPermissionFileTransfer |
@@ -869,7 +901,7 @@ inline constexpr uint16_t kPermissionAll = kPermissionInput | kPermissionClipboa
                                            kPermissionPortForward | kPermissionTerminal |
                                            kPermissionRecord | kPermissionCamera |
                                            kPermissionRestart | kPermissionBlockInput |
-                                           kPermissionOsLogin;
+                                           kPermissionOsLogin | kPermissionSessionSelect;
 
 // Informational platform tag in the trust list.
 enum class DevicePlatform : uint8_t {
@@ -1019,6 +1051,11 @@ struct ServerInfo {
     // lock screen. Decoded from the permission mask; the host still checks the
     // desktop state and its live setting for every request.
     bool os_login_enabled = false;
+    // v40: the viewer may list the machine's Windows sessions and move the
+    // stream to another one. Decoded from the permission mask; only a host
+    // running in service mode sets it, and the host re-enumerates the sessions
+    // when a request arrives.
+    bool session_select_enabled = false;
     // v35: audio packets follow on QUIC DATAGRAM frames, not the reliable
     // audio stream. Set only alongside audio.enabled.
     bool audio_datagram = false;
@@ -1593,6 +1630,76 @@ std::vector<uint8_t> make_os_login_result(OsLoginCode code,
                                           const std::string& reason = {});
 bool parse_os_login_result(const std::vector<uint8_t>& payload, OsLoginCode& code,
                            std::string& reason, std::string* error);
+
+// ----- remote sessions (protocol v40) -----
+//
+// A Windows machine can run several sessions at once (the console plus RDP
+// sessions). The service backend always serves one of them; these messages let
+// the viewer list the sessions that are active and signed in, and ask the
+// service to move the stream to another one. The list is deliberately not part
+// of HelloAck: it names other users, so it must not travel before the viewer is
+// authenticated, and it has to be re-read when the viewer asks rather than at
+// handshake time. Selecting a session ends the current connection; the viewer
+// reconnects as usual and reaches the worker in the new session.
+inline constexpr size_t kMaxRemoteSessions = 16;
+inline constexpr size_t kMaxSessionUserBytes = 256;
+inline constexpr size_t kMaxSessionReason = 256;
+
+enum class SessionListCode : uint8_t {
+    Ok = 0,
+    Denied = 1,       // the permission or the host's setting does not allow it
+    Unsupported = 2,  // this host does not run as the service with a switch backend
+    Failed = 3,       // the platform enumeration failed; the reason says why
+};
+
+enum class SessionSelectCode : uint8_t {
+    Ok = 0,           // accepted; this session is ending and the worker restarts
+    NotFound = 1,     // the id is not an active, signed-in session any more
+    Denied = 2,       // the permission or the host's setting does not allow it
+    Unsupported = 3,  // this host does not run as the service with a switch backend
+    Busy = 4,         // another viewer owns the shared desktop's control
+    Failed = 5,       // the switch could not be requested; the reason says why
+};
+
+struct RemoteSession {
+    uint32_t id = 0;
+    // Sign-in name as the machine reports it; empty when Windows exposes none.
+    std::string user;
+    bool active = false;
+    // The session the current stream is served from. Selecting it is a no-op
+    // answered with Ok rather than a handoff.
+    bool current = false;
+};
+
+struct SessionListResult {
+    SessionListCode code = SessionListCode::Ok;
+    std::string reason;
+    std::vector<RemoteSession> sessions;
+};
+
+struct SessionSelectResult {
+    uint32_t session_id = 0;
+    SessionSelectCode code = SessionSelectCode::Ok;
+    std::string reason;
+};
+
+// The makers reject zero and 0xFFFFFFFF session ids, unknown codes, an Ok list
+// with more than kMaxRemoteSessions entries, duplicate ids, malformed or
+// over-long user names, and a non-Ok list with entries. The parsers reject the
+// same cases plus trailing bytes. Reasons are truncated on a UTF-8 boundary by
+// the maker and rejected when malformed or over-long by the parser.
+std::vector<uint8_t> make_session_list_request();
+bool parse_session_list_request(const std::vector<uint8_t>& payload,
+                                std::string* error);
+std::vector<uint8_t> make_session_list_result(const SessionListResult& result);
+bool parse_session_list_result(const std::vector<uint8_t>& payload,
+                               SessionListResult& result, std::string* error);
+std::vector<uint8_t> make_session_select_request(uint32_t session_id);
+bool parse_session_select_request(const std::vector<uint8_t>& payload,
+                                  uint32_t& session_id, std::string* error);
+std::vector<uint8_t> make_session_select_result(const SessionSelectResult& result);
+bool parse_session_select_result(const std::vector<uint8_t>& payload,
+                                 SessionSelectResult& result, std::string* error);
 
 // CursorUpdate payloads. The maker drops an attached sprite that does not
 // match width*height*4 and clamps the size to kMaxCursorSize; callers that

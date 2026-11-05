@@ -274,6 +274,38 @@ const char* os_login_code_name(chast::OsLoginCode code) {
     return "the host refused OS login";
 }
 
+const char* session_list_code_name(chast::SessionListCode code) {
+    switch (code) {
+        case chast::SessionListCode::Ok:
+            return "the session list was read";
+        case chast::SessionListCode::Denied:
+            return "the host denied the session list";
+        case chast::SessionListCode::Unsupported:
+            return "this host cannot list Windows sessions";
+        case chast::SessionListCode::Failed:
+            return "the host could not read the session list";
+    }
+    return "the host refused the session list";
+}
+
+const char* session_select_code_name(chast::SessionSelectCode code) {
+    switch (code) {
+        case chast::SessionSelectCode::Ok:
+            return "the session switch was requested";
+        case chast::SessionSelectCode::NotFound:
+            return "the session is not active any more";
+        case chast::SessionSelectCode::Denied:
+            return "the host denied the session switch";
+        case chast::SessionSelectCode::Unsupported:
+            return "this host cannot switch Windows sessions";
+        case chast::SessionSelectCode::Busy:
+            return "another viewer controls this host";
+        case chast::SessionSelectCode::Failed:
+            return "the host could not switch sessions";
+    }
+    return "the host refused the session switch";
+}
+
 const char* desktop_kind_name(chast::DesktopKind kind) {
     switch (kind) {
         case chast::DesktopKind::Default:
@@ -443,6 +475,12 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
             std::fill(pending_os_login_->begin(), pending_os_login_->end(), '\0');
             pending_os_login_.reset();
         }
+    }
+    // Nor may a session switch target reach a different host.
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        pending_session_list_ = false;
+        pending_session_select_.reset();
     }
     // Port forwarding belongs to one session too; the listener lives on the
     // session thread and goes away with it.
@@ -1312,6 +1350,39 @@ bool ViewerEngine::RequestOsLogin(const std::string& password) {
     return true;
 }
 
+bool ViewerEngine::RequestSessionList() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.session_select_supported) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    pending_session_list_ = true;
+    return true;
+}
+
+bool ViewerEngine::RequestSessionSelect(uint32_t session_id) {
+    if (chast::make_session_select_request(session_id).empty()) {
+        return false;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.session_select_supported) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    pending_session_select_ = session_id;
+    return true;
+}
+
 bool ViewerEngine::SendChat(const std::string& text) {
     if (!chast::valid_chat_text(text)) {
         return false;
@@ -1755,6 +1826,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     int os_login_code = 0;
     std::string os_login_error;
     uint64_t os_login_updates = 0;
+    bool session_select_supported = false;
+    std::vector<chast::RemoteSession> sessions;
+    int session_list_code = 0;
+    std::string session_list_error;
+    uint64_t session_list_updates = 0;
+    uint32_t session_select_id = 0;
+    int session_select_code = 0;
+    std::string session_select_error;
+    uint64_t session_select_updates = 0;
     uint64_t display_switches = 0;
     uint64_t display_switch_failures = 0;
     std::string display_switch_error;
@@ -2041,6 +2121,15 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.os_login_code = os_login_code;
             status_.os_login_error = os_login_error;
             status_.os_login_updates = os_login_updates;
+            status_.session_select_supported = session_select_supported;
+            status_.sessions = sessions;
+            status_.session_list_code = session_list_code;
+            status_.session_list_error = session_list_error;
+            status_.session_list_updates = session_list_updates;
+            status_.session_select_id = session_select_id;
+            status_.session_select_code = session_select_code;
+            status_.session_select_error = session_select_error;
+            status_.session_select_updates = session_select_updates;
             status_.display_switches = display_switches;
             status_.display_switch_failures = display_switch_failures;
             status_.display_switch_error = display_switch_error;
@@ -2463,9 +2552,14 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                 const bool os_login =
                     (mask & (chast::kPermissionInput | chast::kPermissionOsLogin)) ==
                     (chast::kPermissionInput | chast::kPermissionOsLogin);
+                // The session bit is mask-only: the host itself decides when
+                // the service backend can honour a switch.
+                const bool session_select =
+                    (mask & chast::kPermissionSessionSelect) != 0;
                 restart_supported = restart;
                 block_input_supported = block_input;
                 os_login_supported = os_login;
+                session_select_supported = session_select;
                 if (!block_input) {
                     block_input_active = false;
                 }
@@ -2495,6 +2589,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     status_.restart_supported = restart;
                     status_.block_input_supported = block_input;
                     status_.os_login_supported = os_login;
+                    status_.session_select_supported = session_select;
                     if (!block_input) {
                         status_.block_input_active = false;
                     }
@@ -5320,6 +5415,109 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the queued list refresh and switch target. A local
+                // failure (the permission was revoked between the queue and
+                // the send) is reported like the host's answer, so the UI
+                // always gets one.
+                auto drain_session_requests = [&] {
+                    bool list = false;
+                    std::optional<uint32_t> select;
+                    {
+                        std::lock_guard<std::mutex> lock(session_mutex_);
+                        list = pending_session_list_;
+                        pending_session_list_ = false;
+                        select.swap(pending_session_select_);
+                    }
+                    if (list) {
+                        const chast::Error sent = session->request_session_list();
+                        if (!sent.ok()) {
+                            session_list_code =
+                                static_cast<int>(chast::SessionListCode::Failed);
+                            session_list_error = "request: " + sent.to_string();
+                            ++session_list_updates;
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.session_list_code = session_list_code;
+                            status_.session_list_error = session_list_error;
+                            status_.session_list_updates = session_list_updates;
+                            std::fprintf(stderr, "viewer: session list request failed: %s\n",
+                                         sent.to_string().c_str());
+                        }
+                    }
+                    if (select) {
+                        const chast::Error sent = session->request_session_select(*select);
+                        if (!sent.ok()) {
+                            session_select_id = *select;
+                            session_select_code =
+                                static_cast<int>(chast::SessionSelectCode::Failed);
+                            session_select_error = "request: " + sent.to_string();
+                            ++session_select_updates;
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.session_select_id = session_select_id;
+                            status_.session_select_code = session_select_code;
+                            status_.session_select_error = session_select_error;
+                            status_.session_select_updates = session_select_updates;
+                            std::fprintf(stderr, "viewer: session select request failed: %s\n",
+                                         sent.to_string().c_str());
+                        }
+                    }
+                };
+
+                // Adopts every answer. An accepted switch ends this
+                // connection; the caller's reconnect then lands in the target
+                // session.
+                auto receive_session_answers = [&] {
+                    chast::SessionListResult list_result;
+                    while (session->take_session_list_result(list_result)) {
+                        session_list_code = static_cast<int>(list_result.code);
+                        session_list_error =
+                            list_result.code == chast::SessionListCode::Ok
+                                ? std::string()
+                                : (list_result.reason.empty()
+                                       ? session_list_code_name(list_result.code)
+                                       : list_result.reason);
+                        sessions = std::move(list_result.sessions);
+                        ++session_list_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.sessions = sessions;
+                            status_.session_list_code = session_list_code;
+                            status_.session_list_error = session_list_error;
+                            status_.session_list_updates = session_list_updates;
+                        }
+                        std::fprintf(stderr, "viewer: session list %s%s%s (%zu session(s))\n",
+                                     list_result.code == chast::SessionListCode::Ok
+                                         ? "read"
+                                         : "refused",
+                                     session_list_error.empty() ? "" : ": ",
+                                     session_list_error.c_str(), sessions.size());
+                    }
+                    chast::SessionSelectResult select_result;
+                    while (session->take_session_select_result(select_result)) {
+                        session_select_id = select_result.session_id;
+                        session_select_code = static_cast<int>(select_result.code);
+                        session_select_error =
+                            select_result.code == chast::SessionSelectCode::Ok
+                                ? std::string()
+                                : (select_result.reason.empty()
+                                       ? session_select_code_name(select_result.code)
+                                       : select_result.reason);
+                        ++session_select_updates;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.session_select_id = session_select_id;
+                            status_.session_select_code = session_select_code;
+                            status_.session_select_error = session_select_error;
+                            status_.session_select_updates = session_select_updates;
+                        }
+                        std::fprintf(stderr, "viewer: session select %s%s%s\n",
+                                     select_result.code == chast::SessionSelectCode::Ok
+                                         ? "accepted"
+                                         : "refused",
+                                     session_select_error.empty() ? "" : ": ",
+                                     session_select_error.c_str());
+                    }
+                };
+
                 // Chat is ungated: an admitted session is the authorization.
                 // Text goes into the UI queue; the status only carries counts,
                 // so a 4 KiB line never inflates the poll.
@@ -6603,6 +6801,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_host_action();
                     drain_os_login();
                     receive_os_login();
+                    drain_session_requests();
+                    receive_session_answers();
                     receive_chat();
                     drain_chat();
                     drain_text();
@@ -6712,6 +6912,8 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_host_action();
                     drain_os_login();
                     receive_os_login();
+                    drain_session_requests();
+                    receive_session_answers();
                     receive_chat();
                     drain_chat();
                     drain_text();

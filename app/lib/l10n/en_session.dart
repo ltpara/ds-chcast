@@ -503,4 +503,29 @@ const Map<String, String> kEnglishSession = <String, String>{
   '系统登录未能排队：请确认主机权限与会话状态':
       'The OS login could not be queued: check the host permissions and session state',
   '无法发送登录密码': 'Cannot send the password',
+  '切换主机的 Windows 会话': 'Switch the host Windows session',
+  '服务端未开放会话切换': 'The host has not enabled session switching',
+  '正在读取主机会话…': 'Reading the host sessions…',
+  '读取会话列表失败：{detail}': 'Could not read the session list: {detail}',
+  '主机上没有可切换的已登录会话。':
+      'The host has no other signed-in session to switch to.',
+  '当前会话': 'Current session',
+  '切换到该会话会结束当前连接，并在目标会话继续。':
+      'Switching ends this connection and continues in the target session.',
+  '正在切换到会话 {id}…': 'Switching to session {id}…',
+  '切换会话失败：{detail}': 'Session switch failed: {detail}',
+  '会话列表未能排队：请确认主机权限与会话状态':
+      'The session list could not be queued: check the host permissions and session state',
+  '无法读取主机会话': 'Cannot read the host sessions',
+  '主机未授权读取会话列表': 'The host did not authorize reading its session list',
+  '主机不支持读取 Windows 会话':
+      'The host does not support reading Windows sessions',
+  '主机无法读取会话列表': 'The host could not read its session list',
+  '主机拒绝了会话列表': 'The host refused the session list',
+  '目标会话已不活跃': 'The target session is no longer active',
+  '主机未授权会话切换': 'The host did not authorize session switching',
+  '主机不支持切换 Windows 会话':
+      'The host does not support switching Windows sessions',
+  '主机无法切换会话': 'The host could not switch sessions',
+  '主机拒绝了会话切换': 'The host refused the session switch',
 };

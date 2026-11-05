@@ -156,6 +156,13 @@ struct HostServerStats {
     // the ones not answered Ok. The password itself is never kept here.
     uint64_t os_login_requests = 0;
     uint64_t os_login_failures = 0;
+    // Session select (protocol v40): list and select requests handled, and the
+    // accepted handoffs. A selection of the current session is answered Ok
+    // without counting as a switch.
+    uint64_t session_list_requests = 0;
+    uint64_t session_select_requests = 0;
+    uint64_t session_switches = 0;
+    uint64_t session_select_failures = 0;
     // Near-end frames that passed through echo cancellation and how many times
     // its adaptive filter restarted (playback start/stop or endpoint reopen).
     uint64_t audio_dsp_frames = 0;
@@ -391,6 +398,18 @@ struct HostServerConfig {
     // injector. Returning false fills the reason and reports Failed. The
     // password must never be logged or written anywhere by this callback.
     std::function<bool(const std::string& password, std::string*)> os_login;
+    // Enumerates the Windows sessions the viewer can move the stream to. Only
+    // active sessions with a signed-in user are valid targets, and `current`
+    // marks the session this process runs in. Empty means the host cannot
+    // switch: HelloAck withholds kPermissionSessionSelect and every request is
+    // answered Unsupported. Returning false fills the reason and reports
+    // Failed.
+    std::function<bool(std::vector<RemoteSession>& sessions, std::string*)> list_sessions;
+    // Asks the serving backend to move the worker to `session_id`. The host has
+    // already re-validated the id against list_sessions and the control lease.
+    // Returning false fills the reason and reports Failed; true means the
+    // session is ending and the worker restarts in the target.
+    std::function<bool(uint32_t session_id, std::string*)> select_session;
 };
 
 class HostServer {
@@ -546,6 +565,12 @@ private:
     // soon as it has been handed over and is never logged.
     bool handle_os_login_requests(HostServerStats& stats, std::string* error,
                                   bool* peer_left);
+    // Answers every pending SessionListRequest/SessionSelectRequest. The
+    // permission, the control lease and the host setting are checked here, and
+    // the session list is re-enumerated for every request so a stale id is
+    // refused instead of switching into a session that is gone.
+    bool handle_session_requests(HostServerStats& stats, std::string* error,
+                                 bool* peer_left);
     // Releases local input blocking if this session owns it. `notify` answers
     // an unsolicited denial, used when the permission is revoked mid-session;
     // the session-end guard passes false because the connection is going away.

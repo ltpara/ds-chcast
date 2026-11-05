@@ -137,6 +137,12 @@ struct HostSettings {
     // it at all. Also needs input control, and the host still refuses it
     // unless a sign-in or lock screen is actually current.
     bool allow_os_login = false;
+    // Let the viewer list this machine's Windows sessions and move the stream
+    // to another one (share-RDP style). Off by default: the list names other
+    // signed-in users, and a switch moves the stream into their session. Only a
+    // host running in service mode can honour it, and every request is still
+    // checked against this setting and the control lease.
+    bool allow_session_select = false;
     HostAuthMode auth_mode = HostAuthMode::Both;
     // Legacy mirror of auth_mode: true unless the mode is Password. The mode
     // is authoritative; this stays so older builds and callers keep working.

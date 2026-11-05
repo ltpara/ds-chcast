@@ -891,6 +891,9 @@ std::vector<uint8_t> build_server_info(const ServerInfo& info) {
     if (info.os_login_enabled) {
         permissions |= kPermissionOsLogin;
     }
+    if (info.session_select_enabled) {
+        permissions |= kPermissionSessionSelect;
+    }
     put_u16(cursor, permissions);
     return payload;
 }
@@ -1102,14 +1105,14 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
         set_error(error, "HelloAck grants unknown permissions");
         return false;
     }
-    // Restart, block input and OS login have no flag of their own (their bits
-    // collide with the files-only and datagram-audio flags, or have no flag
-    // left), so they live in the mask alone; every other permission must still
-    // match its flag.
+    // Restart, block input, OS login and session select have no flag of their
+    // own (their bits collide with the files-only and datagram-audio flags, or
+    // have no flag left), so they live in the mask alone; every other
+    // permission must still match its flag.
     if (permissions !=
         ((flags & kServerInfoPermissionFlags) |
-         (permissions &
-          (kPermissionRestart | kPermissionBlockInput | kPermissionOsLogin)))) {
+         (permissions & (kPermissionRestart | kPermissionBlockInput |
+                         kPermissionOsLogin | kPermissionSessionSelect)))) {
         set_error(error, "HelloAck permission mask disagrees with its flags");
         return false;
     }
@@ -1155,6 +1158,7 @@ bool parse_hello_ack(const std::vector<uint8_t>& payload, ServerInfo& info, std:
     info.restart_enabled = (permissions & kPermissionRestart) != 0;
     info.block_input_enabled = (permissions & kPermissionBlockInput) != 0;
     info.os_login_enabled = (permissions & kPermissionOsLogin) != 0;
+    info.session_select_enabled = (permissions & kPermissionSessionSelect) != 0;
     if (!reader.at_end()) {
         set_error(error, "HelloAck carries trailing bytes");
         return false;
@@ -2479,6 +2483,235 @@ bool parse_os_login_result(const std::vector<uint8_t>& payload, OsLoginCode& cod
     }
     if (!reason.empty() && !valid_utf8(reason)) {
         set_error(error, "OsLoginResult carries a malformed reason");
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+bool valid_session_id(uint32_t id) {
+    return id != 0 && id != 0xFFFFFFFFu;
+}
+
+bool valid_session_list_code(SessionListCode code) {
+    return code == SessionListCode::Ok || code == SessionListCode::Denied ||
+           code == SessionListCode::Unsupported || code == SessionListCode::Failed;
+}
+
+bool valid_session_select_code(SessionSelectCode code) {
+    return code == SessionSelectCode::Ok || code == SessionSelectCode::NotFound ||
+           code == SessionSelectCode::Denied || code == SessionSelectCode::Unsupported ||
+           code == SessionSelectCode::Busy || code == SessionSelectCode::Failed;
+}
+
+bool valid_session_flags(uint8_t flags) {
+    return (flags & ~3u) == 0;
+}
+
+}  // namespace
+
+std::vector<uint8_t> make_session_list_request() {
+    return make_control(ControlType::SessionListRequest, {});
+}
+
+bool parse_session_list_request(const std::vector<uint8_t>& payload, std::string* error) {
+    if (!payload.empty()) {
+        set_error(error, "SessionListRequest carries a payload");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_session_list_result(const SessionListResult& result) {
+    if (!valid_session_list_code(result.code)) {
+        return {};
+    }
+    if (result.code != SessionListCode::Ok && !result.sessions.empty()) {
+        return {};
+    }
+    if (result.sessions.size() > kMaxRemoteSessions) {
+        return {};
+    }
+    const std::string reason = truncate_utf8_reason(result.reason, kMaxSessionReason);
+    std::vector<uint8_t> payload(3 + reason.size() + 2);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+        cursor += reason.size();
+    }
+    put_u16(cursor, static_cast<uint16_t>(result.sessions.size()));
+    std::vector<uint32_t> ids;
+    ids.reserve(result.sessions.size());
+    for (const RemoteSession& session : result.sessions) {
+        if (!valid_session_id(session.id) || session.user.size() > kMaxSessionUserBytes ||
+            !valid_utf8(session.user)) {
+            return {};
+        }
+        for (const uint32_t id : ids) {
+            if (id == session.id) {
+                return {};
+            }
+        }
+        ids.push_back(session.id);
+        const size_t entry = 4 + 1 + 2 + session.user.size();
+        payload.resize(payload.size() + entry);
+        cursor = payload.data() + payload.size() - entry;
+        put_u32(cursor, session.id);
+        put_u8(cursor, static_cast<uint8_t>((session.active ? 1u : 0u) |
+                                            (session.current ? 2u : 0u)));
+        put_u16(cursor, static_cast<uint16_t>(session.user.size()));
+        std::memcpy(cursor, session.user.data(), session.user.size());
+    }
+    return make_control(ControlType::SessionListResult, payload);
+}
+
+bool parse_session_list_result(const std::vector<uint8_t>& payload,
+                               SessionListResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    uint16_t count = 0;
+    result = SessionListResult{};
+    if (!reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(result.reason, reason_size) || !reader.u16(count)) {
+        set_error(error, "malformed SessionListResult");
+        return false;
+    }
+    result.code = static_cast<SessionListCode>(raw_code);
+    if (!valid_session_list_code(result.code)) {
+        set_error(error, "SessionListResult carries an unknown code");
+        return false;
+    }
+    if (result.reason.size() > kMaxSessionReason) {
+        set_error(error, "SessionListResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "SessionListResult carries a malformed reason");
+        return false;
+    }
+    if (count > kMaxRemoteSessions) {
+        set_error(error, "SessionListResult lists too many sessions");
+        return false;
+    }
+    if (result.code != SessionListCode::Ok && count != 0) {
+        set_error(error, "SessionListResult lists sessions in a non-Ok answer");
+        return false;
+    }
+    std::vector<uint32_t> ids;
+    for (uint16_t i = 0; i < count; ++i) {
+        RemoteSession session;
+        uint8_t flags = 0;
+        uint16_t user_size = 0;
+        if (!reader.u32(session.id) || !reader.u8(flags) || !reader.u16(user_size) ||
+            !reader.string(session.user, user_size)) {
+            set_error(error, "truncated SessionListResult entry");
+            return false;
+        }
+        if (!valid_session_id(session.id)) {
+            set_error(error, "SessionListResult carries an invalid session id");
+            return false;
+        }
+        if (!valid_session_flags(flags)) {
+            set_error(error, "SessionListResult carries unknown session flags");
+            return false;
+        }
+        if (session.user.size() > kMaxSessionUserBytes) {
+            set_error(error, "SessionListResult user name is too long");
+            return false;
+        }
+        if (!session.user.empty() && !valid_utf8(session.user)) {
+            set_error(error, "SessionListResult carries a malformed user name");
+            return false;
+        }
+        for (const uint32_t id : ids) {
+            if (id == session.id) {
+                set_error(error, "SessionListResult repeats a session id");
+                return false;
+            }
+        }
+        ids.push_back(session.id);
+        session.active = (flags & 1u) != 0;
+        session.current = (flags & 2u) != 0;
+        result.sessions.push_back(std::move(session));
+    }
+    if (!reader.at_end()) {
+        set_error(error, "SessionListResult carries trailing bytes");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_session_select_request(uint32_t session_id) {
+    if (!valid_session_id(session_id)) {
+        return {};
+    }
+    std::vector<uint8_t> payload(4);
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, session_id);
+    return make_control(ControlType::SessionSelectRequest, payload);
+}
+
+bool parse_session_select_request(const std::vector<uint8_t>& payload,
+                                  uint32_t& session_id, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u32(session_id) || !reader.at_end()) {
+        set_error(error, "malformed SessionSelectRequest");
+        return false;
+    }
+    if (!valid_session_id(session_id)) {
+        set_error(error, "SessionSelectRequest carries an invalid session id");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_session_select_result(const SessionSelectResult& result) {
+    if (!valid_session_id(result.session_id) || !valid_session_select_code(result.code)) {
+        return {};
+    }
+    const std::string reason = truncate_utf8_reason(result.reason, kMaxSessionReason);
+    std::vector<uint8_t> payload(7 + reason.size());
+    uint8_t* cursor = payload.data();
+    put_u32(cursor, result.session_id);
+    put_u8(cursor, static_cast<uint8_t>(result.code));
+    put_u16(cursor, static_cast<uint16_t>(reason.size()));
+    if (!reason.empty()) {
+        std::memcpy(cursor, reason.data(), reason.size());
+    }
+    return make_control(ControlType::SessionSelectResult, payload);
+}
+
+bool parse_session_select_result(const std::vector<uint8_t>& payload,
+                                 SessionSelectResult& result, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    result = SessionSelectResult{};
+    if (!reader.u32(result.session_id) || !reader.u8(raw_code) ||
+        !reader.u16(reason_size) || !reader.string(result.reason, reason_size) ||
+        !reader.at_end()) {
+        set_error(error, "malformed SessionSelectResult");
+        return false;
+    }
+    if (!valid_session_id(result.session_id)) {
+        set_error(error, "SessionSelectResult carries an invalid session id");
+        return false;
+    }
+    result.code = static_cast<SessionSelectCode>(raw_code);
+    if (!valid_session_select_code(result.code)) {
+        set_error(error, "SessionSelectResult carries an unknown code");
+        return false;
+    }
+    if (result.reason.size() > kMaxSessionReason) {
+        set_error(error, "SessionSelectResult reason is too long");
+        return false;
+    }
+    if (!result.reason.empty() && !valid_utf8(result.reason)) {
+        set_error(error, "SessionSelectResult carries a malformed reason");
         return false;
     }
     return true;

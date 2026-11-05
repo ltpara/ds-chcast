@@ -436,6 +436,21 @@ struct ViewerStatus {
     int os_login_code = 0;
     std::string os_login_error;
     uint64_t os_login_updates = 0;
+    // Windows session select (protocol v40). The viewer asks for the list on
+    // demand; `sessions` is the newest answer, `session_list_code` its
+    // SessionListCode (0 = Ok) and `session_list_updates` pairs an answer with
+    // one poll. A switch is answered for `session_select_id` with
+    // `session_select_code` (0 = Ok); an accepted switch ends this connection
+    // and the reconnected viewer is served from the target session.
+    bool session_select_supported = false;
+    std::vector<chast::RemoteSession> sessions;
+    int session_list_code = 0;
+    std::string session_list_error;
+    uint64_t session_list_updates = 0;
+    uint32_t session_select_id = 0;
+    int session_select_code = 0;
+    std::string session_select_error;
+    uint64_t session_select_updates = 0;
     // Session chat. Both directions are ungated once the host admits the
     // viewer. `chat_error` explains a queued line that the transport then
     // failed to send; inbound text is taken through TakeChat() so the status
@@ -850,6 +865,19 @@ public:
     // arrives through ViewerStatus::os_login_*.
     bool RequestOsLogin(const std::string& password);
 
+    // Queues a request for the host's active Windows sessions. Returns false
+    // when the session is not streaming or the host did not grant
+    // kPermissionSessionSelect. The answer arrives through
+    // ViewerStatus::sessions/session_list_code/session_list_error, and
+    // session_list_updates pairs one answer with one poll.
+    bool RequestSessionList();
+    // Queues a switch to the given Windows session. Returns false when the
+    // session is not streaming, the permission is missing or the id is out of
+    // range. The answer arrives through ViewerStatus::session_select_*; an
+    // accepted switch ends this connection, so the caller reconnects and is
+    // served from the target session.
+    bool RequestSessionSelect(uint32_t session_id);
+
     // Queues one UTF-8 chat line for the host. Returns false for empty or
     // oversized text, when no session is streaming, or when the outgoing queue
     // is full. Host lines are popped one at a time through TakeChat().
@@ -991,6 +1019,12 @@ private:
     // ends and right after the request leaves the queue.
     mutable std::mutex os_login_mutex_;
     std::optional<std::string> pending_os_login_;
+    // Session list/select requests: one list refresh and the newest switch
+    // target. Both slots are cleared when the session ends, so a request can
+    // never fire into the next host.
+    mutable std::mutex session_mutex_;
+    bool pending_session_list_ = false;
+    std::optional<uint32_t> pending_session_select_;
 
     // The port-forward target crosses to the session thread here. One slot is
     // enough: the operator picks a target, and a newer pick replaces an

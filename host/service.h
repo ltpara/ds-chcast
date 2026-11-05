@@ -16,6 +16,16 @@ inline constexpr wchar_t kServiceName[] = L"chast-host";
 // Global namespace is required because the service lives in session 0 and the
 // worker in the console session.
 inline constexpr wchar_t kWorkerStopEvent[] = L"Global\\chast-service-worker-stop";
+// Named by the worker after it wrote a session-switch request; the service
+// reads the request, stops the worker and relaunches it in the chosen session.
+// The request file is %ProgramData%\chast\session-switch and carries only a
+// session id: no credential ever travels over this channel.
+inline constexpr wchar_t kWorkerSwitchEvent[] = L"Global\\chast-service-worker-switch";
+
+// The single-id request file the worker writes before signalling
+// kWorkerSwitchEvent. Defined here because both processes must derive the same
+// path from the machine settings location.
+std::wstring session_switch_path();
 
 bool service_installed();
 // True while the service is starting, running or stopping: the tray must not

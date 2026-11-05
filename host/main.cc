@@ -101,6 +101,7 @@ enum ControlId {
     kRestartCheck,
     kBlockInputCheck,
     kOsLoginCheck,
+    kSessionSelectCheck,
     kCarrierCheck,
     kAutostartCheck,
     kSecurityButton,
@@ -886,6 +887,9 @@ std::wstring permission_label(uint16_t mask) {
     if ((mask & kPermissionOsLogin) != 0) {
         add(tr(L"系统登录"));
     }
+    if ((mask & kPermissionSessionSelect) != 0) {
+        add(tr(L"会话切换"));
+    }
     return text.empty() ? tr(L"只看") : text;
 }
 
@@ -906,7 +910,10 @@ uint16_t current_gate_mask() {
                                  (g_app->settings.allow_restart ? kPermissionRestart : 0) |
                                  (g_app->settings.allow_block_input ? kPermissionBlockInput
                                                                     : 0) |
-                                 (g_app->settings.allow_os_login ? kPermissionOsLogin : 0));
+                                 (g_app->settings.allow_os_login ? kPermissionOsLogin : 0) |
+                                 (g_app->settings.allow_session_select
+                                      ? kPermissionSessionSelect
+                                      : 0));
 }
 
 std::wstring security_summary_text(const HostStatus& status) {
@@ -1778,6 +1785,7 @@ enum SecurityDialogId {
     kSecAllowRestart,
     kSecAllowBlockInput,
     kSecAllowOsLogin,
+    kSecAllowSessionSelect,
     kSecAllowChange,
     kSecTokenAuth,
     kSecOneTime,
@@ -1824,6 +1832,7 @@ struct SecurityDialogState {
     HWND allow_restart = nullptr;
     HWND allow_block_input = nullptr;
     HWND allow_os_login = nullptr;
+    HWND allow_session_select = nullptr;
     HWND allow_audio = nullptr;
     HWND allow_microphone = nullptr;
     HWND allow_privacy = nullptr;
@@ -2053,6 +2062,7 @@ bool accept_security_dialog(SecurityDialogState& dialog) {
     updated.allow_restart = is_checked(dialog.allow_restart);
     updated.allow_block_input = is_checked(dialog.allow_block_input);
     updated.allow_os_login = is_checked(dialog.allow_os_login);
+    updated.allow_session_select = is_checked(dialog.allow_session_select);
     updated.allow_audio = is_checked(dialog.allow_audio);
     updated.allow_microphone = is_checked(dialog.allow_microphone);
     updated.allow_privacy_mode = is_checked(dialog.allow_privacy);
@@ -2622,6 +2632,15 @@ bool edit_security_settings(HostSettings& result) {
     add(L"STATIC", tr(L"留空跟随系统默认；固定设备不可用时系统声音不会启动。"), SS_LEFT, 0, 32,
         414, page_text_width, 20, 0, nullptr, &dialog.advanced_page);
 
+    const wchar_t* allow_session_select_text = tr(L"允许切换 Windows 会话（仅服务模式）");
+    dialog.allow_session_select =
+        add(L"BUTTON", allow_session_select_text, BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 450,
+            std::max(360, check_px(allow_session_select_text)), 24, kSecAllowSessionSelect,
+            nullptr, &dialog.advanced_page);
+    add(L"STATIC",
+        tr(L"查看器可列出并切换到本机其他已登录的 Windows 会话；手工运行主机时该项不会生效。"),
+        SS_LEFT, 0, 32, 478, page_text_width, 36, 0, nullptr, &dialog.advanced_page);
+
     const int sec_cancel_left = dialog_width - 20 - 90;
     add(L"BUTTON", tr(L"保存"), BS_DEFPUSHBUTTON | WS_TABSTOP, 0, sec_cancel_left - 10 - 90, 606,
         90, 32, kSecSave, nullptr, nullptr);
@@ -2647,6 +2666,7 @@ bool edit_security_settings(HostSettings& result) {
     set_check(dialog.allow_restart, settings.allow_restart);
     set_check(dialog.allow_block_input, settings.allow_block_input);
     set_check(dialog.allow_os_login, settings.allow_os_login);
+    set_check(dialog.allow_session_select, settings.allow_session_select);
     set_check(dialog.allow_audio, settings.allow_audio);
     set_check(dialog.allow_microphone, settings.allow_microphone);
     set_check(dialog.allow_privacy, settings.allow_privacy_mode);
@@ -2799,6 +2819,9 @@ void show_tray_menu() {
                 kBlockInputCheck, tr(L"允许查看者阻止本地输入"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.allow_os_login ? MF_CHECKED : 0),
                 kOsLoginCheck, tr(L"允许查看者进行系统登录（输入密码）"));
+    AppendMenuW(menu,
+                MF_STRING | (g_app->settings.allow_session_select ? MF_CHECKED : 0),
+                kSessionSelectCheck, tr(L"允许查看者切换 Windows 会话（仅服务模式）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.carrier ? MF_CHECKED : 0), kCarrierCheck,
                 tr(L"弱网回退（TCP/WebSocket）"));
     AppendMenuW(menu, MF_STRING | (g_app->settings.autostart ? MF_CHECKED : 0), kAutostartCheck,
@@ -3154,6 +3177,18 @@ void handle_command(int id) {
                 append_log_line(g_app->settings.allow_os_login ? tr(L"已允许系统登录")
                                                                : tr(L"已撤回系统登录权限"));
             }
+            break;
+        }
+        case kSessionSelectCheck: {
+            g_app->settings.allow_session_select = !g_app->settings.allow_session_select;
+            save_settings();
+            // A manual host has no service switch channel, so the worker never
+            // advertises the permission; the setting only takes effect under
+            // the service. Restarting is enough for the next handshake.
+            restart_server();
+            append_log_line(g_app->settings.allow_session_select
+                                ? tr(L"已允许切换 Windows 会话（仅在服务模式下生效）")
+                                : tr(L"已撤回切换 Windows 会话权限"));
             break;
         }
         case kCarrierCheck:

@@ -8,6 +8,7 @@
 #include "service.h"
 
 #include <windows.h>
+#include <wtsapi32.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,6 +19,7 @@
 
 #include "chast/host_server.h"
 #include "chast/identity.h"
+#include "platform.h"
 #include "service_log.h"
 #include "tunnel.h"
 
@@ -123,6 +125,122 @@ void log_tunnel_event(const TunnelEvent& event) {
     }
 }
 
+// Lists the sessions a viewer may switch to. Only WTSActive sessions with a
+// user are returned: DXGI has no desktop to capture in a disconnected session,
+// and the name is what the viewer shows. `current` marks this worker's own
+// session so the UI can leave it out of the switch choices.
+bool list_active_sessions(std::vector<RemoteSession>& sessions, std::string* error) {
+    PWTS_SESSION_INFOW entries = nullptr;
+    DWORD count = 0;
+    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &entries, &count)) {
+        *error = "cannot enumerate the Windows sessions (error " +
+                 std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    DWORD current = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &current);
+    sessions.clear();
+    for (DWORD i = 0; i < count && sessions.size() < kMaxRemoteSessions; ++i) {
+        const WTS_SESSION_INFOW& entry = entries[i];
+        if (entry.SessionId == 0 || entry.SessionId == 0xFFFFFFFF) {
+            continue;
+        }
+        if (entry.State != WTSActive) {
+            continue;
+        }
+        LPWSTR name = nullptr;
+        DWORD bytes = 0;
+        if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, entry.SessionId,
+                                         WTSUserName, &name, &bytes)) {
+            continue;
+        }
+        std::string user = name != nullptr ? narrow(name) : std::string();
+        WTSFreeMemory(name);
+        RemoteSession session;
+        session.id = entry.SessionId;
+        session.user = std::move(user);
+        session.active = true;
+        session.current = entry.SessionId == current;
+        sessions.push_back(std::move(session));
+    }
+    WTSFreeMemory(entries);
+    return true;
+}
+
+// Re-validates the target, writes the id-only switch request and wakes the
+// service. The file is replaced atomically and the event is signalled only
+// after the write, so the service never reads a partial id.
+bool request_session_switch(uint32_t session_id, std::string* error) {
+    std::vector<RemoteSession> sessions;
+    std::string list_error;
+    if (!list_active_sessions(sessions, &list_error)) {
+        *error = list_error;
+        return false;
+    }
+    const RemoteSession* target = nullptr;
+    for (const RemoteSession& entry : sessions) {
+        if (entry.id == session_id) {
+            target = &entry;
+            break;
+        }
+    }
+    if (target == nullptr) {
+        *error = "the session is not active any more";
+        return false;
+    }
+    if (target->current) {
+        return true;
+    }
+    HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kWorkerSwitchEvent);
+    if (event == nullptr) {
+        *error = "the service session switch channel is unavailable";
+        return false;
+    }
+    const std::wstring path = session_switch_path();
+    if (path.empty()) {
+        CloseHandle(event);
+        *error = "the machine settings path is unavailable";
+        return false;
+    }
+    std::wstring temporary = path;
+    temporary += L".tmp";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        CloseHandle(event);
+        *error = "cannot write the session switch request (error " +
+                 std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    const std::string text = std::to_string(session_id);
+    DWORD written = 0;
+    const BOOL wrote = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written,
+                                 nullptr);
+    CloseHandle(file);
+    if (!wrote || written != static_cast<DWORD>(text.size())) {
+        DeleteFileW(temporary.c_str());
+        CloseHandle(event);
+        *error = "cannot write the session switch request";
+        return false;
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        CloseHandle(event);
+        *error = "cannot publish the session switch request (error " +
+                 std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    const BOOL signalled = SetEvent(event);
+    CloseHandle(event);
+    if (!signalled) {
+        *error = "the service could not be signalled for the session switch";
+        return false;
+    }
+    worker_log("session switch requested: session " + std::to_string(session_id));
+    return true;
+}
+
 bool start_tunnel(TunnelProcess& tunnel, const HostSettings& settings,
                   const std::string& fingerprint, std::atomic<bool>& ended,
                   std::atomic<uint32_t>& exit_code) {
@@ -209,6 +327,21 @@ int run_worker(std::string* error) {
     config.token_changed = save_rotated_token;
     config.trusted_devices_changed = save_trusted_devices;
     config.password_hash_changed = save_password_hash;
+
+    // Only a worker started by the service can hand the stream to another
+    // session; a manual run must not advertise a switch it cannot perform.
+    HANDLE switch_probe = OpenEventW(EVENT_MODIFY_STATE, FALSE, kWorkerSwitchEvent);
+    const bool service_backend = switch_probe != nullptr;
+    if (switch_probe != nullptr) {
+        CloseHandle(switch_probe);
+    }
+    if (service_backend) {
+        config.list_sessions = list_active_sessions;
+        config.select_session = request_session_switch;
+    } else if (settings.allow_session_select) {
+        worker_log("session_select is enabled but no service switch channel is present; "
+                   "the permission is withheld");
+    }
 
     std::string create_error;
     std::unique_ptr<HostServer> server = HostServer::create(std::move(config), &create_error);

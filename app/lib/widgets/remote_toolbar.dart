@@ -57,6 +57,8 @@ class RemoteToolbar extends StatelessWidget {
     required this.privacyEnabled,
     this.osLoginAvailable = false,
     this.onOsLogin,
+    this.sessionSelectAvailable = false,
+    this.onSessionSelect,
     required this.portForwardAvailable,
     required this.portForwardActive,
     required this.onOpenPortForward,
@@ -154,6 +156,11 @@ class RemoteToolbar extends StatelessWidget {
   /// lock screen, which is why the button stays available at other desktops.
   final bool osLoginAvailable;
   final VoidCallback? onOsLogin;
+
+  /// The host's service backend lets the viewer list and switch the Windows
+  /// session it streams from. The page owns the picker and the requests.
+  final bool sessionSelectAvailable;
+  final VoidCallback? onSessionSelect;
   final bool restartAvailable;
   final bool lockAvailable;
   final bool blockInputAvailable;
@@ -642,6 +649,14 @@ class RemoteToolbar extends StatelessWidget {
                     : tr('服务端未开放系统登录'),
                 disabled: !osLoginAvailable,
                 onTap: onOsLogin,
+              ),
+              _BarButton(
+                icon: Icons.swap_horiz_rounded,
+                tooltip: sessionSelectAvailable
+                    ? tr('切换主机的 Windows 会话')
+                    : tr('服务端未开放会话切换'),
+                disabled: !sessionSelectAvailable,
+                onTap: onSessionSelect,
               ),
               _HostPowerButton(
                 restartAvailable: restartAvailable,

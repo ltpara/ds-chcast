@@ -393,6 +393,38 @@ const char* os_login_code_name(OsLoginCode code) {
     return "unknown";
 }
 
+const char* session_list_code_name(SessionListCode code) {
+    switch (code) {
+        case SessionListCode::Ok:
+            return "ok";
+        case SessionListCode::Denied:
+            return "denied";
+        case SessionListCode::Unsupported:
+            return "unsupported";
+        case SessionListCode::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
+const char* session_select_code_name(SessionSelectCode code) {
+    switch (code) {
+        case SessionSelectCode::Ok:
+            return "ok";
+        case SessionSelectCode::NotFound:
+            return "not found";
+        case SessionSelectCode::Denied:
+            return "denied";
+        case SessionSelectCode::Unsupported:
+            return "unsupported";
+        case SessionSelectCode::Busy:
+            return "busy";
+        case SessionSelectCode::Failed:
+            return "failed";
+    }
+    return "unknown";
+}
+
 uint16_t settings_permissions(const HostSettings& settings) {
     uint16_t mask = 0;
     if (settings.allow_input) {
@@ -433,6 +465,9 @@ uint16_t settings_permissions(const HostSettings& settings) {
     }
     if (settings.allow_os_login) {
         mask |= kPermissionOsLogin;
+    }
+    if (settings.allow_session_select) {
+        mask |= kPermissionSessionSelect;
     }
     return mask;
 }
@@ -529,6 +564,7 @@ ServerInfo describe_stream(const std::vector<DisplayInfo>& attached,
     info.microphone_enabled = (permissions & kPermissionMicrophone) != 0;
     info.file_transfer_enabled = (permissions & kPermissionFileTransfer) != 0;
     info.privacy_mode_enabled = (permissions & kPermissionPrivacyMode) != 0;
+    info.session_select_enabled = (permissions & kPermissionSessionSelect) != 0;
     info.audio = audio;
     info.encoder = encoder.implementation().empty() ? "oneVPL" : encoder.implementation();
     const std::vector<DisplayInfo> listed =
@@ -601,6 +637,9 @@ std::string permission_names(uint16_t mask) {
     }
     if ((mask & kPermissionOsLogin) != 0) {
         add("OS login");
+    }
+    if ((mask & kPermissionSessionSelect) != 0) {
+        add("session select");
     }
     return text.empty() ? "view only" : text;
 }
@@ -893,6 +932,11 @@ bool HostServer::open_session(std::string* error) {
     quic.allow_restart = settings_.allow_restart;
     quic.allow_block_input = settings_.allow_block_input;
     quic.allow_os_login = settings_.allow_os_login;
+    // Only the service backend can move the worker; a tray host or a worker
+    // started by hand advertises nothing and refuses every request.
+    quic.allow_session_select = settings_.allow_session_select && config_.service_mode &&
+                                static_cast<bool>(config_.list_sessions) &&
+                                static_cast<bool>(config_.select_session);
     quic.allow_audio = settings_.allow_audio;
     quic.allow_microphone = settings_.allow_microphone;
     quic.allow_privacy_mode = settings_.allow_privacy_mode;
@@ -990,6 +1034,11 @@ HostSecurity::Config HostServer::security_config(const std::string& fingerprint)
         }
     }
     config.default_permissions = settings_permissions(settings_);
+    // A viewer must not be told about a switch this process cannot perform.
+    if (!config_.service_mode || !config_.list_sessions || !config_.select_session) {
+        config.default_permissions &=
+            ~static_cast<uint16_t>(kPermissionSessionSelect);
+    }
     config.allow_permission_change = settings_.allow_permission_change;
     config.ip_whitelist = settings_.ip_whitelist;
     config.service_mode = config_.service_mode;
@@ -1024,7 +1073,8 @@ ClientAuthResult HostServer::authenticate_client(const ClientRequest& request) {
             // refuses host actions, so drop those grants here instead of
             // advertising controls that would only be denied.
             auth.permissions &= ~static_cast<uint16_t>(
-                kPermissionInput | kPermissionRestart | kPermissionBlockInput);
+                kPermissionInput | kPermissionRestart | kPermissionBlockInput |
+                kPermissionSessionSelect);
         } else if (settings_.allow_input && (auth.permissions & kPermissionInput) != 0) {
             if (!registry_->acquire_control(this)) {
                 auth.permissions &= ~static_cast<uint16_t>(kPermissionInput);
@@ -2832,6 +2882,8 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         stream_info.terminal_enabled = (now_mask & kPermissionTerminal) != 0;
         stream_info.record_enabled = (now_mask & kPermissionRecord) != 0;
         stream_info.camera_enabled = (now_mask & kPermissionCamera) != 0;
+        stream_info.session_select_enabled =
+            (now_mask & kPermissionSessionSelect) != 0;
         // A viewer that was denied audio at approval has no AAC config yet,
         // so a fresh description is what makes a restore usable.
         stream_info.audio.enabled =
@@ -4267,6 +4319,11 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             return clean;
         }
         if (!handle_os_login_requests(stats, error, peer_left)) {
+            const bool clean = error->empty();
+            drain_peer(stats);
+            return clean;
+        }
+        if (!handle_session_requests(stats, error, peer_left)) {
             const bool clean = error->empty();
             drain_peer(stats);
             return clean;
@@ -5974,6 +6031,44 @@ bool HostServer::file_session(HostServerStats& stats, std::string* error, bool* 
             }
             log("OS login refused: file-transfer sessions cannot type at the logon screen");
         }
+        while (session_->take_session_list_request()) {
+            ++stats.session_list_requests;
+            SessionListResult denied;
+            denied.code = SessionListCode::Unsupported;
+            denied.reason = "session select is not available in a file-transfer session";
+            const Error sent = session_->send_session_list_result(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "session_list_result: " + sent.to_string();
+                return false;
+            }
+            log("session list refused: file-transfer sessions cannot switch sessions");
+        }
+        uint32_t select_id = 0;
+        while (session_->take_session_select_request(select_id)) {
+            ++stats.session_select_requests;
+            SessionSelectResult denied;
+            denied.session_id = select_id;
+            denied.code = SessionSelectCode::Unsupported;
+            denied.reason = "session select is not available in a file-transfer session";
+            const Error sent = session_->send_session_select_result(denied);
+            if (!sent.ok()) {
+                if (sent.status() == Status::Unavailable ||
+                    sent.status() == Status::WaitTimeout) {
+                    *peer_left = true;
+                    return true;
+                }
+                ++stats.send_errors;
+                *error = "session_select_result: " + sent.to_string();
+                return false;
+            }
+            log("session select refused: file-transfer sessions cannot switch sessions");
+        }
         poll_files(stats);
         if (session_->viewer_finished()) {
             return true;
@@ -6829,6 +6924,139 @@ bool HostServer::handle_os_login_requests(HostServerStats& stats, std::string* e
             *error = "os_login_result: " + sent.to_string();
         }
         return false;
+    }
+    return true;
+}
+
+bool HostServer::handle_session_requests(HostServerStats& stats, std::string* error,
+                                         bool* peer_left) {
+    while (session_->take_session_list_request()) {
+        ++stats.session_list_requests;
+        SessionListResult result;
+        const uint16_t permissions = session_->permissions();
+        if ((permissions & kPermissionSessionSelect) == 0) {
+            result.code = SessionListCode::Denied;
+            result.reason = "session select is not permitted by the host";
+        } else if (!settings_.allow_session_select) {
+            result.code = SessionListCode::Denied;
+            result.reason = "the host does not allow session select";
+        } else if (!config_.list_sessions || !config_.select_session) {
+            result.code = SessionListCode::Unsupported;
+            result.reason = "this host cannot switch Windows sessions";
+        } else {
+            std::string list_error;
+            if (!config_.list_sessions(result.sessions, &list_error)) {
+                result.code = SessionListCode::Failed;
+                result.reason =
+                    list_error.empty() ? "the session list could not be read" : list_error;
+            }
+        }
+        if (result.code == SessionListCode::Ok) {
+            log("session list sent: " + std::to_string(result.sessions.size()) +
+                " active session(s)");
+        } else {
+            log(std::string("session list refused (") +
+                session_list_code_name(result.code) +
+                "): " + (result.reason.empty() ? "no reason given" : result.reason));
+        }
+        const Error sent = session_->send_session_list_result(result);
+        if (!sent.ok()) {
+            if (sent.status() == Status::Unavailable ||
+                sent.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "session_list_result: " + sent.to_string();
+            }
+            return false;
+        }
+        publish_stats(stats);
+    }
+
+    uint32_t select_id = 0;
+    while (session_->take_session_select_request(select_id)) {
+        ++stats.session_select_requests;
+        SessionSelectResult result;
+        result.session_id = select_id;
+        bool accepted = false;
+        bool current = false;
+        auto refuse = [&result](SessionSelectCode code, std::string why) {
+            result.code = code;
+            result.reason = std::move(why);
+        };
+        const uint16_t permissions = session_->permissions();
+        if ((permissions & kPermissionSessionSelect) == 0) {
+            refuse(SessionSelectCode::Denied, "session select is not permitted by the host");
+        } else if (!settings_.allow_session_select) {
+            refuse(SessionSelectCode::Denied, "the host does not allow session select");
+        } else if (!config_.list_sessions || !config_.select_session) {
+            refuse(SessionSelectCode::Unsupported,
+                   "this host cannot switch Windows sessions");
+        } else if (registry_ && !registry_->may_change_host_state(this)) {
+            refuse(SessionSelectCode::Busy, "another viewer controls this host");
+        } else {
+            std::vector<RemoteSession> sessions;
+            std::string list_error;
+            if (!config_.list_sessions(sessions, &list_error)) {
+                refuse(SessionSelectCode::Failed,
+                       list_error.empty() ? "the session list could not be read"
+                                          : list_error);
+            } else {
+                const RemoteSession* target = nullptr;
+                for (const RemoteSession& entry : sessions) {
+                    if (entry.id == select_id) {
+                        target = &entry;
+                        break;
+                    }
+                }
+                if (target == nullptr) {
+                    refuse(SessionSelectCode::NotFound,
+                           "the session is not active any more");
+                } else if (target->current) {
+                    accepted = true;
+                    current = true;
+                } else if (!config_.select_session(select_id, &result.reason)) {
+                    if (result.reason.empty()) {
+                        result.reason = "the session switch could not be requested";
+                    }
+                    result.code = SessionSelectCode::Failed;
+                } else {
+                    accepted = true;
+                }
+            }
+        }
+        if (accepted) {
+            result.code = SessionSelectCode::Ok;
+            result.reason.clear();
+            if (!current) {
+                ++stats.session_switches;
+                log("session switch accepted: session " + std::to_string(select_id));
+            }
+        } else {
+            ++stats.session_select_failures;
+            log(std::string("session select refused (") +
+                session_select_code_name(result.code) +
+                "): " + (result.reason.empty() ? "no reason given" : result.reason));
+        }
+        const Error sent = session_->send_session_select_result(result);
+        if (!sent.ok()) {
+            if (sent.status() == Status::Unavailable ||
+                sent.status() == Status::WaitTimeout) {
+                *peer_left = true;
+            } else {
+                ++stats.send_errors;
+                *error = "session_select_result: " + sent.to_string();
+            }
+            return false;
+        }
+        publish_stats(stats);
+        if (accepted && !current) {
+            // The answer is queued on the control stream; the backend now
+            // stops this worker and restarts it in the target session, so the
+            // frame loop must not start another frame.
+            stopping_.store(true);
+            break;
+        }
     }
     return true;
 }

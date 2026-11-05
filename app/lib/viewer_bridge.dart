@@ -253,6 +253,39 @@ class ViewerDisplayMode {
   }
 }
 
+/// One Windows session the host can hand the stream to (protocol v40).
+/// [id] is the WTS session id the switch request sends back; only active
+/// sessions with a logged-on user are listed, and [current] marks the session
+/// that is being streamed now.
+class ViewerRemoteSession {
+  const ViewerRemoteSession({
+    required this.id,
+    required this.user,
+    this.active = true,
+    this.current = false,
+  });
+
+  final int id;
+  final String user;
+  final bool active;
+  final bool current;
+
+  String get label => user.isEmpty ? 'Session $id' : '$user · Session $id';
+
+  static ViewerRemoteSession? fromMap(Map<Object?, Object?> map) {
+    final int id = (map['id'] as num?)?.toInt() ?? 0;
+    if (id <= 0 || id >= 0xFFFFFFFF) {
+      return null;
+    }
+    return ViewerRemoteSession(
+      id: id,
+      user: (map['user'] as String?) ?? '',
+      active: map['active'] == true,
+      current: map['current'] == true,
+    );
+  }
+}
+
 /// One active capture endpoint the host machine exposes as a microphone
 /// source. [id] is the WASAPI endpoint id the picker sends back.
 class ViewerMicrophoneDevice {
@@ -481,6 +514,15 @@ class ViewerStatus {
     this.osLoginCode = 0,
     this.osLoginError = '',
     this.osLoginUpdates = 0,
+    this.sessionSelectSupported = false,
+    this.sessions = const <ViewerRemoteSession>[],
+    this.sessionListCode = 0,
+    this.sessionListError = '',
+    this.sessionListUpdates = 0,
+    this.sessionSelectId = 0,
+    this.sessionSelectCode = 0,
+    this.sessionSelectError = '',
+    this.sessionSelectUpdates = 0,
     this.chatSent = 0,
     this.chatReceived = 0,
     this.chatFailures = 0,
@@ -904,6 +946,24 @@ class ViewerStatus {
   final String osLoginError;
   final int osLoginUpdates;
 
+  /// Windows session select (protocol v40). [sessionSelectSupported] mirrors
+  /// the host's mask-only permission, which only its service backend grants.
+  /// [sessions] is the newest list answer: [sessionListCode] is its
+  /// [ViewerSessionListCode] (0 = Ok), [sessionListError] its reason and
+  /// [sessionListUpdates] pairs an answer with one poll. A switch is answered
+  /// for [sessionSelectId] with [sessionSelectCode] (0 = Ok, a
+  /// [ViewerSessionSelectCode]) and its reason; an accepted switch ends the
+  /// connection, so the page reconnects and lands in the target session.
+  final bool sessionSelectSupported;
+  final List<ViewerRemoteSession> sessions;
+  final int sessionListCode;
+  final String sessionListError;
+  final int sessionListUpdates;
+  final int sessionSelectId;
+  final int sessionSelectCode;
+  final String sessionSelectError;
+  final int sessionSelectUpdates;
+
   /// Session chat counters. Both directions are ungated once the host admits
   /// the viewer. [chatFailures] counts queued lines the transport failed to
   /// send, with [chatError] explaining the most recent one. Inbound text is
@@ -1077,6 +1137,9 @@ class ViewerStatus {
   // OS login needs both the explicit bit and input; the host refuses it
   // outside a logon or lock screen even when the menu is enabled.
   bool get acceptsOsLogin => isLive && osLoginSupported;
+  // Session select is mask-only: only the host's service backend grants the
+  // bit, so a tray host never shows the switch menu.
+  bool get acceptsSessionSelect => isLive && sessionSelectSupported;
   // The port-forward dialog needs a live session and the host's forward bit.
   bool get acceptsPortForward =>
       isLive && (permissions & ViewerPermission.portForward) != 0;
@@ -1185,6 +1248,18 @@ class ViewerStatus {
           final ViewerDisplayMode? mode = ViewerDisplayMode.fromMap(entry);
           if (mode != null) {
             displayModes.add(mode);
+          }
+        }
+      }
+    }
+    final List<ViewerRemoteSession> sessions = <ViewerRemoteSession>[];
+    final Object? rawSessions = map['sessions'];
+    if (rawSessions is List) {
+      for (final Object? entry in rawSessions) {
+        if (entry is Map) {
+          final ViewerRemoteSession? session = ViewerRemoteSession.fromMap(entry);
+          if (session != null) {
+            sessions.add(session);
           }
         }
       }
@@ -1361,6 +1436,15 @@ class ViewerStatus {
       osLoginCode: asInt(map['osLoginCode']),
       osLoginError: asString(map['osLoginError']),
       osLoginUpdates: asInt(map['osLoginUpdates']),
+      sessionSelectSupported: map['sessionSelectSupported'] == true,
+      sessions: List<ViewerRemoteSession>.unmodifiable(sessions),
+      sessionListCode: asInt(map['sessionListCode']),
+      sessionListError: asString(map['sessionListError']),
+      sessionListUpdates: asInt(map['sessionListUpdates']),
+      sessionSelectId: asInt(map['sessionSelectId']),
+      sessionSelectCode: asInt(map['sessionSelectCode']),
+      sessionSelectError: asString(map['sessionSelectError']),
+      sessionSelectUpdates: asInt(map['sessionSelectUpdates']),
       chatSent: asInt(map['chatSent']),
       chatReceived: asInt(map['chatReceived']),
       chatFailures: asInt(map['chatFailures']),
@@ -1722,6 +1806,31 @@ class ViewerBridge {
   static Future<bool> requestOsLogin(String password) async {
     final bool? queued =
         await _channel.invokeMethod<bool>('requestOsLogin', password);
+    return queued ?? false;
+  }
+
+  /// Asks the host for its active Windows sessions. False means it was not
+  /// queued: no live session, or the host did not grant
+  /// [ViewerPermission.sessionSelect] (only its service backend does). The
+  /// answer arrives in [ViewerStatus.sessions] /
+  /// [ViewerStatus.sessionListCode], counted by
+  /// [ViewerStatus.sessionListUpdates].
+  static Future<bool> requestSessionList() async {
+    final bool? queued = await _channel.invokeMethod<bool>('requestSessionList');
+    return queued ?? false;
+  }
+
+  /// Asks the host to move the stream to Windows session [id]. False means it
+  /// was not queued: no live session, view-only access, or the host did not
+  /// grant [ViewerPermission.sessionSelect]. The answer arrives in
+  /// [ViewerStatus.sessionSelectCode] / [ViewerStatus.sessionSelectError],
+  /// counted by [ViewerStatus.sessionSelectUpdates]. An accepted switch ends
+  /// this connection, so the caller reconnects and lands in the target.
+  static Future<bool> requestSessionSelect(int id) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'requestSessionSelect',
+      <String, Object>{'id': id},
+    );
     return queued ?? false;
   }
 
@@ -2347,6 +2456,33 @@ abstract final class ViewerPermission {
   // The host lets the viewer type its OS password at a logon or lock screen.
   // The host also requires [input] and re-checks its desktop per request.
   static const int osLogin = 0x2000;
+  // The host can list and switch the Windows session it streams from. Only
+  // the service backend grants the bit; a tray host never sends it.
+  static const int sessionSelect = 0x4000;
+}
+
+/// Why a session list was not returned (chast::SessionListCode).
+enum ViewerSessionListCode {
+  ok(0),
+  denied(1),
+  unsupported(2),
+  failed(3);
+
+  const ViewerSessionListCode(this.code);
+  final int code;
+}
+
+/// Why a session switch was not performed (chast::SessionSelectCode).
+enum ViewerSessionSelectCode {
+  ok(0),
+  notFound(1),
+  denied(2),
+  unsupported(3),
+  busy(4),
+  failed(5);
+
+  const ViewerSessionSelectCode(this.code);
+  final int code;
 }
 
 /// Why Ctrl+Alt+Del did not reach the host's secure desktop

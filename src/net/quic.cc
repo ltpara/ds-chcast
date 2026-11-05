@@ -664,6 +664,22 @@ struct QuicSession::Impl {
     OsLoginCode os_login_code = OsLoginCode::Ok;
     std::string os_login_reason;
     uint64_t os_login_results_seen = 0;
+    // Server: a session list request is pending, and the newest select request
+    // waiting for the host loop. A list is coalesced because only the current
+    // session set matters; a select replaces an older one because the viewer
+    // can only be heading to one session.
+    bool session_list_request_pending = false;
+    uint64_t session_list_requests_seen = 0;
+    bool session_select_request_ready = false;
+    uint32_t session_select_request_id = 0;
+    uint64_t session_select_requests_seen = 0;
+    // Client: the newest session list and select answers.
+    bool session_list_result_ready = false;
+    SessionListResult session_list_result;
+    uint64_t session_list_results_seen = 0;
+    bool session_select_result_ready = false;
+    SessionSelectResult session_select_result;
+    uint64_t session_select_results_seen = 0;
     // Server: the newest SetStreamOptions request. Client: the newest answer,
     // carrying the effective settings even when the request was refused.
     bool stream_options_request_ready = false;
@@ -3360,6 +3376,76 @@ struct QuicSession::Impl {
                 cv.notify_all();
                 break;
             }
+            case ControlType::SessionListRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                if (!parse_session_list_request(payload, &error)) {
+                    control_protocol_failure("SessionListRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_list_request_pending = true;
+                    ++session_list_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SessionListResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                SessionListResult result;
+                if (!parse_session_list_result(payload, result, &error)) {
+                    control_protocol_failure("SessionListResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_list_result = std::move(result);
+                    session_list_result_ready = true;
+                    ++session_list_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SessionSelectRequest: {
+                if (role != Role::Server) {
+                    break;
+                }
+                uint32_t session_id = 0;
+                if (!parse_session_select_request(payload, session_id, &error)) {
+                    control_protocol_failure("SessionSelectRequest: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_select_request_id = session_id;
+                    session_select_request_ready = true;
+                    ++session_select_requests_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SessionSelectResult: {
+                if (role != Role::Client) {
+                    break;
+                }
+                SessionSelectResult result;
+                if (!parse_session_select_result(payload, result, &error)) {
+                    control_protocol_failure("SessionSelectResult: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    session_select_result = std::move(result);
+                    session_select_result_ready = true;
+                    ++session_select_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
             case ControlType::SetStreamOptions: {
                 if (role != Role::Server) {
                     break;
@@ -4571,6 +4657,17 @@ struct QuicSession::Impl {
             os_login_code = OsLoginCode::Ok;
             os_login_reason.clear();
             os_login_results_seen = 0;
+            session_list_request_pending = false;
+            session_list_requests_seen = 0;
+            session_select_request_ready = false;
+            session_select_request_id = 0;
+            session_select_requests_seen = 0;
+            session_list_result_ready = false;
+            session_list_result = SessionListResult{};
+            session_list_results_seen = 0;
+            session_select_result_ready = false;
+            session_select_result = SessionSelectResult{};
+            session_select_results_seen = 0;
             stream_options_request_ready = false;
             stream_options_request = StreamOptions{};
             stream_options_requests_seen = 0;
@@ -4689,6 +4786,9 @@ struct QuicSession::Impl {
         }
         if (server_config.allow_os_login) {
             mask |= kPermissionOsLogin;
+        }
+        if (server_config.allow_session_select) {
+            mask |= kPermissionSessionSelect;
         }
         return mask;
     }
@@ -5480,6 +5580,7 @@ Error QuicSession::announce(const ServerInfo& info) {
     ack.restart_enabled = (granted & kPermissionRestart) != 0;
     ack.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     ack.os_login_enabled = (granted & kPermissionOsLogin) != 0;
+    ack.session_select_enabled = (granted & kPermissionSessionSelect) != 0;
     ack.audio.enabled = ack.audio.enabled && (granted & kPermissionAudio) != 0;
     if (!ack.audio.enabled) {
         ack.audio.extradata.clear();
@@ -5611,6 +5712,7 @@ Error QuicSession::refresh_stream(const ServerInfo& info) {
     update.restart_enabled = (granted & kPermissionRestart) != 0;
     update.block_input_enabled = (granted & kPermissionBlockInput) != 0;
     update.os_login_enabled = (granted & kPermissionOsLogin) != 0;
+    update.session_select_enabled = (granted & kPermissionSessionSelect) != 0;
     bool audio_stream_open = false;
     {
         std::lock_guard<std::mutex> lock(impl.mutex);
@@ -6061,6 +6163,134 @@ bool QuicSession::take_os_login_result(OsLoginCode& code, std::string& reason) {
 uint64_t QuicSession::os_login_results() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->os_login_results_seen;
+}
+
+bool QuicSession::take_session_list_request() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->session_list_request_pending) {
+        return false;
+    }
+    impl_->session_list_request_pending = false;
+    return true;
+}
+
+uint64_t QuicSession::session_list_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session_list_requests_seen;
+}
+
+Error QuicSession::send_session_list_result(const SessionListResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_session_list_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    const std::vector<uint8_t> payload = make_session_list_result(result);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "session list result is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_session_select_request(uint32_t& session_id) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->session_select_request_ready) {
+        return false;
+    }
+    session_id = impl_->session_select_request_id;
+    impl_->session_select_request_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::session_select_requests() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session_select_requests_seen;
+}
+
+Error QuicSession::send_session_select_result(const SessionSelectResult& result) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_session_select_result is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    const std::vector<uint8_t> payload = make_session_select_result(result);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "session select result is invalid");
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+Error QuicSession::request_session_list() {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_session_list is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionSessionSelect) == 0) {
+            return Error(Status::PermissionDenied, "session select is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_session_list_request(),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_session_list_result(SessionListResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->session_list_result_ready) {
+        return false;
+    }
+    result = std::move(impl_->session_list_result);
+    impl_->session_list_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::session_list_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session_list_results_seen;
+}
+
+Error QuicSession::request_session_select(uint32_t session_id) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_session_select is a client operation");
+    }
+    const std::vector<uint8_t> payload = make_session_select_request(session_id);
+    if (payload.empty()) {
+        return Error(Status::InvalidCall, "the session id is invalid");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionSessionSelect) == 0) {
+            return Error(Status::PermissionDenied, "session select is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), payload, QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_session_select_result(SessionSelectResult& result) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->session_select_result_ready) {
+        return false;
+    }
+    result = impl_->session_select_result;
+    impl_->session_select_result_ready = false;
+    return true;
+}
+
+uint64_t QuicSession::session_select_results() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session_select_results_seen;
 }
 
 bool QuicSession::take_stream_options_request(StreamOptions& options) {

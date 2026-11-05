@@ -714,6 +714,34 @@ void ViewerBridge::HandleMethodCall(
         map[key("osLoginError")] = flutter::EncodableValue(status.os_login_error);
         map[key("osLoginUpdates")] =
             flutter::EncodableValue(static_cast<int64_t>(status.os_login_updates));
+        map[key("sessionSelectSupported")] =
+            flutter::EncodableValue(status.session_select_supported);
+        map[key("sessionListCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.session_list_code));
+        map[key("sessionListError")] = flutter::EncodableValue(status.session_list_error);
+        map[key("sessionListUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.session_list_updates));
+        map[key("sessionSelectId")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.session_select_id));
+        map[key("sessionSelectCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.session_select_code));
+        map[key("sessionSelectError")] =
+            flutter::EncodableValue(status.session_select_error);
+        map[key("sessionSelectUpdates")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.session_select_updates));
+        {
+            flutter::EncodableList sessions;
+            for (const chast::RemoteSession& session : status.sessions) {
+                flutter::EncodableMap entry;
+                entry[key("id")] =
+                    flutter::EncodableValue(static_cast<int32_t>(session.id));
+                entry[key("user")] = flutter::EncodableValue(session.user);
+                entry[key("active")] = flutter::EncodableValue(session.active);
+                entry[key("current")] = flutter::EncodableValue(session.current);
+                sessions.push_back(flutter::EncodableValue(std::move(entry)));
+            }
+            map[key("sessions")] = flutter::EncodableValue(std::move(sessions));
+        }
         map[key("chatSent")] =
             flutter::EncodableValue(static_cast<int64_t>(status.chat_sent));
         map[key("chatReceived")] =
@@ -1395,6 +1423,27 @@ void ViewerBridge::HandleMethodCall(
             return;
         }
         const bool queued = viewer_ != nullptr && viewer_->RequestOsLogin(*password);
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "requestSessionList") {
+        const bool queued = viewer_ != nullptr && viewer_->RequestSessionList();
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "requestSessionSelect") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t id = 0;
+        if (args == nullptr || !map_int(*args, "id", &id) || id <= 0 ||
+            id >= 0xFFFFFFFFLL) {
+            result->Error("bad_args", "requestSessionSelect wants a session id");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr &&
+            viewer_->RequestSessionSelect(static_cast<uint32_t>(id));
         result->Success(flutter::EncodableValue(queued));
         return;
     }

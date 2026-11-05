@@ -541,6 +541,10 @@ HostSettingsLoad load_host_settings(const std::string& path) {
             if (!parse_bool(value, settings.allow_os_login)) {
                 warn(result.warning, "os_login '" + value + "' is not a boolean");
             }
+        } else if (key == "session_select") {
+            if (!parse_bool(value, settings.allow_session_select)) {
+                warn(result.warning, "session_select '" + value + "' is not a boolean");
+            }
         } else if (key == "audio_device") {
             if (value.size() > 1024) {
                 warn(result.warning, "audio_device is too long; using the default output");
@@ -793,9 +797,9 @@ HostSettingsLoad load_host_settings(const std::string& path) {
         settings.allow_terminal = (permissions_mask & kPermissionTerminal) != 0;
         settings.allow_privacy_mode = (permissions_mask & kPermissionPrivacyMode) != 0;
         // The mask is authoritative for every gate it predates, but not for
-        // record, camera, restart or block input: older builds never wrote
-        // those bits, and the explicit lines (which save always emits
-        // alongside the mask) decide them.
+        // record, camera, restart, block input, OS login or session select:
+        // older builds never wrote those bits, and the explicit lines (which
+        // save always emits alongside the mask) decide them.
     }
     return result;
 }
@@ -824,7 +828,8 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
         (settings.allow_record ? kPermissionRecord : 0) |
         (settings.allow_restart ? kPermissionRestart : 0) |
         (settings.allow_block_input ? kPermissionBlockInput : 0) |
-        (settings.allow_os_login ? kPermissionOsLogin : 0);
+        (settings.allow_os_login ? kPermissionOsLogin : 0) |
+        (settings.allow_session_select ? kPermissionSessionSelect : 0);
     std::ostringstream text;
     text << "# chast host settings\n"
          << "bind=" << settings.bind_address << "\n"
@@ -858,6 +863,7 @@ bool save_host_settings(const std::string& path, const HostSettings& settings,
          << "restart=" << (settings.allow_restart ? 1 : 0) << "\n"
          << "block_input=" << (settings.allow_block_input ? 1 : 0) << "\n"
          << "os_login=" << (settings.allow_os_login ? 1 : 0) << "\n"
+         << "session_select=" << (settings.allow_session_select ? 1 : 0) << "\n"
          << "approve=" << (settings.auth_mode == HostAuthMode::Password ? 0 : 1) << "\n"
          << "token_mode="
          << (settings.token_mode == HostTokenMode::Reusable ? "reusable" : "one_time") << "\n"

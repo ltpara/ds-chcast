@@ -193,6 +193,11 @@ struct QuicServerConfig {
     // host still checks the desktop state for every request, so an unlocked
     // desktop or a UAC prompt refuses it even with this on.
     bool allow_os_login = false;
+    // Accept SessionListRequest/SessionSelectRequest and grant
+    // kPermissionSessionSelect. Off by default: the list names other signed-in
+    // users and a selection moves the stream to another Windows session. The
+    // host only sets this in service mode, where a backend can actually switch.
+    bool allow_session_select = false;
     // Accept set_permissions() during a session. Off freezes the grant made
     // at approval time; the operator can then only end the session.
     bool allow_permission_change = true;
@@ -550,6 +555,26 @@ public:
     // Answers an OsLoginRequest. Ok only when the password was handed to the
     // injector while the logon or lock screen was current.
     Error send_os_login_result(OsLoginCode code, const std::string& reason = {});
+    // Pops the pending SessionListRequest, coalesced: only the newest request
+    // matters, and the host enumerates the sessions when it drains it. The
+    // host checks the permission, its setting and the backend, then answers
+    // send_session_list_result().
+    bool take_session_list_request();
+    // Number of SessionListRequests received. Observation hook for tools and
+    // the host's own counters.
+    uint64_t session_list_requests() const;
+    // Answers a SessionListRequest. A non-Ok code must carry no sessions; the
+    // maker drops them if the caller passes some.
+    Error send_session_list_result(const SessionListResult& result);
+    // Pops the pending SessionSelectRequest. A newer request replaces an older
+    // one: the viewer can only be heading to one session. The host answers
+    // every taken request with send_session_select_result().
+    bool take_session_select_request(uint32_t& session_id);
+    // Number of SessionSelectRequests received. Observation hook for tools.
+    uint64_t session_select_requests() const;
+    // Answers a SessionSelectRequest. Ok means the host accepted the handoff
+    // and is ending this session so the worker can restart in the target.
+    Error send_session_select_result(const SessionSelectResult& result);
     // Releases anything the viewer still holds, then types the password and
     // Return through the server's input injector. The injection thread checks
     // the input desktop before applying, but the caller must still confirm the
@@ -727,6 +752,24 @@ public:
     bool take_os_login_result(OsLoginCode& code, std::string& reason);
     // Total OS-login answers received. Observation hook for tools.
     uint64_t os_login_results() const;
+    // Asks the host which Windows sessions the stream can move to. Requires
+    // the handshake and kPermissionSessionSelect; the answer arrives through
+    // take_session_list_result().
+    Error request_session_list();
+    // Pops the newest session list answer. A refusal carries the host's
+    // UTF-8 reason and no sessions.
+    bool take_session_list_result(SessionListResult& result);
+    // Total session list answers received. Observation hook for tools.
+    uint64_t session_list_results() const;
+    // Asks the host to move the stream to another Windows session. Requires
+    // the handshake and kPermissionSessionSelect; an Ok answer means this
+    // session is about to end, so the caller should wait for the disconnect
+    // and reconnect. The answer arrives through take_session_select_result().
+    Error request_session_select(uint32_t session_id);
+    // Pops the newest session select answer.
+    bool take_session_select_result(SessionSelectResult& result);
+    // Total session select answers received. Observation hook for tools.
+    uint64_t session_select_results() const;
     // Asks the host to change this session's video preferences (encoder,
     // frame-rate ceiling and quality preset). The host can only lower its own
     // budget; the answer arrives through take_stream_options_result(). No

@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -25,9 +26,14 @@ SERVICE_STATUS g_status{};
 HANDLE g_service_stop = nullptr;
 HANDLE g_session_wake = nullptr;
 HANDLE g_worker_stop = nullptr;
+HANDLE g_worker_switch = nullptr;
 HANDLE g_job = nullptr;
 HANDLE g_worker_process = nullptr;
 DWORD g_worker_session = 0;
+// A viewer-selected session outranks the console while it stays active. It is
+// cleared when the session goes away, so the service falls back to the console
+// without any operator action.
+DWORD g_selected_session = 0;
 std::string g_log_path;
 
 bool is_elevated() {
@@ -187,6 +193,63 @@ bool session_has_user(DWORD session) {
     const bool has_user = name != nullptr && name[0] != L'\0';
     WTSFreeMemory(name);
     return has_user;
+}
+
+// DXGI cannot capture a disconnected desktop, so a session is only a valid
+// switch target while Windows reports it active.
+bool session_is_active(DWORD session) {
+    WTS_CONNECTSTATE_CLASS* state = nullptr;
+    DWORD bytes = 0;
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session,
+                                     WTSConnectState,
+                                     reinterpret_cast<LPWSTR*>(&state), &bytes)) {
+        return false;
+    }
+    const bool active = state != nullptr && *state == WTSActive;
+    WTSFreeMemory(state);
+    return active;
+}
+
+// Reads and removes the worker's switch request. The file carries only a
+// decimal session id; anything malformed is dropped, and deleting it before
+// acting means a stale request can never redirect a later worker.
+bool take_session_switch_request(DWORD& session) {
+    const std::wstring path = session_switch_path();
+    if (path.empty()) {
+        return false;
+    }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    char buffer[32] = {};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
+    CloseHandle(file);
+    DeleteFileW(path.c_str());
+    if (!ok || read == 0) {
+        return false;
+    }
+    uint32_t value = 0;
+    for (DWORD i = 0; i < read; ++i) {
+        const char ch = buffer[i];
+        if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') {
+            continue;
+        }
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<uint32_t>(ch - '0');
+        if (value > 0xFFFFFFFEu) {
+            return false;
+        }
+    }
+    if (value == 0) {
+        return false;
+    }
+    session = value;
+    return true;
 }
 
 std::wstring worker_command_line() {
@@ -351,6 +414,10 @@ void service_main(DWORD argc, LPWSTR* argv) {
     g_service_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_session_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_worker_stop = CreateEventW(nullptr, TRUE, FALSE, kWorkerStopEvent);
+    g_worker_switch = CreateEventW(nullptr, FALSE, FALSE, kWorkerSwitchEvent);
+    // A request left by a crashed worker must not redirect this run's first
+    // worker; the worker rewrites the file before every signal.
+    (void)DeleteFileW(session_switch_path().c_str());
     g_job = CreateJobObjectW(nullptr, nullptr);
     if (g_job != nullptr) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -363,7 +430,8 @@ void service_main(DWORD argc, LPWSTR* argv) {
     } else {
         log_line(g_log_path, "cannot create the service job: " + std::to_string(GetLastError()));
     }
-    if (g_service_stop == nullptr || g_session_wake == nullptr || g_worker_stop == nullptr) {
+    if (g_service_stop == nullptr || g_session_wake == nullptr || g_worker_stop == nullptr ||
+        g_worker_switch == nullptr) {
         log_line(g_log_path, "cannot create service events: " + std::to_string(GetLastError()));
         report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
         return;
@@ -382,8 +450,45 @@ void service_main(DWORD argc, LPWSTR* argv) {
         if (WaitForSingleObject(g_service_stop, 0) == WAIT_OBJECT_0) {
             break;
         }
-        const DWORD session = WTSGetActiveConsoleSessionId();
-        const bool logged_in = session != 0xFFFFFFFF && session_has_user(session);
+        const auto now = std::chrono::steady_clock::now();
+        DWORD requested_session = 0;
+        if (take_session_switch_request(requested_session)) {
+            if (requested_session == g_worker_session) {
+                log_line(g_log_path, "session switch ignored: the worker already runs in session " +
+                                         std::to_string(requested_session));
+            } else if (!session_is_active(requested_session) ||
+                       !session_has_user(requested_session)) {
+                log_line(g_log_path, "session switch refused: session " +
+                                         std::to_string(requested_session) +
+                                         " is not active");
+            } else {
+                log_line(g_log_path, "session switch requested: session " +
+                                         std::to_string(requested_session));
+                g_selected_session = requested_session;
+                if (g_worker_process != nullptr) {
+                    stop_worker();
+                    retry_at = now;
+                }
+            }
+        }
+
+        const DWORD console_session = WTSGetActiveConsoleSessionId();
+        DWORD session = console_session;
+        bool logged_in = console_session != 0xFFFFFFFF && session_has_user(console_session);
+        if (g_selected_session != 0) {
+            if (session_is_active(g_selected_session) &&
+                session_has_user(g_selected_session)) {
+                // A viewer-chosen session outranks the console until it goes
+                // away; then the next pass falls back to the console.
+                session = g_selected_session;
+                logged_in = true;
+            } else {
+                log_line(g_log_path, "selected session " +
+                                         std::to_string(g_selected_session) +
+                                         " is no longer active; following the console session");
+                g_selected_session = 0;
+            }
+        }
 
         if (g_worker_process != nullptr) {
             if (!logged_in || session != g_worker_session) {
@@ -401,17 +506,17 @@ void service_main(DWORD argc, LPWSTR* argv) {
             }
         }
 
-        const auto now = std::chrono::steady_clock::now();
-        if (g_worker_process == nullptr && logged_in && now >= retry_at) {
+        if (g_worker_process == nullptr && logged_in &&
+            std::chrono::steady_clock::now() >= retry_at) {
             std::string error;
             if (!start_worker(session, &error)) {
                 log_line(g_log_path, error);
-                retry_at = now + std::chrono::seconds(10);
+                retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             }
         }
 
-        HANDLE waits[2] = {g_service_stop, g_session_wake};
-        WaitForMultipleObjects(2, waits, FALSE, 1000);
+        HANDLE waits[3] = {g_service_stop, g_session_wake, g_worker_switch};
+        WaitForMultipleObjects(3, waits, FALSE, 1000);
     }
 
     stop_worker();
@@ -422,14 +527,26 @@ void service_main(DWORD argc, LPWSTR* argv) {
     CloseHandle(g_service_stop);
     CloseHandle(g_session_wake);
     CloseHandle(g_worker_stop);
+    CloseHandle(g_worker_switch);
     g_service_stop = nullptr;
     g_session_wake = nullptr;
     g_worker_stop = nullptr;
+    g_worker_switch = nullptr;
     log_line(g_log_path, "service stopped");
     report_status(SERVICE_STOPPED);
 }
 
 }  // namespace
+
+std::wstring session_switch_path() {
+    const std::string settings = machine_settings_path();
+    if (settings.empty()) {
+        return {};
+    }
+    std::filesystem::path path(widen(settings));
+    path.replace_filename(L"session-switch");
+    return path.wstring();
+}
 
 bool service_installed() {
     SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
