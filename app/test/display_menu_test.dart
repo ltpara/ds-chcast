@@ -33,6 +33,10 @@ void main() {
     required List<ViewerDisplay> announced,
     required int active,
     required ValueChanged<int> onSelect,
+    bool followCursor = false,
+    bool followWindow = false,
+    VoidCallback? onToggleFollowCursor,
+    VoidCallback? onToggleFollowWindow,
     List<ViewerDisplayMode> modes = const <ViewerDisplayMode>[],
     bool modeChangeAvailable = true,
     ValueChanged<ViewerDisplayMode>? onSelectMode,
@@ -108,6 +112,10 @@ void main() {
           privacyEnabled: false,
           displays: announced,
           activeDisplay: active,
+          followCursor: followCursor,
+          followWindow: followWindow,
+          onToggleFollowCursor: onToggleFollowCursor ?? () {},
+          onToggleFollowWindow: onToggleFollowWindow ?? () {},
           onSelectDisplay: onSelect,
           modes: modes,
           modeChangeAvailable: modeChangeAvailable,
@@ -246,6 +254,61 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('服务端默认'), findsNothing);
     expect(picked, isNull);
+  });
+
+  testWidgets('the follow toggles report clicks and mark the active mode',
+      (WidgetTester tester) async {
+    int cursorTaps = 0;
+    int windowTaps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: 0,
+      onSelect: (int index) {},
+      followCursor: true,
+      onToggleFollowCursor: () => ++cursorTaps,
+      onToggleFollowWindow: () => ++windowTaps,
+    ));
+
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('跟随远程光标'), findsOneWidget);
+    expect(find.text('跟随远程窗口'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<int>, '跟随远程光标'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.widgetWithText(PopupMenuItem<int>, '跟随远程窗口'),
+        matching: find.byIcon(Icons.check_rounded),
+      ),
+      findsNothing,
+    );
+
+    await tester.tap(find.text('跟随远程窗口'));
+    await tester.pumpAndSettle();
+    expect(windowTaps, 1);
+    expect(cursorTaps, 0);
+  });
+
+  testWidgets('follow stays inert on a merged stream', (WidgetTester tester) async {
+    int taps = 0;
+    await tester.pumpWidget(toolbar(
+      announced: displays,
+      active: kViewerDisplayAll,
+      onSelect: (int index) {},
+      onToggleFollowCursor: () => ++taps,
+      onToggleFollowWindow: () => ++taps,
+    ));
+
+    await tester.tap(find.byIcon(Icons.monitor_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('跟随远程光标'));
+    await tester.pumpAndSettle();
+    expect(taps, 0);
   });
 
   testWidgets('lists the host modes and reports the pick', (WidgetTester tester) async {

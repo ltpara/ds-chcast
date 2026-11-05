@@ -193,4 +193,35 @@ void main() {
     expect(fresh.displaySwitchFailures, 0);
     expect(fresh.displaySwitchError, isEmpty);
   });
+
+  test('parses the follow modes and the host refusal', () {
+    final ViewerStatus following = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'displayFollowFlags': ViewerDisplayFollow.cursor | ViewerDisplayFollow.window,
+      'displayFollowCode': 0,
+      'displayFollowResults': 3,
+    });
+    expect(following.displayFollowFlags, 3);
+    expect(following.displayFollowCode, 0);
+    expect(following.displayFollowError, isEmpty);
+    expect(following.displayFollowResults, 3);
+
+    final ViewerStatus refused = ViewerStatus.fromMap(<Object?, Object?>{
+      'state': 'streaming',
+      'displayFollowFlags': 0,
+      'displayFollowCode': 2,
+      'displayFollowError': '全部显示器已经同时显示',
+      'displayFollowResults': 4,
+    });
+    expect(refused.displayFollowFlags, 0);
+    expect(refused.displayFollowCode, 2);
+    expect(refused.displayFollowError, '全部显示器已经同时显示');
+    expect(refused.displayFollowResults, 4);
+
+    const ViewerStatus fresh = ViewerStatus();
+    expect(fresh.displayFollowFlags, 0);
+    expect(fresh.displayFollowCode, 0);
+    expect(fresh.displayFollowError, isEmpty);
+    expect(fresh.displayFollowResults, 0);
+  });
 }

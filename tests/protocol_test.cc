@@ -1460,6 +1460,83 @@ void test_display_switch() {
           "DisplaySwitchResult with trailing bytes is rejected");
 }
 
+void test_display_follow() {
+    std::string error;
+    uint8_t flags = 0xFF;
+    check(chast::parse_set_display_follow(payload_of(chast::make_set_display_follow(0)),
+                                          flags, &error) &&
+              flags == 0,
+          "SetDisplayFollow round-trips following off");
+    check(chast::parse_set_display_follow(
+              payload_of(chast::make_set_display_follow(chast::kDisplayFollowAll)), flags,
+              &error) &&
+              flags == chast::kDisplayFollowAll,
+          "SetDisplayFollow round-trips both modes");
+    check(chast::make_set_display_follow(0x80).empty(),
+          "the SetDisplayFollow maker refuses unknown flags");
+    std::vector<uint8_t> unknown_flags =
+        payload_of(chast::make_set_display_follow(chast::kDisplayFollowCursor));
+    unknown_flags[0] = 0x08;
+    check(!chast::parse_set_display_follow(unknown_flags, flags, &error),
+          "SetDisplayFollow with unknown flags is rejected");
+    check(!chast::parse_set_display_follow(std::vector<uint8_t>(2), flags, &error),
+          "SetDisplayFollow with trailing bytes is rejected");
+
+    chast::DisplayFollowState state;
+    chast::DisplayFollowState sent;
+    sent.flags = chast::kDisplayFollowCursor | chast::kDisplayFollowWindow;
+    sent.code = chast::DisplayFollowCode::Ok;
+    check(chast::parse_display_follow_state(
+              payload_of(chast::make_display_follow_state(sent)), state, &error) &&
+              state.flags == sent.flags && state.code == chast::DisplayFollowCode::Ok &&
+              state.reason.empty(),
+          "DisplayFollowState round-trips the enabled modes");
+    const std::string chinese = "输入权限已被撤销";
+    sent.flags = 0;
+    sent.code = chast::DisplayFollowCode::Failed;
+    sent.reason = chinese;
+    check(chast::parse_display_follow_state(
+              payload_of(chast::make_display_follow_state(sent)), state, &error) &&
+              state.flags == 0 && state.code == chast::DisplayFollowCode::Failed &&
+              state.reason == chinese,
+          "DisplayFollowState round-trips a refusal with a UTF-8 reason");
+    sent.flags = chast::kDisplayFollowCursor;
+    check(chast::make_display_follow_state(sent).empty(),
+          "the DisplayFollowState maker refuses flags on a refusal");
+
+    std::string long_reason(250, 'a');
+    for (int i = 0; i < 10; ++i) {
+        long_reason += chinese;
+    }
+    sent.flags = 0;
+    sent.reason = long_reason;
+    check(chast::parse_display_follow_state(
+              payload_of(chast::make_display_follow_state(sent)), state, &error) &&
+              state.reason.size() <= chast::kMaxDisplayFollowReason && !state.reason.empty(),
+          "an over-long follow reason is truncated on a character boundary");
+
+    std::vector<uint8_t> unknown_code = payload_of(chast::make_display_follow_state(sent));
+    unknown_code[1] = 9;
+    check(!chast::parse_display_follow_state(unknown_code, state, &error),
+          "DisplayFollowState with an unknown code is rejected");
+    std::vector<uint8_t> trailing_state = payload_of(chast::make_display_follow_state(sent));
+    trailing_state.push_back(0);
+    check(!chast::parse_display_follow_state(trailing_state, state, &error),
+          "DisplayFollowState with trailing bytes is rejected");
+
+    const uint16_t overlong_size =
+        static_cast<uint16_t>(chast::kMaxDisplayFollowReason + 1);
+    std::vector<uint8_t> overlong(4, 0);
+    overlong[2] = static_cast<uint8_t>(overlong_size & 0xFFu);
+    overlong[3] = static_cast<uint8_t>(overlong_size >> 8);
+    overlong.resize(4 + overlong_size, 'a');
+    check(!chast::parse_display_follow_state(
+              payload_of(chast::make_control(chast::ControlType::DisplayFollowState,
+                                             overlong)),
+              state, &error),
+          "DisplayFollowState with an over-long reason is rejected");
+}
+
 void test_display_modes() {
     std::string error;
     uint16_t display = chast::kDisplayAuto;
@@ -4015,6 +4092,7 @@ int main(int argc, char** argv) {
     test_stream_options();
     test_privacy_mode();
     test_display_switch();
+    test_display_follow();
     test_display_modes();
     test_file_transfer();
     test_file_browser();

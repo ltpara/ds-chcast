@@ -175,6 +175,18 @@ const char* switch_code_name(chast::DisplaySwitchCode code) {
     return "the host refused the switch";
 }
 
+const char* follow_code_name(chast::DisplayFollowCode code) {
+    switch (code) {
+        case chast::DisplayFollowCode::Ok:
+            return "following is in effect";
+        case chast::DisplayFollowCode::Failed:
+            return "the host could not apply the follow request";
+        case chast::DisplayFollowCode::Unsupported:
+            return "the merged view already shows every display";
+    }
+    return "the host refused the follow request";
+}
+
 const char* mode_code_name(chast::DisplayModeCode code) {
     switch (code) {
         case chast::DisplayModeCode::Ok:
@@ -462,6 +474,10 @@ bool ViewerEngine::Start(const std::string& host, uint16_t port, uint16_t displa
         pending_mode_set_.reset();
     }
     {
+        std::lock_guard<std::mutex> lock(follow_mutex_);
+        pending_follow_.reset();
+    }
+    {
         std::lock_guard<std::mutex> lock(stream_option_mutex_);
         pending_stream_options_.reset();
     }
@@ -655,6 +671,28 @@ bool ViewerEngine::SetDisplayMode(uint16_t display, uint16_t width, uint16_t hei
     pending.height = height;
     pending.refresh_hz = refresh_hz;
     pending_mode_set_ = pending;
+    return true;
+}
+
+bool ViewerEngine::SetDisplayFollow(bool cursor, bool window) {
+    if (!running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.state != ViewerState::kStreaming || !status_.input_enabled) {
+            return false;
+        }
+    }
+    uint8_t flags = 0;
+    if (cursor) {
+        flags |= chast::kDisplayFollowCursor;
+    }
+    if (window) {
+        flags |= chast::kDisplayFollowWindow;
+    }
+    std::lock_guard<std::mutex> lock(follow_mutex_);
+    pending_follow_ = flags;
     return true;
 }
 
@@ -1892,6 +1930,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
     uint64_t display_mode_failures = 0;
     std::string display_mode_error;
     std::string display_modes_error;
+    uint8_t display_follow_flags = 0;
+    int display_follow_code = 0;
+    std::string display_follow_error;
+    uint64_t display_follow_results = 0;
     int stream_quality = 0;
     int stream_option_code = 0;
     std::string stream_option_error;
@@ -2190,6 +2232,10 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
             status_.display_mode_failures = display_mode_failures;
             status_.display_mode_error = display_mode_error;
             status_.display_modes_error = display_modes_error;
+            status_.display_follow_flags = display_follow_flags;
+            status_.display_follow_code = display_follow_code;
+            status_.display_follow_error = display_follow_error;
+            status_.display_follow_results = display_follow_results;
             status_.stream_quality = stream_quality;
             status_.stream_option_code = stream_option_code;
             status_.stream_option_error = stream_option_error;
@@ -6782,6 +6828,63 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     }
                 };
 
+                // Sends the newest follow toggles. One slot, like the display
+                // pickers: the menu's last state is what matters.
+                auto drain_display_follow = [&] {
+                    std::optional<uint8_t> requested;
+                    {
+                        std::lock_guard<std::mutex> lock(follow_mutex_);
+                        requested.swap(pending_follow_);
+                    }
+                    if (!requested) {
+                        return;
+                    }
+                    chast::Error sent = session->request_display_follow(*requested);
+                    if (sent.ok()) {
+                        return;
+                    }
+                    ++display_follow_results;
+                    display_follow_code = static_cast<int>(chast::DisplayFollowCode::Failed);
+                    display_follow_error = "request: " + sent.to_string();
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_.display_follow_code = display_follow_code;
+                        status_.display_follow_error = display_follow_error;
+                        status_.display_follow_results = display_follow_results;
+                    }
+                    std::fprintf(stderr, "viewer: set display follow: %s\n",
+                                 sent.to_string().c_str());
+                };
+
+                // Adopts every follow state. The host reports the modes in
+                // effect, not the modes requested, so a refusal or a
+                // host-initiated disable returns the menu to reality.
+                auto receive_display_follow = [&] {
+                    chast::DisplayFollowState state;
+                    while (session->take_display_follow_state(state)) {
+                        ++display_follow_results;
+                        display_follow_flags = state.flags;
+                        display_follow_code = static_cast<int>(state.code);
+                        display_follow_error =
+                            state.code == chast::DisplayFollowCode::Ok
+                                ? std::string()
+                                : (state.reason.empty() ? follow_code_name(state.code)
+                                                        : state.reason);
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            status_.display_follow_flags = display_follow_flags;
+                            status_.display_follow_code = display_follow_code;
+                            status_.display_follow_error = display_follow_error;
+                            status_.display_follow_results = display_follow_results;
+                        }
+                        std::fprintf(stderr, "viewer: display follow 0x%02x: %s\n",
+                                     static_cast<unsigned>(display_follow_flags),
+                                     display_follow_error.empty()
+                                         ? "ok"
+                                         : display_follow_error.c_str());
+                    }
+                };
+
                 // Sends the newest stream preferences. One slot, like the
                 // display pickers: the menu's last choice is what matters.
                 auto drain_stream_options = [&] {
@@ -6955,9 +7058,11 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_display_switch();
                     receive_display_modes();
                     receive_display_mode_results();
+                    receive_display_follow();
                     receive_stream_options();
                     drain_display_switch();
                     drain_display_modes();
+                    drain_display_follow();
                     drain_stream_options();
                     {
                         const auto probe_now = Clock::now();
@@ -7066,6 +7171,7 @@ void ViewerEngine::Run(std::string host, uint16_t port, uint16_t display,
                     receive_display_switch();
                     receive_display_modes();
                     receive_display_mode_results();
+                    receive_display_follow();
                     receive_stream_options();
                     const auto now = Clock::now();
 

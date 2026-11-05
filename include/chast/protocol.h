@@ -52,7 +52,7 @@
 
 namespace chast {
 
-inline constexpr uint16_t kProtocolVersion = 43;
+inline constexpr uint16_t kProtocolVersion = 44;
 // Complies with the ALPN private-use range. The ALPN names the protocol
 // family, not its version: a mismatch is reported by the Hello exchange with
 // the peer's number instead of as an opaque handshake failure.
@@ -371,6 +371,18 @@ enum class ControlType : uint16_t {
     // reason. Ok means the host accepted the handoff and is about to end this
     // session; every other code leaves it running.
     SessionSelectResult = 62,
+    // Viewer -> host: which automatic display-follow modes this viewer wants.
+    // Payload: flags (u8), bit 0 = follow the host pointer, bit 1 = follow the
+    // window with foreground focus. The host moves its own capture with the
+    // existing switch path, so an accepted follow needs input permission like
+    // SwitchDisplay. The answer is DisplayFollowState. Protocol v44.
+    SetDisplayFollow = 63,
+    // Host -> viewer: the follow modes actually in effect. Payload: flags
+    // (u8), code (u8, see DisplayFollowCode), reason length (u16), UTF-8
+    // reason. Sent as the answer to SetDisplayFollow and unsolicited when the
+    // host turns a mode off itself (input permission revoked, merged view,
+    // session ending). See kDisplayFollowCursor/kDisplayFollowWindow.
+    DisplayFollowState = 64,
 };
 
 // ----- input -----
@@ -1040,6 +1052,29 @@ enum class DisplaySwitchCode : uint8_t {
 // Bound on the UTF-8 reason; the payload stays small enough to be a control
 // message and a longer explanation belongs in the host log, not the wire.
 inline constexpr size_t kMaxDisplaySwitchReason = 256;
+
+// Which automatic display switches a viewer asked the host to perform.
+inline constexpr uint8_t kDisplayFollowCursor = 1;
+inline constexpr uint8_t kDisplayFollowWindow = 2;
+inline constexpr uint8_t kDisplayFollowAll = kDisplayFollowCursor | kDisplayFollowWindow;
+
+// Why a SetDisplayFollow was refused or cut short. Ok is the only code that
+// leaves the requested flags in effect; the viewer shows its toggles from the
+// flags the host reports either way.
+enum class DisplayFollowCode : uint8_t {
+    Ok = 0,
+    Failed = 1,       // the host could not apply the request
+    Unsupported = 2,  // a merged stream already shows every display
+};
+inline constexpr size_t kMaxDisplayFollowReason = 256;
+
+// One DisplayFollowState answer: the modes now in effect, plus the outcome of
+// the request that produced them.
+struct DisplayFollowState {
+    uint8_t flags = 0;
+    DisplayFollowCode code = DisplayFollowCode::Ok;
+    std::string reason;
+};
 
 // Why a SetDisplayMode was refused. Ok is the only code that switches the
 // output; every other code leaves the current mode (and the stream) in place.
@@ -1973,6 +2008,18 @@ std::vector<uint8_t> make_display_switch_result(uint16_t display_index, DisplayS
 bool parse_display_switch_result(const std::vector<uint8_t>& payload, uint16_t& display_index,
                                  DisplaySwitchCode& code, std::string& reason,
                                  std::string* error);
+// Viewer -> host follow-mode request. `flags` is a combination of
+// kDisplayFollowCursor and kDisplayFollowWindow; the host replaces its current
+// modes with it (zero turns following off).
+std::vector<uint8_t> make_set_display_follow(uint8_t flags);
+bool parse_set_display_follow(const std::vector<uint8_t>& payload, uint8_t& flags,
+                              std::string* error);
+// Host -> viewer follow state. The maker truncates `reason` to
+// kMaxDisplayFollowReason bytes on a UTF-8 boundary; the parser rejects an
+// over-long reason or unknown flags instead of repairing them.
+std::vector<uint8_t> make_display_follow_state(const DisplayFollowState& state);
+bool parse_display_follow_state(const std::vector<uint8_t>& payload,
+                                DisplayFollowState& state, std::string* error);
 // Viewer -> host mode list request for one announced display.
 std::vector<uint8_t> make_list_display_modes(uint16_t display_index);
 bool parse_list_display_modes(const std::vector<uint8_t>& payload, uint16_t& display_index,

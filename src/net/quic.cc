@@ -627,6 +627,13 @@ struct QuicSession::Impl {
     DisplayModeCode display_mode_code = DisplayModeCode::Ok;
     std::string display_mode_reason;
     uint64_t display_mode_results_seen = 0;
+    // Server: the newest SetDisplayFollow request. Client: the newest state
+    // the host reported, also used for a host-initiated disable.
+    bool display_follow_request_ready = false;
+    uint8_t display_follow_flags = 0;
+    bool display_follow_state_ready = false;
+    DisplayFollowState display_follow_state;
+    uint64_t display_follow_states_seen = 0;
     // Server: the newest SetPrivacyMode request. Client: the newest state the
     // host sent, also used for a host-initiated disable.
     bool privacy_mode_request_ready = false;
@@ -3186,6 +3193,45 @@ struct QuicSession::Impl {
                     display_mode_reason = std::move(reason);
                     display_mode_result_ready = true;
                     ++display_mode_results_seen;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::SetDisplayFollow: {
+                if (role != Role::Server ||
+                    (session_permissions.load() & kPermissionInput) == 0) {
+                    // Following moves the host's capture like SwitchDisplay, so
+                    // it needs the same grant; without it the request is
+                    // dropped rather than allowed to move the host's view.
+                    break;
+                }
+                uint8_t flags = 0;
+                if (!parse_set_display_follow(payload, flags, &error)) {
+                    control_protocol_failure("SetDisplayFollow: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_follow_flags = flags;
+                    display_follow_request_ready = true;
+                }
+                cv.notify_all();
+                break;
+            }
+            case ControlType::DisplayFollowState: {
+                if (role != Role::Client) {
+                    break;
+                }
+                DisplayFollowState state;
+                if (!parse_display_follow_state(payload, state, &error)) {
+                    control_protocol_failure("DisplayFollowState: " + error);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    display_follow_state = std::move(state);
+                    display_follow_state_ready = true;
+                    ++display_follow_states_seen;
                 }
                 cv.notify_all();
                 break;
@@ -6465,6 +6511,56 @@ Error QuicSession::send_display_mode_result(uint16_t display_index, uint16_t wid
     return impl.send_bytes(impl.control.load(),
                            make_display_mode_result(display_index, width, height, refresh_hz,
                                                     code, reason),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_follow_request(uint8_t& flags) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_follow_request_ready) {
+        return false;
+    }
+    flags = impl_->display_follow_flags;
+    impl_->display_follow_request_ready = false;
+    return true;
+}
+
+Error QuicSession::request_display_follow(uint8_t flags) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Client) {
+        return Error(Status::InvalidCall, "request_display_follow is a client operation");
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        if (!impl.hello_complete) {
+            return Error(Status::InvalidCall, "the handshake has not completed");
+        }
+        if ((impl.session_permissions.load() & kPermissionInput) == 0) {
+            return Error(Status::PermissionDenied, "input is disabled by the host");
+        }
+    }
+    return impl.send_bytes(impl.control.load(), make_set_display_follow(flags),
+                           QUIC_SEND_FLAG_NONE);
+}
+
+bool QuicSession::take_display_follow_state(DisplayFollowState& state) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->display_follow_state_ready) {
+        return false;
+    }
+    state = impl_->display_follow_state;
+    impl_->display_follow_state_ready = false;
+    return true;
+}
+
+Error QuicSession::send_display_follow_state(const DisplayFollowState& state) {
+    Impl& impl = *impl_;
+    if (impl.role != Impl::Role::Server) {
+        return Error(Status::InvalidCall, "send_display_follow_state is a server operation");
+    }
+    if (!impl.announced) {
+        return Error(Status::InvalidCall, "the stream is not open");
+    }
+    return impl.send_bytes(impl.control.load(), make_display_follow_state(state),
                            QUIC_SEND_FLAG_NONE);
 }
 

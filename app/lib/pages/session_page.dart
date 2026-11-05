@@ -953,6 +953,11 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
         status.displayModeChanges > _status.displayModeChanges;
     final bool modeChangeRefused =
         status.displayModeFailures > _status.displayModeFailures;
+    // The host answers every follow request (and an input revocation) with a
+    // state message; only a refusal deserves a toast.
+    final bool followRefused =
+        status.displayFollowResults > _status.displayFollowResults &&
+        status.displayFollowCode != 0;
     // One upload reaches an end this poll. The counters survive the phase
     // reset, so a success and a failure can never both arrive; the name and
     // the reason stay in the status until the next upload starts.
@@ -1091,6 +1096,19 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
             reason.isEmpty
                 ? tr('切换分辨率失败')
                 : tr('切换分辨率失败：{reason}', <String, Object?>{'reason': reason}),
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+    if (followRefused) {
+      final String reason = status.displayFollowError;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason.isEmpty
+                ? tr('无法跟随远程显示')
+                : tr('无法跟随远程显示：{reason}', <String, Object?>{'reason': reason}),
           ),
           duration: const Duration(seconds: 4),
         ),
@@ -2521,9 +2539,66 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
     return _status.streamedDisplayIndex ?? kViewerDisplayAuto;
   }
 
+  bool get _followCursor =>
+      _status.displayFollowFlags & ViewerDisplayFollow.cursor != 0;
+
+  bool get _followWindow =>
+      _status.displayFollowFlags & ViewerDisplayFollow.window != 0;
+
+  /// Hands one or both follow modes to the host. With follow on, the output
+  /// choice belongs to the host, so the local picker returns to "server
+  /// chooses" and the active marker tracks whatever output starts streaming.
+  Future<bool> _setFollow({required bool cursor, required bool window}) async {
+    bool queued = false;
+    try {
+      queued = await ViewerBridge.setDisplayFollow(
+        cursor: cursor,
+        window: window,
+      );
+    } on PlatformException {
+      queued = false;
+    } on MissingPluginException {
+      queued = false;
+    }
+    if (!mounted) {
+      return false;
+    }
+    if (queued && (cursor || window)) {
+      setState(() {
+        _display = kViewerDisplayAuto;
+        _pendingDisplay = null;
+      });
+    }
+    if (!queued) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(tr('无法设置跟随：会话未在串流，或主机未开放输入')),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+    return queued;
+  }
+
+  void _toggleFollowCursor() {
+    unawaited(_setFollow(cursor: !_followCursor, window: _followWindow));
+  }
+
+  void _toggleFollowWindow() {
+    unawaited(_setFollow(cursor: _followCursor, window: !_followWindow));
+  }
+
   Future<void> _switchDisplay(int display) async {
     if (_reconnecting) {
       return;
+    }
+    // A manual choice takes the host's automatic following out of the loop;
+    // otherwise the host would switch back on its next poll.
+    if (_followCursor || _followWindow) {
+      await _setFollow(cursor: false, window: false);
+      if (!mounted) {
+        return;
+      }
     }
     // Tapping the output that is already shown is not a request.
     if (display == _activeDisplay) {
@@ -4153,6 +4228,10 @@ class _SessionPageState extends State<SessionPage> with WidgetsBindingObserver {
                             unawaited(_openPortForwardDialog()),
                         displays: _status.displays,
                         activeDisplay: _activeDisplay,
+                        followCursor: _followCursor,
+                        followWindow: _followWindow,
+                        onToggleFollowCursor: _toggleFollowCursor,
+                        onToggleFollowWindow: _toggleFollowWindow,
                         onSelectDisplay: (int index) =>
                             unawaited(_switchDisplay(index)),
                         modes:

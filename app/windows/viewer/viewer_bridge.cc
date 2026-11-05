@@ -844,6 +844,14 @@ void ViewerBridge::HandleMethodCall(
         map[key("displayModesCode")] =
             flutter::EncodableValue(static_cast<int32_t>(status.display_modes_code));
         map[key("displayModesError")] = flutter::EncodableValue(status.display_modes_error);
+        map[key("displayFollowFlags")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.display_follow_flags));
+        map[key("displayFollowCode")] =
+            flutter::EncodableValue(static_cast<int32_t>(status.display_follow_code));
+        map[key("displayFollowError")] =
+            flutter::EncodableValue(status.display_follow_error);
+        map[key("displayFollowResults")] =
+            flutter::EncodableValue(static_cast<int64_t>(status.display_follow_results));
         map[key("streamQuality")] =
             flutter::EncodableValue(static_cast<int32_t>(status.stream_quality));
         map[key("streamOptionCode")] =
@@ -948,6 +956,21 @@ void ViewerBridge::HandleMethodCall(
         const bool queued =
             viewer_ != nullptr &&
             viewer_->SwitchDisplay(static_cast<uint16_t>(*display));
+        result->Success(flutter::EncodableValue(queued));
+        return;
+    }
+
+    if (method == "setDisplayFollow") {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        bool cursor = false;
+        bool window = false;
+        if (args == nullptr || !map_bool(*args, "cursor", &cursor) ||
+            !map_bool(*args, "window", &window)) {
+            result->Error("bad_args", "setDisplayFollow wants cursor and window booleans");
+            return;
+        }
+        const bool queued =
+            viewer_ != nullptr && viewer_->SetDisplayFollow(cursor, window);
         result->Success(flutter::EncodableValue(queued));
         return;
     }

@@ -3164,6 +3164,82 @@ bool parse_mode_code(uint8_t raw_code, DisplayModeCode& code, std::string* error
 
 }  // namespace
 
+std::vector<uint8_t> make_set_display_follow(uint8_t flags) {
+    if ((flags & ~kDisplayFollowAll) != 0) {
+        return {};
+    }
+    std::vector<uint8_t> payload(1);
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, flags);
+    return make_control(ControlType::SetDisplayFollow, payload);
+}
+
+bool parse_set_display_follow(const std::vector<uint8_t>& payload, uint8_t& flags,
+                              std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    if (!reader.u8(flags) || !reader.at_end()) {
+        set_error(error, "malformed SetDisplayFollow");
+        return false;
+    }
+    if ((flags & ~kDisplayFollowAll) != 0) {
+        set_error(error, "SetDisplayFollow carries unknown flags");
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint8_t> make_display_follow_state(const DisplayFollowState& state) {
+    const uint8_t flags = static_cast<uint8_t>(state.flags & kDisplayFollowAll);
+    // A refusal never claims a mode is on: the flags describe what runs.
+    if (state.code != DisplayFollowCode::Ok && flags != 0) {
+        return {};
+    }
+    const std::string text = truncate_utf8_reason(state.reason, kMaxDisplayFollowReason);
+    std::vector<uint8_t> payload(4 + text.size());
+    uint8_t* cursor = payload.data();
+    put_u8(cursor, flags);
+    put_u8(cursor, static_cast<uint8_t>(state.code));
+    put_u16(cursor, static_cast<uint16_t>(text.size()));
+    if (!text.empty()) {
+        std::memcpy(cursor, text.data(), text.size());
+    }
+    return make_control(ControlType::DisplayFollowState, payload);
+}
+
+bool parse_display_follow_state(const std::vector<uint8_t>& payload,
+                                DisplayFollowState& state, std::string* error) {
+    Reader reader(payload.data(), payload.size());
+    uint8_t flags = 0;
+    uint8_t raw_code = 0;
+    uint16_t reason_size = 0;
+    std::string reason;
+    if (!reader.u8(flags) || !reader.u8(raw_code) || !reader.u16(reason_size) ||
+        !reader.string(reason, reason_size) || !reader.at_end()) {
+        set_error(error, "malformed DisplayFollowState");
+        return false;
+    }
+    if ((flags & ~kDisplayFollowAll) != 0) {
+        set_error(error, "DisplayFollowState carries unknown flags");
+        return false;
+    }
+    if (raw_code > static_cast<uint8_t>(DisplayFollowCode::Unsupported)) {
+        set_error(error, "unknown display follow code " + std::to_string(raw_code));
+        return false;
+    }
+    if (reason.size() > kMaxDisplayFollowReason) {
+        set_error(error, "DisplayFollowState reason is too long");
+        return false;
+    }
+    if (!reason.empty() && !valid_utf8(reason)) {
+        set_error(error, "DisplayFollowState carries a malformed reason");
+        return false;
+    }
+    state.flags = flags;
+    state.code = static_cast<DisplayFollowCode>(raw_code);
+    state.reason = std::move(reason);
+    return true;
+}
+
 std::vector<uint8_t> make_list_display_modes(uint16_t display_index) {
     std::vector<uint8_t> payload(2);
     uint8_t* cursor = payload.data();

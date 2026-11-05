@@ -513,6 +513,15 @@ struct ViewerStatus {
     uint64_t display_mode_changes = 0;
     uint64_t display_mode_failures = 0;
     std::string display_mode_error;
+    // Automatic display following. `display_follow_flags` is what the host
+    // reports in effect (chast::kDisplayFollowCursor/kDisplayFollowWindow),
+    // so the menu reflects a host-initiated disable too. The code describes
+    // the newest answer (0 = Ok) with its reason in display_follow_error;
+    // display_follow_results counts answers, including local send failures.
+    uint8_t display_follow_flags = 0;
+    int display_follow_code = 0;
+    std::string display_follow_error;
+    uint64_t display_follow_results = 0;
     // Stream preferences. `stream_quality` is the host's effective
     // StreamQuality (0 = High); the effective codec and frame rate are the
     // existing `codec`/`framerate`, which the host's StreamInfo also updates.
@@ -685,6 +694,13 @@ public:
     // a newer one replaces an unsent one.
     bool SetDisplayMode(uint16_t display, uint16_t width, uint16_t height,
                         uint16_t refresh_hz);
+    // Queues the automatic follow modes: move the host's capture to whichever
+    // output holds its pointer and/or foreground window. Returns false when
+    // no session is streaming or the host did not grant input. One request is
+    // kept, so two quick toggles send only the final state. The host answers
+    // through display_follow_flags/display_follow_code, which the menu reads;
+    // a merged stream is refused because it already shows every display.
+    bool SetDisplayFollow(bool cursor, bool window);
     // Queues stream preferences: encoder choice, frame-rate cap and quality
     // preset. Returns false when no session is running or a value is outside
     // its wire range. Accepted as soon as the session starts, before the first
@@ -1315,6 +1331,11 @@ private:
     mutable std::mutex mode_mutex_;
     std::optional<uint16_t> pending_mode_list_;
     std::optional<PendingMode> pending_mode_set_;
+
+    // Follow toggles are a snapshot too: only the state the menu last showed
+    // matters, so an unsent request is replaced rather than queued.
+    mutable std::mutex follow_mutex_;
+    std::optional<uint8_t> pending_follow_;
 
     // Stream preferences are a snapshot, not a queue: the operator wants the
     // menu's last choice applied, not every intermediate one.

@@ -589,6 +589,10 @@ class ViewerStatus {
     this.displayModeChanges = 0,
     this.displayModeFailures = 0,
     this.displayModeError = '',
+    this.displayFollowFlags = 0,
+    this.displayFollowCode = 0,
+    this.displayFollowError = '',
+    this.displayFollowResults = 0,
     this.streamQuality = 0,
     this.streamOptionCode = 0,
     this.streamOptionError = '',
@@ -1066,6 +1070,17 @@ class ViewerStatus {
   final int displayModeFailures;
   final String displayModeError;
 
+  /// Automatic display following. Bit 0 follows the host's pointer and bit 1
+  /// its foreground window ([ViewerDisplayFollow]). The flags are what the
+  /// host reports in effect, so a host-initiated disable clears them too.
+  /// [displayFollowCode] is the host's [ViewerDisplayFollowCode] (0 = Ok) for
+  /// the newest answer with its reason in [displayFollowError];
+  /// [displayFollowResults] counts answers, including local send failures.
+  final int displayFollowFlags;
+  final int displayFollowCode;
+  final String displayFollowError;
+  final int displayFollowResults;
+
   /// Stream preferences the host actually runs. [streamQuality] is a
   /// [ViewerStreamQuality] value; the effective encoder and frame rate are
   /// [codec] and [framerate], which the host's StreamInfo also updates.
@@ -1528,6 +1543,10 @@ class ViewerStatus {
       displayModeChanges: asInt(map['displayModeChanges']),
       displayModeFailures: asInt(map['displayModeFailures']),
       displayModeError: asString(map['displayModeError']),
+      displayFollowFlags: asInt(map['displayFollowFlags']),
+      displayFollowCode: asInt(map['displayFollowCode']),
+      displayFollowError: asString(map['displayFollowError']),
+      displayFollowResults: asInt(map['displayFollowResults']),
       streamQuality: asInt(map['streamQuality']),
       streamOptionCode: asInt(map['streamOptionCode']),
       streamOptionError: asString(map['streamOptionError']),
@@ -1869,6 +1888,23 @@ class ViewerBridge {
         'height': height,
         'refresh': refresh,
       },
+    );
+    return queued ?? false;
+  }
+
+  /// Turns automatic display following on or off for this session. The host
+  /// moves its own capture to the display holding [cursor] (the host pointer)
+  /// or [window] (the foreground window), reusing the normal switch path.
+  /// False means the request was not queued (no live session or a view-only
+  /// session); the host's answer then arrives in
+  /// [ViewerStatus.displayFollowFlags] / [ViewerStatus.displayFollowError].
+  static Future<bool> setDisplayFollow({
+    required bool cursor,
+    required bool window,
+  }) async {
+    final bool? queued = await _channel.invokeMethod<bool>(
+      'setDisplayFollow',
+      <String, Object>{'cursor': cursor, 'window': window},
     );
     return queued ?? false;
   }
@@ -2587,10 +2623,16 @@ const int kViewerWheelDelta = 120;
 /// Hello display index meaning "let the server choose the captured output"
 /// (chast::kDisplayAuto in chast/protocol.h).
 const int kViewerDisplayAuto = 0xFFFF;
-
 /// Hello display index meaning "merge every display into one picture"
 /// (chast::kDisplayAll in chast/protocol.h).
 const int kViewerDisplayAll = 0xFFFE;
+
+/// Bits in [ViewerStatus.displayFollowFlags] (chast::kDisplayFollow* in
+/// chast/protocol.h): which automatic display switches the host performs.
+abstract final class ViewerDisplayFollow {
+  static const int cursor = 1;
+  static const int window = 2;
+}
 
 /// The permission mask a host announces (chast::Permission in
 /// chast/protocol.h). Input covers pointer and keyboard injection; clipboard

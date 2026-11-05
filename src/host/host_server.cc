@@ -594,6 +594,59 @@ size_t find_display(const std::vector<DisplayInfo>& attached, const DisplayInfo&
     return 0;
 }
 
+// Index of the output containing a virtual-desktop point, or -1. The host is
+// DPI aware, so GetCursorPos and the DXGI rects share the same physical
+// virtual-desktop space and containment is enough.
+int display_index_at(const std::vector<DisplayInfo>& displays, const POINT& point) {
+    for (size_t i = 0; i < displays.size(); ++i) {
+        const DisplayRect& rect = displays[i].rect;
+        if (point.x >= rect.left && point.x < rect.right && point.y >= rect.top &&
+            point.y < rect.bottom) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// Index of the output holding the foreground window's monitor, or -1 when
+// there is no foreground window. The monitor rect is matched against the DXGI
+// list by intersection instead of device name, because the two enumerations
+// spell monitor names differently.
+int foreground_display_index(const std::vector<DisplayInfo>& displays) {
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr) {
+        return -1;
+    }
+    const HMONITOR monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) {
+        return -1;
+    }
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) {
+        return -1;
+    }
+    const RECT& rect = info.rcMonitor;
+    int best = -1;
+    LONG best_area = 0;
+    for (size_t i = 0; i < displays.size(); ++i) {
+        const DisplayRect& display = displays[i].rect;
+        const LONG width =
+            std::min(rect.right, display.right) - std::max(rect.left, display.left);
+        const LONG height =
+            std::min(rect.bottom, display.bottom) - std::max(rect.top, display.top);
+        if (width <= 0 || height <= 0) {
+            continue;
+        }
+        const LONG area = width * height;
+        if (area > best_area) {
+            best_area = area;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
 const char* codec_name(VideoCodec codec) {
     return codec == VideoCodec::Hevc ? "hevc" : "h264";
 }
@@ -3479,6 +3532,38 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
         return true;
     };
 
+    // Automatic display following. The viewer toggles it per session; the
+    // host polls at a low rate and moves its capture through switch_display,
+    // so a followed switch has exactly the same rebuild, cooldown and refusal
+    // rules as one the viewer asked for. A candidate must stay put for a
+    // moment before it is taken, so a pointer crossing two outputs quickly
+    // cannot trigger two rebuilds.
+    uint8_t follow_flags = 0;
+    uint16_t follow_candidate = kDisplayAuto;
+    Clock::time_point follow_candidate_since{};
+    Clock::time_point follow_polled_at{};
+    Clock::time_point follow_switch_at{};
+    constexpr auto kFollowPollInterval = std::chrono::milliseconds(200);
+    constexpr auto kFollowSettleTime = std::chrono::milliseconds(400);
+    auto send_follow_state = [&](uint8_t flags, DisplayFollowCode code,
+                                 const std::string& reason) -> bool {
+        DisplayFollowState state;
+        state.flags = code == DisplayFollowCode::Ok ? flags : 0;
+        state.code = code;
+        state.reason = reason;
+        Error sent = session_->send_display_follow_state(state);
+        if (sent.ok()) {
+            return true;
+        }
+        if (sent.status() == Status::Unavailable || sent.status() == Status::WaitTimeout) {
+            *peer_left = true;
+        } else {
+            ++stats.send_errors;
+            *error = "send_display_follow_state: " + sent.to_string();
+        }
+        return false;
+    };
+
     // Mode queries and changes for the streamed output. A list request is
     // answered from a fresh enumeration; a change is a synchronous rebuild:
     // the mode is applied, capture is recreated at the new size, a new encoder
@@ -4295,6 +4380,79 @@ bool HostServer::stream_desktop(HostServerStats& stats, std::string* error, bool
             const bool clean = error->empty();
             drain_peer(stats);
             return clean;
+        }
+        uint8_t follow_request = 0;
+        if (session_->take_display_follow_request(follow_request)) {
+            uint8_t applied = follow_request & kDisplayFollowAll;
+            DisplayFollowCode code = DisplayFollowCode::Ok;
+            std::string reason;
+            if ((session_->permissions() & kPermissionInput) == 0) {
+                applied = 0;
+                code = DisplayFollowCode::Failed;
+                reason = "input control is disabled";
+            } else if (applied != 0 && capturer->merged()) {
+                applied = 0;
+                code = DisplayFollowCode::Unsupported;
+                reason = "the merged view already shows every display";
+            }
+            follow_flags = applied;
+            follow_candidate = kDisplayAuto;
+            if (!send_follow_state(follow_flags, code, reason)) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
+            if (code != DisplayFollowCode::Ok) {
+                log("display follow refused: " + reason);
+            }
+        }
+        // Input permission can be revoked while following is on; the viewer
+        // must not keep toggles that can no longer move the host's picture.
+        if (follow_flags != 0 && (session_->permissions() & kPermissionInput) == 0) {
+            follow_flags = 0;
+            follow_candidate = kDisplayAuto;
+            if (!send_follow_state(0, DisplayFollowCode::Failed,
+                                   "input control was disabled")) {
+                const bool clean = error->empty();
+                drain_peer(stats);
+                return clean;
+            }
+        }
+        if (follow_flags != 0 && now - follow_polled_at >= kFollowPollInterval) {
+            follow_polled_at = now;
+            const int streamed = capturer->merged()
+                                     ? -1
+                                     : static_cast<int>(
+                                           find_display(attached, capturer->display()));
+            int target = -1;
+            if ((follow_flags & kDisplayFollowWindow) != 0) {
+                target = foreground_display_index(attached);
+            }
+            if (target < 0 && (follow_flags & kDisplayFollowCursor) != 0) {
+                POINT point{};
+                if (GetCursorPos(&point)) {
+                    target = display_index_at(attached, point);
+                }
+            }
+            if (target < 0 || target == streamed) {
+                follow_candidate = kDisplayAuto;
+                follow_candidate_since = Clock::time_point{};
+            } else if (follow_candidate != static_cast<uint16_t>(target)) {
+                follow_candidate = static_cast<uint16_t>(target);
+                follow_candidate_since = now;
+            } else if (now - follow_candidate_since >= kFollowSettleTime &&
+                       now - follow_switch_at >= std::chrono::seconds(1) &&
+                       (!switched_once ||
+                        now - last_switch_at >= std::chrono::seconds(1))) {
+                follow_switch_at = now;
+                if (!switch_display(static_cast<uint16_t>(target))) {
+                    const bool clean = error->empty();
+                    drain_peer(stats);
+                    return clean;
+                }
+                follow_candidate = kDisplayAuto;
+                follow_candidate_since = Clock::time_point{};
+            }
         }
         StreamOptions options;
         if (session_->take_stream_options_request(options) &&

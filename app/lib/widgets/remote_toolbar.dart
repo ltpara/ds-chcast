@@ -65,6 +65,10 @@ class RemoteToolbar extends StatelessWidget {
     required this.displays,
     required this.activeDisplay,
     required this.onSelectDisplay,
+    required this.followCursor,
+    required this.followWindow,
+    required this.onToggleFollowCursor,
+    required this.onToggleFollowWindow,
     required this.modes,
     required this.modeChangeAvailable,
     required this.onSelectMode,
@@ -176,6 +180,13 @@ class RemoteToolbar extends StatelessWidget {
   final List<ViewerDisplay> displays;
   final int activeDisplay;
   final ValueChanged<int> onSelectDisplay;
+
+  /// The host switched output to the display under the remote pointer (or
+  /// the window with foreground focus) on its own.
+  final bool followCursor;
+  final bool followWindow;
+  final VoidCallback onToggleFollowCursor;
+  final VoidCallback onToggleFollowWindow;
   final List<ViewerDisplayMode> modes;
   final bool modeChangeAvailable;
   final ValueChanged<ViewerDisplayMode> onSelectMode;
@@ -473,7 +484,12 @@ class RemoteToolbar extends StatelessWidget {
               _DisplayButton(
                 displays: displays,
                 active: activeDisplay,
+                followCursor: followCursor,
+                followWindow: followWindow,
+                inputAvailable: inputAvailable,
                 onSelected: onSelectDisplay,
+                onToggleFollowCursor: onToggleFollowCursor,
+                onToggleFollowWindow: onToggleFollowWindow,
               ),
               if (activeDisplay != kViewerDisplayAll)
                 _ResolutionButton(
@@ -1115,16 +1131,32 @@ class _DisplayButton extends StatelessWidget {
   const _DisplayButton({
     required this.displays,
     required this.active,
+    required this.followCursor,
+    required this.followWindow,
+    required this.inputAvailable,
     required this.onSelected,
+    required this.onToggleFollowCursor,
+    required this.onToggleFollowWindow,
   });
 
   final List<ViewerDisplay> displays;
   final int active;
+  final bool followCursor;
+  final bool followWindow;
+  final bool inputAvailable;
   final ValueChanged<int> onSelected;
+  final VoidCallback onToggleFollowCursor;
+  final VoidCallback onToggleFollowWindow;
+
+  // Negative ids keep the follow toggles apart from display indexes and the
+  // kViewerDisplayAuto/kViewerDisplayAll sentinels.
+  static const int _followCursorItem = -1;
+  static const int _followWindowItem = -2;
 
   @override
   Widget build(BuildContext context) {
     final bool available = displays.isNotEmpty;
+    final bool followAvailable = available && inputAvailable && active != kViewerDisplayAll;
     return Tooltip(
       message: available
           ? tr('切换显示器')
@@ -1137,7 +1169,15 @@ class _DisplayButton extends StatelessWidget {
         elevation: 8,
         padding: EdgeInsets.zero,
         constraints: const BoxConstraints(minWidth: 210, maxWidth: 300),
-        onSelected: onSelected,
+        onSelected: (int value) {
+          if (value == _followCursorItem) {
+            onToggleFollowCursor();
+          } else if (value == _followWindowItem) {
+            onToggleFollowWindow();
+          } else {
+            onSelected(value);
+          }
+        },
         itemBuilder: (BuildContext context) {
           return <PopupMenuEntry<int>>[
             _displayItem(kViewerDisplayAuto, tr('服务端默认'), tr('由服务端选择输出'),
@@ -1151,6 +1191,21 @@ class _DisplayButton extends StatelessWidget {
                 _detail(display),
                 Icons.monitor_rounded,
               ),
+            const PopupMenuDivider(height: 8),
+            _followItem(
+              _followCursorItem,
+              tr('跟随远程光标'),
+              followCursor,
+              followAvailable,
+              Icons.ads_click_rounded,
+            ),
+            _followItem(
+              _followWindowItem,
+              tr('跟随远程窗口'),
+              followWindow,
+              followAvailable,
+              Icons.web_asset_rounded,
+            ),
           ];
         },
         child: SizedBox(
@@ -1235,6 +1290,44 @@ class _DisplayButton extends StatelessWidget {
             ),
           ),
           if (selected) const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
+        ],
+      ),
+    );
+  }
+
+  /// Follow rows stay visible but disabled when the host cannot act on them:
+  /// one display needs no switching, the merged stream already shows every
+  /// output, and changing output requires input permission.
+  PopupMenuItem<int> _followItem(
+    int value,
+    String title,
+    bool enabledFlag,
+    bool availableFlag,
+    IconData icon,
+  ) {
+    final Color color = !availableFlag
+        ? Colors.white24
+        : enabledFlag
+            ? kAccentBright
+            : Colors.white70;
+    return PopupMenuItem<int>(
+      value: value,
+      height: 40,
+      enabled: availableFlag,
+      child: Row(
+        children: <Widget>[
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12, color: color),
+            ),
+          ),
+          if (enabledFlag && availableFlag)
+            const Icon(Icons.check_rounded, size: 15, color: kAccentBright),
         ],
       ),
     );

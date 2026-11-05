@@ -510,6 +510,22 @@ public:
     Error send_display_mode_result(uint16_t display_index, uint16_t width, uint16_t height,
                                    uint16_t refresh_hz, DisplayModeCode code,
                                    const std::string& reason = {});
+    // Pops the newest SetDisplayFollow request. Only the newest is kept, like
+    // the switch slot: the viewer's toggles describe the state it wants now.
+    // Requires input permission on both ends; a request without it is dropped
+    // by the transport. The host answers each taken request with
+    // send_display_follow_state().
+    bool take_display_follow_request(uint8_t& flags);
+    // Asks the host for the follow modes this viewer wants. Returns false when
+    // the handshake is not complete or the host did not grant input.
+    Error request_display_follow(uint8_t flags);
+    // Pops the newest DisplayFollowState. The host sends it as the answer and
+    // unsolicited when it turns a mode off itself.
+    bool take_display_follow_state(DisplayFollowState& state);
+    // Answers SetDisplayFollow, or announces a host-initiated change. The
+    // flags describe the modes in effect after the call; a code other than Ok
+    // travels with flags=0.
+    Error send_display_follow_state(const DisplayFollowState& state);
     // Pops the newest SetPrivacyMode request. Only the newest is kept: a viewer
     // that toggles twice wants the final state. The host answers each taken
     // request with send_privacy_mode_state(). Requires the privacy-mode

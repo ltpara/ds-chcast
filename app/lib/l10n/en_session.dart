@@ -73,6 +73,10 @@ const Map<String, String> kEnglishSession = <String, String>{
   '无法切换全屏': 'Cannot toggle fullscreen',
   '无法切换分辨率：会话未在串流，或主机未开放输入':
       'Cannot change resolution: the session is not streaming or the host has not enabled input',
+  '无法设置跟随：会话未在串流，或主机未开放输入':
+      'Cannot set following: the session is not streaming or the host has not enabled input',
+  '无法跟随远程显示': 'Cannot follow the remote display',
+  '无法跟随远程显示：{reason}': 'Cannot follow the remote display: {reason}',
   '无法切换隐私模式': 'Cannot toggle privacy mode',
   '无法切换音频输出': 'Cannot switch audio output',
   '无法切换麦克风': 'Cannot switch microphone',
@@ -237,6 +241,8 @@ const Map<String, String> kEnglishSession = <String, String>{
   '结束语音通话': 'End the voice call',
   '收听主机麦克风': 'Listen to the host microphone',
   '服务端默认': 'Host default',
+  '跟随远程光标': 'Follow the remote cursor',
+  '跟随远程窗口': 'Follow the remote window',
   '查看主机摄像头': 'View host camera',
   '正在读取主机的显示模式': 'Reading the host display modes',
   '流畅': 'Smooth',
