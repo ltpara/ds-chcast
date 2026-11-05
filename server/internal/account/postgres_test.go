@@ -1,6 +1,7 @@
 package account
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -257,5 +258,106 @@ func TestPostgresConcurrentLoginLocks(t *testing.T) {
 	}
 	if !found || record.Failures != workers*perWorker {
 		t.Fatalf("failures = %d (found %v), want %d", record.Failures, found, workers*perWorker)
+	}
+}
+
+// TestPostgresAccountGroups runs the group CRUD, quota and scoped-history
+// paths against PostgreSQL. The FOR UPDATE quota lock and the group event
+// subqueries are the parts most likely to differ from SQLite.
+func TestPostgresAccountGroups(t *testing.T) {
+	dsn := os.Getenv("CHAST_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("CHAST_TEST_POSTGRES_DSN is not set")
+	}
+	store, err := OpenPostgres(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	alice, err := store.CreateUser("PgGroupA"+suffix, "correct horse battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := store.CreateUser("PgGroupB"+suffix, "correct horse battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.DeleteUser(alice.Username); err != nil {
+			t.Errorf("delete alice: %v", err)
+		}
+		if err := store.DeleteUser(bob.Username); err != nil {
+			t.Errorf("delete bob: %v", err)
+		}
+	}()
+	groupID := "pg" + suffix
+	if _, err := store.CreateGroup(groupID, "PostgreSQL", "", 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.DeleteAccountGroup(groupID); err != nil {
+			t.Errorf("delete group: %v", err)
+		}
+	}()
+	if _, err := store.AddGroupMember(groupID, bob.Username, RoleReadonly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddGroupMember(groupID, alice.Username, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddGroupMember(groupID, alice.Username, RoleAdmin); !errors.Is(err, ErrGroupMemberExists) {
+		t.Fatalf("duplicate member = %v", err)
+	}
+	if _, err := store.AddGroupMember(groupID, bob.Username, RoleAdmin); !errors.Is(err, ErrGroupMemberExists) {
+		t.Fatalf("duplicate bob = %v", err)
+	}
+	if _, err := store.AddGroupDevice(groupID, "pgdev"+suffix, alice.Username); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddGroupDevice(groupID, "pgdev2"+suffix, alice.Username); !errors.Is(err, ErrGroupDeviceQuota) {
+		t.Fatalf("device quota = %v", err)
+	}
+	if err := store.RemoveGroupMember(groupID, alice.Username); !errors.Is(err, ErrLastGroupAdmin) {
+		t.Fatalf("last admin removal = %v", err)
+	}
+
+	now := time.Now().UTC()
+	if _, err := store.RecordConnection(bob.ID, bob.Username, "peer-bob",
+		"viewer", "127.0.0.1", "", now.Add(-time.Minute), now, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordConnection(alice.ID, alice.Username, "peer-alice",
+		"viewer", "127.0.0.1", "", now.Add(-time.Minute), now, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendAudit(AuditEvent{Username: bob.Username, Action: "pg_group_probe"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendAudit(AuditEvent{Username: alice.Username, Action: "pg_group_probe"}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.AuditEventsForGroupBefore(groupID, "pg_group_probe", 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("group audit = %+v", events)
+	}
+	connections, err := store.ConnectionsForGroupBefore(groupID, "", "", 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, event := range connections {
+		seen[event.Username] = true
+	}
+	if len(seen) != 2 || !seen[alice.Username] || !seen[bob.Username] {
+		t.Fatalf("group connections = %+v", connections)
+	}
+	access, err := store.GroupsForUser(bob.ID)
+	if err != nil || len(access) != 1 || access[0].Role != RoleReadonly {
+		t.Fatalf("bob groups = %+v, %v", access, err)
 	}
 }

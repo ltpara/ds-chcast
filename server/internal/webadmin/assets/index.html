@@ -21,9 +21,9 @@
         </select>
         <input id="server-key" type="password" placeholder="服务器密钥（未设置可留空）" spellcheck="false" autocomplete="off">
         <span id="login-account" class="login-fields hidden">
-          <input id="account-username" placeholder="用户名" spellcheck="false" autocomplete="username">
-          <input id="account-password" type="password" placeholder="密码" autocomplete="current-password">
-          <input id="account-totp" placeholder="2FA / 恢复码（可选）" maxlength="24" autocomplete="one-time-code">
+          <input id="login-username" placeholder="用户名" spellcheck="false" autocomplete="username">
+          <input id="login-password" type="password" placeholder="密码" autocomplete="current-password">
+          <input id="login-totp" placeholder="2FA / 恢复码（可选）" maxlength="24" autocomplete="one-time-code">
         </span>
         <button type="submit" class="primary">连接</button>
       </form>
@@ -42,6 +42,7 @@
       <button type="button" class="tab active" data-tab="overview" role="tab">概览</button>
       <button type="button" class="tab" data-tab="devices" role="tab">设备</button>
       <button type="button" class="tab" data-tab="accounts" role="tab">账号</button>
+      <button type="button" class="tab" data-tab="groups" role="tab">分组</button>
       <button type="button" class="tab" data-tab="recordings" role="tab">录制</button>
       <button type="button" class="tab" data-tab="audit" role="tab">审计</button>
       <button type="button" class="tab" data-tab="server" role="tab">服务</button>
@@ -127,6 +128,34 @@
       </div>
     </section>
 
+    <section id="panel-groups" class="panel-page">
+      <div class="panel" id="group-create-panel">
+        <div class="panel-head"><h2>新建分组</h2></div>
+        <form id="group-create" class="inline-form" autocomplete="off">
+          <label>ID<input id="group-id" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}" maxlength="64" spellcheck="false" placeholder="lab-a"></label>
+          <label>名称<input id="group-name" required maxlength="64" spellcheck="false"></label>
+          <label>说明<input id="group-description" maxlength="256" spellcheck="false"></label>
+          <label>成员配额（0 不限）<input id="group-member-quota" type="number" min="0" step="1" value="0"></label>
+          <label>设备配额（0 不限）<input id="group-device-quota" type="number" min="0" step="1" value="0"></label>
+          <button type="submit" class="primary">创建</button>
+        </form>
+        <p class="muted">分组把账号与设备绑定在一起：组内 readonly 只读，operator 可维护组设备，admin 还可管理成员与配额。组内审计与连接记录按成员和组设备过滤；分组与地址簿分组 ACL 相互独立。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>分组</h2><button type="button" id="group-refresh">刷新</button></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>名称</th><th>说明</th><th>成员</th><th>设备</th><th>我的角色</th><th>更新时间</th><th class="actions-col">操作</th></tr>
+            </thead>
+            <tbody id="group-rows"></tbody>
+          </table>
+        </div>
+        <p id="group-empty" class="muted hidden">没有分组</p>
+        <p id="group-readonly" class="muted hidden">当前身份没有全局管理台权限，只能查看与管理所属分组。</p>
+      </div>
+    </section>
+
     <section id="panel-recordings" class="panel-page">
       <div class="panel">
         <div class="panel-head">
@@ -163,6 +192,7 @@
             <button type="button" class="subtab" data-audit="files">文件传输</button>
           </div>
           <span class="spacer"></span>
+          <select id="audit-group" aria-label="按分组过滤"></select>
           <input id="audit-filter" type="search" placeholder="动作" spellcheck="false">
           <input id="audit-host" class="hidden" type="search" placeholder="主机 ID（可选）" spellcheck="false">
           <button type="button" id="audit-reload">查询</button>
@@ -213,6 +243,66 @@
         <button type="submit" class="primary">保存</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="group-dialog" class="wide">
+    <div class="dialog-stack">
+      <div class="panel-head">
+        <div>
+          <h2 id="group-dialog-title">分组</h2>
+          <p id="group-dialog-id" class="mono muted"></p>
+        </div>
+        <span id="group-dialog-role" class="pill"></span>
+      </div>
+
+      <h3>设置</h3>
+      <form id="group-edit" class="inline-form" autocomplete="off">
+        <label>名称<input id="group-edit-name" required maxlength="64" spellcheck="false"></label>
+        <label>说明<input id="group-edit-description" maxlength="256" spellcheck="false"></label>
+        <label>成员配额<input id="group-edit-member-quota" type="number" min="0" step="1"></label>
+        <label>设备配额<input id="group-edit-device-quota" type="number" min="0" step="1"></label>
+        <button type="submit" class="primary">保存设置</button>
+      </form>
+
+      <h3>成员</h3>
+      <form id="group-member-add" class="inline-form" autocomplete="off">
+        <label>用户名<input id="group-member-username" required spellcheck="false" autocomplete="off"></label>
+        <label>角色
+          <select id="group-member-role">
+            <option value="readonly">readonly（只读）</option>
+            <option value="operator">operator（组设备）</option>
+            <option value="admin">admin（成员与配额）</option>
+          </select>
+        </label>
+        <button type="submit" class="primary">添加成员</button>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>用户名</th><th>角色</th><th>加入时间</th><th class="actions-col">操作</th></tr></thead>
+          <tbody id="group-member-rows"></tbody>
+        </table>
+      </div>
+      <p id="group-member-empty" class="muted hidden">还没有成员</p>
+
+      <h3>设备</h3>
+      <form id="group-device-add" class="inline-form" autocomplete="off">
+        <label>设备 ID<input id="group-device-peer" required maxlength="64" spellcheck="false" autocomplete="off"></label>
+        <button type="submit" class="primary">添加设备</button>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>设备</th><th>添加者</th><th>加入时间</th><th class="actions-col">操作</th></tr></thead>
+          <tbody id="group-device-rows"></tbody>
+        </table>
+      </div>
+      <p id="group-device-empty" class="muted hidden">还没有设备</p>
+
+      <div class="dialog-actions">
+        <button type="button" id="group-delete" class="danger">删除分组</button>
+        <span class="spacer"></span>
+        <button type="button" id="group-close">关闭</button>
+      </div>
+    </div>
   </dialog>
 
   <script src="app.js"></script>

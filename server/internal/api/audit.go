@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/ltpara/ds-chcast/server/internal/account"
 )
 
 type auditEventView struct {
@@ -24,8 +26,14 @@ type auditResponse struct {
 // auditLog exposes the persisted account-security trail to console readers.
 // Any console role may read it; ordinary viewer accounts may not.
 func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+	groupID, ok := s.auditGroupFilter(w, r)
+	if !ok {
 		return
+	}
+	if groupID == "" {
+		if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+			return
+		}
 	}
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
@@ -50,8 +58,17 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, err := s.cfg.Accounts.AuditEventsForBefore(
-		r.URL.Query().Get("action"), beforeID, limit)
+	var (
+		events []account.AuditEvent
+		err    error
+	)
+	if groupID != "" {
+		events, err = s.cfg.Accounts.AuditEventsForGroupBefore(
+			groupID, r.URL.Query().Get("action"), beforeID, limit)
+	} else {
+		events, err = s.cfg.Accounts.AuditEventsForBefore(
+			r.URL.Query().Get("action"), beforeID, limit)
+	}
 	if err != nil {
 		s.cfg.Logger.Error("account audit query", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the audit log")

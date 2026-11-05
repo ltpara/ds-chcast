@@ -256,6 +256,33 @@ func applyAccountPostgresBaseline(db *sql.DB) error {
 			PRIMARY KEY (issuer, subject)
 		)`,
 		`CREATE INDEX IF NOT EXISTS oidc_identities_user ON oidc_identities(user_id)`,
+		`CREATE TABLE IF NOT EXISTS account_groups (
+			id           TEXT PRIMARY KEY,
+			name         TEXT NOT NULL,
+			description  TEXT NOT NULL DEFAULT '',
+			member_quota BIGINT NOT NULL DEFAULT 0,
+			device_quota BIGINT NOT NULL DEFAULT 0,
+			created_at   BIGINT NOT NULL,
+			updated_at   BIGINT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS account_group_members (
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role       TEXT NOT NULL DEFAULT 'readonly',
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (group_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_group_members_user
+			ON account_group_members(user_id)`,
+		`CREATE TABLE IF NOT EXISTS account_group_devices (
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			peer_id    TEXT NOT NULL,
+			added_by   TEXT NOT NULL DEFAULT '',
+			created_at BIGINT NOT NULL,
+			PRIMARY KEY (group_id, peer_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_group_devices_peer
+			ON account_group_devices(peer_id)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

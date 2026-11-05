@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/ltpara/ds-chcast/server/internal/registry"
 )
 
 // AuditLogin is recorded for every login attempt, including attempts for
@@ -36,6 +38,15 @@ const (
 	AuditDeviceLeaseRemove = "device_lease_remove"
 	AuditRecordingUpload   = "recording_upload"
 	AuditRecordingDelete   = "recording_delete"
+
+	AuditGroupCreate       = "group_create"
+	AuditGroupUpdate       = "group_update"
+	AuditGroupDelete       = "group_delete"
+	AuditGroupMemberAdd    = "group_member_add"
+	AuditGroupMemberUpdate = "group_member_update"
+	AuditGroupMemberRemove = "group_member_remove"
+	AuditGroupDeviceAdd    = "group_device_add"
+	AuditGroupDeviceRemove = "group_device_remove"
 )
 
 // auditRetention keeps the table bounded without an external maintenance job.
@@ -103,18 +114,44 @@ func (s *Store) AuditEventsFor(action string, limit int) ([]AuditEvent, error) {
 // newest row. The cursor is an ID rather than an offset so rows appended while
 // an operator pages do not shift the window.
 func (s *Store) AuditEventsForBefore(action string, beforeID int64, limit int) ([]AuditEvent, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	if limit > 500 {
-		limit = 500
-	}
 	action = strings.TrimSpace(action)
 	clauses := make([]string, 0, 2)
 	args := make([]any, 0, 3)
 	if action != "" {
 		clauses = append(clauses, "action = ?")
 		args = append(args, action)
+	}
+	return s.auditEvents(clauses, args, beforeID, limit)
+}
+
+// AuditEventsForGroupBefore pages the audit trail of one group's members.
+// Audit rows carry a username rather than a user id, so membership is resolved
+// through the account table; a renamed or deleted user stops matching, which
+// is the same rule the rest of the audit view follows.
+func (s *Store) AuditEventsForGroupBefore(groupID, action string, beforeID int64, limit int) ([]AuditEvent, error) {
+	groupID = strings.TrimSpace(groupID)
+	if !registry.ValidID(groupID) {
+		return nil, ErrInvalidAccountGroupID
+	}
+	action = strings.TrimSpace(action)
+	clauses := []string{`username IN (
+		SELECT u.username FROM account_group_members m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.group_id = ?)`}
+	args := []any{groupID}
+	if action != "" {
+		clauses = append(clauses, "action = ?")
+		args = append(args, action)
+	}
+	return s.auditEvents(clauses, args, beforeID, limit)
+}
+
+func (s *Store) auditEvents(clauses []string, args []any, beforeID int64, limit int) ([]AuditEvent, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	if beforeID > 0 {
 		clauses = append(clauses, "id < ?")

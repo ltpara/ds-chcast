@@ -135,8 +135,14 @@ func (s *server) accountFileTransfers(w http.ResponseWriter, r *http.Request) {
 // auditFileTransfers is the operator view across accounts. Console readers may
 // view it; viewer accounts may not.
 func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+	groupID, ok := s.auditGroupFilter(w, r)
+	if !ok {
 		return
+	}
+	if groupID == "" {
+		if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+			return
+		}
 	}
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
@@ -160,10 +166,15 @@ func (s *server) auditFileTransfers(w http.ResponseWriter, r *http.Request) {
 		events []account.FileEvent
 		err    error
 	)
-	if host := strings.TrimSpace(r.URL.Query().Get("host")); host != "" {
+	username := r.URL.Query().Get("username")
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	if groupID != "" {
+		events, err = s.cfg.Accounts.FileTransfersForGroupBefore(
+			groupID, username, host, beforeID, limit)
+	} else if host != "" {
 		events, err = s.cfg.Accounts.FileTransfersForHostBefore(host, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.FileTransfersForBefore(r.URL.Query().Get("username"), beforeID, limit)
+		events, err = s.cfg.Accounts.FileTransfersForBefore(username, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account file transfer audit query", "error", err)

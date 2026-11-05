@@ -11,7 +11,7 @@ import (
 // databases created before schema_migrations existed are upgraded by the
 // baseline migration, which stays idempotent so a crash between applying it
 // and recording the version is harmless.
-const accountSchemaVersion = 6
+const accountSchemaVersion = 7
 
 var accountMigrations = []schemamig.Migration{
 	{Version: 1, Name: "baseline", Apply: applyAccountBaseline},
@@ -20,6 +20,48 @@ var accountMigrations = []schemamig.Migration{
 	{Version: 4, Name: "recording archive", Apply: applyRecordingArchive},
 	{Version: 5, Name: "refresh replay marker", Apply: applyRefreshReplayMarker},
 	{Version: 6, Name: "oidc identities", Apply: applyOIDCIdentities},
+	{Version: 7, Name: "account groups", Apply: applyAccountGroups},
+}
+
+// applyAccountGroups adds operator-managed groups that scope console access
+// and device ownership. These are separate from address book groups: an
+// account group spans users, while an address book group is private to one
+// book and only groups its saved peers.
+func applyAccountGroups(db *sql.DB) error {
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS account_groups (
+			id           TEXT PRIMARY KEY,
+			name         TEXT NOT NULL,
+			description  TEXT NOT NULL DEFAULT '',
+			member_quota INTEGER NOT NULL DEFAULT 0,
+			device_quota INTEGER NOT NULL DEFAULT 0,
+			created_at   INTEGER NOT NULL,
+			updated_at   INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS account_group_members (
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role       TEXT NOT NULL DEFAULT 'readonly',
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (group_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_group_members_user
+			ON account_group_members(user_id)`,
+		`CREATE TABLE IF NOT EXISTS account_group_devices (
+			group_id   TEXT NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+			peer_id    TEXT NOT NULL,
+			added_by   TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (group_id, peer_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS account_group_devices_peer
+			ON account_group_devices(peer_id)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("create account group schema: %w", err)
+		}
+	}
+	return nil
 }
 
 // applyOIDCIdentities links an external OpenID Connect subject to one local

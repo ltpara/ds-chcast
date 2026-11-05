@@ -169,8 +169,14 @@ func (s *server) accountConnections(w http.ResponseWriter, r *http.Request) {
 // narrowed to one username. Console readers may view it; viewer accounts may
 // not.
 func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+	groupID, ok := s.auditGroupFilter(w, r)
+	if !ok {
 		return
+	}
+	if groupID == "" {
+		if _, _, ok := s.consoleActor(w, r, consoleRead); !ok {
+			return
+		}
 	}
 	if s.cfg.Accounts == nil {
 		writeError(w, http.StatusServiceUnavailable, accountUnavailable)
@@ -194,10 +200,15 @@ func (s *server) auditConnections(w http.ResponseWriter, r *http.Request) {
 		events []account.ConnectionEvent
 		err    error
 	)
-	if host := strings.TrimSpace(r.URL.Query().Get("host")); host != "" {
+	username := r.URL.Query().Get("username")
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	if groupID != "" {
+		events, err = s.cfg.Accounts.ConnectionsForGroupBefore(
+			groupID, username, host, beforeID, limit)
+	} else if host != "" {
 		events, err = s.cfg.Accounts.ConnectionsForHostBefore(host, beforeID, limit)
 	} else {
-		events, err = s.cfg.Accounts.ConnectionsForBefore(r.URL.Query().Get("username"), beforeID, limit)
+		events, err = s.cfg.Accounts.ConnectionsForBefore(username, beforeID, limit)
 	}
 	if err != nil {
 		s.cfg.Logger.Error("account connection audit query", "error", err)

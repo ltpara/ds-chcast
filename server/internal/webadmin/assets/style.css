@@ -84,8 +84,8 @@ a { color: var(--accent); }
 .login { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .login-fields { display: inline-flex; align-items: center; gap: 8px; }
 .login input { width: 150px; }
-.login #account-username, .login #account-password { width: 132px; }
-.login #account-totp { width: 96px; }
+.login #login-username, .login #login-password { width: 132px; }
+.login #login-totp { width: 96px; }
 .session { display: flex; align-items: center; gap: 10px; }
 
 .login-note { margin: 6px 22px 0; min-height: 1.2em; font-size: 12.5px; }
@@ -370,6 +370,20 @@ dialog h2 { margin: 0 0 8px; font-size: 16px; }
 dialog label { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; color: var(--muted); font-size: 12.5px; }
 dialog input { width: 100%; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.dialog-stack { display: flex; flex-direction: column; }
+.dialog-stack h3 {
+  margin: 18px 0 8px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+dialog.wide { width: min(860px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; }
+dialog .panel-head { margin-bottom: 0; }
+dialog .panel-head h2 { margin: 0; }
+dialog .panel-head p { margin: 4px 0 0; }
+dialog .inline-form label { margin-top: 0; }
 
 .tag {
   display: inline-block;

@@ -24,6 +24,10 @@
     recordingBefore: 0,
     recordingRows: [],
     recordingGen: 0,
+    groups: [],
+    groupsLoaded: false,
+    groupsLoading: false,
+    groupEditing: null,
   };
 
   class ApiError extends Error {
@@ -198,6 +202,26 @@
     return (ROLE_RANK[auth.role] || 0) >= ROLE_RANK[level];
   }
 
+  // groupOnly is an account whose console access comes from group membership
+  // alone; it may only use the Groups tab and group-scoped audit views.
+  function groupOnly() {
+    const auth = state.auth;
+    return Boolean(auth && auth.mode === 'account' && !ROLE_RANK[auth.role]);
+  }
+
+  function groupByID(id) {
+    return state.groups.find((group) => group.id === id) || null;
+  }
+
+  // group.role already carries the stronger of the global console role and
+  // the membership role, so this mirrors the server's groupActor decision.
+  function canGroup(group, level) {
+    const auth = state.auth;
+    if (!auth || !group) return false;
+    if (auth.mode === 'key') return true;
+    return (ROLE_RANK[group.role] || 0) >= ROLE_RANK[level];
+  }
+
   function authToken() {
     const auth = state.auth;
     if (!auth) return '';
@@ -278,7 +302,21 @@
     state.auth = { mode: 'key', key };
     await api('/v1/stats');
     writeSession(state.auth);
-    enterConsole();
+    await enterConsole();
+  }
+
+  async function hasGroupConsoleAccess(token) {
+    try {
+      const resp = await fetch('/v1/groups', {
+        headers: { Authorization: 'Bearer ' + token },
+        cache: 'no-store',
+      });
+      if (!resp.ok) return false;
+      const data = readJSON(await resp.text());
+      return Boolean(data && Array.isArray(data.groups) && data.groups.length > 0);
+    } catch {
+      return false;
+    }
   }
 
   async function unlockAccount(username, password, code) {
@@ -307,14 +345,14 @@
       throw new ApiError((data && data.error) || resp.status + ' ' + resp.statusText, resp.status);
     }
     const user = data && data.user ? data.user : {};
-    if (!ROLE_RANK[user.role]) {
-      // The viewer session is valid but useless here; revoke it right away.
+    if (!ROLE_RANK[user.role] && !(await hasGroupConsoleAccess(data.token))) {
+      // The session is valid but useless here; revoke it right away.
       fetch('/v1/account/logout', {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + data.token },
         cache: 'no-store',
       }).catch(() => {});
-      throw new ApiError('该账号没有管理台权限（需要 readonly、operator 或 admin 角色）。', 403);
+      throw new ApiError('该账号没有管理台权限（需要 readonly、operator 或 admin 角色，或至少一个分组授权）。', 403);
     }
     state.auth = {
       mode: 'account',
@@ -324,24 +362,36 @@
       role: user.role,
     };
     writeSession(state.auth);
-    enterConsole();
+    await enterConsole();
   }
 
-  function enterConsole() {
+  async function enterConsole() {
     $('login-form').classList.add('hidden');
     $('session-bar').classList.remove('hidden');
     $('login-note').textContent = '';
     $('workspace').classList.remove('hidden');
     renderSession();
+    try {
+      await loadGroups();
+    } catch (err) {
+      // A server without the account store still has a key-only console.
+      if (!err || err.status !== 503) throw err;
+      state.groups = [];
+      state.groupsLoaded = true;
+    }
+    if (groupOnly() && !state.groups.length) {
+      lock('该账号没有分组授权。');
+      return;
+    }
     applyPermissions();
     startTimer();
-    switchTab('overview');
+    switchTab(groupOnly() ? 'groups' : 'overview');
   }
 
   function renderSession() {
     const auth = state.auth;
     if (!auth) return;
-    const role = auth.mode === 'key' ? 'server-key' : auth.role;
+    const role = auth.mode === 'key' ? 'server-key' : (ROLE_RANK[auth.role] ? auth.role : 'group');
     const pill = $('session-role');
     pill.textContent = role;
     pill.className = 'pill ' + (role === 'admin' || role === 'server-key' ? 'ok'
@@ -352,10 +402,25 @@
   function applyPermissions() {
     const admin = can('admin');
     const write = can('operator');
-    document.querySelector('.tab[data-tab="accounts"]').classList.toggle('hidden', !admin);
+    const read = can('readonly');
+    const restricted = groupOnly();
+    const visibility = {
+      overview: read && !restricted,
+      devices: read && !restricted,
+      accounts: admin,
+      groups: true,
+      recordings: read && !restricted,
+      audit: read || restricted,
+      server: read && !restricted,
+    };
+    document.querySelectorAll('.tab').forEach((node) => {
+      node.classList.toggle('hidden', !visibility[node.dataset.tab]);
+    });
     $('device-readonly').classList.toggle('hidden', write);
     $('recording-readonly').classList.toggle('hidden', write);
-    if (!admin && state.tab === 'accounts') switchTab('overview');
+    $('group-create-panel').classList.toggle('hidden', !admin);
+    $('group-readonly').classList.toggle('hidden', admin);
+    if (!visibility[state.tab]) switchTab(restricted ? 'groups' : 'overview');
   }
 
   function lock(message) {
@@ -374,15 +439,22 @@
     state.auditGen++;
     state.recordingRows = [];
     state.recordingGen++;
+    state.groups = [];
+    state.groupsLoaded = false;
+    state.groupEditing = null;
+    clear($('group-rows'));
+    clear($('audit-group'));
     const dialog = $('device-dialog');
     if (dialog.open) dialog.close();
+    const groupDialog = $('group-dialog');
+    if (groupDialog.open) groupDialog.close();
     clearSession();
     $('workspace').classList.add('hidden');
     $('session-bar').classList.add('hidden');
     $('login-form').classList.remove('hidden');
     $('server-key').value = '';
-    $('account-password').value = '';
-    $('account-totp').value = '';
+    $('login-password').value = '';
+    $('login-totp').value = '';
     $('login-note').textContent = message || '已断开连接。';
     syncLoginMode();
   }
@@ -395,6 +467,8 @@
         refreshOverview().catch(() => {});
       } else if (state.tab === 'devices') {
         loadDevices(true).catch(() => {});
+      } else if (state.tab === 'groups') {
+        loadGroups(true).catch(() => {});
       }
     }, REFRESH_MS);
   }
@@ -419,6 +493,7 @@
     if (tab === 'overview') refreshOverview().catch(reportError);
     else if (tab === 'devices') loadDevices().catch(reportError);
     else if (tab === 'accounts') loadAccounts().catch(reportError);
+    else if (tab === 'groups') loadGroups().catch(reportError);
     else if (tab === 'recordings') loadRecordings(true).catch(reportError);
     else if (tab === 'audit') loadAudit(true).catch(reportError);
     else if (tab === 'server') loadServerPanel().catch(reportError);
@@ -860,6 +935,308 @@
     });
   }
 
+  // ---------- groups ----------
+
+  async function loadGroups(silent) {
+    if (state.groupsLoading) return state.groups;
+    state.groupsLoading = true;
+    try {
+      const data = await api('/v1/groups') || {};
+      state.groups = Array.isArray(data.groups) ? data.groups : [];
+      state.groupsLoaded = true;
+      if (state.auth && state.auth.mode === 'account') {
+        const role = data.global_role || 'user';
+        if (state.auth.role !== role) {
+          state.auth.role = role;
+          writeSession(state.auth);
+          renderSession();
+          applyPermissions();
+        }
+      }
+      renderGroups();
+      renderAuditGroups();
+      return state.groups;
+    } catch (err) {
+      if (!silent) throw err;
+      return state.groups;
+    } finally {
+      state.groupsLoading = false;
+    }
+  }
+
+  function rolePill(role) {
+    if (!role) return el('span', 'muted', '—');
+    return pill(role, role === 'admin' ? 'ok' : role === 'operator' ? 'warn' : '');
+  }
+
+  function renderGroups() {
+    const body = $('group-rows');
+    clear(body);
+    state.groups.forEach((group) => body.appendChild(groupRow(group)));
+    $('group-empty').classList.toggle('hidden', state.groups.length > 0);
+    $('group-readonly').classList.toggle('hidden', can('admin'));
+  }
+
+  function groupRow(group) {
+    const tr = document.createElement('tr');
+    const id = cell(group.id);
+    id.className = 'mono';
+    tr.appendChild(id);
+    tr.appendChild(cell(group.name || '—'));
+    tr.appendChild(cell(group.description || '—'));
+    tr.appendChild(cell(group.member_count + ' / ' + (group.member_quota || '∞')));
+    tr.appendChild(cell(group.device_count + ' / ' + (group.device_quota || '∞')));
+    tr.appendChild(cell(rolePill(group.role)));
+    tr.appendChild(cell(fmtTime(group.updated_at_ms)));
+
+    const actions = el('div', 'actions-wrap');
+    const manage = button('管理', 'small');
+    manage.addEventListener('click', () => withButton(manage, () => openGroupDialog(group)));
+    actions.appendChild(manage);
+    tr.appendChild(cell(actions));
+    return tr;
+  }
+
+  async function createGroup() {
+    const submit = $('group-create').querySelector('button[type="submit"]');
+    const body = {
+      id: $('group-id').value.trim(),
+      name: $('group-name').value.trim(),
+      description: $('group-description').value.trim(),
+      member_quota: Number($('group-member-quota').value || 0),
+      device_quota: Number($('group-device-quota').value || 0),
+    };
+    await withButton(submit, async () => {
+      const group = await api('/v1/groups', { method: 'POST', body });
+      $('group-id').value = '';
+      $('group-name').value = '';
+      $('group-description').value = '';
+      $('group-member-quota').value = '0';
+      $('group-device-quota').value = '0';
+      toast('已创建分组 ' + group.id);
+      await loadGroups(true);
+      await openGroupDialog(group);
+    });
+  }
+
+  async function openGroupDialog(group) {
+    state.groupEditing = group;
+    $('group-dialog-title').textContent = group.name || group.id;
+    $('group-dialog-id').textContent = group.id;
+    $('group-dialog-role').textContent = group.role || '';
+    $('group-dialog-role').className = 'pill ' +
+      (group.role === 'admin' ? 'ok' : group.role === 'operator' ? 'warn' : '');
+    const admin = canGroup(group, 'admin');
+    const write = canGroup(group, 'operator');
+    $('group-edit-name').value = group.name || '';
+    $('group-edit-description').value = group.description || '';
+    $('group-edit-member-quota').value = group.member_quota || 0;
+    $('group-edit-device-quota').value = group.device_quota || 0;
+    ['group-edit-name', 'group-edit-description', 'group-edit-member-quota', 'group-edit-device-quota']
+      .forEach((id) => { $(id).disabled = !admin; });
+    $('group-edit').querySelector('button[type="submit"]').classList.toggle('hidden', !admin);
+    $('group-member-add').classList.toggle('hidden', !admin);
+    $('group-device-add').classList.toggle('hidden', !write);
+    $('group-delete').classList.toggle('hidden', !admin);
+    clear($('group-member-rows'));
+    clear($('group-device-rows'));
+    $('group-member-empty').classList.add('hidden');
+    $('group-device-empty').classList.add('hidden');
+    $('group-dialog').showModal();
+    await loadGroupDetail(group.id);
+  }
+
+  async function loadGroupDetail(groupID) {
+    const data = await api('/v1/groups/' + encodeURIComponent(groupID)) || {};
+    if (!state.groupEditing || state.groupEditing.id !== groupID) return;
+    const group = data.group || {};
+    const merged = Object.assign({}, state.groupEditing, {
+      name: group.name || state.groupEditing.name,
+      description: group.description || '',
+      member_quota: group.member_quota || 0,
+      device_quota: group.device_quota || 0,
+      member_count: group.member_count || 0,
+      device_count: group.device_count || 0,
+      updated_at_ms: group.updated_at_ms || state.groupEditing.updated_at_ms,
+    });
+    state.groupEditing = merged;
+    const admin = canGroup(merged, 'admin');
+    const write = canGroup(merged, 'operator');
+    $('group-dialog-title').textContent = merged.name || merged.id;
+    $('group-edit-name').value = merged.name || '';
+    $('group-edit-description').value = merged.description || '';
+    $('group-edit-member-quota').value = merged.member_quota;
+    $('group-edit-device-quota').value = merged.device_quota;
+    ['group-edit-name', 'group-edit-description', 'group-edit-member-quota', 'group-edit-device-quota']
+      .forEach((id) => { $(id).disabled = !admin; });
+    $('group-edit').querySelector('button[type="submit"]').classList.toggle('hidden', !admin);
+    $('group-member-add').classList.toggle('hidden', !admin);
+    $('group-device-add').classList.toggle('hidden', !write);
+    $('group-delete').classList.toggle('hidden', !admin);
+    renderGroupMembers(Array.isArray(data.members) ? data.members : [], admin);
+    renderGroupDevices(Array.isArray(data.devices) ? data.devices : [], write);
+  }
+
+  async function refreshGroupDialog() {
+    const group = state.groupEditing;
+    if (!group) return;
+    await loadGroups(true);
+    const current = groupByID(group.id);
+    if (!current) {
+      $('group-dialog').close();
+      state.groupEditing = null;
+      return;
+    }
+    state.groupEditing = current;
+    await loadGroupDetail(current.id);
+  }
+
+  function renderGroupMembers(members, admin) {
+    const body = $('group-member-rows');
+    clear(body);
+    members.forEach((member) => {
+      const tr = document.createElement('tr');
+      const name = cell(member.username);
+      name.className = 'mono';
+      tr.appendChild(name);
+      if (admin) {
+        const select = document.createElement('select');
+        ['readonly', 'operator', 'admin'].forEach((role) => {
+          const option = document.createElement('option');
+          option.value = role;
+          option.textContent = role;
+          if (member.role === role) option.selected = true;
+          select.appendChild(option);
+        });
+        select.addEventListener('change', () => withButton(select, async () => {
+          try {
+            await updateGroupMember(member.username, select.value);
+          } finally {
+            await refreshGroupDialog();
+          }
+        }));
+        tr.appendChild(cell(select));
+      } else {
+        tr.appendChild(cell(rolePill(member.role)));
+      }
+      tr.appendChild(cell(fmtTime(member.created_at_ms)));
+
+      const actions = el('div', 'actions-wrap');
+      if (admin) {
+        const remove = button('移除', 'small danger');
+        remove.addEventListener('click', () => withButton(remove, async () => {
+          if (!window.confirm('从分组中移除 ' + member.username + '？')) return;
+          await api('/v1/groups/' + encodeURIComponent(state.groupEditing.id) +
+            '/members/' + encodeURIComponent(member.username), { method: 'DELETE' });
+          toast('已移除 ' + member.username);
+          await refreshGroupDialog();
+        }));
+        actions.appendChild(remove);
+      }
+      tr.appendChild(cell(actions));
+      body.appendChild(tr);
+    });
+    $('group-member-empty').classList.toggle('hidden', members.length > 0);
+  }
+
+  function renderGroupDevices(devices, write) {
+    const body = $('group-device-rows');
+    clear(body);
+    devices.forEach((device) => {
+      const tr = document.createElement('tr');
+      const peer = cell(device.peer_id);
+      peer.className = 'mono';
+      tr.appendChild(peer);
+      tr.appendChild(cell(device.added_by || '—'));
+      tr.appendChild(cell(fmtTime(device.created_at_ms)));
+
+      const actions = el('div', 'actions-wrap');
+      if (write) {
+        const remove = button('移除', 'small danger');
+        remove.addEventListener('click', () => withButton(remove, async () => {
+          if (!window.confirm('从分组中移除设备 ' + device.peer_id + '？')) return;
+          await api('/v1/groups/' + encodeURIComponent(state.groupEditing.id) +
+            '/devices/' + encodeURIComponent(device.peer_id), { method: 'DELETE' });
+          toast('已移除设备 ' + device.peer_id);
+          await refreshGroupDialog();
+        }));
+        actions.appendChild(remove);
+      }
+      tr.appendChild(cell(actions));
+      body.appendChild(tr);
+    });
+    $('group-device-empty').classList.toggle('hidden', devices.length > 0);
+  }
+
+  async function updateGroupMember(username, role) {
+    await api('/v1/groups/' + encodeURIComponent(state.groupEditing.id) +
+      '/members/' + encodeURIComponent(username), { method: 'PATCH', body: { role } });
+    toast('已将 ' + username + ' 设为 ' + role);
+  }
+
+  async function addGroupMember() {
+    const group = state.groupEditing;
+    if (!group) return;
+    const username = $('group-member-username').value.trim();
+    const role = $('group-member-role').value;
+    const submit = $('group-member-add').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/groups/' + encodeURIComponent(group.id) + '/members', {
+        method: 'POST',
+        body: { username, role },
+      });
+      $('group-member-username').value = '';
+      toast('已添加 ' + username);
+      await refreshGroupDialog();
+    });
+  }
+
+  async function addGroupDevice() {
+    const group = state.groupEditing;
+    if (!group) return;
+    const peerID = $('group-device-peer').value.trim();
+    const submit = $('group-device-add').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/groups/' + encodeURIComponent(group.id) + '/devices', {
+        method: 'POST',
+        body: { peer_id: peerID },
+      });
+      $('group-device-peer').value = '';
+      toast('已添加设备 ' + peerID);
+      await refreshGroupDialog();
+    });
+  }
+
+  async function saveGroupSettings() {
+    const group = state.groupEditing;
+    if (!group) return;
+    const submit = $('group-edit').querySelector('button[type="submit"]');
+    await withButton(submit, async () => {
+      await api('/v1/groups/' + encodeURIComponent(group.id), {
+        method: 'PATCH',
+        body: {
+          name: $('group-edit-name').value.trim(),
+          description: $('group-edit-description').value.trim(),
+          member_quota: Number($('group-edit-member-quota').value || 0),
+          device_quota: Number($('group-edit-device-quota').value || 0),
+        },
+      });
+      toast('已保存分组设置');
+      await refreshGroupDialog();
+    });
+  }
+
+  async function deleteGroup() {
+    const group = state.groupEditing;
+    if (!group) return;
+    if (!window.confirm('删除分组 ' + group.id + '？成员与设备归属会一并移除，此操作不可撤销。')) return;
+    await api('/v1/groups/' + encodeURIComponent(group.id), { method: 'DELETE' });
+    $('group-dialog').close();
+    state.groupEditing = null;
+    toast('已删除分组 ' + group.id);
+    await loadGroups(true);
+  }
+
   // ---------- recordings ----------
 
   async function loadRecordings(reset) {
@@ -1037,6 +1414,34 @@
     },
   };
 
+  function renderAuditGroups() {
+    const select = $('audit-group');
+    const previous = select.value;
+    clear(select);
+    const all = document.createElement('option');
+    all.value = '';
+    all.textContent = '全部分组';
+    select.appendChild(all);
+    state.groups.forEach((group) => {
+      const option = document.createElement('option');
+      option.value = group.id;
+      option.textContent = group.name && group.name !== group.id
+        ? group.id + ' · ' + group.name : group.id;
+      select.appendChild(option);
+    });
+    if (groupOnly()) {
+      all.disabled = true;
+      all.hidden = true;
+    }
+    if (previous && state.groups.some((group) => group.id === previous)) {
+      select.value = previous;
+    } else if (groupOnly()) {
+      select.value = state.groups.length ? state.groups[0].id : '';
+    } else {
+      select.value = '';
+    }
+  }
+
   function selectAuditTab(tab) {
     state.auditTab = tab;
     document.querySelectorAll('.subtab').forEach((node) => {
@@ -1052,6 +1457,8 @@
 
   function auditParams(spec) {
     const params = new URLSearchParams();
+    const group = $('audit-group').value;
+    if (group) params.set('group', group);
     const filter = $('audit-filter').value.trim();
     if (filter) params.set(spec.filterKey, filter);
     if (spec.hasHost) {
@@ -1069,6 +1476,14 @@
       state.auditRows = [];
     }
     renderAuditHeader(spec);
+    if (groupOnly() && !$('audit-group').value) {
+      state.auditRows = [];
+      state.auditBefore = 0;
+      renderAuditRows(spec);
+      $('audit-summary').textContent = state.groups.length
+        ? '请选择要查看的分组。' : '当前账号还没有分组授权。';
+      return;
+    }
     const params = auditParams(spec);
     params.set('limit', '50');
     const cursor = state.auditBefore;
@@ -1144,7 +1559,7 @@
     const account = $('login-mode').value === 'account';
     $('server-key').classList.toggle('hidden', account);
     $('login-account').classList.toggle('hidden', !account);
-    if (account) $('account-username').focus();
+    if (account) $('login-username').focus();
     else $('server-key').focus();
   }
 
@@ -1155,15 +1570,15 @@
       const mode = $('login-mode').value;
       try {
         if (mode === 'account') {
-          const username = $('account-username').value.trim();
-          const password = $('account-password').value;
+          const username = $('login-username').value.trim();
+          const password = $('login-password').value;
           if (!username || !password) {
             $('login-note').textContent = '请输入用户名与密码。';
             return;
           }
-          await unlockAccount(username, password, $('account-totp').value.trim());
-          $('account-password').value = '';
-          $('account-totp').value = '';
+          await unlockAccount(username, password, $('login-totp').value.trim());
+          $('login-password').value = '';
+          $('login-totp').value = '';
         } else {
           await unlockKey($('server-key').value.trim());
         }
@@ -1222,6 +1637,32 @@
       toast('已刷新');
     }));
 
+    $('group-create').addEventListener('submit', (event) => {
+      event.preventDefault();
+      createGroup();
+    });
+    $('group-refresh').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
+      await loadGroups();
+      toast('已刷新');
+    }));
+    $('group-edit').addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveGroupSettings();
+    });
+    $('group-member-add').addEventListener('submit', (event) => {
+      event.preventDefault();
+      addGroupMember();
+    });
+    $('group-device-add').addEventListener('submit', (event) => {
+      event.preventDefault();
+      addGroupDevice();
+    });
+    $('group-close').addEventListener('click', () => $('group-dialog').close());
+    $('group-delete').addEventListener('click', (event) => withButton(event.currentTarget, deleteGroup));
+    $('group-dialog').addEventListener('close', () => {
+      state.groupEditing = null;
+    });
+
     $('recording-reload').addEventListener('click', (event) => withButton(event.currentTarget, async () => {
       await loadRecordings(true);
     }));
@@ -1242,6 +1683,7 @@
       await loadAudit(false);
     }));
     $('audit-csv').addEventListener('click', (event) => withButton(event.currentTarget, exportAudit));
+    $('audit-group').addEventListener('change', () => loadAudit(true).catch(reportError));
     [$('audit-filter'), $('audit-host')].forEach((input) => {
       input.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') loadAudit(true).catch(reportError);
@@ -1261,6 +1703,7 @@
       if ($('workspace').classList.contains('hidden')) return;
       if (state.tab === 'overview') refreshOverview().catch(() => {});
       else if (state.tab === 'devices') loadDevices(true).catch(() => {});
+      else if (state.tab === 'groups') loadGroups(true).catch(() => {});
     });
   }
 
@@ -1289,13 +1732,12 @@
   function boot() {
     bindEvents();
     syncLoginMode();
-    $('login-note').textContent = '使用服务器密钥，或以 readonly / operator / admin 角色的账号登录。';
+    $('login-note').textContent = '使用服务器密钥，或以账号登录：readonly / operator / admin 可使用完整管理台，仅有分组授权的账号只能查看所属分组。';
     const saved = readSession();
     if (!saved) return;
     state.auth = saved;
-    api('/v1/stats').then(() => {
-      enterConsole();
-    }).catch((err) => {
+    const probe = saved.mode === 'key' || ROLE_RANK[saved.role] ? '/v1/stats' : '/v1/groups';
+    api(probe).then(() => enterConsole()).catch((err) => {
       if (err && err.status === 401) return;
       lock('自动连接失败：' + (err && err.message ? err.message : err));
     });
