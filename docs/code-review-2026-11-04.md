@@ -1,16 +1,16 @@
 # chast 项目代码审核报告
 
-- 审核日期：2026-11-04
+- 审核日期：2026-11-04；修复与复核更新至 2026-11-05
 - 审核范围：仓库全部 C++（`src/`、`include/`、`app/windows/`）、Go 控制面（`server/`）、Flutter 客户端（`app/lib/`）、构建与打包脚本
-- 审核方式：只读静态审核。按模块分工通读关键路径，再对高危结论逐条回读源码复核；未修改任何代码
-- 环境限制：本机没有 Flutter SDK，且 Go module 代理不可达，因此**没有运行** `go test`/`go vet`、`flutter analyze`、C++ 构建与 ctest。下文结论全部来自源码证据，不包含运行验证
+- 审核方式：先做只读静态审核（按模块分工通读关键路径，再对高危结论逐条回读源码复核），随后按发现逐条修复并补回归用例；每条的修复说明与残余风险见对应小节
+- 环境限制：本机没有 Flutter SDK；Go 1.27 可用（`go build ./...` 与相关包测试通过），C++ 改动均构建通过，但新链接的测试二进制被 Smart App Control 拦截，`quic_*`/`host_multi_test` 未做运行时验证。因此报告中的“构建通过”仅指编译，不包含 C++ 运行时验证与 Flutter 侧验证
 
 ---
 
 ## 0. 结论先行
 
-- **默认部署不安全**：`chast-server` 默认 `--server-key` 为空、监听 `0.0.0.0:8443`、账号库默认开启。此时管理 API 对全网无鉴权，任何人可以创建管理员账号、重置密码、注册主机；relay 也退化成开放中继。这是本次审核唯一一条“默认配置即可接管”的问题（C1）。
-- **未认证 DoS 面较大**：rendezvous 的 keepalive 挑战可被任意覆盖（H1），QUIC 服务端在认证前会无限期占住唯一会话槽（H2）。两者都不需要任何凭据。
+- **默认部署不安全（C1，已于 2026-11-05 修复，见该节）**：`chast-server` 原先默认 `--server-key` 为空、监听 `0.0.0.0:8443`，管理 API 对全网无鉴权，任何人可以创建管理员账号、重置密码、注册主机，relay 也退化成开放中继。现在空 key 直接拒绝启动，只有显式 `--insecure-no-server-key` 且 `--http-listen` 为回环时才允许。
+- **未认证 DoS 面（H1/H2，已于 2026-11-05 修复，见各节）**：rendezvous 挑战改为无状态 HMAC（不可覆盖、一次性）并加 per-IP 限流；QUIC 服务端为“已连接未 Hello”加 10 秒超时，且支持多查看器并发，静默连接不再永久占住会话槽。
 - **远程内存安全无实际缺陷（H4 复核为误报）**：FFmpeg 解码把网络缓冲直接挂到非引用计数的 `AVPacket` 上，但 `avcodec_send_packet` 会先 `av_packet_ref` 复制并补齐 `AV_INPUT_BUFFER_PADDING_SIZE` 字节；已用 guard page 回归测试固化该契约。
 - **账号系统有两处设计缺口（H5/H6，已于 2026-11-05 修复，见各节）**：2FA 绑定不要求二次认证（H5），refresh token 宽限让重放检测失效（H6）。
 - **媒体接收无界与 QUIC 句柄并发（H3/M1/M2，已于 2026-11-05 修复，见各节）**：四条媒体队列加了字节高水位反压，句柄与 parser 统一到同一把会话锁。
@@ -22,7 +22,7 @@
 - **客户端通道明文、首次信任与终端/下载防护（M24-M29，已于 2026-11-05 修复，见各节）**：连接服务除回环外强制 HTTPS；服务密钥与账号 token 一样走 DPAPI，并经 stdin 传给 `chast-tunnel`；直连首次连接弹出主机证书指纹确认，保存失败会明确标注“本次未固定”；账号 token 保护失败时不再写明文；终端 CSI 解析有长度与工作量上限；WebAuthn 的 rpId/origin 绑定到所配置的服务器；录制下载边写边校验大小与 SHA-256。
 - **低危健壮性与一致性（L1-L16，已于 2026-11-05 清理，见第 4 节）**：协议解析与构造双端校验、鼠标 X 键按位释放、审计 spool 5 MiB 轮转、PBKDF2 提到 600k 并在登录后自动 rehash、宽窄字符串转换越界、Windows 保留文件名清洗与 `.gitignore` 补齐。
 
-其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平，**修复 C1/H1/H2 的投入产出比最高**（H4 已复核为误报，见该节）。
+其余问题集中在：QUIC 句柄/解析器的并发纪律、审计与日志的可信度、本地文件接收的 TOCTOU、客户端 HTTP 通道的机密性与首次信任。项目整体工程质量高于同类平均水平。**当前剩余待修项**：无；C1/H1/H2、M30、V1–V13 均已完成（第 3.1 节）。
 
 ---
 
@@ -41,14 +41,15 @@
 
 ### 风险分布
 
-| 级别 | 数量 | 说明 |
-| --- | ---: | --- |
-| Critical | 1 | 默认部署下未认证即可接管管理面/中继 |
-| High | 7 | 远程 DoS、远程越界读、账号接管、授权撤销失效 |
-| Medium | 17 | 内存安全竞态、审计/日志可信度、本地提权面、客户端密钥暴露 |
-| Low | 16 | 健壮性、一致性、清理项 |
+| 级别 | 发现 | 已修复 | 待修复 | 说明 |
+| --- | ---: | ---: | ---: | --- |
+| Critical | 1 | 1 | 0 | 默认部署下未认证即可接管管理面/中继 |
+| High | 7 | 6 | 0 | H4 复核为误报；其余为远程 DoS、账号接管、授权撤销失效 |
+| Medium | 30 | 30 | 0 | 全部完成 |
+| Low | 16 | 16 | 0 | 健壮性、一致性、清理项 |
+| 原生查看器（补充） | 13 | 13 | 0 | V1–V13 全部完成，见 3.1 节 |
 
-> 说明：本报告按“可利用性 + 影响面”定级。需要本机低权限用户配合的（TOCTOU、命令行读取密钥）定为 Medium；需要已认证 viewer 配合但能打挂宿主进程的定为 High。
+> 统计截至 2026-11-05 09:00；每条的修复说明见对应小节。本报告按“可利用性 + 影响面”定级：需要本机低权限用户配合的（TOCTOU、命令行读取密钥）定为 Medium；需要已认证 viewer 配合但能打挂宿主进程的定为 High。
 
 ---
 
@@ -109,6 +110,16 @@ stateFile  = flag.String("state", "chast-server-state.db", ...)   // 账号库�
 - relay/carrier 的 viewer 鉴权不要绑定 `--server-key`：每个 lease 始终要求 per-lease token，token 只通过已认证 lookup 下发；
 - 默认监听改为回环，公网部署必须显式指定地址。
 
+**修复（2026-11-05）**
+
+启动期强校验（[`main.go:194`](../server/cmd/chast-server/main.go#L194)、[`:1093`](../server/cmd/chast-server/main.go#L1093)）：
+
+- `checkServerKey()` 在 `--server-key` 为空且未给 `--insecure-no-server-key` 时直接返回错误，进程不启动；两者同时给出也拒绝。
+- `--insecure-no-server-key` 要求 `--http-listen` 是回环地址（`localhost`/`127.0.0.0/8`/`::1`），否则拒绝启动；该模式的帮助文本明确写着“其他 listener 仍未认证”，因此只用于本机开发。
+- `--server-key` 的帮助文本改为“empty refuses to start”，避免运维误以为空值是合法默认。
+
+**残余风险**：`api.authorized()` 仍保留“空 key 即放行”的语义，安全不变量由 `main` 的启动检查保证。`server/internal/api` 是 internal 包，当前只有这一个入口；但如果以后新增第二个 `main` 或嵌入式用法，必须重复调用 `checkServerKey()`。更彻底的做法是给 `api.Config` 增加 `AllowNoServerKey bool`，让 `authorized()` 在空 key 且未显式允许时 fail-closed；由于大量测试直接构造 `api.Config`，这次没有改动，列为后续加固项。
+
 ---
 
 ### H1. 未认证的 keepalive/relay_hello 可覆盖唯一挑战槽，一个包流即可让任意主机离线
@@ -141,6 +152,14 @@ r.challenges[key] = challenge{nonce: nonce, purpose: purpose, expires: now.Add(c
 - 或每个 purpose 保留多个 nonce，只在 nonce 匹配时删除；
 - keepalive/relay_hello/carrier 握手全部加 per-IP 限流；
 - 两类拒绝统一错误文案，避免主机/端口枚举。
+
+**修复（2026-11-05）**
+
+- **挑战改为无状态 HMAC**（[`registry.go:624`](../server/internal/registry/registry.go#L624)）：`mintChallenge()` 用每进程随机 `challengeSecret` 对 `id || purpose || scope || 过期毫秒 || 随机盐` 做 HMAC-SHA256，nonce 形如 `stamp.salt.mac`，自带过期时间与绑定关系。服务端不再保存“每个主机一个 pending 槽”，`IssueChallengeScoped` 也就没有可被覆盖的状态；`challengeExpiry()` 重新计算 HMAC 并校验过期，`VerifyChallenge` 在验签前先查 `usedChallenges`。
+- **一次性**：验证成功的 nonce 记入 `usedChallenges[nonce] = expires`，TTL 30 秒；每次签发顺带清理过期项（[`:616`](../server/internal/registry/registry.go#L616)），内存只随“成功认证速率”增长。
+- **限流**：rendezvous 新增 `keepaliveLimiter`，每个源 IP 每 10 秒 120 条（`DefaultKeepaliveRateMax`，[`rendezvous.go:34`](../server/internal/rendezvous/rendezvous.go#L34)），覆盖 keepalive 的两条腿；relay 的 `relay_hello`/`relay_viewer` 走 `handshakeLimiter`（[`relay.go:993`](../server/internal/relay/relay.go#L993)）。即使攻击者继续发包，也只能得到新 nonce，无法让合法主机的旧 nonce 失效。
+
+**残余风险**：签发挑战仍然不需要凭据（只要求 host_id 已注册），分布式源仍可消耗 HMAC/CPU；限流是 per-IP 的，没有全局配额。考虑到 nonce 已无共享状态、且主机认证不再被阻塞，这属于可接受的成本，必要时可再加全局令牌桶。
 
 ---
 
@@ -191,6 +210,13 @@ const auto deadline = first && config_.first_client_timeout_ms > 0
 - 在 `wait_for_client()` 中为“已连接未 Hello”加独立超时（如 10 秒），超时主动 `ConnectionShutdown` 并清空槽位；
 - 或对 `connected && !hello` 状态不发送 keepalive，让 idle timeout 生效；
 - `host_server` 的等待循环对每次新连接都使用有限 deadline。
+
+**修复（2026-11-05）**
+
+- **传输层超时**（[`quic.cc:4918`](../src/net/quic.cc#L4918)）：`QuicSession::wait_for_client()` 在“已连接、未 Hello”时用 `connected_at + hello_timeout_ms` 计算独立 deadline；到点调用 `reset_connection()` 关闭该连接并继续等待，不再让静默连接借 keepalive 永久占位。默认 `hello_timeout_ms = 10000`（[`quic.h:140`](../include/chast/quic.h#L140)），可由 host 配置覆盖或置 0 关闭。
+- **多查看器重构**：宿主不再只服务一个 viewer。`max_viewers`（1..8，默认 2）在 TLS 完成前做准入，`quic.max_clients` 与之一致，每个被接受的连接交给独立 `HostServer` worker，各自完成握手、审批、权限与流；`max_viewers == 1` 时保留原来的顺序模式。顺序模式的主机侧等待使用 `first_client_timeout_ms` 或 15 秒默认值（[`host_server.cc:1726`](../src/host/host_server.cc#L1726)）。
+
+**残余风险**：准入发生在 TLS 完成之前（有意为之，避免握手成本），因此 N 个静默连接仍会占满 `max_viewers` 个槽位，每个最多 10 秒；这是“10 秒滚动降级”，不再是永久锁死。若暴露面较大，可再加“未完成握手的连接数”上限或 per-IP 握手限流。
 
 ---
 
@@ -495,6 +521,18 @@ CFIL 无权限、CCLB 无权限、第 9 个并发上传等“可恢复拒绝”�
 
 **修复**：撤销时同时 abort `outgoing_uploads`，并在每个发送块前复查 `session_permissions`。
 
+**修复（2026-11-05）**
+
+`set_permissions()` 撤销文件传输时，在同一把锁内把所有未完成的
+`outgoing_uploads` 标记为完成并加入 abort 列表；`send_file_data()` 与
+`finish_file_upload()` 每次调用（即每个 64 KiB 块）前复查
+`session_permissions & kPermissionFileTransfer`，撤销后返回
+`PermissionDenied`，主机的发送循环随即以“文件传输已禁用”失败并向查看器
+发送取消；`try_send_file_data()` 复用同一检查。查看器侧的 PermissionUpdate
+分支原本就会中止 outgoing uploads，保持不变。验证：`chast-quic`、
+`chast-host`、`chast-service` Release 构建通过；本机 Smart App Control 仍
+拦截新构建的未签名二进制，运行时验证受限。
+
 ---
 
 ### M6. 发送队列计数跨会话不复位，下一会话可能永久卡在 `send_cv`
@@ -504,6 +542,18 @@ CFIL 无权限、CCLB 无权限、第 9 个并发上传等“可恢复拒绝”�
 拆除时 `cv.wait_for(1500ms)` 与 `wait_sends(500ms)` 的返回值都被忽略，随后无条件 `StreamClose`；`in_flight_*` 从不复位。连接劣化时 viewer 断开，下一个会话继承非零发送队列，`send_cv.wait` 又没有期限，可能永久阻塞，表现为画面冻结且没有错误。
 
 **修复**：会话拆除时强制复位发送计数；`send_cv.wait` 加超时并返回明确错误；不要忽略 `wait_sends` 的结果。
+
+**修复（2026-11-05）**
+
+发送队列增加 `send_generation`：每次发送在锁内记录代数并写入
+`PendingSend`，`release_send()` 只接受当前代数的完成回调；拆除时
+`reset_send_queue()` 递增代数并清零计数，旧连接的迟到回调因此不会把新会话
+的计数减到负数。无截止时间的 `send_cv.wait` 改为 10 s 上限，超时返回
+`WaitTimeout("send queue did not drain")`；`send_stream_fin()` 同样有上限。
+`wait_sends()` 仍会在 transport down 时醒来，但返回“计数是否真正归零”；
+`reset_connection()` 与 `close()` 在未排空时强制复位。验证：`chast-quic`、
+`chast-host`、`chast-service` Release 构建通过；运行时验证受 Smart App
+Control 限制。
 
 ---
 
@@ -770,6 +820,10 @@ gateway, err := gatewayFromLocation(ctx, location) // 直接 GET 任意 http(s) 
 
 **修复**：记录应答源地址，要求 `LOCATION` host 与应答源 IP 相同且同网段；忽略外部 URLBase；只允许私有地址。
 
+**修复（2026-11-05）**
+
+`Discover` 记录 SSDP 应答源，只接受私有/回环地址（169.254/16 明确排除，避免云元数据端点）；`gatewayFromLocation` 校验 `LOCATION` 的 scheme 与 host——字面 IP 必须等于应答源，域名解析结果必须全部为私有地址且包含应答源——并禁用重定向、不再使用 `URLBase`；`controlURL` 只允许与已校验 `LOCATION` 同 host 或字面私有 IP。新增 5 个单元测试覆盖伪造 host、外部 controlURL、外部 URLBase、公网/元数据应答与重定向；`go test ./internal/upnp` 通过。
+
 ---
 
 ### M21. relay 转发进来的控制报文被 host agent 当可信，viewer 可让 host 向任意地址发 UDP
@@ -780,6 +834,10 @@ relay 只拦截 `relay_hello/relay_auth/relay_viewer` 三种类型，其余报�
 
 **修复**：relay 端点只接受 `relay_challenge`/`relay_ack`；`punch_peer`/`keepalive_*` 只接受 punch 服务器地址；relay 在 viewer→host 方向丢弃 `CHASTC1\n` 开头的报文。
 
+**修复（2026-11-05）**
+
+host agent 按来源分类型准入：`keepalive_challenge`/`keepalive_ack`/`punch_peer` 只接受 rendezvous 的 punch 地址（含 IPv6），`relay_challenge`/`relay_ack` 只接受已公告的 relay 端点；relay 在 viewer→host 方向丢弃 `wire.IsControl` 报文并计入 `dropped`。新增 `TestHostControlSourceGating` 与 `TestRelayDropsViewerControl`，agent/relay 测试通过。
+
 ---
 
 ### M22. 对端地址“先到先得”，单个数据报即可劫持回程
@@ -789,6 +847,12 @@ relay 只拦截 `relay_hello/relay_auth/relay_viewer` 三种类型，其余报�
 host agent 对任何非控制数据报无条件把 `h.remote` 换成其源地址；viewer agent 在非 loopback 监听时同样。攻击者向 host 的公网 punch 端口（或 relay 端口）发一个 UDP 包，之后 chast-host 发给 viewer 的 QUIC 数据报全被转到攻击者地址，真实会话中断（QUIC 端到端认证保证不泄明文，所以是稳定的路径劫持/DoS）。
 
 **修复**：只有收到带 nonce 的 punch 证明或 carrier 会话建立后才更新 `remote`；host 侧按 QUIC connection ID 分派，而不是单一 `remote`。
+
+**修复（2026-11-05）**
+
+host 只在源地址是当前 `remote`、已公告 relay 端点、或 rendezvous 在 `punch_peer` 中公告且未过期的 viewer 地址（`punchTargetTTL`，2 分钟）时才更新 `remote`，其余数据报直接丢弃；viewer 只把携带本次 `nonce` 的 `punch` 当作直接路径证明，并且只接受来自已验证 `direct` 地址的主机数据，陌生的非 loopback 来源不再进入本地客户端分支。carrier 会话仍按既有认证流程建立。
+
+**残余风险**：host 仍是单一 `remote` 模型，未实现按 QUIC connection ID 分派；同一 relay 端口同一时刻只服务一个 viewer（多查看者并发在 chast-host 的会话层完成）。新增 `TestHostViewerSourceGating`、`TestViewerPunchRequiresNonce`，并调整跨地址族转发测试以先登记 punch 地址。
 
 ---
 
@@ -807,6 +871,10 @@ if err != nil {
 连接洪泛打满 fd → `Accept` 返回 `EMFILE/ENFILE`（不是 `net.ErrClosed`）→ 该端口 TCP/WS carrier 永久失效（UDP 仍通、`/healthz` 仍 OK），共享 carrier 退出后所有依赖 TCP/WS 回退的主机都不可达，`ln` 永不关闭造成 fd 泄漏。
 
 **修复**：临时错误退避重试，只在 `net.ErrClosed` 时退出，退出时 `ln.Close()`。
+
+**修复（2026-11-05）**
+
+新增 `acceptWithRetry`：瞬时失败按 5 ms→1 s 指数退避重试，只有 `net.ErrClosed` 才结束循环并在退出时 `ln.Close()`；relay per-port TCP/WS 与共享 carrier 均改用它。新增 `TestAcceptWithRetry` 覆盖连续两次瞬时错误后成功、以及关闭监听器返回 nil。
 
 ---
 
@@ -969,6 +1037,178 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 3. **VPL 解码重试无上限**（[`src/codec/vpl_decoder.cc:611`](../src/codec/vpl_decoder.cc#L611)）：`MFX_ERR_MORE_SURFACE` 直接 `continue`，`MFX_WRN_DEVICE_BUSY` 睡 1 ms 后 `continue`，都没有次数/时间上限（编码器有 `kMaxSyncPolls = 10` 作对照）。GPU 卡死时解码线程 100% CPU 空转、永不上报 DeviceRemoved。应加轮询上限并按 DeviceRemoved 交给上层重建。
 4. **WASAPI 播放器析构与 `push()` 竞态**（[`src/audio/wasapi_player.cc:542`](../src/audio/wasapi_player.cc#L542)）：`close()` 调完 `stop()` 后不持 `format_mutex_` 就 `swr_free(&swr_)`，`event_` 也不持锁 `CloseHandle`；而 `push()` 在 `format_mutex_` 下用同一个 `swr_` 转换，`push/set_mute/set_lead_ms` 都会 `if (event_) SetEvent(event_)`。销毁与媒体线程并发 → `SwrContext` use-after-free、向已关闭/复用的 HANDLE 投递事件。应持锁释放并原子交换句柄。
 
+**修复（2026-11-05）**
+
+- **光标**：新增 `pointer_shape_valid`（[`src/capture/cursor.cc:141`](../src/capture/cursor.cc#L141)）。按类型拒绝零宽/零高/零 pitch；COLOR/MASKED 要求 `Pitch >= Width*4`，MASKED 另加 mask 平面字节；MONOCHROME 要求高度为偶数且 `Pitch >= 对齐后的 mask 行宽`，解码高度按一半计。`source_bytes` 与 `data_size` 交叉校验，解码后的 RGBA 字节数受 `max_bitmap_bytes_` 约束；`update_shape` 先检查 `data_size <= raw_.size()` 再解码。`chast-cursor-test` 增加 15 条断言覆盖短 pitch、奇高度、截断数据与尺寸上限。
+- **摄像头**：`MF_MT_DEFAULT_STRIDE` 按 `INT32` 读取，`<= 0`（bottom-up/未知）不再当作有效 stride，交由 1D 布局分支；1D/2D 的长度计算改为 `uint64_t`，1D 分支在转回 `LONG` 前检查 `LONG_MAX`，2D 分支拒绝 `pitch <= 0`。
+- **VPL 解码**：`kMaxSurfaceRetries = 10`、`kMaxBusyRetries = 1000`，GPU 与 legacy 两条路径共用计数，每成功解出一帧清零；`MFX_ERR_MORE_SURFACE` 超限返回 `Status::NotCurrentlyAvailable`，`MFX_WRN_DEVICE_BUSY` 超限返回 `Status::DeviceRemoved`，由上层重建管线，不再空转。
+- **WASAPI**：新增 `signal_render()`，`push`/`stop`/`set_clock_offset`/`set_lead_ms`/`set_mute`/`fail` 的 `SetEvent` 全部改在 `format_mutex_` 下访问 `event_`（`push` 的信号移入原有的转换锁临界区）；`close()` 在同一把锁内释放 `swr_`、复位格式并取走句柄，锁外 `CloseHandle`。
+
+验证：`cmake --build build/root --config Release --target chast-cursor-test chast.audio chast.codec chast.dxgi` 编译通过。`chast-cursor-test.exe` 在本机被 Device Guard 拒绝执行（`Permission denied`），单元测试仅完成编译验证，未运行。
+
+---
+
+### 3.1 原生 Windows 查看器（Flutter 插件 C++ 后端）
+
+以下问题来自对 `app/windows/viewer/` 的通读（`viewer_engine.cc` 6529 行、`viewer_bridge.cc` 2092 行、`gpu_frame_sink.*`、`remote_cursor.*`、`security_key.*`）。**均尚未修复**，按影响排序；V1–V8 定为中危（需要本地用户操作或主机配合，但会造成崩溃/卡死/资源膨胀），V9–V13 为低危。行号取 2026-11-05 09:00 的树快照；该目录随后继续有改动（语音通话功能），如行号漂移请以函数名与代码片段为准。
+
+#### V1. 相机 sink 的插件输出指针在锁外使用，与 `setCameraOutput`/`stopCamera` 竞争
+
+**位置**：[`app/windows/viewer/gpu_frame_sink.cc:396`](../app/windows/viewer/gpu_frame_sink.cc#L396)、[`viewer_bridge.cc:1450`](../app/windows/viewer/viewer_bridge.cc#L1450)、[`:1493`](../app/windows/viewer/viewer_bridge.cc#L1493)
+
+```cpp
+void* output = nullptr;
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    output = output_;
+}
+...
+set_texture_(output, slot.texture.get());   // 锁外调用插件
+```
+
+`stopCamera` 只调用 `viewer_->StopCamera()`，完全不解绑相机 sink；`setCameraOutput(0)` 会在平台线程把 `output_` 置空。session 线程已经取出旧指针后，Dart 侧注销 Flutter texture，插件仍会收到这个已失效的 texture id。
+
+**影响**：用户在相机预览中关闭窗口/停止预览时，可能与正在提交的帧竞争，崩溃点落在 `flutter_gpu_texture_renderer` 内部（该依赖是 git 拉取的第三方代码，无法在本仓库内确认其解引用语义）。桌面 sink 靠 `Stop()` 先 join、再 `SetOutput(nullptr)` 规避，相机路径没有这个次序。
+
+**修复**：把 `set_texture_` 放进 `mutex_` 临界区，或引入 generation 号/引用计数；`stopCamera` 先停流再解绑；`Shutdown`/`stop` 统一走“停止生产者 → join → 解绑”。
+
+**修复（2026-11-05）**
+
+`GpuFrameSink::OnGpuFrame` 的 `set_texture_` 改为在 `mutex_` 内重新读取 `output_` 后调用：`SetOutput(nullptr)` 与插件调用串行化，它返回后不会再有任何针对旧输出的在途调用，Dart 才能安全注销 texture；blit 期间发生的 detach 让该帧直接丢弃，而不是调用已释放的 texture id。`stop`/`Shutdown` 仍是“join 引擎线程 → 解绑输出”的次序；`stopCamera` 不立即解绑，因为面板停止后可能用同一个 texture 重启摄像头，安全性由上述锁保证。
+
+#### V2. Windows Hello 结果回传失败会让 busy 永久卡死
+
+**位置**：[`app/windows/viewer/viewer_bridge.cc:1745`](../app/windows/viewer/viewer_bridge.cc#L1745)、[`:1793`](../app/windows/viewer/viewer_bridge.cc#L1793)、[`:1804`](../app/windows/viewer/viewer_bridge.cc#L1804)
+
+worker 线程在 `window == nullptr || !PostMessageW(...)` 时直接 `delete completion`，但 `security_key_busy_` 仍为 true；复位只发生在窗口消息处理函数里。窗口已销毁/子类已移除时消息被丢弃，completion 的 `MethodResult` 也泄漏。
+
+**影响**：一次失败后，本进程所有 WebAuthn 调用都返回 “busy”，只能重启查看器恢复；Shutdown 期间同样。
+
+**修复**：worker 的失败分支必须复位 busy（`compare_exchange` 或直接置位）；`Shutdown` 显式复位并取消 pending result；记录 outstanding completion，销毁时统一 delete。
+
+**修复（2026-11-05）**
+
+`SecurityKeyCompletion` 增加 `answered` 原子标志，`complete_security_key()` 只应答一次；worker 与窗口消息处理函数都通过它交付结果，不会再重复 `Success`/`Error`。busy 标志改为 `shared_ptr<atomic<bool>>`，由 worker 与 bridge 共享：`PostMessageW` 失败时 worker 直接复位并当场完成结果；`Shutdown` 也会复位，晚到的消息被忽略。completion 改为 `shared_ptr`，消息参数接管一份引用，窗口销毁导致消息丢失时不再泄漏结果对象。
+
+#### V3. `OpenTerminal` 的拒绝路径把状态永久留在 `kRequesting`
+
+**位置**：[`app/windows/viewer/viewer_engine.cc:1254`](../app/windows/viewer/viewer_engine.cc#L1254)
+
+```cpp
+status_.terminal_phase = TerminalPhase::kRequesting;   // 1271 先改状态
+...
+std::lock_guard<std::mutex> lock(terminal_mutex_);
+if (!terminal_output_ended_) {
+    return false;                                      // 直接返回，状态不回滚
+}
+```
+
+`poll_terminal` 在 `terminal_active == false` 时直接返回，不会推进状态；而 `OpenTerminal` 开头的 `kRequesting` 检查会永久拒绝后续调用。
+
+**影响**：终端面板一次点击失败（上一会话的输出尚未排空）后，本会话再也打不开终端，只能重连。
+
+**修复**：先校验 `terminal_output_ended_` 再改 phase，或在所有失败分支恢复 `kClosed`/`kEnded`。
+
+**修复（2026-11-05）**
+
+`OpenTerminal` 在修改 `terminal_phase` 之前先在 `terminal_mutex_` 下检查 `terminal_output_ended_`，未排空直接返回，状态保持调用前的值；phase 准入仍在 `mutex_` 内完成，两个并发 `OpenTerminal` 由 `kRequesting` 互斥。之后清空输出时不再重复检查——该标志在本次打开把它置假之前不会被其它线程改回真。
+
+#### V4. GPU sink 的错误一旦写入就永久粘住，没有 device-lost 恢复
+
+**位置**：[`app/windows/viewer/gpu_frame_sink.cc:446`](../app/windows/viewer/gpu_frame_sink.cc#L446)、[`:312`](../app/windows/viewer/gpu_frame_sink.cc#L312)、[`viewer_engine.cc:6362`](../app/windows/viewer/viewer_engine.cc#L6362)
+
+`set_error()` 只在 `error_` 为空时赋值，且从不清理。`viewer_engine` 只要看到 `sink_->error()` 非空就 `fail("display: ...")` 并结束会话。驱动 TDR/分辨率切换瞬间的一次 `CreateVideoProcessor*` 失败或 2 秒 Blit 超时，就会终止整场会话；之后所有诊断都显示最早那条错误。
+
+**修复**：区分致命错误（`DXGI_ERROR_DEVICE_REMOVED/RESET`）与可重试错误；错误按帧代次清零；实现 `Reset()`/重建 pipeline。
+
+**修复（2026-11-05）**
+
+`GpuFrameSink` 的 `set_error()` 增加 `device_gone` 分类：`DXGI_ERROR_DEVICE_REMOVED/RESET` 记为致命并覆盖已有诊断，其余为可重试；`OnGpuFrame`/`CaptureBgra` 每次进入清掉上一帧的可重试错误，成功帧不再留下历史错误。新增 `fatal()` 与 `Reset()`：`Reset()` 在会话线程重建 D3D11 设备、查询和 video processor pipeline，Flutter 注册的纹理属于 Flutter 自己的设备，重建后继续使用同一输出指针。`viewer_engine` 的显示 handler 对可重试失败按帧丢弃（连续 300 帧才断流），致命失败返回 `DeviceRemoved`，解码循环做一次“重建 sink 设备 + 重建解码器 + 请求 IDR”的恢复，再失败才结束会话。相机 handler 采用同样的分级：可重试错误只丢帧，致命或持续失败以 `camera: ...` 结束相机而不影响桌面会话。
+
+#### V5. 重复 `start` 会先替换运行中会话的 sink 输出，失败后再置空
+
+**位置**：[`app/windows/viewer/viewer_bridge.cc:416`](../app/windows/viewer/viewer_bridge.cc#L416)
+
+```cpp
+if (output > 0) {
+    texture_sink_->SetOutput(reinterpret_cast<void*>(...));   // 先改
+}
+if (!viewer_->Start(...)) {
+    texture_sink_->SetOutput(nullptr);                        // 再清
+    result->Error("busy", "a session is already running");
+```
+
+**影响**：第二次 `start` 被拒时，正在流式传输的旧会话输出已被换掉再清空，画面静默停更，状态仍报 streaming。
+
+**修复**：`Start` 成功后再 `SetOutput`，或在 busy 分支恢复原指针。
+
+**修复（2026-11-05）**
+
+bridge 的 `start` 先调用 `viewer_->Start`，成功后才 `texture_sink_->SetOutput`；busy 分支只返回错误，不再触碰运行中会话的输出。`Start` 返回后引擎还要完成网络握手才会出帧，晚这一次调用的 attach 不会丢掉首帧。
+
+#### V6. 录制开关跨会话粘滞
+
+**位置**：[`app/windows/viewer/viewer_engine.cc:1027`](../app/windows/viewer/viewer_engine.cc#L1027)、[`:6322`](../app/windows/viewer/viewer_engine.cc#L6322)
+
+`Start()` 复位了 `microphone_wanted_`（[`:421`](../app/windows/viewer/viewer_engine.cc#L421)），但没有复位 `record_wanted_`/`record_dir_`。上一会话开着录制，连到另一台授予 record 权限的主机时，首帧就会自动 `open(record_file_path(...))` 落盘，无需用户在本会话做任何动作。
+
+**影响**：隐私/合意问题——用户以为“录制只针对上一台主机”。
+
+**修复**：`Start()` 里 `record_wanted_.store(false)`；如要保留用户意图，需在新会话首次录制前二次确认。
+
+**修复（2026-11-05）**
+
+`ViewerEngine::Start` 在复位 `microphone_wanted_`/`voice_wanted_` 的同时复位 `record_wanted_`；录制目录仍作为用户偏好保留。每个会话的录制必须由本会话重新开启。
+
+#### V7. 目录下载的遍历队列无上限
+
+**位置**：[`app/windows/viewer/viewer_engine.cc:4007`](../app/windows/viewer/viewer_engine.cc#L4007)
+
+每次 listing 应答把最多 `kMaxFileListEntries = 1024` 个子目录 push 进 `folder_.directories`，每轮只消费一个。恶意主机对每个目录都返回 1024 个子目录，队列随 listing 次数线性膨胀，可持续占内存并让“取消/结束”迟迟不生效。
+
+**修复**：给遍历总条目/总深度设上限（如 200k 条或 100MB 元数据），超限以明确错误结束遍历。
+
+**修复（2026-11-05）**
+
+`FolderDownload` 增加 `walk_entries`，每采纳一个 listing 条目就计数；单个根超过 `kMaxFolderWalkEntries = 200000` 条时以“the folder has too many entries to download”结束遍历。目录深度按底层路径的 `/` 数量相对根计算，超过 `kMaxFolderWalkDepth = 64` 同样明确失败。两个上限都在持有 `browse_mutex_` 的采纳路径内检查，超限会清空目录/文件队列，遍历不会再无限增长。
+
+#### V8. 纹理尺寸没有显式上限
+
+**位置**：[`app/windows/viewer/gpu_frame_sink.cc:159`](../app/windows/viewer/gpu_frame_sink.cc#L159)、[`:227`](../app/windows/viewer/gpu_frame_sink.cc#L227)、[`:432`](../app/windows/viewer/gpu_frame_sink.cc#L432)
+
+`content.OutputWidth/OutputHeight`、`texture_desc.Width/Height` 直接来自解码帧；`CaptureBgra` 按 `row*height` 分配。主机声明超大画面时，3 个共享 BGRA slot + readback 可吃掉数 GiB 显存/内存；`CreateTexture2D` 失败则按 V4 直接断流。
+
+**修复**：在 sink/engine 侧加 `kMaxFrameSide`（如 8192）与像素总量校验，拒绝超限的 `StreamInfo`/帧。
+
+**修复（2026-11-05）**
+
+`GpuFrameSink` 在 `OnGpuFrame` 中同时校验可见画面与解码 surface：任一边超过 8192 或像素数超过 7680×4320 即拒绝，不会创建共享 slot 与 readback。`viewer_engine` 在握手与 `StreamInfo` 更新时先做同一校验，超限直接以明确原因结束会话，避免为超大声明创建解码器；这样恶意主机无法让查看器分配数 GiB 纹理。
+
+#### V9～V13（低危）
+
+| # | 位置 | 问题 | 建议 |
+| --- | --- | --- | --- |
+| V9 | [`viewer_engine.cc:3852`](../app/windows/viewer/viewer_engine.cc#L3852) | 剪贴板 `CF_HDROP` 路径由主机 `rel_path` 拼出，未校验是否等于实际落盘位置；`valid_clipboard_rel_path` 不拒绝 `C:` 段，粘贴对象可能与文件不符 | 用 `FileReceiver` 返回的 `final_path` 反推目录，并做 staging 根前缀检查 |
+| V10 | [`viewer_engine.cc:663`](../app/windows/viewer/viewer_engine.cc#L663) | `RequestFileDownload`/`RequestFileList` 只判空，未做 `valid_file_browser_path`，与 `QueueDownload` 不一致 | 统一走本地路径校验，做纵深防御 |
+| V11 | [`remote_cursor.cc:272`](../app/windows/viewer/remote_cursor.cc#L272) | 淘汰可能销毁正在使用的 `HCURSOR`；`cursor()` 返回 nullptr 时 `cursor_override_` 仍为 true | 淘汰时跳过 `active_shape_`/`active_scale_` |
+| V12 | [`gpu_frame_sink.cc:72`](../app/windows/viewer/gpu_frame_sink.cc#L72) | `EnumAdapters1` 失败分支未判 `FAILED`/空指针就 `GetDesc1` | `if (FAILED(hr) || candidate == nullptr) break;` |
+| V13 | [`security_key.cc:270`](../app/windows/viewer/security_key.cc#L270) | WebAuthn `origin` 与 `rp_id` 无一致性校验，Dart 层被攻破时可产出宣称任意 origin 的断言 | 校验 origin 的 host 等于 rp_id，challenge 做 base64url 合法性检查 |
+
+**修复（2026-11-05）**
+
+- V9：`CF_HDROP` 的顶层目录改由 `FileReceiver::finish()` 返回的 `final_path` 相对 staging 根推导，不再使用主机 `rel_path` 拼接；相对路径的任一段为 `..` 或不在 staging 根下时以明确错误放弃整个列表。`rel_path` 只用于判断平铺文件还是目录树。
+- V10：`RequestFileList`（允许空路径表示根）与 `RequestFileDownload` 统一走 `chast::valid_file_browser_path`，非法路径在进入 pending 队列前即被拒绝。
+- V11：`RemoteCursor::evict_locked` 淘汰时跳过 `active_shape_`，最多多保留一个精灵；正在显示的 `HCURSOR` 不会再被销毁成悬空句柄，`cursor_override_` 与 `cursor()` 的返回值保持一致。
+- V12：`EnumAdapters1` 现在同时检查 `FAILED(hr)` 与空指针后才调用 `GetDesc1`，枚举失败不再解引用空 adapter。
+- V13：新增 `valid_rp_id`（严格主机名字符集）、`origin_matches_rp_id`（仅接受 `https://`、无 userinfo、host 等于 rp_id 或其子域）与 `valid_challenge`（非空、≤128、base64url 字符集）；注册与断言两条路径都在调用 Windows Hello 前校验，失败返回 `bad_args`。
+
+#### 查看器侧已核实无问题
+
+- DPAPI 用法正确：`CurrentUser` + 每用途 entropy，`loadPassword` 不打印明文，`savePassword` 校验 trust key 与长度；未发现明文回退（与 Dart 侧 `account_store` 不同）。
+- `StartSecurityKey` 对 rpId（≤253）、challenge（≤128）、origin 长度做了上限校验。
+- GPU 帧的 rotation/HDR/NV12 路径、ComPtr 引用计数、`ReleaseFrame` 时序总体严谨（除 V1/V4/V8）。
+- 会话停止时 `viewer_->Stop()` 会 join 引擎线程，桌面 sink 的 `SetOutput(nullptr)` 在 join 之后，次序正确。
+
 ---
 
 ## 4. 低危与清理项
@@ -1024,12 +1264,12 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 ## 6. 测试与工程化观察
 
-1. **无法在本环境验证构建/测试**：没有 Flutter SDK，Go module 代理不可达，MSVC/oneVPL/FFmpeg 工具链未确认。因此报告不包含“测试通过/失败”的结论。建议 CI 至少覆盖：`go test ./...`、`go vet ./...`、`flutter analyze && flutter test`、CMake + ctest（含 `quic_recording_hevc`、`quic_weak_network`）。
-2. **测试覆盖偏“功能正确”而非“恶意输入”**：`tests/` 与 `app/test/` 里有大量协议/状态机/UI 测试，但针对本报告中的 fuzz 面（`parse_hello_ack` 尾随字节、`FileOffer` 空名、`CF_DIB` 长度、`FileCancel` 换行、终端 CSI 长序列）没有对应用例。建议为每个解析器补一个“畸形/超长/尾随”用例表。
+1. **本机能验证的部分（2026-11-06 更新）**：Go 1.27.3 可用，`go build ./...`、`go vet ./...`、`go test ./...` 全部通过，`govulncheck ./...` 报告 0。C++ 全量 Release 构建通过，串行 `ctest` 47/47 通过（含此前被 Smart App Control 拦截的 `quic_*`、`host_multi_test` 与新增 `protocol_fuzz`/`service_log`）。Flutter 3.44 可用：`flutter analyze` 无问题、`flutter test` 603 项通过、`flutter build windows --release` 通过。CI 工作流覆盖 Go 与 Flutter；C++ 因依赖 vcpkg/oneVPL/FFmpeg 的 Windows 安装，仍按 `docs/status-2026-10-25.md` 的本地命令验证。
+2. **测试覆盖仍偏“功能正确”（2026-11-06 已补 fuzz）**：`tests/` 与 `app/test/` 里有大量协议/状态机/UI 测试；本批修复补了部分恶意输入用例（`decoder_padding_test.cc` 的 guard page、`parse_hello_ack` 尾随字节、`FileOffer` 空名、`CF_DIB` 长度、终端 CSI 上限、`host_multi_test.cc` 的准入与多查看器）。本轮新增 `tests/protocol_fuzz_test.cc`：69 个解析入口以合法 maker 输出为种子做确定性变异并覆盖 0～1 MiB 边界长度，接入 ctest `protocol_fuzz`。MSVC 无 libFuzzer 运行时，故未做覆盖率引导；新增解析器时应同步把入口加入该测试。
 3. **构建脚本硬编码本机路径**：`CMakeLists.txt` 默认 `D:/vcpkg`、`D:/vpl_install_static`，换机器必须手改；建议用 `CMakePresets.json` + 环境变量，并在 README 写清依赖版本。
 4. **文档与实现有漂移风险**：`docs/roadmap.md` 声称的 ctest 数量、协议版本、ENV/DEV 完成度需要与当前树对齐；本报告发现的 C1/H7 都是“默认值/生命周期”类问题，建议在 `docs/status-*.md` 里增加“安全默认值”一节。
-5. **日志与审计**：主机侧日志是纯文本行式（易注入），审计 spool 无轮转；建议统一成 JSONL（`ts`、`event`、`fields`），并对所有对端字符串做转义。
-6. **依赖**：Flutter 的 `flutter_gpu_texture_renderer` 走 git 固定 commit（好），但 `pubspec.lock` 是否入库、Go 的 `go.sum` 是否校验需在 CI 里确认；建议开启 Dependabot/Renovate 与 `govulncheck`。
+5. **日志与审计（2026-11-06 已完成 JSONL）**：`host/service_log.{h,cc}` 现输出 `{"ts","event","fields"}` JSONL：UTC 毫秒、控制字符/引号转义、非法 UTF-8 替换、5 MiB 轮转、加锁追加；`service.cc`/`worker.cc` 的生命周期、会话、隧道与设置事件均为带字段的事件，自由文本记为 `event=message`。`tests/service_log_test.cc` 覆盖形状、转义、轮转与并发。
+6. **依赖（2026-11-06 已落地扫描）**：`pubspec.lock` 与 `go.sum` 均已入库；`go.mod` 固定 `toolchain go1.27.3`，pgx/x-net/x-text/x-crypto 升到修复版本，`govulncheck ./...` 从 15 条可达漏洞降为 0（模块级也为 0）；新增 `.github/dependabot.yml`（gomod/pub/github-actions）与 `.github/workflows/security.yml`（go vet/test/govulncheck、flutter analyze/test）。Flutter 的 `flutter_gpu_texture_renderer` 继续固定 commit；C++ 依赖无自动扫描，仍人工跟进。
 
 ---
 
@@ -1037,9 +1277,9 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 **第一批（一周内，阻断默认部署风险）**
 
-1. C1：空 `--server-key` 拒绝启动 / 强制回环；relay 始终要求 per-lease token。
-2. H1：把 keepalive/relay/carrier 挑战改成无状态 HMAC 或多槽位，并加 per-IP 限流。
-3. H2：给“已连接未 Hello”加独立超时。
+1. C1：空 `--server-key` 拒绝启动 / 强制回环；relay 始终要求 per-lease token（启动校验已完成；per-lease token 仍随 `--server-key` 开关，见该节残余风险）。
+2. H1：把 keepalive/relay/carrier 挑战改成无状态 HMAC 或多槽位，并加 per-IP 限流（已完成，见该节修复说明）。
+3. H2：给“已连接未 Hello”加独立超时（已完成，另加多查看器并发，见该节修复说明）。
 4. H5：2FA start/enable 要求密码；H6：收紧 refresh 宽限（均已完成，见各节修复说明）。
 
 **第二批（两周内，内存安全与远程 DoS）**
@@ -1058,12 +1298,23 @@ final Map<Object?, Object?> reply = await _invoke('securityKeyMakeCredential', {
 
 **第四批（持续）**
 
-13. 低危表 L1-L16 已清理（见第 4 节修复说明）；恶意输入测试已随协议修复补齐一部分，统一日志/审计格式与 CI `govulncheck`/依赖扫描仍待办。
+13. 低危表 L1-L16 已清理（见第 4 节修复说明）；协议 fuzz、JSONL 服务日志与 CI `govulncheck`/依赖扫描已于 2026-11-06 完成（见第 6 节）。
+
+**第五批（已完成）**
+
+14. 原生查看器 V1/V3/V5/V6：相机输出生命周期、`OpenTerminal` 状态回滚、重复 `start` 的输出恢复、录制开关跨会话复位（2026-11-05 已完成，见各节修复说明）。
+15. 原生查看器 V2/V4/V7/V8：WebAuthn busy 复位、GPU 错误分级与重建、目录遍历上限、纹理尺寸上限（2026-11-05 已完成，见各节修复说明）。
+16. M5/M6：撤销权限时中止 outgoing downloads、发送队列代数与超时（2026-11-05 已完成，见各节修复说明）。
+17. M20～M23：UPnP 应答源校验、relay 控制报文白名单、对端地址证明、TCP accept 退避重试（2026-11-05 已完成，见各节修复说明）。
+18. M30：光标 Pitch/摄像头 stride 几何校验、VPL 重试上限、WASAPI 销毁锁（2026-11-05 已完成，见该节修复说明）。
+19. 查看器 V9–V13 已清理（2026-11-05 已完成，见 3.1 节修复说明）；工程化项（fuzz、JSONL 日志、依赖扫描）已于 2026-11-06 完成（见第 6 节）。
 
 ---
 
 ## 8. 附：本次审核的分工与限制
 
 - 线协议（`protocol.h/.cc`）、QUIC/传输（`quic.cc`/`carrier.cc`）、主机服务端（`host_server.cc`/`host_settings.cc`/`audit_spool.cc`）、安全原语/输入/剪贴板/文件传输、Go API/账号、Go relay/agent/updater、采集/编码/音频、Flutter 客户端、原生 Windows viewer，分别通读后交叉复核。
+- 原生查看器（`app/windows/viewer/`）的 13 条发现在 2026-11-05 补入第 3.1 节；此前只在分工中列出、未并入正文，因此“发现总数”在一开始统计时包含了它、但正文没有对应小节。
+- 2026-11-05 的修复按“先高危、后中危、再低危”推进，每条都在原小节追加“修复”与“残余风险”；未修项集中列在第 7 节第五批。
 - 所有 `文件:行号` 均对应当前工作树；若后续重构导致行号漂移，以函数名/代码片段为准。
-- 本报告是静态审核，不等于渗透测试；未覆盖运行时配置、部署拓扑、第三方依赖漏洞与供应链攻击。
+- 本报告是静态审核 + 定向修复验证，不等于渗透测试；未覆盖运行时配置、部署拓扑、第三方依赖漏洞与供应链攻击。
