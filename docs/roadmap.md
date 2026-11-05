@@ -3222,6 +3222,19 @@
      仅 `net.ErrClosed` 退出并关闭监听器。验证：`go build ./...`、`go vet`、
      `go test ./internal/agent ./internal/relay ./internal/upnp` 与全量
      `go test ./...` 通过（`recordings` 被 Device Guard 随机拦截，与改动无关）。
+145. **P1 · 代码审核 M30（2026-11-05 完成）**：光标形状新增
+     `pointer_shape_valid`，按类型校验 `Width`/`Height`/`Pitch`（COLOR/
+     MASKED 要求 `Pitch >= Width*4`，MASKED 计入 mask 平面，MONOCHROME
+     要求偶数高度与对齐 pitch），并用 `data_size` 与 `max_bitmap_bytes_`
+     交叉校验；摄像头按有符号 `INT32` 读取 `MF_MT_DEFAULT_STRIDE`、拒绝
+     非正值与 `pitch <= 0`，NV12 长度改用 `uint64_t` 并在转 `LONG` 前检查
+     `LONG_MAX`；VPL 解码对 `MFX_ERR_MORE_SURFACE`/
+     `MFX_WRN_DEVICE_BUSY` 设 10/1000 次上限，超限分别返回
+     `NotCurrentlyAvailable`/`DeviceRemoved`，成功解帧后清零；WASAPI 的
+     `SetEvent` 全部改为在 `format_mutex_` 下经 `signal_render()` 访问，
+     `close()` 同锁释放 `swr_`、复位格式并取走句柄后锁外关闭。验证：
+     `chast-cursor-test`、`chast.audio`、`chast.codec`、`chast.dxgi` Release
+     构建通过；Device Guard 拒绝执行新构建的测试二进制，仅编译验证。
 - 明确不做：WebRTC/ICE/STUN/TURN、`licence_key`/Pro 部署模型、
   `conn_type` 服务器侧转发与据此限流。协议字段只增不改，M11 语义变化预计
   提升到 v25。
