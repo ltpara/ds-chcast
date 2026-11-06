@@ -379,3 +379,43 @@ func TestHostInfoReportsViewerPath(t *testing.T) {
 		})
 	}
 }
+
+// TestRelayMuxViewerRenewsRelayAuth keeps an active relay-path session alive
+// past the relay's 60-second viewer authorization window. Without a periodic
+// token proof the relay silently drops viewer->host datagrams while
+// host->viewer keeps flowing, so the echo stalls even though the session
+// still looks alive.
+func TestRelayMuxViewerRenewsRelayAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out the relay viewer authorization window")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := testutil.Start(t)
+	echo := startEcho(t)
+	startHostAgent(t, ctx, s.URL, echo.LocalAddr().String())
+
+	viewer, err := StartViewer(ctx, ViewerConfig{
+		ServerURL:  s.URL,
+		ServerKey:  testutil.ServerKey,
+		HostID:     "devbox",
+		ListenAddr: "127.0.0.1:0",
+		Mode:       ModeRelay,
+		Logger:     quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("start viewer agent: %v", err)
+	}
+	t.Cleanup(viewer.Close)
+	if info := viewer.PathInfo(); info.Path != "relay" {
+		t.Fatalf("path info = %+v, want relay", info)
+	}
+
+	start := time.Now()
+	for _, at := range []time.Duration{time.Second, 20 * time.Second, 40 * time.Second, 62 * time.Second} {
+		if wait := time.Until(start.Add(at)); wait > 0 {
+			time.Sleep(wait)
+		}
+		assertRoundTrip(t, viewer, ModeRelay)
+	}
+}

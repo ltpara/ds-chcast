@@ -476,15 +476,25 @@ func (v *ViewerAgent) sendPunchRequest() {
 const (
 	relayAuthAttempts = 6
 	relayAuthInterval = 500 * time.Millisecond
+	// The relay trusts a viewer proof for viewerIdle (60s). Renew well inside
+	// that window so an active session is not cut off at the authorization
+	// deadline, with room for a lost renewal.
+	relayAuthRefresh = 20 * time.Second
 )
 
 // startRelayAuth proves the lookup token to the relay before the first QUIC
 // datagram. It is safe to call on both the initial relay path and a fallback.
 func (v *ViewerAgent) startRelayAuth() {
-	if v.relay == nil {
+	if v.relayAddress() == nil {
 		return
 	}
 	v.relayAuth.Do(func() { go v.relayAuthLoop() })
+}
+
+func (v *ViewerAgent) relayAddress() *net.UDPAddr {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return cloneAddr(v.relay)
 }
 
 func (v *ViewerAgent) relayAuthLoop() {
@@ -497,17 +507,22 @@ func (v *ViewerAgent) relayAuthLoop() {
 		HostID: v.cfg.HostID,
 		Token:  v.carrierToken,
 	})
-	for i := 0; i < relayAuthAttempts; i++ {
-		if v.relayAuthOK.Load() {
+	for attempt := 1; ; attempt++ {
+		relay := v.relayAddress()
+		if relay == nil {
 			return
 		}
-		if _, err := v.conn.WriteToUDP(msg, v.relay); err != nil {
+		if _, err := v.conn.WriteToUDP(msg, relay); err != nil {
 			v.log.Debug("relay viewer auth write", "error", err)
+		}
+		wait := relayAuthRefresh
+		if attempt < relayAuthAttempts && !v.relayAuthOK.Load() {
+			wait = relayAuthInterval
 		}
 		select {
 		case <-v.ctx.Done():
 			return
-		case <-time.After(relayAuthInterval):
+		case <-time.After(wait):
 		}
 	}
 }
