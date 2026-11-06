@@ -25,7 +25,7 @@ func TestRequestCooldown(t *testing.T) {
 	}
 }
 
-func TestPendingForDeliversOncePerAgent(t *testing.T) {
+func TestPendingForRetriesUntilExpiry(t *testing.T) {
 	broker := New(time.Minute, 30*time.Second, 8)
 	job, _, err := broker.Request("target", "AA:BB:CC:DD:EE:FF", []string{testLink})
 	if err != nil {
@@ -38,8 +38,9 @@ func TestPendingForDeliversOncePerAgent(t *testing.T) {
 	if len(first[0].Broadcasts) != 1 || first[0].Broadcasts[0] != testLink {
 		t.Fatalf("job broadcasts = %v", first[0].Broadcasts)
 	}
-	if second := broker.PendingFor("proxy-a", true, []string{testLink}); len(second) != 0 {
-		t.Fatalf("repeated delivery = %+v", second)
+	second := broker.PendingFor("proxy-a", true, []string{testLink})
+	if len(second) != 1 || second[0].ID != job.ID {
+		t.Fatalf("retry delivery = %+v, want job %s", second, job.ID)
 	}
 	if other := broker.PendingFor("proxy-b", true, []string{testLink}); len(other) != 1 {
 		t.Fatalf("other agent delivery = %+v", other)

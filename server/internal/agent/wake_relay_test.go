@@ -50,6 +50,37 @@ func TestRelayWakeJobsBroadcastsOnce(t *testing.T) {
 	}
 }
 
+func TestRelayWakeJobsRetriesAfterSendFailure(t *testing.T) {
+	listener := wakeListener(t)
+	h := &HostAgent{
+		cfg: HostConfig{WakeRelay: true, WakeTargets: []string{listener.LocalAddr().String()}},
+		log: quietLogger(),
+	}
+	job := wake.Job{ID: "job-retry", Target: "targetbox", MAC: "invalid"}
+	h.relayWakeJobs([]wake.Job{job})
+
+	h.mu.Lock()
+	seenAfterFailure := h.wakeSeen[job.ID]
+	h.mu.Unlock()
+	if seenAfterFailure {
+		t.Fatal("failed wake job was marked as relayed")
+	}
+
+	job.MAC = "AA:BB:CC:DD:EE:FF"
+	h.relayWakeJobs([]wake.Job{job})
+	buf := make([]byte, 2048)
+	listener.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := listener.ReadFromUDP(buf); err != nil {
+		t.Fatalf("retried wake packet: %v", err)
+	}
+	h.mu.Lock()
+	seenAfterSuccess := h.wakeSeen[job.ID]
+	h.mu.Unlock()
+	if !seenAfterSuccess {
+		t.Fatal("successful wake job was not marked as relayed")
+	}
+}
+
 func TestRelayWakeJobsDisabledByDefault(t *testing.T) {
 	listener := wakeListener(t)
 	h := &HostAgent{

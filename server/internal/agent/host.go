@@ -173,8 +173,8 @@ type HostAgent struct {
 	// updatesTried keeps the versions this process already staged or
 	// rejected, so a flapping server cannot loop the download.
 	updatesTried map[string]bool
-	// wakeSeen remembers relayed wake job ids so a duplicate delivery from a
-	// restarted or failed-over server does not broadcast twice.
+	// wakeSeen remembers successfully relayed wake job ids so repeated delivery
+	// or a failed-over server does not broadcast twice.
 	wakeSeen map[string]bool
 	// observedPunch and observedRelay are this host's public mappings as seen
 	// by the rendezvous port and by its relay port. Comparing them classifies
@@ -639,10 +639,9 @@ func (h *HostAgent) startUpdate(n softwareInfo) {
 // the target's, but the agent re-checks against its current interfaces so a
 // delivery queued before a DHCP change is dropped instead of leaking a packet
 // onto a different LAN. An explicit --wake-targets override is used as-is for
-// diagnostics. The server marks a job delivered per agent, so the local set of
-// seen ids only guards against a duplicate after a server restart or failover.
-// A relay failure is logged and the job dropped: the request already returned
-// 202 and the target's MAC does not change, so the caller can simply retry.
+// diagnostics. The server repeats an unexpired job because it cannot know if a
+// registration response arrived; wakeSeen suppresses it only after a successful
+// send, leaving local failures eligible for the next registration refresh.
 func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
 	if !h.cfg.WakeRelay || len(jobs) == 0 {
 		return
@@ -661,12 +660,6 @@ func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
 		}
 		h.mu.Lock()
 		seen := h.wakeSeen[job.ID]
-		if !seen {
-			if h.wakeSeen == nil || len(h.wakeSeen) >= 512 {
-				h.wakeSeen = make(map[string]bool)
-			}
-			h.wakeSeen[job.ID] = true
-		}
 		h.mu.Unlock()
 		if seen {
 			continue
@@ -676,6 +669,12 @@ func (h *HostAgent) relayWakeJobs(jobs []wake.Job) {
 			h.log.Warn("wake relay failed", "target", job.Target, "mac", job.MAC, "error", err)
 			continue
 		}
+		h.mu.Lock()
+		if h.wakeSeen == nil || len(h.wakeSeen) >= 512 {
+			h.wakeSeen = make(map[string]bool)
+		}
+		h.wakeSeen[job.ID] = true
+		h.mu.Unlock()
 		h.log.Info("wake relayed", "target", job.Target, "mac", job.MAC,
 			"packets", sent, "job", job.ID)
 	}

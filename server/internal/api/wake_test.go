@@ -109,8 +109,10 @@ func TestWakeQueuesForProxyAgent(t *testing.T) {
 		t.Fatalf("delivered job broadcasts = %v, want [%s]", job.Broadcasts, wakeLink)
 	}
 
-	if jobs := registerWakeAgentLink(t, s.URL, "proxy", now+3, true, []string{wakeLink}); len(jobs) != 0 {
-		t.Fatalf("proxy got a job twice: %+v", jobs)
+	// The broker must repeat an unexpired job because the previous registration
+	// response may have been lost before the agent received it.
+	if jobs := registerWakeAgentLink(t, s.URL, "proxy", now+3, true, []string{wakeLink}); len(jobs) != 1 || jobs[0].Job != queued.Job {
+		t.Fatalf("proxy retry jobs = %+v, want job %s", jobs, queued.Job)
 	}
 	if jobs := registerWakeAgent(t, s.URL, "targetbox", now+4); len(jobs) != 0 {
 		t.Fatalf("target agent relayed its own wake: %+v", jobs)

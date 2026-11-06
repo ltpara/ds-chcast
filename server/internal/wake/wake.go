@@ -41,9 +41,8 @@ type Job struct {
 }
 
 type entry struct {
-	job       Job
-	expires   time.Time
-	delivered map[string]bool
+	job     Job
+	expires time.Time
 }
 
 // Broker owns the in-memory queue. It is safe for concurrent use.
@@ -108,21 +107,17 @@ func (b *Broker) Request(target, mac string, broadcasts []string) (Job, time.Dur
 		Broadcasts:   append([]string(nil), broadcasts...),
 		ExpiresInSec: int64(b.ttl / time.Second),
 	}
-	b.jobs = append(b.jobs, &entry{
-		job:       job,
-		expires:   now.Add(b.ttl),
-		delivered: make(map[string]bool),
-	})
+	b.jobs = append(b.jobs, &entry{job: job, expires: now.Add(b.ttl)})
 	b.last[target] = now
 	return job, 0, nil
 }
 
-// PendingFor returns every unexpired job the agent may relay and has not
-// received yet. An agent only sees jobs when it registered as a relay and its
-// own directed broadcast endpoints intersect the target's report, which keeps
-// both the job metadata and the magic packet on the target's link. Delivery is
-// marked before the response leaves the server so a refresh loop does not
-// repeat the packet.
+// PendingFor returns every unexpired job the agent may relay. An agent only
+// sees jobs when it registered as a relay and its own directed broadcast
+// endpoints intersect the target's report, which keeps both the job metadata
+// and the magic packet on the target's link. Jobs remain eligible until expiry
+// because the server cannot know whether a registration response reached the
+// agent; agents use the job id to suppress a successfully relayed duplicate.
 func (b *Broker) PendingFor(agentID string, relay bool, broadcasts []string) []Job {
 	if !relay {
 		return nil
@@ -133,11 +128,9 @@ func (b *Broker) PendingFor(agentID string, relay bool, broadcasts []string) []J
 	b.pruneLocked(now)
 	var out []Job
 	for _, item := range b.jobs {
-		if item.job.Target == agentID || item.delivered[agentID] ||
-			!sharedEndpoint(item.job.Broadcasts, broadcasts) {
+		if item.job.Target == agentID || !sharedEndpoint(item.job.Broadcasts, broadcasts) {
 			continue
 		}
-		item.delivered[agentID] = true
 		out = append(out, item.job)
 	}
 	return out
