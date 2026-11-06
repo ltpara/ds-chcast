@@ -767,9 +767,39 @@ bool set_users_write_acl(const std::filesystem::path& path) {
     return set_protected_dacl(path, L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GW;;;BU)");
 }
 
-bool set_legacy_record_acl(const std::filesystem::path& path) {
-    return set_protected_dacl(path,
-                              L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)(A;;GR;;;BU)");
+std::wstring current_user_sid_text() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return {};
+    }
+    DWORD bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    std::vector<unsigned char> buffer(bytes);
+    const bool ok =
+        bytes != 0 &&
+        GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes) != FALSE;
+    CloseHandle(token);
+    if (!ok) {
+        return {};
+    }
+    LPWSTR text = nullptr;
+    if (!ConvertSidToStringSidW(
+            reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &text)) {
+        return {};
+    }
+    std::wstring sid = text;
+    LocalFree(text);
+    return sid;
+}
+
+bool set_legacy_record_acl(const std::filesystem::path& path, const std::wstring& user_sid) {
+    // The old %ProgramData%\chast inherited CREATOR OWNER, which Windows
+    // resolves to the creating administrator's SID when the ACE is applied.
+    // Name that SID explicitly so the fixture stays a legacy record whether
+    // the process token's default owner is the user or Administrators.
+    const std::wstring sddl = L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user_sid +
+                              L")(A;;GR;;;BU)";
+    return set_protected_dacl(path, sddl.c_str());
 }
 
 void test_state_directory_security() {
@@ -818,7 +848,10 @@ void test_state_directory_security() {
           "hardening discards a record that other accounts could change");
 
     write_bytes(state, chast::virtual_display_install_json(record));
-    check(set_legacy_record_acl(state), "a legacy record gets a CREATOR OWNER ACL");
+    const std::wstring user_sid = current_user_sid_text();
+    check(!user_sid.empty(), "the current user SID is available for the legacy fixture");
+    check(set_legacy_record_acl(state, user_sid),
+          "a legacy record keeps the creating administrator's write access");
     check(!chast::read_install_record(&parsed),
           "a legacy record is not trusted until it is migrated");
     check(chast::harden_virtual_display_state_directory(&error),

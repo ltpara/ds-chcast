@@ -5936,6 +5936,33 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             return fail(stats.error);
         }
         drain_display_switch_results();
+        // Wall-clock scheduling: a rebuild after the accepted switch can starve
+        // frames, and a frame-driven timer would then never send the refusal.
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (!switch_ok_sent && stats.switch_ok_index != chast::kDisplayAuto &&
+                stats.received > 0 && now - start >= std::chrono::milliseconds(1200)) {
+                switch_ok_sent = true;
+                if (chast::Error sent_switch =
+                        session->request_display_switch(stats.switch_ok_index);
+                    !sent_switch.ok()) {
+                    return fail("request_display_switch: " + sent_switch.to_string());
+                }
+                // The refusal has to reach the host a full rate-limit window
+                // after the accepted request.
+                switch_bad_at = (std::max)(switch_bad_at,
+                                           now + std::chrono::milliseconds(1200));
+            }
+            if (!switch_bad_sent && stats.switch_bad_index != chast::kDisplayAuto &&
+                now >= switch_bad_at) {
+                switch_bad_sent = true;
+                if (chast::Error sent_switch =
+                        session->request_display_switch(stats.switch_bad_index);
+                    !sent_switch.ok()) {
+                    return fail("request_display_switch: " + sent_switch.to_string());
+                }
+            }
+        }
         if (received.status() == chast::Status::WaitTimeout) {
             if (session->async_error().ok() && !session->video_finished() &&
                 std::chrono::steady_clock::now() - last_frame < std::chrono::seconds(30)) {
@@ -5995,29 +6022,6 @@ ReceiverStats run_receiver(const Options& options, std::shared_future<ServerRead
             session->request_keyframe();
             next_keyframe_request = last_frame +
                 std::chrono::milliseconds(options.keyframe_request_ms);
-        }
-        if (!switch_ok_sent && stats.switch_ok_index != chast::kDisplayAuto &&
-            last_frame - start >= std::chrono::milliseconds(1200)) {
-            switch_ok_sent = true;
-            if (chast::Error sent_switch =
-                    session->request_display_switch(stats.switch_ok_index);
-                !sent_switch.ok()) {
-                return fail("request_display_switch: " + sent_switch.to_string());
-            }
-            // The refusal has to reach the host a full rate-limit window after
-            // the accepted request. Measuring from the send rather than from
-            // start keeps them apart when a frame stall delays both.
-            switch_bad_at = (std::max)(switch_bad_at,
-                                       last_frame + std::chrono::milliseconds(1200));
-        }
-        if (!switch_bad_sent && stats.switch_bad_index != chast::kDisplayAuto &&
-            last_frame >= switch_bad_at) {
-            switch_bad_sent = true;
-            if (chast::Error sent_switch =
-                    session->request_display_switch(stats.switch_bad_index);
-                !sent_switch.ok()) {
-                return fail("request_display_switch: " + sent_switch.to_string());
-            }
         }
         if (header.seq != expected_seq) {
             ++stats.gaps;
@@ -8763,7 +8767,13 @@ int run_verify(const Options& options) {
         }
     }
     const bool keep_file = !options.save.empty();
-    const std::string path = keep_file ? options.save : ".chast-quic-verify.bin";
+    // Concurrent verifies in one directory must not replay each other's
+    // stream, so the scratch copy is unique per process and removed below.
+    const std::string scratch =
+        ".chast-quic-verify-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+        ".bin";
+    const std::string path = keep_file ? options.save : scratch;
 
     // Both ends must not open the same file: the sender's copy is the one the
     // offline replay checks.
@@ -9946,8 +9956,11 @@ int run_weak_network(const Options& options) {
     const uint32_t floor_bps = std::max<uint32_t>(500000u, configured_bps / 10u);
 
     const bool keep_file = !options.save.empty();
-    const std::string path =
-        keep_file ? options.save : ".chast-quic-verify-netem.bin";
+    const std::string scratch =
+        ".chast-quic-verify-netem-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+        ".bin";
+    const std::string path = keep_file ? options.save : scratch;
 
     Options receiver_options = local;
     receiver_options.save.clear();
